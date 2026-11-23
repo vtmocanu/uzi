@@ -135,6 +135,7 @@ import type {
   RunListItem,
   RunMessage,
   RunStartBody,
+  SetRunCiAutofixResponse,
   RunSummaryItem,
   RunNowResponse,
   RunReview,
@@ -1610,6 +1611,16 @@ const realApi = {
    */
   setRunMrRework: (id: string, enabled: boolean | null) =>
     request<{ run: Run }>("PUT", `/runs/${id}/mr-rework`, { enabled }),
+
+  /**
+   * Issue #4617: set (or clear) THIS run's per-run CI-autofix override. `true`/`false` is an
+   * explicit override; `null` clears back to inherit the owner's Settings default. Owner-scoped.
+   * The response carries the updated run plus, when another run on the branch governs the
+   * setting (ci_autofix_governing_run_id) or CI fixes are already in flight
+   * (ci_autofix_inflight_fix_run_ids, which keep their own setting), the ids to tell the owner.
+   */
+  setRunCiAutofix: (id: string, enabled: boolean | null) =>
+    request<SetRunCiAutofixResponse>("PUT", `/runs/${id}/ci-autofix`, { enabled }),
 
   /**
    * PRD #1202: start an ON-DEMAND MR-review-rework run for THIS run's open MR, right now.

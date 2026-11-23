@@ -4270,6 +4270,9 @@ export interface Run {
    *  per-run override. Kept `boolean | null` (never `any`) to preserve the
    *  omitted-vs-null-vs-value distinction, exactly like mr_state's nullability. */
   mr_rework_enabled?: boolean | null;
+  /** Issue #4617: this run's per-run CI-autofix override. null/absent = inherit the owner's
+   *  Settings default; an explicit true/false overrides it for this run's branch. */
+  ci_autofix_enabled?: boolean | null;
   /** PRD #1202 D11: the OWNER-ONLY view of the automatic rework loop guard, so the owner
    *  can see why the watcher stopped. `mr_rework_auto_cycles` is the automatic cycles spent
    *  (0 when none), `mr_rework_auto_cap` the live admin cap. Both are populated only on the
@@ -5194,6 +5197,16 @@ export interface UsageTail {
   coverage: "complete" | "partial";
   coverage_reasons: string[];
   models: UsageTailModel[];
+}
+
+/** Issue #4617: PUT /runs/{id}/ci-autofix response. The two optional-looking hints name
+ *  OTHER runs on the same branch so the UI can tell the owner where the setting is read. */
+export interface SetRunCiAutofixResponse {
+  run: Run;
+  /** The run whose override currently governs automatic CI fixes on this branch, or null. */
+  ci_autofix_governing_run_id: string | null;
+  /** CI-fix runs already in flight on this branch; they keep their own setting. */
+  ci_autofix_inflight_fix_run_ids: string[];
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display
