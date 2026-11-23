@@ -98,7 +98,8 @@ function installCloseHook(t: TestContext): void {
       // present from the start of the flight reroutes the hold exit itself (the flight stops retained before the final drain, so
       // nothing is left to trip). From this point it stays on the flight through settlement. Unlike production (preparePreservation
       // retains custody before it sets `hold`), custody is NOT pre-retained here. Of the row's custody flags, retainedLocalCustody is
-      // the one only the handler's memory branch sets; preserveRecoveryClone and preserveSession are also set by the retained stop.
+      // the one only the handler's memory branch sets; preserveRecoveryClone and preserveSession are already set earlier, by
+      // enterCompletionHold's capture retention, so the row cannot attribute them to the memory branch.
       if (obs.memoryOverlap) obs.flight!.workerMemory = obs.memoryStandIn;
       api.failMessagesNext(1, 403);
       this.emit({ kind: "status", agent: "worker", payload: { text: FRAME } });
