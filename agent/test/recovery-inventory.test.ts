@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
 import { RecoveryCoordinator, canonicalJson, type FrozenOperationOptions, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions, type RecoveryBundleProducer } from "../src/recovery.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, passthroughInventorySection, testGitCacheOptions } from "./helpers.js";
 import { buildRecoveryLiveTiming } from "../src/main.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
@@ -2893,6 +2893,7 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     },
   };
   const git = {
+    withInventorySourceLock: passthroughInventorySection,
     worktreeStatus: async () => [] as string[],
     recoverySettlementRoot: path.join(root, "settlement"),
     deleteRecoveryPin: async () => { state.pinDeletes++; state.candidates = []; },

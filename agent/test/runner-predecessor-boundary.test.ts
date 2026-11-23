@@ -162,7 +162,8 @@ describe("predecessor boundary: grant, tail and scope", () => {
     assert.equal(out.result, "retained");
     assert.deepEqual(out.diagnostics, [{ check: "boundary_exception" }]);
     assert.deepEqual(x.registration.refusals.map(r => r.check), ["predecessor_scope_invalid", "boundary_exception"]);
-    assert.equal(x.requests.length, 2, "the after-scan finishes, then the dead scope stops the proof before any verdict");
+    // issue #4632: a dead scope aborts the inventory section after the content stage, so its after-scan is never started.
+    assert.equal(x.requests.length, 1, "the dead scope aborts the section before the after-scan and before any verdict");
   });
 
   it("a tail replaced between two proves stops the second", async () => {
@@ -181,7 +182,14 @@ describe("predecessor boundary: grant, tail and scope", () => {
     const deadlineAt = Date.now() + 600_000;
     const x = world({ deadlineAt });
     assert.equal((await x.enter(1, x.registration.token, async prove => { await prove(); })).result, "passed");
-    assert.deepEqual(x.w.bounds, Array(4).fill({ ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt }), "content proof and residue listing, on each of two proves");
+    // issue #4632: the section clips the grant's deadline to its own budget and adds its stop latch.
+    const bounds = x.w.bounds as Array<{ deadlineAt: number; stopped: () => boolean }>;
+    assert.equal(bounds.length, 4, "content proof and residue listing, on each of two proves");
+    for (const b of bounds) {
+      assert.ok(b.deadlineAt <= deadlineAt && b.deadlineAt > Date.now(), "deadline clipped to the section budget");
+      assert.equal(typeof b.stopped, "function");
+      assert.deepEqual({ ...b, deadlineAt: 0, stopped: undefined }, { ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt: 0, stopped: undefined });
+    }
     x.w.bounds.length = 0;
     await x.internals.withInventorySourceBoundary({ runId: "run-ordinary", generation: 1, barePath: "/fixture/repo.git" },
       async prove => { await prove(); });
