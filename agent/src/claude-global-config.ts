@@ -24,9 +24,9 @@
 // split it is a plain unlink. Failure (non-zero exit, timeout, signal, a directory at the path)
 // is a refusal. Without the split, ENOTDIR (`.claude` is a file) is accepted as absent: the CLI's
 // stat of the file then fails and its resolver falls back to `.claude.json`. Under the split the
-// image's busybox `rm -f` exits non-zero on ENOTDIR, so that state refuses the start (fail closed). The `.claude<oauth suffix>.json`
-// variants are chosen only with CLAUDE_CODE_CUSTOM_OAUTH_URL, and the run-env `CLAUDE_` prefix is
-// denied (run-env-names.ts), so they are out of scope.
+// image's busybox `rm -f` exits non-zero on ENOTDIR, so that state refuses the start (fail closed).
+// The `.claude<oauth suffix>.json` variants are chosen only with CLAUDE_CODE_CUSTOM_OAUTH_URL,
+// and the run-env `CLAUDE_` prefix is denied (run-env-names.ts), so they are out of scope.
 //
 // Mode. 0660 with the group the HOME hands down (runner for run and chat HOMEs; job HOMEs
 // differ; there is no setgid on single-uid). The CLI saves its config in place (open O_WRONLY,
@@ -37,11 +37,10 @@
 // Fail closed. A directory (or anything else rename cannot replace) at that path makes the start
 // throw a TrustedExecutionRefusal before any process is spawned.
 //
-// Residuals (going into ADR-4416, pending owner decisions): a live runner-uid writer racing the
-// startup read (a background process of an earlier turn can rewrite the file after this reset and
-// before the CLI reads it, or swap the temp entry in a non-sticky HOME), and a possible
-// mid-process re-read (the CLI watches the file for other processes). The reset narrows the
-// window to the spawn; it does not close those.
+// Residuals: ADR-4416, section "Global CLI config input", lists them as pending owner decisions
+// (among them a live runner-uid writer racing the startup read or swapping the temp entry, and a
+// write while the CLI runs, since the CLI watches the file). The reset narrows the window to the
+// spawn; it does not close those.
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
