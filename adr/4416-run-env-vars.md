@@ -424,8 +424,9 @@ every Claude CLI start in every lane, the worker:
    `CLAUDE_CONFIG_DIR` is a protected env key (`agent/src/sdk-env.ts`), so a run variable cannot
    set it.
 
-With `CLAUDE_CONFIG_DIR` set the CLI does not read `HOME/.claude.json`, `HOME/.claude/.config.json`,
-`HOME/.claude/settings.json` or `HOME/.claude/remote-settings.json` (probes below). The earlier
+With `CLAUDE_CONFIG_DIR` set, an env block planted in `HOME/.claude.json`, `HOME/.claude/.config.json`
+or `HOME/.claude/settings.json` was not applied in the probes below (with controls), and neither was
+an unsigned one in `HOME/.claude/remote-settings.json` (no positive control). The earlier
 reset of `HOME/.claude.json` and removal of `HOME/.claude/.config.json` are therefore gone, and no
 runner-uid removal under `HOME/.claude` remains.
 
@@ -573,12 +574,20 @@ recovery described under R3.
   closed (the start is refused, nothing is spawned):
   - the rename aside itself failing (for example a read-only data volume);
   - a second mkdir exit 1 after the one retry;
-  - a transient or other mkdir failure (spawn error, signal, timeout, another non-zero exit such as
-    a `setpriv` failure): that start only, `.claude` kept;
+  - a transient or other mkdir failure (spawn error, signal, timeout, a non-zero exit other than
+    1): that start only, `.claude` kept;
   - a non-zero mkdir of `.claude` itself;
   - a HOME that fails the boundary checks (not worker-owned under the split, a world-writable
     non-sticky parent, or a runner-gid group-writable non-sticky parent);
-  - the directory changing past the bounded number of attempts ("kept changing").
+  - the directory changing past the bounded number of attempts ("kept changing"), and the same
+    bound on the `.claude` targets;
+  - a HOME that is not a canonical absolute path or not a real directory, and a
+    `CLAUDE_CONFIG_DIR` that is not exactly `<HOME>/.uzi-claude-config`.
+
+  Residual (accepted as documented): exit 1 is not proof of a planted entry. mkdir also exits 1 on
+  ENOSPC, EDQUOT or EIO, and `setpriv` exits 1 when it cannot resolve the runner user (for example
+  under descriptor or memory exhaustion). Such a failure moves `.claude` aside once and refuses the
+  start; nothing is deleted, and that session's resume history stays in the aside copy.
 
   Asides (`.claude.stale-*`, `.uzi-claude-config.stale-*`) are not
   reclaimed automatically in a HOME that is never torn down, such as the shared chat root; each

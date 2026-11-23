@@ -11,10 +11,11 @@
 //
 // Policy. The CLI is pointed at a directory the runner cannot change, with CLAUDE_CONFIG_DIR
 // (sdk-env.ts sets it to claudeConfigDir(HOME), a protected key; spawnDetached refuses to start a
-// CLI whose CLAUDE_CONFIG_DIR is anything else). The CLI then reads `<dir>/.claude.json` and nothing
-// under `<HOME>/.claude` that carries configuration: a planted `<HOME>/.claude.json`,
-// `<HOME>/.claude/.config.json`, `<HOME>/.claude/settings.json` and
-// `<HOME>/.claude/remote-settings.json` are not consulted. The directory holds exactly:
+// CLI whose CLAUDE_CONFIG_DIR is anything else). The CLI then reads `<dir>/.claude.json`; in the
+// probes an env block planted in `<HOME>/.claude.json`, `<HOME>/.claude/.config.json` or
+// `<HOME>/.claude/settings.json` was not applied (with controls), nor one in an unsigned
+// `<HOME>/.claude/remote-settings.json` (fake-key session, no positive control; ADR-4416). The
+// directory holds exactly:
 //   .claude.json   the fixed bytes CLAUDE_GLOBAL_CONFIG_BYTES, mode 0444
 //   projects       symlink to ../.claude/projects  (transcripts, so resume and -c keep working)
 //   tasks          symlink to ../.claude/tasks     (the task-list tools need a writable tasks dir)
@@ -33,9 +34,10 @@
 // land in `<HOME>/.claude/projects` through the link, and `--resume <id>` and `-c` find them;
 // TaskCreate works only with the `tasks` link (target writable). A directory the CLI CAN write
 // (one uid, mode 0755) gains backups/, plugins/, sessions/, .last-cleanup and a rewritten
-// `.claude.json`, and gives no protection: it renames over 0444 files. An `env` block written to the config while the
-// CLI runs has no effect (the environment is read at startup), and an unsigned remote-settings
-// env block was never applied.
+// `.claude.json`, and gives no protection: it renames over 0444 files. In `-p` probes against a
+// fake API (no completed turn), an `env` block written to the config while the CLI ran was not
+// applied, and an unsigned remote-settings env block was not applied (no positive control); the
+// scope of both is in ADR-4416.
 //
 // Boundary. Under the uid split (uidSplitActive) HOME must be a real directory owned by the
 // worker uid; this module adds the sticky bit to it, so the group-writable runner can create
@@ -83,10 +85,13 @@
 // directory makes it rename `.claude` aside and recreate it (the transcripts stay in the aside
 // copy, so a resume of that session finds nothing). A `.claude` the worker cannot open
 // (runner-private, the split's normal state) is not inspected and the mkdir is simply repeated (it
-// is idempotent); when that mkdir fails (a file or dangling symlink at a target, an unsearchable
-// `.claude`), `.claude` is renamed aside ONCE and the mkdir retried, and a second failure refuses
+// is idempotent); when that mkdir exits 1 (a file or dangling symlink at a target, an unsearchable
+// `.claude`), `.claude` is renamed aside ONCE and the mkdir retried, and a second exit 1 refuses
 // the start. That keeps a runner-planted target from refusing every later start of a HOME, the
-// shared chat HOME included.
+// shared chat HOME included. Residual: exit 1 is not proof of a planted entry. mkdir also exits 1
+// on ENOSPC/EDQUOT/EIO, and setpriv exits 1 when it cannot resolve the runner user (for example
+// under descriptor or memory exhaustion); such a failure moves `.claude` aside once (nothing is
+// deleted; that session's resume history stays in the aside copy) and the start is refused.
 //
 // Not reset any more: `<HOME>/.claude.json` and `<HOME>/.claude/*` are not read by the CLI, so
 // they are no longer replaced or removed.
