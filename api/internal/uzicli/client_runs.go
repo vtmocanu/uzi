@@ -333,6 +333,29 @@ func (c *HTTPClient) SetRunMrRework(ctx context.Context, id string, enabled *boo
 	return env.Run, nil
 }
 
+// SetRunCIAutofixResult is the PUT /api/runs/{id}/ci-autofix reply: the updated run plus
+// which run governs automatic CI fixes on its branch (nil when none) and the caller's own
+// in-flight ci_fix run ids on that branch (always a list, possibly empty). The ids are
+// server-supplied strings; print them through the sanitizing Printer.
+type SetRunCIAutofixResult struct {
+	Run               apitypes.RunDTO `json:"run"`
+	GoverningRunID    *string         `json:"ci_autofix_governing_run_id"`
+	InflightFixRunIDs []string        `json:"ci_autofix_inflight_fix_run_ids"`
+}
+
+// SetRunCIAutofix sets the per-run CI-autofix override. enabled is tri-state with NO
+// omitempty, like SetRunMrRework: nil marshals as `"enabled":null` (clear to inherit).
+func (c *HTTPClient) SetRunCIAutofix(ctx context.Context, id string, enabled *bool) (SetRunCIAutofixResult, error) {
+	body := struct {
+		Enabled *bool `json:"enabled"`
+	}{Enabled: enabled}
+	var res SetRunCIAutofixResult
+	if err := c.put(ctx, "/api/runs/"+url.PathEscape(id)+"/ci-autofix", body, &res); err != nil {
+		return SetRunCIAutofixResult{}, err
+	}
+	return res, nil
+}
+
 // RunRework triggers one on-demand MR-rework cycle (PRD #1202 M1). guidance rides the
 // body verbatim (NO omitempty — an empty guidance is a valid trigger, so the key is
 // always sent); the server unwraps to the created `mr_rework` run. The exit-code mapping

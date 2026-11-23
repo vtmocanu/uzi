@@ -326,6 +326,13 @@ type FakeClient struct {
 	MrReworkRun         apitypes.RunDTO
 	SetRunMrReworkErr   error
 
+	// SetRunCIAutofix capture, mirroring the MR-rework fields above: the run id, the
+	// tri-state pointer, the canned result, and a write-specific error.
+	LastCIAutofixRunID   string
+	LastCIAutofixEnabled *bool
+	CIAutofixResult      SetRunCIAutofixResult
+	SetRunCIAutofixErr   error
+
 	// RunRework capture (PRD #1202 M1): LastReworkRunID is the run id `uzi run rework`
 	// targeted; LastReworkGuidance is the guidance it sent (from -m or stdin, "" when
 	// none). ReworkRun is the canned success reply; RunReworkErr wins over the blanket Err

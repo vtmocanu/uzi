@@ -173,6 +173,7 @@ uzi run inputs <id> [--json]
 uzi run lead-config <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
+uzi run ci-autofix <id> [--enabled[=false]] [--clear]
 uzi run export <id> --output <path> [--capture <id>]
 uzi run fetches <id> [--json]
 uzi run recovery [<id> | --user <uuid>] [--json]
@@ -1039,6 +1040,28 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
+- **`run ci-autofix <id>`** sets the per-run override for **automatic** CI fixes
+  on the run's branch. It is tri-state: `--enabled` (the default for a bare
+  call) turns them on, `--enabled=false` turns them off, and `--clear` returns
+  the run to inherit (your account default). `--clear` with `--enabled` is a
+  usage error (exit 2) and sends nothing; a foreign or unknown run is not found
+  (exit 4). It is editable on a completed run. The override that counts is the
+  one on the branch's **selected run**: the newest non-cancelled issue,
+  `ci_fix`, prompt or self-improve run that has an MR. A `ci_fix` repair run
+  that completes with a branch and MR becomes the selected run because it
+  inherited the value, so re-enabling after a repair means editing that repair
+  run; the command prints which run governs. A new issue run taking over the
+  same `agent/issue-N` branch starts from its own default, and `mr_rework`
+  runs, and prompt or self-improve runs on their own run-ID branches, do not
+  displace the selection. CI fixes already in flight keep the value they copied
+  at creation: the command lists your own in-flight fixes so you can cancel
+  them or set the value on them too. The admin gate always wins, and manual
+  Fix CI (`uzi ci fix`) is never blocked by this setting. The override does not
+  expire, so re-enable it when you are done. It prints the updated run
+  (`uzi run get` shows the same state in its `CI_AUTOFIX` row) followed by the
+  governing-run and in-flight notes when they apply; `--json` emits the full
+  `{"run": ..., "ci_autofix_governing_run_id": ..., "ci_autofix_inflight_fix_run_ids": [...]}`
+  envelope. See [Automatic CI fixes](./ci-autofix.md#per-run-override).
 - **`run plan <run-id>` prints the latest plan Markdown verbatim.** Use
   `uzi run plan <run-id> [--version N] [--diff] [--json]` regardless of run
   status, including after approval or once the run has finished. For reading

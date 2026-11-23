@@ -388,7 +388,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf),
 		newRunExtendCmd(env, gf),
 		newRunFollowUpCmd(env, gf), newRunAnswerCmd(env, gf), newRunInputsCmd(env, gf), newRunExpediteCmd(env, gf),
-		newRunResumeNowCmd(env, gf), newRunMrReworkCmd(env, gf), newRunPauseCmd(env, gf), newRunResumeCmd(env, gf), newRunReworkCmd(env, gf),
+		newRunResumeNowCmd(env, gf), newRunMrReworkCmd(env, gf), newRunCIAutofixCmd(env, gf), newRunPauseCmd(env, gf), newRunResumeCmd(env, gf), newRunReworkCmd(env, gf),
 		newRunSetTokenCmd(env, gf),
 		newRunDecideCmd(env, gf), newRunExportCmd(env, gf), newRunRecoveryCmd(env, gf), newRunDiscardCmd(env, gf),
 		newRunHeldCmd(env, gf), newRunLeadConfigCmd(env, gf),
