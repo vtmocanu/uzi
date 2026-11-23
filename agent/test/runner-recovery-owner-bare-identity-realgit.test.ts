@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { describe, it, type TestContext } from "node:test";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
@@ -13,10 +14,8 @@ import { RequestError } from "../src/client.js";
 import * as gitModule from "../src/git.js";
 import type { MemoryParkRecord } from "../src/git.js";
 import type { ClaimResponse } from "../src/protocol.js";
-import { reapRunProcesses } from "../src/run-procs.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
 import { treeDigest } from "./restore-route-rig.js";
-import { createHash } from "node:crypto";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -68,8 +67,8 @@ interface Rig {
   /** How many guidance lines the feed already held when the first park was requested. */
   guidanceAtPark?: number;
   counts: { models: number; captures: number; ledger: number; blocks: number; reserves: number; rejections: unknown[]; holds: number; freeCaptures: number;
-    /** Teardown seams a claim exit can reach: clone retire/remove (git), process kill and reap, cache drop (executor). */
-    retires: number; removes: number; kills: number; reaps: number; reclaims: number };
+    /** How many times the claim exit retired the runner clone (a teardown step). */
+    retires: number };
   /** The run's own HOME dir, seeded with a marker file before the claim. */
   home: string;
   flights: Flight[];
@@ -137,7 +136,7 @@ async function build(t: TestContext, o: RigOptions = {}): Promise<Rig> {
     claim, bare, clonePath: clone.path, branch: clone.branch, key, journalKey, ownerKey, registry: new ActiveRunRegistry(), logs,
     parks: [], sequence: [],
     counts: { models: 0, captures: 0, ledger: 0, blocks: 0, reserves: 0, rejections: [], holds: 0, freeCaptures: 0,
-      retires: 0, removes: 0, kills: 0, reaps: 0, reclaims: 0 },
+      retires: 0 },
     home: path.join(homeDir, claim.run_id),
     flights: [], mismatch: { on: false, which: "dev" },
     journal: () => JSON.parse(command(bare, "config", journalKey)) as Journal,
@@ -184,21 +183,15 @@ async function build(t: TestContext, o: RigOptions = {}): Promise<Rig> {
     if (isPark) return { status: body.status, recoveryCause: body.recovery_cause } as never;
     return report(runId, body, signal);
   });
-  // Counted, never replaced: the clone teardown a claim exit performs.
-  for (const [name, field] of [["retireRunnerClone", "retires"], ["removeRunnerClone", "removes"]] as const) {
-    const original = (seam[name] as (...a: unknown[]) => Promise<unknown>).bind(git);
-    t.mock.method(seam, name, async (...args: unknown[]) => { rig.counts[field]++; return original(...args); });
+  // Counted, never replaced: the clone retire a claim exit performs.
+  {
+    const original = (seam.retireRunnerClone as (...a: unknown[]) => Promise<unknown>).bind(git);
+    t.mock.method(seam, "retireRunnerClone", async (...args: unknown[]) => { rig.counts.retires++; return original(...args); });
   }
   rig.execute = async () => {
     api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
-    // Executor-side teardown seams are observed through counting stubs, so a claim exit that kills, reaps or drops caches shows.
-    const executor = {
-      run: async () => { rig.counts.models++; throw new Error("must not model"); },
-      killAgentTree: () => { rig.counts.kills++; },
-      reapAttributedProcesses: async (opts: Parameters<typeof reapRunProcesses>[3]) => { rig.counts.reaps++; return reapRunProcesses(rig.home, undefined, [], opts); },
-      reclaimCachesInPlace: async () => { rig.counts.reclaims++; return { dropped: [], absent: [], failed: [], skipped: [] }; },
-    };
-    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId), executor: executor as never }),
+    const runner = runnerWith(runId => ({ homeDir: path.join(homeDir, runId),
+      executor: { run: async () => { rig.counts.models++; throw new Error("must not model"); } } }),
       fakeGitlab().gitlab, undefined, logs.logger, { recoveryRetryMs: 1, activeRuns: rig.registry, ...o.runnerExtra });
     const priv = runner as unknown as Record<string, (...a: unknown[]) => unknown>;
     // The hold exists only with the fix; a runner without it is observed through the other counters.
@@ -557,22 +550,13 @@ describe("a base-class bare-identity error from any other owner read inside the 
   const predecessor = (r: Rig) => {
     fs.mkdirSync(path.join(r.home, "sub"), { recursive: true });
     fs.writeFileSync(path.join(r.home, "sub", "transcript.jsonl"), "session bytes\n");
+    // One rebuildable cache subtree (a RUN_CACHE_SUBTREES entry), to observe whether today's exit drops it.
+    fs.mkdirSync(path.join(r.home, ".cache", "go-build"), { recursive: true });
+    fs.writeFileSync(path.join(r.home, ".cache", "go-build", "entry"), "cache bytes\n");
     return { homeDigest: treeDigest(r.home), refs: command(r.bare, "for-each-ref"), head: command(r.clonePath, "rev-parse", "HEAD"),
       status: command(r.clonePath, "status", "--porcelain"), cloneDigest: workTree(r.clonePath) };
   };
   const assertTodaysDisposition = (r: Rig, before: ReturnType<typeof predecessor>): void => {
-    // No teardown: nothing retired or removed the clone, killed or reaped a process, or dropped a cache; HOME and the clone are as before.
-    assert.equal(r.counts.retires, 0, "no clone retire");
-    assert.equal(r.counts.removes, 0, "no clone removal");
-    assert.equal(r.counts.kills, 0, "no process kill");
-    assert.equal(r.counts.reaps, 0, "no attributed-process reap");
-    assert.equal(r.counts.reclaims, 0, "no cache drop");
-    assert.equal(fs.existsSync(r.home), true, "the run HOME still exists");
-    assert.equal(treeDigest(r.home), before.homeDigest, "the run HOME is unchanged");
-    assert.equal(command(r.bare, "for-each-ref"), before.refs, "the bare's refs are byte-identical");
-    assert.equal(command(r.clonePath, "rev-parse", "HEAD"), before.head, "the clone's HEAD is unchanged");
-    assert.equal(command(r.clonePath, "status", "--porcelain"), before.status, "the clone's work tree status is unchanged");
-    assert.equal(workTree(r.clonePath), before.cloneDigest, "the clone's work tree is unchanged");
     // Behaviour first, so a baseline that holds fails on the hold and not on the missing class.
     assert.equal(r.counts.holds, 0, "not held");
     assert.equal(guidance(r).length, 0, "no storage-identity guidance line");
@@ -590,6 +574,14 @@ describe("a base-class bare-identity error from any other owner read inside the 
     assert.equal(r.counts.freeCaptures, 0, "no quiescence capture");
     assert.equal(fs.existsSync(r.clonePath), true, "custody kept");
     assert.equal(fs.readFileSync(path.join(r.clonePath, "retained.txt"), "utf8"), "local retained work\n");
+    // No teardown: the clone was not retired; the run HOME, the bare's refs and the clone are as before the claim.
+    assert.equal(r.counts.retires, 0, "no clone retire");
+    assert.equal(fs.existsSync(r.home), true, "the run HOME still exists");
+    assert.equal(treeDigest(r.home), before.homeDigest, "the run HOME is unchanged");
+    assert.equal(command(r.bare, "for-each-ref"), before.refs, "the bare's refs are byte-identical");
+    assert.equal(command(r.clonePath, "rev-parse", "HEAD"), before.head, "the clone's HEAD is unchanged");
+    assert.equal(command(r.clonePath, "status", "--porcelain"), before.status, "the clone's work tree status is unchanged");
+    assert.equal(workTree(r.clonePath), before.cloneDigest, "the clone's work tree is unchanged");
   };
 
   it("the identity changes between the probe and the ordinary owner read: today's preservation_failed, nothing held", async t => {
