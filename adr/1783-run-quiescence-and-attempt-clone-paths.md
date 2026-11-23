@@ -122,9 +122,10 @@ clone key and read that git as unattributed residue, failing the successor.
   escapes the clear. A canonical reseed is over-excluded. While unmarked residue
   persists, a same-key claim waits once, retries once and stops, so repeated
   claims can exhaust requeues; base would instead have failed the seed
-  terminally (`worker_residue_blocked`), since seed mode kills only
-  attempt-marked (own or terminal) residue, and a readable unmarked in-scope
-  process survives as `unattributed_in_scope`. The clear's bare-config reads and observe-only probe
+  terminally (`worker_residue_blocked`), since seed mode kills attempt-marked (own or
+  terminal) residue, and, under the uid split with no other claim, unreadable
+  unattributed processes, but a readable unmarked in-scope process survives as
+  `unattributed_in_scope`. The clear's bare-config reads and observe-only probe
   can outlive the section's budget on expiry, but stay tracked until they settle;
   none of them runs in the clone.
 - **Rollout.** The checks `source_lock_unavailable` and
