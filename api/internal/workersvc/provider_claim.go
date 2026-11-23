@@ -320,8 +320,9 @@ func promotionRunBinding(r store.LockCredentialDisabledRunForPromotionRow) store
 // holdProviderDestinationNotAllowed while the URL is still off the list (stay held), and
 // holdProviderBindingStale when the binding broke while parked (frozen key or revision changed: the
 // caller rewrites the hold, whose "resumes automatically" copy is false then). Run under the owner's
-// secret mutation lock (so a rotation or disable serializes against this decision) with plain reads;
-// the claim re-checks under locks anyway. A retired provider does not block (retiring keeps bound
+// secret mutation lock (so a rotation or disable serializes against this decision); the revision read
+// takes FOR KEY SHARE (GetModelProviderRevisionForOwner) and the key read is plain. The claim
+// re-checks under locks anyway. A retired provider does not block (retiring keeps bound
 // runs). Any other hold reason never reaches here.
 func (s *Service) providerHoldRefusal(ctx context.Context, q *store.Queries, run store.Run) (string, error) {
 	if !providerBoundRun(run) {
