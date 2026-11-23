@@ -190,6 +190,28 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
     }
   });
 
+  it("an observe-only probe under uid split never files an unreadable process for a kill, so it is clear and unsignalled", async () => {
+    const previous = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+    plantUnreadableUnattributed(root, 82);
+    try {
+      // In-process (the fake proc root is not visible to a real helper child); no other claim, empty registry.
+      const out = await quiesceRunAttempt({
+        mode: "own", attempt: undefined, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry: new LiveAttemptRegistry(), observeOnly: true,
+        otherClaimInFlight: false,
+      }, { targetUid: ME, reap: { viaHelper: false } }); // no deadlineAt: a gate deadline turns the fake EISDIR into a table failure
+      assert.deepEqual(out.process?.killed ?? [], []);
+      assert.equal(fs.existsSync(path.join(root, "82")), true, "nothing is killed");
+      assert.equal(out.process?.processes.some((p) => p.reason.startsWith("unreadable_no_other_claim")), false,
+        JSON.stringify(out.process?.processes));
+      assert.equal(inventoryClearVerdict(out.process), "clear", out.process?.detail ?? "no process verdict");
+    } finally {
+      if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = previous;
+    }
+  });
+
   it("without observeOnly the serialized request carries neither field", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-obs-"));
     try {

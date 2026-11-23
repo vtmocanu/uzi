@@ -14,7 +14,8 @@ clone key and read that git as unattributed residue, failing the successor.
 - **Bare-lock section.** Each clone's proof (before-scan, runner git, after-scan)
   runs as one section under the repository's bare lock `B`
   (`GitCache.withInventorySourceLock`). Lock wait is 30 s; the section budget is
-  12 s; the after-scan has 3 s and the status read 3 s. A nested call, a boundary
+  12 s; every scan in it, the before-scan included, has 3 s, and the status read
+  3 s. A nested call, a boundary
   scope that releases `B` itself, an expired lock wait or an active reclaim
   admission refuses `source_lock_unavailable`. A queued seed waits for the
   flight-boundary `A` wait of 30 s (`codexBoundaryDeadlineMs`); each section ahead
@@ -35,8 +36,9 @@ clone key and read that git as unattributed residue, failing the successor.
   probe reads clear. The probe never signals a process. Verdict
   (`inventoryClearVerdict`): unmarked in-scope residue blocks; processes marked
   to another live, protected or terminal attempt, and results that are
-  unverified only through unreadable-unattributed processes, do not. This
-  mirrors the attempt seed's own relaxation. An undefined result, an unverified
+  unverified only through unreadable-unattributed processes, do not. This is
+  broader than the seed's `unverifiedOnlyByUnattributedUnreadable`, which is safe
+  because every seed admitted by a clear still runs its own unchanged sweep. An undefined result, an unverified
   result with no processes or an unknown reason is not clear.
 - **Scope-classed clears.** A full clear sweeps the same scope as a seed
   (`nonLiveKeyPaths`) and removes the settled entries. A restore clear uses the
@@ -61,7 +63,11 @@ clone key and read that git as unattributed residue, failing the successor.
 - **Accepted boundaries.** Operator discards do not consult the registry. The
   `PendingRecoveryCaptureError` recovery capture is ungated (pre-existing).
   Containers are not covered by the probe. A descendant that forges a marker
-  escapes the clear. A canonical reseed is over-excluded.
+  escapes the clear. A canonical reseed is over-excluded. While unmarked residue
+  persists, a same-key claim waits once, retries once and stops, so repeated
+  claims can exhaust requeues; base would instead have killed that unmarked
+  residue in its seed sweep. The clear's bare-config reads and observe-only probe
+  can outlive the section's budget on expiry; none of them runs in the clone.
 - **Rollout.** The checks `source_lock_unavailable` and
   `source_settlement_unproven` are new; older workers do not emit or retry them.
 

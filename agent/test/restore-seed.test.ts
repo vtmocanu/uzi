@@ -12,7 +12,8 @@ import {
 } from "../src/git.js";
 import type { GitAuthorityHooks } from "../src/git-authority-hooks.js";
 import { restoreDigest, type RestoreWindow } from "../src/restore-journal.js";
-import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
+import { attemptClonePath, cloneKeyOf, formatAttemptId } from "../src/attempt-path.js";
+import { InventorySourceExclusionRefusal } from "../src/inventory-exclusion.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -1030,5 +1031,29 @@ describe("sanity of the happy-path fixture", () => {
   it("P's journal digest is sha256 of the raw value", () => {
     assert.equal(restoreDigest(pRaw), sha256(pRaw));
     assert.ok(RestoreCompositeError);
+  });
+});
+
+describe("seedIndependentAttempt: the same-key inventory exclusion (issue #4632)", () => {
+  it("refuses an excluded key whose restore-class probe is not clear, unwrapped, before any write", async () => {
+    const canonical = cache.runnerClonePath(bare, KEY);
+    const calls: Array<{ cloneKey: string; protectedMarkers?: string[] }> = [];
+    cache.setInventoryExclusionProbe(async (req) => { calls.push(req); return "not_clear"; });
+    (cache as unknown as { inventoryExclusion: { addEntry(b: string, k: string, e: unknown): void } }).inventoryExclusion
+      .addEntry(bare, cloneKeyOf(canonical).cloneKey, { id: "e1", clonePath: canonical, gitStarted: true, pending: new Set() });
+    const before = config();
+    const ledger = ledgerValues();
+    const trace: Trace = { steps: [] };
+    let caught: unknown;
+    try { await cache.seedIndependentAttempt(seedInput(trace)); } catch (err) { caught = err; }
+    assert.ok(caught instanceof InventorySourceExclusionRefusal, `expected the exclusion refusal, got ${String(caught)}`);
+    assert.equal(caught instanceof RestoreSeedError, false, "the refusal is not wrapped");
+    assert.equal(calls.length, 1, "the restore-class probe ran once");
+    assert.deepEqual(calls[0]!.protectedMarkers, [`${RUN}:${P_ID}`]);
+    assert.deepEqual(config(), before, "the bare config is byte-identical");
+    assert.deepEqual(ledgerValues(), ledger, "no successor ledger entry");
+    assert.equal(rawKey(S_KEY), undefined, "no restore entry");
+    assert.equal(fs.existsSync(S_PATH), false);
+    assert.deepEqual(trace.steps, [], "no callback ran");
   });
 });

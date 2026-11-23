@@ -2,7 +2,7 @@
 // tail, held scope, deadline) selects it through InventorySourceBoundaryContext.predecessor; it shares
 // proveInventorySources with the ordinary boundary, binds a Codex capture attempt to its own clone path, compares a
 // per-clone baseline on every prove, and gates predecessor FINAL on ignored residue. Real git for the content proof.
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +12,14 @@ import type { InventorySourceBoundaryContext, InventorySourceDiagnostic } from "
 import { mintAttemptId, newRunAttempt, scanOnce, type QuiesceRunRequest, type RunAttempt } from "../src/run-quiescence.js";
 import { GitCache, INVENTORY_CONTENT_PROOF_BOUNDS } from "../src/git.js";
 import { fakeGitlab, git, installHarness, runner } from "./runner-harness.js";
+import { passthroughInventorySection } from "./helpers.js";
 installHarness();
+// issue #4632: this suite drives the runner boundary over a fixture bare path ("/fixture/repo.git") and a stubbed
+// git, so the real locked section (which reads the bare's config) cannot run here; opt this suite into the passthrough.
+// The section's own behavior is covered by git-inventory-exclusion.test.ts and runner-inventory-seed-serialization.test.ts.
+beforeEach(() => {
+  git.withInventorySourceLock = passthroughInventorySection as unknown as typeof git.withInventorySourceLock;
+});
 
 type Refusal = { check: string; clonePath?: string };
 interface Registration {

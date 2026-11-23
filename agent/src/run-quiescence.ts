@@ -1438,8 +1438,9 @@ const INVENTORY_IGNORED_REASONS: ReadonlySet<string> = new Set([
  * a `terminal_attempt:kill_unconfirmed` candidate that was never signalled) are ignored.
  *
  * An `unverified` result with at least one process whose reasons are all `unreadable_unattributed` or ignored
- * counts as clear: this matches what the attempt seed itself admits (see
- * {@link unverifiedOnlyByUnattributedUnreadable}). An unreadable process is unattributable worker-wide, not
+ * counts as clear. That is broader than what the attempt seed itself admits (see
+ * {@link unverifiedOnlyByUnattributedUnreadable}), and it is safe because every seed admitted by a clear still runs
+ * its own unchanged sweep. An unreadable process is unattributable worker-wide, not
  * evidence of our in-scope residue, and our inventory git descendants are ordinary runner-uid processes the
  * scanner can read. Fails closed otherwise: an undefined result, an unverified result with no processes
  * (a table, helper or deadline error) or any unknown reason is `not_clear`.
@@ -2821,7 +2822,10 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       liveMarkers: others.map((a) => a.marker),
       ...(req.protectedMarkers?.length ? { protectedMarkers: [...req.protectedMarkers] } : {}),
       mayKillUnreadableUnattributed:
-        req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
+        req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0 &&
+        // An observe-only probe never signals, so an unreadable pid must classify as
+        // `unreadable_unattributed` (which inventoryClearVerdict admits), not a never-executed kill reason.
+        req.observeOnly !== true,
       ...(req.workerWide === true ? { workerWide: true } : {}),
       ...(req.observeOnly === true ? { observeOnly: true } : {}),
       ...(req.observeOnly === true && req.deadlineAt !== undefined ? { deadlineAt: req.deadlineAt } : {}),
