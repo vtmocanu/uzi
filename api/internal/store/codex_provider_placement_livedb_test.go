@@ -9,7 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-const codexPlacementMigration = "00518_placement_codex_provider_capability.sql"
+const codexPlacementMigration = "00521_placement_codex_provider_capability.sql"
 
 func placementMigrationFunction(t *testing.T, section string) string {
 	t.Helper()
