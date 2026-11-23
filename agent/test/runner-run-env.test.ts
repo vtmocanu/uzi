@@ -335,6 +335,48 @@ describe("a large retained secret history", () => {
     assert.equal(missingRemoved, 0, "every form evicted at terminal");
   });
 
+  it("a 25-version history of 180k forms starts, redacts retained lines in text and report, and completes", async () => {
+    const redact = history(25);
+    const pre = runEnvClaimForms(undefined, redact);
+    assert.equal(pre.redaction.length, 180_175);
+    assert.equal(pre.overBudget, false);
+    const lineA = redact[0]!.value.split("\n")[5]!;
+    const lineB = redact[24]!.value.split("\n")[7000]!;
+
+    const { gitlab } = fakeGitlab();
+    const { logger, added, removed } = secretRecordingLogger();
+    const claim = gitlabClaim(iid++, { secrets: claimSecrets(25) as never });
+    let ran = 0;
+    let redacted: string | undefined;
+    const exec: Executor = {
+      run: async (ctx) => {
+        ran++;
+        redacted = ctx.redactText!(`before ${lineA} middle ${lineB} after`);
+        return { branch: ctx.branch, reportOnly: true, summary: `report ${lineA} and ${lineB}` };
+      },
+    };
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+
+    assert.equal(ran, 1, "the executor ran");
+    assert.equal(api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed").length, 0);
+    const completed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "completed")?.body;
+    assert.ok(completed, "the run completed");
+    const addedSet = new Set(added);
+    const removedSet = new Set(removed);
+    let missingAdded = 0;
+    let missingRemoved = 0;
+    for (const f of pre.redaction) {
+      if (!addedSet.has(f)) missingAdded++;
+      if (!removedSet.has(f)) missingRemoved++;
+    }
+    assert.equal(missingAdded, 0, "every form registered");
+    assert.equal(missingRemoved, 0, "every form evicted at terminal");
+    assert.ok(redacted !== undefined && !redacted.includes(lineA) && !redacted.includes(lineB), "redactText hides both retained lines");
+    assert.ok(typeof (completed as { report_md?: unknown }).report_md === "string", "the completed state carries report_md");
+    const json = JSON.stringify(completed);
+    assert.ok(!json.includes(lineA) && !json.includes(lineB), "the completed state carries neither retained line");
+  });
+
   it("a retained history over the form cap fails with run_env_forms_over_budget through the normal failure report", async () => {
     const redact = history(36);
     assert.equal(runEnvClaimForms(undefined, redact).overBudget, true);
