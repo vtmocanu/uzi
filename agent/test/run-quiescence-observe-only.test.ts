@@ -216,7 +216,7 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
     process.env.UZI_UID_SPLIT = "1";
     plantUnreadableUnattributed(root, 82);
     try {
-      // In-process (the fake proc root is not visible to a real helper child); no other claim, empty registry.
+      // In-process (under the uid split the helper lane refuses a raw view, so the fake root is reached in-process); no other claim, empty registry.
       const out = await quiesceRunAttempt({
         mode: "own", attempt: undefined, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
         dockerHost: undefined, registry: new LiveAttemptRegistry(), observeOnly: true,
@@ -348,7 +348,7 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
         assert.equal(sent.mayKillUnreadableUnattributed, false);
         assert.equal(sent.liveRoots.some((r) => r.pid === PID && r.startTime === START), true, JSON.stringify(sent.liveRoots));
         assert.equal(typeof sent.deadlineAt, "number");
-        assert.ok((sent.deadlineAt as number) <= deadlineAt, "the retry deadline never exceeds the original");
+        assert.ok((sent.deadlineAt as number) < deadlineAt, "the retry carries its own, earlier proof deadline (never the original or later)");
       } finally {
         fs.rmSync(tmp, { recursive: true, force: true });
       }
