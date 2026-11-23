@@ -1121,8 +1121,8 @@ type LockProviderBindingRevisionForKeyShareNowaitRow struct {
 
 // The claim finisher's revision read (PRD #4320 module 5, D9): the same SELECT as
 // GetModelProviderRevisionForOwner but FOR KEY SHARE OF r NOWAIT. The finisher already holds the run
-// row and the key row FOR SHARE; DeleteModelProvider cascades the revision rows BEFORE the key row,
-// so a BLOCKING revision lock here against a provider delete mid-cascade is a lock cycle (40P01,
+// row and the key row FOR SHARE; a provider delete cascades the revision and key rows in either
+// order, so a BLOCKING revision lock here against a delete mid-cascade can be a lock cycle (40P01,
 // which the finishers do not retry). NOWAIT turns that contention into 55P03, which finishRunClaim /
 // finishChatClaim already retry as a bounded whole-transaction retry. A missing row is
 // pgx.ErrNoRows (stale).
