@@ -101,8 +101,14 @@ func wantCodexActualProviderClaim(t *testing.T, pf *pcFix, id uuid.UUID) store.R
 func wantCodexActualNoVendorWrites(t *testing.T, pf *pcFix, r store.Run) {
 	t.Helper()
 	pf.wantNoVendorWrites(t, r)
-	if r.CodexSecretID.Valid || r.CodexAuthMode.Valid || r.CodexMaterialRevision.Valid || r.CodexClaimEpoch != 0 || len(r.CodexCapHash) != 0 {
-		t.Fatal("provider run acquired vendor authority")
+	// ClaimRun advances this revocation counter for every claim, including providers.
+	// The counter alone is no authority: no secret, material, hash or journal may exist.
+	if r.CodexSecretID.Valid || r.CodexAuthMode.Valid || r.CodexMaterialRevision.Valid || len(r.CodexCapHash) != 0 {
+		t.Fatalf("vendor authority present: secret=%t auth=%t material=%t capability_hash=%t",
+			r.CodexSecretID.Valid, r.CodexAuthMode.Valid, r.CodexMaterialRevision.Valid, len(r.CodexCapHash) != 0)
+	}
+	if r.CodexClaimEpoch < r.ClaimGeneration {
+		t.Fatal("shared claim revocation fence regressed")
 	}
 }
 
