@@ -139,8 +139,11 @@ updates with `--no-install` resolve the refreshed output paths. Each pass preser
 one existing `source: nixpkg` entry while invalidating the other raw entries; the
 second pass refreshes the original preserved entry. This avoids the legacy-key
 migration without updating explicit pins or implementing a separate Nix resolver.
-A normal full `devbox update` migrates raw keys to devbox-search `@latest` entries
-and is intentionally avoided.
+A normal full `devbox update` can migrate raw keys to devbox-search `@latest` entries
+(observed on Devbox 0.17.5) and is intentionally avoided. This two-pass method is the
+path proven on Devbox 0.17.5 on Linux; rerun that proof when Devbox is bumped. A failed
+scheduled refresh opens or comments on one `Weekly devbox toolchain refresh failing`
+tracking issue.
 
 The helper requires the manifest to remain byte-identical and validates the
 complete lock and module Go requirements. It then checks every selected output
