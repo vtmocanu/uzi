@@ -73,6 +73,7 @@ const canonicalOf = (key: string): string => git.runnerClonePath(bare, key);
 const keyOf = (key: string): string => cloneKeyOf(canonicalOf(key)).cloneKey;
 const section = <T,>(key: string, body: (s: InventorySection) => Promise<T>, o: Partial<InventorySourceLockOptions> = {}) =>
   git.withInventorySourceLock(bare, { clonePath: canonicalOf(key), branch, isLive: () => false, ...o }, body);
+const withoutHeld = (r: { heldMs?: number }): object => { const { heldMs: _heldMs, ...rest } = r; return rest; };
 const logged = (msg: string): boolean => rec.lines.some((l) => (l as { msg?: string }).msg === msg);
 
 /** A section that started git, settled it and found the clone quiescent, with the given probe verdict. */
@@ -132,7 +133,7 @@ describe("registry", () => {
 describe("section lifecycle", () => {
   it("removes the entry when git never started", async () => {
     const r = await section("issue-1", async () => "v");
-    assert.deepEqual(r, { kind: "ran", value: "v", timedOut: false, entryKept: false });
+    assert.deepEqual(withoutHeld(r), { kind: "ran", value: "v", timedOut: false, aborted: false, entryKept: false });
     assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-1")), false);
     assert.equal(probeCalls.length, 0);
   });
@@ -148,7 +149,7 @@ describe("section lifecycle", () => {
       s.afterScanQuiescent(true);
       return 7;
     });
-    assert.deepEqual(r, { kind: "ran", value: 7, timedOut: false, entryKept: false });
+    assert.deepEqual(withoutHeld(r), { kind: "ran", value: 7, timedOut: false, aborted: false, entryKept: false });
     assert.equal(probeCalls.length, 1);
     assert.deepEqual(probeCalls[0]!.targetPaths, [canonical, sibling].sort());
     assert.equal(probeCalls[0]!.canonicalPath, canonical);
@@ -170,7 +171,7 @@ describe("section lifecycle", () => {
   it("reports the reason a started git stayed excluded", async () => {
     verdict = "not_clear";
     const notClear = await section("issue-4", async (s) => { s.markGitStarted(); s.afterScanQuiescent(true); });
-    assert.deepEqual(notClear, { kind: "ran", value: undefined, timedOut: false, entryKept: true, keptReason: "full_probe_not_clear" });
+    assert.deepEqual(withoutHeld(notClear), { kind: "ran", value: undefined, timedOut: false, aborted: false, entryKept: true, keptReason: "full_probe_not_clear" });
     const calls = probeCalls.length;
     const skipped = await section("issue-5", async (s) => { s.markGitStarted(); s.afterScanQuiescent(false); });
     assert.equal(skipped.kind === "ran" && skipped.keptReason, "full_probe_skipped");
@@ -238,6 +239,29 @@ describe("section lifecycle", () => {
     assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-11")), false, "git never started and nothing pending");
   });
 
+  it("an abort while the step-7 probe is pending keeps the entry and reports aborted", async () => {
+    const ac = new AbortController();
+    git.setInventoryExclusionProbe(async () => { ac.abort(); await tick(5); return "clear"; });
+    const r = await section("issue-13", async (s) => {
+      s.markGitStarted();
+      await s.stage(async () => 1);
+      s.afterScanQuiescent(true);
+      return "body";
+    }, { signal: ac.signal });
+    assert.equal(r.kind === "ran" && r.aborted, true);
+    assert.equal(r.kind === "ran" && r.timedOut, false);
+    assert.equal(r.kind === "ran" && r.entryKept, true);
+    assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-13")), true, "the abort kept the entry");
+  });
+
+  it("heldMs covers a slow lazy clear", async () => {
+    await leaveEntry("issue-14");
+    git.setInventoryExclusionProbe(async () => { await tick(150); return "clear"; });
+    const r = await section("issue-14", async () => "x");
+    assert.equal(r.kind, "ran");
+    assert.ok(r.kind === "ran" && r.heldMs >= 140, `heldMs ${r.kind === "ran" ? r.heldMs : "n/a"} covers the 150 ms lazy clear`);
+  });
+
   it("two entries of one key are all removed by one clear full verdict", async () => {
     const k = keyOf("issue-12");
     const extra = { id: "extra", clonePath: canonicalOf("issue-12"), gitStarted: true, pending: new Set<Promise<unknown>>() };
@@ -276,6 +300,24 @@ describe("clearExclusion", () => {
     git.setInventoryExclusionProbe(async () => { await tick(150); return "clear"; });
     assert.equal(await priv.clearExclusion(bare, branch, canonicalOf("issue-22"), () => false, "full", Date.now() + 60), "not_clear");
     assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-22")), true);
+  });
+
+  it("a timed-out probe keeps the key unsettled until it settles, and a second clear removes nothing meanwhile", async () => {
+    const k = keyOf("issue-26");
+    priv.inventoryExclusion.addEntry(bare, k, { id: "x", clonePath: "/c", gitStarted: true, pending: new Set() });
+    const hold = deferred<"clear">();
+    let calls = 0;
+    git.setInventoryExclusionProbe(() => { calls++; return hold.promise; });
+    assert.equal(await priv.clearExclusion(bare, branch, canonicalOf("issue-26"), () => false, "full", Date.now() + 60), "not_clear");
+    assert.equal(priv.inventoryExclusion.allPendingSettled(bare, k), false, "the abandoned probe is still pending");
+    assert.equal(await priv.clearExclusion(bare, branch, canonicalOf("issue-26"), () => false, "full", Date.now() + 1_000), "not_clear");
+    assert.equal(calls, 1, "no second probe while the first is unsettled");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true);
+    hold.resolve("clear");
+    await git.inventoryExclusionSettled(bare, k);
+    assert.equal(priv.inventoryExclusion.allPendingSettled(bare, k), true);
+    assert.equal(await priv.clearExclusion(bare, branch, canonicalOf("issue-26"), () => false, "full", Date.now() + 1_000), "admit");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), false);
   });
 
   it("full under a restore entry is deferred with no probe and no lstat of the key", async (t) => {

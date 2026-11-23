@@ -5391,6 +5391,8 @@ export class RunRunner {
       };
       const sectionResult = await this.git.withInventorySourceLock(barePath, {
         clonePath: clone.clonePath, branch: clone.branch, isLive: p => this.liveAttempts.isLivePath(p),
+        // Predecessor path: every stage start is gated on the grant (and its held capture) still being live.
+        ...(grant ? { live: () => !scopeLost() } : {}),
       }, async (section): Promise<CloneVerdict> => {
         const quiesce = (req: QuiesceRunRequest) => section.stage(() => this.quiesceImpl({
           ...req, forceHelper: true, deadlineAt: Math.min(section.deadlineAt, Date.now() + INVENTORY_SCAN_BUDGET_MS),
@@ -5460,7 +5462,7 @@ export class RunRunner {
       });
       scope();
       if (sectionResult.kind === "refused") return fail(sectionResult.check, { check: sectionResult.check }, clone.clonePath);
-      if (sectionResult.timedOut || sectionResult.value === undefined) return fail("source_settlement_unproven", { check: "source_settlement_unproven" }, clone.clonePath);
+      if (sectionResult.timedOut || sectionResult.aborted || sectionResult.value === undefined) return fail("source_settlement_unproven", { check: "source_settlement_unproven" }, clone.clonePath);
       if (!sectionResult.value.pass) return fail(sectionResult.value.check, sectionResult.value.diagnostic, clone.clonePath);
     }
     scope();

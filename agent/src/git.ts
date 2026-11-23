@@ -1021,14 +1021,18 @@ export interface InventorySection {
 }
 export type InventoryKeptReason = "full_probe_skipped" | "full_probe_not_clear" | "full_probe_deferred_restore" | "unsettled";
 export type InventorySourceLockResult<T> =
-  | { kind: "refused"; check: "source_lock_unavailable" | "source_settlement_unproven"; detail: string }
-  | { kind: "ran"; value: T | undefined; timedOut: boolean; entryKept: boolean; keptReason?: InventoryKeptReason };
+  /** `heldMs` (time B was held, from acquisition to just before returning) is absent when B was never acquired. */
+  | { kind: "refused"; check: "source_lock_unavailable" | "source_settlement_unproven"; detail: string; heldMs?: number }
+  /** `aborted`: an abort (caller signal, ambient scope or `live` going false) was observed after the section started. */
+  | { kind: "ran"; value: T | undefined; timedOut: boolean; aborted: boolean; entryKept: boolean; keptReason?: InventoryKeptReason; heldMs: number };
 export interface InventorySourceLockOptions {
   clonePath: string;
   branch: string;
   isLive: (p: string) => boolean;
   deadlineMs?: number;
   signal?: AbortSignal;
+  /** Checked before every stage starts; false latches the section as aborted. */
+  live?: () => boolean;
   log?: Logger;
 }
 /** Used by the PREDECESSOR path only; the ordinary terminal FINAL keeps `worktreeStatus`.
@@ -6511,35 +6515,43 @@ export class GitCache {
    * issue #4632: try to clear the key's exclusion, under an already held bare lock. `full` removes every settled entry on a
    * clear verdict; `restore` only admits this one call (the entry stays). No entry admits at once. A `full` clear under a
    * restore entry is deferred without any probe or lstat. The probe runs only when everything an entry started has settled,
-   * and a verdict that arrives after `deadlineAt` is not trusted. Any failure is `not_clear`.
+   * and a verdict that arrives after `deadlineAt` is not trusted. Any failure is `not_clear`. Every read, scope discovery
+   * and probe the call races against the deadline is registered as pending on every entry of the key, so a timed-out one
+   * keeps the key unsettled (no removal, no admission) until it has really settled. `stillLive` is checked synchronously
+   * right before a removal; it defaults to the call's own deadline check.
    */
   private async clearExclusion(
     bare: string, branch: string, canonical: string, isLive: (p: string) => boolean, cls: "full" | "restore",
-    deadlineAt: number, opaque?: ReadonlySet<string>, protectedMarkers?: string[],
+    deadlineAt: number, opaque?: ReadonlySet<string>, protectedMarkers?: string[], stillLive?: () => boolean,
   ): Promise<"admit" | "deferred_restore" | "not_clear"> {
     const { cloneKey } = cloneKeyOf(canonical);
     const reg = this.inventoryExclusion;
     if (!reg.excluded(bare, cloneKey)) return "admit";
+    // Sampled before this call registers any work of its own, so it cannot block itself.
+    const settledAtStart = reg.allPendingSettled(bare, cloneKey);
+    const track = <R,>(work: Promise<R>): Promise<R> => {
+      for (const e of reg.entriesOf(bare, cloneKey)) reg.trackPending(e, work);
+      return work;
+    };
     try {
       let entries: string[] | undefined;
       if (cls === "full") {
-        entries = await withinDeadline(this.configEntries(bare), deadlineAt);
+        entries = await withinDeadline(track(this.configEntries(bare)), deadlineAt);
         if (this.restoreHolder(entries, branch) !== undefined) return "deferred_restore";
       }
-      if (!reg.allPendingSettled(bare, cloneKey)) return "not_clear";
+      if (!settledAtStart) return "not_clear";
       const probe = this.inventoryProbe;
       if (!probe) return "not_clear";
-      const ledger = await withinDeadline(this.readAttemptLedger(bare, branch, entries), deadlineAt);
-      const targetPaths = await withinDeadline(cls === "full"
+      const ledger = await withinDeadline(track(this.readAttemptLedger(bare, branch, entries)), deadlineAt);
+      const targetPaths = await withinDeadline(track(cls === "full"
         ? this.nonLiveKeyPaths(canonical, ledger, isLive)
-        : this.restoreSeedSweepPaths(canonical, ledger, isLive, opaque ?? new Set()), deadlineAt);
-      // Entries are only installed under this lock, so everything here had settled before the probe started.
+        : this.restoreSeedSweepPaths(canonical, ledger, isLive, opaque ?? new Set())), deadlineAt);
       const before = reg.entriesOf(bare, cloneKey).map((e) => e.id);
-      const verdict = await withinDeadline(probe({
+      const verdict = await withinDeadline(track(probe({
         bare, cloneKey, canonicalPath: canonical, targetPaths, deadlineAt,
         ...(protectedMarkers ? { protectedMarkers } : {}),
-      }), deadlineAt);
-      if (Date.now() > deadlineAt || verdict !== "clear") return "not_clear";
+      })), deadlineAt);
+      if (Date.now() > deadlineAt || verdict !== "clear" || (stillLive && !stillLive())) return "not_clear";
       if (cls === "full") {
         for (const e of reg.entriesOf(bare, cloneKey)) {
           if (before.includes(e.id) && reg.entrySettled(e)) reg.removeEntry(bare, cloneKey, e.id);
@@ -6575,12 +6587,31 @@ export class GitCache {
       ({ kind: "refused", check, detail });
     if (this.holdsLock(barePath)) return refused("source_lock_unavailable", "nested inside the bare lock");
     if (this.boundaryProcesses.getStore()?.beforeLockRelease) return refused("source_lock_unavailable", "a boundary scope releases the bare lock itself");
-    const acquire = AbortSignal.any([AbortSignal.timeout(INVENTORY_LOCK_ACQUIRE_MS), ...(opts.signal ? [opts.signal] : [])]);
+    // The section is bound by the same ambient scopes withLock honours (boundary, recovery operation, report proof,
+    // maintenance budget): their signals abort it and their remaining time caps D, measured from this call.
+    let ambientSignals: AbortSignal[];
+    let ambientDeadlineAt = Infinity;
+    try {
+      const boundary = this.boundaryProcesses.getStore();
+      const recovery = this.recoveryOperation();
+      const report = this.reportProofs.getStore();
+      const maintenance = MaintenanceBudget.current();
+      ambientSignals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()]
+        .filter((s): s is AbortSignal => s !== undefined);
+      const remaining = Math.min(recovery ? this.recoveryRemaining(recovery) : Infinity,
+        report ? report.deadline - Date.now() : Infinity, maintenance ? maintenance.remainingMs() : Infinity);
+      if (remaining <= 0 || ambientSignals.some((s) => s.aborted)) return refused("source_lock_unavailable", "the ambient scope is already over");
+      ambientDeadlineAt = Date.now() + remaining;
+    } catch {
+      return refused("source_lock_unavailable", "the ambient scope is already over");
+    }
+    const signal = AbortSignal.any([...ambientSignals, ...(opts.signal ? [opts.signal] : [])]);
+    const acquire = AbortSignal.any([AbortSignal.timeout(INVENTORY_LOCK_ACQUIRE_MS), signal]);
     let acquired = false;
     try {
       return await this.withLock(barePath, async () => {
         acquired = true;
-        return this.runInventorySection(barePath, opts, body);
+        return this.runInventorySection(barePath, { ...opts, signal }, body, ambientDeadlineAt);
       }, acquire);
     } catch (err) {
       if (!acquired && err instanceof Error && err.message === GIT_LOCK_WAIT_ABORT_MESSAGE) {
@@ -6592,18 +6623,21 @@ export class GitCache {
 
   private async runInventorySection<T>(
     barePath: string, opts: InventorySourceLockOptions, body: (section: InventorySection) => Promise<T>,
+    ambientDeadlineAt: number = Infinity,
   ): Promise<InventorySourceLockResult<T>> {
     const reg = this.inventoryExclusion;
     const log = opts.log ?? this.log;
     const { cloneKey, canonicalPath } = cloneKeyOf(opts.clonePath);
+    // B is held from here (the start of the locked fn) until just before this returns.
     const startedAt = Date.now();
-    const deadlineAt = startedAt + (opts.deadlineMs ?? INVENTORY_SECTION_BUDGET_MS);
+    const heldMs = (): number => Date.now() - startedAt;
+    const deadlineAt = Math.min(startedAt + (opts.deadlineMs ?? INVENTORY_SECTION_BUDGET_MS), ambientDeadlineAt);
     // (1) A leftover entry of an earlier section is cleared lazily; a key that stays excluded is not provable.
     const lazy = await this.clearExclusion(barePath, opts.branch, canonicalPath, opts.isLive, "full", Math.min(deadlineAt, startedAt + INVENTORY_LAZY_CLEAR_MS));
-    if (reg.excluded(barePath, cloneKey)) return { kind: "refused", check: "source_settlement_unproven", detail: `same-key exclusion not cleared (${lazy})` };
+    if (reg.excluded(barePath, cloneKey)) return { kind: "refused", check: "source_settlement_unproven", detail: `same-key exclusion not cleared (${lazy})`, heldMs: heldMs() };
     // (2) A reclaim in flight may already be sweeping this key.
     const age = reg.admissionAge(barePath, cloneKey);
-    if (age !== undefined) return { kind: "refused", check: "source_lock_unavailable", detail: `a reclaim admission is active (age ${age} ms)` };
+    if (age !== undefined) return { kind: "refused", check: "source_lock_unavailable", detail: `a reclaim admission is active (age ${age} ms)`, heldMs: heldMs() };
     // (3)
     const entry: ExclusionEntry = { id: randomUUID(), clonePath: opts.clonePath, gitStarted: false, pending: new Set() };
     reg.addEntry(barePath, cloneKey, entry);
@@ -6633,6 +6667,7 @@ export class GitCache {
       markGitStarted: () => { entry.gitStarted = true; },
       stage: async <R,>(fn: () => Promise<R>): Promise<InventoryStageResult<R>> => {
         if (latch) return { ok: false, why: "stopped" };
+        if (opts.live && !opts.live()) { stop("abort"); return { ok: false, why: "stopped" }; }
         let work: Promise<R>;
         try { work = fn(); } catch (error) { work = Promise.reject(error); }
         reg.trackPending(entry, work);
@@ -6655,7 +6690,9 @@ export class GitCache {
     let probe: "skipped" | "cleared" | "not_clear" | "deferred_restore" = "skipped";
     if (result.k === "done" && entry.gitStarted && reg.entrySettled(entry) && !aborted && !timedOut && scanQuiescent
         && deadlineAt - Date.now() >= INVENTORY_FULL_PROBE_MIN_MS) {
-      const verdict = await this.clearExclusion(barePath, opts.branch, canonicalPath, opts.isLive, "full", deadlineAt);
+      // An abort or the deadline while the probe is pending latches; the clear then keeps the entry.
+      const verdict = await this.clearExclusion(barePath, opts.branch, canonicalPath, opts.isLive, "full", deadlineAt,
+        undefined, undefined, () => !latch && !aborted);
       probe = verdict === "admit" ? "cleared" : verdict;
     }
     latch = true;
@@ -6677,8 +6714,8 @@ export class GitCache {
     }
     if (result.k === "threw") throw result.error;
     return {
-      kind: "ran", value: result.k === "done" ? result.value : undefined, timedOut, entryKept,
-      ...(keptReason ? { keptReason } : {}),
+      kind: "ran", value: result.k === "done" ? result.value : undefined, timedOut, aborted, entryKept,
+      ...(keptReason ? { keptReason } : {}), heldMs: heldMs(),
     };
   }
 

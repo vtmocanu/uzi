@@ -36,10 +36,30 @@ clone key and read that git as unattributed residue, failing the successor.
   probe reads clear. The probe never signals a process. Verdict
   (`inventoryClearVerdict`): unmarked in-scope residue blocks; processes marked
   to another live, protected or terminal attempt, and results that are
-  unverified only through unreadable-unattributed processes, do not. This is
-  broader than the seed's `unverifiedOnlyByUnattributedUnreadable`, which is safe
-  because every seed admitted by a clear still runs its own unchanged sweep. An undefined result, an unverified
-  result with no processes or an unknown reason is not clear.
+  unverified only through unreadable-unattributed processes, do not. An undefined
+  result, an unverified result with no processes or an unknown reason is not
+  clear. Inventory descendants are not necessarily readable by the scanner: a
+  clone-configured hook could leave a non-dumpable, unmarked descendant, which
+  reads `unreadable_unattributed`. The clear verdict treats an unreadable-only
+  result as clear, deliberately and as a recorded accepted boundary, because
+  otherwise any worker-wide non-dumpable process would strand every exclusion
+  permanently. That is measured: on the uzi worker, `uzi-codex-super` makes every
+  scan unverified. The attempt seed's own sweep already admits that same case
+  (`unverifiedOnlyByUnattributedUnreadable`), and every seed admitted by a clear
+  still runs its own unchanged sweep.
+- **Helper bounds.** Before- and after-scan helpers get their bound from the
+  parent-side group kill at the gate deadline (`run-quiescence.ts`) and the
+  section race. `deadlineAt` is forwarded into the helper only for observe-only
+  probes, so non-observe classification stays unchanged.
+- **Ambient scopes.** The section is bound by the ambient boundary, recovery
+  operation, report and maintenance-budget scopes `withLock` honours: their
+  signals abort it and their remaining time caps `D`. The predecessor path also
+  gates every stage start on its grant staying live. A section that observed an
+  abort reports `aborted` and is `source_settlement_unproven`, like a timeout. The
+  final clear removes an entry only if no abort or deadline latched while its
+  probe was pending. Every read, scope discovery and probe of a clear is tracked
+  on the key's entries, so a timed-out one keeps the key unsettled until it ends.
+  The result reports `heldMs`, the time `B` was held.
 - **Scope-classed clears.** A full clear sweeps the same scope as a seed
   (`nonLiveKeyPaths`) and removes the settled entries. A restore clear uses the
   narrower restore seed scope and only admits that seed; the entry stays. A full
@@ -67,7 +87,8 @@ clone key and read that git as unattributed residue, failing the successor.
   persists, a same-key claim waits once, retries once and stops, so repeated
   claims can exhaust requeues; base would instead have killed that unmarked
   residue in its seed sweep. The clear's bare-config reads and observe-only probe
-  can outlive the section's budget on expiry; none of them runs in the clone.
+  can outlive the section's budget on expiry, but stay tracked until they settle;
+  none of them runs in the clone.
 - **Rollout.** The checks `source_lock_unavailable` and
   `source_settlement_unproven` are new; older workers do not emit or retry them.
 
