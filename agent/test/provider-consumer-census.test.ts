@@ -12,7 +12,7 @@ import { parseSync } from "oxc-parser";
 // reflection, arbitrary aliases, dependencies and sources outside src are outside this
 // textual census; this is not arbitrary JS dataflow analysis.
 // Native opts.provider sites are explicitly distinguished from claim binding carriers.
-// Guard pins establish reviewed holds, not supported Codex-provider execution or dominance
+// Guard pins establish reviewed guards (the client registration-capability check among them), not supported Codex-provider execution or dominance
 // under arbitrary code movement. Behavioral lane tests remain necessary.
 const SRC = fileURLToPath(new URL("../src/", import.meta.url));
 type Site = { file: string; line: string; count: number; category: string; rationale: string };
@@ -26,7 +26,7 @@ const SITES: Site[] = [
   {"file": "chat-runner.ts", "line": "...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),", "count": 1, "category": "engine-handling", "rationale": "Forwarded ChatContext reaches chat-executor sdkCredentialFromBinding refusal."},
   {"file": "claude-advice-harness.ts", "line": "const providerModel = credential.kind === \"provider\" ? resolveProviderModel(request.model, credential.modelMap) : undefined;", "count": 1, "category": "engine-handling", "rationale": "SdkCredential provider variant is Claude SDK configuration; resolveProviderModel is a Claude map resolver."},
   {"file": "claude-cross-check.ts", "line": "if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);", "count": 1, "category": "lane-refusal", "rationale": "Provider presence refuses this unsupported lane regardless of engine."},
-  {"file": "client.ts", "line": "claim.secrets.provider = provider;", "count": 2, "category": "admission-write", "rationale": "Decoded binding written only after requireProviderCapability engine hold."},
+  {"file": "client.ts", "line": "claim.secrets.provider = provider;", "count": 2, "category": "admission-write", "rationale": "Decoded binding written only after requireProviderCapability's per-engine registration-capability check (Claude: claude_provider_v1; Codex: codex_provider_v1 with the Codex harness and runtime v2)."},
   {"file": "codex/config.ts", "line": "const { model, provider, projectPath } = opts;", "count": 1, "category": "native-config", "rationale": "CodexConfigProvider config builder input is not ClaimProviderBinding and grants no provider execution permission."},
   {"file": "codex/codex-advice-harness.ts", "line": "this.provider = opts.providerBinding ? { ...opts.provider,", "count": 1, "category": "native-config", "rationale": "Native CodexProviderConfig supplies defaults; decoded providerBinding overrides identity, endpoint and default model for isolated advice roots."},
   {"file": "codex/codex-advice-harness.ts", "line": "} : opts.provider;", "count": 1, "category": "native-config", "rationale": "Native CodexProviderConfig supplies defaults; decoded providerBinding overrides identity, endpoint and default model for isolated advice roots."},
@@ -193,7 +193,7 @@ function holdCount(source: string, block: string): number {
 // Separately pin the mechanisms on which carrier classifications rely, including guard
 // bodies and admission calls (a condition alone would not establish refusal).
 const HOLDS: Record<string, string[]> = {
-  "client.ts": ['this.requireProviderCapability(provider.engine);', 'if (engine === "codex") throw new ProviderLaneUnsupportedError();'],
+  "client.ts": ['this.requireProviderCapability(provider.engine);', 'if (!this.hasCodexProviderCapability) throw new ProviderLaneUnsupportedError();'],
   "provider-binding.ts": ['if (oauth !== undefined && oauth !== null && oauth !== "") throw new ProviderBindingError("provider next to an anthropic_oauth_token");', 'if (secrets.codex !== undefined && secrets.codex !== null) throw new ProviderBindingError("provider next to a codex block");', 'if (b.engine !== "claude") throw new ProviderLaneUnsupportedError();', 'if (engine !== "claude" && engine !== "codex") throw new ProviderBindingError("unknown engine");', 'if (protocol !== (engine === "claude" ? "anthropic_messages" : "openai_responses")) throw new ProviderBindingError("unknown protocol");'],
   "main.ts": ['return { executor: new FailClosedExecutor("provider_lane_unsupported") };'],
   "summary-runner.ts": ["const selection = selectCodexExecutionAuthority(claim.secrets);", "const secrets = input.claim ? input.claim.secrets : (input.provider ? { provider: input.provider } : {});", "const selection = selectCodexExecutionAuthority(secrets);", "if (input.claim && input.provider !== undefined) {\ntry {\nconst claimed = decodeProviderBinding(input.claim.secrets);\nconst supplied = decodeProviderBinding({ provider: input.provider });\nif (!claimed || JSON.stringify(claimed) !== JSON.stringify(supplied)) throw new ProviderLaneUnsupportedError();\n} catch {\nthrow new ProviderLaneUnsupportedError();\n}\n}", "const provider = secrets.provider;", "harness = { token: input.token, ...(provider ? { provider } : {}), model: input.model };"],

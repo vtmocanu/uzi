@@ -11,7 +11,7 @@ import { PRIVATE_CA_TITLE } from "./private-ca-title.js";
 //      the receipts gate (`check:codex-m4-receipts`, the LEAD merge gate) exits non-zero until the
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
-import { PROVIDER_ROOT_TITLES } from "./titles-provider.js";
+import { PROVIDER_ADVICE_SUMMARY_TITLE, PROVIDER_ROOT_TITLES } from "./titles-provider.js";
 import type { ClauseRow } from "./clause.js";
 import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
@@ -79,6 +79,14 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     negativeOracle: "receiver sees identical POST body without bearer, rejects 401 and produces no Responses frames; exactly one origin and receiver request",
     intendedOutcome: "pinned runtime strips cross-port bearer but forwards body; executor rejects and disposes its root; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
     tests: [PROVIDER_ROOT_TITLES.cross307, PROVIDER_ROOT_TITLES.cross308],
+  },
+  {
+    id: "codex-p-bound-provider-advice-summary", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "makeProductionCodexAdviceHarnessFactory/makeProductionLaunchAdviceRoot/CodexAdviceHarness via runReadOnlyModelPass (advice) and SummaryRunner (summary) with launchCodexRoot, app-server auth and pinned app-server HTTP",
+    positiveControl: "an advice pass and a plan-summary pass each reach the authenticated Responses fake with the bound key as the only bearer, the mapped gateway model and the slot's model_context_window",
+    negativeOracle: "a clean control pass returns its text unchanged while the pass that echoes the raw, JSON-escaped and percent-encoded key is redacted; zero release/refresh/admission client calls; no other credential header or log line carries the key",
+    intendedOutcome: "provider-bound advice and summary passes run on the frozen binding with the key over the app-server login only; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ADVICE_SUMMARY_TITLE],
   },
   {
     id: "codex-p-phase-model-switch", adapter: "codex", layer: "P", family: "Persisted context and usage replay",

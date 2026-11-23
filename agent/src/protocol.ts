@@ -1222,7 +1222,8 @@ export interface ClaimClaudeProviderBinding {
   };
 }
 
-/** Codex provider wire contract only; execution remains held. */
+/** Codex provider wire contract. The worker accepts it only when its registration advertised
+ *  codex_provider_v1 with the Codex harness and runtime v2 (client.ts requireProviderCapability). */
 export interface ClaimCodexProviderBinding {
   provider_id: string;
   revision: number;

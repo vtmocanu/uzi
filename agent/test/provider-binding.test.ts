@@ -224,7 +224,7 @@ function codexBinding(over: Record<string, unknown> = {}): Record<string, unknow
     model_map: { default: { model: "gateway/default", context_window: 8192 } }, ...over });
 }
 
-describe("Codex provider wire scaffold under HARDHOLD", () => {
+describe("Codex provider wire decode", () => {
   it("decodes all exact slots and rebuilds every nested entry without unknown fields or references", () => {
     const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]
       .map(id => [id, { model: "gateway/target", context_window: 10_000_000, extra: "discard" }]));

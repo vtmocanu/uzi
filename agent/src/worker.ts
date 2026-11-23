@@ -2,7 +2,7 @@ import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import { CLAUDE_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -1126,6 +1126,10 @@ export class Worker {
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
           protocolCapabilities.push(CODEX_PHASE_MODELS_CAPABILITY);
+          // PRD #4323: this build runs a provider-bound Codex claim on the frozen binding (the
+          // gateway key only, the mapped gateway model passed through unchanged), so it advertises
+          // codex_provider_v1 under the same gate and strictly with codex_custom_model_v1 above.
+          protocolCapabilities.push(CODEX_PROVIDER_CAPABILITY);
         }
         // issue #3639: the settlement capability rides only with the pressure capability (the same guard), so a worker
         // that cannot park for memory never offers to deliver a settlement receipt.

@@ -14,7 +14,8 @@ import type { PublicationContextRequest, PublicationContextResponse } from "./pr
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
-import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CODEX_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -1511,6 +1512,7 @@ export class WorkerClient {
   private hasMemoryAuthorityClaimCapability = false;
   /** Whether this registration advertised claude_provider_v1; a provider claim is refused without it. */
   private hasClaudeProviderCapability = false;
+  private hasCodexProviderCapability = false;
   private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
@@ -2187,6 +2189,8 @@ export class WorkerClient {
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     this.hasClaudeProviderCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_CAPABILITY) ?? false;
+    this.hasCodexProviderCapability = [CODEX_PROVIDER_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY]
+      .every(c => originalCapabilities?.includes(c) ?? false);
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
@@ -2832,10 +2836,14 @@ export class WorkerClient {
     return claim;
   }
 
-  /** Codex providers are held unconditionally; Claude providers require their advertised capability. */
+  /** A provider claim requires the capability this registration advertised: Claude needs
+   *  claude_provider_v1; Codex needs codex_provider_v1 together with the Codex harness and runtime
+   *  v2 (the same trio the api admits a Codex provider claim on), else the lane refuses. */
   private requireProviderCapability(engine: "claude" | "codex"): void {
-    // HARDHOLD: no registration capability can authorize Codex provider execution.
-    if (engine === "codex") throw new ProviderLaneUnsupportedError();
+    if (engine === "codex") {
+      if (!this.hasCodexProviderCapability) throw new ProviderLaneUnsupportedError();
+      return;
+    }
     if (!this.hasClaudeProviderCapability) throw new ProviderBindingError("capability not advertised");
   }
 

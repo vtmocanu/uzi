@@ -1403,6 +1403,14 @@ function buildAdviceAuthConfig(
 }
 
 // ─── Part H: the production Codex advice-harness FACTORY (PRD #1429 M3) ─────────
+/** Test-only seams for {@link makeProductionLaunchAdviceRoot}; production passes none. They replace
+ *  only the OS-bound primitives (the supervised launcher and the uid/gid a shared directory must
+ *  carry), so the spec-to-launch mapping, transport and disposal stay the production code. */
+export interface ProductionAdviceRootTestSeams {
+  readonly launchCodexRootForTest?: typeof launchCodexRoot;
+  readonly sharedDirOwner?: { readonly uid: number; readonly gid: number };
+}
+
 /**
  * Build a fresh, disposable Codex advice-launch root for ONE call (PRD #1429 M3). Adapts the
  * SAME `launchCodexRoot` primitive {@link defaultLaunchProviderRoot} uses for the run lane —
@@ -1425,7 +1433,11 @@ function buildAdviceAuthConfig(
  * pre-existing worker:worker parent left by pre-rc.2 code is renamed OUT and recreated fresh
  * as worker:runner (never adopted), so a rolled worker starts clean instead of throwing.
  */
-export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: CodexAppServerAuthMode, log: Logger, ownership?: SummaryOwnership): LaunchAdviceRootSeam {
+export function makeProductionLaunchAdviceRoot(
+  homeRoot: string, authMode: CodexAppServerAuthMode, log: Logger, ownership?: SummaryOwnership,
+  testSeams: ProductionAdviceRootTestSeams = {},
+): LaunchAdviceRootSeam {
+  const launchRootPrimitive = testSeams.launchCodexRootForTest ?? launchCodexRoot;
   return async (spec) => {
     const id = randomUUID();
     const dataParent = path.join(homeRoot, "codex-advice-data");
@@ -1436,8 +1448,8 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
     // they opt in to the narrowly-scoped destructive recovery: a pre-existing worker-group
     // parent is atomically renamed OUT of the live path and recreated FRESH (worker:runner
     // 3770) — NEVER chgrp'd/adopted. The per-call UUID leaves below stay plain strict calls.
-    await ensureCodexSharedDirectory(dataParent, undefined, { recreateDisposableWorkerGroupDir: true });
-    await ensureCodexSharedDirectory(cwdParent, undefined, { recreateDisposableWorkerGroupDir: true });
+    await ensureCodexSharedDirectory(dataParent, testSeams.sharedDirOwner, { recreateDisposableWorkerGroupDir: true });
+    await ensureCodexSharedDirectory(cwdParent, testSeams.sharedDirOwner, { recreateDisposableWorkerGroupDir: true });
     const ownedDataRoot = path.join(dataParent, id);
     const cwd = path.join(cwdParent, id);
     // The launcher's own deriveOwnedTrees creates ownedDataRoot itself (runner-owned, fresh
@@ -1446,9 +1458,9 @@ export function makeProductionLaunchAdviceRoot(homeRoot: string, authMode: Codex
     // shared-directory way as the run lane's HOME (worker-owned, group runner, setgid). It is
     // a fresh per-call UUID leaf (never pre-existing), so it stays a plain strict call — no
     // opt-in recovery.
-    await ensureCodexSharedDirectory(cwd);
+    await ensureCodexSharedDirectory(cwd, testSeams.sharedDirOwner);
 
-    const start = (startupCleanup?: StartupCleanupAuthorization) => launchCodexRoot({
+    const start = (startupCleanup?: StartupCleanupAuthorization) => launchRootPrimitive({
       ownedDataRoot,
       // No credentialValue: the token flows over account/login/start, never the launcher env
       // (mirrors defaultLaunchProviderRoot).
