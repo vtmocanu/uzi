@@ -584,6 +584,8 @@ describe("races during the guidance flush and the park", () => {
     }) as never);
     await r.execute();
     assert.ok(posted.mock.callCount() > 0, "the guidance flush ran");
+    assert.equal(r.counts.holds, 1, "the hold ran exactly once");
+    assert.equal(guidance(r).length, 1, "exactly one bare-identity guidance line was posted");
     assert.equal(adoptionParks(r).length, 0, "the cancel preempted the park");
     assert.equal(logged(r, "retained recovery bare identity change held").length, 0);
     assert.equal(fs.existsSync(r.clonePath), true);

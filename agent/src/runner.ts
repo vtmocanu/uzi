@@ -31235,7 +31235,7 @@ export class RunRunner {
     flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
       "The retained work's storage identity changed (for example a pod replacement remounted the volume), so execution was refused " +
       "before any source action. The work and custody stay on this worker. The worker is requesting an owner hold; the run's " +
-      "status shows whether it was applied. Export or recover the work with `uzi run recovery <run>` rather than Resume: a claimed " +
+      "status shows whether it was applied. Inspect the run with `uzi run recovery <run>`, and export or recover its work (`uzi run export` or the recovery routes) rather than Resume: a claimed " +
       "Resume holds again unchanged and adds a custody hold, up to the custody hold limit. Cancel ends the run."), 1200) } });
     try {
       const delivered = await flight.batcher.flushOwned(
