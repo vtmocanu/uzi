@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -90,14 +91,15 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 		return FireOutcome{}, err
 	}
-
-	// PRD #4173 M4: self-improve files a tracking issue on the repo's issue tracker, and a
-	// linked repo has none to write to until M5 (the write guard would refuse it anyway).
-	// Skipped as a benign, logged no-op before any forge call; never falls back to the forge.
+	// PRD #4173 M5 review: the tracking label is uzi's own bookkeeping marker, never an
+	// opt-in. On a linked repo whose eligibility tag has that name, the tracking issue
+	// would be created eligible, so the cycle is refused (transient to advance: logged and
+	// retried next tick, so it fires again once either name changes) before the forge,
+	// the issue side, the tracking lookup and any write.
 	if repo.IssueTrackerConnectionID.Valid {
-		e.logger.Info("scheduler: self_improve skipped, issue creation is not offered on a repo linked to an issue tracker",
-			"schedule", sched.ID.String(), "repo", repo.ID.String())
-		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
+		if err := issuesource.RefuseEligibilityMarkers(repo.EligibilityTagName.String, SelfImproveTrackingLabel); err != nil {
+			return FireOutcome{}, fmt.Errorf("self-improve tracking issue: %w", err)
+		}
 	}
 
 	// 2. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run
@@ -132,9 +134,14 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{}, fmt.Errorf("build forge driver: %w", err) // transient
 	}
 	// One driver, two halves: MR reads go through the code host, the tracking issue
-	// through the issue tracker.
+	// through the repo's issue side: the forge driver for an unlinked repo, the linked
+	// issue tracker for a linked one (PRD #4173 M5), never the forge for a linked repo.
+	// The tracking issue carries no eligibility tag, so the next linked full sync evicts it.
 	var ch forge.CodeHost = f
-	var tr forge.IssueTracker = f
+	tr, err := e.issueSide(ctx, repo, f)
+	if err != nil {
+		return FireOutcome{}, fmt.Errorf("resolve issue tracker: %w", err) // transient
+	}
 
 	// 4b. Cap concurrent OPEN self-improve MRs per repo (PRD #686 D10/D12). This runs BEFORE
 	// ensureTrackingIssue so a capped cycle does NO forge write. Open-state is resolved LIVE

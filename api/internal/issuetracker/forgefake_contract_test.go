@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/issuetrackertest"
 )
@@ -48,8 +49,35 @@ func TestIssueTrackerForgeFakeContracts(t *testing.T) {
 				if err != nil {
 					t.Fatalf("forge.New(%s): %v", dialect, err)
 				}
+				columns := []string{"contract-column-a", "contract-column-b"}
+				columnSet := map[string]struct{}{columns[0]: {}, columns[1]: {}}
 				return issuetrackertest.Subject{
-					IssueTracker:   driver,
+					IssueTracker: driver,
+					Columns:      columns,
+					PlanMove: func(t *testing.T, iid int64, column string) forge.ColumnMove {
+						issue, err := driver.GetIssue(t.Context(), forgeFakeProjectID, iid)
+						if err != nil {
+							t.Fatalf("GetIssue(%d): %v", iid, err)
+						}
+						add, remove, _ := board.PlanLabelMove(issue.Labels, columnSet, column)
+						move := forge.ColumnMove{Column: column, Add: add, Remove: remove}
+						for _, name := range add {
+							move.Ensure = append(move.Ensure, forge.Label{Name: name, Color: "#428bca"})
+						}
+						return move
+					},
+					ColumnOf: func(ctx context.Context, iid int64) (string, error) {
+						issue, err := driver.GetIssue(ctx, forgeFakeProjectID, iid)
+						if err != nil {
+							return "", err
+						}
+						for _, l := range issue.Labels {
+							if _, ok := columnSet[l]; ok {
+								return l, nil
+							}
+						}
+						return "", nil
+					},
 					ProjectID:      forgeFakeProjectID,
 					OtherProjectID: forgeFakeOtherProjectID,
 					SeedHumanComment: func(t *testing.T, iid int64, username, body string) {

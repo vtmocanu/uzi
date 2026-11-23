@@ -167,7 +167,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "description is too large")
 		return
 	}
-	marker, err := h.settings.FindingLabel(ctx)
+	names, err := h.settings.FilingLabels(ctx)
 	if err != nil {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
@@ -209,7 +209,16 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 		return
 	}
-	filedLabels, requiredLabels := h.findingFilingLabels(callCtx, marker, req.Labels, req.SendToUzi)
+	filedLabels, requiredLabels, err := findingFilingLabels(repo, names, req.Labels, req.SendToUzi)
+	if err != nil {
+		// A marker that would tag the issue eligible: release the claim and refuse before
+		// any write (PRD #4173 M5 review).
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
+			return
+		}
+		httpx.Error(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err := tr.EnsureLabels(callCtx, repo.ForgeProjectID, requiredLabels); err != nil {
 		if callCtx.Err() != nil {
 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
@@ -239,8 +248,10 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := tr.CreateIssue(callCtx, repo.ForgeProjectID, title, description, filedLabels)
 	if err != nil {
-		// The write guard refuses before any request, so nothing was created: release the
-		// group like a definitive rejection instead of marking it uncertain.
+		// A definitive rejection created nothing: release the group instead of marking it
+		// uncertain. The ErrIssueWriteNotOffered branch is defence only, since the guard
+		// passes a create through. On a linked repo every other create failure is treated
+		// as uncertain, because the YouTrack driver returns no definitive rejection.
 		if errors.Is(err, forgesvc.ErrIssueWriteNotOffered) || forge.IsCreateIssueDefinitiveRejection(err) {
 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {
 				writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")

@@ -3,6 +3,7 @@ package forgesvc
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -70,6 +72,14 @@ func (d *stubDriver) UpdateIssueDescription(context.Context, int64, int64, strin
 	d.writes = append(d.writes, "UpdateIssueDescription")
 	return nil
 }
+func (d *stubDriver) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
+	d.writes = append(d.writes, "MoveToColumn")
+	return nil
+}
+func (d *stubDriver) ListIssuesWithState(context.Context, int64, forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
+	d.reads = append(d.reads, "ListIssuesWithState")
+	return []issuesource.StatedIssue{{Issue: forge.Issue{IID: 3}, State: "In Progress"}}, nil
+}
 func (d *stubDriver) SetIssueState(context.Context, int64, int64, forge.IssueState) error {
 	d.writes = append(d.writes, "SetIssueState")
 	return nil
@@ -84,18 +94,18 @@ func (d *stubDriver) CreateIssueNote(context.Context, int64, int64, string) (for
 }
 
 type fakeDrivers struct {
-	driver                  *stubDriver
-	err                     error
-	calls                   int
-	gotUser, gotConn        uuid.UUID
-	gotBinding              issuetracker.Binding
-	gotState, gotOpen, gotC string
+	driver           *stubDriver
+	err              error
+	calls            int
+	gotUser, gotConn uuid.UUID
+	gotBinding       issuetracker.Binding
+	gotStates        issuetracker.StateMapping
 }
 
-func (f *fakeDrivers) DriverFor(_ context.Context, userID, connID uuid.UUID, b issuetracker.Binding, stateField, open, closed string) (issuetracker.Driver, error) {
+func (f *fakeDrivers) DriverFor(_ context.Context, userID, connID uuid.UUID, b issuetracker.Binding, states issuetracker.StateMapping) (issuetracker.Driver, error) {
 	f.calls++
 	f.gotUser, f.gotConn, f.gotBinding = userID, connID, b
-	f.gotState, f.gotOpen, f.gotC = stateField, open, closed
+	f.gotStates = states
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -171,6 +181,7 @@ func writeAll(ctx context.Context, tr forge.IssueTracker, projectID int64) (acce
 		func() error { _, err := tr.CreateIssueNote(ctx, projectID, 9, "note"); return err },
 		func() error { _, err := tr.CreateIssue(ctx, projectID, "t", "d", nil); return err },
 		func() error { return tr.SetIssueState(ctx, projectID, 9, forge.StateClosed) },
+		func() error { return tr.MoveToColumn(ctx, projectID, 9, forge.ColumnMove{Column: "In Progress"}) },
 		func() error { return tr.UpdateIssueDescription(ctx, projectID, 9, "d") },
 		func() error { return tr.EnsureLabels(ctx, projectID, []forge.Label{{Name: "x"}}) },
 	}
@@ -202,8 +213,13 @@ func TestIssueTrackerForRepoUnlinkedWritesReachTheForge(t *testing.T) {
 			t.Fatalf("an unlinked repo's write was refused by the guard: %v", e)
 		}
 	}
-	if got := len(h.rec.Calls()); got != 6 {
-		t.Fatalf("recorder saw %d calls, want 6 writes: %v", got, h.rec.Calls())
+	// The six other writes are one call each; the move is logged in Moves() and reaches
+	// the recorder as its one label call (forge.MoveByLabels), seven calls in all.
+	if got := len(h.rec.Calls()); got != 7 {
+		t.Fatalf("recorder saw %d calls, want 7: %v", got, h.rec.Calls())
+	}
+	if got := len(h.rec.Moves()); got != 1 {
+		t.Fatalf("recorder saw %d moves, want 1: %v", got, h.rec.Moves())
 	}
 	if h.drivers.calls != 0 {
 		t.Fatalf("the issue tracker driver source was used for an unlinked repo")
@@ -232,30 +248,73 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 	if d.calls != 1 || d.gotUser != h.user || d.gotConn != conn || d.gotBinding != want {
 		t.Fatalf("DriverFor got (calls %d, user %v, conn %v, binding %+v), want the repo row's binding for its owner", d.calls, d.gotUser, d.gotConn, d.gotBinding)
 	}
-	if d.gotState != "" || d.gotOpen != "" || d.gotC != "" {
-		t.Errorf("state mapping arguments must be empty until M5, got %q %q %q", d.gotState, d.gotOpen, d.gotC)
+	if d.gotStates.Field != "" || d.gotStates.Open != "" || d.gotStates.Closed != "" || len(d.gotStates.Columns) != 0 {
+		t.Errorf("a repo with no saved state mapping must pass the zero mapping, got %+v", d.gotStates)
 	}
 	if h.built != 0 {
 		t.Errorf("a linked repo's issue side must not build the forge driver")
 	}
 
+	// Every write is offered (PRD #4173 M5, U6 lifts the note and description); only the
+	// eligibility-tag removal is refused, below.
 	accepted, errs := writeAll(context.Background(), tr, 4242)
-	if accepted != 0 || len(errs) != 6 {
-		t.Fatalf("accepted %d writes with %d errors, want none accepted", accepted, len(errs))
+	if accepted != 7 || len(errs) != 0 {
+		t.Fatalf("accepted %d writes with errors %v, want all 7 accepted", accepted, errs)
 	}
-	for _, e := range errs {
-		if !errors.Is(e, ErrIssueWriteNotOffered) || !IssueWriteSkippable(e) {
-			t.Errorf("write error = %v, want ErrIssueWriteNotOffered", e)
-		}
+	wantWrites := []string{"UpdateIssueLabels", "CreateIssueNote", "CreateIssue", "SetIssueState", "MoveToColumn", "UpdateIssueDescription", "EnsureLabels"}
+	if !slices.Equal(d.driver.writes, wantWrites) {
+		t.Fatalf("writes that reached the driver = %v, want %v", d.driver.writes, wantWrites)
 	}
-	if len(d.driver.writes) != 0 {
-		t.Fatalf("writes reached the driver: %v", d.driver.writes)
+	// The guard was built with the row's stored eligibility name ("uzi"): removing it is
+	// refused before the driver, adding it is not.
+	if err := tr.UpdateIssueLabels(context.Background(), 4242, 9, nil, []string{"uzi"}); !errors.Is(err, ErrIssueWriteNotOffered) {
+		t.Fatalf("removing the eligibility name: %v, want ErrIssueWriteNotOffered", err)
+	}
+	if err := tr.UpdateIssueLabels(context.Background(), 4242, 9, []string{"uzi"}, nil); err != nil {
+		t.Fatalf("adding the eligibility name: %v", err)
+	}
+	if len(d.driver.writes) != len(wantWrites)+1 {
+		t.Fatalf("writes that reached the driver = %v, want only the add after the refused removal", d.driver.writes)
 	}
 	if _, err := tr.ListIssues(context.Background(), 4242, forge.ListIssuesOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(d.driver.reads) != 1 {
 		t.Fatalf("reads must pass through, got %v", d.driver.reads)
+	}
+}
+
+// The stored open, closed and column States of the repo row reach DriverFor (PRD #4173 M5);
+// the State field stays empty so the driver's default applies.
+func TestIssueTrackerForRepoPassesTheStoredStateMapping(t *testing.T) {
+	h, src := newSidesHarness(t)
+	h.svc.SetIssueTrackerDrivers(h.drivers)
+	repo := h.addRepo(t, src, h.user, func(r *store.GetRepoIssueSourceForUserRow) {
+		linkTo(uuid.New(), true)(r)
+		r.OpenState = pgtype.Text{String: "To Do", Valid: true}
+		r.ClosedState = pgtype.Text{String: "Done", Valid: true}
+		r.ColumnStates = []byte(`{"In Progress":"Doing","Review":"In Review"}`)
+	})
+	if _, err := h.svc.IssueTrackerForRepo(context.Background(), h.user, repo); err != nil {
+		t.Fatal(err)
+	}
+	got := h.drivers.gotStates
+	if got.Field != "" || got.Open != "To Do" || got.Closed != "Done" ||
+		len(got.Columns) != 2 || got.Columns["In Progress"] != "Doing" || got.Columns["Review"] != "In Review" {
+		t.Fatalf("DriverFor got %+v, want the stored mapping", got)
+	}
+}
+
+// A malformed stored column map fails closed rather than building a driver without it.
+func TestIssueTrackerForRepoRefusesAMalformedColumnMap(t *testing.T) {
+	h, src := newSidesHarness(t)
+	h.svc.SetIssueTrackerDrivers(h.drivers)
+	repo := h.addRepo(t, src, h.user, func(r *store.GetRepoIssueSourceForUserRow) {
+		linkTo(uuid.New(), true)(r)
+		r.ColumnStates = []byte(`[1]`)
+	})
+	if _, err := h.svc.IssueTrackerForRepo(context.Background(), h.user, repo); err == nil || h.drivers.calls != 0 {
+		t.Fatalf("err = %v, DriverFor calls = %d, want an error before any driver is built", err, h.drivers.calls)
 	}
 }
 
@@ -343,4 +402,47 @@ func TestRepoSidesPassBuilderErrorThrough(t *testing.T) {
 	if !errors.Is(err, boom) || ch != nil {
 		t.Errorf("CodeHostForRepo = (%v, %v), want (nil, builder error)", ch, err)
 	}
+}
+
+// errStore fails the repo-source read with a fixed error.
+type errStore struct {
+	IssueStore
+	err error
+}
+
+func (s errStore) GetRepoIssueSourceForUser(context.Context, store.GetRepoIssueSourceForUserParams) (store.GetRepoIssueSourceForUserRow, error) {
+	return store.GetRepoIssueSourceForUserRow{}, s.err
+}
+
+func TestIssueTrackerForRepoClassifiesARepoSourceReadFailure(t *testing.T) {
+	box, err := secretbox.New([]byte("0123456789abcdefghijklmnopqrstuv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(q IssueStore) *Service {
+		return NewWithForgeBuilder(q, box, time.Second, nil, func(forge.Type, string, string, time.Duration) (forge.Forge, error) {
+			return nil, errors.New("unused")
+		})
+	}
+	ctx := context.Background()
+
+	t.Run("a database error is transient and keeps its cause", func(t *testing.T) {
+		inner := errors.New("conn reset")
+		_, err := build(errStore{err: inner}).IssueTrackerForRepo(ctx, uuid.New(), uuid.New())
+		if !errors.Is(err, errRepoSourceRead) || !errors.Is(err, inner) {
+			t.Fatalf("err = %v, want errRepoSourceRead wrapping the inner error", err)
+		}
+	})
+	t.Run("a missing row is permanent", func(t *testing.T) {
+		_, err := build(errStore{err: pgx.ErrNoRows}).IssueTrackerForRepo(ctx, uuid.New(), uuid.New())
+		if err == nil || errors.Is(err, errRepoSourceRead) {
+			t.Fatalf("err = %v, want a non-transient error", err)
+		}
+	})
+	t.Run("no store is not transient", func(t *testing.T) {
+		_, err := build(nil).IssueTrackerForRepo(ctx, uuid.New(), uuid.New())
+		if !errors.Is(err, errNoRepoStore) || errors.Is(err, errRepoSourceRead) {
+			t.Fatalf("err = %v, want errNoRepoStore only", err)
+		}
+	})
 }

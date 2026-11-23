@@ -38,6 +38,20 @@ type Subject struct {
 	// NoteIDUnset says CreateIssueNote returns ID 0, because the issue tracker's
 	// comment ids have no numeric form. When false the case requires a non-zero ID.
 	NoteIDUnset bool
+	// Columns are board column labels the subject can move an issue between;
+	// MoveToColumn cases need at least two. Nil means the subject has no board
+	// columns, so MoveToColumnMovesTheIssue is skipped and the guarded-write
+	// cases use a made-up column.
+	Columns []string
+	// PlanMove builds the ColumnMove that moves issue iid to column ("" is the
+	// implicit Open column) from the issue's current state, the way a caller of
+	// MoveToColumn would. For a label-backed subject it carries the Ensure, Add
+	// and Remove of a label delta against the issue's current labels; for an
+	// issue tracker with its own workflow field the column alone is enough.
+	PlanMove func(t *testing.T, iid int64, column string) forge.ColumnMove
+	// ColumnOf reports which of Columns issue iid is in now, "" when it is in
+	// none (the Open column). It reads server side, not through MoveToColumn.
+	ColumnOf func(ctx context.Context, iid int64) (string, error)
 	// SameName carries the seams of the SameNameTagUsesEligibilityTag case. Nil
 	// means labels on this implementation have no owners, so the case is skipped.
 	SameName *SameNameSeams
@@ -102,6 +116,7 @@ func RunContract(t *testing.T, newSubject func(t *testing.T) Subject) {
 		{"CreateIssueRoundTrips", caseCreateIssue},
 		{"ListIssuesFilters", caseListIssues},
 		{"UpdateLabelsAndDescription", caseUpdate},
+		{"MoveToColumnMovesTheIssue", caseMoveToColumn},
 		{"SetIssueStateClosesAndReopens", caseSetState},
 		{"CommentsOldestFirst", caseComments},
 		{"LabelEventsOldestFirst", caseLabelEvents},
@@ -280,6 +295,51 @@ func caseUpdate(t *testing.T, c *contract) {
 	}
 }
 
+func caseMoveToColumn(t *testing.T, c *contract) {
+	if c.ColumnOf == nil || c.PlanMove == nil || len(c.Columns) < 2 {
+		t.Skip("this implementation has no board columns to move between")
+	}
+	issue := c.create(t, "will be moved between columns")
+	a, b := c.Columns[0], c.Columns[1]
+	for _, column := range []string{a, b, ""} {
+		move := c.PlanMove(t, issue.IID, column)
+		if err := c.IssueTracker.MoveToColumn(c.ctx, c.ProjectID, issue.IID, move); err != nil {
+			t.Fatalf("MoveToColumn(%q): %v", column, err)
+		}
+		got, err := c.ColumnOf(c.ctx, issue.IID)
+		if err != nil {
+			t.Fatalf("ColumnOf after moving to %q: %v", column, err)
+		}
+		if got != column {
+			t.Fatalf("column after MoveToColumn(%q) = %q", column, got)
+		}
+	}
+}
+
+// guardedMove is a ColumnMove for the cases that expect the write to be
+// refused: a column the subject knows when it has any, so the refusal comes
+// from the guard under test and not from an unmapped column.
+func (c *contract) guardedMove() forge.ColumnMove {
+	column := "contract-guarded-column"
+	if len(c.Columns) > 0 {
+		column = c.Columns[0]
+	}
+	return forge.ColumnMove{Column: column, Ensure: []forge.Label{{Name: column}}, Add: []string{column}}
+}
+
+// columnOf is ColumnOf for issue iid, or "" when the subject has no ColumnOf.
+func (c *contract) columnOf(t *testing.T, iid int64) string {
+	t.Helper()
+	if c.ColumnOf == nil {
+		return ""
+	}
+	column, err := c.ColumnOf(c.ctx, iid)
+	if err != nil {
+		t.Fatalf("ColumnOf: %v", err)
+	}
+	return column
+}
+
 func caseSetState(t *testing.T, c *contract) {
 	label := unique("contract-label")
 	c.ensure(t, label)
@@ -413,6 +473,7 @@ func caseMoved(t *testing.T, c *contract) {
 		},
 		"UpdateIssueDescription": func() error { return it.UpdateIssueDescription(c.ctx, pid, iid, "x") },
 		"SetIssueState":          func() error { return it.SetIssueState(c.ctx, pid, iid, forge.StateClosed) },
+		"MoveToColumn":           func() error { return it.MoveToColumn(c.ctx, pid, iid, c.guardedMove()) },
 		"ListIssueLabelEvents":   func() error { _, err := it.ListIssueLabelEvents(c.ctx, pid, iid); return err },
 		"ListIssueComments":      func() error { _, err := it.ListIssueComments(c.ctx, pid, iid); return err },
 		"CreateIssueNote":        func() error { _, err := it.CreateIssueNote(c.ctx, pid, iid, "x"); return err },
@@ -435,6 +496,7 @@ func caseProjectGuard(t *testing.T, c *contract) {
 	c.ensure(t, label)
 	issue := c.create(t, "guarded", label)
 	it, pid, iid := c.IssueTracker, c.OtherProjectID, issue.IID
+	columnBefore := c.columnOf(t, iid)
 	calls := map[string]func() error{
 		"ListLabels":   func() error { _, err := it.ListLabels(c.ctx, pid); return err },
 		"EnsureLabels": func() error { return it.EnsureLabels(c.ctx, pid, []forge.Label{{Name: unique("contract-label")}}) },
@@ -447,12 +509,13 @@ func caseProjectGuard(t *testing.T, c *contract) {
 		"UpdateIssueLabels":      func() error { return it.UpdateIssueLabels(c.ctx, pid, iid, nil, []string{label}) },
 		"UpdateIssueDescription": func() error { return it.UpdateIssueDescription(c.ctx, pid, iid, "changed") },
 		"SetIssueState":          func() error { return it.SetIssueState(c.ctx, pid, iid, forge.StateClosed) },
+		"MoveToColumn":           func() error { return it.MoveToColumn(c.ctx, pid, iid, c.guardedMove()) },
 		"ListIssueLabelEvents":   func() error { _, err := it.ListIssueLabelEvents(c.ctx, pid, iid); return err },
 		"ListIssueComments":      func() error { _, err := it.ListIssueComments(c.ctx, pid, iid); return err },
 		"CreateIssueNote":        func() error { _, err := it.CreateIssueNote(c.ctx, pid, iid, "x"); return err },
 	}
-	if len(calls) != 11 {
-		t.Fatalf("table covers %d methods, want 11", len(calls))
+	if len(calls) != 12 {
+		t.Fatalf("table covers %d methods, want 12", len(calls))
 	}
 	for name, call := range calls {
 		err := call()
@@ -465,6 +528,9 @@ func caseProjectGuard(t *testing.T, c *contract) {
 	got := c.get(t, iid)
 	if got.Description != "guarded" || got.State != string(forge.StateOpened) || !sameSet(got.Labels, []string{label}) {
 		t.Errorf("a guarded call changed the issue: %+v", got)
+	}
+	if columnAfter := c.columnOf(t, iid); columnAfter != columnBefore {
+		t.Errorf("a refused MoveToColumn changed the column from %q to %q", columnBefore, columnAfter)
 	}
 	comments, err := it.ListIssueComments(c.ctx, c.ProjectID, iid)
 	if err != nil {

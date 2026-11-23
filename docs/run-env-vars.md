@@ -51,18 +51,41 @@ denied:
 
 - Prefixes: `UZI_`, `CLAUDE_`, `ANTHROPIC_`, `CODEX_`, `OPENAI_`, `MCP_`,
   `DISABLE_`, `GH_`, `GITHUB_`, `GITLAB_`, `GLAB_`, `GIT_`, `SSH_`, `LD_`,
-  `DYLD_`, `BASH_`, `XDG_`, `SSL_CERT_`, `PYTHON`, `PERL5`, `NIX_`, `DEVBOX_`.
+  `DYLD_`, `BASH_`, `XDG_`, `SSL_CERT_`, `PYTHON`, `PERL5`, `NIX_`, `DEVBOX_`, `BUN_`.
+  The `BUN_` prefix also refuses Bun application settings such as `BUN_INSTALL`
+  and `BUN_CONFIG_REGISTRY` as repo variables: the bundled Claude CLI is a Bun
+  executable whose runtime reads `BUN_*` controls.
 - Any name ending in `_PROXY`.
 - Process, shell, Docker, Go, Node, Java, curl and browser settings such as
   `PATH`, `HOME`, `TMPDIR`, `SHELL`, `DOCKER_HOST`, `DOCKER_CONFIG`, `GOFLAGS`,
   `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, `NETRC`, `CURL_CA_BUNDLE`, `RUBYOPT`.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
-  `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
+  `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`,
+  `NODE_INSPECTOR_IPC`, `VSCODE_INSPECTOR_OPTIONS`, `API_FORCE_IDLE_TIMEOUT`,
+  `ENABLE_TOOL_SEARCH`, `SLASH_COMMAND_TOOL_CHAR_BUDGET`, `AUTOMODE_DECISION_LOG`,
+  `NODE_USE_SYSTEM_CA`, and `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` (a
+  provider selector whose leading underscore escapes the `CLAUDE_` prefix).
+- Telemetry switches the Claude CLI reads outside the denied prefixes:
+  `ENABLE_BETA_TRACING_DETAILED`, `ENABLE_ENHANCED_TELEMETRY_BETA`,
+  `BETA_TRACING_ENDPOINT`. Other `OTEL_*` names are allowed for your own
+  application for now: the CLI starts no third-party OpenTelemetry exporter
+  unless `CLAUDE_CODE_ENABLE_TELEMETRY` (denied by the `CLAUDE_` prefix) or the
+  beta tracing pair above is set, and the worker never sets them. One exception:
+  `OTEL_LOG_RAW_API_BODIES=file:<dir>` makes the CLI write raw API request and
+  response bodies to that directory. The `OTEL_LOG_` and `OTEL_EXPORTER_OTLP_`
+  prefixes are planned to be denied, so do not rely on them.
+- Managed directories the sandbox reads: `TEMP`, `TMP`, `SYSTEMDRIVE`. These
+  are the uppercase spellings of Windows variables (the Windows environment
+  lookup is case-insensitive); API names stay uppercase-only, so the mixed-case
+  `SystemDrive`, `Temp` and `Tmp` are rejected by the name rule.
 
 Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `GOOGLE_APPLICATION_CREDENTIALS`,
 `NPM_TOKEN`, `GRADLE_OPTS`, `DOCKER_AUTH_CONFIG`, `NO_COLOR`. The full list is
 `fixtures/run-env/name-rules.json`.
+
+A variable whose name became denied after it was saved can still be disabled or
+deleted, but never enabled or edited.
 
 ## Entering a value
 

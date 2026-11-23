@@ -583,20 +583,21 @@ type InstanceIntakePauseEvent struct {
 }
 
 type Issue struct {
-	ID             uuid.UUID          `json:"id"`
-	RepoID         uuid.UUID          `json:"repo_id"`
-	ForgeIssueIid  int64              `json:"forge_issue_iid"`
-	Title          string             `json:"title"`
-	State          string             `json:"state"`
-	Labels         []byte             `json:"labels"`
-	WebUrl         string             `json:"web_url"`
-	Author         pgtype.Text        `json:"author"`
-	HasPrdLink     bool               `json:"has_prd_link"`
-	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
-	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
-	BoardPosition  pgtype.Int8        `json:"board_position"`
-	AssigneeIds    []byte             `json:"assignee_ids"`
-	IssueKey       pgtype.Text        `json:"issue_key"`
+	ID                 uuid.UUID          `json:"id"`
+	RepoID             uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid      int64              `json:"forge_issue_iid"`
+	Title              string             `json:"title"`
+	State              string             `json:"state"`
+	Labels             []byte             `json:"labels"`
+	WebUrl             string             `json:"web_url"`
+	Author             pgtype.Text        `json:"author"`
+	HasPrdLink         bool               `json:"has_prd_link"`
+	ForgeUpdatedAt     pgtype.Timestamptz `json:"forge_updated_at"`
+	SyncedAt           pgtype.Timestamptz `json:"synced_at"`
+	BoardPosition      pgtype.Int8        `json:"board_position"`
+	AssigneeIds        []byte             `json:"assignee_ids"`
+	IssueKey           pgtype.Text        `json:"issue_key"`
+	IssueTrackerColumn pgtype.Text        `json:"issue_tracker_column"`
 }
 
 type IssueProposal struct {
@@ -1115,6 +1116,19 @@ type Repo struct {
 	EligibilityTagID                  pgtype.Text        `json:"eligibility_tag_id"`
 	EligibilityTagName                pgtype.Text        `json:"eligibility_tag_name"`
 	IssueTrackerLinkedAt              pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+}
+
+type RepoIssueTrackerColumnState struct {
+	RepoID    uuid.UUID `json:"repo_id"`
+	LabelName string    `json:"label_name"`
+	StateName string    `json:"state_name"`
+}
+
+type RepoIssueTrackerState struct {
+	RepoID      uuid.UUID          `json:"repo_id"`
+	OpenState   string             `json:"open_state"`
+	ClosedState string             `json:"closed_state"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RepoRemovalMarker struct {
@@ -2057,7 +2071,10 @@ type User struct {
 	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
 	PlanningCodexModel        pgtype.Text        `json:"planning_codex_model"`
 	PlanningCodexEffort       pgtype.Text        `json:"planning_codex_effort"`
-	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
+	TaskReviewModel           pgtype.Text        `json:"task_review_model"`
+	CodexTaskReviewModel      pgtype.Text        `json:"codex_task_review_model"`
+	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
+	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
 }
 
 type UserCrossCheckPin struct {
@@ -2105,20 +2122,6 @@ type VaultBrowserSlot struct {
 	TokenVersion int32              `json:"token_version"`
 	VaultEpoch   int64              `json:"vault_epoch"`
 	Generation   int64              `json:"generation"`
-}
-
-type WeeklyLimitAlert struct {
-	ID                uuid.UUID          `json:"id"`
-	UserID            uuid.UUID          `json:"user_id"`
-	AnthropicSecretID pgtype.UUID        `json:"anthropic_secret_id"`
-	CodexAccountID    pgtype.UUID        `json:"codex_account_id"`
-	ObservedAt        pgtype.Timestamptz `json:"observed_at"`
-	AnchorReset       pgtype.Timestamptz `json:"anchor_reset"`
-	AnchorPct         pgtype.Float8      `json:"anchor_pct"`
-	AnchorBucket      pgtype.Text        `json:"anchor_bucket"`
-	AnchorMulti       bool               `json:"anchor_multi"`
-	Warned            bool               `json:"warned"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Worker struct {

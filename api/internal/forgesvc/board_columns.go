@@ -31,8 +31,9 @@ func (e *LabelSeedError) Unwrap() error { return e.Err }
 
 // EnsureBoardColumnRows is the store-only half of EnsureBoardColumns, for a repo linked
 // to an external issue tracker (PRD #4173 M4): it records the DefaultColumns rows when
-// the repo has none and never calls an issue tracker, because uzi creates no labels or
-// tags there (writes arrive in M5). Same one-statement insert, same idempotence.
+// the repo has none and never calls an issue tracker, because a column is not a tag
+// there (D9; a card move writes the State) and no column tags are wanted. Same
+// one-statement insert, same idempotence.
 func EnsureBoardColumnRows(ctx context.Context, q BoardColumnStore, repoID uuid.UUID) error {
 	count, err := q.CountBoardColumns(ctx, repoID)
 	if err != nil {

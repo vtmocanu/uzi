@@ -31,6 +31,13 @@ func labelNameProblem(name string) bool {
 	return bad
 }
 
+// LabelNameProblem reports whether name is empty, over 200 bytes, or holds a brace, an
+// invisible character, or a character a State name may not hold (a blank filler, a
+// variation selector or another ignorable code point, see stateNameProblem). A board
+// column of a linked repo sits next to States on the board and in the mapping, so it
+// gets both rules.
+func LabelNameProblem(name string) bool { return labelNameProblem(name) || stateNameProblem(name) }
+
 func (y *youTrack) checkLabelNames(names ...[]string) error {
 	for _, list := range names {
 		for _, n := range list {

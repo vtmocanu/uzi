@@ -30,6 +30,7 @@ type linkedHandlerFixture struct {
 	h      *Handler
 	pool   *pgxpool.Pool
 	srv    *youtracktest.Server
+	itSvc  *issuetrackersvc.Service
 	rec    *forgetest.Recorder
 	user   store.User
 	repo   uuid.UUID
@@ -61,7 +62,7 @@ func newLinkedHandlerFixture(t *testing.T, withColumns bool) *linkedHandlerFixtu
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &linkedHandlerFixture{h: h, pool: pool, srv: srv, rec: rec, repo: uuid.New(),
+	f := &linkedHandlerFixture{h: h, pool: pool, srv: srv, itSvc: itSvc, rec: rec, repo: uuid.New(),
 		user: store.User{ID: uuid.New(), Email: fmt.Sprintf("lw-%s@e2e", uuid.NewString()[:8])}}
 	exec := func(sql string, args ...any) {
 		t.Helper()
@@ -119,35 +120,20 @@ func (f *linkedHandlerFixture) assertNothingSent(t *testing.T) {
 	}
 }
 
-// Every issue write on a linked repo is a clear 409 and sends nothing anywhere.
-func TestLinkedRepoIssueWritesAreRefusedWith409LiveDB(t *testing.T) {
+// The one issue write on a linked repo that no unit offers, the label ensure endpoint, is a
+// clear 409 and sends nothing anywhere: the eligibility tag is chosen at link time and column
+// and autopilot tags are not wanted. The board move is offered since PRD #4173 M5 (see
+// linked_board_livedb_test.go), and so are the board's new issue and Promote (see
+// linked_repo_create_livedb_test.go). Converted from
+// TestLinkedRepoIssueWritesAreRefusedWith409LiveDB, whose "create issue" and "promote issue"
+// subtests became those acceptance tests.
+func TestLinkedRepoEnsureLabelsIsRefusedWith409LiveDB(t *testing.T) {
 	f := newLinkedHandlerFixture(t, true)
-	cases := []struct {
-		name string
-		do   func() *httptest.ResponseRecorder
-	}{
-		{"create issue", func() *httptest.ResponseRecorder {
-			return f.call(f.h.CreateIssue, http.MethodPost, map[string]string{"title": "t", "description": "d"})
-		}},
-		{"move issue", func() *httptest.ResponseRecorder {
-			return f.call(f.h.MoveIssue, http.MethodPost, map[string]string{"to_column": "In Progress"})
-		}},
-		{"promote issue", func() *httptest.ResponseRecorder {
-			return f.call(f.h.PromoteIssue, http.MethodPost, nil)
-		}},
-		{"ensure labels", func() *httptest.ResponseRecorder {
-			return f.call(f.h.EnsureRepoLabels, http.MethodPost, map[string][]string{"labels": {"uzi"}})
-		}},
+	rr := f.call(f.h.EnsureRepoLabels, http.MethodPost, map[string][]string{"labels": {"uzi"}})
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "this issue write is not offered on a repo linked to an issue tracker") {
+		t.Fatalf("status = %d body = %s, want the 409 refusal", rr.Code, rr.Body.String())
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rr := tc.do()
-			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "issue writes on a repo linked to an issue tracker are not offered yet") {
-				t.Fatalf("status = %d body = %s, want the 409 refusal", rr.Code, rr.Body.String())
-			}
-			f.assertNothingSent(t)
-		})
-	}
+	f.assertNothingSent(t)
 }
 
 // assertNoWrites fails when the issue tracker saw anything but a read (GET) or the

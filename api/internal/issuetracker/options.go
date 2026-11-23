@@ -24,6 +24,16 @@ type Binding struct {
 	EligibilityTag TagRef
 }
 
+// StateMapping is the connection's state configuration as a whole: the State
+// field, the open and closed values, and the State each board column maps to.
+// Options carries the same four as separate fields.
+type StateMapping struct {
+	Field   string
+	Open    string
+	Closed  string
+	Columns map[string]string
+}
+
 // Options configures a driver. There is deliberately no TLS field: a driver
 // trusts the system roots and nothing else (PRD #4173 S3).
 type Options struct {
@@ -44,6 +54,9 @@ type Options struct {
 	StateField  string
 	OpenState   string
 	ClosedState string
+	// ColumnStates maps a board column label to the State name MoveToColumn
+	// writes for it. A column absent from it is refused with ErrColumnNotMapped.
+	ColumnStates map[string]string
 	// Timeout bounds one HTTP request; zero selects defaultTimeout.
 	Timeout time.Duration
 }

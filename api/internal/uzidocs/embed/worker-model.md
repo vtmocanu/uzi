@@ -252,7 +252,7 @@ a table characterized on the pinned CLI. Only a match sends the prompt.
 | `opus` | `claude-opus-5-5` | `medium` |
 | `sonnet` | `claude-sonnet-5-5` | `medium` |
 | `haiku` | `claude-haiku-5-5` | `medium` |
-| `fable` | `claude-fable-5-1` | `high` |
+| `fable` | `claude-fable-5-2` | `medium` |
 
 A full model id, or one mapped by a provider setting, is compared verbatim.
 Anything that cannot be verified holds the run (below); it never implements on
@@ -339,14 +339,66 @@ Until a capable worker is online, a run with a custom Codex
 default stays queued rather than silently falling back to `gpt-6-astra`;
 see [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-custom-codex-models-is-online).
 
-## Task review uses its own built-in model
+## Task review model
 
-Codex task review always runs on the built-in `gpt-6-sol`, independent of
-your saved Codex worker model. It is not affected by your custom ID or
-curated choice. Claude task review keeps its own ambient default the same
-way. There is no setting to choose the task-review model in this release;
-it's tracked as possible future work in [issue
-#1570](https://github.com/vtmocanu/uzi/issues/1570).
+The review pass of a [handoff](./handoff.md#the-review--then-fix-loop)
+(`uzi handoff --review`) has its own model per harness, set under **Settings →
+Run defaults → Task review**. It is independent of your worker model: a custom
+or curated worker choice never reaches the review.
+
+| Harness | Accepts | Empty means |
+| --- | --- | --- |
+| Claude | Any Claude model id; Codex ids are refused. | The review sends no model, so the SDK decides. |
+| Codex | One of the supported Codex role models. | The built-in `gpt-6-sol`. |
+
+From the CLI, use `uzi settings set task-review-model <id> --harness
+claude|codex` and `uzi settings reset task-review-model --harness
+claude|codex` (see [CLI](./cli.md#changing-model-and-effort-settings)). The API
+keys are `task_review_model` (Claude) and `codex_task_review_model` (Codex) on
+`PUT /api/me/model-settings` and `PUT /api/me/settings`; `null` or a blank
+value clears the setting.
+
+- A stored model that later becomes invalid (for example a Codex model that
+  leaves the supported list) falls back to the built-in at review time, and
+  the effective view shows the built-in as the source.
+- A worker older than this release does not read the setting. It runs the
+  built-in review model, and the run feed records a
+  `task_review_settings_omitted` notice.
+- The server does not call the provider when you save. A configured model the
+  provider cannot run produces the existing failed review.
+
+The review's reasoning effort is set separately; see [Task review
+effort](#task-review-effort).
+
+## Task review effort
+
+Each harness's review also has its own reasoning effort, next to the model under
+**Settings → Run defaults → Task review**. It accepts `low`, `medium`, `high`,
+`xhigh` or `max`, or **Runtime default** (`runtime`), which sends no level and
+lets the runtime decide.
+
+Left unset, the review follows your [worker effort](./worker-effort.md) for the
+same harness (the Claude effort or the Codex effort), including a Runtime
+default. If the worker effort is unset too, the built-in `medium` is sent.
+**Behaviour change:** before this release no review effort was sent, so an owner
+who sets nothing now has reviews send their worker effort (the built-in
+`medium` when that is unset too).
+
+From the CLI, use `uzi settings set task-review-effort
+<low|medium|high|xhigh|max|runtime> --harness claude|codex` and `uzi settings
+reset task-review-effort --harness claude|codex`; reset follows your worker
+effort again, it does not pick a level. The API keys are `task_review_effort`
+(Claude) and `codex_task_review_effort` (Codex) on `PUT /api/me/model-settings`
+and `PUT /api/me/settings`.
+
+- A run's one-run effort override does not affect the review.
+- A stored value that is corrupt falls back to the built-in `medium`.
+- A worker older than this release does not read the setting. The api withholds
+  it, the run feed records a `task_review_settings_omitted` notice that names
+  "task review effort" (including an inherited `medium`), and the review runs
+  with no effort as before.
+- The effective view resolves the review effort per harness; its note is
+  `not_sent` only for Runtime default.
 
 ## Per-schedule model
 

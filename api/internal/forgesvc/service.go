@@ -127,6 +127,8 @@ type IssueStore interface {
 	// board_position so a reopened card lands at the bottom of its lane.
 	UpdateIssueState(ctx context.Context, arg store.UpdateIssueStateParams) (store.Issue, error)
 	ReopenIssueState(ctx context.Context, arg store.ReopenIssueStateParams) (store.Issue, error)
+	// SetIssueTrackerColumn writes only a linked card's cached board column (PRD #4173 M5).
+	SetIssueTrackerColumn(ctx context.Context, arg store.SetIssueTrackerColumnParams) (store.Issue, error)
 	DeleteIssuesNotIn(ctx context.Context, arg store.DeleteIssuesNotInParams) (int64, error)
 	// Used by the MR-close watcher (mr_watch.go).
 	ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRWatchCandidatesRow, error)
@@ -518,7 +520,8 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 // AutoMove plans a column label delta, writes it forge-first, then applies it to
 // the current cached row. Forge errors leave the cache untouched; a driver can
 // partially change remote labels before returning an error. No compensation is
-// attempted. The returned issue is the re-cached row. Caller guards own closed
+// attempted. The returned issue is the re-cached row. On a linked repo the cache
+// write is SetIssueTrackerColumn instead of the label write. Caller guards own closed
 // issue and manual-drag policy.
 func (s *Service) AutoMove(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
 	var current []string
@@ -537,21 +540,28 @@ func (s *Service) AutoMove(ctx context.Context, f forge.IssueTracker, forgeProje
 	// be missing or drifted (e.g. the Upcoming→Planned rename, #176). add is the
 	// target column and has at most one element; an empty add (already in the target
 	// column, or a move to Open) ensures nothing and keeps the cheap no-forge-call path.
+	move := forge.ColumnMove{Column: target, Add: add, Remove: remove}
 	if len(add) > 0 {
-		labels := make([]forge.Label, 0, len(add))
+		move.Ensure = make([]forge.Label, 0, len(add))
 		for _, name := range add {
-			labels = append(labels, forge.Label{Name: name, Color: ColumnColor(name)})
-		}
-		if err := f.EnsureLabels(ctx, forgeProjectID, labels); err != nil {
-			return store.Issue{}, err
+			move.Ensure = append(move.Ensure, forge.Label{Name: name, Color: ColumnColor(name)})
 		}
 	}
 
-	// Forge-first: apply the label change remotely before touching the cache. On
-	// failure the cache is untouched (UpdateIssueLabels no-ops on empty sets, so a
-	// move to a column the card already sits in costs no forge call).
-	if err := f.UpdateIssueLabels(ctx, forgeProjectID, issue.ForgeIssueIid, add, remove); err != nil {
+	// Forge-first: apply the move remotely before touching the cache. On failure
+	// the cache is untouched (a label-backed issue tracker's UpdateIssueLabels
+	// no-ops on empty sets, so a move to a column the card already sits in costs
+	// no forge call).
+	if err := f.MoveToColumn(ctx, forgeProjectID, issue.ForgeIssueIid, move); err != nil {
 		return store.Issue{}, err
+	}
+	if isLinkedTracker(f) {
+		// A linked card's column is not a label: cache it in issue_tracker_column and
+		// touch nothing else (PRD #4173 M5), so a stale snapshot of state or labels is
+		// never written back.
+		return s.q.SetIssueTrackerColumn(ctx, store.SetIssueTrackerColumnParams{
+			RepoID: issue.RepoID, ForgeIssueIid: issue.ForgeIssueIid, IssueTrackerColumn: target,
+		})
 	}
 
 	labelsJSON, err := json.Marshal(append([]string{}, newLabels...))
@@ -846,13 +856,13 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	}
 	advanceGroups()
 
-	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, "", nil); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, extra, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, extra, "", nil); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, findingExtra, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, findingExtra, "", nil); err != nil {
 		return Marks{}, err
 	}
 	// A clean SET of fetches that legitimately returns zero issues DOES evict
@@ -946,13 +956,13 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	// deliberately ignored), so incremental passes cannot shift which page the
 	// next FullSync examines. Recorded-op settlement on later pages therefore
 	// happens as FullSync rotates to them.
-	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, "", nil); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel), ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel), "", nil); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel), ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel), "", nil); err != nil {
 		return m, err
 	}
 	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues), Finding: maxUpdatedAt(findingIssues)}), nil
@@ -1010,10 +1020,12 @@ func maxUpdatedAt(issues []forge.Issue) time.Time {
 // upsertIssues writes each forge issue into the cache, computing has_prd_link at
 // write time. issueKeyShort is the linked repo's issue tracker project short name:
 // non-empty, every row is stored with issue_key = short + "-" + iid (D10); empty (the
-// forge sync), issue_key is written NULL. It reports only an error: no high-water mark is read off this path,
+// forge sync), issue_key is written NULL. columns maps an issue iid to its cached board
+// column and is read only on the linked path (nil from the forge sync, which never
+// writes the column). It reports only an error: no high-water mark is read off this path,
 // deliberately, because the time.Now() substitution below would put one past the
 // instant its fetch observed (see maxUpdatedAt).
-func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, issueKeyShort string) error {
+func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, issueKeyShort string, columns map[int64]string) error {
 	for _, is := range issues {
 		labelsJSON, err := json.Marshal(is.Labels)
 		if err != nil {
@@ -1053,8 +1065,27 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		}
 		if issueKeyShort != "" {
 			// The linked sync re-reads every tagged issue each tick, so it writes only rows
-			// that changed; the forge sync keeps the unconditional write.
-			err = s.q.UpsertIssueIfChanged(ctx, store.UpsertIssueIfChangedParams(params))
+			// that changed; the forge sync keeps the unconditional write. The cached board
+			// column has three writers: this linked upsert, SetIssueTrackerColumn (a move) and
+			// ClearIssueTrackerColumnsNotIn (a linked ConfigureColumns); an empty column (the
+			// Open lane) is stored as NULL.
+			changed := store.UpsertIssueIfChangedParams{
+				RepoID:         params.RepoID,
+				ForgeIssueIid:  params.ForgeIssueIid,
+				Title:          params.Title,
+				State:          params.State,
+				Labels:         params.Labels,
+				AssigneeIds:    params.AssigneeIds,
+				WebUrl:         params.WebUrl,
+				Author:         params.Author,
+				HasPrdLink:     params.HasPrdLink,
+				ForgeUpdatedAt: params.ForgeUpdatedAt,
+				IssueKey:       params.IssueKey,
+			}
+			if col := columns[is.IID]; col != "" {
+				changed.IssueTrackerColumn = pgtype.Text{String: col, Valid: true}
+			}
+			err = s.q.UpsertIssueIfChanged(ctx, changed)
 		} else {
 			_, err = s.q.UpsertIssue(ctx, params)
 		}

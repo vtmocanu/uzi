@@ -166,7 +166,7 @@ func ForgeConnection(ctx context.Context, q Store, svc ForgeService, cfg config.
 			continue
 		}
 		// A project linked to an issue tracker before it was removed keeps that issue
-		// source, so its enable is refused (migration 00467). Ask before any label
+		// source, so its enable is refused (migration 00475). Ask before any label
 		// write reaches the forge, as provisionsvc.EnableRepo does, and leave the repo
 		// disabled: failing boot here would repeat on every restart. A database error
 		// is boot-fatal, like every other seed database error.

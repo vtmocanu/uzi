@@ -23,6 +23,8 @@ var issueTrackerRoutes = []struct{ method, path, body string }{
 	{http.MethodGet, "/api/issue-trackers/connections/11111111-1111-1111-1111-111111111111/projects", ""},
 	{http.MethodGet, "/api/issue-trackers/connections/11111111-1111-1111-1111-111111111111/tags", ""},
 	{http.MethodPut, "/api/repos/22222222-2222-2222-2222-222222222222/issue-tracker-link", `{"connection_id":"11111111-1111-1111-1111-111111111111","project_id":"0-1","tag_id":"5-1"}`},
+	{http.MethodGet, "/api/repos/22222222-2222-2222-2222-222222222222/issue-tracker-link/states", ""},
+	{http.MethodPut, "/api/repos/22222222-2222-2222-2222-222222222222/issue-tracker-link/states", `{"open_state":"Open","closed_state":"Fixed","columns":[]}`},
 }
 
 func issueTrackerTestRouter() http.Handler {

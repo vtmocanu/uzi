@@ -862,14 +862,19 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
         "Runtime default · catalog default: none (no reasoning level requested) (gpt-6.1-sol, Codex 0.165.0)"));
     });
 
-    it("refreshes the label from the PUT response after a Claude save", async () => {
+    it.each(["Claude", "Codex"] as const)("adopts only its own catalog lane after a %s effort save", async (harness) => {
       expect((await codexOption(dto()))[1]).toContain("Codex 0.164.0");
-      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "high", default_codex_effort: null,
+      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base,
+        default_effort: harness === "Claude" ? "high" : null, default_codex_effort: harness === "Codex" ? "high" : null,
         effort_settings: cells(dto({ state: "varies" })) } });
-      fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "high" } });
-      fireEvent.click(screen.getByText("Save Claude effort"));
-      await waitFor(() => expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
-        "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version"));
+      fireEvent.change(screen.getByLabelText(`${harness} effort`), { target: { value: "high" } });
+      fireEvent.click(screen.getByText(`Save ${harness} effort`));
+      await screen.findByText(harness === "Claude"
+        ? "Reasoning effort set to high. It applies to your next run."
+        : "Codex reasoning effort set to high. It applies at the next claim.");
+      expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
+        "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0)" +
+        (harness === "Codex" ? " · may differ on workers still on another version" : ""));
     });
 
     it("refreshes the label from the PUT response after a Codex model save", async () => {
