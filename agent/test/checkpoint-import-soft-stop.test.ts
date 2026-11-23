@@ -192,6 +192,9 @@ for (const edge of [
       if (first) await f.fetch();
       else assert.equal(fs.existsSync(f.receipt), false);
       const incoming = f.commit("edge incoming");
+      // The displaced pin write is the stop point. A pin already at the right sha is reused with no write, so drop it
+      // and let the displaced preservation re-create it under the stop trigger.
+      if (edge.operation === "displaced") git(f.bare, "update-ref", "-d", "refs/uzi-owed/" + run + "/" + first);
       if (edge.operation === "bridge") git(f.bare, "-c", "protocol.file.allow=always",
         "fetch", "--no-tags", f.clone, "refs/heads/" + branch);
       const options = { context: { ...f.options.context, generation: edge.generation } };
@@ -509,6 +512,8 @@ it("m3 D/F owned ancestor preservation finishes archive and promotion before a l
     const childBranch = branch + "/new";
     git(f.clone, "update-ref", "-d", "refs/heads/" + branch);
     git(f.clone, "branch", childBranch, f.base);
+    // The ancestor pin write is the stop point; an existing pin at the right sha is reused with no write, so drop it.
+    git(f.bare, "update-ref", "-d", "refs/uzi-owed/" + run + "/" + ancestor);
     const options = { context: { ...f.options.context, generation: 2, branch: childBranch } };
     const soft = new AbortController();
     let preserved = false, archived = false, promoted = false;

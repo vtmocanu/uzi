@@ -456,6 +456,35 @@ export class RecoveryBudgetExhaustedError extends Error {
   constructor() { super("recovery budget exhausted"); }
 }
 
+/** The owner record's bare storage identity (device or inode) differs while its path, branch, key and run
+ *  match. Thrown only by readRecoveryOwner under exactly that condition; every other binding change keeps the
+ *  generic "recovery owner binding changed". The message deliberately avoids the substrings the runner maps
+ *  on (clock, budget, blocked). `recorded`/`current` are non-secret device/inode strings. */
+export class RecoveryOwnerBareIdentityError extends Error {
+  constructor(readonly recorded: { dev: string; ino: string }, readonly current: { dev: string; ino: string },
+    readonly record: RecoveryOwnerRecord) {
+    super("recovery owner binding changed: bare storage identity");
+    this.name = "RecoveryOwnerBareIdentityError";
+  }
+}
+
+/** Typed only when both identities parse as `[path, dev, ino]` string triples with the same path and a
+ *  differing device or inode. Anything else (path change, unparsable value) answers undefined. */
+function bareIdentityDifference(recorded: string, current: string):
+  { recorded: { dev: string; ino: string }; current: { dev: string; ino: string } } | undefined {
+  const parse = (raw: string): [string, string, string] | undefined => {
+    try {
+      const v: unknown = JSON.parse(raw);
+      return Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "string")
+        ? [v[0] as string, v[1] as string, v[2] as string] : undefined;
+    } catch { return undefined; }
+  };
+  const a = parse(recorded);
+  const b = parse(current);
+  if (!a || !b || a[0] !== b[0] || (a[1] === b[1] && a[2] === b[2])) return undefined;
+  return { recorded: { dev: a[1], ino: a[2] }, current: { dev: b[1], ino: b[2] } };
+}
+
 export class ScratchPublicationError extends Error {
   readonly code = "scratch_publication_refused";
   readonly kind: ScratchPublicationKind;
@@ -4267,6 +4296,10 @@ export type TrackingUpdateResult =
       "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed";
       /** issue #4481: the incoming head fetchAgentBranch refused at the owed cap (`owed_limit` only). */
       refusedSha?: string };
+/** {@link GitCache.owedTipRetained}: the write-free twin of retainCurrentOwedCandidate's result. `unretained`
+ *  means the tip is not provably retained by an exact existing owed pin; nothing was written and the caller
+ *  decides whether to run retainCurrentOwedCandidate. */
+export type OwedTipRetainedResult = TrackingUpdateResult | { kind: "unretained" };
 /** One validated read of a bare's owed metadata (see GitCache.readOwedMetadataUnderLock). */
 interface OwedMetadata {
   names: string[];
@@ -4329,6 +4362,14 @@ class OwedCandidateLimitError extends Error {
   constructor(readonly sha?: string, readonly sealed = false, readonly alreadyLedgered = false) {
     super("owed candidate limit reached");
     this.name = "OwedCandidateLimitError";
+  }
+}
+
+/** A retention ref (owed pin or refused-head ref) already exists at a different target; it is left untouched. */
+export class RetentionRefTargetMismatchError extends Error {
+  constructor(readonly ref: string) {
+    super("retention ref target mismatch");
+    this.name = "RetentionRefTargetMismatchError";
   }
 }
 
@@ -12344,9 +12385,21 @@ export class GitCache {
       // issue #1786: a retained stopped canonical clone is never adopted or captured.
       await this.assertNoStoppedMarker(barePath, journal.clonePath, journal);
       if (journal.runId !== runId) throw new ForeignRetainedRecoveryError();
-      await this.checkedRecovery(barePath, branch, key, journal);
+      // issue #4627: a not-blocked journal with a typed bare-identity mismatch is read without the legacy
+      // attribution repair (its ledger append), so the claim can hold without any write.
+      const repair = !(journal.recovery?.stage !== "blocked" &&
+        await this.typedBareIdentityChange(barePath, branch, key, runId));
+      await this.checkedRecovery(barePath, branch, key, journal, false, undefined, repair);
       return { barePath, journal };
     });
+  }
+
+  /** Read-only probe: the typed bare-identity error when the owner record read raises it, else undefined.
+   *  Every other error is swallowed so the caller's existing sequence (and its error precedence) is unchanged. */
+  private async typedBareIdentityChange(barePath: string, branch: string, key: string, runId: string):
+    Promise<RecoveryOwnerBareIdentityError | undefined> {
+    try { await this.readRecoveryOwner(barePath, branch, key, runId); return undefined; }
+    catch (error) { return error instanceof RecoveryOwnerBareIdentityError ? error : undefined; }
   }
 
   /**
@@ -12400,8 +12453,15 @@ export class GitCache {
     if (!entries.length) return undefined;
     if (entries.length !== 1 || !entries[0]!.startsWith(name + "\n")) throw new Error("duplicate or missing recovery owner record");
     const record = parseRecoveryOwner(entries[0]!.slice(name.length + 1));
-    if (record.bare !== await this.recoveryOwnerBareIdentity(barePath) || record.branch !== branch ||
-        record.key !== key || record.runId !== runId) throw new Error("recovery owner binding changed");
+    const identity = await this.recoveryOwnerBareIdentity(barePath);
+    if (record.bare !== identity || record.branch !== branch ||
+        record.key !== key || record.runId !== runId) {
+      if (record.bare !== identity && record.branch === branch && record.key === key && record.runId === runId) {
+        const typed = bareIdentityDifference(record.bare, identity);
+        if (typed) throw new RecoveryOwnerBareIdentityError(typed.recorded, typed.current, record);
+      }
+      throw new Error("recovery owner binding changed");
+    }
     return record;
   }
 
@@ -12490,6 +12550,24 @@ export class GitCache {
     if (!Number.isSafeInteger(episode) || (episode as number) < 0) episode = undefined;
     return this.withLock(barePath, async () => {
       await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
+      // issue #4627: a typed bare-identity mismatch is classified read-only BEFORE the repairing read below.
+      const typedChange = await this.typedBareIdentityChange(barePath, branch, key, expected.runId);
+      if (typedChange) {
+        // Step 1: the read-only source check (allowLegacyRepair=false) refuses a changed source first.
+        const probed = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
+        const probedOld = probed.recovery;
+        // Step 2: the same pure stale fence as below.
+        if (probedOld?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < probedOld.claimGeneration)) {
+          throw new Error("stale recovery claim fence");
+        }
+        // Step 3: every blocked journal keeps today's disposition (the generic binding error).
+        if (probedOld?.stage === "blocked") throw new Error("recovery owner binding changed");
+        // Step 4: only the exact committed reservation may surface the typed error.
+        if (probedOld === undefined || typedChange.record.state !== "committed" ||
+            !ownerJournalMatches(typedChange.record, probed)) throw new Error("recovery owner binding changed");
+        // Step 5: nothing was written; the typed error reaches the runner.
+        throw typedChange;
+      }
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const old = journal.recovery;
       if (old?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < old.claimGeneration)) {
@@ -29743,13 +29821,17 @@ try {
     return `context-${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}.json`;
   }
 
-  private async persistOwedContext(c: StoredOwedContext): Promise<void> {
-    const name = this.contextName(c);
-    const record = { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath,
+  private owedContextRecord(c: StoredOwedContext): Record<string, unknown> {
+    return { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath,
       generation: c.generation, kind: c.kind, defaultIdentity: c.defaultIdentity
         ? { ref: c.defaultIdentity.ref, sha: c.defaultIdentity.sha } : null,
       ...("origin" in c ? { origin: c.origin, producer: c.producer }
         : c.generation === null ? { legacy: true } : {}) };
+  }
+
+  private async persistOwedContext(c: StoredOwedContext): Promise<void> {
+    const name = this.contextName(c);
+    const record = this.owedContextRecord(c);
     const existing = await this.readOwedFile(c.barePath, name);
     if (existing !== undefined) {
       if (JSON.stringify(existing) !== JSON.stringify(record)) throw new Error("owed context identity changed");
@@ -29784,6 +29866,8 @@ try {
     await this.assertBareClear(c.barePath, "owed-pin");
     await this.requireOwedCommit(c.barePath, sha);
     const ref = `refs/uzi-owed/${c.runId}/${sha}`;
+    // issue #4627: a wrong-target ref refuses here, before the cap, marker, context or candidate writes.
+    const refState = await this.classifyRetentionRefUnderLock(c.barePath, ref, sha);
     const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${c.runId}/`]))
       .split("\n").filter(Boolean).map((line) => line.split(" ")[0]!);
     if (!held.includes(ref) && held.length >= this.maxOwedCandidates) {
@@ -29810,7 +29894,7 @@ try {
     const old = await this.readOwedFile(c.barePath, name);
     if (old !== undefined && JSON.stringify(old) !== JSON.stringify(record)) throw new Error("invalid owed candidate record");
     if (old === undefined) await this.writeOwedFile(c.barePath, name, record);
-    await this.runGit(c.barePath, ["update-ref", ref, sha]);
+    if (refState === "absent") await this.createRetentionRefUnderLock(c.barePath, ref, sha);
     if (await this.checkedRefSha(c.barePath, ref) !== sha) throw new Error("owed pin readback mismatch");
   }
 
@@ -30084,7 +30168,10 @@ try {
     // and a failure of either latches this run ineligible for the process lifetime.
     const refWritten = await attempt(async () => {
       const ref = `refs/uzi-incoming/${c.runId}/${generation}/refused-${sha}`;
-      await this.runGit(c.barePath, ["update-ref", ref, sha]);
+      // issue #4627: created only when absent; a wrong target throws here (ref untouched) and latches below.
+      if (await this.classifyRetentionRefUnderLock(c.barePath, ref, sha) === "absent") {
+        await this.createRetentionRefUnderLock(c.barePath, ref, sha);
+      }
       return await this.checkedRefSha(c.barePath, ref) === sha;
     });
     const ledgerWritten = await attempt(async () => {
@@ -30364,13 +30451,37 @@ try {
 
   /** Checked enumeration distinguishes a genuinely absent exact ref from a failed read. */
   private async checkedRefSha(barePath: string, ref: string): Promise<string | undefined> {
+    const sha = await this.rawRefSha(barePath, ref);
+    if (sha === undefined) return undefined;
+    await this.requireOwedCommit(barePath, sha);
+    return sha;
+  }
+
+  /** The exact ref's object id without requiring a commit; undefined only when the ref is genuinely absent. */
+  private async rawRefSha(barePath: string, ref: string): Promise<string | undefined> {
     const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", ref]);
     const matches = out.trim().split("\n").filter((line) => line.startsWith(ref + " "));
     if (matches.length === 0) return undefined;
     if (matches.length !== 1) throw new Error("ambiguous tracking ref");
-    const sha = matches[0]!.slice(ref.length + 1);
-    await this.requireOwedCommit(barePath, sha);
-    return sha;
+    return matches[0]!.slice(ref.length + 1);
+  }
+
+  /** issue #4627, read-only, caller holds the bare lock. A retention ref is only ever created, never moved:
+   *  absent and same-OID are accepted, any other target throws {@link RetentionRefTargetMismatchError} (after
+   *  one warning naming the ref and its current OID) before the caller writes anything. */
+  private async classifyRetentionRefUnderLock(barePath: string, ref: string, sha: string): Promise<"absent" | "same"> {
+    const current = await this.rawRefSha(barePath, ref);
+    if (current === undefined) return "absent";
+    if (current === sha) return "same";
+    this.log.warn("retention ref target mismatch; ref left untouched", { ref, current });
+    throw new RetentionRefTargetMismatchError(ref);
+  }
+
+  /** Create-only: the zero expected-old value makes git refuse when the ref appeared meanwhile; `--no-deref`
+   *  stops a symbolic ref at the destination from redirecting the write. Reads the ref back. */
+  private async createRetentionRefUnderLock(barePath: string, ref: string, sha: string): Promise<void> {
+    await this.runGit(barePath, ["update-ref", "--no-deref", ref, sha, "0".repeat(sha.length)]);
+    if (await this.checkedRefSha(barePath, ref) !== sha) throw new Error("retention ref readback mismatch");
   }
   private checkedTrackingSha(barePath: string, branch: string): Promise<string | undefined> {
     return this.checkedRefSha(barePath, runnerTrackingRef(branch));
@@ -31022,6 +31133,60 @@ try {
         }
         return { kind: "updated", trackingRef: runnerTrackingRef(opts.context.branch),
           candidateSha: observed.sha, retainedShas, divergence: "none" };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
+      }
+    });
+  }
+
+  /**
+   * issue #4627: the strictly write-free twin of {@link retainCurrentOwedCandidate}, for a claim exit that must
+   * not touch the predecessor's bare (a held bare-identity change). It mirrors that method exactly up to the
+   * pin step and answers the same `updated` / `not_updated` kinds, but only counts the tip as retained when
+   * the exact owed pin (`refs/uzi-owed/<run>/<sha>` resolving to the sha), its candidate record and its owed
+   * context file already exist with identical content. In every other case it returns `{ kind: "unretained" }`
+   * having written nothing; the caller then runs {@link retainCurrentOwedCandidate} unchanged (exception E1).
+   * Episode refs and recovery pins never count as retention. A runner tells "unretained" apart by
+   * `result.kind === "unretained"`; any other result is final.
+   */
+  async owedTipRetained(barePath: string, opts: FetchAgentBranchOptions): Promise<OwedTipRetainedResult> {
+    opts = this.snapshotOwedOptions(opts);
+    await this.validateOwedContext(barePath, opts.context.branch, opts.context);
+    this.validateConfirmedSha(opts.remotelyConfirmedSha);
+    return this.withLock(barePath, async () => {
+      const observed = await this.observeTrackingUnderLock(barePath, opts.context.branch);
+      if (!observed?.sha || observed.owner?.runId !== opts.context.runId) {
+        return { kind: "not_updated", reason: "ownership_unknown" };
+      }
+      try {
+        const producing = await this.producingContext(barePath, opts.context.branch, observed.owner);
+        const sealed = refusalFileGenerations(await this.refusalNames(barePath), "final", opts.context.runId);
+        const pinned = producing.generation !== null && producing.generation > 0 ? producing.generation : opts.context.generation;
+        const callerGeneration = opts.context.generation ?? 0;
+        if (sealed.some((g) => g > 0 && ((pinned !== null && pinned > 0 && g >= pinned) || (callerGeneration > 0 && g >= callerGeneration)))) {
+          return { kind: "not_updated", reason: "ownership_unknown" };
+        }
+        const done: OwedTipRetainedResult = { kind: "updated", trackingRef: runnerTrackingRef(opts.context.branch),
+          candidateSha: observed.sha, retainedShas: [], divergence: "none" };
+        if (await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha)) return done;
+        const sha = observed.sha;
+        try {
+          await this.assertBareClear(barePath, "owed-pin");
+          if (await this.rawRefSha(barePath, `refs/uzi-owed/${producing.runId}/${sha}`) !== sha) return { kind: "unretained" };
+          const context = this.contextName(producing);
+          const record = { version: 1, runId: producing.runId, context, sha };
+          const candidate = await this.readOwedFile(barePath, `candidate-${producing.runId}-${sha}-${context.slice(8, -5)}.json`);
+          if (candidate === undefined || JSON.stringify(candidate) !== JSON.stringify(record)) return { kind: "unretained" };
+          const stored = await this.readOwedFile(barePath, context);
+          if (stored === undefined || JSON.stringify(stored) !== JSON.stringify(this.owedContextRecord(producing))) return { kind: "unretained" };
+        } catch (cause) {
+          const abort = this.boundaryAbortError(cause);
+          if (abort) throw abort;
+          return { kind: "unretained" };
+        }
+        return { ...done, retainedShas: [sha] };
       } catch (cause) {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;
