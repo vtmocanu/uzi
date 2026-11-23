@@ -2171,8 +2171,9 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   not, keeps today's disposition and the #3580 re-hold. A later iteration and a changed reservation keep
   today's path.
 - **Read-only probe and exact fence.** In `reserveRecoveryIteration` a probe runs first, under the lock.
-  It writes nothing: a read-only source check, the stale-claim fence, the not-blocked guard (a blocked
-  journal gets the generic error it gets today), and an exact reservation fence (the committed owner record
+  It writes nothing: a read-only source check, the stale-claim fence, the not-blocked guard (a non-renewable
+  blocked journal gets today's `recovery episode is blocked`; only a `budget_exhausted` or `adoption_failed`
+  blocked journal gets the generic binding error), and an exact reservation fence (the committed owner record
   must match the journal's reservation). Only then is the typed error rethrown. Legacy retained discovery
   reads a not-blocked journal with the typed mismatch without the attribution repair; a journal that would
   need the repair is refused read-only through the existing discovery failure path with custody kept. It
@@ -2182,8 +2183,9 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   `recovery_cause_retained_recovery_adoption_failed`, a positive claim generation and a first `running`
   report acknowledged as `running`; otherwise today's path applies. It emits one conditionally worded
   guidance line (inspect with `uzi run recovery <run>`, export or recover rather than Resume, a claimed
-  Resume holds again and adds a custody hold up to `custody_hold_limit`, Cancel ends the run), confirms
-  delivery within a bound, then uses the existing park writer and ends in a nonterminal stop. A stale claim,
+  Resume holds again and adds a custody hold up to `custody_hold_limit`, Cancel ends the run), attempts to
+  confirm delivery within a bound (logging `guidance_unconfirmed` on failure and parking anyway), then uses
+  the existing park writer and ends in a nonterminal stop. An unconfirmed park adds one corrective line. A stale claim,
   a credential switch, lost ownership and an owner Cancel propagate as in #3644.
 - **Teardown guard.** The park's process reap and cache drop are skipped for this hold, as for #3644, so
   the HOME the flight holds is not touched.
@@ -2203,7 +2205,9 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   `refs/uzi-incoming/`) now classify the destination read-only first: absent is created with
   `update-ref --no-deref <ref> <sha>` and the zero object id as expected old value, an identical target is
   reused, and a different target throws `RetentionRefTargetMismatchError` after one warning
-  (`retention ref target mismatch; ref left untouched`), before any other write in the pin. This applies to
+  (`retention ref target mismatch; ref left untouched`). In the owed pin writer the mismatch throws before any
+  other write. In the refusal-ref writer the recording step catches the mismatch, the ledger and marker steps
+  still run, and the run is then latched refusal-incomplete (the existing fail-closed path). This applies to
   every caller, not only the hold. Previously an unconditional `update-ref` moved the wrong target, which
   silently healed it. Now the ref stays wrong until an operator acts: the run's owed inventory stays
   unreadable and fail-closed with custody kept, and a wrong refusal ref stays as evidence. The operator
@@ -2213,7 +2217,8 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   leaves the run `running` on the server and nonterminal. The worker drops it from its active-run snapshot,
   so the ordinary missing-flight requeue accounting applies (a charged requeue below `RUN_MAX_REQUEUES`,
   then `worker_requeue_exhausted` at the cap when recovery evidence or unresolved custody is recorded,
-  otherwise `worker_lost`). Nothing is reported to the API by the worker for this case.
+  otherwise `worker_lost`). The park request was sent; after it the worker sends no further state report, posts
+  one corrective status line saying the hold was not confirmed, and stops nonterminally with custody kept.
 
 **Edges not held.** A blocked journal; a typed mismatch on a later iteration; a changed reservation;
 a not-blocked adopting journal that would need legacy attribution repair (refused read-only today, as it

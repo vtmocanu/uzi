@@ -461,9 +461,10 @@ check. Two holds cover it:
   failing and keeps its local work and custody. Export/recover the retained work
   rather than expecting Resume alone to rebind changed storage. Reholding does
   not rebind the owner record or consume the pending execution grant. On the
-  renewal-check path, the warning now reads
-  `recovery owner binding changed: bare storage identity`; the disposition is
-  unchanged.
+  renewal-check path the logged warning is still
+  `retained adoption renewal evidence unavailable`; only its diagnostic cause
+  now reads `recovery owner binding changed: bare storage identity`, and only
+  for an `adoption_failed` blocker. The disposition is unchanged.
 - A device or inode change alone (for example a pod replacement remounting the
   data volume) found on the first reservation of a claim on a journal that is
   not blocked now parks at `recovery_wait` / `retained_recovery_adoption_failed`
@@ -476,8 +477,10 @@ check. Two holds cover it:
   hold needs the API feature and a running acknowledgement, as for the other
   adoption-failed holds. A definitive refusal (400) of the park, or a park that
   cannot be confirmed, leaves the run nonterminal: the ordinary missing-flight
-  requeue accounting applies, then the `worker_requeue_exhausted` owner hold at
-  the cap.
+  requeue accounting applies. At the cap the disposition is the owner hold
+  `recovery_wait` / `worker_requeue_exhausted` when recovery evidence or
+  unresolved custody is recorded (which a retained run normally has), otherwise
+  `worker_lost`.
 
 The claim's exit keeps the predecessor's refs unchanged when the owed tip is
 already pinned. Otherwise it performs the usual single additive owed pin. On an

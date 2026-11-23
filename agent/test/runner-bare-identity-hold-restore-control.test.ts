@@ -18,7 +18,11 @@ const GUIDANCE = "storage identity changed";
 const guidance = (r: Rig): string[] => api.messages(r.runId).map(m => String((m.payload as { text?: string }).text ?? "")).filter(t => t.includes(GUIDANCE));
 
 /** The predecessor P has an owner record (one charged reservation of its own) and the bare's device number then moves. */
+/** Reads of the shifted identity after the mismatch is armed; the restore route is expected to make none (asserted below). */
+const identityReads = { count: 0 };
+
 async function withTypedMismatch(r: Rig, plain: boolean): Promise<string[]> {
+  identityReads.count = 0;
   const source = { runId: r.runId, clonePath: r.pPath, attemptId: r.pAttempt };
   await git.reserveRecoveryIteration(r.bare, BRANCH, `issue-${IID}`, source, 1, 2, 7, 0);
   if (plain) {
@@ -33,6 +37,7 @@ async function withTypedMismatch(r: Rig, plain: boolean): Promise<string[]> {
   let armed = false;
   mock.method(seam, "recoveryOwnerBareIdentity", async (...args: unknown[]) => {
     if (!armed) return real(...args);
+    identityReads.count++;
     const shifted = [...identity];
     shifted[1] = String(BigInt(identity[1]!) + 1n);
     return JSON.stringify(shifted);
@@ -71,6 +76,9 @@ describe("a foreign-active predecessor slot with a typed bare-identity mismatch 
       assert.equal(logged(r, "retained recovery bare storage identity changed; execution refused").length, 0);
       assert.equal(guidance(r).length, 0, "no guidance line");
       assert.deepEqual(calls, [], "reserveRecoveryIteration was never called");
+      // The restore route classifies from the bare config and authority evidence alone, so the owner record's bare identity is
+      // never read: the armed (shifted) mismatch is never even observed.
+      assert.equal(identityReads.count, 0, "recoveryOwnerBareIdentity was never read while armed");
       assert.equal(api.states.filter(s => s.runId === r.runId && s.body.status === "recovery_wait").length, 0, "no park request");
       // P's journal, owner record, ledger, slots, clone, HOME and provision directory are byte-identical.
       await assertStoppedUntouched(r, before, traps);

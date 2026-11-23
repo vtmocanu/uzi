@@ -5,8 +5,9 @@
 // reaches the tip, today's retainCurrentOwedCandidate adds exactly one owed pin (plus its candidate record, the owed-path marker at
 // the cap, or the refusal evidence above it). A retention ref already at a WRONG target is never moved. Each variant runs for the
 // Claude and the Codex executor with a confirmed and with an uncertain (statusless) owner hold, through the production
-// RunRunner.execute() on real Git, and every outcome is compared with the BASE outcome of the same state under today's
-// unconditional retention (the write-free probe forced to "unretained").
+// RunRunner.execute() on real Git. The probe rows compare every outcome with the BASE outcome of the same state under today's
+// unconditional retention (the write-free probe forced to "unretained"). The wrong-target rows are not base comparisons: their
+// base already includes the additive-only retention writers, so their discriminating checks are the row-specific ones below.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";

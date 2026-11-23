@@ -20,7 +20,8 @@ afterEach(() => cleanupHold());
 
 const feed = (r: HoldRig): string[] => api.messages(r.runId).map(m => String((m.payload as { text?: string }).text ?? ""));
 const guidance = (r: HoldRig): string[] => feed(r).filter(t => t.includes(GUIDANCE));
-const logged = (r: HoldRig, msg: string) => r.logs.lines.filter(l => (l as { msg: string }).msg === msg) as Array<Record<string, unknown>>;
+const corrective = (r: HoldRig): string[] => feed(r).filter(t => t.startsWith("The owner hold for the changed storage identity was not confirmed"));
+const logged =(r: HoldRig, msg: string) => r.logs.lines.filter(l => (l as { msg: string }).msg === msg) as Array<Record<string, unknown>>;
 const failures = (r: HoldRig) => api.states.filter(s => s.runId === r.runId && s.body.status === "failed");
 const holds = (r: HoldRig) => r.parks.filter(p => p.recovery_cause === "retained_recovery_adoption_failed");
 
@@ -50,12 +51,15 @@ for (const harness of ["claude", "codex"] as Harness[]) {
 
         assert.equal(r.counts.holds, 1, "the hold ran once");
         assert.equal(r.flights[0]!.bareIdentityHold, true);
-        assert.equal(holds(r).length >= 1 && holds(r).length <= 2, true, JSON.stringify(r.parks));
+        // parkRetainedRecoveryExhausted sends the park once on a confirming ACK and retries it once on an uncertain one.
+        assert.equal(holds(r).length, ack === "confirmed" ? 1 : 2, JSON.stringify(r.parks));
         assert.equal(r.flights[0]!.parked === true, ack === "confirmed", "parked only on a confirming ACK");
         assert.equal(r.flights[0]!.preserveRecoveryClone, true);
         assert.equal(r.flights[0]!.retainedLocalCustody, true);
         assert.equal(r.flights[0]!.preserveSession, true);
         assert.equal(guidance(r).length, 1, "one guidance line");
+        assert.equal(corrective(r).length, ack === "confirmed" ? 0 : 1,
+          "exactly one corrective 'not confirmed' line on an uncertain park, none on a confirmed one");
         assert.equal(r.registry.has(r.runId), false, "the flight left the active snapshot");
 
         assert.equal(alive(r.child!), true, "the predecessor-attributed child is alive");
