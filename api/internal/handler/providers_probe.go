@@ -182,8 +182,14 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fresh, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
-	if err != nil || !fresh.ProbeAuthResult.Valid {
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		internalProviderError(w, "read provider probe result", err)
+		return
+	}
+	// No current evidence after the commit means the key rotated, or the provider changed, after the
+	// write: the same benign race as a lost write, not a server fault.
+	if err != nil || !fresh.ProbeAuthResult.Valid {
+		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"probe": providerDTO(providerRow(fresh)).Probe})

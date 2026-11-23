@@ -301,3 +301,54 @@ func TestProviderTestProbeRateLimitedLiveDB(t *testing.T) {
 		t.Errorf("test after the slot was freed = %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// Interleave a committed key rotation after the probe's evidence write, before its final re-read.
+type providerProbeFinalReadInterleave struct {
+	store.DBTX
+	mu     sync.Mutex
+	reads  int
+	inHook bool
+	before func()
+}
+
+func (db *providerProbeFinalReadInterleave) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: GetModelProviderForOwner ") {
+		db.mu.Lock()
+		db.reads++
+		fire := db.reads == 3 && !db.inHook
+		if fire {
+			db.inHook = true
+		}
+		db.mu.Unlock()
+		if fire {
+			db.before()
+		}
+	}
+	return db.DBTX.QueryRow(ctx, sql, args...)
+}
+
+// A key rotated after the evidence write commits leaves no current evidence for the final re-read:
+// that is the benign edit race (409), not a server error.
+func TestProviderTestProbeRotationAfterWriteIs409LiveDB(t *testing.T) {
+	f, _, createBody := probeFixture(t)
+	p := f.create(t, createBody)
+	path := "/api/me/providers/" + p.ID
+	if rec := cookieReq(t, f.router, http.MethodPut, path+"/key", f.jwt, `{"key":"`+testProviderKey+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set key = %d %s", rec.Code, rec.Body.String())
+	}
+	fired := false
+	hook := &providerProbeFinalReadInterleave{DBTX: f.pool, before: func() {
+		fired = true
+		if rec := cookieReq(t, f.router, http.MethodPut, path+"/key", f.jwt, `{"key":"replacement-gateway-key-0002"}`); rec.Code != http.StatusOK {
+			t.Fatalf("rotate key = %d %s", rec.Code, rec.Body.String())
+		}
+	}}
+	f.h.q = store.New(hook)
+	rec := bearerReqBody(f.router, http.MethodPost, path+"/test", f.uzc, "")
+	if !fired {
+		t.Fatal("the probe never reached its final re-read")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Errorf("probe = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+}
