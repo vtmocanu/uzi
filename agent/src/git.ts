@@ -468,6 +468,17 @@ export class RecoveryOwnerBareIdentityError extends Error {
   }
 }
 
+/** issue #4627: the only form of the bare-identity error that authorizes the runner's owner hold. Constructed at
+ *  exactly one site, the read-only probe in reserveRecoveryIteration, after every probe fence passed and before
+ *  anything was written. A RecoveryOwnerBareIdentityError raised by any other owner read (the ordinary read, a
+ *  write's readback) stays the base class and keeps today's preservation_failed path. Same message as the base. */
+export class RecoveryOwnerBareIdentityHoldError extends RecoveryOwnerBareIdentityError {
+  constructor(probed: RecoveryOwnerBareIdentityError) {
+    super(probed.recorded, probed.current, probed.record);
+    this.name = "RecoveryOwnerBareIdentityHoldError";
+  }
+}
+
 /** Typed only when both identities parse as `[path, dev, ino]` string triples with the same path and a
  *  differing device or inode. Anything else (path change, unparsable value) answers undefined. */
 function bareIdentityDifference(recorded: string, current: string):
@@ -12569,8 +12580,8 @@ export class GitCache {
         // Step 4: only the exact committed reservation may surface the typed error.
         if (probedOld === undefined || typedChange.record.state !== "committed" ||
             !ownerJournalMatches(typedChange.record, probed)) throw new Error("recovery owner binding changed");
-        // Step 5: nothing was written; the typed error reaches the runner.
-        throw typedChange;
+        // Step 5: nothing was written; only here does the hold-authorizing form reach the runner.
+        throw new RecoveryOwnerBareIdentityHoldError(typedChange);
       }
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const old = journal.recovery;

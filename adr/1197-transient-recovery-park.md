@@ -2166,6 +2166,11 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   mismatch (a path change, an unparsable value, a branch, key or run difference) keeps the generic
   `recovery owner binding changed`. The typed message avoids the substrings the runner maps on (`clock`,
   `budget`, `blocked`).
+  The runner holds only on `RecoveryOwnerBareIdentityHoldError`, a subclass with the same message that
+  only the read-only probe below constructs, after all its fences pass and before anything is written. A
+  storage-identity change detected later in the same reservation (the ordinary owner read after the probe
+  passed, or an owner-record write's readback) raises the base class, is not held, and fails closed as
+  `preservation_failed` with work and custody kept on the worker.
 - **Limits.** The hold applies only on the first reservation iteration of a claim (before any capture,
   teardown or journal write) and only when the journal is not blocked. A blocked journal, renewable or
   not, keeps today's disposition: the #3580 re-hold for an `adoption_failed` or `budget_exhausted`

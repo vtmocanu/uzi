@@ -484,7 +484,9 @@ check. Two holds cover it:
   requeue accounting applies. At the cap the disposition is the owner hold
   `recovery_wait` / `worker_requeue_exhausted` when recovery evidence or
   unresolved custody is recorded (which a retained run normally has), otherwise
-  `worker_lost`.
+  `worker_lost`. A storage-identity change detected later in the same
+  reservation, after the read-only check passed, is not held: it fails closed as
+  `preservation_failed` with work and custody kept on the worker.
 
 The claim's exit keeps the predecessor's refs unchanged when the owed tip is
 already pinned. Otherwise it performs the usual single additive owed pin. On an

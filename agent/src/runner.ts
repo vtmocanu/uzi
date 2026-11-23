@@ -48,7 +48,7 @@ import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sour
 import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken, RefusalReleaseGate } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
-  RecoveryOwnerBareIdentityError,
+  RecoveryOwnerBareIdentityHoldError,
   RecoveryChargeInterruptedError,
   RecoveryBudgetExhaustedError,
   RecoveryDeadlineExhaustedError,
@@ -31224,7 +31224,7 @@ export class RunRunner {
    * `retained_recovery_adoption_failed`, modelled on {@link holdUnsupportedRestore}. Always ends in {@link RetainedRecoveryStop};
    * a stale claim, a credential switch, a lost ownership and an owner Cancel propagate as there.
    */
-  private async holdForBareIdentityChange(claim: ClaimResponse, flight: RunFlight, error: RecoveryOwnerBareIdentityError): Promise<never> {
+  private async holdForBareIdentityChange(claim: ClaimResponse, flight: RunFlight, error: RecoveryOwnerBareIdentityHoldError): Promise<never> {
     flight.bareIdentityHold = true;
     const detail = { recorded_dev: error.recorded.dev, recorded_ino: error.recorded.ino, current_dev: error.current.dev,
       current_ino: error.current.ino, claim_generation: claim.claim_generation };
@@ -31813,8 +31813,9 @@ export class RunRunner {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         if (error instanceof RecoveryChargeInterruptedError) throw new RetainedRecoveryStop({ cause: error });
-        // issue #4627: a changed bare storage identity on the first reservation of a not-blocked journal is held for the owner.
-        if (error instanceof RecoveryOwnerBareIdentityError && !reservedThisClaim && source.recovery?.stage !== "blocked" &&
+        // issue #4627: a changed bare storage identity on the first reservation of a not-blocked journal is held for the owner,
+        // only when the read-only probe produced the hold form; a base-class error from any other owner read takes fail().
+        if (error instanceof RecoveryOwnerBareIdentityHoldError &&!reservedThisClaim && source.recovery?.stage !== "blocked" &&
             this.client.hasFeature(RETAINED_ADOPTION_FAILED_FEATURE) &&
             Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 && flight.runningAckStatus === "running")
           return this.holdForBareIdentityChange(claim, flight, error);

@@ -189,6 +189,30 @@ const failures = (r: Rig) => api.states.filter(s => s.runId === r.claim.run_id &
  */
 const RecoveryOwnerBareIdentityError = (gitModule as Record<string, unknown>).RecoveryOwnerBareIdentityError as
   (new (...a: never[]) => Error) | undefined;
+/** The hold-authorizing subclass, constructed only by the read-only probe; resolved at runtime for the same reason. */
+const HoldError = (gitModule as Record<string, unknown>).RecoveryOwnerBareIdentityHoldError as
+  (new (...a: never[]) => Error) | undefined;
+/**
+ * Today's disposition for a base-class error: fail() runs, and its own recoveryReservationSnapshot re-read hits the same
+ * (still mismatched) identity, so the blocker cannot be persisted and the reason says so; custody is kept regardless.
+ */
+const FAIL_SHAPE = (r: Rig): void => {
+  assert.deepEqual(failures(r).map(f => f.body.failure_reason),
+    ["Retained recovery blocked: preservation failed; blocker persistence unavailable; local work and custody retained"]);
+  assert.match(String((r.counts.rejections[0] as Error).message), /^recovery owner binding changed: bare storage identity$/);
+};
+/** The owner record bytes after the reservation died mid-way: the pending charge is consumed and left, deliberately. */
+const OWNER_SHAPE = (r: Rig, name: string, before: string): void => {
+  const was = JSON.parse(before) as { consumed: number; after: { attempts: number } };
+  const now = r.owner() as { state: string; consumed: number; after: { attempts: number } };
+  assert.equal(was.after.attempts, 1);
+  assert.equal(now.after.attempts, 2, "the charge for this iteration was written");
+  assert.equal(now.consumed, was.consumed, "no raw grant was consumed");
+  assert.equal(now.state, name === "pending charge" ? "pending" : "committed");
+  assert.equal(r.parks.length, 0, "no park of any cause");
+  assert.equal(r.journal().recovery!.attempts, name === "pending charge" ? 1 : 2,
+    "the journal reservation is written only after the pending charge");
+};
 const typedRejections = (r: Rig) => r.counts.rejections.filter(e => RecoveryOwnerBareIdentityError !== undefined && e instanceof RecoveryOwnerBareIdentityError);
 
 /** The shared "this was held" assertions of both journals. */
@@ -466,10 +490,13 @@ describe("blocked journals keep today's disposition", () => {
 
   it("the runner guard alone: a stubbed typed rejection on a renewable blocked budget_exhausted source takes today's fail() route", async t => {
     const r = await build(t, { journal: "budget_exhausted", claim: { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 0 } });
+    // The hold subclass, so the runner's `stage !== "blocked"` guard is what refuses it (the base class would not match at all).
+    assert.ok(HoldError, "git.ts exports RecoveryOwnerBareIdentityHoldError");
     assert.ok(RecoveryOwnerBareIdentityError, "git.ts exports RecoveryOwnerBareIdentityError");
-    const TypedError = RecoveryOwnerBareIdentityError as new (...a: unknown[]) => Error;
+    const Hold = HoldError as new (probed: Error) => Error;
+    const Base = RecoveryOwnerBareIdentityError as new (...a: unknown[]) => Error;
     t.mock.method(git, "reserveRecoveryIteration", async () => {
-      throw new TypedError({ dev: "1", ino: "2" }, { dev: "1", ino: "3" }, r.owner());
+      throw new Hold(new Base({ dev: "1", ino: "2" }, { dev: "1", ino: "3" }, r.owner()));
     });
     await r.execute();
     assert.equal(r.counts.holds, 0);
@@ -477,6 +504,83 @@ describe("blocked journals keep today's disposition", () => {
     assert.equal(adoptionParks(r).length, 0);
     assert.equal(r.parks.filter(p => p.recovery_cause === "retained_recovery_exhausted").length, 1, JSON.stringify(r.parks));
   });
+});
+
+describe("a base-class bare-identity error from any other owner read inside the reservation is never held", () => {
+  /** Marks the span of the reservation under test, so retained discovery's own earlier calls never trigger a flip. */
+  const scope = (t: TestContext, r: Rig): { inReserve: boolean } => {
+    const state = { inReserve: false };
+    const reserve = git.reserveRecoveryIteration.bind(git);
+    t.mock.method(git, "reserveRecoveryIteration", async (...args: Parameters<typeof reserve>) => {
+      state.inReserve = true;
+      try { return await reserve(...args); } finally { state.inReserve = false; }
+    });
+    void r;
+    return state;
+  };
+  const assertTodaysDisposition = (r: Rig, ownerBefore: string): void => {
+    // Behaviour first, so a baseline that holds fails on the hold and not on the missing class.
+    assert.equal(r.counts.holds, 0, "not held");
+    assert.equal(guidance(r).length, 0, "no storage-identity guidance line");
+    assert.equal(r.flights.length, 0);
+    assert.equal(adoptionParks(r).length, 0, "no retained_recovery_adoption_failed park");
+    assert.ok(RecoveryOwnerBareIdentityError && HoldError, "git.ts exports both classes");
+    assert.equal(r.counts.rejections.length, 1, "the reservation rejected once");
+    const error = r.counts.rejections[0];
+    assert.ok(error instanceof RecoveryOwnerBareIdentityError, "a base-class bare-identity error");
+    assert.ok(!(error instanceof HoldError), "not the hold-authorizing subclass");
+    assert.equal(r.parks.length, 0, JSON.stringify(r.parks));
+    assert.equal(failures(r).length, 1, JSON.stringify(failures(r).map(f => f.body)));
+    assert.equal(r.counts.models, 0);
+    assert.equal(r.counts.captures, 0, "no capture");
+    assert.equal(r.counts.freeCaptures, 0, "no quiescence capture");
+    assert.equal(fs.existsSync(r.clonePath), true, "custody kept");
+    assert.equal(fs.readFileSync(path.join(r.clonePath, "retained.txt"), "utf8"), "local retained work\n");
+    void ownerBefore;
+  };
+
+  it("the identity changes between the probe and the ordinary owner read: today's preservation_failed, nothing held", async t => {
+    const r = await build(t);
+    const ownerBefore = r.rawOwner();
+    const state = scope(t, r);
+    const seam = git as any;
+    const real = seam.checkedRecovery.bind(git);
+    let first = true;
+    t.mock.method(seam, "checkedRecovery", async (...args: unknown[]) => {
+      const out = await real(...args);
+      if (state.inReserve && first) { first = false; r.mismatch.on = true; }
+      return out;
+    });
+    await r.execute();
+    assert.equal(first, false, "the flip happened inside the reservation");
+    assertTodaysDisposition(r, ownerBefore);
+    assert.equal(r.rawOwner(), ownerBefore, "the owner record is untouched: the ordinary read refused before any write");
+    FAIL_SHAPE(r);
+  });
+
+  for (const [name, needle] of [["pending charge", `"state":"pending"`], ["committed", `"state":"committed"`]] as const) {
+    it(`the identity changes right after the ${name} write: the readback's base error takes today's preservation_failed route`, async t => {
+      const r = await build(t);
+      const ownerBefore = r.rawOwner();
+      const state = scope(t, r);
+      const seam = git as unknown as { runGit(bare: string, args: string[], ...rest: unknown[]): Promise<string> };
+      const real = seam.runGit.bind(git);
+      let flipped = false;
+      t.mock.method(seam, "runGit", async (bare: string, args: string[], ...rest: unknown[]) => {
+        const out = await real(bare, args, ...rest);
+        if (state.inReserve && !flipped && args[0] === "config" && args[2] === r.ownerKey && String(args[3]).includes(needle)) {
+          flipped = true;
+          r.mismatch.on = true;
+        }
+        return out;
+      });
+      await r.execute();
+      assert.equal(flipped, true, "the flip followed the owner-record write");
+      assertTodaysDisposition(r, ownerBefore);
+      OWNER_SHAPE(r, name, ownerBefore);
+      FAIL_SHAPE(r);
+    });
+  }
 });
 
 describe("park outcomes", () => {
