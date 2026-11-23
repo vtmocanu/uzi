@@ -291,13 +291,14 @@ while [ "$i" -lt "$MAX" ]; do
     CI_FIX_ACTIVE=none; CI_FIX_RECENT=none
   elif branch_writers_read "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" "$PR" \
        && writers_summarize; then
-    mrw_active=$WRITERS_MRW_COUNT; ci_active=$CI_FIX_ACTIVE; ci_count=$CI_FIX_ACTIVE_COUNT
     print_writers_visibility
     # CI_FIX_RECENT stays owner-scoped: reuse the fallback's run list, else read it separately.
     rl2=$WRITERS_RUNS
     [ -n "$rl2" ] || rl2=$(uzi run list --json 2>/dev/null || echo 'x')
-    if ! ci_fix_snapshot "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" 2>/dev/null; then unk ci_fix; fi
-    CI_FIX_ACTIVE=$ci_active; CI_FIX_ACTIVE_COUNT=$ci_count
+    if ci_fix_snapshot "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" 2>/dev/null \
+       && writers_include_owner_active "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" "$PR" 2>/dev/null; then
+      mrw_active=$WRITERS_MRW_COUNT
+    else unk ci_fix; fi
   else
     unk mr_rework
     unk ci_fix

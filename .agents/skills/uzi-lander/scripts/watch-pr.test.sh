@@ -183,6 +183,23 @@ export UZI_LANDER_STATE_DIR="$WORK/state"
 export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 MODE="full"; export MODE
 
+# The owner read is later than the complete snapshot. It may reveal a newly
+# admitted writer that must not be erased by the earlier complete empty result.
+export MODE=greptile_clean CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+export UZI_REPO_JSON='[{"id":"r1","path_with_namespace":"test/repo"}]'
+export UZI_ADMIN_RW=1 UZI_WRITERS_OUT='{"writers":[],"complete":true}'
+export UZI_RUNS_JSON='[{"id":"owner-later","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"running"}]'
+printf '[]\n' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none --max-unknown 1 > "$WORK/owner-later.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 10 ] || fail "complete empty lookup hid owner ci_fix, rc=$rc: $(cat "$WORK/owner-later.out")"
+grep -qxF 'CI_FIX_ACTIVE=owner-later running' "$WORK/owner-later.out" || fail 'owner writer observation lost'
+grep -qxF 'RESULT=ci_fix_active' "$WORK/owner-later.out" || fail 'owner writer did not block readiness'
+unset UZI_REPO_JSON UZI_ADMIN_RW UZI_WRITERS_OUT UZI_RUNS_JSON CHECKS_JSON
+MODE=full; export MODE
+
 jq -n '[
   {user:{login:"tester"},body:"@coderabbitai review",created_at:"2026-09-18T11:12:00Z"},
   {user:{login:"coderabbitai[bot]"},body:"Action not completed: Already reviewed the last commit. Use @coderabbitai full review to rerun a review of the entire changeset.",created_at:"2026-09-18T11:12:56Z"}

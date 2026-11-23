@@ -19,5 +19,6 @@ func TestHeldPublicationDTOTags(t *testing.T) {
 		"id", "run_id", "generation", "ref", "tip", "state", "created_at",
 		"ref_created_at", "acknowledged_at", "expires_at", "owner_expired_at", "deleted_at", "last_error", "refusal_reason")
 	assertTags(t, "HeldPublicationsDTO", HeldPublicationsDTO{}, "publications")
+	assertTags(t, "HeldPublicationsDTO(admin debug)", HeldPublicationsDTO{AdminDebugRead: true}, "publications", "admin_debug_read")
 	assertTags(t, "HeldPublicationsExpireDTO", HeldPublicationsExpireDTO{}, "expired", "publications")
 }

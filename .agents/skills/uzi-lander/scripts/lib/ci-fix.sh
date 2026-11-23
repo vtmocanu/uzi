@@ -136,3 +136,14 @@ writers_summarize() {
   WRITERS_MRW_COUNT=$(printf '%s' "$WRITERS" | jq -r '[.[] | select(.kind == "mr_rework")] | length') || return 1
   case "$CI_FIX_ACTIVE_COUNT$WRITERS_MRW_COUNT" in ''|*[!0-9]*) return 1;; esac
 }
+
+# Neither observation can clear an active writer seen by the other. The owner
+# read happens later, so prefer its status when the same run appears twice.
+writers_include_owner_active() {
+  local owner_active
+  owner_active=$(branch_helper_active_runs "$@") || return 1
+  WRITERS=$(printf '%s\n%s\n' "$WRITERS" "$owner_active" | jq -sce '
+    if length != 2 or any(.[]; type != "array") then error("invalid writer observations")
+    else add | group_by(.id) | map(last) | sort_by(.kind, .id) end') || return 1
+  writers_summarize
+}

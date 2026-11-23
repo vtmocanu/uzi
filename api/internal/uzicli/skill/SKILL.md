@@ -311,7 +311,7 @@ uzi job list [--limit <n>] [--cursor <cursor>]
 uzi job files <job-id>
 uzi job file get <file-id> [-o <path>]
 uzi admin users
-uzi admin runs
+uzi admin runs [--all [--user <uuid|email>] [--since <rfc3339>] [--status <s[,s]>]] [--json]
 uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]   # active ci_fix/mr_rework writers, all owners; needs UZI_ADMIN_RUN_DEBUG + admin_ro token; exits 1 when the answer is incomplete (absence unknown)
 uzi admin workers
 uzi admin health [--all] [--strict]
@@ -1107,7 +1107,9 @@ uzi version
   (`refs/uzi-held/<run-id>/<generation>`) its committed work was published to before custody was
   released, with each ref's state, the tip it holds and when it is deleted. Fetch one before then
   with `git fetch origin <ref>`. `uzi run recovery <run-id>` shows the same ref as a released
-  hold's held receipt. Owner-only (a foreign run is a 404, exit 4).
+  hold's held receipt. Owner-only (a foreign run is a 404, exit 4), except that a live admin's
+  `uza_` token on a server with `UZI_ADMIN_RUN_DEBUG` on reads another user's run as an audited,
+  read-only admin debug read (stderr notice, no expire hint; `--json` stays the bare array).
 - `uzi run held expire <run-id> [--yes]` — make the run's acknowledged held refs due for deletion
   now; the server's cleanup deletes them shortly after (this command deletes nothing itself).
   **Destructive:** fetch the work first. It prompts for confirmation interactively; `--yes` is
@@ -2069,6 +2071,18 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   `*.base`, which matches proper subdomains of base but not base itself. Unknown name:
   exit 4; a name that is not a lowercase slug: exit 2, nothing sent. Creating and editing a list is web-only (cookie-only admin writes). Same
   `uza_`-token ceiling as every other `uzi admin` verb.
+
+- **Admin run debug** (read-only, flag-gated). With the server flag `UZI_ADMIN_RUN_DEBUG` on, a
+  live admin's `uza_` token can read another user's run through `uzi run inputs|fetches|recovery|held`
+  and `uzi admin runs --all [--user <uuid|email>] [--since <rfc3339>] [--status s[,s]]` (every
+  status, newest first, at most 500 rows; `--user`, `--since` and `--status` need `--all`, exit 2
+  otherwise; an email matching no user exits 4, several exit 1; an invalid status exits 2).
+  `uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]` is the flag-gated,
+  audited complete active-writer read; an incomplete answer exits 1. Each
+  read writes one audit log line. A `uzc_` token masks admin, so use `uza_`; a refusal prints a
+  hint naming the flag and token. `run get|logs|plan|lead-config` and `review show` are owner-or-admin
+  regardless of the flag. Steers and writes, archive download, `run export`, `run discard` and
+  `run held expire` stay owner-only. Detail: `uzi docs show cli`, "Admin run debug".
 
 ### PR and CI views
 

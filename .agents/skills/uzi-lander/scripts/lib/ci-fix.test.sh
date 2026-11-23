@@ -128,4 +128,17 @@ WRITERS_RC=0; ADMIN_RW=0; branch_writers_read repo x 7 || fail 'older CLI did no
 RUNS_RC=1; if branch_writers_read repo x 7; then fail 'failed fallback accepted'; fi
 RUNS_RC=0; RUNS_OUT='[{}]'; if branch_writers_read repo x 7; then fail 'malformed fallback accepted'; fi
 unset -f uzi
+WRITERS='[{"id":"foreign","kind":"ci_fix","status":"claimed"}]'
+CI_FIX_RECENT=unchanged
+owner='[{"id":"owner","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"running"}]'
+writers_include_owner_active "$owner" repo x 7 || fail 'union observations'
+[ "$CI_FIX_ACTIVE_COUNT" -eq 2 ] || fail 'union lost an active observation'
+[ "$CI_FIX_ACTIVE" = 'foreign claimed; owner running' ] || fail 'union IDs missing'
+[ "$CI_FIX_RECENT" = unchanged ] || fail 'union changed the recent advisory'
+WRITERS='[{"id":"owner","kind":"ci_fix","status":"claimed"}]'
+writers_include_owner_active "$owner" repo x 7 || fail 'deduplicate observations'
+[ "$CI_FIX_ACTIVE_COUNT" -eq 1 ] && [ "$CI_FIX_ACTIVE" = 'owner running' ] || fail 'union duplicated an ID or lost its later status'
+WRITERS='[]'
+writers_include_owner_active '[]' repo x 7 || fail 'empty union'
+[ "$CI_FIX_ACTIVE_COUNT" -eq 0 ] && [ "$CI_FIX_ACTIVE" = none ] || fail 'empty union invented a writer'
 echo 'PASS ci-fix: exact branch/repo predicate, active/terminal split, 24h boundary, timestamps and unknowns'

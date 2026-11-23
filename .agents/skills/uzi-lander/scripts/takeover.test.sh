@@ -134,6 +134,15 @@ has() { grep -qF -- "$2" "$WORK/$1.out" || fail "$1: missing '$2': $(cat "$WORK/
 has_line() { grep -qxF -- "$2" "$WORK/$1.out" || fail "$1: missing line '$2': $(cat "$WORK/$1.out")"; }
 hasnt() { if grep -qF -- "$2" "$WORK/$1.out"; then fail "$1: unexpected '$2': $(cat "$WORK/$1.out")"; fi; }
 
+# A complete snapshot can precede admission observed in the later owner read.
+export UZI_REPO_JSON='[{"id":"r1","path_with_namespace":"test/repo"}]'
+export UZI_ADMIN_RW=1 UZI_WRITERS_OUT='{"writers":[],"complete":true}'
+export UZI_RUNS_JSON='[{"id":"owner-later","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"running"}]'
+snap head_clean owner-later
+has_line owner-later 'CI_FIX_ACTIVE=owner-later running'
+has_line owner-later 'NEXT=ci_fix_active'
+unset UZI_REPO_JSON UZI_ADMIN_RW UZI_WRITERS_OUT UZI_RUNS_JSON
+
 # An explicit clean pass on THIS head clears the older anchored comment...
 snap head_clean
 has head_clean 'GREPTILE_REVIEWED_HEAD=1'

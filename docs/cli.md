@@ -230,7 +230,7 @@ uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
-uzi admin runs [--all [--user <uuid>] [--since <rfc3339>]] [--json]
+uzi admin runs [--all [--user <uuid|email>] [--since <rfc3339>] [--status <s[,s]>]] [--json]
 uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
@@ -1670,6 +1670,10 @@ differs. V1 remains failed-current-generation only. See
 [Publishing terminal held work](./run-recovery.md#publishing-terminal-held-work)
 for eligibility, deadlines and accepted late-writer risk. Both commands are
 owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
+The one exception is the read: `uzi run held <run-id>` on another user's run is served as an
+admin run debug read when the server flag is on and you use a `uza_` token (see
+[Admin run debug](#admin-run-debug-reading-other-users-runs)); `uzi run held expire` stays
+owner-only.
 
 ```
 uzi run held <run-id> [--json]
@@ -1686,6 +1690,11 @@ uzi run held <run-id> [--json]
   `--quiet`). A parked run, an excluded failure origin or work handled by the archive
   can have no publication; cancellation alone no longer implies that result under V2. A refused
   create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
+- **Another user's run (admin run debug read).** The read prints
+  `note: admin run debug read of another user's run (read-only; held expiry is owner-only)` on
+  stderr, omits the owner-only `uzi run held expire` hint and keeps the `git fetch` advice. A
+  refusal prints the [prerequisites hint](#admin-run-debug-reading-other-users-runs). The
+  response carries `admin_debug_read: true`, but `--json` prints the bare array with no marker.
 - **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
   `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
   `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty
@@ -1741,11 +1750,20 @@ Retry the removal once the refs are deleted or settled.
 
 ### Admin run debug: reading other users' runs
 
-Off by default. A deployment turns it on with `UZI_ADMIN_RUN_DEBUG` (chart value
-`api.adminRunDebug.enabled`; see [configuration](./configuration.md#admin-run-debug-issue-4198)).
-When it is on, a live admin using an `admin_ro` (`uza_`) CLI token can read, never change, another
-user's run data. A browser cookie or a `uzc_` token never qualifies, and demoting the admin takes
-effect on the next request. Each newly authorized cross-user read writes one audit log line.
+Two kinds of read reach another user's run. From the CLI both need a `uza_` (`admin_ro`) token,
+because a `uzc_` token masks admin-ness. Browser admin access is unchanged (the flag-gated reads below
+are CLI-only).
+
+**Owner-or-admin reads, regardless of the flag.** A live admin can read these on any run:
+`run get`, `run logs`, `run plan`, `run lead-config` and `review show`.
+
+**Flag-gated, audited debug reads.** Off by default. A deployment turns it on with
+`UZI_ADMIN_RUN_DEBUG` (chart value `api.adminRunDebug.enabled`; see
+[configuration](./configuration.md#admin-run-debug-issue-4198)). When it is on, a live admin using an
+`admin_ro` (`uza_`) CLI token can read, never change, another user's run data through `run inputs`,
+`run fetches`, `run recovery`, `run held`, `admin runs --all` and `admin run-writers`. A browser cookie or a `uzc_` token
+never qualifies, and demoting the admin takes effect on the next request. Each newly authorized
+cross-user read writes one audit log line.
 
 - **`uzi run inputs <id>` and `uzi run fetches <id>`** work on a foreign run. A foreign chat run still
   reads as not found. A debug-served inputs or archives response carries `admin_debug_read: true`.
@@ -1767,12 +1785,22 @@ effect on the next request. Each newly authorized cross-user read writes one aud
 
   Each entry in `captures` has the same shape as a hold's `captures` entries above. The human view
   prints a `captures (no listed hold)` table instead.
-- **`uzi admin runs --all [--user <uuid>] [--since <rfc3339>]`** lists runs of every status, newest
-  first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions as the active
-  listing (chat, judge and cross-check runs). `--user` limits it to one owner, `--since` to runs
-  created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
-  the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
-  prints a `{runs, truncated}` envelope of summary rows instead of the table.
+- **`uzi run held <id>`** on a foreign run lists its held-work publications (see
+  [`uzi run held`](#fetching-and-expiring-terminal-held-refs-uzi-run-held)). It prints a read-only
+  notice on stderr, drops the owner-only expire hint and keeps the `git fetch` advice. `--json` prints
+  the bare publications array, without the `admin_debug_read` marker.
+- **`uzi admin runs --all [--user <uuid|email>] [--since <rfc3339>] [--status s[,s]]`** lists runs of every
+  status, newest first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions
+  as the active listing (chat, judge and cross-check runs). `--user` limits it to one owner: a user UUID,
+  or an email matched case-insensitively against `admin users` (no match exits 4; several matches exit 1
+  and list the user IDs). `--since` limits it to runs created at or after an RFC3339 time. `--status`
+  takes a comma-separated list of run statuses (for example `failed,cancelled`) and is applied before
+  the 500-row cap; an invalid status exits 2. `--user`, `--since` and `--status` without `--all` exit 2.
+  An older server that ignores `--status` is refused with `this uzi server does not support --status;
+  upgrade the server`. When the cap is hit the CLI prints
+  `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
+  prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
+  `--status` was given.
 - **`uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]`** lists the active `ci_fix` and
   `mr_rework` runs, across all owners, that may push to a branch. Same prerequisites as the rest of this
   section (`UZI_ADMIN_RUN_DEBUG` and an `admin_ro` token; an older server answers 404). `--repo` and
@@ -1787,15 +1815,15 @@ effect on the next request. Each newly authorized cross-user read writes one aud
     unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
     no matching writer at that database snapshot only: a writer may start after the read.
   - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
-    the decoded `{writers, complete}` document.
+    decoded `{writers, complete}` document.
   - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
     the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
     `VISIBILITY=owner_only`.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
-  metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
+  metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
 - **Hints.** When a read that admin run debug could serve is refused or not found (a 404, 401 or 403
-  from `run inputs`, `run fetches`, `run recovery --user` or `admin runs --all`), the CLI prints
+  from `run inputs`, `run fetches`, `run held`, `run recovery --user` or `admin runs --all`), the CLI prints
   `hint: reading another user's run needs the server flag UZI_ADMIN_RUN_DEBUG (chart
   api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
   `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
@@ -4478,8 +4506,8 @@ These are presentation labels: raw JSON, scalar fields and status
 transitions stay unchanged. Filtering raw `status: failed` in JSON still
 includes failed-path cancellations, plan rejections and required-base
 rejections. See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
-for rollout order and older payloads. Neither `run list`
-nor `admin runs` exposes a `--status` flag.
+for rollout order and older payloads. `run list` exposes no `--status` flag;
+`admin runs --all` takes one (see [Admin run debug](#admin-run-debug-reading-other-users-runs)).
 
 ### Provider outage recovery and owner hold
 
