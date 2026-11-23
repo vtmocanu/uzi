@@ -1799,3 +1799,63 @@ override its digest; they are not evidence of executing the published archive.
 The existing best-effort isolation policy remains in force. Runtime v3 is admitted
 as protocol vocabulary only; placement changes, actual-binary catalog/native-tool
 proofs, image builds and hosted rollout verification remain separate obligations.
+
+
+### 2026-11-23 — M4 first pricing unit: GPT-6.2 and cache-write policy
+
+The lead independently fetched the official [pricing table](https://developers.openai.com/api/docs/pricing),
+[Sol page](https://developers.openai.com/api/docs/models/gpt-6.2-sol),
+[Astra page](https://developers.openai.com/api/docs/models/gpt-6.2-astra) and
+[caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+on 2026-11-23 with HTTP 200 and read their actual text. The independent
+fact-checker fetched all four separately on 2026-11-23 at 13:42:49 UTC with
+HTTP 200. All raw-body SHA256 hashes matched the lead's copies:
+
+| Source | SHA256 |
+| --- | --- |
+| Pricing | 154ec24ab36740d2081c41a74e3dc392800df77c138bd4c6e80a3989346d0bdb |
+| Sol | fdb87bee20bf87fd2d493e21f765701fe5b749a61a4eff34a7bc5a4821bbb31d |
+| Astra | 9f2514d9f660bdaa3f646844e5a77a04b4519f7d548584104d5c50a8e77ec70e |
+| Caching | 753dd7cc5ee7fff66c458dfd804bf81b132b8931fffb2e6c15a5abc7bb00a562 |
+
+The Standard pricing table labels its columns “Input”, “Output”, “Cached input”,
+“30m write”, “12h write”. Its Sol row is $2/$10/$0.10/$2.50/$5 and its
+Astra row is $8/$40/$0.40/$10/$20 per million tokens. Both model pages state:
+“For requests with more than 272K input tokens, input and cache rates double
+and output costs 1.5 times the short-context rate for the full request.”
+Sol states: “The cache write price is for 30 minutes of retention. A 12-hour
+cache write costs $5 per million tokens for short-context requests at Standard
+pricing.” Astra states the same with $20.
+
+The table advances to openai-standard-2026-11-23, adding only GPT-6.2 Sol and
+Astra, verified_at 2026-11-23, citing pricing and their respective model pages,
+without promotion boundaries. In input/cached/write/output order, low Sol is
+2/0.10/2.50/10 and high Sol is 4/0.20/5/15; low Astra is 8/0.40/10/40 and
+high Astra is 16/0.80/20/60. Exactly 272000 total input remains low; 272001
+selects high for all buckets of the full request. Older model rates, dates and
+promotional data remain unchanged; the API JSON mirrors the agent bytes.
+
+Owner policy dated 2026-11-23 retains cache_write as the selected 30-minute
+Standard estimate for every old and new row, not observed duration or billed
+money. Missing TTL alone never unprices a complete positive-write breakdown;
+all existing independent refusals remain. The 12-hour low write rates are
+Sol 5 and Astra 20, high 10 and 40, documented here only. Using the selected
+30-minute rate for an actual 12-hour write understates the estimate; the
+owner accepts that policy. No duration parameter, schema field, runtime
+override or trusted-token input is added. TS, Go and jq strict validators
+remain unchanged with unknown-field rejection. Existing Standard-tier
+estimation comments and policy remain in force.
+
+The caching guide says: “The request-level ttl applies to the implicit
+breakpoint and to explicit breakpoints without their own ttl.” It continues:
+“Set prompt_cache_breakpoint.ttl to override it for an individual explicit
+breakpoint. Omitting both settings preserves the default "30m" behavior.”
+The default therefore requires both request TTL and breakpoint TTL omitted.
+Breakpoints can override the request default and mix lifetimes in one request.
+
+The lead's inspected worker source at commit
+ccf9be8cc458bd6b8336fe84d68d8893f2691a5e had prompt_cache_ttl set to None
+in the inspected construction only. Compaction, child, review, recovery and
+inheritance paths remain unverified. No in-run construction or native
+observations were performed for this unit; these remain required M4
+next-unit work. This unit makes no M5 docs/defaults/PRD/changelog changes.

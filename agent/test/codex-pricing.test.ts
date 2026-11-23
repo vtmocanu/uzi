@@ -82,7 +82,7 @@ describe("GPT-6.1 Sol Standard pricing", () => {
 
 describe("codex-pricing: the version id and boundary constants are the pinned D5 values", () => {
   it("records the table version and the Sol review boundary with the table", () => {
-    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-10-09");
+    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-11-23");
     assert.equal(SOL_PROMO_REVIEW_DATE, "2026-11-21");
     assert.equal(CODEX_INPUT_TIER_THRESHOLD_TOKENS, 272_000);
   });
@@ -214,5 +214,35 @@ describe("codex-pricing: gpt-6-sol has no promotional review boundary", () => {
     const onReview = new Date(`${SOL_PROMO_REVIEW_DATE}T00:00:00Z`);
     assert.equal(micro(priceCodexResponse(SOL6, bd({ inputTokens: 100 }), onReview)), 200);
     assert.equal(micro(priceCodexResponse(SOL6, bd({ inputTokens: 100 }), new Date("2027-06-01T00:00:00Z"))), 200);
+  });
+});
+
+
+describe("GPT-6.2 Standard pricing with positive writes and no TTL", () => {
+  it("Sol at 272000 total input prices all four low-tier buckets without TTL", () => {
+    // 342000 + 10000 + 2500 + 420 = 354920 microUSD.
+    assert.equal(micro(priceCodexResponse("gpt-6.2-sol", bd({ inputTokens: 272_000, cachedInputTokens: 100_000, cacheWriteInputTokens: 1_000, outputTokens: 42 }), BEFORE_SOL_REVIEW)), 354_920);
+  });
+  it("Sol at 272001 total input changes all four buckets for the full request", () => {
+    // 684004 + 20000 + 5000 + 630 = 709634 microUSD.
+    assert.equal(micro(priceCodexResponse("gpt-6.2-sol", bd({ inputTokens: 272_001, cachedInputTokens: 100_000, cacheWriteInputTokens: 1_000, outputTokens: 42 }), BEFORE_SOL_REVIEW)), 709_634);
+  });
+  it("Astra at 272000 total input prices all four low-tier buckets without TTL", () => {
+    // 1368000 + 40000 + 10000 + 1680 = 1419680 microUSD.
+    assert.equal(micro(priceCodexResponse("gpt-6.2-astra", bd({ inputTokens: 272_000, cachedInputTokens: 100_000, cacheWriteInputTokens: 1_000, outputTokens: 42 }), BEFORE_SOL_REVIEW)), 1_419_680);
+  });
+  it("Astra at 272001 total input changes all four buckets for the full request", () => {
+    // 2736016 + 80000 + 20000 + 2520 = 2838536 microUSD.
+    assert.equal(micro(priceCodexResponse("gpt-6.2-astra", bd({ inputTokens: 272_001, cachedInputTokens: 100_000, cacheWriteInputTokens: 1_000, outputTokens: 42 }), BEFORE_SOL_REVIEW)), 2_838_536);
+  });
+  it("missing TTL alone keeps complete positive writes priced for every older and new row", () => {
+    // Uncached 100 + cached 100 + write 100, with 42 output; no duration argument.
+    const last = bd({ inputTokens: 300, cachedInputTokens: 100, cacheWriteInputTokens: 100, outputTokens: 42 });
+    for (const [model, expected] of [
+      [ASTRA, 4450], [SOL, 1780], [SOL6, 890], [SOL61, 880], [LUNA, 45],
+      ["gpt-6.2-sol", 880], ["gpt-6.2-astra", 3520],
+    ] as const) {
+      assert.equal(micro(priceCodexResponse(model, last, BEFORE_SOL_REVIEW)), expected, model);
+    }
   });
 });
