@@ -92,8 +92,10 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 	workers := map[string]uuid.UUID{
 		"legacy":        fx.jobWorker("legacy", capOf(1), false),
 		"claude":        fx.jobWorker("claude", capOf(1), false, claudeProviderCap),
-		"native":        fx.jobWorker("native", capOf(1), false, "codex_harness_v1", "codex_runtime_v2"),
-		"codex":         fx.jobWorker("codex", capOf(1), false, "codex_harness_v1", "codex_runtime_v2", "codex_provider_v1"),
+		"native":        fx.jobWorker("native", capOf(1), false, "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"),
+		"native-v2":     fx.jobWorker("native-v2", capOf(1), false, "codex_harness_v1", "codex_runtime_v2"),
+		"codex":         fx.jobWorker("codex", capOf(1), false, "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_provider_v1"),
+		"codex-v2":      fx.jobWorker("codex-v2", capOf(1), false, "codex_harness_v1", "codex_runtime_v2", "codex_provider_v1"),
 		"provider-only": fx.jobWorker("provider-only", capOf(1), false, "codex_provider_v1"),
 	}
 	code := queuedRunWithCaps(fx, []string{})
@@ -109,11 +111,11 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 		run     uuid.UUID
 		want    map[string]bool
 	}{
-		{"codex-provider", "codex", code, map[string]bool{"codex": true}},
+		{"codex-provider", "codex", code, map[string]bool{"codex": true, "codex-v2": false, "native-v2": false}},
 		{"unknown-provider", "unknown", code, map[string]bool{}},
 		{"claude-provider", "claude", claude, map[string]bool{"claude": true}},
-		{"vendor-claude", "claude", vendorClaude, map[string]bool{"legacy": true, "claude": true, "native": true, "codex": true, "provider-only": true}},
-		{"vendor-codex", "codex", vendorCode, map[string]bool{"native": true, "codex": true}},
+		{"vendor-claude", "claude", vendorClaude, map[string]bool{"legacy": true, "claude": true, "native": true, "codex": true, "provider-only": true, "native-v2": true, "codex-v2": true}},
+		{"vendor-codex", "codex", vendorCode, map[string]bool{"native": true, "codex": true, "native-v2": false, "codex-v2": false}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, err := fx.pool.Query(fx.ctx, `SELECT p.worker_id FROM runs r
@@ -163,6 +165,20 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	const definition = `SELECT pg_get_functiondef('fn_placement_admitting_workers(runs,text,timestamptz,timestamptz,interval,boolean,text[])'::regprocedure)`
+	var latest string
+	if err := tx.QueryRow(ctx, definition).Scan(&latest); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range migrationDownStatements(t, "00522_codex_runtime_v3.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var current string
+	if err := tx.QueryRow(ctx, definition).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(ctx, "SAVEPOINT guarded_down"); err != nil {
 		t.Fatal(err)
 	}
@@ -179,11 +195,6 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM runs WHERE id=$1", run); err != nil {
-		t.Fatal(err)
-	}
-	var current string
-	const definition = `SELECT pg_get_functiondef('fn_placement_admitting_workers(runs,text,timestamptz,timestamptz,interval,boolean,text[])'::regprocedure)`
-	if err := tx.QueryRow(ctx, definition).Scan(&current); err != nil {
 		t.Fatal(err)
 	}
 	for _, stmt := range migrationDownStatements(t, codexPlacementMigration) {
@@ -219,6 +230,17 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if restored != current {
-		t.Fatal("Down/Up roundtrip changed current definition")
+		t.Fatal("00521 Down/Up roundtrip changed boundary definition")
+	}
+	for _, stmt := range migrationUpStatements(t, "00522_codex_runtime_v3.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored != latest {
+		t.Fatal("00522 Up did not restore exact latest definition")
 	}
 }

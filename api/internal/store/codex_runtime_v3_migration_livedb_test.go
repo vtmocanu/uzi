@@ -86,16 +86,31 @@ func runtimeV3AssertVersion(t *testing.T, pool *pgxpool.Pool, want int64) {
 	}
 }
 
+func runtimeV3AssertProviderClauses(t *testing.T, definition string) {
+	t.Helper()
+	for _, clause := range []string{
+		"AND (r.model_provider_key_mode IS NULL",
+		"OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))",
+		"OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))",
+	} {
+		if !strings.Contains(definition, clause) {
+			t.Fatalf("placement definition lost engine-aware provider clause %q", clause)
+		}
+	}
+}
+
 func TestCodexRuntimeV3MigrationRoundTripLiveDB(t *testing.T) {
 	pool, dsn, p, v := runtimeV3MigrationDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	before := runtimeV3Definition(t, pool)
+	runtimeV3AssertProviderClauses(t, before)
 	runtimeV3AssertVersion(t, pool, p)
 	if err := MigrateTo(ctx, dsn, v); err != nil {
 		t.Fatal(err)
 	}
 	after := runtimeV3Definition(t, pool)
+	runtimeV3AssertProviderClauses(t, after)
 	if !strings.Contains(after, "'codex_runtime_v3'") {
 		t.Fatal("committed Up did not require v3")
 	}
