@@ -17,40 +17,35 @@ import (
 
 // Exercise the production entry point, not assembleProviderBinding. With no store,
 // box or vault, any context/credential access panics; no payload can authorize spend.
-func TestCodexProviderActualClaimHeldBeforeReads(t *testing.T) {
-	for _, kind := range []string{runkind.Issue, runkind.Task, runkind.Prompt, runkind.SelfImprove} {
+func TestCodexProviderUnsupportedActualClaimBeforeReads(t *testing.T) {
+	for _, kind := range []string{runkind.Judge, runkind.Job, runkind.CrossCheck, runkind.Chat} {
 		t.Run(kind, func(t *testing.T) {
 			run := providerBoundRow(kind)
 			run.Harness = harnessCodex
-			run.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
-			run.ClaimGeneration = 1
-			switch kind {
-			case runkind.Issue:
-				run.IssueIid = pgtype.Int8{Int64: 42, Valid: true}
-				run.IssueTitle = "Implement the requested change"
-				run.IssueDescription = "A valid issue description"
-			case runkind.Task:
-				run.Interactive = true
-				run.Title = pgtype.Text{String: "Review the task", Valid: true}
-				run.IssueDescription = "A valid task instruction"
-			case runkind.Prompt:
-				run.Title = pgtype.Text{String: "Run the prompt", Valid: true}
-				run.IssueDescription = "A valid prompt instruction"
-			case runkind.SelfImprove:
-				run.ScheduleID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
-				run.IssueDescription = "Improve the repository"
-			}
-			wkr := store.Worker{ID: uuid.New(), UserID: run.UserID, ProtocolCapabilities: []string{
-				capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
-				capability.ClaudeProviderV1,
-			}}
-			// Production must refuse even a fully capable worker at the actual claim seam.
-			svc := &Service{}
-			payload, err := svc.assembleClaim(context.Background(), wkr, run)
+			worker := store.Worker{ProtocolCapabilities: []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}}
+			payload, err := (&Service{}).assembleClaim(context.Background(), worker, run)
 			if payload != nil || !errors.Is(err, errProviderLaneClaimRefused) {
-				t.Fatalf("payload present=%v err=%v, want provider lane refusal and no payload", payload != nil, err)
+				t.Fatalf("payload present=%v err=%v", payload != nil, err)
 			}
 		})
+	}
+	for _, engine := range []string{harnessCodex, "unknown"} {
+		run := providerBoundRow(runkind.Issue)
+		run.Harness = engine
+		payload, err := (&Service{}).assembleClaim(context.Background(), store.Worker{}, run)
+		want := ErrProviderLaneUnsupported
+		if engine == "unknown" {
+			want = errProviderLaneClaimRefused
+		}
+		if payload != nil || !errors.Is(err, want) {
+			t.Fatalf("engine=%s payload present=%v err=%v", engine, payload != nil, err)
+		}
+	}
+	run := providerBoundRow(runkind.Issue)
+	run.Harness = harnessCodex
+	run.EgressProfileID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	if payload, err := (&Service{}).assembleClaim(context.Background(), store.Worker{}, run); payload != nil || !errors.Is(err, errIsolatedClaimRefused) {
+		t.Fatalf("isolated payload present=%v err=%v", payload != nil, err)
 	}
 }
 

@@ -215,22 +215,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// run's own web search is server-side (Decision 10; the schema CHECK forbids the pair,
 	// this is the backstop).
 	isolated := run.EgressProfileID.Valid
-	// PRD #4323: shared untrusted-input bounds still block Codex provider activation.
-	// Hold every provider-bound Codex claim before context, binding or credential reads,
-	// regardless of worker capabilities; the pure binding builder is not activation proof.
-	if providerBoundRun(run) && run.Harness == harnessCodex {
-		return nil, errProviderLaneClaimRefused
-	}
 	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
 		return nil, errIsolatedClaimRefused
 	}
-	// PRD #4320 module 5: a provider-bound run exists only on the Claude issue/chat lanes (module 4's
-	// creation refusals). Judge, job, cross-check and isolated claims have no provider support until
-	// PRD #4322, so such a row (data that creation cannot produce; defence in depth) is refused
-	// terminally before anything is opened: a provider run never reaches a vendor credential ladder.
+	// Provider claims support ordinary engine-aware lanes only; refuse unsupported
+	// shapes before context or credential reads, without entering a vendor ladder.
 	if providerBoundRun(run) && (run.Kind == runkind.Judge || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
 		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
 		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
+		return nil, errProviderLaneClaimRefused
+	}
+	if providerBoundRun(run) && !workerSupportsProvider(wkr, run.Harness) {
 		return nil, errProviderLaneClaimRefused
 	}
 	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A

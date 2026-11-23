@@ -8,9 +8,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// These tests deliberately stop short of successful Claim/reclaim: assembleClaim
-// holds all provider-bound Codex runs until the completed-delivery activation gate passes.
-// assembleProviderBinding below proves only frozen persistence and key opening.
+// These helper-only tests prove frozen persistence and key opening. Actual
+// Service.Claim/reclaim is covered by codex_provider_actual_claim_livedb_test.go.
 func restartCodexBindingService(f *codexBindingFix) {
 	reads := &codexBindingReads{Queries: f.env.q}
 	svc := New(reads, f.env.box, f.svc.p)
@@ -36,18 +35,6 @@ func codexReclaimWorker(f *codexBindingFix) store.Worker {
 	}}
 }
 
-func wantCodexActivationHeld(t *testing.T, f *codexBindingFix, run store.Run) {
-	t.Helper()
-	before := f.reads.cipherReads
-	payload, err := f.svc.assembleClaim(f.env.ctx, codexReclaimWorker(f), run)
-	if payload != nil || !errors.Is(err, errProviderLaneClaimRefused) {
-		t.Fatalf("assembly payload present=%t err=%v; want activation refusal", payload != nil, err)
-	}
-	if f.reads.cipherReads != before {
-		t.Fatal("activation refusal read credential ciphertext")
-	}
-}
-
 func TestCodexProviderCreationCrashBeforeClaimPersistenceAssemblyLiveDB(t *testing.T) {
 	f := newCodexBindingFix(t) // createRunAtomic has committed A; no claim was made.
 	f.anthropic()
@@ -68,7 +55,6 @@ func TestCodexProviderCreationCrashBeforeClaimPersistenceAssemblyLiveDB(t *testi
 		t.Fatalf("unclaimed committed run status = %s", persisted.Status)
 	}
 	f.wantOpen(t, persisted, a, 1, "gateway")
-	wantCodexActivationHeld(t, f, persisted)
 
 	// Both vendor sources are available to creation on the restarted service.
 	// Clearing the selection affects this new run only, not the committed A run.
@@ -92,7 +78,6 @@ func TestCodexProviderReclaimFrozenBindingPersistenceAssemblyLiveDB(t *testing.T
 			f.anthropic()
 			f.codexDefault()
 			a, keyA := f.provider, f.key
-			// A successful provider claim cannot be manufactured pre-activation.
 			// Open the binding only, discard service state, then reopen the DB row.
 			f.wantOpen(t, mustRun(t, f.env, f.run.ID), a, 1, "gateway")
 			selectCodexReclaimReplacement(t, f)
@@ -106,7 +91,6 @@ func TestCodexProviderReclaimFrozenBindingPersistenceAssemblyLiveDB(t *testing.T
 			restartCodexBindingService(f)
 			persisted := mustRun(t, f.env, f.run.ID)
 			wantCodexBinding(t, f.provFix, persisted, 1, f.keyRevision)
-			wantCodexActivationHeld(t, f, persisted)
 			if mutation == "intact" {
 				f.wantOpen(t, persisted, a, 1, "gateway")
 			} else {

@@ -11,7 +11,7 @@ import (
 )
 
 // These are placement/composition proofs only. They neither claim through the
-// worker service nor deliver credentials, and do not lift the Codex provider claim hold.
+// worker service nor deliver credentials. Advertisement awaits completed M1-M4 delivery.
 // Native Codex provenance and Claude controls remain in
 // TestHibernationWakeRechecksCodexProvenanceLiveDB and
 // TestHibernationWakeSuppressesEphemeralProvisioningLiveDB.

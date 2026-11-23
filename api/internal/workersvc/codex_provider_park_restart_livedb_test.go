@@ -29,8 +29,8 @@ func newCodexProviderParkFix(t *testing.T) *codexProviderParkFix {
 		t.Fatal(err)
 	}
 	f := &codexProviderParkFix{provFix: fx, id: run.ID, worker: wkrRow(t, fx.env, fx.workerID), keyRev: 7}
-	// An already-running provider flight: Codex provider Claim is intentionally held by policy.
-	// This seeds its ownership, not an exemption from any admission guard.
+	// This park-only fixture seeds an already-running flight's ownership.
+	// Actual service claim admission is exercised separately; no guard is bypassed here.
 	fx.env.exec(`UPDATE runs SET status='running', worker_id=$2, claim_generation=11,
  wait_on_limit=true, started_at=now(), budget_wall_seconds=3600, session_id='m3-provider-session'
  WHERE id=$1`, f.id, f.worker.ID)

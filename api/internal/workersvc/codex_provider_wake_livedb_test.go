@@ -13,9 +13,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Bounded M3 proves wake admission only. The actual claim remains held by
-// TestCodexProviderActualClaimHeldBeforeReads. Positive claim proof remains
-// required at final activation; neither this fixture nor readiness removes that hold.
+// These tests prove wake admission only. Actual claim/reclaim coverage lives in
+// codex_provider_actual_claim_livedb_test.go; advertisement awaits completed M1-M4 delivery.
 func codexProviderWakeFixture(t *testing.T) (*provFix, *hibFx) {
 	t.Helper()
 	p := newProvFix(t)
