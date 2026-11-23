@@ -216,7 +216,8 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
     process.env.UZI_UID_SPLIT = "1";
     plantUnreadableUnattributed(root, 82);
     try {
-      // In-process (under the uid split the helper lane refuses a raw view, so the fake root is reached in-process); no other claim, empty registry.
+      // In-process via viaHelper: false (under UZI_UID_SPLIT the default lane is the runner-uid helper, which this single-uid
+      // host cannot start; no capture scope is entered); no other claim, empty registry.
       const out = await quiesceRunAttempt({
         mode: "own", attempt: undefined, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
         dockerHost: undefined, registry: new LiveAttemptRegistry(), observeOnly: true,
@@ -226,6 +227,8 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
       assert.equal(fs.existsSync(path.join(root, "82")), true, "nothing is killed");
       assert.equal(out.process?.processes.some((p) => p.reason.startsWith("unreadable_no_other_claim")), false,
         JSON.stringify(out.process?.processes));
+      assert.equal(out.process?.processes.some((p) => p.pid === 82 && p.reason === "unreadable_unattributed"), true,
+        `the in-process scan classified pid 82: ${JSON.stringify(out.process?.processes)}`);
       assert.equal(out.process?.state, "unverified", JSON.stringify(out.process));
       assert.equal(inventoryClearVerdict(out.process), "not_clear", out.process?.detail ?? "no process verdict");
     } finally {
@@ -324,7 +327,7 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
       assert.ok(calls >= 1);
     });
 
-    it("B (helper lane): the late-root retry is a second helper request whose deadline never exceeds the original", async () => {
+    it("B (helper lane): the late-root retry is a second helper request carrying its own deadline, earlier than the original", async () => {
       plantUnreadable();
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-obs-"));
       try {
