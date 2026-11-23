@@ -12,9 +12,11 @@ import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { assertClosedReaperRequest } from "../src/closed-reaper.js";
 import { runnerTmpdir } from "../src/runner-uid.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import {
   LiveAttemptRegistry,
+  helperReapDeps,
   inventoryClearVerdict,
   newRunAttempt,
   setQuiescenceViewForTests,
@@ -206,6 +208,43 @@ describe("issue #3980: the uid-split helper path with a gate deadline", () => {
     const late = await run(200, 100);
     assert.equal(late.state, "unverified");
     assert.match(late.detail, /deadline/);
+  });
+
+  describe("a survivors verdict that cleanup delays past the deadline (inventoryClearVerdict reads ignored reasons as clear)", () => {
+    const ignoredSurvivor = JSON.stringify({ state: "survivors", killed: [], detail: "1 in-scope process(es) survive the reap",
+      processes: [{ pid: 70, uid: 1, comm: "c", cwd: CLONE, reason: "terminal_attempt:kill_unconfirmed" }] });
+    const run = async (req: ScanRequest, forward: boolean, cleanupMs: number, deadlineMs: number): Promise<ProcessQuiescence> => {
+      const child = fakeChild();
+      const pending = reapRunProcesses(req, { viaHelper: true, deadlineAt: Date.now() + deadlineMs,
+        ...(forward ? { forwardDeadlineToHelper: true as const } : {}),
+        helperTmp: { make: () => "/private", remove: async () => { await sleep(cleanupMs); } },
+        spawnHelper: () => child });
+      await sleep(10);
+      (child.stdout as unknown as PassThrough).write(`${ignoredSurvivor}\n`);
+      child.emit("close", 0, null);
+      return pending;
+    };
+
+    for (const [name, req, forward] of [
+      ["an observe-only probe", fakeReq({ observeOnly: true }), false],
+      ["an opted-in (forwardDeadlineToHelper) inventory scan", fakeReq(), true],
+    ] as const) {
+      it(`${name}: timely is survivors and clear; expired is the unverified withdrawal and not_clear`, async () => {
+        const timely = await run(req, forward, 0, 5000);
+        assert.equal(timely.state, "survivors");
+        assert.equal(inventoryClearVerdict(timely), "clear");
+        const late = await run(req, forward, 250, 120);
+        assert.equal(late.state, "unverified");
+        assert.equal(late.detail, "gate checkpoint deadline exhausted");
+        assert.deepEqual(late.processes, []);
+        assert.equal(inventoryClearVerdict(late), "not_clear");
+      });
+    }
+
+    it("control: a non-opted-in (#3980 checkpoint) scan keeps its survivors result past the deadline", async () => {
+      const late = await run(fakeReq(), false, 250, 120);
+      assert.equal(late.state, "survivors");
+    });
   });
 });
 
@@ -411,15 +450,91 @@ describe("a helper-style reap (excludeAllDescendants + deadlineAt) never signals
     assert.equal(crossed.r.state, "unverified");
     assert.equal(crossed.r.detail, "process proof deadline");
   });
+
+  it("the final kill gate: a candidate whose identity read crosses D after admission is not signalled, and its successor is not even read", async () => {
+    // The kill loop's identity read goes through the bounded table, which checks the clock BEFORE the read. The
+    // second candidate's read advances the clock to D from inside the read (after admission), so only the kill
+    // loop's own gate stands between that candidate and a signal.
+    const D = 5_000;
+    let t = 0;
+    const killed: number[] = [];
+    const statReads: Record<number, number> = {};
+    const env = `${RUN_ATTEMPT_ENV}=run-17:own\u0000${RUN_CLONE_KEY_ENV}=${KEY}\u0000`;
+    const pids = [2001, 2002, 2003];
+    const table: ProcTable = {
+      listPids: () => pids,
+      readStatus: (pid) => `Name:\tproc${pid}\nState:\tS (sleeping)\nUid:\t${RUNNER}\t${RUNNER}\t${RUNNER}\t${RUNNER}\n`,
+      readEnviron: () => env,
+      readCwd: () => CLONE,
+      readStat: (pid) => {
+        if (killed.length > 0) {
+          statReads[pid] = (statReads[pid] ?? 0) + 1;
+          if (pid === 2002) t = D;
+        }
+        return `${pid} (proc ${pid}) S 1 ${pid} ${pid} ${"0 ".repeat(15)}1000 0 0`;
+      },
+    };
+    const req = fakeReq({ deadlineAt: D });
+    const r = await reapProcesses(req, { ...helperReapDeps(req), table, selfPid: SELF, now: () => t, sleep: async (ms) => { t += ms; },
+      kill: (pid) => { killed.push(pid); } });
+    assert.deepEqual(killed, [2001], "only the candidate admitted before D was signalled");
+    assert.equal(statReads[2002], 1, "the second candidate's identity read ran (and crossed D)");
+    assert.equal(statReads[2003], undefined, "the loop stopped at the gate, before reading the third");
+    assert.equal(r.state, "unverified");
+    assert.equal(r.detail, "process proof deadline");
+  });
 });
 
-describe("fail closed: a helper-side deadline records procfs EACCES as a table failure", () => {
+describe("the helper's reap deps are built from the serialized request", () => {
+  const sentBy = async (extra: Partial<QuiesceRunRequest>): Promise<ScanRequest> => {
+    const child = fakeChild();
+    let sent = "";
+    const stdin = child.stdin as unknown as PassThrough;
+    stdin.on("data", (c: Buffer | string) => { sent += c; });
+    stdin.on("end", () => { (child.stdout as unknown as PassThrough).write(`${quiescent}\n`); child.emit("close", 0, null); });
+    await quiesceRunAttempt(quiesceReq({ processes: true, forceHelper: true, ...extra }),
+      { reap: { spawnHelper: () => child, helperTmp: { make: () => "/private", remove: () => undefined } }, targetUid: RUNNER });
+    return JSON.parse(sent) as ScanRequest;
+  };
+
+  for (const [name, extra] of [
+    ["observeOnly", { observeOnly: true as const }],
+    ["helperDeadline", { helperDeadline: true as const }],
+  ] as const) {
+    it(`${name}: the deadline sent to the helper becomes the reaper's deadline, never later than D`, async () => {
+      const D = Date.now() + 30_000;
+      const parsed = await sentBy({ ...extra, deadlineAt: D });
+      assert.equal(typeof parsed.deadlineAt, "number");
+      assert.equal(helperReapDeps(parsed).deadlineAt, parsed.deadlineAt);
+      assert.ok(helperReapDeps(parsed).deadlineAt! <= D);
+      assert.equal(helperReapDeps(parsed).excludeAllDescendants, true);
+    });
+  }
+
+  it("negative control: a plain deadlined helper scan (#3980) gives the reaper no deadline", async () => {
+    const parsed = await sentBy({ deadlineAt: Date.now() + 30_000 });
+    assert.equal(helperReapDeps(parsed).deadlineAt, undefined);
+  });
+});
+
+describe("fail closed: a gate checkpoint (deps.deadlineAt, no serialized request deadline) records procfs EACCES as a table failure", () => {
   const eaccesTable = (): ProcTable => ({
     ...fakeTable({ 2000: { uid: RUNNER, cwd: CLONE } }),
     readEnviron: () => { throw errno("EACCES"); },
   });
 
-  it("with deadlineAt the scan is unverified with no processes, nothing is killed, and the inventory verdict is not_clear", async () => {
+  it("a serialized request deadline reaches per-PID attribution instead: unreadable_unattributed, unsignalled, not_clear", async () => {
+    let t = 0;
+    const killed: number[] = [];
+    const r = await reapProcesses(fakeReq({ deadlineAt: 1_000_000 }), { table: eaccesTable(), selfPid: SELF, excludeAllDescendants: true,
+      now: () => t, sleep: async ms => { t += ms; }, kill: pid => { killed.push(pid); }, deadlineAt: 1_000_000, deadlineMs: 100 });
+    assert.equal(r.state, "unverified");
+    assert.deepEqual(r.processes.map(p => p.reason), ["unreadable_unattributed"]);
+    assert.deepEqual(killed, []);
+    assert.equal(inventoryClearVerdict(r), "not_clear");
+  });
+
+  it("with only deps.deadlineAt the scan is unverified with no processes, nothing is killed, and the inventory verdict is not_clear", async () => {
     let t = 0;
     const killed: number[] = [];
     const r = await reapProcesses(fakeReq(), { table: eaccesTable(), selfPid: SELF, excludeAllDescendants: true,

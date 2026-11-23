@@ -38,7 +38,7 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV, workerSpawnNonce } from "../src/wor
 import type { RunContext, ExecutorResult } from "../src/executor.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
-import { makeFakeProcRoot, plantUnreadableUnattributed, scopedRealView } from "./fake-proc.js";
+import { makeFakeProcRoot, plantFakeProc, plantUnreadableUnattributed, scopedRealView } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
@@ -655,7 +655,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
 
   /** A ProcessQuiescence built exactly as the observe-only scan returns it for a persistent unreadable pid: the real reap loop
    *  over a fake procfs holding one unreadable, unattributed runner-uid process (state `unverified`, one process). No gate
-   *  deadline is passed: with one the same unreadable read becomes a table failure with no processes (the EACCES case below). */
+   *  deadline is passed (the production probe serializes one; the EACCES case below pins that shape). */
   async function unverifiedUnreadableOutcome(req: QuiesceRunRequest): Promise<QuiesceRunOutcome> {
     const fakeRoot = makeFakeProcRoot();
     try {
@@ -747,7 +747,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     executed++;
   });
 
-  it("case 14: a before-scan carrying helperDeadline whose helper hit EACCES is unverified with no processes, so the proof refuses before any git and keeps custody", async () => {
+  it("case 14: a before-scan carrying helperDeadline whose helper hit EACCES on an unattributed pid is unverified (unreadable_unattributed), so the proof refuses before any git and keeps custody", async () => {
     const iid = 4615;
     const r = await retainedClone(iid);
     const calls: Array<{ site: string | undefined; deadlineAt: number | undefined; forceHelper: boolean; observeOnly: boolean; helperDeadline: boolean }> = [];
@@ -769,6 +769,8 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
         const scan: ScanRequest = {
           mode: req.mode, targetUid: process.getuid?.() ?? 0, targetKey: req.cloneKey, targetPaths: req.targetPaths,
           liveMarkers: [], liveRoots: [], workerNonce: workerSpawnNonce(),
+          // As the helper receives it: the opted-in request's serialized deadline rides on the scan itself.
+          ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }),
         };
         const killed: number[] = [];
         const proc = await reapProcesses(scan, {
@@ -776,6 +778,8 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
           kill: (pid) => { killed.push(pid); }, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }),
         });
         assert.deepEqual(killed, [], "nothing is signalled");
+        assert.deepEqual(proc.processes.map((p) => p.reason), ["unreadable_unattributed"],
+          "the EACCES pid reaches attribution and, unattributed, stays unverified (not a table failure)");
         assert.equal(inventoryClearVerdict(proc), "not_clear");
         return { process: proc as ProcessQuiescence, docker: { state: "not_wired", removed: [], detail: "" } };
       },
@@ -791,6 +795,88 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.equal(calls[0]!.observeOnly, false, "a signalling (non-observe) scan");
     assert.equal(calls[0]!.helperDeadline, true, "issue #4632: the runner's inventory before-scan opts in to the helper deadline");
     assert.equal(typeof calls[0]!.deadlineAt, "number", "the signalling inventory scan carries a deadline into the helper");
+    executed++;
+  });
+
+  // ─── the REAL probe (forceHelper + observeOnly + deadlineAt, real helper) over a fake procfs holding a non-dumpable peer ───
+
+  /** Leaves a same-key exclusion the way case 13 does (a section whose git left a detached sibling descendant that then exits),
+   *  so only the probe's own verdict can clear it. */
+  async function leaveKeptExclusion(iid: number): Promise<void> {
+    await git.ensureClone(fx.originPath);
+    const sibling = await plantSibling(iid);
+    const sleepPid = detach(sibling, "sleep 300");
+    const kept = await git.withInventorySourceLock(bare(), { clonePath: canonicalOf(iid), branch: branchOf(iid), isLive: (p: string) => live.isLivePath(p) },
+      async (s) => { s.markGitStarted(); await s.stage(async () => 1); s.afterScanQuiescent(true); });
+    assert.equal(kept.kind === "ran" && kept.entryKept, true, "the exclusion entry was kept");
+    await killAndWait(sleepPid);
+  }
+  const excluded = (iid: number): boolean =>
+    (git as unknown as { inventoryExclusion: { excluded(b: string, k: string): boolean } }).inventoryExclusion.excluded(bare(), keyOf(iid));
+
+  /** A runner whose clear probe is the REAL one (forceHelper + observeOnly + deadlineAt, real helper) over a fake proc root holding
+   *  a non-dumpable runner-uid peer (the Codex supervisor shape). The fake view is installed only around the probe scan, so the
+   *  runner's own worker-wide and seed scans keep the real view (the peer is not visible to them). `recorded` makes the peer the
+   *  recorded root (pid and start time) of another live attempt; without it the peer is attributed to nothing. */
+  function runnerOverFakePeer(recorded: boolean, rec: ReturnType<typeof recordingLogger>, counters: { started: number }, cleanup: Array<() => void>) {
+    const fakeRoot = makeFakeProcRoot();
+    cleanup.push(() => fs.rmSync(fakeRoot, { recursive: true, force: true }));
+    const PEER = { pid: 91, startTime: 4242 };
+    plantFakeProc(fakeRoot, PEER.pid, { uid: process.getuid?.() ?? 0, comm: "codex-supervisor", env: "unreadable", cwd: "/", startTime: PEER.startTime });
+    if (recorded) live.add(newRunAttempt(randomUUID(), 1, path.join(scratch, "other-attempt"), () => [PEER]));
+    return runnerWith((runId): ReturnType<ExecutorFactory> => ({
+      homeDir: path.join(homeDir, runId),
+      executor: { run: async (_ctx: RunContext): Promise<ExecutorResult> => { counters.started++; throw new Error("stop after the seed"); } },
+    }), fakeGitlab().gitlab, undefined, rec.logger, {
+      quiesceRun: async (req) => {
+        if (req.site !== "inventory_source:clear_probe") return quiesceRunAttempt({ ...req, dockerHost: undefined });
+        assert.equal(req.forceHelper, true);
+        assert.equal(req.observeOnly, true);
+        assert.equal(typeof req.deadlineAt, "number");
+        setQuiescenceViewForTests({ procRoot: fakeRoot });
+        try { return await quiesceRunAttempt({ ...req, dockerHost: undefined }); }
+        finally { setQuiescenceViewForTests(scopedRealView({ pidFiles: [pidFile] })); }
+      },
+      liveAttempts: live, recoveryRetryMs: 5, dockerHost: "unix:///nonexistent-4632.sock",
+    });
+  }
+
+  it("case 15: the real probe over an attributed non-dumpable peer clears a kept exclusion, and the seed proceeds", { timeout: 90_000 }, async (t) => {
+    const iid = 4616;
+    await leaveKeptExclusion(iid);
+    assert.equal(excluded(iid), true);
+    const counters = { started: 0 };
+    const cleanup: Array<() => void> = [];
+    t.after(() => { for (const fn of cleanup) fn(); });
+    const claimRunner = runnerOverFakePeer(true, recordingLogger(), counters, cleanup);
+    await claimRunner.execute(gitlabClaim(iid));
+    assert.equal(counters.started, 1, "the probe was clear (the peer is attributed to another live attempt), so the seed ran and the claim started");
+    assert.equal(excluded(iid), false, "the exclusion was cleared");
+    executed++;
+  });
+
+  it("case 16: the same peer with no recorded root keeps the key excluded; the seed refuses (not a residue block) and the claim stops for retry", { timeout: 90_000 }, async (t) => {
+    const iid = 4617;
+    await leaveKeptExclusion(iid);
+    const dirsBefore = attemptDirs(iid);
+    const counters = { started: 0 };
+    const rec = recordingLogger();
+    const cleanup: Array<() => void> = [];
+    t.after(() => { for (const fn of cleanup) fn(); });
+    const claimRunner = runnerOverFakePeer(false, rec, counters, cleanup); // registers its probe on the shared git
+    const statesBefore = api.states.length;
+    await assert.rejects(seed(iid, seedOptions(async () => {})), (e: unknown) =>
+      e instanceof InventorySourceExclusionRefusal && !(e instanceof RunResidueBlockedError) && e.reason === "excluded");
+    await claimRunner.execute(gitlabClaim(iid));
+    assert.deepEqual(attemptDirs(iid), dirsBefore, "nothing was seeded");
+    assert.equal(excluded(iid), true, "the exclusion stays");
+    assert.equal(counters.started, 0, "no model work started");
+    assert.equal(api.states.slice(statesBefore).some((s) => s.body.status === "failed"), false, "no failed report");
+    const warn = rec.lines.find((l) => (l as { msg?: string }).msg === "retained inventory proof still settling on this clone key; stopping claim for retry") as
+      { cause?: string; reason?: string } | undefined;
+    assert.ok(warn, "the typed warning was logged");
+    assert.equal(warn.cause, "inventory_source_exclusion");
+    assert.equal(warn.reason, "excluded");
     executed++;
   });
 

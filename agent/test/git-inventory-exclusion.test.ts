@@ -553,7 +553,7 @@ describe("worktreeStatus and the content proof", () => {
     assert.deepEqual(seen, [1234, undefined]);
   });
 
-  it("the content proof starts no git once stopped() is true", async () => {
+  it("the content proof starts no git once stopped() is true", async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "excl-proof-"));
     try {
       const g = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, stdio: "pipe" });
@@ -563,11 +563,19 @@ describe("worktreeStatus and the content proof", () => {
       g("add", "a.txt");
       g("commit", "-q", "-m", "init");
       const plain = new GitCache(dir, rec.logger);
+      // Record every dispatch at the Git runner boundary the proof's pinned calls go through.
+      type RunBytes = (cwd: string, args: string[], opts: unknown) => Promise<unknown>;
+      const target = plain as unknown as { runGitAsRunnerBytes: RunBytes };
+      const original = target.runGitAsRunnerBytes.bind(plain);
+      const dispatched = t.mock.method(target, "runGitAsRunnerBytes", (cwd: string, args: string[], opts: unknown) => original(cwd, args, opts));
       assert.equal(await plain.inventorySourceContentProof(dir, { ...INVENTORY_CONTENT_PROOF_BOUNDS }), "clean");
+      assert.ok(dispatched.mock.callCount() >= 1, "a clean proof dispatches git through the recorded boundary");
+      dispatched.mock.resetCalls();
       let polls = 0;
       const stopped = await plain.inventorySourceContentProof(dir, { ...INVENTORY_CONTENT_PROOF_BOUNDS, stopped: () => { polls++; return true; } });
       assert.equal(stopped, "unreadable");
       assert.ok(polls >= 1);
+      assert.equal(dispatched.mock.callCount(), 0, "a stopped proof dispatched no git");
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
@@ -823,5 +831,36 @@ describe("detectNamespaceRestartBoundary", () => {
     assert.equal(detectNamespaceRestartBoundary(procRoot(t, { exe1: "/usr/lib/systemd/systemd" })).scoped, false);
     assert.equal(detectNamespaceRestartBoundary(procRoot(t, {})).scoped, false);
     assert.equal(detectNamespaceRestartBoundary(path.join(os.tmpdir(), "no-such-proc-root")).scoped, false);
+  });
+
+  /** A real fake root with docker-init as PID 1 and one tini child (no children file, so the stat census runs),
+   *  plus a second listed pid whose stat read the injected fs fails with `code`. */
+  function censusRoot(t: { after(fn: () => void): void }): string {
+    return procRoot(t, { exe1: "/sbin/docker-init", kids: { "7": { exe: "/sbin/tini", ppid: 1 }, "9": { exe: "/bin/sh", ppid: 7 } } });
+  }
+  const failingStat = (root: string, pid: string, code: string): typeof fs => ({
+    ...fs,
+    readFileSync: ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (String(p) === path.join(root, pid, "stat")) throw Object.assign(new Error(`${code}: injected`), { code });
+      return (fs.readFileSync as (...a: unknown[]) => unknown)(p, ...rest);
+    }) as typeof fs.readFileSync,
+  } as typeof fs);
+
+  it("a complete census with exactly one tini child is scoped", (t) => {
+    assert.equal(detectNamespaceRestartBoundary(censusRoot(t)).scoped, true);
+  });
+  it("a pid that vanished (ENOENT) during the census is skipped", (t) => {
+    const root = censusRoot(t);
+    assert.equal(detectNamespaceRestartBoundary(root, failingStat(root, "9", "ENOENT")).scoped, true);
+  });
+  it("a pid that vanished (ESRCH) during the census is skipped", (t) => {
+    const root = censusRoot(t);
+    assert.equal(detectNamespaceRestartBoundary(root, failingStat(root, "9", "ESRCH")).scoped, true);
+  });
+  it("an unreadable stat (EACCES) leaves the census incomplete, so it is not scoped", (t) => {
+    const root = censusRoot(t);
+    const r = detectNamespaceRestartBoundary(root, failingStat(root, "9", "EACCES"));
+    assert.equal(r.scoped, false);
+    assert.match(r.detail, /unreadable: EACCES/);
   });
 });

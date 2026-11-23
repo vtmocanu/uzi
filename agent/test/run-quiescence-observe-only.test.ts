@@ -221,7 +221,7 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
         mode: "own", attempt: undefined, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
         dockerHost: undefined, registry: new LiveAttemptRegistry(), observeOnly: true,
         otherClaimInFlight: false,
-      }, { targetUid: ME, reap: { viaHelper: false } }); // no deadlineAt: a gate deadline turns the fake EISDIR into a table failure
+      }, { targetUid: ME, reap: { viaHelper: false } }); // no deadlineAt: the unreadable environ is classified unreadable_unattributed, never a signal
       assert.deepEqual(out.process?.killed ?? [], []);
       assert.equal(fs.existsSync(path.join(root, "82")), true, "nothing is killed");
       assert.equal(out.process?.processes.some((p) => p.reason.startsWith("unreadable_no_other_claim")), false,
@@ -308,24 +308,128 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
       assert.equal(r.state, "quiescent", JSON.stringify(r));
     });
 
-    it("an opted-in (inventory) deadlined helper scan is unverified with no processes: the EACCES-class read is a table failure", async () => {
+    it("an opted-in (inventory) deadlined helper scan is quiescent: the per-PID EACCES reaches pid + start-time attribution", async () => {
       plantPeer();
       const r = await reapRunProcesses(scan(), { viaHelper: true, deadlineAt: deadlineAt(), forwardDeadlineToHelper: true, spawnHelper: rewrapSpawn({}) });
+      assert.equal(r.state, "quiescent", JSON.stringify(r));
+      assert.equal(inventoryClearVerdict(r), "clear");
+    });
+
+    it("the production probe flags (observeOnly + deadlineAt) on the same attributed peer read clear", async () => {
+      plantPeer();
+      const r = await reapRunProcesses({ ...scan(), observeOnly: true }, { viaHelper: true, deadlineAt: deadlineAt(), spawnHelper: rewrapSpawn({}) });
+      assert.equal(inventoryClearVerdict(r), "clear", JSON.stringify(r));
+    });
+
+    it("negative control: the same pid with no recorded root stays unverified (unreadable_unattributed) and not_clear", async () => {
+      plantPeer();
+      const r = await reapRunProcesses(req({ observeOnly: true }), { viaHelper: true, deadlineAt: deadlineAt(), spawnHelper: rewrapSpawn({}) });
       assert.equal(r.state, "unverified");
-      assert.deepEqual(r.processes, []);
-      assert.match(r.detail, /EISDIR/);
+      assert.equal(r.processes.some((p) => p.pid === PEER && p.reason === "unreadable_unattributed"), true, JSON.stringify(r.processes));
+      assert.equal(inventoryClearVerdict(r), "not_clear");
+    });
+
+    it("negative control: a recorded root whose start time does not match (a recycled pid) stays not_clear", async () => {
+      plantPeer();
+      const r = await reapRunProcesses({ ...req({ liveRoots: [{ pid: PEER, startTime: peerRoot.startTime + 1 }] }), observeOnly: true },
+        { viaHelper: true, deadlineAt: deadlineAt(), spawnHelper: rewrapSpawn({}) });
+      assert.equal(r.processes.some((p) => p.pid === PEER && p.reason === "unreadable_unattributed"), true, JSON.stringify(r.processes));
       assert.equal(inventoryClearVerdict(r), "not_clear");
     });
   });
 
-  it("the helper honours the serialized deadline while an unverified process persists", async () => {
-    plantUnreadableUnattributed(root, 81);
-    const started = Date.now();
-    const r = await reapRunProcesses(req({ observeOnly: true }), {
-      viaHelper: true, deadlineAt: Date.now() + 1_500, helperTimeoutMs: 20_000,
+  describe("per-PID access denial under a serialized deadline (in-process, injected table)", () => {
+    const PEER = 92;
+    const eacces = (code: string) => Object.assign(new Error(`${code}: injected`), { code });
+    const plant = (env: "readable" | "unreadable"): void =>
+      plantFakeProc(root, PEER, { uid: ME, comm: "peer", env: env === "readable" ? {} : "unreadable", cwd: "/", startTime: 4242 });
+    const attributed = { pid: PEER, startTime: 4242 };
+    type Over = Partial<ReturnType<typeof procfsTableAt>>;
+    // The injected clock starts at 0, so the dep deadline is a far-future value on that clock.
+    async function reap(r: ScanRequest, over: Over, gate = 1_000_000) {
+      let t = 0;
+      const killed: number[] = [];
+      const result = await reapProcesses(r, {
+        table: { ...procfsTableAt(root), ...over }, selfPid: 1, now: () => t, sleep: async (ms) => { t += ms; },
+        deadlineMs: 100, intervalMs: 10, kill: (pid) => { killed.push(pid); },
+        deadlineAt: gate,
+      });
+      return { result, killed };
+    }
+    const withDeadline = (extra: Partial<ScanRequest> = {}): ScanRequest => req({ liveRoots: [attributed], deadlineAt: Date.now() + 60_000, ...extra });
+
+    it("readCwd EACCES on an attributed pid is exempt: quiescent", async () => {
+      plant("readable");
+      const o = await reap(withDeadline(), { readCwd: (pid) => { if (pid === PEER) throw eacces("EACCES"); return procfsTableAt(root).readCwd(pid); } });
+      assert.equal(o.result.state, "quiescent", JSON.stringify(o.result));
     });
-    assert.equal(r.state, "unverified");
-    assert.ok(Date.now() - started < 12_000, "ended near the deadline, not the helper timeout");
+
+    it("readEnviron EPERM on an attributed pid is exempt: quiescent", async () => {
+      plant("readable");
+      const o = await reap(withDeadline(), { readEnviron: (pid) => { if (pid === PEER) throw eacces("EPERM"); return ""; } });
+      assert.equal(o.result.state, "quiescent", JSON.stringify(o.result));
+    });
+
+    it("readStatus EACCES is a table failure: unverified with no processes", async () => {
+      plant("readable");
+      const o = await reap(withDeadline(), { readStatus: () => { throw eacces("EACCES"); } });
+      assert.equal(o.result.state, "unverified");
+      assert.deepEqual(o.result.processes, []);
+    });
+
+    it("readStat EACCES is a table failure: unverified with no processes", async () => {
+      plant("readable");
+      const o = await reap(withDeadline(), { readStat: () => { throw eacces("EACCES"); } });
+      assert.equal(o.result.state, "unverified");
+      assert.deepEqual(o.result.processes, []);
+    });
+
+    it("readEnviron EIO on an attributed pid is a table failure: unverified with no processes", async () => {
+      plant("readable");
+      const o = await reap(withDeadline(), { readEnviron: () => { throw eacces("EIO"); } });
+      assert.equal(o.result.state, "unverified");
+      assert.deepEqual(o.result.processes, []);
+    });
+
+    it("scope key: an in-process scan with deps.deadlineAt but NO request deadlineAt (the #3980 checkpoint shape) keeps EACCES a table failure", async () => {
+      plant("unreadable");
+      const o = await reap(req({ liveRoots: [attributed] }), { readEnviron: () => { throw eacces("EACCES"); } });
+      assert.equal(o.result.state, "unverified");
+      assert.deepEqual(o.result.processes, [], "a table failure names no process");
+    });
+
+    it("an opted-in signalling scan reaches the unreadable_no_other_claim kill for an unattributed EACCES pid", async () => {
+      plant("readable");
+      const o = await reap(withDeadline({ liveRoots: [], mayKillUnreadableUnattributed: true }),
+        { readEnviron: (pid) => { if (pid === PEER) throw eacces("EACCES"); return ""; } });
+      assert.equal(o.killed.length >= 1 && o.killed.every((pid) => pid === PEER), true, JSON.stringify(o.killed));
+      assert.equal(o.result.processes.some((p) => p.pid === PEER && p.reason === "unreadable_no_other_claim:kill_unconfirmed"), true,
+        JSON.stringify(o.result));
+    });
+  });
+
+  it("the helper honours the forwarded deadline while an unverified process persists; without it the same scan runs to the view deadline", async () => {
+    // A non-observe request keeps the loop alive on the persistent unverified process, so only a deadline ends it early.
+    // The request's own deadlineAt (the serialized field) is earlier than the parent's gate deadline, so the helper
+    // reaches it by itself; the parent's helper timer sits far beyond both.
+    setQuiescenceViewForTests({ procRoot: root, deadlineMs: 3_000 });
+    plantUnreadableUnattributed(root, 81);
+    const t0 = Date.now();
+    const bounded = await reapRunProcesses(req({ deadlineAt: Date.now() + 700 }), {
+      viaHelper: true, forwardDeadlineToHelper: true, deadlineAt: Date.now() + 60_000, helperTimeoutMs: 20_000,
+    });
+    const boundedMs = Date.now() - t0;
+    assert.equal(bounded.state, "unverified");
+    assert.equal(bounded.detail, "process proof deadline");
+    assert.ok(boundedMs < 2_800, `ended at the serialized deadline, before the view deadline (${boundedMs} ms)`);
+
+    const t1 = Date.now();
+    const unbounded = await reapRunProcesses(req(), { viaHelper: true, helperTimeoutMs: 20_000 });
+    const unboundedMs = Date.now() - t1;
+    assert.equal(unbounded.state, "unverified");
+    assert.notEqual(unbounded.detail, "process proof deadline");
+    assert.match(unbounded.detail, /env\/cwd unreadable/);
+    assert.ok(unboundedMs >= 2_900, `without a deadline it polls to the view deadline (${unboundedMs} ms)`);
   });
 });
 

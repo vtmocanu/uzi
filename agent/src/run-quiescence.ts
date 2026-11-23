@@ -667,8 +667,23 @@ function descendantsTable(root: number, extraPids: readonly number[], extraPidFi
 function viewReapDeps(view: QuiescenceView): Required<Pick<ReapDeps, "table" | "kill" | "deadlineMs" | "intervalMs">> {
   if ("procRoot" in view) {
     const root = view.procRoot;
+    const raw = procfsTableAt(root);
+    // Test-only: a fake unreadable environ is planted as a directory (EISDIR); the kernel's answer for a
+    // non-dumpable process is EACCES, so present it that way to the reaper.
+    const asAccessDenied = <T>(read: () => T): T => {
+      try {
+        return read();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EISDIR") throw err;
+        throw Object.assign(new Error(`EACCES: permission denied (fake proc ${(err as Error).message})`), { code: "EACCES" });
+      }
+    };
     return {
-      table: procfsTableAt(root),
+      table: {
+        ...raw,
+        readEnviron: (pid) => asAccessDenied(() => raw.readEnviron(pid)),
+        readCwd: (pid) => asAccessDenied(() => raw.readCwd(pid)),
+      },
       kill: (pid) => fs.rmSync(path.join(root, String(pid)), { recursive: true, force: true }),
       deadlineMs: view.deadlineMs ?? FAKE_VIEW_DEADLINE_MS,
       intervalMs: view.intervalMs ?? FAKE_VIEW_INTERVAL_MS,
@@ -1517,7 +1532,11 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   let tableFailure: unknown;
   let bytes = 0;
   const gateDeadline = deps.deadlineAt;
-  const bounded = <T>(read: () => T, cap?: number): T => {
+  // issue #4632: a per-PID environ/cwd EACCES/EPERM of a scan the deadline was serialized into (req.deadlineAt, set
+  // only for observe-only and opted-in helper scans, never for an in-process #3980 checkpoint that merely carries
+  // deps.deadlineAt) is not a table failure: scanOnce classifies it through pid + start-time attribution.
+  const perPidAccessIsPerProcess = req.deadlineAt !== undefined && !reportBudget && !scoped && !ambient;
+  const bounded = <T>(read: () => T, cap?: number, perPid?: true): T => {
     try {
       ambient?.check();
       MaintenanceResources.checkIfActive();
@@ -1541,7 +1560,9 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     } catch (error) {
       // Vanishing processes retain the existing attribution semantics. Budget and
       // incomplete-table failures cannot be hidden by scanOnce's per-PID tryRead.
-      if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) tableFailure = error;
+      const code = (error as NodeJS.ErrnoException).code ?? "";
+      const perPidDenial = perPid === true && perPidAccessIsPerProcess && (code === "EACCES" || code === "EPERM");
+      if (!perPidDenial && !["ENOENT", "ESRCH"].includes(code)) tableFailure = error;
       throw error;
     }
   };
@@ -1556,8 +1577,8 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     }),
     readStatus: pid => bounded(() => baseTable.readStatus(pid), 64 * 1024),
     readStat: pid => bounded(() => baseTable.readStat(pid), 64 * 1024),
-    readEnviron: pid => bounded(() => baseTable.readEnviron(pid), 256 * 1024),
-    readCwd: pid => bounded(() => baseTable.readCwd(pid), 64 * 1024),
+    readEnviron: pid => bounded(() => baseTable.readEnviron(pid), 256 * 1024, true),
+    readCwd: pid => bounded(() => baseTable.readCwd(pid), 64 * 1024, true),
     ...(baseTable.readExecutable ? { readExecutable: (pid: number) => bounded(() => baseTable.readExecutable!(pid), 64 * 1024) } : {}),
     ...(baseTable.readProcMountInfo ? { readProcMountInfo: () => bounded(() => baseTable.readProcMountInfo!(), 256 * 1024) } : {}),
   } : baseTable;
@@ -2037,13 +2058,14 @@ async function reapProcessesViaHelper(
   const gateDeadline = opts.deadlineAt;
   // Only an observe-only probe or an explicit opt-in (issue #4632, the inventory scans) serializes the deadline into
   // the helper's scan; every other signalling scan keeps its serialized request unchanged, so the #3980 gate
-  // checkpoints and terminal preservation are unaffected. A helper-side deadline makes the reaper record a
-  // non-ENOENT/ESRCH procfs error (EACCES on environ/cwd) as a table failure. That is kept deliberately and fails
-  // closed, with this scope: ANY unreadable runner-uid process worker-wide, including a correctly attributed peer
-  // such as the Codex supervisor, makes the opted-in scan unverified (processes may be empty, and a failure on a
-  // later pass follows any kill an earlier pass already made). It also makes the #3915 late-root re-proof and the
-  // mayKillUnreadableUnattributed reap unreachable there. This applies only to inventory scans and observe-only probes.
-  if (gateDeadline !== undefined && (req.observeOnly === true || opts.forwardDeadlineToHelper === true))
+  // checkpoints and terminal preservation are unaffected. In the helper, a per-PID EACCES/EPERM on environ or cwd
+  // is not a table failure: it reaches the existing pid + start-time attribution in scanOnce, so only a process
+  // attributed to another live attempt or a recorded worker root (such as the Codex supervisor) is exempt and an
+  // unattributed one stays unverified (unreadable_unattributed). Table read failures (listPids, status, stat), other
+  // errnos, the byte/PID budgets and the deadline itself still fail closed, and the #3915 late-root re-proof and the
+  // mayKillUnreadableUnattributed reap stay reachable for an opted-in signalling scan.
+  const deadlineForwarded = gateDeadline !== undefined && (req.observeOnly === true || opts.forwardDeadlineToHelper === true);
+  if (deadlineForwarded)
     req = { ...req, deadlineAt: Math.min(gateDeadline, req.deadlineAt ?? Infinity) };
   const gateExpired = (): boolean => gateDeadline !== undefined && Date.now() >= gateDeadline;
   if (gateExpired()) return unverified("gate checkpoint deadline exhausted");
@@ -2124,9 +2146,12 @@ async function reapProcessesViaHelper(
           () => resolve(unverified("report helper cleanup failed")));
       } else if (gateDeadline !== undefined) {
         // The helper has closed. Await the private-temp removal before resolving; an expiry at any
-        // stage turns a quiescent verdict unverified (a non-quiescent one already fails closed).
+        // stage turns a quiescent verdict unverified (a non-quiescent one already fails closed). A scan the deadline
+        // was forwarded to (observe-only or opted-in inventory scans) feeds inventoryClearVerdict, where a survivors
+        // result holding only ignored reasons reads as clear, so it withdraws ANY non-unverified result after expiry.
         Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).then(
-          () => resolve(r.state === "quiescent" && gateExpired() ? unverified("gate checkpoint deadline exhausted") : r),
+          () => resolve(r.state !== "unverified" && gateExpired() && (deadlineForwarded || r.state === "quiescent")
+            ? unverified("gate checkpoint deadline exhausted") : r),
           () => resolve(unverified("gate checkpoint helper cleanup failed")));
       } else { removeTmp(); resolve(r); }
     };
@@ -2601,9 +2626,11 @@ export interface QuiesceRunRequest {
   /** Observe-only probe: see {@link ScanRequest.observeOnly}. The process verdict never signals anything. */
   observeOnly?: true;
   /** issue #4632 (owner-required): serialize `deadlineAt` into the helper's signalling scan, so the helper enforces
-   *  the deadline on its own reap loop. Set ONLY by the runner's inventory before/after scans. It makes any unreadable
-   *  runner-uid process worker-wide (including an attributed non-dumpable peer such as the Codex supervisor) an
-   *  unverified result, so it must never be set for a #3980 gate checkpoint or terminal preservation. */
+   *  the deadline on its own reap loop. Set ONLY by the runner's inventory before/after scans; never set it for a
+   *  #3980 gate checkpoint or terminal preservation. A per-PID environ/cwd EACCES/EPERM still reaches the existing
+   *  pid + start-time attribution: only a process attributed to another live attempt or a recorded worker root (such
+   *  as the Codex supervisor) is exempt, an unattributed one stays unverified, and the mayKillUnreadableUnattributed
+   *  reap and the #3915 refresh re-proof stay reachable. Table read failures, budgets and the deadline fail closed. */
   helperDeadline?: true;
 }
 
@@ -3030,6 +3057,13 @@ async function readHelperRequest(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** The reap deps the helper builds from its serialized request: the view's table, every descendant of the helper
+ *  excluded, and the request's own `deadlineAt` (present only for an observe-only or opted-in scan). */
+export function helperReapDeps(req: Pick<ScanRequest, "view" | "deadlineAt">): ReapDeps {
+  const view = req.view === undefined ? {} : viewReapDeps(req.view);
+  return { ...view, excludeAllDescendants: true, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }) };
+}
+
 async function helperMain(): Promise<ProcessQuiescence> {
   let req: unknown;
   try {
@@ -3038,12 +3072,8 @@ async function helperMain(): Promise<ProcessQuiescence> {
     return { state: "unverified", processes: [], killed: [], detail: "helper request unparsable" };
   }
   if (!isScanRequest(req)) return { state: "unverified", processes: [], killed: [], detail: "helper request invalid" };
-  const reap = () => {
-    const view = req.view === undefined ? {} : viewReapDeps(req.view);
-    // observeOnly rides on the request itself (reapProcesses reads it from scanRequest); the deadline is a dep.
-    return reapProcesses(req, { ...view, excludeAllDescendants: true,
-      ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }) });
-  };
+  // observeOnly rides on the request itself (reapProcesses reads it from scanRequest); the deadline is a dep.
+  const reap = () => reapProcesses(req, helperReapDeps(req));
   return req.workLimits === undefined ? reap() : helperWork.run(new HelperWork(req.workLimits), reap);
 }
 

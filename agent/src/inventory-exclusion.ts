@@ -180,7 +180,13 @@ function childrenOfInit(procRoot: string, fsImpl: ProcFs): number[] {
     if (!/^[0-9]+$/.test(name) || name === "1") continue;
     let stat: string;
     try { stat = String(fsImpl.readFileSync(path.join(procRoot, name, "stat"), "utf8")); }
-    catch { continue; }
+    catch (err) {
+      // Only a pid that vanished mid-census is skipped; any other failure leaves the census incomplete, so
+      // the caller reports not scoped instead of counting a subset of init's children.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") continue;
+      throw err;
+    }
     const rest = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
     if (rest[1] === "1") out.push(Number(name));
   }
