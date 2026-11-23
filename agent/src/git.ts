@@ -6667,6 +6667,8 @@ export class GitCache {
       markGitStarted: () => { entry.gitStarted = true; },
       stage: async <R,>(fn: () => Promise<R>): Promise<InventoryStageResult<R>> => {
         if (latch) return { ok: false, why: "stopped" };
+        // The deadline timer can lag D (a busy event loop): a continuation running after D must not start a stage.
+        if (Date.now() >= deadlineAt) { stop("deadline"); return { ok: false, why: "deadline" }; }
         if (opts.live && !opts.live()) { stop("abort"); return { ok: false, why: "stopped" }; }
         let work: Promise<R>;
         try { work = fn(); } catch (error) { work = Promise.reject(error); }

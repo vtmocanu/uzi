@@ -241,6 +241,34 @@ describe("section lifecycle", () => {
     assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-11")), false, "git never started and nothing pending");
   });
 
+  it("a stage started after the deadline but before the timer fired is refused on the clock", async () => {
+    let second = false;
+    let firstValue: unknown;
+    let secondValue: unknown;
+    let latchedBeforeSecond: boolean | undefined;
+    const r = await section("issue-15", async (s) => {
+      s.markGitStarted();
+      // Block the event loop past D inside the first stage, so the deadline timer cannot fire before the next stage
+      // starts: only the clock check can refuse it.
+      firstValue = await s.stage(async () => {
+        const until = s.deadlineAt + 20;
+        while (Date.now() < until) { /* busy-wait past D */ }
+        return 1;
+      });
+      latchedBeforeSecond = s.stopped();
+      secondValue = await s.stage(async () => { second = true; return 2; });
+      s.afterScanQuiescent(true);
+    }, { deadlineMs: 150 });
+    assert.deepEqual(firstValue, { ok: true, value: 1 });
+    assert.equal(latchedBeforeSecond, false, "the timer had not latched yet");
+    assert.deepEqual(secondValue, { ok: false, why: "deadline" });
+    assert.equal(second, false, "the stage body was never invoked");
+    assert.equal(r.kind === "ran" && r.timedOut, true);
+    assert.equal(r.kind === "ran" && r.entryKept, true);
+    assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-15")), true);
+    assert.equal(probeCalls.length, 0);
+  });
+
   it("an abort while the step-7 probe is pending keeps the entry and reports aborted", async () => {
     const ac = new AbortController();
     git.setInventoryExclusionProbe(async () => { ac.abort(); await tick(5); return "clear"; });
