@@ -34,7 +34,10 @@ func TestHealthCrossCheckPinsWorkerReason(t *testing.T) {
 			pinned, pinAware, checkAware, runtimeV3 bool
 			want                                    string
 		}{
-			{"missing runtime v3", true, true, true, false, reasonNoCrossCheckPinCapableWorker},
+			{"missing runtime v3", true, true, true, false, reasonNoCurrentCodexRuntime},
+			{"unpinned runtime gap", false, false, true, false, reasonNoCurrentCodexRuntime},
+			{"runtime and pin gap", true, false, true, false, reasonNoCrossCheckPinCapableWorker},
+			{"runtime and check gap", false, false, false, false, reasonNoCrossCheckWorker},
 			{"missing pin support", true, false, true, true, reasonNoCrossCheckPinCapableWorker},
 			{"unPinned old worker", false, false, true, true, reasonPlanCrossCheckWaiting},
 			{"pin aware worker", true, true, true, true, reasonPlanCrossCheckWaiting},

@@ -40,7 +40,7 @@ import { P_LAYER_SKIP } from "./p-platform.js";
 import { dummyCredential } from "./fake-provider.js";
 import { message } from "../codex-m0/harness.mjs";
 import { recordEvidence } from "./evidence.js";
-import { CODEX_U_TRUST_CONSTRUCTION_TITLE } from "./titles-c3.js";
+import { CODEX_U_TRUST_CONSTRUCTION_TITLE, CODEX_P_NO_TTL_TITLES } from "./titles-c3.js";
 
 let mods: UModules;
 let execMods: ExecModules;
@@ -158,7 +158,7 @@ describe("codex U repository trust construction (real config builders + real exe
 // Bounded API-key loopback observations through launchCodexRoot. These prove absence
 // on the exercised request path, not subscription routing or all upstream inheritance.
 for (const model of ["gpt-6.2-sol", "gpt-6.2-astra"] as const) {
-  it(`no TTL overrides: actual pinned binary and provider request for ${model}`,
+  it(CODEX_P_NO_TTL_TITLES[model],
     { skip: P_LAYER_SKIP, timeout: P_SUITE_DEADLINE_MS }, async (t) => {
       const protocol = await loadProtocolModules();
       const obs = await runProtocolTurn(protocol, {
@@ -192,6 +192,7 @@ for (const model of ["gpt-6.2-sol", "gpt-6.2-astra"] as const) {
       assert.ok(Array.isArray(obs.turnParams.input) && obs.turnParams.input.length > 0);
       assertNoTtlOverrides(obs.threadParams, model + " exercised thread/start");
       assertNoTtlOverrides(obs.turnParams, model + " exercised turn/start");
+      recordEvidence(CODEX_P_NO_TTL_TITLES[model], "pass");
       t.diagnostic(JSON.stringify({ model, requests: obs.providerRequests.length, configs: obs.emittedConfigTomls.length,
         version: obs.binaryEvidence.version, integrity: obs.binaryEvidence.integrity, elapsedMs: obs.elapsedMs }));
     });

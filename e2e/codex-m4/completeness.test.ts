@@ -16,6 +16,7 @@ import {
   CODEX_P_SHELL_POLICY_TITLES,
   CODEX_P_FILE_POLICY_TITLES,
   NATIVE_PATCH_INERT_TITLES,
+  CODEX_P_NO_TTL_TITLES,
 } from "./titles-c3.js";
 
 /** A minimal well-formed U/P clause. */
@@ -183,6 +184,7 @@ describe("M6 per-model evidence completeness", () => {
   });
 
   const maps = [
+    ["codex-p-no-ttl-overrides", CODEX_P_NO_TTL_TITLES],
     ["codex-p-native-async-utc-exceptions", { legacy: EXCEPTIONS_TITLE, ...ASYNC_MESSAGE_TITLES }],
     ["codex-p-native-bypass-forced-dispatch", CODEX_P_NATIVE_ABSENT_TITLES],
     ["codex-p-shell-policy", CODEX_P_SHELL_POLICY_TITLES],

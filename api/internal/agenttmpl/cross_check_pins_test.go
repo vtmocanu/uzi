@@ -155,7 +155,7 @@ func TestM2ModelWriteBoundaries(t *testing.T) {
 			t.Errorf("role accepted custom %s", model)
 		}
 	}
-	if _, err := ValidateFamilyModel("claude", "gpt-6-luna"); err == nil {
-		t.Error("Claude checker accepted luna")
+	if got, err := ValidateFamilyModel("claude", " gpt-6-luna "); err != nil || got != "gpt-6-luna" {
+		t.Errorf("legacy Claude checker luna pin: %q, %v", got, err)
 	}
 }

@@ -29,6 +29,7 @@ import {
   CODEX_U_SIGNAL_ORIGIN_TITLE,
   CODEX_U_SIGNAL_REPLAY_TITLE,
   CODEX_U_TRUST_CONSTRUCTION_TITLE,
+  CODEX_P_NO_TTL_TITLES,
 } from "./titles-c3.js";
 import {
   CODEX_U_LIFECYCLE_SYNC_CHILD_TITLE,
@@ -390,6 +391,18 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       + "with no second effect; a settled root signal replayed returns the cached terminal (latches once)",
     intendedOutcome: "direct malformed/replayed identity injection (a UNIT/broker layer) causes no unauthorized re-execution or extra reducer transition",
     tests: [CODEX_U_SIGNAL_REPLAY_TITLE],
+  },
+
+  {
+    id: "codex-p-no-ttl-overrides",
+    adapter: "codex",
+    layer: "P",
+    family: "Repository trust",
+    seam: "launchCodexRoot config and actual API-key provider request",
+    positiveControl: "the pinned binary completes with nonempty structured input for each selected model",
+    negativeOracle: "every observed provider body, emitted config and exercised thread/turn request has no TTL override",
+    intendedOutcome: "worker construction leaves TTL unset on the exercised path for both models",
+    tests: Object.values(CODEX_P_NO_TTL_TITLES),
   },
 
   // ── Repository trust ──

@@ -54,3 +54,8 @@ export const NATIVE_PATCH_INERT_TITLES: Readonly<Record<string, string>> = Objec
     ["fresh", "cold", "cold-no-explicit-selection", "fresh-no-launcher-guard"].map(scenario =>
       [`${model}/${scenario}`, `codex P native patch inert: ${model}/${scenario}`])),
 );
+
+export const CODEX_P_NO_TTL_TITLES = {
+  "gpt-6.2-sol": "no TTL overrides: actual pinned binary and provider request for gpt-6.2-sol",
+  "gpt-6.2-astra": "no TTL overrides: actual pinned binary and provider request for gpt-6.2-astra",
+} as const;

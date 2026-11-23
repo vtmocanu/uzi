@@ -37,7 +37,7 @@ func ValidateFamilyModel(harness, raw string) (string, error) {
 	}
 	switch harness {
 	case "claude":
-		if CodexRoleModels[model] {
+		if CuratedCodexModels[model] {
 			return "", fmt.Errorf("model is a Codex model id")
 		}
 	case "codex":

@@ -1,4 +1,4 @@
-import { CODEX_ROLE_MODELS } from "./codexModels";
+import { CODEX_CURATED_MODELS } from "./codexModels";
 import type { Harness } from "./apiTypes";
 import { modelFieldWarning } from "./agentTemplates";
 
@@ -15,7 +15,7 @@ export function checkerModelWarning(model: string, harness: Harness): string {
   if (syntax) return syntax;
   if (new TextEncoder().encode(value).length > 100) return "Invalid model ID.";
   const otherFamily = harness === "claude"
-    ? CODEX_ROLE_MODELS
+    ? CODEX_CURATED_MODELS
     : ["opus", "sonnet", "haiku", "fable"];
   return otherFamily.includes(value) ? "Choose a model from the checker's model family." : "";
 }
