@@ -22,7 +22,7 @@ import {
   detectNamespaceRestartBoundary,
 } from "../src/inventory-exclusion.js";
 import { cloneKeyOf } from "../src/attempt-path.js";
-import { mintAttemptId } from "../src/run-quiescence.js";
+import { inventoryClearVerdict, mintAttemptId, type ProcessQuiescence } from "../src/run-quiescence.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
@@ -486,6 +486,26 @@ describe("seed sites", () => {
     assert.equal(fs.existsSync(`${canonicalOf(key)}.attempt-${id}`), false);
     assert.throws(() => execFileSync("git", ["-C", bare, "config", "--get-all", `uzi-attempts.agent/issue-${iid}.entry`], { env: GIT_ENV, stdio: "pipe" }),
       (e: unknown) => (e as { status?: number }).status === 1, "no ledger entry was written");
+  });
+
+  it("an unverified probe result carrying an unreadable_unattributed process keeps the entry and refuses a same-key seed (real clear verdict)", async () => {
+    const iid = 54;
+    const key = `issue-${iid}`;
+    const unverified: ProcessQuiescence = {
+      state: "unverified", killed: [], detail: "one process could not be read",
+      processes: [{ pid: 73, uid: 1000, comm: "sleep", cwd: canonicalOf(key), reason: "unreadable_unattributed" }],
+    };
+    assert.equal(inventoryClearVerdict(unverified), "not_clear");
+    git.setInventoryExclusionProbe(async () => inventoryClearVerdict(unverified));
+    const r = await section(key, async (s) => { s.markGitStarted(); await s.stage(async () => 1); s.afterScanQuiescent(true); });
+    assert.equal(r.kind === "ran" && r.entryKept, true, "the section kept its entry");
+    assert.equal(priv.inventoryExclusion.excluded(bare, keyOf(key)), true, "the unverified probe never clears the key");
+    const id = mintAttemptId(1);
+    await assert.rejects(
+      git.createOrAttachRunnerClone(bare, iid, noProofReseed, "run-e", false, undefined, attemptOpts(id)),
+      (e: unknown) => e instanceof InventorySourceExclusionRefusal && e.reason === "excluded" && e.key === keyOf(key));
+    assert.equal(fs.existsSync(`${canonicalOf(key)}.attempt-${id}`), false, "the refused seed seeded nothing");
+    assert.equal(priv.inventoryExclusion.excluded(bare, keyOf(key)), true, "the refusal left the entry");
   });
 
   it("a clearable exclusion is cleared by the seed, which then proceeds", async () => {

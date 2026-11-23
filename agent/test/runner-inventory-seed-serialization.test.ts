@@ -720,7 +720,18 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.deepEqual(attemptDirs(iid), dirsBefore, "the refused seed seeded nothing");
     assert.ok(probeOutcomes.includes("unverified:unreadable_unattributed"), `the probe saw the unverified/unreadable result: ${JSON.stringify(probeOutcomes)}`);
 
-    await claimRunner.execute(gitlabClaim(iid));
+    // Retry contract: exactly one settlement wait and exactly one seed retry (two admissions, each probed) before the stop.
+    const probesBeforeClaim = probeOutcomes.length;
+    let settleWaits = 0;
+    const realSettled = git.inventoryExclusionSettled.bind(git);
+    git.inventoryExclusionSettled = (b: string, k: string) => { settleWaits++; return realSettled(b, k); };
+    try {
+      await claimRunner.execute(gitlabClaim(iid));
+    } finally {
+      delete (git as unknown as Record<string, unknown>).inventoryExclusionSettled;
+    }
+    assert.equal(settleWaits, 1, "exactly one settlement wait before the stop");
+    assert.equal(probeOutcomes.length - probesBeforeClaim, 2, "exactly two probed seed admissions (the first and exactly one retry) before the stop");
     assert.equal(started, 0, "no model work started");
     assert.equal(api.states.some((s) => s.body.status === "failed"), false, "no failed report");
     assert.equal(api.states.some((s) => s.body.fail_origin === "worker_residue_blocked"), false);
