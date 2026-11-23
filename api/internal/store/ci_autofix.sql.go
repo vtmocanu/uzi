@@ -268,8 +268,9 @@ type ListCIAutofixCandidateRefsRow struct {
 //     protected-branch check.
 //  3. THE OPT-IN + TOKEN GATE. The selected run's effective opt-in must not be OFF AND
 //     its owner must have an Anthropic token on file. ci_autofix_enabled is a tri-state
-//     (PRD #914): NULL (inherit the admin global default, which is ON) and explicit
-//     true both pass; only an explicit false is excluded — hence `IS NOT FALSE`. Since
+//     (PRD #914): on the OWNER column, NULL (inherit the admin global default, which is
+//     ON) and explicit true both pass; only an explicit false is excluded — hence
+//     `IS NOT FALSE`. On the RUN column NULL is different: it means inherit the owner. Since
 //     issue #4617 the per-run override (runs.ci_autofix_enabled, carried by the
 //     per_branch CTE from the newest qualifying run) WINS over the owner default:
 //     COALESCE(run, owner) IS NOT FALSE, resolved live. The admin global gate is NOT

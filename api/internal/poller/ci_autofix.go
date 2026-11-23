@@ -321,6 +321,11 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 		// Transient (forge unreachable, locked PR, candidates moved): leave the pipeline
 		// unrecorded so the next tick retries.
 		slog.Warn("poller: ci-autofix PR binding not verifiable, will retry", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+	case errors.Is(err, workersvc.ErrCIAutofixIneligible):
+		// Issue #4617: the in-transaction recheck found the branch no longer eligible (opt-out,
+		// cancellation or owner change since detection). Nothing was created: no ledger write,
+		// no recorded pipeline, no comment. The next tick re-evaluates the ref from the listing.
+		slog.Debug("poller: ci-autofix no longer eligible", "repo", r.PathWithNamespace, "ref", ref, "reason", err)
 	default:
 		// ErrRepoNotFound / a transient DB error: leave unrecorded so the next tick retries.
 		slog.Error("poller: ci-autofix create run", "repo", r.PathWithNamespace, "ref", ref, "error", err)

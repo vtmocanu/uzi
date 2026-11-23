@@ -248,6 +248,46 @@ func TestCIAutofixSelectedRunMirrorsCandidateLiveDB(t *testing.T) {
 	}
 }
 
+// TestCIAutofixSelectedRunTieBreakLiveDB pins the id DESC tie-break: two qualifying runs on
+// one branch with an IDENTICAL created_at must resolve to the larger id in both the
+// candidate listing and the single-branch selection. The runs differ in owner and mr_iid so
+// the pick is observable.
+func TestCIAutofixSelectedRunTieBreakLiveDB(t *testing.T) {
+	e := newAutofixOverrideEnv(t, 15)
+	const branch = "agent/issue-51"
+	lowOwner := e.newUser(t, nil, true)
+	highOwner := e.newUser(t, nil, true)
+	lowID := uuid.MustParse("00000000-0000-4000-8000-000000000001")
+	highID := uuid.MustParse("ffffffff-ffff-4fff-8fff-ffffffffffff")
+	insert := func(id, owner uuid.UUID, mr int64, iss int64) {
+		mustExec(e.ctx, t, e.pool,
+			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, branch, mr_iid, created_at)
+			 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'completed', $5, $6, '2026-01-02 03:04:05+00')`,
+			id, owner, e.repoID, iss, branch, mr)
+	}
+	// Insert the larger id first so insertion order cannot explain the pick.
+	insert(highID, highOwner, 502, 5102)
+	insert(lowID, lowOwner, 501, 5101)
+	e.insertFailedPipeline(t, branch, 8501)
+
+	cand, ok := e.candidateRefs(t)[branch]
+	if !ok {
+		t.Fatalf("%s is not a candidate", branch)
+	}
+	if cand.MrIid.Int64 != 502 || cand.UserID != highOwner {
+		t.Errorf("candidate picked mr_iid=%d user=%s, want the larger-id run (mr_iid=502 user=%s)", cand.MrIid.Int64, cand.UserID, highOwner)
+	}
+	sel, err := e.q.GetCIAutofixSelectedRun(e.ctx, store.GetCIAutofixSelectedRunParams{
+		RepoID: e.repoID, Ref: pgtype.Text{String: branch, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("GetCIAutofixSelectedRun: %v", err)
+	}
+	if sel.ID != highID || sel.UserID != highOwner {
+		t.Errorf("selected run = %s user=%s, want the larger id %s user=%s", sel.ID, sel.UserID, highID, highOwner)
+	}
+}
+
 // TestSetRunCiAutofixEnabledLiveDB pins the owner-scoped setter: true/false/NULL and a
 // foreign user_id affecting 0 rows.
 func TestSetRunCiAutofixEnabledLiveDB(t *testing.T) {
