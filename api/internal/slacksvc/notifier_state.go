@@ -1202,12 +1202,14 @@ func limitWaitDetail(rc store.GetSlackRunContextRow, wl *apitypes.WeeklyLimitDTO
 // a code span so a label's own markers stay literal. It is empty for a nil
 // block, so a park without one renders byte-identically to before. omitCommand names a command the
 // line already shows; it is skipped in favour of the next fix with one. A fix whose label is not
-// command-safe has no command, and the line then carries the reason alone.
+// command-safe has no command: when no fix supplies one to show and some fix was withheld for that
+// reason, the line says to rename the token in Settings to get a copyable command.
 func weeklyLimitSuffix(wl *apitypes.WeeklyLimitDTO, omitCommand string) string {
 	if wl == nil {
 		return ""
 	}
 	out := " · " + EscapeMrkdwn(wl.ReasonText())
+	withheld := false
 	for _, f := range wl.Fix {
 		if f.Command != "" && f.Command != omitCommand {
 			// A Slack code span: the label inside the command may carry mrkdwn markers (a
@@ -1215,6 +1217,12 @@ func weeklyLimitSuffix(wl *apitypes.WeeklyLimitDTO, omitCommand string) string {
 			// name a different credential). Inside backticks the text is literal.
 			return out + " · `" + EscapeMrkdwn(f.Command) + "`"
 		}
+		if f.Command == "" && f.CommandUnavailable != "" {
+			withheld = true
+		}
+	}
+	if withheld {
+		out += " · " + EscapeMrkdwn("rename the token in Settings to get a copyable command")
 	}
 	return out
 }

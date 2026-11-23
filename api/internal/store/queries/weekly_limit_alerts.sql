@@ -61,3 +61,33 @@ SELECT EXISTS (
     WHERE r.user_id = @user_id AND s.provider_account_id = @account_id::uuid
       AND r.status NOT IN ('completed', 'failed', 'cancelled')
 ) AS has_run;
+
+-- The four queries below are the DM's run total and run lines. Their predicates are EXACTLY those of
+-- the two HasNonTerminalRun queries above (the claim's), so the DM's total can never disagree with the
+-- claim: no kind exclusion (a chat run counts) and no row cap on the count.
+
+-- name: CountNonTerminalRunsForAnthropicSecret :one
+SELECT count(*) FROM runs r
+WHERE r.user_id = @user_id AND r.anthropic_secret_id = @secret_id::uuid
+  AND r.status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: ListNonTerminalRunsForAnthropicSecret :many
+SELECT r.* FROM runs r
+WHERE r.user_id = @user_id AND r.anthropic_secret_id = @secret_id::uuid
+  AND r.status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT @max_rows::int;
+
+-- name: CountNonTerminalRunsForCodexAccount :one
+SELECT count(*) FROM runs r
+JOIN codex_credential_state s ON s.user_secret_id = r.codex_secret_id AND s.user_id = r.user_id
+WHERE r.user_id = @user_id AND s.provider_account_id = @account_id::uuid
+  AND r.status NOT IN ('completed', 'failed', 'cancelled');
+
+-- name: ListNonTerminalRunsForCodexAccount :many
+SELECT r.* FROM runs r
+JOIN codex_credential_state s ON s.user_secret_id = r.codex_secret_id AND s.user_id = r.user_id
+WHERE r.user_id = @user_id AND s.provider_account_id = @account_id::uuid
+  AND r.status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT @max_rows::int;

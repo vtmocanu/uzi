@@ -123,6 +123,48 @@ func TestHostileLabelIsEscapedInSlackBlocksAndFallback(t *testing.T) {
 	}
 }
 
+// A server-withheld command (the label is not command-safe) leaves the park line with a rename hint,
+// in the block and the fallback, on both the limit_wait park and the reserve pause; a shown command
+// carries no hint.
+func TestWithheldCommandAddsARenameHint(t *testing.T) {
+	const hint = "rename the token in Settings to get a copyable command"
+	withheld := func() *apitypes.WeeklyLimitDTO {
+		return &apitypes.WeeklyLimitDTO{Reason: "pinned", CredentialLabel: "work", Fix: []apitypes.WeeklyLimitFixDTO{
+			{Kind: "set_token", TargetLabel: "odd", CommandUnavailable: apitypes.WeeklyFixCommandLabel},
+		}}
+	}
+	rc := parkedCtx("seven_day", 2*time.Hour, 1)
+	blocks, fallback, ok := renderThreadBlocks(rc, "", withheld())
+	if !ok {
+		t.Fatal("park must thread")
+	}
+	if !strings.Contains(contextText(blocks), hint) || !strings.Contains(fallback, hint) || strings.Contains(fallback, "set-token") {
+		t.Fatalf("limit_wait park:\n block: %s\n fallback: %s", contextText(blocks), fallback)
+	}
+
+	reserve := providerHoldRun(t)
+	reserve.HoldReason = txt("weekly_reserve")
+	resume := "uzi run resume " + reserve.ID.String()
+	wl := withheld()
+	wl.Fix = append([]apitypes.WeeklyLimitFixDTO{{Kind: "resume_reserve", Command: resume}}, wl.Fix...)
+	blocks, fallback, ok = renderThreadBlocks(reserve, "", wl)
+	if !ok {
+		t.Fatal("reserve park must thread")
+	}
+	if !strings.Contains(contextText(blocks), hint) || !strings.Contains(fallback, hint) {
+		t.Fatalf("reserve pause (resume shown elsewhere):\n block: %s\n fallback: %s", contextText(blocks), fallback)
+	}
+
+	// A command that is shown makes the hint redundant.
+	cmd := "uzi run set-token " + rc.ID.String() + " -- spare"
+	wl = withheld()
+	wl.Fix = append(wl.Fix, apitypes.WeeklyLimitFixDTO{Kind: "set_token", Command: cmd})
+	blocks, fallback, _ = renderThreadBlocks(rc, "", wl)
+	if strings.Contains(contextText(blocks), hint) || strings.Contains(fallback, hint) || !strings.Contains(fallback, cmd) {
+		t.Fatalf("a shown command must suppress the hint:\n block: %s\n fallback: %s", contextText(blocks), fallback)
+	}
+}
+
 func TestCommandIsInACodeSpanSoAMarkedUpLabelStaysLiteral(t *testing.T) {
 	rc := parkedCtx("seven_day", 2*time.Hour, 1)
 	cmd := "uzi run set-token " + rc.ID.String() + " -- _prod_"

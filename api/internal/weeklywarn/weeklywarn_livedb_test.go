@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -100,7 +102,6 @@ func newFixture(t *testing.T) *fixture {
 	})
 	f.w = New(Config{
 		Pool: pool, Queries: f.q, Publisher: pubSink{f}, Blocks: fakeBlocks{},
-		Runs:           func(context.Context, uuid.UUID) ([]store.Run, error) { return nil, nil },
 		ClaudeInterval: time.Hour, CodexInterval: time.Hour, Now: func() time.Time { return f.now },
 	})
 	return f
@@ -415,15 +416,103 @@ func TestWeeklyWarnRejectedReadingDoesNotCancelAPendingClaimLiveDB(t *testing.T)
 	if !ok {
 		t.Fatal("R1 dropped")
 	}
-	// R2 is stale (written more than three intervals before the warner's clock): rejected before any
-	// transaction, so observed_at stays at R1's instant.
+	before := f.ledger(s)
+	// R2 is persisted at an instant NEWER than R1, so the SQL fence alone would accept it; the step-0
+	// gate must be what rejects it. The clock moves two hours on and R2's window reset lies between its
+	// instant and the new clock: a pre-reset reading.
+	base := f.now
+	f.now = base.Add(2 * time.Hour)
+	r2At, r2Reset := base.Add(time.Hour), base.Add(90*time.Minute)
 	pct := int16(99)
-	f.w.ObserveAnthropicWeekly(f.ctx, f.user, s, rev, &pct, &reset, f.now.Add(-4*time.Hour))
-	if l := f.ledger(s); !l.observedAt.Equal(f.at(1)) || l.warned {
-		t.Fatalf("a rejected reading touched the ledger: %+v", l)
+	if !r2At.After(before.observedAt) {
+		t.Fatal("R2 must be newer than R1")
+	}
+	if f.w.anthropicCredential(f.user, s, rev, &pct, &r2Reset, r2At) != nil {
+		t.Fatal("the validity gate must reject R2")
+	}
+	f.w.ObserveAnthropicWeekly(f.ctx, f.user, s, rev, &pct, &r2Reset, r2At)
+	after := f.ledger(s)
+	if !after.observedAt.Equal(before.observedAt) || after.warned != before.warned || after.multi != before.multi ||
+		after.anchor == nil || !after.anchor.Equal(*before.anchor) || *after.pct != *before.pct {
+		t.Fatalf("a rejected reading touched the ledger: before %+v after %+v", before, after)
 	}
 	f.w.claim(f.ctx, c1, n1)
 	f.wantDMs(1, "R1's claim still commits exactly one DM")
+}
+
+// A Codex reading with one valid and one invalid sibling window is rejected whole: against an anchored
+// multi-window row it changes nothing, though its instant is newer.
+func TestWeeklyWarnCodexMixedValidityReadingChangesNothingLiveDB(t *testing.T) {
+	cf := newCodexFx(t)
+	reset := cf.resetIn(100)
+	cf.observe(1, cf.fence(), cwin{"codex", 40, reset}, cwin{"codex", 30, reset}) // a duplicate bucket id: anchor_multi
+	before := cf.ledger()
+	if !before.exists || before.anchor == nil || before.bucket == nil || !before.multi || before.warned {
+		t.Fatalf("anchored multi-window row = %+v", before)
+	}
+	mixed := buckets(cwin{"codex", 97, reset})
+	mixed = append(mixed, apitypes.CodexRateLimitBucketDTO{ID: "sibling", Primary: weeklyWindow(fp(math.NaN()), reset.Unix())})
+	if _, ok := codexGate(cf.fence(), mixed, cf.at(2), time.Hour, cf.now); ok {
+		t.Fatal("the validity gate must reject a reading with an invalid weekly sibling")
+	}
+	cf.w.ObserveCodexWeekly(cf.ctx, cf.fence(), mixed, cf.at(2))
+	after := cf.ledger()
+	if !after.observedAt.Equal(before.observedAt) || after.warned != before.warned || after.multi != before.multi ||
+		after.anchor == nil || !after.anchor.Equal(*before.anchor) || *after.bucket != *before.bucket || *after.pct != *before.pct {
+		t.Fatalf("a rejected Codex reading touched the ledger: before %+v after %+v", before, after)
+	}
+	cf.wantDMs(0, "rejected mixed-validity reading")
+}
+
+// The DM's total and run lines come from queries that share the claim's predicate: a chat run counts,
+// and neither 201 older completed runs nor another credential's runs distort the total.
+func TestWeeklyWarnDMRunsUseTheClaimPredicateLiveDB(t *testing.T) {
+	f := newFixture(t)
+	s := f.secret(store.KindAnthropicToken, "tok")
+	other := f.secret(store.KindAnthropicToken, "other")
+	// The 201 completed runs are NEWER than every live one, so a newest-200 listing would hide them all.
+	const ins = `INSERT INTO runs (user_id, kind, issue_title, issue_description, harness, status, anthropic_secret_id, created_at)
+		SELECT $1, 'chat', $2::text || g::text, 'd', 'claude', $3, $4, now() - make_interval(secs => $6::int + g) FROM generate_series(1, $5::int) g`
+	f.exec(ins, f.user, "old-", "completed", s, 201, 0)
+	f.exec(ins, f.user, "run-", "running", s, 6, 100000)
+	f.exec(ins, f.user, "wait-", "awaiting_approval", s, 1, 200000)
+	f.exec(ins, f.user, "elsewhere-", "running", other, 3, 100000)
+	f.exec(ins, f.user, "gone-", "cancelled", s, 2, 100000)
+
+	aff, err := f.w.runs(f.ctx, f.user, s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aff.Total != 7 || len(aff.Newest) != maxRunLines {
+		t.Fatalf("total / listed = %d / %d, want 7 / %d", aff.Total, len(aff.Newest), maxRunLines)
+	}
+	for i, r := range aff.Newest {
+		if want := fmt.Sprintf("run-%d", i+1); r.IssueTitle != want {
+			t.Fatalf("newest[%d] = %q, want %q (newest first, the oldest live run is cut)", i, r.IssueTitle, want)
+		}
+	}
+	// The same total reaches the DM and the claim's own existence check agrees with it.
+	if has, err := f.q.HasNonTerminalRunForAnthropicSecret(f.ctx, store.HasNonTerminalRunForAnthropicSecretParams{UserID: f.user, SecretID: s}); err != nil || !has {
+		t.Fatalf("claim predicate = %v, %v", has, err)
+	}
+	f.claude(s, f.rev(s), 92, f.resetIn(100), 1)
+	f.wantDMs(1, "near reading")
+	body := f.published()[0].n.Slack.Body
+	if !strings.Contains(body, "7 runs use this credential") || !strings.Contains(body, "and 2 more") || strings.Contains(body, "old-") || strings.Contains(body, "elsewhere-") {
+		t.Fatalf("DM body:\n%s", body)
+	}
+
+	cf := newCodexFx(t)
+	const cins = `INSERT INTO runs (user_id, kind, issue_title, issue_description, harness, status, codex_secret_id) VALUES ($1, 'chat', $2, 'd', 'codex', $3, $4)`
+	cf.exec(cins, cf.user, "cdx-done", "completed", cf.alias)
+	cf.exec(cins, cf.user, "cdx-live", "running", cf.alias)
+	caff, err := cf.w.runs(cf.ctx, cf.user, cf.account, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caff.Total != 2 || len(caff.Newest) != 2 {
+		t.Fatalf("codex total / listed = %d / %d, want 2 / 2", caff.Total, len(caff.Newest))
+	}
 }
 
 func TestWeeklyWarnFreshCredentialRejectedReadingCreatesNoRowLiveDB(t *testing.T) {

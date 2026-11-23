@@ -31,8 +31,12 @@ type Payload struct {
 
 // runLine is one affected run as the DM shows it.
 type runLine struct {
-	ID                 uuid.UUID
+	ID    uuid.UUID
+	Title string
+	// Reason is a workersvc.NextClaimReason value and Wait a workersvc.Wait* value; both are empty for
+	// a run the block builder produced no block for.
 	Reason             string
+	Wait               string
 	Command            string
 	CommandUnavailable bool
 }
@@ -54,28 +58,28 @@ type dm struct {
 func (w *Warner) build(ctx context.Context, c *credential, near usagereserve.NearVerdict) notifysvc.Notification {
 	d := dm{Label: c.label, Pct: near.Pct, Limit: near.EffectiveLimit, ResetsAt: near.ResetsAt, At: near.State == usagereserve.NearAt}
 	if w.blocks != nil {
-		if runs, err := w.runs(ctx, c.userID); err != nil {
+		if aff, err := w.runs(ctx, c.userID, c.credID, c.harness); err != nil {
 			w.logger.Warn("weeklywarn: list runs for the warning", "error", err)
 		} else {
-			var open []store.Run
-			for _, r := range runs {
-				if !apitypes.IsTerminalRunStatus(r.Status) && r.Harness == c.harness {
-					open = append(open, r)
-				}
+			newest := aff.Newest
+			if len(newest) > maxRunLines {
+				newest = newest[:maxRunLines]
 			}
-			blocks := w.blocks.ForRuns(ctx, c.userID, open)
-			for _, r := range open {
-				dto := blocks[r.ID]
-				if dto == nil || dto.CredentialKey != c.key {
-					continue
+			// The total is the claim's own count; the listed runs are never fewer than it.
+			d.Total = max(aff.Total, len(newest))
+			blocks := w.blocks.ForRuns(ctx, c.userID, newest)
+			labelSet := false
+			for _, r := range newest {
+				// A run the block builder drops (or places on another credential) is still listed by
+				// id and title: it is counted in the total, so it must be visible.
+				line := runLine{ID: r.ID, Title: r.IssueTitle}
+				if dto := blocks[r.ID]; dto != nil && dto.CredentialKey == c.key {
+					if !labelSet && dto.CredentialLabel != "" {
+						d.Label, labelSet = dto.CredentialLabel, true
+					}
+					line = lineOf(r, dto)
 				}
-				if d.Total == 0 && dto.CredentialLabel != "" {
-					d.Label = dto.CredentialLabel
-				}
-				d.Total++
-				if len(d.Runs) < maxRunLines {
-					d.Runs = append(d.Runs, lineOf(r.ID, dto))
-				}
+				d.Runs = append(d.Runs, line)
 			}
 		}
 	}
@@ -85,8 +89,8 @@ func (w *Warner) build(ctx context.Context, c *credential, near usagereserve.Nea
 	return notifysvc.Notification{UserID: c.userID, Kind: notifysvc.KindWeeklyLimitWarning, Payload: payload, Slack: &slack}
 }
 
-func lineOf(id uuid.UUID, dto *apitypes.WeeklyLimitDTO) runLine {
-	l := runLine{ID: id, Reason: dto.Reason}
+func lineOf(r store.Run, dto *apitypes.WeeklyLimitDTO) runLine {
+	l := runLine{ID: r.ID, Title: r.IssueTitle, Reason: dto.Reason, Wait: dto.Wait}
 	for _, f := range dto.Fix {
 		if f.Command != "" {
 			l.Command = f.Command
@@ -121,7 +125,32 @@ func reasonText(r string) string {
 	case workersvc.NextClaimPinned:
 		return "pinned to this token"
 	}
-	return "will wait for the reset"
+	return "can't tell whether it can switch"
+}
+
+// waitText is the DM's only statement about what a run does at the limit, taken from the block's Wait
+// field and never inferred from the reason. An empty or unknown value states nothing.
+func waitText(w string) string {
+	switch w {
+	case workersvc.WaitWaits:
+		return "will wait for the reset"
+	case workersvc.WaitFails:
+		return "will fail at the limit"
+	case workersvc.WaitReservePause:
+		return "will pause at the reserve"
+	}
+	return ""
+}
+
+// maxTitleRunes bounds the owner-authored run title shown on a line.
+const maxTitleRunes = 60
+
+func titleText(s string) string {
+	t := []rune(ownerLabel(s))
+	if len(t) > maxTitleRunes {
+		return string(t[:maxTitleRunes]) + "…"
+	}
+	return string(t)
 }
 
 // ownerTextStrip removes what could turn owner-authored text into markup once the body is parsed as
@@ -165,7 +194,20 @@ func renderSlack(d dm) notifysvc.SlackRender {
 		}
 		fmt.Fprintf(&b, "\n%d %s this credential:", d.Total, noun)
 		for _, r := range d.Runs {
-			fmt.Fprintf(&b, "\n• `%s` %s", r.ID.String()[:8], reasonText(r.Reason))
+			fmt.Fprintf(&b, "\n• `%s`", r.ID.String()[:8])
+			if t := titleText(r.Title); t != "" {
+				b.WriteString(" " + t)
+			}
+			var parts []string
+			if r.Reason != "" {
+				parts = append(parts, reasonText(r.Reason))
+			}
+			if wt := waitText(r.Wait); wt != "" {
+				parts = append(parts, wt)
+			}
+			if len(parts) > 0 {
+				b.WriteString(" - " + strings.Join(parts, "; "))
+			}
 			switch {
 			case r.Command != "" && !strings.ContainsAny(r.Command, "`\n\r"):
 				fmt.Fprintf(&b, ": `%s`", r.Command)

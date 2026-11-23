@@ -30,8 +30,15 @@ func (f fakeBlocks) ForRuns(_ context.Context, _ uuid.UUID, runs []store.Run) ma
 }
 
 func renderWarner(runs []store.Run, blocks Blocks, runsErr error) *Warner {
+	return renderWarnerTotal(runs, len(runs), blocks, runsErr)
+}
+
+// renderWarnerTotal is renderWarner with a claim-predicate total larger than the listed runs.
+func renderWarnerTotal(newest []store.Run, total int, blocks Blocks, runsErr error) *Warner {
 	return New(Config{Pool: &countingPool{}, Queries: store.New(nil), Publisher: noPublisher{}, Blocks: blocks,
-		Runs: func(context.Context, uuid.UUID) ([]store.Run, error) { return runs, runsErr }})
+		Runs: func(context.Context, uuid.UUID, uuid.UUID, string) (AffectedRuns, error) {
+			return AffectedRuns{Total: total, Newest: newest}, runsErr
+		}})
 }
 
 func nearAt(pct int, limit int) usagereserve.NearVerdict {
@@ -45,23 +52,15 @@ func TestRenderListsTotalAndAtMostFiveRuns(t *testing.T) {
 	key := "anthropic:" + secret.String()
 	var runs []store.Run
 	blocks := fakeBlocks{}
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 5; i++ {
 		r := store.Run{ID: uuid.New(), UserID: owner, Status: "running", Harness: "claude"}
 		runs = append(runs, r)
 		blocks[r.ID] = &apitypes.WeeklyLimitDTO{CredentialKey: key, CredentialLabel: "subscription", Reason: workersvc.NextClaimNoAlternative,
 			Fix: []apitypes.WeeklyLimitFixDTO{{Kind: "set_token", Command: fmt.Sprintf("uzi run set-token %s -- 'other'", r.ID)}}}
 	}
-	// A terminal run, a run on another credential, a run of another harness and a run without a block
-	// are never listed.
-	runs = append(runs,
-		store.Run{ID: uuid.New(), Status: "completed", Harness: "claude"},
-		store.Run{ID: uuid.New(), Status: "running", Harness: "codex"},
-	)
-	other := store.Run{ID: uuid.New(), Status: "running", Harness: "claude"}
-	runs = append(runs, other)
-	blocks[other.ID] = &apitypes.WeeklyLimitDTO{CredentialKey: "anthropic:" + uuid.NewString(), CredentialLabel: "someone else"}
 
-	w := renderWarner(runs, blocks, nil)
+	// The source reports the claim's total (8) and its five newest runs.
+	w := renderWarnerTotal(runs, 8, blocks, nil)
 	c := &credential{userID: owner, key: key, harness: "claude", label: "fallback", fence: func(*notifysvc.SlackRender) {}}
 	n := w.build(context.Background(), c, nearAt(92, 100))
 	body := n.Slack.Body
@@ -70,9 +69,6 @@ func TestRenderListsTotalAndAtMostFiveRuns(t *testing.T) {
 	}
 	if got := strings.Count(body, "\n• "); got != 5 {
 		t.Fatalf("run lines = %d, want 5:\n%s", got, body)
-	}
-	if strings.Contains(body, "someone else") || strings.Contains(body, other.ID.String()[:8]) {
-		t.Fatalf("another credential's run leaked:\n%s", body)
 	}
 	if !strings.Contains(body, "**subscription**") || !strings.Contains(body, "92% of its 100% weekly limit") ||
 		!strings.Contains(body, "no other token to switch to") || !strings.Contains(body, "`uzi run set-token ") {
@@ -190,6 +186,50 @@ func TestRenderThroughSlackBlockKeepsDateTokenAndEscapesOnce(t *testing.T) {
 	}
 	if strings.Contains(body, "<!date") || strings.Contains(body, "&lt;!date") {
 		t.Fatalf("date token leaked into the body:\n%s", body)
+	}
+}
+
+// The wait statement comes only from the block's Wait field; an unknown reason says the DM cannot tell
+// whether the run can switch and never claims the run waits.
+func TestRenderWaitStatementComesOnlyFromWaitField(t *testing.T) {
+	owner, secret := uuid.New(), uuid.New()
+	key := "anthropic:" + secret.String()
+	mk := func(reason, wait string) string {
+		r := store.Run{ID: uuid.New(), Status: "running", Harness: "claude", IssueTitle: "t"}
+		blocks := fakeBlocks{r.ID: {CredentialKey: key, Reason: reason, Wait: wait}}
+		c := &credential{userID: owner, key: key, harness: "claude", label: "tok", fence: func(*notifysvc.SlackRender) {}}
+		return renderWarner([]store.Run{r}, blocks, nil).build(context.Background(), c, nearAt(92, 100)).Slack.Body
+	}
+	body := mk(workersvc.NextClaimUnknown, workersvc.WaitFails)
+	if strings.Contains(body, "wait for the reset") || !strings.Contains(body, "can't tell whether it can switch") || !strings.Contains(body, "will fail at the limit") {
+		t.Fatalf("unknown reason + fails:\n%s", body)
+	}
+	if body := mk(workersvc.NextClaimNoAlternative, workersvc.WaitWaits); !strings.Contains(body, "no other token to switch to; will wait for the reset") {
+		t.Fatalf("waits:\n%s", body)
+	}
+	if body := mk(workersvc.NextClaimNoAlternative, workersvc.WaitReservePause); !strings.Contains(body, "will pause at the reserve") || strings.Contains(body, "wait for the reset") {
+		t.Fatalf("reserve_pause:\n%s", body)
+	}
+	if body := mk(workersvc.NextClaimNoAlternative, workersvc.WaitUnknown); strings.Contains(body, "wait for the reset") || strings.Contains(body, "will fail") {
+		t.Fatalf("unknown wait states nothing:\n%s", body)
+	}
+}
+
+// A counted run the block builder dropped (or put on another credential) is still listed by id and title.
+func TestRenderListsARunWithoutABlock(t *testing.T) {
+	owner, secret := uuid.New(), uuid.New()
+	key := "anthropic:" + secret.String()
+	bare := store.Run{ID: uuid.New(), Status: "running", Harness: "claude", IssueTitle: "Fix *the* login"}
+	foreign := store.Run{ID: uuid.New(), Status: "running", Harness: "claude", IssueTitle: "other"}
+	blocks := fakeBlocks{foreign.ID: {CredentialKey: "anthropic:" + uuid.NewString(), CredentialLabel: "someone else", Reason: workersvc.NextClaimPinned}}
+	c := &credential{userID: owner, key: key, harness: "claude", label: "tok", fence: func(*notifysvc.SlackRender) {}}
+	body := renderWarner([]store.Run{bare, foreign}, blocks, nil).build(context.Background(), c, nearAt(92, 100)).Slack.Body
+	if !strings.Contains(body, "2 runs use this credential") || !strings.Contains(body, "`"+bare.ID.String()[:8]+"` Fix the login") ||
+		!strings.Contains(body, "`"+foreign.ID.String()[:8]+"` other") {
+		t.Fatalf("runs without a block not listed:\n%s", body)
+	}
+	if strings.Contains(body, "someone else") || strings.Contains(body, "pinned") {
+		t.Fatalf("another credential's block leaked:\n%s", body)
 	}
 }
 

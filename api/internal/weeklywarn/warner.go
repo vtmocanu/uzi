@@ -32,8 +32,17 @@ type Blocks interface {
 	ForRuns(ctx context.Context, ownerID uuid.UUID, runs []store.Run) map[uuid.UUID]*apitypes.WeeklyLimitDTO
 }
 
-// RunSource lists an owner's runs, newest first. The default reads store.ListRunsForUser.
-type RunSource func(ctx context.Context, ownerID uuid.UUID) ([]store.Run, error)
+// AffectedRuns is the DM's view of the runs on one credential: Total is every non-terminal run (the
+// claim's own predicate, uncapped) and Newest at most maxRunLines of them, newest first.
+type AffectedRuns struct {
+	Total  int
+	Newest []store.Run
+}
+
+// RunSource reads the non-terminal runs of one owner on one credential (an Anthropic secret id for
+// harness "claude", a Codex provider account id for "codex"). The default runs the queries that share
+// their predicate with the claim's HasNonTerminalRun queries.
+type RunSource func(ctx context.Context, ownerID, credentialID uuid.UUID, harness string) (AffectedRuns, error)
 
 // Config wires a Warner. Pool, Queries and Publisher are required; a nil Blocks sends a DM without
 // the per-run lines.
@@ -89,25 +98,35 @@ func New(cfg Config) *Warner {
 	return w
 }
 
-func (w *Warner) listRuns(ctx context.Context, ownerID uuid.UUID) ([]store.Run, error) {
-	rows, err := w.q.ListRunsForUser(ctx, store.ListRunsForUserParams{
-		UserID:                ownerID,
-		BackgroundGraceCutoff: pgtype.Timestamptz{Time: w.now(), Valid: true},
-	})
+func (w *Warner) listRuns(ctx context.Context, ownerID, credentialID uuid.UUID, harness string) (AffectedRuns, error) {
+	var (
+		total int64
+		runs  []store.Run
+		err   error
+	)
+	if harness == "codex" {
+		if total, err = w.q.CountNonTerminalRunsForCodexAccount(ctx, store.CountNonTerminalRunsForCodexAccountParams{UserID: ownerID, AccountID: credentialID}); err != nil {
+			return AffectedRuns{}, err
+		}
+		runs, err = w.q.ListNonTerminalRunsForCodexAccount(ctx, store.ListNonTerminalRunsForCodexAccountParams{UserID: ownerID, AccountID: credentialID, MaxRows: maxRunLines})
+	} else {
+		if total, err = w.q.CountNonTerminalRunsForAnthropicSecret(ctx, store.CountNonTerminalRunsForAnthropicSecretParams{UserID: ownerID, SecretID: credentialID}); err != nil {
+			return AffectedRuns{}, err
+		}
+		runs, err = w.q.ListNonTerminalRunsForAnthropicSecret(ctx, store.ListNonTerminalRunsForAnthropicSecretParams{UserID: ownerID, SecretID: credentialID, MaxRows: maxRunLines})
+	}
 	if err != nil {
-		return nil, err
+		return AffectedRuns{}, err
 	}
-	out := make([]store.Run, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.Run)
-	}
-	return out, nil
+	return AffectedRuns{Total: int(total), Newest: runs}, nil
 }
 
 // credential is one reading's identity and the ledger accessors that differ between the two vendors.
 // next is the pure state machine over the locked row; trigger is the reading's headline window.
 type credential struct {
-	userID  uuid.UUID
+	userID uuid.UUID
+	// credID is the Anthropic secret id or the Codex provider account id the reading belongs to.
+	credID  uuid.UUID
 	key     string
 	harness string
 	obs     time.Time
@@ -148,7 +167,7 @@ func (w *Warner) anthropicCredential(userID, secretID uuid.UUID, rev int64, pct 
 	win := ClaudeWindow{Reset: wr.ResetsAt, Pct: wr.Pct}
 	fence := notifysvc.CredentialFence{SecretID: secretID, Kind: store.KindAnthropicToken, EnablementRev: rev}
 	c := &credential{
-		userID: userID, key: workersvc.AnthropicCredentialKey(secretID), harness: "claude", obs: obs, trigger: wr,
+		userID: userID, credID: secretID, key: workersvc.AnthropicCredentialKey(secretID), harness: "claude", obs: obs, trigger: wr,
 		next: func(r Row) Next { return nextClaude(r, obs, win) },
 		seed: func(ctx context.Context, q *store.Queries) error {
 			return q.SeedWeeklyLimitAlertAnthropic(ctx, store.SeedWeeklyLimitAlertAnthropicParams{UserID: userID, SecretID: secretID})
@@ -194,7 +213,7 @@ func (w *Warner) codexCredential(fence notifysvc.CodexAccountFence, buckets []ap
 	trig, _ := view.Trigger()
 	account := fence.AccountID
 	c := &credential{
-		userID: fence.OwnerID, key: workersvc.CodexCredentialKey(account), harness: "codex", obs: obs, trigger: trig,
+		userID: fence.OwnerID, credID: account, key: workersvc.CodexCredentialKey(account), harness: "codex", obs: obs, trigger: trig,
 		label: "Codex account",
 		next:  func(r Row) Next { return nextCodex(r, obs, view) },
 		seed: func(ctx context.Context, q *store.Queries) error {
