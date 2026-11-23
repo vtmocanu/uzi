@@ -37,8 +37,9 @@ for (const scenario of [
   test(title, { skip: P_LAYER_SKIP }, async (t) => {
     recordEvidence(title, "fail");
     const resolved = resolveCodexBin();
-    assert.ok(process.env.TMPDIR && path.isAbsolute(process.env.TMPDIR), "absolute scratch TMPDIR required");
-    const parent = await fs.mkdtemp(path.join(process.env.TMPDIR, "provider-production-root-"));
+    const scratch = path.resolve(__dirname, "../../.uzi/scratch");
+    mkdirSync(scratch, { recursive: true });
+    const parent = await fs.mkdtemp(path.join(scratch, "provider-production-root-"));
     t.after(() => fs.rm(parent, { recursive: true, force: true }));
     const priorLoopback = process.env.UZI_PROVIDER_ALLOW_LOOPBACK;
     process.env.UZI_PROVIDER_ALLOW_LOOPBACK = "true";

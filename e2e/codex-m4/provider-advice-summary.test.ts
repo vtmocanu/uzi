@@ -34,8 +34,9 @@ import { P_LAYER_SKIP } from "./p-platform.js";
 test(PROVIDER_ADVICE_SUMMARY_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   recordEvidence(PROVIDER_ADVICE_SUMMARY_TITLE, "fail");
   const resolved = resolveCodexBin();
-  assert.ok(process.env.TMPDIR && path.isAbsolute(process.env.TMPDIR), "absolute scratch TMPDIR required");
-  const parent = await fs.mkdtemp(path.join(process.env.TMPDIR, "provider-advice-summary-"));
+  const scratch = path.resolve(__dirname, "../../.uzi/scratch");
+  mkdirSync(scratch, { recursive: true });
+  const parent = await fs.mkdtemp(path.join(scratch, "provider-advice-summary-"));
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
   const priorLoopback = process.env.UZI_PROVIDER_ALLOW_LOOPBACK;
   process.env.UZI_PROVIDER_ALLOW_LOOPBACK = "true";
