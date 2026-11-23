@@ -248,8 +248,12 @@ agent writes to the usual config files in the home is not read, so it does not
 apply at the next start. With a single user (some small installs) there is no
 such protection, because the agent has the worker's own permissions. If something
 unexpected sits at that path, the worker moves it aside (`.uzi-claude-config.stale-*`,
-`.claude.stale-*`) and rebuilds; it fails the run instead of starting the CLI only
-when it cannot do that, for example on a read-only data volume. ADR-4416 has the
+`.claude.stale-*`) and rebuilds. It fails the run instead of starting the CLI when
+it cannot do that or cannot trust the layout: the rename fails (for example a
+read-only data volume), the home directory fails the worker's ownership and parent
+mode checks, preparing the transcript directories fails again after the one retry
+or fails for another reason (a transient spawn failure refuses that start only), or
+the directory keeps changing while the worker prepares it. ADR-4416 has the
 details and the limits.
 
 ## Name and value rules

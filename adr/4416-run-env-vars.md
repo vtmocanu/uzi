@@ -126,7 +126,8 @@ later rule denies can still be removed.
   invalid vault still parks the run as `run_env_history_unavailable`.
   The variable list and write responses (`api/internal/handler/run_env_vars.go`) open plain values at
   the epoch read with them (the write response at the epoch locked in its transaction), so a value
-  is never shown that was opened at a different epoch than its row.
+  is never shown that was opened at a different epoch than its row. The one exception is the no-op
+  description save, which reads no epoch and opens with a lock-state check instead.
 - `run_env_v1` (`api/internal/capability`) is required by `ClaimRun` for a lead-lane run whose
   repo has an enabled live variable or that holds a secret receipt, as a standalone clause in
   `api/internal/store/queries/runtime.sql`. The same condition is mirrored in fleet-aware placement
@@ -410,15 +411,16 @@ every Claude CLI start in every lane, the worker:
    path through a symlink and never deletes anything in it;
 3. creates the `HOME/.claude/projects` and `HOME/.claude/tasks` targets as the runner uid with a
    fixed `/bin/mkdir -p -m 700` argv, so they are runner-owned and private, as when the CLI made
-   them. The worker never writes or renames anything inside `.claude`. A mkdir that completes
-   with a non-zero exit (a planted non-directory, an unsearchable `.claude`) renames `.claude`
-   aside once and retries (transcripts stay in the aside copy, so a resume of that session finds
-   none); a second such exit refuses the start. A transient failure (spawn error, signal,
-   timeout) only refuses that start and leaves `.claude`, and the shared chat root's transcripts,
-   in place;
-4. refuses the start, with no spawn, when it cannot do the above. `spawnDetached` also refuses
-   unless `env.CLAUDE_CONFIG_DIR` equals that exact path, and refuses a start that carries a
-   provider credential but no `HOME` (the CLI would fall back to the runner's passwd home).
+   them. The worker never writes or renames anything inside `.claude`. Only a mkdir that
+   completes with exit status 1 (a planted non-directory, an unsearchable `.claude`) renames
+   `.claude` aside once and retries (transcripts stay in the aside copy, so a resume of that
+   session finds none); a second exit 1 refuses the start. Any other failure (spawn error, signal,
+   timeout, another non-zero exit such as a `setpriv` failure) refuses that start only and leaves
+   `.claude`, and the shared chat root's transcripts, in place;
+4. refuses the start, with no spawn, when it cannot do the above. When `HOME` is set,
+   `spawnDetached` also refuses unless `env.CLAUDE_CONFIG_DIR` equals that exact path; a start that
+   carries a provider credential but no `HOME` is refused (the CLI would fall back to the runner's
+   passwd home).
    `CLAUDE_CONFIG_DIR` is a protected env key (`agent/src/sdk-env.ts`), so a run variable cannot
    set it.
 
@@ -444,9 +446,9 @@ module relies on and does not create (`agent/templates/entrypoint.sh`):
   `homeRoot: sdkHomeRoot`), live in `agent-home`, a sticky 3775 root (setgid, group-write, sticky),
   so a runner-group member that does not own an entry cannot rename or replace it.
 - Job HOMEs live under the `jobs` root, in per-run trees that are 2750 under the split (`agent/src/job-workspace.ts`).
-- The data root on a hosted volume is 2775 with group 10001, restored by `align_pvc_root`. It is
-  group-writable and not sticky, and the chat HOME is `agent-home` itself, so the worker does not
-  refuse that parent: refusing it would stop every chat start.
+- The data root on a hosted volume is 2775 with group 10001, restored by `align_pvc_root` when the
+  epoch lock is not in use. It is group-writable and not sticky, and the chat HOME is `agent-home`
+  itself, so the worker does not refuse that parent: refusing it would stop every chat start.
 - The worker refuses a HOME whose parent is world-writable and not sticky, and one whose parent is
   group-writable and not sticky with a runner, runner-cmd or codex-session gid (10002, 10003,
   10004), since the runner could then rename HOME's entry. The hosted 2775 data root (group 10001)
@@ -478,15 +480,16 @@ allowance. See [ADR-2332](2332-sdk-spill-read-allowance.md).
   good directory (same inode, no stale copy), rebuild of a tampered one-uid 0555 directory (extra
   entry, retargeted link, other bytes, other mode), symlinked `.claude` and `projects` moved aside
   and never followed, a regular file at `.claude/projects` or `.claude/tasks` recovered, the
-  runner mkdir exiting non-zero once (retry after rename aside) and twice (refusal), a transient
+  runner mkdir exiting 1 once (retry after rename aside) and twice (refusal), a transient or other
   mkdir failure (refusal, `.claude` kept), the `spawnDetached`
   refusals (mismatched `CLAUDE_CONFIG_DIR`, credential without `HOME`), the HOME parent cases
   (world-writable non-sticky, runner-gid group-writable non-sticky refused; hosted 2775 and
   sticky accepted), per-step hostile-process scenarios, concurrent prepares, and `rmHomeTree`
   removing the HOME with the directory and its aside copies.
-- `agent/test/sdk-executor-global-config.test.ts`, through the real executor and spawn path: a
-  run-written env block (`OTEL_LOG_RAW_API_BODIES` and other denied names) planted at the old
-  locations never reaches the CLI process.
+- `agent/test/sdk-executor-global-config.test.ts`, through the real executor and spawn path: the CLI
+  process is pointed at the prepared directory and sees the fixed bytes (its fake CLI reads only that
+  directory). It does not show that a planted env block never reaches the CLI; the claim that planted
+  old-location files are ignored rests on the "Planted config ignored" CLI probe below.
 - `agent/test/sdk-env.test.ts`, `agent/test/sdk-spawn.test.ts` and `agent/test/guardrails.test.ts`:
   the `CLAUDE_CONFIG_DIR` env value and protected key, the spawn seam, and the config-dir
   transcript path in the spill allowance.
@@ -497,7 +500,7 @@ allowance. See [ADR-2332](2332-sdk-spill-read-allowance.md).
 real account involved). Command shape, one per run:
 `env -i PATH=/usr/bin:/bin HOME=<home> ANTHROPIC_API_KEY=<fake> ANTHROPIC_BASE_URL=http://127.0.0.1:<port> DISABLE_TELEMETRY=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CONFIG_DIR=<home>/.uzi-claude-config timeout <T> <claude> -p hi </dev/null`,
 against a fake Messages API (a second loopback server served as the "planted" target to detect
-any redirect). The tool probes add `--permission-mode bypassPermissions --allowedTools <Tool>` and a
+any redirect). Every probe used `-p` mode; SDK mode was not probed. The tool probes add `--permission-mode bypassPermissions --allowedTools <Tool>` and a
 fake server that answers with a `tool_use` and then ends the turn. Results:
 
 - **Layout.** Only `.claude.json` (0444, `{"hasCompletedOnboarding":true,"numStartups":1}`) and
@@ -513,16 +516,21 @@ fake server that answers with a `tool_use` and then ends the turn. Results:
   `HOME/.claude/.claude.json` and `HOME/.claude/settings.json`, each with an `env` block pointing
   `ANTHROPIC_BASE_URL` at the second server, had no effect with `CLAUDE_CONFIG_DIR` set (all
   requests reached the real base, none the planted one; directory 0755 and 0555). The controls
-  without `CLAUDE_CONFIG_DIR` applied them (the planted server received the requests).
+  without `CLAUDE_CONFIG_DIR` applied them (the planted server received the requests) for three of
+  the four planted files; there is no control for `HOME/.claude/.claude.json`, so that file's
+  being ignored is shown only by the absence of an effect.
 - **R2, a write during a running CLI.** The detector is `OTEL_LOG_RAW_API_BODIES=file:<dir>`, which
   makes the CLI write a request file per API call into `<dir>`. A control with the `env` block
   present at startup wrote request files (so the detector is sensitive and the block is applied at
   startup). An `env` block written into the config by atomic rename five seconds into a 40 second
   run (both files, `.claude.json` only, `.config.json` only) wrote no request file and redirected
-  nothing: the environment is read once at startup.
+  nothing. This shows the config is not re-read during a running process, with a fake API
+  returning 500 and the CLI retrying (no completed turn), in `-p` mode only, not SDK mode.
 - **R4, an unsigned remote settings file.** `{"env":{"ANTHROPIC_BASE_URL":"<planted>"}}` in
-  `remote-settings.json` was never applied: in the config directory, in `HOME/.claude`, in both,
-  and with `CLAUDE_CONFIG_DIR` pointed at `HOME/.claude`. An empty read-only file and `{}` also
+  `remote-settings.json`: an unsigned env block in it was not applied (fake-key, no-account
+  session; the probe has no positive control, so it does not show the CLI never reads the file) in
+  the config directory, in `HOME/.claude`, in both, and with `CLAUDE_CONFIG_DIR` pointed at
+  `HOME/.claude`. An empty read-only file and `{}` also
   start cleanly. **Scope: this was a no-account session with a fake key only.** A real OAuth
   subscription login was not tested; see "Pending owner acceptance" below.
 - **Tools.** With a 0555 directory holding `.claude.json` and `projects`: Bash, Read, Write and
@@ -532,14 +540,18 @@ fake server that answers with a `tool_use` and then ends the turn. Results:
   (sourced by Bash), `plugins`, `hooks`, `skills`, `commands`, `agents`, `rules` (configuration and
   code). Interactive and SDK-mode `TodoWrite` were not probed.
 - **Transcripts and resume.** The CLI writes `projects/<slug-of-cwd>/<session>.jsonl` through the
-  link into `HOME/.claude/projects`, in both modes. `--resume <session-id>` and `-c` (same cwd)
-  appended to the same file; a made-up session id exits 1 (so resume does find real sessions).
+  link into `HOME/.claude/projects`, with the directory at 0755 and at 0555. `--resume <session-id>`
+  and `-c` (same cwd) appended to the same file and were probed with the directory at 0755 only
+  (the 0555 tool probe covered tools, not resume); a made-up session id exits 1 (so resume does
+  find real sessions).
 
 **Two-uid evidence (e2e).** `e2e/home-uid-split/fixture.test.ts`, run with
-`task test:home-uid-split` against a freshly built worker image (12 of 12 pass). The case "the
+`task test:home-uid-split` against a freshly built worker image of the final tree of this change
+(re-run at the final tree; see the PR verification list). The case "the
 runner cannot change, move or replace the prepared Claude config directory, and a re-prepare reuses
-it (#4416)" shows that the runner and runner-cmd cannot write, replace, rename or chmod the config
-directory or its file, and cannot rename HOME; that a re-prepare keeps the same inode; and that
+it (#4416)" shows that the runner cannot write, replace, rename or chmod the config
+directory or its file and that runner-cmd cannot write or `mv` it (runner-cmd chmod was not
+checked), and that neither can rename HOME; that a re-prepare keeps the same inode; and that
 `rmHomeTree` reclaims a HOME holding the directory. The case "a runner-planted file at
 .claude/projects does not refuse the start: .claude is moved aside and rebuilt (#4416)" shows the
 recovery described under R3.
@@ -551,26 +563,36 @@ recovery described under R3.
   directory and its file are worker-owned and the runner cannot write or move them (e2e above). A
   live process can still plant files elsewhere under HOME, which the CLI does not read. With one
   uid the limit above applies.
-- **R2, a write during a running CLI: verified.** A mid-process write has no effect (probe above),
-  and the runner cannot write the file anyway under the split.
-- **R3, a planted entry at a path the worker needs: recovered, with one fail-closed case; follow-up
-  documented.** A file, symlink or wrong-mode entry at `<HOME>/.uzi-claude-config`, or a
+- **R2, a write during a running CLI: probed, `-p` mode only.** In the probe the config was not
+  re-read during a running process (fake API returning 500, CLI retrying, no completed turn; SDK
+  mode not probed), and the runner cannot write the file anyway under the split.
+- **R3, a planted entry at a path the worker needs: recovered, with several fail-closed cases;
+  follow-up documented.** A file, symlink or wrong-mode entry at `<HOME>/.uzi-claude-config`, or a
   non-directory `.claude`, `projects` or `tasks` is renamed aside and rebuilt, so a planted entry no
   longer refuses every later start of a HOME, the shared chat HOME included. What still fails
-  closed: the rename aside itself failing (for example a read-only data volume), a second runner
-  mkdir non-zero exit after the one retry, a transient mkdir failure (that start only), and a HOME
-  that fails the boundary checks. Asides (`.claude.stale-*`, `.uzi-claude-config.stale-*`) are not
+  closed (the start is refused, nothing is spawned):
+  - the rename aside itself failing (for example a read-only data volume);
+  - a second mkdir exit 1 after the one retry;
+  - a transient or other mkdir failure (spawn error, signal, timeout, another non-zero exit such as
+    a `setpriv` failure): that start only, `.claude` kept;
+  - a non-zero mkdir of `.claude` itself;
+  - a HOME that fails the boundary checks (not worker-owned under the split, a world-writable
+    non-sticky parent, or a runner-gid group-writable non-sticky parent);
+  - the directory changing past the bounded number of attempts ("kept changing").
+
+  Asides (`.claude.stale-*`, `.uzi-claude-config.stale-*`) are not
   reclaimed automatically in a HOME that is never torn down, such as the shared chat root; each
   start makes at most a bounded number, and across starts they accumulate until removed. The run, or the
   chat, then fails with the refusal "Claude CLI config directory could not be prepared by the
-  worker" or "Claude CLI config directory refused: <reason>". Operator recovery: fix the cause (for
-  example a read-only mount) and start again; nothing else is needed. When space matters, remove
+  worker" or "Claude CLI config directory refused: <reason>". Operator recovery by class: make the
+  data volume writable; check HOME and its parent modes against the entrypoint layout
+  (`agent/templates/entrypoint.sh`); for a transient failure (load, spawn) start again. When space matters, remove
   the aside copies, `agent-home/.uzi-claude-config.stale-*` and `agent-home/.claude.stale-*` (and
   the same names under a per-run `agent-home/<runId>`); a HOME that is reclaimed takes its own asides
   with it (`rmHomeTree`). The owner marked this documented, not further automated.
-- **R4, other agent-writable CLI inputs: verified for the no-account probe only.** Unsigned
-  `remote-settings.json` env was never applied in a fake-key, no-account session, and the CLI does
-  not read it from `HOME/.claude` when `CLAUDE_CONFIG_DIR` is set. Managed settings
+- **R4, other agent-writable CLI inputs: probed in a no-account session only.** An unsigned env
+  block in `remote-settings.json` was not applied (fake-key, no-account session; no positive
+  control), including with the file in `HOME/.claude` while `CLAUDE_CONFIG_DIR` is set. Managed settings
   (`/etc/claude-code`) are root-owned and absent from the image.
 
 **Pending owner acceptance (not verified).** Whether a real OAuth subscription session applies an
