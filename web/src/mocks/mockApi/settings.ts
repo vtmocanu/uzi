@@ -632,18 +632,35 @@ function mockPlanningModel(raw: string | null | undefined, harness: Harness = "c
   return trimmed;
 }
 
-// The mock has no lead-template pin; each default follows its worker lane or built-in.
-function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude"): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" })[] {
+// Each default follows the server's agenttmpl.ResolveWorkerDefaultModel, as planningModelCells
+// composes it: the worker lane (user_default), else the lead template's pin for the harness
+// (template), else the built-in.
+function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude", leadPin: string | null = null): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" | "template" })[] {
   const valid = (m: string) => harness === "codex" ? !KNOWN_CLAUDE_ALIASES.includes(m) : !CODEX_ROLE_MODELS.includes(m);
   const laneModel = lane?.trim() ?? "";
+  const pin = leadPin?.trim() ?? "";
   const def = laneModel !== "" && valid(laneModel)
     ? { model: laneModel, source: "user_default" as const }
-    : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" as const };
+    : pin !== "" && valid(pin)
+      ? { model: pin, source: "template" as const }
+      : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" as const };
   const stored = planning?.trim() ?? "";
   const set = stored !== "" && valid(stored);
   return [{ harness, model: planning ?? null,
     default_model: def.model, default_source: def.source,
     resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source }];
+}
+
+// The lead template's per-harness model pin the planning Defaults resolve through (the server's
+// leadClaudePin / leadCodexPin). A delivered mock lead template's Claude model wins; otherwise the
+// active recording's template-sourced worker default, since each recording was taken with its
+// lead template pinned. So the planning cells name the same default the effective view predicts.
+function mockLeadModelPins(): Record<Harness, string | null> {
+  const recorded = (h: Harness) => {
+    const c = recordedEffectiveScenario().get.models?.find(m => m.setting === "worker_model" && m.harness === h);
+    return c?.default_source === "template" ? c.default_model : null;
+  };
+  return { claude: (state.session ? mockDefaultClaudeModel() : null) ?? recorded("claude"), codex: recorded("codex") };
 }
 
 function mockPlanningEffortCells(
@@ -716,7 +733,8 @@ function mySettingsResponse(): { settings: UserSettings } {
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
   const leadEfforts = state.session ? mockLeadTemplateEfforts() : { claude: null, codex: null };
-  const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex")];
+  const leadPins = mockLeadModelPins();
+  const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model, "claude", leadPins.claude), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex", leadPins.codex)];
   const planning_efforts = [...mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort, "claude", leadEfforts.claude), ...mockPlanningEffortCells(userSettings.planning_codex_effort, userSettings.default_codex_effort, "codex", leadEfforts.codex)];
   const task_review_efforts = mockTaskReviewEffortCells(
     { claude: userSettings.task_review_effort, codex: userSettings.codex_task_review_effort },
@@ -979,7 +997,7 @@ function withPlanning(view: EffectiveSettings): EffectiveSettings {
     const model = userSettings[`planning_${harness}_model`], effort = userSettings[`planning_${harness}_effort`];
     if (model !== undefined) {
       const lane = userSettings[`default_${harness}_model`];
-      const [m] = mockPlanningModelCells(model, lane, harness);
+      const [m] = mockPlanningModelCells(model, lane, harness, mockLeadModelPins()[harness]);
       const inherited = lane != null ? m : view.models.find(c => c.setting === "worker_model" && c.harness === harness) ?? m;
       const resolved = model === null ? inherited : m;
       view.models = view.models.map(c => c.setting !== "planning_model" || c.harness !== harness ? c

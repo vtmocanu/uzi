@@ -4,7 +4,7 @@
 // is SAVED ("Saved effective value: …"), and a draft that differs from it marks the cell
 // Unsaved with a brand rail and border rather than pretending to predict the unsaved edit.
 
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import type { ModelsField } from "../../lib/modelsDraft";
 import { cx } from "../ui";
 import { harnessName } from "./modelsLabels";
@@ -41,25 +41,40 @@ export function ModelsCell({
   const errorId = `${idBase}-error`;
   const describedBy = [predictionId, reason ? reasonId : "", error ? errorId : ""].filter(Boolean).join(" ");
   const family = field.family ? harnessName(field.family) : null;
+  const root = useRef<HTMLDivElement>(null);
+  // An errored cell marks its controls aria-invalid. ModelSelect and EffortSelect are shared
+  // pickers with no aria-invalid prop, so the cell sets it on its own select/input; it runs
+  // after every render because the custom model ID box mounts and unmounts.
+  useLayoutEffect(() => {
+    root.current?.querySelectorAll("select, input").forEach((el) => {
+      if (error) el.setAttribute("aria-invalid", "true");
+      else el.removeAttribute("aria-invalid");
+    });
+  });
   return (
     <div
+      ref={root}
       data-field={field.key}
       data-dirty={dirty ? "true" : undefined}
       className={cx(
         // scroll-mb keeps a keyboard-focused control clear of the sticky Save bar.
         "min-w-0 space-y-1.5 border-l-2 pl-3 transition-colors motion-reduce:transition-none [&_input]:scroll-mb-40 [&_select]:scroll-mb-40",
+        // Brand orange means Unsaved here, so focus takes the foreground tone instead (border and
+        // keyboard ring), and a focused unsaved control never reads as one signal. fg is the
+        // text colour, so the ring keeps well over 3:1 against the page in every theme.
+        "[&_input:focus]:border-fg/60 [&_select:focus]:border-fg/60 [&_input:focus-visible]:ring-fg [&_select:focus-visible]:ring-fg",
         // An error outranks the Unsaved accent: one rail colour per cell, never two competing.
         error
           ? "border-danger [&_input]:border-danger/70 [&_select]:border-danger/70"
           : dirty
             ? "border-brand [&_input]:border-brand/70 [&_select]:border-brand/70"
             : "border-transparent",
-        wide && "sm:col-span-2",
+        wide && "md:col-span-2",
       )}
     >
       {/* The accessible name is "<Row> — <Family>"; the visible part is the family alone, and
-          only below sm, where the column headers are hidden and the cells stack. */}
-      <label htmlFor={control} className={cx("block text-xs font-medium text-muted", family ? "sm:sr-only" : "sr-only")}>
+          only below md, where the column headers are hidden and the cells stack. */}
+      <label htmlFor={control} className={cx("block text-xs font-medium text-muted", family ? "md:sr-only" : "sr-only")}>
         {family ? (
           <>
             <span className="sr-only">{field.row} {"—"} </span>

@@ -16,10 +16,15 @@ import { Button } from "../ui";
 
 export function UnsavedModelsGuard({
   dirtyCount,
+  saving = false,
   viewerId,
   onDiscard,
 }: {
   dirtyCount: number;
+  /** A save is in flight: discarding now could not stop the PUT from committing the
+   *  "discarded" values, so Discard waits. A success leaves nothing dirty and the blocked
+   *  navigation proceeds; a failure re-enables Discard. */
+  saving?: boolean;
   /** The viewer whose draft this is. */
   viewerId: string;
   /** Drops the draft back to the saved baseline before the blocked navigation proceeds. */
@@ -65,6 +70,7 @@ export function UnsavedModelsGuard({
   if (blocker.state !== "blocked" || !dirty) return null;
   const stay = () => blocker.reset();
   const discard = () => {
+    if (saving) return;
     onDiscard();
     blocker.proceed();
   };
@@ -72,15 +78,16 @@ export function UnsavedModelsGuard({
     <Modal label="You have unsaved model changes" onClose={stay}>
       <div className="w-full max-w-md space-y-4 rounded-xl border border-edge bg-surface p-5 shadow-2xl">
         <h2 className="text-base font-semibold text-fg">You have unsaved model changes</h2>
-        <p className="text-sm text-muted">
-          {dirtyCount === 1 ? "1 change is" : `${dirtyCount} changes are`} not saved yet. Stay to review and
-          save, or discard and continue.
+        <p role="status" aria-live="polite" className="text-sm text-muted">
+          {saving
+            ? `Saving ${dirtyCount === 1 ? "1 change" : `${dirtyCount} changes`}… You continue once the save finishes.`
+            : `${dirtyCount === 1 ? "1 change is" : `${dirtyCount} changes are`} not saved yet. Stay to review and save, or discard and continue.`}
         </p>
         <div className="flex flex-wrap justify-end gap-2">
           <Button type="button" variant="secondary" onClick={stay}>
             Stay
           </Button>
-          <Button type="button" variant="danger" onClick={discard}>
+          <Button type="button" variant="danger" disabled={saving} onClick={discard}>
             Discard changes
           </Button>
         </div>

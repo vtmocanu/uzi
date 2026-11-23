@@ -248,6 +248,59 @@ describe("unsaved-changes guard", () => {
     expect(unloads(add)).toHaveLength(2);
   }, 30000);
 
+  // Discarding while the PUT is in flight could not stop it committing the "discarded" values,
+  // so the dialog waits: Discard is disabled while saving, Stay still works, a successful save
+  // proceeds on its own (nothing is left dirty), and a failed save re-enables Discard.
+  function deferNextSave() {
+    const real = mockApi.putMyModelSettings.bind(mockApi);
+    let release: () => void = () => {};
+    vi.spyOn(mockApi, "putMyModelSettings").mockImplementationOnce(
+      (patch) => new Promise((resolve) => { release = () => resolve(real(patch)); }),
+    );
+    return () => release();
+  }
+
+  it("while a save is in flight the dialog waits; a successful save then proceeds with the saved values", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    const release = deferNextSave();
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await act(() => router.navigate("/settings/appearance"));
+    const open = await screen.findByRole("dialog", { name: DIALOG });
+    expect(open.textContent).toContain("Saving 1 change");
+    const discard = within(open).getByRole("button", { name: "Discard changes" }) as HTMLButtonElement;
+    expect(discard.disabled).toBe(true);
+    fireEvent.click(discard);
+    expect(path(router)).toBe("/settings/models");
+    // Stay still works while saving.
+    fireEvent.click(within(open).getByRole("button", { name: "Stay" }));
+    await waitFor(() => expect(dialog()).toBeNull());
+    await act(() => router.navigate("/settings/appearance"));
+    await screen.findByRole("dialog", { name: DIALOG });
+    await act(async () => release());
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"), { timeout: 5000 });
+    expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: "gpt-6-sol" });
+  }, 30000);
+
+  it("a save that fails while the dialog is open re-enables Discard, which then discards and proceeds", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    const release = deferNextSave();
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await act(() => router.navigate("/settings/appearance"));
+    const open = await screen.findByRole("dialog", { name: DIALOG });
+    expect((within(open).getByRole("button", { name: "Discard changes" }) as HTMLButtonElement).disabled).toBe(true);
+    failNextMockModelSettingsWrite("write_failed");
+    await act(async () => release());
+    await waitFor(() =>
+      expect((within(open).getByRole("button", { name: "Discard changes" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(open.textContent).toContain("1 change is not saved yet");
+    fireEvent.click(within(open).getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+    expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: null });
+  }, 30000);
+
   it("logout while dirty reaches /login without the dialog", async () => {
     const router = await openModels();
     select("Worker model — Codex", "gpt-6-sol");

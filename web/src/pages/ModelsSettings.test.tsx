@@ -374,14 +374,20 @@ describe("Models page", () => {
     select("Worker model — Codex", "gpt-6-sol");
     expect(status()).toBe("1 unsaved change: Worker model — Codex");
     expect(describedText("Worker model — Claude")).toContain("Enter a custom model ID, or choose Default.");
+    // The errored cell's controls are aria-invalid; a clean neighbour's are not.
+    expect(control("Worker model — Claude").getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByLabelText("Worker model — Claude, custom model ID").getAttribute("aria-invalid")).toBe("true");
+    expect(control("Worker model — Codex").hasAttribute("aria-invalid")).toBe(false);
     expect(saveButton().disabled).toBe(true);
     fireEvent.click(discardButton());
     expect(control("Worker model — Claude").value).toBe("inherit");
     expect(screen.queryByLabelText("Worker model — Claude, custom model ID")).toBeNull();
     expect(describedText("Worker model — Claude")).not.toContain("Enter a custom model ID");
-    // With only the non-dirty empty custom entry left, Discard still clears it.
+    expect(control("Worker model — Claude").hasAttribute("aria-invalid")).toBe(false);
+    // With only the non-dirty empty custom entry left, the bar says what blocks Save rather
+    // than "No unsaved changes", and Discard still clears it.
     select("Worker model — Claude", "custom");
-    expect(status()).toBe("No unsaved changes");
+    expect(status()).toBe("Fix 1 value before saving");
     expect(discardButton().disabled).toBe(false);
     fireEvent.click(discardButton());
     expect(control("Worker model — Claude").value).toBe("inherit");

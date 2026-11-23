@@ -33,7 +33,7 @@ function OutcomeAlert({ outcome, onReload, reloading }: { outcome: SaveOutcome; 
   );
   switch (outcome.kind) {
     case "saved":
-      return <Alert tone="success" message={`Saved ${plural(outcome.count, "change", "changes")}. Your next runs use them.`} />;
+      return <Alert tone="success" message={`Saved ${plural(outcome.count, "change", "changes")}. Your next runs use ${outcome.count === 1 ? "it" : "them"}.`} />;
     case "saved_no_prediction":
       return withReload(
         <Alert
@@ -91,7 +91,7 @@ export function ModelsSaveBar({
   dirtyRows,
   saving,
   busy,
-  blocked,
+  blockedCount,
   outcome,
   reloading,
   onDiscard,
@@ -102,14 +102,15 @@ export function ModelsSaveBar({
   saving: boolean;
   /** A save or a reload is in flight: Save and Discard wait for it. */
   busy: boolean;
-  /** A local problem (an empty custom model ID) that must be fixed before saving. */
-  blocked: boolean;
+  /** Values with a local problem (an empty custom model ID) that must be fixed before saving. */
+  blockedCount: number;
   outcome: SaveOutcome | null;
   reloading: boolean;
   onDiscard: () => void;
   onReload: () => void;
 }) {
   const count = dirtyRows.length;
+  const blocked = blockedCount > 0;
   return (
     <section
       aria-label="Save model changes"
@@ -124,6 +125,10 @@ export function ModelsSaveBar({
         <p role="status" aria-live="polite" data-testid="models-save-status" className="min-w-0 text-sm sm:flex-1">
           {saving ? (
             <span className="text-fg">Saving {plural(count, "change", "changes")}{"…"}</span>
+          ) : count === 0 && blocked ? (
+            // Nothing differs from what is saved, but a cell still blocks Save (an "Other" picker
+            // with an empty box), so say what to do rather than "No unsaved changes".
+            <span className="font-semibold text-fg">Fix {plural(blockedCount, "value", "values")} before saving</span>
           ) : count === 0 ? (
             <span className="text-muted">No unsaved changes</span>
           ) : (

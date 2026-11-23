@@ -56,9 +56,10 @@ export function predictionText(field: ModelsField, effective: EffectiveSettings 
     const value = effective.start?.find((c) => c.choice === "default")?.harness;
     if (!value) return null;
     const notes = (value.notes ?? []).map((n) => modelSettingSourceLabel("note", n));
-    const shown = value.value === "claude" || value.value === "codex"
-      ? HARNESS_NAME[value.value]
-      : modelSettingSourceLabel("harness", "chosen_at_create");
+    // No fixed harness reads "Automatic", matching the select's "Default · automatic", so the
+    // source label ("chosen when the run is created", or a note such as "chosen by the soonest
+    // weekly reset") says how it is chosen without repeating "chosen".
+    const shown = value.value === "claude" || value.value === "codex" ? HARNESS_NAME[value.value] : "Automatic";
     const source = notes.length > 0 ? notes.join(", ") : modelSettingSourceLabel("harness", value.source);
     return shown === source ? shown : `${shown} · ${source}`;
   }

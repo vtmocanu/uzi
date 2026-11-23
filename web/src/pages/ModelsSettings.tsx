@@ -50,7 +50,7 @@ import {
 } from "../components/models/modelsLabels";
 
 // The grid's three-track template, shared by the header and every row so the columns align.
-const ROW_GRID = "sm:grid sm:grid-cols-[minmax(9rem,13rem)_minmax(0,1fr)_minmax(0,1fr)] sm:gap-x-6";
+const ROW_GRID = "md:grid md:grid-cols-[minmax(9rem,13rem)_minmax(0,1fr)_minmax(0,1fr)] md:gap-x-6";
 
 interface RowDef {
   row: string;
@@ -120,8 +120,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
   // (whose value never changed, so it would not re-derive) returns to its stored option.
   const [pickerGeneration, setPickerGeneration] = useState(0);
-  // Save and Reload never overlap: each disables the other, so neither can outrank the other's
-  // request token and leave its busy flag set.
+  // Save and Reload never overlap: while either is in flight, both are disabled, so neither
+  // request can supersede the other's token.
   const busy = saving || reloading;
 
   // A response is installed only if it answers the newest request, for this viewer, while
@@ -222,8 +222,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         setOutcome({ kind: "unknown" });
       }
     } finally {
-      // Cleared whenever still mounted, not only for the newest request: a busy flag left set
-      // by a superseded request would disable its button for good.
+      // Cleared whenever still mounted, even if a newer request token was issued meanwhile
+      // (e.g. the viewer-fenced load): a saving flag left set would disable Save for good.
       if (mounted.current) setSaving(false);
     }
   };
@@ -341,7 +341,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
   return (
     <form onSubmit={(e) => void save(e)} className="space-y-4 pb-6" noValidate>
-      <UnsavedModelsGuard dirtyCount={dirty.length} viewerId={viewerId} onDiscard={discard} />
+      <UnsavedModelsGuard dirtyCount={dirty.length} saving={saving} viewerId={viewerId} onDiscard={discard} />
       <fieldset disabled={busy} className="min-w-0 space-y-4 disabled:opacity-80">
         <legend className="sr-only">Model settings</legend>
         <Card className="space-y-1">
@@ -353,7 +353,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
           {/* Default harness: one choice for both families. */}
           <div className={`border-t border-edge pt-4 mt-4 ${ROW_GRID}`}>
-            <div className="mb-3 sm:mb-0">
+            <div className="mb-3 md:mb-0">
               <h3 className="text-sm font-medium text-fg">Default harness</h3>
               <p className="text-xs text-faint">
                 Used when a run or schedule doesn't choose one. Switching keeps both families' choices below.
@@ -398,11 +398,11 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
               </div>
               {group.rows.map(({ row, description }) => (
                 <div key={row} data-row={row} className={`border-t border-edge py-4 ${ROW_GRID}`}>
-                  <div className="mb-3 sm:mb-0">
+                  <div className="mb-3 md:mb-0">
                     <h4 className="text-sm font-medium text-fg">{row}</h4>
                     <p className="text-xs text-faint">{description}</p>
                   </div>
-                  <div className="space-y-4 sm:contents">
+                  <div className="space-y-4 md:contents">
                     {(["claude", "codex"] as const).map((h) => {
                       const field = fieldFor(row, h);
                       return (
@@ -422,7 +422,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         dirtyRows={dirtyRows}
         saving={saving}
         busy={busy}
-        blocked={customEmpty.size > 0}
+        blockedCount={customEmpty.size}
         outcome={outcome}
         reloading={reloading}
         onDiscard={discard}

@@ -1,5 +1,5 @@
-// PRD #3263 M1 in a real browser (layout needs a layout engine): below 640px the grid's
-// cells stack under their row with a visible family label; from 640px Claude and Codex sit
+// PRD #3263 M1 in a real browser (layout needs a layout engine): below 768px the grid's
+// cells stack under their row with a visible family label; from 768px Claude and Codex sit
 // side by side under column headers; the sticky Save bar never covers the last row; and every
 // control's computed accessible name is "<Row> — <Family>".
 import "../index.css";
@@ -54,7 +54,8 @@ async function mount(width: number) {
   await page.viewport(width, 700);
   const router = createMemoryRouter([{ path: "*", element: <ModelsSettings /> }], { initialEntries: ["/settings/models"] });
   render(
-    <div className="px-4">
+    // AppShell's <main> padding, which the settings tab row's negative margins assume.
+    <div className="px-4 sm:px-6">
       <RouterProvider router={router} />
     </div>,
   );
@@ -87,8 +88,9 @@ afterEach(() => {
 });
 
 describe("Models grid layout", () => {
-  it("stacks the cells below 640px, each with a visible family label", async () => {
-    await mount(390);
+  // 700px is inside the 640-768 band where three tracks would squeeze each select to ~163px.
+  it.each([390, 700])("stacks the cells below 768px (%ipx), each with a visible family label", async (width) => {
+    await mount(width);
     for (const row of ["Worker model", "Planning effort"]) {
       const claude = rect(cellOf(`${row} — Claude`));
       const codex = rect(cellOf(`${row} — Codex`));
@@ -107,12 +109,12 @@ describe("Models grid layout", () => {
     expect(bar.bottom).toBeLessThanOrEqual(window.innerHeight + 0.5);
     expect(bar.top).toBeLessThan(window.innerHeight);
     // Nothing overflows the narrow viewport sideways.
-    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
     expectBarClearsLastRow();
   });
 
-  it("puts Claude and Codex side by side from 640px, labelled by the column headers", async () => {
-    await mount(1024);
+  it.each([768, 1024])("puts Claude and Codex side by side from 768px (%ipx), labelled by the column headers", async (width) => {
+    await mount(width);
     const claude = rect(cellOf("Worker effort — Claude"));
     const codex = rect(cellOf("Worker effort — Codex"));
     expect(Math.abs(codex.top - claude.top)).toBeLessThan(1);
