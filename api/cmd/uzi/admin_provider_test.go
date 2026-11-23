@@ -80,6 +80,7 @@ func TestAdminProviderListJSONAndEmpty(t *testing.T) {
 
 func TestAdminProviderGetByIDAndName(t *testing.T) {
 	fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{sharedAdminFixture(sharedTestID, "Corp Shared")}}
+	wantGets := 0
 	for _, arg := range []string{sharedTestID, "corp shared"} {
 		out, errOut, code := runCLI(t, fakeEnv(fc), "admin", "provider", "get", arg)
 		if code != uzicli.ExitOK {
@@ -94,6 +95,10 @@ func TestAdminProviderGetByIDAndName(t *testing.T) {
 		if fc.LastProviderID != sharedTestID {
 			t.Errorf("get %q fetched id %q", arg, fc.LastProviderID)
 		}
+		wantGets++
+		if fc.SharedProviderGets != wantGets {
+			t.Errorf("get %q: SharedProviderGets = %d, want %d", arg, fc.SharedProviderGets, wantGets)
+		}
 	}
 	out, _, code := runCLI(t, fakeEnv(fc), "--json", "admin", "provider", "get", sharedTestID)
 	var got apitypes.AdminSharedProviderDTO
@@ -107,6 +112,9 @@ func TestAdminProviderGetPersonalIDIsNotFound(t *testing.T) {
 	_, errOut, code := runCLI(t, fakeEnv(fc), "admin", "provider", "get", providerTestID)
 	if code != uzicli.ExitNotFound || !strings.Contains(errOut, "personal providers are not shown here") || !strings.Contains(errOut, "uzi admin provider list") {
 		t.Errorf("code %d, stderr %q", code, errOut)
+	}
+	if fc.SharedProviderGets != 0 {
+		t.Errorf("SharedProviderGets = %d, want 0", fc.SharedProviderGets)
 	}
 }
 
@@ -146,8 +154,8 @@ func TestProviderListMarksSharedAndSanitizes(t *testing.T) {
 		if strings.HasPrefix(line, "team") && !strings.Contains(line, "admin") {
 			t.Errorf("shared row not marked: %q", line)
 		}
-		if strings.HasPrefix(line, "mine") && strings.Contains(line, "admin") {
-			t.Errorf("owned row marked admin: %q", line)
+		if strings.HasPrefix(line, "mine") && (strings.Contains(line, "admin") || !strings.HasSuffix(strings.TrimSpace(line), "you")) {
+			t.Errorf("owned row not marked you: %q", line)
 		}
 	}
 	for _, bad := range []string{"\x1b", "\u202e", "\x07"} {
@@ -168,10 +176,10 @@ func TestProviderUseAndTestRefuseAmbiguousName(t *testing.T) {
 	for _, args := range [][]string{{"provider", "use", "CORP"}, {"provider", "test", "corp"}} {
 		fc := &uzicli.FakeClient{ProviderList: ambiguousList()}
 		_, errOut, code := runCLI(t, fakeEnv(fc), args...)
-		if code != uzicli.ExitConflict {
-			t.Errorf("%v: exit = %d, want %d (stderr %q)", args, code, uzicli.ExitConflict, errOut)
+		if code != uzicli.ExitUsage {
+			t.Errorf("%v: exit = %d, want %d (stderr %q)", args, code, uzicli.ExitUsage, errOut)
 		}
-		for _, want := range []string{providerTestID, sharedTestID, "pass the provider id"} {
+		for _, want := range []string{providerTestID, sharedTestID, "pass an id"} {
 			if !strings.Contains(errOut, want) {
 				t.Errorf("%v: stderr missing %q: %q", args, want, errOut)
 			}
@@ -219,6 +227,81 @@ func TestProviderEditAndRetireRefuseSharedWithoutRequest(t *testing.T) {
 		}
 		if fc.LastProviderPatch != nil || fc.ProviderRetireCalls != 0 {
 			t.Errorf("%v sent a write request", args)
+		}
+	}
+}
+
+// Errors print through cellText's 200-rune cap, so a refusal must carry its fix step inside it
+// even for a maximum-length (64) name and two full UUIDs.
+func TestProviderRefusalsSurviveTheErrorCapWithLongName(t *testing.T) {
+	long := strings.Repeat("n", 64)
+	shared := sharedProviderFixture(sharedTestID, long)
+	own := providerFixture(long)
+
+	fc := &uzicli.FakeClient{ProviderList: enabledList(own, shared)}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", long)
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, providerTestID) || !strings.Contains(errOut, sharedTestID) ||
+		!strings.Contains(errOut, "(yours)") || !strings.Contains(errOut, "(admin)") {
+		t.Errorf("ambiguity: code %d, stderr %q", code, errOut)
+	}
+
+	fc = &uzicli.FakeClient{ProviderList: enabledList(shared)}
+	_, errOut, code = runCLI(t, fakeEnv(fc), "provider", "edit", long, "--name", "x")
+	if code != uzicli.ExitConflict || !strings.Contains(errOut, "only an admin can change it") || !strings.Contains(errOut, "uzi provider use") {
+		t.Errorf("edit refusal: code %d, stderr %q", code, errOut)
+	}
+}
+
+func TestProviderSharedRefusalRetiredOmitsUseAdvice(t *testing.T) {
+	shared := sharedProviderFixture(sharedTestID, "team")
+	shared.Retired = true
+	fc := &uzicli.FakeClient{ProviderList: enabledList(shared)}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "provider", "retire", "team")
+	if code != uzicli.ExitConflict || !strings.Contains(errOut, "only an admin can change it") {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	if strings.Contains(errOut, "uzi provider use") {
+		t.Errorf("retired refusal suggests use: %q", errOut)
+	}
+}
+
+func TestProviderRefusalsWithHostileNameCarryNoControlBytes(t *testing.T) {
+	name := "x" + hostileSegment
+	shared := sharedProviderFixture(sharedTestID, name)
+	cases := map[string]apitypes.ProviderListDTO{
+		"edit": enabledList(shared),
+		"use":  enabledList(providerFixture(name), shared),
+	}
+	for verb, list := range cases {
+		args := []string{"provider", verb, name}
+		if verb == "edit" {
+			args = append(args, "--name", "y")
+		}
+		_, errOut, code := runCLI(t, fakeEnv(&uzicli.FakeClient{ProviderList: list}), args...)
+		if code == uzicli.ExitOK || errOut == "" {
+			t.Fatalf("%s: code %d, stderr %q", verb, code, errOut)
+		}
+		for _, bad := range []string{"\x1b", "\u202e", "\x07"} {
+			if strings.Contains(errOut, bad) {
+				t.Errorf("%s stderr carries control %q: %q", verb, bad, errOut)
+			}
+		}
+	}
+}
+
+func TestProviderUseConfirmationNamesSharedSource(t *testing.T) {
+	shared := sharedProviderFixture(sharedTestID, "team")
+	shared.HasKey, shared.KeyEnabled = true, true
+	own := providerFixture("mine")
+	own.HasKey, own.KeyEnabled = true, true
+	for name, want := range map[string]bool{"team": true, "mine": false} {
+		fc := &uzicli.FakeClient{ProviderList: enabledList(own, shared)}
+		out, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", name)
+		if code != uzicli.ExitOK {
+			t.Fatalf("%s: code %d, stderr %q", name, code, errOut)
+		}
+		if got := strings.Contains(out, "(shared by your admin)"); got != want {
+			t.Errorf("%s: confirmation %q, shared suffix = %v, want %v", name, out, got, want)
 		}
 	}
 }

@@ -328,6 +328,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			var want *string
 			var name string
+			var sharedTarget bool
 			if !useNone {
 				target, err := resolveProvider(cmd, c, args[0], resolveVisible)
 				if err != nil {
@@ -343,7 +344,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 				if err := providerUsableRefusal(target); err != nil {
 					return err
 				}
-				want, name = &target.ID, target.Name
+				want, name, sharedTarget = &target.ID, target.Name, isSharedProvider(target)
 			}
 			var got *string
 			if useEngine == "codex" {
@@ -366,7 +367,11 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 						p.Printf("Codex runs now use their native source (no model provider selected).\n")
 					}
 				} else {
-					p.Printf("%s runs you start now use provider %q.\n", cellText(useEngine), cellText(name))
+					suffix := ""
+					if sharedTarget {
+						suffix = " (shared by your admin)"
+					}
+					p.Printf("%s runs you start now use provider %q%s.\n", cellText(useEngine), cellText(name), suffix)
 				}
 			}
 			return nil
@@ -443,13 +448,13 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode provi
 		for _, d := range named {
 			kind := "yours"
 			if isSharedProvider(d) {
-				kind = "shared by your admin"
+				kind = "admin"
 			}
 			ids = append(ids, fmt.Sprintf("%s (%s)", cellText(d.ID), kind))
 		}
-		return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitConflict,
-			"the name %q matches more than one provider: %s; pass the provider id instead",
-			cellText(arg), strings.Join(ids, ", "))
+		return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+			"%q names %d providers; pass an id: %s",
+			cellText(arg), len(named), strings.Join(ids, ", "))
 	}
 	return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitNotFound,
 		"no provider named or with id %q; `uzi provider list` shows yours", cellText(arg))
@@ -458,9 +463,14 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode provi
 // sharedManagedRefusal is the refusal for an edit or retire aimed at an admin-shared definition:
 // only an admin changes it (in the web UI), so no request is sent.
 func sharedManagedRefusal(d apitypes.ProviderDTO) error {
+	// Errors print through cellText, which caps at 200 runes: keep this under that even with a
+	// 64-char name, so the fix step is never cut off.
+	hint := "; you can select it with `uzi provider use`"
+	if d.Retired {
+		hint = ""
+	}
 	return uzicli.Exitf(uzicli.ExitConflict,
-		"provider %q (%s) is managed by your admin and cannot be edited or retired here; you can still select it with `uzi provider use` and add your own key in the web Settings",
-		cellText(d.Name), cellText(d.ID))
+		"provider %q is managed by your admin; only an admin can change it%s", cellText(d.Name), hint)
 }
 
 // providerUsableRefusal refuses, before any write, a provider the list already shows cannot be the
@@ -669,18 +679,15 @@ func printProvider(p *uzicli.Printer, d apitypes.ProviderDTO) {
 	p.Printf("  auth:   %s\n", cellText(d.AuthStyle))
 	p.Printf("  models: %s\n", dashOr(modelsCell(d.ModelMap)))
 	p.Printf("  key:    %s\n", providerKeyCell(d))
-	if isSharedProvider(d) {
-		p.Printf("  managed by: %s (per-user key: the key shown is yours)\n", providerManagedCell(d))
-	}
 }
 
-// providerManagedCell renders MANAGED BY: "admin" for an admin-shared definition, "-" for your own.
+// providerManagedCell renders MANAGED BY: "admin" for an admin-shared definition, "you" for your own.
 // Both values are fixed literals, so no server text is drawn here.
 func providerManagedCell(d apitypes.ProviderDTO) string {
 	if isSharedProvider(d) {
 		return "admin"
 	}
-	return "-"
+	return "you"
 }
 
 // providerProtocol rejects absent or unknown stored engines rather than defaulting them.
