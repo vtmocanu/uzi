@@ -20,6 +20,8 @@ import { pathToFileURL } from "node:url";
 type RmtreeModule = typeof import("../../agent/src/rmtree.js");
 type RunnerUidModule = typeof import("../../agent/src/runner-uid.js");
 type ReclaimModule = typeof import("../../agent/src/home-reclaim.js");
+type ConfigModule = typeof import("../../agent/src/claude-global-config.js");
+type ConfigDirModule = typeof import("../../agent/src/claude-config-dir.js");
 
 // The code under test is loaded from the image's /app/src by default, so a built image
 // proves what it ships. HOME_SPLIT_SRC points it at a mounted source tree instead.
@@ -34,6 +36,8 @@ const SENTINEL_FILE = path.join(SENTINEL_DIR, "keep.txt");
 let rmtree: RmtreeModule;
 let runnerUid: RunnerUidModule;
 let reclaim: ReclaimModule;
+let config: ConfigModule;
+let configDir: ConfigDirModule;
 
 /** Run a shell snippet as `runner` through the production setpriv wrapper. */
 function asRunner(script: string, ...args: string[]): void {
@@ -45,6 +49,21 @@ function asRunner(script: string, ...args: string[]): void {
 function asCommand(script: string, ...args: string[]): void {
   const wrapped = runnerUid.commandRootCommand("/bin/sh", ["-c", script, "sh", ...args]);
   execFileSync(wrapped.command, wrapped.args, { stdio: "inherit", env: { PATH: "/usr/bin:/bin" } });
+}
+
+/** Run a shell snippet as `runner` or `runner-cmd` and require the kernel to refuse it. */
+function assertDenied(as: "runner" | "command", script: string, ...args: string[]): void {
+  const argv = ["-c", script, "sh", ...args];
+  const wrapped = as === "runner" ? runnerUid.runnerCommand("/bin/sh", argv) : runnerUid.commandRootCommand("/bin/sh", argv);
+  try {
+    execFileSync(wrapped.command, wrapped.args, { stdio: ["ignore", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin" } });
+  } catch (e) {
+    const err = e as { status?: number | null; stderr?: Buffer };
+    assert.ok(typeof err.status === "number" && err.status !== 0, `denied: ${script}`);
+    assert.match(String(err.stderr), /Permission denied|Operation not permitted|Read-only/i, `refused by the kernel: ${script}`);
+    return;
+  }
+  assert.fail(`${as} must be refused, but this succeeded: ${script}`);
 }
 
 /**
@@ -107,6 +126,8 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     rmtree = await load<RmtreeModule>("rmtree.ts");
     runnerUid = await load<RunnerUidModule>("runner-uid.ts");
     reclaim = await load<ReclaimModule>("home-reclaim.ts");
+    config = await load<ConfigModule>("claude-global-config.ts");
+    configDir = await load<ConfigDirModule>("claude-config-dir.ts");
     await fs.mkdir(SENTINEL_DIR, { recursive: true });
     await fs.writeFile(SENTINEL_FILE, "keep\n");
     await fs.chmod(SENTINEL_FILE, 0o644);
@@ -282,6 +303,76 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     assert.equal(after.mode & 0o7777, before.mode & 0o7777, "no chmod repair");
     asRunner(`set -e; test -z "$(ls -A "$1/.uzi-go-work")"`, home);
     await rmtree.rmHomeTree(home);
+  });
+
+  // PRD #4416: the Claude CLI config directory is worker-owned inside a runner-writable, sticky HOME;
+  // neither the runner nor runner-cmd may change it, and the targets under HOME/.claude are
+  // runner-private so runner-cmd cannot tamper with a Claude run's transcripts.
+  it("the runner cannot change, move or replace the prepared Claude config directory, and a re-prepare reuses it (#4416)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004416");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    const dir = configDir.claudeConfigDir(home);
+    const cliEnv = { HOME: home, CLAUDE_CONFIG_DIR: dir };
+
+    config.prepareClaudeConfigDir(cliEnv);
+    const before = await fs.lstat(dir);
+    const bytes = await fs.readFile(path.join(dir, ".claude.json"), "utf8");
+    assert.equal(bytes, config.CLAUDE_GLOBAL_CONFIG_BYTES);
+    assert.equal(before.uid, runnerUid.WORKER_UID, "the directory is worker-owned");
+    assert.equal(before.mode & 0o7777 & ~0o2000, 0o755);
+    assert.ok((await fs.lstat(home)).mode & 0o1000, "HOME is sticky");
+
+    // The targets were created by the runner uid, private to it (as the CLI itself would make them).
+    const claude = await fs.lstat(path.join(home, ".claude"));
+    assert.equal(claude.uid, runnerUid.RUNNER_UID, ".claude is runner-owned");
+    assert.equal(claude.mode & 0o7777, 0o700, ".claude is private");
+    asRunner(
+      `set -e; for t in projects tasks; do test "$(stat -c %a "$1/.claude/$t")" = 700; test "$(stat -c %u "$1/.claude/$t")" = 10002; done`,
+      home,
+    );
+
+    // The runner, as the agent's Bash tool would be, tries every way to change what the CLI reads.
+    assertDenied("runner", `echo '{"env":{"NODE_OPTIONS":"x"}}' > "$1/.claude.json"`, dir);
+    assertDenied("runner", `rm -f "$1/.claude.json" && echo x > "$1/.claude.json"`, dir);
+    assertDenied("runner", `: > "$1/.config.json"`, dir);
+    assertDenied("runner", `: > "$1/remote-settings.json"`, dir);
+    assertDenied("runner", `mv "$1" "$1.moved"`, dir);
+    assertDenied("runner", `mv "$1" "$1.moved" && ln -s /tmp "$1"`, dir);
+    assertDenied("runner", `mv "$1" "$1.moved"`, home);
+    assertDenied("runner", `rm "$1/projects" && ln -s /tmp "$1/projects"`, dir);
+    assertDenied("runner", `chmod 0777 "$1"`, dir);
+    assertDenied("runner", `chmod 0666 "$1/.claude.json"`, dir);
+    // runner-cmd (group runner) cannot touch the config directory or a Claude run's transcripts either.
+    assertDenied("command", `echo x > "$1/.claude.json"`, dir);
+    assertDenied("command", `mv "$1" "$1.moved"`, dir);
+    assertDenied("command", `mkdir "$1/.claude/projects/planted"`, home);
+    assertDenied("command", `echo x > "$1/.claude/projects/planted"`, home);
+    assertDenied("command", `mv "$1/.claude" "$1/.claude.moved"`, home);
+
+    // Nothing changed; the next start reuses the very same directory.
+    const mid = await fs.lstat(dir);
+    assert.equal(mid.ino, before.ino);
+    assert.equal(await fs.readlink(path.join(dir, "projects")), "../.claude/projects", "the projects link was not retargeted");
+    assert.deepEqual((await fs.readdir(dir)).sort(), [".claude.json", "projects", "tasks"], "nothing was added to the directory");
+    assert.equal(await fs.readFile(path.join(dir, ".claude.json"), "utf8"), bytes);
+    config.prepareClaudeConfigDir(cliEnv);
+    const after = await fs.lstat(dir);
+    assert.equal(after.ino, before.ino, "the directory is reused, not rebuilt");
+    assert.equal(after.isDirectory() && !after.isSymbolicLink(), true);
+    assert.equal(await fs.readFile(path.join(dir, ".claude.json"), "utf8"), bytes, "the bytes are the fixed bytes");
+    assert.deepEqual((await fs.readdir(home)).filter((n) => n.includes(".stale-")), [], "no aside copy was made");
+
+    // Reclaim: an aside copy, the directory and the runner-private transcripts all go with the HOME.
+    await fs.rename(dir, `${dir}.stale-aaaaaaaaaaaaaaaa`);
+    config.prepareClaudeConfigDir(cliEnv);
+    asRunner(
+      `set -e; umask 077; mkdir -p "$1/.claude/projects/-s"; echo T > "$1/.claude/projects/-s/t.jsonl"`,
+      home,
+    );
+    await rmtree.rmHomeTree(home);
+    assert.equal(await exists(home), false, "the whole HOME, config directory and aside copy included, is gone");
+    await assertSentinelIntact();
   });
 
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {

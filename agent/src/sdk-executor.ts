@@ -146,6 +146,7 @@ import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedE
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { isSeededOwnerPlan } from "./seeded-plan.js";
 import { redactPlanSummary, SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
@@ -6006,13 +6007,14 @@ export class SdkExecutor implements Executor {
 
   /**
    * PRD #4416: evidence only, never a reap or a refusal. spawnDetached prepares the CLI's config
-   * directory at each CLI start; under the uid split a live runner process cannot change it, but
-   * with one uid a process of this run that is still alive (the HOME-attributed scan, one pass, no
-   * settle poll) can alter it between that preparation and the CLI's startup read. Logs the count
-   * (or an incomplete scan), nothing else. RunProcessOps.scan takes no budget option, so this scan
-   * runs under the scan's own default budget.
+   * directory at each CLI start; under the uid split a live runner process cannot change it, so
+   * nothing is scanned or logged there. With one uid a process of this run that is still alive (the
+   * HOME-attributed scan, one pass, no settle poll) can alter it between that preparation and the
+   * CLI's startup read. Logs the count (or an incomplete scan), nothing else. RunProcessOps.scan
+   * takes no budget option, so this scan runs under the scan's own default budget.
    */
   private async warnLiveWritersAtConfigReset(): Promise<void> {
+    if (uidSplitActive()) return;
     // Advisory only: nothing here may fail the run or skip the reset that follows. A scan that
     // throws or returns a malformed result (no `pids` array) is reported as incomplete, and any
     // error while logging is swallowed.
@@ -6029,7 +6031,7 @@ export class SdkExecutor implements Executor {
       const what = complete
         ? `${pids.length} run processes are alive at this turn boundary`
         : `the process scan was incomplete (${pids.length} run processes seen) at this turn boundary`;
-      this.log.warn(`${what}; a live writer can race the global-config reset`, {
+      this.log.warn(`${what}; a live process of the run can alter the Claude config directory before the CLI reads it (single uid)`, {
         count: pids.length,
         scanComplete: complete,
       });

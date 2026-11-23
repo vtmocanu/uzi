@@ -132,6 +132,10 @@ beforeEach(() => {
   resetResidueQuarantineForTests();
 });
 afterEach(() => {
+  // The one-uid config directory is 0555; reopen it (and any aside copy) so the tree can go.
+  for (const f of fs.existsSync(homeDir) ? fs.readdirSync(homeDir) : []) {
+    if (f.startsWith(".uzi-claude-config")) fs.chmodSync(path.join(homeDir, f), 0o755);
+  }
   fs.rmSync(homeDir, { recursive: true, force: true });
   fs.rmSync(workDir, { recursive: true, force: true });
   for (const [k, v] of Object.entries(saved)) {
@@ -147,7 +151,11 @@ const dumpDir = (leg: number): string => fs.readFileSync(dumpPath(leg) + ".dir",
 const EXPECTED_DUMP_DIR = (): string => `${configDir()}|.claude.json,projects,tasks`;
 
 describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at every start (PRD #4416)", () => {
-  it("(a) config files an agent planted during one leg, wherever the old design looked, never reach the next CLI start", async () => {
+  // What this checks: at every start the CLI is pointed at the prepared directory and finds the fixed
+  // bytes there, and what an agent planted under HOME does not change that. The dump reads only that
+  // directory, so it cannot show that the real CLI ignores the planted files: that is the pinned-CLI
+  // probe, probe-m3 (g) in the PRD #4416 probe notes.
+  it("(a) the CLI is pointed at the prepared directory and finds the fixed bytes at every start, whatever was planted under HOME", async () => {
     const exec = makeExecutor(
       twoLegs((leg) => {
         if (leg !== 1) return;
@@ -173,6 +181,7 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
     const exec = makeExecutor(
       twoLegs((leg) => {
         if (leg !== 1) return;
+        fs.chmodSync(dir, 0o755); // one uid: the agent owns the 0555 directory and can reopen it
         fs.chmodSync(path.join(dir, ".claude.json"), 0o644);
         fs.writeFileSync(path.join(dir, ".claude.json"), MALICIOUS);
         fs.writeFileSync(path.join(dir, ".config.json"), MALICIOUS);
@@ -199,7 +208,9 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
       const log = { ...nullLogger(), warn: (msg: string) => { warns.push(msg); } };
       const exec = new SdkExecutor(log as never, homeDir, {
         queryFn: twoLegs((leg) => {
-          if (leg === 1) fs.writeFileSync(path.join(configDir(), ".config.json"), MALICIOUS);
+          if (leg !== 1) return;
+          fs.chmodSync(configDir(), 0o755); // one uid: the agent can reopen its own 0555 directory
+          fs.writeFileSync(path.join(configDir(), ".config.json"), MALICIOUS);
         }),
         runProcesses: {
           scan: (() => { scans++; return (scan as () => unknown)(); }) as never,
@@ -208,7 +219,7 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
       });
       await exec.run(makeCtx());
       assert.ok(scans >= 1, "the implement boundary consulted the scan");
-      assert.ok(warns.some((w) => w.includes("live writer can race")), "an unusable scan is reported as incomplete");
+      assert.ok(warns.some((w) => w.includes("can alter the Claude config directory before the CLI reads it (single uid)")), "an unusable scan is reported as incomplete");
       assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES, "leg 2's CLI still started on the prepared directory");
       assert.strictEqual(dumpAlt(2), "ABSENT");
     });
@@ -261,7 +272,7 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
     assert.ok(fs.existsSync(path.join(configDir(), "planted")), "nothing was deleted");
   });
 
-  it("(e) the file is mode 0444 in a directory that is not writable by group or others", async () => {
+  it("(e) the file is mode 0444 in a directory nobody can write (0555 with one uid), so the CLI saves nothing", async () => {
     let fileMode: number | undefined;
     let dirMode: number | undefined;
     await makeExecutor(
@@ -272,7 +283,7 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
       }),
     ).run(makeCtx());
     assert.strictEqual(fileMode, 0o444);
-    assert.strictEqual(dirMode, 0o755);
+    assert.strictEqual(dirMode, 0o555);
   });
 
   it("(f) a session transcript written before is visible through the config directory (resume)", async () => {

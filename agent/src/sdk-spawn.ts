@@ -29,6 +29,7 @@ import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { killRunnerGroup, killRunnerGroupOnly, runnerSpawn } from "./runner-uid.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 import { prepareClaudeConfigDir, type PrepareDeps } from "./claude-global-config.js";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 
 /** The variables that carry a provider credential into the Claude CLI's environment (sdk-env.ts). */
 export const PROVIDER_CREDENTIAL_VARS = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] as const;
@@ -44,6 +45,11 @@ export function spawnDetached(opts: SpawnOptions, prepareDeps?: PrepareDeps): Ch
   // start. It throws a refusal, before any spawn, when it cannot, or when the env does not point
   // the CLI at that directory. Kept ahead of the quarantine assert so that assert stays the last
   // statement before the spawn. `prepareDeps` is a test seam; production callers pass one argument.
+  // A credential-carrying start with no HOME would have the CLI fall back to the runner's passwd HOME
+  // and skip every check below, so it is refused; credential-free probes without a HOME stay a no-op.
+  if (carriesProviderCredential(opts.env) && (opts.env?.HOME ?? "") === "") {
+    throw new TrustedExecutionRefusal("Claude CLI config directory refused: a provider credential without a HOME");
+  }
   prepareClaudeConfigDir(opts.env, prepareDeps);
   // issue #2213 (belt): a spawn whose environment carries a provider credential is a new provider
   // turn; refuse it synchronously on a quarantined worker. The credential-free spawns (the

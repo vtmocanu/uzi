@@ -35,6 +35,8 @@ const waitUntil = async (fn: () => boolean, timeoutMs = 4000): Promise<boolean> 
 const spawnHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-spawn-home-")));
 
 after(() => {
+  // The one-uid config directory is 0555; reopen it so the tree can be removed.
+  fs.chmodSync(path.join(spawnHome, ".uzi-claude-config"), 0o755);
   fs.rmSync(spawnHome, { recursive: true, force: true });
 });
 
