@@ -5395,7 +5395,8 @@ export class RunRunner {
         ...(grant ? { live: () => !scopeLost() } : {}),
       }, async (section): Promise<CloneVerdict> => {
         const quiesce = (req: QuiesceRunRequest) => section.stage(() => this.quiesceImpl({
-          ...req, forceHelper: true, deadlineAt: Math.min(section.deadlineAt, Date.now() + INVENTORY_SCAN_BUDGET_MS),
+          // helperDeadline: issue #4632, owner-required; set only on these inventory scans.
+          ...req, forceHelper: true, helperDeadline: true, deadlineAt:Math.min(section.deadlineAt, Date.now() + INVENTORY_SCAN_BUDGET_MS),
         }));
         const beforeStage = await quiesce(request);
         if (!beforeStage.ok) return unsettled;

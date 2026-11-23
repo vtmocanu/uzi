@@ -2013,7 +2013,9 @@ async function reapProcessesViaHelper(
   req: HelperScanRequest,
   opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number };
     /** issue #3980: absolute epoch-ms deadline (see {@link QuiesceRunRequest.deadlineAt}). */
-    deadlineAt?: number } = {},
+    deadlineAt?: number;
+    /** issue #4632: also serialize the deadline into a non-observe-only helper scan (see {@link ReapRunOptions}). */
+    forwardDeadlineToHelper?: true } = {},
 ): Promise<ProcessQuiescence> {
   if (uidSplitActive() && hasReaperCaptureScope()) {
     return { state: "unverified", processes: [], killed: [], detail: "raw scoped helper refused" };
@@ -2033,11 +2035,15 @@ async function reapProcessesViaHelper(
   // issue #3980: the absolute gate-checkpoint deadline. Every stage below is admitted only before it,
   // the helper and the private-temp commands are killed and JOINED at it, and an expiry is unverified.
   const gateDeadline = opts.deadlineAt;
-  // Every helper scan (observe-only or signalling) carries the gate deadline, so the helper enforces the same
-  // absolute deadline on its own reap loop and never signals at or after it. A helper-side deadline also makes
-  // the reaper record a non-ENOENT/ESRCH procfs error (EACCES on environ/cwd) as a table failure; that effect is
-  // kept deliberately and fails closed: the scan returns unverified with no processes before any kill.
-  if (gateDeadline !== undefined)
+  // Only an observe-only probe or an explicit opt-in (issue #4632, the inventory scans) serializes the deadline into
+  // the helper's scan; every other signalling scan keeps its serialized request unchanged, so the #3980 gate
+  // checkpoints and terminal preservation are unaffected. A helper-side deadline makes the reaper record a
+  // non-ENOENT/ESRCH procfs error (EACCES on environ/cwd) as a table failure. That is kept deliberately and fails
+  // closed, with this scope: ANY unreadable runner-uid process worker-wide, including a correctly attributed peer
+  // such as the Codex supervisor, makes the opted-in scan unverified (processes may be empty, and a failure on a
+  // later pass follows any kill an earlier pass already made). It also makes the #3915 late-root re-proof and the
+  // mayKillUnreadableUnattributed reap unreachable there. This applies only to inventory scans and observe-only probes.
+  if (gateDeadline !== undefined && (req.observeOnly === true || opts.forwardDeadlineToHelper === true))
     req = { ...req, deadlineAt: Math.min(gateDeadline, req.deadlineAt ?? Infinity) };
   const gateExpired = (): boolean => gateDeadline !== undefined && Date.now() >= gateDeadline;
   if (gateExpired()) return unverified("gate checkpoint deadline exhausted");
@@ -2229,6 +2235,9 @@ export interface ReapRunOptions extends ReapDeps {
   spawnHelper?: HelperSpawn;
   helperTimeoutMs?: number;
   helperTmp?: HelperTmp;
+  /** issue #4632 (owner-required): serialize `deadlineAt` into a signalling helper scan. Observe-only scans always
+   *  forward it. See {@link QuiesceRunRequest.helperDeadline}. */
+  forwardDeadlineToHelper?: true;
 }
 
 /** The uid whose processes a reap considers: the runner under the split, else this process's. */
@@ -2256,6 +2265,7 @@ export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = 
       reportBudget: opts.reportBudget,
       producerWorkLimits: opts.producerWorkLimits,
       ...(opts.deadlineAt === undefined ? {} : { deadlineAt: opts.deadlineAt }),
+      ...(opts.forwardDeadlineToHelper === true ? { forwardDeadlineToHelper: true as const } : {}),
     });
   }
     // In-process work keeps actual scoped parent metering and a sticky local envelope.
@@ -2590,6 +2600,11 @@ export interface QuiesceRunRequest {
   forceHelper?: true;
   /** Observe-only probe: see {@link ScanRequest.observeOnly}. The process verdict never signals anything. */
   observeOnly?: true;
+  /** issue #4632 (owner-required): serialize `deadlineAt` into the helper's signalling scan, so the helper enforces
+   *  the deadline on its own reap loop. Set ONLY by the runner's inventory before/after scans. It makes any unreadable
+   *  runner-uid process worker-wide (including an attributed non-dumpable peer such as the Codex supervisor) an
+   *  unverified result, so it must never be set for a #3980 gate checkpoint or terminal preservation. */
+  helperDeadline?: true;
 }
 
 /** The two halves' results. `process` is undefined when the process half was skipped. */
@@ -2806,7 +2821,8 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       docker: { state: "not_wired", removed: [], detail: "" } };
   }
   const reapOptions = { ...deps.reap, producerWorkLimits, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }),
-    ...(req.forceHelper === true ? { viaHelper: true } : {}) };
+    ...(req.forceHelper === true ? { viaHelper: true } : {}),
+    ...(req.helperDeadline === true ? { forwardDeadlineToHelper: true as const } : {}) };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
     const collected = collectLiveRoots(others, workerRunnerRootPids());
@@ -2827,7 +2843,8 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
         req.observeOnly !== true,
       ...(req.workerWide === true ? { workerWide: true } : {}),
       ...(req.observeOnly === true ? { observeOnly: true } : {}),
-      ...(req.deadlineAt !== undefined ? { deadlineAt: req.deadlineAt } : {}),
+      ...((req.observeOnly === true || req.helperDeadline === true) && req.deadlineAt !== undefined
+        ? { deadlineAt: req.deadlineAt } : {}),
       liveRoots: collected.roots,
       workerNonce: workerSpawnNonce(),
     };
@@ -2879,9 +2896,10 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
             ? { refreshAfterUnattributed: refreshInProcess } : {}),
           ...(req.reportBudget ? { reportBudget: req.reportBudget,
             deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : {}),
-          // The helper path forwards the deadline (reapProcessesViaHelper also serializes it into the scan); the
-          // helper-side deadline records a procfs EACCES as a table failure, which is kept deliberately and fails
-          // closed (unverified, nothing killed). The in-process path shrinks only its existing reap deadline.
+          // The helper path caps its own setup, child and cleanup at the retry deadline. The deadline is serialized
+          // into the helper's scan only for an observe-only probe or an opted-in request (helperDeadline, kept in
+          // reapOptions.forwardDeadlineToHelper, which this spread preserves); other retries stay unchanged. The
+          // in-process path shrinks only its existing reap deadline.
           ...(retryDeadlineAt === undefined ? {} : viaHelper
             ? { deadlineAt: retryDeadlineAt,
               helperTimeoutMs: Math.max(1, Math.floor(Math.min(reapOptions.helperTimeoutMs ?? Infinity,

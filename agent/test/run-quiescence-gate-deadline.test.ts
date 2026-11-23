@@ -268,10 +268,10 @@ describe("issue #3980: quiesceRunAttempt Docker admission with a gate deadline",
   });
 });
 
-// ─── every helper scan carries the gate deadline (a request without observeOnly included) ───────────
+// ─── an opted-in (inventory, issue #4632) helper scan carries the gate deadline; no other signalling scan does ───
 
 /** Runs reapRunProcesses through a fake helper child and returns the request it was sent on stdin. */
-async function sentToHelper(req: ScanRequest, deadlineAt: number | undefined): Promise<Record<string, unknown>> {
+async function sentToHelper(req: ScanRequest, deadlineAt: number | undefined, optIn = true): Promise<Record<string, unknown>> {
   const child = fakeChild();
   let sent = "";
   const stdin = child.stdin as unknown as PassThrough;
@@ -281,12 +281,13 @@ async function sentToHelper(req: ScanRequest, deadlineAt: number | undefined): P
     child.emit("close", 0, null);
   });
   await reapRunProcesses(req, { viaHelper: true, ...(deadlineAt === undefined ? {} : { deadlineAt }),
+    ...(optIn ? { forwardDeadlineToHelper: true as const } : {}),
     helperTmp: { make: () => "/private", remove: () => undefined }, spawnHelper: () => child });
   return JSON.parse(sent) as Record<string, unknown>;
 }
 
-describe("every helper scan carries the gate deadline", () => {
-  it("a non-observe request without its own deadlineAt is serialized with deadlineAt <= D", async () => {
+describe("an opted-in (inventory) helper scan carries the gate deadline", () => {
+  it("an opted-in non-observe request without its own deadlineAt is serialized with deadlineAt <= D", async () => {
     const D = Date.now() + 30_000;
     const sent = await sentToHelper(fakeReq(), D);
     assert.equal("observeOnly" in sent, false);
@@ -303,7 +304,36 @@ describe("every helper scan carries the gate deadline", () => {
     assert.equal("deadlineAt" in (await sentToHelper(fakeReq(), undefined)), false);
   });
 
-  it("the scoped (closed reaper) path serializes the scan's own deadlineAt for a non-observe request", async () => {
+  it("negative control: a non-observe, non-opted-in reapRunProcesses with a deadline serializes NO deadlineAt (#3980 checkpoints unchanged)", async () => {
+    const D = Date.now() + 30_000;
+    const sent = await sentToHelper(fakeReq(), D, false);
+    assert.equal("deadlineAt" in sent, false);
+    // Even a request that carries its own deadlineAt is untouched by the gate deadline: it is not min-ed with D.
+    assert.equal((await sentToHelper(fakeReq({ deadlineAt: D + 10_000 }), D, false)).deadlineAt, D + 10_000);
+  });
+
+  it("an observe-only request carries the deadline without any opt-in", async () => {
+    const D = Date.now() + 30_000;
+    assert.equal((await sentToHelper(fakeReq({ observeOnly: true }), D, false)).deadlineAt, D);
+  });
+
+  it("negative control: a non-opted-in quiesceRunAttempt (the #3980 checkpoint shape) serializes no deadlineAt; helperDeadline opts in", async () => {
+    const sentBy = async (extra: Partial<QuiesceRunRequest>): Promise<Record<string, unknown>> => {
+      const child = fakeChild();
+      let sent = "";
+      const stdin = child.stdin as unknown as PassThrough;
+      stdin.on("data", (c: Buffer | string) => { sent += c; });
+      stdin.on("end", () => { (child.stdout as unknown as PassThrough).write(`${quiescent}\n`); child.emit("close", 0, null); });
+      await quiesceRunAttempt(quiesceReq({ processes: true, forceHelper: true, deadlineAt: Date.now() + 30_000, ...extra }),
+        { reap: { spawnHelper: () => child, helperTmp: { make: () => "/private", remove: () => undefined } }, targetUid: RUNNER });
+      return JSON.parse(sent) as Record<string, unknown>;
+    };
+    assert.equal("deadlineAt" in await sentBy({}), false);
+    assert.equal(typeof (await sentBy({ helperDeadline: true })).deadlineAt, "number");
+    assert.equal(typeof (await sentBy({ observeOnly: true })).deadlineAt, "number");
+  });
+
+  it("the scoped (closed reaper) path serializes the scan's own deadlineAt for an opted-in non-observe request", async () => {
     // This path builds its stdin from the ScanRequest itself, not through the plain helper's serialization.
     const oldSplit = process.env.UZI_UID_SPLIT;
     process.env.UZI_UID_SPLIT = "1";
@@ -314,7 +344,7 @@ describe("every helper scan carries the gate deadline", () => {
     const deadlineAt = Date.now() + 30_000;
     const request: QuiesceRunRequest = { mode: "capture", attempt, cloneKey: attempt.cloneKey,
       targetPaths: [attempt.clonePath], processes: true, dockerHost: undefined, registry: live,
-      otherClaimInFlight: false, deadlineAt };
+      otherClaimInFlight: false, deadlineAt, helperDeadline: true };
     const temp = path.join(runnerTmpdir() ?? os.tmpdir(), "uzi-quiesce-gatescoped");
     let sent: Record<string, unknown> | undefined;
     let seamFailure: unknown;

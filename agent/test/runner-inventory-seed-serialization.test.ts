@@ -169,7 +169,7 @@ const seed = (iid: number, probe: SeedProbe): Promise<{ path: string }> =>
 
 // ─── the runner side: the real proof, with scripted git ───────────────────────────────────
 
-interface QuiesceCall { site: string | undefined; mode: string; forceHelper: boolean; observeOnly: boolean; at: number }
+interface QuiesceCall { site: string | undefined; mode: string; forceHelper: boolean; observeOnly: boolean; helperDeadline: boolean; at: number }
 interface Rig {
   runner: ReturnType<typeof runnerWith>;
   quiesceCalls: QuiesceCall[];
@@ -192,7 +192,7 @@ type BoundaryRunner = {
 function makeRig(opts: { deadlineMs?: number; log?: ReturnType<typeof recordingLogger>["logger"]; claim?: boolean } = {}): Rig {
   const quiesceCalls: QuiesceCall[] = [];
   const quiesceRun = (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
-    quiesceCalls.push({ site: req.site, mode: req.mode, forceHelper: req.forceHelper === true, observeOnly: req.observeOnly === true, at: Date.now() });
+    quiesceCalls.push({ site: req.site, mode: req.mode, forceHelper: req.forceHelper === true, observeOnly: req.observeOnly === true, helperDeadline: req.helperDeadline === true, at: Date.now() });
     return quiesceRunAttempt({ ...req, dockerHost: undefined }, { docker: { intervalMs: 5, deadlineMs: 1_000, requestTimeoutMs: 500 } });
   };
   const factory: ExecutorFactory = (runId) => ({ homeDir: path.join(homeDir, runId), executor: { run: async () => { throw new Error("no executor"); } } });
@@ -347,6 +347,8 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.equal(proof.outcome, "passed", `checks ${proof.checks.join(",")}`);
     const proofCalls = rig.quiesceCalls.filter((c) => c.site === "inventory_source" || c.site === "inventory_source:after_runner_git");
     assert.ok(proofCalls.length >= 2 && proofCalls.every((c) => c.at >= releasedAt), "every proof stage ran after the seed released the lock");
+    assert.deepEqual([...new Set(proofCalls.map((c) => c.site))].sort(), ["inventory_source", "inventory_source:after_runner_git"], "both the before and the after scan ran");
+    assert.ok(proofCalls.every((c) => c.helperDeadline && c.forceHelper), "issue #4632: the inventory before/after quiesce requests opt in to the helper deadline");
     assert.equal(rig.statusCalls.length >= 1, true);
     log("case 2", rig.sections);
     assertHeldBounded(rig.sections);
@@ -734,10 +736,10 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     executed++;
   });
 
-  it("case 14: a before-scan whose helper hit EACCES (deadline forwarded) is unverified with no processes, so the proof refuses before any git and keeps custody", async () => {
+  it("case 14: a before-scan carrying helperDeadline whose helper hit EACCES is unverified with no processes, so the proof refuses before any git and keeps custody", async () => {
     const iid = 4615;
     const r = await retainedClone(iid);
-    const calls: Array<{ site: string | undefined; deadlineAt: number | undefined; forceHelper: boolean; observeOnly: boolean }> = [];
+    const calls: Array<{ site: string | undefined; deadlineAt: number | undefined; forceHelper: boolean; observeOnly: boolean; helperDeadline: boolean }> = [];
     const eaccesTable = (clone: string): ProcTable => ({
       listPids: () => [2000],
       readStatus: () => `Name:\tproc\nState:\tS (sleeping)\nUid:\t${process.getuid?.() ?? 0}\t${process.getuid?.() ?? 0}\t${process.getuid?.() ?? 0}\t${process.getuid?.() ?? 0}\n`,
@@ -751,7 +753,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
       // The runner's own before-scan request (site inventory_source) run through the real reap loop with the table the helper
       // would have seen; the deadline the runner computed is passed as the helper's reap deadline, as the helper forwards it.
       quiesceRun: async (req) => {
-        calls.push({ site: req.site, deadlineAt: req.deadlineAt, forceHelper: req.forceHelper === true, observeOnly: req.observeOnly === true });
+        calls.push({ site: req.site, deadlineAt: req.deadlineAt, forceHelper: req.forceHelper === true, observeOnly: req.observeOnly === true, helperDeadline: req.helperDeadline === true });
         let t = 0;
         const scan: ScanRequest = {
           mode: req.mode, targetUid: process.getuid?.() ?? 0, targetKey: req.cloneKey, targetPaths: req.targetPaths,
@@ -776,6 +778,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.deepEqual(calls.map((c) => c.site), ["inventory_source"], "no after-scan or later stage ran");
     assert.equal(calls[0]!.forceHelper, true);
     assert.equal(calls[0]!.observeOnly, false, "a signalling (non-observe) scan");
+    assert.equal(calls[0]!.helperDeadline, true, "issue #4632: the runner's inventory before-scan opts in to the helper deadline");
     assert.equal(typeof calls[0]!.deadlineAt, "number", "the signalling inventory scan carries a deadline into the helper");
     executed++;
   });
