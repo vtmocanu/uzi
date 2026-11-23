@@ -54,6 +54,12 @@ func TestHealthCrossCheckPinsWorkerReason(t *testing.T) {
 					r.Harness = "claude"
 					r.CodexSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 				}
+				if !tc.runtimeV3 {
+					// GetRunByID can have binding indicators absent from the earlier list snapshot.
+					r.Harness = "claude"
+					r.CodexMaterialRevision = pgtype.Int8{}
+					r.CodexSecretID = pgtype.UUID{}
+				}
 
 				fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
 				svc.q = crossCheckRuntimeHealthStore{fs}
