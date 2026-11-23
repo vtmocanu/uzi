@@ -346,7 +346,8 @@ known, and the preview never disables **Start run**.
 - **Board card.** Under **Start run**, a quiet line reads **If started now:
   harness · model · effort**. It is closed by default; open it to see each
   value with its source, the token, and a **Run defaults** link to
-  Settings → Run defaults (see [Worker model](./worker-model.md)).
+  Settings → Run defaults; the model and effort themselves are set in
+  **Settings → Models** (see [Worker model](./worker-model.md)).
 - **Issue page.** The same list under **If it started now**, open by default.
 - **Run options dialog.** The same list, following the harness, token, model
   and effort you pick as you pick them.

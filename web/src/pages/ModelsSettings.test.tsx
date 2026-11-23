@@ -220,6 +220,29 @@ describe("Models page", () => {
     expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ default_effort: "runtime", default_codex_effort: null });
   });
 
+  // Moved from Run defaults (PRD #3263 M3): each family's Runtime default option names what it
+  // means, Codex's from the server's catalog_default on the saved effort cell.
+  it("labels Runtime default per family: Claude reports no value, Codex names its catalog default", async () => {
+    const effortSetting = (harness: "claude" | "codex", extra: object = {}) => ({
+      harness, effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit", ...extra,
+    });
+    const known = { state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z" };
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({
+      effort_settings: [effortSetting("claude"), effortSetting("codex", { catalog_default: known })] as UserSettings["effort_settings"],
+    }) });
+    mount();
+    await screen.findByLabelText("Worker effort — Codex");
+    const runtimeText = (name: string) => Array.from(control(name).options).find((o) => o.value === "runtime")?.text;
+    expect(runtimeText("Worker effort — Claude")).toBe("Runtime default · value not reported");
+    expect(runtimeText("Worker effort — Codex")).toBe("Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0)");
+    cleanup();
+    // Without a reported catalog default the Codex option says so rather than guessing.
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings() });
+    mount();
+    await screen.findByLabelText("Worker effort — Codex");
+    expect(runtimeText("Worker effort — Codex")).toBe("Runtime default · catalog default unknown until a Codex run reports it");
+  });
+
   it("switching the default harness twice keeps both families' model choices", async () => {
     mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_claude_model: "sonnet", default_codex_model: "gpt-6-sol" }) });
     mount();

@@ -46,7 +46,8 @@ a meter against what you expected to spend.
   The Start card also shows a read-only line, "If started now: …", naming the
   harness, model, effort and token a one-click start would use, with their
   sources where known, plus a **Run defaults** link to Settings → Run defaults
-  (see [the start preview](./board.md#the-if-started-now-preview)). It is a
+  (see [the start preview](./board.md#the-if-started-now-preview); the model and
+  effort themselves are set in **Settings → Models**). It is a
   prediction only: the Start request is unchanged (the repository and the
   issue), and the line never blocks the button.
   Steering only applies to issue runs; ask it to steer a chat and it tells

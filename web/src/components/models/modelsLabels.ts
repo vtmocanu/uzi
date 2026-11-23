@@ -1,10 +1,11 @@
 // Copy for the Models grid (PRD #3263): each select's Default option, each cell's "Saved
 // effective value" line, and the judge's routing and Not used copy. Every word about where a
 // value comes from is the server's source token rendered through lib/modelSettings.ts; nothing
-// here resolves precedence. Some Default labels and the judge copy reuse Run defaults' wording
-// (judgeRunsOnHelp, the helper and task-review Default labels) and the retired CrossCheckDefaults
-// grid's checker labels; the worker and planning Default labels are this page's own, read from
-// the server cell's default_model / default_source (Run defaults' copy only without a cell).
+// here resolves precedence. Some Default labels and the judge copy keep the wording the retired
+// Run defaults model editors used (judgeRunsOnHelp, the helper and task-review Default labels) and
+// the retired CrossCheckDefaults grid's checker labels; the worker and planning Default labels are
+// read from the server cell's default_model / default_source. Run defaults' read-only judge
+// summary reuses harnessName and judgeRunsOnHelp, so the routing copy has one home.
 
 import type {
   CrossCheckPinDTO,
@@ -196,8 +197,8 @@ export function checkerModelDefaultLabel(harness: Harness, pin: CrossCheckPinDTO
 
 export const CHECKER_EFFORT_DEFAULT_LABEL = "Default · high (cross-check default)";
 
-// Judge runs on: what each choice does to a judged run (Run defaults' judgeRunsOnHelp), for the
-// DRAFT choice, so the copy follows the select before it is saved.
+// Judge runs on: what each choice does to a judged run. Models passes the DRAFT choice, so the
+// copy follows the select before it is saved; Run defaults' judge summary passes the saved one.
 export function judgeRunsOnHelp(choice: string): string {
   if (choice !== "claude" && choice !== "codex") {
     return "Claude runs use the Claude judge model, Codex runs the Codex model. Pick Claude or Codex to judge every run on one harness.";

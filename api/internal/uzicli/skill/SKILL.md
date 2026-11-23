@@ -411,7 +411,11 @@ uzi version
   is passed through and the server validates it; `reset` clears to the inherited value.
   Prints the changed row with its source, from a fresh effective-settings read; when
   that read fails the stored value is shown, the write still exits 0 and the read error
-  goes to stderr. `--json` prints the server's `{"settings": ...}` envelope unchanged.
+  goes to stderr. `--json` prints the server's `{"settings": ..., "effective": ...}` envelope
+  unchanged (`effective` is null with `effective_error` if the server's own read failed).
+  The route allows 19 fields (the Settings → Models page saves through it); a 400 adds an
+  `errors` array per problem. The writes commit in one transaction; the response reads
+  are separate queries after it, not a snapshot.
   Usage exit 2 (no request) on an unknown setting, a missing, invalid or unwanted
   `--harness`, or an invalid value. Exit 6 with "the save may or may not have been
   applied; check with `uzi settings get`" when the commit outcome is unknown, and with

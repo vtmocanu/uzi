@@ -317,7 +317,7 @@ A few worth knowing:
   throughout). A schedule's pin (or `implicit` when unset) shows on `uzi
   schedule get`.
   There's no CLI setter for your own default harness; that's a **Settings →
-  Run defaults** web-only control (see [Worker model](./worker-model.md)).
+  Models** web control (see [Worker model](./worker-model.md)).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own
   version (the `v*` release this binary was built from). When a server URL is
   configured it additionally reports that server's build info — version, full
@@ -3415,7 +3415,7 @@ The human table shows the Plan and Code cross-check cells: stage, harness,
 active/inactive status, stored model and effort, worker default model,
 resolved model and effort, and each resolved field's source. Stored null
 fields show `Default`; explicit choices show `Pin · value`. All
-cells are active and editable in **Settings → Run defaults → Cross-check**:
+cells are active and editable in **Settings → Models → Cross-check**:
 in each stage the Codex cell configures the checker of a Claude lead, the Claude cell the
 checker of a Codex lead. Pin or clear a cell from the CLI with `uzi settings
 set|reset cross-check` ([Changing model and effort
@@ -3478,7 +3478,7 @@ claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
 `unknown`). `resolved_effort` is `null` exactly when
 `mode` is `runtime_default`. Change effort with `uzi settings set effort`
 ([Changing model and effort settings](#changing-model-and-effort-settings)) or in
-**Settings → Run defaults → Reasoning effort**. See
+**Settings → Models**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
 
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
@@ -3505,7 +3505,7 @@ uzi settings reset cross-check --stage plan --harness codex
 `uzi settings set <setting> <value>` and `uzi settings reset <setting>` write
 your own model and effort defaults for new runs (`PUT /api/me/model-settings`,
 which accepts a `uzc_` or `uza_` Bearer token). They write the same stored
-values as the matching **Settings → Run defaults** controls; the other users and
+values as the matching **Settings → Models** controls; the other users and
 the instance defaults are untouched.
 
 | Setting | `--harness` | Value | Web control |
@@ -3549,8 +3549,12 @@ the write did (`your choice` after a set; the default's own source after a
 reset). `judge-runs-on` prints the `Judge runs on:` line instead, and
 `cross-check` prints that cell's row of the cross-check table (stored pin,
 resolved value and source). `--json` prints
-the server's `{"settings": {...}}` envelope unchanged, without the effective
-read.
+the server's response envelope unchanged: `{"settings": {...}, "effective":
+{...}}`, where `effective` is the same effective-settings view
+[`uzi settings get`](#effective-settings) shows. If the server's own effective
+read fails after the save committed, the envelope is `{"settings": {...},
+"effective": null, "effective_error": "settings_effective_readback_failed"}`
+and the write still exits 0.
 
 A saved setting applies to runs that resolve it after the save. It never changes
 a run that froze its own choice, such as a run-level `--model` or `--effort`.
@@ -3573,10 +3577,31 @@ server could not confirm or read back the write, while the exit 0 line means
 the server confirmed the write and only the CLI's own effective-settings read
 failed.
 
-The route is an allowlist of fourteen fields (the two worker-model lanes, the two
-effort lanes, the two judge-model lanes, the two summary-model lanes, the two
-task-review-model lanes, the two task-review-effort lanes, `judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
-are written in one transaction. Consent switches (enabling the judge, cross-check
+The route is an allowlist of nineteen fields: `default_harness`, the two
+worker-model lanes (`default_claude_model`, `default_codex_model`), the two
+effort lanes (`default_effort`, `default_codex_effort`), the four planning fields
+(`planning_claude_model`, `planning_claude_effort`, `planning_codex_model`,
+`planning_codex_effort`), `judge_runs_on`, the two judge-model lanes
+(`judge_model`, `codex_judge_model`), the two summary-model lanes
+(`summary_model`, `codex_summary_model`), the two task-review-model lanes
+(`task_review_model`, `codex_task_review_model`), the two task-review-effort lanes
+(`task_review_effort`, `codex_task_review_effort`) and `cross_check_pins`. The
+**Settings → Models** page saves through this same route, so a Bearer token can
+now also write `default_harness` and the planning fields, though the CLI has no
+command for them. Any other key is a 400 naming it, and the fields of one request
+are written in one transaction.
+
+A 400 keeps the `error` and `field` of the first problem and adds an `errors`
+array with one entry per problem: `{"field", "message"}` plus, where they apply,
+`stage`, `harness` and `member` (the web page uses them to mark the cell). For
+unknown keys only the first five, sorted, are listed, and caller text echoed
+back is clipped to 64 bytes. The 200 body is `{"settings", "effective"}`. The
+guarantee is that the writes commit together or not at all; the response reads
+run as separate queries after the commit, not as a snapshot, so a concurrent
+save from another client can interleave and the returned values may include it.
+A failed prediction read after the commit is still a 200 with `effective: null`
+and `effective_error`; the two 500 reasons (`settings_commit_unknown`,
+`settings_saved_readback_failed`) are unchanged. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
 `judge-runs-on`, `judge-model`, `summary-model`, `task-review-model` and `task-review-effort` choose which harness, model or effort
 already-enabled judge, summary and task-review work uses, and cannot turn that work on.
@@ -3857,7 +3882,7 @@ run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
 `judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
 `judge_harness` cell. Change it with `uzi settings set judge-runs-on`
 ([Changing model and effort settings](#changing-model-and-effort-settings)) or in
-**Settings → Run defaults → Run judge**.
+**Settings → Models → Helper runs**.
 
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your

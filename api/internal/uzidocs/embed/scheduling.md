@@ -623,8 +623,8 @@ the server's answer and applies no precedence of its own.
   `predicted · fixed when it fires` or `predicted · read when a worker picks
   the run up`. Credential shows the kind, source and timing, never which
   credential. Effort is read-only ("schedules can't change it") and links to
-  **Run defaults (opens in new tab)** (`/settings/run-defaults`), where it is
-  set; the link opens in a new tab so the draft is kept. Subagents shows the
+  **Run defaults (opens in new tab)** (`/settings/run-defaults`); effort itself
+  is set in **Settings → Models**. The link opens in a new tab so the draft is kept. Subagents shows the
   mode, the lead's model and any subagent pins, without a timing label.
 - **Harness chosen at fire.** When the harness is chosen when the schedule
   fires, the Harness row says so and the preview shows one row group per
