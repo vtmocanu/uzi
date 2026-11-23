@@ -456,9 +456,11 @@ Owner authorization remains bound to the recorded repository path, device and
 inode. A changed storage identity refuses execution; Resume cannot override that
 check. Two holds cover it:
 
-- Every journal that is already blocked (renewable or not) keeps the existing
+- Every journal that is already blocked keeps today's disposition unchanged.
+  For an `adoption_failed` or `budget_exhausted` blocker that is the existing
   re-hold: with the source journal still valid, the run re-holds instead of
-  failing and keeps its local work and custody. Export/recover the retained work
+  failing and keeps its local work and custody. Any other blocker still ends
+  the run failed with local work and custody kept, as today. Export/recover the retained work
   rather than expecting Resume alone to rebind changed storage. Reholding does
   not rebind the owner record or consume the pending execution grant. On the
   renewal-check path the logged warning is still

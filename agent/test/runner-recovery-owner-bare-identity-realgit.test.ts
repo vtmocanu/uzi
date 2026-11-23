@@ -10,7 +10,8 @@ import { execFileSync } from "node:child_process";
 import { describe, it, type TestContext } from "node:test";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { RequestError } from "../src/client.js";
-import { RecoveryOwnerBareIdentityError, type MemoryParkRecord } from "../src/git.js";
+import * as gitModule from "../src/git.js";
+import type { MemoryParkRecord } from "../src/git.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
@@ -182,14 +183,23 @@ const guidance = (r: Rig): string[] => feed(r).filter(t => t.includes(GUIDANCE))
 const logged = (r: Rig, msg: string) => r.logs.lines.filter(l => (l as { msg: string }).msg === msg) as Array<Record<string, unknown>>;
 const adoptionParks = (r: Rig) => r.parks.filter(p => p.recovery_cause === "retained_recovery_adoption_failed");
 const failures = (r: Rig) => api.states.filter(s => s.runId === r.claim.run_id && s.body.status === "failed");
-const typedRejections = (r: Rig) => r.counts.rejections.filter(e => e instanceof RecoveryOwnerBareIdentityError);
+/**
+ * Resolved at runtime so this file also loads on a baseline without the typed error; the
+ * assertions that need it assert it is defined, so they fail there for the right reason.
+ */
+const RecoveryOwnerBareIdentityError = (gitModule as Record<string, unknown>).RecoveryOwnerBareIdentityError as
+  (new (...a: never[]) => Error) | undefined;
+const typedRejections = (r: Rig) => r.counts.rejections.filter(e => RecoveryOwnerBareIdentityError !== undefined && e instanceof RecoveryOwnerBareIdentityError);
 
 /** The shared "this was held" assertions of both journals. */
 async function assertHeld(t: TestContext, r: Rig, before: ReturnType<typeof dumps>, ownerBefore: string, journalBefore: string, captured: number): Promise<void> {
   void t;
-  assert.equal(typedRejections(r).length, 1, "the reservation rejected with the typed error");
-  assert.equal(r.counts.holds, 1);
+  // Behaviour first, so a baseline fails on the missing hold (a failed report) and not on the missing class.
+  assert.equal(failures(r).length, 0, `nothing was failed: ${JSON.stringify(failures(r).map(f => f.body))}`);
   assert.equal(adoptionParks(r).length, 1, JSON.stringify(api.states));
+  assert.equal(r.counts.holds, 1);
+  assert.ok(RecoveryOwnerBareIdentityError, "git.ts exports RecoveryOwnerBareIdentityError");
+  assert.equal(typedRejections(r).length, 1, "the reservation rejected with the typed error");
   assert.equal(adoptionParks(r)[0]!.claim_generation, r.claim.claim_generation);
   assert.equal(adoptionParks(r)[0]!.recovery_detail, undefined, "no detail rides the hold");
   assert.equal(guidance(r).length, 1, "one guidance line");
@@ -412,8 +422,10 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
 
 describe("blocked journals keep today's disposition", () => {
   it("a renewable budget_exhausted journal: generic error at the reservation, then the #3580 exhausted rehold", async t => {
-    const { r, ownerBefore } = await armedHold(t, { journal: "budget_exhausted", claim: { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 0 } });
+    const { r, ownerBefore, journalBefore } = await armedHold(t, { journal: "budget_exhausted", claim: { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 0 } });
     await r.execute();
+    // Measured on the pre-fix baseline: the journal's config value is left unchanged by this path.
+    assert.equal(JSON.stringify(r.journal()), journalBefore, "the journal is unchanged from before, as on base");
     assert.equal(r.counts.rejections.length, 1, "the reservation was reached");
     assert.equal(typedRejections(r).length, 0, "the generic error, not the typed one");
     assert.match(String((r.counts.rejections[0] as Error).message), /^recovery owner binding changed$/);
@@ -429,8 +441,16 @@ describe("blocked journals keep today's disposition", () => {
   });
 
   it("a renewable adoption_failed journal is unreachable at the reservation: today's adoption rehold, not the new hold", async t => {
-    const { r } = await armedHold(t, { journal: "adoption_failed", claim: { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 1 } });
+    const { r, ownerBefore, journalBefore } = await armedHold(t, { journal: "adoption_failed", claim: { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 1 } });
     await r.execute();
+    // Measured on the pre-fix baseline: journal and owner record are both left unchanged by this path.
+    assert.equal(JSON.stringify(r.journal()), journalBefore, "the journal is unchanged from before, as on base");
+    assert.equal(r.rawOwner(), ownerBefore, "the owner record is unchanged from before, as on base");
+    // Base carries the generic cause only; the typed message exists only where the class does.
+    if (RecoveryOwnerBareIdentityError) {
+      const cause = String(logged(r, "retained adoption renewal evidence unavailable")[0]?.cause);
+      assert.ok(cause.includes("recovery owner binding changed: bare storage identity"), cause);
+    }
     assert.equal(r.counts.rejections.length, 0, "canRenewRecoveryAdoption refused before any reservation");
     assert.equal(r.counts.holds, 0);
     assert.equal(guidance(r).length, 0, "no bare-identity guidance line");
@@ -446,8 +466,10 @@ describe("blocked journals keep today's disposition", () => {
 
   it("the runner guard alone: a stubbed typed rejection on a renewable blocked budget_exhausted source takes today's fail() route", async t => {
     const r = await build(t, { journal: "budget_exhausted", claim: { claim_generation: 3, worker_recovery_episode: 8, worker_recovery_owner_episode: 0 } });
+    assert.ok(RecoveryOwnerBareIdentityError, "git.ts exports RecoveryOwnerBareIdentityError");
+    const TypedError = RecoveryOwnerBareIdentityError as new (...a: unknown[]) => Error;
     t.mock.method(git, "reserveRecoveryIteration", async () => {
-      throw new RecoveryOwnerBareIdentityError({ dev: "1", ino: "2" }, { dev: "1", ino: "3" }, r.owner() as never);
+      throw new TypedError({ dev: "1", ino: "2" }, { dev: "1", ino: "3" }, r.owner());
     });
     await r.execute();
     assert.equal(r.counts.holds, 0);

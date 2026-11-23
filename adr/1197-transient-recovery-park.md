@@ -2168,7 +2168,8 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   `budget`, `blocked`).
 - **Limits.** The hold applies only on the first reservation iteration of a claim (before any capture,
   teardown or journal write) and only when the journal is not blocked. A blocked journal, renewable or
-  not, keeps today's disposition and the #3580 re-hold. A later iteration and a changed reservation keep
+  not, keeps today's disposition: the #3580 re-hold for an `adoption_failed` or `budget_exhausted`
+  blocker, and for any other blocker the run still ends failed with local work and custody kept. A later iteration and a changed reservation keep
   today's path.
 - **Read-only probe and exact fence.** In `reserveRecoveryIteration` a probe runs first, under the lock.
   It writes nothing: a read-only source check, the stale-claim fence, the not-blocked guard (a non-renewable
