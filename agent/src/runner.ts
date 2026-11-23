@@ -19851,8 +19851,9 @@ export class RunRunner {
     //                  that arm, so it is unreachable in the window. Were it ever reached on a Codex executor, safety.withBoundary
     //                  would run BEFORE this guard, so the guard alone would not protect P there.
     //   not reached    handlePermanentFailure's terminal reapRecoveryProviderForSettle -> reapForSink (the batcher breaker): the
-    //                  handler IS reached in the window, but behind its policyHold/iterationParkState returns it returns for
-    //                  restoreUnsupportedHold and stops nonterminally while restorePredecessor is set, before any reap (#4644).
+    //                  handler IS reached in the window, but it returns for restoreUnsupportedHold first and, behind its
+    //                  policyHold/iterationParkState/workerMemory returns, stops nonterminally while restorePredecessor is set,
+    //                  before any reap (#4644).
     //   permitted      the seed's own beforeSeed sweep (S's executor, explicit P-free targets).
     //   covered else   settleForCredentialCapture and the credential switch: enterRetainedCredentialSwitch stops before settling
     //                  (3.4 b), and escapedInPlaceSwitch (the closed-route arm) skips settlement and goes straight to the op-fenced
