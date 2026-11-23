@@ -277,7 +277,7 @@ func TestAssembleCards(t *testing.T) {
 	}
 	position := map[string]int{"In Progress": 0}
 
-	cards := assembleCards(issues, runRows, nil, nil, position, viewer, "forgejo", nil, 2*time.Hour)
+	cards := assembleCards(issues, runRows, nil, nil, position, viewer, "forgejo", false, nil, 2*time.Hour)
 	byIID := make(map[int64]cardDTO, len(cards))
 	for _, c := range cards {
 		byIID[c.IID] = c
@@ -378,7 +378,7 @@ func TestAssembleCardsCarriesAutofixHalt(t *testing.T) {
 		{ForgeIssueIid: 10, Title: "ten", State: "opened", Labels: []byte(`[]`)},
 		{ForgeIssueIid: 20, Title: "twenty", State: "opened", Labels: []byte(`[]`)},
 	}
-	cards := assembleCards(issues, nil, nil, map[int64]int32{20: 2}, nil, uuid.Nil, "gitlab", nil, 0)
+	cards := assembleCards(issues, nil, nil, map[int64]int32{20: 2}, nil, uuid.Nil, "gitlab", false, nil, 0)
 	byIID := map[int64]cardDTO{}
 	for _, c := range cards {
 		byIID[c.IID] = c
@@ -389,7 +389,7 @@ func TestAssembleCardsCarriesAutofixHalt(t *testing.T) {
 	if c := byIID[10]; c.CIAutofixHalted || c.CIAutofixAttempts != 0 {
 		t.Fatalf("card 10 = (halted %v, attempts %d), want (false, 0)", c.CIAutofixHalted, c.CIAutofixAttempts)
 	}
-	for _, c := range assembleCards(issues, nil, nil, nil, nil, uuid.Nil, "gitlab", nil, 0) {
+	for _, c := range assembleCards(issues, nil, nil, nil, nil, uuid.Nil, "gitlab", false, nil, 0) {
 		if c.CIAutofixHalted || c.CIAutofixAttempts != 0 {
 			t.Fatalf("nil halt map: card %d = (halted %v, attempts %d), want (false, 0)", c.IID, c.CIAutofixHalted, c.CIAutofixAttempts)
 		}

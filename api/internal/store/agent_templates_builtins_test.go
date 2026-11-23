@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 // reconcilerFake implements builtinReconcilerQueries in memory so the collision
@@ -20,9 +22,13 @@ type reconcilerFake struct {
 	inserted  []string
 	seeded    []string // names passed to SeedSharedTemplateAllocationByName
 	refreshed []string // names passed to RefreshPristineBuiltin (no-insert path only)
+	// insertArgs and refreshArgs record the full params, so a dropped column is visible.
+	insertArgs  []InsertBuiltinAgentTemplateParams
+	refreshArgs []RefreshPristineBuiltinParams
 }
 
 func (f *reconcilerFake) InsertBuiltinAgentTemplate(_ context.Context, arg InsertBuiltinAgentTemplateParams) (int64, error) {
+	f.insertArgs = append(f.insertArgs, arg)
 	if _, ok := f.existing[arg.Name]; ok {
 		return 0, nil
 	}
@@ -43,6 +49,7 @@ func (f *reconcilerFake) SeedSharedTemplateAllocationByName(_ context.Context, n
 // reconciler routes the no-insert path here. Returns 0 rows (a no-op refresh).
 func (f *reconcilerFake) RefreshPristineBuiltin(_ context.Context, arg RefreshPristineBuiltinParams) (int64, error) {
 	f.refreshed = append(f.refreshed, arg.Name)
+	f.refreshArgs = append(f.refreshArgs, arg)
 	return 0, nil
 }
 
@@ -148,5 +155,77 @@ func TestReconcileLogsReadBackErrorAtDebug(t *testing.T) {
 	}
 	if strings.Contains(logs, "shadowed by a custom row") {
 		t.Errorf("a read-back error must not be reported as a shadow; logs:\n%s", logs)
+	}
+}
+
+func TestBuiltinColumnsRejectOutOfContractEffort(t *testing.T) {
+	for _, d := range []agenttmpl.Definition{{Effort: "HIGH"}, {Effort: "runtime"}, {CodexEffort: "ultra"}} {
+		if _, err := builtinColumns(d); err == nil {
+			t.Errorf("builtinColumns(%+v) accepted an out-of-contract effort", d)
+		}
+	}
+}
+
+func TestBuiltinColumnsMapBlankEffortToNull(t *testing.T) {
+	for _, tc := range []struct {
+		name, effort, codex string
+		wantEffort          string
+		wantValid           bool
+	}{
+		{"empty", "", "", "", false},
+		{"whitespace", "  \t", " ", "", false},
+		{"level", "high", "", "high", true},
+		{"padded level", " max ", "", "max", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cols, err := builtinColumns(agenttmpl.Definition{Effort: tc.effort, CodexEffort: tc.codex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cols.effort.Valid != tc.wantValid || cols.effort.String != tc.wantEffort {
+				t.Errorf("effort=%+v", cols.effort)
+			}
+			if cols.codexEffort.Valid && cols.codexEffort.String == "" {
+				t.Errorf("codex_effort is a non-NULL empty string: %+v", cols.codexEffort)
+			}
+		})
+	}
+	cols, err := builtinColumns(agenttmpl.Definition{Effort: "low", CodexEffort: "xhigh"})
+	if err != nil || cols.effort.String != "low" || cols.codexEffort.String != "xhigh" {
+		t.Fatalf("lanes crossed: %+v err=%v", cols, err)
+	}
+}
+
+// TestReconcileCarriesShippedEffortToInsertAndRefresh pins the boot wiring of the effort pins
+// (issue #3258): a shipped definition's effort and codex_effort reach the insert of a missing
+// builtin and the pristine refresh of an existing one. The LiveDB refresh tests call the queries
+// directly, so without this a dropped `Effort: cols.effort` in the reconciler stays green.
+func TestReconcileCarriesShippedEffortToInsertAndRefresh(t *testing.T) {
+	defs := []agenttmpl.Definition{
+		{Name: "fresh", Description: "d", PromptBody: "b\n", Effort: "high", CodexEffort: "low"},
+		{Name: "seeded", Description: "d", PromptBody: "b\n", Effort: " xhigh ", CodexEffort: "max"},
+	}
+	fake := &reconcilerFake{existing: map[string]AgentTemplate{"seeded": {Name: "seeded", IsBuiltin: true}}}
+	if _, err := reconcileBuiltinDefinitions(context.Background(), fake, defs); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var fresh *InsertBuiltinAgentTemplateParams
+	for i := range fake.insertArgs {
+		if fake.insertArgs[i].Name == "fresh" {
+			fresh = &fake.insertArgs[i]
+		}
+	}
+	if fresh == nil {
+		t.Fatalf("no insert for the missing builtin; inserts=%+v", fake.insertArgs)
+	}
+	if !fresh.Effort.Valid || fresh.Effort.String != "high" || !fresh.CodexEffort.Valid || fresh.CodexEffort.String != "low" {
+		t.Errorf("insert effort=%+v codex_effort=%+v, want high/low", fresh.Effort, fresh.CodexEffort)
+	}
+	if len(fake.refreshArgs) != 1 || fake.refreshArgs[0].Name != "seeded" {
+		t.Fatalf("refresh calls = %+v, want exactly the seeded builtin", fake.refreshArgs)
+	}
+	r := fake.refreshArgs[0]
+	if !r.Effort.Valid || r.Effort.String != "xhigh" || !r.CodexEffort.Valid || r.CodexEffort.String != "max" {
+		t.Errorf("refresh effort=%+v codex_effort=%+v, want xhigh/max", r.Effort, r.CodexEffort)
 	}
 }

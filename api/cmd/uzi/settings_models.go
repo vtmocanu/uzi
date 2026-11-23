@@ -26,46 +26,55 @@ var settingsModelColumns = []string{"SETTING", "HARNESS", "STORED", "DEFAULT", "
 // (go:embed cannot reach the fixtures directory above this module); the CLI test
 // pins this table to the fixture in both directions.
 var modelSettingLabels = map[[2]string]string{
-	{"model", "user_default"}:                   "your choice",
-	{"model", "instance_default"}:               "instance default",
-	{"model", "builtin"}:                        "built-in",
-	{"effort", "user_default"}:                  "your choice",
-	{"effort", "builtin"}:                       "built-in",
-	{"effort", "runtime_default"}:               "runtime default",
-	{"effort", "catalog_default"}:               "catalog default",
-	{"model", "schedule_pin"}:                   "schedule pin",
-	{"model", "template"}:                       "lead template",
-	{"model", "cross_check_pin"}:                "checker pin",
-	{"model", "cross_check_worker_default"}:     "worker default",
-	{"effort", "cross_check_pin"}:               "checker pin",
-	{"effort", "cross_check_default"}:           "cross-check default",
-	{"model", "run_override"}:                   "this run",
-	{"effort", "run_override"}:                  "this run",
-	{"harness", "run_override"}:                 "your choice for this run",
-	{"harness", "schedule_pin"}:                 "schedule pin",
-	{"harness", "user_default"}:                 "your default harness",
-	{"harness", "automatic"}:                    "automatic",
-	{"harness", "chosen_at_create"}:             "chosen when the run is created",
-	{"judge_harness", "user_default"}:           "your setting",
-	{"judge_harness", "same_as_run"}:            "same as the run",
-	{"credential", "chosen_at_create"}:          "chosen when the run is created",
-	{"credential", "claim_selection"}:           "chosen when the run starts",
-	{"credential", "auto_selection"}:            "automatic selection",
-	{"credential", "owner_default"}:             "your default credential",
-	{"credential", "token_override"}:            "token chosen for this run",
-	{"credential", "codex_default_credential"}:  "your default Codex credential",
-	{"note", "schedule_pin_ignored"}:            "the schedule's model pin does not apply to this harness",
-	{"note", "sdk_default"}:                     "the SDK decides",
-	{"note", "not_configurable"}:                "not configurable",
-	{"note", "not_sent"}:                        "not sent",
-	{"note", "not_used"}:                        "not used: the judge runs on the other harness",
-	{"note", "user_default_harness_unusable"}:   "your default harness has no usable credential",
-	{"note", "issue_labels_may_select_harness"}: "issue labels may select the harness",
-	{"note", "repo_agents_not_predicted"}:       "repository agents are not predicted",
-	{"note", "token_fixed"}:                     "the token is fixed",
-	{"note", "instance_settings_unavailable"}:   "instance settings are unavailable",
-	{"note", "automatic_weekly_reset"}:          "chosen by the soonest weekly reset",
-	{"note", "overflow"}:                        "may move to the other harness near its limit",
+	{"model", "user_default"}:                    "your choice",
+	{"model", "instance_default"}:                "instance default",
+	{"model", "builtin"}:                         "built-in",
+	{"effort", "user_default"}:                   "your choice",
+	{"effort", "builtin"}:                        "built-in",
+	{"effort", "runtime_default"}:                "runtime default",
+	{"effort", "catalog_default"}:                "catalog default",
+	{"model", "schedule_pin"}:                    "schedule pin",
+	{"model", "template"}:                        "lead template",
+	{"model", "cross_check_pin"}:                 "checker pin",
+	{"model", "cross_check_worker_default"}:      "worker default",
+	{"effort", "template"}:                       "lead template",
+	{"effort", "cross_check_pin"}:                "checker pin",
+	{"effort", "cross_check_default"}:            "cross-check default",
+	{"model", "run_override"}:                    "this run",
+	{"effort", "run_override"}:                   "this run",
+	{"harness", "run_override"}:                  "your choice for this run",
+	{"harness", "schedule_pin"}:                  "schedule pin",
+	{"harness", "user_default"}:                  "your default harness",
+	{"harness", "automatic"}:                     "automatic",
+	{"harness", "chosen_at_create"}:              "chosen when the run is created",
+	{"judge_harness", "user_default"}:            "your setting",
+	{"judge_harness", "same_as_run"}:             "same as the run",
+	{"credential", "chosen_at_create"}:           "chosen when the run is created",
+	{"credential", "claim_selection"}:            "chosen when the run starts",
+	{"credential", "auto_selection"}:             "automatic selection",
+	{"credential", "owner_default"}:              "your default credential",
+	{"credential", "token_override"}:             "token chosen for this run",
+	{"credential", "codex_default_credential"}:   "your default Codex credential",
+	{"note", "schedule_pin_ignored"}:             "the schedule's model pin does not apply to this harness",
+	{"note", "sdk_default"}:                      "the SDK decides",
+	{"note", "not_configurable"}:                 "not configurable",
+	{"note", "not_sent"}:                         "not sent",
+	{"note", "not_used"}:                         "not used: the judge runs on the other harness",
+	{"note", "user_default_harness_unusable"}:    "your default harness has no usable credential",
+	{"note", "issue_labels_may_select_harness"}:  "issue labels may select the harness",
+	{"note", "repo_agents_not_predicted"}:        "repository agents are not predicted",
+	{"note", "token_fixed"}:                      "the token is fixed",
+	{"note", "instance_settings_unavailable"}:    "instance settings are unavailable",
+	{"note", "automatic_weekly_reset"}:           "chosen by the soonest weekly reset",
+	{"note", "overflow"}:                         "may move to the other harness near its limit",
+	{"planning_model", "user_planning_default"}:  "your choice",
+	{"planning_model", "user_default"}:           "your choice",
+	{"planning_model", "template"}:               "lead template",
+	{"planning_model", "builtin"}:                "built-in",
+	{"planning_effort", "user_planning_default"}: "your choice",
+	{"planning_effort", "user_default"}:          "your choice",
+	{"planning_effort", "builtin"}:               "built-in",
+	{"planning_effort", "template"}:              "lead template",
 }
 
 // modelSettingSource labels a provenance token for a settings field. An unknown
@@ -116,9 +125,13 @@ func effortRow(setting string, c apitypes.EffortSettingCellDTO) settingRow {
 	default:
 		resolved = "unknown"
 	}
+	def := c.DefaultEffort
+	if def == "runtime" {
+		def = modelSettingSource("effort", "runtime_default")
+	}
 	return settingRow{
 		Setting: setting, Harness: c.Harness, Stored: c.Effort,
-		Default: c.DefaultEffort, Resolved: resolved,
+		Default: def, Resolved: resolved,
 		Field: "effort", Source: c.Source,
 	}
 }
@@ -192,5 +205,37 @@ func settingRowsTable(rows []settingRow) [][]string {
 // settingsModelRows collects every setting family's rows for `uzi settings get`.
 func settingsModelRows(s apitypes.UserSettingsDTO) []settingRow {
 	rows := append(modelSettingRows("judge", s.JudgeModels), modelSettingRows("summary", s.SummaryModels)...)
-	return append(rows, effortSettingRows(s.EffortSettings)...)
+	rows = append(rows, effortSettingRows(s.EffortSettings)...)
+	return append(rows, planningSettingRows(s.PlanningModels, s.PlanningEfforts)...)
+}
+
+// planningSettingRows reads each known harness once per setting, regardless of cell order.
+// An absent cell yields no row.
+func planningSettingRows(models []apitypes.ModelSettingCellDTO, efforts []apitypes.EffortSettingCellDTO) []settingRow {
+	var rows []settingRow
+	seenModels := map[string]bool{}
+	for _, c := range models {
+		if (c.Harness != "claude" && c.Harness != "codex") || seenModels[c.Harness] {
+			continue
+		}
+		seenModels[c.Harness] = true
+		// A built-in Claude model is empty: the SDK picks it, so say that rather than print nothing.
+		def, resolved := orSDKDefault(c.DefaultModel), orSDKDefault(c.ResolvedModel)
+		rows = append(rows, settingRow{
+			Setting: "planning model", Harness: c.Harness, Stored: c.Model,
+			Default: def, Resolved: resolved,
+			Field: "planning_model", Source: c.Source,
+		})
+	}
+	seenEfforts := map[string]bool{}
+	for _, c := range efforts {
+		if (c.Harness != "claude" && c.Harness != "codex") || seenEfforts[c.Harness] {
+			continue
+		}
+		seenEfforts[c.Harness] = true
+		row := effortRow("planning effort", c)
+		row.Field = "planning_effort"
+		rows = append(rows, row)
+	}
+	return rows
 }

@@ -156,7 +156,7 @@ func TestScheduledRunDisabledStoredPinStartsNoRunLiveDB(t *testing.T) {
 		t.Fatalf("prompt fire err = %v, want ErrCredentialDisabled", err)
 	}
 	seedEligibleIssue(t, env, repoID, 4101)
-	if _, err := svc.CreateScheduledRun(env.ctx, userID, repoID, 4101, "desc", nil, nil, nil, false, nil, override, nil); !errors.Is(err, ErrCredentialDisabled) {
+	if _, err := svc.CreateScheduledRun(env.ctx, userID, repoID, 4101, "desc", nil, nil, nil, false, nil, override, nil, nil); !errors.Is(err, ErrCredentialDisabled) {
 		t.Fatalf("issue fire err = %v, want ErrCredentialDisabled", err)
 	}
 	if n := runCountForUser(t, env, userID); n != 0 {

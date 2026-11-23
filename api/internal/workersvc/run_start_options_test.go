@@ -72,7 +72,7 @@ func TestModelIncompatibleErrorText(t *testing.T) {
 func TestCreateRunRefusesInvalidEffort(t *testing.T) {
 	for _, e := range []string{"", "HIGH", "ultra", " high", "high\x1b[2J"} {
 		e := e
-		_, err := (&Service{}).createRun(context.Background(), uuid.New(), uuid.New(), 1, "manual", "", false, nil, nil, nil, modelSourceNone, &e, false, false, nil, nil, nil, nil, nil)
+		_, err := (&Service{}).createRun(context.Background(), uuid.New(), uuid.New(), 1, "manual", "", false, nil, nil, nil, modelSourceNone, &e, false, false, nil, nil, nil, nil, nil, nil)
 		if !errors.Is(err, ErrInvalidRunEffort) {
 			t.Errorf("effort %q: err = %v, want ErrInvalidRunEffort", e, err)
 		}

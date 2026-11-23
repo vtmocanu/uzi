@@ -31,16 +31,20 @@ const (
 // else, including default_harness, the legacy default_model, appearance and every consent
 // switch, is a 400 naming the key.
 var modelSettingsAllowlist = map[string]struct{}{
-	"default_claude_model": {},
-	"default_codex_model":  {},
-	"default_effort":       {},
-	"default_codex_effort": {},
-	"judge_model":          {},
-	"codex_judge_model":    {},
-	"judge_runs_on":        {},
-	"summary_model":        {},
-	"codex_summary_model":  {},
-	"cross_check_pins":     {},
+	"default_claude_model":     {},
+	"default_codex_model":      {},
+	"default_effort":           {},
+	"default_codex_effort":     {},
+	"judge_model":              {},
+	"codex_judge_model":        {},
+	"judge_runs_on":            {},
+	"summary_model":            {},
+	"codex_summary_model":      {},
+	"task_review_model":        {},
+	"codex_task_review_model":  {},
+	"task_review_effort":       {},
+	"codex_task_review_effort": {},
+	"cross_check_pins":         {},
 }
 
 // modelSettingsField is one decoded tri-state field: absent (present=false) leaves the column,
@@ -52,9 +56,11 @@ type modelSettingsField struct {
 
 // modelSettingsWrite is the validated phase-1 state writeModelSettings applies.
 type modelSettingsWrite struct {
-	claude, codex, effort, codexEffort modelSettingsField
-	judge, codexJudge, judgeRunsOn     modelSettingsField
-	summary, codexSummary              modelSettingsField
+	claude, codex, effort, codexEffort      modelSettingsField
+	judge, codexJudge, judgeRunsOn          modelSettingsField
+	summary, codexSummary                   modelSettingsField
+	taskReview, codexTaskReview             modelSettingsField
+	taskReviewEffort, codexTaskReviewEffort modelSettingsField
 	// crossCheckPins are the decoded cross_check_pins patches (decodeCrossCheckPins); empty when
 	// the key is absent or an empty list.
 	crossCheckPins []store.PatchUserCrossCheckPinParams
@@ -65,7 +71,7 @@ func (w modelSettingsWrite) any() bool {
 		return true
 	}
 	for _, f := range []modelSettingsField{w.claude, w.codex, w.effort, w.codexEffort,
-		w.judge, w.codexJudge, w.judgeRunsOn, w.summary, w.codexSummary} {
+		w.judge, w.codexJudge, w.judgeRunsOn, w.summary, w.codexSummary, w.taskReview, w.codexTaskReview, w.taskReviewEffort, w.codexTaskReviewEffort} {
 		if f.present {
 			return true
 		}
@@ -140,6 +146,10 @@ func (h *Handler) PutMyModelSettings(w http.ResponseWriter, r *http.Request) {
 		{"codex_judge_model", decodeCodexJudgeModelField, &in.codexJudge},
 		{"summary_model", decodeSummaryModelField, &in.summary},
 		{"codex_summary_model", decodeCodexSummaryModelField, &in.codexSummary},
+		{"task_review_model", decodeTaskReviewModelField, &in.taskReview},
+		{"codex_task_review_model", decodeCodexTaskReviewModelField, &in.codexTaskReview},
+		{"task_review_effort", effort("task_review_effort"), &in.taskReviewEffort},
+		{"codex_task_review_effort", effort("codex_task_review_effort"), &in.codexTaskReviewEffort},
 		{"judge_runs_on", decodeJudgeRunsOnField, &in.judgeRunsOn},
 	}
 	for _, st := range steps {
@@ -293,6 +303,26 @@ func (h *Handler) applyModelSettings(ctx context.Context, tx pgx.Tx, userID uuid
 	}
 	if in.codexSummary.present {
 		if _, err := q.SetUserCodexSummaryModel(ctx, store.SetUserCodexSummaryModelParams{ID: userID, CodexSummaryModel: in.codexSummary.val}); err != nil {
+			return err
+		}
+	}
+	if in.taskReview.present {
+		if _, err := q.SetUserTaskReviewModel(ctx, store.SetUserTaskReviewModelParams{ID: userID, TaskReviewModel: in.taskReview.val}); err != nil {
+			return err
+		}
+	}
+	if in.codexTaskReview.present {
+		if _, err := q.SetUserCodexTaskReviewModel(ctx, store.SetUserCodexTaskReviewModelParams{ID: userID, CodexTaskReviewModel: in.codexTaskReview.val}); err != nil {
+			return err
+		}
+	}
+	if in.taskReviewEffort.present {
+		if _, err := q.SetUserTaskReviewEffort(ctx, store.SetUserTaskReviewEffortParams{ID: userID, TaskReviewEffort: in.taskReviewEffort.val}); err != nil {
+			return err
+		}
+	}
+	if in.codexTaskReviewEffort.present {
+		if _, err := q.SetUserCodexTaskReviewEffort(ctx, store.SetUserCodexTaskReviewEffortParams{ID: userID, CodexTaskReviewEffort: in.codexTaskReviewEffort.val}); err != nil {
 			return err
 		}
 	}

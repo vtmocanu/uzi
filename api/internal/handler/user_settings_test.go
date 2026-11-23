@@ -58,6 +58,21 @@ type fakeSettingsDB struct {
 	defaultHarness  pgtype.Text
 	claudeModel     pgtype.Text
 	codexModel      pgtype.Text
+	// planningModel and planningEffort are users.planning_claude_model / planning_claude_effort
+	// (PRD #3252), written by SetUserPlanningClaude.
+	planningModel       pgtype.Text
+	planningEffort      pgtype.Text
+	planningCodexModel  pgtype.Text
+	planningCodexEffort pgtype.Text
+	// taskReview and codexTaskReview are users.task_review_model / codex_task_review_model
+	// (PRD #1570), written by SetUserTaskReviewModel / SetUserCodexTaskReviewModel.
+	taskReview      pgtype.Text
+	codexTaskReview pgtype.Text
+	// taskReviewEffort and codexTaskReviewEffort are users.task_review_effort /
+	// codex_task_review_effort (PRD #1570), written by SetUserTaskReviewEffort /
+	// SetUserCodexTaskReviewEffort.
+	taskReviewEffort      pgtype.Text
+	codexTaskReviewEffort pgtype.Text
 	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
 	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
 	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
@@ -126,6 +141,32 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 				f.model = v
 			}
 		}
+	case strings.Contains(sql, "SET planning_claude_model = CASE") && len(args) >= 5:
+		// SetUserPlanningClaude: $1=set_model, $2=planning_claude_model, $3=set_effort,
+		// $4=planning_claude_effort, $5=id. A field is written only when its set flag is true.
+		if set, _ := args[0].(bool); set {
+			if v, ok := args[1].(pgtype.Text); ok {
+				f.planningModel = v
+			}
+		}
+		if set, _ := args[2].(bool); set {
+			if v, ok := args[3].(pgtype.Text); ok {
+				f.planningEffort = v
+			}
+		}
+	case strings.Contains(sql, "SET planning_codex_model = CASE") && len(args) >= 5:
+		// SetUserPlanningCodex: $1=set_model, $2=planning_codex_model, $3=set_effort,
+		// $4=planning_codex_effort, $5=id. A field is written only when its set flag is true.
+		if set, _ := args[0].(bool); set {
+			if v, ok := args[1].(pgtype.Text); ok {
+				f.planningCodexModel = v
+			}
+		}
+		if set, _ := args[2].(bool); set {
+			if v, ok := args[3].(pgtype.Text); ok {
+				f.planningCodexEffort = v
+			}
+		}
 	case strings.Contains(sql, "UPDATE users SET default_codex_effort") && len(args) >= 1:
 		if e, ok := args[0].(pgtype.Text); ok {
 			f.codexEffort = e
@@ -145,6 +186,22 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 	case strings.Contains(sql, "UPDATE users SET judge_runs_on") && len(args) >= 1:
 		if j, ok := args[0].(pgtype.Text); ok {
 			f.judgeRunsOn = j // SetUserJudgeRunsOn: $1 = judge_runs_on (PRD #3257)
+		}
+	case strings.Contains(sql, "UPDATE users SET codex_task_review_effort") && len(args) >= 1:
+		if e, ok := args[0].(pgtype.Text); ok {
+			f.codexTaskReviewEffort = e // SetUserCodexTaskReviewEffort: $1 = codex_task_review_effort
+		}
+	case strings.Contains(sql, "UPDATE users SET task_review_effort") && len(args) >= 1:
+		if e, ok := args[0].(pgtype.Text); ok {
+			f.taskReviewEffort = e // SetUserTaskReviewEffort: $1 = task_review_effort
+		}
+	case strings.Contains(sql, "UPDATE users SET codex_task_review_model") && len(args) >= 1:
+		if s, ok := args[0].(pgtype.Text); ok {
+			f.codexTaskReview = s // SetUserCodexTaskReviewModel: $1 = codex_task_review_model
+		}
+	case strings.Contains(sql, "UPDATE users SET task_review_model") && len(args) >= 1:
+		if s, ok := args[0].(pgtype.Text); ok {
+			f.taskReview = s // SetUserTaskReviewModel: $1 = task_review_model
 		}
 	case strings.Contains(sql, "UPDATE users SET codex_summary_model") && len(args) >= 1:
 		if s, ok := args[0].(pgtype.Text); ok {
@@ -211,56 +268,72 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		}
 	}
 	return fakeSettingsRow{
-		model:           f.model,
-		effort:          f.effort,
-		codexEffort:     f.codexEffort,
-		judge:           f.judge,
-		codexJudge:      f.codexJudge,
-		judgeRunsOn:     f.judgeRunsOn,
-		summary:         f.summary,
-		codexSummary:    f.codexSummary,
-		theme:           f.theme,
-		mrRework:        f.mrRework,
-		nowSummary:      f.nowSummary,
-		weeklyPct:       f.weeklyPct,
-		weeklyPause:     f.weeklyPause,
-		sidebarIDs:      f.sidebarIDs,
-		sidebarCodexIDs: f.sidebarCodexIDs,
-		apprMode:        f.apprMode,
-		lightTheme:      f.lightTheme,
-		darkTheme:       f.darkTheme,
-		typeface:        f.typeface,
-		sidebarMotion:   f.sidebarMotion,
-		defaultHarness:  f.defaultHarness,
-		claudeModel:     f.claudeModel,
-		codexModel:      f.codexModel,
+		model:                 f.model,
+		effort:                f.effort,
+		codexEffort:           f.codexEffort,
+		judge:                 f.judge,
+		codexJudge:            f.codexJudge,
+		judgeRunsOn:           f.judgeRunsOn,
+		summary:               f.summary,
+		codexSummary:          f.codexSummary,
+		theme:                 f.theme,
+		mrRework:              f.mrRework,
+		nowSummary:            f.nowSummary,
+		weeklyPct:             f.weeklyPct,
+		weeklyPause:           f.weeklyPause,
+		sidebarIDs:            f.sidebarIDs,
+		sidebarCodexIDs:       f.sidebarCodexIDs,
+		apprMode:              f.apprMode,
+		lightTheme:            f.lightTheme,
+		darkTheme:             f.darkTheme,
+		typeface:              f.typeface,
+		sidebarMotion:         f.sidebarMotion,
+		defaultHarness:        f.defaultHarness,
+		claudeModel:           f.claudeModel,
+		codexModel:            f.codexModel,
+		planningModel:         f.planningModel,
+		planningEffort:        f.planningEffort,
+		taskReview:            f.taskReview,
+		codexTaskReview:       f.codexTaskReview,
+		taskReviewEffort:      f.taskReviewEffort,
+		codexTaskReviewEffort: f.codexTaskReviewEffort,
+		planningCodexModel:    f.planningCodexModel,
+		planningCodexEffort:   f.planningCodexEffort,
 	}
 }
 
 type fakeSettingsRow struct {
-	model           pgtype.Text
-	effort          pgtype.Text
-	codexEffort     pgtype.Text
-	judge           pgtype.Text
-	codexJudge      pgtype.Text
-	judgeRunsOn     pgtype.Text
-	summary         pgtype.Text
-	codexSummary    pgtype.Text
-	theme           pgtype.Text
-	mrRework        pgtype.Bool
-	nowSummary      pgtype.Bool
-	weeklyPct       pgtype.Int2
-	weeklyPause     bool
-	sidebarIDs      []uuid.UUID
-	sidebarCodexIDs []uuid.UUID
-	apprMode        pgtype.Text
-	lightTheme      pgtype.Text
-	darkTheme       pgtype.Text
-	typeface        pgtype.Text
-	sidebarMotion   pgtype.Bool
-	defaultHarness  pgtype.Text
-	claudeModel     pgtype.Text
-	codexModel      pgtype.Text
+	model                 pgtype.Text
+	effort                pgtype.Text
+	codexEffort           pgtype.Text
+	judge                 pgtype.Text
+	codexJudge            pgtype.Text
+	judgeRunsOn           pgtype.Text
+	summary               pgtype.Text
+	codexSummary          pgtype.Text
+	theme                 pgtype.Text
+	mrRework              pgtype.Bool
+	nowSummary            pgtype.Bool
+	weeklyPct             pgtype.Int2
+	weeklyPause           bool
+	sidebarIDs            []uuid.UUID
+	sidebarCodexIDs       []uuid.UUID
+	apprMode              pgtype.Text
+	lightTheme            pgtype.Text
+	darkTheme             pgtype.Text
+	typeface              pgtype.Text
+	sidebarMotion         pgtype.Bool
+	defaultHarness        pgtype.Text
+	claudeModel           pgtype.Text
+	codexModel            pgtype.Text
+	planningModel         pgtype.Text
+	planningEffort        pgtype.Text
+	taskReview            pgtype.Text
+	codexTaskReview       pgtype.Text
+	taskReviewEffort      pgtype.Text
+	codexTaskReviewEffort pgtype.Text
+	planningCodexModel    pgtype.Text
+	planningCodexEffort   pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -297,7 +370,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 25: // GetUserSettings: 22 settings columns + two provider IDs + sidebar_motion.
+	case 33: // GetUserSettings: 22 settings columns + two provider IDs + sidebar_motion + both planning pairs and per-harness task-review models/efforts.
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -386,6 +459,29 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		// sidebar_motion (issue #4510) is the 25th column, after both provider IDs.
 		if p, ok := dest[24].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
+		}
+		// planning_claude_model and planning_claude_effort (PRD #3252) are columns 26 and 27.
+		if p, ok := dest[25].(*pgtype.Text); ok {
+			*p = r.planningModel
+		}
+		if p, ok := dest[26].(*pgtype.Text); ok {
+			*p = r.planningEffort
+		}
+		*dest[27].(*pgtype.Text) = r.planningCodexModel
+		*dest[28].(*pgtype.Text) = r.planningCodexEffort
+		// task-review models follow both planning pairs.
+		if p, ok := dest[29].(*pgtype.Text); ok {
+			*p = r.taskReview
+		}
+		if p, ok := dest[30].(*pgtype.Text); ok {
+			*p = r.codexTaskReview
+		}
+		// task-review efforts follow the task-review models.
+		if p, ok := dest[31].(*pgtype.Text); ok {
+			*p = r.taskReviewEffort
+		}
+		if p, ok := dest[32].(*pgtype.Text); ok {
+			*p = r.codexTaskReviewEffort
 		}
 	}
 	return nil
@@ -1757,8 +1853,8 @@ func TestSidebarMotionNullUserResolvesToInstanceDefault(t *testing.T) {
 		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
 	}
 	raw, eff := decodeSidebarMotion(t, rec.Body.Bytes())
-	if raw != nil || eff {
-		t.Fatalf("NULL user: raw=%v effective=%v, want nil/false", raw, eff)
+	if raw != nil || !eff {
+		t.Fatalf("NULL user: raw=%v effective=%v, want nil/true", raw, eff)
 	}
 }
 
@@ -1792,9 +1888,9 @@ func TestSidebarMotionPutNullClears(t *testing.T) {
 	if db.sidebarMotion.Valid {
 		t.Fatalf("stored sidebar_motion should be NULL, got %+v", db.sidebarMotion)
 	}
-	raw, _ := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
-	if raw != nil {
-		t.Fatalf("raw after clear = %v, want nil", *raw)
+	raw, eff := decodeSidebarMotion(t, getSettingsBody(h).Body.Bytes())
+	if raw != nil || !eff {
+		t.Fatalf("after clear: raw=%v effective=%v, want nil/true", raw, eff)
 	}
 }
 

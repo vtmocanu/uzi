@@ -70,6 +70,8 @@ type AgentTemplate struct {
 	Customized  bool               `json:"customized"`
 	Origin      pgtype.Text        `json:"origin"`
 	CodexModel  pgtype.Text        `json:"codex_model"`
+	Effort      pgtype.Text        `json:"effort"`
+	CodexEffort pgtype.Text        `json:"codex_effort"`
 }
 
 type AgentTemplateAllocation struct {
@@ -581,20 +583,21 @@ type InstanceIntakePauseEvent struct {
 }
 
 type Issue struct {
-	ID             uuid.UUID          `json:"id"`
-	RepoID         uuid.UUID          `json:"repo_id"`
-	ForgeIssueIid  int64              `json:"forge_issue_iid"`
-	Title          string             `json:"title"`
-	State          string             `json:"state"`
-	Labels         []byte             `json:"labels"`
-	WebUrl         string             `json:"web_url"`
-	Author         pgtype.Text        `json:"author"`
-	HasPrdLink     bool               `json:"has_prd_link"`
-	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
-	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
-	BoardPosition  pgtype.Int8        `json:"board_position"`
-	AssigneeIds    []byte             `json:"assignee_ids"`
-	IssueKey       pgtype.Text        `json:"issue_key"`
+	ID                 uuid.UUID          `json:"id"`
+	RepoID             uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid      int64              `json:"forge_issue_iid"`
+	Title              string             `json:"title"`
+	State              string             `json:"state"`
+	Labels             []byte             `json:"labels"`
+	WebUrl             string             `json:"web_url"`
+	Author             pgtype.Text        `json:"author"`
+	HasPrdLink         bool               `json:"has_prd_link"`
+	ForgeUpdatedAt     pgtype.Timestamptz `json:"forge_updated_at"`
+	SyncedAt           pgtype.Timestamptz `json:"synced_at"`
+	BoardPosition      pgtype.Int8        `json:"board_position"`
+	AssigneeIds        []byte             `json:"assignee_ids"`
+	IssueKey           pgtype.Text        `json:"issue_key"`
+	IssueTrackerColumn pgtype.Text        `json:"issue_tracker_column"`
 }
 
 type IssueProposal struct {
@@ -1114,6 +1117,19 @@ type Repo struct {
 	EligibilityTagID                  pgtype.Text        `json:"eligibility_tag_id"`
 	EligibilityTagName                pgtype.Text        `json:"eligibility_tag_name"`
 	IssueTrackerLinkedAt              pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+}
+
+type RepoIssueTrackerColumnState struct {
+	RepoID    uuid.UUID `json:"repo_id"`
+	LabelName string    `json:"label_name"`
+	StateName string    `json:"state_name"`
+}
+
+type RepoIssueTrackerState struct {
+	RepoID      uuid.UUID          `json:"repo_id"`
+	OpenState   string             `json:"open_state"`
+	ClosedState string             `json:"closed_state"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RepoRemovalMarker struct {
@@ -1740,6 +1756,7 @@ type RunSchedule struct {
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
 	CiArtifacts                []byte             `json:"ci_artifacts"`
+	FireEpoch                  int64              `json:"fire_epoch"`
 }
 
 type RunTerminalContribution struct {
@@ -1875,6 +1892,24 @@ type RunUserInput struct {
 	GateRevision            pgtype.Int8        `json:"gate_revision"`
 	IncludedAt              pgtype.Timestamptz `json:"included_at"`
 	InclusionReported       bool               `json:"inclusion_reported"`
+}
+
+type ScheduleOnceFire struct {
+	ScheduleID   uuid.UUID          `json:"schedule_id"`
+	FireEpoch    int64              `json:"fire_epoch"`
+	EffectiveCap pgtype.Int4        `json:"effective_cap"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type ScheduleOnceFireRun struct {
+	ScheduleID uuid.UUID          `json:"schedule_id"`
+	FireEpoch  int64              `json:"fire_epoch"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	IssueIid   int64              `json:"issue_iid"`
+	IssueTitle string             `json:"issue_title"`
+	WebUrl     string             `json:"web_url"`
+	RunUuid    uuid.UUID          `json:"run_uuid"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type SemanticCandidateHistory struct {
@@ -2033,7 +2068,15 @@ type User struct {
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
 	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
 	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
+	PlanningClaudeModel       pgtype.Text        `json:"planning_claude_model"`
+	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
 	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
+	PlanningCodexModel        pgtype.Text        `json:"planning_codex_model"`
+	PlanningCodexEffort       pgtype.Text        `json:"planning_codex_effort"`
+	TaskReviewModel           pgtype.Text        `json:"task_review_model"`
+	CodexTaskReviewModel      pgtype.Text        `json:"codex_task_review_model"`
+	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
+	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
 }
 
 type UserCrossCheckPin struct {

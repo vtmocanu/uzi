@@ -1319,10 +1319,13 @@ const realApi = {
     request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
   resetAdminWorkerSize: (name: string) =>
     request<AdminWorkerSizeWrite>("POST", `/admin/worker-sizes/${encodeURIComponent(name)}/reset`),
-  // PRD #4213 M3: PUT on an absent name creates the size (201); the editor checks locally
-  // that the name is new, since the same PUT on an existing name edits it.
+  // PRD #4213 M3: PUT on an absent name creates the size (201). `If-None-Match: *` makes it
+  // create-only: an existing name is refused 412 {reason: "size_exists"} instead of edited,
+  // so a stale local list cannot turn an add into a silent overwrite.
   createAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
-    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec, {
+      "If-None-Match": "*",
+    }),
   // 409 {reason: "builtin" | "in_use", used_by: {workers, settings}} when the size cannot go.
   deleteAdminWorkerSize: (name: string) =>
     request<{ deleted: string }>("DELETE", `/admin/worker-sizes/${encodeURIComponent(name)}`),

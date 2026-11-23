@@ -84,8 +84,17 @@ type Store interface {
 	GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error)
 	CountInProgressRunsForUser(context.Context, uuid.UUID) (int64, error)
 	ClaimDueSchedules(ctx context.Context) ([]store.RunSchedule, error)
-	AdvanceSchedule(ctx context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error)
-	SetRunScheduleStatus(ctx context.Context, arg store.SetRunScheduleStatusParams) (store.RunSchedule, error)
+	// Issue #4512 (ADR-4007 T3a): every schedule write of a fire is guarded to the claimed
+	// fire_epoch (zero rows = a stale fire, never an error). The recurring advance, the guarded
+	// park and the one-time issue/prompt advance are single autocommit statements; a one-time
+	// sweep's summary goes through RunCreator.WriteOnceFireSummary instead.
+	AdvanceScheduleGuarded(ctx context.Context, arg store.AdvanceScheduleGuardedParams) (int64, error)
+	AdvanceOnceScheduleGuarded(ctx context.Context, arg store.AdvanceOnceScheduleGuardedParams) (int64, error)
+	ParkScheduleGuarded(ctx context.Context, arg store.ParkScheduleGuardedParams) (int64, error)
+	// ListOnceFireProgress and GetOnceFireCap are the scheduled once sweep's unlocked progress
+	// read at the start of a fire; the writes re-read under the schedule row lock.
+	ListOnceFireProgress(ctx context.Context, arg store.ListOnceFireProgressParams) ([]store.ListOnceFireProgressRow, error)
+	GetOnceFireCap(ctx context.Context, arg store.GetOnceFireCapParams) (pgtype.Int4, error)
 	ListSweepCandidateIssues(ctx context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error)
 	CountSweepCandidateIssues(ctx context.Context, arg store.CountSweepCandidateIssuesParams) (store.CountSweepCandidateIssuesRow, error)
 	HasActiveRunForIssue(ctx context.Context, arg store.HasActiveRunForIssueParams) (bool, error)
@@ -112,8 +121,9 @@ type Store interface {
 	// #1093), RAW: expiry is computed in Go against e.now() at fire time, not by SQL.
 	// ErrNoRows resolves to not paused (fail-open).
 	GetUserSchedulePause(ctx context.Context, userID uuid.UUID) (store.GetUserSchedulePauseRow, error)
-	// RecordScheduleHeldFire writes only last_fire on a still-active one-time row (PRD #1732
-	// D2): the credential_disabled hold records why the row waits without advancing it.
+	// RecordScheduleHeldFire writes last_fire and, when matched > 0, prepends recent_fires
+	// on a still-active one-time row (PRD #1732 D2). The credential_disabled hold has
+	// matched = 1 and records why the row waits without advancing it.
 	RecordScheduleHeldFire(ctx context.Context, arg store.RecordScheduleHeldFireParams) (int64, error)
 	// GetCIWatchEpisode is the ci_watch fire's UNLOCKED read of one workflow's episode (PRD
 	// #2865). Every write is rechecked under locks by the RunCreator seam below.
@@ -129,13 +139,13 @@ type RunCreator interface {
 	// CreateScheduledRun is the non-auto-approve scheduled path: like the manual create but the
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
-	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error)
 	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
 	// CreateAutopilotRun inherits owner defaults (see workersvc.CreateScheduledAutopilotRun).
-	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
 	// CreateCIRepairRun is the ci_watch fire's guarded prompt-run insert (PRD #2865): the repo,
 	// schedule and episode locks, the configuration and episode rechecks, the run INSERT and the
@@ -164,6 +174,11 @@ type RunCreator interface {
 	ScheduleCredentialDisabled(ctx context.Context, userID uuid.UUID, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) error
 	// CheckStoredCredentialOverrideEnabled preserves errors from the late stored-pin lookup.
 	CheckStoredCredentialOverrideEnabled(ctx context.Context, userID uuid.UUID, credOverride *workersvc.CredentialOverride) error
+	// WriteOnceFireSummary is the one place a one-time sweep's summary is written (issue #4512,
+	// ADR-4007 T3a): a short transaction under the same schedule row lock each admission holds,
+	// composing the summary from the durable ledger. It lives on the run-creation seam because
+	// the transaction does, and fails closed without one. *workersvc.Service satisfies it.
+	WriteOnceFireSummary(ctx context.Context, scheduleID, userID uuid.UUID, fireEpoch int64, compose func(workersvc.OnceFireSnapshot) (workersvc.OnceFireWrite, error)) (workersvc.OnceFireSummaryResult, error)
 }
 
 // storedOverrideLookupError identifies a late lookup failure rather than a credential refusal.
@@ -432,9 +447,24 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 	// The tick path threads the FireOutcome into advance, which persists it into
 	// last_fire on the success/benign path (PRD #308 M2). RunNow does NOT reach here, so
 	// a manual fire never persists a last_fire (Decision 3).
-	out, fireErr := e.fireOne(ctx, sched)
+	out, fireErr := e.fireOne(ctx, sched, true)
 	if holdsOnceCredentialDisabled(sched, fireErr) {
 		e.holdOnceCredentialDisabled(ctx, sched, heldSkipReason(fireErr))
+		return
+	}
+	if errors.Is(fireErr, errOnceFireHeld) {
+		// Issue #4512: a continuation of a partially admitted once sweep whose owner capacity has
+		// no room. Quiet: no transient warning, no advance; the row stays due and retries next
+		// tick. A summary of the progress so far, with the observed capacity, says why it waits;
+		// its dedupe ignores the volatile in-flight and room numbers.
+		e.logger.Debug("scheduler: once sweep continuation held, no capacity room", "schedule", sched.ID.String())
+		e.writeOnceSweepSummary(ctx, sched, out, onceSummaryPartial)
+		return
+	}
+	if errors.Is(fireErr, workersvc.ErrOnceFireStale) {
+		// The occurrence was re-armed, converted, parked or deleted under this fire: it must
+		// neither advance nor park the row, and is not an error.
+		e.logger.Info("scheduler: once sweep fire is stale, dropping it", "schedule", sched.ID.String(), "fire_epoch", sched.FireEpoch)
 		return
 	}
 	e.advance(ctx, sched, out, fireErr)
@@ -449,6 +479,12 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.RunSchedule, reason SkipReason) {
 	e.logger.Debug("scheduler: credential disabled, holding once schedule", "schedule", sched.ID.String())
 	out := credentialDisabledHoldOutcome(sched, reason)
+	if sched.Target == "sweep" {
+		// Issue #4512: a one-time sweep's hold is written under the schedule row lock, keeping
+		// the admitted starts of a partially admitted fire in the summary.
+		e.writeOnceSweepSummary(ctx, sched, out, onceSummaryHeld)
+		return
+	}
 	if lastFireIsHold(sched.LastFire, out) {
 		return
 	}
@@ -457,7 +493,7 @@ func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.
 		e.logger.Error("scheduler: marshal held last_fire", "schedule", sched.ID.String(), "error", err)
 		return
 	}
-	if _, err := e.store.RecordScheduleHeldFire(ctx, store.RecordScheduleHeldFireParams{ID: sched.ID, LastFire: lastFireJSON}); err != nil {
+	if _, err := e.store.RecordScheduleHeldFire(ctx, store.RecordScheduleHeldFireParams{ID: sched.ID, LastFire: lastFireJSON, FireEpoch: sched.FireEpoch}); err != nil {
 		e.logger.Error("scheduler: record held last_fire", "schedule", sched.ID.String(), "error", err)
 	}
 }
@@ -523,7 +559,9 @@ func fireCredentialOverride(sched store.RunSchedule) *workersvc.CredentialOverri
 // ErrBranchInUse on an issue target, which becomes an already_running skip, and a one-time
 // schedule's credential_disabled hold, which becomes the credential_disabled skip (see below).
 func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
-	out, err := e.fireOne(ctx, sched)
+	// scheduled=false: a manual fire is a distinct fire. It reads and writes no once-fire
+	// progress and persists no last_fire (issue #4512).
+	out, err := e.fireOne(ctx, sched, false)
 	// Issue #1626: createIssueRun returns ErrBranchInUse as an error for a once issue
 	// schedule so the tick path holds the row. RunNow never advances, so there is nothing
 	// to hold: answer with the benign already_running skip instead of a 502. The skip
@@ -557,7 +595,10 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOu
 //
 // On any non-nil error the returned FireOutcome is the zero value: the outcome is only
 // meaningful on the success/benign advance path (M2 persists it there).
-func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
+//
+// scheduled is true only for a scheduler tick (process); RunNow passes false. Only a scheduled
+// tick on a one-time sweep uses the durable per-fire progress (issue #4512).
+func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule, scheduled bool) (FireOutcome, error) {
 	if sched.RemoveLabelOnDispatch && (sched.Target != "sweep" || sched.Timing != "recurring") {
 		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
 	}
@@ -565,7 +606,7 @@ func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) (FireO
 	case "issue":
 		return e.fireIssue(ctx, sched)
 	case "sweep":
-		return e.fireSweep(ctx, sched)
+		return e.fireSweep(ctx, sched, scheduled)
 	case "prompt":
 		return e.firePrompt(ctx, sched)
 	case "self_improve":
@@ -623,7 +664,7 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
 	issue := capture.Issue
-	return e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL, capture, repo.ForgeProjectID)
+	return e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL, capture, repo.ForgeProjectID, nil)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -647,7 +688,13 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 // backlog (whatever the cap) so the outcome can report how many open issues match the
 // selector but are not eligible (FireOutcome.IneligibleMatched); an assigned sweep counts
 // only when a cap is set, since only a cap can truncate.
-func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (FireOutcome, error) {
+//
+// Durable per-fire progress (issue #4512, ADR-4007 T3a): a SCHEDULED tick on a one-time sweep
+// first reads the fire's ledger. With rows it is a continuation: the stored cap (not a
+// recomputed one) bounds the fire, recorded candidates are never started or skipped again, and
+// each admission records itself in its run-create transaction. RunNow and recurring sweeps pass
+// no progress and keep today's behaviour exactly.
+func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule, scheduled bool) (FireOutcome, error) {
 	// Catalog overlay (PRD #589 M2, Decision 2): a default-origin sweep row stores NULL
 	// labels/guidance and carries them in the builtin catalog, resolved HERE by catalog_slug
 	// so a shipped selector/guidance change reaches every enabled default automatically. The
@@ -708,7 +755,35 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		}
 		selectorLabel = raw[0]
 	}
+	var prior []store.ListOnceFireProgressRow
+	onceProgress := scheduled && sched.Timing == "once"
+	continuation := false
+	if onceProgress {
+		var err error
+		prior, err = e.store.ListOnceFireProgress(ctx, store.ListOnceFireProgressParams{ScheduleID: sched.ID, FireEpoch: sched.FireEpoch})
+		if err != nil {
+			return FireOutcome{}, err // transient: nothing was started, retry next tick
+		}
+		if len(prior) > 0 {
+			// The header of a fire with rows always exists (both commit in one transaction); its
+			// stored cap (NULL = unlimited), not a recomputed one, bounds the whole fire.
+			storedCap, err := e.store.GetOnceFireCap(ctx, store.GetOnceFireCapParams{ScheduleID: sched.ID, FireEpoch: sched.FireEpoch})
+			if err != nil {
+				return FireOutcome{}, err
+			}
+			continuation = true
+			sched.MaxIssues = storedCap
+		}
+	}
+	started := foldPriorStarts(prior)
+	if continuation && sched.MaxIssues.Valid && len(prior) >= int(sched.MaxIssues.Int32) {
+		// The cap was already reached by earlier attempts: nothing left to start, so go straight
+		// to the completing advance without waiting on capacity or the forge.
+		return FireOutcome{Matched: len(started), Started: started}, nil
+	}
 	var capacity *CapacityCheck
+	// newRoom bounds only the starts of THIS attempt of a continuation (-1: no bound).
+	newRoom := -1
 	if sched.CapacityLimit.Valid {
 		if selectorKind != schedtmpl.SelectorLabel {
 			return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
@@ -719,13 +794,39 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		}
 		room := max(int64(0), int64(sched.CapacityLimit.Int32)-count)
 		capacity = &CapacityCheck{InFlight: count, Limit: int(sched.CapacityLimit.Int32), RoomNeeded: int(sched.CapacityRoomNeeded.Int32), Room: int(room), Blocked: room < int64(sched.CapacityRoomNeeded.Int32)}
-		if capacity.Blocked {
-			return FireOutcome{Capacity: capacity}, nil
+		if continuation {
+			// The fire was already admitted, so the room-needed check is not repeated: room only
+			// bounds the NEW starts, and none at all is a quiet hold.
+			capacity.Blocked = false
+			if room == 0 {
+				held := *capacity
+				held.Blocked = true
+				return FireOutcome{Capacity: &held, Started: started, Matched: len(started)}, errOnceFireHeld
+			}
+			newRoom = int(room)
+		} else {
+			if capacity.Blocked {
+				return FireOutcome{Capacity: capacity}, nil
+			}
+			// This local cap bounds both the backfill scan and starts; the stored cap is unchanged.
+			if !sched.MaxIssues.Valid || int64(sched.MaxIssues.Int32) > room {
+				sched.MaxIssues = pgtype.Int4{Int32: int32(room), Valid: true} //nolint:gosec // room is bounded by capacity_limit <= 50.
+			}
 		}
-		// This local cap bounds both the backfill scan and starts; the stored cap is unchanged.
-		if !sched.MaxIssues.Valid || int64(sched.MaxIssues.Int32) > room {
-			sched.MaxIssues = pgtype.Int4{Int32: int32(room), Valid: true} //nolint:gosec // room is bounded by capacity_limit <= 50.
+	}
+	var progressTpl *workersvc.OnceFireProgress
+	if onceProgress {
+		var effCap *int
+		if sched.MaxIssues.Valid {
+			c := int(sched.MaxIssues.Int32)
+			effCap = &c
 		}
+		// IssueIID, Title and WebURL are filled per candidate in createIssueRun.
+		progressTpl = &workersvc.OnceFireProgress{ScheduleID: sched.ID, UserID: sched.UserID, FireEpoch: sched.FireEpoch, EffectiveCap: effCap}
+	}
+	recorded := make(map[int64]bool, len(prior))
+	for _, p := range prior {
+		recorded[p.IssueIid] = true
 	}
 	repo, f, err := e.resolveRepoForge(ctx, sched)
 	if err != nil {
@@ -814,10 +915,22 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	// invariant (PRD #308 Decision 4) by construction. Every candidate the loop reaches
 	// lands in exactly one of Started/Skips; the loop stops early once max_issues have
 	// started, so Matched counts attempts (may exceed max_issues), not the whole window.
-	out := FireOutcome{Capacity: capacity, Capped: capped, IneligibleMatched: ineligibleMatched}
+	out := FireOutcome{Capacity: capacity, Capped: capped, IneligibleMatched: ineligibleMatched, Started: started}
 	for _, c := range candidates {
 		iid := c.ForgeIssueIid
 		iidCopy := iid
+		if onceProgress && ctx.Err() != nil {
+			// A cancelled run context (shutdown) makes every remaining seam call fail and would be
+			// recorded as fetch_failed skips, then the completing advance would consume the unused
+			// slots. Return it as transient: the row stays due and the ledger resumes the fire.
+			return FireOutcome{}, ctx.Err()
+		}
+		if recorded[iid] {
+			// A slot an earlier attempt of this fire already spent (its run is in Started, folded
+			// from the ledger): never started again and never skipped, even if the run has ended or
+			// the issue has left the selector.
+			continue
+		}
 		active, err := e.store.HasActiveRunForIssue(ctx, store.HasActiveRunForIssueParams{
 			RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true},
 		})
@@ -843,7 +956,22 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			continue
 		}
 		issue := capture.Issue
-		res, err := e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL, capture, repo.ForgeProjectID)
+		res, err := e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL, capture, repo.ForgeProjectID, progressTpl)
+		// This attempt's own starts: the ledger-folded prior starts must not steer the arms below.
+		newStarts := len(out.Started) - len(prior)
+		if errors.Is(err, workersvc.ErrOnceFireStale) {
+			return FireOutcome{}, err // the occurrence moved on: stop, no advance
+		}
+		if errors.Is(err, workersvc.ErrOnceFireIdentity) {
+			e.logger.Error("scheduler: once fire progress identity mismatch (bug), will retry", "schedule", sched.ID.String(), "issue", iid, "error", err)
+			return FireOutcome{}, err // transient, and nothing was created
+		}
+		if errors.Is(err, workersvc.ErrOnceFireCapSpent) {
+			break // the stored cap is already spent (e.g. by a lost-ack admission): no skip to record
+		}
+		if errors.Is(err, workersvc.ErrOnceFireCandidateRecorded) {
+			continue // this slot is already spent: no run, no skip
+		}
 		if holdsOnceCredentialDisabled(sched, err) {
 			// PRD #1732 D2: the schedule-wide pin is disabled, so every candidate would be
 			// refused the same way. A one-time sweep that has started nothing yet is held
@@ -851,7 +979,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			// this fire is not: holding it would re-fire the whole sweep after re-enable and
 			// start up to max_issues more on top of the runs already started, so it records the
 			// skip, stops the fan-out and advances normally.
-			if len(out.Started) == 0 {
+			if newStarts == 0 {
 				return FireOutcome{}, err
 			}
 			e.logger.Info("scheduler: sweep stopped, credential disabled mid-fire", "schedule", sched.ID.String(), "issue", iid, "reason", err)
@@ -860,7 +988,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		}
 		var lookupErr *storedOverrideLookupError
 		if sched.Timing == "once" && errors.As(err, &lookupErr) {
-			if len(out.Started) == 0 {
+			if newStarts == 0 {
 				return FireOutcome{}, err
 			}
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipFetchFailed, WebURL: issue.WebURL})
@@ -877,6 +1005,18 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			// credential-disabled and stored-override arms above also stop and advance. Holding
 			// it would re-fire the whole sweep and could start up to max_issues more on top of
 			// this fire's runs.
+			//
+			// Issue #4512: a SCHEDULED one-time sweep has a durable ledger, so it does not advance
+			// either: it returns the error (not advanced, retried next tick, resuming with only its
+			// remaining slots) after a best-effort partial summary of what it has started.
+			if onceProgress {
+				if len(out.Started) > 0 {
+					partial := out
+					partial.Skips = append(append([]Skip(nil), out.Skips...), Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipConsumerGateBusy, WebURL: issue.WebURL})
+					e.writeOnceSweepSummary(ctx, sched, partial, onceSummaryPartial)
+				}
+				return FireOutcome{}, err
+			}
 			if len(out.Started) == 0 {
 				return FireOutcome{}, err
 			}
@@ -899,15 +1039,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 				for i := range res.Started {
 					res.Started[i].SelectorLabel = selectorLabel
 				}
-				uziLabel := settings.DefaultUziLabel
-				var removeErr error
-				if e.settings != nil {
-					var live string
-					live, removeErr = e.settings.UziLabel(ctx)
-					if strings.TrimSpace(live) != "" {
-						uziLabel = live
-					}
-				}
+				uziLabel, removeErr := e.dispatchEligibilityLabel(ctx, repo)
 				if removeErr != nil || selectorLabel != uziLabel {
 					if removeErr == nil {
 						var cached store.Issue
@@ -937,6 +1069,13 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		if sched.MaxIssues.Valid && len(out.Started) >= int(sched.MaxIssues.Int32) {
 			break
 		}
+		// A continuation's owner-capacity room bounds only the starts of this attempt.
+		if newRoom >= 0 && len(out.Started)-len(prior) >= newRoom {
+			break
+		}
+	}
+	if onceProgress && ctx.Err() != nil {
+		return FireOutcome{}, ctx.Err() // see the loop-top check: never advance a cancelled once fire
 	}
 	// Matched = candidates examined this fire (== started + skipped by construction).
 	out.Matched = len(out.Started) + len(out.Skips)
@@ -1080,8 +1219,17 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 // MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
 // ErrDescriptionTooLarge skip. It is purely additive: the eligibility gate reads the
 // cached issue's uzi_label (PRD #764 M1) and never sees the composed text.
-func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, webURL string, capture *issueinput.Capture, projectID int64) (FireOutcome, error) {
+func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, webURL string, capture *issueinput.Capture, projectID int64, progressTpl *workersvc.OnceFireProgress) (FireOutcome, error) {
 	iidCopy := iid
+	// Issue #4512: a scheduled one-time sweep admits each run in the create transaction together
+	// with its ledger row; progressTpl carries the fire's identity and cap (nil for every other
+	// fire, which is exactly today's behaviour).
+	var progress *workersvc.OnceFireProgress
+	if progressTpl != nil {
+		p := *progressTpl
+		p.RepoID, p.IssueIID, p.Title, p.WebURL = repoID, iid, title, webURL
+		progress = &p
+	}
 	selection, err := workersvc.ResolveIssueHarness(capture, projectID, iid, scheduleHarness(sched))
 	if err != nil {
 		var reason SkipReason
@@ -1117,7 +1265,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// PRD #1247 M6: the schedule's stored credential override is threaded here
 		// (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), selection.Explicit)
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), selection.Explicit, progress)
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -1129,7 +1277,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// trailing seed=nil (no seeded plan for a scheduled issue run); PRD #1247 M6 threads
 		// the schedule's stored credential override (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), selection.Explicit)
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), selection.Explicit, progress)
 	}
 
 	if err == nil {
@@ -1245,8 +1393,9 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 	// A gate wait can end because this context was canceled AFTER a candidate
 	// committed. Preserve the narrowed partial-fire disposition independently of
 	// that cancellation, but bound this metadata write. No further runs are created.
-	// This is still a separate best-effort write, not durable per-fire progress.
-	if fireErr == nil && len(out.Started) > 0 {
+	// This detach is for the recurring arm only: a one-time sweep's summary has its own detached
+	// bounded context inside WriteOnceFireSummary (issue #4512).
+	if fireErr == nil && sched.Timing == "recurring" && len(out.Started) > 0 {
 		for _, skip := range out.Skips {
 			if skip.Reason == SkipConsumerGateBusy {
 				var cancel context.CancelFunc
@@ -1279,6 +1428,12 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 		return
 	}
 
+	if sched.Timing == "once" && sched.Target == "sweep" {
+		// Issue #4512: the completing advance of a one-time sweep is composed from the ledger
+		// under the schedule row lock, never from this fire's in-memory Started.
+		e.writeOnceSweepSummary(ctx, sched, out, onceSummaryComplete)
+		return
+	}
 	now := e.now()
 	lastFireJSON, err := marshalLastFire(out, now)
 	if err != nil {
@@ -1297,24 +1452,36 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 			e.park(ctx, sched, "the schedule's cron expression has no next fire")
 			return
 		}
-		if _, err := e.store.AdvanceSchedule(ctx, store.AdvanceScheduleParams{
+		n, err := e.store.AdvanceScheduleGuarded(ctx, store.AdvanceScheduleGuardedParams{
 			LastFiredAt: pgconv.Time(now),
 			NextFireAt:  pgconv.Time(next),
 			Status:      "active",
 			LastFire:    lastFireJSON,
 			ID:          sched.ID,
-		}); err != nil {
+			FireEpoch:   sched.FireEpoch,
+		})
+		switch {
+		case err != nil:
 			e.logger.Error("scheduler: advance recurring", "schedule", sched.ID.String(), "error", err)
+		case n == 0:
+			e.logger.Info("scheduler: recurring fire is stale (schedule changed or removed mid-fire), not advancing", "schedule", sched.ID.String())
 		}
 	case "once":
-		if _, err := e.store.AdvanceSchedule(ctx, store.AdvanceScheduleParams{
+		// A one-time issue (or prompt) fire: guarded to the claimed occurrence and a still-active
+		// row, so a fire a re-arm has replaced can never overwrite the new occurrence.
+		n, err := e.store.AdvanceOnceScheduleGuarded(ctx, store.AdvanceOnceScheduleGuardedParams{
 			LastFiredAt: pgconv.Time(now),
 			NextFireAt:  pgtype.Timestamptz{}, // NULL: a once schedule never fires again
 			Status:      "fired",
 			LastFire:    lastFireJSON,
 			ID:          sched.ID,
-		}); err != nil {
+			FireEpoch:   sched.FireEpoch,
+		})
+		switch {
+		case err != nil:
 			e.logger.Error("scheduler: advance once", "schedule", sched.ID.String(), "error", err)
+		case n == 0:
+			e.logger.Info("scheduler: once fire is stale (schedule changed or removed mid-fire), not advancing", "schedule", sched.ID.String())
 		}
 	default:
 		// A timing the DB CHECK should have rejected. Park it rather than leave
@@ -1328,10 +1495,16 @@ func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out Fi
 // park moves a schedule to status='error' (dropping it from the active claim set) and
 // notifies the owner, if a notifier is wired, so a parked schedule is not silent.
 func (e *Scheduler) park(ctx context.Context, sched store.RunSchedule, reason string) {
-	if _, err := e.store.SetRunScheduleStatus(ctx, store.SetRunScheduleStatusParams{
-		Status: "error", ID: sched.ID,
-	}); err != nil {
+	// Issue #4512: guarded to the claimed occurrence and a still-active row, for every timing.
+	// Zero rows is a stale fire (a re-arm, a conversion or a deletion replaced it): the new
+	// occurrence is left alone and the owner is not told it was paused.
+	n, err := e.store.ParkScheduleGuarded(ctx, store.ParkScheduleGuardedParams{ID: sched.ID, FireEpoch: sched.FireEpoch})
+	if err != nil {
 		e.logger.Error("scheduler: park schedule", "schedule", sched.ID.String(), "error", err)
+		return
+	}
+	if n == 0 {
+		e.logger.Info("scheduler: park skipped, the fire is stale", "schedule", sched.ID.String(), "reason", reason)
 		return
 	}
 	e.logger.Warn("scheduler: schedule parked at error", "schedule", sched.ID.String(), "reason", reason)
@@ -1372,6 +1545,26 @@ func (e *Scheduler) resolveSweepLabels(stored []byte, defaultLabel string) ([]by
 		return nil, fmt.Errorf("marshal sweep labels: %w", err)
 	}
 	return out, nil
+}
+
+// dispatchEligibilityLabel is the label remove-label-on-dispatch must never remove: the
+// stored eligibility tag name on a repo linked to an issue tracker (PRD #4173 D14), so a
+// selector equal to it is kept; the live configured uzi label otherwise, falling back to
+// settings.DefaultUziLabel when it is blank. A failed settings read is returned alongside
+// the label, as before, so the caller records the removal as failed.
+func (e *Scheduler) dispatchEligibilityLabel(ctx context.Context, repo store.GetRepoForUserRow) (string, error) {
+	if repo.IssueTrackerConnectionID.Valid {
+		return e.eligibilityLabel(ctx, repo)
+	}
+	uziLabel := settings.DefaultUziLabel
+	if e.settings == nil {
+		return uziLabel, nil
+	}
+	live, err := e.settings.UziLabel(ctx)
+	if strings.TrimSpace(live) != "" {
+		uziLabel = live
+	}
+	return uziLabel, err
 }
 
 // eligibilityLabel is the label a sweep treats as run eligibility for repo: the link's

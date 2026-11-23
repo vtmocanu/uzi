@@ -34,6 +34,15 @@ type fakeStore struct {
 
 	advanceCalls []store.AdvanceScheduleParams
 	statusCalls  []store.SetRunScheduleStatusParams
+	// writeEpochs is the fire_epoch every guarded advance/park carried, in order (issue #4512);
+	// guardedRows overrides their affected-rows answer; progressReads counts ledger reads and
+	// progressErr fails them (nil ledger: no progress).
+	partialCalls  []store.RecordOnceFirePartialParams
+	writeEpochs   []int64
+	guardedRows   *int64
+	progressReads int
+	progressErr   error
+	ledger        *fakeOnceLedger
 	// heldFireCalls records every RecordScheduleHeldFire (PRD #1732 D2 credential_disabled hold).
 	heldFireCalls []store.RecordScheduleHeldFireParams
 
@@ -192,13 +201,40 @@ func (f *fakeStore) RecordScheduleHeldFire(_ context.Context, arg store.RecordSc
 	}
 	return 1, nil
 }
-func (f *fakeStore) AdvanceSchedule(_ context.Context, arg store.AdvanceScheduleParams) (store.RunSchedule, error) {
-	f.advanceCalls = append(f.advanceCalls, arg)
-	return store.RunSchedule{}, nil
+
+// The guarded writes of issue #4512 are recorded in the pre-existing buckets (advanceCalls,
+// statusCalls) so every older assertion keeps reading them; the epoch each carried is kept in
+// writeEpochs. guardedRows (nil = 1) lets a test answer "zero rows" for a stale fire.
+func (f *fakeStore) AdvanceScheduleGuarded(_ context.Context, arg store.AdvanceScheduleGuardedParams) (int64, error) {
+	f.advanceCalls = append(f.advanceCalls, store.AdvanceScheduleParams{LastFiredAt: arg.LastFiredAt, NextFireAt: arg.NextFireAt, Status: arg.Status, LastFire: arg.LastFire, ID: arg.ID})
+	f.writeEpochs = append(f.writeEpochs, arg.FireEpoch)
+	return f.rows(), nil
 }
-func (f *fakeStore) SetRunScheduleStatus(_ context.Context, arg store.SetRunScheduleStatusParams) (store.RunSchedule, error) {
-	f.statusCalls = append(f.statusCalls, arg)
-	return store.RunSchedule{}, nil
+func (f *fakeStore) AdvanceOnceScheduleGuarded(_ context.Context, arg store.AdvanceOnceScheduleGuardedParams) (int64, error) {
+	f.advanceCalls = append(f.advanceCalls, store.AdvanceScheduleParams{LastFiredAt: arg.LastFiredAt, NextFireAt: arg.NextFireAt, Status: arg.Status, LastFire: arg.LastFire, ID: arg.ID})
+	f.writeEpochs = append(f.writeEpochs, arg.FireEpoch)
+	return f.rows(), nil
+}
+func (f *fakeStore) ParkScheduleGuarded(_ context.Context, arg store.ParkScheduleGuardedParams) (int64, error) {
+	f.statusCalls = append(f.statusCalls, store.SetRunScheduleStatusParams{Status: "error", ID: arg.ID})
+	f.writeEpochs = append(f.writeEpochs, arg.FireEpoch)
+	return f.rows(), nil
+}
+func (f *fakeStore) rows() int64 {
+	if f.guardedRows != nil {
+		return *f.guardedRows
+	}
+	return 1
+}
+func (f *fakeStore) ListOnceFireProgress(_ context.Context, arg store.ListOnceFireProgressParams) ([]store.ListOnceFireProgressRow, error) {
+	if f.progressErr != nil {
+		return nil, f.progressErr
+	}
+	f.progressReads++
+	return f.ledger.rows(arg.ScheduleID, arg.FireEpoch), nil
+}
+func (f *fakeStore) GetOnceFireCap(_ context.Context, arg store.GetOnceFireCapParams) (pgtype.Int4, error) {
+	return f.ledger.cap(arg.ScheduleID, arg.FireEpoch)
 }
 func (f *fakeStore) ListSweepCandidateIssues(_ context.Context, arg store.ListSweepCandidateIssuesParams) ([]store.ListSweepCandidateIssuesRow, error) {
 	f.sweepLabelParam = arg.Labels
@@ -375,6 +411,17 @@ type fakeRuns struct {
 	ciTransitions   []workersvc.CIWatchTransition
 	ciCreateErr     error
 	ciTransitionErr error
+
+	// Issue #4512 once-fire fakes (once_fire_fakes_test.go): the in-memory ledger shared with
+	// the fakeStore, the store the summary writer applies its write to, every progress context
+	// a scheduled create received, and the summary writer's call log and scripted failure.
+	ledger       *fakeOnceLedger
+	st           *fakeStore
+	progressSeen []workersvc.OnceFireProgress
+	summaryCalls int
+	summaryErr   error
+	// lostAck makes a scheduled create for the iid commit (run and ledger row) and THEN fail.
+	lostAck map[int64]error
 }
 
 func (f *fakeRuns) CreateCIRepairRun(_ context.Context, p workersvc.CIRepairRunParams) (store.Run, error) {
@@ -436,7 +483,7 @@ func (f *fakeRuns) CreateRun(_ context.Context, userID, repoID uuid.UUID, issueI
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, false, nil, false, force, credOverride, nil})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, _ string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, _ *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error) {
 	// The non-auto-approve scheduled path: recorded in the same `runs` bucket as
 	// CreateRun so the existing wait-on-limit / path-selection count assertions still
 	// observe it, but tagged scheduled=true so a test can prove the scheduler routed
@@ -444,12 +491,15 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
+	if err := f.admitOnce(progress); err != nil {
+		return store.Run{}, err
+	}
 	// false force: the scheduled seam never forces a run creation (issue #856).
 	// credOverride captured (PRD #1247 M6): proves the non-auto path threads the schedule's
 	// stored override onto the run. explicit captured (PRD #1429 M2, D5): proves it threads
 	// the effective pin or fresh issue-label selection.
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false, credOverride, explicit})
-	return store.Run{ID: uuid.New()}, nil
+	return f.finishOnce(progress, issueIID, store.Run{ID: uuid.New()})
 }
 func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error) {
 	if f.err != nil {
@@ -462,7 +512,7 @@ func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUI
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
+func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness, progress *workersvc.OnceFireProgress) (store.Run, error) {
 	// The auto-approve scheduled path (PRD #274 Decision 1a): recorded in the same
 	// `autopilot` bucket as CreateAutopilotRun so the existing count assertions still
 	// observe it, but it CAPTURES waitOnLimit (which CreateAutopilotRun drops), the
@@ -472,11 +522,14 @@ func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repo
 	if err := f.effErr(issueIID); err != nil {
 		return store.Run{}, err
 	}
+	if err := f.admitOnce(progress); err != nil {
+		return store.Run{}, err
+	}
 	if f.inspectM2 != nil {
 		f.inspectM2(ctx, issueIID, description)
 	}
 	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, credOverride, explicit})
-	return store.Run{ID: uuid.New()}, nil
+	return f.finishOnce(progress, issueIID, store.Run{ID: uuid.New()})
 }
 func (f *fakeRuns) CreatePromptRun(_ context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
 	if f.err != nil {
@@ -658,9 +711,10 @@ type harness struct {
 func newHarness() *harness {
 	owner := uuid.New()
 	repoID := uuid.New()
+	led := &fakeOnceLedger{}
 	h := &harness{
-		st:     &fakeStore{repoRow: store.GetRepoForUserRow{ID: repoID, UserID: owner, ForgeProjectID: 42, ForgeType: "gitlab", PathWithNamespace: "vtmocanu/uzi", FoldImproveUziBacklog: true}},
-		runs:   &fakeRuns{},
+		st:     &fakeStore{repoRow: store.GetRepoForUserRow{ID: repoID, UserID: owner, ForgeProjectID: 42, ForgeType: "gitlab", PathWithNamespace: "vtmocanu/uzi", FoldImproveUziBacklog: true}, ledger: led},
+		runs:   &fakeRuns{ledger: led},
 		fb:     &fakeBuilder{f: &fakeForge{issue: forge.Issue{IID: 7, Description: "body", Labels: []string{"PRD"}}, createdIID: 7}},
 		set:    &fakeSettings{uziLabel: "uzi"},
 		notif:  &fakeNotifier{},
@@ -669,6 +723,7 @@ func newHarness() *harness {
 		owner:  owner,
 		repoID: repoID,
 	}
+	h.runs.st = h.st
 	h.sched = New(h.st, h.runs, h.fb, h.set, h.notif, h.vault, time.Minute, nil)
 	h.sched.now = func() time.Time { return h.now }
 	return h
@@ -1943,7 +1998,7 @@ func TestFireSweepCapped(t *testing.T) {
 		h := newHarness()
 		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
 		h.st.sweepCount = 9
-		out, err := h.sched.fireSweep(context.Background(), h.assignedSweepSchedule(pgtype.Int4{}))
+		out, err := h.sched.fireSweep(context.Background(), h.assignedSweepSchedule(pgtype.Int4{}), false)
 		if err != nil {
 			t.Fatalf("fireSweep: %v", err)
 		}
@@ -1983,7 +2038,7 @@ func TestFireSweepCapped(t *testing.T) {
 		h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 96}}
 		h.st.sweepCount = 4
 		h.st.sweepMatched = ptrI64(10)
-		out, err := h.sched.fireSweep(context.Background(), h.assignedSweepSchedule(pgtype.Int4{Int32: 1, Valid: true}))
+		out, err := h.sched.fireSweep(context.Background(), h.assignedSweepSchedule(pgtype.Int4{Int32: 1, Valid: true}), false)
 		if err != nil {
 			t.Fatalf("fireSweep: %v", err)
 		}
@@ -3431,7 +3486,7 @@ func TestFireSweepDefaultResolvesFromCatalog(t *testing.T) {
 		Enabled:     true,
 	}
 
-	out, err := h.sched.fireSweep(context.Background(), sched)
+	out, err := h.sched.fireSweep(context.Background(), sched, false)
 	if err != nil {
 		t.Fatalf("fireSweep: %v", err)
 	}
@@ -3503,7 +3558,7 @@ func TestFireSweepAssignedDefaultThreadsSelectorAndBotID(t *testing.T) {
 		Enabled:     true,
 	}
 
-	out, err := h.sched.fireSweep(context.Background(), sched)
+	out, err := h.sched.fireSweep(context.Background(), sched, false)
 	if err != nil {
 		t.Fatalf("fireSweep: %v", err)
 	}
@@ -3574,7 +3629,7 @@ func TestFireSweepLabelSweepThreadsUziLabel(t *testing.T) {
 			h := newHarness()
 			h.set.uziLabel = c.setting
 			h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
-			if _, err := h.sched.fireSweep(context.Background(), h.sweepSchedule(pgtype.Int4{})); err != nil {
+			if _, err := h.sched.fireSweep(context.Background(), h.sweepSchedule(pgtype.Int4{}), false); err != nil {
 				t.Fatalf("fireSweep: %v", err)
 			}
 			if h.st.sweepUziLabelParam != c.want {
@@ -3597,7 +3652,7 @@ func TestFireSweepLabelSweepThreadsLabelSelector(t *testing.T) {
 	s := h.sweepSchedule(pgtype.Int4{}) // user-origin, Labels ["PRD"]
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
 
-	out, err := h.sched.fireSweep(context.Background(), s)
+	out, err := h.sched.fireSweep(context.Background(), s, false)
 	if err != nil {
 		t.Fatalf("fireSweep: %v", err)
 	}
@@ -3636,7 +3691,7 @@ func TestFireSweepDefaultUnknownSlugParks(t *testing.T) {
 		Status:      "active",
 		Enabled:     true,
 	}
-	_, err := h.sched.fireSweep(context.Background(), sched)
+	_, err := h.sched.fireSweep(context.Background(), sched, false)
 	if !errors.Is(err, ErrBadConfig) {
 		t.Fatalf("unknown slug error = %v, want ErrBadConfig", err)
 	}
@@ -3796,7 +3851,7 @@ func TestFireSweepDefaultComposesBakedAndOverlay(t *testing.T) {
 	}
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
 
-	if _, err := h.sched.fireSweep(context.Background(), newSweepDefault(h, overlay)); err != nil {
+	if _, err := h.sched.fireSweep(context.Background(), newSweepDefault(h, overlay), false); err != nil {
 		t.Fatalf("fireSweep: %v", err)
 	}
 	if len(h.runs.autopilot) != 1 {
@@ -3828,7 +3883,7 @@ func TestFireSweepDefaultEmptyOverlayEqualsBakedOnly(t *testing.T) {
 	}
 	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 7}}
 
-	if _, err := h.sched.fireSweep(context.Background(), newSweepDefault(h, "")); err != nil {
+	if _, err := h.sched.fireSweep(context.Background(), newSweepDefault(h, ""), false); err != nil {
 		t.Fatalf("fireSweep: %v", err)
 	}
 	if len(h.runs.autopilot) != 1 {
@@ -3865,7 +3920,7 @@ func TestFireSweepUserRowUsesColumnVerbatim(t *testing.T) {
 		Enabled:     true,
 	}
 
-	if _, err := h.sched.fireSweep(context.Background(), sched); err != nil {
+	if _, err := h.sched.fireSweep(context.Background(), sched, false); err != nil {
 		t.Fatalf("fireSweep: %v", err)
 	}
 	if len(h.runs.autopilot) != 1 {

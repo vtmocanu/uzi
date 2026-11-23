@@ -1,7 +1,7 @@
 {
   "harness_versions": {
-    "claude_agent_sdk": "0.3.319",
-    "codex": "0.167.0"
+    "claude_agent_sdk": "0.3.325",
+    "codex": "0.169.0"
   },
   "denied_names": [
     "HOME",
@@ -60,7 +60,21 @@
     "GIT_CONFIG_PARAMETERS",
     "API_TIMEOUT_MS",
     "MAX_THINKING_TOKENS",
-    "MAX_MCP_OUTPUT_TOKENS"
+    "MAX_MCP_OUTPUT_TOKENS",
+    "NODE_INSPECTOR_IPC",
+    "VSCODE_INSPECTOR_OPTIONS",
+    "TEMP",
+    "TMP",
+    "SYSTEMDRIVE",
+    "API_FORCE_IDLE_TIMEOUT",
+    "ENABLE_TOOL_SEARCH",
+    "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+    "AUTOMODE_DECISION_LOG",
+    "NODE_USE_SYSTEM_CA",
+    "ENABLE_BETA_TRACING_DETAILED",
+    "ENABLE_ENHANCED_TELEMETRY_BETA",
+    "BETA_TRACING_ENDPOINT",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"
   ],
   "denied_prefixes": [
     "UZI_",
@@ -84,12 +98,31 @@
     "PYTHON",
     "PERL5",
     "NIX_",
-    "DEVBOX_"
+    "DEVBOX_",
+    "BUN_"
   ],
   "denied_suffixes": [
     "_PROXY"
   ],
   "overlaps": [
+    {
+      "name": "BUN_CONFIG_HTTP_IDLE_TIMEOUT",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the other denied prefixes: idle timeout of the Bun HTTP client inside the bundled CLI; denied by the BUN_ prefix"
+    },
+    {
+      "name": "BUN_OPTIONS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control: Bun runtime flags for the bundled CLI process (the Bun counterpart of NODE_OPTIONS); denied by the BUN_ prefix"
+    },
+    {
+      "name": "BUN_INSTALL",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "application configuration for Bun projects, refused as a repo variable by the BUN_ prefix (owner decision #4611): the bundled CLI is a Bun executable and the prefix denies every Bun runtime control"
+    },
     {
       "name": "AWS_REGION",
       "harness": "claude",
@@ -155,6 +188,108 @@
       "harness": "claude",
       "decision": "denied",
       "reason": "harness control outside the denied prefixes: tool output bound of the Claude CLI"
+    },
+    {
+      "name": "NODE_INSPECTOR_IPC",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: TypeScript debug-mode selector read by the bundled CLI (not a claim that it starts an inspector)"
+    },
+    {
+      "name": "VSCODE_INSPECTOR_OPTIONS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: TypeScript debug-mode selector read by the bundled CLI (not a claim that it starts an inspector)"
+    },
+    {
+      "name": "TEMP",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "managed directory: Windows sandbox temporary-path selector"
+    },
+    {
+      "name": "TMP",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "managed directory: Windows sandbox temporary-path selector"
+    },
+    {
+      "name": "SYSTEMDRIVE",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "managed directory: uppercase API spelling of the Windows SystemDrive read, whose environment lookup is case-insensitive; mixed-case SystemDrive stays rejected by the name grammar"
+    },
+    {
+      "name": "API_FORCE_IDLE_TIMEOUT",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: idle (body) watchdog on the Claude CLI's own API connection, a sibling of API_TIMEOUT_MS (owner decision #4611)"
+    },
+    {
+      "name": "ENABLE_TOOL_SEARCH",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: switches the Claude CLI's tool-search mode (owner decision #4611)"
+    },
+    {
+      "name": "SLASH_COMMAND_TOOL_CHAR_BUDGET",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: character budget of the Claude CLI's slash-command tool prompt (owner decision #4611)"
+    },
+    {
+      "name": "AUTOMODE_DECISION_LOG",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: makes the Claude CLI write a decision log file in its config directory (owner decision #4611)"
+    },
+    {
+      "name": "NODE_USE_SYSTEM_CA",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: selects the certificate store the Claude CLI trusts for its own connections (owner decision #4611)"
+    },
+    {
+      "name": "ENABLE_BETA_TRACING_DETAILED",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: with BETA_TRACING_ENDPOINT, turns on the Claude CLI's OpenTelemetry trace and log export without CLAUDE_CODE_ENABLE_TELEMETRY (owner decision #4611)"
+    },
+    {
+      "name": "ENABLE_ENHANCED_TELEMETRY_BETA",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: with CLAUDE_CODE_ENABLE_TELEMETRY, adds the Claude CLI's enhanced telemetry (trace export) beta; the unprefixed alias of CLAUDE_CODE_ENHANCED_TELEMETRY_BETA (owner decision #4611)"
+    },
+    {
+      "name": "BETA_TRACING_ENDPOINT",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: OTLP endpoint of the Claude CLI's beta trace and log export (owner decision #4611)"
+    },
+    {
+      "name": "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "provider selector outside the denied prefixes (its leading underscore escapes CLAUDE_): makes the Claude CLI treat the worker-set ANTHROPIC_BASE_URL gateway as the first-party Anthropic API; denied under the provider-selection invariant (#4611)"
+    },
+    {
+      "name": "TSC_NONPOLLING_WATCHER",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration: TypeScript compiler filesystem-watcher preference read by the bundled TypeScript; no effect on how the harness runs"
+    },
+    {
+      "name": "TSC_WATCHDIRECTORY",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration: TypeScript compiler filesystem-watcher preference read by the bundled TypeScript; no effect on how the harness runs"
+    },
+    {
+      "name": "TSC_WATCHFILE",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration: TypeScript compiler filesystem-watcher preference read by the bundled TypeScript; no effect on how the harness runs"
     },
     {
       "name": "DISABLE_TELEMETRY",

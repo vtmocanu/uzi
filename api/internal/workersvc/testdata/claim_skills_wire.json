@@ -92,6 +92,7 @@
         "Edit"
       ],
       "model": "opus",
+      "effort": "high",
       "skills": [
         "team-runbook",
         "team-kb"

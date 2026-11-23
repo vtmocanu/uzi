@@ -120,6 +120,7 @@ func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 	} {
 		want["'"+c+"' = ANY(w.protocol_capabilities)"] = 1
 	}
+	want["WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)"] = 1
 	keys := make([]string, 0, len(want))
 	for k := range want {
 		keys = append(keys, k)

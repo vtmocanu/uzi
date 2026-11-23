@@ -1,0 +1,508 @@
+{
+  "_comment": "Shared cases for PRD #3252 M1. Each case seeds the stored planning pair (and optionally default_effort), PUTs body to /api/me/settings, and expects the status and the stored planning pair after the request (a 400 leaves the seed unchanged). The combination cases pin that planning effort and a Runtime default Claude effort save together in either order (Q-spike recorded that omitting effort reverts, so no combination rule exists). Go reads this in api/internal/handler (TestPlanningDefaultsFixture); the Vitest mock consumer is web/src/mocks/mockApi.planningDefaults.test.ts (M2). Codex cases select harness=codex and use the corresponding planning/default Codex keys.",
+  "cases": [
+    {
+      "id": "absent-keeps",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "default_effort": "low"
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      }
+    },
+    {
+      "id": "null-clears",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": null,
+        "planning_claude_effort": null
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": null,
+        "planning_claude_effort": null
+      }
+    },
+    {
+      "id": "value-sets",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": "sonnet",
+        "planning_claude_effort": "max"
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": "sonnet",
+        "planning_claude_effort": "max"
+      }
+    },
+    {
+      "id": "value-trimmed",
+      "seed": {},
+      "body": {
+        "planning_claude_model": "  sonnet  ",
+        "planning_claude_effort": " low "
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": "sonnet",
+        "planning_claude_effort": "low"
+      }
+    },
+    {
+      "id": "blank-clears",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": "   ",
+        "planning_claude_effort": ""
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": null,
+        "planning_claude_effort": null
+      }
+    },
+    {
+      "id": "partial-model-only-keeps-effort",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": "haiku"
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": "haiku",
+        "planning_claude_effort": "high"
+      }
+    },
+    {
+      "id": "codex-role-id-rejected",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": "gpt-6-sol"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_claude_model",
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high",
+        "unchanged": true
+      }
+    },
+    {
+      "id": "custom-claude-id-accepted",
+      "seed": {},
+      "body": {
+        "planning_claude_model": "claude-opus-5-5"
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": "claude-opus-5-5",
+        "planning_claude_effort": null
+      }
+    },
+    {
+      "id": "over-length-model-rejected",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_claude_model",
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high",
+        "unchanged": true
+      }
+    },
+    {
+      "id": "unknown-effort-rejected",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_effort": "ultra"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_claude_effort",
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high",
+        "unchanged": true
+      }
+    },
+    {
+      "id": "runtime-effort-rejected",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_effort": "runtime"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_claude_effort",
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high",
+        "unchanged": true
+      }
+    },
+    {
+      "id": "bad-field-writes-nothing",
+      "seed": {
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "planning_claude_model": "sonnet",
+        "planning_claude_effort": "ultra"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_claude_effort",
+        "planning_claude_model": "opus",
+        "planning_claude_effort": "high",
+        "unchanged": true
+      }
+    },
+    {
+      "id": "combination-planning-then-runtime",
+      "seed": {
+        "planning_claude_effort": "high"
+      },
+      "body": {
+        "default_effort": "runtime"
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": null,
+        "planning_claude_effort": "high",
+        "default_effort": "runtime"
+      }
+    },
+    {
+      "id": "combination-runtime-then-planning",
+      "seed": {
+        "default_effort": "runtime"
+      },
+      "body": {
+        "planning_claude_effort": "high"
+      },
+      "expect": {
+        "status": 200,
+        "planning_claude_model": null,
+        "planning_claude_effort": "high",
+        "default_effort": "runtime"
+      }
+    },
+    {
+      "id": "codex-absent-keeps",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "default_codex_effort": "low"
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-null-clears",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": null,
+        "planning_codex_effort": null
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": null,
+        "planning_codex_effort": null
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-value-sets",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "gpt-6.1-sol",
+        "planning_codex_effort": "max"
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": "gpt-6.1-sol",
+        "planning_codex_effort": "max"
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-value-trimmed",
+      "seed": {},
+      "body": {
+        "planning_codex_model": "  gpt-6.1-sol  ",
+        "planning_codex_effort": " low "
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": "gpt-6.1-sol",
+        "planning_codex_effort": "low"
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-blank-clears",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "   ",
+        "planning_codex_effort": ""
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": null,
+        "planning_codex_effort": null
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-partial-model-only-keeps-effort",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "gpt-6-luna"
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": "gpt-6-luna",
+        "planning_codex_effort": "high"
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-claude-alias-rejected",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "opus"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_model",
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high",
+        "unchanged": true
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-custom-id-accepted",
+      "seed": {},
+      "body": {
+        "planning_codex_model": "custom-codex-plan"
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": "custom-codex-plan",
+        "planning_codex_effort": null
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-over-length-model-rejected",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_model",
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high",
+        "unchanged": true
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-unknown-effort-rejected",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_effort": "ultra"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_effort",
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high",
+        "unchanged": true
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-runtime-effort-rejected",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_effort": "runtime"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_effort",
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high",
+        "unchanged": true
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-bad-field-writes-nothing",
+      "seed": {
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "gpt-6.1-sol",
+        "planning_codex_effort": "ultra"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_effort",
+        "planning_codex_model": "gpt-6-astra",
+        "planning_codex_effort": "high",
+        "unchanged": true
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-combination-planning-then-runtime",
+      "seed": {
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "default_codex_effort": "runtime"
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": null,
+        "planning_codex_effort": "high",
+        "default_codex_effort": "runtime"
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-combination-runtime-then-planning",
+      "seed": {
+        "default_codex_effort": "runtime"
+      },
+      "body": {
+        "planning_codex_effort": "high"
+      },
+      "expect": {
+        "status": 200,
+        "planning_codex_model": null,
+        "planning_codex_effort": "high",
+        "default_codex_effort": "runtime"
+      },
+      "harness": "codex"
+    },
+    {
+      "id": "codex-model-wrong-json-type",
+      "harness": "codex",
+      "seed": {
+        "planning_codex_model": "custom-plan",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": 42
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_model",
+        "planning_codex_model": "custom-plan",
+        "planning_codex_effort": "high"
+      }
+    },
+    {
+      "id": "codex-model-interior-space",
+      "harness": "codex",
+      "seed": {
+        "planning_codex_model": "custom-plan",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_model": "bad model"
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_model",
+        "planning_codex_model": "custom-plan",
+        "planning_codex_effort": "high"
+      }
+    },
+    {
+      "id": "codex-effort-wrong-json-type",
+      "harness": "codex",
+      "seed": {
+        "planning_codex_model": "custom-plan",
+        "planning_codex_effort": "high"
+      },
+      "body": {
+        "planning_codex_effort": true
+      },
+      "expect": {
+        "status": 400,
+        "error_contains": "planning_codex_effort",
+        "planning_codex_model": "custom-plan",
+        "planning_codex_effort": "high"
+      }
+    }
+  ]
+}

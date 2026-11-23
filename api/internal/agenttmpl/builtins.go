@@ -69,7 +69,7 @@ func BuiltinByName(name string) (Definition, bool) {
 
 // parse reads a Claude Code subagent Markdown file into a Definition. It is the
 // inverse of Render for the subset of frontmatter these files use (name,
-// version, description, tools, model). It is only ever fed the embedded builtin
+// version, description, tools, model, effort). It is only ever fed the embedded builtin
 // files; user templates never go through it (they arrive as structured JSON). The
 // round-trip parse->Render is pinned byte-for-byte by the parse/validity test.
 func parse(raw []byte) (Definition, error) {
@@ -116,6 +116,14 @@ func parse(raw []byte) (Definition, error) {
 			d.Description = unquoteScalar(val)
 		case "model":
 			d.Model = val
+		case "effort":
+			// PRD #3258 N8: an optional Claude-family effort pin. Upstream copies ship
+			// none today; a later release may. Anything but one of EffortLevels
+			// (blank included) is a parse error, never a silent inherit.
+			if !IsEffortLevel(val) {
+				return Definition{}, fmt.Errorf("invalid effort %q: want one of %s", val, strings.Join(EffortLevels, ", "))
+			}
+			d.Effort = val
 		case "tools":
 			for _, t := range strings.Split(val, ", ") {
 				if t != "" {

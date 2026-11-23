@@ -636,3 +636,371 @@ describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evi
     assert.equal(Math.round(astra.costUSD! * 1e6), 13000);
   });
 });
+
+// #4580 M1: model segments. `beginModelSegment` cuts a thread's cumulative at the running max;
+// no production caller cuts yet (#3253), so these tests drive the public accountant directly.
+describe("#4580 model segments (token-only)", () => {
+  const MODEL_A = "gpt-6-astra";
+  const MODEL_B = "gpt-5.6-sol";
+  /** A well-formed note: total = input + output, `last` = the same as the cumulative delta. */
+  const wf = (t: Partial<CodexUsageBreakdown>, l: Partial<CodexUsageBreakdown>): CodexThreadTokenUsage => {
+    const full = bd(t);
+    const last = bd(l);
+    return {
+      total: { ...full, totalTokens: full.inputTokens + full.outputTokens },
+      last: { ...last, totalTokens: last.inputTokens + last.outputTokens },
+    };
+  };
+  const want = (input: number, output: number, cacheRead = 0, cacheCreation = 0, reasoning = 0) =>
+    ({ input, output, cacheRead, cacheCreation, reasoning });
+
+  it("an unknown thread and an equal-model cut change nothing (allocating no segment is not observable through the public API)", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 }));
+    const before = acct.aggregateByModel();
+    acct.beginModelSegment("th-unknown", MODEL_B);
+    acct.beginModelSegment(ROOT, MODEL_A);
+    assert.deepEqual(acct.aggregateByModel(), before);
+    acct.record(ROOT, wf({ inputTokens: 150, outputTokens: 70 }, { inputTokens: 50, outputTokens: 20 }));
+    assertEntry(acct.aggregateByModel()?.[MODEL_A], want(150, 70));
+    assert.equal(acct.aggregateByModel()?.[MODEL_B], undefined);
+    assert.equal(acct.usageIncomplete, false);
+  });
+
+  it("a fresh-thread cut attributes work before the cut to the old model and later work to the new one", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    const first = acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 }));
+    assert.equal(first?.model, MODEL_A);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    const second = acct.record(ROOT, wf({ inputTokens: 250, outputTokens: 120 }, { inputTokens: 150, outputTokens: 70 }));
+    assert.equal(second?.model, MODEL_B);
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(100, 50));
+    assertEntry(agg?.[MODEL_B], want(150, 70));
+  });
+
+  it("a resumed thread without a baseline rebinds, then proved replay is not charged and only new work is", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, true);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 500, outputTokens: 200 }, { inputTokens: 500, outputTokens: 200 }), true), undefined);
+    const live = acct.record(ROOT, wf({ inputTokens: 600, outputTokens: 250 }, { inputTokens: 100, outputTokens: 50 }));
+    assert.equal(live?.model, MODEL_B);
+    const agg = acct.aggregateByModel();
+    assert.equal(agg?.[MODEL_A], undefined, "a healthy rebind leaves no entry for the replaced model");
+    assertEntry(agg?.[MODEL_B], want(100, 50));
+    assert.equal(acct.usageIncomplete, false);
+  });
+
+  it("a quarantined thread only rebinds: it stays quarantined, attributes nothing, and both models report zero", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, true);
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 })), undefined);
+    assert.equal(acct.usageIncomplete, true);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 500, outputTokens: 200 }, { inputTokens: 500, outputTokens: 200 }), true), undefined,
+      "still quarantined: a later proved replay attributes nothing");
+    assert.equal(acct.hasBaseline(ROOT), false);
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(0, 0));
+    assertEntry(agg?.[MODEL_B], want(0, 0));
+  });
+
+  it("a rebind on a thread that is incomplete for another reason keeps the replaced model as a zero unreported entry", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.markIncomplete(ROOT, "invalid_identity");
+    acct.beginModelSegment(ROOT, MODEL_B);
+    acct.beginModelSegment(ROOT, MODEL_A);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    const agg = acct.aggregateByModel();
+    assert.deepEqual(Object.keys(agg ?? {}).sort(), [MODEL_A, MODEL_B].sort());
+    assertEntry(agg?.[MODEL_A], want(0, 0));
+    assertEntry(agg?.[MODEL_B], want(0, 0));
+  });
+
+  it("duplicate, stale and older-than-cut notes after a cut are not adopted and move no segment", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    const n1 = wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 });
+    const n2 = wf({ inputTokens: 200, outputTokens: 100 }, { inputTokens: 100, outputTokens: 50 });
+    acct.record(ROOT, n1);
+    acct.record(ROOT, n2);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.record(ROOT, n2), undefined, "duplicate of the cut point");
+    assert.equal(acct.record(ROOT, n1), undefined, "older than the cut");
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 10, outputTokens: 5 }, { inputTokens: 10, outputTokens: 5 })), undefined, "stale");
+    let agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(200, 100));
+    assert.equal(agg?.[MODEL_B], undefined, "no usage yet on the new segment, so a healthy unused model is omitted");
+    const live = acct.record(ROOT, wf({ inputTokens: 260, outputTokens: 130 }, { inputTokens: 60, outputTokens: 30 }));
+    assert.equal(live?.model, MODEL_B);
+    agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(200, 100));
+    assertEntry(agg?.[MODEL_B], want(60, 30));
+    assert.equal(acct.usageIncomplete, false);
+  });
+
+  it("A to B to A conserves every column per model, and each response carries its segment's model", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    const models: (string | undefined)[] = [];
+    const rec = (u: CodexThreadTokenUsage) => models.push(acct.record(ROOT, u)?.model);
+    rec(wf({ inputTokens: 100, cachedInputTokens: 20, cacheWriteInputTokens: 5, outputTokens: 40, reasoningOutputTokens: 10 },
+      { inputTokens: 100, outputTokens: 40 }));
+    acct.beginModelSegment(ROOT, MODEL_B);
+    rec(wf({ inputTokens: 300, cachedInputTokens: 90, cacheWriteInputTokens: 15, outputTokens: 100, reasoningOutputTokens: 30 },
+      { inputTokens: 200, outputTokens: 60 }));
+    rec(wf({ inputTokens: 350, cachedInputTokens: 100, cacheWriteInputTokens: 15, outputTokens: 110, reasoningOutputTokens: 33 },
+      { inputTokens: 50, outputTokens: 10 }));
+    acct.beginModelSegment(ROOT, MODEL_A);
+    rec(wf({ inputTokens: 500, cachedInputTokens: 160, cacheWriteInputTokens: 25, outputTokens: 150, reasoningOutputTokens: 50 },
+      { inputTokens: 150, outputTokens: 40 }));
+    assert.deepEqual(models, [MODEL_A, MODEL_B, MODEL_B, MODEL_A]);
+    const agg = acct.aggregateByModel();
+    // A: first segment (100/20/5/40/10) plus the last (150/60/10/40/17 raw deltas)
+    assertEntry(agg?.[MODEL_A], want(100 - 20 - 5 + (150 - 60 - 10), 40 + 40, 20 + 60, 5 + 10, 10 + 17));
+    assertEntry(agg?.[MODEL_B], want(250 - 80 - 10, 70, 80, 10, 23));
+    const sum = (k: keyof CodexModelUsageEntry) =>
+      Object.values(agg ?? {}).reduce((s, e) => s + (e[k] as number), 0);
+    assert.equal(sum("inputTokens"), 500 - 160 - 25);
+    assert.equal(sum("cacheReadInputTokens"), 160);
+    assert.equal(sum("cacheCreationInputTokens"), 25);
+    assert.equal(sum("outputTokens"), 150);
+    assert.equal(sum("reasoningOutputTokens"), 50);
+  });
+
+  it("an incomplete cut thread taints every segment model and retains tokens", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 }));
+    acct.beginModelSegment(ROOT, MODEL_B);
+    acct.record(ROOT, wf({ inputTokens: 150, outputTokens: 80 }, { inputTokens: 50, outputTokens: 30 }));
+    acct.markIncomplete(ROOT, "invalid_identity");
+    const agg = acct.aggregateByModel({ authMode: "api_key", now: new Date("2026-01-01T00:00:00Z") });
+    assert.equal(agg?.[MODEL_A]?.costStatus, "unreported");
+    assert.equal(agg?.[MODEL_B]?.costStatus, "unreported");
+    assert.equal(agg?.[MODEL_A]?.inputTokens, 100);
+    assert.equal(agg?.[MODEL_B]?.inputTokens, 50);
+  });
+
+  it("a cache split that is malformed at a cut cannot inflate the new model's uncached input", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 10, cachedInputTokens: 20, outputTokens: 10 }, { inputTokens: 10, cachedInputTokens: 20, outputTokens: 10 }));
+    assert.equal(acct.usageIncomplete, false, "an uncut malformed split stays accepted, as before");
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.usageIncomplete, true);
+    acct.record(ROOT, wf({ inputTokens: 20, cachedInputTokens: 20, outputTokens: 20 }, { inputTokens: 10, outputTokens: 10 }));
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(0, 10, 20));
+    assertEntry(agg?.[MODEL_B], want(0, 10, 0));
+    assert.match(acct.incompleteNoticeText ?? "", /Diagnostic: bucket relationship \(total\.cachedInputTokens\)\./);
+  });
+
+  it("a cache split that turns malformed after the cut is adopted, conserved and marks the thread incomplete", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 10, cachedInputTokens: 10, outputTokens: 10 }, { inputTokens: 10, cachedInputTokens: 10, outputTokens: 10 }));
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.usageIncomplete, false, "a well-formed boundary does not mark");
+    const adopted = acct.record(ROOT, wf({ inputTokens: 20, cachedInputTokens: 21, outputTokens: 20 }, { inputTokens: 10, cachedInputTokens: 11, outputTokens: 10 }));
+    assert.equal(adopted?.model, MODEL_B, "the malformed note is still adopted");
+    assert.equal(acct.usageIncomplete, true);
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(0, 10, 10));
+    assertEntry(agg?.[MODEL_B], want(0, 10, 11));
+  });
+
+  it("a multi-segment thread does not absorb a single-segment sibling's negative raw uncached delta", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread("child-x", MODEL_A, false);
+    acct.registerThread("root-y", MODEL_A, false);
+    acct.record("child-x", wf({ inputTokens: 100, cachedInputTokens: 101, outputTokens: 60 }, { inputTokens: 100, cachedInputTokens: 101, outputTokens: 60 }));
+    acct.record("root-y", wf({ inputTokens: 30, outputTokens: 30 }, { inputTokens: 30, outputTokens: 30 }));
+    acct.beginModelSegment("root-y", MODEL_B);
+    acct.record("root-y", wf({ inputTokens: 50, outputTokens: 50 }, { inputTokens: 20, outputTokens: 20 }));
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(30, 90, 101));
+    assertEntry(agg?.[MODEL_B], want(20, 20));
+  });
+
+  it("a note that advances magnitude but regresses a segment-spanning column is refused after a cut as well", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 10, outputTokens: 10, reasoningOutputTokens: 5 }, { inputTokens: 10, outputTokens: 10 }));
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 20, outputTokens: 20, reasoningOutputTokens: 4 }, { inputTokens: 10, outputTokens: 10 })), undefined);
+    assert.equal(acct.usageIncomplete, true);
+    assertEntry(acct.aggregateByModel()?.[MODEL_A], want(10, 10, 0, 0, 5));
+  });
+
+  it("a malformed proved-replay baseline marks the thread incomplete at a cut even when the cut point is well-formed", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, true);
+    // Replay baseline: cached exceeds input (malformed split).
+    acct.record(ROOT, wf({ inputTokens: 10, cachedInputTokens: 20, outputTokens: 10 }, { inputTokens: 10, outputTokens: 10 }), true);
+    assert.equal(acct.usageIncomplete, false, "an uncut malformed baseline is accepted, as before");
+    // A well-formed advance: cached unchanged, input grew past it.
+    assert.ok(acct.record(ROOT, wf({ inputTokens: 50, cachedInputTokens: 20, outputTokens: 20 }, { inputTokens: 40, outputTokens: 10 })));
+    assert.equal(acct.usageIncomplete, false);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.usageIncomplete, true);
+    assert.match(acct.incompleteNoticeText ?? "", /Diagnostic: bucket relationship \(total\.cachedInputTokens\)\./);
+  });
+
+  it("a healthy rebind does not remember the replaced model once the thread later becomes incomplete", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, true);
+    acct.beginModelSegment(ROOT, MODEL_B);
+    assert.equal(acct.usageIncomplete, false);
+    // A live note with no proved baseline: missing replay boundary, quarantine.
+    assert.equal(acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 })), undefined);
+    assert.equal(acct.usageIncomplete, true);
+    const agg = acct.aggregateByModel();
+    assert.equal(agg?.[MODEL_A], undefined, "the replaced model was never used while incomplete");
+    assertEntry(agg?.[MODEL_B], want(0, 0));
+  });
+
+  it("pins the caller ordering contract owned by #3253: a note delivered after a cut that advances the max belongs to the new model", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_A, false);
+    acct.record(ROOT, wf({ inputTokens: 100, outputTokens: 50 }, { inputTokens: 100, outputTokens: 50 }));
+    acct.beginModelSegment(ROOT, MODEL_B);
+    // An earlier turn's note arriving late: it advances the max, so it is attributed to MODEL_B.
+    const late = acct.record(ROOT, wf({ inputTokens: 200, outputTokens: 100 }, { inputTokens: 100, outputTokens: 50 }));
+    assert.equal(late?.model, MODEL_B);
+    const agg = acct.aggregateByModel();
+    assertEntry(agg?.[MODEL_A], want(100, 50));
+    assertEntry(agg?.[MODEL_B], want(100, 50));
+  });
+});
+
+// Seeded randomized conservation (#4580): per column, the sum over emitted models equals the
+// thread's accepted final cumulative, whatever the cut pattern. totalTokens is not an emitted
+// column; its conservation follows from total = input + output in every generated note.
+describe("#4580 randomized conservation across cuts", () => {
+  function mulberry32(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6.1-sol"];
+
+  function runFamily(family: "well-formed" | "malformed", baseSeed: number,
+    stats = { multiModel: 0, malformedNotes: 0, incomplete: 0 }): string | undefined {
+    for (let k = 0; k < 200; k++) {
+      const seed = baseSeed + k;
+      const rnd = mulberry32(seed);
+      const int = (n: number) => Math.floor(rnd() * (n + 1));
+      const acct = new CodexUsageAccountant();
+      let cur = MODELS[0]!;
+      acct.registerThread("t", cur, false);
+      const s = { inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+      let accepted = { ...s };
+      const history: CodexThreadTokenUsage[] = [];
+      const steps = 3 + int(9);
+      let cuts = 0;
+      let malformedPhase = true;
+      for (let i = 0; i < steps; i++) {
+        const kind = int(9);
+        if (kind <= 3 && cuts < 4) {
+          cuts++;
+          // kind 0: a same-model cut; otherwise always a different model, so cuts change attribution.
+          cur = kind === 0 ? cur : MODELS[(MODELS.indexOf(cur) + 1 + int(1)) % MODELS.length]!;
+          acct.beginModelSegment("t", cur);
+          continue;
+        }
+        if (kind === 4 && history.length > 0) {
+          const old = history[int(history.length - 1)]!;
+          const r = acct.record("t", old);
+          if (r !== undefined) return `seed ${seed}: a stale or duplicate note was adopted`;
+          continue;
+        }
+        const inInc = int(50);
+        const outInc = int(50);
+        // Raw uncached input before this step; negative while the cache split is malformed.
+        const rawBefore = s.inputTokens - s.cachedInputTokens - s.cacheWriteInputTokens;
+        s.inputTokens += inInc;
+        s.outputTokens += outInc;
+        s.reasoningOutputTokens = Math.min(s.reasoningOutputTokens + int(20), s.outputTokens);
+        if (family === "malformed" && malformedPhase) {
+          // Malformed prefix: cached exceeds input, so the clamped uncached input stays 0.
+          s.cachedInputTokens = Math.max(s.cachedInputTokens, s.inputTokens + 1 + int(5));
+          s.cacheWriteInputTokens += int(10);
+          stats.malformedNotes++;
+          if (rnd() < 0.3) malformedPhase = false; // once well-formed, the split stays well-formed
+        } else if (rawBefore < 0) {
+          // Leaving a malformed split: the clamped uncached input is 0 before, so any raw
+          // growth keeps it non-decreasing.
+          s.cachedInputTokens += int(10);
+          s.cacheWriteInputTokens += int(5);
+        } else {
+          // Bound the cache increments by this step's input increment so the clamped uncached
+          // input never decreases: every generated note is monotone in all seven gated columns.
+          const c = int(inInc);
+          s.cachedInputTokens += c;
+          s.cacheWriteInputTokens += int(inInc - c);
+        }
+        const note: CodexThreadTokenUsage = {
+          total: { ...s, totalTokens: s.inputTokens + s.outputTokens },
+          last: { ...bd(), inputTokens: inInc, outputTokens: 1, totalTokens: inInc + 1 },
+        };
+        history.push(note);
+        const r = acct.record("t", note);
+        // Every generated note is monotone, so one that advances the magnitude must be adopted;
+        // regression refusals are covered by the deterministic gate tests, not here.
+        if (inInc + outInc > 0 && r === undefined) return `seed ${seed} (${family}): a monotone advancing note was refused`;
+        if (r !== undefined) {
+          accepted = { ...s };
+          if (r.model !== cur) return `seed ${seed}: adopted model ${r.model} expected ${cur}`;
+        }
+        if (int(5) === 0) acct.record("t", note); // an immediate duplicate must not move anything
+      }
+      if (family === "well-formed" && acct.usageIncomplete) return `seed ${seed}: a well-formed sequence ended incomplete`;
+      if (acct.usageIncomplete) stats.incomplete++;
+      const agg = acct.aggregateByModel() ?? {};
+      const withTokens = Object.values(agg).filter(e =>
+        e.inputTokens + e.outputTokens + e.cacheReadInputTokens + e.cacheCreationInputTokens > 0).length;
+      if (withTokens >= 2) stats.multiModel++;
+      const sum = (key: keyof CodexModelUsageEntry) => Object.values(agg).reduce((t, e) => t + (e[key] as number), 0);
+      const expected: [keyof CodexModelUsageEntry, number][] = [
+        ["inputTokens", Math.max(accepted.inputTokens - accepted.cachedInputTokens - accepted.cacheWriteInputTokens, 0)],
+        ["cacheReadInputTokens", accepted.cachedInputTokens],
+        ["cacheCreationInputTokens", accepted.cacheWriteInputTokens],
+        ["outputTokens", accepted.outputTokens],
+        ["reasoningOutputTokens", accepted.reasoningOutputTokens],
+      ];
+      for (const [key, value] of expected) {
+        const got = sum(key);
+        if (got !== value) return `seed ${seed} (${family}): ${key} summed to ${got}, expected ${value}`;
+      }
+    }
+    return undefined;
+  }
+
+  it("well-formed notes: 200 seeded sequences conserve every emitted column", () => {
+    const stats = { multiModel: 0, malformedNotes: 0, incomplete: 0 };
+    const mismatch = runFamily("well-formed", 1000, stats);
+    assert.equal(mismatch, undefined, mismatch ?? "");
+    assert.ok(stats.multiModel >= 100, `only ${stats.multiModel} of 200 sequences carried tokens on 2+ models`);
+  });
+
+  it("malformed cache splits: 200 seeded sequences conserve every emitted column", () => {
+    // Raw columns and the clamped uncached input stay monotone, so every advancing note is
+    // adopted: a malformed prefix (cached above input) is followed by a well-formed tail.
+    const stats = { multiModel: 0, malformedNotes: 0, incomplete: 0 };
+    const mismatch = runFamily("malformed", 5000, stats);
+    assert.equal(mismatch, undefined, mismatch ?? "");
+    assert.ok(stats.malformedNotes >= 200, `only ${stats.malformedNotes} malformed notes generated`);
+    assert.ok(stats.multiModel >= 50, `only ${stats.multiModel} of 200 sequences carried tokens on 2+ models`);
+    assert.ok(stats.incomplete >= 20, `only ${stats.incomplete} of 200 sequences hit the D6 boundary check`);
+  });
+});

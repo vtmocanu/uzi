@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 func TestTemplatePinRequestSemantics(t *testing.T) {
@@ -78,5 +80,112 @@ func TestTemplatePinValidationErrorsNameField(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &req); err == nil {
 			t.Errorf("accepted %s", body)
 		}
+	}
+}
+
+func TestTemplateEffortRequestSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name, body                 string
+		present, valid, customized bool
+		want                       string
+	}{
+		{"omitted keeps", "{}", false, true, true, "high"},
+		{"null clears", `{"effort":null}`, true, false, false, ""},
+		{"blank clears", `{"effort":""}`, true, false, false, ""},
+		{"whitespace clears", `{"effort":"  \t"}`, true, false, false, ""},
+		{"explicit trimmed", `{"effort":" max "}`, true, true, true, "max"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := seededRow(t, "coder")
+			row.Effort = pgtype.Text{String: "high", Valid: true}
+			dto := templateDTO(row)
+			req := templateWriteRequest{Description: dto.Description, Model: dto.Model, Tools: dto.Tools, PromptBody: dto.PromptBody}
+			if err := json.Unmarshal([]byte(tc.body), &req); err != nil {
+				t.Fatal(err)
+			}
+			if req.Effort.Present != tc.present {
+				t.Fatal("presence mismatch")
+			}
+			fields, err := validateTemplateFields(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Create has no current row to merge: omission is NULL.
+			if !tc.present && fields.effort.Valid {
+				t.Fatal("omitted create effort is not NULL")
+			}
+			fields = mergeOmittedTemplatePins(req, fields, row)
+			if fields.effort.Valid != tc.valid || fields.effort.String != tc.want {
+				t.Fatalf("merged effort=%+v", fields.effort)
+			}
+			// The seeded builtin ships no effort, so any stored effort is customized.
+			if got := updateMarksCustomized(row, fields); got != tc.customized {
+				t.Errorf("customized=%v want %v", got, tc.customized)
+			}
+			if !differsFromBuiltin(row) {
+				t.Error("a stored effort pin must drift from the shipped NULL")
+			}
+			if got := templateToDefinition(row).Effort; got != "high" {
+				t.Errorf("definition effort=%q", got)
+			}
+			if dto.Effort == nil || *dto.Effort != "high" || dto.CodexEffort != nil {
+				t.Errorf("DTO effort=%v codex_effort=%v", dto.Effort, dto.CodexEffort)
+			}
+		})
+	}
+}
+
+func TestTemplateCodexEffortIsIndependentOfEffort(t *testing.T) {
+	row := seededRow(t, "coder")
+	row.Effort = pgtype.Text{String: "low", Valid: true}
+	row.CodexEffort = pgtype.Text{String: "xhigh", Valid: true}
+	var req templateWriteRequest
+	if err := json.Unmarshal([]byte(`{"effort":null}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	req.Description, req.PromptBody = "d", "p"
+	fields, err := validateTemplateFields(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields = mergeOmittedTemplatePins(req, fields, row)
+	if fields.effort.Valid || !fields.codexEffort.Valid || fields.codexEffort.String != "xhigh" {
+		t.Fatalf("effort=%+v codex_effort=%+v", fields.effort, fields.codexEffort)
+	}
+}
+
+func TestTemplateEffortValidationErrorsNameField(t *testing.T) {
+	for _, tc := range []struct{ body, field string }{
+		{`{"effort":"runtime"}`, "effort:"},
+		{`{"effort":"High"}`, "effort:"},
+		{`{"effort":"extreme"}`, "effort:"},
+		{`{"effort":"hi gh"}`, "effort:"},
+		{`{"codex_effort":"runtime"}`, "codex_effort:"},
+		{`{"codex_effort":"ultra"}`, "codex_effort:"},
+	} {
+		req := templateWriteRequest{Description: "Code", PromptBody: "Code"}
+		if err := json.Unmarshal([]byte(tc.body), &req); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validateTemplateFields(req); err == nil || !strings.HasPrefix(err.Error(), tc.field) {
+			t.Errorf("%s: error=%v", tc.body, err)
+		}
+	}
+	for _, body := range []string{`{"effort":1}`, `{"codex_effort":{}}`, `{"effort":[]}`} {
+		var req templateWriteRequest
+		if err := json.Unmarshal([]byte(body), &req); err == nil {
+			t.Errorf("accepted %s", body)
+		}
+	}
+}
+
+func TestBuiltinDefinitionViewCarriesEffortPins(t *testing.T) {
+	dto := builtinDefinitionView(agenttmpl.Definition{Name: "n", Effort: " high ", CodexEffort: "  "})
+	if dto.Effort == nil || *dto.Effort != "high" || dto.CodexEffort != nil {
+		t.Fatalf("effort=%v codex_effort=%v", dto.Effort, dto.CodexEffort)
+	}
+	raw, err := json.Marshal(builtinDefinitionView(agenttmpl.Definition{Name: "n"}))
+	if err != nil || !strings.Contains(string(raw), `"effort":null`) || !strings.Contains(string(raw), `"codex_effort":null`) {
+		t.Fatalf("a shipped definition without efforts must serialize explicit nulls: %s err=%v", raw, err)
 	}
 }

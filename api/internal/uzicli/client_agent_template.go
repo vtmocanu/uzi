@@ -10,16 +10,20 @@ import (
 // client_agent_template.go holds the owner-scoped agent-template pin verbs (PRD #3264 M3):
 // GET /api/me/agent-templates and PUT /api/me/agent-templates/{id}/model-pins.
 
-// AgentTemplatePins is one template in the restricted CLI view: identity, the two stored pins
-// (nil when the template inherits) and two flags. It carries no prompt body, description or tools.
+// AgentTemplatePins is one template in the restricted CLI view: identity, the four stored pins
+// (model and effort per harness; nil when the template inherits) and two flags. It carries no prompt body, description or tools.
 type AgentTemplatePins struct {
 	ID         string  `json:"id"`
 	Name       string  `json:"name"`
 	Scope      string  `json:"scope"`
 	Model      *string `json:"model"`
 	CodexModel *string `json:"codex_model"`
-	Customized bool    `json:"customized"`
-	Editable   bool    `json:"editable"`
+	// Effort and CodexEffort are the per-harness reasoning-effort pins (PRD #3258). An older
+	// server omits them, which reads as nil (inherit).
+	Effort      *string `json:"effort"`
+	CodexEffort *string `json:"codex_effort"`
+	Customized  bool    `json:"customized"`
+	Editable    bool    `json:"editable"`
 }
 
 // AgentTemplateListResult is the 200 reply of GET /api/me/agent-templates: the decoded templates
@@ -62,7 +66,9 @@ func (c *HTTPClient) ListMyAgentTemplates(ctx context.Context) (AgentTemplateLis
 }
 
 // PutAgentTemplateModelPins sets (string) or clears (nil, JSON null) the pins named in patch, whose
-// keys are the API fields model and codex_model. Any 404 is a missing template (ExitNotFound); an
+// keys are the API fields model, codex_model, effort and codex_effort. A 400 "unknown field
+// effort" or "unknown field codex_effort" is a server that predates the effort pins, mapped to the
+// "upgrade the server" error. Any 404 is a missing template (ExitNotFound); an
 // error-less 405 is a server without the route, mapped to the "upgrade the server" error like the
 // list.
 func (c *HTTPClient) PutAgentTemplateModelPins(ctx context.Context, id string, patch map[string]*string) (AgentTemplatePinsResult, error) {
@@ -76,6 +82,12 @@ func (c *HTTPClient) PutAgentTemplateModelPins(ctx context.Context, id string, p
 		if resp.StatusCode != http.StatusNotFound {
 			if e := unsupportedRouteError(resp.StatusCode, body, errAgentTemplatesUnsupported); e != nil {
 				return AgentTemplatePinsResult{}, e
+			}
+		}
+		if resp.StatusCode == http.StatusBadRequest {
+			switch serverErrMsg(body) {
+			case "unknown field effort", "unknown field codex_effort":
+				return AgentTemplatePinsResult{}, Exitf(ExitGeneric, "%s", errAgentTemplatesUnsupported)
 			}
 		}
 		return AgentTemplatePinsResult{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))

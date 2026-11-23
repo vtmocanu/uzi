@@ -63,11 +63,14 @@ type agentTemplateWriteStore interface {
 // the template inherits all tools (matching the render semantics); model is
 // null when it inherits the model.
 type agentTemplateDTO struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Model       *string  `json:"model"`
-	CodexModel  *string  `json:"codex_model"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Model       *string `json:"model"`
+	CodexModel  *string `json:"codex_model"`
+	// Effort and CodexEffort are the per-harness reasoning-effort pins (PRD #3258); null = no pin.
+	Effort      *string  `json:"effort"`
+	CodexEffort *string  `json:"codex_effort"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
 	IsBuiltin   bool     `json:"is_builtin"`
@@ -113,6 +116,12 @@ func templateDTO(t store.AgentTemplate) agentTemplateDTO {
 	if t.CodexModel.Valid {
 		dto.CodexModel = &t.CodexModel.String
 	}
+	if t.Effort.Valid {
+		dto.Effort = &t.Effort.String
+	}
+	if t.CodexEffort.Valid {
+		dto.CodexEffort = &t.CodexEffort.String
+	}
 	if t.UserID.Valid {
 		u := uuid.UUID(t.UserID.Bytes).String()
 		dto.UserID = &u
@@ -157,6 +166,12 @@ func templateToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	if t.CodexModel.Valid {
 		d.CodexModel = t.CodexModel.String
 	}
+	if t.Effort.Valid {
+		d.Effort = t.Effort.String
+	}
+	if t.CodexEffort.Valid {
+		d.CodexEffort = t.CodexEffort.String
+	}
 	return d
 }
 
@@ -176,6 +191,12 @@ func fieldsToDefinition(name string, f validatedFields) agenttmpl.Definition {
 	}
 	if f.codexModel.Valid {
 		d.CodexModel = f.codexModel.String
+	}
+	if f.effort.Valid {
+		d.Effort = f.effort.String
+	}
+	if f.codexEffort.Valid {
+		d.CodexEffort = f.codexEffort.String
 	}
 	return d
 }
@@ -250,6 +271,8 @@ type builtinDefinitionDTO struct {
 	Description string   `json:"description"`
 	Model       *string  `json:"model"`
 	CodexModel  *string  `json:"codex_model"`
+	Effort      *string  `json:"effort"`
+	CodexEffort *string  `json:"codex_effort"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
 }
@@ -268,6 +291,12 @@ func builtinDefinitionView(def agenttmpl.Definition) builtinDefinitionDTO {
 	if def.CodexModel != "" {
 		m := def.CodexModel
 		dto.CodexModel = &m
+	}
+	if e := strings.TrimSpace(def.Effort); e != "" {
+		dto.Effort = &e
+	}
+	if e := strings.TrimSpace(def.CodexEffort); e != "" {
+		dto.CodexEffort = &e
 	}
 	return dto
 }
@@ -328,6 +357,11 @@ type templateWriteRequest struct {
 	Description string              `json:"description"`
 	Model       *string             `json:"model"`
 	CodexModel  optionalTemplatePin `json:"codex_model"`
+	// Effort and CodexEffort are tri-state like CodexModel: omitted keeps the stored value on
+	// update (NULL on create), null or blank clears it, otherwise it must be an
+	// agenttmpl.EffortLevels value (PRD #3258).
+	Effort      optionalTemplatePin `json:"effort"`
+	CodexEffort optionalTemplatePin `json:"codex_effort"`
 	Tools       []string            `json:"tools"`
 	PromptBody  string              `json:"prompt_body"`
 	Scope       string              `json:"scope"`
@@ -492,6 +526,8 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Description: fields.description,
 		Model:       fields.model,
 		CodexModel:  fields.codexModel,
+		Effort:      fields.effort,
+		CodexEffort: fields.codexEffort,
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
 		Scope:       scope,
@@ -582,6 +618,8 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Description: fields.description,
 		Model:       fields.model,
 		CodexModel:  fields.codexModel,
+		Effort:      fields.effort,
+		CodexEffort: fields.codexEffort,
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
 		UpdatedBy:   pgconv.UUID(actor.ID),
@@ -664,6 +702,8 @@ func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Description: def.Description,
 		Model:       model,
 		CodexModel:  pgtype.Text{String: def.CodexModel, Valid: def.CodexModel != ""},
+		Effort:      shippedEffort(def.Effort),
+		CodexEffort: shippedEffort(def.CodexEffort),
 		Tools:       tools,
 		PromptBody:  def.PromptBody,
 		UpdatedBy:   pgconv.UUID(actor.ID),
@@ -743,6 +783,8 @@ type validatedFields struct {
 	description string
 	model       pgtype.Text
 	codexModel  pgtype.Text
+	effort      pgtype.Text
+	codexEffort pgtype.Text
 	tools       []byte
 	promptBody  string
 }
@@ -790,6 +832,15 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 	}
 	f.model = model
 	f.codexModel, err = validateTemplatePin("codex", "codex_model", req.CodexModel.Value)
+	if err != nil {
+		return f, err
+	}
+
+	f.effort, err = validateTemplateEffort("effort", req.Effort.Value)
+	if err != nil {
+		return f, err
+	}
+	f.codexEffort, err = validateTemplateEffort("codex_effort", req.CodexEffort.Value)
 	if err != nil {
 		return f, err
 	}

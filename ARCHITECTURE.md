@@ -186,7 +186,8 @@ The endpoints that call out to the forge on a user's behalf (`.../verify`, `.../
 
 An agent template (`agent_templates` table) is the definition of one role an
 agent can play: name, description, optional per-harness model pins (`model`
-for Claude, `codex_model` for Codex), an optional tools allowlist, and a prompt
+for Claude, `codex_model` for Codex), optional per-harness effort pins
+(`effort`, `codex_effort`), an optional tools allowlist, and a prompt
 body. It is not itself an agent; it is the recipe a later release renders into
 a running one.
 
@@ -202,6 +203,20 @@ a running one.
   and no agent-source sync replaced, so admin edits survive restarts and future
   releases add or upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
   a non-builtin row already occupies a builtin's name.
+- **Task-review settings ride review claims behind a capability (PRD #1570).** A
+  task-review claim carries the owner's configured, re-validated `task_review_model`
+  and `task_review_effort` (resolved per harness; the worker effort when unset) only to a worker advertising `task_review_settings_v1`; absent, the worker runs its
+  built-in. For an older worker the api withholds it and writes one
+  `task_review_settings_omitted` run-feed notice per claim generation; the review still
+  runs, on the built-in.
+- **Effort pins are projected per family, behind a capability.** The claim
+  carries a subagent's `effort` for the run's harness only, and only to a worker
+  advertising `template_effort_v1`; for an older worker the api omits the pins
+  and, when at least one subagent pin was withheld, writes one run-feed notice
+  per claim generation. The lead template's
+  effort is not projected as a pin: it is a tier of the lead's own effort
+  (run override, then the user's preference, then the lead template, then
+  medium). See [PRD #3258](prds/done/3258-per-harness-template-effort.md).
 - **The `lead` is the main thread, not a subagent.** The worker
   (`agent/src/agents.ts`) selects the first delivered own template matching
   `lead`/`orchestrator` case-insensitively and routes its body and delivered

@@ -7,31 +7,50 @@ import os from "node:os";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
-import { buildSdkEnv } from "../src/sdk-env.js";
+import { buildSdkEnv, PROVIDER_FALLBACK_CONTEXT_WINDOW } from "../src/sdk-env.js";
 
 // PRD #4320 M2 (agent half): does CLAUDE_CODE_MAX_CONTEXT_TOKENS / CLAUDE_CODE_AUTO_COMPACT_WINDOW
 // change the REAL bundled CLI's auto-compaction point for a model name it does not recognize
 // (a gateway name such as `corp-sonnet`)? The CLI runs in provider-like mode against a loopback
-// Messages API whose reported `usage.input_tokens` is a pure function of the request (PER_MESSAGE
+// Messages API whose reported `usage.input_tokens` is a pure function of the request (perMessage
 // tokens per message in the history), so the point at which the CLI issues its summarization
-// request is a function of the history length alone. The compaction point itself is chosen by the
-// CLI and moves by a turn or two between runs, so the assertions are ordering properties (the keyed
-// compaction happens strictly below the unkeyed baseline and at or below the configured window),
-// not narrow token windows. Findings: the PRD Decision Log entry "M1 verification: context-window
-// behaviour characterized at the pin" in prds/4320-custom-providers-core-anthropic.md.
+// request is a function of the history length alone.
+//
+// Two different things are measured and kept apart:
+//  - the RUNTIME default: what the CLI does with NO window override at all. Characterized at SDK
+//    0.3.325 / CLI 2.1.325 (2026-11-22): it assumes 1M tokens for an unrecognized id and compacts near
+//    1M. At 0.3.319 the same case compacted near 200k, so this one is a dependency-induced change.
+//  - the uzi PRODUCTION policy: buildSdkEnv always sets CLAUDE_CODE_MAX_CONTEXT_TOKENS for a provider
+//    credential, to the configured window or PROVIDER_FALLBACK_CONTEXT_WINDOW (200k) when none is
+//    configured. For a model id the CLI does not recognize that is what keeps an unconfigured provider
+//    compacting early; it is uzi's choice, not the CLI's. For ids the CLI recognizes (claude-sonnet-4-5,
+//    us.anthropic.claude-sonnet-4-5) the measured CLI ignores both the fallback and an explicit window:
+//    see the mapped-name cases below.
+// The compaction point itself is chosen by the CLI and moves by a turn or two between runs, so every
+// assertion is a MEASURED BAND: its lower bound is at least one reported-token step (2 * perMessage,
+// the increment between consecutive lead calls) below the observed first compaction and its upper bound
+// is the configured or runtime window (or at least one step above the observation), never an exact
+// threshold. Findings: the PRD Decision Log in prds/4320-custom-providers-core-anthropic.md.
 
 const DRIVE_BUDGET_MS = 90_000;
-const PER_MESSAGE = 5_000; // reported input tokens per history message
-const MAX_TOOL_TURNS = 60;
+const PER_MESSAGE = 5_000; // default reported input tokens per history message
+const MAX_TOOL_TURNS = 60; // default cap on lead tool turns
 const SUBAGENT_TOKEN = "SUBAGENT-TASK-9d41";
 const LEAD_MODEL = "corp-sonnet";
 const SUB_MODEL = "corp-haiku";
 // Carried in the subagent's system prompt, so a request is attributed to the subagent by identity
 // and not by model name (the small/fast haiku slot also serves side calls for the lead).
 const SUB_IDENTITY = "SUBAGENT-IDENTITY-7b3f";
-// Every unkeyed run compacts above this; a keyed run must compact below it.
+// Lower edge of the 200k policy band: one 10k step below the 170k observed at perMessage 5_000.
 const BASELINE_FLOOR = 160_000;
-const DEFAULT_WINDOW = 200_000;
+// The CLI's own window for a model id it does not recognize, measured with no override at all
+// (SDK 0.3.325 / CLI 2.1.325). Not uzi policy: see UZI_FALLBACK_WINDOW.
+const RUNTIME_DEFAULT_WINDOW = 1_000_000;
+// Reported-token step per lead tool turn is 2 * perMessage; the runtime-default cases use 10_000 so
+// the step (20k) is smaller than the ~33k buffer the CLI keeps below the window.
+const RUNTIME_PER_MESSAGE = 10_000;
+// What buildSdkEnv sets for a provider credential with no configured window (uzi policy).
+const UZI_FALLBACK_WINDOW = PROVIDER_FALLBACK_CONTEXT_WINDOW;
 
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
@@ -68,7 +87,7 @@ class Gateway {
   private subTurns = 0;
   private subSinceCompaction = 0;
   private spawned = false;
-  constructor(private readonly opts: { withSubagent: boolean; subTurns: number }) {
+  constructor(private readonly opts: { withSubagent: boolean; subTurns: number; perMessage: number; maxToolTurns: number }) {
     this.server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on("data", (c: Buffer) => chunks.push(c));
@@ -111,7 +130,7 @@ class Gateway {
     const isSub = systemText.includes(SUB_IDENTITY) || firstText.includes(SUBAGENT_TOKEN);
     const compaction = /detailed summary of the conversation|summary of the conversation so far|CRITICAL: Respond with TEXT ONLY/i.test(lastText);
     const hasBash = tools.includes("Bash");
-    const reported = PER_MESSAGE * body.messages.length;
+    const reported = this.opts.perMessage * body.messages.length;
     let turn: { text: string } | { tool: string; input: Record<string, unknown> };
     if (compaction) {
       turn = { text: "<analysis>a</analysis><summary>Work so far: ran many echo commands.</summary>" };
@@ -134,7 +153,7 @@ class Gateway {
       if (leadCompacted) this.leadTurnsSinceCompaction++;
       const toolTurns = body.messages.filter((m) => m.role === "assistant" && Array.isArray(m.content) && m.content.some((b: { type?: string }) => b.type === "tool_use")).length;
       turn =
-        (leadCompacted && this.leadTurnsSinceCompaction >= 2) || toolTurns >= MAX_TOOL_TURNS
+        (leadCompacted && this.leadTurnsSinceCompaction >= 2) || toolTurns >= this.opts.maxToolTurns
           ? { text: "lead done" }
           : { tool: "Bash", input: { command: "echo lead", description: "lead step" } };
     }
@@ -181,7 +200,12 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
     for (const r of roots) fs.rmSync(r, { recursive: true, force: true });
   });
 
-  async function run(contextEnv: Record<string, string>, withSubagent: boolean, subTurns = 0): Promise<Outcome> {
+  async function run(
+    contextEnv: Record<string, string>,
+    withSubagent: boolean,
+    subTurns = 0,
+    gwOpts: { perMessage?: number; maxToolTurns?: number } = {},
+  ): Promise<Outcome> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-ctxwin-it-"));
     roots.push(root);
     const home = path.join(root, "home");
@@ -189,7 +213,7 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
     const tmp = path.join(root, "tmp");
     for (const d of [path.join(home, ".claude"), worktree, tmp]) fs.mkdirSync(d, { recursive: true });
     fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
-    const gw = new Gateway({ withSubagent, subTurns });
+    const gw = new Gateway({ withSubagent, subTurns, perMessage: gwOpts.perMessage ?? PER_MESSAGE, maxToolTurns: gwOpts.maxToolTurns ?? MAX_TOOL_TURNS });
     const baseUrl = await gw.listen();
     let stderr = "";
     const sysNotes: string[] = [];
@@ -236,7 +260,7 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
     }
     if (process.env.UZI_CTXWIN_DEBUG) {
       const seq = gw.calls.map((c) => `${c.agent}/${c.model}/${c.compaction ? "COMPACT" : "turn"}/${c.reported}`).join(" ");
-      console.log(`DBG ${JSON.stringify(contextEnv)} sub=${withSubagent} :: ${seq} :: stderr=${JSON.stringify(stderr.slice(0, 500))}`);
+      console.log(`DBG ${JSON.stringify(contextEnv)} sub=${withSubagent} pm=${gwOpts.perMessage ?? PER_MESSAGE} :: ${seq} :: stderr=${JSON.stringify(stderr.slice(0, 500))}`);
     }
     return { gw, stderr, sysNotes };
   }
@@ -252,99 +276,130 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
     assert.ok(n > lo && n <= hi, `${what}: first compaction at ${n}, expected above ${lo} and at most ${hi}\ncalls: ${trace(o)}`);
   };
 
-  // Observed at the pinned SDK 0.3.319 (CLI 2.1.319): the unknown-model default window is 200k and the
-  // CLI compacts about 33k below the window, i.e. when the last reported input_tokens is ~170k.
-  it("single model, no context env: assumes a 200k window and warns unrecognized_model", { timeout: 120_000 }, async () => {
-    const o = await run({}, false);
-    within(firstCompaction(o, "lead", "baseline"), BASELINE_FLOOR, DEFAULT_WINDOW, "baseline", o);
+  // Characterized at SDK 0.3.325 / CLI 2.1.325 (2026-11-22). History: at 0.3.319 an unrecognized id
+  // assumed 200k and compacted at ~170k; the target (measured at 0.3.325 / CLI 2.1.325; the CLI changelog dates the change to 2.1.323) assumes 1M. Observed first compaction (last reported
+  // input_tokens before the summarization request) at perMessage 10_000: 970k to 980k.
+  const RUNTIME_BAND_LO = RUNTIME_DEFAULT_WINDOW - 50_000; // >= one 20k step below the lowest observation
+  it("runtime default (no override): a lead on an unrecognized model compacts near 1M and warns unrecognized_model", { timeout: 120_000 }, async () => {
+    const o = await run({}, false, 0, { perMessage: RUNTIME_PER_MESSAGE });
+    within(firstCompaction(o, "lead", "runtime default"), RUNTIME_BAND_LO, RUNTIME_DEFAULT_WINDOW, "runtime default", o);
     assert.match(o.stderr, /unrecognized_model\] \{"model":"corp-sonnet"/);
   });
 
-  it("single model: CLAUDE_CODE_MAX_CONTEXT_TOKENS=50000 moves the compaction point down to ~window minus the buffer", { timeout: 120_000 }, async () => {
-    const o = await run({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" }, false);
-    within(firstCompaction(o, "lead", "MAX_CONTEXT_TOKENS=50000"), 0, 50_000, "MAX_CONTEXT_TOKENS=50000", o);
+  it("runtime default (no override): lead and subagent on different unrecognized models both compact near 1M", { timeout: 120_000 }, async () => {
+    const o = await run({}, true, 60, { perMessage: RUNTIME_PER_MESSAGE });
+    within(firstCompaction(o, "lead", "lead"), RUNTIME_BAND_LO, RUNTIME_DEFAULT_WINDOW, "lead", o);
+    within(firstCompaction(o, "sub", "sub"), RUNTIME_BAND_LO, RUNTIME_DEFAULT_WINDOW, "sub", o);
+    assert.match(o.stderr, /unrecognized_model\] \{"model":"corp-haiku"/);
   });
 
-  it("single model: CLAUDE_CODE_MAX_CONTEXT_TOKENS above the default raises the compaction point", { timeout: 120_000 }, async () => {
-    const o = await run({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "400000" }, false);
-    within(firstCompaction(o, "lead", "MAX_CONTEXT_TOKENS=400000"), DEFAULT_WINDOW, 400_000, "MAX_CONTEXT_TOKENS=400000", o);
-  });
-
-  it("single model: CLAUDE_CODE_AUTO_COMPACT_WINDOW=120000 moves the compaction point to ~window minus the buffer", { timeout: 120_000 }, async () => {
-    const o = await run({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "120000" }, false);
-    const n = firstCompaction(o, "lead", "AUTO_COMPACT_WINDOW=120000");
-    assert.ok(n < BASELINE_FLOOR, `not below the baseline: ${n}\ncalls: ${trace(o)}`);
-    within(n, 0, 120_000, "AUTO_COMPACT_WINDOW=120000", o);
-  });
-
-  it("single model: CLAUDE_CODE_AUTO_COMPACT_WINDOW below 100000 is floored (50000 behaves like 100000)", { timeout: 120_000 }, async () => {
-    const o = await run({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "50000" }, false);
-    // Unfloored, a 50000 window would compact near 17k; the floor keeps it above 50k and within 100k.
-    within(firstCompaction(o, "lead", "AUTO_COMPACT_WINDOW=50000"), 50_000, 100_000, "AUTO_COMPACT_WINDOW=50000", o);
-  });
-
-  // The context env for a mapped sonnet name with a 50000 window, taken from the production buildSdkEnv.
-  const WINDOW = 50_000;
-  const prodWindowEnv = (sonnet: string): Record<string, string> => {
+  // The context env for a mapped sonnet name, taken from the production buildSdkEnv. With a window it
+  // is that window; without one it is the uzi fallback (PROVIDER_FALLBACK_CONTEXT_WINDOW).
+  const prodEnv = (sonnet: string, window?: number): Record<string, string> => {
     const prod = buildSdkEnv(
-      { kind: "provider", baseUrl: "http://127.0.0.1:1", authStyle: "bearer", key: "k", modelMap: { sonnet: { model: sonnet, context_window: WINDOW }, haiku: { model: SUB_MODEL } } },
+      {
+        kind: "provider",
+        baseUrl: "http://127.0.0.1:1",
+        authStyle: "bearer",
+        key: "k",
+        modelMap: { sonnet: { model: sonnet, ...(window === undefined ? {} : { context_window: window }) }, haiku: { model: SUB_MODEL } },
+      },
       "/unused-home",
     );
-    assert.equal(prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS, String(WINDOW));
+    assert.equal(prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS, String(window ?? PROVIDER_FALLBACK_CONTEXT_WINDOW));
     return { ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet, CLAUDE_CODE_MAX_CONTEXT_TOKENS: prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS! };
   };
   const maxLeadTokens = (o: Outcome): number => Math.max(0, ...o.gw.calls.filter((c) => c.agent === "lead" && !c.compaction).map((c) => c.reported));
 
-  // OBSERVED at the pin (SDK 0.3.319 / CLI 2.1.319, 2026-11-18), with a 50000 window: the names below
-  // were NOT compacted at that window. These tests record what was seen, not why; they fail if a CLI
-  // bump starts honouring the window for them, and the docs/CLI help/form warning must be revisited.
-  for (const [name, minReported] of [
-    ["claude-sonnet-4-5", DEFAULT_WINDOW],
-    ["us.anthropic.claude-sonnet-4-5", DEFAULT_WINDOW],
-    // Unrecognized by the CLI (it logs unrecognized_model) yet not honoured: it compacted near the 200k default.
-    ["claude-corp-custom", 100_000],
-  ] as const) {
-    it(`single model, mapped name ${name} with a 50000 window from buildSdkEnv: the window is not honoured`, { timeout: 120_000 }, async () => {
-      const o = await run(prodWindowEnv(name), false);
-      assert.ok(o.gw.calls.some((c) => c.model === name), `the name reached the gateway\ncalls: ${trace(o)}`);
-      const max = maxLeadTokens(o);
-      assert.ok(max > minReported, `the lead only reached ${max} reported tokens, expected above ${minReported} (window 50000)\ncalls: ${trace(o)}`);
-      const n = o.gw.tokensAtFirstCompaction("lead");
-      assert.ok(n === undefined || n > WINDOW, `compaction at or below the configured window (first compaction at ${n})\ncalls: ${trace(o)}`);
-    });
-  }
-
-  // Positive control for the same measurement: a name containing "claude" that WAS enforced.
-  it("single model, mapped name corp-claude-x with a 50000 window from buildSdkEnv: the window is enforced", { timeout: 120_000 }, async () => {
-    const o = await run(prodWindowEnv("corp-claude-x"), false);
-    assert.ok(o.gw.calls.some((c) => c.model === "corp-claude-x"), `the name reached the gateway\ncalls: ${trace(o)}`);
-    within(firstCompaction(o, "lead", "corp-claude-x"), 0, WINDOW, "corp-claude-x", o);
+  // Observed 170k for both lead and subagent at perMessage 5_000 (step 10k): inside (160k, 200k].
+  it("uzi production policy (buildSdkEnv, no configured window, unknown name): the lead compacts within the 200k fallback", { timeout: 120_000 }, async () => {
+    const o = await run(prodEnv(LEAD_MODEL), false);
+    within(firstCompaction(o, "lead", "production no-window"), BASELINE_FLOOR, UZI_FALLBACK_WINDOW, "production no-window", o);
   });
 
-  it("lead + subagent on different unrecognized models: no context env, both assume the same 200k default", { timeout: 120_000 }, async () => {
-    const o = await run({}, true, 40);
-    within(firstCompaction(o, "lead", "lead"), BASELINE_FLOOR, DEFAULT_WINDOW, "lead", o);
-    within(firstCompaction(o, "sub", "sub"), BASELINE_FLOOR, DEFAULT_WINDOW, "sub", o);
-    assert.match(o.stderr, /unrecognized_model\] \{"model":"corp-haiku"/);
+  it("uzi production policy (buildSdkEnv, no configured window, unknown names): lead and subagent both compact within the 200k fallback", { timeout: 120_000 }, async () => {
+    const o = await run(prodEnv(LEAD_MODEL), true, 40);
+    within(firstCompaction(o, "lead", "lead"), BASELINE_FLOOR, UZI_FALLBACK_WINDOW, "lead", o);
+    within(firstCompaction(o, "sub", "sub"), BASELINE_FLOOR, UZI_FALLBACK_WINDOW, "sub", o);
+  });
+
+  // Explicit overrides. Observed at perMessage 5_000 (step 10k): MAX=50000 -> 20k; MAX=400000 -> 370k;
+  // AUTO_COMPACT=120000 -> 90k (105k seen at 0.3.319); AUTO_COMPACT=50000 -> 70k (floored to 100000).
+  it("explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS=50000 moves the compaction point down to ~window minus the buffer", { timeout: 120_000 }, async () => {
+    const o = await run({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" }, false);
+    within(firstCompaction(o, "lead", "MAX_CONTEXT_TOKENS=50000"), 10_000, 50_000, "MAX_CONTEXT_TOKENS=50000", o);
+  });
+
+  it("explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS=400000, below the runtime default, lowers the compaction point", { timeout: 120_000 }, async () => {
+    const o = await run({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "400000" }, false);
+    within(firstCompaction(o, "lead", "MAX_CONTEXT_TOKENS=400000"), 360_000, 400_000, "MAX_CONTEXT_TOKENS=400000", o);
+  });
+
+  it("explicit CLAUDE_CODE_AUTO_COMPACT_WINDOW=120000 moves the compaction point to ~window minus the buffer", { timeout: 120_000 }, async () => {
+    const o = await run({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "120000" }, false);
+    const n = firstCompaction(o, "lead", "AUTO_COMPACT_WINDOW=120000");
+    assert.ok(n < BASELINE_FLOOR, `not below the policy band: ${n}\ncalls: ${trace(o)}`);
+    within(n, 70_000, 120_000, "AUTO_COMPACT_WINDOW=120000", o);
+  });
+
+  it("explicit CLAUDE_CODE_AUTO_COMPACT_WINDOW below 100000 is floored (50000 behaves like 100000)", { timeout: 120_000 }, async () => {
+    const o = await run({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "50000" }, false);
+    // Unfloored, a 50000 window would compact near 17k; the floor keeps it above 50k and within 100k.
+    within(firstCompaction(o, "lead", "AUTO_COMPACT_WINDOW=50000"), 50_000, 100_000, "AUTO_COMPACT_WINDOW=50000", o);
   });
 
   it("lead + subagent: one process-wide CLAUDE_CODE_MAX_CONTEXT_TOKENS applies to both models", { timeout: 120_000 }, async () => {
     const o = await run({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" }, true, 40);
     for (const agent of ["lead", "sub"] as const) {
       const n = firstCompaction(o, agent, "MAX_CONTEXT_TOKENS=50000");
-      assert.ok(n < BASELINE_FLOOR, `${agent} not below the baseline: ${n}\ncalls: ${trace(o)}`);
+      assert.ok(n < BASELINE_FLOOR, `${agent} not below the policy band: ${n}\ncalls: ${trace(o)}`);
       within(n, 0, 50_000, agent, o);
     }
   });
 
   it("lead + subagent: one process-wide CLAUDE_CODE_AUTO_COMPACT_WINDOW applies to both models", { timeout: 120_000 }, async () => {
     const o = await run({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "120000" }, true, 40);
-    // The exact trigger varies by a turn or two between runs (90k and 105k seen for the lead), so
-    // assert the ordering only: below the unkeyed baseline and within the configured window.
+    // The exact trigger varies by a turn or two between runs (90k and 105k seen for the lead).
     for (const agent of ["lead", "sub"] as const) {
       const n = firstCompaction(o, agent, "AUTO_COMPACT_WINDOW=120000");
-      assert.ok(n < BASELINE_FLOOR, `${agent} not below the baseline: ${n}\ncalls: ${trace(o)}`);
+      assert.ok(n < BASELINE_FLOOR, `${agent} not below the policy band: ${n}\ncalls: ${trace(o)}`);
       within(n, 0, 120_000, agent, o);
     }
   });
+
+  // Mapped names with a 50000 window from buildSdkEnv, observed at perMessage 5_000 (step 10k):
+  //  - claude-corp-custom and corp-claude-x: enforced, first compaction at 20k. (claude-corp-custom was
+  //    NOT enforced at 0.3.319, where it compacted near the 200k default.)
+  //  - claude-sonnet-4-5 and us.anthropic.claude-sonnet-4-5: not enforced. The CLI recognizes them (no
+  //    unrecognized_model warning) and never compacted up to the 60-turn cap (605k reported).
+  // These record what was seen, not why; a CLI bump that changes either side reddens them and the
+  // docs/CLI help/form warning must be revisited.
+  const WINDOW = 50_000;
+  for (const name of ["claude-corp-custom", "corp-claude-x"]) {
+    it(`mapped name ${name} with a 50000 window from buildSdkEnv: the window is enforced`, { timeout: 120_000 }, async () => {
+      const o = await run(prodEnv(name, WINDOW), false);
+      assert.ok(o.gw.calls.some((c) => c.model === name), `the name reached the gateway\ncalls: ${trace(o)}`);
+      within(firstCompaction(o, "lead", name), 10_000, WINDOW, name, o);
+    });
+  }
+
+  for (const name of ["claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-5"]) {
+    it(`mapped name ${name} with a 50000 window from buildSdkEnv: the window is not honoured`, { timeout: 120_000 }, async () => {
+      const o = await run(prodEnv(name, WINDOW), false);
+      assert.ok(o.gw.calls.some((c) => c.model === name), `the name reached the gateway\ncalls: ${trace(o)}`);
+      const max = maxLeadTokens(o);
+      assert.ok(max > 500_000, `the lead only reached ${max} reported tokens, expected above 500000 (window ${WINDOW})\ncalls: ${trace(o)}`);
+      const n = o.gw.tokensAtFirstCompaction("lead");
+      assert.ok(n === undefined || n > WINDOW, `compaction at or below the configured window (first compaction at ${n})\ncalls: ${trace(o)}`);
+    });
+
+    it(`mapped name ${name} with no configured window from buildSdkEnv: the 200k fallback is not honoured`, { timeout: 120_000 }, async () => {
+      const o = await run(prodEnv(name), false);
+      assert.ok(o.gw.calls.some((c) => c.model === name), `the name reached the gateway\ncalls: ${trace(o)}`);
+      const max = maxLeadTokens(o);
+      assert.ok(max > 500_000, `the lead only reached ${max} reported tokens, expected above 500000 (fallback ${UZI_FALLBACK_WINDOW})\ncalls: ${trace(o)}`);
+      const n = o.gw.tokensAtFirstCompaction("lead");
+      assert.ok(n === undefined || n > UZI_FALLBACK_WINDOW, `compaction at or below the fallback (first compaction at ${n})\ncalls: ${trace(o)}`);
+    });
+  }
 });

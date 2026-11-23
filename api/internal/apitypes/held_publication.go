@@ -44,6 +44,9 @@ type HeldPublicationDTO struct {
 // publications, newest generation first (empty, never null, when it has none).
 type HeldPublicationsDTO struct {
 	Publications []HeldPublicationDTO `json:"publications"`
+	// AdminDebugRead is true only on an admin run debug read of another user's run
+	// (issue #4198); omitted otherwise. Expiry stays owner-only.
+	AdminDebugRead bool `json:"admin_debug_read,omitempty"`
 }
 
 // HeldPublicationsExpireDTO is the answer to POST /api/runs/{id}/held-publications/expire: the

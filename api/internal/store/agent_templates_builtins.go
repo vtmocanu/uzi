@@ -44,18 +44,27 @@ type builtinReconcilerQueries interface {
 // which ReconcileBuiltinSkills rejects — but callers should be failing on the
 // error anyway.
 func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) (TemplatesReconciled, error) {
+	return reconcileBuiltinDefinitions(ctx, q, agenttmpl.Builtins())
+}
+
+// reconcileBuiltinDefinitions is ReconcileBuiltinTemplates over an explicit definition list, the
+// seam that lets a unit test drive a shipped definition carrying pins no embedded builtin carries
+// (issue #3258: effort and codex_effort must reach both the insert and the pristine refresh).
+func reconcileBuiltinDefinitions(ctx context.Context, q builtinReconcilerQueries, defs []agenttmpl.Definition) (TemplatesReconciled, error) {
 	var inserted int
-	for _, def := range agenttmpl.Builtins() {
-		model, codexModel, tools, err := builtinColumns(def)
+	for _, def := range defs {
+		cols, err := builtinColumns(def)
 		if err != nil {
 			return TemplatesReconciled{}, fmt.Errorf("encode builtin %q: %w", def.Name, err)
 		}
 		n, err := q.InsertBuiltinAgentTemplate(ctx, InsertBuiltinAgentTemplateParams{
 			Name:        def.Name,
 			Description: def.Description,
-			Model:       model,
-			CodexModel:  codexModel,
-			Tools:       tools,
+			Model:       cols.model,
+			CodexModel:  cols.codexModel,
+			Effort:      cols.effort,
+			CodexEffort: cols.codexEffort,
+			Tools:       cols.tools,
 			PromptBody:  def.PromptBody,
 		})
 		if err != nil {
@@ -79,9 +88,11 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 			if _, err := q.RefreshPristineBuiltin(ctx, RefreshPristineBuiltinParams{
 				Name:        def.Name,
 				Description: def.Description,
-				Model:       model,
-				CodexModel:  codexModel,
-				Tools:       tools,
+				Model:       cols.model,
+				CodexModel:  cols.codexModel,
+				Effort:      cols.effort,
+				CodexEffort: cols.codexEffort,
+				Tools:       cols.tools,
 				PromptBody:  def.PromptBody,
 			}); err != nil {
 				return TemplatesReconciled{}, fmt.Errorf("refresh pristine builtin %q: %w", def.Name, err)
@@ -109,29 +120,44 @@ func ReconcileBuiltinTemplates(ctx context.Context, q builtinReconcilerQueries) 
 		}
 		inserted += int(n)
 	}
-	slog.Info("reconciled builtin agent templates", "builtins", len(agenttmpl.Builtins()), "inserted", inserted)
+	slog.Info("reconciled builtin agent templates", "builtins", len(defs), "inserted", inserted)
 	return TemplatesReconciled{done: true}, nil
 }
 
-// builtinColumns converts both model pins and tools into DB column types:
-// an empty pin is NULL (inherit), an empty tools list is a NULL tools
-// column (inherit all), and a non-empty tools list is a JSON array.
-func builtinColumns(def agenttmpl.Definition) (pgtype.Text, pgtype.Text, []byte, error) {
-	var model pgtype.Text
-	if def.Model != "" {
-		model = pgtype.Text{String: def.Model, Valid: true}
+// builtinCols is the DB-typed form of a builtin's pins and tools.
+type builtinCols struct {
+	model, codexModel, effort, codexEffort pgtype.Text
+	tools                                  []byte
+}
+
+// builtinColumns converts the model and effort pins and tools into DB column types:
+// an empty pin (or a whitespace-only effort, as agenttmpl.ValidateEffort treats it) is NULL
+// (inherit), an empty tools list is a NULL tools column (inherit all), and a non-empty tools
+// list is a JSON array.
+func builtinColumns(def agenttmpl.Definition) (builtinCols, error) {
+	text := func(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }
+	// Validated, not only trimmed: a shipped effort outside agenttmpl.EffortLevels fails the
+	// reconcile with a named error instead of tripping the column CHECK mid-boot.
+	effort, err := agenttmpl.ValidateEffort(def.Effort)
+	if err != nil {
+		return builtinCols{}, fmt.Errorf("effort: %w", err)
 	}
-	var codexModel pgtype.Text
-	if def.CodexModel != "" {
-		codexModel = pgtype.Text{String: def.CodexModel, Valid: true}
+	codexEffort, err := agenttmpl.ValidateEffort(def.CodexEffort)
+	if err != nil {
+		return builtinCols{}, fmt.Errorf("codex_effort: %w", err)
 	}
-	var tools []byte
+	c := builtinCols{
+		model:       text(def.Model),
+		codexModel:  text(def.CodexModel),
+		effort:      text(effort),
+		codexEffort: text(codexEffort),
+	}
 	if len(def.Tools) > 0 {
 		b, err := json.Marshal(def.Tools)
 		if err != nil {
-			return pgtype.Text{}, pgtype.Text{}, nil, err
+			return builtinCols{}, err
 		}
-		tools = b
+		c.tools = b
 	}
-	return model, codexModel, tools, nil
+	return c, nil
 }

@@ -95,7 +95,7 @@ func TestLinkedUnmappedIssueAuthorScheduledRunIsNotAutoApprovedLiveDB(t *testing
 			f.syncOK(t)
 			f.wireRuns(t)
 
-			run, err := f.h.wsvc.CreateScheduledAutopilotRun(context.Background(), f.user.ID, f.repo, f.issueN, "", nil, nil, nil, false, nil, nil)
+			run, err := f.h.wsvc.CreateScheduledAutopilotRun(context.Background(), f.user.ID, f.repo, f.issueN, "", nil, nil, nil, false, nil, nil, nil)
 			if err != nil {
 				t.Fatalf("scheduled run: %v", err)
 			}

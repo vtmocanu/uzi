@@ -2,11 +2,13 @@ package forgesvc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -35,7 +37,8 @@ func (s *Service) SyncIssuesIncremental(ctx context.Context, userID, repoID uuid
 
 // syncLinkedIssues caches the issues of a linked repo's eligibility tag (D10, D14).
 // It reads the link from the owner-scoped repo row (the row repoSource reads), lists
-// the tag's issues, and upserts every one with issue_key = short + "-" + number. No
+// the tag's issues, and upserts every one with issue_key = short + "-" + number and the board column its
+// State maps to. No
 // open-issue and no finding fetch: only tagged issues are cached.
 //
 // The listing never carries UpdatedAfter, in either form: the id-scoped listing has
@@ -56,11 +59,36 @@ func (s *Service) syncLinkedIssues(ctx context.Context, userID, repoID uuid.UUID
 	if !src.IssueTrackerProjectShort.Valid || !src.EligibilityTagName.Valid {
 		return m, ErrLinkedRepoUnresolvable
 	}
-	issues, err := tr.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{src.EligibilityTagName.String}})
+	// The listing carries each issue's State so the board column can be cached (PRD
+	// #4173 M5). The write guard of a linked repo always offers it; a linked side that
+	// cannot is a fault, never an empty listing, which the full form would read as
+	// "evict everything".
+	lister, ok := tr.(issuesource.IssueStateLister)
+	if !ok {
+		return m, fmt.Errorf("linked issue sync: %w", errNoStateListing)
+	}
+	stated, err := lister.ListIssuesWithState(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{src.EligibilityTagName.String}})
 	if err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, issues, src.IssueTrackerProjectShort.String); err != nil {
+	stateColumns, err := reverseColumnStates(src.ColumnStates)
+	if err != nil {
+		return m, err
+	}
+	issues := make([]forge.Issue, 0, len(stated))
+	columns := make(map[int64]string, len(stated))
+	for _, si := range stated {
+		issues = append(issues, si.Issue)
+		// A resolved issue, the open state and a State no column maps to are all the Open
+		// lane (empty column, stored as NULL); closed is decided by issues.state.
+		if si.Issue.State == string(forge.StateClosed) {
+			continue
+		}
+		if col, mapped := stateColumns[si.State]; mapped {
+			columns[si.Issue.IID] = col
+		}
+	}
+	if err := s.upsertIssues(ctx, repoID, issues, src.IssueTrackerProjectShort.String, columns); err != nil {
 		return m, err
 	}
 	if full {
@@ -73,4 +101,22 @@ func (s *Service) syncLinkedIssues(ctx context.Context, userID, repoID uuid.UUID
 		}
 	}
 	return m.Advance(Marks{PRD: maxUpdatedAt(issues)}), nil
+}
+
+// reverseColumnStates inverts the stored column-to-State mapping (a JSON object of
+// board column label to State name) into State name to column label. The stored
+// States are distinct per repo, so the inverse is a function.
+func reverseColumnStates(raw []byte) (map[string]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var columns map[string]string
+	if err := json.Unmarshal(raw, &columns); err != nil {
+		return nil, fmt.Errorf("decode stored column states: %w", err)
+	}
+	out := make(map[string]string, len(columns))
+	for col, state := range columns {
+		out[state] = col
+	}
+	return out, nil
 }

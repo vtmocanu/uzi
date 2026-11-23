@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -35,8 +36,10 @@ type youTrack struct {
 	stateField  string
 	openState   string
 	closedState string
-	client      *http.Client
-	red         redactor
+	// columnStates maps a board column label to the State name MoveToColumn writes.
+	columnStates map[string]string
+	client       *http.Client
+	red          redactor
 
 	// accountMu guards account, the token's own account. It is read from
 	// users/me the first time tag ownership matters, then kept (see connAccount).
@@ -69,16 +72,17 @@ func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 		stateField = defaultStateField
 	}
 	return &youTrack{
-		baseURL:     baseURL,
-		token:       opts.Token,
-		project:     opts.Project,
-		projectID:   opts.ProjectID,
-		eligibility: opts.EligibilityTag,
-		stateField:  stateField,
-		openState:   opts.OpenState,
-		closedState: opts.ClosedState,
-		client:      newHTTPClient(opts.Timeout, base),
-		red:         newRedactor(opts.Token),
+		baseURL:      baseURL,
+		token:        opts.Token,
+		project:      opts.Project,
+		projectID:    opts.ProjectID,
+		eligibility:  opts.EligibilityTag,
+		stateField:   stateField,
+		openState:    opts.OpenState,
+		closedState:  opts.ClosedState,
+		columnStates: maps.Clone(opts.ColumnStates),
+		client:       newHTTPClient(opts.Timeout, base),
+		red:          newRedactor(opts.Token),
 	}, nil
 }
 

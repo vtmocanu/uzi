@@ -42,6 +42,22 @@ type EffectiveEffortCellDTO struct {
 	Notes   []string `json:"notes"`
 }
 
+// EffectivePlanPhaseDTO is the lead model and effort of every turn before plan approval (PRD
+// #3252), exactly the claim's plan_phase: the same tokens and the same omission. It appears on a
+// preview only for a run whose owner's harness-specific planning model or effort applies, and is
+// omitted otherwise, so every other preview body is unchanged. model and effort are the values the
+// claim ships (omitted when the plan side ships none, which then follows the implement side);
+// model_source and effort_source are the claim's provenance tokens: user_planning_default for a
+// planning value, else the implement value's source (run_override or schedule_pin freeze the
+// model in both phases, run_override freezes the effort in both). The implement pair is the
+// preview's own worker_model and worker_effort (and the worker cells of GET).
+type EffectivePlanPhaseDTO struct {
+	Model        *string `json:"model,omitempty"`
+	Effort       *string `json:"effort,omitempty"`
+	ModelSource  string  `json:"model_source,omitempty"`
+	EffortSource string  `json:"effort_source,omitempty"`
+}
+
 // CredentialDTO says which credential a run would use and when that is fixed, never which one.
 // Kind is anthropic or codex; Source is claim_selection, chosen_at_create, auto_selection,
 // owner_default, token_override or codex_default_credential; AuthMode (codex only) is
@@ -91,7 +107,10 @@ type EffectiveCrossCheckDTO struct {
 }
 
 // EffectiveSettingsDTO is the body of GET /api/me/effective-settings: both harnesses, the three
-// start choices, the 8 model cells, the 4 effort cells, the 8 cross-check cells and the judge harness.
+// start choices, the 10 model cells, the 6 effort cells, the 8 cross-check cells and the judge harness.
+// The extra model and effort cells are the Claude and Codex planning cells (PRD #3252, settings planning_model and
+// planning_effort): Default is the implement resolution, and a stored planning value resolves with
+// source user_planning_default.
 type EffectiveSettingsDTO struct {
 	Version    int                       `json:"version"`
 	Harnesses  []EffectiveHarnessDTO     `json:"harnesses"`
@@ -136,6 +155,8 @@ type StartPreviewAlternativeDTO struct {
 	Refusal       *string               `json:"refusal"`
 	RefusalDetail *string               `json:"refusal_detail"`
 	WorkerEffort  *EffortSettingCellDTO `json:"worker_effort,omitempty"`
+	// PlanPhase is the harness-specific plan-phase pair (PRD #3252) of a Claude alternative; see StartPreviewDTO.
+	PlanPhase *EffectivePlanPhaseDTO `json:"plan_phase,omitempty"`
 }
 
 // StartPreviewDTO is the body of POST /api/me/effective-settings/start-preview. When the
@@ -148,6 +169,9 @@ type StartPreviewAlternativeDTO struct {
 // refusal (create refuses that model before any credential check, so the preview does too). WorkerModel and WorkerEffort are present only when
 // the request carried that choice and the harness is decided (source run_override); with an undecided
 // harness only effort is answered, per alternative (a model request always decides the harness).
+// PlanPhase (PRD #3252) is present only when the harness is decided and the owner's planning
+// model or effort applies; a start-time model or effort the request carries is frozen into both
+// phases, so that setting stays out of the planning lane. It is omitted on every other response.
 type StartPreviewDTO struct {
 	Version       int                          `json:"version"`
 	Harness       *HarnessValueDTO             `json:"harness"`
@@ -156,6 +180,7 @@ type StartPreviewDTO struct {
 	Credential    *CredentialDTO               `json:"credential"`
 	WorkerModel   *ModelSettingCellDTO         `json:"worker_model,omitempty"`
 	WorkerEffort  *EffortSettingCellDTO        `json:"worker_effort,omitempty"`
+	PlanPhase     *EffectivePlanPhaseDTO       `json:"plan_phase,omitempty"`
 	Alternatives  []StartPreviewAlternativeDTO `json:"alternatives,omitempty"`
 }
 
@@ -277,6 +302,8 @@ type ScheduleAlternativeDTO struct {
 	Subagents     *EffectiveSubagentsDTO  `json:"subagents"`
 	Refusal       *string                 `json:"refusal"`
 	RefusalDetail *string                 `json:"refusal_detail"`
+	// PlanPhase is the harness-specific plan-phase pair (PRD #3252); omitted unless the planning lane applies.
+	PlanPhase *EffectivePlanPhaseDTO `json:"plan_phase,omitempty"`
 }
 
 // ScheduleSettingsPreviewDTO is the body of POST /api/me/effective-settings/schedule-preview:
@@ -296,4 +323,9 @@ type ScheduleSettingsPreviewDTO struct {
 	Subagents     *EffectiveSubagentsDTO   `json:"subagents"`
 	Notes         []string                 `json:"notes"`
 	Alternatives  []ScheduleAlternativeDTO `json:"alternatives,omitempty"`
+	// PlanPhase (PRD #3252) is the plan-phase pair of a fire on Claude: present only when the
+	// owner's harness-specific planning model or effort applies (a schedule's model pin is frozen into both
+	// phases, so the planning model then yields to it), omitted otherwise. With the harness chosen
+	// at creation it is carried per alternative instead.
+	PlanPhase *EffectivePlanPhaseDTO `json:"plan_phase,omitempty"`
 }

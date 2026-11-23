@@ -15,6 +15,7 @@ import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
   isAppearanceMode,
+  DEFAULT_SIDEBAR_MOTION,
   isDarkTheme,
   isLightTheme,
   isTheme,
@@ -32,12 +33,13 @@ import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
+import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ModelSettingCell, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
 import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "../data/effectiveSettings";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
-import { mockDefaultClaudeModel } from "./agents";
+import { claudeReviewModelError, mockTaskReviewEffort, mockTaskReviewEffortCells, mockTaskReviewModelCells } from "./taskReviewModels";
+import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
 
@@ -89,6 +91,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_codex_model: null,
   default_effort: null,
   default_codex_effort: null,
+  // Planning fields stay absent until saved: undefined preserves the recording,
+  // while an explicit null resets that field to "Same as the run".
   judge_model: null,
   // PRD #3245: the Codex judge lane; null = inherit. Resolved per harness into
   // judge_models (mockJudgeModelCells) and edited on Run defaults.
@@ -97,6 +101,12 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #3248: the Codex summary lane; null = inherit. Resolved per harness into
   // summary_models (mockSummaryModelCells) and edited on Run defaults.
   codex_summary_model: null,
+  // PRD #1570: the task-review lanes; null = the built-in. Resolved into task_review_models.
+  task_review_model: null,
+  codex_task_review_model: null,
+  // PRD #1570 M2: the task-review efforts; null = inherit the worker effort.
+  task_review_effort: null,
+  codex_task_review_effort: null,
   theme: null,
   // PRD #1167 "Lights on" m2: the four raw appearance overrides, all null = inherit
   // the instance defaults.
@@ -104,7 +114,7 @@ const SEED_USER_SETTINGS: UserSettings = {
   light_theme: null,
   dark_theme: null,
   typeface: null,
-  // Opt-in animated sidebar icons; null = inherit the (off) instance default.
+  // Animated sidebar icons are on by default; null follows that default.
   sidebar_motion: null,
   sidebar_token_ids: [],
   // PRD #1209 M3: LINKED Codex subscription accounts surfaced on the sidebar rail — the
@@ -299,6 +309,12 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // provides it going forward (like judge_model).
     (u.default_effort === undefined || u.default_effort === null || typeof u.default_effort === "string") &&
     (u.default_codex_effort === undefined || u.default_codex_effort === null || typeof u.default_codex_effort === "string") &&
+    // Optional so a pre-#3252 blob stays valid; preserve absent versus explicit null
+    // for withPlanning, while mySettingsResponse projects either as null.
+    (u.planning_claude_model === undefined || u.planning_claude_model === null || typeof u.planning_claude_model === "string") &&
+    (u.planning_codex_model === undefined || u.planning_codex_model === null || typeof u.planning_codex_model === "string") &&
+    (u.planning_codex_effort === undefined || u.planning_codex_effort === null || typeof u.planning_codex_effort === "string") &&
+    (u.planning_claude_effort === undefined || u.planning_claude_effort === null || typeof u.planning_claude_effort === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
     // Optional so a pre-#3245 blob stays valid; absent reads as inherit.
@@ -590,6 +606,65 @@ function mockEffortCell(harness: Harness, stored: string | null | undefined): Ef
   return { ...base, resolved_effort: "medium", source: "builtin", mode: "explicit" };
 }
 
+// Planning validators mirror the server; the preference-only runtime token is refused.
+function mockPlanningEffort(raw: string | null | undefined, harness: Harness = "claude"): string | null {
+  if (raw != null && typeof raw !== "string") throw new ApiError(400, `planning_${harness}_effort: must be a string or null`);
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return null;
+  if (!["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
+    throw new ApiError(400, `planning_${harness}_effort: effort must be one of low, medium, high, xhigh, max`);
+  }
+  return trimmed;
+}
+
+function mockPlanningModel(raw: string | null | undefined, harness: Harness = "claude"): string | null {
+  const field = `planning_${harness}_model`;
+  if (raw != null && typeof raw !== "string") throw new ApiError(400, `${field}: must be a string or null`);
+  const trimmed = raw?.trim() ?? "";
+  if (trimmed === "") return null;
+  if (new TextEncoder().encode(trimmed).length > 100) throw new ApiError(400, `${field}: model must be at most 100 characters`);
+  for (const ch of trimmed) {
+    if (ch === "�" || /[\p{Cc}\p{Cf}]/u.test(ch)) throw new ApiError(400, `${field}: model must not contain newlines or control characters`);
+    if (/\s/.test(ch)) throw new ApiError(400, `${field}: model must be a single token with no spaces`);
+  }
+  if (harness === "claude" && CODEX_ROLE_MODELS.includes(trimmed)) throw new ApiError(400, `${field}: model is a Codex model id`);
+  if (harness === "codex" && KNOWN_CLAUDE_ALIASES.includes(trimmed)) throw new ApiError(400, `${field}: a Claude model is not valid for the Codex lane`);
+  return trimmed;
+}
+
+// The mock has no lead-template pin; each default follows its worker lane or built-in.
+function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude"): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" })[] {
+  const valid = (m: string) => harness === "codex" ? !KNOWN_CLAUDE_ALIASES.includes(m) : !CODEX_ROLE_MODELS.includes(m);
+  const laneModel = lane?.trim() ?? "";
+  const def = laneModel !== "" && valid(laneModel)
+    ? { model: laneModel, source: "user_default" as const }
+    : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" as const };
+  const stored = planning?.trim() ?? "";
+  const set = stored !== "" && valid(stored);
+  return [{ harness, model: planning ?? null,
+    default_model: def.model, default_source: def.source,
+    resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source }];
+}
+
+function mockPlanningEffortCells(
+  planning: string | null | undefined,
+  effort: string | null | undefined,
+  harness: Harness = "claude",
+  leadEffort: string | null = null,
+): (EffortSettingCell & { source: "builtin" | "user_default" | "user_planning_default" | "template" })[] {
+  let ordinary = mockEffortCell(harness, effort);
+  if (leadEffort && (effort ?? "").trim() === "") {
+    ordinary = { ...ordinary, resolved_effort: leadEffort, source: "template", mode: "explicit" };
+  }
+  const level = (planning ?? "").trim();
+  const set = ["low", "medium", "high", "xhigh", "max"].includes(level);
+  return [{ harness, effort: planning ?? null,
+    default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source,
+    resolved_effort: set ? level : ordinary.resolved_effort,
+    source: set ? "user_planning_default" : ordinary.source === "template" ? "template" : ordinary.source === "user_default" ? "user_default" : "builtin",
+    mode: set ? "explicit" : ordinary.mode }];
+}
+
 // Issue #3251: the Codex cell's catalog_default as the mock serves it. The mock returns
 // STATIC samples (the server's selection rule is not reimplemented here); a test
 // picks one with setMockCodexCatalogSample, and a module reload restores "known".
@@ -604,10 +679,6 @@ let mockCodexCatalogSample: MockCodexCatalogSample = "known";
 export function setMockCodexCatalogSample(sample: MockCodexCatalogSample): void {
   mockCodexCatalogSample = sample;
 }
-
-// The mock's compiled default for animated sidebar icons (off), the value a null
-// override resolves against; mirrors the server's compiled default.
-const MOCK_SIDEBAR_MOTION_DEFAULT = false;
 
 // mySettingsResponse projects the deprecated default_model from the effective-harness
 // lane so a stale client still reads a coherent single model, while the two explicit
@@ -639,10 +710,18 @@ function mySettingsResponse(): { settings: UserSettings } {
     { claude: userSettings.summary_model, codex: userSettings.codex_summary_model },
     { claude: appSettings.summary_model, codex: appSettings.codex_summary_model },
   );
+  const task_review_models = mockTaskReviewModelCells(userSettings.task_review_model, userSettings.codex_task_review_model);
   const effort_settings = [
     mockEffortCell("claude", userSettings.default_effort),
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
+  const leadEfforts = state.session ? mockLeadTemplateEfforts() : { claude: null, codex: null };
+  const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex")];
+  const planning_efforts = [...mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort, "claude", leadEfforts.claude), ...mockPlanningEffortCells(userSettings.planning_codex_effort, userSettings.default_codex_effort, "codex", leadEfforts.codex)];
+  const task_review_efforts = mockTaskReviewEffortCells(
+    { claude: userSettings.task_review_effort, codex: userSettings.codex_task_review_effort },
+    { claude: effort_settings[0], codex: effort_settings[1] },
+  );
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
   const me = state.session;
@@ -653,8 +732,13 @@ function mySettingsResponse(): { settings: UserSettings } {
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
   const codex_provider_id = mockCodexProviderId();
-  const effective_sidebar_motion = userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, codex_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, codex_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts,
+    planning_claude_model: userSettings.planning_claude_model ?? null,
+    planning_claude_effort: userSettings.planning_claude_effort ?? null,
+    planning_codex_model: userSettings.planning_codex_model ?? null,
+    planning_codex_effort: userSettings.planning_codex_effort ?? null,
+    default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -798,7 +882,7 @@ export function sessionBody() {
       light_theme: resolved.light,
       dark_theme: resolved.dark,
       typeface: resolved.typeface,
-      sidebar_motion: userSettings.sidebar_motion ?? MOCK_SIDEBAR_MOTION_DEFAULT,
+      sidebar_motion: userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION,
       overrides: {
         mode: userSettings.appearance_mode,
         light_theme: userSettings.light_theme,
@@ -811,7 +895,7 @@ export function sessionBody() {
         light_theme: appSettings.default_light_theme,
         dark_theme: appSettings.default_dark_theme,
         typeface: appSettings.default_typeface,
-        sidebar_motion: MOCK_SIDEBAR_MOTION_DEFAULT,
+        sidebar_motion: DEFAULT_SIDEBAR_MOTION,
       },
     },
     // Deprecated single-theme trio (PRD #21), derived from the resolved appearance so
@@ -835,7 +919,7 @@ export function sessionBody() {
 }
 
 function recordedEffectiveScenario(): RecordedEffectiveScenario {
-  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault" } as Record<string, string>)[mockScenario()] ?? "default";
+  const name = ({ "codex-only": "codexOnly", "overflow-codex-default": "overflowCodexDefault", "planning-pair": "planning", "planning-codex-pair": "planningCodex" } as Record<string, string>)[mockScenario()] ?? "default";
   const found = RECORDED_EFFECTIVE_SCENARIOS.find(s => s.name === name);
   if (!found) throw new Error(`no recorded effective-settings scenario ${name}`);
   return found;
@@ -853,6 +937,64 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
       ? { ...c, notes: [...c.notes, "not_used"] }
       : c,
   );
+  return view;
+}
+
+// Issue #3258 N3: the recordings carry no lead-template effort, so the delivered mock lead
+// template's effort is applied at response time, mirroring how leadEffortSettingCell derives it: when
+// the owner's preference for the harness is NULL or blank, the worker_effort cell resolves to the
+// template's level with source template, and its default names the template. The demo ships no
+// lead row, so without a delivered lead template effort the recording is served unchanged. The
+// extra `c.effort === null` check only keeps a recorded stored preference authoritative.
+function withLeadTemplateEffort(view: EffectiveSettings, efforts: { claude: string | null; codex: string | null }, prefs: { claude: unknown; codex: unknown }): EffectiveSettings {
+  view.efforts = view.efforts.map(c => {
+    if (c.setting !== "worker_effort") return c;
+    const h = c.harness as "claude" | "codex";
+    const level = efforts[h];
+    if (!level) return c;
+    const next = { ...c, default_effort: level, default_source: "template" };
+    const pref = prefs[h];
+    if (c.effort === null && (pref === null || pref === undefined || (typeof pref === "string" && pref.trim() === ""))) {
+      return { ...next, resolved_effort: level, source: "template", mode: "explicit" as const };
+    }
+    return next;
+  });
+  // Planning inherits the resolved run effort, including the template tier, unless pinned.
+  view.efforts = view.efforts.map(c => {
+    if (c.setting !== "planning_effort") return c;
+    const h = c.harness as "claude" | "codex";
+    const ordinary = view.efforts.find(o => o.setting === "worker_effort" && o.harness === h);
+    if (!efforts[h] || !ordinary) return c;
+    const next = { ...c, default_effort: ordinary.resolved_effort ?? "runtime", default_source: ordinary.source };
+    return c.effort === null
+      ? { ...next, resolved_effort: ordinary.resolved_effort, source: ordinary.source, mode: ordinary.mode }
+      : next;
+  });
+  return view;
+}
+
+// Apply only saved fields to their own harness. Null inherits the recorded worker
+// resolution unless an explicit ordinary user preference governs that lane.
+function withPlanning(view: EffectiveSettings): EffectiveSettings {
+  for (const harness of ["claude", "codex"] as const) {
+    const model = userSettings[`planning_${harness}_model`], effort = userSettings[`planning_${harness}_effort`];
+    if (model !== undefined) {
+      const lane = userSettings[`default_${harness}_model`];
+      const [m] = mockPlanningModelCells(model, lane, harness);
+      const inherited = lane != null ? m : view.models.find(c => c.setting === "worker_model" && c.harness === harness) ?? m;
+      const resolved = model === null ? inherited : m;
+      view.models = view.models.map(c => c.setting !== "planning_model" || c.harness !== harness ? c
+        : { ...c, model: m.model, resolved_model: resolved.resolved_model, source: resolved.source });
+    }
+    if (effort !== undefined) {
+      const lane = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+      const [e] = mockPlanningEffortCells(effort, lane, harness, mockLeadTemplateEfforts()[harness]);
+      const inherited = lane != null ? e : view.efforts.find(c => c.setting === "worker_effort" && c.harness === harness) ?? e;
+      const resolved = effort === null ? inherited : e;
+      view.efforts = view.efforts.map(c => c.setting !== "planning_effort" || c.harness !== harness ? c
+        : { ...c, effort: e.effort, resolved_effort: resolved.resolved_effort, source: resolved.source, mode: resolved.mode });
+    }
+  }
   return view;
 }
 
@@ -1588,10 +1730,15 @@ export const settingsApi = {
   },
   // PRD #3254 M2: the recorded server behavior for the active demo scenario, not a second
   // resolver. "codex-only" serves the codexOnly recording and "overflow-codex-default" the
-  // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
+  // overflowCodexDefault one (the recorded refused-alternative case) and "planning-pair" the
+  // planning one (an owner with a Claude planning pair, PRD #3252); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
+    const view = withLeadTemplateEffort(
+      withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on),
+      mockLeadTemplateEfforts(),
+      { claude: userSettings.default_effort, codex: userSettings.default_codex_effort });
+    return delay(withPlanning(view), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();
@@ -1714,6 +1861,16 @@ export const settingsApi = {
     if (patch.default_codex_effort !== undefined) {
       next = { ...next, default_codex_effort: mockDefaultEffort(patch.default_codex_effort) };
     }
+    // PRD #3252: absent keeps, null/blank clears. Both validate before `next` is committed,
+    // so a bad field writes nothing.
+    if (patch.planning_codex_model !== undefined) next = { ...next, planning_codex_model: mockPlanningModel(patch.planning_codex_model, "codex") };
+    if (patch.planning_codex_effort !== undefined) next = { ...next, planning_codex_effort: mockPlanningEffort(patch.planning_codex_effort, "codex") };
+    if (patch.planning_claude_model !== undefined) {
+      next = { ...next, planning_claude_model: mockPlanningModel(patch.planning_claude_model) };
+    }
+    if (patch.planning_claude_effort !== undefined) {
+      next = { ...next, planning_claude_effort: mockPlanningEffort(patch.planning_claude_effort) };
+    }
     if (patch.judge_model !== undefined) {
       // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with
       // internal whitespace is rejected, mirroring the server's ValidateModel.
@@ -1757,6 +1914,29 @@ export const settingsApi = {
         throw new ApiError(400, `codex_summary_model: "${trimmed}" is not a supported Codex model`);
       }
       next = { ...next, codex_summary_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.task_review_model !== undefined) {
+      // PRD #1570: blank clears to the built-in; the Claude lane refuses a Codex role id,
+      // mirroring the server's Claude-lane validator.
+      const trimmed = patch.task_review_model?.trim() ?? "";
+      const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+      if (modelError !== "") {
+        throw new ApiError(400, `task_review_model: ${modelError}`);
+      }
+      next = { ...next, task_review_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.codex_task_review_model !== undefined) {
+      const trimmed = patch.codex_task_review_model?.trim() ?? "";
+      if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
+        throw new ApiError(400, `codex_task_review_model: "${trimmed}" is not a supported Codex model`);
+      }
+      next = { ...next, codex_task_review_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.task_review_effort !== undefined) {
+      next = { ...next, task_review_effort: mockTaskReviewEffort(patch.task_review_effort, "task_review_effort") };
+    }
+    if (patch.codex_task_review_effort !== undefined) {
+      next = { ...next, codex_task_review_effort: mockTaskReviewEffort(patch.codex_task_review_effort, "codex_task_review_effort") };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

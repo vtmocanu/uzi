@@ -9,8 +9,9 @@ import (
 
 // Every non-chat predicate site has a disposition. Load predicates must use the
 // per-claim marker; excluding every child would lose legacy run-slot accounting.
-// The three *RunOutcomes queries left this inventory in #4209: they use fn_usage_primary_kind
-// (see usage_primary_kind_sql_test.go) instead of a hand-written non-chat list.
+// The three *RunOutcomes queries are outside this literal-predicate inventory: their non-chat
+// predicate lives in fn_outcome_kind (#4577) and deliberately includes cross_check lane
+// children (see usage_primary_kind_sql_test.go).
 func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 	type disposition struct {
 		file, name string
@@ -25,6 +26,7 @@ func TestCrossCheckLaneSQLExclusionParity(t *testing.T) {
 		{"runtime", "ListActiveRunsAll", 1, ""},
 		{"runtime", "ListRunsAdminDebug", 1, ""},
 		{"runtime", "ListAllWorkers", 1, ""},
+		{"runtime", "HasQueuedRunForUser", 1, "idle precheck repeats ClaimRun target conjuncts (incl. NOT cross_check_lane) and admits nothing; ClaimRun stays authoritative (#4602)"},
 		{"runtime", "ClaimRun", 5, "selection and harness gates retain legacy children; load sites are separately pinned"},
 		{"runtime", "RunHasPendingOutcomeLease", 1, "pending outcome fence applies to children"},
 		{"runtime", "CancelRunServerSideWithPendingOutcome", 2, "cancellation fences retain children"},

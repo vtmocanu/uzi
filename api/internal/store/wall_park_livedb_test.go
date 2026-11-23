@@ -57,6 +57,7 @@ func newWPFixture(t *testing.T) *wpFixture {
 	fx := &wpFixture{t: t, ctx: ctx, pool: pool, q: store.New(pool), userID: uuid.New(), connID: uuid.New(), repoID: uuid.New()}
 	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		fx.userID, fmt.Sprintf("wallpark-%s@e2e", fx.userID))
+	t.Cleanup(func() { dropFixtureUser(ctx, pool, fx.userID) })
 	mustExec(ctx, t, pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, fx.connID, fx.userID, []byte{0x1})

@@ -62,16 +62,35 @@ template's prompt only tunes its persona and workflow; the primary-directive
 guardrails (never touch `main`, no `git push`, the plan gate) are enforced by
 the worker regardless.
 
-The list and detail page name both harnesses, for example **Claude: sonnet ·
-Codex: gpt-6-sol**. Empty pins use the same honest **Default · …** labels in the
-editor, builtin diff and agent-source review:
+The list has a **Model & effort** column that names both harnesses with
+per-family lines: **Claude: sonnet**, then **effort: high**, and the same for
+Codex. The detail page uses the same per-family lines. Empty pins use the same honest
+**Default · …** labels in the editor, builtin diff and agent-source review:
 
-- Subagents: **Default · lead's model** for either harness.
-- Lead (or orchestrator), Claude: **Default · SDK/account default (built-in)**.
-- Lead (or orchestrator), Codex: **Default · built-in (gpt-6.1-sol)**.
+- Subagent model: **Default · follows lead**, for either harness.
+- Subagent effort: **Default · follows the run's effort**, for either harness.
+- Lead (or orchestrator), Claude model: **Default · SDK/account default (built-in)**.
+- Lead (or orchestrator), Codex model: **Default · built-in (gpt-6.1-sol)**.
+- Lead (or orchestrator), effort, either harness: **Default · built-in (medium)**.
 
-Your worker model (**Settings → Run defaults**) takes precedence over the
-matching lead-template pin for your runs.
+A subagent whose four pins are all empty collapses to the two Default lines
+plus **both harnesses**. A lead or orchestrator template never collapses.
+
+The list also shows a personalized lead line, **For your Claude runs: …** (and
+the Codex equivalent), built from your effective settings: the worker model and
+effort with their source. It appears only for harnesses you can use. It sits on
+the lead row when exactly one lead template is enabled for you; otherwise it is
+a note above the table (**For your lead runs**). It refreshes after you change
+**In my runs** or **Global default**, and is hidden if the read fails. The
+stored-pin cells are shared and never change per viewer.
+
+For the lead, the editor help states the precedence. Model: a model chosen when
+starting the run or a schedule's model, then your **Run defaults** model, beat
+the pin; with none and no pin, Claude uses the SDK/account default and Codex
+uses gpt-6.1-sol. Effort: an effort chosen when starting the run, then your
+**Run defaults** effort (a level or Runtime default), beat the pin; otherwise
+the built-in medium. The subagent help keeps that **Use the run's resolved model
+for subagents too** overrides model pins only.
 
 ## Model pins
 
@@ -121,13 +140,15 @@ the wrong family. See the [approved PRD](../prds/3249-per-harness-template-pins.
 
 You can read and change the Claude and Codex pins of **your own** templates with
 `uzi agent-template list|show|set|reset`, for example `uzi agent-template set
-my-reviewer --harness claude sonnet`. The save-time rules above apply, since the
+my-reviewer --harness claude sonnet`; the same commands pin the reasoning
+effort with `--effort` (see [Reasoning effort pins](#reasoning-effort-pins)).
+The save-time rules above apply, since the
 server validates the pin like the web editor, and a clear (`reset`) makes that
 family inherit again. Only a template you own (scope `user`) is editable: a
 builtin or global template is edited in the web UI by an admin, even when the
 CLI token is an admin's, and another user's template is not found. The command
-changes only the two pins; description, tools and prompt are untouched. See
-[Agent-template model pins](./cli.md#agent-template-model-pins) for the commands,
+changes only the pins; description, tools and prompt are untouched. See
+[Agent-template model pins](./cli.md#agent-template-model-and-effort-pins) for the commands,
 name and id resolution and exit codes.
 
 The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it
@@ -138,6 +159,43 @@ when the template is seeded; they are not in the upstream file. A subagent
 reaches the forge only through an explicit `mcp__forge__*` entry in its
 `tools:` list: a template with no `tools:` list inherits the standard tools but
 not the forge ones. The lead is the exception and always has forge read access.
+
+## Reasoning effort pins
+
+A template also stores two independent effort pins: `effort` is the **Claude
+effort** and `codex_effort` is the **Codex effort**. A run receives the pin for
+its own harness only; the other family's pin is never sent.
+
+- **Levels.** `low`, `medium`, `high`, `xhigh` or `max`. The editor's
+  **Default · follows the run's effort** leaves a subagent's pin empty; for the
+  lead it reads **Default · built-in (medium)**.
+  `runtime` (Runtime default) is not a template effort. The API rejects it, and
+  any other value, with HTTP 400 naming `effort` or `codex_effort`; the CLI
+  refuses it before sending anything (exit 2), and the editor offers only the
+  five levels.
+- **Clearing.** JSON `null` or a blank string clears a pin. Omitting an effort
+  field on update preserves the stored pin.
+- **Subagents.** A subagent with a pin for the run's harness uses it. An empty
+  pin follows the run's resolved lead effort for its phase, and when that is
+  **Runtime default** nothing is sent. This is the stored contract; see
+  [Reasoning effort](./worker-effort.md#subagent-effort-pins) for where it
+  applies.
+- **The lead template.** Its effort is not a subagent pin. It is a tier of the
+  lead's own effort: used only when you have no per-harness default effort, and
+  beaten by a run-level effort and by your own preference, including **Runtime
+  default**. See [Reasoning effort](./worker-effort.md#the-lead-templates-effort).
+  The shipped `lead` has no effort pin.
+- **Older workers.** A worker that predates template effort (it does not
+  advertise `template_effort_v1`) is sent no effort pins, so those subagents run
+  at the run's effort. When at least one delivered subagent template pins an
+  effort for the run's harness, the run feed shows one line per claim: "stored
+  subagent effort pins omitted: this worker predates template effort; those
+  subagents use the run's effort". The lead template's effort still reaches it
+  through the lead's default effort.
+
+Use **Claude effort** and **Codex effort** to edit the pins independently.
+Editing a builtin's effort customizes it (see [Resetting a builtin
+template](#resetting-a-builtin-template)).
 
 ## Parallel dispatch
 
@@ -222,12 +280,13 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
 1. Open **Agents**, click **New agent** (or a template's name to edit).
 2. Pick the scope (admins only — yours is always **Mine**), then set the
    name (kebab-case, immutable after creation), description, and prompt body.
-3. Optionally set **Claude model** and **Codex model**, or restrict tools.
-   Leave either harness on **Default** so a subagent follows the lead on that
-   harness. **Use the run's resolved model for subagents too** on a schedule overrides
-   these pins.
+3. Optionally set **Claude model**, **Codex model**, **Claude effort** and
+   **Codex effort**, or restrict tools.
+   Leave either harness on **Default** (effort: **Default · follows the run's
+   effort**) so a subagent follows the lead on that harness. **Use the run's resolved model for subagents too** on a schedule overrides
+   these model pins; effort pins are kept.
 4. The live Markdown preview exports the Claude definition, including its
-   Claude pin. The Codex pin is saved separately.
+   Claude model and effort pins. The Codex pins are saved separately.
 
 ![Creating an agent template with both harness pins and the Claude Markdown preview](img/agent-templates-editor.png)
 
@@ -256,8 +315,10 @@ role library a uzi version ships is the release commit pinned as `upstream_sha` 
 Editing a builtin marks it customized and opts it out of that automatic
 tracking until it is reset. Changing either model pin counts as a customization:
 setting a Codex pin also stops shipped prompt refreshes until **Reset**.
-Saving it with exactly the shipped description, both model pins, tools and body
-is not an edit: the template stays pristine and keeps tracking shipped changes.
+Changing either effort pin counts too. **Reset** restores the shipped values,
+including the shipped efforts (none for the builtins today).
+Saving it with exactly the shipped description, both model pins, both effort
+pins, tools and body is not an edit: the template stays pristine and keeps tracking shipped changes.
 **Reset to default** returns a builtin to pristine: it re-applies the shipped
 content, including the Claude pin and the empty Codex pin, and re-enables
 tracking, so the template picks up future shipped changes on boot again.

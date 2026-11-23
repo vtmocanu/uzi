@@ -25,12 +25,21 @@ func TestEffectiveSettingsSchedulePinClaimEquivalenceLiveDB(t *testing.T) {
 	}{
 		{"claude pin on claude", &claude, "sonnet", false,
 			leadWant{harness: HarnessClaude, model: "sonnet", modelSource: "schedule_pin", claimModel: "sonnet", claimSource: "schedule_pin", effort: "medium", effortSource: "builtin"}, false},
+		// PRD #3252: a schedule pin is frozen onto the run, so it is the plan model too; the planning
+		// effort (set below for this case only) still splits the plan effort.
+		{"claude pin on claude with a planning pair", &claude, "sonnet", false,
+			leadWant{harness: HarnessClaude, model: "sonnet", modelSource: "schedule_pin", claimModel: "sonnet", claimSource: "schedule_pin", effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Model: strp("sonnet"), Effort: strp("high"), ModelSource: "schedule_pin", EffortSource: "user_planning_default"}}, false},
 		{"claude pin on codex is ignored for the lane", &codex, "sonnet", true,
 			leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "user_default", claimModel: "gpt-6-sol", claimSource: "user_default", effort: "medium", effortSource: "builtin"}, true},
 		{"custom pin on codex is ignored for the lane", &codex, "my-custom-model", false,
 			leadWant{harness: HarnessCodex, model: "gpt-6-sol", modelSource: "user_default", claimModel: "gpt-6-sol", claimSource: "user_default", effort: "medium", effortSource: "builtin"}, true},
 		{"codex pin on codex", &codex, "gpt-6-astra", true,
 			leadWant{harness: HarnessCodex, model: "gpt-6-astra", modelSource: "schedule_pin", claimModel: "gpt-6-astra", claimSource: "schedule_pin", effort: "medium", effortSource: "builtin"}, false},
+
+		{"codex pin with a planning pair", &codex, "gpt-6-astra", false,
+			leadWant{harness: HarnessCodex, model: "gpt-6-astra", modelSource: "schedule_pin", claimModel: "gpt-6-astra", claimSource: "schedule_pin", effort: "medium", effortSource: "builtin",
+				plan: &ClaimPhaseSettings{Model: strp("gpt-6-astra"), Effort: strp("high"), ModelSource: "schedule_pin", EffortSource: "user_planning_default"}}, false},
 		{"codex role pin on claude is ignored", &claude, "gpt-6-luna", false,
 			leadWant{harness: HarnessClaude, model: "opus", modelSource: "template", effort: "medium", effortSource: "builtin"}, true},
 	} {
@@ -40,10 +49,19 @@ func TestEffectiveSettingsSchedulePinClaimEquivalenceLiveDB(t *testing.T) {
 			fx.codexDefault()
 			fx.template(effLeadName, "opus", "gpt-6-astra")
 			fx.lane("default_codex_model", "gpt-6-sol")
+			if c.want.plan != nil {
+				if c.want.harness == HarnessCodex {
+					fx.lane("planning_codex_model", "custom-plan")
+					fx.lane("planning_codex_effort", "high")
+				} else {
+					fx.lane("planning_claude_model", "opus")
+					fx.lane("planning_claude_effort", "high")
+				}
+			}
 			fx.iid++
 			seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
 			pin := c.pin
-			created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, &pin, c.toggle, nil, nil, c.explicit)
+			created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, &pin, c.toggle, nil, nil, c.explicit, nil)
 			if err != nil {
 				t.Fatalf("CreateScheduledRun: %v", err)
 			}
@@ -86,7 +104,7 @@ func TestEffectiveSettingsScheduleSubagentModesLiveDB(t *testing.T) {
 				fx.template("eff-tester", "", "")
 				fx.iid++
 				seedEligibleIssue(t, fx.env, fx.repoID, fx.iid)
-				created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, nil, toggle, nil, nil, &h)
+				created, err := fx.svc.CreateScheduledRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, nil, toggle, nil, nil, &h, nil)
 				if err != nil {
 					t.Fatalf("CreateScheduledRun: %v", err)
 				}

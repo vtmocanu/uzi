@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  worker anthropic_bind_mode(auto); secret auto_eligible pool flags; anthropic_rate_limits gauge rows; a spare anthropic_token
-# restores: worker bind mode->default; spare token deleted; default gauge->55/12, 7-day reset +3d; pool left empty
+# restores: worker bind mode->default; spare token deleted; default gauge->55/12, 7-day reset +3d; pool left empty; the four cancelled fixture runs' custody holds (AS_RUN, AS_RUN_RF, AS_RUN2 gen 1, AS_RUN3 cancel-time gen) resolved explicitly
 # ---------------------------------------------------------------------------
 # PRD #111 M6: auto-selection, end to end through the REAL claim path.
 #
@@ -107,6 +107,8 @@ AS_GOT="$(as_run_credential "$AS_RUN")"
 pass "an auto worker skipped the below-floor default and spent the eligible pooled token (spare-key, auto, 95% headroom)"
 apipost "/api/runs/$AS_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN"
 wait_status "$AS_RUN" cancelled
+AS_GEN="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$AS_RUN'")"
+[[ "$AS_GEN" =~ ^[1-9][0-9]*$ ]] || fail "auto-selection run $AS_RUN has no claim generation: '$AS_GEN'"
 
 # ── (a2) #3844: the SOONEST weekly reset wins over more headroom ───────────────────
 # Both tokens are now above the floor: the default has 40 points of headroom and a 7-day
@@ -129,6 +131,8 @@ AS_GOT_RF="$(as_run_credential "$AS_RUN_RF")"
 pass "#3844: an auto worker spent the pooled token whose weekly limit resets soonest ($AS_DEFAULT_LABEL, auto, 40% headroom) over the emptier one"
 apipost "/api/runs/$AS_RUN_RF/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel reset-first run $AS_RUN_RF"
 wait_status "$AS_RUN_RF" cancelled
+AS_GEN_RF="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$AS_RUN_RF'")"
+[[ "$AS_GEN_RF" =~ ^[1-9][0-9]*$ ]] || fail "reset-first run $AS_RUN_RF has no claim generation: '$AS_GEN_RF'"
 # Put the default back to the state the later cases were written against (headroom 8,
 # reset +3 days).
 as_gauge "$AS_DEFAULT_SECRET" 92 40 "now()" "now() + interval '3 days'"
@@ -157,6 +161,8 @@ AS_GOT2="$(as_run_credential "$AS_RUN2")"
 pass "an entirely stale pool floors onto the pooled token, never the out-of-pool default (spare-key, pool_stale, no headroom)"
 apipost "/api/runs/$AS_RUN2/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN2"
 wait_status "$AS_RUN2" cancelled
+AS_GEN2="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$AS_RUN2'")"
+[[ "$AS_GEN2" =~ ^[1-9][0-9]*$ ]] || fail "stale-pool run $AS_RUN2 has no claim generation: '$AS_GEN2'"
 
 # ── (c) #754: a GENUINELY empty pool HOLDS in pool_wait and spends nothing, then RESUMES ──
 # Pre-#754 an empty pool fell through to the owner default at awaiting_approval and recorded
@@ -199,6 +205,9 @@ case "$AS_GOT3B" in
 esac
 apipost "/api/runs/$AS_RUN3/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN3"
 wait_status "$AS_RUN3" cancelled
+# Generation 2 is the post-resume claim; its generation-1 hold already released (no_adopted_source).
+AS_GEN3="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$AS_RUN3'")"
+[[ "$AS_GEN3" =~ ^[1-9][0-9]*$ ]] || fail "empty-pool run $AS_RUN3 has no claim generation: '$AS_GEN3'"
 
 # ── leave the stack exactly as this phase found it ──────────────────────────────
 # Keep the four fixture runs as history. Each cancellation must settle before the
@@ -236,3 +245,11 @@ apiget /api/me/secrets \
 # later reader of /api/me/rate-limits sees what that phase established rather than what
 # this one needed.
 as_gauge "$AS_DEFAULT_SECRET" 55 12 "now()" "now() + interval '3 days'"
+
+# The four cancelled fixture runs each leave a capture-less open custody hold that
+# the worker would settle only slowly; end those owner obligations here so the
+# driver's end-of-phase hold boundary finds none.
+resolve_fixture_source_hold "$AS_RUN" "$AS_GEN"
+resolve_fixture_source_hold "$AS_RUN_RF" "$AS_GEN_RF"
+resolve_fixture_source_hold "$AS_RUN2" "$AS_GEN2"
+resolve_fixture_source_hold "$AS_RUN3" "$AS_GEN3"

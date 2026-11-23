@@ -27,13 +27,17 @@ var deniedNames = []string{
 	"UZI_SQLC_DIR", "UZI_RUN_ATTEMPT", "UZI_RUN_CLONE", "UZI_RUN_CLONE_KEY", "UZI_WORKER_SPAWN",
 	"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
 	"API_TIMEOUT_MS", "MAX_THINKING_TOKENS", "MAX_MCP_OUTPUT_TOKENS",
+	"NODE_INSPECTOR_IPC", "VSCODE_INSPECTOR_OPTIONS", "TEMP", "TMP", "SYSTEMDRIVE",
+	"API_FORCE_IDLE_TIMEOUT", "ENABLE_TOOL_SEARCH", "SLASH_COMMAND_TOOL_CHAR_BUDGET", "AUTOMODE_DECISION_LOG",
+	"NODE_USE_SYSTEM_CA", "ENABLE_BETA_TRACING_DETAILED", "ENABLE_ENHANCED_TELEMETRY_BETA", "BETA_TRACING_ENDPOINT",
+	"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
 }
 
 var deniedPrefixes = []string{
 	"UZI_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_",
 	"GH_", "GITHUB_", "GITLAB_", "GLAB_",
 	"GIT_", "SSH_",
-	"LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
+	"LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_", "BUN_",
 }
 
 var deniedSuffixes = []string{"_PROXY"}
@@ -72,11 +76,21 @@ func deniedBy(name string) string {
 	return ""
 }
 
+// ValidateNameShape applies only the name grammar, not the denylist. Disable and
+// delete use it so a variable stored under a name that was denied later can still
+// be cut off. A non-nil result is a *RuleError.
+func ValidateNameShape(name string) error {
+	if !NameRegexp.MatchString(name) {
+		return &RuleError{Field: "name", Rule: "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)"}
+	}
+	return nil
+}
+
 // ValidateName applies the name shape and the denylist. A non-nil result is a
 // *RuleError whose message names the broken rule.
 func ValidateName(name string) error {
-	if !NameRegexp.MatchString(name) {
-		return &RuleError{Field: "name", Rule: "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)"}
+	if err := ValidateNameShape(name); err != nil {
+		return err
 	}
 	if rule := deniedBy(name); rule != "" {
 		return &RuleError{Field: "name", Rule: rule}

@@ -342,6 +342,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A Codex run held for its recorded worker is nudged once at the affinity ceiling when a drain overlapped its stale-requeue grace ([#4507](https://github.com/vtmocanu/uzi/pull/4507), [#4534](https://github.com/vtmocanu/uzi/pull/4534)).**
   The health detector now records an observed draining or maintenance owner hold per episode (runs.health_owner_hold_since); holds that start and clear between ticks, or whose marker write fails, keep the earlier stale-grace timing. Notification timing only.
 
+- **Every refused size in the table stays visible on the Worker sizes card ([#4518](https://github.com/vtmocanu/uzi/pull/4518), [#4588](https://github.com/vtmocanu/uzi/pull/4588)).**
+  Each refused size lists up to three affected workers and the true count of the rest, however many workers the fleet has refused.
+
+- **One-time sweeps resume an interrupted fire without re-running or exceeding its cap ([#4512](https://github.com/vtmocanu/uzi/pull/4512), [#4592](https://github.com/vtmocanu/uzi/pull/4592)).**
+  A scheduled one-time sweep records each started run in a durable per-fire ledger, so a busy repository gate, crash or failed advance leaves it due and the next tick fills only the remaining slots; on rollback an older scheduler binary ignores the ledger and can exceed the cap when resuming a partial one-time fire.
+
+- **A Codex plan summary started under the old credential can no longer run on the new one after an in-place credential switch ([#4573](https://github.com/vtmocanu/uzi/pull/4573), [#4583](https://github.com/vtmocanu/uzi/pull/4583)).**
+  A plan-summary callback created before a switch now belongs to the credential that was current when it was created. If the switch replaces that credential, the stale callback does nothing instead of building and posting a summary with the new credential. Plan gates that run after the switch get a fresh callback and summarise normally.
+
+- **Malformed Codex reasoning and total-token regressions are refused conservatively ([#4580](https://github.com/vtmocanu/uzi/pull/4580), [#4586](https://github.com/vtmocanu/uzi/pull/4586)).**
+  A cumulative usage note that advances the cumulative magnitude while its reasoning or total tokens fall now leaves that model's cost unreported and keeps the proven tokens; the accountant can also attribute usage to model segments, but no production caller cuts a segment yet.
+
+- **Checked plans on non-issue runs no longer carry milestones ([#4555](https://github.com/vtmocanu/uzi/pull/4555), [#4564](https://github.com/vtmocanu/uzi/pull/4564)).**
+  When a plan cross-check runs on a run that is not an issue run (for example an MR rework, CI fix or prompt run), the server drops the milestone list the lead submits instead of refusing the plan. The checked plan is reviewed and stored with no milestones, so a stray or malformed list no longer sends an auto-approved run to the human gate. Issue runs keep their milestone validation. Malformed retries that conflict with a stored attempt retain the `400 candidate_invalid` response.
+
+- **Adding a worker size no longer overwrites a size another admin just added ([#4515](https://github.com/vtmocanu/uzi/pull/4515), [#4589](https://github.com/vtmocanu/uzi/pull/4589)).**
+  The add is refused as a name conflict, the form keeps your values and the list refreshes; editing a size is unchanged.
+
+- **CI repair guidance coordinates one fixer before branch work or merge ([#4615](https://github.com/vtmocanu/uzi/pull/4615)).**
+  The bundled CLI skill checks CI-fix and rework ownership and scheduled default-branch repairs, preserving held work during local takeover.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -530,6 +551,24 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Custom provider runs are activated for every install, with the Claude CLI redirect risk accepted ([#4505](https://github.com/vtmocanu/uzi/pull/4505), [#4551](https://github.com/vtmocanu/uzi/pull/4551)).**
   Workers now advertise `claude_provider_v1` by default (no switch), so a run bound to a custom provider starts instead of queueing; the loopback relay that would stop redirects ([#4496](https://github.com/vtmocanu/uzi/pull/4496)) is parked. The pinned Claude CLI follows gateway redirects, so a gateway that answers with one can make the CLI re-send the key to another path on the same host under both auth styles and the request body (prompts, plus code and tool output the agent read) to any Location host, and with `x_api_key` auth the key goes cross-host too, while Bearer drops Authorization cross-origin. The operator allowlist (`UZI_PROVIDER_ALLOWED_BASE_URLS`) is the only control on where provider traffic starts, so allowlist only gateways you trust not to redirect and prefer Bearer auth. The worker redacts the provider key and its encoded forms from model, review and summary output, run and chat text, PR descriptions and other forge text, and blocks any forge upload (branch push, checkpoints, held publication) whose objects carry it, keeping the work local (`push_secret_blocked`); recovery-bundle uploads to the uzi API custody archive are not scanned, and a provider run whose new objects exceed the scan caps has checkpoints withheld and its final push refused. Rollout: the release helper bumps the chart's worker image pin, but operator image overrides and Compose or separately run workers must be updated by their operator; an old worker never claims a provider run, which stays queued with "no worker that supports model providers is online", and an old ephemeral worker bound to one is reaped and re-provisioned, with churn that is not bounded while an old image override remains. See ADR-4320 and docs/providers.md.
 
+- **Agent templates can pin a reasoning effort per harness ([#3258](https://github.com/vtmocanu/uzi/pull/3258), [#4595](https://github.com/vtmocanu/uzi/pull/4595)).**
+  Each template now has an optional Claude effort and Codex effort (low, medium, high, xhigh or max), set in the template editor or with `uzi agent-template set --effort`; an agent source can set the Claude effort. A pinned subagent runs at its own effort and an unpinned one follows the run; the lead template's effort applies when you have no default effort for that harness. Repo agents can declare `effort:` in `.claude/agents` Markdown or `model_reasoning_effort` in `.codex/agents` TOML, and an invalid value is ignored with a run-feed note. Older workers run subagents at the run's effort, and the run feed says so when a pin was withheld.
+
+- **Claude runs can plan on a separate model and effort, then implement on the run's own ([#3252](https://github.com/vtmocanu/uzi/pull/3252)).**
+  Lead turns before plan approval use an optional planning pair (set with `PUT /api/me/settings`; no CLI setter yet), and the run switches in the same session after approval, held as `phase_switch_unavailable` if the worker cannot verify the switch, with only `claude_phase_models_v1` workers claiming such runs and Codex unchanged.
+
+- **Run defaults has a Planning card for the Claude planning model and effort ([#3252](https://github.com/vtmocanu/uzi/pull/3252)).**
+  The card sets the optional planning pair that applies until a plan is approved, saves only the fields you changed, and shows the run page Resume and Cancel panel for a held planning switch.
+
+- **Operator docs on database connection memory and an opt-in pool memory measurement harness ([#4591](https://github.com/vtmocanu/uzi/pull/4591), [#4593](https://github.com/vtmocanu/uzi/pull/4593)).**
+  No runtime default changed (the api keeps pgx's 512-statement cache); the synthetic measurement in ADR-4591 was inconclusive, and the docs describe the `DATABASE_URL` overrides and a sizing estimate.
+
+- **Codex runs can plan with a separate model and effort ([#3253](https://github.com/vtmocanu/uzi/pull/3253), [#4599](https://github.com/vtmocanu/uzi/pull/4599)).**
+  Save per-harness planning defaults together; implementation resumes the same conversation, verifies its model before starting, and attributes usage to each phase's model.
+
+- **Admins can read another user's held publications and filter the debug run listing by status ([#4614](https://github.com/vtmocanu/uzi/pull/4614), [#4620](https://github.com/vtmocanu/uzi/pull/4620)).**
+  `uzi run held <id>` joins the flag-gated, audited admin run debug reads (`UZI_ADMIN_RUN_DEBUG`, `uza_` token), and `uzi admin runs --all` gains `--status s[,s]` and `--user <email>`; held expiry stays owner-only.
+
 ### Changed
 
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
@@ -708,6 +747,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Sidebar icon animations play only when you click an icon ([#4556](https://github.com/vtmocanu/uzi/pull/4556), [#4557](https://github.com/vtmocanu/uzi/pull/4557)).**
   Hovering or focusing a sidebar row no longer sets off animations; clicking it, or pressing Enter on it, still plays the one-shot animation.
+
+- **Overview outcomes count every run kind except chat ([#4577](https://github.com/vtmocanu/uzi/pull/4577), [#4581](https://github.com/vtmocanu/uzi/pull/4581)).**
+  Failed reworks, CI fixes, cross-checks and judge runs now show in the failed count, failure rate, latest failure and By-user columns; Runs stays primary work only.
+
+- **Per-run cache caps stop at 15 GiB on large worker volumes ([#4576](https://github.com/vtmocanu/uzi/pull/4576), [#4579](https://github.com/vtmocanu/uzi/pull/4579)).**
+  `UZI_RUN_CACHE_CAP_MAX_BYTES` (default 15 GiB, `off` disables it) now bounds the soft cache cap, so a 100 GiB volume with two run slots caps at 15 GiB instead of 25 GiB, at the cost of more Go cache rebuilds, possible whole-module-cache drops on a trim and more uncounted preventive parks; it is a mitigation, not a within-turn bound. Hosted deployments can set it and the cap fraction through the chart values `workers.runCacheCapMaxBytes` / `workers.runCacheCapFraction` (strings only, empty by default, relayed verbatim by the controller only when nonempty, so a change rolls the fleet once); both `docker-compose.yml` and the VPS stack `deploy/compose/compose.yaml` now pass them through, so an existing `.env` `UZI_RUN_CACHE_CAP_FRACTION` line now takes effect.
+
+- **Animated sidebar icons default on for users who have not chosen ([#4510](https://github.com/vtmocanu/uzi/pull/4510) follow-up) ([#4590](https://github.com/vtmocanu/uzi/pull/4590)).**
+  New and unchosen accounts get animated icons; saved on/off choices and reduced-motion preferences remain respected.
+
+- **Overview Usage card explanations move into info tips ([#4601](https://github.com/vtmocanu/uzi/pull/4601)).**
+  The scope notes open from an (i) beside the Usage title and the outcome line, and each fail rate shows its finished-run count on hover or focus, keeping By user rows to one line.
+
+- **Idle workers no longer run the full claim query when their owner has nothing queued ([#4602](https://github.com/vtmocanu/uzi/pull/4602), [#4607](https://github.com/vtmocanu/uzi/pull/4607)).**
+  A cheap per-owner queued-run check now precedes `ClaimRun` on each poll; a queued run the worker cannot claim still runs it, and `plan_cache_mode` stays `auto`.
+
+- **Agents list shows per-harness model and effort with honest Default labels ([#3262](https://github.com/vtmocanu/uzi/pull/3262), [#4604](https://github.com/vtmocanu/uzi/pull/4604)).**
+  Empty subagent pins read Default · follows lead (model) and Default · follows the run's effort (effort), empty lead pins name the built-in defaults, the list adds a personalized lead line from your effective settings, and the Run defaults and Planning effort Defaults name the lead-template tier.
+
+- **The worker's Codex runtime moves to rust-v0.169.0 ([#4605](https://github.com/vtmocanu/uzi/pull/4605)).**
+  Every registered Codex version and digest pin follows the new package lock.
 
 ### Security
 

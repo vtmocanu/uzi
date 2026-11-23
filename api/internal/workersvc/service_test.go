@@ -156,6 +156,20 @@ type fakeStore struct {
 	defaultEffort      pgtype.Text
 	defaultCodexEffort pgtype.Text
 	defaultEffortErr   error
+	// planningModel/planningEffort feed GetUserPlanningClaude (PRD #3252); planningErr forces the
+	// strict planning read to fail.
+	planningModel  pgtype.Text
+	planningEffort pgtype.Text
+	planningErr    error
+	// taskReviewModel/codexTaskReviewModel feed GetUserTaskReviewSettings (PRD #1570);
+	// taskReviewErr forces the strict review-settings read to fail.
+	taskReviewModel      pgtype.Text
+	codexTaskReviewModel pgtype.Text
+	// taskReviewEffort/codexTaskReviewEffort are the stored review efforts; the worker efforts the
+	// same read returns come from defaultEffort/defaultCodexEffort.
+	taskReviewEffort      pgtype.Text
+	codexTaskReviewEffort pgtype.Text
+	taskReviewErr         error
 	// attributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// live at standard-claim assembly. The zero value is false; scheduleModelStore sets
 	// it to true so existing fixtures mirror a fresh user's default-on state, and a test
@@ -1067,6 +1081,17 @@ func (f *fakeStore) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (sto
 		DefaultCodexModel:  f.defaultCodexModel,
 	}, f.defaultModelErr
 }
+func (f *fakeStore) GetUserPlanningClaude(context.Context, uuid.UUID) (store.GetUserPlanningClaudeRow, error) {
+	return store.GetUserPlanningClaudeRow{PlanningClaudeModel: f.planningModel, PlanningClaudeEffort: f.planningEffort}, f.planningErr
+}
+
+func (f *fakeStore) GetUserPlanningCodex(context.Context, uuid.UUID) (store.GetUserPlanningCodexRow, error) {
+	return store.GetUserPlanningCodexRow{}, nil
+}
+
+func (f *fakeStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, store.CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error) {
+	return 1, nil
+}
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultEffort, f.defaultEffortErr
 }
@@ -1078,6 +1103,13 @@ func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool,
 }
 func (f *fakeStore) GetUserJudgeModels(context.Context, uuid.UUID) (store.GetUserJudgeModelsRow, error) {
 	return store.GetUserJudgeModelsRow{JudgeModel: f.judgeModel, CodexJudgeModel: f.codexJudgeModel}, f.judgeModelErr
+}
+func (f *fakeStore) GetUserTaskReviewSettings(context.Context, uuid.UUID) (store.GetUserTaskReviewSettingsRow, error) {
+	return store.GetUserTaskReviewSettingsRow{
+		TaskReviewModel: f.taskReviewModel, CodexTaskReviewModel: f.codexTaskReviewModel,
+		TaskReviewEffort: f.taskReviewEffort, CodexTaskReviewEffort: f.codexTaskReviewEffort,
+		DefaultEffort: f.defaultEffort, DefaultCodexEffort: f.defaultCodexEffort,
+	}, f.taskReviewErr
 }
 func (f *fakeStore) GetUserSummaryModels(context.Context, uuid.UUID) (store.GetUserSummaryModelsRow, error) {
 	return store.GetUserSummaryModelsRow{SummaryModel: f.summaryModel, CodexSummaryModel: f.codexSummaryModel}, f.summaryModelErr
@@ -6449,7 +6481,7 @@ func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
 		{"codex", []string{"", "", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}},
 	} {
 		t.Run(tc.harness, func(t *testing.T) {
-			agents := agentsFromTemplates(rows, nil, tc.harness)
+			agents := agentsFromTemplates(rows, nil, tc.harness, false)
 			if len(agents) != len(rows) {
 				t.Fatalf("agents=%d", len(agents))
 			}
@@ -6476,4 +6508,64 @@ func (f *fakeStore) GetUserProviderSource(context.Context, store.GetUserProvider
 // GetUserProviderLaneSources preserves the fixture's unselected-source policy.
 func (f *fakeStore) GetUserProviderLaneSources(context.Context, uuid.UUID) (store.GetUserProviderLaneSourcesRow, error) {
 	return store.GetUserProviderLaneSourcesRow{}, nil
+}
+
+func TestAgentsFromTemplatesEffortProjection(t *testing.T) {
+	rows := []store.AgentTemplate{
+		{Name: "claude-only", Effort: pgconv.TextOrNull("high")},
+		{Name: "codex-only", CodexEffort: pgconv.TextOrNull("low")},
+		{Name: "dual", Effort: pgconv.TextOrNull("max"), CodexEffort: pgconv.TextOrNull("xhigh")},
+		{Name: "hostile", Effort: pgconv.TextOrNull("High"), CodexEffort: pgconv.TextOrNull("runtime")},
+		{Name: "unpinned"},
+		{Name: "lead", Effort: pgconv.TextOrNull("max"), CodexEffort: pgconv.TextOrNull("xhigh")},
+	}
+	for _, tc := range []struct {
+		name    string
+		harness string
+		flag    bool
+		want    []string
+	}{
+		{"claude with capability", "claude", true, []string{"high", "", "max", "", "", ""}},
+		{"codex with capability", "codex", true, []string{"", "low", "xhigh", "", "", ""}},
+		{"claude without capability", "claude", false, []string{"", "", "", "", "", ""}},
+		{"codex without capability", "codex", false, []string{"", "", "", "", "", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agents := agentsFromTemplates(rows, nil, tc.harness, tc.flag)
+			for i, a := range agents {
+				got := ""
+				if a.Effort != nil {
+					got = *a.Effort
+				}
+				if got != tc.want[i] {
+					t.Errorf("%s effort=%q, want %q", a.Name, got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestHasWithheldTemplateEffort(t *testing.T) {
+	pinned := func(name string) store.AgentTemplate {
+		return store.AgentTemplate{Name: name, Effort: pgconv.TextOrNull("high"), CodexEffort: pgconv.TextOrNull("low")}
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []store.AgentTemplate
+		harness string
+		want    bool
+	}{
+		{"subagent pin", []store.AgentTemplate{pinned("coder")}, "claude", true},
+		{"lead pin is not a subagent pin", []store.AgentTemplate{pinned("lead")}, "claude", false},
+		{"orchestrator is lead-shaped", []store.AgentTemplate{pinned("orchestrator")}, "codex", false},
+		{"other family only", []store.AgentTemplate{{Name: "coder", CodexEffort: pgconv.TextOrNull("low")}}, "claude", false},
+		{"hostile value", []store.AgentTemplate{{Name: "coder", Effort: pgconv.TextOrNull("ultra")}}, "claude", false},
+		{"none", []store.AgentTemplate{{Name: "coder"}}, "claude", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasWithheldTemplateEffort(tc.rows, tc.harness); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }

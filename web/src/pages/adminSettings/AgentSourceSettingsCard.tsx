@@ -8,7 +8,7 @@ import {
 } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { useAsyncData } from "../../lib/useAsyncData";
-import { templateModelDefaultLabel } from "../../lib/agentTemplates";
+import { templateEffortDefaultLabel, templateModelDefaultLabel } from "../../lib/agentTemplates";
 import {
   Alert,
   Badge,
@@ -162,6 +162,13 @@ function AgentSourceStagedReview({
                     <dd className="text-muted">{role.claude_model || templateModelDefaultLabel(role.name, "claude")}</dd>
                     <dt className="text-faint">Codex model</dt>
                     <dd className="text-muted">{role.codex_model || templateModelDefaultLabel(role.name, "codex")}</dd>
+                    <dt className="text-faint">Claude effort</dt>
+                    <dd className="text-muted">
+                      {role.effort || templateEffortDefaultLabel(role.name)}
+                      {role.notes?.includes("effort_ignored") && (
+                        <span className="text-warn"> (the source's effort is not one of low, medium, high, xhigh or max, so it was ignored)</span>
+                      )}
+                    </dd>
                     <dt className="text-faint">Tools</dt>
                     <dd className="font-mono text-muted">
                       {role.tools && role.tools.length > 0 ? role.tools.join(", ") : "inherit all"}

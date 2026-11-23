@@ -6,8 +6,8 @@ import path from "node:path";
 import { query, type SDKUserMessage, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { buildSdkOptions } from "../src/claude-harness.js";
 
-export const CLAUDE_PHASE_SDK = "0.3.319";
-export const CLAUDE_PHASE_CLI = "2.1.319";
+export const CLAUDE_PHASE_SDK = "0.3.325";
+export const CLAUDE_PHASE_CLI = "2.1.325";
 
 /** Test/probe driver only. Nothing from the contributor's HOME or repository is loaded. */
 export class PhaseClaude {
@@ -30,7 +30,7 @@ export class PhaseClaude {
   }
   async turn(input: {
     prompt: string | AsyncIterable<SDKUserMessage>; model?: string; effort?: Options["effort"];
-    resume?: string; onInit?: () => void; onReady?: () => void; abortOnInit?: boolean;
+    resume?: string; onInit?: () => void; onReady?: (settings: unknown) => void; abortOnInit?: boolean;
   }): Promise<{ session: string; model: string; cli: string; effort: unknown; usage: unknown; text: string; aborted: boolean; pid: number; thinkingBlocks: number; failure: string | undefined }> {
     const installed = JSON.parse(fs.readFileSync(new URL("../node_modules/@anthropic-ai/claude-agent-sdk/package.json", import.meta.url), "utf8"));
     if (installed.version !== CLAUDE_PHASE_SDK) throw new Error("phase proof SDK pin mismatch");
@@ -66,7 +66,7 @@ export class PhaseClaude {
     const control = q as unknown as { getSettings?: () => Promise<{ applied?: { effort?: unknown } }> };
     const settings = () => typeof control.getSettings === "function"
       ? control.getSettings.call(q) : Promise.reject(new Error("get_settings unsupported"));
-    const ready = input.onReady ? settings().then(() => input.onReady!()).catch(() => undefined) : undefined;
+    const ready = input.onReady ? settings().then(applied => input.onReady!(applied)).catch(() => undefined) : undefined;
     try {
       for await (const frame of q) {
         if (frame.type === "assistant") result.thinkingBlocks += frame.message.content.filter(b => b.type === "thinking" || b.type === "redacted_thinking").length;

@@ -448,6 +448,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	var defaultModel pgtype.Text
 	var leadSettings LeadSettings
+	var leadInput LeadSettingsInput
 	leadResolved := false
 	if checkerResolution == nil && (harness != HarnessCodex || !isReviewRun) {
 		lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID)
@@ -465,14 +466,24 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// and a subagent template's own model: pin still wins. An INCOMPATIBLE frozen model
 		// records the existing visible fallback note and falls back to the lane, or the harness
 		// default when that lane is unset or dropped.
-		leadSettings = resolveLeadSettings(LeadSettingsInput{
+		leadInput = LeadSettingsInput{
 			Harness:         harness,
 			RunModel:        run.Model,
 			RunModelSource:  run.ModelSource,
 			RunEffort:       run.Effort,
 			RunEffortSource: run.EffortSource,
 			LaneModel:       laneModel,
-		})
+			TemplateEffort:  leadTemplateEffort(templates, harness),
+		}
+		// Only lead-lane claims read planning defaults; errors fail the claim.
+		if leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+			model, effort, perr := s.readPlanningDefaults(ctx, run.UserID, harness)
+			if perr != nil {
+				return nil, fmt.Errorf("planning defaults lookup: %w", perr)
+			}
+			leadInput.PlanningModel, leadInput.PlanningEffort = model, effort
+		}
+		leadSettings = resolveLeadSettings(leadInput)
 		// PRD #3250: a run_override model or effort the claim cannot honor parks the run (never a
 		// fallback). Checked before any fallback note, the custom-Codex capability re-check and the
 		// late effort read, so a held run writes no harness_model_fallback line.
@@ -493,6 +504,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		defaultModel = pgconv.TextPtr(checkerResolution.Model)
 	}
 
+	// Issue #3258 N6: stored subagent effort pins ride the claim only to a worker advertising
+	// template_effort_v1. The withheld-pins feed line is recorded at the end of assembly, once no
+	// later refusal or isolation strip can make it misleading.
+	templateEffortSupported := slices.Contains(wkr.ProtocolCapabilities, capability.TemplateEffortV1)
+
 	// PRD #1551 M4 (D6): post-claim custom-Codex capability re-check. ClaimRun commits BEFORE
 	// assembleClaim runs (service.go), so the owner's Codex lane could have flipped to a CUSTOM
 	// (non-curated) id in the window between the claim's SQL gate and here. For an ordinary
@@ -508,12 +524,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, errCustomModelCapabilityMissing
 	}
 
-	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
-	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
+	// The run owner's per-user default reasoning effort (PRD #617). Ordinary lanes resolve NULL
+	// to the built-in medium; the lead lane also applies its template tier below the user's choice.
+	// An explicit level is carried and
 	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. A start-time
 	// run_override effort frozen onto the run (runs.effort, PRD #3250) wins over the owner's value
-	// through leadEffortFor; otherwise the owner's per-user value is the only source, except for a
+	// through leadEffortFor (or the lead-specific helper below), except for a
 	// checker child, which carries its frozen cross-check
 	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
 	// is always a canonical level (validated pin or high), never `runtime`, so it
@@ -530,7 +546,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
 	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
-	// ships leadEffortFor's value as DefaultEffort (nil for the owner's runtime default), so the
+	// ships leadEffortWithTemplate's value as DefaultEffort (nil for the owner's runtime default), so the
 	// value and its source come from one resolver.
 	var defaultModelSource, defaultEffortSource *string
 	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
@@ -545,7 +561,24 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		shippedEffort = eff
 	}
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
+		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortWithTemplate(harness, run.Effort, run.EffortSource, defaultEffort, leadTemplateEffort(templates, harness))
+		// PRD #3252: re-derive the plan pair over the same input with the late-read user effort; the
+		// precedence rule stays in resolvePlanPhase.
+		leadInput.UserEffort = defaultEffort
+		leadSettings.Plan = resolvePlanPhase(leadInput, leadSettings)
+		// A claim carrying a plan_phase needs its harness capability, including when the owner's
+		// planning setting changed after SQL admission. Requeue retains Codex claim provenance
+		// (ADR-4476), so another worker cannot take over a rejected Codex claim.
+		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, phaseModelsCapability(harness)) {
+			return nil, errPhaseModelsCapabilityMissing
+		}
+		// Resolve the final plan before checking custom passthrough: effort-only planning inherits
+		// the effective root model, and a planning model may differ from the implementation root.
+		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil &&
+			!harnessModelCompatible(HarnessCodex, *leadSettings.Plan.Model) &&
+			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
+			return nil, errCustomModelCapabilityMissing
+		}
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es
@@ -696,6 +729,38 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// Run-summary model for this claim's harness (see resolveClaimSummaryModel).
 	summaryModel := s.resolveClaimSummaryModel(ctx, run)
+
+	// PRD #1570: a REVIEW run resolves the owner's task-review settings (ResolveTaskReview, the rule
+	// the effective-settings view also uses). They ride the claim only to a worker advertising
+	// task_review_settings_v1; for one that lacks it, a configured value is withheld and the feed
+	// notice is recorded at the end of assembly. A non-review claim never carries them.
+	var taskReviewModel, taskReviewEffort *string
+	var taskReviewWithheld []string
+	if isReviewRun {
+		tr, terr := s.resolveUserTaskReview(ctx, run.UserID, harness)
+		if terr != nil {
+			return nil, terr
+		}
+		if slices.Contains(wkr.ProtocolCapabilities, capability.TaskReviewSettingsV1) {
+			// Omitted when unset (PRD #1570): the worker's own built-in applies, so the wire carries
+			// only an owner's configured, re-validated model.
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault && tr.Model != "" {
+				m := tr.Model
+				taskReviewModel = &m
+			}
+			// The resolved level (inherited from the worker effort when unset), nil for Runtime default.
+			taskReviewEffort = tr.EffortLevelPtr()
+		} else {
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewModelSettingName)
+			}
+			// An inherited built-in level counts: the old worker sends none, a change from the
+			// resolved view. No notice when the resolved effort is Runtime default.
+			if tr.EffortLevelPtr() != nil {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewEffortSettingName)
+			}
+		}
+	}
 
 	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
 	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
@@ -945,7 +1010,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.
-		SummaryModel: summaryModel,
+		SummaryModel:     summaryModel,
+		TaskReviewModel:  taskReviewModel,
+		TaskReviewEffort: taskReviewEffort,
 		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
 		// already set, so a resume/re-claim skips INTENT generation rather than
 		// re-spending the owner's token. Derived straight off the run row.
@@ -965,7 +1032,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			AnthropicOAuthToken: string(anthropic),
 			Provider:            providerBinding,
 		},
-		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
+		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness, templateEffortSupported),
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{
@@ -997,6 +1064,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			DefaultEffort:               shippedEffort,
 			DefaultModelSource:          defaultModelSource,
 			DefaultEffortSource:         defaultEffortSource,
+			PlanPhase:                   leadSettings.Plan,
 			CodexCatalogContext:         claimCodexCatalogContext(run),
 			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
@@ -1155,6 +1223,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	payload.PublicationResume = resume
 	if err := assertClaimSecretsExclusive(payload.Secrets); err != nil {
 		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
+	// Issue #3258 N6: last, so no refusal above and no isolation strip (payload.Agents empty)
+	// leaves a feed line naming pins the claim never carried.
+	if !templateEffortSupported && !isolated && len(payload.Agents) > 0 && hasWithheldTemplateEffort(templates, run.Harness) {
+		payload.LastSeq = s.recordTemplateEffortOmittedNote(ctx, run, payload.LastSeq)
+	}
+	// PRD #1570: also last, for the same reason; no notice when nothing configured was withheld.
+	if len(taskReviewWithheld) > 0 {
+		payload.LastSeq = s.recordTaskReviewSettingsOmittedNote(ctx, run, payload.LastSeq, taskReviewWithheld)
 	}
 	return payload, nil
 }
@@ -1523,4 +1600,12 @@ func linkedIssueKey(run store.Run, projectShort pgtype.Text) string {
 		return ""
 	}
 	return projectShort.String + "-" + strconv.FormatInt(run.IssueIid.Int64, 10)
+}
+
+// phaseModelsCapability selects the protocol for the run's harness.
+func phaseModelsCapability(h Harness) string {
+	if h == HarnessCodex {
+		return capability.CodexPhaseModelsV1
+	}
+	return capability.ClaudePhaseModelsV1
 }

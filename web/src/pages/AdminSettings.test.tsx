@@ -1196,10 +1196,10 @@ describe("AdminSettings — agent source (PRD #602 M5)", () => {
     for (const role of source.staged!.roles) {
       const row = within(c.getByText(role.name, { selector: "code" }).closest("li")!);
       expect(row.getByText("Claude model").nextElementSibling?.textContent).toBe(
-        role.claude_model || (role.name === "lead" ? "Default · SDK/account default (built-in)" : "Default · lead's model"),
+        role.claude_model || (role.name === "lead" ? "Default · SDK/account default (built-in)" : "Default · follows lead"),
       );
       expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe(
-        role.codex_model || (role.name === "lead" ? "Default · built-in (gpt-6.1-sol)" : "Default · lead's model"),
+        role.codex_model || (role.name === "lead" ? "Default · built-in (gpt-6.1-sol)" : "Default · follows lead"),
       );
       expect(row.queryByText("Model", { exact: true })).toBeNull();
     }

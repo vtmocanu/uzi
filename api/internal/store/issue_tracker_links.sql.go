@@ -30,11 +30,15 @@ SELECT r.id, r.forge_project_id, r.awaiting_first_enable,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at,
        c.forge_type, c.base_url, c.token_ciphertext,
-       itc.id AS linked_connection_id
+       itc.id AS linked_connection_id,
+       s.open_state, s.closed_state,
+       COALESCE((SELECT jsonb_object_agg(cs.label_name, cs.state_name)
+                 FROM repo_issue_tracker_column_states cs WHERE cs.repo_id = r.id), '{}'::jsonb)::jsonb AS column_states
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 LEFT JOIN issue_tracker_connections itc
        ON itc.id = r.issue_tracker_connection_id AND itc.user_id = c.user_id
+LEFT JOIN repo_issue_tracker_states s ON s.repo_id = r.id
 WHERE r.id = $1 AND c.user_id = $2
 `
 
@@ -57,6 +61,9 @@ type GetRepoIssueSourceForUserRow struct {
 	BaseUrl                  string             `json:"base_url"`
 	TokenCiphertext          []byte             `json:"token_ciphertext"`
 	LinkedConnectionID       pgtype.UUID        `json:"linked_connection_id"`
+	OpenState                pgtype.Text        `json:"open_state"`
+	ClosedState              pgtype.Text        `json:"closed_state"`
+	ColumnStates             []byte             `json:"column_states"`
 }
 
 // Repo to issue tracker project links (PRD #4173 M4, DL-3..DL-5).
@@ -65,7 +72,9 @@ type GetRepoIssueSourceForUserRow struct {
 // owning user, never by forge project number. linked_connection_id is the link's
 // connection ONLY when it belongs to the same user as the forge connection; a linked
 // repo whose connection is missing for that owner reads NULL here and the resolver
-// fails closed.
+// fails closed. open_state and closed_state are NULL until the state mapping is saved
+// (PRD #4173 M5); column_states is the board column label to State name map, '{}' when
+// no column is mapped.
 func (q *Queries) GetRepoIssueSourceForUser(ctx context.Context, arg GetRepoIssueSourceForUserParams) (GetRepoIssueSourceForUserRow, error) {
 	row := q.db.QueryRow(ctx, getRepoIssueSourceForUser, arg.ID, arg.UserID)
 	var i GetRepoIssueSourceForUserRow
@@ -83,6 +92,9 @@ func (q *Queries) GetRepoIssueSourceForUser(ctx context.Context, arg GetRepoIssu
 		&i.BaseUrl,
 		&i.TokenCiphertext,
 		&i.LinkedConnectionID,
+		&i.OpenState,
+		&i.ClosedState,
+		&i.ColumnStates,
 	)
 	return i, err
 }
@@ -165,6 +177,7 @@ SELECT (
  OR EXISTS (SELECT 1 FROM recommendation_filed_issues WHERE recommendation_filed_issues.filed_repo_id = $1 AND recommendation_filed_issues.filed_issue_iid IS NOT NULL)
  OR EXISTS (SELECT 1 FROM finding_dispositions WHERE finding_dispositions.repo_id = $1 AND finding_dispositions.filed_issue_iid IS NOT NULL)
  OR EXISTS (SELECT 1 FROM finding_group_operations WHERE finding_group_operations.repo_id = $1 AND finding_group_operations.issue_iid IS NOT NULL)
+ OR EXISTS (SELECT 1 FROM schedule_once_fire_runs WHERE schedule_once_fire_runs.repo_id = $1 AND schedule_once_fire_runs.issue_iid IS NOT NULL)
 )::boolean AS stores_issue_number
 `
 

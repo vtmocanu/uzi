@@ -6,8 +6,8 @@
 /** Harness versions the lists below were derived from. A bump of either harness must
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
-  claude_agent_sdk: "0.3.319",
-  codex: "0.167.0",
+  claude_agent_sdk: "0.3.325",
+  codex: "0.169.0",
 } as const;
 
 /** Exact names a variable may not use. */
@@ -24,13 +24,17 @@ export const RUN_ENV_DENIED_NAMES: readonly string[] = [
   "UZI_SQLC_DIR", "UZI_RUN_ATTEMPT", "UZI_RUN_CLONE", "UZI_RUN_CLONE_KEY", "UZI_WORKER_SPAWN",
   "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
   "API_TIMEOUT_MS", "MAX_THINKING_TOKENS", "MAX_MCP_OUTPUT_TOKENS",
+  "NODE_INSPECTOR_IPC", "VSCODE_INSPECTOR_OPTIONS", "TEMP", "TMP", "SYSTEMDRIVE",
+  "API_FORCE_IDLE_TIMEOUT", "ENABLE_TOOL_SEARCH", "SLASH_COMMAND_TOOL_CHAR_BUDGET", "AUTOMODE_DECISION_LOG",
+  "NODE_USE_SYSTEM_CA", "ENABLE_BETA_TRACING_DETAILED", "ENABLE_ENHANCED_TELEMETRY_BETA", "BETA_TRACING_ENDPOINT",
+  "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
 ];
 
 export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [
   "UZI_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_",
   "GH_", "GITHUB_", "GITLAB_", "GLAB_",
   "GIT_", "SSH_",
-  "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
+  "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_", "BUN_",
 ];
 
 export const RUN_ENV_DENIED_SUFFIXES: readonly string[] = ["_PROXY"];

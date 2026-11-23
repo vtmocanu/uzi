@@ -338,3 +338,158 @@ func TestSettingsGetSummaryRowsUnknownSource(t *testing.T) {
 		t.Fatalf("unknown source row missing: exit %d %q", code, out)
 	}
 }
+
+func TestSettingsGetPlanningRows(t *testing.T) {
+	for _, effective := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stored-only", true: "effective"}[effective], func(t *testing.T) { settingsGetPlanningRows(t, effective) })
+	}
+}
+
+// settingsGetPlanningRows checks both table paths: an older server without the effective view, and a
+// current one serving it, where effectiveSettingsRows replaces settingsModelRows.
+func settingsGetPlanningRows(t *testing.T, effective bool) {
+	stored := "opus"
+	high := "high"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		PlanningModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", Model: &stored, DefaultModel: "sonnet", DefaultSource: "user_default", ResolvedModel: "opus", Source: "user_planning_default"},
+		},
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", DefaultEffort: "medium", DefaultSource: "builtin", ResolvedEffort: &high, Source: "builtin", Mode: "explicit"},
+		},
+	}}
+	if effective {
+		fc.Effective = &apitypes.EffectiveSettingsDTO{}
+	}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	idx := strings.Index(out, "Model settings")
+	if idx < 0 {
+		t.Fatalf("no Model settings table: %q", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out[idx:]), "\n")
+	var got []string
+	for _, l := range lines {
+		if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, "planning ") {
+			got = append(got, f)
+		}
+	}
+	want := []string{
+		"planning model claude Pin · opus sonnet opus your choice",
+		"planning effort claude Default medium high built-in",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("planning rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestSettingsGetPlanningRowsBuiltinModelAndRuntimeEffort(t *testing.T) {
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		PlanningModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", DefaultSource: "builtin", Source: "builtin"},
+		},
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", DefaultEffort: "runtime", DefaultSource: "user_default", Source: "user_default", Mode: "runtime_default"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got []string
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, "planning ") {
+			got = append(got, f)
+		}
+	}
+	want := []string{
+		"planning model claude Default SDK/account default SDK/account default built-in",
+		"planning effort claude Default runtime default runtime default (value not reported) your choice",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("planning rows:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestSettingsGetPlanningRowsLeadTemplateEffort(t *testing.T) {
+	high := "high"
+	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{
+		PlanningModels: []apitypes.ModelSettingCellDTO{
+			{Harness: "claude", DefaultSource: "builtin", Source: "builtin"},
+		},
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			{Harness: "claude", DefaultEffort: "high", DefaultSource: "template", ResolvedEffort: &high, Source: "template", Mode: "explicit"},
+		},
+	}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	var got []string
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Join(strings.Fields(l), " "); strings.HasPrefix(f, "planning effort") {
+			got = append(got, f)
+		}
+	}
+	want := "planning effort claude Default high high lead template"
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("planning effort rows = %q, want %q", got, want)
+	}
+}
+
+func TestSettingsModelRowsOmitAbsentPlanningCells(t *testing.T) {
+	for _, r := range settingsModelRows(apitypes.UserSettingsDTO{}) {
+		if strings.HasPrefix(r.Setting, "planning") {
+			t.Errorf("row %q rendered without a planning cell", r.Setting)
+		}
+	}
+}
+
+// Both table consumers must read each harness even when duplicates precede it.
+func TestSettingsGetPlanningRowsPerHarness(t *testing.T) {
+	for _, effective := range []bool{false, true} {
+		for _, first := range []string{"claude", "codex"} {
+			name := first
+			if effective {
+				name += "-effective"
+			}
+			t.Run(name, func(t *testing.T) {
+				other := "codex"
+				if first == "codex" {
+					other = "claude"
+				}
+				model, effort := "custom-plan", "max"
+				s := apitypes.UserSettingsDTO{}
+				for _, harness := range []string{"unknown", first, first, other, other} {
+					s.PlanningModels = append(s.PlanningModels, apitypes.ModelSettingCellDTO{Harness: harness, Model: &model, DefaultModel: "base", ResolvedModel: model, Source: "user_planning_default"})
+					s.PlanningEfforts = append(s.PlanningEfforts, apitypes.EffortSettingCellDTO{Harness: harness, Effort: &effort, DefaultEffort: "medium", ResolvedEffort: &effort, Source: "user_planning_default", Mode: "explicit"})
+				}
+				fc := &uzicli.FakeClient{Settings: s}
+				if effective {
+					fc.Effective = &apitypes.EffectiveSettingsDTO{}
+				}
+				out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+				if code != 0 {
+					t.Fatalf("exit %d: %s", code, stderr)
+				}
+				counts := map[string]int{}
+				for _, line := range strings.Split(out, "\n") {
+					f := strings.Fields(line)
+					if len(f) >= 3 && f[0] == "planning" {
+						counts[strings.Join(f[:3], " ")]++
+					}
+				}
+				for _, key := range []string{"planning model claude", "planning model codex", "planning effort claude", "planning effort codex"} {
+					if counts[key] != 1 {
+						t.Errorf("%s: got %d rows, want 1", key, counts[key])
+					}
+				}
+				if len(counts) != 4 {
+					t.Errorf("unexpected planning rows: %v", counts)
+				}
+			})
+		}
+	}
+}

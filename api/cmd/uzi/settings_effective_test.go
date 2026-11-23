@@ -64,13 +64,15 @@ func effectiveFixture() *apitypes.EffectiveSettingsDTO {
 			modelCell("summary_model", "claude", nil, "haiku", "builtin", "haiku", "builtin"),
 			modelCell("summary_model", "codex", nil, "gpt-6-luna", "builtin", "gpt-6-luna", "builtin"),
 			modelCell("task_review_model", "claude", nil, "", "builtin", "", "builtin", "sdk_default"),
-			modelCell("task_review_model", "codex", nil, "gpt-6-sol", "builtin", "gpt-6-sol", "builtin", "not_configurable"),
+			modelCell("task_review_model", "codex", sptr("gpt-6.1-sol"), "gpt-6-sol", "builtin", "gpt-6.1-sol", "user_default"),
 		},
 		Efforts: []apitypes.EffectiveEffortCellDTO{
 			effortCell("worker_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
 			effortCell("worker_effort", "codex", sptr("runtime"), nil, "user_default", "runtime_default"),
-			effortCell("task_review_effort", "claude", nil, nil, "builtin", "runtime_default", "not_sent"),
-			effortCell("task_review_effort", "codex", nil, nil, "builtin", "runtime_default", "not_sent"),
+			// An unset Claude review effort inherits the worker effort (medium, built-in); an explicit
+			// Codex `runtime` (an explicit review preference) sends no level. (effortCell fixes DefaultEffort to medium.)
+			effortCell("task_review_effort", "claude", nil, sptr("medium"), "builtin", "explicit"),
+			effortCell("task_review_effort", "codex", sptr("runtime"), nil, "user_default", "runtime_default", "not_sent"),
 		},
 	}
 }
@@ -116,9 +118,9 @@ func TestSettingsGetEffectiveRows(t *testing.T) {
 		"judge claude Default haiku haiku instance default",
 		"summary codex Default gpt-6-luna gpt-6-luna built-in",
 		"task review model claude Default SDK/account default SDK/account default built-in · the SDK decides",
-		"task review model codex Default gpt-6-sol gpt-6-sol built-in · not configurable",
-		"task review effort claude Default medium runtime default (value not reported) built-in · not sent",
-		"task review effort codex Default medium runtime default (catalog default unknown) built-in · not sent",
+		"task review model codex Pin · gpt-6.1-sol gpt-6-sol gpt-6.1-sol your choice",
+		"task review effort claude Default medium medium built-in",
+		"task review effort codex runtime default medium runtime default (catalog default unknown) your choice · not sent",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing row %q in:\n%s", want, out)
@@ -150,6 +152,35 @@ func TestSettingsGetEffectiveRows(t *testing.T) {
 	} {
 		if !strings.Contains(out, want+"\n") {
 			t.Errorf("missing line %q in:\n%s", want, out)
+		}
+	}
+}
+
+// An unset Codex review model reads as the built-in review model (gpt-6-sol), next to the configured
+// pin the base fixture carries (PRD #1570).
+func TestSettingsGetEffectiveUnsetCodexReviewModel(t *testing.T) {
+	e := effectiveFixture()
+	for i, c := range e.Models {
+		if c.Setting == "task_review_model" && c.Harness == "codex" {
+			e.Models[i] = modelCell("task_review_model", "codex", nil, "gpt-6-sol", "builtin", "gpt-6-sol", "builtin")
+		}
+	}
+	fc := &uzicli.FakeClient{Settings: settingsWithLegacyCells(), Effective: e}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	var rows []string
+	for _, l := range strings.Split(out, "\n") {
+		rows = append(rows, fields(l))
+	}
+	joined := strings.Join(rows, "\n")
+	for _, want := range []string{
+		"task review model codex Default gpt-6-sol gpt-6-sol built-in",
+		"task review model claude Default SDK/account default SDK/account default built-in · the SDK decides",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing row %q in:\n%s", want, out)
 		}
 	}
 }
@@ -270,5 +301,36 @@ func TestSettingsGetEffectiveHostileTextAndBounds(t *testing.T) {
 	_, stderr, code = runCLI(t, fakeEnv(fc), "settings", "get")
 	if code != 0 || strings.ContainsAny(stderr, "\x1b\x07\u202e") || len(stderr) > 400 {
 		t.Fatalf("hostile failure text on stderr: exit %d, %q", code, stderr)
+	}
+}
+
+// TestSettingsGetEffectivePlanningRowsPrintOnce pins PRD #3252 on the effective table path: the
+// view's planning cells (settings planning_model and planning_effort) do not add rows, because the
+// planning rows come from the settings read, so each prints exactly once.
+func TestSettingsGetEffectivePlanningRowsPrintOnce(t *testing.T) {
+	e := effectiveFixture()
+	opus, high := "opus", "high"
+	pm := modelCell("planning_model", "claude", &opus, "opus", "template", "opus", "user_planning_default")
+	pe := effortCell("planning_effort", "claude", &high, &high, "user_planning_default", "explicit")
+	e.Models = append(e.Models, pm)
+	e.Efforts = append(e.Efforts, pe)
+	s := settingsWithLegacyCells()
+	s.PlanningModels = []apitypes.ModelSettingCellDTO{pm.ModelSettingCellDTO}
+	s.PlanningEfforts = []apitypes.EffortSettingCellDTO{pe.EffortSettingCellDTO}
+	out, stderr, code := runCLI(t, fakeEnv(&uzicli.FakeClient{Settings: s, Effective: e}), "settings", "get")
+	if code != 0 || stderr != "" {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	counts := map[string]int{}
+	for _, l := range strings.Split(out, "\n") {
+		f := fields(l)
+		for _, p := range []string{"planning model ", "planning effort "} {
+			if strings.HasPrefix(f, p) {
+				counts[p]++
+			}
+		}
+	}
+	if counts["planning model "] != 1 || counts["planning effort "] != 1 {
+		t.Errorf("planning rows printed %v, want once each:\n%s", counts, out)
 	}
 }

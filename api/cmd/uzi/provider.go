@@ -95,9 +95,11 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			"as listed (path included). --model maps an engine model slot to a gateway model and is repeatable:\n" +
 			"alias=model[:context_window]. Claude: haiku (required), sonnet, opus, fable. Codex: default (required), gpt-6-astra,\n" +
 			"gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol, gpt-6-luna. Codex requires bearer auth.\n" +
-			"Set the context window to the gateway model's real window; without it Claude assumes 200000\n" +
-			"for model names it does not recognise. Caveat: for some model names containing \"claude\" the\n" +
-			"Claude CLI was observed to ignore the configured window, so it may not take effect there.\n\n" +
+			"Set the context window to the gateway model's real window. Claude: the smallest window set on any\n" +
+			"model applies to all of them; with none set, uzi assumes 200000.\n" +
+			"Claude caveat: the Claude CLI may apply its own window to model names it recognizes as Anthropic\n" +
+			"models (for example claude-sonnet-4-5), ignoring both a configured window and uzi's 200000\n" +
+			"default (measured at Claude Code 2.1.325).\n\n" +
 			"The API key is added in the web Settings, never from the CLI.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -159,8 +161,11 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Rename a provider and/or replace its model map",
 		Long: "Rename a provider (--name) and/or replace its model map (--model, repeatable, same form as\n" +
 			"`create`). Giving any --model replaces the whole map, so repeat every alias you want to keep,\n" +
-			"context windows included. A context window may not take effect for model names containing\n" +
-			"\"claude\": the Claude CLI was observed to ignore it for some such names.\n\n" +
+			"context windows included. The smallest window set on any model applies to all of them; with\n" +
+			"none set, uzi assumes 200000. The Claude CLI may\n" +
+			"apply its own window to model names it recognizes as Anthropic models (for example\n" +
+			"claude-sonnet-4-5), ignoring both a configured window and uzi's 200000 default (measured\n" +
+			"at Claude Code 2.1.325).\n\n" +
 			"Changing the base URL or auth style is web-only (Settings).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -507,18 +512,20 @@ func parseModelFlags(vals []string) (apitypes.ModelMapDTO, error) {
 }
 
 // warnClaudeWindow prints a one-line plain-text stderr warning per mapped model name that contains
-// "claude" (any case) and carries a context window: the pinned Claude CLI was observed to ignore
-// the configured window for such names (PRD #4320 Decision Log).
+// "claude" (any case), whether or not a context window is set: the Claude CLI may apply its own
+// window to names it recognizes as Anthropic models, ignoring both a configured window and uzi's
+// 200000 default (measured at Claude Code 2.1.325). Only the fixed alias is echoed, never the
+// untrusted model name.
 func warnClaudeWindow(env Env, mm apitypes.ModelMapDTO) {
 	h := mm.Haiku
 	for _, e := range []struct {
 		alias string
 		m     *apitypes.ModelEntryDTO
 	}{{"haiku", &h}, {"sonnet", mm.Sonnet}, {"opus", mm.Opus}, {"fable", mm.Fable}} {
-		if e.m == nil || e.m.ContextWindow == nil || !strings.Contains(strings.ToLower(e.m.Model), "claude") {
+		if e.m == nil || !strings.Contains(strings.ToLower(e.m.Model), "claude") {
 			continue
 		}
-		_, _ = fmt.Fprintf(env.Stderr, "warning: --model %s: context_window may not take effect for model names containing 'claude'; the Claude CLI was observed to ignore it for some such names\n", e.alias)
+		_, _ = fmt.Fprintf(env.Stderr, "warning: --model %s: the Claude CLI may ignore the context window (configured or uzi's 200000 default) for model names it recognizes as Anthropic models, such as claude-sonnet-4-5 (measured at Claude Code 2.1.325)\n", e.alias)
 	}
 }
 

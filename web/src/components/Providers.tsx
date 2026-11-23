@@ -48,10 +48,10 @@ const CTX_MIN = 8192;
 const CTX_MAX = 10_000_000;
 
 const NO_CONTEXT_WARNING =
-  "No context window set. Without it the Claude CLI assumes a 200k-token window for unrecognized model names and compacts too late if the gateway's window is smaller.";
+  "No context window set. The smallest window configured on any model applies to all of them, and uzi assumes 200k tokens if none is configured; set the gateway model's real window.";
 
 const CATALOG_CONTEXT_WARNING =
-  "context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for some such names.";
+  "The Claude CLI may apply its own window to model names it recognizes as Anthropic models (for example claude-sonnet-4-5), ignoring both a configured window and uzi's 200k default (measured at Claude Code 2.1.325).";
 
 interface ModelRow {
   model: string;
@@ -212,7 +212,7 @@ function ModelMapFields({
                 {label}: {engine === "codex" ? "No context window set. Codex uses its runtime fallback context window, which may differ from the gateway limit." : NO_CONTEXT_WARNING}
               </p>
             )}
-            {engine === "claude" && row.model.toLowerCase().includes("claude") && row.ctx.trim() !== "" && (
+            {engine === "claude" && row.model.toLowerCase().includes("claude") && (
               <p className="text-xs text-warn" data-testid={`ctx-unenforced-${role}`}>
                 {label}: {CATALOG_CONTEXT_WARNING}
               </p>
@@ -384,6 +384,12 @@ function ProviderRow({
 
   const canTest = p.has_key && p.key_enabled && !p.retired;
   const mapped = rolesFor(p.engine).filter(({ role }) => p.model_map[role]);
+  // Claude only: the worker sets one process-wide window, the smallest configured one across all
+  // mapped models, or uzi's 200k fallback when none is configured (agent/src/sdk-env.ts).
+  const configured = p.engine === "claude" ? mapped.map(({ role }) => p.model_map[role]!.context_window).filter((w): w is number => !!w) : [];
+  const blankLabel = configured.length
+    ? ` (no context window: uzi requests the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens)`
+    : " (no context window: 200k assumed)";
   const rowBusy = busy || testing;
   const blocked = sourceBlockedReason(p);
 
@@ -420,7 +426,7 @@ function ProviderRow({
               return (
                 <li key={role}>
                   {label}: <code>{sanitizeLabel(e.model)}</code>
-                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : " (no context window)"}
+                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : blankLabel}
                 </li>
               );
             })}

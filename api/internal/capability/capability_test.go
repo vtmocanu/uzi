@@ -226,6 +226,21 @@ func TestFilterProtocol_KeepsCodexCustomModelV1(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_KeepsClaudePhaseModelsV1 pins PRD #3252: the Claude planning-phase protocol
+// capability survives registration (the claim mirrors read it off workers.protocol_capabilities)
+// and is not a scheduler capability.
+func TestFilterProtocol_KeepsClaudePhaseModelsV1(t *testing.T) {
+	if got := FilterProtocol([]string{ClaudePhaseModelsV1}); !reflect.DeepEqual(got, []string{ClaudePhaseModelsV1}) {
+		t.Errorf("FilterProtocol(%q) = %v, want it KEPT (missing from the protocol vocabulary?)", ClaudePhaseModelsV1, got)
+	}
+	if got := Filter([]string{ClaudePhaseModelsV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", ClaudePhaseModelsV1, got)
+	}
+	if got := SelfReportable([]string{ClaudePhaseModelsV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", ClaudePhaseModelsV1, got)
+	}
+}
+
 // TestFilterProtocol_KeepsAdviceClaimFenceV1 pins issue #1423: advice_claim_fence_v1 survives
 // registration (the advice-post stamping requirement reads it off workers.protocol_capabilities),
 // is not a scheduler capability, and orders after gate_revision_v1 in protocolOrder.
@@ -478,5 +493,17 @@ func TestCrossCheckOwnerSteeringProtocolToken(t *testing.T) {
 	}
 	if len(Filter([]string{CrossCheckOwnerSteeringV1})) != 0 {
 		t.Fatal("protocol token offered as a repo capability")
+	}
+}
+
+func TestFilterProtocol_KeepsCodexPhaseModelsV1(t *testing.T) {
+	if got := FilterProtocol([]string{CodexPhaseModelsV1}); !reflect.DeepEqual(got, []string{CodexPhaseModelsV1}) {
+		t.Errorf("FilterProtocol(%q) = %v, want it KEPT (missing from the protocol vocabulary?)", CodexPhaseModelsV1, got)
+	}
+	if got := Filter([]string{CodexPhaseModelsV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", CodexPhaseModelsV1, got)
+	}
+	if got := SelfReportable([]string{CodexPhaseModelsV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", CodexPhaseModelsV1, got)
 	}
 }

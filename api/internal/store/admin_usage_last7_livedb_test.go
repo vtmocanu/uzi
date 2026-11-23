@@ -77,7 +77,7 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 		if r.patch {
 			patch = "saved patch"
 		}
-		// Respect each kind's shape, so excluded kinds exercise the real queries.
+		// Respect each kind's shape, so every kind exercises the real queries.
 		var repo, iid, target, budget any = e.repoID, int64(243900 + i), nil, nil
 		harness, reportOnly := "claude", false
 		if r.kind == "chat" || r.kind == "judge" {
@@ -133,7 +133,8 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 	// Independent expected token totals, microdollars, counts and cost exclusions.
 	// Issue #4209: run_count slots (5 and 13) count primary work runs only. The judge
 	// (factor 5) and cross_check (factor 6) rows still feed tokens, cost and the
-	// disclosure counts, but no longer the run counts: user 0 is 4 lifetime, 3 in 7 days.
+	// disclosure counts, but not the run counts: user 0 is 4 lifetime, 3 in 7 days. Their failed
+	// rows DO feed the outcome vectors below (issue #4577: outcomes count every kind but chat).
 	wantUsage := map[uuid.UUID][16]int64{
 		users[0]: {21, 42, 63, 84, 70, 4, 1, 1, 19, 38, 57, 76, 60, 3, 1, 1},
 		users[1]: {15, 30, 45, 60, 75, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -171,13 +172,13 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantCounts := map[uuid.UUID][12]int64{
-		users[0]: {10, 1, 1, 1, 7, 2, 9, 1, 1, 1, 6, 2},
+		users[0]: {12, 1, 1, 1, 9, 2, 11, 1, 1, 1, 8, 2},
 		users[1]: {2, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0},
 		users[2]: {1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0},
 	}
 	wantOrigins := map[uuid.UUID][2]map[string]int64{
-		users[0]: {{"agent_failure": 2, "unknown": 1, "workflow_scope_missing": 1, "push_secret_blocked": 1, "history_rewritten": 1, "finalize_base_align_conflict": 1},
-			{"agent_failure": 1, "unknown": 1, "workflow_scope_missing": 1, "push_secret_blocked": 1, "history_rewritten": 1, "finalize_base_align_conflict": 1}},
+		users[0]: {{"agent_failure": 4, "unknown": 1, "workflow_scope_missing": 1, "push_secret_blocked": 1, "history_rewritten": 1, "finalize_base_align_conflict": 1},
+			{"agent_failure": 3, "unknown": 1, "workflow_scope_missing": 1, "push_secret_blocked": 1, "history_rewritten": 1, "finalize_base_align_conflict": 1}},
 		users[1]: {{"workflow_scope_missing": 1}, {}},
 		users[2]: {{"unknown": 1}, {"unknown": 1}},
 	}
@@ -232,7 +233,7 @@ func TestAdminUsageSevenDayWindowsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	counts := [12]int64{f.LifetimeFinished, f.LifetimeCompleted, f.LifetimeCancelled, f.LifetimePlanRejected, f.LifetimeFailed, f.LifetimeNeedsLanding, f.Last7Finished, f.Last7Completed, f.Last7Cancelled, f.Last7PlanRejected, f.Last7Failed, f.Last7NeedsLanding}
-	if counts != countSums || counts != [12]int64{13, 2, 1, 1, 9, 3, 10, 1, 1, 1, 7, 2} {
+	if counts != countSums || counts != [12]int64{15, 2, 1, 1, 11, 3, 12, 1, 1, 1, 9, 2} {
 		t.Fatalf("factory counts %v sums %v", counts, countSums)
 	}
 	if !reflect.DeepEqual(mapSums, [2]map[string]int64{decode(f.LifetimeFailOrigins), decode(f.Last7FailOrigins)}) {

@@ -60,6 +60,7 @@ type AgentSourceRoleDTO struct {
 	Model         string   `json:"model,omitempty"`
 	ClaudeModel   string   `json:"claude_model"`
 	CodexModel    string   `json:"codex_model"`
+	Effort        string   `json:"effort"`
 	Tools         []string `json:"tools,omitempty"`
 	PromptBody    string   `json:"prompt_body,omitempty"`
 	BodySanitized bool     `json:"body_sanitized"`

@@ -82,15 +82,17 @@ class RevisionTransport implements CodexTransport {
     else this.queue.push(value);
   }
   request<T>(method: string, params?: unknown): Promise<T> {
-    const p = params as { type?: string; threadId?: string; input?: { text?: string }[] };
+    const p = params as { type?: string; model?: string; threadId?: string; input?: { text?: string }[] };
     let result: unknown = {};
     if (method === "initialize") result = { userAgent: "codex/0.153.2", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
     if (method === "account/login/start") result = { type: p.type };
-    if (method === "thread/start" || method === "thread/resume") result = { thread: { id: "th-revision" } };
+    if (method === "thread/start" || method === "thread/resume") result = { thread: { id: "th-revision" }, model: p.model };
     if (method === "turn/start") {
       this.starts.push({ prompt: p.input?.[0]?.text ?? "", threadId: p.threadId });
       const n = this.starts.length;
       if (n === 1) this.push({ kind: "thread_started", method: "thread/started", threadId: "th-revision", params: { thread: { id: "th-revision" } } });
+      this.push({ kind: "turn_started", method: "turn/started", threadId: "th-revision", turnId: "tn-revision",
+        params: { threadId: "th-revision", turn: { id: "tn-revision" } } });
       const f = this.frame();
       const deliver = (): void => {
         const status = "failure" in f ? "failed" : "completed";

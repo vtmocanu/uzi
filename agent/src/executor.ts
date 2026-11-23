@@ -1,6 +1,7 @@
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { execFile } from "node:child_process";
 import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
+import type { PhaseSettings, PhaseSwitchCause } from "./phase-switch-unverified.js";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
@@ -1062,6 +1063,11 @@ export interface ExecutorResult {
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
   walled?: { reason: string };
+  /** PRD #3252 D8 (m4): phase verification failed before prompt release or a later init contradicted
+   *  the admitted pair (a request may already have been admitted). The runner reads it in phasePublish to SKIP
+   *  finalization and enter the phase-switch worker hold (no push, no PR, no terminal report).
+   *  Codex also returns this for an unverified cold same-thread implementation handoff. */
+  phaseSwitchHeld?: { cause: PhaseSwitchCause; requested: PhaseSettings; observed: PhaseSettings; phase: "plan" | "implement" };
   /** Disposition for every iteration sink outcome. The runner must skip finalization for either. */
   iterationParked?: { outcome: IterationParkOutcome };
   /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
@@ -1221,7 +1227,7 @@ export interface Executor {
   /** Issue #1604: true when run() awaits a resumed claim's pending gate inputs
    * (ctx.takeResumedGateEvent) and may RE-PRESENT its persisted unapproved plan at the gate
    * (resume_phase "awaiting_approval"). The runner then lets the re-presented gate keep epoch 0.
-   * Absent (Codex, stub) ⇒ the executor always gates a plan no human has seen on a resumed claim,
+   * Absent (stub) ⇒ the executor always gates a plan no human has seen on a resumed claim,
    * so the runner bumps the epoch at its first gate. Either way the runner's gatePlan reads the
    * replayed backlog before it reports awaiting_approval. */
   readonly resumesAtGate?: boolean;

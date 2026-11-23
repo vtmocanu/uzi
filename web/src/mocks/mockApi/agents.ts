@@ -55,7 +55,7 @@ function shippedBuiltin(name: string): BuiltinDefinition | undefined {
   return mockShippedBuiltins.find((d) => d.name === name);
 }
 
-// sameContent mirrors the server's agenttmpl.SameContent over the five mutable
+// sameContent mirrors the server's agenttmpl.SameContent over the seven mutable
 // columns. It is a SECOND IMPLEMENTATION of that comparison and that is
 // deliberate: the mock has no server to ask, and a hard-coded flag would make
 // every drift the fixture claims unfalsifiable. The rules it must keep in step
@@ -72,6 +72,8 @@ export function sameContent(row: AgentTemplate, def: BuiltinDefinition): boolean
     row.description === def.description &&
     (row.model ?? "") === (def.model ?? "") &&
     (row.codex_model ?? "") === (def.codex_model ?? "") &&
+    (row.effort ?? "") === (def.effort ?? "") &&
+    (row.codex_effort ?? "") === (def.codex_effort ?? "") &&
     row.prompt_body === def.prompt_body &&
     a.length === b.length &&
     a.every((t, i) => t === b[i])
@@ -120,6 +122,22 @@ function inheritedClaudeModel(templates: AgentTemplate[], allocations: TemplateA
     (t.scope !== "user" || (t.user_id === userId && !sharedNames.has(t.name))))
     .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
     .find(t => /^(lead|orchestrator)$/i.test(t.name))?.model ?? null;
+}
+
+// Issue #3258 N3: the delivered lead template's per-harness effort pins, picked by the same
+// first-delivered-lead rule as inheritedClaudeModel. Only one of the five levels counts.
+const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+export function mockLeadTemplateEfforts(): { claude: string | null; codex: string | null } {
+  const me = requireSession();
+  const allocs = templateAllocationView(me);
+  const sharedNames = new Set(templates.filter(t => t.scope !== "user").map(t => t.name));
+  const delivered = new Set(allocs.filter(t => t.effective).map(t => t.id));
+  const lead = templates.filter(t => delivered.has(t.id) &&
+    (t.scope !== "user" || (t.user_id === me.id && !sharedNames.has(t.name))))
+    .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+    .find(t => LEAD_NAME_RE.test(t.name));
+  const valid = (v: string | null | undefined) => (v && EFFORT_LEVELS.has(v) ? v : null);
+  return { claude: valid(lead?.effort), codex: valid(lead?.codex_effort) };
 }
 
 export function mockDefaultClaudeModel(): string | null {
@@ -195,6 +213,8 @@ export const agentsApi = {
       description: input.description,
       model: input.model?.trim() || null,
       codex_model: input.codex_model?.trim() || null,
+      effort: input.effort?.trim() || null,
+      codex_effort: input.codex_effort?.trim() || null,
       tools: input.tools,
       prompt_body: input.prompt_body,
       is_builtin: false,
@@ -250,6 +270,8 @@ export const agentsApi = {
     t.model = input.model?.trim() || null;
     // Old clients omit the pin; merge it before comparing with the shipped content.
     if (input.codex_model !== undefined) t.codex_model = input.codex_model?.trim() || null;
+    if (input.effort !== undefined) t.effort = input.effort?.trim() || null;
+    if (input.codex_effort !== undefined) t.codex_effort = input.codex_effort?.trim() || null;
     t.tools = input.tools;
     t.prompt_body = input.prompt_body;
     t.updated_by = me.email;
@@ -277,6 +299,8 @@ export const agentsApi = {
       description: shipped.description,
       model: shipped.model,
       codex_model: shipped.codex_model,
+      effort: shipped.effort ?? null,
+      codex_effort: shipped.codex_effort ?? null,
       tools: shipped.tools,
       prompt_body: shipped.prompt_body,
       // Reset restores the embedded default in every sense, including provenance:

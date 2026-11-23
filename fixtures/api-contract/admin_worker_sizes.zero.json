@@ -1,0 +1,18 @@
+{
+  "sizes": null,
+  "ceilings": {
+    "cpu_limit_millicores": null,
+    "memory_limit_mib": null,
+    "data_gib": null,
+    "dind_data_gib": null,
+    "dind_overridden": false,
+    "enabled_tiers": null
+  },
+  "editable": false,
+  "read_only_reason": null,
+  "read_only_code": null,
+  "advisories": null,
+  "max_sizes": 0,
+  "refusals": null,
+  "refusal_totals": null
+}

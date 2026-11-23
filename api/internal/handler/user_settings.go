@@ -58,6 +58,18 @@ type userSettingsDTO struct {
 	// CodexSummaryModel is the Codex summary lane (PRD #3248): null = inherit the
 	// instance Codex summary model; a value is a Codex role id.
 	CodexSummaryModel *string `json:"codex_summary_model"`
+	// TaskReviewModel and CodexTaskReviewModel are the owner's per-harness model for the handoff
+	// review pass (PRD #1570): null = the built-in review model. TaskReviewModels is the read-only
+	// resolved view of both lanes, ordered claude then codex; never accepted on a PUT.
+	TaskReviewModel      *string                        `json:"task_review_model"`
+	CodexTaskReviewModel *string                        `json:"codex_task_review_model"`
+	TaskReviewModels     []apitypes.ModelSettingCellDTO `json:"task_review_models"`
+	// TaskReviewEffort and CodexTaskReviewEffort are the owner's per-harness review effort (PRD
+	// #1570): a level or `runtime`, null = inherit the worker effort. TaskReviewEfforts is the
+	// read-only resolved view (claude then codex); never accepted on a PUT.
+	TaskReviewEffort      *string                         `json:"task_review_effort"`
+	CodexTaskReviewEffort *string                         `json:"codex_task_review_effort"`
+	TaskReviewEfforts     []apitypes.EffortSettingCellDTO `json:"task_review_efforts"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
 	// release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -111,6 +123,15 @@ type userSettingsDTO struct {
 	// EffortSettings is the read-only resolved view of both ordinary effort preferences
 	// (PRD #3247), ordered claude then codex. It is never accepted on a PUT.
 	EffortSettings []apitypes.EffortSettingCellDTO `json:"effort_settings"`
+	// PlanningClaudeModel and PlanningClaudeEffort are the owner's Claude planning pair (PRD
+	// #3252): null = "Same as the run". PlanningModels and PlanningEfforts are the read-only
+	// resolved views (Claude then Codex); they are never accepted on a PUT.
+	PlanningClaudeModel  *string                         `json:"planning_claude_model"`
+	PlanningClaudeEffort *string                         `json:"planning_claude_effort"`
+	PlanningCodexModel   *string                         `json:"planning_codex_model"`
+	PlanningCodexEffort  *string                         `json:"planning_codex_effort"`
+	PlanningModels       []apitypes.ModelSettingCellDTO  `json:"planning_models"`
+	PlanningEfforts      []apitypes.EffortSettingCellDTO `json:"planning_efforts"`
 	// WeeklyReservePct and WeeklyReservePauseRunning are the weekly usage reserve (PRD
 	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
@@ -150,7 +171,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		slog.Error("get user settings", "error", err)
 		return userSettingsDTO{}, err
 	}
-	pins, leadCodexPin, err := h.crossCheckPinSettings(r.Context(), userID)
+	pins, leadCodexPin, leadClaudePin, leadClaudeEffort, leadCodexEffort, err := h.crossCheckPinSettings(r.Context(), userID)
 	if err != nil {
 		slog.Error("get cross-check pins", "error", err)
 		return userSettingsDTO{}, err
@@ -209,18 +230,33 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 	// The codex cell's catalog default (issue #3251): the lane default_codex_model wins, then
 	// the lead template's Codex pin read with the pin rows above, then the provider default.
 	catalogDefault := h.codexCatalogDefaultCell(r.Context(), userID, s.DefaultCodexModel, leadCodexPin)
+	taskReviewLane := textPtrValue(s.TaskReviewModel.Valid, s.TaskReviewModel.String)
+	codexTaskReviewLane := textPtrValue(s.CodexTaskReviewModel.Valid, s.CodexTaskReviewModel.String)
+	taskReviewEffort := textPtrValue(s.TaskReviewEffort.Valid, s.TaskReviewEffort.String)
+	codexTaskReviewEffort := textPtrValue(s.CodexTaskReviewEffort.Valid, s.CodexTaskReviewEffort.String)
+	planningModel := textPtrValue(s.PlanningClaudeModel.Valid, s.PlanningClaudeModel.String)
+	planningEffort := textPtrValue(s.PlanningClaudeEffort.Valid, s.PlanningClaudeEffort.String)
+	planningCodexModel := textPtrValue(s.PlanningCodexModel.Valid, s.PlanningCodexModel.String)
+	planningCodexEffort := textPtrValue(s.PlanningCodexEffort.Valid, s.PlanningCodexEffort.String)
 	return userSettingsDTO{
-		VaultAutoReunlock:      settingsAutoReunlock(r),
-		CrossCheckPins:         pins,
-		DefaultModel:           textPtrValue(legacyModel.Valid, legacyModel.String),
-		DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
-		DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
-		DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
-		DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
-		JudgeModel:             judgeLane,
-		CodexJudgeModel:        codexJudgeLane,
-		SummaryModel:           summaryLane,
-		CodexSummaryModel:      codexSummaryLane,
+		VaultAutoReunlock:     settingsAutoReunlock(r),
+		CrossCheckPins:        pins,
+		DefaultModel:          textPtrValue(legacyModel.Valid, legacyModel.String),
+		DefaultClaudeModel:    textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+		DefaultCodexModel:     textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+		DefaultEffort:         textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+		DefaultCodexEffort:    textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
+		JudgeModel:            judgeLane,
+		CodexJudgeModel:       codexJudgeLane,
+		SummaryModel:          summaryLane,
+		CodexSummaryModel:     codexSummaryLane,
+		TaskReviewModel:       taskReviewLane,
+		CodexTaskReviewModel:  codexTaskReviewLane,
+		TaskReviewModels:      taskReviewModelCells(taskReviewLane, codexTaskReviewLane),
+		TaskReviewEffort:      taskReviewEffort,
+		CodexTaskReviewEffort: codexTaskReviewEffort,
+		TaskReviewEfforts: taskReviewEffortCells(taskReviewEffort, codexTaskReviewEffort,
+			textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String), textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String)),
 		Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 		MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
 		NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
@@ -242,11 +278,39 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 			textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
 			textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
 			catalogDefault),
+		PlanningCodexModel:   planningCodexModel,
+		PlanningCodexEffort:  planningCodexEffort,
+		PlanningClaudeModel:  planningModel,
+		PlanningClaudeEffort: planningEffort,
+		PlanningModels: planningModelCells(planningModel,
+			textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
+			textPtrValue(leadClaudePin.Valid, leadClaudePin.String), planningCodexModel,
+			textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
+			textPtrValue(leadCodexPin.Valid, leadCodexPin.String)),
+		PlanningEfforts: []apitypes.EffortSettingCellDTO{
+			planningEffortCellFor(workersvc.HarnessClaude, planningEffort, s.DefaultEffort, leadClaudeEffort),
+			planningEffortCellFor(workersvc.HarnessCodex, planningCodexEffort, s.DefaultCodexEffort, leadCodexEffort),
+		},
 		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 		CodexAccountMode:          codexMode,
 		HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
 	}, nil
+}
+
+// planningEffortCellFor composes the same per-harness lead and planning resolutions as
+// claim assembly and the effective view, including the selected lead template's effort tier.
+func planningEffortCellFor(harness workersvc.Harness, planning *string, userEffort, rawTemplateEffort pgtype.Text) apitypes.EffortSettingCellDTO {
+	var template pgtype.Text
+	if rawTemplateEffort.Valid && agenttmpl.IsEffortLevel(rawTemplateEffort.String) {
+		template = rawTemplateEffort
+	}
+	effort, source := workersvc.LeadEffortWithTemplate(harness, userEffort, template)
+	lead := workersvc.LeadPrediction{
+		Harness: harness, UserEffort: textPtrValue(userEffort.Valid, userEffort.String),
+		TemplateEffort: textPtrValue(template.Valid, template.String), Effort: effort, EffortSource: source,
+	}
+	return planningEffortCellFromOrdinary(planning, leadEffortSettingCell(string(harness), lead))
 }
 
 // GetMySettings returns the current user's own settings. Session-authenticated
@@ -317,10 +381,18 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		CodexJudgeModel    json.RawMessage `json:"codex_judge_model"`
 		SummaryModel       json.RawMessage `json:"summary_model"`
 		CodexSummaryModel  json.RawMessage `json:"codex_summary_model"`
-		Theme              json.RawMessage `json:"theme"`
-		MrReworkEnabled    json.RawMessage `json:"mr_rework_enabled"`
-		NowSummaryEnabled  json.RawMessage `json:"now_summary_enabled"`
-		SidebarTokenIds    json.RawMessage `json:"sidebar_token_ids"`
+		// task_review_model / codex_task_review_model (PRD #1570): the handoff review model per
+		// harness, same absent/null/value tri-state. task_review_models is read-only.
+		TaskReviewModel      json.RawMessage `json:"task_review_model"`
+		CodexTaskReviewModel json.RawMessage `json:"codex_task_review_model"`
+		// task_review_effort / codex_task_review_effort: the review effort per harness, same
+		// tri-state. task_review_efforts is read-only.
+		TaskReviewEffort      json.RawMessage `json:"task_review_effort"`
+		CodexTaskReviewEffort json.RawMessage `json:"codex_task_review_effort"`
+		Theme                 json.RawMessage `json:"theme"`
+		MrReworkEnabled       json.RawMessage `json:"mr_rework_enabled"`
+		NowSummaryEnabled     json.RawMessage `json:"now_summary_enabled"`
+		SidebarTokenIds       json.RawMessage `json:"sidebar_token_ids"`
 		// The linked Codex accounts on the sidebar rail (PRD #1209 M1): same
 		// absent/present tri-state as sidebar_token_ids — absent leaves the stored set,
 		// present (a JSON array, or null) replaces it. Unlike sidebar_token_ids, a
@@ -346,6 +418,13 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		// absent ⇒ column unchanged, null ⇒ clear to NULL ("same as the run"), a
 		// claude|codex value ⇒ validated then set.
 		JudgeRunsOn json.RawMessage `json:"judge_runs_on"`
+		// planning_claude_model / planning_claude_effort (PRD #3252), same absent/null/value
+		// tri-state: absent ⇒ unchanged, null or blank ⇒ clear ("Same as the run"), a validated
+		// value ⇒ set. planning_models / planning_efforts are read-only and rejected as unknown.
+		PlanningClaudeModel  json.RawMessage `json:"planning_claude_model"`
+		PlanningClaudeEffort json.RawMessage `json:"planning_claude_effort"`
+		PlanningCodexEffort  json.RawMessage `json:"planning_codex_effort"`
+		PlanningCodexModel   json.RawMessage `json:"planning_codex_model"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -460,6 +539,50 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		codexSummaryVal = v
 	}
 
+	var taskReviewVal pgtype.Text
+	taskReviewPresent := req.TaskReviewModel != nil
+	if taskReviewPresent {
+		v, ferr := decodeTaskReviewModelField(req.TaskReviewModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		taskReviewVal = v
+	}
+
+	var codexTaskReviewVal pgtype.Text
+	codexTaskReviewPresent := req.CodexTaskReviewModel != nil
+	if codexTaskReviewPresent {
+		v, ferr := decodeCodexTaskReviewModelField(req.CodexTaskReviewModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		codexTaskReviewVal = v
+	}
+
+	var taskReviewEffortVal pgtype.Text
+	taskReviewEffortPresent := req.TaskReviewEffort != nil
+	if taskReviewEffortPresent {
+		v, ferr := decodeDefaultEffortField(req.TaskReviewEffort, "task_review_effort")
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		taskReviewEffortVal = v
+	}
+
+	var codexTaskReviewEffortVal pgtype.Text
+	codexTaskReviewEffortPresent := req.CodexTaskReviewEffort != nil
+	if codexTaskReviewEffortPresent {
+		v, ferr := decodeDefaultEffortField(req.CodexTaskReviewEffort, "codex_task_review_effort")
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		codexTaskReviewEffortVal = v
+	}
+
 	// The legacy theme field (DEPRECATED, PRD #1167) still writes users.theme via
 	// SetUserTheme for the deprecated trio's consistency, AND folds into the
 	// appearance patch below: a valid theme maps into its polarity slot + mode; a
@@ -528,6 +651,50 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		judgeRunsOnVal = v
+	}
+
+	var planningModelVal pgtype.Text
+	planningModelPresent := req.PlanningClaudeModel != nil
+	if planningModelPresent {
+		v, ferr := decodePlanningClaudeModelField(req.PlanningClaudeModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningModelVal = v
+	}
+
+	var planningEffortVal pgtype.Text
+	planningEffortPresent := req.PlanningClaudeEffort != nil
+	if planningEffortPresent {
+		v, ferr := decodePlanningEffortField(req.PlanningClaudeEffort)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningEffortVal = v
+	}
+
+	var planningCodexModelVal pgtype.Text
+	planningCodexModelPresent := req.PlanningCodexModel != nil
+	if planningCodexModelPresent {
+		v, ferr := decodePlanningCodexModelField(req.PlanningCodexModel)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningCodexModelVal = v
+	}
+
+	var planningCodexEffortVal pgtype.Text
+	planningCodexEffortPresent := req.PlanningCodexEffort != nil
+	if planningCodexEffortPresent {
+		v, ferr := decodePlanningCodexEffortField(req.PlanningCodexEffort)
+		if ferr != nil {
+			httpx.Error(w, http.StatusBadRequest, ferr.Message)
+			return
+		}
+		planningCodexEffortVal = v
 	}
 
 	var mrVal pgtype.Bool
@@ -741,6 +908,34 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if planningModelPresent || planningEffortPresent {
+		if _, err := h.q.SetUserPlanningClaude(r.Context(), store.SetUserPlanningClaudeParams{
+			ID:                   user.ID,
+			SetModel:             planningModelPresent,
+			PlanningClaudeModel:  planningModelVal,
+			SetEffort:            planningEffortPresent,
+			PlanningClaudeEffort: planningEffortVal,
+		}); err != nil {
+			slog.Error("set user planning claude", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if planningCodexModelPresent || planningCodexEffortPresent {
+		if _, err := h.q.SetUserPlanningCodex(r.Context(), store.SetUserPlanningCodexParams{
+			ID:                  user.ID,
+			SetModel:            planningCodexModelPresent,
+			PlanningCodexModel:  planningCodexModelVal,
+			SetEffort:           planningCodexEffortPresent,
+			PlanningCodexEffort: planningCodexEffortVal,
+		}); err != nil {
+			slog.Error("set user planning codex", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
 	if judgeRunsOnPresent {
 		if _, err := h.q.SetUserJudgeRunsOn(r.Context(), store.SetUserJudgeRunsOnParams{
 			ID:          user.ID,
@@ -769,6 +964,50 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			CodexSummaryModel: codexSummaryVal,
 		}); err != nil {
 			slog.Error("set user codex summary model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if taskReviewPresent {
+		if _, err := h.q.SetUserTaskReviewModel(r.Context(), store.SetUserTaskReviewModelParams{
+			ID:              user.ID,
+			TaskReviewModel: taskReviewVal,
+		}); err != nil {
+			slog.Error("set user task review model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexTaskReviewPresent {
+		if _, err := h.q.SetUserCodexTaskReviewModel(r.Context(), store.SetUserCodexTaskReviewModelParams{
+			ID:                   user.ID,
+			CodexTaskReviewModel: codexTaskReviewVal,
+		}); err != nil {
+			slog.Error("set user codex task review model", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if taskReviewEffortPresent {
+		if _, err := h.q.SetUserTaskReviewEffort(r.Context(), store.SetUserTaskReviewEffortParams{
+			ID:               user.ID,
+			TaskReviewEffort: taskReviewEffortVal,
+		}); err != nil {
+			slog.Error("set user task review effort", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexTaskReviewEffortPresent {
+		if _, err := h.q.SetUserCodexTaskReviewEffort(r.Context(), store.SetUserCodexTaskReviewEffortParams{
+			ID:                    user.ID,
+			CodexTaskReviewEffort: codexTaskReviewEffortVal,
+		}); err != nil {
+			slog.Error("set user codex task review effort", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

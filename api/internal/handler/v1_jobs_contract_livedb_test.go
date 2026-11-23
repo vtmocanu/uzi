@@ -42,6 +42,10 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 	readOnly := v1MintProductToken(t, e.h.q, owner, product, []string{producttoken.ScopeJobsRead}, nil)
 	runOnly := v1MintProductToken(t, e.h.q, owner, product, []string{producttoken.ScopeJobsRun}, nil)
 	unknown := v1UnknownProductToken(t)
+	// Issue #4541: a separate provider-sourced user for the create 409 (the shared owner stays
+	// vendor-sourced, so the other create cases are unaffected).
+	provUser, provTok := e.user()
+	e.selectProvider(provUser)
 
 	// Issue #1992: a production router over a CLOSED pool, so RequireV1Caller's token lookup
 	// fails with a store error (not pgx.ErrNoRows) and answers the auth 503 auth_unavailable on
@@ -108,6 +112,7 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "create 422", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research"}`, want: 422},
 		{name: "create 422 unknown type", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"x","prompt":"p"}`, want: 422},
 		{name: "create 422 egress", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":""}`, want: 422},
+		{name: "create 409 provider lane", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: provTok, body: v1MinimalJob, want: 409},
 		{name: "create 404 unknown egress profile", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":"no-such-list"}`, want: 404},
 		{name: "create 503 isolated lane unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: fmt.Sprintf(`{"type":"research","prompt":"p","egress_profile":%q}`, e.siteList()), want: 503,
 			pre: func() { e.enableLane(false) }},

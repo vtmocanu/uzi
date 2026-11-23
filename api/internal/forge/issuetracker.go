@@ -113,6 +113,39 @@ type ListIssuesOptions struct {
 	Limit int
 }
 
+// ColumnMove is one board move of an issue, carrying both the target column and
+// the label delta a label-backed issue tracker applies to reach it.
+type ColumnMove struct {
+	// Column is the target board column label. The empty string is the implicit
+	// Open column.
+	Column string
+	// Ensure is the labels to ensure exist before the move; empty means no
+	// EnsureLabels call is made.
+	Ensure []Label
+	// Add and Remove are the label delta, exactly board.PlanLabelMove's output.
+	Add    []string
+	Remove []string
+	// Reopen is set only by an explicit reopen of a closed card. Any other
+	// move (an automatic one, or a drag of a card the cache shows open) leaves it
+	// false, so an issue tracker that keeps its own resolved state refuses to
+	// write over an issue a person resolved there. A
+	// label-backed forge ignores it: a forge label move never reopens.
+	Reopen bool
+}
+
+// MoveByLabels is the label-backed implementation of IssueTracker.MoveToColumn:
+// EnsureLabels (only when move.Ensure is non-empty), then exactly one
+// UpdateIssueLabels with move.Add and move.Remove passed through untouched, so a
+// nil slice stays nil.
+func MoveByLabels(ctx context.Context, tr IssueTracker, projectID, issueIID int64, move ColumnMove) error {
+	if len(move.Ensure) > 0 {
+		if err := tr.EnsureLabels(ctx, projectID, move.Ensure); err != nil {
+			return err
+		}
+	}
+	return tr.UpdateIssueLabels(ctx, projectID, issueIID, move.Add, move.Remove)
+}
+
 // IssueTracker is the issue-side half of the driver contract: issues, labels,
 // comments and issue state. It is split out of Forge (PRD #4173) so a later phase
 // can let a non-forge issue tracker implement it without the code-host methods.
@@ -140,6 +173,11 @@ type IssueTracker interface {
 	// GitLab this is atomic (a single add_labels/remove_labels update);
 	// single-column enforcement relies on that atomicity.
 	UpdateIssueLabels(ctx context.Context, projectID, issueIID int64, add, remove []string) error
+	// MoveToColumn moves an issue to the board column move.Column. A label-backed
+	// issue tracker (GitLab, GitHub, Forgejo) applies the label delta in move via
+	// MoveByLabels; an issue tracker with its own workflow field (YouTrack) writes
+	// the value mapped to move.Column and ignores the label delta.
+	MoveToColumn(ctx context.Context, projectID, issueIID int64, move ColumnMove) error
 	// UpdateIssueDescription replaces an issue's description wholesale (PRD #72 M5).
 	// It is a read-modify-write from the CALLER's point of view — the caller reads
 	// via GetIssue, rewrites, and writes back — because no forge here offers a patch

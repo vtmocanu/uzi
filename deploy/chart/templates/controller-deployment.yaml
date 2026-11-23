@@ -259,6 +259,17 @@ spec:
             - name: UZI_WORKER_GO_MAXPROCS
               value: {{ $goMaxProcs | quote }}
             {{- end }}
+            {{- /* Per-run cache cap (#4576): strings relayed verbatim, only when nonempty. */}}
+            {{- $runCacheCapMaxBytes := include "uzi.workerRunCacheCapSetting" (dict "name" "runCacheCapMaxBytes" "root" .) }}
+            {{- if $runCacheCapMaxBytes }}
+            - name: UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES
+              value: {{ $runCacheCapMaxBytes | quote }}
+            {{- end }}
+            {{- $runCacheCapFraction := include "uzi.workerRunCacheCapSetting" (dict "name" "runCacheCapFraction" "root" .) }}
+            {{- if $runCacheCapFraction }}
+            - name: UZI_WORKER_RUN_CACHE_CAP_FRACTION
+              value: {{ $runCacheCapFraction | quote }}
+            {{- end }}
             - name: UZI_WORKER_EPOCH_SCRATCH_DELETION
               value: {{ .Values.workers.epochReclaim.scratchDeletion | quote }}
             - name: UZI_WORKER_RETIRE_SCRATCH_OUTCOMES

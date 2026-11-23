@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -64,15 +65,17 @@ type agentSourceStatusDTO struct {
 }
 
 type agentSourceRoleDTO struct {
-	Name        string   `json:"name"`
-	OK          bool     `json:"ok"`
-	Reason      string   `json:"reason,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	ClaudeModel string   `json:"claude_model"`
-	CodexModel  string   `json:"codex_model"`
-	Tools       []string `json:"tools,omitempty"`
-	PromptBody  string   `json:"prompt_body,omitempty"`
+	Name        string `json:"name"`
+	OK          bool   `json:"ok"`
+	Reason      string `json:"reason,omitempty"`
+	Description string `json:"description,omitempty"`
+	Model       string `json:"model,omitempty"`
+	ClaudeModel string `json:"claude_model"`
+	CodexModel  string `json:"codex_model"`
+	// Effort is the staged role's Claude-family effort pin (PRD #3258 N8), "" for none.
+	Effort     string   `json:"effort"`
+	Tools      []string `json:"tools,omitempty"`
+	PromptBody string   `json:"prompt_body,omitempty"`
 	// BodySanitized is true when display-sanitization actually altered PromptBody, i.e.
 	// the raw body carries hidden control/bidi/format characters that the sanitized
 	// preview drops. The web approval surface flags this so the admin knows the preview
@@ -384,8 +387,12 @@ func stagedToDTO(staged store.AgentSourceStaged, lastAppliedSHA string) *agentSo
 			Model:       termsafe.CellText(role.Model),
 			ClaudeModel: termsafe.CellText(def.Model),
 			CodexModel:  termsafe.CellText(def.CodexModel),
-			Tools:       role.Tools,
-			PromptBody:  sanitizedBody,
+			// Effort is closed-set at parse time (one of the five levels or ""). The panel
+			// projects it through the same ValidateEffort apply uses (storeColumns), so a
+			// tampered snapshot shows exactly what Approve would store, never other text.
+			Effort:     panelEffort(def.Effort),
+			Tools:      role.Tools,
+			PromptBody: sanitizedBody,
 			// body_sanitized: true only when sanitization changed the body, i.e. the raw
 			// body differs from the preview shown. Apply still writes the RAW body.
 			BodySanitized: sanitizedBody != role.PromptBody,
@@ -426,4 +433,15 @@ func parseSyncCounts(raw string) (agentSourceCountsDTO, bool) {
 		return agentSourceCountsDTO{}, false
 	}
 	return agentSourceCountsDTO{Staged: m["staged"], Changed: m["changed"], Failed: m["failed"]}, true
+}
+
+// panelEffort is what the staged review shows for a role's Claude effort: the value
+// agentsource's storeColumns would write (ValidateEffort trims, then requires an exact
+// level), or "" when it would refuse it (Apply then fails the whole snapshot closed).
+func panelEffort(raw string) string {
+	e, err := agenttmpl.ValidateEffort(raw)
+	if err != nil {
+		return ""
+	}
+	return e
 }

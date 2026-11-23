@@ -31,6 +31,10 @@ func TestSettingsSetAndResetPatches(t *testing.T) {
 		{"codex judge", []string{"set", "judge-model", "--harness", "codex", "j"}, map[string]*string{"codex_judge_model": msPtr("j")}},
 		{"claude summary", []string{"set", "summary-model", "--harness", "claude", "s"}, map[string]*string{"summary_model": msPtr("s")}},
 		{"codex summary", []string{"set", "summary-model", "--harness", "codex", "s"}, map[string]*string{"codex_summary_model": msPtr("s")}},
+		{"claude task review", []string{"set", "task-review-model", "--harness", "claude", "t"}, map[string]*string{"task_review_model": msPtr("t")}},
+		{"codex task review", []string{"set", "task-review-model", "--harness", "codex", "gpt-6.1-sol"}, map[string]*string{"codex_task_review_model": msPtr("gpt-6.1-sol")}},
+		{"claude task review effort", []string{"set", "task-review-effort", "--harness", "claude", "high"}, map[string]*string{"task_review_effort": msPtr("high")}},
+		{"codex task review effort runtime", []string{"set", "task-review-effort", "--harness", "codex", "runtime"}, map[string]*string{"codex_task_review_effort": msPtr("runtime")}},
 		{"judge runs on claude", []string{"set", "judge-runs-on", "claude"}, map[string]*string{"judge_runs_on": msPtr("claude")}},
 		{"judge runs on codex", []string{"set", "judge-runs-on", "codex"}, map[string]*string{"judge_runs_on": msPtr("codex")}},
 		{"judge runs on same-as-run", []string{"set", "judge-runs-on", "same-as-run"}, map[string]*string{"judge_runs_on": nil}},
@@ -42,6 +46,10 @@ func TestSettingsSetAndResetPatches(t *testing.T) {
 		{"reset codex judge", []string{"reset", "judge-model", "--harness", "codex"}, map[string]*string{"codex_judge_model": nil}},
 		{"reset claude summary", []string{"reset", "summary-model", "--harness", "claude"}, map[string]*string{"summary_model": nil}},
 		{"reset codex summary", []string{"reset", "summary-model", "--harness", "codex"}, map[string]*string{"codex_summary_model": nil}},
+		{"reset claude task review", []string{"reset", "task-review-model", "--harness", "claude"}, map[string]*string{"task_review_model": nil}},
+		{"reset codex task review", []string{"reset", "task-review-model", "--harness", "codex"}, map[string]*string{"codex_task_review_model": nil}},
+		{"reset claude task review effort", []string{"reset", "task-review-effort", "--harness", "claude"}, map[string]*string{"task_review_effort": nil}},
+		{"reset codex task review effort", []string{"reset", "task-review-effort", "--harness", "codex"}, map[string]*string{"codex_task_review_effort": nil}},
 		{"reset judge runs on", []string{"reset", "judge-runs-on"}, map[string]*string{"judge_runs_on": nil}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

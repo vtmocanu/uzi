@@ -946,6 +946,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
+	{"POST", "/api/worker/runs/{id}/phase-switch-hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/repo-agent-source-hold", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
@@ -1143,6 +1144,9 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	// PRD #4173 M4: the repo link reads the issue tracker (token, projects, tags).
 	{"PUT", "/api/repos/{id}/issue-tracker-link", limForge},
+	// PRD #4173 M5: the State mapping reads the issue tracker's States on both verbs.
+	{"GET", "/api/repos/{id}/issue-tracker-link/states", limForge},
+	{"PUT", "/api/repos/{id}/issue-tracker-link/states", limForge},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	{"PUT", "/api/repos/{id}/env/{name}", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as

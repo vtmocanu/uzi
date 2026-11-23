@@ -212,7 +212,7 @@ func TestSettingsCatalogDefaultAsksTheWorkersCodexModel(t *testing.T) {
 func TestCrossCheckPinSettingsReturnsLeadCodexPin(t *testing.T) {
 	db := &leadPinSettingsDB{fakeSettingsDB: &fakeSettingsDB{}, pin: pgtype.Text{String: "gpt-6-astra", Valid: true}}
 	h := &Handler{q: store.New(db)}
-	cells, pin, err := h.crossCheckPinSettings(context.Background(), uuid.New())
+	cells, pin, _, _, _, err := h.crossCheckPinSettings(context.Background(), uuid.New())
 	if err != nil || len(cells) != 4 {
 		t.Fatalf("cells=%d err=%v", len(cells), err)
 	}

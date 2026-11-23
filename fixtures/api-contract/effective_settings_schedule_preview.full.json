@@ -133,7 +133,19 @@
         ]
       },
       "refusal": "x",
-      "refusal_detail": "x"
+      "refusal_detail": "x",
+      "plan_phase": {
+        "model": "x",
+        "effort": "x",
+        "model_source": "x",
+        "effort_source": "x"
+      }
     }
-  ]
+  ],
+  "plan_phase": {
+    "model": "x",
+    "effort": "x",
+    "model_source": "x",
+    "effort_source": "x"
+  }
 }

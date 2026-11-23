@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -82,7 +83,7 @@ func TestLinkedFireWithoutSourcesFailsClosed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			h, _, _ := linkedHarness(false)
 			h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 1}}
-			_, err := h.sched.fireOne(context.Background(), sched(h))
+			_, err := h.sched.fireOne(context.Background(), sched(h), false)
 			if err == nil {
 				t.Fatal("a linked repo with no resolver fired")
 			}
@@ -111,17 +112,61 @@ func TestLinkedProposalDigestWithoutSourcesIsSkipped(t *testing.T) {
 	}
 }
 
-func TestLinkedSelfImproveIsSkippedWithoutAnyIssueWrite(t *testing.T) {
-	h, tr, _ := linkedHarness(true)
-	out, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule())
+// PRD #4173 M5 (converted from TestLinkedSelfImproveIsSkippedWithoutAnyIssueWrite, the M4
+// refusal): the tracking issue is created through the resolver's issue side, never the
+// forge, carries only the tracking label (no eligibility tag), and the cycle starts.
+func TestLinkedSelfImproveFilesTheTrackingIssueThroughTheResolver(t *testing.T) {
+	h, tr, src := linkedHarness(true)
+	tr.createdIID = 501
+	out, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipConfigNotSupported {
-		t.Fatalf("out = %+v, want one config_not_supported skip", out)
+	if len(out.Started) != 1 || len(h.runs.selfImprove) != 1 {
+		t.Fatalf("out = %+v, runs = %d, want one started self_improve run", out, len(h.runs.selfImprove))
 	}
-	if h.fb.f.createCount != 0 || h.fb.f.listCount != 0 || tr.createCount != 0 || tr.listCount != 0 || len(h.runs.selfImprove) != 0 {
-		t.Fatal("self_improve touched an issue tracker or started a run on a linked repo")
+	if tr.listCount != 1 || tr.createCount != 1 || h.fb.f.createCount != 0 || h.fb.f.listCount != 0 {
+		t.Fatalf("resolver list/create = %d/%d, forge list/create = %d/%d, want 1/1 and 0/0",
+			tr.listCount, tr.createCount, h.fb.f.listCount, h.fb.f.createCount)
+	}
+	if len(tr.createdLabels) != 1 || tr.createdLabels[0] != SelfImproveTrackingLabel {
+		t.Fatalf("tracking issue labels = %v, want only %q", tr.createdLabels, SelfImproveTrackingLabel)
+	}
+	if len(src.users) == 0 || src.users[0] != h.owner || src.repos[0] != h.repoID {
+		t.Fatalf("the resolver is bound by owner and repo row, got %v %v", src.users, src.repos)
+	}
+}
+
+// PRD #4173 M5 review: the tracking label is uzi's own marker. When it is also the link's
+// eligibility name the issue would be created eligible, so the cycle is refused before the
+// forge, the resolver, the tracking lookup and any write, and no run starts. A cycle whose
+// names differ (the control) still files the tracking issue.
+func TestLinkedSelfImproveRefusesWhenTheTrackingLabelIsTheEligibilityName(t *testing.T) {
+	h, tr, src := linkedHarness(true)
+	h.st.repoRow.EligibilityTagName = pgtype.Text{String: SelfImproveTrackingLabel, Valid: true}
+	_, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule(), false)
+	if !errors.Is(err, issuesource.ErrMarkerConfersEligibility) {
+		t.Fatalf("err = %v, want ErrMarkerConfersEligibility", err)
+	}
+	if errors.Is(err, errBadConfig) {
+		t.Fatalf("err = %v: the refusal must be transient so the cycle fires once a name changes", err)
+	}
+	if tr.listCount != 0 || tr.createCount != 0 || h.fb.f.listCount != 0 || h.fb.f.createCount != 0 || len(src.users) != 0 {
+		t.Fatalf("an issue tracker or forge call was made before the refusal: resolver list/create = %d/%d, forge = %d/%d, resolver binds = %d",
+			tr.listCount, tr.createCount, h.fb.f.listCount, h.fb.f.createCount, len(src.users))
+	}
+	if len(h.runs.selfImprove) != 0 {
+		t.Fatalf("a self_improve run started: %d", len(h.runs.selfImprove))
+	}
+}
+
+func TestLinkedSelfImproveWithoutSourcesFailsClosedAndNeverTouchesTheForge(t *testing.T) {
+	h, _, _ := linkedHarness(false)
+	if _, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule(), false); err == nil {
+		t.Fatal("a linked repo with no resolver fired")
+	}
+	if h.fb.f.createCount != 0 || h.fb.f.listCount != 0 || len(h.runs.selfImprove) != 0 {
+		t.Fatal("self_improve fell back to the forge or started a run on an unresolved linked repo")
 	}
 }
 
@@ -186,7 +231,7 @@ func TestLinkedFireSweepWithNoStoredTagIsABadConfigNotAForgeLabel(t *testing.T) 
 	h.st.repoRow.EligibilityTagName = pgtype.Text{}
 	sched := h.sweepSchedule(pgtype.Int4{})
 	sched.Labels = nil
-	if _, err := h.sched.fireSweep(context.Background(), sched); !errors.Is(err, errBadConfig) {
+	if _, err := h.sched.fireSweep(context.Background(), sched, false); !errors.Is(err, errBadConfig) {
 		t.Fatalf("err = %v, want errBadConfig", err)
 	}
 }

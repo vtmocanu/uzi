@@ -388,6 +388,12 @@ The Anthropic token's default option reads `Default · worker's token (worker
 binding)`, and the auto-rework inherit option reads `Default · on (your
 setting)` or `Default · off (your setting)`.
 
+A model a schedule pins also applies while a Claude run plans: it wins over
+your [planning model](./worker-model.md#planning-model-and-effort) in both the
+planning and implementation phases, so a pinned schedule never switches models
+at plan approval. A schedule left on **Default** uses your planning setting
+for the plan phase and your worker model afterwards.
+
 Schedule rows and job catalog cards show a model chip: `model: default`, or
 `model: <value> · pinned` when the schedule pins a model. Rows add `+ agents`
 when the subagent toggle is on. Your own schedule rows with no model pin also
@@ -558,7 +564,13 @@ refusal is recorded as a `no_usable_credential` skip.
 | `self_improve` | As above, and a Claude run spends the credential of your Judge binding, not a worker's and not a per-schedule override. The credential source is `token_override` for a pinned Judge token, `auto_selection` for an automatic Judge binding (an empty pool falls back to your default, shown as `owner_default`), and `owner_default` for the default binding. The notes carry `token_fixed` unless the binding is automatic. No token id or label is shown. |
 
 `worker_model`, `worker_effort`, `credential` and `subagents` are those of
-the chosen harness. A Codex run accepts only the curated model pins, so a
+the chosen harness. On a Claude fire where your
+[planning settings](./worker-model.md#planning-model-and-effort) apply, the
+preview also carries `plan_phase` (`model`, `effort`, `model_source`,
+`effort_source`, each omitted when absent), per alternative when the harness is
+chosen at creation; see [Effective
+settings](./configuration.md#where-each-value-comes-from). A schedule's model
+pin is frozen into both phases, so the planning model then yields to it. A Codex run accepts only the curated model pins, so a
 model pin it cannot run is not used: the cell shows the default model, the
 pin appears as `ignored` (with source `schedule_pin`) and the notes carry
 `schedule_pin_ignored`.
@@ -765,11 +777,18 @@ exceed `max_issues` once backfill walks past a skip), which ones
 - `description_too_large` — the composed run instruction (issue body
   plus any [guidance](#guidance)) exceeds the size limit.
 - `consumer_gate_busy`: a sweep had already started work before a candidate's
-  repository gate was busy. The partial fire stops and is consumed. A one-time
-  sweep does not retry it automatically; start that issue manually or explicitly
-  re-fire the sweep as a new fire. If nothing had started, the schedule stays
-  armed and retries instead. Durable partial-fire progress is deferred to
-  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
+  repository gate was busy. A **recurring** sweep records the skip, stops and
+  advances; the issue is considered again at the next fire. A **one-time**
+  sweep fired by the scheduler is not advanced: it stays active and due and the
+  next tick resumes the same fire. Each run the fire starts is recorded in a
+  durable per-fire ledger, so the retry never re-starts an issue the fire
+  already started (even if that run finished, was deleted, or the issue left the
+  selector) and never exceeds the fire's original cap; it only fills the
+  remaining slots. `last_fire` shows the progress while it waits.
+  `run-now` is a distinct manual fire: it records no progress and
+  never advances. If nothing had started, the schedule stays armed and retries
+  as before. See [ADR-4007](../adr/4007-terminal-preservation.md)
+  (T3a, [#4512](https://github.com/vtmocanu/uzi/issues/4512)).
 - `fetch_failed` — a transient forge or database error while checking
   a sweep candidate. The same underlying error is handled differently
   by target: on a **pinned issue**, it's transient and the fire retries
@@ -813,8 +832,12 @@ exceed `max_issues` once backfill walks past a skip), which ones
   Recurring schedules advance and re-fire next cadence. A one-time schedule
   with a disabled stored pin/override is **held** before any start: due,
   un-advanced, with the skip recorded as its last fire, until re-enable or
-  a changed stored choice. A disable after a partial one-time sweep start
-  stops the scan and advances instead. A one-time single issue whose label
+  a changed stored choice. A disable seen before a tick starts anything,
+  including on a resumed partial one-time sweep, holds the fire the same way;
+  once re-enabled it resumes only its remaining slots from the per-fire
+  ledger. A disable that lands after the current tick has already started a
+  run stops the scan, records the skip and advances, dropping the remaining
+  slots. A one-time single issue whose label
   selects a disabled harness holds like a pin. On an unpinned label-selected
   sweep, harness disable is a per-candidate skip and scanning continues
   within the caps; stored-pin/override rules still apply. Missing credentials
@@ -938,7 +961,14 @@ last fire without advancing, so it can show a `last_fire` while still due. A
 `run-now` fire reports its own outcome in the response without
 touching `last_fire` at all, since a manual fire must not disturb the
 cadence. A schedule that has never fired and was never held that way
-reads `last_fire: null`.
+reads `last_fire: null`. A scheduled one-time sweep held partway (a busy
+repository gate, a capacity or credential hold) also writes `last_fire` as a
+progress summary while it stays due; after a crash, a failed advance or a
+shutdown outside the repository-gate wait nothing is written until the next
+tick's write (a shutdown during that wait counts as a busy gate and writes the
+summary). The summary names
+the runs the fire has started so far, and a named run may have since been
+deleted (the ledger keeps its run id, title and URL).
 
 ### Recent fires
 
@@ -956,6 +986,16 @@ panel note), not an examined-0 one. The parked and transient paths write nothing
 either field, and `run-now` records nothing in either. A one-time schedule
 held on a disabled credential appends its hold once, not once per tick,
 because the hold only writes when the stored summary differs.
+
+A partially completed one-time sweep fire does not append to `recent_fires`
+while it waits to resume; the entry is appended once, when the fire completes.
+Changing the configuration of a pending one-time schedule (a change requires
+a future `run_at`) starts a new occurrence with the full cap; that is the
+owner's explicit re-fire. Pausing and resuming it keeps the same occurrence
+and its progress. Rollback limitation: an older scheduler binary ignores the per-fire
+ledger, so while it runs it can exceed the cap when resuming a partial one-time
+fire and advance normally. There is no end-to-end (compose) coverage of the
+scheduled one-time retry; it is covered by LiveDB and unit tests.
 
 Skips count, so a schedule-wide skip also takes a slot: the `schedules_paused`
 skip recorded on every tick while all schedules are paused, or a persistent

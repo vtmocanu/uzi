@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   applySubagentModelOverride,
   assembleAgents,
+  fillSubagentEffort,
   LEAD_NAME_RE,
   planTurnSubagents,
   selectSubagents,
@@ -262,6 +263,62 @@ describe("subagentsFromTemplates (PRD #37 repo source)", () => {
     const inherit = subagentsFromTemplates([repoAuditor], new Set());
     assert.strictEqual(inherit.auditor!.tools, undefined, "inherit-all is not materialized into an allowlist");
     assert.strictEqual(inherit.auditor!.prompt, withNudge("audit body"), "inherit-all subagent's prompt still carries the nudge");
+  });
+});
+
+describe("issue #3258: template effort on Claude subagents", () => {
+  const pinnedA: AgentTemplate = { name: "arch", description: "a", prompt_body: "A body", effort: "high" };
+  const unpinnedB: AgentTemplate = { name: "bee", description: "b", prompt_body: "B body" };
+
+  it("a pinned subagent keeps its pin and an unpinned one follows the run effort", () => {
+    const { subagents } = assembleAgents([pinnedA, unpinnedB]);
+    const filled = fillSubagentEffort(subagents, "medium");
+    assert.strictEqual(filled.arch?.effort, "high");
+    assert.strictEqual(filled.bee?.effort, "medium");
+  });
+
+  it("under the Runtime default (no lead effort) a pin survives and an unpinned subagent carries no effort key", () => {
+    const { subagents } = assembleAgents([pinnedA, unpinnedB]);
+    const filled = fillSubagentEffort(subagents, undefined);
+    assert.strictEqual(filled.arch?.effort, "high");
+    assert.ok(!("effort" in filled.bee!), "no effort key is added when the lead runs on the Runtime default");
+  });
+
+  it("does not mutate the input roster or its definitions", () => {
+    const { subagents } = assembleAgents([pinnedA, unpinnedB]);
+    const beeBefore = subagents.bee;
+    const filled = fillSubagentEffort(subagents, "low");
+    assert.notStrictEqual(filled, subagents);
+    assert.notStrictEqual(filled.bee, beeBefore);
+    assert.ok(!("effort" in subagents.bee!), "the assembled definition stays unfilled");
+    assert.strictEqual(subagents.arch?.effort, "high");
+  });
+
+  it("the schedule model override keeps each subagent's effort as is", () => {
+    const { subagents } = assembleAgents([pinnedA, unpinnedB]);
+    const filled = fillSubagentEffort(subagents, "medium");
+    applySubagentModelOverride(filled, "sonnet");
+    assert.strictEqual(filled.arch?.model, "sonnet");
+    assert.strictEqual(filled.arch?.effort, "high");
+    assert.strictEqual(filled.bee?.effort, "medium");
+  });
+
+  it("projects each of the five levels", () => {
+    for (const level of ["low", "medium", "high", "xhigh", "max"]) {
+      const { subagents } = assembleAgents([{ ...unpinnedB, effort: level }]);
+      assert.strictEqual(subagents.bee?.effort, level);
+    }
+  });
+
+  it("never projects a hostile or out-of-contract pin", () => {
+    for (const bad of ["HIGH", "runtime", "ultra", " high", "", "high\n"]) {
+      const own = assembleAgents([{ ...pinnedA, effort: bad }]).subagents;
+      assert.ok(!("effort" in own.arch!), `own path ignores ${JSON.stringify(bad)}`);
+      const repo = subagentsFromTemplates([{ ...pinnedA, effort: bad }], new Set());
+      assert.ok(!("effort" in repo.arch!), `repo path ignores ${JSON.stringify(bad)}`);
+    }
+    const nulled = assembleAgents([{ ...pinnedA, effort: null }]).subagents;
+    assert.ok(!("effort" in nulled.arch!), "a null pin is no pin");
   });
 });
 

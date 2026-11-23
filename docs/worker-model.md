@@ -166,6 +166,131 @@ choice is stored on the run and shown with the source **this run**
 - Successor runs do not inherit the choice, and chat and Slack start cards
   carry no model or effort.
 
+## Planning model and effort
+
+Claude and Codex runs can plan on one model and effort, then implement on
+another: for example, Codex can plan on `gpt-6-astra` at `high` and implement
+on `gpt-6.1-sol` at `medium`. Each harness retains its own optional per-user
+planning model and effort. Left empty, they read **Same as the run**
+and the run uses one model and effort throughout, as before.
+
+- **Set them in the web app.** **Settings → Run defaults → Planning** has a
+  model picker and an effort picker for each usable harness; the same
+  **Save planning defaults** button saves the changed Claude and Codex fields
+  together. The intro on the card explains the two phases. The empty option reads like
+  `Same as the run · <model> (<where it comes from>)`.
+- **Or through the API.** `PUT /api/me/settings` takes a planning model and a
+  planning effort per harness: `planning_claude_model`,
+  `planning_claude_effort`, `planning_codex_model` and `planning_codex_effort`
+  (absent leaves it unchanged, `null` clears it, a value sets it). That
+  endpoint is cookie-only; there is no CLI setter for planning settings yet. `uzi settings get` shows them (see [the CLI
+  reference](./cli.md#effective-settings)).
+- **Planning effort** takes `low`, `medium`, `high`, `xhigh` or `max`, with no
+  runtime option; see [Reasoning effort](./worker-effort.md#planning-effort).
+
+### What counts as planning
+
+The planning pair applies to the lead's turns **before the plan is approved**:
+the first plan, clarification rounds, revisions, and a re-plan after a later
+claim (for example a resumed run that plans again). After approval the run
+switches to its own model and effort, in the same session and conversation,
+so the plan and everything said so far carry over. A re-plan switches back to
+the planning pair for the new claim; each claim fixes its pair when the worker
+claims the run, and a settings change takes effect at the next claim.
+
+It applies to Claude and Codex lead-lane runs: issue, CI-fix, self-improve,
+prompt, MR-rework and task runs. Planning stays on the run's harness. Review,
+chat, judge, cross-check, job and egress-bound runs keep their existing lanes.
+
+- **Frozen choices win in both phases.** A model chosen when starting the run
+  or pinned by a [schedule](./scheduling.md), and an effort chosen at run start,
+  apply to planning and implementation alike. Model and effort are decided
+  independently: a frozen model still allows a planning effort, and vice versa.
+- **Task (handoff) runs plan first.** A [task run](./cli.md) started with
+  `uzi handoff` also has a plan turn before it implements, so with a planning
+  model set it spends that turn on the planning pair. That turn costs as
+  the planning model prices it, so a strong planning model makes each handoff
+  more expensive than the same handoff on your worker model alone.
+- **An empty Claude worker-model lane uses the template model.** With no worker model
+  and the built-in `lead` template (`opus`), implementation uses the
+  template's model, so the switch is from your planning model to `opus`.
+
+### Unsupported configuration
+
+A Claude planning model needs an implementation model to switch to. If you set a
+planning model but there is no worker model and no template model, the run is
+refused before any turn with "unsupported phase configuration": set a worker
+model or clear the planning model. The refusal applies to every start or
+resume, whether the run is new, already approved or resumed at its plan gate,
+even if you would simply approve. It does not apply to provider runs.
+
+### Which workers run it
+
+Deploy the API before the workers. Separate planning settings require
+`claude_phase_models_v1` for Claude or `codex_phase_models_v1` for Codex.
+An effective custom Codex planning model also requires `codex_custom_model_v1`;
+a curated planning model or effort-only setting does not add that requirement.
+A curated frozen run model wins in both phases, so a saved custom planning
+model does not add a custom-model requirement in that case.
+Older workers leave the run queued. For otherwise eligible runs with curated
+roots, missing phase support reads **no worker supporting separate planning
+settings is online**. A custom effective root can show the custom-model health
+reason when no worker supports both requirements;
+see [Hosted workers](./hosted-workers.md#my-run-says-no-worker-supporting-separate-planning-settings-is-online).
+A run that was queued on an incapable worker may stay with it for about two
+minutes before another capable worker can take it.
+
+### The switch is verified
+
+For Claude, before the first turn after approval, the worker withholds the
+prompt and asks the runtime which model and effort it has applied, then
+compares them with
+a table characterized on the pinned CLI. Only a match sends the prompt.
+
+| Alias | Expected model | Effort when none is sent |
+| --- | --- | --- |
+| `opus` | `claude-opus-5-5` | `medium` |
+| `sonnet` | `claude-sonnet-5-5` | `medium` |
+| `haiku` | `claude-haiku-5-5` | `medium` |
+| `fable` | `claude-fable-5-2` | `medium` |
+
+A full model id, or one mapped by a provider setting, is compared verbatim.
+Anything that cannot be verified holds the run (below); it never implements on
+the planning pair. The same check applies to a reclaim of an approved run and to
+a switch back to planning after a re-plan.
+
+Known limits:
+
+- A provider gateway that rewrites model ids can make a correct switch look
+  like a mismatch and hold the run.
+- The alias table was characterized with a dummy key; alias stability under
+  subscription auth is not separately proven.
+- With no implementation effort sent, the expected effort comes from the model
+  the runtime reports. A provider run holds unless its provider maps the alias
+  (`ANTHROPIC_DEFAULT_<ALIAS>_MODEL`, compared as given) to one of the four
+  characterized model ids.
+- The refusal of a planning model with no implementation model is skipped on
+  provider runs, because the provider map always yields an explicit model or
+  fails with `provider_model_unmapped`.
+
+For Codex, approval cold-resumes the same conversation on the implementation
+pair. Before an implementation turn, the worker compares the resumed thread's
+reported model with the intended canonical model ID. A mismatch, missing model
+or unsafe model value holds the run before the turn starts. The phase switch
+has no fresh-thread fallback. Runtime default implementation effort sends no
+level; on pinned Codex 0.167.0 cold resume, the reported effort is present but
+`null`, not an inferred numeric level. This allowance does not cover a warm
+switch that could retain a prior effort override.
+
+### When the switch cannot be confirmed
+
+The run parks `paused` with hold `phase_switch_unavailable` (**planning switch
+unavailable**) and a feed line such as "Paused: the runtime kept the planning
+model X instead of switching to Y. Resume retries on a new claim; Cancel ends
+the run." **Resume** retries on a new claim, which verifies again; **Cancel**
+ends the run. See [Pausing and resuming a run](./run-pause.md#held-when-the-planning-to-implementation-switch-cannot-be-verified)
+and [the CLI reference](./cli.md#waiting-for-a-state-uzi-run-wait).
+
 ## Claude model guard and recovery
 
 Saving the Claude worker lane (`default_claude_model`, or legacy
@@ -200,25 +325,80 @@ characters but makes no provider call at save time; an unavailable or
 unsupported ID only fails visibly on your first run, exactly like an
 unrecognized custom Claude ID.
 
-This custom lane applies only to your Codex **worker root** default, the
-model your run itself executes on. It never reaches a schedule's pinned
-model, a per-role agent-template pin, or the judge/summary models, which
-stay on their own curated vocabularies.
+Safe custom IDs are accepted for Codex **worker and planning roots**. The
+Codex lane rejects Claude aliases (`opus`, `sonnet`, `haiku`, `fable`);
+use a canonical Codex model ID. These root settings do not widen the accepted
+models for a run-start choice, schedule pin, per-role agent-template pin,
+or judge/summary lane. The dedicated Plan cross-check checker pin retains its
+separate custom-ID contract.
 
-A custom Codex default also needs a worker that advertises the
-`codex_custom_model_v1` capability (curated Codex models need only the
-ordinary Codex capability). Until one is online, a run with a custom Codex
+A custom Codex root also needs a worker that advertises the
+`codex_custom_model_v1` capability. Curated models do not add this custom-model
+requirement; separate planning settings still require `codex_phase_models_v1`.
+Until a capable worker is online, a run with a custom Codex
 default stays queued rather than silently falling back to `gpt-6-astra`;
 see [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-custom-codex-models-is-online).
 
-## Task review uses its own built-in model
+## Task review model
 
-Codex task review always runs on the built-in `gpt-6-sol`, independent of
-your saved Codex worker model. It is not affected by your custom ID or
-curated choice. Claude task review keeps its own ambient default the same
-way. There is no setting to choose the task-review model in this release;
-it's tracked as possible future work in [issue
-#1570](https://github.com/vtmocanu/uzi/issues/1570).
+The review pass of a [handoff](./handoff.md#the-review--then-fix-loop)
+(`uzi handoff --review`) has its own model per harness, set under **Settings →
+Run defaults → Task review**. It is independent of your worker model: a custom
+or curated worker choice never reaches the review.
+
+| Harness | Accepts | Empty means |
+| --- | --- | --- |
+| Claude | Any Claude model id; Codex ids are refused. | The review sends no model, so the SDK decides. |
+| Codex | One of the supported Codex role models. | The built-in `gpt-6-sol`. |
+
+From the CLI, use `uzi settings set task-review-model <id> --harness
+claude|codex` and `uzi settings reset task-review-model --harness
+claude|codex` (see [CLI](./cli.md#changing-model-and-effort-settings)). The API
+keys are `task_review_model` (Claude) and `codex_task_review_model` (Codex) on
+`PUT /api/me/model-settings` and `PUT /api/me/settings`; `null` or a blank
+value clears the setting.
+
+- A stored model that later becomes invalid (for example a Codex model that
+  leaves the supported list) falls back to the built-in at review time, and
+  the effective view shows the built-in as the source.
+- A worker older than this release does not read the setting. It runs the
+  built-in review model, and the run feed records a
+  `task_review_settings_omitted` notice.
+- The server does not call the provider when you save. A configured model the
+  provider cannot run produces the existing failed review.
+
+The review's reasoning effort is set separately; see [Task review
+effort](#task-review-effort).
+
+## Task review effort
+
+Each harness's review also has its own reasoning effort, next to the model under
+**Settings → Run defaults → Task review**. It accepts `low`, `medium`, `high`,
+`xhigh` or `max`, or **Runtime default** (`runtime`), which sends no level and
+lets the runtime decide.
+
+Left unset, the review follows your [worker effort](./worker-effort.md) for the
+same harness (the Claude effort or the Codex effort), including a Runtime
+default. If the worker effort is unset too, the built-in `medium` is sent.
+**Behaviour change:** before this release no review effort was sent, so an owner
+who sets nothing now has reviews send their worker effort (the built-in
+`medium` when that is unset too).
+
+From the CLI, use `uzi settings set task-review-effort
+<low|medium|high|xhigh|max|runtime> --harness claude|codex` and `uzi settings
+reset task-review-effort --harness claude|codex`; reset follows your worker
+effort again, it does not pick a level. The API keys are `task_review_effort`
+(Claude) and `codex_task_review_effort` (Codex) on `PUT /api/me/model-settings`
+and `PUT /api/me/settings`.
+
+- A run's one-run effort override does not affect the review.
+- A stored value that is corrupt falls back to the built-in `medium`.
+- A worker older than this release does not read the setting. The api withholds
+  it, the run feed records a `task_review_settings_omitted` notice that names
+  "task review effort" (including an inherited `medium`), and the review runs
+  with no effort as before.
+- The effective view resolves the review effort per harness; its note is
+  `not_sent` only for Runtime default.
 
 ## Per-schedule model
 
@@ -242,7 +422,7 @@ may overflow to the other harness when it fires (see [Which harness a
 schedule runs on](./scheduling.md#which-harness-a-schedule-runs-on)). The
 schedule field accepts a single token of at most 100
 characters; blank means Default. The Codex schedule picker remains curated;
-the custom Codex worker-root escape hatch does not extend to schedule pins.
+the custom Codex worker/planning-root escape hatch does not extend to schedule pins.
 The frozen model is readable with `uzi run get <id> --field model` (or in
 `uzi run get <id> --json`); to see the model a run actually used, see [See
 which model a run used](#see-which-model-a-run-used).
@@ -341,7 +521,7 @@ Where to see it:
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.167.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
 when no schedule model, worker-model override or lead Codex pin is set.
 Explicit model preferences remain unchanged. Both harnesses inherit medium
 reasoning effort; Claude and Codex keep separate overrides, and each can

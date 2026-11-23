@@ -10,6 +10,7 @@ import { useNow } from "../lib/useNow";
 import { breakdown, harnessShare, perUserRows, type UsageWindow } from "../lib/usageByUser";
 import { costShareRows } from "../lib/costShares";
 import { Card, SectionTitle } from "./ui";
+import { InfoTip } from "./InfoTip";
 import {
   failRate, failRateDelta, formatSince, summaryCost, perPrText, failureAgo,
   FailedRunsBlock, TopCauses, SinceLastFailedRun, SegmentedToggle, WindowToggle, Th, Td, hasRecordedUsage, USAGE_SCOPE_NOTE,
@@ -40,11 +41,17 @@ function Kpi({ label, value, valueClass = "", sub }: { label: string; value: Rea
 const LAST_FAILURE_TITLE =
   "All time: the API serves the last failure time for all time only, so this column is the same in both windows";
 
+// The denominator lives in the rate's tip, keeping each row to one line; "—" (no finished
+// runs) has no denominator to explain and stays plain text.
 function FailRateCell({ outcomes, total }: { outcomes: RunOutcomes; total?: boolean }) {
+  const rate = failRate(outcomes);
   return (
-    <Td total={total} title={`${outcomes.failed} of ${outcomes.finished} finished runs`}>
-      {failRate(outcomes)}
-      <span className="block text-[11px] font-normal text-faint">of {outcomes.finished.toLocaleString("en-US")} finished</span>
+    <Td total={total}>
+      {outcomes.finished === 0 ? rate : (
+        <InfoTip tip={`${outcomes.failed.toLocaleString("en-US")} failed of ${outcomes.finished.toLocaleString("en-US")} finished runs`}>
+          {rate}
+        </InfoTip>
+      )}
     </Td>
   );
 }
@@ -310,7 +317,10 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
   return (
     <Card className="min-w-0">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <SectionTitle>Usage</SectionTitle>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <SectionTitle>Usage</SectionTitle>
+          <InfoTip label="About usage figures" tip={USAGE_SCOPE_NOTE} />
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           {/* steadyWidth: the same toggle look as Issue work's, and no shift on a pick (#4052). */}
           {admin && <SegmentedToggle label="Usage scope" options={SCOPE_OPTIONS} value={scope} onChange={setScope} className="" steadyWidth />}
@@ -337,7 +347,6 @@ export function OverviewUsageCard({ self, admin, window, onWindowChange, viewerI
             sub={`in ${formatTokens(selected.fresh)}, cached ${formatTokens(selected.cached)}, out ${formatTokens(selected.out)}`}
           />
         </div>
-        <p className="mt-3 text-[11px] leading-relaxed text-muted">{USAGE_SCOPE_NOTE}</p>
         {!hasRecordedUsage(usage) && <p className="mt-3 text-xs text-muted">No token usage recorded yet.</p>}
         <div className="mt-5 grid gap-6 border-t border-edge pt-4 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)]">
           <div className="min-w-0 space-y-3">

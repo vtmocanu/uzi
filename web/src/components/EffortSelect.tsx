@@ -21,15 +21,17 @@ export function EffortSelect({
   id,
   defaultLabel,
   runtimeLabel,
+  ariaDescribedBy,
 }: {
   value: string;
   onChange: (effort: string) => void;
   id?: string;
   defaultLabel: string;
   runtimeLabel?: string;
+  ariaDescribedBy?: string;
 }) {
   return (
-    <Select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
+    <Select id={id} aria-describedby={ariaDescribedBy} value={value} onChange={(e) => onChange(e.target.value)}>
       <option value="">{defaultLabel}</option>
       {runtimeLabel !== undefined && <option value="runtime">{runtimeLabel}</option>}
       {EFFORT_LEVELS.map((lvl) => (

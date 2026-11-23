@@ -238,6 +238,7 @@ func TestResolveSidebarMotion(t *testing.T) {
 		fallback bool
 		want     bool
 	}{
+		{"unchosen uses the shipped on default", nil, FallbackSidebarMotion, true},
 		{"nil falls back to off", nil, false, false},
 		{"nil falls back to on", nil, true, true},
 		{"explicit true", &yes, false, true},

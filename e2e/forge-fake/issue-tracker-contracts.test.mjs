@@ -49,7 +49,7 @@ async function stop(child) {
 // seams. ProjectGuard must pass on every forge.
 const ALLOWED_SKIPS = new Set(["MovedIssueIsRefused", "SameNameTagUsesEligibilityTag", "RenamedEligibilityTagIsStillListed", "ListLabelsOnlyUsableTags"]);
 const CASES = [
-  "EnsureLabelsIsIdempotent", "CreateIssueRoundTrips", "ListIssuesFilters", "UpdateLabelsAndDescription",
+  "EnsureLabelsIsIdempotent", "CreateIssueRoundTrips", "ListIssuesFilters", "UpdateLabelsAndDescription", "MoveToColumnMovesTheIssue",
   "SetIssueStateClosesAndReopens", "CommentsOldestFirst", "LabelEventsOldestFirst", "MissingIssueIsNotFound", "MovedIssueIsRefused",
   "ProjectGuard", "SameNameTagUsesEligibilityTag", "RenamedEligibilityTagIsStillListed", "ListLabelsOnlyUsableTags",
 ];

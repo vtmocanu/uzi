@@ -10,7 +10,8 @@
 // advice request's `model` field (never the shared provider default). The shared
 // production provider default (CODEX_PRODUCTION_PROVIDER.model in codex-executor.ts) and
 // the ordinary no-model Codex run fallback stay `gpt-6.1-sol`; only Codex task review uses this value. It is one of the curated
-// contract models, so the advice renderer accepts it. No review-model SETTING ships in
-// #1551 (configurable review-model defaults are future work, brainstorm issue #1570).
+// contract models, so the advice renderer accepts it. This built-in applies when the
+// owner sets no review model; an owner setting (PRD #1570) rides `claim.task_review_model`
+// and overrides it in review-runner.ts.
 
 export const CODEX_TASK_REVIEW_MODEL = "gpt-6-sol";

@@ -10,8 +10,8 @@ running, plan-approved run; then hand it to `uzi-lander`, which lands the PR. Ma
 once is the normal case. This repo is **GitHub**: use `gh` only (never `glab`/`tea`), and
 CI is **GitHub Actions** (`.github/workflows/`).
 
-uzi never touches `main` (four guardrail layers). The merge and every CI fix are a local
-session's job, not uzi's; that session runs `uzi-lander`.
+uzi never touches `main` (four guardrail layers). `uzi-lander` owns repair coordination
+and merging. Use one fixer per target: local, branch `ci_fix`, or scheduled `ci_watch`.
 
 ## Load the tools; do not duplicate them
 
@@ -93,8 +93,17 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
 
    ```
    # build the flag from the decision: --mr-rework=false (off) | --mr-rework (on) | omit (inherit)
-   <this skill's directory>/scripts/create-run.sh REPO_ID ISSUE_NUM --mr-rework=false
+   # then add the chosen effort, if any: --effort high | --effort xhigh | the user's level
+   <this skill's directory>/scripts/create-run.sh REPO_ID ISSUE_NUM --mr-rework=false [--effort high|xhigh]
    ```
+
+   **Choose the effort per issue** (table and examples: `.agents/skills/uzi-watcher/effort.md`).
+   An explicit user effort wins verbatim. Otherwise urgent or trust-boundary → `--effort
+   xhigh`; PRD-sized (by scope) or `priority::high` → `--effort high`; else omit `--effort`
+   (Default: the server applies the owner's Settings, never write `--effort medium`). The
+   stronger level wins on overlap. State the effort and a one-line issue-specific reason
+   before creating. The script's retries reuse the same flags. The effort never authorizes
+   a `--harness`/`--token` pin, a settings change or a gate bypass.
 
    Pass `--mr-rework` (v0.70.0) to control whether uzi auto-reworks this run's MR from
    review comments — the decision, the three-way flag, and when to ask the user live in the
@@ -737,7 +746,8 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    the AGENTS.md *Two harnesses* exceptions: `claude` for Claude SDK work or after a Codex
    provider safety-policy refusal (`fail_origin` `provider_policy_refusal`), `codex` for
    Codex SDK work. Leave `--token` off unless the user authorized a specific credential
-   override; never pin an excluded credential. Verify `harness`, `auto_approve=false` and
+   override; never pin an excluded credential. Re-choose the effort per *The loop, per run* step 2 (`effort.md`; a
+   successor does not inherit a run-level effort). Verify `harness`, `auto_approve=false` and
    `credential_override` (null when the server chose) from `uzi run get`. At the gate, require the plan to build on the existing
    commits and finish the in-progress milestone, and co-review it with the buddy.
 
@@ -775,7 +785,8 @@ ids on the same way.
 
 ## Keep this skill (and its scripts) current
 
-This skill and its `scripts/` (`create-run.sh` to create a run through the label-sync
+This skill, its references (`effort.md` for the per-issue effort choice, `resume-recipe.md`)
+and its `scripts/` (`create-run.sh` to create a run through the label-sync
 retry; `watch-run.sh` to poll a uzi run to a gate, park or
 terminal state; `backup-runs.sh` / `backup-loop.sh` to snapshot in-flight run work from
 worker PVCs) are living documents — **update them in the same session you find them

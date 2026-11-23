@@ -91,6 +91,12 @@ describe("Providers — feature off", () => {
 });
 
 describe("Providers — list", () => {
+  it("labels a blank slot 200k assumed only when no mapped model has a window", async () => {
+    await renderCard(list({ providers: [provider({ id: "p3", model_map: { haiku: { model: "gw-small" }, sonnet: { model: "gw-large" } } })] }));
+    const row = await screen.findByTestId("provider-p3");
+    expect(within(row).getAllByText(/\(no context window: 200k assumed\)/)).toHaveLength(2);
+  });
+
   it("renders name, URL, auth style, models, key state and retired badge as text", async () => {
     await renderCard(
       list({
@@ -106,7 +112,9 @@ describe("Providers — list", () => {
     expect(within(first).getByText(URL_A)).toBeTruthy();
     expect(within(first).getByText("Authorization: Bearer")).toBeTruthy();
     expect(within(first).getByText("gw-small")).toBeTruthy();
-    expect(within(first).getByText(/\(no context window\)/)).toBeTruthy();
+    // p1 maps haiku with a 32768 window and sonnet with none: the smallest configured window applies.
+    expect(within(first).getByText(/\(no context window: uzi requests the smallest configured one, 32,768 tokens\)/)).toBeTruthy();
+    expect(within(first).queryByText(/200k assumed/)).toBeNull();
     expect(within(first).getByText("Key enabled")).toBeTruthy();
 
     const second = screen.getByTestId("provider-p2");
@@ -166,21 +174,24 @@ describe("Providers — create", () => {
     await renderCard(list({ providers: [] }));
     expect(screen.queryByTestId("ctx-warning-haiku")).toBeNull();
     fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
-    expect(screen.getByTestId("ctx-warning-haiku").textContent).toMatch(/assumes a 200k-token window/);
+    expect(screen.getByTestId("ctx-warning-haiku").textContent).toMatch(/smallest window configured on any model applies to all of them, and uzi assumes 200k tokens if none is configured; set the gateway model's real window/);
     fireEvent.change(within(form()).getByLabelText("Haiku context window"), { target: { value: "65536" } });
     expect(screen.queryByTestId("ctx-warning-haiku")).toBeNull();
   });
 
-  it("warns a context window may not take effect for a name containing claude, only when one is set", async () => {
+  it("warns the CLI may apply its own window for a name containing claude, with or without a window", async () => {
     await renderCard(list({ providers: [] }));
     fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "us.anthropic.Claude-haiku-4-5" } });
-    expect(screen.getByTestId("ctx-warning-haiku").textContent).toMatch(/assumes a 200k-token window/);
-    expect(screen.getByTestId("ctx-warning-haiku").textContent).not.toMatch(/may not take effect/);
-    expect(screen.queryByTestId("ctx-unenforced-haiku")).toBeNull();
-    fireEvent.change(within(form()).getByLabelText("Haiku context window"), { target: { value: "65536" } });
+    // No window: both the 200k-assumed warning and the claude caveat show.
+    expect(screen.getByTestId("ctx-warning-haiku").textContent).toMatch(/uzi assumes 200k tokens if none is configured/);
     expect(screen.getByTestId("ctx-unenforced-haiku").textContent).toMatch(
-      /context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for some such names/,
+      /may apply its own window to model names it recognizes as Anthropic models.*ignoring both a configured window and uzi's 200k default \(measured at Claude Code 2\.1\.325\)/,
     );
+    // With a window: the no-window warning clears, the caveat stays.
+    fireEvent.change(within(form()).getByLabelText("Haiku context window"), { target: { value: "65536" } });
+    expect(screen.queryByTestId("ctx-warning-haiku")).toBeNull();
+    expect(screen.getByTestId("ctx-unenforced-haiku").textContent).toMatch(/may apply its own window/);
+    // A non-claude name drops the caveat.
     fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
     expect(screen.queryByTestId("ctx-unenforced-haiku")).toBeNull();
   });

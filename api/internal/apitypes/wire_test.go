@@ -1240,8 +1240,14 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"codex_provider_id",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
+		// PRD #1570: the per-harness task-review models (null ⇒ built-in) and their read-only cells.
+		"task_review_model", "codex_task_review_model", "task_review_models",
+		// PRD #1570 M2: the per-harness review efforts (null ⇒ inherit the worker effort) and their cells.
+		"task_review_effort", "codex_task_review_effort", "task_review_efforts",
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
+		// PRD #3252: the Claude planning pair (null ⇒ "Same as the run") and its read-only cells.
+		"planning_claude_model", "planning_claude_effort", "planning_codex_model", "planning_codex_effort", "planning_models", "planning_efforts",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		// Issue #3719: the user's Codex account mode (default|auto).
@@ -1569,5 +1575,37 @@ func TestRunCreatedIssuesWire(t *testing.T) {
 	}
 	if len(decoded.CreatedIssues) != 1 || decoded.CreatedIssues[0] != want[0] {
 		t.Fatalf("roundtrip=%+v", decoded.CreatedIssues)
+	}
+}
+
+// TestEffectivePlanPhaseIsOmittedUnlessSet pins PRD #3252: plan_phase rides the start and schedule
+// previews (and their alternatives) only when set, so a preview with no planning value applying is
+// byte-identical to one that predates it, and the object carries the claim's own plan_phase keys.
+func TestEffectivePlanPhaseIsOmittedUnlessSet(t *testing.T) {
+	for name, v := range map[string]any{
+		"StartPreviewDTO": StartPreviewDTO{}, "StartPreviewAlternativeDTO": StartPreviewAlternativeDTO{},
+		"ScheduleSettingsPreviewDTO": ScheduleSettingsPreviewDTO{}, "ScheduleAlternativeDTO": ScheduleAlternativeDTO{},
+	} {
+		for _, k := range tagSet(t, v) {
+			if k == "plan_phase" {
+				t.Errorf("%s zero value carries plan_phase", name)
+			}
+		}
+	}
+	m, e := "opus", "high"
+	raw, err := json.Marshal(StartPreviewDTO{PlanPhase: &EffectivePlanPhaseDTO{Model: &m, Effort: &e, ModelSource: "user_planning_default", EffortSource: "user_planning_default"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body["plan_phase"]); got != `{"model":"opus","effort":"high","model_source":"user_planning_default","effort_source":"user_planning_default"}` {
+		t.Fatalf("plan_phase = %s", got)
+	}
+	// Neither side's values: the object is empty, never null members.
+	if raw, _ := json.Marshal(EffectivePlanPhaseDTO{}); string(raw) != `{}` {
+		t.Fatalf("empty plan_phase = %s", raw)
 	}
 }

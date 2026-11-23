@@ -16,11 +16,17 @@ export type { LeadEffortSource, LeadModelSource } from "./protocol.js";
 
 export type LeadPhase = "plan" | "implement";
 
+/** PRD #3252: advertised by every worker that resolves a claim's `plan_phase` for the Claude lead. */
+export const CLAUDE_PHASE_MODELS_CAPABILITY = "claude_phase_models_v1";
+/** Codex cold approval epochs verify the implementation model and cut usage at replay completion. */
+export const CODEX_PHASE_MODELS_CAPABILITY = "codex_phase_models_v1";
+
 // ── Resolver ─────────────────────────────────────────────────────────────────
 
 export interface LeadRequestInput {
   harness: "claude" | "codex";
-  /** Ignored in H; a later planning-phase child selects planning values by it. */
+  /** Phase "plan" takes claim `plan_phase` model/effort key by key; an omitted key
+   *  keeps the implement result, including its template/provider fallback. */
   phase: LeadPhase;
   config: ClaimConfig | null | undefined;
   /** The selected owner lead template's delivered model (assembleAgents' leadModel for Claude). */
@@ -54,13 +60,27 @@ export function resolveLeadRequest(input: LeadRequestInput): LeadRequest {
     model = config?.default_model ?? templateModel ?? input.providerDefaultModel;
     modelSource = config?.default_model != null ? claimSource : templateModel !== undefined ? "template" : "builtin";
   }
-  const effort = config?.default_effort as HarnessEffort | undefined;
+  let effort = config?.default_effort as HarnessEffort | undefined;
+  let effortSource: LeadEffortSource = config?.default_effort_source ?? "builtin";
+  // Planning phase: each key is replaced by the claim's `plan_phase` value only when
+  // that key is present; an absent key keeps exactly the implement result above.
+  const planPhase = input.phase === "plan" ? config?.plan_phase : undefined;
+  if (planPhase?.model) {
+    model = planPhase.model;
+    // A claim that omits the source falls back to the implement source (what the claim declared
+    // for its default model), never a silent "builtin" that would misattribute a user choice.
+    modelSource = planPhase.model_source ?? claimSource;
+  }
+  if (planPhase?.effort) {
+    effort = planPhase.effort as HarnessEffort;
+    effortSource = planPhase.effort_source ?? "builtin";
+  }
   return {
     ...(model !== undefined ? { model } : {}),
     modelSource,
     ...(effort ? { effort } : {}),
     effortMode: effort ? "explicit" : "runtime_default",
-    effortSource: config?.default_effort_source ?? "builtin",
+    effortSource,
   };
 }
 

@@ -5,7 +5,8 @@
 #
 # Debian (not alpine) because the optional git smart-HTTP endpoint shells out to
 # `git http-backend`, which alpine's git package does not ship but debian's does
-# (/usr/lib/git-core/git-http-backend).
+# (/usr/lib/git-core/git-http-backend). Alpine puts it in the separate git-daemon
+# subpackage, which the worker templates install.
 FROM node:26-bookworm-slim@sha256:88e480776c6149ff1d098cd304f44bf18057fb5d284a3329b78162d29821e28c
 WORKDIR /app
 RUN apt-get update \

@@ -54,7 +54,6 @@ const (
 const (
 	maxPredictedPinnedSubagents = 32
 	predictLeadSourceBuiltin    = agenttmpl.WorkerDefaultSourceBuiltin
-	predictReviewEffortSource   = "builtin"
 	predictIssueKind            = "issue"
 )
 
@@ -287,7 +286,8 @@ type SubagentPrediction struct {
 }
 
 // LeadPrediction is the lead worker model and effort a run on Harness would use, with where each
-// value comes from. For a task review it is the reviewer's built-in.
+// value comes from. For a task review it is the owner's review model, else the reviewer's built-in,
+// and the review effort (the owner's, else their worker effort).
 type LeadPrediction struct {
 	Harness Harness
 	Review  bool
@@ -307,9 +307,23 @@ type LeadPrediction struct {
 	DefaultModelSource string
 	// DroppedRunModel is a frozen model the harness cannot run, ignored in favour of the lane.
 	DroppedRunModel *string
-	// Effort is the claim's default_effort (nil: nothing is sent); EffortSource its provenance.
+	// Effort is the claim's default_effort (nil: nothing is sent); EffortSource its provenance. For
+	// a review it is the task_review_effort the review claim ships (nil: Runtime default), with
+	// UserEffort the stored review preference.
 	Effort       *string
 	EffortSource string
+	// ReviewEffort, ReviewEffortInherited and ReviewWorkerEffort are set on a review only (PRD
+	// #1570): the final review resolution, whether it came from the owner's worker effort, and that
+	// worker effort's own resolution (what a reset of the review effort selects).
+	ReviewEffort          agenttmpl.EffortResolution
+	ReviewEffortInherited bool
+	ReviewWorkerEffort    agenttmpl.EffortResolution
+	// TemplateEffort is the lead template's valid effort for the harness (nil: none), what an unset
+	// preference resolves to.
+	TemplateEffort *string
+	// Plan is the claim's plan_phase pair (PRDs #3252/#3253), nil unless the owner's planning lane for Harness
+	// contributes a value; it is exactly what resolveLeadSettings ships on the claim.
+	Plan *ClaimPhaseSettings
 	// Subagents is nil for a review.
 	Subagents *SubagentPrediction
 	// Unhonorable is set when a start-time run_override model or effort cannot run on Harness; every
@@ -324,8 +338,10 @@ type leadPredictStore interface {
 }
 
 // PredictLead predicts the lead model and effort of a run on harness, and its subagents. A
-// task-review run never reaches the lead path, so the review branch is decided first: Codex runs
-// the built-in review model, Claude sends no model, and neither sends an effort. Otherwise the
+// task-review run never reaches the lead path, so the review branch is decided first: it runs the
+// owner's review model and effort for the harness (ResolveTaskReview), else the built-in model
+// (Codex: the curated review model, Claude: no model, the SDK decides) and the inherited worker
+// effort. Otherwise the
 // claim's own rule (resolveLeadSettings, over the lanes and efforts ListUserCrossCheckPins reads
 // with the lead template's pins) decides, and an empty claim model falls to the worker default
 // (agenttmpl.ResolveWorkerDefaultModel). frozenModel is a schedule's frozen run model.
@@ -364,13 +380,17 @@ func (c leadRunChoice) apply(in *LeadSettingsInput) {
 
 func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Harness, choice leadRunChoice, overrideSubagent bool, review bool) (LeadPrediction, error) {
 	if review {
-		model := agenttmpl.ClaudeTaskReviewModel
-		if harness == HarnessCodex {
-			model = agenttmpl.CodexTaskReviewModel
+		// The review path never reaches the lead resolver: it uses ResolveTaskReview, the rule the
+		// review claim applies (PRD #1570), over the owner's stored review model for the harness.
+		tr, err := s.resolveUserTaskReview(ctx, userID, harness)
+		if err != nil {
+			return LeadPrediction{}, fmt.Errorf("lead predict: %w", err)
 		}
 		return LeadPrediction{
-			Harness: harness, Review: true, Model: model, ModelSource: predictLeadSourceBuiltin,
-			DefaultModel: model, DefaultModelSource: predictLeadSourceBuiltin, EffortSource: predictReviewEffortSource,
+			Harness: harness, Review: true, LaneModel: tr.StoredModel, Model: tr.Model, ModelSource: tr.ModelSource,
+			DefaultModel: tr.BuiltinModel, DefaultModelSource: predictLeadSourceBuiltin,
+			UserEffort: tr.StoredEffort, Effort: tr.EffortLevelPtr(), EffortSource: tr.Effort.Source,
+			ReviewEffort: tr.Effort, ReviewEffortInherited: tr.EffortInherited, ReviewWorkerEffort: tr.WorkerEffort,
 		}, nil
 	}
 	q, ok := s.q.(leadPredictStore)
@@ -391,7 +411,19 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 	}
 	tClaude, tCodex := textPtr(row.TemplateModel), textPtr(row.TemplateCodexModel)
 
-	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort}
+	// Issue #3258 N3: the lead template's effort for this harness's family, the tier below the
+	// owner's default (the same value a claim derives from agenttmpl.SelectLead over its templates).
+	var templateEffort pgtype.Text
+	if e := agenttmpl.EffortForHarness(string(harness), derefString(textPtr(row.TemplateEffort)), derefString(textPtr(row.TemplateCodexEffort))); e != "" {
+		templateEffort = pgtype.Text{String: e, Valid: true}
+	}
+	in := LeadSettingsInput{Harness: harness, LaneModel: lane, UserEffort: effort, TemplateEffort: templateEffort}
+	// Read the same harness-specific planning columns as claim assembly.
+	planningModel, planningEffort, perr := s.readPlanningDefaults(ctx, userID, harness)
+	if perr != nil {
+		return LeadPrediction{}, fmt.Errorf("lead predict: read planning defaults: %w", perr)
+	}
+	in.PlanningModel, in.PlanningEffort = planningModel, planningEffort
 	choice.apply(&in)
 	settings := resolveLeadSettings(in)
 	if settings.Unhonorable != nil {
@@ -401,6 +433,8 @@ func (s *Service) predictLead(ctx context.Context, userID uuid.UUID, harness Har
 		Harness: harness, LaneModel: textPtr(lane), UserEffort: textPtr(effort),
 		Effort: settings.Effort, EffortSource: string(settings.EffortSource),
 		DroppedRunModel: textPtr(settings.DroppedRunModel),
+		TemplateEffort:  textPtr(templateEffort),
+		Plan:            settings.Plan,
 	}
 	out.DefaultModel, out.DefaultModelSource = agenttmpl.ResolveWorkerDefaultModel(string(harness), nil, tClaude, tCodex)
 	if settings.Model.Valid {
@@ -464,4 +498,16 @@ func (s *Service) predictSubagents(ctx context.Context, q leadPredictStore, user
 	}
 	out.Pinned = pins
 	return out, nil
+}
+
+func (s *Service) readPlanningDefaults(ctx context.Context, userID uuid.UUID, harness Harness) (pgtype.Text, pgtype.Text, error) {
+	if harness == HarnessCodex {
+		row, err := s.q.GetUserPlanningCodex(ctx, userID)
+		return row.PlanningCodexModel, row.PlanningCodexEffort, err
+	}
+	if harness == HarnessClaude {
+		row, err := s.q.GetUserPlanningClaude(ctx, userID)
+		return row.PlanningClaudeModel, row.PlanningClaudeEffort, err
+	}
+	return pgtype.Text{}, pgtype.Text{}, nil
 }

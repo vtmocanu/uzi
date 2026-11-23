@@ -172,6 +172,24 @@ describe("buildCodexRunPlan", () => {
     assert.equal(coder.effort, "medium");
   });
 
+  it("carries each role's own effort pin into the delegation table (issue #3258)", () => {
+    const plan = buildCodexRunPlan(
+      runRequest({
+        model: "gpt-6-astra",
+        effort: "medium",
+        agents: {
+          deep: agent({ effort: "xhigh" }),
+          quick: agent({ effort: "low" }),
+          plain: agent(),
+        },
+      }),
+    );
+    assert.equal(plan.roles.get("deep")?.effort, "xhigh");
+    assert.equal(plan.roles.get("quick")?.effort, "low");
+    assert.equal(plan.roles.get("plain")?.effort, "medium");
+    assert.equal(plan.lead.modelReasoningEffort, "medium");
+  });
+
   it("derives allowedRoles as exactly the known role names", () => {
     const plan = buildCodexRunPlan(
       runRequest({ agents: { coder: agent(), reviewer: agent(), zeta: agent() } }),

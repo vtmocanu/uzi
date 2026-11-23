@@ -14,7 +14,7 @@
 FROM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS runtime
 WORKDIR /app
 
-# git for clone/fetch/worktree; bash for the SDK Bash tool (M3); tini as PID 1 so
+# git for clone/fetch/worktree (git-daemon for git-http-backend); bash for the SDK Bash tool (M3); tini as PID 1 so
 # SIGTERM reaches the worker and it shuts down cleanly. curl + xz + tar for the
 # pinned nix/devbox downloads below. setpriv (util-linux) is the PRD #51 A1 drop
 # wrapper the root entrypoint uses to drop root -> worker keeping only
@@ -32,10 +32,13 @@ WORKDIR /app
 # Retry apk on a transient Alpine-mirror blip (issue #739). 5 attempts, n*3s backoff;
 # the setpriv assertion stays outside the loop (it is not a network step).
 # acl (#4486): /usr/bin/getfacl is the managed-bare ACL observer the epoch proof runs by absolute path.
-RUN n=0; until apk add --no-cache git bash tini curl xz tar setpriv acl docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
+# git-daemon: Alpine ships git-http-backend only in this subpackage; native smart-HTTP tests
+# (handler recovery-restore LiveDB, pushbroker, e2e/forge-fake mr-get) need it. Inert: nothing starts git-daemon.
+RUN n=0; until apk add --no-cache git git-daemon bash tini curl xz tar setpriv acl docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid \
     && test -x /usr/bin/getfacl && /usr/bin/getfacl --version | grep -q '^getfacl ' \
-    && test -x /usr/bin/setfacl
+    && test -x /usr/bin/setfacl \
+    && test -x "$(git --exec-path)/git-http-backend"
 
 # Three runtime uids (PRD #51 A1 + PRD #1171 M1). `worker` (uid 10001) holds the run
 # credentials (join token, forge PAT, Anthropic token) and does all credentialed work;
@@ -435,7 +438,7 @@ RUN chmod -R a+rX /nix \
 # manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
 # build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
 # (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
-# `codex-cli 0.167.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# `codex-cli 0.169.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
 # sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
 # helpers + lock are removed after (no residue); NO auth/config/session state is baked.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.

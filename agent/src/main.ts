@@ -866,6 +866,7 @@ async function mainBody(): Promise<void> {
     config: {
       capEnabled: config.runCacheCapEnabled,
       capFraction: config.runCacheCapFraction,
+      capMaxBytes: config.runCacheCapMaxBytes,
       lowWater: config.runCacheLowWater,
       maxConcurrentRuns: config.maxConcurrentRuns,
       hardStopEnabled: config.diskHardStopEnabled,

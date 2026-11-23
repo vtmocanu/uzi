@@ -989,6 +989,7 @@ type Store interface {
 	// carries no attestation: running -> paused with hold_reason='base_attestation_missing',
 	// fenced to this worker's live claim generation. An owner-only exit; nothing automatic leaves it.
 	SetRunBaseAttestationHold(ctx context.Context, arg store.SetRunBaseAttestationHoldParams) (store.Run, error)
+	SetRunPhaseSwitchHold(ctx context.Context, arg store.SetRunPhaseSwitchHoldParams) (store.Run, error)
 	SetRunRepoAgentSourceHold(ctx context.Context, arg store.SetRunRepoAgentSourceHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
@@ -1226,7 +1227,11 @@ type Store interface {
 	// 'codex_harness_v1' AND 'codex_custom_model_v1' gets reasonNoCustomCodexCapableWorker — the
 	// run's non-bypassable custom-model claim clause can never be satisfied. A per-run lookup like
 	// CountOnlineWorkersSatisfyingCodexHarness above, and off the hot path for the same reason.
-	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCustomCodexParams) (int64, error)
+	// CountOnlineWorkersSatisfyingPhaseModels backs the queued-reason rung: a lead-lane run
+	// whose owner has planning settings needs its harness-specific phase capability
+	// (reasonNoPhaseModelsCapableWorker when none is online).
+	CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, arg store.CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error)
 	// CountOnlineWorkersSatisfyingJobRunner backs PRD #1908's (D-A) queued-reason rung: a queued
 	// kind='job' run whose owner has NO online non-docker worker advertising 'job_runner_v1' gets
 	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
@@ -1476,6 +1481,10 @@ type Store interface {
 	// claim assembly, keyed on the run owner. The lane matching the already-frozen run
 	// harness replaces the legacy shared default_model; each lane NULL ⇒ inherit.
 	GetUserHarnessModelDefaults(ctx context.Context, id uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error)
+	// The owner's Claude planning model and effort (PRD #3252): read strictly at lead-lane Claude
+	// claim assembly, beside the lane read; blank = "Same as the run".
+	GetUserPlanningClaude(ctx context.Context, id uuid.UUID) (store.GetUserPlanningClaudeRow, error)
+	GetUserPlanningCodex(ctx context.Context, id uuid.UUID) (store.GetUserPlanningCodexRow, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
 	// default `medium` at claim assembly (issue #1157).
@@ -1493,6 +1502,9 @@ type Store interface {
 	// (PRD #3248): read at ISSUE-run claim assembly, keyed on the run owner. NULL ⇒
 	// inherit the instance value for that harness.
 	GetUserSummaryModels(ctx context.Context, id uuid.UUID) (store.GetUserSummaryModelsRow, error)
+	// The owner's task-review model per harness (PRD #1570): read at REVIEW-run claim assembly and
+	// by the effective-settings prediction, keyed on the run owner. NULL = the built-in.
+	GetUserTaskReviewSettings(ctx context.Context, id uuid.UUID) (store.GetUserTaskReviewSettingsRow, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
@@ -2256,6 +2268,13 @@ type Service struct {
 	// inserted in the open transaction, right before that transaction's COMMIT, on every
 	// transactional create path. Nil in production.
 	createBeforeCommitHook func(run store.Run)
+	// createBeforeCommitErrHook is the error-returning sibling of createBeforeCommitHook, called
+	// right after it on the same transactional create paths: a non-nil error aborts the create
+	// before COMMIT, so the run and everything written with it roll back. Nil in production.
+	createBeforeCommitErrHook func(run store.Run) error
+	// onceFireSummaryAfterReadHook is a test-only seam in WriteOnceFireSummary: it runs with the
+	// schedule row lock held, after the ledger read and before the write. Nil in production.
+	onceFireSummaryAfterReadHook func()
 	// planCrossCheckAfterPreflightHook is a test-only seam in SubmitPlanCrossCheck: it runs right
 	// after the preflight transaction commits, before the checker child is created. Nil in production.
 	planCrossCheckAfterPreflightHook func()
@@ -3937,7 +3956,7 @@ func requestActivePairs(snap *ActiveSnapshot) ([]uuid.UUID, []int64) {
 //   - a vanished run (its forge connection cascade-deleted the repo → run) is dropped.
 //
 // A chat spends the owner's default token and has no custom Codex root, so it produces
-// neither errAutoPoolEmpty nor errCustomModelCapabilityMissing and has no arm for them:
+// neither errAutoPoolEmpty, errCustomModelCapabilityMissing nor errPhaseModelsCapabilityMissing and has no arm for them:
 // either would fall through to the default and propagate.
 //
 // The returned error is nil for every handled case (report idle) and non-nil only
@@ -4012,6 +4031,13 @@ var errRunRepoOwnerMismatch = errors.New("the run's repository is not owned by t
 // queued for a capable worker rather than failing or silently running Astra. Its message carries
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
+
+// errPhaseModelsCapabilityMissing marks a lead-lane claim that carries a plan_phase (PRD
+// #3253) on a worker that does not advertise its harness phase capability: the owner set a planning
+// value between ClaimRun's SQL gate and assembly. Transient like errCustomModelCapabilityMissing:
+// the run returns to queued, and the next ClaimRun pass excludes the worker. Its message carries no
+// secret bytes.
+var errPhaseModelsCapabilityMissing = errors.New("worker lacks the harness phase-models capability for a planning phase")
 
 // errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
 // the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the
@@ -8132,18 +8158,18 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
 	// user choice is wired in M2. Threaded through the signature now so M2 does not
 	// reopen this seam (the freeze).
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, model, runOverrideSource(model), effort, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, model, runOverrideSource(model), effort, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride, nil /*progress*/)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
 // or label-sweep schedule firing an issue with the plan gate still requiring a human).
 // It is IDENTICAL to CreateRun — same single uzi_label eligibility gate (PRD #764 M1) —
 // and, like every create path, no longer requires a PRD link.
-func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
+func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness, progress *OnceFireProgress) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
 	// schedule's pin or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/, progress)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -8172,17 +8198,17 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// choice, so it inherits the worker binding exactly as before.
 	// explicit is the fresh issue-label selection; nil keeps implicit D11 resolution.
 	// No raw credential override is supplied by the poller.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, modelSourceNone, nil /*effort*/, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, modelSourceNone, nil /*effort*/, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/, nil /*progress*/)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve scheduled issue run. It carries
 // the schedule's wait/model/override choices and effective pin or issue-label harness.
 // The poller supplies only its issue-label harness and inherits the owner defaults.
-func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
+func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness, progress *OnceFireProgress) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/, progress)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -8224,7 +8250,18 @@ type SeededPlan struct {
 // inferred from triggerSource: run_override from a manual request's model, schedule_pin from a
 // schedule's, none otherwise. A run_override model is checked against the resolved harness inside
 // the create transaction; effort, when present, is stamped with effort_source run_override.
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride, progress *OnceFireProgress) (store.Run, error) {
+	// Issue #4512: a non-nil progress is a scheduled once-sweep admission. It fails closed (nothing
+	// read, locked or written) without a transaction, or when its context disagrees with the create
+	// arguments; nil is today's behaviour exactly.
+	if progress != nil {
+		if !s.onceFireTxReady() {
+			return store.Run{}, errOnceFireRequiresTx
+		}
+		if err := checkOnceFireArgs(progress, userID, repoID, issueIID); err != nil {
+			return store.Run{}, err
+		}
+	}
 	// PRD #3250: an effort is stored only as an exact canonical level, whichever caller supplied it.
 	if effort != nil && !validRunEffort(*effort) {
 		return store.Run{}, ErrInvalidRunEffort
@@ -8539,7 +8576,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// two plain reads are kept out of the lock-holding window rather than acquiring a second
 	// connection inside it. (An explicit credential override is still validated in-closure, on the
 	// tx-bound q, so it takes no second connection either.)
-	originColumn := s.originColumn(ctx, repoID, issue)
+	originColumn := s.originColumn(ctx, repoID, issue, row.IssueTrackerConnectionID.Valid)
 	resolvedWaitOnLimit := s.resolveWaitOnLimit(ctx, userID, waitOnLimit)
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		// Issue #1626: the authoritative cross-kind branch check, FIRST in the closure. The
@@ -8621,7 +8658,22 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if interlockOn {
 			completionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 		}
-		return q.CreateRun(ctx, store.CreateRunParams{
+		// Issue #4512 steps 6-9 (the identity compare against the create arguments already ran
+		// before any lock, at the top of createRun): repo share lock, schedule row lock, recheck,
+		// header, stored cap and spent-slot checks. After the pinned-secret share lock above and
+		// before CreateRun, so a refusal creates nothing and the whole transaction rolls back.
+		var onceQ *store.Queries
+		if progress != nil {
+			tq, ok := q.(*store.Queries)
+			if !ok {
+				return store.Run{}, errOnceFireRequiresTx
+			}
+			onceQ = tq
+			if err := admitOnceFire(ctx, onceQ, progress, userID, repoID); err != nil {
+				return store.Run{}, err
+			}
+		}
+		created, err := q.CreateRun(ctx, store.CreateRunParams{
 			UserID:                    userID,
 			RepoID:                    repoID,
 			IssueIid:                  pgtype.Int8{Int64: issueIID, Valid: true},
@@ -8706,12 +8758,28 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			CredentialOverrideMode:     pgOverrideMode(effOverride),
 			CredentialOverrideSecretID: pgOverrideSecretID(effOverride),
 		})
+		if err != nil {
+			return store.Run{}, err
+		}
+		// Issue #4512 step 11: the ledger row, with run_uuid the id CreateRun just returned, in
+		// the same transaction.
+		if progress != nil {
+			if err := recordOnceFire(ctx, onceQ, progress, created); err != nil {
+				return store.Run{}, err
+			}
+		}
+		return created, nil
 	}, harnessCreationOrigin{
 		Kind: "issue", TriggerSource: triggerSource, Explicit: explicit, Model: model,
 		AnthropicOverride: credOverride != nil || (rawOverride != nil && rawOverride.Mode != CredentialOverrideModeInherit),
 		ConsumerGateRepo:  gateRepoOf(repoID),
 	})
 	if err != nil {
+		// Issue #4512: a 23505 on the ledger's primary key is a lost race for the same issue,
+		// not an active-run conflict; it must be matched before the generic arm below.
+		if isOnceFireLedgerConflict(err) {
+			return store.Run{}, ErrOnceFireCandidateRecorded
+		}
 		if isUniqueViolation(err) {
 			return store.Run{}, ErrActiveRunExists
 		}
@@ -8737,6 +8805,20 @@ func (s *Service) uziLabel(ctx context.Context) string {
 		}
 	}
 	return settings.DefaultUziLabel
+}
+
+// autopilotLabel is the configured autopilot label, falling back to the compiled-in
+// default when the settings reader is unwired, cannot say, or has it blank. It reads the
+// label through an optional interface so a SettingsReader implementation need not carry it.
+func (s *Service) autopilotLabel(ctx context.Context) string {
+	if r, ok := s.settings.(interface {
+		AutopilotLabel(ctx context.Context) (string, error)
+	}); ok {
+		if l, _ := r.AutopilotLabel(ctx); l != "" {
+			return l
+		}
+	}
+	return settings.DefaultAutopilotLabel
 }
 
 // isEligibleIssue reports whether a cached issue's labels jsonb carries ANY of the
@@ -8780,7 +8862,11 @@ func isAssignedToBot(assigneeIDsJSON []byte, botID int64) bool {
 // cannot be listed the origin is left NULL (unknown), NOT "" — the run is not
 // blocked, but a later restore must skip rather than confidently strip the card
 // to Open on a guess (spec invariant: NULL = unknown = never restore).
-func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue store.Issue) pgtype.Text {
+//
+// linked is the repo's linkage (PRD #4173 M5): a linked card's column is its cached
+// issue_tracker_column, never a label, so the origin is the card's real column and the
+// lifecycle's manual-drag guard compares like with like.
+func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue store.Issue, linked bool) pgtype.Text {
 	cols, err := s.q.ListBoardColumns(ctx, repoID)
 	if err != nil {
 		return pgtype.Text{} // NULL = unknown, never guess Open
@@ -8793,7 +8879,7 @@ func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue stor
 	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	col, _, _ := board.ResolveColumn(labels, issue.State, position)
+	col, _, _ := board.ResolveColumn(board.CardColumnLabels(linked, labels, issue.IssueTrackerColumn.String), issue.State, position)
 	return pgconv.Text(col) // always valid: "" = the implicit Open column, never NULL
 }
 
@@ -8941,11 +9027,15 @@ func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRuns
 // ListRunsAdminDebug returns up to maxRows runs of every status across all users (or
 // one user when userID is non-nil), newest first, optionally created at or after since,
 // excluding chat, judge, and cross-check runs (issue #4198 admin run debug listing).
-func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
+// statuses narrows to those run statuses: nil means unfiltered (pgx encodes a nil slice
+// as NULL), while an empty non-nil slice matches nothing, so callers pass nil when the
+// filter is absent.
+func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, statuses []string, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
 	return s.q.ListRunsAdminDebug(ctx, store.ListRunsAdminDebugParams{
 		BackgroundGraceCutoff: s.activeRunsPriorityCutoff(),
 		UserID:                pgconv.UUIDPtr(userID),
 		Since:                 pgconv.TimePtr(since),
+		Statuses:              statuses,
 		MaxRows:               maxRows,
 	})
 }

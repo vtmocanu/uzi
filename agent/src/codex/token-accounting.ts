@@ -1,10 +1,10 @@
 // PRD #1332 (M5A, C4a) — Codex per-thread/per-model token accounting.
 //
-// The accounting spine for Codex runs: an IMMUTABLE `threadId -> configured model` map plus a
-// per-thread cumulative-snapshot reconciler. The {@link CodexHarness} feeds it every typed
-// `thread/tokenUsage/updated` notification (root AND demuxed child) and reads it at each turn
-// terminal to project the result frame's per-model `modelUsage`, metered or unreported per
-// model as COST below describes.
+// The accounting spine for Codex runs: a `threadId -> configured model` map (the model of a
+// thread's CURRENT segment; see ThreadAccount) plus a per-thread cumulative-snapshot reconciler.
+// The {@link CodexHarness} feeds it every typed `thread/tokenUsage/updated` notification (root
+// AND demuxed child) and reads it at each turn terminal to project the result frame's per-model
+// `modelUsage`, metered or unreported per model as COST below describes.
 //
 // RECONCILIATION (D5), stated as invariants the tests pin:
 //   - `total` is the thread's CUMULATIVE usage; `last` is the single most-recent response.
@@ -20,7 +20,15 @@
 //     proved replay, usage is INCOMPLETE for the claim; no total-minus-last recovery is assumed.
 //   - A DUPLICATE, STALE or OUT-OF-ORDER note cannot increase usage: a note is adopted only
 //     when its cumulative MAGNITUDE strictly exceeds the running max, and it then replaces the
-//     whole breakdown (so a stale note cannot inflate a single bucket).
+//     whole breakdown (so a stale note cannot inflate a single bucket). An ADVANCING note that
+//     lowers any of the seven gated columns (the six wire buckets, or the clamped uncached input)
+//     is refused and marks the thread incomplete.
+//   - MODEL SEGMENTS (#4580): `beginModelSegment` splits a thread's cumulative at the running max
+//     into model segments. For non-negative safe-integer buckets (what Codex emits) each raw column's segment
+//     deltas sum exactly to `maxTotal - baseline`; non-integer values are subject to float rounding;
+//     reconciliation and pricing run per segment against that segment's own model. CodexHarness
+//     cuts the root segment at the verified planning-to-implementation boundary, after replay.
+//     Child threads retain their own registrations and are not cut by that root transition.
 //   - UNKNOWN / unregistered threads are dropped, NEVER attributed to the root model.
 //   - Reasoning tokens are a subset of output and are carried, never added to output twice.
 //
@@ -112,12 +120,15 @@ function toCumulative(b: CodexUsageBreakdown): Cumulative {
 /** A monotonic scalar for a cumulative breakdown, used to decide whether a note is NEWER than
  *  the running max (and so should be adopted). Uses the reported `totalTokens` but never trusts
  *  it below `inputTokens + outputTokens`, so a provider that under-reports/omits `totalTokens`
- *  still advances rather than freezing after the first note. */
+ *  still advances rather than freezing after the first note. The advancing gate in `record`
+ *  separately refuses a note whose `totalTokens` (or any other column) falls below the running max. */
 function magnitude(b: CodexUsageBreakdown): number {
   return Math.max(b.totalTokens, b.inputTokens + b.outputTokens);
 }
 
-/** Per-bucket `max(a[k] - b[k], 0)` — a non-negative delta of two cumulatives. */
+/** Per-bucket difference `max(a[k] - b[k], 0)` of two cumulatives. A defensive floor: under the
+ *  monotone advancing gate, for non-negative buckets, it is identical to the plain difference. It
+ *  keeps a malformed direct note (e.g. a negative bucket) from producing a negative delta. */
 function diffClamp(a: Cumulative, b: Cumulative): Cumulative {
   return {
     inputTokens: Math.max(a.inputTokens - b.inputTokens, 0),
@@ -146,15 +157,16 @@ function sumResponses(responses: readonly CodexUsageBreakdown[]): Cumulative {
 }
 
 /**
- * The D5 "usage replay ambiguity" reconciliation for ONE thread: do the observed per-response
+ * The D5 "usage replay ambiguity" reconciliation for ONE model segment: do the observed per-response
  * `last` breakdowns account for the cumulative token delta this leg is charging? Cost is the SUM
  * of per-response prices, but token totals come from the cumulative `total` delta; if a response's
  * `tokenUsage/updated` note was dropped, the cumulative still moved by it while its `last` was
  * never observed, so `sum(last) != delta` on the priced buckets. Reconciling on the four PRICED
  * buckets (uncached input is derived from input/cached/cacheWrite, and output) is what lets a
  * missed response degrade the model to `unreported` while its tokens are retained. `totalTokens`
- * and `reasoningOutputTokens` are intentionally NOT reconciled: they never enter the price, and a
- * provider that under-reports `totalTokens` must not spuriously fail an otherwise-clean leg.
+ * and `reasoningOutputTokens` are intentionally NOT reconciled: they never enter the price, so an
+ * under-reported `totalTokens` does not by itself fail reconciliation (the advancing gate in
+ * `record` separately refuses a note whose `totalTokens` regresses).
  */
 function responsesReconcileDelta(responseSum: Cumulative, delta: Cumulative): boolean {
   return (
@@ -203,12 +215,17 @@ const INCOMPLETE_CAUSES: Record<IncompleteCause, string> = {
 
 /** The reconciliation state for one authorized thread. */
 interface ThreadAccount {
-  /** Bounded, sticky causes affect only this thread's model cost. */
+  /** Bounded, sticky causes affect only this thread's models' cost. */
   readonly incompleteCauses: Set<IncompleteCause>;
   /** Live work without a baseline prevents later replay from erasing attempted work. */
   attributionQuarantined: boolean;
-  /** The IMMUTABLE configured model for this thread (root or child). */
-  readonly model: string;
+  /** Model segments in order; the LAST one is current. Registration creates segment 0, whose
+   *  `start` is undefined (the thread baseline). Every later segment starts at the cumulative
+   *  running max at its cut. */
+  readonly segments: Segment[];
+  /** Models replaced by a rebind on a thread that was already incomplete; they keep an
+   *  explicit zero-token `unreported` entry (deduplicated, in rebind order). */
+  readonly taintModels: string[];
   /** True when first registered by thread/resume: requires proved replay to establish its
    *  pre-claim cumulative. Repeat registrations retain the original claim state. */
   readonly resumed: boolean;
@@ -218,21 +235,43 @@ interface ThreadAccount {
   maxTotal?: Cumulative;
   /** The magnitude of {@link maxTotal}, for the newer-than test. */
   maxMagnitude: number;
-  /** The observed per-response `last` breakdowns of THIS leg, one per ADOPTED note — the pricing
+}
+
+/** One model's span of a thread's cumulative usage. */
+interface Segment {
+  /** The configured model for this span. A segment with no responses may be rebound in place. */
+  model: string;
+  /** The cumulative at the cut; undefined only for segment 0, whose start is the thread baseline. */
+  readonly start?: Cumulative;
+  /** The observed per-response `last` breakdowns of THIS span, one per ADOPTED note — the pricing
    *  basis (C4b, D5). A note is recorded here on exactly the same gate that advances {@link
-   *  maxTotal}, so a duplicate/stale/out-of-order note is neither charged nor priced twice. A
-   *  Proved replay is never recorded here: its last belongs to historical work. */
+   *  ThreadAccount.maxTotal}, so a duplicate/stale/out-of-order note is neither charged nor priced
+   *  twice. A proved replay is never recorded here: its last belongs to historical work. */
   readonly responses: CodexUsageBreakdown[];
-  /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note carried an
-   *  absent or malformed pricing-required bucket (`transport.ts` pricingEvidenceComplete). It
-   *  fails pricing closed for this thread's model in {@link aggregateByModel}'s pricing branch even
-   *  when the coerced-to-0 buckets reconcile numerically — token totals are still retained; only
-   *  cost/costStatus is gated. A stale/out-of-order note (not adopted) never taints it. */
+  /** PRD #1332 m3 (CodeRabbit 4004800884): FALSE once any CONSUMED (adopted) note of this span
+   *  carried an absent or malformed pricing-required bucket (`transport.ts`
+   *  pricingEvidenceComplete). It fails pricing closed for this span's model in {@link
+   *  CodexUsageAccountant.aggregateByModel} even when the coerced-to-0 buckets reconcile
+   *  numerically; token totals are still retained. A stale note (not adopted) never taints it. */
   pricingEvidenceComplete: boolean;
 }
 
+/** True when the cache detail buckets exceed the raw input they are a subset of. */
+function malformedCacheSplit(c: Cumulative): boolean {
+  return c.cachedInputTokens + c.cacheWriteInputTokens > c.inputTokens;
+}
+
+/** Clamped cumulative uncached input, the same quantity the advancing gate keeps non-decreasing. */
+function uncachedOf(c: Cumulative): number {
+  return Math.max(c.inputTokens - c.cachedInputTokens - c.cacheWriteInputTokens, 0);
+}
+
 /**
- * Codex usage accountant for one executor claim leg. ONE instance is owned by that invocation's
+ * Codex usage accountant for one executor claim leg. A thread's usage may be split into model
+ * segments with {@link CodexUsageAccountant.beginModelSegment}; CodexHarness calls it at the
+ * verified root planning-to-implementation boundary after recording replay. Child registrations
+ * remain independent.
+ * ONE instance is owned by that invocation's
  * EpochSharedContext and shared across every provider-epoch {@link CodexHarness}. It survives plan
  * approval and checkpoint recreation, but a later worker claim deliberately creates a new instance
  * and an explicit init lineage so the resumed delta is additive in the server fold. NOT thread-safe
@@ -271,14 +310,48 @@ export class CodexUsageAccountant {
     return acct !== undefined && (!acct.resumed || acct.baseline !== undefined);
   }
 
-  /** Register the IMMUTABLE `threadId -> model` mapping. The FIRST registration wins: a repeat
+  /** Register the `threadId -> model` mapping as segment 0. The FIRST registration wins: a repeat
    *  call for a known thread is ignored, so a stray/duplicate registration cannot rebind a
-   *  thread's model. `resumed` distinguishes a resumed root (baselines at the pre-resume
+   *  thread's model; only {@link beginModelSegment} changes it. `resumed` distinguishes a resumed root (baselines at the pre-resume
    *  cumulative) from a fresh root/child (baselines at zero). */
   registerThread(threadId: string, model: string, resumed: boolean): void {
     if (threadId.length === 0 || this.threads.has(threadId)) return;
-    this.threads.set(threadId, { model, resumed, maxMagnitude: 0, responses: [], pricingEvidenceComplete: true,
-      incompleteCauses: new Set(), attributionQuarantined: false });
+    this.threads.set(threadId, { segments: [{ model, responses: [], pricingEvidenceComplete: true }],
+      taintModels: [], resumed, maxMagnitude: 0, incompleteCauses: new Set(), attributionQuarantined: false });
+  }
+
+  /**
+   * Switch a registered thread to `model` for the usage recorded from now on. The caller must have
+   * recorded any historical replay first. Caller contract: EVERY usage note of the previous
+   * segment's work (historical replay AND live notes of earlier turns) must already have been
+   * recorded. A note delivered after the cut that advances the running max is attributed to the NEW
+   * segment, so CodexHarness must drain or fence earlier-turn notes before cutting. Unknown thread, or the current segment already on
+   * `model`: no-op. Before the thread has an accepted cumulative (including a resumed thread
+   * awaiting proved replay, and a quarantined thread) the current segment has no responses, so it
+   * is rebound in place; on an already-incomplete thread the replaced model is remembered so it
+   * keeps a zero-token `unreported` entry. Otherwise a new segment starts at the running max.
+   * Never changes attribution quarantine.
+   */
+  beginModelSegment(threadId: string, model: string): void {
+    const acct = this.threads.get(threadId);
+    if (acct === undefined) return;
+    const current = acct.segments[acct.segments.length - 1]!;
+    if (current.model === model) return;
+    if (acct.maxTotal === undefined) {
+      if (acct.incompleteCauses.size > 0 && !acct.taintModels.includes(current.model)) acct.taintModels.push(current.model);
+      current.model = model;
+      return;
+    }
+    acct.segments.push({ model, start: { ...acct.maxTotal }, responses: [], pricingEvidenceComplete: true });
+    this.checkSegmentedSplit(threadId, acct, acct.baseline ?? zeroCumulative(), acct.maxTotal);
+  }
+
+  /** Multi-segment uncached input differences telescope only over well-formed boundaries; a
+   *  malformed cache split at one marks the thread incomplete through an existing cause. */
+  private checkSegmentedSplit(threadId: string, acct: ThreadAccount, ...boundaries: Cumulative[]): void {
+    if (acct.segments.length < 2 || !boundaries.some(malformedCacheSplit)) return;
+    this.markIncomplete(threadId, "invalid_raw_usage", false,
+      { predicate: "bucket relationship", breakdown: "total", bucket: "cachedInputTokens" });
   }
 
   /**
@@ -297,8 +370,9 @@ export class CodexUsageAccountant {
       return;
     }
     const total = toCumulative(usage.total);
+    const segment = acct.segments[acct.segments.length - 1]!;
     // PRD #1332 m3 (CodeRabbit 4004800884): a note carrying a present-but-malformed pricing-required
-    // bucket taints THIS thread's pricing evidence. Applied ONLY when the note is adopted (below),
+    // bucket taints the CURRENT segment's pricing evidence. Applied ONLY when the note is adopted (below),
     // so a duplicate/stale/out-of-order note — which is neither charged nor priced — cannot taint.
     const evidenceIncomplete = usage.pricingEvidenceComplete === false;
     if (acct.maxTotal === undefined) {
@@ -309,28 +383,28 @@ export class CodexUsageAccountant {
       acct.maxMagnitude = magnitude(usage.total);
       // Historical replay last is never a response of this claim.
       if (!replay) {
-        acct.responses.push(usage.last);
+        segment.responses.push(usage.last);
         adopted = Object.freeze({
-          model: acct.model,
+          model: segment.model,
           last: Object.freeze(toCumulative(usage.last)),
           pricingEvidenceComplete: usage.pricingEvidenceComplete !== false,
         });
       }
-      if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
+      if (evidenceIncomplete) segment.pricingEvidenceComplete = false;
       return adopted;
     }
     const m = magnitude(usage.total);
     if (m > acct.maxMagnitude) {
       // Raw input includes cached details, so growing raw buckets can still reduce priced uncached input.
-      const uncached = Math.max(total.inputTokens - total.cachedInputTokens - total.cacheWriteInputTokens, 0);
-      const acceptedUncached = Math.max(
-        acct.maxTotal.inputTokens - acct.maxTotal.cachedInputTokens - acct.maxTotal.cacheWriteInputTokens, 0,
-      );
+      const uncached = uncachedOf(total);
+      const acceptedUncached = uncachedOf(acct.maxTotal);
       if (uncached < acceptedUncached ||
           total.inputTokens < acct.maxTotal.inputTokens ||
           total.cachedInputTokens < acct.maxTotal.cachedInputTokens ||
           total.cacheWriteInputTokens < acct.maxTotal.cacheWriteInputTokens ||
-          total.outputTokens < acct.maxTotal.outputTokens) {
+          total.outputTokens < acct.maxTotal.outputTokens ||
+          total.reasoningOutputTokens < acct.maxTotal.reasoningOutputTokens ||
+          total.totalTokens < acct.maxTotal.totalTokens) {
         this.markIncomplete(threadId, "advancing_regression");
         return;
       }
@@ -340,96 +414,137 @@ export class CodexUsageAccountant {
       // priced response. Mirrors the magnitude gate so a duplicate/stale/out-of-order note (which
       // does NOT advance the max) is never priced twice.
       if (!replay) {
-        acct.responses.push(usage.last);
+        segment.responses.push(usage.last);
         adopted = Object.freeze({
-          model: acct.model,
+          model: segment.model,
           last: Object.freeze(toCumulative(usage.last)),
           pricingEvidenceComplete: usage.pricingEvidenceComplete !== false,
         });
       }
-      if (evidenceIncomplete) acct.pricingEvidenceComplete = false;
+      if (evidenceIncomplete) segment.pricingEvidenceComplete = false;
+      this.checkSegmentedSplit(threadId, acct, total);
     }
     // else: a duplicate, stale resume replay or out-of-order note — cannot increase usage or cost.
     return adopted;
   }
 
   /**
-   * Aggregate the reconciled per-thread deltas by ACTUAL configured model into the result-frame
+   * Aggregate the reconciled per-segment deltas by ACTUAL configured model into the result-frame
    * `modelUsage` shape. Returns `undefined` when no charged usage or incomplete model exists.
    * Incomplete models retain proved tokens, including an explicit zero lower bound, so the server
-   * can degrade their existing cost status without changing token high-water marks.
+   * can degrade their existing cost status without changing token high-water marks. A thread's
+   * incompleteness taints every model it used, including a model replaced by a rebind.
    *
-   * TOKEN buckets are always the cumulative `total` deltas (unchanged from C4a). COST (C4b, D5)
+   * TOKEN buckets are always the cumulative `total` deltas (unchanged from C4a), split per model
+   * segment so, for non-negative safe-integer buckets (what Codex emits), each raw column's segment deltas sum
+   * exactly to the thread's `maxTotal - baseline` (non-integer values are subject to float rounding).
+   * Uncached input of a thread cut into two or more segments is the per-segment difference of the
+   * clamped cumulative uncached value, which telescopes the same way; a single-segment thread
+   * contributes raw deltas to the model's clamped uncached derivation as before. COST (C4b, D5)
    * depends on `pricing`:
    *   - `pricing` omitted            → every entry `unreported`, no `costUSD` (token-only caller).
    *   - `pricing` present (either auth mode) → per model, CONSERVATIVE DOMINANCE: the entry is `metered`
    *                                    with the SUMMED per-response price ONLY when EVERY observed
-   *                                    response of EVERY thread on that model has COMPLETE pricing
+   *                                    response of EVERY segment on that model has COMPLETE pricing
    *                                    evidence (m3: no present-but-malformed priced bucket),
-   *                                    reconciles to its cumulative delta AND prices; if ANY thread
-   *                                    saw malformed pricing evidence (m3, CodeRabbit 4004800884),
-   *                                    ANY response is unpriceable (unknown model, Sol boundary, bad
-   *                                    cache split) or ANY thread's responses do not reconcile (a
-   *                                    missed update), the WHOLE model entry is `unreported` with its
-   *                                    tokens RETAINED and no `costUSD`.
+   *                                    reconciles to its segment's cumulative delta AND prices; if ANY
+   *                                    segment saw malformed pricing evidence (m3, CodeRabbit
+   *                                    4004800884), ANY response is unpriceable (unknown model, Sol
+   *                                    boundary, bad cache split) or ANY segment's responses do not
+   *                                    reconcile (a missed update), the WHOLE model entry is
+   *                                    `unreported` with its tokens RETAINED and no `costUSD`.
    */
   aggregateByModel(pricing?: CodexPricingContext): Record<string, CodexModelUsageEntry> | undefined {
     interface ModelAgg {
       tokens: Cumulative;
+      /** Raw input/cache buckets of single-segment threads only; their uncached input is derived
+       *  from the sum, as before segments existed. */
+      single: Cumulative;
+      /** Summed per-segment clamped-uncached differences of multi-segment threads. */
+      segmentedUncached: number;
       incomplete: boolean;
-      /** True until a thread on this model fails to reconcile or has an unpriceable response.
+      /** True until a segment on this model fails to reconcile or has an unpriceable response.
        *  Only consulted when pricing context is present. */
       priceable: boolean;
-      /** Summed per-response price across every thread on this model (either credential mode). */
+      /** Summed per-response price across every segment on this model (either credential mode). */
       costUSD: number;
     }
     const byModel = new Map<string, ModelAgg>();
     const hasPricing = pricing !== undefined;
+    const aggFor = (model: string): ModelAgg => {
+      let agg = byModel.get(model);
+      if (agg === undefined) {
+        agg = { tokens: zeroCumulative(), single: zeroCumulative(), segmentedUncached: 0, incomplete: false, priceable: true, costUSD: 0 };
+        byModel.set(model, agg);
+      }
+      return agg;
+    };
     for (const acct of this.threads.values()) {
       const incomplete = acct.incompleteCauses.size > 0;
       if (acct.maxTotal === undefined && !incomplete) continue;
-      const charged = acct.maxTotal === undefined ? zeroCumulative()
-        : diffClamp(acct.maxTotal, acct.baseline ?? zeroCumulative());
-      const agg = byModel.get(acct.model) ?? { tokens: zeroCumulative(), incomplete: false, priceable: true, costUSD: 0 };
-      agg.incomplete ||= incomplete;
-      if (incomplete) agg.priceable = false;
-      addInto(agg.tokens, charged);
-      if (hasPricing && agg.priceable) {
-        // PRD #1332 m3 (CodeRabbit 4004800884): fail closed on pricing-evidence completeness FIRST.
-        // If any consumed note on this thread carried a present-but-malformed pricing-required
-        // bucket, the coerced-to-0 values can make sum(last) and the delta BOTH zero and reconcile
-        // spuriously — so the numeric reconciliation is NOT sufficient. Degrade the model to
-        // `unreported` (tokens still retained via the coerced totals) rather than emit an
-        // understated metered cost. Dominance: one tainted thread taints the whole model.
-        if (!acct.pricingEvidenceComplete) {
-          agg.priceable = false;
-        } else if (!responsesReconcileDelta(sumResponses(acct.responses), charged)) {
-          // Reconcile THIS thread's observed responses to ITS OWN cumulative delta before pricing:
-          // a dropped note (missed response) leaves sum(last) below the delta, so the model degrades
-          // to `unreported` while its tokens are retained (never fabricate a price for an unobserved
-          // response). A reconciled thread prices every response independently (the >272K tier is
-          // per response); any single unpriceable response taints the whole model (dominance).
-          agg.priceable = false;
+      const multi = acct.segments.length >= 2;
+      const baseline = acct.baseline ?? zeroCumulative();
+      for (let i = 0; i < acct.segments.length; i++) {
+        const seg = acct.segments[i]!;
+        // Only segment 0 has an undefined start (the thread baseline); a segment ends where the
+        // next one starts, the last at the running max. No accepted cumulative means no usage.
+        const start = seg.start ?? baseline;
+        const end = acct.segments[i + 1]?.start ?? acct.maxTotal;
+        const charged = end === undefined ? zeroCumulative() : diffClamp(end, start);
+        const agg = aggFor(seg.model);
+        agg.incomplete ||= incomplete;
+        if (incomplete) agg.priceable = false;
+        addInto(agg.tokens, charged);
+        if (multi) {
+          if (end !== undefined) agg.segmentedUncached += uncachedOf(end) - uncachedOf(start);
         } else {
-          for (const r of acct.responses) {
-            const price = priceCodexResponse(acct.model, r, pricing.now);
-            if (price === undefined) {
-              agg.priceable = false;
-              break;
+          addInto(agg.single, charged);
+        }
+        if (hasPricing && agg.priceable) {
+          // PRD #1332 m3 (CodeRabbit 4004800884): fail closed on pricing-evidence completeness FIRST.
+          // If any consumed note on this segment carried a present-but-malformed pricing-required
+          // bucket, the coerced-to-0 values can make sum(last) and the delta BOTH zero and reconcile
+          // spuriously — so the numeric reconciliation is NOT sufficient. Degrade the model to
+          // `unreported` (tokens still retained via the coerced totals) rather than emit an
+          // understated metered cost. Dominance: one tainted segment taints the whole model.
+          if (!seg.pricingEvidenceComplete) {
+            agg.priceable = false;
+          } else if (!responsesReconcileDelta(sumResponses(seg.responses), charged)) {
+            // Reconcile THIS segment's observed responses to ITS OWN cumulative delta before pricing:
+            // a dropped note (missed response) leaves sum(last) below the delta, so the model degrades
+            // to `unreported` while its tokens are retained (never fabricate a price for an unobserved
+            // response). A reconciled segment prices every response independently (the >272K tier is
+            // per response); any single unpriceable response taints the whole model (dominance).
+            agg.priceable = false;
+          } else {
+            for (const r of seg.responses) {
+              const price = priceCodexResponse(seg.model, r, pricing.now);
+              if (price === undefined) {
+                agg.priceable = false;
+                break;
+              }
+              agg.costUSD += price;
             }
-            agg.costUSD += price;
           }
         }
       }
-      byModel.set(acct.model, agg);
+      // taintModels is only pushed when incompleteCauses is non-empty and causes are never removed,
+      // so a non-empty taintModels implies this thread is incomplete.
+      for (const model of acct.taintModels) {
+        const agg = aggFor(model);
+        agg.incomplete = true;
+        agg.priceable = false;
+      }
     }
     const out: Record<string, CodexModelUsageEntry> = {};
     let any = false;
     for (const [model, agg] of byModel) {
       const c = agg.tokens;
       // Uncached input = total input minus the two detail buckets (D5), non-overlapping and
-      // clamped >= 0, matching Claude's `input_tokens` (uncached) column semantics.
-      const uncached = Math.max(c.inputTokens - c.cachedInputTokens - c.cacheWriteInputTokens, 0);
+      // clamped >= 0, matching Claude's `input_tokens` (uncached) column semantics. Multi-segment
+      // threads add their already-clamped cumulative differences outside the clamp.
+      const uncached = Math.max(agg.single.inputTokens - agg.single.cachedInputTokens - agg.single.cacheWriteInputTokens, 0)
+        + agg.segmentedUncached;
       // Explicit zero entries preserve incomplete models; healthy unused models stay omitted.
       if (!agg.incomplete && uncached === 0 && c.cachedInputTokens === 0 && c.cacheWriteInputTokens === 0 && c.outputTokens === 0) {
         continue;

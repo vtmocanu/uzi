@@ -114,9 +114,9 @@ jobs:
         with:
           go-version-file: api/go.mod
           cache: false
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e  # v5
         with:
-          version: v4.3.1
+          version: v4.3.2
       - uses: ./.github/actions/setup-task
       - name: Install the locked web test dependencies
         working-directory: web
@@ -806,9 +806,9 @@ jobs:
       id-token: write   # cosign keyless: mint the OIDC token used to sign
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e  # v5
         with:
-          version: v4.3.1
+          version: v4.3.2
       # Retrying, checksum-pinned cosign install (issue #945; rationale in the action
       # header). Needs the repo checked out first (actions/checkout runs above).
       - uses: ./.github/actions/install-cosign

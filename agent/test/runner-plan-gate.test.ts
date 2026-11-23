@@ -224,11 +224,12 @@ function summaryPlanProvider(
         result = { userAgent: "codex/test", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
       else if (request.method === "account/login/start") result = { type: request.params.type };
       else if (request.method === "thread/start" || request.method === "thread/resume")
-        result = { thread: { id: "summary-thread" } };
+        result = { thread: { id: "summary-thread" }, model: request.params.model };
       else if (request.method === "turn/start") {
         const index = turns++;
         const turnId = `summary-turn-${index}`;
         result = { turn: { id: turnId } };
+        frame({ method: "turn/started", params: { threadId: "summary-thread", turn: { id: turnId } } });
         frame({ id: 100 + index, method: "item/tool/call", params: {
           threadId: "summary-thread", turnId, callId: `summary-call-${index}`,
           tool: index < plans.length ? "submit_plan" : "signal_done",

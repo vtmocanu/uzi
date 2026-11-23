@@ -42,6 +42,10 @@
 //     (models.ts) — a full id like `claude-opus-4-8`, not only a short alias.
 //     Only a string that could never be a model id (control chars, whitespace,
 //     over-length) is ignored, and the agent inherits the run default.
+//   - `effort` (PRD #3258 N9): kept only when exactly one of low, medium, high,
+//     xhigh or max; anything else is dropped with an `effort_ignored` note (value
+//     never echoed) and the agent follows the run's effort. It is the Claude-family
+//     effort, deleted on a Codex run by projectForHarness.
 //
 // The Agent/deferral denial here is DEFENCE-IN-DEPTH (layer 1). The structural
 // layer lives in the assembly path M3 routes repo agents through: `agents.ts`
@@ -99,6 +103,7 @@ import path from "node:path";
 import { AGENT_NAME_MAX_LEN, AGENT_NAME_RE, type AgentTemplate, type RepoAgentSummary } from "./protocol.js";
 import { ASYNC_DEFERRAL_TOOLS, NESTED_AGENT_TOOL } from "./guardrails.js";
 import { isValidModel } from "./models.js";
+import { isHarnessEffort } from "./harness.js";
 import { isCodexRoleModel } from "./codex/render.js";
 import { parseCodexAgentFile } from "./repoagents-codex.js";
 
@@ -187,7 +192,11 @@ export type RepoAgentNoteReason =
   | "unsafe_path"
   /** A Codex agent declares a restriction (`features`, `skills`, `sandbox_mode`,
    *  `tools`) uzi cannot honour yet, so it is skipped rather than run unrestricted. */
-  | "restriction_unsupported";
+  | "restriction_unsupported"
+  /** Kept, with an invalid effort ignored (the agent follows the run's effort): a
+   *  Markdown `effort:` or a TOML `model_reasoning_effort` that is not exactly one of
+   *  the five levels. The value is never echoed. */
+  | "effort_ignored";
 
 export interface RepoAgentNote {
   /** The agent (or file) the note is about. Sanitized: it reaches a run message.
@@ -204,6 +213,9 @@ export interface RepoAgentNote {
   restrictions?: string[];
   /** For a folder-level "unsafe_path" (empty `name`): the folder that was refused. */
   folder?: RepoAgentFolder;
+  /** For "effort_ignored": the agent file's basename without its extension. Present only
+   *  when it passes the agent-name regex and length cap (it reaches a run message). */
+  file?: string;
 }
 
 export interface DetectedRepoAgents {
@@ -265,6 +277,8 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
         : `repo agent file "${note.name}" was skipped: its location could not be verified inside the agents folder`;
     case "restriction_unsupported":
       return `repo agent "${note.name}" was skipped: it declares a Codex restriction (${(note.restrictions ?? []).join(", ")}) uzi cannot honour yet`;
+    case "effort_ignored":
+      return `repo agent "${note.name}"${note.file ? ` (file "${note.file}")` : ""} declared an invalid effort; it follows the run's effort`;
   }
 }
 
@@ -442,7 +456,12 @@ async function loadFolder(spec: FolderSpec, source: FolderFiles): Promise<Detect
     }
     seen.add(parsed.template.name);
     agents.push(parsed.template);
-    notes.push(...parsed.notes);
+    // The file's basename (without extension) joins an effort note only when it passes the
+    // same name regex and length cap as an agent name; otherwise the note names the agent alone.
+    const stem = file.slice(0, -spec.ext.length);
+    for (const note of parsed.notes) {
+      notes.push(note.reason === "effort_ignored" && isValidAgentName(stem) ? { ...note, file: stem } : note);
+    }
   }
 
   agents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -491,7 +510,15 @@ export async function detectRepoAgents(
 }
 
 function projectForHarness(harness: RepoAgentHarness, detected: DetectedRepoAgents): DetectedRepoAgents {
-  detected.agents = detected.agents.map((template) => filterRepoAgentModel(template, harness));
+  // An effort belongs to its folder's family (.codex/agents = Codex levels, .claude/agents =
+  // Claude levels): drop it when the folder's family differs from the run's harness, so a
+  // `.codex` effort never reaches a Claude run and a `.claude` one never reaches a Codex run.
+  const dropEffort = (detected.folder === ".codex/agents") !== (harness === "codex");
+  detected.agents = detected.agents.map((template) => {
+    const projected = filterRepoAgentModel(template, harness);
+    if (dropEffort) delete projected.effort;
+    return projected;
+  });
   return detected;
 }
 
@@ -610,6 +637,15 @@ function parseAgentFile(raw: string, slug: string): ParsedAgentFile {
     else notes.push({ name, reason: "model_ignored" });
   }
 
+  // PRD #3258 N9: `effort:` is the agent's Claude-family effort when it is exactly one of the
+  // five levels after the trim; an empty value inherits silently (like model); anything else is
+  // dropped with a note that never carries the value. The loader adds the file's basename.
+  const effort = fm.fields.effort?.trim();
+  if (effort) {
+    if (isHarnessEffort(effort)) template.effort = effort;
+    else notes.push({ name, reason: "effort_ignored" });
+  }
+
   return { ok: true, template, notes };
 }
 
@@ -634,12 +670,12 @@ function filterTools(declared: readonly string[]): { kept: string[]; denied: str
 }
 
 interface Frontmatter {
-  fields: { name?: string; description?: string; tools?: string[]; model?: string };
+  fields: { name?: string; description?: string; tools?: string[]; model?: string; effort?: string };
   body: string;
 }
 
 /**
- * Split leading YAML frontmatter, keeping only the four keys an AgentTemplate has.
+ * Split leading YAML frontmatter, keeping only the five keys an AgentTemplate has.
  * Every other key is ignored — `hooks`, `settings`, and anything else a repo
  * invents can never reach the SDK through this path.
  *
@@ -688,6 +724,7 @@ function parseFrontmatter(raw: string): Frontmatter | null {
     if (key === "name" && fields.name === undefined) fields.name = value;
     else if (key === "description" && fields.description === undefined) fields.description = value;
     else if (key === "model" && fields.model === undefined) fields.model = value;
+    else if (key === "effort" && fields.effort === undefined) fields.effort = value;
     else if (key === "tools" && fields.tools === undefined) {
       if (value === "") {
         // `tools:` with nothing on the line opens a block sequence. Note it as a

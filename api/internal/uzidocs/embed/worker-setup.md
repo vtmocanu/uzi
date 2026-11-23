@@ -212,7 +212,8 @@ and switches are unchanged. Five mechanisms:
 2. **In-run cache cap, two layers** (D4). A *soft* layer trims a running
    run's own caches (least-recently-used entries first) at a proven quiet
    point between turns — no live process, never judged from file mtimes —
-   whenever they exceed the run's share of the volume; a run that stays over
+   whenever they exceed the run's share of the volume (by default also
+   capped at an absolute 15 GiB per run, `UZI_RUN_CACHE_CAP_MAX_BYTES`); a run that stays over
    the cap parks preventively (uncounted, so this cannot by itself fail a
    run). A *hard* layer watches the data volume itself on every stats tick,
    independent of turn boundaries, and — only once the volume nears the
@@ -884,8 +885,10 @@ guarantee drain completion or unblock an image roll. Existing drain/shutdown
 policy is unchanged. See [owner recovery steps](./run-recovery.md#when-plan-revision-retries-expire).
 
 Reclaim does not restore the allowance, expired wait or predecessor chain.
-Claude retains existing FIFO replay of unapplied inputs; Codex shows a fresh
-plan and asks the owner to re-send feedback. A new flight may get a fresh
+Claude and Codex replay a still-pending revise against the persisted plan on a
+subsequent admitted claim. Codex rebuilds the planning context without a saved
+conversation; the input becomes APPLIED only after the revised plan persists,
+and applied feedback is not replayed again. A new flight may get a fresh
 allowance. Initial claims and existing episode, credential and transient
 redispatch paths prevent an unconditional lifetime bound. Custody protections
 and missing-snapshot reconciliation retain their existing boundaries.

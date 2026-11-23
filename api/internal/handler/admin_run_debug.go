@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,7 @@ const (
 	adminRunDebugRouteInputs   adminRunDebugRoute = "runs.inputs"
 	adminRunDebugRouteArchives adminRunDebugRoute = "runs.archives"
 	adminRunDebugRouteFetches  adminRunDebugRoute = "runs.fetches"
+	adminRunDebugRouteHeld     adminRunDebugRoute = "runs.held_publications"
 	adminRunDebugRouteHolds    adminRunDebugRoute = "recovery.holds"
 	adminRunDebugRouteRuns     adminRunDebugRoute = "admin.runs"
 )
@@ -54,8 +56,8 @@ func adminRunDebugAllowed(flagOn bool, cred mw.CLICredential, credOK bool, user 
 	return flagOn && credOK && cred.Scope == clitoken.ScopeAdminRO && userOK && user.IsAdmin
 }
 
-// adminRunDebugForeignRun resolves a run the caller does not own for the three per-run
-// debug READS (inputs, archives, fetches); no write path calls it. It is reached only
+// adminRunDebugForeignRun resolves a run the caller does not own for the per-run
+// debug READS (inputs, archives, fetches, held publications list); no write path calls it. It is reached only
 // after the owner path answered ErrRunNotFound. When the request may not take the debug
 // path it writes the same 404 as an unknown run, with no further query. Otherwise it
 // loads the run as an admin (not found is 404, other errors 500). ok=false means the
@@ -110,15 +112,19 @@ func auditHoldsRunDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID
 }
 
 // auditRunsListDebugRead records an all-states admin run listing. ownerFilter nil
-// means all owners; since is omitted from the record when nil.
-func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, route adminRunDebugRoute, ownerFilter *uuid.UUID, since *time.Time, returned int) {
+// means all owners; since is omitted from the record when nil, statuses when empty.
+// The route is always adminRunDebugRouteRuns.
+func auditRunsListDebugRead(r *http.Request, actor store.User, tokenID uuid.UUID, ownerFilter *uuid.UUID, since *time.Time, statuses []string, returned int) {
 	owner := "all"
 	if ownerFilter != nil {
 		owner = ownerFilter.String()
 	}
-	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, route), "owner_filter", owner)
+	attrs := append(adminRunDebugBaseAttrs(actor, tokenID, adminRunDebugRouteRuns), "owner_filter", owner)
 	if since != nil {
 		attrs = append(attrs, "since", since.UTC().Format(time.RFC3339Nano))
+	}
+	if len(statuses) > 0 {
+		attrs = append(attrs, "status_filter", strings.Join(statuses, ","))
 	}
 	attrs = append(attrs, "returned", returned)
 	adminRunDebugLogger().InfoContext(r.Context(), adminRunDebugMessage, attrs...)

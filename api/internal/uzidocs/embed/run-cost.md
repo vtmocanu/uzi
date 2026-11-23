@@ -24,7 +24,7 @@ names them, then asks the harder question: is the cheaper run as good?
 
 ## How a run's cost is counted
 
-A run's lead makes one SDK `query()` call per turn — the planning turn, then
+A Claude run's lead makes one SDK `query()` call per turn — the planning turn, then
 each implement/review iteration, each resumed on the previous turn's session
 id. Before Claude Agent SDK 0.3.277, the SDK reported cost **per `query()`
 call, not cumulatively over the resumed session**, so every one of those
@@ -47,9 +47,33 @@ and the measured under-count it replaced, and
 [ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
 session-cumulative fold and what it does not backfill.
 
+### Codex planning and implementation costs
+
+With [separate planning settings](./worker-model.md#planning-model-and-effort),
+Codex attributes root usage to the planning model until implementation starts,
+then to the implementation model. Historical usage replayed at the switch
+stays with planning; child agents retain their own model attribution. Cost
+is priced per response on that response's model. A custom model without a
+price, or incomplete usage evidence, leaves the affected cost `unreported`
+while retaining proven tokens.
+
+The switch does not promise crash recovery of spend. A process crash loses
+in-memory accounting and unflushed frames. The next claim starts accounting
+for its current phase and treats proved history as a baseline; it does not
+reconstruct the missing spend. Delivered frames retain the existing
+idempotent, additive per-leg fold. This is not an fsync or storage-crash
+recovery guarantee. See [ADR-2555](../adr/2555-run-usage-attribution.md).
+
 ## Rejected runs and failure accounting
 
-Usage outcomes count finished run rows, including runs with no usage. A failed
+Usage outcomes count finished run rows, including runs with no usage. They
+cover every terminal run kind except chat: issue, task, prompt, job,
+self_improve, mr_rework, ci_fix, cross_check and judge. Chat runs are
+conversation sessions and are excluded. The `Runs` count stays primary work
+only. Membership is by run status alone: each run is one row, with no
+deduplication against its parent run, and cross-check metadata (supersession,
+`approved_not_stored`, a negative verdict) never moves a run between buckets.
+The numerator and denominator are the same population. A failed
 run with `fail_origin = base_diverged` has its own count, as does
 `plan_rejected`; neither contributes to the `failed` count, `fail_origins`
 map or lifetime failure recency. These definitions apply to personal, factory

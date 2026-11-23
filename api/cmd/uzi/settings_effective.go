@@ -94,7 +94,9 @@ func effectiveSettingsRows(s apitypes.UserSettingsDTO, e *apitypes.EffectiveSett
 	}
 	rows = append(rows, modelSettingRows("summary", s.SummaryModels)...)
 	rows = append(rows, modelRows("task_review_model")...)
-	return append(rows, effortRows("task_review_effort")...)
+	rows = append(rows, effortRows("task_review_effort")...)
+	// PRD #3252: the Claude planning rows come from the settings read on both table paths.
+	return append(rows, planningSettingRows(s.PlanningModels, s.PlanningEfforts)...)
 }
 
 // effectiveStartRows renders the start choices: what a start with that harness choice resolves to
@@ -193,18 +195,19 @@ func schedulePreviewRows(d *apitypes.ScheduleSettingsPreviewDTO) []settingRow {
 	}
 	rows := []settingRow{row}
 	if d.Harness != nil && d.Harness.Value != nil && d.Refusal == nil {
-		rows = append(rows, scheduleBranchRows(*d.Harness.Value, d.WorkerModel, d.WorkerEffort, d.Credential, d.Subagents, nil, nil)...)
+		rows = append(rows, scheduleBranchRows(*d.Harness.Value, d.WorkerModel, d.WorkerEffort, d.Credential, d.Subagents, d.PlanPhase, nil, nil)...)
 	}
 	for _, a := range d.Alternatives[:min(len(d.Alternatives), 2)] {
-		rows = append(rows, scheduleBranchRows(a.Harness, a.WorkerModel, a.WorkerEffort, a.Credential, a.Subagents, a.Refusal, a.RefusalDetail)...)
+		rows = append(rows, scheduleBranchRows(a.Harness, a.WorkerModel, a.WorkerEffort, a.Credential, a.Subagents, a.PlanPhase, a.Refusal, a.RefusalDetail)...)
 	}
 	return rows
 }
 
 // scheduleBranchRows are the rows of one harness: its fire refusal, or the worker model, worker
-// effort, credential and subagent rows.
+// effort, plan phase (PRD #3252, only when the owner's planning lane applies), credential and
+// subagent rows.
 func scheduleBranchRows(harness string, model *apitypes.EffectiveModelCellDTO, effort *apitypes.EffectiveEffortCellDTO,
-	cred *apitypes.CredentialDTO, subs *apitypes.EffectiveSubagentsDTO, refusal, detail *string) []settingRow {
+	cred *apitypes.CredentialDTO, subs *apitypes.EffectiveSubagentsDTO, plan *apitypes.EffectivePlanPhaseDTO, refusal, detail *string) []settingRow {
 	if refusal != nil {
 		return []settingRow{{Setting: "fire", Harness: harness, StoredText: "-", Default: "-", Resolved: "refused: " + refusalText(refusal, detail)}}
 	}
@@ -221,6 +224,7 @@ func scheduleBranchRows(harness string, model *apitypes.EffectiveModelCellDTO, e
 		r.Harness, r.Notes = harness, effort.Notes
 		rows = append(rows, r)
 	}
+	rows = append(rows, planPhaseRows(harness, plan)...)
 	if cred != nil {
 		resolved := cred.Kind + " credential"
 		if cred.AuthMode != nil {
@@ -232,6 +236,38 @@ func scheduleBranchRows(harness string, model *apitypes.EffectiveModelCellDTO, e
 		rows = append(rows, settingRow{Setting: "subagents", Harness: harness, StoredText: "-", Default: "-", Resolved: subagentsText(subs)})
 	}
 	return rows
+}
+
+// planPhaseRows renders the plan-phase pair of a schedule fire as a plan model row and a plan effort
+// row, next to the worker rows that are the implement pair. The source label is the planning one
+// for a planning value and the ordinary model or effort label when the implement value won (a
+// schedule pin); a side the plan phase ships nothing for reads as following the implement side.
+func planPhaseRows(harness string, p *apitypes.EffectivePlanPhaseDTO) []settingRow {
+	if p == nil {
+		return nil
+	}
+	pick := func(planning, ordinary, source string) (field string) {
+		if source == "" {
+			return "" // nothing shipped on this side: no provenance to label
+		}
+		if _, ok := modelSettingLabels[[2]string{planning, source}]; ok {
+			return planning
+		}
+		return ordinary
+	}
+	model, effort := "same as the worker model", "same as the worker effort"
+	if p.Model != nil {
+		model = orSDKDefault(*p.Model)
+	}
+	if p.Effort != nil {
+		effort = *p.Effort
+	}
+	return []settingRow{
+		{Setting: "plan phase model", Harness: harness, StoredText: "-", Default: "-", Resolved: model,
+			Field: pick("planning_model", "model", p.ModelSource), Source: p.ModelSource},
+		{Setting: "plan phase effort", Harness: harness, StoredText: "-", Default: "-", Resolved: effort,
+			Field: pick("planning_effort", "effort", p.EffortSource), Source: p.EffortSource},
+	}
 }
 
 // subagentsText says how the subagents pick a model. At most eight pins are named.

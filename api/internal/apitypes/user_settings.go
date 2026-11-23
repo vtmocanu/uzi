@@ -44,6 +44,18 @@ type UserSettingsDTO struct {
 	// instance Codex summary model. SummaryModels is the read-only resolved view of both
 	// summary lanes, ordered claude then codex.
 	CodexSummaryModel *string `json:"codex_summary_model"`
+	// TaskReviewModel and CodexTaskReviewModel mirror the owner's per-harness model for the
+	// handoff review pass (PRD #1570); null = the built-in review model. TaskReviewModels is the
+	// read-only resolved view, ordered claude then codex.
+	TaskReviewModel      *string               `json:"task_review_model"`
+	CodexTaskReviewModel *string               `json:"codex_task_review_model"`
+	TaskReviewModels     []ModelSettingCellDTO `json:"task_review_models"`
+	// TaskReviewEffort and CodexTaskReviewEffort mirror the owner's per-harness effort for the review
+	// pass (PRD #1570): a level or `runtime`; null = inherit the worker effort. TaskReviewEfforts is
+	// the read-only resolved view, ordered claude then codex.
+	TaskReviewEffort      *string                `json:"task_review_effort"`
+	CodexTaskReviewEffort *string                `json:"codex_task_review_effort"`
+	TaskReviewEfforts     []EffortSettingCellDTO `json:"task_review_efforts"`
 	// Theme is the DEPRECATED legacy single-theme override mirror (PRD #21); kept
 	// one release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`
@@ -67,7 +79,7 @@ type UserSettingsDTO struct {
 	LightTheme     *string `json:"light_theme"`
 	DarkTheme      *string `json:"dark_theme"`
 	Typeface       *string `json:"typeface"`
-	// SidebarMotion and EffectiveSidebarMotion mirror the animated-sidebar-icons opt-in
+	// SidebarMotion and EffectiveSidebarMotion mirror the animated-sidebar-icons choice
 	// (issue #4510): the raw choice (null = not chosen) and the resolved flag. Fidelity
 	// only; there is no CLI setter.
 	SidebarMotion          *bool `json:"sidebar_motion"`
@@ -96,6 +108,17 @@ type UserSettingsDTO struct {
 	// EffortSettings is read-only (never sent on a PUT): the resolved ordinary effort
 	// preference per harness (PRD #3247), claude then codex.
 	EffortSettings []EffortSettingCellDTO `json:"effort_settings"`
+	// PlanningClaudeModel and PlanningClaudeEffort are the owner's Claude planning pair (PRD
+	// #3252): used only while a Claude lead-lane run plans; null = "Same as the run". Writable on
+	// PUT /api/me/settings.
+	PlanningClaudeModel  *string `json:"planning_claude_model"`
+	PlanningClaudeEffort *string `json:"planning_claude_effort"`
+	PlanningCodexModel   *string `json:"planning_codex_model"`
+	PlanningCodexEffort  *string `json:"planning_codex_effort"`
+	// PlanningModels and PlanningEfforts are read-only (never sent on a PUT): the resolved view of
+	// the planning pairs, ordered claude then codex.
+	PlanningModels  []ModelSettingCellDTO  `json:"planning_models"`
+	PlanningEfforts []EffortSettingCellDTO `json:"planning_efforts"`
 	// WeeklyReservePct and WeeklyReservePauseRunning mirror the weekly usage reserve (PRD
 	// #3522): the 7-day utilization percent (1..100) at which uzi stops spending the user's
 	// subscription (null = off), and whether a running run is also paused. They are NOT

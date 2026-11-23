@@ -1176,7 +1176,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// work was published to, and an early expiry of the acknowledged ones. Same
 				// RequireUser group and strict GetRun owner-or-404 gate as the hold discard above, so
 				// `uzi run held` reaches both from a uzc_ Bearer and a worker token is refused. The
-				// expiry deletes nothing: it makes the rows due, and the held_publication sweeper
+				// list is owner-or-404 plus the audited admin_ro debug read of a foreign run
+				// (adminRunDebugForeignRun); the expiry stays strictly owner-only. The expiry
+				// deletes nothing: it makes the rows due, and the held_publication sweeper
 				// pass deletes the refs. Not gated by UZI_HELD_PUBLICATION (cleanup never is).
 				r.Get("/{id}/held-publications", h.ListRunHeldPublications)
 				r.Post("/{id}/held-publications/expire", h.ExpireRunHeldPublications)
@@ -1368,6 +1370,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// retained work no checkpoint attests; the service parks its own live claim (running ->
 		// paused, hold_reason='base_attestation_missing') before the agent ever runs.
 		r.Post("/runs/{id}/base-attestation-hold", h.WorkerRunBaseAttestationHold)
+		// PRD #3252 m4: the Claude phase-switch HOLD. The worker could not bind the next plan/implement
+		// phase to a supported model configuration; the service parks its own live claim (running |
+		// awaiting_approval -> paused, hold_reason='phase_switch_unavailable'). A job run never holds.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/phase-switch-hold", h.WorkerRunPhaseSwitchHold)
 		r.Post("/runs/{id}/repo-agent-source-hold", h.WorkerRunRepoAgentSourceHold)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,

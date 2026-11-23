@@ -119,18 +119,23 @@ func saveCrossCheckPinsTx(ctx context.Context, q *store.Queries, patches []store
 	return nil
 }
 
-// crossCheckPinSettings returns the four pin cells and, as a second value, the lead
-// template's Codex pin (template_codex_model) from the same rows: the LATERAL
+// crossCheckPinSettings returns the four pin cells and, as second and third values, the lead
+// template's Codex pin (template_codex_model) and Claude pin (template_model) from the same rows: the LATERAL
 // lead/orchestrator selection is the one rule, identical on every row, so the first
-// row carries it (invalid when there are no rows or no pin).
-func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, pgtype.Text, error) {
+// row carries it (invalid when there are no rows or no pin). The fourth and fifth values are the
+// lead template's raw Claude effort (template_effort) and Codex effort (template_codex_effort),
+// unfiltered; invalid when unset or there are no rows.
+func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) ([]crossCheckPinDTO, pgtype.Text, pgtype.Text, pgtype.Text, pgtype.Text, error) {
 	rows, err := h.q.ListUserCrossCheckPins(ctx, userID)
 	if err != nil {
-		return nil, pgtype.Text{}, err
+		return nil, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, err
 	}
-	var leadCodexPin pgtype.Text
+	var leadCodexPin, leadClaudePin, leadClaudeEffort, leadCodexEffort pgtype.Text
 	if len(rows) > 0 {
 		leadCodexPin = rows[0].TemplateCodexModel
+		leadClaudePin = rows[0].TemplateModel
+		leadClaudeEffort = rows[0].TemplateEffort
+		leadCodexEffort = rows[0].TemplateCodexEffort
 	}
 	cells := make([]crossCheckPinDTO, 0, len(rows))
 	for _, row := range rows {
@@ -152,5 +157,5 @@ func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) (
 			Model: model, Effort: effort, ResolvedModel: resolved.Model, ResolvedEffort: resolved.Effort,
 			ModelSource: resolved.ModelSource, EffortSource: resolved.EffortSource, Active: true})
 	}
-	return cells, leadCodexPin, nil
+	return cells, leadCodexPin, leadClaudePin, leadClaudeEffort, leadCodexEffort, nil
 }

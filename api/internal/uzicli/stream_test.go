@@ -981,6 +981,24 @@ func TestKnownRunStatusesMatchTheMigrationCheck(t *testing.T) {
 			"Widening the CHECK is a three-file edit: the migration, knownRunStatuses, and the count in its comment.",
 			fromGo, fromSQL, chosen)
 	}
+
+	// The server-side apitypes.RunStatuses (the admin run listing's ?status= vocabulary)
+	// must be the same set, with no duplicates.
+	seen := map[string]bool{}
+	for _, s := range apitypes.RunStatuses {
+		if seen[s] {
+			t.Errorf("apitypes.RunStatuses lists %q twice", s)
+		}
+		seen[s] = true
+	}
+	var fromAPI []string
+	for s := range seen {
+		fromAPI = append(fromAPI, s)
+	}
+	sort.Strings(fromAPI)
+	if strings.Join(fromAPI, ",") != strings.Join(fromGo, ",") {
+		t.Fatalf("apitypes.RunStatuses has drifted from knownRunStatuses.\n  apitypes: %v\n  Go:       %v", fromAPI, fromGo)
+	}
 }
 
 // gooseUpHalf returns the text between `-- +goose Up` and `-- +goose Down`, and whether

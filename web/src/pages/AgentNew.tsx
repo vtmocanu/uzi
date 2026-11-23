@@ -13,6 +13,8 @@ const BLANK = {
   description: "",
   model: null,
   codex_model: null,
+  effort: null,
+  codex_effort: null,
   tools: null,
   prompt_body: "",
 };
