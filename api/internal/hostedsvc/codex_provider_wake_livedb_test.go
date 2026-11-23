@@ -217,6 +217,43 @@ func TestCodexProviderWakeLeaseLiveDB(t *testing.T) {
 	}
 }
 
+// With no sleeper or wake, only the lease protocol can suppress provisioning.
+func TestCodexProviderLeaseProvisionWithoutWakeLiveDB(t *testing.T) {
+	for _, compatible := range []bool{false, true} {
+		name := "incompatible"
+		if compatible {
+			name = "compatible"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newWakeEnv(t, true)
+			e.settings.lease = time.Hour
+			run := codexProviderWakeRun(e)
+			leased := e.leasedEphemeral(run)
+			caps := []string{"codex_harness_v1", "codex_runtime_v2"}
+			if compatible {
+				caps = codexProviderWakeCaps()
+			}
+			e.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, leased, caps)
+			if e.wake() != 0 || e.wakeRowsFor(run) != 0 {
+				t.Fatal("fixture unexpectedly supplied wake coverage")
+			}
+			want := int64(1)
+			if compatible {
+				want = 0
+			}
+			if got := e.provision(); got != want {
+				t.Fatalf("ProvisionPass=%d, want %d with compatible lease=%t", got, want, compatible)
+			}
+			if bound := e.count(`SELECT count(*) FROM workers WHERE user_id=$1 AND ephemeral AND ephemeral_run_id=$2`, e.user, run); bound != int(want) {
+				t.Fatalf("bound replacements=%d, want %d", bound, want)
+			}
+			if e.ephemeralWorkers() != 1+int(want) || e.count(`SELECT count(*) FROM workers WHERE id=$1`, leased) != 1 {
+				t.Fatal("lease control or replacement worker count changed unexpectedly")
+			}
+		})
+	}
+}
+
 func TestCodexProviderReapProvisionLiveDB(t *testing.T) {
 	for _, guard := range []string{"none", "busy", "custody"} {
 		t.Run(guard, func(t *testing.T) {
