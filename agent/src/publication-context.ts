@@ -3,7 +3,7 @@ import type { PublicationContextRequest, PublicationContextResponse, Publication
 const reasons = new Set([
   "claim_changed", "ancestry_unknown", "association_unknown", "ambiguous_source",
   "source_unknown", "authority_unknown", "publication_unproven", "invalid_request",
-  "forge_unknown", "forge_mismatch", "authority_changed",
+  "forge_unknown", "forge_mismatch", "authority_changed", "target_terminal",
 ]);
 /** Returns the refusal reason only when it is one of the closed set the api may report. */
 export function publicationContextReason(v: unknown): string | undefined {

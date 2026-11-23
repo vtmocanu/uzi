@@ -24,6 +24,7 @@ type fakeNotifStore struct {
 	codexCurrent  bool
 	codexErr      error
 	codexAsked    []store.IsCodexEarlyResetCurrentParams
+	weeklyAsked   []store.IsCodexWeeklyWarningCurrentParams
 	rc            store.GetSlackRunContextRow
 	crossCheckRun store.Run
 	// Gated plan cross-check summary (PRD #3708): nil + nil error models no row.
@@ -1395,13 +1396,13 @@ func TestParkedRunRendersAsPausedNotAsARawStatus(t *testing.T) {
 // park by the marker, not by this function; this test pins that renderThreadBlocks stays
 // out of the resume business.
 func TestRenderThreadBlocksThreadsParkNotQueued(t *testing.T) {
-	if _, _, ok := renderThreadBlocks(parkedCtx("seven_day", time.Hour, 1), "https://uzi.example"); !ok {
+	if _, _, ok := renderThreadBlocks(parkedCtx("seven_day", time.Hour, 1), "https://uzi.example", nil); !ok {
 		t.Fatal("a park threaded nothing; the edited root raises no Slack notification, so " +
 			"the user would never learn the run paused")
 	}
 	// The promotion back to queued must NOT thread here — the resume is anchor-driven, not
 	// a renderThreadBlocks status arm, so this function stays ok=false for queued.
-	if _, _, ok := renderThreadBlocks(baseRun("queued"), "https://uzi.example"); ok {
+	if _, _, ok := renderThreadBlocks(baseRun("queued"), "https://uzi.example", nil); ok {
 		t.Fatal("renderThreadBlocks threaded a queued event; the resume is anchor-driven, " +
 			"not a status arm here")
 	}
@@ -1438,7 +1439,7 @@ func TestRecoveryWaitRendersAsRecoveringNotARawStatus(t *testing.T) {
 // "Recovering". Reddening mutation: add a recovery_wait arm to renderThreadBlocks → ok
 // becomes true and this fails.
 func TestRenderThreadBlocksDoesNotThreadRecoveryWait(t *testing.T) {
-	if _, _, ok := renderThreadBlocks(baseRun("recovery_wait"), "https://uzi.example"); ok {
+	if _, _, ok := renderThreadBlocks(baseRun("recovery_wait"), "https://uzi.example", nil); ok {
 		t.Fatal("renderThreadBlocks threaded a recovery_wait event; an unbounded auto-resuming " +
 			"park must not thread per-park (it would violate the bounded-by-construction property)")
 	}
@@ -1450,7 +1451,7 @@ func TestRenderThreadBlocksDoesNotThreadRecoveryWait(t *testing.T) {
 // no longer says a usage limit was cleared.
 func TestProviderGatewayParkRendersAsGatewayWaitNotUsageLimit(t *testing.T) {
 	rc := parkedCtx("provider_gateway_limit", 5*time.Minute, 2)
-	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example", nil)
 	if !ok {
 		t.Fatal("a gateway park must thread like any park")
 	}
@@ -1474,7 +1475,7 @@ func TestProviderGatewayParkRendersAsGatewayWaitNotUsageLimit(t *testing.T) {
 		t.Errorf("root = %q / %q, want the gateway wording", rootSection, rootFallback)
 	}
 	owner := parkedCtx("provider_gateway_limit", 0, 4)
-	d := limitWaitDetail(owner)
+	d := limitWaitDetail(owner, nil)
 	if !strings.Contains(d, "waiting for you to resume") || !strings.Contains(d, "uzi run resume") || strings.Contains(d, "<!date^") {
 		t.Errorf("owner-wait detail = %q, want the resume path and no retry time", d)
 	}
@@ -1490,11 +1491,11 @@ func TestProviderGatewayParkRendersAsGatewayWaitNotUsageLimit(t *testing.T) {
 func TestLimitWaitDetailOmitsWhatItDoesNotKnow(t *testing.T) {
 	// A park with no window and no stamp on the first pause has no detail at all: the
 	// section carries the head, and the context is just the deep link.
-	if bare := limitWaitDetail(parkedCtx("", 0, 1)); bare != "" {
+	if bare := limitWaitDetail(parkedCtx("", 0, 1), nil); bare != "" {
 		t.Fatalf("a park with no window and no stamp had detail %q; it must be empty rather "+
 			"than inventing a window or a time", bare)
 	}
-	blocks, _, ok := renderThreadBlocks(parkedCtx("", 0, 1), "https://uzi.example")
+	blocks, _, ok := renderThreadBlocks(parkedCtx("", 0, 1), "https://uzi.example", nil)
 	if !ok {
 		t.Fatal("a bare park must still thread the head + link")
 	}
@@ -1502,15 +1503,15 @@ func TestLimitWaitDetailOmitsWhatItDoesNotKnow(t *testing.T) {
 	if !strings.Contains(section, "Paused · usage limit") {
 		t.Fatalf("park section = %q, want the pause head", section)
 	}
-	if strings.Contains(limitWaitDetail(parkedCtx("five_hour", time.Hour, 1)), "(pause") {
+	if strings.Contains(limitWaitDetail(parkedCtx("five_hour", time.Hour, 1), nil), "(pause") {
 		t.Fatal("a pause counter on the FIRST park is noise — the counter is the signal that a run is burning its retry budget")
 	}
-	if repeat := limitWaitDetail(parkedCtx("five_hour", time.Hour, 3)); !strings.Contains(repeat, "(pause 3)") {
+	if repeat := limitWaitDetail(parkedCtx("five_hour", time.Hour, 3), nil); !strings.Contains(repeat, "(pause 3)") {
 		t.Fatalf("%q — from the second park on, the rising count is the warning that this "+
 			"run may be about to fail for good", repeat)
 	}
 	// The reader-local resume token is preserved verbatim.
-	if d := limitWaitDetail(parkedCtx("five_hour", time.Hour, 1)); !strings.Contains(d, "resumes <!date^") {
+	if d := limitWaitDetail(parkedCtx("five_hour", time.Hour, 1), nil); !strings.Contains(d, "resumes <!date^") {
 		t.Fatalf("detail = %q, want the <!date^…> reader-local resume token preserved", d)
 	}
 }
@@ -1520,7 +1521,7 @@ func TestLimitWaitDetailOmitsWhatItDoesNotKnow(t *testing.T) {
 // refactor. That is exactly the population the CHECK exists for, so the renderer
 // escapes rather than trusting.
 func TestLimitWaitDetailEscapesTheWindowField(t *testing.T) {
-	got := limitWaitDetail(parkedCtx("five_hour<https://evil|click>", time.Hour, 1))
+	got := limitWaitDetail(parkedCtx("five_hour<https://evil|click>", time.Hour, 1), nil)
 	if strings.Contains(got, "<https://evil|click>") {
 		t.Fatalf("unescaped mrkdwn reached the DM: %q", got)
 	}
@@ -1938,7 +1939,7 @@ func TestRenderThreadBlocksShapesPerEvent(t *testing.T) {
 		{"cancelled", baseRun("cancelled"), "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
 		{"limit_wait", parkedCtx("five_hour", time.Hour, 1), "⏸️ *Paused · usage limit*", "Paused · usage limit · grp/repo#42"},
 	} {
-		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example")
+		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example", nil)
 		if !ok {
 			t.Errorf("%s: ok=false, want a threaded event", tc.name)
 			continue
@@ -1966,7 +1967,7 @@ func TestRenderThreadBlocksScopeCappedCompletion(t *testing.T) {
 	capped.Status = "completed"
 	capped.StopKind = txt("scope_capped")
 
-	blocks, fallback, ok := renderThreadBlocks(capped, "https://uzi.example")
+	blocks, fallback, ok := renderThreadBlocks(capped, "https://uzi.example", nil)
 	if !ok {
 		t.Fatal("scope-capped completion must thread an event")
 	}
@@ -1984,7 +1985,7 @@ func TestRenderThreadBlocksScopeCappedCompletion(t *testing.T) {
 	// A normal completion is unchanged: plain label, plain fallback, no milestone count.
 	normal := milestoneRun(t, 3, 7, "")
 	normal.Status = "completed"
-	blocks, fallback, ok = renderThreadBlocks(normal, "https://uzi.example")
+	blocks, fallback, ok = renderThreadBlocks(normal, "https://uzi.example", nil)
 	if !ok {
 		t.Fatal("normal completion must thread an event")
 	}
@@ -2057,7 +2058,7 @@ func TestRenderThreadBlocksNeedsLanding(t *testing.T) {
 		{"plain-failed-non-landable", plainFailed, "❌ *Failed*", "Failed · grp/repo#42"},
 		{"cancelled-still-cancelled", cancelledLandable, "🚫 *Cancelled*", "Cancelled · grp/repo#42"},
 	} {
-		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example")
+		blocks, fallback, ok := renderThreadBlocks(tc.rc, "https://uzi.example", nil)
 		if !ok {
 			t.Errorf("%s: ok=false, want a threaded event", tc.name)
 			continue
@@ -2081,7 +2082,7 @@ func TestRenderThreadBlocksPausedCarriesCheckpoint(t *testing.T) {
 	rc.Status = "paused"
 	rc.CheckpointTip = txt("abc1234def5678") // >7 chars: must be truncated
 
-	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example", nil)
 	if !ok {
 		t.Fatal("a paused transition must thread an event")
 	}
@@ -2114,7 +2115,7 @@ func TestRenderThreadBlocksPausedCarriesCheckpoint(t *testing.T) {
 
 	// A run with no published checkpoint omits the clause entirely.
 	rc.CheckpointTip = pgtype.Text{}
-	blocks, _, _ = renderThreadBlocks(rc, "https://uzi.example")
+	blocks, _, _ = renderThreadBlocks(rc, "https://uzi.example", nil)
 	if strings.Contains(contextText(blocks), "checkpoint") {
 		t.Fatalf("a run with no checkpoint must omit the clause: %q", contextText(blocks))
 	}
@@ -2123,7 +2124,7 @@ func TestRenderThreadBlocksPausedCarriesCheckpoint(t *testing.T) {
 // A non-terminal, non-park transition threads nothing (ok=false).
 func TestRenderThreadBlocksSkipsRunningAndQueued(t *testing.T) {
 	for _, status := range []string{"queued", "running", "claimed", "awaiting_approval"} {
-		if _, _, ok := renderThreadBlocks(baseRun(status), "https://uzi.example"); ok {
+		if _, _, ok := renderThreadBlocks(baseRun(status), "https://uzi.example", nil); ok {
 			t.Errorf("%s must not thread a terminal event", status)
 		}
 	}
@@ -2134,7 +2135,7 @@ func TestRenderThreadBlocksSkipsRunningAndQueued(t *testing.T) {
 func TestRenderThreadBlocksFailedReasonIsAnEscapedSection(t *testing.T) {
 	rc := baseRun("failed")
 	rc.FailureReason = txt("boom <@U9> leaked sk-ant-abc123DEF")
-	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example", nil)
 	if !ok {
 		t.Fatal("failed must thread an event")
 	}
@@ -2156,7 +2157,7 @@ func TestRenderThreadBlocksUseEmojiPresentation(t *testing.T) {
 		baseRun("cancelled"),
 		parkedCtx("five_hour", time.Hour, 2),
 	} {
-		blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+		blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example", nil)
 		if !ok {
 			t.Fatalf("%s: want a threaded event", rc.Status)
 		}

@@ -1,7 +1,7 @@
 # PRD #4123: Weekly limit warning and switch reason
 
 **Issue**: #4123
-**Status**: Draft (refreshed 2026-11-22 against main `aa46586b`)
+**Status**: Implemented M1–M3 on branch `agent/issue-4123` (2026-11-22); owner acceptance pending (live Slack DM and hosted rendering)
 **Priority**: Normal
 
 ## Problem
@@ -106,7 +106,7 @@ Acceptance examples:
   - `RunDTO` carries the full block on run detail. `RunSummaryItemDTO` carries only `{tier, credential_key, credential_label}`. Preserve the existing owner/admin disclosure boundary for labels and alternatives.
 - **Escaping**: labels are owner-authored text, escaped per surface.
   - Slack: `EscapeMrkdwn` (blocks and fallback text).
-  - TUI/CLI: the bounded `cellText` in `api/cmd/uzi/render.go` (not the unbounded `CellText`).
+  - TUI/CLI: the bounded `cellText` in `api/cmd/uzi/render.go` (not the unbounded `CellText`) for every label cell. Exception: the fix-command cell is sanitized (`uzicli.CellText`) but not truncated, because a valid 64-byte label of `'` characters shell-quotes to 258 runes and a 200-rune cap would break the command; `set-token` has no stable-id form. A label that is not command-safe (sanitizing would change it, or it contains a replacement character) gets no command string at all, only a rename hint (D17).
   - Web: React text.
   - A rendered fix command that contains a label is shell-quoted correctly, or uses an existing stable-id form; `cellText` sanitization alone does not quote shell metacharacters.
   - Each surface gets a hostile-label test with quotes, backticks and `$(...)` syntax, assembled at runtime.
@@ -152,7 +152,7 @@ Acceptance examples:
   - The existing credential/account authority fence (Codex: owner/account/generation/credential_revision/enablement_sig) is carried through creation and queued delivery.
   - The Slack DM is best-effort. The durable Slack path deliberately excludes credential-fenced notifications (`notifysvc/service.go`, "a stale fenced DM must never be replayed"), and that is not reopened for this kind. Ordinary Slack consent and link checks apply.
   - The `notifications` row is not owner-visible (PRD #1650 retired the in-app inbox; the table is a pruned, write-only event log). A lost DM is accepted: the live web/TUI banner still shows the warning.
-- **Bounds**: one row per credential; one notification per credential per weekly window. The grouped run list is capped: a total plus a truncated list, using existing render limits.
+- **Bounds**: one row per credential; at most one notification per credential per observed anchored weekly period (D16). This is not a guaranteed seven elapsed days. The grouped run list is capped: a total plus a truncated list, using existing render limits.
 
 ### 6. Per-user margin setting (M2)
 
@@ -216,6 +216,9 @@ Acceptance examples:
 
 ### M1: Parked runs say why they could not switch
 
+**Status**: implemented; unit, handler, CLI, web and Slack render tests plus mutation checks green in-run.
+
+
 Modules 1, 2 (park cases), 4 (run page, `uzi run get`/TUI, Slack park and reserve-pause messages). The selection-kernel extraction lands here, with parity proven first. No migration.
 
 - **Blocked by**: none.
@@ -229,6 +232,9 @@ Modules 1, 2 (park cases), 4 (run page, `uzi run get`/TUI, Slack park and reserv
 
 ### M2: Early warning on web and CLI, with the margin setting
 
+**Status**: implemented; the margin route LiveDB tests (auth, CSRF, default 15, CHECK) passed on a throwaway database.
+
+
 Module 3, the near/at cases of module 2 for running and queued runs, the `RunSummaryItemDTO` projection, the run-page banner, the `limit` decision kind, TUI/CLI rendering, module 6 (migration).
 
 - **Blocked by**: M1.
@@ -240,6 +246,9 @@ Module 3, the near/at cases of module 2 for running and queued runs, the `RunSum
   - the setting round-trips in web and `uzi settings`.
 
 ### M3: Slack warning, once per weekly window
+
+**Status**: implemented; the weeklywarn state-machine tests and 15 LiveDB tests (ordering, rollback, concurrency, fences, cascade, vault reset, relink) passed on a throwaway database. Live Slack delivery is owner acceptance.
+
 
 Module 5 (migration).
 
@@ -271,3 +280,9 @@ Module 5 (migration).
   - a forward-only timestamp threshold: it misses a refill at an unchanged reset timestamp, and recognized resets that move less than the threshold;
   - a row per (owner, credential, window): it grows and needs a sweeper prune.
 - **D14. Vendor subscriptions only; no #4323 dependency (2026-11-22).** Applicability follows the run's frozen binding: provider-bound and API-key runs are excluded before any vendor meter read. Custom providers have no weekly subscription meter in uzi.
+- **D15. Observation gap after the fenced meter write is an accepted residual (2026-11-22, maintainer lead and buddy).** The warning ledger's observation transaction stays separate from the fenced meter write and runs after it, and the fenced meter write paths are not changed. A crash, or a failed observation transaction, between the meter commit and the observation commit can lose a refill-only observation; that period may then get no second DM. This is accepted under D11 (the Slack DM is best-effort; the live banner is the guaranteed surface). It is a new decision, not a pre-existing allowance. It amends D11's sentence "a failed write never suppresses later attempts": that holds for the notification-row write (the claim rolls back and the next near reading notifies, because the observation already committed), not for a lost observation.
+- **D16. Canonical Codex anchored period and the observed-period bound (2026-11-22).** A Codex weekly window (604800 s, primary or secondary) is identified by bucket id plus boundary, never by slot or payload order. The anchor is the valid weekly window with the highest utilization whose reset is after the observation instant (ties: earliest reset, then smallest bucket id, then primary). A sticky per-period flag (`anchor_multi`) records that the anchored bucket has shown two or more weekly windows; while it is set, a single remaining window is never inferred to be a forward roll, and only a matched unchanged-boundary refill or a verified fresh post-boundary reading (the observation instant is past the anchored boundary with no same-boundary window) starts a new period. The bound is at most one DM per credential per observed anchored period, not a guaranteed seven elapsed days. This amends D13 ("re-armed only by an observed reset") to also allow the verified post-boundary re-anchor, and an anchor cleared when no valid window resets in the future. Residual (data ambiguity): if a second weekly window B was absent from every accepted reading of the period, the flag stays false, so A vanishing while B appears alone with a later reset is treated as a forward roll and that period can get one extra DM. A window absent from every accepted reading is indistinguishable from a genuine early reset. Deleting an Anthropic token or a full vault reset removes the ledger row (a new ledger, which can warn again in the same calendar week); a Codex relink reuses the account row, so its ledger survives.
+- **D17. Fix commands are copyable and safe (2026-11-22).** Every label-bearing fix command puts all flags before `--` and then the shell-quoted label (a valid label such as `--default` stays positional); `uzi token pool` always carries `--kind`. Grandfathered labels that are not command-safe get no command.
+- **D18. A run is never listed twice on the Overview (2026-11-22).** The `limit` decision item is skipped for any run already shown on the "Needs your decision" card as a plan, question or owner park, not only an owner park, so the module 4 suppression rule is widened to satisfy M2's "a run is never listed twice". The credential row's run count therefore counts only runs not listed elsewhere; the run page banner still shows for every affected run.
+- **D19. Near-limit blocks on other-window parks (2026-11-22).** A run parked on `five_hour` or a per-model window whose credential's overall weekly reading is near or at the limit gets the M2 near-limit block on web/CLI/TUI (the Slack park message is unchanged). Its wait is `unknown`, because its stored retry/reset stamps belong to the other window. Below the margin such parks render exactly as before.
+- **D20. Implementation choices (2026-11-22).** The `--` command grammar and an always-present `--kind` (D17); a run-scoped `uzi run set-token <id> --auto` alongside worker auto; the warning fence instant is the exact persisted reading time (µs) compared in SQL; the observation and claim are separate transactions so a failed notification-row write never loses rearm evidence (D15); a pure step-0 validity gate runs before any transaction, so a rejected reading takes no lock and writes no row; the DM content is built before the claim transaction, which re-checks every gate.

@@ -258,6 +258,13 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// session user, never the body.
 	r.With(h.requireUser()).Put("/me/usage-reserve", h.SetUsageReserve)
 
+	// Current-user weekly-limit warning margin (PRD #4123): how many percentage points below its
+	// effective weekly limit a credential must be before the early banner shows (0 = off). A
+	// dedicated route rather than a widened /me/usage-reserve, whose body requires both reserve
+	// fields. RequireUser like the reserve (`uzi settings warning-margin` over a uzc_ Bearer); cookie
+	// writes require CSRF. Identity is the session user, never the body.
+	r.With(h.requireUser()).Put("/me/weekly-warning-margin", h.SetWeeklyWarningMargin)
+
 	// Current-user Codex account mode (issue #3719): "default" binds the default alias,
 	// "auto" picks among the aliases the user pooled. RequireUser, so a uzc_ CLI Bearer
 	// works (`uzi settings codex-mode`). The pool flags are the per-alias consent and the

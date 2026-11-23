@@ -2237,6 +2237,10 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// terminalStopFault is a test seam (nil in production): the publication-context terminal stop
+	// (issue #4616) calls it at the named phase of each attempt, and a non-nil error is treated
+	// exactly like the corresponding store failure. See terminalStopFaultPhase.
+	terminalStopFault func(phase string, attempt int) error
 	// registerAfterBegin is a test seam (nil in production): Register calls it right after its
 	// transaction BEGINs and before it locks the worker row, so a test can pause a registration whose
 	// now() is already fixed while a credential-switch hold is stamped behind it.
@@ -9168,6 +9172,19 @@ type SubmitInputResult struct {
 // the run must be assigned to a worker whose heartbeat is fresh. A queued run
 // (no worker) or a stale/absent worker means no live poller.
 func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error) {
+	return s.hasLivePollerWith(ctx, s.q, run)
+}
+
+// livePollerReader is the read surface hasLivePollerWith needs; both the Service's Store and a
+// transaction-bound *store.Queries satisfy it, so the terminal-target cancel (issue #4616) can
+// decide liveness inside its own locked transaction with the identical rule.
+type livePollerReader interface {
+	GetWorkerByID(ctx context.Context, id uuid.UUID) (store.Worker, error)
+	RunHasPendingOutcomeLease(ctx context.Context, id uuid.UUID) (bool, error)
+}
+
+// hasLivePollerWith is hasLivePoller over an explicit reader.
+func (s *Service) hasLivePollerWith(ctx context.Context, q livePollerReader, run store.Run) (bool, error) {
 	// PRD #35: a PARKED run has no poller either, and this check is POSITIVE — which
 	// is why it is one of the two sites in the whole PRD that genuinely needed
 	// editing, while every negative guard elsewhere covered limit_wait for free.
@@ -9197,7 +9214,7 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || run.Status == "paused" || !run.WorkerID.Valid {
 		return false, nil
 	}
-	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
+	wkr, err := q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -9220,7 +9237,7 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// claim-exclusion join; chat is exempt (D6/D10: it never journals a terminal), so it is skipped
 	// here rather than round-tripped for a query that always answers false.
 	if run.Kind != runkind.Chat {
-		pending, perr := s.q.RunHasPendingOutcomeLease(ctx, run.ID)
+		pending, perr := q.RunHasPendingOutcomeLease(ctx, run.ID)
 		if perr != nil {
 			return false, perr
 		}

@@ -4,7 +4,7 @@
 -- codex_provider_account.reauth_*), 00199/00200 (codex_provider_account /
 -- codex_credential_state).
 
--- name: UpsertCodexAccountRateLimits :execrows
+-- name: UpsertCodexAccountRateLimits :one
 -- The revision-fenced SUCCESS write (PRD #1209 M1): install a fresh reading on an account,
 -- but ONLY IF authority still holds — the account is still at the (generation,
 -- credential_revision) the poll observed AND still has at least one linked alias. Both are
@@ -13,8 +13,8 @@
 -- rejects a reading for an account whose last codex_auth alias was unlinked/deleted between
 -- observation and write (there is no longer a subscription to meter). INSERT ... SELECT ...
 -- WHERE puts every fence in front of the write: a failed fence selects no row, so nothing
--- is written on EITHER the insert or the conflict path. :execrows — 0 rows means authority
--- moved, and the caller discards the reading rather than writing it stale.
+-- is written on EITHER the insert or the conflict path. :one — pgx.ErrNoRows means a refused
+-- write (authority moved), and the caller discards the reading rather than writing it stale.
 --
 -- 🔴 ENABLEMENT fence (PRD #1732 D6/D13). A Codex reading describes an ACCOUNT, and an
 -- account is live only while at least one ENABLED alias is linked to it, so the fence is
@@ -100,7 +100,8 @@ ON CONFLICT (user_id, provider_account_id) DO UPDATE SET
     attempt_status               = EXCLUDED.attempt_status,
     attempt_error                = NULL,
     enablement_sig               = EXCLUDED.enablement_sig,
-    updated_at                   = now();
+    updated_at                   = now()
+RETURNING last_success_at;
 
 -- name: RecordCodexAccountPollFailure :execrows
 -- The health-only FAILURE write (PRD #1209 M1): record that the last poll ATTEMPT failed,
@@ -428,6 +429,31 @@ WHERE a.user_id = @user_id AND a.id = @provider_account_id
     AND a.generation = @observed_generation::bigint
     AND a.credential_revision = @observed_credential_revision::bigint
     AND u.notify_early_limit_reset
+    AND a.coord_state IN ('idle', 'committed')
+    AND NOT a.reauth_required AND a.recovery_sealed IS NULL
+    AND EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    AND @enablement_sig::text <> ''
+    AND (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text = @enablement_sig::text;
+
+-- name: IsCodexWeeklyWarningCurrent :one
+-- PRD #4123 M3: the weekly-warning twin of IsCodexEarlyResetCurrent, WITHOUT the owner's
+-- notify_early_limit_reset opt-in (the warning is governed by the margin setting, not that
+-- flag). Same authority fence; no row refuses delivery.
+SELECT true::boolean AS is_current
+FROM codex_provider_account a
+WHERE a.user_id = @user_id AND a.id = @provider_account_id
+    AND a.generation = @observed_generation::bigint
+    AND a.credential_revision = @observed_credential_revision::bigint
     AND a.coord_state IN ('idle', 'committed')
     AND NOT a.reauth_required AND a.recovery_sealed IS NULL
     AND EXISTS (

@@ -101,7 +101,15 @@ func TestPublicationContextCIFixBindingToOldPRLiveDB(t *testing.T) {
 	// The old PR's root is the only candidate; the forge reports that old bound PR merged.
 	c.proof.summary = forge.MergeRequestSummary{IID: ciBindingOldMR, State: forge.MRStateMerged,
 		SourceBranch: c.branch, HeadSHA: strings.Repeat("b", 40)}
-	wantUnknown(t, c.resolve(), "forge_mismatch")
+	// A merged bound PR is a terminal target (issue #4616): the run is stopped, not refused.
+	wantUnknown(t, c.resolve(), "target_terminal")
+	var stopKind, stopReason string
+	if err := c.f.e.pool.QueryRow(c.f.e.ctx, "SELECT coalesce(stop_kind,''), coalesce(stop_reason,'') FROM runs WHERE id=$1", c.requestID).Scan(&stopKind, &stopReason); err != nil {
+		t.Fatal(err)
+	}
+	if stopKind != "cancelled" || stopReason != "target MR merged; further publication stopped." {
+		t.Fatalf("stop stamp = %q/%q", stopKind, stopReason)
+	}
 }
 
 func TestPublicationContextCIFixBindingWithoutRowsLiveDB(t *testing.T) {

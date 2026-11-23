@@ -236,16 +236,16 @@ func (s *m3OrderedStore) GetCodexEarlyResetBaseline(_ context.Context, p store.G
 	s.lastRead = p
 	return s.baseline, s.readErr
 }
-func (s *m3OrderedStore) UpsertCodexAccountRateLimits(ctx context.Context, p store.UpsertCodexAccountRateLimitsParams) (int64, error) {
+func (s *m3OrderedStore) UpsertCodexAccountRateLimits(ctx context.Context, p store.UpsertCodexAccountRateLimitsParams) (pgtype.Timestamptz, error) {
 	s.events = append(s.events, "write")
 	if s.writeErr != nil {
-		return 0, s.writeErr
+		return pgtype.Timestamptz{}, s.writeErr
 	}
-	n, err := s.fakeStore.UpsertCodexAccountRateLimits(ctx, p)
-	if err == nil && n > 0 {
+	ts, err := s.fakeStore.UpsertCodexAccountRateLimits(ctx, p)
+	if err == nil {
 		s.baseline.Buckets = append([]byte(nil), p.Buckets...)
 	}
-	return n, err
+	return ts, err
 }
 
 type m3Notifier struct {

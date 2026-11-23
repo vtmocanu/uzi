@@ -104,7 +104,7 @@ func codexPersistReading(t *testing.T, env codexTestEnv, userID, accountID uuid.
 	if err != nil {
 		t.Fatalf("marshal buckets: %v", err)
 	}
-	n, err := env.q.UpsertCodexAccountRateLimits(env.ctx, store.UpsertCodexAccountRateLimitsParams{
+	n, err := upsertCodexRows(env.ctx, env.q, store.UpsertCodexAccountRateLimitsParams{
 		UserID:                     userID,
 		ProviderAccountID:          accountID,
 		Buckets:                    raw,

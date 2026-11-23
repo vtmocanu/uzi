@@ -1,6 +1,6 @@
 // The default Overview's "Needs your decision" card (PRD #3878 M2, regrouped by #4041): the
-// viewer's own plan reviews, questions, owner-action parks and open pull requests, held work
-// first and PRs last. Several items of one kind (and every open PR) collapse into one group row
+// viewer's own plan reviews, questions, owner-action parks, credentials near their weekly limit
+// (PRD #4123, one row per credential) and open pull requests, held work first and PRs last. Several items of one kind (and every open PR) collapse into one group row
 // that previews three and expands in place, each item keeping its own action. Self-hiding when
 // empty. The caller passes only the viewer's own items.
 
@@ -16,6 +16,7 @@ import {
   decisionCount,
   decisionRows,
   groupTitle,
+  limitCredentialNoun,
   planDetail,
   type DecisionItem,
   type DecisionKind,
@@ -23,6 +24,7 @@ import {
   type RunDecisionItem,
 } from "../lib/overview";
 import { activityAge } from "../lib/runActivity";
+import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { stripUnsafeChars } from "../lib/safeText";
 import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { RunIssueRef } from "./RunIssueRef";
@@ -111,6 +113,15 @@ export function KindIcon({ kind }: { kind: IconKind }) {
           <circle cx="6" cy="19" r="2" />
           <circle cx="18" cy="19" r="2" />
           <path d="M6 7v10M18 17V9a3 3 0 0 0-3-3h-4m2-2-2 2 2 2" />
+        </svg>
+      );
+    case "limit":
+      // A half dial with its needle near the top of the range: a meter close to full.
+      return (
+        <svg {...common} strokeLinecap="round" strokeLinejoin="round">
+          <path d="M4 17a8 8 0 0 1 16 0" />
+          <path d="M12 17l5-5" />
+          <path d="M4 17h16" />
         </svg>
       );
     case "held":
@@ -478,6 +489,116 @@ function GroupRow({
   );
 }
 
+// One credential near or at its weekly limit (PRD #4123) and the viewer's runs on it that have a
+// fix. The headline names the credential (owner text, Cf-stripped like every token label); the
+// fix itself lives on each run's page, where the weekly-limit banner shows the server's commands.
+// One run links straight to it; several preview and expand in place like a group.
+function LimitRow({
+  credentialKey,
+  credentialLabel,
+  items,
+  demo,
+  border,
+}: {
+  credentialKey: string;
+  credentialLabel: string;
+  items: RunDecisionItem[];
+  demo: boolean;
+  border: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const titleId = useId();
+  const listId = useId();
+  const label = sanitizeLabel(credentialLabel);
+  const title = (
+    <p id={titleId} data-limit-credential="" className="text-sm font-medium text-fg">
+      {limitCredentialNoun(credentialKey)} “<span className="[overflow-wrap:anywhere]">{label}</span>” is at or near its
+      weekly limit
+    </p>
+  );
+  if (items.length === 1) {
+    const { run } = items[0];
+    return (
+      <RowShell
+        kind="limit"
+        border={border}
+        action={
+          <Link to={`/runs/${run.id}`} aria-describedby={titleId} className={ACTION_CLASS}>
+            {items[0].verb}
+          </Link>
+        }
+      >
+        {title}
+        <p className="mt-0.5 truncate text-xs text-muted">
+          {run.repo_path && <span className="text-faint">{repoLabel(run, demo)} </span>}
+          <IssueLabel run={run} />
+        </p>
+        <Meta parts={[<span key="n">{groupTitle("limit", 1)}</span>]} />
+      </RowShell>
+    );
+  }
+  const shown = open ? items : items.slice(0, GROUP_PREVIEW);
+  const hidden = items.length - shown.length;
+  return (
+    <RowShell
+      kind="limit"
+      border={border}
+      actionFirst
+      action={
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={listId}
+          aria-describedby={titleId}
+          onClick={() => setOpen((o) => !o)}
+          className={`${ACTION_CLASS} cursor-pointer`}
+        >
+          {open ? "Show fewer" : GROUP_BUTTON.limit}
+        </button>
+      }
+    >
+      {title}
+      <Meta parts={[<span key="n">{groupTitle("limit", items.length)}</span>]} />
+      <ul id={listId} className="mt-1 grid min-w-0 gap-0.5 text-xs text-muted">
+        {shown.map((item) => (
+          <LimitItem key={item.run.id} item={item} open={open} />
+        ))}
+        {hidden > 0 && <li className="text-faint">+{hidden} more</li>}
+      </ul>
+    </RowShell>
+  );
+}
+
+function LimitItem({ item, open }: { item: RunDecisionItem; open: boolean }) {
+  const { run } = item;
+  const labelId = useId();
+  const safeTitle = stripUnsafeChars(run.issue_title);
+  if (!open) {
+    return (
+      <li className="relative min-w-0 truncate">
+        <IssueLabel run={run} />
+      </li>
+    );
+  }
+  return (
+    <li className="relative min-w-0 py-0.5">
+      <div className="flex min-w-0 items-center gap-x-2">
+        <span id={labelId} className="flex min-w-0 flex-1 items-center gap-x-1">
+          <span className="relative max-w-[40%] shrink-0 truncate">
+            <RunIssueRef issueIid={run.issue_iid} issueWebUrl={run.issue_web_url} kind={run.kind} forgeType={run.forge_type} />
+          </span>{" "}
+          <span title={safeTitle} className="min-w-0 truncate">
+            {safeTitle}
+          </span>
+        </span>
+        <Link to={`/runs/${run.id}`} aria-describedby={labelId} className={ITEM_ACTION_CLASS}>
+          {item.verb}
+        </Link>
+      </div>
+    </li>
+  );
+}
+
 export function NeedsDecisionCard({ items, now, demo }: { items: DecisionItem[]; now: number; demo: boolean }) {
   if (items.length === 0) return null;
   const rows = decisionRows(items);
@@ -505,6 +626,15 @@ export function NeedsDecisionCard({ items, now, demo }: { items: DecisionItem[];
         {rows.map((row, i) =>
           row.type === "held" ? (
             <HeldDecisionRow key="held" item={row.item} now={now} border={border(i)} />
+          ) : row.type === "limit" ? (
+            <LimitRow
+              key={`limit:${row.credentialKey}`}
+              credentialKey={row.credentialKey}
+              credentialLabel={row.credentialLabel}
+              items={row.items}
+              demo={demo}
+              border={border(i)}
+            />
           ) : row.type === "single" ? (
             <SingleRow key={`${row.item.kind}:${row.item.run.id}`} item={row.item} now={now} demo={demo} border={border(i)} />
           ) : (

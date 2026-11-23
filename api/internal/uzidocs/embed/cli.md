@@ -318,6 +318,15 @@ A few worth knowing:
   schedule get`.
   There's no CLI setter for your own default harness; that's a **Settings →
   Run defaults** web-only control (see [Worker model](./worker-model.md)).
+- **`run get` explains a 7-day park.** For a run parked at `limit_wait` on the
+  `seven_day` window, or paused by the weekly usage reserve, `uzi run get`
+  adds a `WEEKLY_LIMIT` row (the credential, its reason in plain words and what
+  happens if you do nothing) and one `FIX` row per copyable fix command (`FIX_FUTURE_RUNS` for advice that only affects runs you start later).
+  Both rows are absent on any other run, including 5-hour and per-model parks,
+  and for the owner only. A token label that cannot be copied safely shows a
+  hint to rename the token in Settings instead of a command. `--json` carries
+  the same block as `weekly_limit`. Reasons, wait statements and fix commands
+  are described in [Why the run did not move to another token](./run-limit-wait.md#why-the-run-did-not-move-to-another-token).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own
   version (the `v*` release this binary was built from). When a server URL is
   configured it additionally reports that server's build info — version, full
@@ -1761,7 +1770,7 @@ are CLI-only).
 `UZI_ADMIN_RUN_DEBUG` (chart value `api.adminRunDebug.enabled`; see
 [configuration](./configuration.md#admin-run-debug-issue-4198)). When it is on, a live admin using an
 `admin_ro` (`uza_`) CLI token can read, never change, another user's run data through `run inputs`,
-`run fetches`, `run recovery`, `run held` and `admin runs --all`. A browser cookie or a `uzc_` token
+`run fetches`, `run recovery`, `run held`, `admin runs --all` and `admin run-writers`. A browser cookie or a `uzc_` token
 never qualifies, and demoting the admin takes effect on the next request. Each newly authorized
 cross-user read writes one audit log line.
 
@@ -1801,6 +1810,24 @@ cross-user read writes one audit log line.
   `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
   prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
   `--status` was given.
+- **`uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]`** lists the active `ci_fix` and
+  `mr_rework` runs, across all owners, that may push to a branch. Same prerequisites as the rest of this
+  section (`UZI_ADMIN_RUN_DEBUG` and an `admin_ro` token; an older server answers 404). `--repo` and
+  `--branch` are required; `--mr` must be positive. Each read is audited.
+  - **Matching.** `ci_fix` runs match by exact branch; `mr_rework` runs match only by `--mr`, never by
+    branch alone. Equivalent connections across owners count as the same repo: the match is by forge
+    type, the canonical base URL (`:443` folded; `api.github.com` folded to `github.com` for GitHub) and
+    the project id. A writer's REPO column is its own repo id, which may differ from `--repo` because
+    equivalent connections of other owners match.
+  - **Completeness.** `complete=false` means more than 500 matched and the answer is unknown: the CLI
+    prints `incomplete: more than 500 matching writers; absence is unknown` on stderr and exits 1,
+    unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
+    no matching writer at that database snapshot only: a writer may start after the read.
+  - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
+    decoded `{writers, complete}` document.
+  - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
+    the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
+    `VISIBILITY=owner_only`.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
@@ -3786,6 +3813,28 @@ On a run the reserve touches, `uzi run get` shows:
   uzi run resume <id>`);
 - a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
   `run pause` above.
+
+### Weekly warning margin
+
+```sh
+uzi settings warning-margin 15
+uzi settings warning-margin off
+```
+
+`uzi settings warning-margin <0..50|off>` sets how many percentage points below its
+effective weekly limit a credential must be before the [early
+warning](./rate-limits.md#early-warning-before-the-weekly-limit) shows. The
+default is 15; `0` (or `off`) turns early warnings off, including the [Slack
+warning](./rate-limits.md#slack-warning) (park explanations stay).
+A value outside 0..50 is a usage error. It posts to `PUT /api/me/weekly-warning-margin`
+(`{"margin_pts": <0..50>}`), which accepts a `uzc_` Bearer token; the response
+is `{"weekly_warning_margin_pts": <n>}`. Human output prints `Weekly warning
+margin: 15 points`, or a `Weekly warning margin: 0 (off ...)` line when off;
+`--json` returns `weekly_warning_margin_pts`. `uzi settings get` prints the same
+`Weekly warning margin:` line and its `--json` carries the field.
+
+For a run that is near its weekly limit but not yet parked, `uzi run get` shows
+the same `WEEKLY_LIMIT` and `FIX` rows as for a park.
 
 ### Codex account mode
 

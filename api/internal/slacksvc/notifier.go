@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -20,6 +21,7 @@ import (
 // *store.Queries satisfies it.
 type NotifierStore interface {
 	IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error)
+	IsCodexWeeklyWarningCurrent(context.Context, store.IsCodexWeeklyWarningCurrentParams) (bool, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
 	GetRunByID(ctx context.Context, runID uuid.UUID) (store.Run, error)
@@ -182,6 +184,9 @@ type Notifier struct {
 	// Zero until wired via WithRunWallCeiling; zero falls back to runTimeout in the room math.
 	runWallCeiling      time.Duration
 	notificationUserCap int32
+	// weeklyLimit returns the weekly-limit block of a run (PRD #4123), nil when it has none. nil
+	// until wired via WithWeeklyLimit; unwired parks render exactly as before.
+	weeklyLimit func(ctx context.Context, runID uuid.UUID) *apitypes.WeeklyLimitDTO
 }
 
 // NotifierOption configures retention and optional near-timeout health DM
@@ -216,6 +221,13 @@ func WithRunWallCeiling(d time.Duration) NotifierOption {
 // suggests a duration within the maximum.
 func WithExtensionCap(fn func(context.Context) (int, error)) NotifierOption {
 	return func(n *Notifier) { n.extensionCap = fn }
+}
+
+// WithWeeklyLimit wires the weekly-limit source: the seven_day limit_wait park and the weekly-reserve
+// pause lines append the block's reason and fix command. The function is the same one the run DTO
+// uses (weeklylimit.Loader.ForRunID), so Slack and the web show one computation.
+func WithWeeklyLimit(fn func(ctx context.Context, runID uuid.UUID) *apitypes.WeeklyLimitDTO) NotifierOption {
+	return func(n *Notifier) { n.weeklyLimit = fn }
 }
 
 type stateEvent struct {

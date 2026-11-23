@@ -267,6 +267,9 @@ type RunDTO struct {
 	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
 	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
 	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
+	// WeeklyLimit is the owner-only weekly-limit block (PRD #4123); absent unless the run's vendor
+	// credential is in a weekly-limit park.
+	WeeklyLimit *WeeklyLimitDTO `json:"weekly_limit,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1275,6 +1278,8 @@ type RunSummaryItemDTO struct {
 	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
+	// WeeklyLimit is the compact owner-only weekly-limit projection (PRD #4123).
+	WeeklyLimit *WeeklyLimitSummaryDTO `json:"weekly_limit,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -2168,6 +2173,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		PolicyHold:                    item.PolicyHold,
 		WorkerRecovery:                item.WorkerRecovery,
 		MemoryHold:                    item.MemoryHold,
+		WeeklyLimit:                   item.WeeklyLimit.Summary(),
 		ID:                            item.ID,
 		RepoID:                        item.RepoID,
 		ForgeType:                     item.ForgeType,
@@ -2364,6 +2370,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			PolicyHold:                    s.PolicyHold,
 			WorkerRecovery:                s.WorkerRecovery,
 			MemoryHold:                    s.MemoryHold,
+			WeeklyLimit:                   weeklyLimitFromSummary(s.WeeklyLimit),
 			ID:                            s.ID,
 			RepoID:                        s.RepoID,
 			ForgeType:                     s.ForgeType,
@@ -2874,4 +2881,25 @@ type AdminRunsDebugDTO struct {
 	// StatusFilter echoes the applied status filter so a client can detect an older
 	// server that ignored it (the key is then absent). Omitted when no filter was sent.
 	StatusFilter []string `json:"status_filter,omitempty"`
+}
+
+// RunWriterDTO is one active ci_fix / mr_rework run in the GET /api/admin/run-writers
+// response (issue #4618). Metadata only: no plan, report, log or patch text.
+type RunWriterDTO struct {
+	RunID       string    `json:"run_id"`
+	Kind        string    `json:"kind"`
+	Status      string    `json:"status"`
+	OwnerID     string    `json:"owner_id"`
+	RepoID      string    `json:"repo_id"`
+	PipelineRef *string   `json:"pipeline_ref"`
+	MRIID       *int64    `json:"mr_iid"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// RunWritersDTO is the GET /api/admin/run-writers response. Writers is always a JSON array,
+// never null. Complete is false when more matching writers existed than the server serves,
+// in which case the absence of a writer from the list proves nothing.
+type RunWritersDTO struct {
+	Writers  []RunWriterDTO `json:"writers"`
+	Complete bool           `json:"complete"`
 }

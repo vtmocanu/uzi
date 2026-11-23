@@ -62,7 +62,7 @@ func assertHumanStopSurfaces(t *testing.T, tc humanStopCase) {
 		rc.FailOrigin = txt("workflow_scope_missing")
 		rc.HasPreservedPatch = true
 	}
-	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example", nil)
 	_, section := blockSummary(blocks)
 	if ok != tc.thread || section != tc.head || fallback != tc.fallback {
 		t.Errorf("thread: ok=%v section=%q fallback=%q; want %v %q %q", ok, section, fallback, tc.thread, tc.head, tc.fallback)

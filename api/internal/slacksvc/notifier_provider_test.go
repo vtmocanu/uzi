@@ -283,7 +283,7 @@ func TestProviderHoldTypedCopyAndStopEligibility(t *testing.T) {
 				rc.HoldReason = txt("<@U1>")
 			}
 			blocks, fallback := rootBlocks(rc, "")
-			thread, tfallback, ok := renderThreadBlocks(rc, "")
+			thread, tfallback, ok := renderThreadBlocks(rc, "", nil)
 			if !ok {
 				t.Fatal("hold must render thread")
 			}

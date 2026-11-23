@@ -217,3 +217,29 @@ publish. Check the gate before promising one.
 - **Run each outward action in its own Bash call.** A classifier denial drops the whole
   call, including the reads and trail writes chained with it. Hand the user the exact
   `!` command when it is denied.
+
+## Branch-writer visibility (`VISIBILITY=`)
+
+`takeover.sh`, `watch-pr.sh`, `land-prep.sh` and `merge.sh` share `branch_writers_read`
+(`lib/ci-fix.sh`), which decides whether a `ci_fix` (exact branch) or `mr_rework` (this MR
+only) is active.
+
+- **Complete read:** `uzi admin run-writers` needs a `uza_` admin_ro token plus the server
+  flag `UZI_ADMIN_RUN_DEBUG`. A valid, complete result prints `VISIBILITY=all_owners`:
+  every owner's writers, with older runs included.
+- **Fallback:** HTTP 401/403/404 (CLI exit 3/4) or a CLI without the verb falls back to
+  `uzi run list`, the lander's own latest runs, and prints `VISIBILITY=owner_only` plus
+  `note: owner-only visibility; foreign or older writers are not excluded`. Owner-only
+  absence is never factory-wide.
+- **Refusal:** any other failure (5xx, transport, malformed, incomplete or mismatched
+  result, unparseable run list) refuses and never downgrades to owner-only: merge exit 4,
+  land-prep exit 4, takeover/watch-pr unknown.
+- **Unchanged:** a repo not connected under the lander's own account still skips the check.
+  `CI_FIX_RECENT` stays owner-scoped. `--no-rework-check` keeps its meaning.
+- **Audit:** each read writes one server audit line, so `watch-pr.sh` polling writes one per poll.
+- **Race:** a writer may start after the read. `merge.sh` repeats the read right before
+  `gh pr merge`, and `--match-head-commit` refuses the merge if anything was pushed since.
+  A merged or closed MR's active `mr_rework` is cancelled by the server's MR watcher on its
+  next poll, not instantly, and a late `ci_fix` push targets only the PR branch (deleted by
+  default after merge), never `main`. Late work can be stranded, but it cannot change what
+  was merged. Each successful (200) read writes one audit line; refused reads do not.

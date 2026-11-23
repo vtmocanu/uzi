@@ -407,6 +407,7 @@ var wantRouteMounts = []routeMount{
 	// call, no token spend) in the admin read group → noLimiter, like /rate-limits beside it.
 	{"GET", "/api/admin/codex-rate-limits", noLimiter},
 	{"GET", "/api/admin/runs", noLimiter},
+	{"GET", "/api/admin/run-writers", noLimiter},
 	{"GET", "/api/admin/agent-source", noLimiter},
 	// PRD #836 M3: the admin Updates-card data source — a cache-backed read, no forge
 	// call → noLimiter, like the agent-source GET beside it.
@@ -1104,6 +1105,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #3522: the weekly usage reserve (SetUsageReserve). One owner-scoped UPDATE of two
 	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
 	{"PUT", "/api/me/usage-reserve", noLimiter},
+	// PRD #4123 M2: the weekly-limit warning margin (SetWeeklyWarningMargin). One owner-scoped UPDATE
+	// of one column: the same shape as /me/usage-reserve.
+	{"PUT", "/api/me/weekly-warning-margin", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
 	{"PUT", "/api/me/harness-overflow", noLimiter},
 	// PRD #3264: the model and effort defaults (PutMyModelSettings). One bounded body, one transaction

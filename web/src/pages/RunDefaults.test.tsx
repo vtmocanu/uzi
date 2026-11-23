@@ -39,6 +39,7 @@ vi.mock("../lib/api", async (importActual) => {
       setWaitOnLimit: vi.fn(),
       setNotifyEarlyReset: vi.fn(),
       setUsageReserve: vi.fn(),
+      setWeeklyWarningMargin: vi.fn(),
       setJudgeEnabled: vi.fn(),
       setAttributionEnabled: vi.fn(),
       getMySettings: vi.fn(),
@@ -3080,5 +3081,40 @@ describe("Run defaults — Claude planning model and effort (PRD #3252)", () => 
     fireEvent.click(saveBtn());
     expect(await screen.findAllByText("bad planning pair")).toHaveLength(2);
     expect(screen.getByLabelText("Claude planning model").getAttribute("aria-describedby")).toBe("planning-model-error");
+  });
+});
+
+// PRD #4123 module 6: the weekly-limit warning margin sits under the reserve, fed by the
+// settings read; WeeklyWarningMarginSetting.test.tsx covers its validation and save states.
+describe("Run defaults — weekly limit warning margin (PRD #4123)", () => {
+  const renderPage = () =>
+    render(
+      <MemoryRouter>
+        <RunDefaults />
+      </MemoryRouter>,
+    );
+  const settingsWith = (over: Partial<UserSettings>) =>
+    mockApi.getMySettings.mockResolvedValue({
+      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, ...over } as UserSettings,
+    });
+
+  it("shows the stored margin from GET /me/settings and saves a new one", async () => {
+    settingsWith({ weekly_warning_margin_pts: 15 });
+    mockApi.setWeeklyWarningMargin.mockImplementation(async (n) => ({ weekly_warning_margin_pts: n }));
+    renderPage();
+    const input = (await screen.findByLabelText("Warn this many points before the limit")) as HTMLInputElement;
+    expect(input.value).toBe("15");
+    expect(screen.getByText("Warnings start at 85% weekly usage, 15 points before the limit.")).toBeTruthy();
+    fireEvent.change(input, { target: { value: "0" } });
+    fireEvent.blur(input);
+    await waitFor(() => expect(mockApi.setWeeklyWarningMargin).toHaveBeenCalledWith(0));
+    expect(await screen.findByText(/Early warnings are off/)).toBeTruthy();
+  });
+
+  it("stays hidden on a server whose settings carry no margin", async () => {
+    renderPage();
+    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalled());
+    await screen.findByText("Weekly usage reserve");
+    expect(screen.queryByLabelText("Warn this many points before the limit")).toBeNull();
   });
 });

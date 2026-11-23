@@ -265,6 +265,10 @@ type Client interface {
 	// subscription; pauseRunning also pauses running runs. Both are always sent (the
 	// server requires both). RequireUser, so a uzc_ token reaches it. Returns the updated user.
 	SetUsageReserve(ctx context.Context, thresholdPct *int, pauseRunning bool) (apitypes.UserDTO, error)
+	// SetWeeklyWarningMargin sets the caller's weekly-limit early-warning margin (PRD #4123):
+	// PUT /api/me/weekly-warning-margin {"margin_pts": 0..50}, 0 = off. RequireUser, so a
+	// uzc_ token reaches it. Returns the saved value.
+	SetWeeklyWarningMargin(ctx context.Context, marginPts int) (int, error)
 	ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error)
 	// DeleteRepo removes a single repo: DELETE /api/repos/{id}, 204 on success
 	// (PRD #357 M3). The server only removes a DISABLED repo and refuses one that
@@ -302,6 +306,11 @@ type Client interface {
 	// An older server ignores the query and answers with its active-runs listing, which
 	// is refused here with a clear error rather than shown as if it were everything.
 	AdminListRunsDebug(ctx context.Context, userID, since string, statuses []string) (apitypes.AdminRunsDebugDTO, error)
+	// AdminRunWriters is GET /api/admin/run-writers (issue #4618): active ci_fix / mr_rework
+	// writers for repoID and branch, plus mrIID's mr_rework writers when mrIID > 0. Needs the
+	// admin run debug prerequisites (403 -> ExitAuth, older server 404 -> ExitNotFound). The
+	// reply is decoded strictly; Complete=false means absence proves nothing.
+	AdminRunWriters(ctx context.Context, repoID, branch string, mrIID int64) (apitypes.RunWritersDTO, error)
 	AdminListWorkers(ctx context.Context) ([]apitypes.AdminWorkerDTO, error)
 	// AdminHealth reads the admin health document (PRD #1484 M3): GET
 	// /api/admin/health, in the admin READ group (RequireUser + RequireAdminRO), so a
