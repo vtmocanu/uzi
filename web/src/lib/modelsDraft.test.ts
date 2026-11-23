@@ -7,6 +7,7 @@ import {
   emptyCustomFields,
   fieldLabel,
   localFieldWarnings,
+  storedFieldWarnings,
   mapFieldErrors,
   MODELS_FIELDS,
   normalizeValue,
@@ -99,6 +100,24 @@ describe("localFieldWarnings", () => {
     expect(buildModelsPatch(base, { ...base, [key]: "\u2003custom-id\u2003" })).toEqual({
       cross_check_pins: [{ stage: "plan", harness: "codex", model: "custom-id" }],
     });
+  });
+});
+
+describe("storedFieldWarnings", () => {
+  it("flags only unchanged stored values its validator refuses, and drops the flag once the cell is edited", () => {
+    const base = baselineFromSettings(settings({
+      summary_model: "gpt-6-sol",
+      default_claude_model: "gpt-6-sol", // the worker lanes are left to the server
+      cross_check_pins: [{ stage: "code", harness: "claude", model: "gpt-6.1-sol", effort: null }] as UserSettings["cross_check_pins"],
+    }));
+    expect(storedFieldWarnings(base, base)).toEqual({
+      summary_model: "The saved value is not valid here. Not a Claude model: gpt-6-sol is a Codex model, so Claude summaries skip it. Choose Default to clear it.",
+      "cross_check_pins:code/claude/model": "The saved value is not valid here. Choose a model from the checker's model family.",
+    });
+    const edited = storedFieldWarnings(base, { ...base, summary_model: "" });
+    expect(Object.keys(edited)).toEqual(["cross_check_pins:code/claude/model"]);
+    // Stored warnings are not blocking ones.
+    expect(localFieldWarnings(base, base)).toEqual({});
   });
 });
 

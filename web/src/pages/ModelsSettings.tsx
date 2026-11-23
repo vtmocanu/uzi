@@ -28,6 +28,7 @@ import {
   emptyCustomFields,
   fieldLabel,
   localFieldWarnings,
+  storedFieldWarnings,
   mapFieldErrors,
   MODELS_FIELDS,
   type ModelsField,
@@ -227,6 +228,9 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // family's model in a checker) blocks Save on its cell, dimmed or not.
   const localWarnings = useMemo(() => localFieldWarnings(baseline, draft), [baseline, draft]);
   const blocked = useMemo(() => new Set([...customEmpty, ...Object.keys(localWarnings)]), [customEmpty, localWarnings]);
+  // An UNCHANGED stored value the same validator refuses (a legacy Codex id in a Claude lane) is
+  // shown on its cell as information; it never blocks Save.
+  const storedWarnings = useMemo(() => storedFieldWarnings(baseline, draft), [baseline, draft]);
 
   const setValue = (key: string, value: string) => {
     setDraft((d) => ({ ...d, [key]: value }));
@@ -352,9 +356,10 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     field,
     idBase: idFor(field),
     dirty: dirtyKeys.has(field.key),
-    prediction: predictionText(field, effective, settings),
+    prediction: predictionText(field, effective),
     reason: field.family ? harnessReason(field.family, effective) : null,
     notUsed: judgeNotUsedReason(field, judgeRunsOn),
+    storedWarning: storedWarnings[field.key] ?? null,
     error:
       fieldErrors[field.key] ??
       localWarnings[field.key] ??

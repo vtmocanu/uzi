@@ -114,7 +114,8 @@ export function ModelsSaveBar({
   saving: boolean;
   /** A save or a reload is in flight: Save and Discard wait for it. */
   busy: boolean;
-  /** Values with a local problem (an empty custom model ID) that must be fixed before saving. */
+  /** Values with a local problem that must be fixed before saving: an "Other" picker with an
+   *  empty box (dirty or not) or a changed value its own validator refuses. */
   blockedCount: number;
   outcome: SaveOutcome | null;
   reloading: boolean;
@@ -140,8 +141,9 @@ export function ModelsSaveBar({
           {saving ? (
             <span className="text-fg">Saving {plural(count, "change", "changes")}{"…"}</span>
           ) : count === 0 && blocked ? (
-            // Nothing differs from what is saved, but a cell still blocks Save (an "Other" picker
-            // with an empty box), so say what to do rather than "No unsaved changes".
+            // Nothing differs from what is saved, but a cell still blocks Save. Only an "Other"
+            // picker with an empty box can (a validator warning needs a changed value, so count
+            // is then above 0), so say what to do rather than "No unsaved changes".
             <span className="font-semibold text-fg">Fix {plural(blockedCount, "value", "values")} before saving</span>
           ) : count === 0 ? (
             <span className="text-muted">No unsaved changes</span>

@@ -15,7 +15,8 @@
 //
 // A field may carry a local `validate` that mirrors its server validator (the Claude helper
 // lanes refuse Codex ids, a checker refuses the other family's model): a DIRTY value it flags
-// blocks Save on its own cell. The server stays authoritative; this only spares a round trip.
+// blocks Save on its own cell; a STORED value it flags is shown on the cell as information only.
+// The server stays authoritative; this only spares a round trip.
 
 import type { Harness, ModelSettingsFieldError, ModelSettingsPatch, ModelSettingsPinPatch, UserSettings } from "./apiTypes";
 import { modelFieldWarning } from "./agentTemplates";
@@ -147,7 +148,7 @@ export function dirtyFields(baseline: ModelsValues, draft: ModelsValues, fields:
 }
 
 /** localFieldWarnings maps each DIRTY field whose value its own validator refuses to that
- *  warning. A stored value is never flagged: only an edit can be blocked. Dimmed cells are
+ *  warning. A stored value is never blocked here (storedFieldWarnings reports it). Dimmed cells are
  *  validated like any other. */
 export function localFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): Record<string, string> {
   const warnings: Record<string, string> = {};
@@ -155,6 +156,22 @@ export function localFieldWarnings(baseline: ModelsValues, draft: ModelsValues, 
     const value = normalizeValue(draft[f.key], f);
     const warning = value === "" || !f.validate ? "" : f.validate(draft[f.key] ?? "");
     if (warning) warnings[f.key] = warning;
+  }
+  return warnings;
+}
+
+/** storedFieldWarnings maps each UNCHANGED field whose stored value its own validator refuses
+ *  (a legacy Codex id in a Claude helper lane, the other family's model in a checker pin) to
+ *  that warning, prefixed so it reads as a fact about what is saved. It is informational: it
+ *  never blocks Save, since the user did not make that value and may be saving something else. */
+export function storedFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): Record<string, string> {
+  const dirty = new Set(dirtyFields(baseline, draft, fields).map((f) => f.key));
+  const warnings: Record<string, string> = {};
+  for (const f of fields) {
+    if (dirty.has(f.key) || !f.validate) continue;
+    const stored = baseline[f.key] ?? "";
+    const warning = normalizeValue(stored, f) === "" ? "" : f.validate(stored);
+    if (warning) warnings[f.key] = `The saved value is not valid here. ${warning}`;
   }
   return warnings;
 }

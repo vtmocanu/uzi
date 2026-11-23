@@ -26,6 +26,7 @@ export function ModelsCell({
   reason,
   note,
   notUsed,
+  storedWarning,
   error,
   wide = false,
   children,
@@ -40,6 +41,9 @@ export function ModelsCell({
   note?: ReactNode;
   /** Why the draft leaves this cell unused; dims the control and is read as its description. */
   notUsed?: string | null;
+  /** A problem with the SAVED value (a legacy id the validator now refuses): information only,
+   *  so it never marks the control invalid or blocks Save. */
+  storedWarning?: string | null;
   error?: string | null;
   /** Spans both family columns (a row with one control). */
   wide?: boolean;
@@ -51,7 +55,8 @@ export function ModelsCell({
   const errorId = `${idBase}-error`;
   const noteId = `${idBase}-note`;
   const notUsedId = `${idBase}-not-used`;
-  const describedBy = [predictionId, notUsed ? notUsedId : "", note ? noteId : "", reason ? reasonId : "", error ? errorId : ""]
+  const storedId = `${idBase}-stored-warning`;
+  const describedBy = [predictionId, notUsed ? notUsedId : "", note ? noteId : "", reason ? reasonId : "", storedWarning ? storedId : "", error ? errorId : ""]
     .filter(Boolean)
     .join(" ");
   const family = field.family ? harnessName(field.family) : null;
@@ -132,6 +137,11 @@ export function ModelsCell({
       {reason && (
         <p id={reasonId} className="text-xs text-warn">
           {reason}
+        </p>
+      )}
+      {storedWarning && (
+        <p id={storedId} className="text-xs text-warn">
+          {storedWarning}
         </p>
       )}
       {error && (

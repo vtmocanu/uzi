@@ -1,10 +1,10 @@
 // Copy for the Models grid (PRD #3263): each select's Default option, each cell's "Saved
 // effective value" line, and the judge's routing and Not used copy. Every word about where a
 // value comes from is the server's source token rendered through lib/modelSettings.ts; nothing
-// here resolves precedence. The Default labels follow Run defaults' wording (RunDefaults.tsx
-// modelDefaultLabel, judgeRunsOnHelp and the task-review labels; the checker labels of the
-// retired CrossCheckDefaults grid), so both pages name a default the same way until M3 retires
-// Run defaults' model editors.
+// here resolves precedence. Some Default labels and the judge copy reuse Run defaults' wording
+// (judgeRunsOnHelp, the helper and task-review Default labels) and the retired CrossCheckDefaults
+// grid's checker labels; the worker and planning Default labels are this page's own, read from
+// the server cell's default_model / default_source (Run defaults' copy only without a cell).
 
 import type {
   CrossCheckPinDTO,
@@ -14,7 +14,6 @@ import type {
   EffortSettingCell,
   Harness,
   ModelSettingCell,
-  UserSettings,
 } from "../../lib/apiTypes";
 import { modelSettingSourceLabel } from "../../lib/modelSettings";
 import type { ModelsField } from "../../lib/modelsDraft";
@@ -40,17 +39,6 @@ const EFFORT_SETTING: Record<string, EffectiveEffortCell["setting"]> = {
   "Task review effort": "task_review_effort",
 };
 
-// The /me/settings cells a helper row falls back to when the effective view lacks its cell
-// (an older server or a failed prediction read): the same server resolution, already saved.
-const MODEL_CELLS: Record<string, (s: UserSettings) => ModelSettingCell[] | null | undefined> = {
-  "Judge model": (s) => s.judge_models,
-  "Summary model": (s) => s.summary_models,
-  "Task review model": (s) => s.task_review_models,
-};
-const EFFORT_CELLS: Record<string, (s: UserSettings) => EffortSettingCell[] | null | undefined> = {
-  "Task review effort": (s) => s.task_review_efforts,
-};
-
 // The source-label field the server's token belongs to: planning cells carry their own
 // vocabulary (user_planning_default reads "your choice").
 function sourceField(field: ModelsField): string {
@@ -74,50 +62,40 @@ function noteSuffix(notes: readonly string[] | undefined, model: string): string
   return shown.map((n) => ` · ${modelSettingSourceLabel("note", n)}`).join("");
 }
 
+// The helper model rows show the server's notes after the source (the judge's not_used); the
+// worker and planning rows show the value and source alone.
+const NOTED_MODEL_ROWS = new Set(["Judge model", "Summary model", "Task review model"]);
+
 function judgeRoutingText(value: string | null | undefined, source: string): string {
   if (value === "claude" || value === "codex") return `${HARNESS_NAME[value]} · ${modelSettingSourceLabel("judge_harness", source)}`;
   return "Same as the run";
 }
 
-// A cross-check cell's prediction: the effective view's cross_check cell, else the stored pin's
-// own resolution (model_source/effort_source read as the matching provenance token).
-function pinPrediction(field: ModelsField, effective: EffectiveSettings | null, settings: UserSettings | null): string | null {
+// A cross-check cell's prediction: the effective view's cross_check cell for its stage and
+// family, with the server's own source token. The stored pin is never read as a prediction.
+function pinPrediction(field: ModelsField, effective: EffectiveSettings): string | null {
   if (!("pin" in field.target)) return null;
   const { stage, harness, member } = field.target.pin;
   const setting = stage === "plan" ? "cross_check_plan" : "cross_check_code";
   if (member === "model") {
-    const cell = effective?.cross_check?.models?.find((c) => c.setting === setting && c.harness === harness);
-    if (cell) return `${modelValue(cell.resolved_model)} · ${modelSettingSourceLabel("model", cell.source)}`;
-    const pin = settings?.cross_check_pins?.find((p) => p.stage === stage && p.harness === harness);
-    if (!pin) return null;
-    const token = pin.model_source === "pin" ? "cross_check_pin" : "cross_check_worker_default";
-    return `${modelValue(pin.resolved_model ?? "")} · ${modelSettingSourceLabel("model", token)}`;
+    const cell = effective.cross_check?.models?.find((c) => c.setting === setting && c.harness === harness);
+    return cell ? `${modelValue(cell.resolved_model)} · ${modelSettingSourceLabel("model", cell.source)}` : null;
   }
-  const cell = effective?.cross_check?.efforts?.find((c) => c.setting === setting && c.harness === harness);
-  if (cell) return `${effortValue(cell)} · ${modelSettingSourceLabel("effort", cell.source)}`;
-  const pin = settings?.cross_check_pins?.find((p) => p.stage === stage && p.harness === harness);
-  if (!pin) return null;
-  const token = pin.effort_source === "pin" ? "cross_check_pin" : "cross_check_default";
-  return `${pin.resolved_effort} · ${modelSettingSourceLabel("effort", token)}`;
+  const cell = effective.cross_check?.efforts?.find((c) => c.setting === setting && c.harness === harness);
+  return cell ? `${effortValue(cell)} · ${modelSettingSourceLabel("effort", cell.source)}` : null;
 }
 
-// Rows added with the helper and cross-check groups read the effective view first, then fall
-// back to the saved /me/settings cell; the worker and planning rows read the effective view only.
-const SETTINGS_FALLBACK = new Set(["Judge runs on", ...Object.keys(MODEL_CELLS), ...Object.keys(EFFORT_CELLS)]);
-
 // predictionText is the saved prediction for one cell, without the "Saved effective value"
-// prefix, or null when neither the effective settings nor (for a helper or cross-check row)
-// the saved settings cell carry one.
-export function predictionText(field: ModelsField, effective: EffectiveSettings | null, settings: UserSettings | null = null): string | null {
-  if ("pin" in field.target) return pinPrediction(field, effective, settings);
-  const fallback = SETTINGS_FALLBACK.has(field.row) ? settings : null;
+// prefix. It reads ONLY the server's effective view (buildEffectiveSettings, from PredictLead and
+// the stored pins' server resolution): with no view (a failed read) or no cell for this row in
+// it, the answer is null and the cell reads Unavailable, never a guess from /me/settings.
+export function predictionText(field: ModelsField, effective: EffectiveSettings | null): string | null {
+  if (!effective) return null;
+  if ("pin" in field.target) return pinPrediction(field, effective);
   if (field.kind === "routing") {
-    if (effective?.judge_harness) return judgeRoutingText(effective.judge_harness.value, effective.judge_harness.source);
-    return fallback ? judgeRoutingText(fallback.judge_runs_on, "user_default") : null;
+    return effective.judge_harness ? judgeRoutingText(effective.judge_harness.value, effective.judge_harness.source) : null;
   }
-  if (!effective && !fallback) return null;
   if (field.kind === "harness") {
-    if (!effective) return null;
     const value = effective.start?.find((c) => c.choice === "default")?.harness;
     if (!value) return null;
     const notes = (value.notes ?? []).map((n) => modelSettingSourceLabel("note", n));
@@ -129,16 +107,12 @@ export function predictionText(field: ModelsField, effective: EffectiveSettings 
     return `${shown} · ${source}`;
   }
   if (field.kind === "model") {
-    const setting = MODEL_SETTING[field.row];
-    const live = effective?.models?.find((c) => c.setting === setting && c.harness === field.family);
-    const cell = live ?? (fallback ? MODEL_CELLS[field.row]?.(fallback)?.find((c) => c.harness === field.family) : undefined);
+    const cell = effective.models?.find((c) => c.setting === MODEL_SETTING[field.row] && c.harness === field.family);
     if (!cell) return null;
-    return `${modelValue(cell.resolved_model)} · ${modelSettingSourceLabel(sourceField(field), cell.source)}${fallback ? noteSuffix(live?.notes, cell.resolved_model) : ""}`;
+    const notes = NOTED_MODEL_ROWS.has(field.row) ? noteSuffix(cell.notes, cell.resolved_model) : "";
+    return `${modelValue(cell.resolved_model)} · ${modelSettingSourceLabel(sourceField(field), cell.source)}${notes}`;
   }
-  const setting = EFFORT_SETTING[field.row];
-  const cell =
-    effective?.efforts?.find((c) => c.setting === setting && c.harness === field.family) ??
-    (fallback ? EFFORT_CELLS[field.row]?.(fallback)?.find((c) => c.harness === field.family) : undefined);
+  const cell = effective.efforts?.find((c) => c.setting === EFFORT_SETTING[field.row] && c.harness === field.family);
   if (!cell) return null;
   return `${effortValue(cell)} · ${modelSettingSourceLabel(sourceField(field), cell.source)}`;
 }

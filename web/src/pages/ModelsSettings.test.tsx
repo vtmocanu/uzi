@@ -783,7 +783,7 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ default_claude_model: "haiku" });
   });
 
-  it("falls back to the saved settings cells for helper and checker predictions when the effective view is unavailable", async () => {
+  it("shows Unavailable for every saved effective value when the effective view is unavailable, never a /me/settings guess", async () => {
     mockApi.getEffectiveSettings.mockRejectedValue(new ApiError(500, "boom"));
     mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({
       judge_runs_on: "codex",
@@ -791,14 +791,67 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     }) });
     mount();
     await screen.findByLabelText("Judge runs on");
-    expect(describedText("Worker model — Claude")).toContain("Saved effective value: Unavailable");
-    expect(describedText("Judge runs on")).toContain("Saved effective value: Codex · your setting");
-    expect(describedText("Summary model — Codex")).toContain("Saved effective value: gpt-6-luna · built-in");
-    expect(describedText("Task review effort — Claude")).toContain("Saved effective value: Runtime default · your choice");
-    expect(describedText("Plan cross-check model — Claude")).toContain("Saved effective value: sonnet · checker pin");
-    expect(describedText("Plan cross-check effort — Claude")).toContain("Saved effective value: max · checker pin");
-    // No stored pin for the code stage: nothing to fall back to.
+    for (const name of ["Worker model — Claude", ...HELPER_NAMES]) {
+      expect(describedText(name), name).toContain("Saved effective value: Unavailable");
+    }
+    // The stored values still load into the controls; only the prediction is withheld.
+    expect(control("Judge runs on").value).toBe("codex");
+    expect(control("Plan cross-check model — Claude").value).toBe("sonnet");
+  });
+
+  it("reads a checker's saved effective value only from effective.cross_check, never from the stored pin", async () => {
+    const effective = helperEffective();
+    effective.cross_check.models = effective.cross_check.models.map((c) =>
+      c.setting === "cross_check_plan" && c.harness === "claude" ? { ...c, resolved_model: "server-checker", source: "cross_check_pin" } : c,
+    );
+    // The code stage's Claude cells are missing from the response.
+    effective.cross_check.models = effective.cross_check.models.filter((c) => !(c.setting === "cross_check_code" && c.harness === "claude"));
+    effective.cross_check.efforts = effective.cross_check.efforts.filter((c) => !(c.setting === "cross_check_code" && c.harness === "claude"));
+    mockApi.getEffectiveSettings.mockResolvedValue(effective);
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({
+      cross_check_pins: [
+        pinDto("plan", "claude", { model: "stale-pin", resolved_model: "stale-pin", model_source: "pin" }),
+        pinDto("plan", "codex"),
+        pinDto("code", "claude", { model: "sonnet", resolved_model: "sonnet", model_source: "pin", effort: "max", resolved_effort: "max", effort_source: "pin" }),
+        pinDto("code", "codex"),
+      ],
+    }) });
+    mount();
+    await screen.findByLabelText("Plan cross-check model — Claude");
+    expect(describedText("Plan cross-check model — Claude")).toContain("Saved effective value: server-checker · checker pin");
+    expect(describedText("Plan cross-check model — Claude")).not.toContain("stale-pin");
+    expect(describedText("Plan cross-check effort — Claude")).toContain("Saved effective value: high · cross-check default");
     expect(describedText("Code cross-check model — Claude")).toContain("Saved effective value: Unavailable");
+    expect(describedText("Code cross-check effort — Claude")).toContain("Saved effective value: Unavailable");
+  });
+
+  it("shows Unavailable for a helper row the effective view has no cell for", async () => {
+    const effective = helperEffective();
+    effective.models = effective.models.filter((c) => c.setting !== "summary_model");
+    mockApi.getEffectiveSettings.mockResolvedValue(effective);
+    mount();
+    await screen.findByLabelText("Summary model — Claude");
+    expect(describedText("Summary model — Claude")).toContain("Saved effective value: Unavailable");
+    expect(describedText("Summary model — Codex")).toContain("Saved effective value: Unavailable");
+    expect(describedText("Judge model — Claude")).toContain("Saved effective value: opus");
+  });
+
+  it("flags a stored value its validator refuses as information, without blocking a save of something else", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({
+      judge_model: "gpt-6-sol",
+      cross_check_pins: [pinDto("plan", "claude"), pinDto("plan", "codex", { model: "sonnet" }), pinDto("code", "claude"), pinDto("code", "codex")],
+    }) });
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: helperSettings({ judge_model: "gpt-6-sol" }), effective: helperEffective() });
+    mount();
+    await screen.findByLabelText("Plan cross-check model — Codex");
+    expect(describedText("Judge model — Claude")).toContain("The saved value is not valid here. Not a Claude model: gpt-6-sol is a Codex model");
+    expect(describedText("Plan cross-check model — Codex")).toContain("The saved value is not valid here. Choose a model from the checker's model family.");
+    expect(control("Judge model — Claude").hasAttribute("aria-invalid")).toBe(false);
+    expect(status()).toBe("No unsaved changes");
+    select("Task review effort — Claude", "high");
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ task_review_effort: "high" }));
   });
 
   it("a 400 on a retry after an unconfirmed save still says the earlier save is unconfirmed, and keeps Reload", async () => {
