@@ -201,6 +201,9 @@ async function capture(cli: string, outPath: string): Promise<void> {
   const repoRoot = path.resolve(import.meta.dirname, "../..");
   const sdkVersion = (JSON.parse(await fs.readFile(path.resolve(import.meta.dirname, "../node_modules/@anthropic-ai/claude-agent-sdk/package.json"), "utf8")) as { version: string }).version;
   assert.equal(sdkVersion, "0.3.319", "the fixture file name pins SDK 0.3.319; rename it when the SDK is bumped");
+  // This probe still only captures at 0.3.319 (the assertion above). Not recaptured at 0.3.325: a recapture must change the
+  // assertion and the default output path to a NEW versioned fixture (claude-structured-output-<sdk>.json); the 0.3.319
+  // fixture and the tests that replay it stay as history.
   const scratch = path.join(repoRoot, ".uzi/scratch");
   await fs.mkdir(scratch, { recursive: true });
   const root = await fs.mkdtemp(path.join(scratch, "so-probe-"));

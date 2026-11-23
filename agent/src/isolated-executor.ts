@@ -91,7 +91,7 @@ const RUN_SECRETS_DIR = "/run/uzi-secrets";
 const PINNED_BUILTIN_AGENTS: ReadonlySet<string> = new Set(["claude", "general-purpose", "statusline-setup"]);
 const PINNED_BUILTIN_SKILLS: ReadonlySet<string> = new Set(["doctor"]);
 
-/** The SDK's end-turn tool for `outputFormat: {type: "json_schema"}`, recorded in
+/** The SDK's end-turn tool for `outputFormat: {type: "json_schema"}`, recorded at SDK 0.3.319 in
  *  test/fixtures/claude-structured-output-0.3.319.json (init tools and assistant tool_use name). */
 export const STRUCTURED_OUTPUT_CARRIER = "StructuredOutput" as const;
 

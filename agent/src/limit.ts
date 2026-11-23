@@ -294,7 +294,7 @@ export function describeLimit(limit: { resetsAtMs?: number; rateLimitType?: stri
 // these strings). So this one classifier matches three sentences, exact and case-sensitive, and
 // only on a lead terminal that structurally is a 400 `api_error` result: the organization spend
 // limit, the workspace spend limit, and (issue #4426) the Claude CLI's credit-depletion sentence.
-// SDK 0.3.319 re-check for credit depletion: the CLI maps Anthropic's 400 credit-balance error to
+// SDK 0.3.319 re-check for credit depletion (the replacement text was re-found by `strings` in the 0.3.325 CLI binary; not re-captured): the CLI maps Anthropic's 400 credit-balance error to
 // an assistant API-error message whose text is exactly `Credit balance is too low` (assistant
 // `error: "billing_error"`, never retried), and the result frame is structurally the same as a
 // spend-limit frame (`is_error: true`, `terminal_reason: "api_error"`, `api_error_status: 400`).
@@ -307,7 +307,7 @@ export const SPEND_LIMIT_WORKSPACE_TEXT = "You have reached your specified works
 /**
  * Credit depletion sentence (issue #4426): an Anthropic API key whose prepaid credit balance ran
  * out. Observed on a hosted worker (0.87.0-rc.15) as `provider error: 400 Credit balance is too low`.
- * This is the Claude CLI's own replacement text at SDK 0.3.319 (its `billing_error` mapping of the
+ * This is the Claude CLI's own replacement text, characterized at SDK 0.3.319; the same text was re-found by `strings` in the 0.3.325 CLI binary (its `billing_error` mapping of the
  * API's credit-balance 400), not the sentence on Anthropic's errors page, and it arrives bare, with
  * no `API Error:` wrapper.
  */

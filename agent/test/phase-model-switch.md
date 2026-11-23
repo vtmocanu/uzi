@@ -2,7 +2,7 @@
 
 These are maintainer-only probes. They are not gate targets and never run from CI
 or uzi. The ordinary characterization tests use dummy credentials and loopback
-providers. They pin SDK 0.3.319 (bundled CLI 2.1.319) and Codex 0.169.0.
+providers. They pin SDK 0.3.325 (bundled CLI 2.1.325) and Codex 0.169.0.
 
 Run from this worktree's `agent/` directory. The user supplies credentials at run
 time; neither command reads or prints a credential file in the calling session.

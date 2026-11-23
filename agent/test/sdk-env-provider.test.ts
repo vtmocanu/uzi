@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildSdkEnv, PROTECTED_ENV_KEYS, type SdkCredential } from "../src/sdk-env.js";
+import { buildSdkEnv, PROTECTED_ENV_KEYS, PROVIDER_FALLBACK_CONTEXT_WINDOW, type SdkCredential } from "../src/sdk-env.js";
 import { COMMAND_ENV_PROTECTED_KEYS } from "../src/codex/codex-executor.js";
 
 // PRD #4320 module 6: buildSdkEnv in provider mode. The gateway key is assembled at runtime: no
@@ -62,7 +62,7 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
     assert.equal(e.ANTHROPIC_DEFAULT_FABLE_MODEL, undefined, "an unmapped alias is pinned off");
     assert.equal(e.ANTHROPIC_SMALL_FAST_MODEL, "corp-haiku");
     assert.equal(e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
-    assert.equal(e.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined, "no context_window set: the key is omitted");
+    assert.equal(e.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "200000", "no context_window set: the conservative 200K fallback applies");
     for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_FABLE_MODEL"]) assert.ok(k in e, `${k} is pinned`);
   });
 
@@ -113,6 +113,16 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
     assert.equal(one.CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined, "the floored key is never used");
   });
 
+  it("no configured window falls back to 200000; windows above it are never raised or capped to it", () => {
+    assert.equal(PROVIDER_FALLBACK_CONTEXT_WINDOW, 200_000);
+    const above = buildSdkEnv(providerCred({
+      modelMap: { opus: { model: "o", context_window: 1_000_000 }, sonnet: { model: "s", context_window: 400_000 }, haiku: { model: "h", context_window: 300_000 } },
+    }), HOME_DIR);
+    assert.equal(above.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "300000", "an explicit window above the fallback wins");
+    const partial = buildSdkEnv(providerCred({ modelMap: { sonnet: { model: "s", context_window: 400_000 }, haiku: { model: "h" } } }), HOME_DIR);
+    assert.equal(partial.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "400000", "a partial map uses the smallest explicit window (documented limitation)");
+  });
+
   it("a provisioned tool env can never set or clear a provider-mode key", () => {
     const hostile: Record<string, string> = {
       ANTHROPIC_BASE_URL: "https://evil.example.test", ANTHROPIC_AUTH_TOKEN: "x", ANTHROPIC_API_KEY: "y", CLAUDE_CODE_OAUTH_TOKEN: "z",
@@ -129,7 +139,7 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
     assert.equal(e.ANTHROPIC_DEFAULT_OPUS_MODEL, "corp-opus");
     assert.equal(e.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
     assert.equal(e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
-    assert.equal(e.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
+    assert.equal(e.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "200000", "the provisioned \"9\" never wins over the fallback");
     assert.equal(e.CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined);
     // OAuth mode: the same protected keys hold.
     const oauth = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, hostile);

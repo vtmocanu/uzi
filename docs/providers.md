@@ -57,14 +57,27 @@ uzi provider create --name corp-gw \
 - **Model map.** `--model alias=model[:context_window]`, repeatable, with `alias` one of
   `haiku`, `sonnet`, `opus` or `fable`. **`haiku` is required**: Claude's background calls use
   the small/fast slot, which is `haiku`. Set `context_window` to the gateway model's real
-  window. Without it, the Claude CLI assumes a 200k window for model names it does not
-  recognize and auto-compacts about 33k tokens below it, which is wrong for a smaller or larger
-  model. Measured at the pinned CLI, the configured window was enforced for `corp-sonnet` and
-  `corp-claude-x`, and was **not honoured** for `claude-sonnet-4-5`,
-  `us.anthropic.claude-sonnet-4-5` and `claude-corp-custom`. So for model names containing
-  "claude", `context_window` may not take effect; the CLI was observed to ignore it for some such
-  names. Not every name containing "claude" was ignored, and the rule behind the difference is
-  not known.
+  window.
+  - **Default.** With no `context_window` on any mapped model, uzi assumes 200k tokens. The
+    worker sets that value itself; the Claude CLI's own default for an unrecognized model name
+    is now 1M (Claude Code 2.1.325), which would compact far too late on a smaller model.
+  - **Configured windows.** The window is process-wide: the smallest `context_window` across
+    all mapped models applies to the whole run, to the lead and to subagents alike. The CLI
+    auto-compacts about 30k tokens below the window (measured: 50000 compacts at 20k, 400000 at
+    370k).
+  - **Partly configured map.** If only some models carry a `context_window`, the smallest
+    explicit one applies to every model, including those you left blank. This is a known
+    limitation.
+  - **Measured exceptions.** Measured at Claude Code 2.1.325, the configured window was
+    enforced for `corp-sonnet`, `claude-corp-custom` and `corp-claude-x`. It was **not
+    honoured** for `claude-sonnet-4-5` and `us.anthropic.claude-sonnet-4-5`, with a configured
+    window or with uzi's 200k default: no compaction was seen up to 605k reported tokens. The
+    CLI logged no unrecognized-model warning for those ids, so it appears to recognize them; we
+    record what was seen, not which window it applied, and other names the CLI recognizes as
+    Anthropic models may behave the same. (The Claude Code 2.1.325 changelog says the setting
+    now also applies to unrecognized ids starting with `claude-`, which matches
+    `claude-corp-custom` being enforced there but not at 2.1.319.) The web form and
+    `uzi provider create`/`edit` show a caveat for any model name containing "claude".
 
 ## The key
 

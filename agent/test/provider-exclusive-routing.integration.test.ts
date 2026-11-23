@@ -298,7 +298,7 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
   }
 
   // ── Redirects ───────────────────────────────────────────────────────────────────────────────
-  // ACCEPTED RISK (ADR-4320, 2026-11-19, #4505): the pinned CLI (SDK 0.3.319 / CLI 2.1.319) FOLLOWS a
+  // ACCEPTED RISK (ADR-4320, 2026-11-19, #4505): the CLI, characterized at SDK 0.3.319 / CLI 2.1.319, FOLLOWS a
   // gateway 307 for POST /v1/messages, re-sending the request body to the Location the gateway names:
   // to a same-origin sibling path with the auth header, and to a second loopback origin (bearer: the
   // Authorization header is dropped by the fetch cross-origin rule; x_api_key: `x-api-key` IS forwarded).
