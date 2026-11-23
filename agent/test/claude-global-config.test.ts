@@ -912,21 +912,46 @@ describe("the bounded runner helper", () => {
     });
   });
 
-  it("timeout around a sleeping helper returns within the bound, as a kill the preparation treats as transient", { skip: !fs.existsSync("/usr/bin/timeout") || !fs.existsSync("/bin/sleep") }, () => {
+  it("the helper's stdout reaches the caller through the intermediary's output file", () => {
+    const r = runBounded("/bin/sh", ["-c", "printf '10002|2700|directory|/x\\n'"]);
+    assert.deepStrictEqual(r, { status: 0, signal: null, stdout: "10002|2700|directory|/x\n" });
+    assert.strictEqual(runBounded("/bin/sh", ["-c", "exit 1"]).status, 1);
+  });
+
+  it("a helper that ignores its own timeout is cut off by the intermediary's kill within the bound, and the preparation treats it as transient", { skip: !fs.existsSync("/bin/sh") || !fs.existsSync("/bin/sleep") }, () => {
     const t0 = Date.now();
-    const r = runBounded("/usr/bin/timeout", ["-s", "KILL", "2", "/bin/sleep", "10"]);
+    assert.throws(() => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 8"]), TrustedExecutionRefusal);
     const elapsed = Date.now() - t0;
-    assert.ok(elapsed < 3_500, `returned after ${elapsed} ms`);
-    assert.ok(r.signal === "SIGKILL" || r.status === 124 || r.status === 137, `a killed helper, got ${String(r.status)} / ${String(r.signal)}`);
-    // The preparation reads either status from mkdir as transient: it refuses and moves nothing.
+    assert.ok(elapsed < 4_500, `returned after ${elapsed} ms`);
+    // The same through the preparation: it refuses and moves nothing.
     fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
-    const stuck = (): HelperResult => ({ status: r.status, signal: r.signal, stdout: "" });
-    assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: stuck }), /did not complete/);
+    const stuck = (): HelperResult => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 8"]);
+    assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: stuck }), TrustedExecutionRefusal);
     assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), []);
   });
 
-  it("a command that does not exist is a refusal, not a status", () => {
-    assert.throws(() => runBounded(path.join(root, "no-such-binary"), []), TrustedExecutionRefusal);
+  it("output over 64 KiB refuses, and a stat helper doing that moves nothing", () => {
+    const big = (): HelperResult => runBounded("/bin/sh", ["-c", "head -c 70000 /dev/zero"]);
+    assert.throws(() => big(), /output limit/);
+    process.env.UZI_UID_SPLIT = "1";
+    const claude = path.join(home, ".claude");
+    fs.mkdirSync(claude);
+    const h = helpers({ mkdir: () => 1, stat: () => big() });
+    assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /output limit/);
+    assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), []);
+    assert.ok(fs.statSync(claude).isDirectory());
+  });
+
+  it("a command that does not exist is a status the preparation treats as transient, not a success", () => {
+    const r = runBounded(path.join(root, "no-such-binary"), []);
+    assert.strictEqual(r.status, 127);
+  });
+
+  it("leaves no output directory behind", () => {
+    const before = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("uzi-helper-")).length;
+    runBounded("/bin/sh", ["-c", "true"]);
+    assert.throws(() => runBounded("/bin/sh", ["-c", "head -c 70000 /dev/zero"]));
+    assert.strictEqual(fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("uzi-helper-")).length, before);
   });
 });
 
@@ -972,6 +997,22 @@ describe("prepareClaudeConfigDir: the final rename failing", () => {
     assert.strictEqual(n, 2);
     assertFixedDir(dirOf());
     assert.strictEqual(staleNames().length, 1);
+  });
+
+  it("a successful install on the last attempt after three failed ones is not a refusal", () => {
+    let n = 0;
+    prep(envOf(), {
+      rename: (from, to) => {
+        if (++n <= 3) {
+          fs.mkdirSync(dirOf());
+          fs.writeFileSync(path.join(dirOf(), "planted"), "x");
+          throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+        }
+        fs.renameSync(from, to);
+      },
+    });
+    assert.strictEqual(n, 4);
+    assertFixedDir(dirOf());
   });
 
   it("EEXIST-class errors with another valid directory present reuse it", () => {

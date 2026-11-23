@@ -12,7 +12,7 @@
 
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -420,8 +420,10 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
   });
 
   // The runner-uid helpers the preparation runs, in their real wrapper: the stat probe prints the
-  // exact line format the module parses, and a helper that does not finish is killed within the bound.
-  it("the runner-uid stat helper prints the parsed line format, and a sleeping helper is killed within the bound (#4416)", async () => {
+  // exact line format the module parses (the setgid bit HOME carries is inherited by .claude, so the
+  // fields are checked, not a mode string), and a helper that does not finish returns control to the
+  // worker within the bound.
+  it("the runner-uid stat helper prints the parsed line format (#4416)", async () => {
     const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004419");
     await fs.mkdir(home);
     await fs.chmod(home, 0o2775);
@@ -432,17 +434,55 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     const stat = config.helperCommand("/bin/stat", ["-c", "%u|%a|%F|%n", "--", claude, projects], true);
     const r = config.runBounded(stat.command, stat.args);
     assert.equal(r.status, 0);
-    assert.equal(r.stdout, `10002|700|directory|${claude}\n10002|600|regular file|${projects}\n`);
+    const lines = r.stdout.split("\n").filter((l) => l !== "").map((l) => l.split("|"));
+    assert.equal(lines.length, 2);
+    const [dirLine, fileLine] = lines;
+    assert.equal(dirLine![0], String(runnerUid.RUNNER_UID));
+    assert.equal(Number.parseInt(dirLine![1]!, 8) & 0o700, 0o700, "the owner has rwx");
+    assert.equal(dirLine![2], "directory");
+    assert.equal(dirLine![3], claude);
+    assert.equal(fileLine![0], String(runnerUid.RUNNER_UID));
+    assert.equal(fileLine![2], "regular file");
+    assert.equal(fileLine![3], projects);
 
+    await rmtree.rmHomeTree(home);
+    assert.equal(await exists(home), false);
+  });
+
+  it("the worker regains control within the bound from a runner helper it cannot signal (#4416)", async () => {
+    // Under the split the worker uid cannot signal the runner-uid helper; only the worker-uid
+    // intermediary is killed, so runBounded returns whether the helper dies on its own or is stopped.
     const sleep = config.helperCommand("/bin/sleep", ["10"], true);
     const t0 = Date.now();
     const killed = config.runBounded(sleep.command, sleep.args);
     const elapsed = Date.now() - t0;
-    assert.ok(elapsed < 3500, `the helper returned after ${elapsed} ms`);
-    assert.ok(killed.signal === "SIGKILL" || killed.status === 124 || killed.status === 137, `killed, got ${String(killed.status)} / ${String(killed.signal)}`);
+    assert.ok(elapsed < 4500, `the helper returned after ${elapsed} ms`);
+    assert.notEqual(killed.status, 0);
 
-    await rmtree.rmHomeTree(home);
-    assert.equal(await exists(home), false);
+    // Another runner process stops both the helper and its timeout: nothing runner-side can end it.
+    const stopper = [
+      'sig="$1"; n="$2"; i=0',
+      'while [ "$i" -lt "$n" ]; do',
+      '  for p in /proc/[0-9]*; do',
+      '    id="${p#/proc/}"; [ "$id" = "$$" ] && continue',
+      `    c=$(tr '\\0' ' ' < "$p/cmdline" 2>/dev/null) || continue`,
+      '    case "$c" in *"sle""ep 7 "*) kill -"$sig" "$id" 2>/dev/null ;; esac',
+      "  done",
+      "  i=$((i+1)); sleep 0.1",
+      "done",
+    ].join("\n");
+    const wrapped = runnerUid.runnerCommand("/bin/sh", ["-c", stopper, "sh", "STOP", "45"]);
+    const watcher = spawn(wrapped.command, wrapped.args, { stdio: "ignore" });
+    const stuck = config.helperCommand("/bin/sleep", ["7"], true);
+    const t1 = Date.now();
+    try {
+      assert.throws(() => config.runBounded(stuck.command, stuck.args));
+      const stoppedElapsed = Date.now() - t1;
+      assert.ok(stoppedElapsed < 5000, `the stopped helper returned after ${stoppedElapsed} ms`);
+    } finally {
+      asRunner(stopper, "KILL", "3");
+      watcher.kill();
+    }
   });
 
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {

@@ -235,6 +235,31 @@ describe("the Claude provider belts (issue #2213)", () => {
     }
   });
 
+  it("a credentialed spawn with HOME and CLAUDE_CONFIG_DIR refuses on the latch and prepares nothing in HOME", () => {
+    latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-spawn-")));
+    const home = path.join(dir, "home");
+    fs.mkdirSync(home);
+    const marker = path.join(dir, "ran");
+    try {
+      assert.throws(
+        () =>
+          spawnDetached({
+            command: "/bin/sh",
+            args: ["-c", `echo ran > '${marker}'`],
+            cwd: "/",
+            env: { PATH: "/usr/bin:/bin", HOME: home, CLAUDE_CONFIG_DIR: claudeConfigDir(home), CLAUDE_CODE_OAUTH_TOKEN: "a-provider-credential-value" },
+            signal: new AbortController().signal,
+          }),
+        ResidueQuarantinedError,
+      );
+      assert.deepEqual(fs.readdirSync(home), [], "neither .claude nor the config directory was created");
+      assert.equal(fs.existsSync(marker), false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("control: while open the same spawn starts; and a credential-free spawn is not a turn", async () => {
     const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-spawn-")));
     const marker = path.join(dir, "ran");

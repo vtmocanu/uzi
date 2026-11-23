@@ -106,14 +106,21 @@
 // targets itself and applies the same rule (the owner is compared with the worker's uid), and mkdir
 // is spawned directly.
 //
-// Bound. Under the split each helper is `runnerCommand("/usr/bin/timeout", ["-s", "KILL", "2",
-// <bin>, ...args])` run by spawnSync with a 4 s timeout and SIGKILL. The whole preparation has one
-// absolute deadline of 10 s, read from PrepareDeps.now and checked before each helper spawn: past
-// it the start is refused and the tree is kept. A helper stuck in uninterruptible I/O is not
-// terminated by SIGKILL until the I/O returns, so neither limit shortens a call that is already
-// blocked; they bound how many helpers start and how long a responsive one runs. A spawn error, a
-// signal, a null status, and (for mkdir) any status other than 0 and 1, including those of timeout
-// itself (124, 125, 126, 127, 137), are transient: they refuse this start and move nothing.
+// Bound. Each helper is `runnerCommand("/usr/bin/timeout", ["-s", "KILL", "2", <bin>, ...args])`
+// under the split (the binary itself with one uid), started by a worker-uid `/bin/sh` intermediary
+// (INTERMEDIARY_SCRIPT) that sends its stdout to a file in a worker-private mkdtemp directory and
+// waits for it. spawnSync waits only on that sh, with a 4 s timeout and SIGKILL: the sh runs as the
+// worker uid, so that kill always lands, and all of spawnSync's stdio is ignored, so no pipe is held
+// open by a helper that outlives it. The worker uid cannot signal the runner-uid helper (no
+// CAP_KILL); an orphaned runner helper may outlive the preparation and is the runner's own process.
+// Its output is read from the file after the spawn, at most 64 KiB; more refuses. The whole
+// preparation has one absolute deadline of 10 s, read from PrepareDeps.now and checked before each
+// helper spawn: past it the start is refused and the tree is kept. A helper stuck in uninterruptible
+// I/O is not terminated by SIGKILL until the I/O returns, so neither limit shortens a call that is
+// already blocked; they bound how many helpers start and how long a responsive one runs. A spawn
+// error, a killed sh, a null status, output over the limit, and (for mkdir) any status other than 0
+// and 1, including those of timeout itself (124, 125, 126, 127, 137), are transient: they refuse
+// this start and move nothing.
 //
 // The CLI reads the linked `<HOME>/.claude/projects` (transcripts, per-project memory) and
 // `<HOME>/.claude/tasks`, which stay runner-writable data. `<HOME>/.claude.json` and the
@@ -127,6 +134,7 @@
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { claudeConfigDir, CLAUDE_CONFIG_DIR_NAME } from "./claude-config-dir.js";
 import { CODEX_SESSION_GID, COMMAND_UID, RUNNER_UID, runnerCommand, uidSplitActive } from "./runner-uid.js";
@@ -271,21 +279,46 @@ function renameAside(p: string): void {
   fs.renameSync(p, `${p}.stale-${hex()}`);
 }
 
-/** Spawn `command` with the helper bounds: a fixed worker-authored argv on workerSpawnEnv with a
- *  minimal PATH, no shell, stdout captured (utf8, bounded), spawnSync's 4 s timeout and SIGKILL. A
- *  spawn error (including a timeout or an exceeded buffer) throws a refusal. */
+/** The constant script of the worker-uid intermediary: `$0` is the output file, the rest is the
+ *  helper argv; nothing is interpolated. */
+const INTERMEDIARY_SCRIPT = '"$@" >"$0" & wait $!';
+
+/** Read at most HELPER_MAX_BUFFER bytes of the helper's output file; more than that refuses. */
+function readHelperOutput(file: string): string {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const buf = Buffer.alloc(HELPER_MAX_BUFFER + 1);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    if (n > HELPER_MAX_BUFFER) throw refuse("a runner helper printed more than its output limit");
+    return buf.subarray(0, n).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Run `command args` through a worker-uid `/bin/sh` intermediary that starts it in the background
+ *  with stdout going to a file in a worker-private directory (mkdtemp, mode 0700) and waits for it.
+ *  spawnSync waits only on that sh, with a 4 s timeout and SIGKILL, which the worker uid can always
+ *  deliver; all of spawnSync's stdio is ignored, so no pipe is held by a helper that outlives it. The
+ *  helper's exit status is the sh's. A spawn error, a timeout or a signal on the sh, or output over
+ *  64 KiB, throws a refusal. */
 export function runBounded(command: string, args: readonly string[]): HelperResult {
-  const r = spawnSync(command, [...args], {
-    env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
-    shell: false,
-    stdio: ["ignore", "pipe", "ignore"],
-    encoding: "utf8",
-    maxBuffer: HELPER_MAX_BUFFER,
-    timeout: HELPER_SPAWN_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-  });
-  if (r.error) throw refuse("a runner helper did not complete");
-  return { status: r.status, signal: r.signal, stdout: typeof r.stdout === "string" ? r.stdout : "" };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-helper-"));
+  try {
+    const out = path.join(dir, "out");
+    fs.closeSync(fs.openSync(out, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600));
+    const r = spawnSync("/bin/sh", ["-c", INTERMEDIARY_SCRIPT, out, command, ...args], {
+      env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
+      shell: false,
+      stdio: "ignore",
+      timeout: HELPER_SPAWN_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    });
+    if (r.error || r.signal !== null) throw refuse("a runner helper did not complete");
+    return { status: r.status, signal: null, stdout: readHelperOutput(out) };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** The argv the helper runs as: under the split the runner uid via setpriv around `timeout -s KILL 2`,
@@ -308,12 +341,12 @@ function runHelper(prep: Prep, bin: string, args: readonly string[]): HelperResu
 
 /** `/bin/mkdir <args>` as the runner: true when it exited 0, false when it exited 1 (it ran and
  *  failed); any other outcome is transient and throws. */
-function mkdirAsRunner(prep: Prep, args: readonly string[]): boolean {
+function mkdirAsRunner(prep: Prep, args: readonly string[], what: string): boolean {
   const r = runHelper(prep, MKDIR_BIN, args);
-  if (r.signal !== null || r.status === null) throw refuse("the runner mkdir of the .claude targets did not complete");
+  if (r.signal !== null || r.status === null) throw refuse(`the runner mkdir of ${what} did not complete`);
   if (r.status === 0) return true;
   if (r.status === MKDIR_FAILED_STATUS) return false;
-  throw refuse("the runner mkdir of the .claude targets did not complete");
+  throw refuse(`the runner mkdir of ${what} did not complete`);
 }
 
 interface EntryFact {
@@ -375,7 +408,7 @@ function ensureTargets(home: string, prep: Prep, step: (name: string) => void): 
       step("claude-aside");
       continue;
     }
-    if (st === undefined && !mkdirAsRunner(prep, ["-p", "-m", "700", "--", claude])) {
+    if (st === undefined && !mkdirAsRunner(prep, ["-p", "-m", "700", "--", claude], ".claude")) {
       throw refuse("the runner could not create .claude");
     }
     const missing: string[] = [];
@@ -401,7 +434,7 @@ function ensureTargets(home: string, prep: Prep, step: (name: string) => void): 
       step("claude-aside");
       continue;
     }
-    if (missing.length > 0 && !mkdirAsRunner(prep, ["-p", "-m", "700", "--", ...missing])) {
+    if (missing.length > 0 && !mkdirAsRunner(prep, ["-p", "-m", "700", "--", ...missing], "the .claude targets")) {
       // Only a positive obstruction moves the HOME entry aside, once; anything else refuses this start.
       if (!positiveObstruction(prep, claude, missing)) throw refuse("the runner mkdir of the .claude targets did not complete");
       if (movedAfterObstruction) throw refuse("the runner could not create the .claude targets");
@@ -559,6 +592,10 @@ function ensureConfigDir(home: string, dir: string, step: (name: string) => void
       if (installed) step("installed");
     } finally {
       if (!installed) removeTemp(tmp);
+    }
+    if (installed) {
+      step("inspect");
+      if (inspect(dir).state === "ok") return;
     }
   }
   throw refuse("the config directory kept changing while it was prepared");

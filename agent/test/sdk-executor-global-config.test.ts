@@ -302,6 +302,15 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
 });
 
 describe("SdkExecutor: run variables need the uid split (PRD #4416)", () => {
+  let splitBefore: string | undefined;
+  beforeEach(() => {
+    splitBefore = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+  });
+  afterEach(() => {
+    if (splitBefore === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = splitBefore;
+  });
   const runEnvCtx = (): RunContext => ({
     ...makeCtx(),
     runEnv: [{ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "REGION", value: "eu-west", secret: false, description: "" }],
