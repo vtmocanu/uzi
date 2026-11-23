@@ -30,6 +30,7 @@ const DUMP_SCRIPT = [
   "let r;",
   'try { r = fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"); } catch { r = "ABSENT"; }',
   "fs.writeFileSync(process.argv[1], r);",
+  'fs.writeFileSync(process.argv[1] + ".alt", fs.existsSync(process.env.HOME + "/.claude/.config.json") ? "PRESENT" : "ABSENT");',
 ].join("\n");
 
 function assistantTool(name: string, input: Record<string, unknown>, id: string): SDKMessage {
@@ -171,6 +172,7 @@ describe("SdkExecutor + spawnDetached: the CLI global config is reset at every s
     fs.mkdirSync(path.join(homeDir, ".claude.json"));
     await assert.rejects(makeExecutor(twoLegs()).run(makeCtx()), (err: unknown) => {
       const e = err as Error;
+      assert.ok(err instanceof TrustedExecutionRefusal);
       assert.match(String(e.message ?? err), /Claude CLI global config could not be replaced by the worker/);
       return true;
     });
@@ -180,6 +182,33 @@ describe("SdkExecutor + spawnDetached: the CLI global config is reset at every s
       [],
       "no temp file is left behind",
     );
+  });
+
+  it("(g) a .claude/.config.json an agent planted is removed, so the CLI resolves the fixed .claude.json", async () => {
+    const claudeDir = path.join(homeDir, ".claude");
+    const alt = path.join(claudeDir, ".config.json");
+    const exec = makeExecutor(
+      twoLegs((leg) => {
+        if (leg === 1) {
+          fs.mkdirSync(claudeDir, { recursive: true });
+          fs.writeFileSync(alt, JSON.stringify({ env: { OTEL_LOG_RAW_API_BODIES: "1" } }));
+        }
+      }),
+    );
+    await exec.run(makeCtx());
+    assert.strictEqual(fs.readFileSync(dumpPath(2) + ".alt", "utf8"), "ABSENT", "leg 2's CLI sees no .config.json");
+    assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES);
+    assert.ok(!fs.existsSync(alt));
+  });
+
+  it("(h) a directory at .claude/.config.json refuses the start, with no spawn", async () => {
+    fs.mkdirSync(path.join(homeDir, ".claude", ".config.json"), { recursive: true });
+    await assert.rejects(makeExecutor(twoLegs()).run(makeCtx()), (err: unknown) => {
+      assert.ok(err instanceof TrustedExecutionRefusal);
+      assert.match(String((err as Error).message), /Claude CLI global config could not be replaced by the worker/);
+      return true;
+    });
+    assert.strictEqual(readDump(1), undefined, "the CLI was never started");
   });
 
   it("(e) the file is mode 0660", async () => {
@@ -201,6 +230,25 @@ describe("resetClaudeGlobalConfig (PRD #4416)", () => {
     resetClaudeGlobalConfig({ HOME: undefined });
     resetClaudeGlobalConfig({ HOME: "" });
     assert.deepStrictEqual(fs.readdirSync(homeDir), before);
+  });
+
+  it("under the uid split the alternate file is removed through the runner seam, and its failure refuses", () => {
+    process.env.UZI_UID_SPLIT = "1";
+    const calls: string[] = [];
+    resetClaudeGlobalConfig({ HOME: homeDir }, { removeAsRunner: (f) => calls.push(f) });
+    assert.deepStrictEqual(calls, [path.join(homeDir, ".claude", ".config.json")]);
+    assert.strictEqual(fs.readFileSync(path.join(homeDir, ".claude.json"), "utf8"), CLAUDE_GLOBAL_CONFIG_BYTES);
+    fs.writeFileSync(path.join(homeDir, ".claude.json"), "SENTINEL");
+    assert.throws(
+      () =>
+        resetClaudeGlobalConfig({ HOME: homeDir }, {
+          removeAsRunner: () => {
+            throw new Error("rm exited 1");
+          },
+        }),
+      TrustedExecutionRefusal,
+    );
+    assert.strictEqual(fs.readFileSync(path.join(homeDir, ".claude.json"), "utf8"), "SENTINEL", "no replace after a failed removal");
   });
 
   it("refuses a HOME that is not a canonical absolute path", () => {

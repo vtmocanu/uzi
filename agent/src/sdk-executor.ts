@@ -6008,17 +6008,21 @@ export class SdkExecutor implements Executor {
    * PRD #4416: evidence only, never a reap or a refusal. spawnDetached replaces the CLI's global
    * config with fixed bytes at each CLI start; a process of this run that is still alive (the
    * HOME-attributed scan, one pass, no settle poll) can rewrite that file between the reset and the
-   * CLI's startup read. Logs the count (or an incomplete scan), nothing else.
+   * CLI's startup read. Logs the count (or an incomplete scan), nothing else. RunProcessOps.scan
+   * takes no budget option, so this scan runs under the scan's own default budget.
    */
   private async warnLiveWritersAtConfigReset(): Promise<void> {
     const scan = await this.runProcesses
       .scan(this.homeDir, this.runWorktree, [...this.spawnedPids])
       .catch((): RunProcessScan => ({ pids: [], complete: false }));
     if (scan.complete && scan.pids.length === 0) return;
-    this.log.warn(
-      `global CLI config replaced while ${scan.pids.length} run processes are alive; a live writer can race the CLI start`,
-      { count: scan.pids.length, scanComplete: scan.complete },
-    );
+    const what = scan.complete
+      ? `${scan.pids.length} run processes are alive before a CLI start`
+      : `the process scan was incomplete (${scan.pids.length} run processes seen) before a CLI start`;
+    this.log.warn(`${what}; a live writer can race the global-config reset`, {
+      count: scan.pids.length,
+      scanComplete: scan.complete,
+    });
   }
 
   /**
