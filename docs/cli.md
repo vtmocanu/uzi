@@ -1048,9 +1048,10 @@ A few worth knowing:
   (exit 4). It is editable on a completed run. The override that counts is the
   one on the branch's **selected run**: the newest non-cancelled issue,
   `ci_fix`, prompt or self-improve run that has an MR. A `ci_fix` repair run
-  that completes with a branch and MR becomes the selected run because it
-  inherited the value, so re-enabling after a repair means editing that repair
-  run; the command prints which run governs. A new issue run taking over the
+  that ends (completed or failed) with a branch and MR becomes the selected
+  run, as the newest qualifying run, and carries the value it inherited, so
+  re-enabling after a repair means editing that repair run; the command prints
+  the governing run when it is another of your runs. A new issue run taking over the
   same `agent/issue-N` branch starts from its own default, and `mr_rework`
   runs, and prompt or self-improve runs on their own run-ID branches, do not
   displace the selection. CI fixes already in flight keep the value they copied

@@ -56,9 +56,10 @@ run's selection. A new issue run taking over the same `agent/issue-N` branch
 starts from its own default, not from the previous run's override.
 
 **Repair runs take over.** A `ci_fix` repair run inherits the override when it
-is created. When it completes with a branch and MR it becomes the selected run,
-so to turn automatic fixes back on after a repair, edit that repair run. The
-command and the API tell you which run governs.
+is created. When it ends (completed or failed) with a branch and MR it becomes
+the selected run, so to turn automatic fixes back on after a repair, edit that
+repair run. The command and the API report the governing run when it is another
+of your runs.
 
 **Fixes in flight.** A CI fix already running keeps the value it copied when
 it was created. Changing the override does not stop it. Setting the override

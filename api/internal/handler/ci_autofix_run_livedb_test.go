@@ -325,6 +325,28 @@ func TestSetRunCIAutofixGoverningAndInflightLiveDB(t *testing.T) {
 	}
 }
 
+// TestSetRunCIAutofixOmitsEditedRunFromInflightLiveDB pins that editing an ACTIVE ci_fix run
+// (branch NULL, ref from pipeline_ref) does not list that run as an in-flight fix of itself.
+func TestSetRunCIAutofixOmitsEditedRunFromInflightLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	repoID := cliSeedOwnedRepo(t, pool, owner)
+	const ref = "agent/issue-46179"
+	fixID := uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_title, issue_description, status, kind, pipeline_ref, pipeline_id)
+		 VALUES ($1, $2, $3, 't', 'd', 'queued', 'ci_fix', $4, 11)`, fixID, owner, repoID, ref)
+
+	code, resp, body := ciaPut(t, router, fixID, uzc, `{"enabled":false}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT = %d\nbody: %s", code, body)
+	}
+	if len(resp.Inflight) != 0 || !strings.Contains(body, `"ci_autofix_inflight_fix_run_ids":[]`) {
+		t.Fatalf("inflight = %v, want [] (the edited run must not list itself)\nbody: %s", resp.Inflight, body)
+	}
+}
+
 // TestSetRunCIAutofixRefDerivationLiveDB pins the ref derivation per run kind when
 // runs.branch is NULL, via the in-flight list of an active ci_fix on the derived ref, and
 // the no-ref case.

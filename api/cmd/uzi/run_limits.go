@@ -513,7 +513,7 @@ func newRunCIAutofixCmd(env Env, gf *globalFlags) *cobra.Command {
 			"The override that counts is the one on the branch's selected run: the newest non-cancelled " +
 			"issue, ci_fix, prompt or self-improve run that has an MR. A ci_fix repair run inherits the " +
 			"value and can become the selected run, so after a repair, re-enable it by editing that run; " +
-			"the command prints which run governs. The admin gate always wins. A manual Fix CI " +
+			"the command prints the governing run when it is another of your runs. The admin gate always wins. A manual Fix CI " +
 			"(the web button or the ci fix command) is never blocked by this setting. The override does not expire, so " +
 			"re-enable it when you are done.\n\n" +
 			"A foreign or unknown run is a 404 (exit 4). Prints the run's resulting CI_AUTOFIX state " +

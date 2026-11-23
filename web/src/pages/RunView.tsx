@@ -1096,6 +1096,8 @@ export function CiAutofixPanel({
 
   const save = async (enabled: boolean | null) => {
     setError("");
+    setGoverningId(null);
+    setInflightIds([]);
     setSaving(true);
     try {
       const res = await api.setRunCiAutofix(run.id, enabled);

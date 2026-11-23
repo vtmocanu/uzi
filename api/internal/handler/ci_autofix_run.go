@@ -151,8 +151,11 @@ func (h *Handler) SetRunCIAutofixEnabled(w http.ResponseWriter, r *http.Request)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if ids != nil {
-			inflight = ids
+		// The edited run is never reported as an in-flight fix of itself.
+		for _, id := range ids {
+			if id != runID {
+				inflight = append(inflight, id)
+			}
 		}
 	}
 

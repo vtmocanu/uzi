@@ -8273,7 +8273,7 @@ describe("CiAutofixPanel — per-run CI-autofix checkbox (issue #4617)", () => {
     ci_autofix_governing_run_id: null,
     ci_autofix_inflight_fix_run_ids: [] as string[],
   };
-  const renderPanel = (over: Partial<Run>, extra: { canSteer?: boolean; userDefault?: boolean | null; busy?: boolean } = {}) =>
+  const renderPanel = (over: Partial<Run>, extra: { canSteer?: boolean; userDefault?: boolean | null; busy?: boolean; onChanged?: () => void } = {}) =>
     render(
       <MemoryRouter>
         <CiAutofixPanel
@@ -8281,6 +8281,7 @@ describe("CiAutofixPanel — per-run CI-autofix checkbox (issue #4617)", () => {
           busy={extra.busy ?? false}
           canSteer={extra.canSteer ?? true}
           userDefault={extra.userDefault ?? null}
+          onChanged={extra.onChanged}
         />
       </MemoryRouter>,
     );
@@ -8353,5 +8354,43 @@ describe("CiAutofixPanel — per-run CI-autofix checkbox (issue #4617)", () => {
     renderPanel({});
     fireEvent.click(screen.getByLabelText(LABEL));
     expect(await screen.findByText(/boom: forbidden/)).toBeTruthy();
+  });
+
+  it("calls onChanged after a successful toggle", async () => {
+    const onChanged = vi.fn();
+    renderPanel({}, { onChanged });
+    fireEvent.click(screen.getByLabelText(LABEL));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+  });
+
+  it("removes earlier notes after a later successful toggle with empty hints", async () => {
+    mockApi.setRunCiAutofix.mockResolvedValueOnce({
+      ...okResponse,
+      ci_autofix_governing_run_id: "gov12345-aaaa",
+      ci_autofix_inflight_fix_run_ids: ["fix11111-bbbb"],
+    });
+    renderPanel({});
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/governs automatic CI fixes on this branch/i)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(LABEL));
+    await waitFor(() => expect(mockApi.setRunCiAutofix).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/governs automatic CI fixes on this branch/i)).toBeNull());
+    expect(screen.queryByText(/keep their own setting/i)).toBeNull();
+  });
+
+  it("shows the error and no stale notes after a failed toggle following one with notes", async () => {
+    mockApi.setRunCiAutofix.mockResolvedValueOnce({
+      ...okResponse,
+      ci_autofix_governing_run_id: "gov12345-aaaa",
+      ci_autofix_inflight_fix_run_ids: ["fix11111-bbbb"],
+    });
+    mockApi.setRunCiAutofix.mockRejectedValueOnce(new ApiError(403, "boom: forbidden"));
+    renderPanel({});
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/governs automatic CI fixes on this branch/i)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/boom: forbidden/)).toBeTruthy();
+    expect(screen.queryByText(/governs automatic CI fixes on this branch/i)).toBeNull();
+    expect(screen.queryByText(/keep their own setting/i)).toBeNull();
   });
 });
