@@ -1853,9 +1853,54 @@ breakpoint. Omitting both settings preserves the default "30m" behavior.”
 The default therefore requires both request TTL and breakpoint TTL omitted.
 Breakpoints can override the request default and mix lifetimes in one request.
 
-The lead's inspected worker source at commit
+The lead's inspected pinned upstream source at commit
 ccf9be8cc458bd6b8336fe84d68d8893f2691a5e had prompt_cache_ttl set to None
 in the inspected construction only. Compaction, child, review, recovery and
 inheritance paths remain unverified. No in-run construction or native
 observations were performed for this unit; these remain required M4
 next-unit work. This unit makes no M5 docs/defaults/PRD/changelog changes.
+
+#### Bounded worker construction and observed request regression
+
+The worker construction inventory covers config.ts's generic, production and
+loopback builders and shared nativeDisabledConfigLines; launcher.ts's emitted
+config.toml; pr-description-eval-launch.ts's separate use of the production
+builder; render.ts/run-builder.ts/delegation.ts callers; CodexHarness
+thread/start, thread/resume and turn/start; CodexAdviceHarness thread/turn;
+CodexExecutor delegated child thread/turn; and cross-check.ts thread/turn.
+The requestOnTransport and startupRequest wrappers forward those constructions.
+Advice callers include judge, review, summaries, plan-contract and PR-description
+evaluation; their model choices remain independent. This is a bounded inventory
+of worker-owned constructions, not upstream internal request paths.
+
+The inspected pinned app-server turn_processor.rs:732 sets prompt_cache_ttl:
+None. core/src/client.rs:1335 maps a populated internal TTL to
+prompt_cache_options.ttl; codex-api/src/common.rs:320–321 defines that option
+and :344–345 omit None. protocol/src/turn_input.rs:273–279 serializes 30m/12h.
+The inspected app-server protocol/config schema does not expose these API
+request/breakpoint TTL controls as worker RPC setters. An unsupported injected
+field still violates the worker construction invariant; its rejection by a
+test does not prove that upstream would honor it for billing. prompt_cache_key
+is cache identity and remains allowed.
+
+Existing config, launcher, harness, advice, executor and cross-check tests now
+execute their constructors and check parsed emitted TOML/full intercepted
+thread-start/resume/turn params for prompt_cache_ttl, prompt_cache_retention,
+prompt_cache_options.ttl and prompt_cache_breakpoint.ttl, including structured
+nested/dotted fields. Model, normal-field and nonempty/count controls prevent
+vacuous absence checks. Prompt string values are not interpreted as fields.
+Production config's existing option whitelist is unchanged; TTL injection
+through it is refused. No TTL input or feature opt-in was added.
+
+The focused trust-construction real-binary cases exercise both gpt-6.2-sol and
+gpt-6.2-astra through launchCodexRoot with the test-only authenticated loopback
+builder. On 2026-11-23 each completed with verified 0.171.0 receipt/integrity,
+one actual provider request using the selected ID, one captured emitted config,
+and no TTL/retention override in structured request/config/thread/turn fields.
+They do not prove subscription routing. Separate production-builder unit
+coverage retains that distinction. Neither these two observed turns nor the
+worker-owned child/advice construction tests exhaust compaction, upstream
+child/review/recovery internals, inherited configuration or breakpoint behavior.
+Cache-write lifetime is not exposed by the inspected usage protocol. The
+owner-selected 30-minute estimate and accepted 12-hour underestimation risk
+therefore remain policy, not an observation or guarantee of billed lifetime.

@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
@@ -5656,6 +5657,14 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
       // A child thread + turn were started on the SAME transport (demuxed).
       assert.equal(rig.transport.threadStartCount, 2, "a child thread/start was issued");
       assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was issued");
+      for (const method of ["thread/start", "turn/start"]) {
+        const frames = rig.transport.requests.filter(request => request.method === method);
+        assert.equal(frames.length, 2, "root and child constructions are both captured");
+        for (const [index, frame] of frames.entries()) {
+          assert.equal(rec(frame.params).model, "gpt-6-astra");
+          assertNoTtlOverrides(frame.params, `${index === 0 ? "root" : "child"} ${method} full params`);
+        }
+      }
       const childTurn = rig.transport.requests.filter((request) => request.method === "turn/start")[1];
       assert.ok(childTurn);
       assert.deepEqual(rec(childTurn.params).environments, [], "the child turn disables native execution environments");

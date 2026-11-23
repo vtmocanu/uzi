@@ -1,3 +1,5 @@
+import { parse } from "smol-toml";
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
@@ -433,6 +435,9 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     // requires_openai_auth=false and BYPASS the account/login/start the auth session performs).
     const configFile = treeCalls[0]?.files[0];
     assert.ok(configFile);
+    const emittedConfig = parse(configFile.content);
+    assert.equal(emittedConfig.model, "gpt-5-codex");
+    assertNoTtlOverrides(emittedConfig, "launcher emitted TOML");
     assert.match(configFile.content, /project_doc_max_bytes = 0/);
     assert.match(configFile.content, /trust_level = "untrusted"/);
     assert.match(configFile.content, /model_provider = "openai"/);
@@ -454,6 +459,9 @@ describe("launchCodexRoot: app-server auth (production config, no env credential
     );
     const configFile = treeCalls[0]?.files[0];
     assert.ok(configFile);
+    const emittedConfig = parse(configFile.content);
+    assert.equal(emittedConfig.model, "gpt-5-codex");
+    assertNoTtlOverrides(emittedConfig, "launcher emitted TOML");
     assert.match(configFile.content, /^model_provider = "uzi-m3b-openai"$/m);
     assert.match(configFile.content, /^\[model_providers\."uzi-m3b-openai"\]$/m);
     assert.match(configFile.content, /^base_url = "http:\/\/127\.0\.0\.1:43123\/v1"$/m);

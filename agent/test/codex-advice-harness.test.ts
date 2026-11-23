@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { AdmissionClock, flushUntil } from "./operation-admission-clock.js";
@@ -588,13 +589,19 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     assert.equal(bits.disposeCalls(), 1, "the root disposer runs exactly once");
   });
 
-  it("turn/start carries the rendered prompt + model + effort", async () => {
+  it("no TTL overrides: turn/start carries the rendered prompt + model + effort", async () => {
     const bits = makeHarness();
     bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     await bits.harness.run(makeAdviceRequest({ effort: "high", prompt: "please review" }), noThrowPolicy);
 
     const start = bits.transport.requests.find((r) => r.method === "turn/start");
     assert.ok(start);
+    assert.equal(bits.transport.requests.filter(r => r.method === "turn/start").length, 1);
+    assertNoTtlOverrides(start.params, "advice turn full params");
+    const threads = bits.transport.requests.filter(r => r.method === "thread/start");
+    assert.equal(threads.length, 1);
+    assert.equal((threads[0]!.params as Record<string, unknown>).model, "gpt-6-astra");
+    assertNoTtlOverrides(threads[0]!.params, "advice start full params");
     const params = start.params as Record<string, unknown>;
     assert.deepEqual(params.environments, [], "the advice turn disables native execution environments");
     assert.deepEqual(params.input, [{ type: "text", text: "please review" }]);
@@ -722,6 +729,9 @@ describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () =
       assert.ok(start);
       const params = start.params as Record<string, unknown>;
       const config = params.config as Record<string, unknown>;
+      assert.equal(bits.transport.requests.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(params.model, "gpt-6-astra");
+      assertNoTtlOverrides(params, "advice guarded start full params");
       assertNoNativeServers(config);
       assert.equal(params.ephemeral, true);
       assert.equal(bits.transport.requests.some(r => r.method === "thread/resume"), false);
