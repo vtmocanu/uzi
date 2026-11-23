@@ -41,7 +41,8 @@
 // worker uid; this module adds the sticky bit to it, so the group-writable runner can create
 // entries in HOME but cannot rename, replace or unlink the worker-owned config directory, and the
 // directory itself grants the runner no write. It also refuses a HOME whose parent is
-// world-writable without the sticky bit. A group-writable parent is NOT refused: the data root is
+// world-writable without the sticky bit. A group-writable parent whose group is not one of the
+// runner's is NOT refused: the data root is
 // 2775 on a hosted volume (entrypoint.sh align_pvc_root) and the chat HOME is `<dataDir>/agent-home`
 // itself, so refusing it would stop every chat start. HOME's own entry is therefore protected by the
 // data-root layout, not by this module: per-run HOMEs live in the sticky `agent-home` root (3775),
@@ -70,8 +71,8 @@
 // Targets. `<HOME>/.claude/projects` and `<HOME>/.claude/tasks` must exist and be writable by the
 // CLI. Missing ones are created AS THE RUNNER UID (a fixed worker-authored `/bin/mkdir -p -m 700`
 // argv through runnerCommand, workerSpawnEnv on a minimal PATH env, no shell; the spawnSync timeout
-// is not a hard bound, see defaultMkdirAsRunner; a non-zero exit, signal or spawn error is a
-// failure), so they are runner-owned and private (0700) exactly as when the CLI created them, and
+// is not a hard bound, see defaultMkdirAsRunner; exit status 1 is the planted-entry signal, any
+// other non-zero exit, a signal or a spawn error is a transient refusal), so they are runner-owned and private (0700) exactly as when the CLI created them, and
 // neither runner-cmd (the Codex command uid, which shares group runner) nor the worker ever holds
 // a write path into a Claude transcript directory. The worker never writes or renames anything
 // under `.claude`; the only thing it ever moves is the `.claude` entry itself in HOME. That mkdir
@@ -124,10 +125,13 @@ const DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constant
 const RUNNER_GIDS: readonly number[] = [RUNNER_UID, COMMAND_UID, CODEX_SESSION_GID];
 const MKDIR_BIN = "/bin/mkdir";
 const MKDIR_TIMEOUT_MS = 5_000;
+/** The exit status of a mkdir that ran and failed (a planted file, an unsearchable directory). */
+const MKDIR_PLANTED_STATUS = 1;
 
 /** Test-only seams. `onStep` is called with a step name before each stage, so a test can act as a
  *  hostile process at that point. `mkdirAsRunner` replaces the runner-uid `mkdir` (it receives the
- *  mkdir arguments and throws on failure). Production callers pass nothing. */
+ *  mkdir arguments and returns its exit status: 0, or 1 for a planted entry; any other value or a
+ *  throw is a transient refusal). Production callers pass nothing. */
 export interface PrepareDeps {
   onStep?: (name: string) => void;
   /** Run `/bin/mkdir <args>` as the runner: returns its exit status; throws on a transient failure. */
@@ -202,7 +206,8 @@ function renameAside(p: string): void {
 }
 
 /** Run `/bin/mkdir <args>` as the runner uid (directly with one uid). A fixed worker-authored argv:
- *  workerSpawnEnv on a minimal PATH env, no shell; any failure throws. The spawnSync timeout and
+ *  workerSpawnEnv on a minimal PATH env, no shell; returns 0 or 1 (mkdir's failure); anything else
+ *  (spawn error, signal, timeout, another exit status) throws. The spawnSync timeout and
  *  SIGKILL only bound the wait until the kill is attempted: under the split the child is the runner
  *  uid after setpriv and the worker cannot kill(2) it (EPERM, see runner-uid.ts), so no stronger
  *  bound is claimed. The argv is fixed and the command short-lived. */
@@ -216,8 +221,13 @@ function defaultMkdirAsRunner(args: readonly string[]): number {
     killSignal: "SIGKILL",
   });
   // A spawn error, a signal or a timeout is transient: it refuses this start only, so a burst of
-  // load never moves the shared chat root's transcripts aside. A completed mkdir reports its exit.
+  // load never moves the shared chat root's transcripts aside. Only mkdir's own failure status 1
+  // (a planted file, an unsearchable directory) is returned as such; setpriv's own failures (126,
+  // 127 on a failed credential change or execve, e.g. RLIMIT_NPROC EAGAIN) are transient too.
   if (r.error || r.signal || r.status === null) throw refuse("the runner mkdir of the .claude targets did not complete");
+  if (r.status !== 0 && r.status !== MKDIR_PLANTED_STATUS) {
+    throw refuse("the runner mkdir of the .claude targets did not complete");
+  }
   return r.status;
 }
 
@@ -235,6 +245,7 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => number,
     if (st === undefined && mkdir(["-p", "-m", "700", "--", claude]) !== 0) {
       throw refuse("the runner could not create .claude");
     }
+    // (any non-zero status here refuses without moving anything: HOME holds no .claude to move)
     const missing: string[] = [];
     let aside = false;
     for (const name of ["projects", "tasks"] as const) {
@@ -259,11 +270,14 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => number,
       continue;
     }
     if (missing.length > 0) {
-      if (mkdir(["-p", "-m", "700", "--", ...missing]) !== 0) {
+      const status = mkdir(["-p", "-m", "700", "--", ...missing]);
+      if (status !== 0) {
         // Under the split the worker cannot look into the runner-private .claude, so a non-directory
-        // (or an unsearchable .claude) shows up only as a completed mkdir with a non-zero exit. Only
-        // that moves the HOME entry aside, once, and rebuilds; a second such exit refuses the start.
-        // A transient failure (spawn error, signal, timeout) throws above and keeps .claude in place.
+        // (or an unsearchable .claude) shows up only as mkdir's own failure status 1. Only that moves
+        // the HOME entry aside, once, and rebuilds; a second such exit refuses the start. Any other
+        // status (setpriv's 126/127 on a failed credential change or execve under load, a seam's
+        // other value) is transient: it refuses this start and keeps .claude in place.
+        if (status !== MKDIR_PLANTED_STATUS) throw refuse("the runner mkdir of the .claude targets did not complete");
         if (retriedAfterMkdirFailure) throw refuse("the runner could not create the .claude targets");
         retriedAfterMkdirFailure = true;
         renameAside(claude);

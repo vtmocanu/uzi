@@ -141,12 +141,29 @@ describe("prepareClaudeConfigDir: build and reuse", () => {
   });
 
   it("a failing runner-uid mkdir refuses the start and builds no config directory", () => {
+    let calls = 0;
     assert.throws(
-      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => 1 }),
-      TrustedExecutionRefusal,
+      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { calls++; return 1; } }),
+      /the runner could not create \.claude/,
     );
+    assert.strictEqual(calls, 1, "the .claude creation is not retried");
     assert.ok(!fs.existsSync(dirOf()));
   });
+
+  for (const status of [126, 127, 2]) {
+    it(`a runner mkdir exiting ${status} (not mkdir's own failure status 1) refuses without moving .claude aside`, () => {
+      fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
+      fs.writeFileSync(path.join(home, ".claude", "projects", "keep.jsonl"), "x");
+      let calls = 0;
+      assert.throws(
+        () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { calls++; return status; } }),
+        /did not complete/,
+      );
+      assert.strictEqual(calls, 1);
+      assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0, "no aside");
+      assert.ok(fs.existsSync(path.join(home, ".claude", "projects", "keep.jsonl")));
+    });
+  }
 
   it("a transient runner mkdir failure (spawn error, signal, timeout) refuses this start and keeps .claude in place", () => {
     fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
