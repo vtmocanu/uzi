@@ -216,9 +216,9 @@ func canonicalUUID(raw json.RawMessage) (uuid.UUID, bool) {
 	return id, true
 }
 
-// validBranchName refuses empty, over-long, invalid UTF-8 and control or format (ANSI, bidi,
+// ValidBranchName refuses empty, over-long, invalid UTF-8 and control or format (ANSI, bidi,
 // zero-width) characters.
-func validBranchName(s string) bool {
+func ValidBranchName(s string) bool {
 	if s == "" || len(s) > 255 || !utf8.ValidString(s) {
 		return false
 	}
@@ -315,7 +315,7 @@ func parsePublicationIntent(raw json.RawMessage) (publicationIntentBody, error) 
 	if err := json.Unmarshal(probe["floor"], &b.Floor); err != nil {
 		return b, ErrInvalidState
 	}
-	if !validBranchName(b.Branch) || b.ClaimGeneration <= 0 || !gitOIDHexRe.MatchString(b.OriginalHead) {
+	if !ValidBranchName(b.Branch) || b.ClaimGeneration <= 0 || !gitOIDHexRe.MatchString(b.OriginalHead) {
 		return b, ErrInvalidState
 	}
 	// The floor is exactly {"kind":"absent"} or {"kind":"pinned","oid":"<40 hex>"}: an oid member

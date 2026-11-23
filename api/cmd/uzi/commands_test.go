@@ -73,7 +73,7 @@ func TestCommandTree(t *testing.T) {
 		"project-sync": {"status", "resync"},
 		"handoff":      {"rm", "review"},
 		"job":          {"create", "get", "result", "cancel", "list", "files", "file"},
-		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products", "review-bots", "maintenance"},
+		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products", "review-bots", "maintenance", "run-writers"},
 		"skill":        {"status", "install"},
 		"auth":         {"token", "status"},
 	}

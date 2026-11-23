@@ -119,13 +119,13 @@ func NormalizeTrustedBotBaseURL(raw string) (string, error) {
 	return "https://" + strings.ToLower(u.Host), nil
 }
 
-// canonicalInstance maps the GitHub API host onto the web host: the GitHub driver treats
+// CanonicalInstance maps the GitHub API host onto the web host: the GitHub driver treats
 // https://api.github.com and https://github.com as one instance (forge/github.go,
 // isDefaultGitHubBase), so an entry written for either must match a connection on either.
 // The https default port is treated as absent on both sides, because a connection base URL
 // stored via config.NormalizeForgeBaseURL keeps an explicit :443 while an entry may omit it
 // (write validation still accepts both spellings). Other ports stay distinct instances.
-func canonicalInstance(normalized string) string {
+func CanonicalInstance(normalized string) string {
 	normalized = strings.TrimSuffix(normalized, ":443")
 	if normalized == "https://api.github.com" {
 		return "https://github.com"
@@ -145,9 +145,9 @@ func TrustedBotMatches(bots []TrustedBot, connectionBaseURL string, forgeUserID 
 	if err != nil {
 		return false
 	}
-	inst := canonicalInstance(norm)
+	inst := CanonicalInstance(norm)
 	for _, b := range bots {
-		if b.ForgeUserID == forgeUserID && canonicalInstance(b.BaseURL) == inst {
+		if b.ForgeUserID == forgeUserID && CanonicalInstance(b.BaseURL) == inst {
 			return true
 		}
 	}

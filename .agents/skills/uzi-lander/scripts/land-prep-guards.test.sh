@@ -87,7 +87,14 @@ cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then printf '%s\n' "$UZI_REPOS_JSON"; exit 0; fi
-if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then printf '%s\n' "$UZI_RUNS_JSON"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUNS_RC:-0}" -eq 0 ] || exit "$UZI_RUNS_RC"; printf '%s\n' "$UZI_RUNS_JSON"; exit 0; fi
+# cobra prints the parent help (rc 0) for any admin subcommand; the verb line exists only on a new CLI.
+if [ "${1:-}" = admin ] && [ "${2:-}" = --help ]; then
+  printf 'Available Commands:\n  review       x\n'; [ -z "${UZI_ADMIN_RW:-}" ] || printf '  run-writers  y\n'; exit 0
+fi
+if [ "${1:-}" = admin ] && [ "${2:-}" = run-writers ]; then
+  [ "${UZI_WRITERS_RC:-0}" -eq 0 ] || exit "$UZI_WRITERS_RC"; printf '%s\n' "$UZI_WRITERS_OUT"; exit 0
+fi
 echo "unexpected uzi call: $*" >&2; exit 1
 STUB
 # task: records every call; migration:renumber refuses (so a detected collision is exit 6
@@ -156,6 +163,46 @@ done
 export UZI_RUNS_JSON='[{"id":"other-branch","kind":"ci_fix","repo_id":"repo-1","pipeline_ref":"other","status":"running"},{"id":"other-repo","kind":"ci_fix","repo_id":"repo-2","pipeline_ref":"cifix","status":"running"}]'
 run cifix 110 --gate none --no-push
 [ "$rc" -eq 0 ] || fail "unrelated active ci_fix blocked preparation, rc=$rc: $(cat "$WORK/out.110")"
+# Authorized all-owners read (run-writers) decides; the owner list is empty/unusable in every case.
+export UZI_ADMIN_RW=1 UZI_RUNS_JSON='not-json'
+W='{"run_id":"foreign-fix","kind":"ci_fix","status":"running","owner_id":"o2","repo_id":"repo-1","pipeline_ref":"cifix","mr_iid":null,"created_at":"t"}'
+UZI_WRITERS_OUT="{\"writers\":[$W],\"complete\":true}" run cifix 110 --gate none
+[ "$rc" -eq 4 ] && grep -Fq 'foreign-fix' "$WORK/out.110" || fail "authorized foreign ci_fix not refused, rc=$rc: $(cat "$WORK/out.110")"
+[ ! -s "$PUSH_LOG" ] || fail "push ran despite authorized writer"
+UZI_WRITERS_OUT='{"writers":[{"run_id":"foreign-rw","kind":"mr_rework","status":"running","mr_iid":110}],"complete":true}' run cifix 110 --gate none
+[ "$rc" -eq 4 ] && grep -Fq 'mr_rework run is ACTIVE' "$WORK/out.110" || fail "authorized mr_rework not refused: $(cat "$WORK/out.110")"
+UZI_WRITERS_OUT='{"writers":[],"complete":true}' run cifix 110 --gate none --no-push
+[ "$rc" -eq 0 ] && grep -Fq 'VISIBILITY=all_owners' "$WORK/out.110" || fail "complete empty read did not proceed with visibility, rc=$rc: $(cat "$WORK/out.110")"
+# Malformed, incomplete, server-error and mismatched authorized results refuse, without downgrading.
+export UZI_RUNS_JSON='[]'
+for case_ in '0|junk' '0|{"writers":[],"complete":false}' '1|{"writers":[],"complete":false}' '6|' '1|' '2|' \
+  '0|{"writers":[{"run_id":"a","kind":"ci_fix","status":"running","pipeline_ref":"other"}],"complete":true}' \
+  '0|{"writers":[{"run_id":"a","kind":"mr_rework","status":"running","mr_iid":111}],"complete":true}'; do
+  UZI_WRITERS_RC=${case_%%|*} UZI_WRITERS_OUT=${case_#*|} run cifix 110 --gate none --no-push
+  [ "$rc" -eq 4 ] || fail "authorized result '$case_' not refused, rc=$rc: $(cat "$WORK/out.110")"
+  grep -Fq 'cannot rule out active helpers' "$WORK/out.110" || fail "refusal for '$case_' not explained"
+done
+# HTTP 401/403 (rc 3) and 404 (rc 4) fall back to the owner list and say so.
+for rc_ in 3 3 4; do
+  export UZI_WRITERS_RC=$rc_ UZI_RUNS_JSON='[{"id":"own-fix","kind":"ci_fix","repo_id":"repo-1","pipeline_ref":"cifix","status":"running"}]'
+  run cifix 110 --gate none --no-push
+  [ "$rc" -eq 4 ] && grep -Fq 'own-fix' "$WORK/out.110" || fail "owner writer not refused on fallback rc=$rc_: $(cat "$WORK/out.110")"
+  UZI_RUNS_JSON='[]' run cifix 110 --gate none --no-push
+  [ "$rc" -eq 0 ] && grep -Fq 'VISIBILITY=owner_only' "$WORK/out.110" \
+    && grep -Fq 'note: owner-only visibility; foreign or older writers are not excluded' "$WORK/out.110" || fail "owner-only note missing, rc=$rc: $(cat "$WORK/out.110")"
+done
+# A failed or malformed fallback refuses; so does a malformed row that does not match the branch.
+UZI_RUNS_RC=1 UZI_RUNS_JSON='[]' run cifix 110 --gate none --no-push
+[ "$rc" -eq 4 ] || fail "failed fallback not refused, rc=$rc"
+for bad in '[][]' '[] []' '[{}]' '[1]' '[{"id":"x","kind":"mr_rework","repo_id":"repo-1","mr_iid":"7","status":"running"}]' '[{"id":"o","kind":"issue","repo_id":"elsewhere","status":"RUNNING"}]'; do
+  UZI_RUNS_JSON=$bad run cifix 110 --gate none --no-push
+  [ "$rc" -eq 4 ] || fail "malformed fallback $bad not refused, rc=$rc: $(cat "$WORK/out.110")"
+done
+# An older CLI (help without run-writers) falls back even when the verb would have failed.
+unset UZI_ADMIN_RW
+UZI_WRITERS_RC=6 UZI_RUNS_JSON='[]' run cifix 110 --gate none --no-push
+[ "$rc" -eq 0 ] && grep -Fq 'VISIBILITY=owner_only' "$WORK/out.110" || fail "older CLI did not fall back, rc=$rc"
+unset UZI_WRITERS_RC UZI_WRITERS_OUT
 export UZI_REPOS_JSON='[]' UZI_RUNS_JSON='[]'
 rm -f "$WORK/bin/git"
 

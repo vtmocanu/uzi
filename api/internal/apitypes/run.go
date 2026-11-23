@@ -2875,3 +2875,24 @@ type AdminRunsDebugDTO struct {
 	// server that ignored it (the key is then absent). Omitted when no filter was sent.
 	StatusFilter []string `json:"status_filter,omitempty"`
 }
+
+// RunWriterDTO is one active ci_fix / mr_rework run in the GET /api/admin/run-writers
+// response (issue #4618). Metadata only: no plan, report, log or patch text.
+type RunWriterDTO struct {
+	RunID       string    `json:"run_id"`
+	Kind        string    `json:"kind"`
+	Status      string    `json:"status"`
+	OwnerID     string    `json:"owner_id"`
+	RepoID      string    `json:"repo_id"`
+	PipelineRef *string   `json:"pipeline_ref"`
+	MRIID       *int64    `json:"mr_iid"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// RunWritersDTO is the GET /api/admin/run-writers response. Writers is always a JSON array,
+// never null. Complete is false when more matching writers existed than the server serves,
+// in which case the absence of a writer from the list proves nothing.
+type RunWritersDTO struct {
+	Writers  []RunWriterDTO `json:"writers"`
+	Complete bool           `json:"complete"`
+}

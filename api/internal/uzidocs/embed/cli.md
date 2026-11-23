@@ -1761,7 +1761,7 @@ are CLI-only).
 `UZI_ADMIN_RUN_DEBUG` (chart value `api.adminRunDebug.enabled`; see
 [configuration](./configuration.md#admin-run-debug-issue-4198)). When it is on, a live admin using an
 `admin_ro` (`uza_`) CLI token can read, never change, another user's run data through `run inputs`,
-`run fetches`, `run recovery`, `run held` and `admin runs --all`. A browser cookie or a `uzc_` token
+`run fetches`, `run recovery`, `run held`, `admin runs --all` and `admin run-writers`. A browser cookie or a `uzc_` token
 never qualifies, and demoting the admin takes effect on the next request. Each newly authorized
 cross-user read writes one audit log line.
 
@@ -1801,6 +1801,24 @@ cross-user read writes one audit log line.
   `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
   prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
   `--status` was given.
+- **`uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]`** lists the active `ci_fix` and
+  `mr_rework` runs, across all owners, that may push to a branch. Same prerequisites as the rest of this
+  section (`UZI_ADMIN_RUN_DEBUG` and an `admin_ro` token; an older server answers 404). `--repo` and
+  `--branch` are required; `--mr` must be positive. Each read is audited.
+  - **Matching.** `ci_fix` runs match by exact branch; `mr_rework` runs match only by `--mr`, never by
+    branch alone. Equivalent connections across owners count as the same repo: the match is by forge
+    type, the canonical base URL (`:443` folded; `api.github.com` folded to `github.com` for GitHub) and
+    the project id. A writer's REPO column is its own repo id, which may differ from `--repo` because
+    equivalent connections of other owners match.
+  - **Completeness.** `complete=false` means more than 500 matched and the answer is unknown: the CLI
+    prints `incomplete: more than 500 matching writers; absence is unknown` on stderr and exits 1,
+    unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
+    no matching writer at that database snapshot only: a writer may start after the read.
+  - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
+    decoded `{writers, complete}` document.
+  - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
+    the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
+    `VISIBILITY=owner_only`.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
