@@ -51,7 +51,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     id: "codex-p-private-ca-uid-resume-cleanup-invalid-sources",
     adapter: "codex", layer: "P", family: "Credential isolation",
     seam: "candidate base worker entrypoint/loadConfig/buildRunExecutor/default launcher/pinned app-server",
-    positiveControl: "private CA completes authenticated Responses and fresh-executor resume retains runtime session and prior history",
+    positiveControl: "private CA interrupts an active callback continuation, proves owned-root settlement, and fresh-executor resume retains the same runtime session and callback call/output history",
     negativeOracle: "runner cannot read source; staged exact PEM is UID 10002 mode 0600 outside sessions; owned roots disappear after capture/disposal; five invalid sources fail; no-extra/unrelated TLS refuse and stalled TLS times out",
     intendedOutcome: "all ten packaged fixture cases execute on the candidate base image; selected UID split, resume and cleanup observations only; no environment/archive/vendor-control or broader lifecycle claim",
     tests: [PRIVATE_CA_TITLE],

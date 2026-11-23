@@ -4,7 +4,7 @@ import { test } from "node:test";
 import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { createServer as httpsServer } from "node:https";
-import { createServer as httpServer } from "node:http";
+import { createServer as httpServer, type ServerResponse } from "node:http";
 import { createServer as netServer, type Socket } from "node:net";
 
 // The fixture is mounted outside /app; load baked source by absolute URL.
@@ -141,6 +141,19 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
     let ownedRoots: string[] = [];
     let resumeSessionId: string | undefined;
     let executionPhase = 1, phaseReceipts = 0;
+    const firstController = new AbortController();
+    let heldResponse: ServerResponse | undefined;
+    let continuationReady!: () => void;
+    const continuation = new Promise<void>(resolve => { continuationReady = resolve; });
+    let firstRunObserved: Promise<{ status: "fulfilled" } | { status: "rejected"; error: unknown }> | undefined;
+    const assertCallbackHistory = (input: unknown) => {
+      assert.ok(Array.isArray(input), "actual Responses input is an item array");
+      assert.ok(input.some(item => item?.type === "function_call" &&
+        item.call_id === "ca-done-1" && item.name === "signal_done"), "original callback call retained");
+      assert.ok(input.some(item => item?.type === "function_call_output" &&
+        item.call_id === "ca-done-1" && typeof item.output === "string"),
+        "matching original callback output retained");
+    };
     const probeRoots = (roots?: string[]) => {
       const probe = runnerCommand(process.execPath, ["-e", `
         const fs = require("node:fs"), path = require("node:path");
@@ -252,6 +265,15 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
           res.writeHead(400).end();
           return;
         }
+        if (row === "trusted" && executionPhase === 2 && phaseReceipts === 1) {
+          assertCallbackHistory(parsed.input);
+        }
+        if (row === "trusted" && executionPhase === 1 && phaseReceipts === 2) {
+          assertCallbackHistory(parsed.input);
+          heldResponse = res;
+          continuationReady();
+          return; // Keep the active continuation open; no terminal assistant response.
+        }
         const item = phaseReceipts === 1
           ? { type: "function_call", call_id: `ca-done-${executionPhase}`, name: done.name, arguments: "{}" }
           : { type: "message", role: "assistant", content: [{ type: "output_text", text: "private CA complete" }] };
@@ -299,6 +321,8 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
             console.log("capture", JSON.stringify(captured));
             assert.equal(captured.kind, "observed_empty");
           } finally {
+            heldResponse?.destroy();
+            heldResponse = undefined;
             console.log("await-boundary", trusted, "safety.dispose");
             const disposed = await executor.safety.dispose({ boundary: "shutdown", deadlineMs: 10000 });
             console.log("disposal", JSON.stringify(disposed));
@@ -350,15 +374,44 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
               : "other-status" : "other-event";
           observe(`emit-${phase}`);
         } };
-      const run = executor.run(context);
+      const run = executor.run({ ...context, signal: firstController.signal });
+      let firstRunPending = true;
+      // Attach both branches immediately, including while readiness is being awaited.
+      firstRunObserved = run.then(
+        () => { firstRunPending = false; return { status: "fulfilled" as const }; },
+        (error: unknown) => { firstRunPending = false; return { status: "rejected" as const, error }; },
+      );
       observe("await-executor.run");
       console.log("await-boundary", id, "executor.run");
       const started = performance.now();
       if (row === "trusted") {
-        await run;
-        console.log("await-returned", id, "executor.run");
-        // Production run finally persists the final epoch before returning. Read only;
-        // never invoke persist or manufacture sessions in this observation.
+        let readinessTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            continuation,
+            new Promise<never>((_, reject) => {
+              readinessTimer = setTimeout(() => reject(new Error("active continuation readiness deadline exceeded")), 10000);
+            }),
+          ]);
+          assert.equal(firstRunPending, true, "first run pending at active continuation barrier");
+        } finally {
+          if (readinessTimer) clearTimeout(readinessTimer);
+        }
+        const firstRoots = [...ownedRoots];
+        firstController.abort();
+        // Start public capture immediately; never pass the spent run signal to it.
+        // Join both branches even if capture or the run fails.
+        const [cleanup, interrupted] = await Promise.allSettled([disposeOwned(), firstRunObserved]);
+        if (cleanup.status === "rejected") throw cleanup.reason;
+        assert.equal(interrupted.status, "fulfilled", "run observer joined");
+        if (interrupted.status !== "fulfilled") throw interrupted.reason;
+        assert.equal(interrupted.value.status, "rejected", "interrupted run must reject");
+        if (interrupted.value.status !== "rejected") assert.fail("interrupted run fulfilled");
+        assert.ok(interrupted.value.error instanceof Error);
+        assert.equal(interrupted.value.error.message, "run cancelled");
+        console.log("interrupted-root-settled-observed", "trusted", "active-turn", "cancelled", "owned-root-absent");
+        // Read the production generation only after cancellation and public disposal settle.
+        // Never invoke persist or manufacture sessions in this observation.
         const store = "/data/agent-home/ca-trusted/codex-session-store";
         const current = (await fs.readFile(store + "/current", "utf8")).trim();
         assert.ok(/^[a-zA-Z0-9_-]+$/.test(current), "published generation is a safe path component");
@@ -403,11 +456,9 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         assert.ok(transcripts > 0 && transcriptBytes > 0, "production persist captured nonempty runtime sessions");
         assert.equal(runtimeMetadata, true, "copied transcript contains real runtime session metadata");
         console.log("persisted-session-subset-observed", "trusted", "nonempty-runtime-jsonl", "exclusions-pass");
-        assert.ok(receipts.length >= 2, "tool call then assistant completion reached our listener");
-        assert.ok(JSON.stringify(emitted).includes("private CA complete"));
+        assert.equal(receipts.length, 2, "callback continuation held without terminal completion");
+        assertCallbackHistory(JSON.parse((receipts[1] as { body: string }).body).input);
         assert.ok(resumeSessionId, "real persisted runtime session ID required for resume");
-        const firstRoots = [...ownedRoots];
-        await disposeOwned();
         executionPhase = 2;
         phaseReceipts = 0;
         ownedRoots = [];
@@ -418,7 +469,7 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         assert.equal(executor.constructor.name, "CodexExecutor");
         const firstReceiptCount = receipts.length;
         emitted.length = 0;
-        await executor.run({ ...context, sessionId: resumeSessionId });
+        await executor.run({ ...context, sessionId: resumeSessionId, signal: new AbortController().signal });
         if (ownedObservationError) throw ownedObservationError;
         assert.equal(ownedObserved, true, "second live owned root observed");
         assert.equal(ownedRoots.length, 1);
@@ -426,8 +477,7 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
         for (const observed of probeRoots(firstRoots)) assert.equal(observed.error, "ENOENT", "old root remains absent after resume");
         assert.ok(phaseReceipts >= 2, "second execution completes callback continuation");
         const resumedRequest = JSON.parse((receipts[firstReceiptCount] as { body: string }).body);
-        assert.ok(JSON.stringify(resumedRequest.input).includes("private CA complete"),
-          "actual resumed request carries first execution assistant history");
+        assertCallbackHistory(resumedRequest.input);
         assert.ok(JSON.stringify(emitted).includes("private CA complete"), "resumed execution completes");
         const resumedGeneration = (await fs.readFile(store + "/current", "utf8")).trim();
         assert.match(resumedGeneration, /^[a-zA-Z0-9_-]+$/);
@@ -464,7 +514,12 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
     } finally {
       observe("entered-finally");
       try {
-        if (!disposedCurrent) await disposeOwned();
+        firstController.abort();
+        const joined = await Promise.allSettled([
+          !disposedCurrent ? disposeOwned() : Promise.resolve(),
+          firstRunObserved ?? Promise.resolve(),
+        ]);
+        if (joined[0].status === "rejected") throw joined[0].reason;
       } finally {
         for (const socket of sockets) socket.destroy();
         observe("await-stalled-close");

@@ -19,6 +19,7 @@ export const PRIVATE_CA_OBSERVATIONS = [
   "owned-filesystem-observed trusted",
   "owned-filesystem-observed no-extra",
   "persisted-session-subset-observed trusted nonempty-runtime-jsonl exclusions-pass",
+  "interrupted-root-settled-observed trusted active-turn cancelled owned-root-absent",
   "fresh-executor-resume-observed trusted same-runtime-session prior-history distinct-root-auth-home old-root-absent",
   ...["stalled", "trusted", "no-extra", "unrelated"].map(row => `owned-roots-absent ${row} `),
 ];
