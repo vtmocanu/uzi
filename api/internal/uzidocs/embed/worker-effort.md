@@ -80,7 +80,7 @@ The lead's effort for a harness resolves in this order:
    *lead template*.
 4. The built-in **medium**.
 
-On Claude, a configured [planning effort](#planning-effort) overrides steps 2 through 4 for the plan phase.
+On either harness, a configured [planning effort](#planning-effort) overrides steps 2 through 4 for the plan phase.
 
 The template tier is lead-only: with an unset preference, everything outside the lead lane (judge, chat, jobs, isolated and review runs) uses medium. It applies only when your preference is unset or blank, so
 choosing **Runtime default** keeps sending no level even when the lead template
@@ -90,12 +90,15 @@ Codex catalog advisory below still applies to the lead only.
 
 ## Planning effort
 
-A Claude run can plan at a different effort than it implements. In **Settings →
-Run defaults → Planning**, **Claude planning effort** takes `low`, `medium`,
-`high`, `xhigh` or `max`; its empty option, **Same as the run**, plans at the
-run's own effort. The empty option names the lead template tier when that
-supplies the run's effort, for example **Same as the run · high (lead
-template)**, matching what a run actually plans at. There is no Runtime default choice for planning effort, and
+Claude and Codex runs can plan at a different effort than they implement.
+In **Settings → Run defaults → Planning**, each harness's planning effort
+takes `low`, `medium`, `high`, `xhigh` or `max`; its empty option,
+**Same as the run**, plans at the run's own effort. The shared
+**Save planning defaults** button saves changed fields for both harnesses.
+The empty option names the lead template tier when that supplies the run's
+effort, for example **Same as the run · high (lead template)**, matching what
+a run actually plans at.
+There is no Runtime default choice for planning effort, and
 the setting is written through `PUT /api/me/settings` (cookie-only) or that
 card; no CLI command sets it. Phases, scope and the planning model are in
 [Worker model](./worker-model.md#planning-model-and-effort).
@@ -103,10 +106,13 @@ card; no CLI command sets it. Phases, scope and the planning model are in
 - **Any combination is allowed.** A planning effort can be set while your
   implementation effort is **Runtime default**. When the run switches to
   implementation, uzi sends no effort and the runtime reverts to its own
-  default for the model; this was observed on the pinned Claude runtime, and
-  the worker verifies the applied effort before it sends the first
-  implementation prompt, holding the run if it differs.
-- **Which defaults apply.** After approval the runtime default is the one
+  default for the model. This combination is accepted in either save order.
+  Claude verifies the applied effort before the first implementation prompt,
+  holding if it differs. Codex uses a cold resume of the same conversation;
+  pinned 0.167.0 reports effort present as `null`. uzi sends no level and
+  invents no numeric effective effort. A warm switch retaining the planning
+  override is outside this allowance.
+- **Claude defaults.** After approval the runtime default is the one
   characterized for the implementation model: `medium` for `opus`, `sonnet`
   and `haiku`, and `high` for `fable`. An unlisted model has no independently
   established default, so that switch holds. The model is the one the runtime
@@ -141,9 +147,17 @@ oversized or timed-out catalog, or no matching entry, produces no warning. The
 catalog is per-account and can refresh, so the warning is advisory and can be
 wrong either way.
 
-The [judge](./judge.md) uses the preference for its own harness. Task-review
-and internal PR-description passes retain their existing SDK/catalog effort
-behavior; their built-in Codex model remains `gpt-6-sol`.
+With a separate planning pair, this one probe checks the first actual phase
+(the planning pair on a gated run). Approval does not trigger another catalog
+probe or warning for the implementation pair. Both phases still send their
+requested effort unchanged.
+
+The [judge](./judge.md) uses the preference for its own harness. The
+handoff task review has its own per-harness effort, which follows your worker
+effort until you set one (see [Task review
+effort](./worker-model.md#task-review-effort)). Internal PR-description passes
+retain their existing SDK/catalog effort behavior; the built-in Codex review
+model remains `gpt-6-sol`.
 
 From the CLI, `uzi settings set effort --harness claude|codex
 <low|medium|high|xhigh|max|runtime>` writes the same preference and `uzi
@@ -230,6 +244,11 @@ use, if it is at most 30 days old. The Codex **Runtime default** option reads:
 | `catalog default: ultra (Codex substitutes another level) (...)` | Known, and the level is `ultra` (see above). |
 | `... · may differ on workers still on another version` | Varies: workers on different Codex runtime versions reported different levels for the current credential. The label shows the highest runtime version's level (ties: the latest report). |
 | `catalog default unknown until a Codex run reports it` | Unknown: no report within 30 days for the current credential, no usable Codex credential, an unlinked subscription, or Codex account mode `auto` with at least one pooled login (the login is chosen only when a run is created, so none can be predicted). With `auto` and an empty pool uzi uses the default credential, so the label can be known. |
+
+A planning-model catalog report is stored under that planning model. Settings
+filter reports by the implementation model as well as the credential, so a
+different planning model cannot supply its label. A gated run that probes only
+the planning model can leave the implementation model’s label unknown or older.
 
 Saving a different Codex model refreshes the label. Because the value is a
 report from an earlier run, it can lag a Codex runtime upgrade, or a catalog

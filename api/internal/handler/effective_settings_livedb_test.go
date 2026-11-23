@@ -385,7 +385,7 @@ func TestEffectiveSettingsClaudeOnlyLiveDB(t *testing.T) {
 	f.leadTemplate("opus", "")
 	dto, _ := f.get()
 
-	if dto.Version != 1 || len(dto.Harnesses) != 2 || len(dto.Start) != 3 || len(dto.Models) != 9 || len(dto.Efforts) != 5 ||
+	if dto.Version != 1 || len(dto.Harnesses) != 2 || len(dto.Start) != 3 || len(dto.Models) != 10 || len(dto.Efforts) != 6 ||
 		len(dto.CrossCheck.Models) != 4 || len(dto.CrossCheck.Efforts) != 4 {
 		t.Fatalf("shape: version=%d harnesses=%d start=%d models=%d efforts=%d cross-check=%d/%d", dto.Version, len(dto.Harnesses), len(dto.Start),
 			len(dto.Models), len(dto.Efforts), len(dto.CrossCheck.Models), len(dto.CrossCheck.Efforts))
@@ -465,23 +465,81 @@ func TestEffectiveSettingsTaskReviewCellsLiveDB(t *testing.T) {
 	f := newEffFix(t, nil)
 	f.anthropic()
 	f.codexDefault()
-	f.set("default_codex_model", "custom-codex-preview") // whatever the lane holds, the review built-in is fixed
+	f.set("default_codex_model", "custom-codex-preview") // whatever the worker lane holds, the review model is its own setting
 	f.set("default_claude_model", "sonnet")
 	dto, _ := f.get()
 
+	// Unset: the built-ins, no longer marked not configurable.
 	codex := modelCell(t, dto.Models, "task_review_model", "codex")
-	if codex.ResolvedModel != agenttmpl.CodexTaskReviewModel || codex.Source != "builtin" || codex.Model != nil || strings.Join(codex.Notes, ",") != "not_configurable" || codex.FixedAt != "claim" {
+	if codex.ResolvedModel != agenttmpl.CodexTaskReviewModel || codex.Source != "builtin" || codex.Model != nil || len(codex.Notes) != 0 || codex.FixedAt != "claim" {
 		t.Errorf("codex task review model = %+v", codex)
 	}
 	claude := modelCell(t, dto.Models, "task_review_model", "claude")
-	if claude.ResolvedModel != "" || claude.Source != "builtin" || strings.Join(claude.Notes, ",") != "sdk_default" {
-		t.Errorf("claude task review model = %+v (the Claude lane is ignored by the reviewer)", claude)
+	if claude.ResolvedModel != "" || claude.Source != "builtin" || claude.Model != nil || strings.Join(claude.Notes, ",") != "sdk_default" {
+		t.Errorf("claude task review model = %+v (the Claude worker lane is ignored by the reviewer)", claude)
 	}
+	// Unset review effort with unset worker efforts inherits the built-in medium, which is sent.
 	for _, h := range []string{"claude", "codex"} {
 		e := effortCell(t, dto.Efforts, "task_review_effort", h)
-		if e.ResolvedEffort != nil || e.Mode != "runtime_default" || e.Source != "builtin" || strings.Join(e.Notes, ",") != "not_sent" || e.Effort != nil {
+		if e.ResolvedEffort == nil || *e.ResolvedEffort != "medium" || e.Mode != "explicit" || e.Source != "builtin" || len(e.Notes) != 0 || e.Effort != nil ||
+			e.DefaultEffort != "medium" || e.DefaultSource != "builtin" {
 			t.Errorf("%s task review effort = %+v", h, e)
 		}
+	}
+
+	// Configured: the owner's models, source user_default, no note for a Claude model, and the
+	// Codex effort catalog default follows the configured review model.
+	f.set("task_review_model", "opus")
+	f.set("codex_task_review_model", "gpt-6.1-sol")
+	f.catalog.reset()
+	dto, _ = f.get()
+	codex = modelCell(t, dto.Models, "task_review_model", "codex")
+	if codex.ResolvedModel != "gpt-6.1-sol" || codex.Source != "user_default" || codex.Model == nil || *codex.Model != "gpt-6.1-sol" ||
+		codex.DefaultModel != agenttmpl.CodexTaskReviewModel || codex.DefaultSource != "builtin" || len(codex.Notes) != 0 {
+		t.Errorf("configured codex task review model = %+v", codex)
+	}
+	claude = modelCell(t, dto.Models, "task_review_model", "claude")
+	if claude.ResolvedModel != "opus" || claude.Source != "user_default" || claude.Model == nil || *claude.Model != "opus" || len(claude.Notes) != 0 {
+		t.Errorf("configured claude task review model = %+v", claude)
+	}
+	if !f.catalog.saw("gpt-6.1-sol") {
+		t.Errorf("the Codex review effort catalog default read %v, want the configured review model gpt-6.1-sol", f.catalog.models)
+	}
+
+	// A stored Codex model the claim would refuse shows as the built-in.
+	f.set("codex_task_review_model", "gpt-4-retired")
+	dto, _ = f.get()
+	if c := modelCell(t, dto.Models, "task_review_model", "codex"); c.ResolvedModel != agenttmpl.CodexTaskReviewModel || c.Source != "builtin" {
+		t.Errorf("retired codex task review model = %+v", c)
+	}
+
+	// The review effort inherits the owner's stored worker effort; a run_override cannot reach it.
+	f.set("default_effort", "high")
+	f.set("default_codex_effort", "runtime")
+	dto, _ = f.get()
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "claude"); e.Effort != nil || e.ResolvedEffort == nil || *e.ResolvedEffort != "high" ||
+		e.Source != "user_default" || e.DefaultEffort != "high" || e.DefaultSource != "user_default" || len(e.Notes) != 0 {
+		t.Errorf("inherited claude task review effort = %+v", e)
+	}
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "codex"); e.Effort != nil || e.ResolvedEffort != nil || e.Mode != "runtime_default" ||
+		e.Source != "user_default" || e.DefaultEffort != "runtime" || strings.Join(e.Notes, ",") != "not_sent" {
+		t.Errorf("inherited Runtime default codex task review effort = %+v", e)
+	}
+	// An explicit value (a level, or runtime with a worker level set) overrides.
+	f.set("task_review_effort", "runtime")
+	f.set("codex_task_review_effort", "xhigh")
+	dto, _ = f.get()
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "claude"); e.Effort == nil || *e.Effort != "runtime" || e.ResolvedEffort != nil || e.Mode != "runtime_default" ||
+		e.DefaultEffort != "high" || strings.Join(e.Notes, ",") != "not_sent" {
+		t.Errorf("explicit runtime claude task review effort = %+v", e)
+	}
+	if e := effortCell(t, dto.Efforts, "task_review_effort", "codex"); e.Effort == nil || *e.Effort != "xhigh" || e.ResolvedEffort == nil || *e.ResolvedEffort != "xhigh" ||
+		e.Source != "user_default" || e.DefaultEffort != "runtime" || len(e.Notes) != 0 {
+		t.Errorf("explicit xhigh codex task review effort = %+v", e)
+	}
+	// The worker effort cells are untouched by the review settings.
+	if e := effortCell(t, dto.Efforts, "worker_effort", "claude"); e.ResolvedEffort == nil || *e.ResolvedEffort != "high" {
+		t.Errorf("worker effort = %+v", e)
 	}
 }
 
@@ -895,10 +953,51 @@ func TestEffectiveSettingsCellsEqualMySettingsLiveDB(t *testing.T) {
 	}
 }
 
-// TestEffectiveSettingsPlanningCellsLiveDB pins the Claude planning cells and plan_phase (PRD
-// #3252): the effective cells equal the /me/settings planning cells, resolved/source follow the
-// claim's plan pair (user_planning_default), a Codex role id stored in the planning column is
-// ignored, and every preview is plan_phase-free until a planning value applies.
+// TestCodexPlanningRuntimeSaveOrdersLiveDB preserves explicit planning effort with Runtime
+// default implementation effort in both save orders, and rejects aliases without changing the pair.
+func TestCodexPlanningRuntimeSaveOrdersLiveDB(t *testing.T) {
+	for _, planFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("plan_first_%v", planFirst), func(t *testing.T) {
+			f := newEffFix(t, nil)
+			bodies := []string{`{"planning_codex_model":"custom-plan","planning_codex_effort":"high"}`, `{"default_codex_effort":"runtime"}`}
+			if !planFirst {
+				bodies[0], bodies[1] = bodies[1], bodies[0]
+			}
+			for _, body := range bodies {
+				rec := httptest.NewRecorder()
+				f.h.PutMySettings(rec, userReq(http.MethodPut, "/api/me/settings", body, f.user, nil))
+				if rec.Code != http.StatusOK {
+					t.Fatalf("PUT status=%d: %s", rec.Code, rec.Body.String())
+				}
+			}
+			plan, err := f.h.q.GetUserPlanningCodex(f.ctx, f.user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := f.h.q.GetUserDefaultCodexEffort(f.ctx, f.user)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !plan.PlanningCodexModel.Valid || plan.PlanningCodexModel.String != "custom-plan" ||
+				!plan.PlanningCodexEffort.Valid || plan.PlanningCodexEffort.String != "high" || !run.Valid || run.String != "runtime" {
+				t.Fatalf("saved model/plan effort/run effort = %v / %v / %v", plan.PlanningCodexModel, plan.PlanningCodexEffort, run)
+			}
+			rec := httptest.NewRecorder()
+			f.h.PutMySettings(rec, userReq(http.MethodPut, "/api/me/settings",
+				`{"planning_codex_model":"opus","planning_codex_effort":"low"}`, f.user, nil))
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "planning_codex_model") {
+				t.Fatalf("Claude alias status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			after, err := f.h.q.GetUserPlanningCodex(f.ctx, f.user)
+			if err != nil || after != plan {
+				t.Fatal("rejected Claude alias changed the stored planning pair")
+			}
+		})
+	}
+}
+
+// TestEffectiveSettingsPlanningCellsLiveDB compares both harnesses' planning cells and previews
+// with the settings response, preserving claim-time resolution and independent frozen overrides.
 func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
 	mySettings := func(f *effFix) (models []apitypes.ModelSettingCellDTO, efforts []apitypes.EffortSettingCellDTO) {
 		rec := httptest.NewRecorder()
@@ -981,7 +1080,7 @@ func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
 		// A start-time model is frozen into both phases; the planning effort still applies.
 		pv, _ = f.preview(`{"harness":"claude","credential_override":null,"model":"haiku"}`)
 		check("start preview with a model", pv.PlanPhase, &apitypes.EffectivePlanPhaseDTO{Model: sp("haiku"), Effort: sp("xhigh"), ModelSource: "run_override", EffortSource: "user_planning_default"})
-		// Codex has no plan phase.
+		// Claude-only planning settings leave the Codex plan pair unset.
 		pv, body := f.preview(`{"harness":"codex","credential_override":null}`)
 		if pv.PlanPhase != nil || bytes.Contains(body, []byte("plan_phase")) {
 			t.Errorf("codex start preview carries plan_phase: %s", body)
@@ -1002,6 +1101,32 @@ func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("Codex planning pair on GET and start and schedule previews", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.bothUsable(10, 10)
+		f.set("default_codex_model", "gpt-6-sol")
+		f.set("default_codex_effort", "runtime")
+		f.set("planning_codex_model", "custom-plan")
+		f.set("planning_codex_effort", "high")
+		dto, _ := f.get()
+		m := modelCell(t, dto.Models, "planning_model", "codex")
+		e := effortCell(t, dto.Efforts, "planning_effort", "codex")
+		if m.ResolvedModel != "custom-plan" || m.DefaultModel != "gpt-6-sol" || m.Source != "user_planning_default" {
+			t.Errorf("model = %+v", m)
+		}
+		if e.ResolvedEffort == nil || *e.ResolvedEffort != "high" || e.DefaultEffort != "runtime" || e.Source != "user_planning_default" {
+			t.Errorf("effort = %+v", e)
+		}
+		pv, _ := f.preview(`{"harness":"codex","credential_override":null}`)
+		if p := pv.PlanPhase; p == nil || p.Model == nil || *p.Model != "custom-plan" || p.Effort == nil || *p.Effort != "high" {
+			t.Errorf("start plan = %+v", pv.PlanPhase)
+		}
+		sched, _ := f.schedulePreview(`{"target":"sweep","harness":"codex"}`)
+		if p := sched.PlanPhase; p == nil || p.Model == nil || *p.Model != "custom-plan" || p.Effort == nil || *p.Effort != "high" {
+			t.Errorf("schedule plan = %+v", sched.PlanPhase)
+		}
+	})
 	t.Run("lead template effort, no preference", func(t *testing.T) {
 		f := newEffFix(t, nil)
 		f.anthropic()
@@ -1016,6 +1141,21 @@ func TestEffectiveSettingsPlanningCellsLiveDB(t *testing.T) {
 		if !eqStr(e.Effort, m.Effort) || e.DefaultEffort != m.DefaultEffort || e.DefaultSource != m.DefaultSource || e.Source != m.Source || e.Mode != m.Mode ||
 			!eqStr(e.ResolvedEffort, m.ResolvedEffort) {
 			t.Errorf("planning effort %+v != /me/settings %+v", e, m)
+		}
+	})
+	t.Run("Codex planning Default matches template-aware settings", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.bothUsable(10, 10)
+		f.leadTemplateEffort("low", "high")
+		dto, _ := f.get()
+		e := effortCell(t, dto.Efforts, "planning_effort", "codex")
+		_, me := mySettings(f)
+		m := me[1]
+		if e.DefaultEffort != "high" || e.DefaultSource != "template" || e.Source != "template" || e.ResolvedEffort == nil || *e.ResolvedEffort != "high" {
+			t.Fatalf("effective Codex planning effort = %+v", e)
+		}
+		if !eqStr(e.Effort, m.Effort) || e.DefaultEffort != m.DefaultEffort || e.DefaultSource != m.DefaultSource || e.Source != m.Source || e.Mode != m.Mode || !eqStr(e.ResolvedEffort, m.ResolvedEffort) {
+			t.Fatalf("effective Codex effort %+v != /me/settings %+v", e, m)
 		}
 	})
 	t.Run("a codex role id in the planning column is ignored", func(t *testing.T) {
@@ -1082,7 +1222,7 @@ func TestEffectiveSettingsSizeBoundsAndNoCredentialMaterialLiveDB(t *testing.T) 
 	if len(body) >= 16<<10 {
 		t.Errorf("GET body = %d bytes, want < 16 KiB", len(body))
 	}
-	if len(dto.Models) != 9 || len(dto.Efforts) != 5 {
+	if len(dto.Models) != 10 || len(dto.Efforts) != 6 {
 		t.Fatalf("models = %d", len(dto.Models))
 	}
 	const inherit = `{"harness":null,"credential_override":{"mode":"inherit"}}`
@@ -1270,6 +1410,23 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 		[2]string{"unpinned sweep pinned to claude", `{"target":"sweep","harness":"claude"}`},
 		[2]string{"sweep with a model pin and no harness", `{"target":"sweep","model":"sonnet"}`},
 		[2]string{"sweep pinned to codex", `{"target":"sweep","harness":"codex"}`},
+	)})
+
+	// Codex planning uses a safe custom ID and Runtime default implementation effort.
+	f = newEffFix(t, nil)
+	both(f)
+	f.set("default_codex_effort", "runtime")
+	f.set("planning_codex_model", "custom-plan")
+	f.set("planning_codex_effort", "high")
+	dto, _ = f.get()
+	corpus.Scenarios = append(corpus.Scenarios, effCorpusScenario{Name: "planningCodex", Get: dto, StartPreviews: previews(f,
+		[2]string{"codex", `{"harness":"codex","credential_override":null}`},
+		[2]string{"claude", `{"harness":"claude","credential_override":null}`},
+		[2]string{"codex with a model", `{"harness":"codex","credential_override":null,"model":"gpt-6-sol"}`},
+		[2]string{"effort only without a harness", `{"harness":null,"credential_override":null,"effort":"medium"}`},
+	), SchedulePreviews: schedules(f,
+		[2]string{"sweep pinned to codex", `{"target":"sweep","harness":"codex"}`},
+		[2]string{"sweep with a Codex model pin", `{"target":"sweep","harness":"codex","model":"gpt-6-astra"}`},
 	)})
 
 	var buf bytes.Buffer

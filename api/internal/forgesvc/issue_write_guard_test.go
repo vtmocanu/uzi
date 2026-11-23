@@ -7,9 +7,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -93,6 +95,28 @@ func TestGuardedMRMoveOnALinkedRepoRecordsTheMRState(t *testing.T) {
 	assertRecorded(t, st, runID, "closed")
 }
 
+// A card a person resolved in the issue tracker (cache still open) is not moved: the
+// edge is consumed, the MR state is recorded, and nothing is retried.
+func TestGuardedMRMoveOnAnIssueResolvedInTheIssueTrackerRecordsAndSkips(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("opened"))},
+		issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	st.issue.IssueTrackerColumn = pgtype.Text{String: board.ColumnHumanReview, Valid: true}
+	f := &fakeForge{mr: forgeMR(13, "closed")}
+	d := &movingDriver{err: fmt.Errorf("move: %w", issuetracker.ErrIssueResolved)}
+
+	if err := newTestService(st).SyncMRStates(context.Background(), repoID, testProjectID, f, &issueWriteGuard{inner: d}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.moves) != 1 {
+		t.Fatalf("move attempts = %v, want exactly one (no retry)", d.moves)
+	}
+	assertRecorded(t, st, runID, "closed")
+}
+
 // A plain (unlinked) forge failure on the same edge still leaves the edge.
 func TestGuardedMRMoveForgeFailureStillDefers(t *testing.T) {
 	runID, repoID := uuid.New(), uuid.New()
@@ -108,20 +132,49 @@ func TestGuardedMRMoveForgeFailureStillDefers(t *testing.T) {
 	assertNoRecord(t, st)
 }
 
-// The PRD link patch settles its marker on a linked repo: the description write is
-// not offered, so retrying it would never end.
-func TestPRDLinkPatchSettlesWhenWritesAreNotOffered(t *testing.T) {
+// Converted from TestPRDLinkPatchSettlesWhenWritesAreNotOffered (PRD #4173 M5 U6): the
+// description write is offered on a linked repo, so it reaches the issue tracker and the marker
+// settles because the patch landed.
+func TestPRDLinkPatchWritesTheDescriptionOnALinkedRepo(t *testing.T) {
 	s, st, f, id := newPRDFixture(t, nil)
 	guarded := &issueWriteGuard{inner: f}
 	if err := s.SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f, guarded); err != nil {
 		t.Fatal(err)
 	}
 	enumerated(t, st)
-	if len(f.descriptionUpdates) != 0 {
-		t.Fatalf("a request reached the tracker: %+v", f.descriptionUpdates)
+	if len(f.descriptionUpdates) != 1 {
+		t.Fatalf("description writes = %+v, want exactly one to reach the issue tracker", f.descriptionUpdates)
 	}
 	if len(st.prdSettled) != 1 || st.prdSettled[0] != id {
 		t.Fatalf("settled = %v, want the run %v", st.prdSettled, id)
+	}
+}
+
+// An issue that moved away between the read and the write is skippable: the marker settles.
+func TestPRDLinkPatchSettlesWhenTheIssueMovesAwayOnTheWrite(t *testing.T) {
+	s, st, f, id := newPRDFixture(t, nil)
+	f.updateDescErr = &forge.IssueNotFoundError{Err: errors.New("404")}
+	guarded := &issueWriteGuard{inner: f}
+	if err := s.SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f, guarded); err != nil {
+		t.Fatal(err)
+	}
+	enumerated(t, st)
+	if len(st.prdSettled) != 1 || st.prdSettled[0] != id {
+		t.Fatalf("settled = %v, want the run %v", st.prdSettled, id)
+	}
+}
+
+// A transient write failure keeps the marker so the next tick retries.
+func TestPRDLinkPatchKeepsTheMarkerOnATransientLinkedWriteFailure(t *testing.T) {
+	s, st, f, _ := newPRDFixture(t, nil)
+	f.updateDescErr = errors.New("503")
+	guarded := &issueWriteGuard{inner: f}
+	if err := s.SyncPRDLinkPatches(context.Background(), uuid.New(), fixProject, f, guarded); err != nil {
+		t.Fatal(err)
+	}
+	enumerated(t, st)
+	if len(st.prdSettled) != 0 {
+		t.Fatalf("a transient failure must not settle: %v", st.prdSettled)
 	}
 }
 
@@ -151,9 +204,9 @@ func TestPRDLinkPatchKeepsTheMarkerOnAPlainForgeNotFound(t *testing.T) {
 }
 
 // An unresolvable linked repo's issue side must never be nil and must not settle any
-// marker: reads fail with the cause (not skippable), writes are refused.
-func TestUnavailableIssueTrackerReadsFailAndWritesAreRefused(t *testing.T) {
-	cause := errors.New("tracker unavailable")
+// marker: reads and writes fail with the cause (not skippable).
+func TestUnavailableIssueTrackerReadsAndWritesFailWithTheCause(t *testing.T) {
+	cause := errors.New("issue tracker unavailable")
 	tr := UnavailableIssueTracker(cause)
 	ctx := context.Background()
 	if _, err := tr.GetIssue(ctx, 1, 2); !errors.Is(err, cause) || IssueWriteSkippable(err) {
@@ -162,11 +215,11 @@ func TestUnavailableIssueTrackerReadsFailAndWritesAreRefused(t *testing.T) {
 	if _, err := tr.ListIssues(ctx, 1, forge.ListIssuesOptions{}); !errors.Is(err, cause) {
 		t.Fatalf("ListIssues error = %v", err)
 	}
-	if err := tr.UpdateIssueDescription(ctx, 1, 2, "d"); !IssueWriteSkippable(err) {
-		t.Fatalf("a write must be refused as not offered, got %v", err)
+	if err := tr.UpdateIssueDescription(ctx, 1, 2, "d"); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+		t.Fatalf("a write must fail with the cause and not be skippable, got %v", err)
 	}
 	if !isLinkedTracker(tr) {
-		t.Fatal("the unavailable tracker must dispatch as linked")
+		t.Fatal("the unavailable issue tracker must dispatch as linked")
 	}
 	if isLinkedTracker(&fakeForge{}) {
 		t.Fatal("a forge driver must not dispatch as linked")

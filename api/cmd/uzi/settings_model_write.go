@@ -63,6 +63,10 @@ var modelSettingSpecs = []modelSettingSpec{
 		parse: parseModelID, rowLabel: "judge", fallbackLabel: "judge"},
 	{name: "summary-model", fields: map[string]string{"claude": "summary_model", "codex": "codex_summary_model"},
 		parse: parseModelID, rowLabel: "summary", fallbackLabel: "summary"},
+	{name: "task-review-model", fields: map[string]string{"claude": "task_review_model", "codex": "codex_task_review_model"},
+		parse: parseModelID, rowLabel: effectiveModelLabels["task_review_model"]},
+	{name: "task-review-effort", fields: map[string]string{"claude": "task_review_effort", "codex": "codex_task_review_effort"},
+		parse: parseEffort, rowLabel: effectiveEffortLabels["task_review_effort"]},
 	{name: "judge-runs-on", fields: map[string]string{"": "judge_runs_on"}, parse: parseJudgeRunsOn},
 }
 
@@ -117,15 +121,17 @@ func newSettingsSetCmd(env Env, gf *globalFlags) *cobra.Command {
 	var cc crossCheckFlags
 	cmd := &cobra.Command{
 		Use:   "set <setting> [<value>]",
-		Short: "Set a model or effort default: worker-model, effort, judge-model, summary-model, judge-runs-on, cross-check",
+		Short: "Set a model or effort default: worker-model, effort, judge-model, summary-model, task-review-model, task-review-effort, judge-runs-on, cross-check",
 		Long: "Set one model or effort default for new runs.\n\n" +
 			"  uzi settings set worker-model --harness claude <model-id>\n" +
 			"  uzi settings set effort --harness codex <low|medium|high|xhigh|max|runtime>\n" +
 			"  uzi settings set judge-model --harness codex <model-id>\n" +
 			"  uzi settings set summary-model --harness claude <model-id>\n" +
+			"  uzi settings set task-review-model --harness codex <model-id>\n" +
+			"  uzi settings set task-review-effort --harness claude <low|medium|high|xhigh|max|runtime>\n" +
 			"  uzi settings set judge-runs-on <same-as-run|claude|codex>\n" +
 			"  uzi settings set cross-check --stage plan|code --harness claude|codex [--model <model-id>] [--effort <low|medium|high|xhigh|max>]\n\n" +
-			"worker-model, effort, judge-model and summary-model need --harness claude|codex; judge-runs-on\n" +
+			"worker-model, effort, judge-model, summary-model, task-review-model and task-review-effort need --harness claude|codex; judge-runs-on\n" +
 			"takes none. cross-check pins the checker of one stage and family: it takes no value, needs --stage and\n" +
 			"--harness and at least one of --model and --effort, and leaves a member you omit unchanged. A model id\n" +
 			"is passed through and the server validates it. Undo with `uzi settings reset`.",
@@ -162,7 +168,9 @@ func newSettingsResetCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "reset <setting>",
 		Short: "Clear a model or effort default back to its inherited value",
 		Long: "Clear one model or effort default so it inherits again (judge-runs-on returns to same as the run).\n" +
-			"Takes the same settings and --harness as `uzi settings set`.\n\n" +
+			"Takes the same settings and --harness as `uzi settings set`. task-review-model returns to the built-in\n" +
+			"review model (Claude: the SDK default, Codex: gpt-6-sol). task-review-effort follows the worker effort\n" +
+			"for that harness again.\n\n" +
 			"  uzi settings reset cross-check --stage plan|code --harness claude|codex\n\n" +
 			"clears both the model and the effort pin of that checker cell: its model follows the worker default and its effort the cross-check default (high).",
 		Args: cobra.ExactArgs(1),
@@ -344,6 +352,14 @@ func storedModelSetting(s apitypes.UserSettingsDTO, field string) *string {
 		return s.SummaryModel
 	case "codex_summary_model":
 		return s.CodexSummaryModel
+	case "task_review_model":
+		return s.TaskReviewModel
+	case "codex_task_review_model":
+		return s.CodexTaskReviewModel
+	case "task_review_effort":
+		return s.TaskReviewEffort
+	case "codex_task_review_effort":
+		return s.CodexTaskReviewEffort
 	case "judge_runs_on":
 		return s.JudgeRunsOn
 	}

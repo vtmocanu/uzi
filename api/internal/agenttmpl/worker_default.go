@@ -10,8 +10,9 @@ const (
 )
 
 // Built-in task-review models per harness, pinned to fixtures/model-settings/task-review.json
-// builtins (TestTaskReviewBuiltinsMatchFixture) and to the agent's CODEX_TASK_REVIEW_MODEL. The
-// Claude review pass sends no model (the SDK default).
+// builtins (TestTaskReviewBuiltinsMatchFixture) and to the agent's CODEX_TASK_REVIEW_MODEL. They
+// apply when the owner sets no review model (users.task_review_model / codex_task_review_model,
+// PRD #1570). The Claude built-in sends no model (the SDK default).
 const (
 	ClaudeTaskReviewModel = ""
 	CodexTaskReviewModel  = "gpt-6-sol"

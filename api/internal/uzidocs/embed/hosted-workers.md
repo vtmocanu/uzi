@@ -1118,10 +1118,10 @@ A related knob does not hold a worker back: the controller also forwards `UZI_CO
 ## My Codex run says "no worker supporting custom Codex models is online"
 
 This is a narrower version of the message above, and only shows up when the
-run's effective Codex model is a [custom worker-root
-ID](./worker-model.md#custom-codex-model) rather than a curated one. A
-curated Codex model (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`) needs only
-the ordinary Codex capability covered above; a custom root model additionally
+run's effective worker or planning root uses a [custom Codex
+ID](./worker-model.md#custom-codex-model). A curated Codex model
+(`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`) does not need
+the custom-model capability; a custom root model additionally
 needs a worker advertising `codex_custom_model_v1`, which only ships with a
 newer worker image.
 
@@ -1147,16 +1147,23 @@ not itself release custody (see
 
 ## My run says "no worker supporting separate planning settings is online"
 
-A Claude run that uses a [planning model or planning effort](./worker-model.md#planning-model-and-effort)
-needs a worker advertising the `claude_phase_models_v1` capability, which ships
-with a newer worker image. A run on an older worker image never claims it and
-never plans and implements on one pair silently; it stays queued, and its health
-reason reads **no worker supporting separate planning settings is online**.
+A Claude or Codex run that uses a [planning model or planning effort](./worker-model.md#planning-model-and-effort)
+needs a worker advertising `claude_phase_models_v1` or `codex_phase_models_v1`,
+respectively. An effective custom Codex planning model requires both
+`codex_phase_models_v1` and `codex_custom_model_v1`; curated planning models
+and effort-only settings do not add the custom-model requirement. A curated
+frozen run model wins in both phases and suppresses a saved custom planning model.
+Deploy the API before the workers. An incapable worker leaves the run queued.
+For an otherwise eligible run with curated roots, missing phase support reads
+**no worker supporting separate planning settings is online**. A custom effective
+root can instead show the custom-model reason above when no worker supports both
+custom models and the required separate-planning capability.
 
 - Ask your admin to upgrade or roll the hosted worker fleet to an image that
-  advertises `claude_phase_models_v1`. Ephemeral and hosted placement provisions
+  advertises the phase capability for the run's harness (and the custom-model
+  capability when needed). Ephemeral and hosted placement provisions
   a current worker for such a run on its own once hosting can supply one.
-- Or clear the **Claude planning model** and **Claude planning effort** in
+- Or clear the planning model and planning effort for the run's harness in
   [Settings → Run defaults](./worker-model.md#planning-model-and-effort) if you
   don't need them right now. A run that already queued uses the settings
   resolved when a worker claims it, so the change reaches it at its next claim.

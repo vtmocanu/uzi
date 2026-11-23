@@ -1,5 +1,5 @@
-// PRD #3252 D8 (m4): what the pinned bundled Claude CLI (CLAUDE_PHASE_SDK 0.3.319 / CLAUDE_PHASE_CLI
-// 2.1.319, see test/phase-model-claude.ts) reports as `applied.model` / `applied.effort` from
+// PRD #3252 D8 (m4): what the bundled Claude CLI, characterized at SDK 0.3.325 / CLI 2.1.325 (re-checked; fable moved from claude-fable-5-1/high at 0.3.319) (current pin CLAUDE_PHASE_SDK / CLAUDE_PHASE_CLI
+// in test/phase-model-claude.ts) reports as `applied.model` / `applied.effort` from
 // `getSettings` for a requested alias. Only values that test/phase-model-switch.integration.test.ts
 // observed offline are listed: that test asserts these tables equal what the pin reports, so a CLI bump
 // that changes an id or a default reddens it. An alias absent here has NO characterized expectation and
@@ -10,7 +10,7 @@ export const CLAUDE_CANONICAL_MODELS: Readonly<Record<string, string>> = {
   opus: "claude-opus-5-5",
   sonnet: "claude-sonnet-5-5",
   haiku: "claude-haiku-5-5",
-  fable: "claude-fable-5-1",
+  fable: "claude-fable-5-2",
 };
 
 /** canonical id -> the effort the pinned CLI applies when the request names none. */
@@ -18,7 +18,7 @@ export const CLAUDE_OMITTED_EFFORT: Readonly<Record<string, string>> = {
   "claude-opus-5-5": "medium",
   "claude-sonnet-5-5": "medium",
   "claude-haiku-5-5": "medium",
-  "claude-fable-5-1": "high",
+  "claude-fable-5-2": "medium",
 };
 
 /** Aliases the Claude CLI resolves itself (a bare family name, optionally the 1M-context variant). */

@@ -21,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -474,8 +475,8 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 	linked := repo.IssueTrackerConnectionID.Valid
 	var boardErr error
 	if linked {
-		// No labels are created on a linked issue tracker (writes arrive in M5): the
-		// column rows are seeded from the store alone.
+		// No column labels are created on a linked issue tracker (a column is not a tag
+		// there, D9): the column rows are seeded from the store alone.
 		boardErr = forgesvc.EnsureBoardColumnRows(r.Context(), h.q, repo.ID)
 	} else {
 		boardErr = forgesvc.EnsureBoardColumns(r.Context(), h.q, tr, repo.ID, repo.ForgeProjectID)
@@ -548,7 +549,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
 	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
-	cards := assembleCards(issues, runRows, cardPipelines, autofixHalts, position, repo.UserID, repo.ForgeType, revising, h.cfg.RunTimeout)
+	cards := assembleCards(issues, runRows, cardPipelines, autofixHalts, position, repo.UserID, repo.ForgeType, repo.IssueTrackerConnectionID.Valid, revising, h.cfg.RunTimeout)
 
 	return boardDTO{
 		RepoID:         repo.ID.String(),
@@ -696,7 +697,7 @@ func nonNilAssigneeIDs(ids []int64) []int64 {
 // ids whose latest plan-ish message is a plan_revising (issue #750); a nil map leaves
 // every IsRevising false. autofixHalts is cardAutofixHalts' iid -> attempts map (PRD
 // #1650 D3a); a nil map leaves every card un-halted.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, autofixHalts map[int64]int32, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, autofixHalts map[int64]int32, position map[string]int, viewerID uuid.UUID, forgeType string, linked bool, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
@@ -713,7 +714,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	cards := make([]cardDTO, 0, len(issues))
 	for _, is := range issues {
 		labels := decodeLabels(is.Labels)
-		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
+		col, closed, conflict := board.ResolveColumn(board.CardColumnLabels(linked, labels, is.IssueTrackerColumn.String), is.State, position)
 		card := cardDTO{
 			IID:         is.ForgeIssueIid,
 			Title:       is.Title,
@@ -751,7 +752,9 @@ type configureColumnsRequest struct {
 // ConfigureColumns replaces a repo's column set. Positions are taken from array
 // order. Each column name is ensured to exist as a label on the forge (so a
 // newly typed column becomes a real, addressable label), then the board_columns
-// rows are replaced wholesale.
+// rows are replaced wholesale. A repo linked to an issue tracker has no column labels to
+// ensure: only the rows are replaced, and the state mapping of a removed column is pruned
+// (replaceLinkedBoardColumns).
 func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
@@ -798,6 +801,29 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A linked repo's columns are uzi's own: the issue tracker has no column labels to
+	// ensure, so no issue tracker is resolved and nothing is sent to it (PRD #4173 M5).
+	if repo.IssueTrackerConnectionID.Valid {
+		// The labels are stored and shown back, so they get the rule the driver applies to a
+		// tag name and a State name: no braces, no invisible, blank-filler or
+		// variation-selector character, at most 200 bytes.
+		for _, n := range names {
+			if issuetracker.LabelNameProblem(n) {
+				httpx.Error(w, http.StatusBadRequest, "a column name is too long (max 200 bytes) or has a brace or an invisible, blank-filler or variation-selector character")
+				return
+			}
+		}
+		if !h.replaceLinkedBoardColumns(w, r, repo, names) {
+			return
+		}
+		b, ok := h.buildBoard(w, r, repo)
+		if !ok {
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+		return
+	}
+
 	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
@@ -840,6 +866,55 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+}
+
+// replaceLinkedBoardColumns replaces the board_columns rows of a linked repo and prunes the
+// state mapping rows and cached card columns of every column that is gone, in one transaction that first takes the repo
+// row lock the state mapping route takes, so a mapping save and a reconfigure serialise. It
+// writes the response itself on failure and reports whether it succeeded.
+func (h *Handler) replaceLinkedBoardColumns(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow, names []string) bool {
+	ctx := r.Context()
+	fail := func(msg string, err error) bool {
+		slog.Error(msg, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fail("begin linked board columns tx", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	qtx := h.q.WithTx(tx)
+	if _, err := qtx.LockRepoForStateMappingForUser(ctx, store.LockRepoForStateMappingForUserParams{ID: repo.ID, UserID: repo.UserID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "repo not found")
+			return false
+		}
+		return fail("lock linked repo for board columns", err)
+	}
+	if err := qtx.DeleteBoardColumnsByRepo(ctx, repo.ID); err != nil {
+		return fail("delete board columns", err)
+	}
+	for i, n := range names {
+		if err := qtx.InsertBoardColumn(ctx, store.InsertBoardColumnParams{RepoID: repo.ID, LabelName: n, Position: int32(i)}); err != nil {
+			return fail("insert board column", err)
+		}
+	}
+	// No column left prunes every mapping row, which is right. The keep list is never nil: a
+	// nil slice is sent as NULL, and "<> ALL(NULL)" matches nothing, so nothing would be pruned.
+	keep := append([]string{}, names...)
+	if err := qtx.PruneRepoIssueTrackerColumnStates(ctx, store.PruneRepoIssueTrackerColumnStatesParams{RepoID: repo.ID, Keep: keep}); err != nil {
+		return fail("prune issue tracker column states", err)
+	}
+	// A cached card whose column is gone returns to the Open lane in the same transaction,
+	// or its cached column would name a column no board shows (PRD #4173 M5).
+	if err := qtx.ClearIssueTrackerColumnsNotIn(ctx, store.ClearIssueTrackerColumnsNotInParams{RepoID: repo.ID, Keep: keep}); err != nil {
+		return fail("clear cached columns of removed board columns", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fail("commit linked board columns tx", err)
+	}
+	return true
 }
 
 // ── Manual order ────────────────────────────────────────────────────────────
@@ -1094,6 +1169,11 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		if writeIssueWriteNotOffered(w, err) {
 			return
 		}
+		// On a linked repo a refused move (409) or a moved-away issue (404) leaves the
+		// cache unchanged, so the card snaps back; any other failure is a 502.
+		if repo.IssueTrackerConnectionID.Valid && writeLinkedMoveError(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
 		return
 	}
@@ -1122,7 +1202,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	card := issueToCard(updated, position, repo.ForgeType)
+	card := issueToCard(updated, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
 	// Carry the issue's latest run on the single-card response too, so a drag never
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
@@ -1194,6 +1274,11 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	// UziLabel already falls back to the compiled-in default when unset, so label is
 	// never empty here.
 	label, _ := h.settings.UziLabel(r.Context())
+	// On a repo linked to an issue tracker the label is the link's stored eligibility
+	// name (PRD #4173 D14), which the driver resolves to the stored tag id.
+	if eligibility, linked := linkedEligibility(repo); linked {
+		label = eligibility
+	}
 
 	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
 	if err != nil {
@@ -1243,7 +1328,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	card := issueToCard(updated, position, repo.ForgeType)
+	card := issueToCard(updated, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
@@ -1264,9 +1349,9 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 // issueToCard resolves a cached issue row into a card DTO. forgeType stamps the
 // card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
 // Three production callers: MoveIssue, PromoteIssue and CreateIssue (issues.go).
-func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
+func issueToCard(is store.Issue, position map[string]int, forgeType string, linked bool) cardDTO {
 	labels := decodeLabels(is.Labels)
-	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
+	col, closed, conflict := board.ResolveColumn(board.CardColumnLabels(linked, labels, is.IssueTrackerColumn.String), is.State, position)
 	card := cardDTO{
 		IID:         is.ForgeIssueIid,
 		Title:       is.Title,

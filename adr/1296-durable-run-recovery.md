@@ -844,6 +844,9 @@ proof and journal/API formats are unchanged. Pruning remains #2823's carried #24
 with independent fail-closed authority. Measurements and regression evidence belong in
 the implementing PR.
 
+The #4609 queue-latency investigation, which records no decision, is in
+[issue-4609-inventory-queue-investigation](../docs/issue-4609-inventory-queue-investigation.md).
+
 ## Amendment (2026-11-01, #3727 C2): D5 thin archive FINAL on a pinned prerequisite closure
 
 **Status**: Implemented by C2 of [PRD #2506](../prds/2506-prerequisite-closure.md); builds on the pin lifecycle in [ADR-3591](3591-prerequisite-closure.md). The parent #2506 stays open (C3, E5 and parent acceptance).

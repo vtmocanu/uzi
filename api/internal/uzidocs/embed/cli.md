@@ -230,7 +230,7 @@ uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
 uzi admin users | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
-uzi admin runs [--all [--user <uuid>] [--since <rfc3339>]] [--json]
+uzi admin runs [--all [--user <uuid|email>] [--since <rfc3339>] [--status <s[,s]>]] [--json]
 uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
@@ -1670,6 +1670,10 @@ differs. V1 remains failed-current-generation only. See
 [Publishing terminal held work](./run-recovery.md#publishing-terminal-held-work)
 for eligibility, deadlines and accepted late-writer risk. Both commands are
 owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
+The one exception is the read: `uzi run held <run-id>` on another user's run is served as an
+admin run debug read when the server flag is on and you use a `uza_` token (see
+[Admin run debug](#admin-run-debug-reading-other-users-runs)); `uzi run held expire` stays
+owner-only.
 
 ```
 uzi run held <run-id> [--json]
@@ -1686,6 +1690,11 @@ uzi run held <run-id> [--json]
   `--quiet`). A parked run, an excluded failure origin or work handled by the archive
   can have no publication; cancellation alone no longer implies that result under V2. A refused
   create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
+- **Another user's run (admin run debug read).** The read prints
+  `note: admin run debug read of another user's run (read-only; held expiry is owner-only)` on
+  stderr, omits the owner-only `uzi run held expire` hint and keeps the `git fetch` advice. A
+  refusal prints the [prerequisites hint](#admin-run-debug-reading-other-users-runs). The
+  response carries `admin_debug_read: true`, but `--json` prints the bare array with no marker.
 - **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
   `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
   `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty
@@ -1741,11 +1750,20 @@ Retry the removal once the refs are deleted or settled.
 
 ### Admin run debug: reading other users' runs
 
-Off by default. A deployment turns it on with `UZI_ADMIN_RUN_DEBUG` (chart value
-`api.adminRunDebug.enabled`; see [configuration](./configuration.md#admin-run-debug-issue-4198)).
-When it is on, a live admin using an `admin_ro` (`uza_`) CLI token can read, never change, another
-user's run data. A browser cookie or a `uzc_` token never qualifies, and demoting the admin takes
-effect on the next request. Each newly authorized cross-user read writes one audit log line.
+Two kinds of read reach another user's run. From the CLI both need a `uza_` (`admin_ro`) token,
+because a `uzc_` token masks admin-ness. Browser admin access is unchanged (the flag-gated reads below
+are CLI-only).
+
+**Owner-or-admin reads, regardless of the flag.** A live admin can read these on any run:
+`run get`, `run logs`, `run plan`, `run lead-config` and `review show`.
+
+**Flag-gated, audited debug reads.** Off by default. A deployment turns it on with
+`UZI_ADMIN_RUN_DEBUG` (chart value `api.adminRunDebug.enabled`; see
+[configuration](./configuration.md#admin-run-debug-issue-4198)). When it is on, a live admin using an
+`admin_ro` (`uza_`) CLI token can read, never change, another user's run data through `run inputs`,
+`run fetches`, `run recovery`, `run held` and `admin runs --all`. A browser cookie or a `uzc_` token
+never qualifies, and demoting the admin takes effect on the next request. Each newly authorized
+cross-user read writes one audit log line.
 
 - **`uzi run inputs <id>` and `uzi run fetches <id>`** work on a foreign run. A foreign chat run still
   reads as not found. A debug-served inputs or archives response carries `admin_debug_read: true`.
@@ -1767,17 +1785,27 @@ effect on the next request. Each newly authorized cross-user read writes one aud
 
   Each entry in `captures` has the same shape as a hold's `captures` entries above. The human view
   prints a `captures (no listed hold)` table instead.
-- **`uzi admin runs --all [--user <uuid>] [--since <rfc3339>]`** lists runs of every status, newest
-  first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions as the active
-  listing (chat, judge and cross-check runs). `--user` limits it to one owner, `--since` to runs
-  created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
-  the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
-  prints a `{runs, truncated}` envelope of summary rows instead of the table.
+- **`uzi run held <id>`** on a foreign run lists its held-work publications (see
+  [`uzi run held`](#fetching-and-expiring-terminal-held-refs-uzi-run-held)). It prints a read-only
+  notice on stderr, drops the owner-only expire hint and keeps the `git fetch` advice. `--json` prints
+  the bare publications array, without the `admin_debug_read` marker.
+- **`uzi admin runs --all [--user <uuid|email>] [--since <rfc3339>] [--status s[,s]]`** lists runs of every
+  status, newest first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions
+  as the active listing (chat, judge and cross-check runs). `--user` limits it to one owner: a user UUID,
+  or an email matched case-insensitively against `admin users` (no match exits 4; several matches exit 1
+  and list the user IDs). `--since` limits it to runs created at or after an RFC3339 time. `--status`
+  takes a comma-separated list of run statuses (for example `failed,cancelled`) and is applied before
+  the 500-row cap; an invalid status exits 2. `--user`, `--since` and `--status` without `--all` exit 2.
+  An older server that ignores `--status` is refused with `this uzi server does not support --status;
+  upgrade the server`. When the cap is hit the CLI prints
+  `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
+  prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
+  `--status` was given.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
-  metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
+  metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
 - **Hints.** When a read that admin run debug could serve is refused or not found (a 404, 401 or 403
-  from `run inputs`, `run fetches`, `run recovery --user` or `admin runs --all`), the CLI prints
+  from `run inputs`, `run fetches`, `run held`, `run recovery --user` or `admin runs --all`), the CLI prints
   `hint: reading another user's run needs the server flag UZI_ADMIN_RUN_DEBUG (chart
   api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
   `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
@@ -3486,6 +3514,8 @@ the instance defaults are untouched.
 | `effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` | [Reasoning effort](./worker-effort.md) |
 | `judge-model` | `claude` or `codex`, required | A model id, validated by the server (the Codex judge lane accepts only curated models) | [Run judge](./judge.md#which-model-it-runs-on) |
 | `summary-model` | `claude` or `codex`, required | A model id, validated by the server | [Run summaries](./run-summaries.md#which-model-it-runs-on) |
+| `task-review-model` | `claude` or `codex`, required | A model id, validated by the server (Claude: any Claude id, Codex ids refused; Codex: a supported Codex role model). `reset` returns to the built-in (Claude: the SDK default, Codex: `gpt-6-sol`) | [Task review model](./worker-model.md#task-review-model) |
+| `task-review-effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` (Runtime default, no level sent). `reset` follows your worker effort again (the built-in `medium` when that is unset) | [Task review effort](./worker-model.md#task-review-effort) |
 | `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
 | `cross-check` | `claude` or `codex`, required, plus `--stage plan` or `--stage code`, required | No positional value; `--model <id>` and `--effort low`, `medium`, `high`, `xhigh` or `max`, at least one of them (`runtime` is not a checker effort) | [Cross-check pins](./configuration.md#plan-cross-check-model-and-effort-pins) |
 
@@ -3543,13 +3573,13 @@ server could not confirm or read back the write, while the exit 0 line means
 the server confirmed the write and only the CLI's own effective-settings read
 failed.
 
-The route is an allowlist of ten fields (the two worker-model lanes, the two
-effort lanes, the two judge-model lanes, the two summary-model lanes,
-`judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
+The route is an allowlist of fourteen fields (the two worker-model lanes, the two
+effort lanes, the two judge-model lanes, the two summary-model lanes, the two
+task-review-model lanes, the two task-review-effort lanes, `judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
 are written in one transaction. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
-`judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
-already-enabled judge and summary work uses, and cannot turn that work on.
+`judge-runs-on`, `judge-model`, `summary-model`, `task-review-model` and `task-review-effort` choose which harness, model or effort
+already-enabled judge, summary and task-review work uses, and cannot turn that work on.
 
 ### Agent-template model and effort pins
 
@@ -3624,10 +3654,10 @@ setting prints once. The rows, in order:
 | `start (default)`, `start (claude)`, `start (codex)` | One each | `HARNESS`, `STORED` and `DEFAULT` show `-`. `RESOLVED` is the predicted harness, `claude or codex` when the harness is chosen when the run is created, or `refused: <token>` / `refused: <token> (<detail>)`. `SOURCE` is the harness source label (`your choice for this run`, `your default harness`, `automatic` or `chosen when the run is created`) plus its notes. |
 | `worker model` | `claude`, `codex` | `RESOLVED` and `DEFAULT` show `SDK/account default` when the runtime decides. |
 | `worker effort` | `claude`, `codex` | As the existing effort rows. `SOURCE` reads `lead template` when you have no per-harness effort preference and the lead template's effort is used (see [the lead template's effort](./worker-effort.md#the-lead-templates-effort)). |
-| `planning model`, `planning effort` | `claude` | The optional [Claude planning settings](./worker-model.md#planning-model-and-effort), shown only for Claude. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
+| `planning model`, `planning effort` | `claude`, `codex` | The optional per-harness [planning settings](./worker-model.md#planning-model-and-effort), with one model row and one effort row for each harness. `STORED` shows `Default` when unset, and `RESOLVED` then reads the run's own (implementation) value, for example `opus` or `SDK/account default`. Where a preview shows a run's plan and implement values, it may show them as a pair. Read-only here: there is no CLI setter for these two settings. |
 | `judge`, `summary` | `claude`, `codex` | Unchanged; printed from the settings read. |
-| `task review model` | `claude`, `codex` | Built-in; Codex notes `not configurable`, Claude `the SDK decides`. |
-| `task review effort` | `claude`, `codex` | `not sent` for both. |
+| `task review model` | `claude`, `codex` | Your stored model (`your choice`) or the built-in; an unset Claude model notes `the SDK decides`. Set it with `uzi settings set task-review-model`. |
+| `task review effort` | `claude`, `codex` | Your stored level, else the worker effort it follows (SOURCE is then the worker effort's source and STORED reads Default), else the built-in `medium`; `not sent` only for Runtime default. Set it with `uzi settings set task-review-effort`; `reset` follows the worker effort again. |
 
 `SOURCE` appends each cell's notes after a `·`, for example `built-in · not sent`.
 When a start choice is chosen at creation, the table is followed by one block per
@@ -3650,7 +3680,7 @@ usable. The CLI shows the `GET` only; it does not call the start-preview.
 `--schedule` adds the schedule preview, below.
 
 `--json` carries every key of the settings read plus an `effective` key holding
-the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes the Claude `planning_model` cell and `efforts` the `planning_effort` cell) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
+the view's body: `version`, `harnesses`, `start`, `models`, `efforts` (`models` includes Claude and Codex `planning_model` cells and `efforts` their `planning_effort` cells) and `cross_check` (fields in [Configuration](./configuration.md#effective-settings)).
 `effective` is `null` when the server does not have the view or the read failed.
 In that case the human output falls back to the previous Model settings rows, a
 line goes to stderr (`Effective settings: not available on this server` for an
@@ -3675,7 +3705,7 @@ the same columns:
 | --- | --- | --- |
 | `schedule harness` | `-` | `RESOLVED` is the harness, `claude or codex` when it is chosen when the run is created, or `refused: <token>` (with the detail in parentheses). A refusal on a known harness reads `<harness>, refused: <token>`. |
 | `worker model`, `worker effort`, `credential`, `subagents` | `claude` or `codex` | One set per harness the fire can land on; with a single harness the rows are that harness's. |
-| `plan phase model`, `plan phase effort` | `claude` | Printed between the worker effort and credential rows, and only on a Claude fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
+| `plan phase model`, `plan phase effort` | `claude`, `codex` | Printed between the worker effort and credential rows, and only on a fire where your [planning settings](./worker-model.md#planning-model-and-effort) apply. `STORED` and `DEFAULT` show `-`. `RESOLVED` is the model or effort the plan phase ships (`SDK/account default` for an empty model), or `same as the worker model` / `same as the worker effort` when the plan phase ships nothing on that side. `SOURCE` is the planning label for a planning value, else the ordinary model or effort label of the implement value that won (for example a schedule pin). On the model row it shows `-` when the plan phase ships no model; the effort row shows the implement effort's label (for example `your choice`). |
 | `fire` | `claude` or `codex` | Replaces the set above for a harness whose fire is refused, as `refused: <token>`. |
 
 When the harness is chosen at creation, the rows for both harnesses follow
@@ -4460,8 +4490,8 @@ These are presentation labels: raw JSON, scalar fields and status
 transitions stay unchanged. Filtering raw `status: failed` in JSON still
 includes failed-path cancellations, plan rejections and required-base
 rejections. See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
-for rollout order and older payloads. Neither `run list`
-nor `admin runs` exposes a `--status` flag.
+for rollout order and older payloads. `run list` exposes no `--status` flag;
+`admin runs --all` takes one (see [Admin run debug](#admin-run-debug-reading-other-users-runs)).
 
 ### Provider outage recovery and owner hold
 

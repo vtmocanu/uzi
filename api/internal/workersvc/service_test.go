@@ -161,6 +161,15 @@ type fakeStore struct {
 	planningModel  pgtype.Text
 	planningEffort pgtype.Text
 	planningErr    error
+	// taskReviewModel/codexTaskReviewModel feed GetUserTaskReviewSettings (PRD #1570);
+	// taskReviewErr forces the strict review-settings read to fail.
+	taskReviewModel      pgtype.Text
+	codexTaskReviewModel pgtype.Text
+	// taskReviewEffort/codexTaskReviewEffort are the stored review efforts; the worker efforts the
+	// same read returns come from defaultEffort/defaultCodexEffort.
+	taskReviewEffort      pgtype.Text
+	codexTaskReviewEffort pgtype.Text
+	taskReviewErr         error
 	// attributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// live at standard-claim assembly. The zero value is false; scheduleModelStore sets
 	// it to true so existing fixtures mirror a fresh user's default-on state, and a test
@@ -1075,7 +1084,12 @@ func (f *fakeStore) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (sto
 func (f *fakeStore) GetUserPlanningClaude(context.Context, uuid.UUID) (store.GetUserPlanningClaudeRow, error) {
 	return store.GetUserPlanningClaudeRow{PlanningClaudeModel: f.planningModel, PlanningClaudeEffort: f.planningEffort}, f.planningErr
 }
-func (f *fakeStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, uuid.UUID) (int64, error) {
+
+func (f *fakeStore) GetUserPlanningCodex(context.Context, uuid.UUID) (store.GetUserPlanningCodexRow, error) {
+	return store.GetUserPlanningCodexRow{}, nil
+}
+
+func (f *fakeStore) CountOnlineWorkersSatisfyingPhaseModels(context.Context, store.CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error) {
 	return 1, nil
 }
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
@@ -1089,6 +1103,13 @@ func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool,
 }
 func (f *fakeStore) GetUserJudgeModels(context.Context, uuid.UUID) (store.GetUserJudgeModelsRow, error) {
 	return store.GetUserJudgeModelsRow{JudgeModel: f.judgeModel, CodexJudgeModel: f.codexJudgeModel}, f.judgeModelErr
+}
+func (f *fakeStore) GetUserTaskReviewSettings(context.Context, uuid.UUID) (store.GetUserTaskReviewSettingsRow, error) {
+	return store.GetUserTaskReviewSettingsRow{
+		TaskReviewModel: f.taskReviewModel, CodexTaskReviewModel: f.codexTaskReviewModel,
+		TaskReviewEffort: f.taskReviewEffort, CodexTaskReviewEffort: f.codexTaskReviewEffort,
+		DefaultEffort: f.defaultEffort, DefaultCodexEffort: f.defaultCodexEffort,
+	}, f.taskReviewErr
 }
 func (f *fakeStore) GetUserSummaryModels(context.Context, uuid.UUID) (store.GetUserSummaryModelsRow, error) {
 	return store.GetUserSummaryModelsRow{SummaryModel: f.summaryModel, CodexSummaryModel: f.codexSummaryModel}, f.summaryModelErr

@@ -61,3 +61,55 @@ func TestAssertGoldenWritesThenMatches(t *testing.T) {
 }
 
 func reflectValue(v any) reflect.Value { return reflect.ValueOf(v) }
+
+// moveInner stubs the label writes and fails the test if the Recorder ever
+// forwards MoveToColumn to it.
+type moveInner struct {
+	BaseFake
+	t          *testing.T
+	underlying []string
+}
+
+func (m *moveInner) EnsureLabels(context.Context, int64, []forge.Label) error {
+	m.underlying = append(m.underlying, "EnsureLabels")
+	return nil
+}
+
+func (m *moveInner) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
+	m.underlying = append(m.underlying, "UpdateIssueLabels")
+	return nil
+}
+
+func (m *moveInner) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
+	m.t.Error("Recorder forwarded MoveToColumn to the wrapped Forge")
+	return nil
+}
+
+func TestRecorderMoveToColumnRecordsTheLabelBackedMove(t *testing.T) {
+	inner := &moveInner{t: t}
+	rec := NewRecorder(inner)
+	move := forge.ColumnMove{
+		Column: "In Progress",
+		Ensure: []forge.Label{{Name: "In Progress", Color: "#123456"}},
+		Add:    []string{"In Progress"},
+		Remove: []string{"Planned"},
+	}
+	if err := rec.MoveToColumn(context.Background(), 42, 7, move); err != nil {
+		t.Fatal(err)
+	}
+
+	wantMoves := []string{`MoveToColumn(42, 7, {Column:"In Progress" Ensure:[{Name:"In Progress" Color:"#123456"}] Add:["In Progress"] Remove:["Planned"] Reopen:false})`}
+	if got := rec.Moves(); !slices.Equal(got, wantMoves) {
+		t.Fatalf("moves = %q, want %q", got, wantMoves)
+	}
+	wantCalls := []string{
+		`EnsureLabels(42, [{Name:"In Progress" Color:"#123456"}])`,
+		`UpdateIssueLabels(42, 7, ["In Progress"], ["Planned"])`,
+	}
+	if got := rec.Calls(); !slices.Equal(got, wantCalls) {
+		t.Fatalf("calls = %q, want %q", got, wantCalls)
+	}
+	if want := []string{"EnsureLabels", "UpdateIssueLabels"}; !slices.Equal(inner.underlying, want) {
+		t.Fatalf("wrapped calls = %v, want %v", inner.underlying, want)
+	}
+}

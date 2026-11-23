@@ -46,15 +46,19 @@ func ptrOrEmpty(p *string) string {
 }
 
 func TestPlanningEffortCellFollowsLeadTemplate(t *testing.T) {
-	level := "low"
-	lead := workersvc.LeadPrediction{Effort: &level, EffortSource: "template", TemplateEffort: &level}
-	inherited := planningEffortCell(lead, nil)
-	if ptrOrEmpty(inherited.ResolvedEffort) != level || inherited.Source != "template" || inherited.DefaultEffort != level {
-		t.Fatalf("planning inheritance lost the lead template: %+v", inherited)
-	}
-	planning := "high"
-	pinned := planningEffortCell(lead, &planning)
-	if ptrOrEmpty(pinned.ResolvedEffort) != planning || pinned.Source != "user_planning_default" || pinned.DefaultEffort != level {
-		t.Fatalf("planning pin must win while its default follows the lead: %+v", pinned)
+	for _, harness := range []workersvc.Harness{workersvc.HarnessClaude, workersvc.HarnessCodex} {
+		t.Run(string(harness), func(t *testing.T) {
+			level := "low"
+			lead := workersvc.LeadPrediction{Harness: harness, Effort: &level, EffortSource: "template", TemplateEffort: &level}
+			inherited := planningEffortCell(lead, nil)
+			if inherited.Harness != string(harness) || ptrOrEmpty(inherited.ResolvedEffort) != level || inherited.Source != "template" || inherited.DefaultEffort != level {
+				t.Fatalf("planning inheritance lost the lead template: %+v", inherited)
+			}
+			planning := "high"
+			pinned := planningEffortCell(lead, &planning)
+			if pinned.Harness != string(harness) || ptrOrEmpty(pinned.ResolvedEffort) != planning || pinned.Source != "user_planning_default" || pinned.DefaultEffort != level {
+				t.Fatalf("planning pin must win while its default follows the lead: %+v", pinned)
+			}
+		})
 	}
 }

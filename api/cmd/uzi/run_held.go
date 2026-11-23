@@ -18,6 +18,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+// adminRunDebugHeldNotice is printed on stderr above an admin debug read of another user's held
+// publications.
+const adminRunDebugHeldNotice = "note: admin run debug read of another user's run (read-only; held expiry is owner-only)"
+
 // newRunHeldCmd builds `uzi run held <run-id>` (list) with its `expire` subcommand.
 func newRunHeldCmd(env Env, gf *globalFlags) *cobra.Command {
 	held := &cobra.Command{
@@ -36,9 +40,9 @@ func newRunHeldCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			got, err := c.HeldPublications(cmd.Context(), args[0])
 			if err != nil {
-				return err
+				return hintOnForeignReadRefusal(env, err)
 			}
-			return renderHeldPublications(env, gf, args[0], got.Publications)
+			return renderHeldPublications(env, gf, args[0], got.Publications, got.AdminDebugRead)
 		},
 	}
 	held.AddCommand(newRunHeldExpireCmd(env, gf))
@@ -138,14 +142,19 @@ func shortSha(s string) string {
 }
 
 // renderHeldPublications prints a run's held publications: --json the DTO array (never null), the
-// human form one row per publication plus a fetch hint for the ones still on the forge.
-func renderHeldPublications(env Env, gf *globalFlags, runID string, pubs []apitypes.HeldPublicationDTO) error {
+// human form one row per publication plus a fetch hint for the ones still on the forge. adminDebug
+// marks an admin run debug read of another user's run: a stderr notice is printed (even for an
+// empty list) and the hint drops the owner-only expire half.
+func renderHeldPublications(env Env, gf *globalFlags, runID string, pubs []apitypes.HeldPublicationDTO, adminDebug bool) error {
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		if pubs == nil {
 			pubs = []apitypes.HeldPublicationDTO{}
 		}
 		return p.JSON(pubs)
+	}
+	if adminDebug && !gf.quiet {
+		_, _ = fmt.Fprintln(env.Stderr, adminRunDebugHeldNotice)
 	}
 	if len(pubs) == 0 {
 		if !gf.quiet {
@@ -175,7 +184,11 @@ func renderHeldPublications(env Env, gf *globalFlags, runID string, pubs []apity
 		}
 	}
 	if onForge && !gf.quiet {
-		p.Printf("\nfetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire %s`\n", sanitizeTTY(runID))
+		if adminDebug {
+			p.Printf("\nfetch a held ref with `git fetch origin <ref>`\n")
+		} else {
+			p.Printf("\nfetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire %s`\n", sanitizeTTY(runID))
+		}
 	}
 	return nil
 }

@@ -26,6 +26,7 @@ func TestBaseFakeMethodsNotStubbed(t *testing.T) {
 		{"GetIssue", func(b *BaseFake) error { _, err := b.GetIssue(ctx, 1, 2); return err }},
 		{"CreateIssue", func(b *BaseFake) error { _, err := b.CreateIssue(ctx, 1, "t", "d", nil); return err }},
 		{"UpdateIssueLabels", func(b *BaseFake) error { return b.UpdateIssueLabels(ctx, 1, 2, nil, nil) }},
+		{"MoveToColumn", func(b *BaseFake) error { return b.MoveToColumn(ctx, 1, 2, forge.ColumnMove{}) }},
 		{"UpdateIssueDescription", func(b *BaseFake) error { return b.UpdateIssueDescription(ctx, 1, 2, "d") }},
 		{"SetIssueState", func(b *BaseFake) error { return b.SetIssueState(ctx, 1, 2, forge.StateClosed) }},
 		{"ListIssueLabelEvents", func(b *BaseFake) error { _, err := b.ListIssueLabelEvents(ctx, 1, 2); return err }},
@@ -36,8 +37,8 @@ func TestBaseFakeMethodsNotStubbed(t *testing.T) {
 		{"ListTags", func(b *BaseFake) error { _, err := b.ListTags(ctx); return err }},
 		{"ListStates", func(b *BaseFake) error { _, err := b.ListStates(ctx, "p"); return err }},
 	}
-	if len(methods) != 15 {
-		t.Fatalf("expected 15 methods, got %d", len(methods))
+	if len(methods) != 16 {
+		t.Fatalf("expected 16 methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

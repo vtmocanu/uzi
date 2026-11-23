@@ -62,12 +62,12 @@ func TestCardLabelsNeverMarshalAsNull(t *testing.T) {
 			is := store.Issue{ForgeIssueIid: 1, Title: "t", State: "opened", Labels: []byte(tc.stored)}
 
 			t.Run("issueToCard", func(t *testing.T) {
-				if got := labelsFieldOf(t, issueToCard(is, nil, "gitlab")); got != tc.want {
+				if got := labelsFieldOf(t, issueToCard(is, nil, "gitlab", false)); got != tc.want {
 					t.Fatalf("labels = %s, want %s", got, tc.want)
 				}
 			})
 			t.Run("assembleCards", func(t *testing.T) {
-				cards := assembleCards([]store.Issue{is}, nil, nil, nil, nil, uuid.Nil, "gitlab", nil, 0)
+				cards := assembleCards([]store.Issue{is}, nil, nil, nil, nil, uuid.Nil, "gitlab", false, nil, 0)
 				if len(cards) != 1 {
 					t.Fatalf("expected one card, got %d", len(cards))
 				}

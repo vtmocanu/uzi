@@ -6,6 +6,14 @@ often more than an hour, to learn one bit. Local evidence never waives exact-hea
 another gate, coordinator rules or a user decision the attribution rule in `SKILL.md`
 requires.
 
+Before editing, follow SKILL.md's **CI-fix branch ownership** check, or **Main-CI repair ownership** for a default-branch failure. Agree one fixer; recheck before pushing or merging.
+
+## Main-CI repair ownership
+
+Before local repair, inspect the repo's `ci_watch` schedules and episode run IDs, including gated prompt repair runs. Agree one fixer. For authorized local takeover, pause only the matching schedule, settle its existing run by waiting or cancelling with custody review, and record who restores the prior schedule state. Pausing a schedule does not stop its run. Do not disable global automation. Neither the owner-run snapshot nor a truncated admin listing proves global exclusion; coordinate unknown ownership. Branch ci_fix is a separate detector: disabling mr-rework or cancelling one ci_fix does not disable future CI fixes.
+
+## Attribute the failure
+
 1. **Classify first.** Read the log; never infer the cause from the job name.
    - Cancelled usually means superseded by a newer push: reconcile the live PR head and
      its run, and never rerun a superseded SHA. Never let an old `main` rerun cancel the

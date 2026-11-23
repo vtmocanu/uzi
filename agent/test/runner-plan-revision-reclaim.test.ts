@@ -4,13 +4,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { api, client, fakeGitlab, installHarness, runner } from "./runner-harness.js";
 import { feed, freshClaim, gates, newApi, row, send, until } from "./gate-revision-harness.js";
 import { providerFixture } from "./plan-revision-provider-fixture.js";
+import { waitForTestEvent } from "./helpers.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { RunContext } from "../src/executor.js";
 
 installHarness();
 const SOURCE = "# Source R";
 const REVISED = "# Successor J";
-const FRESH = "# Fresh Codex plan";
+const CODEX_SUCCESSOR = "# Codex successor plan";
 function barrier() {
   let release!: () => void;
   return { promise: new Promise<void>(resolve => { release = resolve; }), release: () => release() };
@@ -20,7 +21,9 @@ function barrier() {
 // durable retry checkpoint, exactly-once provider execution, or lifetime allowance.
 for (const harness of ["claude", "codex"] as const) {
   for (const stage of ["expired", "J queued", "J publication uncommitted", "J committed before ACK"] as const) {
-    it(`reclaim ${harness}: loss at ${stage}`, async t => {
+    it(harness === "codex" && stage === "expired"
+      ? "reclaim codex: expired pending revise replays the persisted plan once and is not reapplied"
+      : `reclaim ${harness}: loss at ${stage}`, async t => {
       newApi();
       api.planRevisionRetries = true;
       client.protocolFeatures = [...client.protocolFeatures, "plan_revision_retry_v1"];
@@ -33,6 +36,8 @@ for (const harness of ["claude", "codex"] as const) {
       const arrived = barrier();
       const nextRevision = barrier();
       const nextRevisionBlocked = barrier();
+      const appliedReceipt = barrier();
+      let releaseApplied = () => {};
       let restore = () => {};
       const oldFlight = runner(old.executor, fakeGitlab().gitlab, undefined, {
         planRevisionRetryPolicy: { random: () => 0, sleep: async (ms, signal) => {
@@ -92,7 +97,7 @@ for (const harness of ["claude", "codex"] as const) {
         restore();
 
         const persisted = committed ? REVISED : SOURCE;
-        const successor = providerFixture(harness, () => harness === "claude" ? { failure: true } : { plan: FRESH });
+        const successor = providerFixture(harness, () => harness === "claude" ? { failure: true } : { plan: CODEX_SUCCESSOR });
         if (harness === "claude" && !committed) {
           const run = successor.executor.run.bind(successor.executor);
           t.mock.method(successor.executor, "run", (ctx: RunContext) => run({
@@ -118,6 +123,18 @@ for (const harness of ["claude", "codex"] as const) {
         const before = gates(id).length;
         const receiptStart = api.inputReceiptCalls.length;
         const waits: number[] = [];
+        if (harness === "codex" && stage === "expired") {
+          // Publishing the gate and applying its input are separate requests. Force the
+          // gate to be observable first, and observe the receipt's own acknowledgement.
+          releaseApplied = api.holdNextInputReceipt("applied");
+          const apply = client.applyInputs.bind(client);
+          t.mock.method(client, "applyInputs", async (...args: Parameters<typeof apply>) => {
+            const receipt = await apply(...args);
+            if (args[0] === id && args[2] === 2 && receipt.active && receipt.inputs.some(input => input.id === i!.id))
+              appliedReceipt.release();
+            return receipt;
+          });
+        }
         nextFlight = runner(successor.executor, fakeGitlab().gitlab, undefined, {
           planRevisionRetryPolicy: { random: () => 0, sleep: async (ms, signal) => {
             signal.throwIfAborted();
@@ -143,13 +160,23 @@ for (const harness of ["claude", "codex"] as const) {
           assert.ok(await until(() => gates(id).length > before), "successor presents a gate");
           const publication = gates(id).at(-1)!;
           assert.equal(publication.claim_generation, 2);
-          assert.equal(publication.plan_md, harness === "codex" ? FRESH : REVISED);
+          assert.equal(publication.plan_md, harness === "codex" ? CODEX_SUCCESSOR : REVISED);
           assert.equal(publication.revision_input_id, undefined);
           assert.equal(publication.superseded_revision_input_ids, undefined, "no reconstructed predecessors");
           if (harness === "codex") {
             assert.equal(successor.starts.length, 1);
             assert.equal(successor.starts[0]!.threadId, "th-revision", "turn/start uses the provider thread identity");
-            if (!committed) {
+            if (stage === "expired") {
+              const prompt = successor.starts[0]!.prompt;
+              assert.ok(prompt.includes(SOURCE), "the revision uses the persisted source plan");
+              assert.equal(prompt.split("old I").length - 1, 1, "pending feedback is replayed exactly once");
+              queueMicrotask(releaseApplied);
+              await waitForTestEvent(appliedReceipt.promise, "reclaimed revise APPLIED receipt");
+              assert.equal(api.isApplied(id, i!.id), true, "the persisted revised plan applies the pending input");
+              assert.equal(api.isInputSuperseded(id, i!.id), false, "replay is application, not stale disposal");
+              assert.equal(feed(id).some(t => /ignored.*re-send/.test(t)), false, "replayed feedback needs no re-send notice");
+              assert.equal(api.inputReceiptCalls.filter(c => c.kind === "applied" && c.ids.includes(i!.id)).length, 1);
+            } else if (!committed) {
               assert.ok(await until(() => feed(id).some(t => /ignored.*re-send/.test(t))), "old feedback needs resending");
               // Generic stale APPLIED disposal is not a revision persistence receipt.
               assert.equal(api.isInputSuperseded(id, i!.id), false);
@@ -168,10 +195,34 @@ for (const harness of ["claude", "codex"] as const) {
           assert.ok(api.isInputSuperseded(id, i!.id));
           assert.equal(api.isInputSuperseded(id, j!.id), false);
         }
+        if (harness === "codex" && stage === "expired") {
+          // Lose the successor after its revised plan and receipt are durable. A further
+          // admitted claim may plan afresh without a session, but must not replay applied I.
+          nextFlight.shutdown();
+          await nextDone;
+          const third = providerFixture("codex", () => ({ plan: "# Third claim" }));
+          api.setInputClaimGeneration(id, 3);
+          api.setOwnershipStatus(id, "awaiting_approval", 3);
+          const beforeThird = gates(id).length;
+          const thirdReceiptStart = api.inputReceiptCalls.length;
+          nextFlight = runner(third.executor, fakeGitlab().gitlab);
+          nextDone = nextFlight.execute({ ...resumed, claim_generation: 3,
+            last_seq: Math.max(0, ...api.messages(id).map(m => m.seq)), plan_md: CODEX_SUCCESSOR,
+            resume_plan_at: api.resumePlanAt(id), ...api.gateResumeFields(id) });
+          assert.ok(await until(() => gates(id).length > beforeThird), "second reclaim presents its own plan");
+          assert.equal(third.starts.length, 1);
+          assert.equal(third.starts[0]!.prompt.includes("old I"), false, "applied feedback is not replayed again");
+          assert.equal(api.isApplied(id, i!.id), true);
+          assert.equal(api.isInputSuperseded(id, i!.id), false);
+          assert.equal(api.inputReceiptCalls.filter(c => c.kind === "applied" && c.ids.includes(i!.id)).length, 1,
+            "a second reclaim never reapplies the input");
+          assert.ok(api.inputReceiptCalls.slice(thirdReceiptStart).every(c => c.generation === 3));
+        }
         send(id, row("cancel"));
         nextRevision.release();
         await nextDone;
       } finally {
+        releaseApplied();
         hold.release();
         oldFlight.shutdown();
         await oldDone;

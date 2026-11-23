@@ -188,6 +188,7 @@ Do not trust issue line numbers.
 6. **Conditionals**: resolve every "also fix X if Y" in the body against code before queuing; an auto-approved run cannot ask.
 7. **Partly done**: rewrite the body (and title) to the open half; cite the PR that fixed the rest.
 8. **LiveDB-only tests**: default `gate:api` skips them, so a run can go green without executing the fix. Name `./e2e/run-store-it.sh` in the issue and require the test to run, not skip.
+9. **CI repair ownership**: before dispatch, check whether another session or uzi run owns the same repo/ref and failing execution. Agree one fixer; link or hand over existing work instead of dispatching a duplicate. Follow uzi-lander's branch/main-CI repair ownership checks; an incomplete lookup is not proof of no fixer.
 
 ## Step 5: Propose, confirm, apply
 

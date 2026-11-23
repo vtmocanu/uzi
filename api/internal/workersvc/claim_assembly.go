@@ -473,15 +473,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			LaneModel:       laneModel,
 			TemplateEffort:  leadTemplateEffort(templates, harness),
 		}
-		// PRD #3252: the owner's Claude planning pair is read (strictly) only for a Claude lead-lane
-		// claim, so no other claim pays the read or can fail on it.
-		if harness == HarnessClaude && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-			planning, perr := s.q.GetUserPlanningClaude(ctx, run.UserID)
+		// Only lead-lane claims read planning defaults; errors fail the claim.
+		if leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+			model, effort, perr := s.readPlanningDefaults(ctx, run.UserID, harness)
 			if perr != nil {
 				return nil, fmt.Errorf("planning defaults lookup: %w", perr)
 			}
-			leadInput.PlanningModel = planning.PlanningClaudeModel
-			leadInput.PlanningEffort = planning.PlanningClaudeEffort
+			leadInput.PlanningModel, leadInput.PlanningEffort = model, effort
 		}
 		leadSettings = resolveLeadSettings(leadInput)
 		// PRD #3250: a run_override model or effort the claim cannot honor parks the run (never a
@@ -566,10 +564,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// precedence rule stays in resolvePlanPhase.
 		leadInput.UserEffort = defaultEffort
 		leadSettings.Plan = resolvePlanPhase(leadInput, leadSettings)
-		// A claim carrying a plan_phase needs the worker capability. The requeue is non-looping: the
-		// next ClaimRun pass excludes this worker once the owner's planning value is set.
-		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, capability.ClaudePhaseModelsV1) {
+		// A claim carrying a plan_phase needs its harness capability, including when the owner's
+		// planning setting changed after SQL admission. Requeue retains Codex claim provenance
+		// (ADR-4476), so another worker cannot take over a rejected Codex claim.
+		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, phaseModelsCapability(harness)) {
 			return nil, errPhaseModelsCapabilityMissing
+		}
+		// Resolve the final plan before checking custom passthrough: effort-only planning inherits
+		// the effective root model, and a planning model may differ from the implementation root.
+		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil &&
+			!harnessModelCompatible(HarnessCodex, *leadSettings.Plan.Model) &&
+			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
+			return nil, errCustomModelCapabilityMissing
 		}
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
@@ -721,6 +727,38 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// Run-summary model for this claim's harness (see resolveClaimSummaryModel).
 	summaryModel := s.resolveClaimSummaryModel(ctx, run)
+
+	// PRD #1570: a REVIEW run resolves the owner's task-review settings (ResolveTaskReview, the rule
+	// the effective-settings view also uses). They ride the claim only to a worker advertising
+	// task_review_settings_v1; for one that lacks it, a configured value is withheld and the feed
+	// notice is recorded at the end of assembly. A non-review claim never carries them.
+	var taskReviewModel, taskReviewEffort *string
+	var taskReviewWithheld []string
+	if isReviewRun {
+		tr, terr := s.resolveUserTaskReview(ctx, run.UserID, harness)
+		if terr != nil {
+			return nil, terr
+		}
+		if slices.Contains(wkr.ProtocolCapabilities, capability.TaskReviewSettingsV1) {
+			// Omitted when unset (PRD #1570): the worker's own built-in applies, so the wire carries
+			// only an owner's configured, re-validated model.
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault && tr.Model != "" {
+				m := tr.Model
+				taskReviewModel = &m
+			}
+			// The resolved level (inherited from the worker effort when unset), nil for Runtime default.
+			taskReviewEffort = tr.EffortLevelPtr()
+		} else {
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewModelSettingName)
+			}
+			// An inherited built-in level counts: the old worker sends none, a change from the
+			// resolved view. No notice when the resolved effort is Runtime default.
+			if tr.EffortLevelPtr() != nil {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewEffortSettingName)
+			}
+		}
+	}
 
 	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
 	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
@@ -970,7 +1008,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.
-		SummaryModel: summaryModel,
+		SummaryModel:     summaryModel,
+		TaskReviewModel:  taskReviewModel,
+		TaskReviewEffort: taskReviewEffort,
 		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
 		// already set, so a resume/re-claim skips INTENT generation rather than
 		// re-spending the owner's token. Derived straight off the run row.
@@ -1184,6 +1224,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// leaves a feed line naming pins the claim never carried.
 	if !templateEffortSupported && !isolated && len(payload.Agents) > 0 && hasWithheldTemplateEffort(templates, run.Harness) {
 		payload.LastSeq = s.recordTemplateEffortOmittedNote(ctx, run, payload.LastSeq)
+	}
+	// PRD #1570: also last, for the same reason; no notice when nothing configured was withheld.
+	if len(taskReviewWithheld) > 0 {
+		payload.LastSeq = s.recordTaskReviewSettingsOmittedNote(ctx, run, payload.LastSeq, taskReviewWithheld)
 	}
 	return payload, nil
 }
@@ -1552,4 +1596,12 @@ func linkedIssueKey(run store.Run, projectShort pgtype.Text) string {
 		return ""
 	}
 	return projectShort.String + "-" + strconv.FormatInt(run.IssueIid.Int64, 10)
+}
+
+// phaseModelsCapability selects the protocol for the run's harness.
+func phaseModelsCapability(h Harness) string {
+	if h == HarnessCodex {
+		return capability.CodexPhaseModelsV1
+	}
+	return capability.ClaudePhaseModelsV1
 }

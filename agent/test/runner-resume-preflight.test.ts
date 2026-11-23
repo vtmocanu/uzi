@@ -13,6 +13,7 @@ import { type RunContext, type ExecutorResult } from "../src/executor.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { assertCaptureLaunch } from "../src/git.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { newApi, gates, send, row } from "./gate-revision-harness.js";
 import {
   type ExecutorFactory,
   RESUME_CONTINUED_EVENT,
@@ -110,6 +111,65 @@ describe("RunRunner — resume preflight (issue #105)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+
+  for (const usable of [true, false]) {
+    it(`Codex ${usable ? "retains" : "replaces"} persisted gate identity after session preflight`, { skip: LINUX_ONLY }, async () => {
+      newApi();
+      const { gitlab } = fakeGitlab();
+      const homeRoot = path.join(fx.dataDir, `gate-preflight-${usable}`);
+      const source = path.join(homeRoot, "source");
+      const presentationId = "0f5c2d4e-1111-4a2b-8c3d-000000000001";
+      const plan = "persisted candidate";
+      const claim = gitlabClaim(usable ? 704 : 705, {
+        claim_generation: 2, session_id: SID, plan_approved: false, plan_md: plan,
+        plan_source: "agent", resume_phase: "awaiting_approval",
+        resume_plan_at: "2000-01-01T00:00:00.000000Z",
+        resume_gate_revision: 3, resume_gate_presentation_id: presentationId,
+        secrets: { forge_pat: "fixture-forge", forge_username: "bot", codex: {
+          auth_mode: "subscription", access_token: "fixture-access", capability: "fixture-capability",
+          generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null,
+        } },
+      });
+      api.setInputClaimGeneration(claim.run_id, 2);
+      api.seedGate(claim.run_id, { revision: 3, presentationId, historical: [], payload: { plan_md: plan } });
+      // This approval is valid only if preflight preserves the original gate.
+      send(claim.run_id, row("approve_plan", null, { gate_binding: "bound", gate_revision: 3 }));
+      api.onState(claim.run_id, body => {
+        if (body.status === "awaiting_approval" && !usable) send(claim.run_id, row("reject_plan", "fresh gate"));
+      });
+      if (usable) {
+        fs.mkdirSync(path.join(source, "sessions"), { recursive: true });
+        fs.writeFileSync(path.join(source, "sessions", `rollout-${SID}.jsonl`), "{}\n");
+        const store = path.join(homeRoot, claim.run_id, "codex-session-store");
+        fs.mkdirSync(path.dirname(store), { recursive: true });
+        await CodexSessionStore.persist(source, store);
+      }
+      let verdict: string | undefined;
+      await runnerWith(runId => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          resumesAtGate: true,
+          run: async ctx => {
+            assert.equal(ctx.sessionId, usable ? SID : undefined);
+            assert.equal(await ctx.takeResumedGateEvent?.(), undefined, "queued approve stays buffered");
+            verdict = (await ctx.gatePlan!(plan)).kind;
+            throw new Error("gate identity observed");
+          },
+        },
+      }), gitlab).execute(claim);
+      const [gate] = gates(claim.run_id);
+      assert.ok(gate, "the candidate was presented");
+      assert.equal(gate.plan_md, plan, "text equality alone cannot preserve a lost-session gate");
+      assert.equal(verdict, usable ? "approve" : "reject");
+      if (usable) {
+        assert.equal(gate.presentation_id, presentationId);
+        assert.equal(api.gateOf(claim.run_id).revision, 3);
+      } else {
+        assert.notEqual(gate.presentation_id, presentationId);
+        assert.equal(api.gateOf(claim.run_id).revision, 4);
+      }
+    });
+  }
 
   it("drops the resume and says so when the transcript is not on this worker", async () => {
     const { gitlab } = fakeGitlab();

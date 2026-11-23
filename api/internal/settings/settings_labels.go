@@ -31,6 +31,31 @@ func (c *Cache) FindingLabel(ctx context.Context) (string, error) {
 	return c.get(ctx, KeyFindingLabel)
 }
 
+// FilingLabels are the label names a finding filing assembles its label set from.
+type FilingLabels struct {
+	Finding   string
+	Uzi       string
+	Autopilot string
+}
+
+// FilingLabels returns the finding marker, the uzi label and the autopilot label from ONE
+// settings snapshot, each with its default. A caller that combines them must not read them
+// one by one: a settings change between two reads can pair an old marker with a new uzi
+// label, two names no single valid settings ever held together (PRD #4173 M5 review). On a
+// cold refresh error it returns the defaults alongside the error, as the single-key
+// accessors do.
+func (c *Cache) FilingLabels(ctx context.Context) (FilingLabels, error) {
+	m, err := c.snapshot(ctx)
+	if err != nil {
+		m = nil
+	}
+	return FilingLabels{
+		Finding:   c.effective(KeyFindingLabel, m),
+		Uzi:       c.effective(KeyUziLabel, m),
+		Autopilot: c.effective(KeyAutopilotLabel, m),
+	}, err
+}
+
 // maxLabelLen is Decision 8's length cap (runes, not bytes).
 const maxLabelLen = 64
 

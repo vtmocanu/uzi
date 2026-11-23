@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -132,8 +134,21 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// draft (GetFindingIssueDraft), and attach solely when the repo owner explicitly keeps them
 	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
 	// action, not an agent-injected one.
-	marker, _ := h.settings.FindingLabel(ctx)
-	filedLabels, requiredLabels := h.findingFilingLabels(ctx, marker, req.Labels, req.SendToUzi)
+	names, err := h.settings.FilingLabels(ctx)
+	if err != nil {
+		// Fail closed: on an unreadable settings store the accessor returns the default
+		// names, which cannot say which label the owner meant as a run opt-in or which
+		// marker is required. Nothing is claimed or written yet.
+		slog.Error("file finding: label settings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	filedLabels, requiredLabels, err := findingFilingLabels(repo, names, req.Labels, req.SendToUzi)
+	if err != nil {
+		// Refused before the claim and before any write (PRD #4173 M5 review).
+		httpx.Error(w, http.StatusConflict, err.Error())
+		return
+	}
 
 	// (5) Claim-first (D4): a guarded open→filing UPDATE. 0 rows affected means the coordinate
 	// is already filed or being filed (the single row is not `open`), so exactly one of two
@@ -308,26 +323,83 @@ func assembleFindingLabels(marker string, userLabels []string) []string {
 // findingFilingLabels preserves assembleFindingLabels' explicit-label budget, then appends
 // the requested run labels without displacing accepted user labels. Required forge labels
 // are built independently so an explicit-label collision never skips ensuring a run label.
-func (h *Handler) findingFilingLabels(ctx context.Context, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
+//
+// On a repo linked to an issue tracker the filed set maps the uzi label to the stored
+// eligibility name and drops the autopilot label, and neither run label is ensured: the
+// eligibility tag already exists by id and is never created, and autopilot is not
+// offered (PRD #4173 D12, D14).
+//
+// The marker and both run labels come from one settings snapshot (settings.FilingLabels).
+//
+// A linked repo refuses two filings before the caller writes anything, judged on the
+// linked label set actually built:
+//   - issuesource.ErrMarkerNotWritable when the finding marker is not in it under its own
+//     name (it is also the autopilot label, which is dropped, or the uzi label, which is
+//     rewritten). An eligibility opt-in does not waive the marker.
+//   - issuesource.ErrMarkerConfersEligibility when the set carries the eligibility name
+//     without an explicit opt-in: the issue would be tagged eligible for runs. The opt-ins
+//     are send-to-uzi, or an owner-chosen label that is the eligibility name or the
+//     configured uzi label (which the linked set maps to it).
+func findingFilingLabels(repo store.GetRepoForUserRow, names settings.FilingLabels, userLabels []string, sendToUzi bool) ([]string, []forge.Label, error) {
+	uzi, autopilot := names.Uzi, names.Autopilot
+	if uzi == "" {
+		uzi = settings.DefaultUziLabel
+	}
+	if autopilot == "" {
+		autopilot = settings.DefaultAutopilotLabel
+	}
+	filed, required := forgeFindingFilingLabels(names.Finding, uzi, autopilot, userLabels, sendToUzi)
+	eligibility, linked := linkedEligibility(repo)
+	if !linked {
+		return filed, required, nil
+	}
+	linkedFiled := issuesource.LinkedLabels(filed, uzi, autopilot, eligibility)
+	if err := issuesource.RequireMarker(linkedFiled, names.Finding); err != nil {
+		return nil, nil, err
+	}
+	if !sendToUzi && !ownerChoseEligibility(userLabels, uzi, eligibility) && slices.Contains(linkedFiled, eligibility) {
+		// Name the marker when it is the cause; otherwise the set still must not confer
+		// eligibility.
+		if err := issuesource.RefuseEligibilityMarkers(eligibility, names.Finding); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, issuesource.ErrMarkerConfersEligibility
+	}
+	linkedRequired := make([]forge.Label, 0, len(required))
+	for _, l := range required {
+		if l.Name != uzi && l.Name != autopilot && l.Name != eligibility {
+			linkedRequired = append(linkedRequired, l)
+		}
+	}
+	return linkedFiled, linkedRequired, nil
+}
+
+// ownerChoseEligibility reports whether one of the labels the owner selected is the
+// eligibility name or the configured uzi label, after the same sanitising
+// assembleFindingLabels applies, so an owner's deliberate opt-in is not refused.
+func ownerChoseEligibility(userLabels []string, uziLabel, eligibility string) bool {
+	for _, raw := range userLabels {
+		clean := termsafe.SanitizeBounded(raw, 64)
+		if clean != "" && (clean == eligibility || clean == uziLabel) {
+			return true
+		}
+	}
+	return false
+}
+
+// forgeFindingFilingLabels is the unlinked assembly findingFilingLabels starts from.
+func forgeFindingFilingLabels(marker, uzi, autopilot string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
 	filed := assembleFindingLabels(marker, userLabels)
 	required := []forge.Label{{Name: marker}}
 	if !sendToUzi {
 		return filed, required
-	}
-	eligibility, _ := h.settings.UziLabel(ctx)
-	if eligibility == "" {
-		eligibility = settings.DefaultUziLabel
-	}
-	autopilot, _ := h.settings.AutopilotLabel(ctx)
-	if autopilot == "" {
-		autopilot = settings.DefaultAutopilotLabel
 	}
 	filedSeen := make(map[string]bool, len(filed)+2)
 	for _, name := range filed {
 		filedSeen[name] = true
 	}
 	requiredSeen := map[string]bool{marker: true}
-	for _, name := range []string{eligibility, autopilot} {
+	for _, name := range []string{uzi, autopilot} {
 		if !filedSeen[name] {
 			filed = append(filed, name)
 			filedSeen[name] = true

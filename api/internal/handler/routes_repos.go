@@ -112,6 +112,11 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// and tag lists), so it carries the per-user forge budget; owner-scoped in the
 			// service (404 for a foreign repo or connection). No unlink or relink route exists.
 			r.With(forgeLimiter.PerUserMiddleware).Put("/{id}/issue-tracker-link", h.LinkRepoToIssueTracker)
+			// The linked repo's State mapping (PRD #4173 M5): the GET lists the project's States
+			// from the issue tracker and the PUT validates against them, so both carry the forge
+			// budget. Session-only and owner-scoped in the service, like the link itself.
+			r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/issue-tracker-link/states", h.GetIssueTrackerStateMapping)
+			r.With(forgeLimiter.PerUserMiddleware).Put("/{id}/issue-tracker-link/states", h.PutIssueTrackerStateMapping)
 			// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
 			// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
 			// preflight inside each handler; admin skips it. Instance flag still gates.

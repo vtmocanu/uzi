@@ -133,7 +133,7 @@ describe("RunRunner #3767 spend-limit hold", () => {
     });
   });
 
-  // Issue #4426: the characterized credit-depletion terminal (SDK 0.3.319; see
+  // Issue #4426: the credit-depletion terminal (characterized at SDK 0.3.319; see
   // spend-limit-regression.test.ts) goes through the REAL classifier exactly as
   // sdk-executor.ts does, so a classifier that rejects it yields the plain failure Error.
   const CREDIT = "Credit balance is too low";

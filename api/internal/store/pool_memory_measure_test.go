@@ -2211,10 +2211,10 @@ var pmBreadth = []pmEntry{
 		return q.CountOnlineWorkersSatisfyingCodexRuntime(ctx, f.User)
 	}},
 	{"CountOnlineWorkersSatisfyingCustomCodex", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
-		return q.CountOnlineWorkersSatisfyingCustomCodex(ctx, f.User)
+		return q.CountOnlineWorkersSatisfyingCustomCodex(ctx, store.CountOnlineWorkersSatisfyingCustomCodexParams{UserID: f.User})
 	}},
 	{"CountOnlineWorkersSatisfyingPhaseModels", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
-		return q.CountOnlineWorkersSatisfyingPhaseModels(ctx, f.User)
+		return q.CountOnlineWorkersSatisfyingPhaseModels(ctx, store.CountOnlineWorkersSatisfyingPhaseModelsParams{UserID: f.User, Harness: "claude"})
 	}},
 	{"CountOnlineWorkersSatisfyingProtocol", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.CountOnlineWorkersSatisfyingProtocol(ctx, f.User)
@@ -2501,6 +2501,9 @@ var pmBreadth = []pmEntry{
 	}},
 	{"GetUserSummaryModels", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.GetUserSummaryModels(ctx, f.User)
+	}},
+	{"GetUserTaskReviewSettings", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
+		return q.GetUserTaskReviewSettings(ctx, f.User)
 	}},
 	{"GetUserUsageReserve", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.GetUserUsageReserve(ctx, f.User)

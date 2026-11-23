@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "../src/worker.js";
+import { CODEX_PHASE_MODELS_CAPABILITY } from "../src/lead-config-report.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Outbox } from "../src/outbox.js";
@@ -1047,6 +1048,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_rounds_v1",
     "cross_check_pins_v1",
     "template_effort_v1",
+    "task_review_settings_v1",
     "cross_check_codex_lead_v1",
     "cross_check_gated_v1",
     "cross_check_semantic_plan_v1",
@@ -1112,7 +1114,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, "pending_outcome_scoped_claim_v1"],
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_PHASE_MODELS_CAPABILITY, "pending_outcome_scoped_claim_v1"],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -1177,6 +1179,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     for (const advertise of [true, false]) {
       const caps = await advertisedCapabilities(fakeConfig({ codexHarness: { advertise, degraded: false, landlock: "available" } }));
       assert.equal(caps?.includes(CODEX_RUNTIME_V2_CAPABILITY), advertise);
+      assert.equal(caps?.includes(CODEX_PHASE_MODELS_CAPABILITY), advertise);
     }
   });
 

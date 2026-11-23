@@ -58,6 +58,7 @@ func actionMethods() []struct {
 			return err
 		}},
 		{"UpdateIssueLabels", func(b *BaseFake) error { return b.UpdateIssueLabels(ctx, 1, 2, nil, nil) }},
+		{"MoveToColumn", func(b *BaseFake) error { return b.MoveToColumn(ctx, 1, 2, forge.ColumnMove{}) }},
 		{"UpdateIssueDescription", func(b *BaseFake) error { return b.UpdateIssueDescription(ctx, 1, 2, "d") }},
 		{"SetIssueState", func(b *BaseFake) error { return b.SetIssueState(ctx, 1, 2, forge.StateClosed) }},
 		{"UserExists", func(b *BaseFake) error { _, err := b.UserExists(ctx, "u"); return err }},
@@ -166,8 +167,8 @@ func actionMethods() []struct {
 
 func TestBaseFakeActionMethodsNotStubbed(t *testing.T) {
 	methods := actionMethods()
-	if len(methods) != 37 {
-		t.Fatalf("expected 37 action methods, got %d", len(methods))
+	if len(methods) != 38 {
+		t.Fatalf("expected 38 action methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

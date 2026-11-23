@@ -393,6 +393,29 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	}
 }
 
+// A variable stored under a name that was denied later can still be disabled and
+// deleted, but never enabled or edited (PRD #4416).
+func TestRunEnvDeniedNameDisableDeleteLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("LEGACY_TMP", jsonBody(map[string]any{"value": "https://legacy.example.test", "secret": false}), http.StatusCreated)
+	// Rename the stored row to an already-denied name, bypassing PUT validation.
+	cliMustExec(t, f.pool, `UPDATE run_env_vars SET name='TMPDIR' WHERE repo_id=$1 AND name='LEGACY_TMP'`, f.repo)
+
+	f.must(f.do(http.MethodPost, "/TMPDIR/disable", ""), http.StatusOK)
+	if n := f.rowCount("name='TMPDIR' AND disabled_at IS NOT NULL AND retired_at IS NULL"); n != 1 {
+		t.Fatalf("disabled rows = %d, want 1", n)
+	}
+	f.must(f.do(http.MethodPost, "/TMPDIR/enable", ""), http.StatusUnprocessableEntity)
+	f.must(f.do(http.MethodPut, "/TMPDIR", jsonBody(map[string]any{"description": "x"})), http.StatusUnprocessableEntity)
+	if n := f.rowCount("name='TMPDIR' AND disabled_at IS NOT NULL"); n != 1 {
+		t.Fatalf("a refused enable or PUT changed the row: %d disabled rows", n)
+	}
+	f.must(f.do(http.MethodDelete, "/TMPDIR", ""), http.StatusOK)
+	if n := f.rowCount("name='TMPDIR'"); n != 0 {
+		t.Fatalf("rows after delete = %d, want 0", n)
+	}
+}
+
 func TestRunEnvValueAndNameRulesLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	body := func(m map[string]any) string { return jsonBody(m) }

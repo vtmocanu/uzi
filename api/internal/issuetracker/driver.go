@@ -27,6 +27,11 @@ type State struct {
 	Name     string
 	Resolved bool // true when the state counts as closed
 	Ordinal  int
+	// Archived is true for a value the bundle keeps but no longer offers.
+	Archived bool
+	// LocalizedName is the value's name in the server's language, empty when it
+	// has none or the driver refused it (see stateNameProblem).
+	LocalizedName string
 }
 
 // Driver is an external issue tracker connection. It embeds forge.IssueTracker

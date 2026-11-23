@@ -68,6 +68,63 @@ func summaryModelCell(harness string, user *string, instance string) apitypes.Mo
 	}
 }
 
+// taskReviewModelCells builds the task-review model setting's cells (PRD #1570), always ordered
+// claude then codex. userClaude/userCodex are the stored user lanes (nil = Default). Each cell
+// resolves through workersvc.ResolveTaskReview, the rule the review claim applies: a valid stored
+// model is user_default, anything else the built-in (Claude: no model, the SDK decides).
+func taskReviewModelCells(userClaude, userCodex *string) []apitypes.ModelSettingCellDTO {
+	return []apitypes.ModelSettingCellDTO{
+		taskReviewModelCell(workersvc.HarnessClaude, userClaude),
+		taskReviewModelCell(workersvc.HarnessCodex, userCodex),
+	}
+}
+
+func taskReviewModelCell(harness workersvc.Harness, user *string) apitypes.ModelSettingCellDTO {
+	r := workersvc.ResolveTaskReview(harness, workersvc.TaskReviewInput{Model: user})
+	return apitypes.ModelSettingCellDTO{
+		Harness:       string(harness),
+		Model:         user,
+		DefaultModel:  r.BuiltinModel,
+		DefaultSource: agenttmpl.WorkerDefaultSourceBuiltin,
+		ResolvedModel: r.Model,
+		Source:        r.ModelSource,
+	}
+}
+
+// taskReviewEffortCells builds the task-review effort setting's cells (PRD #1570), always ordered
+// claude then codex, from the stored review preferences and the stored ordinary worker efforts.
+func taskReviewEffortCells(reviewClaude, reviewCodex, workerClaude, workerCodex *string) []apitypes.EffortSettingCellDTO {
+	return []apitypes.EffortSettingCellDTO{
+		taskReviewEffortCell(workersvc.HarnessClaude, reviewClaude, workerClaude),
+		taskReviewEffortCell(workersvc.HarnessCodex, reviewCodex, workerCodex),
+	}
+}
+
+func taskReviewEffortCell(harness workersvc.Harness, review, worker *string) apitypes.EffortSettingCellDTO {
+	r := workersvc.ResolveTaskReview(harness, workersvc.TaskReviewInput{Effort: review, WorkerEffort: worker})
+	return reviewEffortCellFrom(string(harness), r.StoredEffort, r.WorkerEffort, r.Effort)
+}
+
+// reviewEffortCellFrom is the one cell shape of the task-review effort, shared by the Settings
+// cells and the effective view. stored is the owner's review preference (nil = inherits); worker is
+// the worker effort's resolution, what a reset selects (DefaultEffort carries its level, or the
+// `runtime` token when it sends none); final is what the review resolves to.
+func reviewEffortCellFrom(harness string, stored *string, worker, final agenttmpl.EffortResolution) apitypes.EffortSettingCellDTO {
+	cell := apitypes.EffortSettingCellDTO{
+		Harness: harness, Effort: stored,
+		DefaultEffort: worker.Level, DefaultSource: worker.Source,
+		Source: final.Source, Mode: final.Mode,
+	}
+	if worker.Mode == agenttmpl.EffortModeRuntimeDefault {
+		cell.DefaultEffort = agenttmpl.EffortRuntime
+	}
+	if final.Mode == agenttmpl.EffortModeExplicit {
+		level := final.Level
+		cell.ResolvedEffort = &level
+	}
+	return cell
+}
+
 // effortSettingCells builds the ordinary effort setting's cells (PRD #3247), always
 // ordered claude then codex, from the stored preference tokens of one row read.
 // catalog (issue #3251) is attached to the codex cell only; the claude cell never
@@ -84,33 +141,47 @@ func effortSettingCells(claude, codex *string, catalog *apitypes.CatalogDefaultD
 // planningSourceUserPlanningDefault is the provenance token of a stored planning value (PRD #3252).
 const planningSourceUserPlanningDefault = "user_planning_default"
 
-// planningModelCells builds the read-only Claude planning model cell (PRD #3252). planning is the
+// planningModelCells builds the read-only planning model cells, Claude then Codex (PRD #3252). planning is the
 // stored planning model (nil = "Same as the run"). The default pair is the implement lane's
-// resolution: the user's default_claude_model lane (user_default), else the lead template's model
-// (template), else the built-in (the SDK decides). A set planning value resolves with
+// resolution: the user's harness-specific model lane (user_default), else the lead template's
+// model (template), else the harness built-in. A set planning value resolves with
 // user_planning_default; otherwise the cell resolves to the default pair.
-func planningModelCells(planning, claudeLane, leadClaudePin *string) []apitypes.ModelSettingCellDTO {
-	defModel, defSource := agenttmpl.ResolveWorkerDefaultModel("claude", claudeLane, leadClaudePin, nil)
+func planningModelCells(planning, claudeLane, leadClaudePin, codexPlanning, codexLane, leadCodexPin *string) []apitypes.ModelSettingCellDTO {
+	return []apitypes.ModelSettingCellDTO{
+		planningModelSettingCell("claude", planning, claudeLane, leadClaudePin, nil),
+		planningModelSettingCell("codex", codexPlanning, codexLane, nil, leadCodexPin),
+	}
+}
+
+func planningModelSettingCell(harness string, planning, lane, claudePin, codexPin *string) apitypes.ModelSettingCellDTO {
+	defModel, defSource := agenttmpl.ResolveWorkerDefaultModel(harness, lane, claudePin, codexPin)
 	cell := apitypes.ModelSettingCellDTO{
-		Harness: "claude", Model: planning,
+		Harness: harness, Model: planning,
 		DefaultModel: defModel, DefaultSource: defSource,
 		ResolvedModel: defModel, Source: defSource,
 	}
 	if planning != nil {
-		if m := strings.TrimSpace(*planning); m != "" && !agenttmpl.CodexRoleModels[m] {
+		m := strings.TrimSpace(*planning)
+		valid := !agenttmpl.CodexRoleModels[m]
+		if harness == "codex" {
+			_, err := agenttmpl.ValidateModel(m)
+			valid = err == nil && !agenttmpl.KnownClaudeAliases[m]
+		}
+		if m != "" && valid {
 			cell.ResolvedModel, cell.Source = m, planningSourceUserPlanningDefault
 		}
 	}
-	return []apitypes.ModelSettingCellDTO{cell}
+	return cell
 }
 
-// planningEffortCellFromOrdinary builds the read-only Claude planning effort cell (PRD #3252). The
-// default pair is the ordinary Claude effort cell's resolution (including Runtime default mode,
+// planningEffortCellFromOrdinary builds the read-only per-harness planning effort cell (PRD #3252). The
+// default pair is the ordinary harness effort cell's resolution (including Runtime default mode,
 // where no level is sent and DefaultEffort carries the preference token); a stored planning level
 // resolves with user_planning_default and explicit mode.
 func planningEffortCellFromOrdinary(planning *string, ordinary apitypes.EffortSettingCellDTO) apitypes.EffortSettingCellDTO {
+	harness := ordinary.Harness
 	cell := apitypes.EffortSettingCellDTO{
-		Harness: "claude", Effort: planning,
+		Harness: harness, Effort: planning,
 		DefaultSource:  ordinary.Source,
 		ResolvedEffort: ordinary.ResolvedEffort,
 		Source:         ordinary.Source,
@@ -122,7 +193,7 @@ func planningEffortCellFromOrdinary(planning *string, ordinary apitypes.EffortSe
 		cell.DefaultEffort = agenttmpl.EffortRuntime
 	}
 	if planning != nil {
-		if r := agenttmpl.ResolveHarnessEffort("claude", planning); r.Mode == agenttmpl.EffortModeExplicit && r.Source == agenttmpl.EffortSourceUserDefault {
+		if r := agenttmpl.ResolveHarnessEffort(harness, planning); r.Mode == agenttmpl.EffortModeExplicit && r.Source == agenttmpl.EffortSourceUserDefault {
 			level := r.Level
 			cell.ResolvedEffort, cell.Source, cell.Mode = &level, planningSourceUserPlanningDefault, agenttmpl.EffortModeExplicit
 		}

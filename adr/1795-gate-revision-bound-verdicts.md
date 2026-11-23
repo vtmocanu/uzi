@@ -72,9 +72,9 @@ epoch bump earlier (rejected: still admits an old-plan approve during the report
 early with no way to roll back concurrent routing or discards already in flight).
 
 **D1. Gate presentation identity.** The worker mints a presentation id for each gate it
-shows. A retry of the same report (lost response), or an SDK resume re-presenting the
-persisted unapproved plan at its gate, reuses that id; every other gate (fresh plan,
-revision, a stub/Codex resumed gate) mints a new one, even when the plan text is identical —
+shows. A retry of the same report (lost response), or an SDK or Codex resume re-presenting
+its persisted unapproved plan at the gate, reuses that id; every other gate (fresh plan,
+revision, a stub resumed gate or a Codex re-plan) mints a new one, even when the plan text is identical —
 text or status equality cannot tell these cases apart. The server maps a presentation id to a
 monotonically increasing per-run gate revision: a new id allocates `revision + 1` atomically
 with persisting the report; a retry or re-presentation succeeds only for the run's current
@@ -128,7 +128,7 @@ new worker against an old api: no fields arrive, every input is legacy. A new ap
 an old worker's report (no presentation id) allocates a new revision unconditionally; the
 persisted gate then has a revision but no presentation id. A new worker resuming such a gate
 sends an explicit `adopt_gate_revision: N`, never inferred from an unchanged payload (an
-identical-text stub/Codex gate would look the same); the server accepts the adoption only
+identical-text stub gate or Codex re-plan would look the same); the server accepts the adoption only
 under the run-row lock when the current revision is N, its id is null, the payload matches,
 and claim fencing passes — then binds the id to N so a pending bound approve still counts.
 Any other state is a stale-adoption refusal, itself a failed gate report under D1's refusal
@@ -200,6 +200,16 @@ which persist the originating card's revision alongside the existing `gate_ts` a
    the run to `gate_presentation_refused`; only a refusal from the run's still-current claim
    counts.
 
+## Amendment 2026-11-22: Codex gate re-presentation (#3253 / PR #4599)
+
+The owner confirmed Codex resume-at-gate replay; see
+[ADR-1604](1604-plan-gate-verdict-durability.md). D1's existing re-presentation
+rules now apply to Codex as well as the SDK. The original stub/Codex examples
+have been qualified above: a genuine Codex re-presentation may retain/adopt its
+persisted identity; a fresh Codex re-plan still mints a new presentation, even
+when its text is identical. Payload equality alone remains insufficient, and
+all explicit adoption, binding and claim fences are unchanged.
+
 ## Alternatives considered
 
 - **Bump the epoch earlier, before the report is sent.** Rejected: still admits an
@@ -207,9 +217,9 @@ which persist the originating card's revision alongside the existing `gate_ts` a
   fail-closed replay window from ADR-1604) forward can end that protection early with no way
   to undo concurrent routing or discards already in flight.
 - **Infer adoption of an id-less legacy gate from an unchanged payload.** Rejected: an
-  identical-text stub/Codex resumed gate is indistinguishable from a genuine re-presentation
+  identical-text stub resumed gate or Codex re-plan is indistinguishable from a genuine re-presentation
   by payload alone; adoption is an explicit `adopt_gate_revision` operation instead.
-  Prevented a real ambiguity — a stub/Codex resumed gate frequently repeats the plan text
+  Prevented a real ambiguity — a stub resumed gate or Codex re-plan can repeat the plan text
   verbatim without being the same presentation.
 - **Treat every unbound verdict the same way (disposed of).** Rejected (A2): a reject or
   revise sent while no gate was visible already had fail-closed, useful legacy handling (stop

@@ -150,7 +150,7 @@ func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID,
 		noProject issuetracker.Project
 		noTag     issuetracker.Tag
 	)
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	if err != nil {
 		return noAccount, noProject, noTag, err
 	}

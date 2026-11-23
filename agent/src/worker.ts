@@ -15,7 +15,7 @@ import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import { CLAUDE_PHASE_MODELS_CAPABILITY } from "./lead-config-report.js";
+import { CLAUDE_PHASE_MODELS_CAPABILITY, CODEX_PHASE_MODELS_CAPABILITY } from "./lead-config-report.js";
 import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, PublicationResumeEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
@@ -1049,6 +1049,10 @@ export class Worker {
           // Issue #3258: this image applies `agents[].effort` template pins on both harnesses
           // (Claude AgentDefinition.effort, Codex per-role effort). Advertised unconditionally.
           "template_effort_v1",
+          // PRD #1570: this image applies the owner-configured task-review model and effort
+          // (claim.task_review_model, claim.task_review_effort) on both harnesses. The api
+          // sends them only to a worker advertising this. Advertised unconditionally.
+          "task_review_settings_v1",
           // PRD #2460: this image runs a Codex lead's checked plan gate and a Claude plan
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.
@@ -1121,6 +1125,7 @@ export class Worker {
           // model through unchanged, so advertise the custom-model capability under the same
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
+          protocolCapabilities.push(CODEX_PHASE_MODELS_CAPABILITY);
         }
         // issue #3639: the settlement capability rides only with the pressure capability (the same guard), so a worker
         // that cannot park for memory never offers to deliver a settlement receipt.

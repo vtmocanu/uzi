@@ -11,10 +11,10 @@ import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
 import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
 import { UsageReserveSetting } from "../components/UsageReserveSetting";
-import type { UserSettings, BindMode, Harness, ModelSettingCell } from "../lib/apiTypes";
+import type { UserSettings, BindMode, EffortSettingCell, Harness, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
+import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
 import { DEFAULT_CODEX_MODEL, ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
@@ -60,20 +60,30 @@ function judgeLaneNote(cell: ModelSettingCell | undefined, notUsed: string): str
     : notUsed;
 }
 
-// The two summary lanes save independently, so a response may carry a stale sibling cell
+// Harness lanes save independently, so a response may carry a stale sibling cell
 // when saves land out of order. Take only the saved lane's cell from the response and keep
 // the rest of the committed cells; a response without that cell (older server) leaves them be.
-function mergeSummaryCell(
-  current: ModelSettingCell[] | undefined,
-  fromResponse: ModelSettingCell[] | undefined,
+function mergeHarnessCell<T extends { harness: ModelSettingCell["harness"] }>(
+  current: T[] | undefined,
+  fromResponse: T[] | undefined,
   harness: ModelSettingCell["harness"],
-): ModelSettingCell[] | undefined {
+): T[] | undefined {
   const saved = fromResponse?.find((c) => c.harness === harness);
   if (!saved) return current;
-  if (!current) return fromResponse;
+  if (!current) return [saved];
   return current.some((c) => c.harness === harness)
     ? current.map((c) => (c.harness === harness ? saved : c))
     : [...current, saved];
+}
+
+// Task-review lane labels (PRD #1570). The Claude built-in is the SDK default, which the
+// server reports as an empty model, so it never reads as a bare "Default · ".
+const TASK_REVIEW_CLAUDE_DEFAULT = "SDK default (built-in)";
+const TASK_REVIEW_CODEX_BUILTIN = "gpt-6-sol";
+
+function taskReviewClaudeInEffect(cell: ModelSettingCell): string {
+  const model = cell.resolved_model === "" ? "SDK default" : cell.resolved_model;
+  return `In effect: ${model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
 }
 
 const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
@@ -426,6 +436,20 @@ export function RunDefaults() {
   const [codexSummaryModel, setCodexSummaryModel] = useState("");
   const [savedCodexSummaryModel, setSavedCodexSummaryModel] = useState("");
   const [codexSummaryModelBusy, setCodexSummaryModelBusy] = useState(false);
+  // PRD #1570: the task-review model per harness ("" = the built-in default).
+  const [taskReviewModel, setTaskReviewModel] = useState("");
+  const [savedTaskReviewModel, setSavedTaskReviewModel] = useState("");
+  const [taskReviewModelBusy, setTaskReviewModelBusy] = useState(false);
+  const [codexTaskReviewModel, setCodexTaskReviewModel] = useState("");
+  const [savedCodexTaskReviewModel, setSavedCodexTaskReviewModel] = useState("");
+  const [codexTaskReviewModelBusy, setCodexTaskReviewModelBusy] = useState(false);
+  // PRD #1570 M2: the task-review effort per harness ("" = follow the worker effort).
+  const [taskReviewEffort, setTaskReviewEffort] = useState("");
+  const [savedTaskReviewEffort, setSavedTaskReviewEffort] = useState("");
+  const [taskReviewEffortBusy, setTaskReviewEffortBusy] = useState(false);
+  const [codexTaskReviewEffort, setCodexTaskReviewEffort] = useState("");
+  const [savedCodexTaskReviewEffort, setSavedCodexTaskReviewEffort] = useState("");
+  const [codexTaskReviewEffortBusy, setCodexTaskReviewEffortBusy] = useState(false);
 
   // Per-user default reasoning effort (PRD #617 M5): "" = inherit (a NULL/inherit value
   // resolves to the uzi default `medium` at claim assembly, issue #1157). Its own saved/busy pair,
@@ -439,13 +463,20 @@ export function RunDefaults() {
   const [savedCodexEffort, setSavedCodexEffort] = useState("");
   const [codexEffortBusy, setCodexEffortBusy] = useState(false);
 
-  // Claude planning model and effort (PRD #3252): "" = "Same as the run". One shared
+  // Planning model and effort (PRD #3252): "" = "Same as the run". One shared
   // saved/busy pair; the inline errors are keyed by the field the server names.
   const [planningModel, setPlanningModel] = useState("");
   const [savedPlanningModel, setSavedPlanningModel] = useState("");
   const [planningModelCustom, setPlanningModelCustom] = useState(false);
   const [planningEffort, setPlanningEffort] = useState("");
   const [savedPlanningEffort, setSavedPlanningEffort] = useState("");
+  const [planningCodexModel, setPlanningCodexModel] = useState("");
+  const [savedPlanningCodexModel, setSavedPlanningCodexModel] = useState("");
+  const [planningCodexModelError, setPlanningCodexModelError] = useState("");
+  const [planningCodexEffort, setPlanningCodexEffort] = useState("");
+  const [savedPlanningCodexEffort, setSavedPlanningCodexEffort] = useState("");
+  const [planningCodexEffortError, setPlanningCodexEffortError] = useState("");
+  const [planningCodexModelCustom, setPlanningCodexModelCustom] = useState(false);
   const [planningBusy, setPlanningBusy] = useState(false);
   const [planningModelError, setPlanningModelError] = useState("");
   const [planningEffortError, setPlanningEffortError] = useState("");
@@ -482,12 +513,28 @@ export function RunDefaults() {
       const csm = settings.codex_summary_model ?? "";
       setCodexSummaryModel(csm);
       setSavedCodexSummaryModel(csm);
+      const trm = settings.task_review_model ?? "";
+      setTaskReviewModel(trm);
+      setSavedTaskReviewModel(trm);
+      const ctrm = settings.codex_task_review_model ?? "";
+      setCodexTaskReviewModel(ctrm);
+      setSavedCodexTaskReviewModel(ctrm);
+      const tre = settings.task_review_effort ?? "";
+      setTaskReviewEffort(tre);
+      setSavedTaskReviewEffort(tre);
+      const ctre = settings.codex_task_review_effort ?? "";
+      setCodexTaskReviewEffort(ctre);
+      setSavedCodexTaskReviewEffort(ctre);
       const codexEff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(codexEff);
       setSavedCodexEffort(codexEff);
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
+      setPlanningCodexModel(settings.planning_codex_model ?? "");
+      setSavedPlanningCodexModel(settings.planning_codex_model ?? "");
+      setPlanningCodexEffort(settings.planning_codex_effort ?? "");
+      setSavedPlanningCodexEffort(settings.planning_codex_effort ?? "");
       const pm = settings.planning_claude_model ?? "";
       setPlanningModel(pm);
       setSavedPlanningModel(pm);
@@ -598,7 +645,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         summary_model: settings.summary_model,
-        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "claude"),
+        summary_models: mergeHarnessCell(current.summary_models, settings.summary_models, "claude"),
       }));
       const model = settings.summary_model ?? "";
       setSummaryModel(model);
@@ -624,7 +671,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         codex_summary_model: settings.codex_summary_model,
-        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "codex"),
+        summary_models: mergeHarnessCell(current.summary_models, settings.summary_models, "codex"),
       }));
       const model = settings.codex_summary_model ?? "";
       setCodexSummaryModel(model);
@@ -638,6 +685,116 @@ export function RunDefaults() {
       setError(errorMessage(err, "Failed to save Codex summary model"));
     } finally {
       setCodexSummaryModelBusy(false);
+    }
+  };
+
+  // Task-review model (PRD #1570): the Claude lane is free text guarded like the summary
+  // lane (a Codex role id is refused by the server, so block Save here); the Codex lane
+  // is the closed Codex role list.
+  const claudeTaskReviewCell = committedSettings?.task_review_models?.find((c) => c.harness === "claude");
+  const codexTaskReviewCell = committedSettings?.task_review_models?.find((c) => c.harness === "codex");
+  const claudeTaskReviewTrimmed = taskReviewModel.trim();
+  const taskReviewModelWarning =
+    modelFieldWarning(taskReviewModel) ||
+    (CODEX_ROLE_MODELS.includes(claudeTaskReviewTrimmed)
+      ? `Not a Claude model: ${claudeTaskReviewTrimmed} is a Codex model, so the server refuses this save. Clear the field to use the default.`
+      : "");
+  const taskReviewModelDirty = claudeTaskReviewTrimmed !== savedTaskReviewModel;
+  const codexTaskReviewModelDirty = codexTaskReviewModel.trim() !== savedCodexTaskReviewModel;
+  const codexTaskReviewDefaultLabel = codexTaskReviewCell
+    ? modelDefaultLabel(codexTaskReviewCell)
+    : `Default \u00b7 ${TASK_REVIEW_CODEX_BUILTIN} (${modelSettingSourceLabel("model", "builtin")})`;
+
+  const saveTaskReviewModel = async () => {
+    setError("");
+    setNotice("");
+    setTaskReviewModelBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ task_review_model: claudeTaskReviewTrimmed || null });
+      setCommittedSettings(current => current && ({
+        ...current,
+        task_review_model: settings.task_review_model,
+        task_review_models: mergeHarnessCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "claude"),
+      }));
+      const model = settings.task_review_model ?? "";
+      setTaskReviewModel(model);
+      setSavedTaskReviewModel(model);
+      setNotice(
+        model === ""
+          ? "Claude task-review model cleared. Claude task reviews use the SDK default."
+          : `Claude task-review model set to ${model}. It applies to your next task review.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err, "Failed to save Claude task-review model"));
+    } finally {
+      setTaskReviewModelBusy(false);
+    }
+  };
+
+  const saveCodexTaskReviewModel = async () => {
+    setError("");
+    setNotice("");
+    setCodexTaskReviewModelBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ codex_task_review_model: codexTaskReviewModel.trim() || null });
+      setCommittedSettings(current => current && ({
+        ...current,
+        codex_task_review_model: settings.codex_task_review_model,
+        task_review_models: mergeHarnessCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "codex"),
+      }));
+      const model = settings.codex_task_review_model ?? "";
+      setCodexTaskReviewModel(model);
+      setSavedCodexTaskReviewModel(model);
+      setNotice(
+        model === ""
+          ? "Codex task-review model cleared. Codex task reviews use the default."
+          : `Codex task-review model set to ${model}. It applies to your next task review.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err, "Failed to save Codex task-review model"));
+    } finally {
+      setCodexTaskReviewModelBusy(false);
+    }
+  };
+
+  // Task-review effort (PRD #1570 M2): a closed enum like the worker effort, so no warning
+  // gate. The Default option follows the worker effort; the label names its current level.
+  const claudeTaskReviewEffortCell = committedSettings?.task_review_efforts?.find((c) => c.harness === "claude");
+  const codexTaskReviewEffortCell = committedSettings?.task_review_efforts?.find((c) => c.harness === "codex");
+  const taskReviewEffortDirty = taskReviewEffort !== savedTaskReviewEffort;
+  const codexTaskReviewEffortDirty = codexTaskReviewEffort !== savedCodexTaskReviewEffort;
+  const taskReviewEffortDefaultLabel = (cell: EffortSettingCell | undefined) =>
+    `Default \u00b7 follows worker effort (${
+      !cell ? "medium" : cell.default_effort === "runtime" ? "Runtime default" : cell.default_effort
+    })`;
+  const saveTaskReviewEffort = async (harness: "claude" | "codex") => {
+    setError("");
+    setNotice("");
+    const claude = harness === "claude";
+    (claude ? setTaskReviewEffortBusy : setCodexTaskReviewEffortBusy)(true);
+    try {
+      const value = (claude ? taskReviewEffort : codexTaskReviewEffort) || null;
+      const { settings } = await api.putMySettings(claude ? { task_review_effort: value } : { codex_task_review_effort: value });
+      setCommittedSettings(current => current && ({
+        ...current,
+        [claude ? "task_review_effort" : "codex_task_review_effort"]: claude ? settings.task_review_effort : settings.codex_task_review_effort,
+        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, harness),
+      }));
+      const saved = (claude ? settings.task_review_effort : settings.codex_task_review_effort) ?? "";
+      (claude ? setTaskReviewEffort : setCodexTaskReviewEffort)(saved);
+      (claude ? setSavedTaskReviewEffort : setSavedCodexTaskReviewEffort)(saved);
+      const name = claude ? "Claude" : "Codex";
+      setNotice(
+        saved === ""
+          ? `${name} task-review effort cleared. Task reviews follow your ${name} worker effort.`
+          : saved === "runtime"
+            ? `${name} task-review effort set to Runtime default. The runtime decides.`
+            : `${name} task-review effort set to ${saved}. It applies to your next task review.`,
+      );
+    } catch (err) {
+      setError(errorMessage(err, `Failed to save ${claude ? "Claude" : "Codex"} task-review effort`));
+    } finally {
+      (claude ? setTaskReviewEffortBusy : setCodexTaskReviewEffortBusy)(false);
     }
   };
 
@@ -656,8 +813,9 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         default_effort: settings.default_effort,
-        effort_settings: settings.effort_settings,
-        planning_efforts: settings.planning_efforts,
+        effort_settings: mergeHarnessCell(current.effort_settings, settings.effort_settings, "claude"),
+        planning_efforts: mergeHarnessCell(current.planning_efforts, settings.planning_efforts, "claude"),
+        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, "claude"),
       }));
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
@@ -683,7 +841,12 @@ export function RunDefaults() {
     setCodexEffortBusy(true);
     try {
       const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({ ...current, default_codex_effort: settings.default_codex_effort, effort_settings: settings.effort_settings }));
+      setCommittedSettings(current => current && ({
+        ...current, default_codex_effort: settings.default_codex_effort,
+        effort_settings: mergeHarnessCell(current.effort_settings, settings.effort_settings, "codex"),
+        planning_efforts: mergeHarnessCell(current.planning_efforts, settings.planning_efforts, "codex"),
+        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, "codex"),
+      }));
       const eff = settings.default_codex_effort ?? "";
       setDefaultCodexEffort(eff);
       setSavedCodexEffort(eff);
@@ -699,7 +862,7 @@ export function RunDefaults() {
     }
   };
 
-  // Claude planning pair (PRD #3252). The default labels describe the SAVED state: the
+  // Planning pairs (PRD #3252). The default labels describe the SAVED state: the
   // server-resolved cells name what "Same as the run" currently means.
   const planningModelCell = committedSettings?.planning_models?.find((c) => c.harness === "claude");
   const planningEffortCell = committedSettings?.planning_efforts?.find((c) => c.harness === "claude");
@@ -726,6 +889,20 @@ export function RunDefaults() {
   const planningModelDirty = planningModelTrimmed !== savedPlanningModel;
   const planningEffortDirty = planningEffort !== savedPlanningEffort;
   const planningCustomEmpty = planningModelCustom && planningModelTrimmed === "";
+  const planningCodexModelCell = committedSettings?.planning_models?.find(c => c.harness === "codex");
+  const planningCodexEffortCell = committedSettings?.planning_efforts?.find(c => c.harness === "codex");
+  const planningCodexModelDefaultLabel = planningCodexModelCell
+    ? `Same as the run · ${planningCodexModelCell.default_model} (${modelSettingSourceLabel("planning_model", planningCodexModelCell.default_source)})`
+    : "Same as the run";
+  const planningCodexEffortDefaultLabel = planningCodexEffortCell
+    ? `Same as the run · ${planningCodexEffortCell.default_effort === "runtime" ? modelSettingSourceLabel("effort", "runtime_default") : planningCodexEffortCell.default_effort} (${modelSettingSourceLabel("planning_effort", planningCodexEffortCell.default_source)})`
+    : "Same as the run";
+  const planningCodexModelWarning = modelFieldWarning(planningCodexModel) ||
+    (["opus", "sonnet", "haiku", "fable"].includes(planningCodexModel.trim()) ? "A Claude model is not valid for the Codex lane." : "");
+  const planningCodexCustomEmpty = planningCodexModelCustom && planningCodexModel.trim() === "";
+  const planningCodexModelDirty = planningCodexModel.trim() !== savedPlanningCodexModel;
+  const planningCodexEffortDirty = planningCodexEffort !== savedPlanningCodexEffort;
+  const planningCodexBlocked = planningCodexModelWarning !== "" || planningCodexCustomEmpty;
   const planningBlocked = planningModelWarning !== "" || planningCustomEmpty;
   // The messages shown under the model select, so assistive tech reads them with it.
   const planningModelDescribedBy =
@@ -738,26 +915,35 @@ export function RunDefaults() {
       .join(" ") || undefined;
 
   // One PUT carrying only the dirty fields (null = Same as the run). A 400 names its field
-  // as a "planning_claude_model:" / "planning_claude_effort:" prefix; an unattributable
-  // message shows under both controls.
+  // as a planning field prefix; an unattributable message shows under all controls.
   const savePlanning = async () => {
     setError("");
     setNotice("");
     setPlanningModelError("");
     setPlanningEffortError("");
+    setPlanningCodexModelError("");
+    setPlanningCodexEffortError("");
     setPlanningBusy(true);
     try {
       const patch: UserSettingsPatch = {};
       if (planningModelDirty) patch.planning_claude_model = planningModelTrimmed || null;
       if (planningEffortDirty) patch.planning_claude_effort = planningEffort || null;
+      if (planningCodexModelDirty) patch.planning_codex_model = planningCodexModel.trim() || null;
+      if (planningCodexEffortDirty) patch.planning_codex_effort = planningCodexEffort || null;
       const { settings } = await api.putMySettings(patch);
       setCommittedSettings(current => current && ({
         ...current,
+        planning_codex_model: settings.planning_codex_model,
+        planning_codex_effort: settings.planning_codex_effort,
         planning_claude_model: settings.planning_claude_model,
         planning_claude_effort: settings.planning_claude_effort,
         planning_models: settings.planning_models,
         planning_efforts: settings.planning_efforts,
       }));
+      setPlanningCodexModel(settings.planning_codex_model ?? "");
+      setSavedPlanningCodexModel(settings.planning_codex_model ?? "");
+      setPlanningCodexEffort(settings.planning_codex_effort ?? "");
+      setSavedPlanningCodexEffort(settings.planning_codex_effort ?? "");
       const pm = settings.planning_claude_model ?? "";
       setPlanningModel(pm);
       setSavedPlanningModel(pm);
@@ -767,10 +953,15 @@ export function RunDefaults() {
       setNotice("Planning defaults saved. They apply the next time a run plans.");
     } catch (err) {
       const message = errorMessage(err, "Failed to save planning defaults");
-      const forModel = message.startsWith("planning_claude_model:");
-      const forEffort = message.startsWith("planning_claude_effort:");
-      if (!forModel) setPlanningEffortError(message);
-      if (!forEffort) setPlanningModelError(message);
+      const fields = [
+        ["planning_claude_model", setPlanningModelError],
+        ["planning_claude_effort", setPlanningEffortError],
+        ["planning_codex_model", setPlanningCodexModelError],
+        ["planning_codex_effort", setPlanningCodexEffortError],
+      ] as const;
+      const field = fields.find(([name]) => message.startsWith(`${name}:`));
+      if (field) field[1](message);
+      else for (const [, setFieldError] of fields) setFieldError(message);
     } finally {
       setPlanningBusy(false);
     }
@@ -1433,6 +1624,113 @@ export function RunDefaults() {
         </div>
       </Card>
 
+      {/* Task review model (PRD #1570 M1), one per harness: the model the optional
+          `uzi handoff --review` pass uses. Lanes follow showClaudeLane / showCodexLane. */}
+      <Card className="space-y-4">
+        <div>
+          <SectionTitle>Task review</SectionTitle>
+          <p className="mt-2 text-sm text-muted">
+            The model and effort the optional <code>uzi handoff --review</code> pass uses to review a task
+            run&rsquo;s work. The effort follows your worker effort unless you set one here. Applies to your own runs only.
+          </p>
+        </div>
+        <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
+          {showClaudeLane && (
+            <div className="space-y-1.5">
+              <Field label="Claude task-review model" htmlFor="task-review-model">
+                <Input
+                  id="task-review-model"
+                  value={taskReviewModel}
+                  placeholder={TASK_REVIEW_CLAUDE_DEFAULT}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-describedby={
+                    [claudeTaskReviewCell && "task-review-model-effect", "task-review-model-help", taskReviewModelWarning && "task-review-model-warning"]
+                      .filter(Boolean).join(" ")
+                  }
+                  onChange={(e) => setTaskReviewModel(e.target.value)}
+                />
+              </Field>
+              {claudeTaskReviewCell && (
+                <p id="task-review-model-effect" className="text-xs text-faint">
+                  {taskReviewClaudeInEffect(claudeTaskReviewCell)}
+                </p>
+              )}
+              <p id="task-review-model-help" className="text-xs text-faint">Leave empty for the SDK default.</p>
+              {taskReviewModelWarning && (
+                <div id="task-review-model-warning"><Alert message={taskReviewModelWarning} tone="warning" /></div>
+              )}
+              <Button
+                type="button"
+                disabled={taskReviewModelBusy || !taskReviewModelDirty || taskReviewModelWarning !== ""}
+                onClick={saveTaskReviewModel}
+              >
+                Save Claude task-review model
+              </Button>
+              <Field label="Claude task-review effort" htmlFor="task-review-effort">
+                <EffortSelect
+                  id="task-review-effort"
+                  value={taskReviewEffort}
+                  onChange={setTaskReviewEffort}
+                  defaultLabel={taskReviewEffortDefaultLabel(claudeTaskReviewEffortCell)}
+                  runtimeLabel="Runtime default"
+                />
+              </Field>
+              <Button
+                type="button"
+                disabled={taskReviewEffortBusy || !taskReviewEffortDirty}
+                onClick={() => saveTaskReviewEffort("claude")}
+              >
+                Save Claude task-review effort
+              </Button>
+            </div>
+          )}
+          {showCodexLane && (
+            <div className="space-y-1.5">
+              <Field label="Codex task-review model" htmlFor="codex-task-review-model">
+                <ModelSelect
+                  id="codex-task-review-model"
+                  harness="codex"
+                  models={CODEX_ROLE_MODELS}
+                  value={codexTaskReviewModel}
+                  onChange={setCodexTaskReviewModel}
+                  defaultLabel={codexTaskReviewDefaultLabel}
+                  ariaDescribedBy={codexTaskReviewCell ? "codex-task-review-model-effect" : undefined}
+                />
+              </Field>
+              {codexTaskReviewCell && (
+                <p id="codex-task-review-model-effect" className="text-xs text-faint">
+                  {modelInEffect(codexTaskReviewCell)}
+                </p>
+              )}
+              <Button
+                type="button"
+                disabled={codexTaskReviewModelBusy || !codexTaskReviewModelDirty}
+                onClick={saveCodexTaskReviewModel}
+              >
+                Save Codex task-review model
+              </Button>
+              <Field label="Codex task-review effort" htmlFor="codex-task-review-effort">
+                <EffortSelect
+                  id="codex-task-review-effort"
+                  value={codexTaskReviewEffort}
+                  onChange={setCodexTaskReviewEffort}
+                  defaultLabel={taskReviewEffortDefaultLabel(codexTaskReviewEffortCell)}
+                  runtimeLabel="Runtime default"
+                />
+              </Field>
+              <Button
+                type="button"
+                disabled={codexTaskReviewEffortBusy || !codexTaskReviewEffortDirty}
+                onClick={() => saveTaskReviewEffort("codex")}
+              >
+                Save Codex task-review effort
+              </Button>
+            </div>
+          )}
+        </div>
+      </Card>
+
       <Card className="space-y-4">
         <div>
           <SectionTitle>Automatic CI fixes</SectionTitle>
@@ -1727,7 +2025,7 @@ export function RunDefaults() {
         )}
       </Card>
 
-      {/* Claude planning model and effort (PRD #3252): used while a run plans; the run
+      {/* Planning model and effort (PRD #3252): used while a run plans; the run
           continues on the worker model and effort above once the plan is approved. */}
       <Card className="space-y-5">
         <div>
@@ -1741,49 +2039,70 @@ export function RunDefaults() {
           <Skeleton className="h-9 w-full max-w-sm" />
         ) : (
           <div className="space-y-3">
-            <Field label="Claude planning model" htmlFor="planning-claude-model">
-              <ModelSelect
-                id="planning-claude-model"
-                value={planningModel}
-                onChange={(v) => { setPlanningModel(v); setPlanningModelError(""); }}
-                harness="claude"
-                defaultLabel={planningModelDefaultLabel}
-                customAriaLabel="Custom Claude planning model ID"
-                onCustomModeChange={setPlanningModelCustom}
-                ariaDescribedBy={planningModelDescribedBy}
-              />
-            </Field>
-            {planningModelWarning && (
-              <div id="planning-model-warning">
-                <Alert message={planningModelWarning} tone="warning" />
-              </div>
-            )}
-            {planningCustomEmpty && (
-              <p id="planning-model-empty" className="text-xs text-danger" role="alert">
-                Enter a custom model ID, or choose Same as the run.
-              </p>
-            )}
-            {planningModelError && (
-              <p id="planning-model-error" className="text-xs text-danger" role="alert">
-                {planningModelError}
-              </p>
-            )}
-            <Field label="Claude planning effort" htmlFor="planning-claude-effort">
-              <EffortSelect
-                id="planning-claude-effort"
-                value={planningEffort}
-                onChange={(v) => { setPlanningEffort(v); setPlanningEffortError(""); }}
-                defaultLabel={planningEffortDefaultLabel}
-              />
-            </Field>
-            {planningEffortError && (
-              <p id="planning-effort-error" className="text-xs text-danger" role="alert">
-                {planningEffortError}
-              </p>
-            )}
+            {showClaudeLane && <>
+              <Field label="Claude planning model" htmlFor="planning-claude-model">
+                <ModelSelect
+                  id="planning-claude-model"
+                  value={planningModel}
+                  onChange={(v) => { setPlanningModel(v); setPlanningModelError(""); }}
+                  harness="claude"
+                  defaultLabel={planningModelDefaultLabel}
+                  customAriaLabel="Custom Claude planning model ID"
+                  onCustomModeChange={setPlanningModelCustom}
+                  ariaDescribedBy={planningModelDescribedBy}
+                />
+              </Field>
+              {planningModelWarning && (
+                <div id="planning-model-warning">
+                  <Alert message={planningModelWarning} tone="warning" />
+                </div>
+              )}
+              {planningCustomEmpty && (
+                <p id="planning-model-empty" className="text-xs text-danger" role="alert">
+                  Enter a custom model ID, or choose Same as the run.
+                </p>
+              )}
+              {planningModelError && (
+                <p id="planning-model-error" className="text-xs text-danger" role="alert">
+                  {planningModelError}
+                </p>
+              )}
+              <Field label="Claude planning effort" htmlFor="planning-claude-effort">
+                <EffortSelect
+                  id="planning-claude-effort"
+                  value={planningEffort}
+                  onChange={(v) => { setPlanningEffort(v); setPlanningEffortError(""); }}
+                  defaultLabel={planningEffortDefaultLabel}
+                />
+              </Field>
+              {planningEffortError && (
+                <p id="planning-effort-error" className="text-xs text-danger" role="alert">
+                  {planningEffortError}
+                </p>
+              )}
+            </>}
+            {showCodexLane && <>
+              <Field label="Codex planning model" htmlFor="planning-codex-model">
+                <ModelSelect id="planning-codex-model" harness="codex" allowCustom
+                  value={planningCodexModel} defaultLabel={planningCodexModelDefaultLabel}
+                  onChange={v => { setPlanningCodexModel(v); setPlanningCodexModelError(""); }}
+                  customAriaLabel="Custom Codex planning model ID" onCustomModeChange={setPlanningCodexModelCustom}
+                  ariaDescribedBy={[planningCodexModelWarning && "planning-codex-model-warning", planningCodexCustomEmpty && "planning-codex-model-empty", planningCodexModelError && "planning-codex-model-error"].filter(Boolean).join(" ") || undefined}
+                />
+              </Field>
+              {planningCodexModelWarning && <p id="planning-codex-model-warning" className="text-xs text-danger" role="alert">{planningCodexModelWarning}</p>}
+              {planningCodexCustomEmpty && <p id="planning-codex-model-empty" className="text-xs text-danger" role="alert">Enter a custom model ID, or choose Same as the run.</p>}
+              {planningCodexModelError && <p id="planning-codex-model-error" className="text-xs text-danger" role="alert">{planningCodexModelError}</p>}
+              <Field label="Codex planning effort" htmlFor="planning-codex-effort">
+                <EffortSelect id="planning-codex-effort" value={planningCodexEffort}
+                  defaultLabel={planningCodexEffortDefaultLabel}
+                  onChange={v => { setPlanningCodexEffort(v); setPlanningCodexEffortError(""); }} />
+              </Field>
+              {planningCodexEffortError && <p id="planning-codex-effort-error" className="text-xs text-danger" role="alert">{planningCodexEffortError}</p>}
+            </>}
             <Button
               type="button"
-              disabled={planningBusy || planningBlocked || !(planningModelDirty || planningEffortDirty)}
+              disabled={planningBusy || (showClaudeLane && planningBlocked) || (showCodexLane && planningCodexBlocked) || !(planningModelDirty || planningEffortDirty || planningCodexModelDirty || planningCodexEffortDirty)}
               onClick={savePlanning}
             >
               Save planning defaults

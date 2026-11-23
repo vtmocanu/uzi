@@ -80,7 +80,7 @@ type ServerInputs struct {
 	// TemplateEffort is the lead template's stored effort for the case's harness family (issue #3258
 	// N3); absent or null is unset. It applies only when UserEffort is unset.
 	TemplateEffort *string `json:"template_effort"`
-	// PlanningModel and PlanningEffort are the owner's Claude planning columns (PRD #3252);
+	// PlanningModel and PlanningEffort are the owner's planning columns for the case's harness (PRDs #3252/#3253);
 	// null is unset.
 	PlanningModel  *string `json:"planning_model"`
 	PlanningEffort *string `json:"planning_effort"`
