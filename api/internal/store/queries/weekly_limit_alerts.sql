@@ -1,4 +1,4 @@
--- PRD #4123 M3: the weekly-limit warning ledger (weekly_limit_alerts, migration 00510).
+-- PRD #4123 M3: the weekly-limit warning ledger (weekly_limit_alerts, migration 00513).
 -- Every query is keyed by the owning user AND the credential, and every observation
 -- comparison happens here in SQL, never in Go.
 

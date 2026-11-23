@@ -5,12 +5,12 @@
 -- (the park explanations are unaffected). The default is 15.
 --
 -- Additive: one NOT NULL column with a constant default (no table rewrite). The CHECK is added NOT
--- VALID and validated in 00509, the two-step pattern of 00366/00368, so the ADD takes no validating
+-- VALID and validated in 00512, the two-step pattern of 00366/00368, so the ADD takes no validating
 -- scan under the ACCESS EXCLUSIVE lock. The ALTER takes a brief lock on users, so the statement times
 -- out rather than queue behind a long transaction and stall logins.
 --
--- The migration number is a draft: it is renumbered above the live head at landing, the pair (00508,
--- 00509) together.
+-- The migration number is a draft: it is renumbered above the live head at landing, the pair (00511,
+-- 00512) together.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE users
