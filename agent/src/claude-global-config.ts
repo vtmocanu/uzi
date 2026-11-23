@@ -21,7 +21,8 @@
 // and is worker-owned, never group- or world-writable (a setgid bit inherited from HOME is
 // tolerated): mode 0755 under the uid split (the runner cannot write it), 0555 with one uid (the CLI
 // is then the directory's owner and would otherwise write it; with 0555 the pinned CLI saves and
-// creates nothing, see the probes below, so the next start finds it unchanged and reuses it). Only those two links are made: session-env and shell-snapshots (sourced by Bash),
+// creates nothing, see the probes below, so the next start finds it unchanged and reuses it).
+// Only those two links are made: session-env and shell-snapshots (sourced by Bash),
 // plugins, hooks, skills, commands and agents (configuration and code) are deliberately not linked,
 // so the CLI finds them absent in a directory it cannot create them in. Only ONE of `.claude.json`
 // and `.config.json` is present, because the CLI prints a warning when both exist and prefers
@@ -68,18 +69,23 @@
 //
 // Targets. `<HOME>/.claude/projects` and `<HOME>/.claude/tasks` must exist and be writable by the
 // CLI. Missing ones are created AS THE RUNNER UID (a fixed worker-authored `/bin/mkdir -p -m 700`
-// argv through runnerCommand, workerSpawnEnv on a minimal PATH env, no shell, 5 s SIGKILL bound; a
-// non-zero exit, signal or spawn error refuses the start), so they are runner-owned and private
-// (0700) exactly as when the CLI created them, and neither runner-cmd (the Codex command uid, which
-// shares group runner) nor the worker ever holds a write path into a Claude transcript directory.
-// The worker never writes under `.claude`. That mkdir follows a runner-planted symlink only with
-// the runner's own permissions, so it needs no confinement. With one uid the same argv is spawned
-// directly (worker == runner). `.claude` that is not a real directory (a symlink, a file) is
-// renamed aside (rename does not follow) and recreated. Where the worker can look inside `.claude`,
-// a `projects` that is not a real directory makes it rename `.claude` aside and recreate it (the
-// transcripts stay in the aside copy, so a resume of that session finds nothing); a `.claude` the
-// worker cannot open (runner-private) is not inspected and the mkdir is simply repeated (it is
-// idempotent).
+// argv through runnerCommand, workerSpawnEnv on a minimal PATH env, no shell; the spawnSync timeout
+// is not a hard bound, see defaultMkdirAsRunner; a non-zero exit, signal or spawn error is a
+// failure), so they are runner-owned and private (0700) exactly as when the CLI created them, and
+// neither runner-cmd (the Codex command uid, which shares group runner) nor the worker ever holds
+// a write path into a Claude transcript directory. The worker never writes or renames anything
+// under `.claude`; the only thing it ever moves is the `.claude` entry itself in HOME. That mkdir
+// follows a runner-planted symlink only with the runner's own permissions, so it needs no
+// confinement. With one uid the same argv is spawned directly (worker == runner). `.claude` that
+// is not a real directory (a symlink, a file) is renamed aside (rename does not follow) and
+// recreated. Where the worker can look inside `.claude`, a `projects` or `tasks` that is not a real
+// directory makes it rename `.claude` aside and recreate it (the transcripts stay in the aside
+// copy, so a resume of that session finds nothing). A `.claude` the worker cannot open
+// (runner-private, the split's normal state) is not inspected and the mkdir is simply repeated (it
+// is idempotent); when that mkdir fails (a file or dangling symlink at a target, an unsearchable
+// `.claude`), `.claude` is renamed aside ONCE and the mkdir retried, and a second failure refuses
+// the start. That keeps a runner-planted target from refusing every later start of a HOME, the
+// shared chat HOME included.
 //
 // Not reset any more: `<HOME>/.claude.json` and `<HOME>/.claude/*` are not read by the CLI, so
 // they are no longer replaced or removed.
@@ -195,7 +201,10 @@ function renameAside(p: string): void {
 }
 
 /** Run `/bin/mkdir <args>` as the runner uid (directly with one uid). A fixed worker-authored argv:
- *  workerSpawnEnv on a minimal PATH env, no shell, bounded, and any failure is a refusal. */
+ *  workerSpawnEnv on a minimal PATH env, no shell; any failure throws. The spawnSync timeout and
+ *  SIGKILL only bound the wait until the kill is attempted: under the split the child is the runner
+ *  uid after setpriv and the worker cannot kill(2) it (EPERM, see runner-uid.ts), so no stronger
+ *  bound is claimed. The argv is fixed and the command short-lived. */
 function defaultMkdirAsRunner(args: readonly string[]): void {
   const wrapped = runnerCommand(MKDIR_BIN, args);
   const r = spawnSync(wrapped.command, wrapped.args, {
@@ -211,6 +220,7 @@ function defaultMkdirAsRunner(args: readonly string[]): void {
 /** Make `<HOME>/.claude/{projects,tasks}` exist, writable by the CLI (see the Targets section). */
 function ensureTargets(home: string, mkdir: (args: readonly string[]) => void, step: (name: string) => void): void {
   const claude = path.join(home, ".claude");
+  let retriedAfterMkdirFailure = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const st = fs.lstatSync(claude, { throwIfNoEntry: false });
     if (st !== undefined && !st.isDirectory()) {
@@ -235,24 +245,27 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => void, s
         if (c !== "ENOENT") throw err;
       }
       if (t === undefined) missing.push(target);
-      else if (!t.isDirectory()) {
-        if (name === "projects") aside = true;
-        else {
-          try {
-            fs.renameSync(target, `${target}.stale-${hex()}`);
-            missing.push(target);
-          } catch {
-            /* cannot move it: leave it, TaskCreate then fails soft */
-          }
-        }
-      }
+      else if (!t.isDirectory()) aside = true;
     }
     if (aside) {
       renameAside(claude);
       step("claude-aside");
       continue;
     }
-    if (missing.length > 0) mkdir(["-p", "-m", "700", "--", ...missing]);
+    if (missing.length > 0) {
+      try {
+        mkdir(["-p", "-m", "700", "--", ...missing]);
+      } catch (err) {
+        // Under the split the worker cannot look into the runner-private .claude, so a non-directory
+        // (or an unsearchable .claude) shows up only as this failure. Move the HOME entry aside once
+        // and rebuild; a second failure refuses the start.
+        if (retriedAfterMkdirFailure) throw err;
+        retriedAfterMkdirFailure = true;
+        renameAside(claude);
+        step("claude-aside");
+        continue;
+      }
+    }
     return;
   }
   throw refuse("the .claude targets could not be prepared");
@@ -262,7 +275,7 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => void, s
  *  uid (the CLI is the owner, so only the mode keeps it from writing). */
 const configDirMode = (): number => (uidSplitActive() ? 0o755 : 0o555);
 
-type Seen ={ state: "absent" | "ok" | "rewrite" } | { state: "bad"; dev: number; ino: number };
+type Seen = { state: "absent" | "ok" | "rewrite" } | { state: "bad"; dev: number; ino: number };
 
 /** Classify the config directory without following anything. `rewrite`: a real, worker-owned
  *  directory in the expected shape whose `.claude.json` has other bytes or mode. */

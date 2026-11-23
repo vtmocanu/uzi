@@ -375,6 +375,31 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await assertSentinelIntact();
   });
 
+  // PRD #4416 review: under the split HOME/.claude is runner-private, so the worker cannot look
+  // inside it. A runner-planted file at a target must not refuse every later start of that HOME
+  // (the shared chat root): the failed runner mkdir moves .claude aside once and recreates it.
+  it("a runner-planted file at .claude/projects does not refuse the start: .claude is moved aside and rebuilt (#4416)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004417");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    const cliEnv = { HOME: home, CLAUDE_CONFIG_DIR: configDir.claudeConfigDir(home) };
+    asRunner(`set -e; umask 077; mkdir -p "$1/.claude"; echo x > "$1/.claude/projects"; mkdir "$1/.claude/tasks"`, home);
+
+    config.prepareClaudeConfigDir(cliEnv);
+
+    assert.equal((await fs.readdir(home)).filter((n) => n.startsWith(".claude.stale-")).length, 1, ".claude was moved aside once");
+    const claude = await fs.lstat(path.join(home, ".claude"));
+    assert.equal(claude.uid, runnerUid.RUNNER_UID, "the fresh .claude is runner-owned");
+    assert.equal(claude.mode & 0o7777, 0o700, "and private");
+    asRunner(
+      `set -e; for t in projects tasks; do test -d "$1/.claude/$t"; test ! -L "$1/.claude/$t"; test "$(stat -c %a "$1/.claude/$t")" = 700; test "$(stat -c %u "$1/.claude/$t")" = 10002; done`,
+      home,
+    );
+    assert.equal(await fs.readFile(path.join(cliEnv.CLAUDE_CONFIG_DIR, ".claude.json"), "utf8"), config.CLAUDE_GLOBAL_CONFIG_BYTES);
+    await rmtree.rmHomeTree(home);
+    assert.equal(await exists(home), false);
+  });
+
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {
     const terminal = await makeLeakedHome("00000000-0000-4000-8000-00000000000a", 0o2770);
     const running = await makeLeakedHome("00000000-0000-4000-8000-00000000000b", 0o2770);

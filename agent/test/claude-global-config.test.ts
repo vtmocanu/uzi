@@ -371,6 +371,84 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
     assert.ok(fs.statSync(path.join(home, ".claude", "tasks")).isDirectory(), "the missing tasks dir was added");
     assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")), []);
   });
+
+  const claudeStale = (): string[] => fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-"));
+  const assertTargets = (): void => {
+    for (const t of ["projects", "tasks"]) {
+      const st = fs.lstatSync(path.join(home, ".claude", t));
+      assert.ok(st.isDirectory() && !st.isSymbolicLink(), t);
+      assert.strictEqual(st.mode & 0o7777, 0o700, t);
+    }
+  };
+
+  it("a regular file at .claude/projects or .claude/tasks: .claude is moved aside and the start is not refused (default mkdir)", () => {
+    for (const name of ["projects", "tasks"]) {
+      const h = path.join(root, `file-${name}`);
+      fs.mkdirSync(path.join(h, ".claude"), { recursive: true });
+      fs.writeFileSync(path.join(h, ".claude", name), "FILE");
+      prepareClaudeConfigDir(envOf(h));
+      for (const t of ["projects", "tasks"]) assert.ok(fs.lstatSync(path.join(h, ".claude", t)).isDirectory(), `${name}: ${t}`);
+      assert.strictEqual(fs.readdirSync(h).filter((f) => f.startsWith(".claude.stale-")).length, 1, name);
+    }
+  });
+
+  it("the default runner mkdir failing (unsearchable .claude) moves .claude aside once and recreates the targets", { skip: process.getuid?.() === 0 }, () => {
+    fs.mkdirSync(path.join(home, ".claude"));
+    fs.chmodSync(path.join(home, ".claude"), 0o000);
+    prepareClaudeConfigDir(envOf());
+    assertTargets();
+    assert.strictEqual(claudeStale().length, 1);
+    assertFixedDir(dirOf());
+  });
+
+  it("a runner mkdir that fails once is retried after .claude is moved aside; failing twice refuses", () => {
+    fs.mkdirSync(path.join(home, ".claude"));
+    let calls = 0;
+    prepareClaudeConfigDir(envOf(), {
+      mkdirAsRunner: (a) => {
+        if (++calls === 1) throw new Error("mkdir failed");
+        mkdirStub(a);
+      },
+    });
+    assert.strictEqual(calls, 3, "targets (fails), .claude, targets");
+    assert.strictEqual(claudeStale().length, 1);
+    assertTargets();
+
+    const h = path.join(root, "twice");
+    fs.mkdirSync(path.join(h, ".claude"), { recursive: true });
+    let n = 0;
+    assert.throws(
+      () => prepareClaudeConfigDir(envOf(h), { mkdirAsRunner: () => { n++; throw new Error("mkdir failed"); } }),
+      TrustedExecutionRefusal,
+    );
+    assert.strictEqual(n, 2, "the targets mkdir fails, .claude moves aside, the retry fails, then refusal");
+    assert.ok(!fs.existsSync(claudeConfigDir(h)), "no config directory is built");
+  });
+
+  describe("one uid: a 0555 config directory that was tampered with is detected and rebuilt", { skip: process.getuid?.() === 0 }, () => {
+    const tamper = (fn: (dir: string) => void): void => {
+      prep(envOf());
+      fs.chmodSync(dirOf(), 0o755);
+      fn(dirOf());
+      fs.chmodSync(dirOf(), 0o555);
+      prep(envOf());
+      assertFixedDir(dirOf());
+      assert.strictEqual(staleNames().length, 1, "the tampered directory is kept aside");
+    };
+    it("an extra entry", () => tamper((d) => fs.writeFileSync(path.join(d, "remote-settings.json"), MALICIOUS)));
+    it("a retargeted link", () =>
+      tamper((d) => {
+        fs.rmSync(path.join(d, "projects"));
+        fs.symlinkSync(outside, path.join(d, "projects"));
+      }));
+    it("other bytes in .claude.json", () =>
+      tamper((d) => {
+        fs.chmodSync(path.join(d, ".claude.json"), 0o644);
+        fs.writeFileSync(path.join(d, ".claude.json"), '{"hasCompletedOnboarding":true,"numStartups":2}\n');
+        fs.chmodSync(path.join(d, ".claude.json"), 0o444);
+      }));
+    it("another mode on .claude.json", () => tamper((d) => fs.chmodSync(path.join(d, ".claude.json"), 0o644)));
+  });
 });
 
 describe("prepareClaudeConfigDir: the uid-split checks", () => {
