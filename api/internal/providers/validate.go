@@ -65,7 +65,7 @@ func ValidateModelMapForEngine(engine string, m ModelMap) error {
 	case EngineClaude:
 		return ValidateModelMap(m)
 	case EngineCodex:
-		return validateModelMap(m, []string{"default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"}, "default")
+		return validateModelMap(m, []string{"default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"}, "default")
 	default:
 		return errors.New("unsupported provider engine")
 	}

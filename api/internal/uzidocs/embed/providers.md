@@ -234,7 +234,7 @@ picks the source from the provider's engine; clearing needs the engine named
 `PUT /api/me/providers/codex-source` or `.../claude-source` and accept a Bearer token.
 
 - **Model map.** `default` is required. The optional keys are the Codex model ids uzi can send:
-  `gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6-luna`. Each entry is
+  `gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra` and `gpt-6-luna`. Each entry is
   `model[:context_window]` as for Claude (8,192 to 10,000,000 tokens).
   - **An explicit model you pick** (`--model` on a run, or a model pinned on a schedule) resolves
     only through its own key. If the map has no such key the run is refused with

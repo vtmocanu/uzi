@@ -79,7 +79,7 @@ describe("mock claude provider source", () => {
 
 it("roundtrips Codex mappings and keeps source selection independent with mismatch 404", async () => {
   const api = await load();
-  const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"].map(role => [role, { model: "gw-" + role, context_window: 32768 }]));
+  const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"].map(role => [role, { model: "gw-" + role, context_window: 32768 }]));
   const { providers, allowed_base_urls } = await api.listProviders();
   const { provider: code } = await api.createProvider({ name: "code", engine: "codex", protocol: "openai_responses", base_url: allowed_base_urls[0], auth_style: "bearer", model_map: map });
   expect(code.model_map).toEqual(map);

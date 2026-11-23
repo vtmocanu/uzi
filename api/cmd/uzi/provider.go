@@ -94,7 +94,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Create a model provider. --base-url must be one of the URLs your operator allowed, exactly\n" +
 			"as listed (path included). --model maps an engine model slot to a gateway model and is repeatable:\n" +
 			"alias=model[:context_window]. Claude: haiku (required), sonnet, opus, fable. Codex: default (required), gpt-6-astra,\n" +
-			"gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol, gpt-6-luna. Codex requires bearer auth.\n" +
+			"gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol, gpt-6.2-sol, gpt-6.2-astra, gpt-6-luna. Codex requires bearer auth.\n" +
 			"Set the context window to the gateway model's real window. Claude: the smallest window set on any\n" +
 			"model applies to all of them; with none set, uzi assumes 200000.\n" +
 			"Claude caveat: the Claude CLI may apply its own window to model names it recognizes as Anthropic\n" +
@@ -494,6 +494,10 @@ func parseModelFlags(vals []string) (apitypes.ModelMapDTO, error) {
 			mm.GPT6Sol = &entry
 		case "gpt-6.1-sol":
 			mm.GPT61Sol = &entry
+		case "gpt-6.2-sol":
+			mm.GPT62Sol = &entry
+		case "gpt-6.2-astra":
+			mm.GPT62Astra = &entry
 		case "gpt-6-luna":
 			mm.GPT6Luna = &entry
 		case "haiku":
@@ -562,6 +566,8 @@ func modelsCell(m apitypes.ModelMapDTO) string {
 	add("gpt-5.6-sol", m.GPT56Sol)
 	add("gpt-6-sol", m.GPT6Sol)
 	add("gpt-6.1-sol", m.GPT61Sol)
+	add("gpt-6.2-sol", m.GPT62Sol)
+	add("gpt-6.2-astra", m.GPT62Astra)
 	add("gpt-6-luna", m.GPT6Luna)
 	return strings.Join(parts, " ")
 }
