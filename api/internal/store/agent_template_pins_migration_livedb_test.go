@@ -3,12 +3,10 @@ package store
 import (
 	"context"
 	"reflect"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 // Uses a separate database: never rolls back the shared store-IT database.
@@ -32,14 +30,9 @@ func TestAgentTemplatePinMigrationUpDownLiveDB(t *testing.T) {
 		customized      bool
 	}
 	ptr := func(s string) *string { return &s }
-	ids := make([]string, 0, len(agenttmpl.CodexRoleModels))
-	for id := range agenttmpl.CodexRoleModels {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	if len(ids) == 0 || !agenttmpl.CodexRoleModels["gpt-6-luna"] {
-		t.Fatal("role registry must include luna")
-	}
+	// The applied 00401 migration recognizes these historical role IDs only.
+	// Current vocabulary additions must not change which saved pins it moved.
+	ids := []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}
 	var fixtures []fixture
 	for _, scope := range []string{"builtin", "global", "user"} {
 		cases := []struct{ input, moved *string }{
@@ -47,6 +40,7 @@ func TestAgentTemplatePinMigrationUpDownLiveDB(t *testing.T) {
 			{ptr("vgpt-6-sol"), nil}, {ptr("gpt-6-solv"), nil},
 			{ptr(" \t" + "gpt-6-sol" + "\n "), ptr("gpt-6-sol")},
 			{ptr("\vgpt-6-luna\v"), ptr("gpt-6-luna")},
+			{ptr("gpt-6.2-sol"), nil}, {ptr("gpt-6.2-astra"), nil},
 		}
 		for _, id := range ids {
 			cases = append(cases, struct{ input, moved *string }{ptr(id), ptr(id)})
@@ -101,7 +95,7 @@ func TestAgentTemplatePinMigrationUpDownLiveDB(t *testing.T) {
 		if counts[scope] != len(ids)+2 {
 			t.Fatalf("%s moved %d want %d", scope, counts[scope], len(ids)+2)
 		}
-		t.Logf("%s: verified %d recognized moves and 5 unchanged cases", scope, counts[scope])
+		t.Logf("%s: verified %d recognized moves and 7 unchanged cases", scope, counts[scope])
 	}
 	// Post-upgrade dual pins deliberately lose the Codex pin on Down; a Codex-only
 	// pin created after upgrade is restored to the legacy column.
