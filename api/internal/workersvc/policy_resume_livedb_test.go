@@ -31,7 +31,7 @@ func newPolicyLive(t *testing.T) policyLive {
 	t.Helper()
 	e := setupInterlockLiveDB(t)
 	svc, _ := e.providerParkService(t, ppBound)
-	caps := []string{capability.ProviderPolicyHoldV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	caps := []string{capability.ProviderPolicyHoldV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	wid := e.seedWorker(t, caps)
 	worker, err := e.q.GetWorkerByID(e.ctx, wid)
 	if err != nil {
@@ -657,8 +657,8 @@ func TestPolicySavedWorkHeadLiveDB(t *testing.T) {
 	t.Run("only a policy-capable worker claims a saved-work row", func(t *testing.T) {
 		p := newPolicyLive(t)
 		id := p.savedWorkRun(t, a)
-		plain := p.e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
-		if run, err := p.e.q.ClaimRun(p.e.ctx, p.e.claimParams(plain, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false)); err == nil {
+		plain := p.e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3})
+		if run, err := p.e.q.ClaimRun(p.e.ctx, p.e.claimParams(plain, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}, false)); err == nil {
 			t.Fatalf("incapable worker claimed saved-work run %s", run.ID)
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatal(err)

@@ -17,7 +17,7 @@ func planCrossCheckClaimParams(f *awaitingInputFixture) store.ClaimRunParams {
 		SpreadCutoff:             planCrossCheckTime(time.Now().Add(-time.Minute)),
 		CrossCheckEvaluatedAt:    planCrossCheckTime(time.Now()),
 		CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-2 * time.Minute)),
-		WorkerProtocolCaps:       []string{"codex_harness_v1", "codex_runtime_v2", "cross_check_v1", "codex_custom_model_v1"}}
+		WorkerProtocolCaps:       []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "cross_check_v1", "codex_custom_model_v1"}}
 }
 
 // Polling has a context deadline and returns early if the contender completes.

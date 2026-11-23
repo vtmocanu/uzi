@@ -1519,7 +1519,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- @worker_protocol_caps param the completion clause reads (the claimant's stored
       -- workers.protocol_capabilities, passed by the Go caller).
       AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-           OR ('codex_harness_v1' = ANY(@worker_protocol_caps::text[]) AND 'codex_runtime_v2' = ANY(@worker_protocol_caps::text[])))
+           OR ('codex_harness_v1' = ANY(@worker_protocol_caps::text[]) AND 'codex_runtime_v2' = ANY(@worker_protocol_caps::text[]) AND 'codex_runtime_v3' = ANY(@worker_protocol_caps::text[])))
       -- Issue #4476: Codex claim provenance. A Codex-indicating run that has been claimed before (generation >= 1)
       -- is claimable only by its last successful Codex claimant for the CURRENT generation. Standalone,
       -- like the clauses above; never bypassed by capability or affinity overrides.
@@ -1825,7 +1825,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- the peer's OWN workers.protocol_capabilities column directly (no Go param, unlike the
                 -- claimant's @worker_protocol_caps).
                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                     OR ('codex_harness_v1' = ANY(p.protocol_capabilities) AND 'codex_runtime_v2' = ANY(p.protocol_capabilities)))
+                     OR ('codex_harness_v1' = ANY(p.protocol_capabilities) AND 'codex_runtime_v2' = ANY(p.protocol_capabilities) AND 'codex_runtime_v3' = ANY(p.protocol_capabilities)))
                 -- Issue #4476: MIRROR the Codex claim-provenance clause for the peer, so a recorded worker never
                 -- defers to a peer that provenance would stop from claiming the run.
                 AND fn_codex_claim_provenance_admits(r, p.id)
@@ -12017,7 +12017,7 @@ WHERE run.id = @run_id
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.kind = 'prompt' AND run.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = run.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
-       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
+       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)))
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
@@ -12381,7 +12381,7 @@ WHERE w.user_id = @user_id
   -- claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
-  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities);
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities);
 
 -- name: CountOnlineWorkersSatisfyingCodexCompletion :one
 -- Static protocol intersection for an interlocked Codex run. Ignore free slots and the
@@ -12397,7 +12397,7 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
-  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
   AND 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND (NOT @custom_root::boolean OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities));
 
@@ -12430,7 +12430,7 @@ WHERE w.user_id = @user_id
   -- claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
-  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   AND (NOT @phase_models_required::boolean OR 'codex_phase_models_v1' = ANY(w.protocol_capabilities));
 
@@ -12452,7 +12452,7 @@ WHERE w.user_id = @user_id
   -- The lane half of ClaimRun's isolated-lane clause: a lane worker never claims an unbound run.
   AND NOT w.isolated_lane
   AND CASE @harness::text WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities)
-  AND (@harness::text <> 'codex' OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)));
+  AND (@harness::text <> 'codex' OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)));
 
 -- name: CountOnlineWorkersSatisfyingJobRunner :one
 -- PRD #1908 (D-A): how many of a user's ONLINE, non-draining, non-ephemeral, NON-docker workers
@@ -12844,7 +12844,7 @@ WHERE r.status = 'queued'
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
@@ -12958,7 +12958,7 @@ WHERE r.status = 'queued'
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))

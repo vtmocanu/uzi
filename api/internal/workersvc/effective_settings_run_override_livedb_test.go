@@ -181,7 +181,7 @@ func TestEffectiveSettingsRunOverrideUnhonorableIsNeverSubstitutedLiveDB(t *test
 
 			fx.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, run.ID, fx.workerID)
 			w := store.Worker{ID: fx.workerID, UserID: fx.userID, ProtocolCapabilities: []string{
-				capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1,
+				capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1,
 			}}
 			if _, err := fx.svc.assembleClaim(fx.env.ctx, w, mustRun(t, fx.env, run.ID)); !errors.Is(err, errRunOverrideUnavailable) {
 				t.Fatalf("assembleClaim = %v, want errRunOverrideUnavailable (the claim parks, never substitutes)", err)

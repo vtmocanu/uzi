@@ -26,7 +26,7 @@ func TestPlanCrossCheckRoundTwoFleetPeerDeferralLiveDB(t *testing.T) {
 				t.Cleanup(func() { mustExec(fx.ctx, t, fx.pool, "DELETE FROM users WHERE id=$1", fx.userID) })
 				a, b := fx.worker("busy", capOf(2), false), fx.worker("idle", capOf(2), false)
 				protocols := func(current bool) []string {
-					caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+					caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 					if current {
 						caps = append(caps, capability.CrossCheckRoundsV1)
 					}

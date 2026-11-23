@@ -599,7 +599,7 @@ func TestCompletionLifecycleAcceptLiveDB(t *testing.T) {
 // nothing; the four-capability worker claims, is denied with m5 undone, and is granted once m5 is declared.
 func TestCompletionLifecycleCodexParityLiveDB(t *testing.T) {
 	f := newLifecycleFixture(t, HarnessCodex)
-	oldCodex := []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	oldCodex := []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	r := f.reachFrozenRunning(t, oldCodex, codexCompletionCaps(), 5)
 
 	res := r.attempt(t, lifecycleHead1, "m1", "m2", "m3", "m4")

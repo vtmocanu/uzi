@@ -98,7 +98,7 @@ AND max_cross_check_slots > 0
 AND 'cross_check_code_v1'=ANY(protocol_capabilities)
 AND 'cross_check_lane_v1'=ANY(protocol_capabilities)
 AND 'codex_harness_v1'=ANY(protocol_capabilities)
-AND 'codex_runtime_v2'=ANY(protocol_capabilities))`, user.ID).Scan(&available)
+AND 'codex_runtime_v2'=ANY(protocol_capabilities) AND 'codex_runtime_v3'=ANY(protocol_capabilities))`, user.ID).Scan(&available)
 		if err != nil {
 			slog.Error("check code cross-check workers", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

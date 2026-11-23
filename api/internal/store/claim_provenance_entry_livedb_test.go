@@ -274,7 +274,7 @@ func TestCodexProvenanceEntryCrossCheckBypassLiveDB(t *testing.T) {
 	fx := newRollAffinityFixture(t)
 	a := fx.worker("A", 0, false)
 	b := fx.worker("B", 0, false)
-	caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = ANY($1)`, []uuid.UUID{a, b}, caps)
 
 	lead, child := fx.unclaimedRun(), fx.unclaimedRun()

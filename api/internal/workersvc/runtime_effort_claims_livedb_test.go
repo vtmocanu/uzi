@@ -22,7 +22,7 @@ func TestRuntimeEffortCodexIssueClaimLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
-	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 	// The Claude column must not influence the Codex claim, and NULL still rides medium.
 	env.exec(`UPDATE users SET default_effort='max',default_codex_effort=NULL WHERE id=$1`, f.userID)
 	payload, err := svc.assembleClaim(env.ctx, worker, run)

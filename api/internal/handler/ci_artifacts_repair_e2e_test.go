@@ -143,7 +143,7 @@ func ciRepairHarnessE2E(ctx context.Context, t *testing.T, node, agent, scratch,
 	defer upstream.Close()
 	mustExecT(ctx, t, f.pool, `UPDATE forge_connections SET forge_type='github',base_url=$1 WHERE user_id=$2`, upstream.URL, f.owner)
 	mustExecT(ctx, t, f.pool, `UPDATE repos SET path_with_namespace='g/repo' WHERE id=$1`, repoID)
-	caps := []string{capability.CIConfigGuardV1, capability.CIArtifactsV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCompletionInterlockV1}
+	caps := []string{capability.CIConfigGuardV1, capability.CIArtifactsV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCompletionInterlockV1}
 	mustExecT(ctx, t, f.pool, `UPDATE workers SET protocol_capabilities=$1,max_concurrent_runs=1 WHERE user_id=$2`, caps, f.owner)
 	if harness == "codex" {
 		sealed, err := box.Seal([]byte("openai-fixture-" + uuid.NewString()))

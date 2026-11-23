@@ -14,7 +14,7 @@ func TestClaimCodexRoleLaneUnchangedLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
-	w := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+	w := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 	// Luna is deliberately included: the Codex lane accepts it as a custom root under
 	// the existing curated capability rule. The Claude lane must not affect this claim.
 	models := append(codexRoleFixture(t), "custom-codex-preview", "")
