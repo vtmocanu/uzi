@@ -15,7 +15,7 @@
 //     supported suppression settings. The production authentication builder below is narrower:
 //     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
 //
-// #4509, pin 0.167.0: apply_patch_freeform is removed/ignored; model catalog metadata
+// #4509, measured at 0.167.0 (pin 0.169.0, not re-measured): apply_patch_freeform is removed/ignored; model catalog metadata
 // overrides code_mode/code_mode_only. Native apply_patch remains advertised under the
 // code-mode host. Registration is not execution authority: explicit environments: []
 // at root thread/start and turn/start (including child, advice, cross-check and cold

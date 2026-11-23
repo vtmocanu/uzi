@@ -40,7 +40,7 @@ before(async () => {
  *  list: it is the authority-free callback-routing execution HOST (off on the advice/stock lane,
  *  enabled on the run lane), asserted posture-by-posture below — not an always-off native-execution
  *  grant. Removed apply_patch_freeform and catalog-overridden code_mode/code_mode_only keys
- *  are construction checks, not runtime suppression proof (pin 0.167.0). Native patch remains
+ *  are construction checks, not runtime suppression proof (measured at 0.167.0; pin 0.169.0 not re-measured). Native patch remains
  *  advertised; environments: [] and launcher CODEX_EXEC_SERVER_URL=none deny execution. */
 const NATIVE_FEATURES = [
   "goals",

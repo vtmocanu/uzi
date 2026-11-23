@@ -234,7 +234,7 @@ These are known, accepted limitations recorded honestly, not defects hiding behi
   observed provider traffic. It does not traverse nested tools or prove nested `apply_patch`
   absent. The [exact inventory matrix](native-patch-inert.test.ts) covers the four curated
   models on fresh and truly cold roots, with nested/direct patch refusal and working nested
-  worker patch/exec controls. At pin 0.167.0, `apply_patch_freeform` is removed/ignored and
+  worker patch/exec controls. Measured at 0.167.0 (pin 0.169.0, not re-measured), `apply_patch_freeform` is removed/ignored and
   model metadata overrides `code_mode` / `code_mode_only`; native patch remains advertised.
   Registration grants no execution authority: explicit `environments: []` at root thread/start
   and turns (including child/advice/cross-check/cold resume), plus replaced launcher

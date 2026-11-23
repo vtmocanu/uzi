@@ -438,7 +438,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     negativeOracle:
       "the fixed config pins project_doc_max_bytes=0 + trust_level untrusted and supported suppression; "
       + "exact false feature keys test construction, not runtime suppression: apply_patch_freeform is "
-      + "removed/ignored and model catalog metadata overrides code_mode/code_mode_only at pin 0.167.0. "
+      + "removed/ignored and model catalog metadata overrides code_mode/code_mode_only at 0.167.0 (pin 0.169.0, not re-measured). "
       + "Native patch remains advertised under the run host; registration is not authority. Unknown "
       + "keys are rejected, no AGENTS.md/.codex input is taken, and start/resume reassert untrusted "
       + "config. Root thread/start and turn/start select environments:[]; thread/resume has no such "
