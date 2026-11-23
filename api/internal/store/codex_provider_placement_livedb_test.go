@@ -9,7 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-const codexPlacementMigration = "00505_placement_codex_provider_capability.sql"
+const codexPlacementMigration = "00518_placement_codex_provider_capability.sql"
 
 func placementMigrationFunction(t *testing.T, section string) string {
 	t.Helper()
@@ -44,7 +44,7 @@ func codexPlacementSections(t *testing.T) (string, string) {
 }
 
 func TestCodexProviderPlacementRestoresOriginalFunction(t *testing.T) {
-	raw, err := os.ReadFile("migrations/00486_placement_provider_capability.sql")
+	raw, err := os.ReadFile("migrations/00507_placement_codex_phase_models.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestCodexProviderPlacementRestoresOriginalFunction(t *testing.T) {
 	up, down := codexPlacementSections(t)
 	prior := placementMigrationFunction(t, original)
 	if placementMigrationFunction(t, down) != prior {
-		t.Fatal("Down does not restore exact 00486 Up function")
+		t.Fatal("Down does not restore exact 00507 Up function")
 	}
 	// Removing just the replacement provider clause must recover every other byte.
 	oldClause := "AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))"
@@ -172,7 +172,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 			break
 		}
 	}
-	if refusal == nil || !strings.Contains(refusal.Error(), "refusing to roll back 00505") {
+	if refusal == nil || !strings.Contains(refusal.Error(), "refusing to roll back 00518") {
 		t.Fatalf("Down refusal=%v", refusal)
 	}
 	if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT guarded_down"); err != nil {
@@ -191,7 +191,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	raw, err := os.ReadFile("migrations/00486_placement_provider_capability.sql")
+	raw, err := os.ReadFile("migrations/00507_placement_codex_phase_models.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

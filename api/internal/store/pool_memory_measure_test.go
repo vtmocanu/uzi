@@ -2201,9 +2201,6 @@ var pmBreadth = []pmEntry{
 	{"CountOnlineWorkersSatisfyingCIConfigGuard", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.CountOnlineWorkersSatisfyingCIConfigGuard(ctx, f.User)
 	}},
-	{"CountOnlineWorkersSatisfyingClaudeProvider", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
-		return q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, f.User)
-	}},
 	{"CountOnlineWorkersSatisfyingCodexHarness", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.CountOnlineWorkersSatisfyingCodexHarness(ctx, f.User)
 	}},
@@ -2215,6 +2212,9 @@ var pmBreadth = []pmEntry{
 	}},
 	{"CountOnlineWorkersSatisfyingPhaseModels", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.CountOnlineWorkersSatisfyingPhaseModels(ctx, store.CountOnlineWorkersSatisfyingPhaseModelsParams{UserID: f.User, Harness: "claude"})
+	}},
+	{"CountOnlineWorkersSatisfyingProvider", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
+		return q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: f.User, Engine: "claude"})
 	}},
 	{"CountOnlineWorkersSatisfyingProtocol", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.CountOnlineWorkersSatisfyingProtocol(ctx, f.User)

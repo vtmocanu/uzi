@@ -2070,13 +2070,13 @@ type User struct {
 	SidebarMotion             pgtype.Bool        `json:"sidebar_motion"`
 	PlanningClaudeModel       pgtype.Text        `json:"planning_claude_model"`
 	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
-	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
 	PlanningCodexModel        pgtype.Text        `json:"planning_codex_model"`
 	PlanningCodexEffort       pgtype.Text        `json:"planning_codex_effort"`
 	TaskReviewModel           pgtype.Text        `json:"task_review_model"`
 	CodexTaskReviewModel      pgtype.Text        `json:"codex_task_review_model"`
 	TaskReviewEffort          pgtype.Text        `json:"task_review_effort"`
 	CodexTaskReviewEffort     pgtype.Text        `json:"codex_task_review_effort"`
+	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
 }
 
 type UserCrossCheckPin struct {

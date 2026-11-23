@@ -2,6 +2,9 @@
 SET LOCAL lock_timeout = '5s';
 
 -- M1 schema seam only; engine-aware runtime consumers are a separate change.
+-- Replaces the current head body of fn_placement_admitting_workers (00507); the only change is the
+-- provider claim clause, which is now engine-aware (Claude needs claude_provider_v1, Codex needs
+-- codex_provider_v1). Down restores that predecessor body.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -54,17 +57,32 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                  AND (r.model_provider_key_mode IS NULL
                       OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
                       OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+                 -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
+                 -- requires its harness's phase-models capability. ClaimRun enforces the same clause;
+                 -- the kind list is pinned to leadcfg.LeadLane by a test.
+                 AND (NOT (r.harness IN ('claude', 'codex')
+                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                           AND r.review_target_run_id IS NULL
+                           AND r.egress_profile_id IS NULL
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END)))
+                      OR CASE r.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
-                         AND COALESCE(
+                         AND (COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
                                  p_checker_model) WHEN r.model = ANY(p_codex_curated_models) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(p_codex_curated_models)),
                              false)
+                  OR (r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND r.egress_profile_id IS NULL
+                      AND NOT COALESCE(r.model = ANY(p_codex_curated_models), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY(p_codex_curated_models)))))
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
                  )
@@ -103,13 +121,13 @@ LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM runs WHERE harness = 'codex' AND model_provider_key_mode IS NOT NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back 00505: Codex provider runs still exist';
+        RAISE EXCEPTION 'refusing to roll back 00518: Codex provider runs still exist';
     END IF;
 END
 $$;
 -- +goose StatementEnd
 
--- Restore the original 00486 Up definition.
+-- Restore the 00507 Up definition (the head body before this migration).
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -161,17 +179,32 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                  -- PRD #4320 module 5: the provider claim clause (see ClaimRun's NON-BYPASSABLE provider clause): a
                  -- provider-bound run is placeable only on a worker reporting 'claude_provider_v1'.
                  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                 -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
+                 -- requires its harness's phase-models capability. ClaimRun enforces the same clause;
+                 -- the kind list is pinned to leadcfg.LeadLane by a test.
+                 AND (NOT (r.harness IN ('claude', 'codex')
+                           AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                           AND r.review_target_run_id IS NULL
+                           AND r.egress_profile_id IS NULL
+                           AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id AND (CASE r.harness WHEN 'claude' THEN pu.planning_claude_model IS NOT NULL OR pu.planning_claude_effort IS NOT NULL WHEN 'codex' THEN pu.planning_codex_model IS NOT NULL OR pu.planning_codex_effort IS NOT NULL ELSE false END)))
+                      OR CASE r.harness WHEN 'claude' THEN 'claude_phase_models_v1' WHEN 'codex' THEN 'codex_phase_models_v1' END = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
-                         AND COALESCE(
+                         AND (COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
                                  p_checker_model) WHEN r.model = ANY(p_codex_curated_models) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(p_codex_curated_models)),
                              false)
+                  OR (r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
+                      AND r.egress_profile_id IS NULL
+                      AND NOT COALESCE(r.model = ANY(p_codex_curated_models), false)
+                      AND EXISTS (SELECT 1 FROM users pu WHERE pu.id = r.user_id
+                          AND pu.planning_codex_model IS NOT NULL
+                          AND NOT (pu.planning_codex_model = ANY(p_codex_curated_models)))))
                      )
                      OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
                  )

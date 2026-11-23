@@ -12,7 +12,7 @@ LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM users WHERE codex_provider_id IS NOT NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back 00501: Codex sources still selected';
+        RAISE EXCEPTION 'refusing to roll back 00514: Codex sources still selected';
     END IF;
 END
 $$;

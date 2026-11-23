@@ -66,7 +66,7 @@ func TestCodexProviderSchemaLiveDB(t *testing.T) {
 	}
 
 	// Replaying guarded Downs in rolled-back transactions must preserve each dependency.
-	for _, migration := range []string{"00498_codex_provider_profiles.sql", "00499_openai_compatible_provider_keys.sql", "00501_users_codex_provider_source.sql"} {
+	for _, migration := range []string{"00511_codex_provider_profiles.sql", "00512_openai_compatible_provider_keys.sql", "00514_users_codex_provider_source.sql"} {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -165,7 +165,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		stmts := migrationDownStatements(t, "00503_runs_codex_provider_exclusive.sql")
+		stmts := migrationDownStatements(t, "00516_runs_codex_provider_exclusive.sql")
 		for i, stmt := range stmts {
 			_, err = tx.Exec(ctx, stmt)
 			if i == 1 && err == nil {
@@ -178,7 +178,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 				break
 			}
 		}
-		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00503: Codex provider runs still exist") {
+		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00516: Codex provider runs still exist") {
 			t.Fatalf("Down refusal: %v", err)
 		}
 	})
@@ -202,7 +202,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 		if _, err := tx.Exec(ctx, `DELETE FROM model_providers WHERE id=$1`, p.ID); err != nil {
 			t.Fatal(err)
 		}
-		for _, migration := range []string{"00503_runs_codex_provider_exclusive.sql", "00501_users_codex_provider_source.sql", "00499_openai_compatible_provider_keys.sql", "00498_codex_provider_profiles.sql"} {
+		for _, migration := range []string{"00516_runs_codex_provider_exclusive.sql", "00514_users_codex_provider_source.sql", "00512_openai_compatible_provider_keys.sql", "00511_codex_provider_profiles.sql"} {
 			for _, stmt := range migrationDownStatements(t, migration) {
 				if _, err := tx.Exec(ctx, stmt); err != nil {
 					t.Fatalf("%s cleared Down: %v", migration, err)
