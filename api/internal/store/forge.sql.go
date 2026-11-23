@@ -1093,6 +1093,70 @@ func (q *Queries) InsertDefaultBoardColumns(ctx context.Context, arg InsertDefau
 	return err
 }
 
+const listActiveMRTargetRuns = `-- name: ListActiveMRTargetRuns :many
+SELECT id, kind, status, worker_id, claim_generation, pipeline_ref,
+       (CASE kind WHEN 'ci_fix' THEN ci_fix_mr_iid ELSE mr_iid END)::bigint AS target_mr_iid
+FROM runs
+WHERE repo_id = $1::uuid
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND ((kind = 'ci_fix' AND ci_fix_mr_iid IS NOT NULL)
+       OR (kind = 'mr_rework' AND mr_iid IS NOT NULL))
+  AND id > $2::uuid
+ORDER BY id
+LIMIT 33
+`
+
+type ListActiveMRTargetRunsParams struct {
+	RepoID  uuid.UUID `json:"repo_id"`
+	AfterID uuid.UUID `json:"after_id"`
+}
+
+type ListActiveMRTargetRunsRow struct {
+	ID              uuid.UUID   `json:"id"`
+	Kind            string      `json:"kind"`
+	Status          string      `json:"status"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+	PipelineRef     pgtype.Text `json:"pipeline_ref"`
+	TargetMrIid     int64       `json:"target_mr_iid"`
+}
+
+// Issue #4616 early-polling enumeration: the active ci_fix / mr_rework runs of one repo
+// that carry a verified MR target, so the poller can cancel them once that MR merges or
+// closes. repo_id leads uq_runs_one_active_branch_ref (migration 00167) and
+// idx_runs_repo (00020), so the scan is repo-scoped through an index. The
+// caller takes 32 rows and keeps a keyset cursor (id > @after_id); LIMIT 33 lets it tell
+// whether another page exists. An unbound ci_fix (NULL ci_fix_mr_iid) is deliberately
+// excluded: there is no branch-to-MR inference here.
+func (q *Queries) ListActiveMRTargetRuns(ctx context.Context, arg ListActiveMRTargetRunsParams) ([]ListActiveMRTargetRunsRow, error) {
+	rows, err := q.db.Query(ctx, listActiveMRTargetRuns, arg.RepoID, arg.AfterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveMRTargetRunsRow{}
+	for rows.Next() {
+		var i ListActiveMRTargetRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Status,
+			&i.WorkerID,
+			&i.ClaimGeneration,
+			&i.PipelineRef,
+			&i.TargetMrIid,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAllForgeConnections = `-- name: ListAllForgeConnections :many
 SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections ORDER BY created_at ASC
 `

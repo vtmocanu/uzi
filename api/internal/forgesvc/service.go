@@ -25,6 +25,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PromoteLabelColor is the color EnsureLabels pins when Promote (PRD #102 Decision
@@ -134,6 +135,8 @@ type IssueStore interface {
 	ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRWatchCandidatesRow, error)
 	// Used by the board-free MR-state recorder (board_free_mr_watch.go, PRD #908).
 	ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListBoardFreeMRStateWatchCandidatesRow, error)
+	// Used by the active-MR-target enumeration (active_mr_targets.go, issue #4616).
+	ListActiveMRTargetRuns(ctx context.Context, arg store.ListActiveMRTargetRunsParams) ([]store.ListActiveMRTargetRunsRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	SetRunMRState(ctx context.Context, arg store.SetRunMRStateParams) (int64, error)
@@ -209,6 +212,16 @@ type Service struct {
 	// the mid-flight abort is skipped — every other MR-sync behaviour is unaffected.
 	reworkCanceller ReworkCanceller
 
+	// terminalTargetCanceller stops an active ci_fix / mr_rework run whose verified target
+	// MR merged or closed (issue #4616). Optional (nil-safe): unset skips SyncActiveMRTargets.
+	terminalTargetCanceller TerminalTargetCanceller
+
+	// activeMRTargetCursor is SyncActiveMRTargets' per-repo keyset cursor (the last run id
+	// taken from an overflowing page). It is pure rotation state and carries no cancellation
+	// authority: every cancel is re-verified from live forge data and fenced in the store.
+	activeTargetMu     sync.Mutex
+	activeTargetCursor map[uuid.UUID]uuid.UUID
+
 	// cappedRepos remembers which repos' pipeline watch dropped branches at the ref
 	// cap on their last sync, so SyncPipelines logs the transition into and out of
 	// the capped state rather than once per tick (issue #1483). Lazily initialised;
@@ -222,6 +235,13 @@ type Service struct {
 // means the mid-flight abort is skipped and every other sync behaviour is unchanged.
 type ReworkCanceller interface {
 	CancelReworkForMR(ctx context.Context, repoID uuid.UUID, mrIID int64, reason string) error
+}
+
+// TerminalTargetCanceller stops one active ci_fix / mr_rework run whose verified target MR
+// merged or closed (issue #4616). *workersvc.Service satisfies it; it re-validates the
+// observation under row locks.
+type TerminalTargetCanceller interface {
+	CancelRunForTerminalTarget(ctx context.Context, repoID uuid.UUID, obs workersvc.TerminalTargetObservation) error
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
@@ -469,6 +489,16 @@ func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.
 // Call once at startup, before the poller runs. A nil canceller (the default) disables
 // the abort; the rest of the sync is unchanged.
 func (s *Service) SetReworkCanceller(c ReworkCanceller) { s.reworkCanceller = c }
+
+// SetTerminalTargetCanceller wires the terminal-target cancel collaborator (issue #4616).
+// Call once at startup, before the poller runs. A nil canceller (the default) disables
+// SyncActiveMRTargets. A typed-nil *workersvc.Service is also treated as unset.
+func (s *Service) SetTerminalTargetCanceller(c TerminalTargetCanceller) {
+	if v, ok := c.(*workersvc.Service); ok && v == nil {
+		c = nil
+	}
+	s.terminalTargetCanceller = c
+}
 
 // uziLabel resolves the configured uzi run-eligibility label for the sync filters,
 // falling back to the compiled-in default when unconfigured or on a settings read
