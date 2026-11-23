@@ -183,6 +183,7 @@ func (l *Loader) ForRun(run store.Run, snap *workersvc.NextClaimSnapshot) *apity
 		EffectiveLimit:  snap.EffectiveLimit(),
 		Reason:          res.Reason,
 		Wait:            previewWait(run, snap),
+		EarlyWarning:    snap.MarginPts > 0,
 		Fix:             []apitypes.WeeklyLimitFixDTO{},
 		FutureRuns:      []apitypes.WeeklyLimitFixDTO{},
 	}

@@ -50,6 +50,11 @@ type WeeklyLimitDTO struct {
 	Fix []WeeklyLimitFixDTO `json:"fix"`
 	// Wait is waits | fails | reserve_pause | unknown.
 	Wait string `json:"wait"`
+	// EarlyWarning is the owner's early-warning opt-in (weekly_warning_margin_pts > 0). It is
+	// server-only: margin 0 keeps the park explanation and its fixes on detail, CLI and Slack,
+	// but Summary projects such a block as notice, so it creates no Overview limit decision
+	// (PRD #4123 module 6 / D7).
+	EarlyWarning bool `json:"-"`
 }
 
 // WeeklyLimitSummaryDTO is the compact projection carried on a run summary row.
@@ -64,7 +69,11 @@ func (w *WeeklyLimitDTO) Summary() *WeeklyLimitSummaryDTO {
 	if w == nil {
 		return nil
 	}
-	return &WeeklyLimitSummaryDTO{Tier: w.Tier, CredentialKey: w.CredentialKey, CredentialLabel: w.CredentialLabel}
+	tier := w.Tier
+	if tier == WeeklyLimitTierWarning && !w.EarlyWarning {
+		tier = WeeklyLimitTierNotice
+	}
+	return &WeeklyLimitSummaryDTO{Tier: tier, CredentialKey: w.CredentialKey, CredentialLabel: w.CredentialLabel}
 }
 
 // weeklyLimitFromSummary is Summary's inverse for ListItem: only the three summary fields come
