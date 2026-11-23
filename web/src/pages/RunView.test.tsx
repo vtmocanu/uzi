@@ -28,6 +28,7 @@ import {
   LimitWaitPanel,
   RecoveryWaitPanel,
   MrReworkPanel,
+  CiAutofixPanel,
   PausedPanel,
   ReserveExemptLine,
   pauseRequestedLabel,
@@ -90,6 +91,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       // PRD #1202: the on-demand "Rework now" action. Defaulted to resolve with a new
       // mr_rework run so a click settles; the cases that assert its args/link override it.
       startRunRework: vi.fn().mockResolvedValue({ run: null }),
+      // Issue #4617: the per-run CI-autofix toggle; the panel tests set the response.
+      setRunCiAutofix: vi.fn().mockResolvedValue({ run: null, ci_autofix_governing_run_id: null, ci_autofix_inflight_fix_run_ids: [] }),
 
       // PRD #1190: pause/resume mutations. Defaulted to resolve so a click + refreshRun
       // settles; the paused cases assert the call args.
@@ -8260,5 +8263,134 @@ describe("RunView stored harness decision placement", () => {
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
     render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
     expect(screen.getByRole("region", { name: "Harness decision at creation time" }).textContent).toContain("preferred claude, chosen codex. Reason: overflow");
+  });
+});
+
+describe("CiAutofixPanel — per-run CI-autofix checkbox (issue #4617)", () => {
+  const LABEL = /automatically fix ci failures/i;
+  const okResponse = {
+    run: null as unknown as Run,
+    ci_autofix_governing_run_id: null,
+    ci_autofix_inflight_fix_run_ids: [] as string[],
+  };
+  const renderPanel = (over: Partial<Run>, extra: { canSteer?: boolean; userDefault?: boolean | null; busy?: boolean; onChanged?: () => void } = {}) =>
+    render(
+      <MemoryRouter>
+        <CiAutofixPanel
+          run={run(over)}
+          busy={extra.busy ?? false}
+          canSteer={extra.canSteer ?? true}
+          userDefault={extra.userDefault ?? null}
+          onChanged={extra.onChanged}
+        />
+      </MemoryRouter>,
+    );
+
+  beforeEach(() => {
+    mockApi.setRunCiAutofix.mockReset();
+    mockApi.setRunCiAutofix.mockResolvedValue(okResponse);
+  });
+  afterEach(cleanup);
+
+  it("renders for an owner's issue run, checked by default", () => {
+    renderPanel({ kind: "issue" });
+    expect((screen.getByLabelText(LABEL) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("is hidden for a chat run and for a non-owner", () => {
+    renderPanel({ kind: "chat" });
+    expect(screen.queryByLabelText(LABEL)).toBeNull();
+    cleanup();
+    renderPanel({ kind: "issue" }, { canSteer: false });
+    expect(screen.queryByLabelText(LABEL)).toBeNull();
+  });
+
+  it("reflects an explicit override over the user default, and inherits otherwise", () => {
+    renderPanel({ ci_autofix_enabled: false }, { userDefault: true });
+    expect((screen.getByLabelText(LABEL) as HTMLInputElement).checked).toBe(false);
+    cleanup();
+    renderPanel({ ci_autofix_enabled: null }, { userDefault: false });
+    expect((screen.getByLabelText(LABEL) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("unchecking sends an explicit false", async () => {
+    renderPanel({ id: "r9" });
+    fireEvent.click(screen.getByLabelText(LABEL));
+    await waitFor(() => expect(mockApi.setRunCiAutofix).toHaveBeenCalledWith("r9", false));
+  });
+
+  it("shows Reset to default only when overridden, and it sends null", async () => {
+    renderPanel({ ci_autofix_enabled: null });
+    expect(screen.queryByRole("button", { name: /reset to default/i })).toBeNull();
+    cleanup();
+    renderPanel({ id: "r9", ci_autofix_enabled: false });
+    fireEvent.click(screen.getByRole("button", { name: /reset to default/i }));
+    await waitFor(() => expect(mockApi.setRunCiAutofix).toHaveBeenCalledWith("r9", null));
+  });
+
+  it("disables the controls while the page is busy", () => {
+    renderPanel({ ci_autofix_enabled: true }, { busy: true });
+    expect((screen.getByLabelText(LABEL) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /reset to default/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("names the governing run and in-flight fixes with links", async () => {
+    mockApi.setRunCiAutofix.mockResolvedValue({
+      ...okResponse,
+      ci_autofix_governing_run_id: "gov12345-aaaa",
+      ci_autofix_inflight_fix_run_ids: ["fix11111-bbbb", "fix22222-cccc"],
+    });
+    renderPanel({});
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/governs automatic CI fixes on this branch/i)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "gov12345" }).getAttribute("href")).toBe("/runs/gov12345-aaaa");
+    expect(screen.getByText(/keep their own setting/i)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "fix11111" }).getAttribute("href")).toBe("/runs/fix11111-bbbb");
+    expect(screen.getByRole("link", { name: "fix22222" }).getAttribute("href")).toBe("/runs/fix22222-cccc");
+  });
+
+  it("renders an API error inline", async () => {
+    mockApi.setRunCiAutofix.mockRejectedValue(new ApiError(403, "boom: forbidden"));
+    renderPanel({});
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/boom: forbidden/)).toBeTruthy();
+  });
+
+  it("calls onChanged after a successful toggle", async () => {
+    const onChanged = vi.fn();
+    renderPanel({}, { onChanged });
+    fireEvent.click(screen.getByLabelText(LABEL));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+  });
+
+  it("removes earlier notes after a later successful toggle with empty hints", async () => {
+    mockApi.setRunCiAutofix.mockResolvedValueOnce({
+      ...okResponse,
+      ci_autofix_governing_run_id: "gov12345-aaaa",
+      ci_autofix_inflight_fix_run_ids: ["fix11111-bbbb"],
+    });
+    renderPanel({});
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/governs automatic CI fixes on this branch/i)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(LABEL));
+    await waitFor(() => expect(mockApi.setRunCiAutofix).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/governs automatic CI fixes on this branch/i)).toBeNull());
+    expect(screen.queryByText(/keep their own setting/i)).toBeNull();
+  });
+
+  it("shows the error and no stale notes after a failed toggle following one with notes", async () => {
+    mockApi.setRunCiAutofix.mockResolvedValueOnce({
+      ...okResponse,
+      ci_autofix_governing_run_id: "gov12345-aaaa",
+      ci_autofix_inflight_fix_run_ids: ["fix11111-bbbb"],
+    });
+    mockApi.setRunCiAutofix.mockRejectedValueOnce(new ApiError(403, "boom: forbidden"));
+    renderPanel({});
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/governs automatic CI fixes on this branch/i)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText(LABEL));
+    expect(await screen.findByText(/boom: forbidden/)).toBeTruthy();
+    expect(screen.queryByText(/governs automatic CI fixes on this branch/i)).toBeNull();
+    expect(screen.queryByText(/keep their own setting/i)).toBeNull();
   });
 });

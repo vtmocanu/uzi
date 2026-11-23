@@ -1437,6 +1437,7 @@ type Run struct {
 	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
 	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
 	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
+	CiAutofixEnabled                  pgtype.Bool        `json:"ci_autofix_enabled"`
 }
 
 type RunCompletionAttempt struct {

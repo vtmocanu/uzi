@@ -3,10 +3,12 @@ package workersvc
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -36,6 +38,16 @@ func TestCodexProviderFreshConstructorPathsLiveDB(t *testing.T) {
 						fx.env.exec("UPDATE users SET codex_provider_id=NULL WHERE id=$1", fx.userID)
 					case "disabled":
 						fx.env.exec("UPDATE user_secrets SET disabled_at=now() WHERE id=$1", fx.key)
+					}
+					if path == "auto-ci-fix" {
+						// The poller needs a qualifying run on this branch. The cancelled task
+						// above retains binding A but cannot serve as that candidate.
+						const mrIID int64 = 900
+						ref := source.Branch.String
+						seedRecordedPR(t, fx.env, fx.userID, fx.repoID, ref, mrIID, time.Now())
+						fx.svc.SetForges(bindingBuilder{&bindingForge{answers: map[int64]bindingAnswer{
+							mrIID: bindSum(mrIID, forge.MRStateOpened, ref),
+						}}})
 					}
 					before := fx.runCount()
 					var got store.Run

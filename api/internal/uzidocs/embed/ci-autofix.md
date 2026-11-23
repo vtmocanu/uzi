@@ -38,6 +38,49 @@ kill-switch, and set the same way: through the settings API rather than a
 dedicated Admin → Instance control today. A settings-read hiccup is treated as
 off (fail closed), never as silently on.
 
+### Per-run override
+
+You can also switch automatic CI fixes off (or back on) for a single run's
+branch without touching your account default. Precedence, highest first:
+
+1. The admin instance-wide kill-switch. When it is off, nothing runs.
+2. The run override, if the branch's governing run has one.
+3. Your account default (**Settings → Automatic CI fixes**).
+
+**Which run governs.** The override that counts is the one on the branch's
+selected run: the newest non-cancelled issue, `ci_fix`, prompt or
+self-improve run that has a merge request. Setting it on an older run of the
+same branch has no effect on automatic fixes. `mr_rework` runs, and prompt or
+self-improve runs on their own run-ID branches, do not displace an issue
+run's selection. A new issue run taking over the same `agent/issue-N` branch
+starts from its own default, not from the previous run's override.
+
+**Repair runs take over.** A `ci_fix` repair run inherits the override when it
+is created. When it ends (completed or failed) with a branch and MR it becomes
+the selected run, so to turn automatic fixes back on after a repair, edit that
+repair run. The command and the API report the governing run when it is another
+of your runs.
+
+**Fixes in flight.** A CI fix already running keeps the value it copied when
+it was created. Changing the override does not stop it. Setting the override
+lists your own in-flight fixes on that branch so you can cancel them or set
+the value on them too.
+
+**No expiry.** The override stays until you change it. If you turned
+automatic fixes off while you worked on a branch, turn them back on (or
+`--clear` it) when you are done. The manual **Fix CI** button and
+`uzi ci fix` are never blocked by the override.
+
+**How to set it.**
+
+- CLI: `uzi run ci-autofix <run-id> [--enabled[=false]] [--clear]`; see
+  [the CLI reference](./cli.md). `uzi run get` shows the current value in its
+  `CI_AUTOFIX` row.
+- Web: the "Automatically fix CI failures on this branch" checkbox in the run page's settings.
+- API: `PUT /api/runs/{id}/ci-autofix` with `{"enabled": true|false|null}`
+  (`null` clears it). The reply carries the run, the governing run id and your
+  in-flight fix run ids.
+
 ### Upgrading from an older uzi
 
 Automatic CI fixes used to be off by default and opt-in per user. A

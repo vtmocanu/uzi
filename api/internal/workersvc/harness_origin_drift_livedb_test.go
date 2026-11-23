@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -64,6 +65,12 @@ type originDriftForge struct {
 
 func (f *originDriftForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
 	return forge.Issue{IID: iid, Title: "origin-drift issue", Description: "d", State: "opened"}, nil
+}
+
+// GetMergeRequestSummary answers merged for every PR: the CI-fix origin seeds a recorded PR so
+// the automatic path has a selected run (issue #4617), and a merged answer leaves the fix unbound.
+func (f *originDriftForge) GetMergeRequestSummary(_ context.Context, _ int64, iid int64) (forge.MergeRequestSummary, error) {
+	return forge.MergeRequestSummary{IID: iid, State: forge.MRStateMerged, SourceBranch: "merged"}, nil
 }
 
 func (f *originDriftForge) ListIssueComments(_ context.Context, _ int64, _ int64) ([]forge.IssueComment, error) {
@@ -178,6 +185,9 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 
 	t.Run("CI-fix (Service.CreateAutoCIFixRun)", func(t *testing.T) {
 		ref := "origin-drift-cifix-" + uuid.NewString()
+		// The automatic path needs a selected run on the branch (issue #4617). Its recorded PR
+		// answers merged from the fake forge, so the binding passes and stays unbound.
+		seedRecordedPR(t, env, userID, repoID, ref, iidBase+7, time.Now().Add(-time.Hour))
 		run, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "desc", sampleSnapshot(), nil)
 		if err != nil {
 			t.Fatalf("CreateAutoCIFixRun: %v", err)
