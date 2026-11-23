@@ -13,7 +13,8 @@ export type SaveOutcome =
   | { kind: "unknown" }
   | { kind: "saved_unreadable" }
   | { kind: "reloaded"; stillDirty: number }
-  | { kind: "reload_failed"; message: string };
+  | { kind: "reload_failed"; message: string }
+  | { kind: "discarded_unconfirmed" };
 
 function plural(n: number, one: string, many: string): string {
   return n === 1 ? `1 ${one}` : `${n} ${many}`;
@@ -92,6 +93,13 @@ function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
               : `Reloaded the saved settings. ${plural(outcome.stillDirty, "edit differs", "edits differ")} from what is stored.`
           }
         />
+      );
+    case "discarded_unconfirmed":
+      return withReload(
+        <Alert
+          tone="warning"
+          message="Your edits were discarded here, but an earlier save may still have been applied. Reload the saved settings to see what is stored."
+        />,
       );
     case "reload_failed":
       return withReload(<Alert message={`Could not reload the saved settings: ${outcome.message}`} />);

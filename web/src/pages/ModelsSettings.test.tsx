@@ -352,8 +352,17 @@ describe("Models page", () => {
     await within(bar()).findByText(/could not confirm whether this save was applied/);
     fireEvent.click(discardButton());
     expect(control("Worker model — Codex").value).toBe("inherit");
-    expect(within(bar()).getByText(/could not confirm whether this save was applied/)).toBeTruthy();
-    expect(within(bar()).getByRole("button", { name: "Reload saved settings" })).toBeTruthy();
+    // The alert no longer says the edits are still here; it says an earlier save may apply.
+    expect(within(bar()).queryByText(/Your edits are still here/)).toBeNull();
+    expect(within(bar()).getByText(/Your edits were discarded here, but an earlier save may still have been applied/)).toBeTruthy();
+    // The save had in fact committed: Reload adopts the stored value instead of inventing a
+    // pending "revert" edit from the discarded pre-save draft.
+    mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_codex_model: "gpt-6-sol" }) });
+    fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
+    await within(bar()).findByText("Reloaded the saved settings. They match your edits.");
+    expect(status()).toBe("No unsaved changes");
+    expect(control("Worker model — Codex").value).toBe("gpt-6-sol");
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1);
   });
 
   it("takes the worker effort Default from the template-aware effective cell, not the preference-only settings cell", async () => {

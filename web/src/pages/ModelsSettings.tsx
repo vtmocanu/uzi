@@ -177,10 +177,10 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [outcome, setOutcome] = useState<SaveOutcome | null>(null);
   // An earlier save may have committed without confirmation. Kept apart from `outcome`, which a
-  // later failed reload or failed retry replaces: only a successful save, a successful reload or
-  // Discard reconciles it, so a dialog shown while a commit is unconfirmed never offers "Discard
-  // changes". (A draft that becomes clean again, by editing back or the bar's Discard, is not
-  // guarded: the bar's Discard explicitly accepts the last loaded values.)
+  // later failed reload or failed retry replaces: only a successful save or a successful reload
+  // reconciles it, so a dialog shown while a commit is unconfirmed never offers "Discard changes".
+  // Discard drops the local draft but keeps this (with Reload) because it cannot know what the
+  // server stored; a clean draft is not guarded by the leave dialog.
   const [uncertainty, setUncertainty] = useState<"unknown" | "saved_unreadable" | null>(null);
   const [customMode, setCustomMode] = useState<Record<string, boolean>>({});
   // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
@@ -257,9 +257,9 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const discard = useCallback(() => {
     setDraft(baseline);
     setFieldErrors({});
-    setOutcome((o) => (o?.kind === "unknown" || o?.kind === "saved_unreadable" ? o : null));
+    setOutcome(uncertainty ? { kind: "discarded_unconfirmed" } : null);
     setPickerGeneration((g) => g + 1);
-  }, [baseline]);
+  }, [baseline, uncertainty]);
 
   const save = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -318,11 +318,18 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       const next = await fetchSaved();
       if (!isCurrent(seq)) return;
       const values = baselineFromSettings(next.settings);
+      // A clean draft (nothing edited, or edits discarded) adopts the stored values too, so a
+      // committed save never reappears as a pending "revert" edit.
+      const clean = dirtyFields(baseline, draft).length === 0;
       setLoaded(next);
       setBaseline(values);
+      if (clean) {
+        setDraft(values);
+        setPickerGeneration((g) => g + 1);
+      }
       setFieldErrors({});
       setUncertainty(null);
-      setOutcome({ kind: "reloaded", stillDirty: dirtyFields(values, draft).length });
+      setOutcome({ kind: "reloaded", stillDirty: clean ? 0 : dirtyFields(values, draft).length });
     } catch (err) {
       if (isCurrent(seq)) setOutcome({ kind: "reload_failed", message: errorMessage(err, "request failed") });
     } finally {
@@ -528,8 +535,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         dirtyCount={dirty.length}
         saving={saving}
         // The PUT may have committed: leaving must not read as a discard (PRD: explain the
-        // uncertainty, never claim a rollback). Cleared only by a successful save, a successful
-        // reload or Discard.
+        // uncertainty, never claim a rollback). Cleared only by a successful save or a successful
+        // reload.
         saveUncertainty={uncertainty}
         viewerId={viewerId}
         onDiscard={discard}
