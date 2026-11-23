@@ -41,7 +41,7 @@ func newCodexActualClaimFix(t *testing.T) (*pcFix, uuid.UUID) {
 	pf.provider, pf.key = p.ID, key.ID
 	pf.env.exec(`UPDATE users SET codex_provider_id=$2,default_harness='codex' WHERE id=$1`, pf.userID, pf.provider)
 	pf.env.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, pf.workerID,
-		[]string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1})
+		[]string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1, capability.RepoAgentSourceV1})
 	// A usable native credential remains available throughout every provider refusal.
 	vendor := pf.env.seedStaticAPIKey(t, pf.userID, "available-native-"+uuid.NewString(), "inert-available-native-key")
 	pf.env.exec(`UPDATE user_secrets SET is_default=true WHERE id=$1`, vendor)
@@ -52,6 +52,9 @@ func newCodexActualClaimFix(t *testing.T) (*pcFix, uuid.UUID) {
 	}
 	id := created.ID
 	frozen := mustRun(t, pf.env, id)
+	if !frozen.RepoAgentSourceRequired {
+		t.Fatal("real creation must retain the repository-source protocol fence")
+	}
 	if frozen.Harness != harnessCodex || !frozen.ModelProviderID.Valid ||
 		uuid.UUID(frozen.ModelProviderID.Bytes) != pf.provider {
 		t.Fatal("creation did not commit provider A")
