@@ -181,7 +181,7 @@ Probe quotas and downstream worker frame/queue/advice/child budgets do not estab
 
 ## Codex engine (PRD #4323, 2026-11-23)
 
-[PRD #4323](../prds/4323-codex-compatible-providers.md) adds a second engine arm to this core. Everything above holds for it unless stated here.
+[PRD #4323](../prds/done/4323-codex-compatible-providers.md) adds a second engine arm to this core. Everything above holds for it unless stated here.
 
 - **The binding admits `codex` / `openai_responses`.** A provider may now have engine `codex`, protocol `openai_responses` and auth style `bearer` only (restricted at save). Its key is the vault kind `openai_compatible_key` (never `openai_api_key` or `codex_auth`, no `codex_credential_state` row), with the same `(user, kind)` AAD and the engine-checked insert (the key kind follows the provider's engine). Selection is per engine: `users.codex_provider_id` (composite FK, `ON DELETE RESTRICT`), `uzi provider use <name>` sets the provider's own engine and clearing needs `--none --engine claude|codex`. The run binding reuses the `runs.model_provider_*` columns, fenced by the key's `enablement_rev` alone. The Responses probe posts to `<base_url>/responses` and never follows a redirect.
 - **Exclusive with `secrets.codex`.** A Codex provider claim carries the key only in `claim.secrets.provider` and no `secrets.codex` block, hence no vendor credential-operation capability. The api's `assertClaimSecretsExclusive` and the worker's `decodeProviderBinding` each refuse a claim holding both. There are zero vendor release or refresh calls, and `/codex/release` and `/codex/refresh` refuse a provider-bound run; in-place Codex account switching is refused for provider runs. The worker's internal auth mode is a distinct `provider` value.
