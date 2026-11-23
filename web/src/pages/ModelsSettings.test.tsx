@@ -883,6 +883,42 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ task_review_effort: "high" }));
   });
 
+  it.each([
+    ["Worker model — Claude", "gpt-6-sol", "Not a Claude model: gpt-6-sol is a Codex model, so Claude runs skip it. Choose Default to clear it."],
+    ["Worker model — Codex", "opus", "Not a Codex model: opus is a Claude model alias, so the Codex lane cannot use it. Choose Default to clear it."],
+    ["Planning model — Codex", "sonnet", "Not a Codex model: sonnet is a Claude model alias, so the Codex lane cannot use it. Choose Same as the run to clear it."],
+  ])("blocks Save on %s set to the other family's model %s, and a custom ID clears it", async (name, invalid, message) => {
+    mount();
+    await screen.findByLabelText(name);
+    select(name, "custom");
+    const custom = screen.getByLabelText(`${name}, custom model ID`);
+    fireEvent.change(custom, { target: { value: invalid } });
+    expect(describedText(name)).toContain(message);
+    expect(control(name).getAttribute("aria-invalid")).toBe("true");
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.submit(saveButton().closest("form")!);
+    expect(mockApi.putMyModelSettings).not.toHaveBeenCalled();
+    fireEvent.change(custom, { target: { value: "custom-lane-id" } });
+    expect(describedText(name)).not.toContain("Not a ");
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it("flags a stored cross-family worker or planning model as information, and Default clears it in the save", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({ default_claude_model: "gpt-6-sol", planning_codex_model: "opus" }) });
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: helperSettings({ planning_codex_model: "opus" }), effective: helperEffective() });
+    mount();
+    await screen.findByLabelText("Worker model — Claude");
+    expect(describedText("Worker model — Claude")).toContain("The saved value is not valid here. Not a Claude model: gpt-6-sol is a Codex model, so Claude runs skip it.");
+    expect(describedText("Planning model — Codex")).toContain("The saved value is not valid here. Not a Codex model: opus is a Claude model alias");
+    expect(control("Worker model — Claude").hasAttribute("aria-invalid")).toBe(false);
+    expect(status()).toBe("No unsaved changes");
+    select("Worker model — Claude", "inherit");
+    expect(describedText("Worker model — Claude")).not.toContain("The saved value is not valid here");
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ default_claude_model: null }));
+  });
+
   it("a 400 on a retry after an unconfirmed save still says the earlier save is unconfirmed, and keeps Reload", async () => {
     mockApi.putMyModelSettings.mockRejectedValueOnce(new ApiError(500, "may or may not", { reason: "settings_commit_unknown" }));
     const errors = [{ field: "cross_check_pins", message: "cross_check_pins[plan/codex].model: invalid", stage: "plan" as const, harness: "codex" as const, member: "model" as const }];

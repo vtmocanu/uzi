@@ -129,11 +129,13 @@ describe("Models settings flow (stateful mock)", () => {
     select("Worker effort — Codex", "max");
     select("Worker model — Claude", "custom");
     fireEvent.change(screen.getByLabelText("Worker model — Claude, custom model ID"), { target: { value: "gpt-6-sol" } });
-    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
-    await within(bar()).findByRole("alert", {}, { timeout: 5000 });
+    // The Claude lane's own guard (the server's rejectCodexIDInClaudeLane) blocks Save locally.
+    const save = within(bar()).getByRole("button", { name: "Save changes" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
     const claude = control("Worker model — Claude");
     const errorId = (claude.getAttribute("aria-describedby") ?? "").split(" ").find((id) => id.endsWith("-error"))!;
-    expect(document.getElementById(errorId)?.textContent).toContain("default_claude_model");
+    expect(document.getElementById(errorId)?.textContent).toContain("Not a Claude model: gpt-6-sol is a Codex model");
     expect(control("Worker effort — Codex").getAttribute("aria-describedby")).not.toContain("-error");
     expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_effort: "low", default_claude_model: null });
 

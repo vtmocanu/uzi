@@ -82,7 +82,7 @@ describe("localFieldWarnings", () => {
       "cross_check_pins:plan/claude/model": "gpt-6-sol",
       "cross_check_pins:code/codex/model": "sonnet",
       "cross_check_pins:plan/codex/model": "custom-codex-checker",
-      default_claude_model: "gpt-6-sol", // the worker lanes are left to the server
+      default_codex_model: "custom-codex-id", // a custom id passes the Codex lane
     };
     const warnings = localFieldWarnings(base, draft);
     expect(Object.keys(warnings)).toEqual([
@@ -107,7 +107,7 @@ describe("storedFieldWarnings", () => {
   it("flags only unchanged stored values its validator refuses, and drops the flag once the cell is edited", () => {
     const base = baselineFromSettings(settings({
       summary_model: "gpt-6-sol",
-      default_claude_model: "gpt-6-sol", // the worker lanes are left to the server
+      planning_codex_model: "claude-opus-4-8", // a full Claude id is not an alias, so it passes
       cross_check_pins: [{ stage: "code", harness: "claude", model: "gpt-6.1-sol", effort: null }] as UserSettings["cross_check_pins"],
     }));
     expect(storedFieldWarnings(base, base)).toEqual({
@@ -118,6 +118,64 @@ describe("storedFieldWarnings", () => {
     expect(Object.keys(edited)).toEqual(["cross_check_pins:code/claude/model"]);
     // Stored warnings are not blocking ones.
     expect(localFieldWarnings(base, base)).toEqual({});
+  });
+});
+
+describe("worker and planning lane guards (mirror the server decoders)", () => {
+  const claudeWorker = "Not a Claude model: gpt-6-sol is a Codex model, so Claude runs skip it. Choose Default to clear it.";
+  const claudePlanning = "Not a Claude model: gpt-6-astra is a Codex model, so Claude planning skips it. Choose Same as the run to clear it.";
+  const codexWorker = "Not a Codex model: opus is a Claude model alias, so the Codex lane cannot use it. Choose Default to clear it.";
+  const codexPlanning = "Not a Codex model: sonnet is a Claude model alias, so the Codex lane cannot use it. Choose Same as the run to clear it.";
+
+  it("blocks a dirty Codex id in a Claude lane and a dirty Claude alias in a Codex lane", () => {
+    const base = baselineFromSettings(settings());
+    const draft = {
+      ...base,
+      default_claude_model: " gpt-6-sol ",
+      default_codex_model: "opus",
+      planning_claude_model: "gpt-6-astra",
+      planning_codex_model: "sonnet",
+    };
+    expect(localFieldWarnings(base, draft)).toEqual({
+      default_claude_model: claudeWorker,
+      default_codex_model: codexWorker,
+      planning_claude_model: claudePlanning,
+      planning_codex_model: codexPlanning,
+    });
+  });
+
+  it("passes custom ids and the lane's own family, and applies the shared syntax rules", () => {
+    const base = baselineFromSettings(settings());
+    expect(localFieldWarnings(base, {
+      ...base,
+      default_claude_model: "claude-opus-4-8",
+      default_codex_model: "claude-opus-4-8", // only the closed alias list is refused
+      planning_claude_model: "opus",
+      planning_codex_model: "gpt-6-sol",
+    })).toEqual({});
+    expect(localFieldWarnings(base, { ...base, default_codex_model: "two words" })).toEqual({
+      default_codex_model: "Model must be a single token with no spaces.",
+    });
+  });
+
+  it("reports a stored refused value as information, not as a blocking warning", () => {
+    const base = baselineFromSettings(settings({
+      default_claude_model: "gpt-6-sol",
+      default_codex_model: "opus",
+      planning_claude_model: "gpt-6-astra",
+      planning_codex_model: "sonnet",
+    }));
+    expect(localFieldWarnings(base, base)).toEqual({});
+    expect(storedFieldWarnings(base, base)).toEqual({
+      default_claude_model: `The saved value is not valid here. ${claudeWorker}`,
+      default_codex_model: `The saved value is not valid here. ${codexWorker}`,
+      planning_claude_model: `The saved value is not valid here. ${claudePlanning}`,
+      planning_codex_model: `The saved value is not valid here. ${codexPlanning}`,
+    });
+    // Choosing Default clears the stored flag and is not itself blocked.
+    const cleared = { ...base, default_claude_model: "" };
+    expect(storedFieldWarnings(base, cleared).default_claude_model).toBeUndefined();
+    expect(localFieldWarnings(base, cleared)).toEqual({});
   });
 });
 

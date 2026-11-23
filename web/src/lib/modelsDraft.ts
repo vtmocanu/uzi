@@ -13,9 +13,10 @@
 // override, compared and sent trimmed. "runtime" is an ordinary non-empty value, so Runtime
 // default stays distinct from Default. Predictions are not part of the draft and never count.
 //
-// A field may carry a local `validate` that mirrors its server validator (the Claude helper
-// lanes refuse Codex ids, a checker refuses the other family's model): a DIRTY value it flags
-// blocks Save on its own cell; a STORED value it flags is shown on the cell as information only.
+// A field may carry a local `validate` that mirrors its server validator (the Claude worker,
+// planning and helper lanes refuse Codex ids, the Codex worker and planning lanes refuse a Claude
+// alias, a checker refuses the other family's model): a DIRTY value it flags blocks Save on its
+// own cell; a STORED value it flags is shown on the cell as information only.
 // The server stays authoritative; this only spares a round trip.
 
 import type { Harness, ModelSettingsFieldError, ModelSettingsPatch, ModelSettingsPinPatch, UserSettings } from "./apiTypes";
@@ -73,6 +74,32 @@ function claudeHelperModel(skips: string): (value: string) => string {
   };
 }
 
+// The worker and planning lanes mirror their server decoders. A Claude lane uses the shared
+// model rules (validateModel), then refuses a Codex role id (rejectCodexIDInClaudeLane, or
+// validateClaudeJudgeModel for planning). A Codex lane uses the shared rules, then refuses a
+// known Claude alias (rejectClaudeAliasInCodexLane). Custom ids pass both lanes.
+function claudeLaneModel(effect: string, clear: string): (value: string) => string {
+  return (value) => {
+    const syntax = modelFieldWarning(value);
+    if (syntax) return syntax;
+    const m = value.trim();
+    return CODEX_ROLE_MODELS.includes(m) ? `Not a Claude model: ${m} is a Codex model, so ${effect}. ${clear}` : "";
+  };
+}
+
+// KNOWN_CLAUDE_ALIASES is the server's closed knownClaudeAliases set (agenttmpl.KnownClaudeAliases).
+// A full Claude id such as claude-opus-4-8 is not in it and passes, as on the server.
+const KNOWN_CLAUDE_ALIASES: readonly string[] = ["opus", "sonnet", "haiku", "fable"];
+
+function codexLaneModel(clear: string): (value: string) => string {
+  return (value) => {
+    const syntax = modelFieldWarning(value);
+    if (syntax) return syntax;
+    const m = value.trim();
+    return KNOWN_CLAUDE_ALIASES.includes(m) ? `Not a Codex model: ${m} is a Claude model alias, so the Codex lane cannot use it. ${clear}` : "";
+  };
+}
+
 function pinKey(stage: string, harness: string, member: string): string {
   return `cross_check_pins:${stage}/${harness}/${member}`;
 }
@@ -95,12 +122,12 @@ export function pinField(row: string, stage: PinStage, harness: Harness, member:
 /** Every Models cell, in display order. */
 export const MODELS_FIELDS: readonly ModelsField[] = [
   scalar("default_harness", "Default harness", null, "harness"),
-  scalar("default_claude_model", "Worker model", "claude", "model"),
-  scalar("default_codex_model", "Worker model", "codex", "model"),
+  scalar("default_claude_model", "Worker model", "claude", "model", claudeLaneModel("Claude runs skip it", "Choose Default to clear it.")),
+  scalar("default_codex_model", "Worker model", "codex", "model", codexLaneModel("Choose Default to clear it.")),
   scalar("default_effort", "Worker effort", "claude", "effort"),
   scalar("default_codex_effort", "Worker effort", "codex", "effort"),
-  scalar("planning_claude_model", "Planning model", "claude", "model"),
-  scalar("planning_codex_model", "Planning model", "codex", "model"),
+  scalar("planning_claude_model", "Planning model", "claude", "model", claudeLaneModel("Claude planning skips it", "Choose Same as the run to clear it.")),
+  scalar("planning_codex_model", "Planning model", "codex", "model", codexLaneModel("Choose Same as the run to clear it.")),
   scalar("planning_claude_effort", "Planning effort", "claude", "effort"),
   scalar("planning_codex_effort", "Planning effort", "codex", "effort"),
   scalar("judge_runs_on", "Judge runs on", null, "routing"),
