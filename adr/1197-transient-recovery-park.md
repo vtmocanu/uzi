@@ -2213,12 +2213,14 @@ source effect. No `adoption_failed` blocker is persisted and no quiescence is pr
   unreadable and fail-closed with custody kept, and a wrong refusal ref stays as evidence. The operator
   inspects with `uzi run recovery <run>`, then exports or recovers the work, or discards or settles the
   run's holds through the existing routes. No deletion tool is added.
-- **A refused or unconfirmed park.** A definitive 400 of the park, or a park that cannot be confirmed,
-  leaves the run `running` on the server and nonterminal. The worker drops it from its active-run snapshot,
-  so the ordinary missing-flight requeue accounting applies (a charged requeue below `RUN_MAX_REQUEUES`,
-  then `worker_requeue_exhausted` at the cap when recovery evidence or unresolved custody is recorded,
-  otherwise `worker_lost`). The park request was sent; after it the worker sends no further state report, posts
-  one corrective status line saying the hold was not confirmed, and stops nonterminally with custody kept.
+- **A refused or unconfirmed park.** The park request (and, on an uncertain ACK, at most one replay) was
+  sent; after it the worker sends no further state report, posts one corrective status line saying the hold
+  was not confirmed, and stops nonterminally with custody kept. A definitive 400 leaves the run `running` on
+  the server. An unconfirmed park may also have been applied with every ACK lost, in which case the owner
+  hold stands. When the run is still `running`, the worker has dropped it from its active-run snapshot, so the
+  ordinary missing-flight requeue accounting applies (a charged requeue below `RUN_MAX_REQUEUES`, then
+  `worker_requeue_exhausted` at the cap when recovery evidence or unresolved custody is recorded, otherwise
+  `worker_lost`).
 
 **Edges not held.** A blocked journal; a typed mismatch on a later iteration; a changed reservation;
 a not-blocked adopting journal that would need legacy attribution repair (refused read-only today, as it

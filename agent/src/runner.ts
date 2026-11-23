@@ -31231,7 +31231,7 @@ export class RunRunner {
     flight.runLog.warn("retained recovery bare storage identity changed; execution refused", detail);
     const emitCorrected = () => flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
       "The owner hold for the changed storage identity was not confirmed; the run is not failed and its work and custody stay on " +
-      "this worker. Automatic retries follow the ordinary requeue accounting."), 600) } });
+      "this worker. Unless the hold was applied without its acknowledgement, automatic retries follow the ordinary requeue accounting."), 600) } });
     flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
       "The retained work's storage identity changed (for example a pod replacement remounted the volume), so execution was refused " +
       "before any source action. The work and custody stay on this worker. The worker is requesting an owner hold; the run's " +

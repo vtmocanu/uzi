@@ -21,7 +21,7 @@ afterEach(() => cleanupHold());
 const feed = (r: HoldRig): string[] => api.messages(r.runId).map(m => String((m.payload as { text?: string }).text ?? ""));
 const guidance = (r: HoldRig): string[] => feed(r).filter(t => t.includes(GUIDANCE));
 const corrective = (r: HoldRig): string[] => feed(r).filter(t => t.startsWith("The owner hold for the changed storage identity was not confirmed"));
-const logged =(r: HoldRig, msg: string) => r.logs.lines.filter(l => (l as { msg: string }).msg === msg) as Array<Record<string, unknown>>;
+const logged = (r: HoldRig, msg: string) => r.logs.lines.filter(l => (l as { msg: string }).msg === msg) as Array<Record<string, unknown>>;
 const failures = (r: HoldRig) => api.states.filter(s => s.runId === r.runId && s.body.status === "failed");
 const holds = (r: HoldRig) => r.parks.filter(p => p.recovery_cause === "retained_recovery_adoption_failed");
 

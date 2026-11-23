@@ -475,8 +475,10 @@ check. Two holds cover it:
   custody hold, up to the custody hold limit, so inspect with
   `uzi run recovery <run>` and export/recover the work rather than Resume. The
   hold needs the API feature and a running acknowledgement, as for the other
-  adoption-failed holds. A definitive refusal (400) of the park, or a park that
-  cannot be confirmed, leaves the run nonterminal: the ordinary missing-flight
+  adoption-failed holds. A definitive refusal (400) of the park leaves the run
+  nonterminal, and the ordinary missing-flight requeue accounting applies. A
+  park that cannot be confirmed may still have been applied with its
+  acknowledgement lost, in which case the owner hold stands; otherwise the same
   requeue accounting applies. At the cap the disposition is the owner hold
   `recovery_wait` / `worker_requeue_exhausted` when recovery evidence or
   unresolved custody is recorded (which a retained run normally has), otherwise

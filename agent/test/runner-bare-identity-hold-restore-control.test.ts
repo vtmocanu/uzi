@@ -17,10 +17,10 @@ afterEach(() => { cleanupRig(); });
 const GUIDANCE = "storage identity changed";
 const guidance = (r: Rig): string[] => api.messages(r.runId).map(m => String((m.payload as { text?: string }).text ?? "")).filter(t => t.includes(GUIDANCE));
 
-/** The predecessor P has an owner record (one charged reservation of its own) and the bare's device number then moves. */
 /** Reads of the shifted identity after the mismatch is armed; the restore route is expected to make none (asserted below). */
 const identityReads = { count: 0 };
 
+/** The predecessor P has an owner record (one charged reservation of its own) and the bare's device number then moves. */
 async function withTypedMismatch(r: Rig, plain: boolean): Promise<string[]> {
   identityReads.count = 0;
   const source = { runId: r.runId, clonePath: r.pPath, attemptId: r.pAttempt };

@@ -3,8 +3,8 @@
 // A held claim must not write to the predecessor's bare unless that is the one additive retention of E1: when an exact owed pin and
 // its records already retain the tip nothing is written and retainCurrentOwedCandidate is never called; when only an episode ref
 // reaches the tip, today's retainCurrentOwedCandidate adds exactly one owed pin (plus its candidate record, the owed-path marker at
-// the cap, or the refusal evidence above it). A retention ref already at a WRONG target is never moved. Each variant runs for the
-// Claude and the Codex executor with a confirmed and with an uncertain (statusless) owner hold, through the production
+// the cap, or the refusal evidence above it). A retention ref already at a WRONG target is never moved. Each probe variant runs for the
+// Claude and the Codex executor (the wrong-target rows run on Claude only) with a confirmed and with an uncertain (statusless) owner hold, through the production
 // RunRunner.execute() on real Git. The probe rows compare every outcome with the BASE outcome of the same state under today's
 // unconditional retention (the write-free probe forced to "unretained"). The wrong-target rows are not base comparisons: their
 // base already includes the additive-only retention writers, so their discriminating checks are the row-specific ones below.
