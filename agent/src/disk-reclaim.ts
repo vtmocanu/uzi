@@ -454,6 +454,14 @@ async function listDirs(
 /** Budget cap for the default liveness scan (run-procs.ts SCAN_BUDGET_MS is its own default). */
 const PROCESSES_CLEAR_MAX_BUDGET_MS = 30_000;
 
+let testProcessesClearScan: typeof scanRunProcesses | undefined;
+
+/** TEST ONLY: wraps the scan the default processesClear runs. No environment/config selects this
+ *  override; undefined restores the production default. */
+export function setDefaultProcessesClearScanForTests(scan: typeof scanRunProcesses | undefined): void {
+  testProcessesClearScan = scan;
+}
+
 /**
  * The default {@link DiskReclaimDeps.processesClear}. Linux only, the same platform rule as the
  * runner's quiesceRun fold so the two gates cannot disagree; elsewhere there is no scan to run.
@@ -468,7 +476,7 @@ async function defaultProcessesClear(home: string, budgetMs: number): Promise<bo
   const scanBudgetMs = Math.min(PROCESSES_CLEAR_MAX_BUDGET_MS, budgetMs - HELPER_SLACK_MS);
   if (scanBudgetMs <= 0) return false;
   try {
-    const scan = await scanRunProcesses(home, undefined, [], { budgetMs: scanBudgetMs });
+    const scan = await (testProcessesClearScan ?? scanRunProcesses)(home, undefined, [], { budgetMs: scanBudgetMs });
     return scan.complete && scan.pids.length === 0;
   } catch {
     return false;
