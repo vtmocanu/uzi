@@ -127,6 +127,7 @@ function mount() {
 const control = (name: string) => screen.getByLabelText(name) as HTMLSelectElement;
 const select = (name: string, value: string) => fireEvent.change(control(name), { target: { value } });
 const bar = () => screen.getByTestId("models-save-bar");
+const WARNING = "models-earlier-request-warning";
 const saveButton = () => within(bar()).getByRole("button", { name: /Save changes|Saving/ }) as HTMLButtonElement;
 const discardButton = () => within(bar()).getByRole("button", { name: "Discard" }) as HTMLButtonElement;
 const status = () => screen.getByTestId("models-save-status").textContent ?? "";
@@ -364,9 +365,141 @@ describe("Models page", () => {
     mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_effort: "low" }) });
     fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
     await waitFor(() => expect(control("Worker effort — Claude").value).toBe("low"));
-    await within(bar()).findByText(/previous request may still finish/);
+    await within(bar()).findByText("Reloaded the saved settings.");
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
     expect(status()).toBe("1 unsaved change: Worker model — Codex");
     expect(within(bar()).getByRole("button", { name: "Reload saved settings" })).toBeTruthy();
+  });
+
+  // #4639: a save whose response was lost may still commit after any later request, so the
+  // standing warning (with the page's only Reload button) outlives every later outcome.
+  describe("a lost-response save keeps its standing warning", () => {
+    const savedWith = { settings: makeSettings({ default_codex_model: "gpt-6-sol" }) };
+    const reloadButtons = () => within(bar()).getAllByRole("button", { name: "Reload saved settings" });
+    const expectStanding = () => {
+      expect(within(bar()).getByTestId(WARNING).textContent).toContain(
+        "An earlier save whose response was lost may still finish and replace the values shown here. Reloading shows a snapshot; it cannot confirm that request has finished.",
+      );
+      expect(reloadButtons()).toHaveLength(1);
+    };
+    async function loseResponse() {
+      mockApi.putMyModelSettings.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+      mount();
+      await screen.findByLabelText("Worker model — Codex");
+      select("Worker model — Codex", "gpt-6-sol");
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/could not confirm whether this save was applied/);
+      expectStanding();
+    }
+
+    it("a retry that saves without a prediction", async () => {
+      await loseResponse();
+      // No `effective`: the commit succeeded but its prediction could not be read.
+      mockApi.putMyModelSettings.mockResolvedValueOnce(savedWith as Awaited<ReturnType<typeof api.putMyModelSettings>>);
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/Every change committed, but the new effective values could not be read/);
+      expectStanding();
+    });
+
+    it("a retry whose readback failed, then a later edit", async () => {
+      await loseResponse();
+      mockApi.putMyModelSettings.mockRejectedValueOnce(
+        new ApiError(500, "readback failed", { reason: "settings_saved_readback_failed" }),
+      );
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/reading them back failed/);
+      expectStanding();
+      select("Worker effort — Claude", "high");
+      expectStanding();
+    });
+
+    it("a 400 retry drops the unconfirmed suffix the standing warning replaces", async () => {
+      await loseResponse();
+      const message = "default_codex_model: not valid";
+      mockApi.putMyModelSettings.mockRejectedValueOnce(
+        new ApiError(400, message, { error: message, field: "default_codex_model" }),
+      );
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/1 value needs attention/);
+      expect(within(bar()).queryByText(/An earlier save is still unconfirmed/)).toBeNull();
+      expectStanding();
+    });
+
+    it("a plain 500 retry", async () => {
+      await loseResponse();
+      mockApi.putMyModelSettings.mockRejectedValueOnce(new ApiError(500, "boom"));
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/The save failed and nothing was changed: boom/);
+      expect(within(bar()).queryByText(/An earlier save is still unconfirmed/)).toBeNull();
+      expectStanding();
+    });
+
+    it("a commit-unknown retry, then a successful one", async () => {
+      await loseResponse();
+      mockApi.putMyModelSettings.mockRejectedValueOnce(
+        new ApiError(500, "unknown", { reason: "settings_commit_unknown" }),
+      );
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/could not confirm whether this save was applied/);
+      expectStanding();
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      fireEvent.click(saveButton());
+      await within(bar()).findByText("Saved 1 change.");
+      expect(within(bar()).queryByText(/Your next runs use/)).toBeNull();
+      expectStanding();
+    });
+
+    it("a successful retry keeps the lost request's keys: re-choosing the saved value is sent again", async () => {
+      await loseResponse();
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      fireEvent.click(saveButton());
+      await within(bar()).findByText("Saved 1 change.");
+      expect(status()).toBe("No unsaved changes");
+      // The lost request may still overwrite this key, so an explicit re-choice of the value
+      // the retry stored counts as a change and is sent again.
+      select("Worker model — Codex", "inherit");
+      select("Worker model — Codex", "gpt-6-sol");
+      expect(status()).toBe("1 unsaved change: Worker model — Codex");
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenLastCalledWith({ default_codex_model: "gpt-6-sol" }));
+      await within(bar()).findByText("Saved 1 change.");
+      expectStanding();
+    });
+
+    it("a failed Reload", async () => {
+      await loseResponse();
+      mockApi.getMySettings.mockRejectedValueOnce(new Error("offline"));
+      fireEvent.click(reloadButtons()[0]);
+      await within(bar()).findByText(/Could not reload the saved settings/);
+      expectStanding();
+    });
+
+    it("negative control: commit-unknown alone is fully cleared by a successful retry", async () => {
+      mockApi.putMyModelSettings.mockRejectedValueOnce(
+        new ApiError(500, "unknown", { reason: "settings_commit_unknown" }),
+      );
+      mount();
+      await screen.findByLabelText("Worker model — Codex");
+      select("Worker model — Codex", "gpt-6-sol");
+      fireEvent.click(saveButton());
+      await within(bar()).findByText(/could not confirm whether this save was applied/);
+      expect(within(bar()).queryByTestId(WARNING)).toBeNull();
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      fireEvent.click(saveButton());
+      await within(bar()).findByText("Saved 1 change. Your next runs use it.");
+      expect(within(bar()).queryByTestId(WARNING)).toBeNull();
+    });
+
+    it("negative control: a plain save never shows the warning", async () => {
+      mockApi.putMyModelSettings.mockResolvedValueOnce({ ...savedWith, effective: makeEffective() });
+      mount();
+      await screen.findByLabelText("Worker model — Codex");
+      select("Worker model — Codex", "gpt-6-sol");
+      fireEvent.click(saveButton());
+      await within(bar()).findByText("Saved 1 change. Your next runs use it.");
+      expect(within(bar()).queryByTestId(WARNING)).toBeNull();
+    });
   });
 
   it("Discard after an unconfirmed save keeps the uncertainty and Reload, without claiming the stored values", async () => {

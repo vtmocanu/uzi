@@ -178,7 +178,9 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const [outcome, setOutcome] = useState<SaveOutcome | null>(null);
   // An earlier save may have committed without confirmation. Kept apart from `outcome`, which a
   // later failed reload or failed retry replaces: a confirmed save or a read after a completed response
-  // reconciles it, so a dialog shown while a commit is unconfirmed never offers "Discard changes".
+  // reconciles it, except after a lost response (`requestMayStillFinish`): that request may still
+  // commit, so nothing clears it for the page's life. A dialog shown while a commit is unconfirmed
+  // never offers "Discard changes".
   // Discard drops the local draft but keeps this (with Reload) because it cannot know what the
   // server stored; a clean draft is not guarded by the leave dialog.
   const [uncertainty, setUncertainty] = useState<"unknown" | "saved_unreadable" | null>(null);
@@ -257,7 +259,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
   // Discard drops the local draft only. After an uncertain save it does not reconcile what the
   // server stored, so the uncertainty and its alert (with Reload saved settings) stay until a
-  // confirmed save or a reload that is safe to reconcile.
+  // confirmed save or a reload that is safe to reconcile; after a lost-response request
+  // (`requestMayStillFinish`) they stay for the page's life.
   const discard = useCallback(() => {
     setDraft(baseline);
     setReaffirmed(new Set());
@@ -271,6 +274,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     if (busy || dirty.length === 0 || blocked.size > 0) return;
     const seq = ++requestSeq.current;
     const count = dirty.length;
+    const earlierMayStillFinish = requestMayStillFinish;
     setSaving(true);
     setOutcome(null);
     setFieldErrors({});
@@ -283,11 +287,18 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       setLoaded({ settings: res.settings, effective: res.effective ?? null });
       setBaseline(values);
       setDraft(values);
-      setUncertainty(null);
-      setUnconfirmedKeys(new Set());
+      // A lost-response request may still commit after this retry and overwrite it, so this
+      // confirmation covers only its own save: the earlier uncertainty stays.
+      if (!earlierMayStillFinish) {
+        setUncertainty(null);
+        setUnconfirmedKeys(new Set());
+      }
       setReaffirmed(new Set());
-      setRequestMayStillFinish(false);
-      setOutcome(res.effective ? { kind: "saved", count } : { kind: "saved_no_prediction" });
+      setOutcome(
+        res.effective
+          ? { kind: "saved", count, ...(earlierMayStillFinish ? { earlierMayStillFinish: true } : {}) }
+          : { kind: "saved_no_prediction" },
+      );
     } catch (err) {
       if (!isCurrent(seq)) return;
       // Every failure keeps the draft: nothing is rolled back in the browser.
@@ -559,6 +570,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         // uncertainty, never claim a rollback). A reload after a lost response may still
         // predate the earlier write.
         saveUncertainty={uncertainty}
+        requestMayStillFinish={requestMayStillFinish}
         viewerId={viewerId}
         onDiscard={discard}
       />
@@ -648,6 +660,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         outcome={outcome}
         reloading={reloading}
         uncertain={uncertainty !== null}
+        requestMayStillFinish={requestMayStillFinish}
         onDiscard={discard}
         onReload={() => void reload()}
       />
