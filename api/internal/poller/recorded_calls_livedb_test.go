@@ -2,6 +2,7 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -50,7 +51,8 @@ type recordedPollForge struct {
 	// repo's code-host probe.
 	getProjectErr error
 	// ciBranch is the source branch the forge reports for MR 51 (the seeded ci_fix's ref).
-	ciBranch string
+	ciBranch      string
+	listIssuesErr error
 }
 
 func (f *recordedPollForge) GetProject(context.Context, int64) (forge.Project, error) {
@@ -59,7 +61,10 @@ func (f *recordedPollForge) GetProject(context.Context, int64) (forge.Project, e
 
 var recordedPollAt = time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
 
-func (*recordedPollForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
+func (f *recordedPollForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
+	if f.listIssuesErr != nil {
+		return nil, f.listIssuesErr
+	}
 	if len(opts.Labels) == 1 && opts.Labels[0] == "agent-found" {
 		// One agent-found issue so the finding mark is non-zero and tick 2's
 		// incremental finding fetch carries its UpdatedAfter bound.
@@ -203,4 +208,35 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 		t.Fatalf("terminal-target canceller observations = %+v, want two merged observations of ci_fix %s on MR 51", canceller.obs, ciFix)
 	}
 	forgetest.AssertGolden(t, "recorded_calls_poller_tick.golden", lines)
+
+	workerSvc := workersvc.New(q, nil, workersvc.Params{})
+	workerSvc.SetTxBeginner(pool)
+	svc.SetTerminalTargetCanceller(workerSvc)
+	pollForge.listIssuesErr = errors.New("issue listing failed")
+	for _, tc := range []struct {
+		name      string
+		pollCount int
+	}{{"full", 0}, {"incremental", 1}} {
+		t.Run(tc.name+"_issue_sync_failure_still_cancels", func(t *testing.T) {
+			fix := uuid.New()
+			pollForge.ciBranch = recordedPollCIBranch(repo) + "-" + tc.name
+			exec("INSERT INTO runs(id,user_id,repo_id,kind,pipeline_id,pipeline_ref,ci_fix_mr_iid,status,issue_title,issue_description) VALUES($1,$2,$3,'ci_fix',99,$4,51,'queued','t','d')", fix, user, repo, pollForge.ciBranch)
+			engine.states[repo].pollCount = tc.pollCount
+			var syncReported, syncOK bool
+			engine.SetSyncAttempt(func(uuid.UUID) func(bool, forge.ErrorClass) {
+				return func(ok bool, _ forge.ErrorClass) { syncReported, syncOK = true, ok }
+			})
+			engine.PollOnce(ctx)
+			if !syncReported || syncOK {
+				t.Fatalf("issue sync report: called=%t ok=%t, want a failed sync", syncReported, syncOK)
+			}
+			run, err := q.GetRunByID(ctx, fix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.Status != "cancelled" || run.StopReason.String != workersvc.TerminalTargetStopReason(forge.MRStateMerged) {
+				t.Fatalf("verified merged target: status=%q, stop reason=%q, want terminal-target cancellation", run.Status, run.StopReason.String)
+			}
+		})
+	}
 }
