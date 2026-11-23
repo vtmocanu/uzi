@@ -48,6 +48,12 @@ export type Ack = "confirmed" | "statusless" | "lost";
 
 export const gitIn = (dir: string, ...args: string[]): string => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: "pipe", env: GIT_ENV }).trim();
 
+/** Set (to the reason) where alive() cannot read the procfs stat file; the hold test files skip their describes with it. */
+export const PROCFS_SKIP: string | false = process.platform !== "linux" || !fs.existsSync("/proc/self/stat")
+  ? "requires Linux procfs (/proc/<pid>/stat) for alive()" : false;
+/** The `{ skip }` option the hold test files pass to every top-level describe. */
+export const procfs = { skip: PROCFS_SKIP };
+
 /** True while the process exists and is not a zombie. */
 export function alive(pid: number): boolean {
   try {
@@ -126,6 +132,9 @@ export interface HoldOptions {
   /** `unretained` replaces the write-free owed-tip probe with an always-"unretained" answer, so the exit runs today's
    *  retainCurrentOwedCandidate unconditionally: the BASE outcome a variant is compared against. */
   probeMode?: "real" | "unretained";
+  /** Arm one permanent (403) message-batch refusal inside the hold, right after the hold flag is set and before its guidance
+   *  flush, so the batcher's breaker trips and the guidance is unconfirmed. */
+  failGuidanceFlush?: boolean;
   /** Runs immediately before the claim executes (the mismatch is armed right after it). */
   beforeExecute?: (rig: HoldRig) => Promise<void> | void;
 }
@@ -153,7 +162,7 @@ export interface HoldRig {
   quiesce: QuiesceRunRequest[];
   counts: {
     holds: number; models: number; reaps: number; kills: number; ledger: number; captures: number; blocks: number; reserves: number;
-    freeCaptures: number; retainCalls: number; retainResults: string[]; probeResults: string[];
+    freeCaptures: number; retainCalls: number; retainResults: string[]; probeResults: string[]; reclaims: number;
   };
   rejections: unknown[];
   mismatch: { on: boolean };
@@ -230,7 +239,7 @@ export async function buildHold(t: TestContext, o: HoldOptions): Promise<HoldRig
     claim, harness: o.harness, bare, clonePath: clone.path, branch: clone.branch, key, runId: claim.run_id, home, provision, skills,
     child: undefined, authority, codex: undefined, registry: new ActiveRunRegistry(), logs, parks: [], sequence: [], flights: [], quiesce: [],
     counts: { holds: 0, models: 0, reaps: 0, kills: 0, ledger: 0, captures: 0, blocks: 0, reserves: 0, freeCaptures: 0, retainCalls: 0,
-      retainResults: [], probeResults: [] },
+      retainResults: [], probeResults: [], reclaims: 0 },
     rejections: [], mismatch: { on: false }, runner: undefined as never,
     executeClaim: async () => undefined,
     owedDir: () => path.join(bare, "uzi-owed"),
@@ -303,7 +312,7 @@ export async function buildHold(t: TestContext, o: HoldOptions): Promise<HoldRig
 
   const home0 = home;
   const reaping = (): Partial<Executor> => ({
-    reclaimCachesInPlace: async () => ({ dropped: [], absent: [], failed: [], skipped: [] }),
+    reclaimCachesInPlace: async () => { rig.counts.reclaims++; return { dropped: [], absent: [], failed: [], skipped: [] }; },
     killAgentTree: () => { rig.counts.kills++; },
     reapAttributedProcesses: async opts => { rig.counts.reaps++; return reapRunProcesses(home0, undefined, [], opts); },
   });
@@ -319,7 +328,7 @@ export async function buildHold(t: TestContext, o: HoldOptions): Promise<HoldRig
   const priv = rig.runner as unknown as Record<string, (...a: unknown[]) => unknown>;
   if (typeof priv.holdForBareIdentityChange === "function") {
     const hold = priv.holdForBareIdentityChange.bind(rig.runner);
-    t.mock.method(priv, "holdForBareIdentityChange", (...args: unknown[]) => { rig.counts.holds++; rig.flights.push(args[1] as HoldFlight); return hold(...args); });
+    t.mock.method(priv, "holdForBareIdentityChange", (...args: unknown[]) => { rig.counts.holds++; rig.flights.push(args[1] as HoldFlight); if (o.failGuidanceFlush) api.failMessagesNext(1, 403); return hold(...args); });
   }
   const free = priv.runFreeCapture!.bind(rig.runner);
   t.mock.method(priv, "runFreeCapture", (...args: unknown[]) => { rig.counts.freeCaptures++; return free(...args); });

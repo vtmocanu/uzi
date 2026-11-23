@@ -13,10 +13,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import type { PositiveOwedCandidateContext } from "../src/git.js";
-import { api, git, installHarness } from "./runner-harness.js";
+import { api, git, installHarness, setUpHarness, tearDownHarness } from "./runner-harness.js";
 import { fixtureFetchTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
 import {
-  CLAIM_GENERATION, PREDECESSOR_GENERATION, alive, buildHold, cleanupHold, commitOnBranch, gitIn, type Ack, type Harness, type HoldFlight,
+  CLAIM_GENERATION, PREDECESSOR_GENERATION, alive, buildHold, cleanupHold, commitOnBranch, gitIn, procfs, type Ack, type Harness, type HoldFlight,
   type HoldRig, type Snapshot,
 } from "./runner-bare-identity-hold-fixture.js";
 
@@ -244,6 +244,7 @@ function assertUntouched(o: Outcome): void {
   const { r, before, after } = o;
   assert.equal(alive(r.child!), true, "the predecessor-attributed child is alive");
   assert.equal(r.counts.reaps, 0, "no reap");
+  assert.equal(r.counts.reclaims, 0, "no cache reclaim");
   assert.equal(r.counts.models, 0);
   assert.equal(r.counts.ledger, 0, "no attempt ledger append");
   assert.equal(api.states.filter(s => s.runId === r.runId && s.body.status === "failed").length, 0, "no failed report");
@@ -280,6 +281,24 @@ const TARGETS: Target[] = [
   { label: "codex (facade closed by an earlier boundary)", harness: "codex", closed: true, skipped: false },
 ];
 
+/** The BASE outcome of a variant when its `base:` sibling did not run first (a single test selected by name): run it in a scene
+ *  of its own, keep only its plain recorded values, then tear that scene down and set up a fresh one for the hold under test.
+ *  Nothing of the first scene (its filesystem, its mocks, its planted child) is read again. */
+async function freshBase(t: TestContext, v: Variant, target: Target, ack: Ack): Promise<Outcome> {
+  const o = await baseRun(t, v, target, ack);
+  t.mock.restoreAll();
+  cleanupHold();
+  await tearDownHarness();
+  await setUpHarness(t);
+  return o;
+}
+
+async function baseRun(t: TestContext, v: Variant, target: Target, ack: Ack): Promise<Outcome> {
+  const o = await execute(t, v, target, ack, "unretained");
+  assert.equal(o.retainCalls, target.skipped ? 0 : 1, target.skipped ? "an unproven Codex disposal skips the retention" : "today's retention ran once");
+  return o;
+}
+
 /** Run ids and commit ids differ between two fixtures of the same variant; compare their shapes. */
 function norm(o: Outcome, text: string): string {
   let out = text.split(o.r.runId).join("<RUN>");
@@ -291,18 +310,17 @@ const shape = (o: Outcome, d: Diff): string => norm(o, JSON.stringify(d));
 for (const v of [...VARIANTS, ...WRONG_TARGET]) {
   for (const target of TARGETS.filter(x => v.harnesses === undefined || v.harnesses.includes(x.harness) && !x.closed)) {
     for (const ack of ACKS) {
-      describe(`${v.name}: ${target.label}, ${ack === "confirmed" ? "confirmed" : "uncertain"} park`, () => {
+      describe(`${v.name}: ${target.label}, ${ack === "confirmed" ? "confirmed" : "uncertain"} park`, procfs, () => {
         // The skipped Codex arrangement never reaches the retention, so one base run per ack (on the variant that would write the
         // most) proves today's unconditional call is skipped there too; the other rows' hold runs assert it directly.
         const baseRuns = !target.skipped || v === VARIANTS[1];
         if (baseRuns) it("base: today's unconditional retention yields the outcome the hold is compared with", async t => {
-          const o = await execute(t, v, target, ack, "unretained");
-          assert.equal(o.retainCalls, target.skipped ? 0 : 1, target.skipped ? "an unproven Codex disposal skips the retention" : "today's retention ran once");
+          const o = await baseRun(t, v, target, ack);
           outcomes.set(keyOf(v, target, ack), o);
         });
 
         it("hold: the exit leaves the predecessor's refs and files as the variant requires", async t => {
-          const base = outcomes.get(keyOf(v, target, ack));
+          const base = outcomes.get(keyOf(v, target, ack)) ?? await freshBase(t, v, target, ack);
           const o = await execute(t, v, target, ack, "real");
           assertUntouched(o);
           assert.equal(gitIn(o.r.bare, "cat-file", "-t", o.d.tip), "commit", "the tip is still reachable");
@@ -316,10 +334,8 @@ for (const v of [...VARIANTS, ...WRONG_TARGET]) {
             assert.deepEqual(refDiff(o.before.refs, o.after.refs), none, "refs");
             assert.equal(o.after.owed, o.before.owed, "uzi-owed files");
             assert.equal(o.after.refusals, o.before.refusals, "refusal files");
-            if (base) {
-              assert.equal(base.retainCalls, 0, "today's unconditional call is skipped too");
-              assert.equal(base.flight.sourceJoinFailed, true);
-            }
+            assert.equal(base.retainCalls, 0, "today's unconditional call is skipped too");
+            assert.equal(base.flight.sourceJoinFailed, true);
             return;
           }
           // The probe's answer, then the retention call the exit made (if any).
@@ -355,7 +371,6 @@ for (const v of [...VARIANTS, ...WRONG_TARGET]) {
           assert.deepEqual(diffNames(o.before.refusals, o.after.refusals), v.refusals(o.r, o.d), "refusal files");
           v.extra?.(o.r, o.d, o.after);
           // The same state under today's unconditional retention ends the same way: only the spy count differs on a retained tip.
-          assert.ok(base, "the base outcome of this variant was recorded");
           assert.deepEqual({ kind: o.final.kind, reason: o.final.reason }, { kind: base.final.kind, reason: base.final.reason }, "the outcome equals the base outcome");
           assert.equal(o.flight.sourceJoinFailed === true, base.flight.sourceJoinFailed === true, "sourceJoinFailed equals the base");
           assert.equal(o.flight.sourceCleanupJoined === true, base.flight.sourceCleanupJoined === true, "sourceCleanupJoined equals the base");
@@ -385,7 +400,7 @@ function infoTree(bare: string): Record<string, string> {
   return out;
 }
 
-describe("the guarded hold exit's refusal-provenance admission write (today's behaviour)", () => {
+describe("the guarded hold exit's refusal-provenance admission write (today's behaviour)", procfs, () => {
   async function run(t: TestContext, guarded: boolean, mode: "real" | "unretained") {
     const r = await buildHold(t, { harness: "claude", ack: "confirmed", ...(guarded ? { guarded: true } : {}), probeMode: mode,
       tracked: async rig => { await trackedHead(rig); } });
@@ -397,6 +412,7 @@ describe("the guarded hold exit's refusal-provenance admission write (today's be
     assert.equal(r.counts.holds, 1, "the hold ran");
     const added = Object.keys(infoAfter).filter(n => !(n in infoBefore)).map(n => n.split(r.runId).join("<RUN>"));
     assert.deepEqual(Object.keys(infoBefore).filter(n => infoAfter[n] !== infoBefore[n]), [], "no existing info file changed");
+    assert.equal(r.counts.reclaims, 0, "no cache reclaim");
     assert.equal(after.refs, before.refs, "refs unchanged");
     assert.equal(after.config, before.config, "config unchanged");
     assert.equal(after.journal, before.journal, "journal unchanged");

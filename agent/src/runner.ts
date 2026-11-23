@@ -8879,8 +8879,9 @@ export class RunRunner {
    */
   private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
     // issue #4058: a predecessor-remediation hold reports no terminal state and aborts nothing; the flight stops
-    // retained through holdForPredecessorRemediation.
-    if (flight.orphanRemediationHold) return;
+    // retained through holdForPredecessorRemediation. issue #4627: a bare-identity hold is likewise nonterminal and keeps its
+    // source; a permanent refusal of its guidance flush (the batcher breaker) must not turn the held park into a `failed` report.
+    if (flight.orphanRemediationHold || flight.bareIdentityHold) return;
     if (flight.policyHold || flight.iterationParkState !== "none") return;
     if (flight.workerMemory?.hold) {
       this.retainWorkerMemoryCustody(flight);

@@ -9,7 +9,7 @@ import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { api, git, installHarness } from "./runner-harness.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
-import { alive, buildHold, cleanupHold, gitIn, GUIDANCE, type HoldRig } from "./runner-bare-identity-hold-fixture.js";
+import { alive, buildHold, cleanupHold, gitIn, GUIDANCE, procfs, type HoldRig } from "./runner-bare-identity-hold-fixture.js";
 
 installHarness();
 afterEach(() => cleanupHold());
@@ -34,7 +34,7 @@ async function legacyAdopting(r: HoldRig): Promise<void> {
     JSON.stringify({ ...journal, recovery: { ...journal.recovery, successor, stage: "adopting" } }));
 }
 
-describe("a not-blocked adopting journal that needs the legacy repair, with a typed bare-identity mismatch", () => {
+describe("a not-blocked adopting journal that needs the legacy repair, with a typed bare-identity mismatch", procfs, () => {
   it("is refused read-only by discovery: the existing operator text, custody kept, no ledger append, no reservation, no hold", async t => {
     const r = await buildHold(t, { harness: "claude", ack: "confirmed", skipReserve: true, tracked: legacyAdopting });
     const journal = JSON.parse(gitIn(r.bare, "config", `uzi-recovery.${r.branch}.clone`)) as { recovery: { stage: string } };

@@ -10,7 +10,7 @@ import { afterEach, describe, it } from "node:test";
 import { reapRunProcesses } from "../src/run-procs.js";
 import { installHarness, api, git } from "./runner-harness.js";
 import {
-  GUIDANCE, alive, buildHold, cleanupHold, plantChild, type Ack, type Harness, type HoldRig,
+  GUIDANCE, alive, buildHold, cleanupHold, plantChild, procfs, type Ack, type Harness, type HoldRig,
 } from "./runner-bare-identity-hold-fixture.js";
 import { setQuiescenceViewForTests } from "../src/run-quiescence.js";
 import { scopedRealView } from "./fake-proc.js";
@@ -25,7 +25,7 @@ const logged = (r: HoldRig, msg: string) => r.logs.lines.filter(l => (l as { msg
 const failures = (r: HoldRig) => api.states.filter(s => s.runId === r.runId && s.body.status === "failed");
 const holds = (r: HoldRig) => r.parks.filter(p => p.recovery_cause === "retained_recovery_adoption_failed");
 
-describe("instrument control", () => {
+describe("instrument control", procfs, () => {
   it("the reaping executor kills a planted HOME-attributed child, so a surviving child proves no reap ran", async t => {
     const r = await buildHold(t, { harness: "claude", ack: "confirmed" });
     const second = await plantChild(r.home, r.clonePath);
@@ -41,7 +41,7 @@ describe("instrument control", () => {
 
 for (const harness of ["claude", "codex"] as Harness[]) {
   for (const ack of ["confirmed", "statusless", "lost"] as Ack[]) {
-    describe(`whole claim exit of a held bare identity change: ${harness}, ${ack === "confirmed" ? "confirmed park" : `uncertain park (${ack} ACK)`}`, () => {
+    describe(`whole claim exit of a held bare identity change: ${harness}, ${ack === "confirmed" ? "confirmed park" : `uncertain park (${ack} ACK)`}`, procfs, () => {
       it("leaves the predecessor's process, clone, HOME, caches, provision dir, slots, journal, owner record and ledger untouched", async t => {
         const r = await buildHold(t, { harness, ack });
         const before = await r.snapshot();
@@ -69,6 +69,8 @@ for (const harness of ["claude", "codex"] as Harness[]) {
         assert.equal(r.counts.captures, 0, "no capture");
         assert.equal(r.counts.blocks, 0, "no blocker recorded");
         assert.equal(r.counts.freeCaptures, 0, "no credential-free capture");
+        assert.equal(r.counts.reclaims, 0, "no cache reclaim");
+        for (const p of holds(r)) assert.equal(p.claim_generation, r.claim.claim_generation, "every park (retries included) carries the claim's generation");
         assert.equal(failures(r).length, 0, "no failed report");
         assert.equal(api.states.filter(s => s.runId === r.runId && s.body.status === "completed").length, 0);
         assert.deepEqual(r.quiesce.filter(q => q.targetPaths.some(p => p === r.clonePath || p.startsWith(r.clonePath + path.sep))), [],
@@ -108,4 +110,30 @@ for (const harness of ["claude", "codex"] as Harness[]) {
       });
     });
   }
+}
+
+for (const harness of ["claude", "codex"] as Harness[]) {
+  describe(`a permanent refusal of the hold's guidance flush trips the batcher breaker without failing the run: ${harness}, confirmed park`, procfs, () => {
+    it("reports no failed state, reaps nothing and leaves the predecessor untouched", async t => {
+      const r = await buildHold(t, { harness, ack: "confirmed", failGuidanceFlush: true });
+      const before = await r.snapshot();
+      await r.executeClaim();
+      const after = await r.snapshot();
+
+      assert.equal(r.counts.holds, 1, "the hold ran once");
+      assert.equal(failures(r).length, 0, "no failed report");
+      assert.ok(logged(r, "guidance_unconfirmed").length >= 1, "the unconfirmed guidance flush was logged (the breaker tripped)");
+      assert.equal(holds(r).length, 1, "the park was requested once");
+      assert.equal(r.counts.reaps, 0, "no HOME-attributed reap was requested");
+      assert.equal(r.counts.reclaims, 0, "no cache reclaim");
+      assert.equal(alive(r.child!), true, "the predecessor-attributed child is alive");
+      const flight = r.flights[0]!;
+      assert.equal(flight.bareIdentityHold, true);
+      assert.equal(flight.preserveRecoveryClone, true);
+      assert.equal(flight.retainedLocalCustody, true);
+      assert.equal(after.clone, before.clone, "the clone is byte-identical");
+      assert.equal(after.home, before.home, "HOME is byte-identical");
+      assert.equal(after.caches, before.caches, "the caches and the Go work leaf are byte-identical");
+    });
+  });
 }
