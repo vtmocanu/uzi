@@ -1532,9 +1532,10 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   let tableFailure: unknown;
   let bytes = 0;
   const gateDeadline = deps.deadlineAt;
-  // issue #4632: a per-PID environ/cwd EACCES/EPERM of a scan the deadline was serialized into (req.deadlineAt, set
-  // only for observe-only and opted-in helper scans, never for an in-process #3980 checkpoint that merely carries
-  // deps.deadlineAt) is not a table failure: scanOnce classifies it through pid + start-time attribution.
+  // issue #4632: a per-PID environ/cwd EACCES/EPERM of a scan the deadline was serialized into is not a table failure:
+  // scanOnce classifies it through pid + start-time attribution. req.deadlineAt is set by quiesceRunAttempt only for
+  // observe-only and helperDeadline (inventory) scans, whichever lane runs them (in-process, helper or the scoped
+  // reaper, which serializes the same scan); never for a #3980 checkpoint that merely carries deps.deadlineAt.
   const perPidAccessIsPerProcess = req.deadlineAt !== undefined && !reportBudget && !scoped && !ambient;
   const bounded = <T>(read: () => T, cap?: number, perPid?: true): T => {
     try {

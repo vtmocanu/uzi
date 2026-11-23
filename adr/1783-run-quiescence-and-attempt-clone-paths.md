@@ -123,7 +123,8 @@ clone key and read that git as unattributed residue, failing the successor.
   persists, a same-key claim waits once, retries once and stops, so repeated
   claims can exhaust requeues; base would instead have failed the seed
   terminally (`worker_residue_blocked`), since seed mode kills only
-  terminal-attempt residue and an unmarked in-scope process survives. The clear's bare-config reads and observe-only probe
+  attempt-marked (own or terminal) residue, and a readable unmarked in-scope
+  process survives as `unattributed_in_scope`. The clear's bare-config reads and observe-only probe
   can outlive the section's budget on expiry, but stay tracked until they settle;
   none of them runs in the clone.
 - **Rollout.** The checks `source_lock_unavailable` and
