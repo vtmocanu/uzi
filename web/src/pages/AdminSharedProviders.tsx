@@ -6,7 +6,8 @@
 // The page answers two questions per definition: what is fixed (endpoint, auth style: a
 // locked block, never an input once created) and who depends on it (how many users selected
 // it, how many personal keys are attached). Delete is guarded on both: its confirmation says
-// how many keys go with it and is refused while anyone has it selected.
+// how many keys go with it and, while anyone has it selected, leads with the refusal instead.
+// Every confirmation opens with focus on Cancel.
 //
 // Server strings (names, URLs, model names) render as React text nodes only; nothing here
 // uses dangerouslySetInnerHTML.
@@ -205,7 +206,8 @@ function ProviderCard({
 
   useEffect(() => {
     setError("");
-    if (confirm) confirmRef.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    // Focus the safe choice, never the destructive one: an Enter right after opening must not act.
+    if (confirm) confirmRef.current?.querySelector<HTMLButtonElement>("button[data-confirm-cancel]")?.focus();
   }, [confirm]);
 
   const act = async (fn: () => Promise<string>, fallback: string) => {
@@ -215,8 +217,9 @@ function ProviderCard({
       await onDone(await fn());
     } catch (err) {
       setError(sharedError(err, fallback));
-      // A refused delete means the counts on screen were stale: refresh them in place.
-      if (err instanceof ApiError && err.status === 409) await onStale();
+      // A 409 means the counts on screen were stale, a 404 that another admin already deleted the
+      // definition: either way refresh the list, so no stale count or ghost card stays behind.
+      if (err instanceof ApiError && (err.status === 409 || err.status === 404)) await onStale();
     } finally {
       setWorking(false);
     }
@@ -279,7 +282,7 @@ function ProviderCard({
               }, "Failed to retire the shared provider")}>
                 {working ? "Retiring…" : "Retire definition"}
               </Button>
-              <Button variant="ghost" size="sm" disabled={working} onClick={onCancel}>Cancel</Button>
+              <Button variant="ghost" size="sm" disabled={working} onClick={onCancel} data-confirm-cancel>Cancel</Button>
             </>
           }
         >
@@ -303,19 +306,33 @@ function ProviderCard({
               }, "Failed to delete the shared provider")}>
                 {working ? "Deleting…" : "Delete definition and keys"}
               </Button>
-              <Button variant="ghost" size="sm" disabled={working} onClick={onCancel}>Cancel</Button>
+              <Button variant="ghost" size="sm" disabled={working} onClick={onCancel} data-confirm-cancel>Cancel</Button>
             </>
           }
         >
-          <p data-testid={`delete-keys-${p.id}`}>
-            Delete {name}? This also deletes {plural(keys, "personal key", "personal keys")} users attached to it, and their Test
-            results. This cannot be undone.
-          </p>
-          <p data-testid={`delete-selected-${p.id}`} className={selected > 0 ? "text-warn" : "text-muted"}>
-            {selected > 0
-              ? `Selected as the Claude source by ${plural(selected, "user", "users")}. Delete is refused until nobody has it selected: retire it, then ask them to choose another source.`
-              : "No user has it selected as their Claude source."}
-          </p>
+          {/* While anyone has it selected the server refuses, so the box leads with the refusal
+              instead of asking a question it will not act on. */}
+          {selected > 0 ? (
+            <>
+              <p data-testid={`delete-selected-${p.id}`} className="text-warn">
+                {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their Claude source. Retire it, then ask them to choose another source.`}
+              </p>
+              <p data-testid={`delete-keys-${p.id}`} className="text-muted">
+                Once nobody has it selected, deleting it would also delete {plural(keys, "personal key", "personal keys")} users
+                attached to it, and their Test results.
+              </p>
+            </>
+          ) : (
+            <>
+              <p data-testid={`delete-keys-${p.id}`}>
+                Delete {name}? This also deletes {plural(keys, "personal key", "personal keys")} users attached to it, and their
+                Test results. This cannot be undone.
+              </p>
+              <p data-testid={`delete-selected-${p.id}`} className="text-muted">
+                No user has it selected as their Claude source.
+              </p>
+            </>
+          )}
         </ConfirmBox>
       )}
     </Card>

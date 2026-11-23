@@ -12,7 +12,7 @@
 // answers 404 to the owner routes), and both attaching a key and selecting it as the Claude
 // source first show SharedProviderDisclosure: who controls what, and where the key goes.
 
-import { useCallback, useEffect, useId, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type Ref } from "react";
 import {
   api,
   type ProviderAuthStyle,
@@ -42,9 +42,11 @@ import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleto
 const isShared = (p: ProviderDTO) => p.credential_mode === "per_user_key";
 
 // A personal and a shared definition may carry the same name, so the source line says which.
+// A retired source stays selected (nothing falls back on its own), so the line says it is unusable.
 function sourceName(p: ProviderDTO | undefined): string {
   if (!p) return "a provider that no longer exists";
-  return isShared(p) ? `${sanitizeLabel(p.name)} (managed by your admin)` : sanitizeLabel(p.name);
+  const name = isShared(p) ? `${sanitizeLabel(p.name)} (managed by your admin)` : sanitizeLabel(p.name);
+  return p.retired ? `${name}, retired: new runs cannot use it until you stop using it or choose another source` : name;
 }
 
 const engineLabel = (engine: ProviderDTO["engine"]) => engine === "codex" ? "Codex" : "Claude";
@@ -114,11 +116,26 @@ function ProbeResults({ probe }: { probe: ProviderProbe | null }) {
 // definition into what the admin decides and what the user holds, then says where the key
 // goes. Indigo (the "plan" token) marks admin-controlled things throughout: the badge, this
 // panel's frame and its left column; the user's own column stays in plain foreground.
-function SharedProviderDisclosure({ provider: p, context }: { provider: ProviderDTO; context: "attach" | "select" }) {
+// It is focusable (tabIndex -1, named by its aria-label) so the select panel can move focus
+// onto it, and its id describes the control it gates (the key input, the Confirm button).
+function SharedProviderDisclosure({
+  provider: p,
+  context,
+  id,
+  ref,
+}: {
+  provider: ProviderDTO;
+  context: "attach" | "select";
+  id: string;
+  ref?: Ref<HTMLElement>;
+}) {
   return (
     <section
+      ref={ref}
+      id={id}
+      tabIndex={-1}
       aria-label={context === "attach" ? "Before you attach your key" : "Before you use this provider"}
-      className="space-y-3 rounded-lg border border-plan/30 bg-plan/5 p-3 text-sm"
+      className="space-y-3 rounded-lg border border-plan/30 bg-plan/5 p-3 text-sm outline-hidden focus:ring-2 focus:ring-ring"
       data-testid={`shared-disclosure-${p.id}`}
     >
       <div className="grid gap-3 sm:grid-cols-2">
@@ -126,12 +143,13 @@ function SharedProviderDisclosure({ provider: p, context }: { provider: Provider
           <h4 className="font-medium text-plan">Set by your admin</h4>
           <p>
             Endpoint <code className="break-all">{sanitizeLabel(p.base_url)}</code>, fixed when your admin created
-            this definition. It cannot be changed, so your key is never moved to a different gateway behind your back.
+            this definition. Your admin cannot repoint your key to a different gateway.
           </p>
           <p>Auth style: your key is sent as {AUTH_LABELS[p.auth_style]}.</p>
           <p>
-            Model map: your admin chooses which gateway model serves each uzi model and can change it later without
-            asking you. Runs that already started keep the map they started with.
+            Model map: your admin chooses which gateway model serves each uzi model, so it decides which model and
+            context window your own key pays for on your next fresh run. An admin edit changes that without asking you;
+            runs that already started keep the map they started with.
           </p>
         </div>
         <div className="space-y-1.5 border-l-2 border-edge pl-3">
@@ -190,6 +208,14 @@ function ProviderRow({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmKeyDelete, setConfirmKeyDelete] = useState(false);
   const [testing, setTesting] = useState(false);
+  const disclosureId = `${uid}-disclosure`;
+  const disclosureRef = useRef<HTMLElement>(null);
+
+  // Opening the select panel moves focus onto its disclosure, so the next Tab reaches Confirm
+  // directly instead of walking past Rotate, Disable, Delete and Test first.
+  useEffect(() => {
+    if (panel === "select") disclosureRef.current?.focus();
+  }, [panel]);
 
   const open = (next: Panel) => {
     setFormError("");
@@ -423,7 +449,9 @@ function ProviderRow({
       </div>
       {shared && (
         <p className="text-xs text-faint" data-testid={`shared-note-${p.id}`}>
-          {p.retired
+          {p.retired && isSource
+            ? `Your admin retired this definition, but it is still your ${engineLabel(p.engine)} source, so new runs cannot start on it. Stop using it or choose another source. You can still disable or delete your key.`
+            : p.retired
             ? "Your admin retired this definition. It can no longer be selected or tested; you can still disable or delete your key."
             : "Your admin manages this definition's name, endpoint and models. You manage only your own key."}
         </p>
@@ -502,12 +530,13 @@ function ProviderRow({
       )}
       {panel === "key" && (
         <form onSubmit={saveKey} className="space-y-3 border-t border-edge pt-3">
-          {shared && <SharedProviderDisclosure provider={p} context="attach" />}
+          {shared && <SharedProviderDisclosure provider={p} context="attach" id={disclosureId} />}
           <Field label={p.has_key ? "New key" : "Key"}>
             <Input
               type="password"
               autoComplete="off"
               aria-label="Provider key"
+              aria-describedby={shared ? disclosureId : undefined}
               placeholder="Paste the gateway API key"
               value={key}
               onChange={(e) => setKey(e.target.value)}
@@ -520,10 +549,11 @@ function ProviderRow({
       )}
       {panel === "select" && shared && !isSource && (
         <div className="space-y-3 border-t border-edge pt-3">
-          <SharedProviderDisclosure provider={p} context="select" />
+          <SharedProviderDisclosure provider={p} context="select" id={disclosureId} ref={disclosureRef} />
           <div className="flex flex-wrap gap-2">
             <Button
               size="sm"
+              aria-describedby={disclosureId}
               disabled={rowBusy || blocked !== null}
               onClick={async () => {
                 if (await selectAsSource()) setPanel(null);

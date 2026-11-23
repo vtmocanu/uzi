@@ -8,7 +8,7 @@ import { api, type AdminSharedProvider } from "../lib/api";
 
 // PRD #4324 M4: Admin → Shared providers at phone width. A long fixed endpoint, the counts and
 // the delete confirmation must wrap inside the card, never push the page sideways, and the
-// confirm button takes focus with a visible focus ring.
+// Cancel takes focus (never the destructive button) with a visible focus ring.
 vi.mock("../lib/api", async original => {
   const actual = await original<typeof import("../lib/api")>();
   return { ...actual, api: { adminListSharedProviders: vi.fn(), listProviders: vi.fn(), adminDeleteSharedProvider: vi.fn() } };
@@ -37,7 +37,7 @@ it("keeps the card, fixed facts and delete confirmation inside a 390px viewport"
   expect(within(group).getByTestId("delete-selected-s1").textContent).toMatch(/2 users/);
   const confirm = within(group).getByRole("button", { name: "Delete definition and keys" }) as HTMLButtonElement;
   expect(confirm.disabled).toBe(true);
-  // The disabled confirm is skipped: focus lands on Cancel. Keyboard focus shows the global
+  // Focus lands on Cancel, the safe choice. Keyboard focus shows the global
   // :focus-visible ring (a programmatic focus after a mouse click deliberately does not).
   const cancel = within(group).getByRole("button", { name: "Cancel" });
   expect(document.activeElement).toBe(cancel);

@@ -153,4 +153,22 @@ describe("mock admin-shared providers", () => {
     await api.adminRetireSharedProvider(provider.id);
     await expect(api.adminPatchSharedProvider(provider.id, { name: "z" })).rejects.toMatchObject({ status: 409, body: { reason: "provider_retired" } });
   });
+
+  // PRD #4324: retirement never clears a source or falls back. The selection stays (unusable),
+  // a re-select is refused, and only an explicit clear moves the user off it.
+  it("keeps a retired selected definition as the source and refuses a re-select", async () => {
+    const api = await load();
+    await api.putProviderKey(SHARED, "k".repeat(24));
+    await api.setClaudeProviderSource(SHARED);
+    await api.adminRetireSharedProvider(SHARED);
+    expect((await api.getMySettings()).settings.claude_provider_id).toBe(SHARED);
+    expect((await api.listProviders()).providers.find(p => p.id === SHARED)).toMatchObject({ retired: true });
+    await expect(api.setClaudeProviderSource(SHARED)).rejects.toMatchObject({
+      status: 409,
+      body: { reason: "provider_source_unusable" },
+    });
+    expect((await api.getMySettings()).settings.claude_provider_id).toBe(SHARED);
+    await expect(api.setClaudeProviderSource(null)).resolves.toEqual({ claude_provider_id: null });
+    expect((await api.getMySettings()).settings.claude_provider_id).toBeNull();
+  });
 });

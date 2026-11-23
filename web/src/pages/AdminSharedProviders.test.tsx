@@ -201,6 +201,7 @@ describe("AdminSharedProviders — retire", () => {
     const box = within(screen.getByRole("group", { name: "Confirm retiring platform-gateway" }));
     expect(box.getByText(/2 users keep it selected but cannot use it/)).toBeTruthy();
     expect(box.getByText(/runs already started keep their binding/)).toBeTruthy();
+    expect(document.activeElement).toBe(box.getByRole("button", { name: "Cancel" }));
     fireEvent.click(box.getByRole("button", { name: "Retire definition" }));
     await waitFor(() => expect(mockApi.adminRetireSharedProvider).toHaveBeenCalledWith("s1"));
     expect(await screen.findByText("platform-gateway retired.")).toBeTruthy();
@@ -218,7 +219,8 @@ describe("AdminSharedProviders — delete", () => {
     expect(box.getByTestId("delete-keys-s1").textContent).toMatch(/This also deletes 3 personal keys users attached to it/);
     expect(box.getByTestId("delete-selected-s1").textContent).toBe("No user has it selected as their Claude source.");
     const confirm = box.getByRole("button", { name: "Delete definition and keys" });
-    expect(document.activeElement).toBe(confirm);
+    // Focus starts on the safe choice, so an Enter right after opening cannot delete.
+    expect(document.activeElement).toBe(box.getByRole("button", { name: "Cancel" }));
     fireEvent.click(confirm);
     await waitFor(() => expect(mockApi.adminDeleteSharedProvider).toHaveBeenCalledWith("s1"));
     expect(await screen.findByText("platform-gateway deleted, with 3 attached keys.")).toBeTruthy();
@@ -228,9 +230,35 @@ describe("AdminSharedProviders — delete", () => {
     await renderPage([shared({ selected_user_count: 2, attached_key_count: 1 })]);
     fireEvent.click(screen.getByRole("button", { name: "Delete platform-gateway" }));
     const box = within(screen.getByRole("group", { name: "Confirm deleting platform-gateway" }));
-    expect(box.getByTestId("delete-keys-s1").textContent).toMatch(/This also deletes 1 personal key users attached/);
-    expect(box.getByTestId("delete-selected-s1").textContent).toMatch(/Selected as the Claude source by 2 users\. Delete is refused/);
+    // The refusal leads; the confirm box never asks a question it will refuse to act on.
+    const lead = box.getByTestId("delete-selected-s1");
+    expect(lead.textContent).toMatch(/^platform-gateway can't be deleted yet: 2 users have it selected as their Claude source\./);
+    expect(box.queryByText(/Delete platform-gateway\?/)).toBeNull();
+    expect(lead.compareDocumentPosition(box.getByTestId("delete-keys-s1")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(box.getByTestId("delete-keys-s1").textContent).toMatch(/would also delete 1 personal key users attached/);
     expect((box.getByRole("button", { name: "Delete definition and keys" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(document.activeElement).toBe(box.getByRole("button", { name: "Cancel" }));
+  });
+
+  it("reloads on a 404, so a definition another admin deleted leaves no ghost card", async () => {
+    mockApi.adminDeleteSharedProvider.mockRejectedValue(new ApiError(404, "not found", { error: "not found" }));
+    await renderPage([shared({ selected_user_count: 0 })]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete platform-gateway" }));
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [] });
+    const group = screen.getByRole("group", { name: "Confirm deleting platform-gateway" });
+    fireEvent.click(within(group).getByRole("button", { name: "Delete definition and keys" }));
+    expect(await screen.findByText("No shared providers yet")).toBeTruthy();
+    expect(screen.queryByTestId("selected-count-s1")).toBeNull();
+    expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2);
+  });
+
+  it("reloads on a 404 from retire too", async () => {
+    mockApi.adminRetireSharedProvider.mockRejectedValue(new ApiError(404, "not found", { error: "not found" }));
+    await renderPage([shared()]);
+    fireEvent.click(screen.getByRole("button", { name: "Retire platform-gateway" }));
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [] });
+    fireEvent.click(within(screen.getByRole("group", { name: "Confirm retiring platform-gateway" })).getByRole("button", { name: "Retire definition" }));
+    expect(await screen.findByText("No shared providers yet")).toBeTruthy();
   });
 
   it("surfaces a 409 in-use refusal from stale counts inside the confirmation and refreshes them", async () => {

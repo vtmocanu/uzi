@@ -601,11 +601,19 @@ describe("Providers — admin-shared definitions (PRD #4324)", () => {
     const text = box.textContent ?? "";
     expect(text).toContain("your key is sent as Authorization: Bearer");
     expect(text).toContain(URL_B);
-    expect(text).toMatch(/fixed when your admin created this definition\. It cannot be changed/);
+    expect(text).toMatch(/fixed when your admin created this definition\. Your admin cannot repoint your key to a different gateway\./);
+    // No absolute promise: the gateway itself can still redirect (the line below says so).
+    expect(text).not.toMatch(/never moved/);
     expect(text).toMatch(/Your key is personal and in your own custody/);
     expect(text).toMatch(/your admin cannot see it/);
     expect(text).toMatch(/Your key is sent to that endpoint on every request\. If the gateway redirects/);
     expect(text).toMatch(/Model map: your admin chooses which gateway model serves each uzi model/);
+    // PRD #4324 trust decision: the admin's map decides what the user's own key pays for.
+    expect(text).toMatch(/decides which model and context window your own key pays for on your next fresh run\. An admin edit changes that/);
+    // The key input is described by the disclosure it sits under.
+    const keyInput = row.getByLabelText("Provider key");
+    expect(keyInput.getAttribute("aria-describedby")).toBe(box.id);
+    expect(box.id).not.toBe("");
     expect(row.queryByTestId("shared-disclosure-xapikey-s1")).toBeNull();
     fireEvent.change(row.getByLabelText("Provider key"), { target: { value: "k".repeat(24) } });
     fireEvent.click(row.getByRole("button", { name: "Save key" }));
@@ -635,7 +643,17 @@ describe("Providers — admin-shared definitions (PRD #4324)", () => {
     expect(use.getAttribute("aria-expanded")).toBe("true");
     const box = row.getByRole("region", { name: "Before you use this provider" });
     expect(box.textContent).toMatch(/your admin cannot see it/);
+    expect(box.textContent).toMatch(/your own key pays for on your next fresh run/);
+    expect(box.textContent).not.toMatch(/never moved/);
     expect(row.getByTestId("shared-disclosure-xapikey-s1")).toBeTruthy();
+    // Focus lands on the disclosure, so the next Tab reaches Confirm rather than Rotate/Disable/Delete/Test.
+    expect(document.activeElement).toBe(box);
+    expect(box.getAttribute("tabindex")).toBe("-1");
+    const confirm = row.getByRole("button", { name: "Confirm and use as Claude source" });
+    expect(confirm.getAttribute("aria-describedby")).toBe(box.id);
+    const focusable = Array.from(document.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, textarea"));
+    const after = focusable.filter((el) => box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(after[0]).toBe(confirm);
     mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "s1" } } as never);
     fireEvent.click(row.getByRole("button", { name: "Confirm and use as Claude source" }));
     await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith("s1"));
@@ -667,5 +685,32 @@ describe("Providers — admin-shared definitions (PRD #4324)", () => {
     expect((row.getByRole("button", { name: "Use as Claude source" }) as HTMLButtonElement).disabled).toBe(true);
     expect((row.getByRole("button", { name: "Test" }) as HTMLButtonElement).disabled).toBe(true);
     expect(row.getByTestId("shared-note-s1").textContent).toMatch(/Your admin retired this definition/);
+  });
+
+  // PRD #4324 L117: retirement does not clear a source or fall back; the selection stays,
+  // unusable, and the user clears it explicitly.
+  it("keeps a retired shared definition that is the current source as the source, unusable, with only Stop using", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "s1" } } as never);
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: null });
+    await renderCard(list({ providers: [shared({ retired: true })] }));
+    await waitFor(() =>
+      expect(screen.getByTestId("claude-source").textContent).toMatch(
+        /Current Claude source: platform-gateway \(managed by your admin\), retired: new runs cannot use it/,
+      ),
+    );
+    const row = within(screen.getByTestId("provider-s1"));
+    expect(row.getByText("Claude source")).toBeTruthy();
+    expect(row.getByText("Retired")).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Use as Claude source" })).toBeNull();
+    expect(row.queryByRole("button", { name: /Confirm and use/ })).toBeNull();
+    expect(row.getByTestId("shared-note-s1").textContent).toMatch(
+      /still your Claude source, so new runs cannot start on it\. Stop using it or choose another source/,
+    );
+    const stop = row.getByRole("button", { name: "Stop using Claude source" }) as HTMLButtonElement;
+    expect(stop.disabled).toBe(false);
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: null } } as never);
+    fireEvent.click(stop);
+    await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null));
+    await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/Current Claude source: Anthropic/));
   });
 });
