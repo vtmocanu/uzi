@@ -172,8 +172,8 @@ func (s *Service) providerBindingRefusal(run store.Run, rev *store.GetModelProvi
 // disable or delete either committed first and is seen here, or waits until this claim decision
 // commits; a held row is 55P03, which rolls the transaction back for the bounded retry instead of
 // blocking under the run lock), then reads the frozen revision FOR KEY SHARE NOWAIT too (a blocking
-// revision lock would form a lock cycle with DeleteModelProvider, which cascades the revisions before
-// the key row: 40P01, which the finishers do not retry; NOWAIT makes it 55P03, which they do), and
+// revision lock can form a lock cycle with a provider delete, which cascades the revision and key
+// rows in either order: 40P01, which the finishers do not retry; NOWAIT makes it 55P03, which they do), and
 // returns the refusal reason or "" when intact. A missing key row or revision is stale. A
 // not-provider-bound run returns "".
 func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store.Run) (string, error) {

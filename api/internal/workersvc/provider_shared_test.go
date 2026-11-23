@@ -17,7 +17,8 @@ import (
 
 // PRD #4324 corrupt or inaccessible provider references, through fakes where the database constraints
 // forbid planting them. Every case must read as missing, stale or invalid and never reach a vault open
-// or a dial: the stores here panic (nil embedding) on any credential read.
+// or a dial. The nil-embedding fakes panic on a method they do not implement; the ciphertext lookup
+// is implemented by fakeStore, so the claim test asserts its byIDLookups stays empty instead.
 
 // A selection whose definition the caller cannot see comes back from GetUserProviderSource with the
 // setting present and every provider column NULL (the visibility join found nothing): provider_missing
@@ -111,7 +112,8 @@ func (noRowsBindingStore) GetProviderBindingKeyByID(context.Context, store.GetPr
 // The claim of a run bound to a reference the run's user cannot see is a stale refusal, for a Claude
 // run and for a Codex run bound to a shared Claude definition, with nothing opened.
 func TestClaimOfAnInaccessibleBindingIsStaleWithoutOpening(t *testing.T) {
-	svc := New(noRowsBindingStore{&fakeStore{}}, newBox(t), testParams())
+	fs := &fakeStore{}
+	svc := New(noRowsBindingStore{fs}, newBox(t), testParams())
 	svc.p.ProviderAllowedBaseURLs = []string{pvBase}
 	for _, harness := range []string{"claude", "codex"} {
 		run := providerBoundRow(runkind.Issue)
@@ -122,6 +124,9 @@ func TestClaimOfAnInaccessibleBindingIsStaleWithoutOpening(t *testing.T) {
 		if !errors.As(err, &refusal) || refusal.Reason != holdProviderBindingStale || !errors.Is(err, ErrProviderBindingStale) {
 			t.Errorf("%s: err = %v, want provider_binding_stale", harness, err)
 		}
+	}
+	if len(fs.byIDLookups) != 0 {
+		t.Fatalf("ciphertext lookups = %+v, want none for an inaccessible binding", fs.byIDLookups)
 	}
 }
 

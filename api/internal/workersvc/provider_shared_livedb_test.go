@@ -161,9 +161,13 @@ func TestSharedProviderRunFreezesTheRecipientsKeyLiveDB(t *testing.T) {
 	if payload.Secrets.AnthropicOAuthToken != "" || payload.Secrets.Codex != nil {
 		t.Fatalf("a shared-provider claim carries a vendor credential: %+v", payload.Secrets)
 	}
-	if run.CredentialOverrideSecretID.Valid || run.AnthropicSecretID.Valid {
-		t.Fatalf("run recorded a vendor or override credential: %+v", run)
+	wantNoVendor := func(r store.Run) {
+		t.Helper()
+		if r.CredentialOverrideSecretID.Valid || r.AnthropicSecretID.Valid {
+			t.Fatalf("run recorded a vendor or override credential after the claim: %+v", bindingOfRun(r))
+		}
 	}
+	wantNoVendor(mustRun(t, fx.env, run.ID))
 
 	// Retry: the admin edits the definition (revision 2) and the run is claimed again; the frozen
 	// binding is unchanged.
@@ -184,6 +188,7 @@ func TestSharedProviderRunFreezesTheRecipientsKeyLiveDB(t *testing.T) {
 	if q := again.Secrets.Provider; q.Revision != 1 || q.Credential != plainB || q.ModelMap["haiku"].Model != "corp-haiku" {
 		t.Fatalf("retry binding = %+v, want the frozen revision 1 and B's key", q)
 	}
+	wantNoVendor(mustRun(t, fx.env, run.ID))
 	if again2 := mustRun(t, fx.env, run.ID); bindingOfRun(again2) != bindingOfRun(run) {
 		t.Fatalf("the frozen binding moved: %+v -> %+v", bindingOfRun(run), bindingOfRun(again2))
 	}
@@ -380,6 +385,8 @@ func TestSharedProviderClaimAndHoldPromotionLiveDB(t *testing.T) {
 	if err != nil || chat == nil || chat.Secrets.Provider == nil || chat.Secrets.Provider.Credential != pf.plain {
 		t.Fatalf("ClaimChat = (%+v, %v), want B's key", chat, err)
 	}
+	pf.wantNoVendorWrites(t, mustRun(t, pf.env, runID))
+	pf.wantNoVendorWrites(t, mustRun(t, pf.env, chatID))
 }
 
 // TestSharedProviderDeleteStalesBoundRunsLiveDB: a shared definition cannot be deleted while selected
@@ -507,6 +514,70 @@ func TestInaccessibleProviderReferencesFailClosedLiveDB(t *testing.T) {
 	}
 }
 
+// TestSharedBindingToAnotherRecipientsKeyIsStaleLiveDB: B and C each attach their own key to one shared
+// definition. A run owned by B but frozen to C's key secret id (planted by raw SQL; runs carry no
+// foreign key to the key) is a corrupt reference: the claim, inherit, the finisher's locked re-check
+// and hold promotion all read it as stale because the key lookup is scoped to the run's owner, so C's
+// ciphertext is never read and C's plaintext never appears in anything the claim path returns.
+func TestSharedBindingToAnotherRecipientsKeyIsStaleLiveDB(t *testing.T) {
+	pf := newSharedPCFix(t)
+	spy := &keyOpenSpy{Store: pf.svc.q, rd: pf.svc.q.(providerClaimReader)}
+	pf.svc.q = spy
+	c := pf.env.seedUser(t)
+	plainC := "gw-key-C-" + uuid.NewString()
+	keyC := seedSealedKey(t, pf.env, c, pf.provider, plainC)
+	var revC int64
+	if err := pf.env.pool.QueryRow(pf.env.ctx, `SELECT enablement_rev FROM user_secrets WHERE id = $1`, keyC).Scan(&revC); err != nil {
+		t.Fatal(err)
+	}
+
+	runID := uuid.New()
+	pf.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description,
+	    status, status_since, worker_id, started_at, budget_wall_seconds, session_id, harness,
+	    model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+	    VALUES ($1, $2, $3, 'issue', 4244, 't', 'd', 'queued', now(), $4, now() - interval '15 minutes', 3600, 'sess-x', 'claude',
+	            $5, 1, 'user_key', $6, $7)`, runID, pf.userID, pf.repoID, pf.workerID, pf.provider, keyC, revC)
+	run := mustRun(t, pf.env, runID)
+	ctx := pf.env.ctx
+
+	_, claimErr := pf.svc.assembleProviderBinding(ctx, pf.worker(t), run)
+	var refusal *providerClaimRefusal
+	if !errors.As(claimErr, &refusal) || refusal.Reason != holdProviderBindingStale || !errors.Is(claimErr, ErrProviderBindingStale) {
+		t.Fatalf("claim err = %v, want provider_binding_stale", claimErr)
+	}
+	if strings.Contains(claimErr.Error(), plainC) {
+		t.Fatalf("the claim refusal leaks C's key: %v", claimErr)
+	}
+
+	tx, err := pf.env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	if _, err := pf.svc.inheritProviderBinding(ctx, tx, q, run); !errors.Is(err, ErrProviderBindingStale) {
+		t.Fatalf("inherit err = %v, want provider_binding_stale", err)
+	}
+	if reason, err := pf.svc.lockedProviderRefusal(ctx, q, run); err != nil || reason != holdProviderBindingStale {
+		t.Fatalf("locked re-check = (%q, %v), want provider_binding_stale", reason, err)
+	}
+	if reason, err := pf.svc.providerHoldRefusal(ctx, q, run); err != nil || reason != holdProviderBindingStale {
+		t.Fatalf("hold promotion = (%q, %v), want provider_binding_stale", reason, err)
+	}
+	if err := tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+		t.Fatal(err)
+	}
+
+	// The real claim path parks the run stale and delivers nothing.
+	if p, err := pf.svc.Claim(ctx, pf.worker(t), nil); err != nil || p != nil {
+		t.Fatalf("Claim = (%+v, %v), want idle", p, err)
+	}
+	pf.wantParked(t, runID, "provider_binding_stale")
+	if c := spy.ciphertextReads.Load(); c != 0 {
+		t.Fatalf("%d ciphertext read(s) for a binding to another recipient's key", c)
+	}
+}
+
 // TestSharedClaudeDefinitionNeverServesACodexRunLiveDB: a shared definition is Claude only. A
 // codex-harness run bound to it (with B's Claude key) is a corrupt reference and refuses stale on the
 // claim and the finisher's re-check, never decrypting the key.
@@ -535,6 +606,9 @@ func TestSharedClaudeDefinitionNeverServesACodexRunLiveDB(t *testing.T) {
 	defer func() { _ = tx.Rollback(pf.env.ctx) }()
 	if reason, err := pf.svc.lockedProviderRefusal(pf.env.ctx, store.New(tx), run); err != nil || reason != holdProviderBindingStale {
 		t.Fatalf("locked re-check = (%q, %v), want provider_binding_stale", reason, err)
+	}
+	if reason, err := pf.svc.providerHoldRefusal(pf.env.ctx, store.New(tx), run); err != nil || reason != holdProviderBindingStale {
+		t.Fatalf("hold promotion = (%q, %v), want provider_binding_stale", reason, err)
 	}
 	if _, err := pf.svc.inheritProviderBinding(pf.env.ctx, tx, store.New(tx), run); !errors.Is(err, ErrProviderBindingStale) {
 		t.Fatalf("inherit err = %v, want provider_binding_stale", err)
