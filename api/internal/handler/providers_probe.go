@@ -62,7 +62,7 @@ func (h *Handler) providerProbe() (*providers.Prober, *providers.ProbeLimiter) {
 	return h.providerProber, h.providerProbeLimiter
 }
 
-// TestMyProvider probes one of the caller's providers (POST /api/me/providers/{id}/test): a bounded
+// TestMyProvider probes a provider visible to the caller, with the caller's own key (POST /api/me/providers/{id}/test): a bounded
 // request in the profile's protocol and, if it succeeds, a forced single-tool request at its base URL
 // with its key. The key is opened for the call and dropped after it; the response carries the two
 // outcomes and nothing from the gateway's bodies. The result is stored for the current revision.
@@ -75,7 +75,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	row, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	row, err := h.q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: id, UserID: user.ID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusNotFound, "provider not found")
 		return
@@ -147,7 +147,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	// both revisions in one snapshot after opening and before any network request,
 	// so a new destination's key can never be sent to the old destination. Edits
 	// after this check can only leave us sending the old key to its old endpoint.
-	current, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	current, err := h.q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: id, UserID: user.ID})
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && (current.CurrentRevision != row.CurrentRevision ||
 		current.KeySecretID != row.KeySecretID || !row.KeyEnablementRev.Valid ||
 		current.KeyEnablementRev != row.KeyEnablementRev || current.KeyDisabledAt.Valid || current.RetiredAt.Valid) {
@@ -181,7 +181,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
 		return
 	}
-	fresh, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	fresh, err := h.q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: id, UserID: user.ID})
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		internalProviderError(w, "read provider probe result", err)
 		return
@@ -192,7 +192,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"probe": providerDTO(providerRow(fresh)).Probe})
+	httpx.JSON(w, http.StatusOK, map[string]any{"probe": providerDTO(fresh).Probe})
 }
 
 // recordProviderProbeResult stores a Test result for the exact tuple the probe ran against: the
@@ -201,7 +201,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 // provider row lock before the key row lock, the order every key mutation uses. A rotation, disable,
 // delete, edit or retire that committed first leaves a lock with no row, so a late result writes
 // nothing and the caller reports the conflict; one still in flight is waited for and re-checked.
-func (h *Handler) recordProviderProbeResult(ctx context.Context, userID, providerID uuid.UUID, row store.GetModelProviderForOwnerRow, auth, tool string) (bool, error) {
+func (h *Handler) recordProviderProbeResult(ctx context.Context, userID, providerID uuid.UUID, row providerRow, auth, tool string) (bool, error) {
 	if h.pool == nil {
 		return false, store.ErrVaultTransactionRequired
 	}
