@@ -132,12 +132,13 @@ function SharedProviderDisclosure({
   return (
     <section
       ref={ref}
-      id={id}
       tabIndex={-1}
       aria-label={context === "attach" ? "Before you attach your key" : "Before you use this provider"}
       className="space-y-3 rounded-lg border border-plan/30 bg-plan/5 p-3 text-sm outline-hidden focus:ring-2 focus:ring-ring"
       data-testid={`shared-disclosure-${p.id}`}
     >
+      {/* The description target carries no aria-label, so assistive tech reads the disclosure text itself. */}
+      <div id={id} className="space-y-3">
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="space-y-1.5 border-l-2 border-plan/60 pl-3">
           <h4 className="font-medium text-plan">Set by your admin</h4>
@@ -169,6 +170,7 @@ function SharedProviderDisclosure({
           With x-api-key auth, a redirect can also forward the key itself to another host. Bearer auth limits this.
         </p>
       )}
+      </div>
     </section>
   );
 }
