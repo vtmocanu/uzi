@@ -49,6 +49,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { runnerCommand, uidSplitActive } from "./runner-uid.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const RM_BIN = "/bin/rm";
 const RM_TIMEOUT_MS = 5000;
@@ -62,7 +63,9 @@ export interface ResetDeps {
 function removeAsRunnerDefault(file: string): void {
   const cmd = runnerCommand(RM_BIN, ["-f", "--", file], true);
   const r = spawnSync(cmd.command, cmd.args, {
-    env: { PATH: "/usr/bin:/bin" },
+    // A fixed, worker-authored argv that runs no repo- or agent-configured code: worker-marked
+    // (runner-spawn-sites.test.ts), so the run-quiescence reaper never kills it.
+    env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
     shell: false,
     stdio: "ignore",
     timeout: RM_TIMEOUT_MS,

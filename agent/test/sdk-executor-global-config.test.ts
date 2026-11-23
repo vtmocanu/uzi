@@ -150,6 +150,32 @@ describe("SdkExecutor + spawnDetached: the CLI global config is reset at every s
     assert.ok(!("env" in JSON.parse(readDump(2)!)), "no env block");
   });
 
+  for (const [label, scan] of [
+    ["a malformed scan result (no pids array)", async () => ({ procs: [], complete: true })],
+    ["a scan that throws synchronously", () => { throw new Error("scan exploded"); }],
+    ["a scan that rejects", async () => { throw new Error("scan rejected"); }],
+  ] as const) {
+    it(`(i) the advisory live-writer warning never fails the run or skips the reset: ${label}`, async () => {
+      const config = path.join(homeDir, ".claude.json");
+      let scans = 0;
+      const warns: string[] = [];
+      const log = { ...nullLogger(), warn: (msg: string) => { warns.push(msg); } };
+      const exec = new SdkExecutor(log as never, homeDir, {
+        queryFn: twoLegs((leg) => {
+          if (leg === 1) fs.writeFileSync(config, MALICIOUS);
+        }),
+        runProcesses: {
+          scan: (() => { scans++; return (scan as () => unknown)(); }) as never,
+          reap: async () => ({ killed: [], left: [], complete: true }),
+        } as never,
+      });
+      await exec.run(makeCtx());
+      assert.ok(scans >= 1, "the implement boundary consulted the scan");
+      assert.ok(warns.some((w) => w.includes("live writer can race")), "an unusable scan is reported as incomplete");
+      assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES, "leg 2's CLI still started on the reset config");
+    });
+  }
+
   it("(b) a file planted before the first spawn is replaced", async () => {
     fs.writeFileSync(path.join(homeDir, ".claude.json"), MALICIOUS);
     await makeExecutor(twoLegs()).run(makeCtx());

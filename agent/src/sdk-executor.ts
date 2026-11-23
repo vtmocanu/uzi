@@ -6012,17 +6012,29 @@ export class SdkExecutor implements Executor {
    * takes no budget option, so this scan runs under the scan's own default budget.
    */
   private async warnLiveWritersAtConfigReset(): Promise<void> {
-    const scan = await this.runProcesses
-      .scan(this.homeDir, this.runWorktree, [...this.spawnedPids])
-      .catch((): RunProcessScan => ({ pids: [], complete: false }));
-    if (scan.complete && scan.pids.length === 0) return;
-    const what = scan.complete
-      ? `${scan.pids.length} run processes are alive at this turn boundary`
-      : `the process scan was incomplete (${scan.pids.length} run processes seen) at this turn boundary`;
-    this.log.warn(`${what}; a live writer can race the global-config reset`, {
-      count: scan.pids.length,
-      scanComplete: scan.complete,
-    });
+    // Advisory only: nothing here may fail the run or skip the reset that follows. A scan that
+    // throws or returns a malformed result (no `pids` array) is reported as incomplete, and any
+    // error while logging is swallowed.
+    try {
+      let raw: RunProcessScan | undefined;
+      try {
+        raw = await this.runProcesses.scan(this.homeDir, this.runWorktree, [...this.spawnedPids]);
+      } catch {
+        raw = { pids: [], complete: false };
+      }
+      const pids = Array.isArray(raw?.pids) ? raw.pids : [];
+      const complete = raw?.complete === true && Array.isArray(raw?.pids);
+      if (complete && pids.length === 0) return;
+      const what = complete
+        ? `${pids.length} run processes are alive at this turn boundary`
+        : `the process scan was incomplete (${pids.length} run processes seen) at this turn boundary`;
+      this.log.warn(`${what}; a live writer can race the global-config reset`, {
+        count: pids.length,
+        scanComplete: complete,
+      });
+    } catch {
+      /* advisory: never fails the turn */
+    }
   }
 
   /**
