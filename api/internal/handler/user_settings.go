@@ -113,6 +113,7 @@ type userSettingsDTO struct {
 	// the vendor Claude ladder. READ-ONLY here: the settings PUT never writes it (it is set by
 	// PUT /api/me/providers/claude-source, which validates the provider).
 	ClaudeProviderID *string `json:"claude_provider_id"`
+	CodexProviderID  *string `json:"codex_provider_id"`
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
@@ -135,6 +136,9 @@ type userSettingsDTO struct {
 	// #3522), read-only here: PUT /api/me/usage-reserve owns the write. null = off.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
+	// WeeklyWarningMarginPts is the weekly-limit early-warning margin in percentage points (PRD
+	// #4123), 0..50, 0 = off; read-only here: PUT /api/me/weekly-warning-margin owns the write.
+	WeeklyWarningMarginPts int `json:"weekly_warning_margin_pts"`
 	// CodexAccountMode is the user's Codex account mode (issue #3719): "default" binds the
 	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
 	// PUT /api/me/codex-account-mode owns the write.
@@ -270,6 +274,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 		JudgeRunsOn:            textPtrValue(s.JudgeRunsOn.Valid, s.JudgeRunsOn.String),
 		ClaudeProviderID:       uuidPtrValue(s.ClaudeProviderID),
+		CodexProviderID:        uuidPtrValue(s.CodexProviderID),
 		JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
 		SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
 		EffortSettings: effortSettingCells(
@@ -291,6 +296,7 @@ func (h *Handler) buildUserSettingsDTO(r *http.Request, userID uuid.UUID, sideba
 		},
 		WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 		WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
+		WeeklyWarningMarginPts:    int(s.WeeklyWarningMarginPts),
 		CodexAccountMode:          codexMode,
 		HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
 	}, nil

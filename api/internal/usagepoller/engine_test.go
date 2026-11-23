@@ -1162,3 +1162,30 @@ func TestPollFailureIsLogged(t *testing.T) {
 		}
 	}
 }
+
+// TestUpsertReturnsWrittenInstant (PRD #4123 M3): upsert reports the exact synced_at it wrote,
+// truncated to microseconds (the column's precision), and a fence-refused write reports none.
+func TestUpsertReturnsWrittenInstant(t *testing.T) {
+	user := uuid.New()
+	st := newFakeStore(user)
+	e, clk := newEngine(t, st, &fakeOpener{}, &fakeClient{}, false)
+	clk.set(time.Date(2026, 7, 15, 12, 0, 0, 123456789, time.UTC))
+
+	written, at, err := e.upsert(context.Background(), user, user, 0, reading(10, 50, anthropic.SourceUsageEndpoint))
+	if err != nil || !written {
+		t.Fatalf("upsert = (%v, %v), want written", written, err)
+	}
+	want := time.Date(2026, 7, 15, 12, 0, 0, 123456000, time.UTC)
+	if !at.Equal(want) {
+		t.Fatalf("returned instant = %v, want %v", at, want)
+	}
+	if got := st.upserts[user].SyncedAt.Time; !got.Equal(at) {
+		t.Fatalf("persisted synced_at = %v, returned %v", got, at)
+	}
+
+	st.disabled[user] = true
+	written, at, err = e.upsert(context.Background(), user, user, 0, reading(10, 50, anthropic.SourceUsageEndpoint))
+	if err != nil || written || !at.IsZero() {
+		t.Fatalf("fenced upsert = (%v, %v, %v), want not written, zero instant", written, at, err)
+	}
+}

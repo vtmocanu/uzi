@@ -143,17 +143,15 @@ export interface SecretDependents {
 }
 
 // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
-export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable" | "default" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna";
 
 export interface ProviderModelEntry {
   model: string;
   context_window?: number;
 }
 
-// haiku is required by the server; the other roles are optional.
-export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
-  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
->;
+// The engine requires haiku (Claude) or default (Codex); remaining entries are optional.
+export type ProviderModelMap = Partial<Record<ProviderModelRole, ProviderModelEntry>>;
 
 export type ProviderAuthStyle = "bearer" | "x_api_key";
 
@@ -166,10 +164,10 @@ export interface ProviderProbe {
 export interface ProviderDTO {
   id: string;
   name: string;
-  engine: "claude";
+  engine: "claude" | "codex";
   retired: boolean;
   current_revision: number;
-  protocol: "anthropic_messages";
+  protocol: "anthropic_messages" | "openai_responses";
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
@@ -185,6 +183,8 @@ export interface ProvidersList {
 }
 
 export interface CreateProviderInput {
+  engine?: ProviderDTO["engine"];
+  protocol?: ProviderDTO["protocol"];
   name: string;
   base_url: string;
   auth_style: ProviderAuthStyle;
@@ -635,6 +635,10 @@ export interface UserSettings {
   weekly_reserve_pct?: number | null;
   /** PRD #3522: also pause running runs at the reserve (default true). */
   weekly_reserve_pause_running?: boolean;
+  /** PRD #4123: the weekly-limit early-warning margin in percentage points (0..50, default 15);
+   *  0 turns the early warnings off (park explanations stay). Written only through
+   *  PUT /me/weekly-warning-margin. Absent on a server that predates the setting. */
+  weekly_warning_margin_pts?: number;
   /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
    *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
   codex_account_mode?: CodexAccountMode | string;
@@ -651,6 +655,7 @@ export interface UserSettings {
    *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
    *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
   claude_provider_id?: string | null;
+  codex_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -723,6 +728,60 @@ export interface UserSettingsPatch {
   /** Per-user "Judge runs on" (PRD #3257); same tri-state as default_harness: a value sets the
    *  judge harness, null clears back to "same as the run", absent leaves it unchanged. */
   judge_runs_on?: Harness | null;
+}
+
+/** One cross_check_pins cell of PUT /me/model-settings: omitted members stay unchanged,
+ *  null clears that member's override. */
+export interface ModelSettingsPinPatch {
+  stage: "plan" | "code";
+  harness: Harness;
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** PUT /api/me/model-settings body (PRD #3263): the closed 19-key allowlist, written in one
+ *  transaction. Omitted keys stay unchanged; null clears an override. Values are validated
+ *  server-side, so the scalars are plain strings here. */
+export interface ModelSettingsPatch {
+  default_harness?: string | null;
+  default_claude_model?: string | null;
+  default_codex_model?: string | null;
+  default_effort?: string | null;
+  default_codex_effort?: string | null;
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
+  planning_codex_model?: string | null;
+  planning_codex_effort?: string | null;
+  judge_runs_on?: string | null;
+  judge_model?: string | null;
+  codex_judge_model?: string | null;
+  summary_model?: string | null;
+  codex_summary_model?: string | null;
+  task_review_model?: string | null;
+  codex_task_review_model?: string | null;
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
+  cross_check_pins?: ModelSettingsPinPatch[];
+}
+
+/** The 200 body of PUT /me/model-settings: the canonical settings read after commit, and the
+ *  effective-settings prediction. `effective` is null, with effective_error
+ *  "settings_effective_readback_failed", when only the prediction could not be read: the save
+ *  still committed. */
+export interface ModelSettingsSaveResponse {
+  settings: UserSettings;
+  effective: EffectiveSettings | null;
+  effective_error?: string;
+}
+
+/** One entry of the 400 `errors` array of PUT /me/model-settings. stage/harness/member are set
+ *  only for a cross_check_pins cell defect. */
+export interface ModelSettingsFieldError {
+  field: string;
+  message: string;
+  stage?: "plan" | "code";
+  harness?: Harness;
+  member?: "model" | "effort";
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
@@ -3963,7 +4022,55 @@ export interface HarnessDecision {
   other_weekly_reset_at: string | null;
 }
 
+/** PRD #4123: one allowlisted action in a weekly-limit block (Go WeeklyLimitFixDTO). `command`
+ *  is rendered once by the server, the same string on every surface; it is absent with
+ *  command_unavailable "label" when the target label is not command-safe, and absent for a
+ *  Settings-only fix (edit_reserve). target_label is OWNER text: render as plain text. */
+export interface WeeklyLimitFix {
+  kind: "set_token" | "auto_select" | "pool_on" | "resume_reserve" | "edit_reserve";
+  target_id?: string;
+  target_label?: string;
+  command?: string;
+  command_unavailable?: "label";
+}
+
+/** PRD #4123: the owner-only weekly-limit block on run detail (Go WeeklyLimitDTO), computed
+ *  on read by the server; the web renders it and derives nothing. Labels are owner text. */
+export interface WeeklyLimit {
+  credential_label: string;
+  /** Owner-scoped grouping identity ("anthropic:<secret id>" / "codex:<account id>"), never shown. */
+  credential_key: string;
+  harness: string;
+  /** Weekly utilisation in percent; null when no fresh reading exists. */
+  pct: number | null;
+  /** The reserve when set, else 100. */
+  effective_limit: number;
+  resets_at: string | null;
+  /** warning when the run itself has a fix, else notice. */
+  tier: "warning" | "notice";
+  /** A workersvc NextClaimReason: pinned | not_auto | can_switch | selection_unchanged |
+   *  headroom_outside_pool | pool_exhausted | no_alternative | account_bound | switch_pending |
+   *  unknown. Typed as string so a future value degrades to the unknown wording. */
+  reason: string;
+  alternative_label?: string;
+  /** Advice for runs created afterwards. */
+  future_runs: WeeklyLimitFix[];
+  /** Advice for this run. */
+  fix: WeeklyLimitFix[];
+  wait: "waits" | "fails" | "reserve_pause" | "unknown";
+}
+
+/** PRD #4123: the compact projection on a run summary row (Go WeeklyLimitSummaryDTO). */
+export interface WeeklyLimitSummary {
+  tier: "warning" | "notice";
+  credential_key: string;
+  credential_label: string;
+}
+
 export interface Run {
+  /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on its weekly
+   *  limit (and, from M2, near it). */
+  weekly_limit?: WeeklyLimit;
   policy_hold?: {
     preserve_required: boolean;
     pending_fresh: boolean;
@@ -5133,7 +5240,11 @@ export type RunSummaryItem = Omit<
   | "capability_provenance" | "lead_config" | "created_issues"
   // PRD #3250: the start-time choice is on the run page and the list, not the polling shape.
   | "effort" | "model_source" | "effort_source"
->;
+  // PRD #4123: the summary row carries only the compact projection.
+  | "weekly_limit"
+> & {
+  weekly_limit?: WeeklyLimitSummary;
+};
 
 /** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer
  *  queue plus, only on an admin run debug read of another user's run, admin_debug_read=true. */

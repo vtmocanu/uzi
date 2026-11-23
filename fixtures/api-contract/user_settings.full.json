@@ -71,6 +71,7 @@
   "default_harness": "x",
   "judge_runs_on": "x",
   "claude_provider_id": "x",
+  "codex_provider_id": "x",
   "default_claude_model": "x",
   "default_codex_model": "x",
   "judge_models": [
@@ -145,6 +146,7 @@
   ],
   "weekly_reserve_pct": 1,
   "weekly_reserve_pause_running": true,
+  "weekly_warning_margin_pts": 1,
   "codex_account_mode": "x",
   "harness_overflow_enabled": true
 }

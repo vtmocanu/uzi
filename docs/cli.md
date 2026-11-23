@@ -317,7 +317,16 @@ A few worth knowing:
   throughout). A schedule's pin (or `implicit` when unset) shows on `uzi
   schedule get`.
   There's no CLI setter for your own default harness; that's a **Settings →
-  Run defaults** web-only control (see [Worker model](./worker-model.md)).
+  Models** web control (see [Worker model](./worker-model.md)).
+- **`run get` explains a 7-day park.** For a run parked at `limit_wait` on the
+  `seven_day` window, or paused by the weekly usage reserve, `uzi run get`
+  adds a `WEEKLY_LIMIT` row (the credential, its reason in plain words and what
+  happens if you do nothing) and one `FIX` row per copyable fix command (`FIX_FUTURE_RUNS` for advice that only affects runs you start later).
+  Both rows are absent on any other run, including 5-hour and per-model parks,
+  and for the owner only. A token label that cannot be copied safely shows a
+  hint to rename the token in Settings instead of a command. `--json` carries
+  the same block as `weekly_limit`. Reasons, wait statements and fix commands
+  are described in [Why the run did not move to another token](./run-limit-wait.md#why-the-run-did-not-move-to-another-token).
 - **`version` reports two coordinates, not one.** It always prints the CLI's own
   version (the `v*` release this binary was built from). When a server URL is
   configured it additionally reports that server's build info — version, full
@@ -1761,7 +1770,7 @@ are CLI-only).
 `UZI_ADMIN_RUN_DEBUG` (chart value `api.adminRunDebug.enabled`; see
 [configuration](./configuration.md#admin-run-debug-issue-4198)). When it is on, a live admin using an
 `admin_ro` (`uza_`) CLI token can read, never change, another user's run data through `run inputs`,
-`run fetches`, `run recovery`, `run held` and `admin runs --all`. A browser cookie or a `uzc_` token
+`run fetches`, `run recovery`, `run held`, `admin runs --all` and `admin run-writers`. A browser cookie or a `uzc_` token
 never qualifies, and demoting the admin takes effect on the next request. Each newly authorized
 cross-user read writes one audit log line.
 
@@ -1801,6 +1810,24 @@ cross-user read writes one audit log line.
   `note: showing the newest 500 runs; narrow with --user, --since or --status` on stderr. `--json`
   prints a `{runs, truncated}` envelope of summary rows instead of the table, plus `status_filter` when
   `--status` was given.
+- **`uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]`** lists the active `ci_fix` and
+  `mr_rework` runs, across all owners, that may push to a branch. Same prerequisites as the rest of this
+  section (`UZI_ADMIN_RUN_DEBUG` and an `admin_ro` token; an older server answers 404). `--repo` and
+  `--branch` are required; `--mr` must be positive. Each read is audited.
+  - **Matching.** `ci_fix` runs match by exact branch; `mr_rework` runs match only by `--mr`, never by
+    branch alone. Equivalent connections across owners count as the same repo: the match is by forge
+    type, the canonical base URL (`:443` folded; `api.github.com` folded to `github.com` for GitHub) and
+    the project id. A writer's REPO column is its own repo id, which may differ from `--repo` because
+    equivalent connections of other owners match.
+  - **Completeness.** `complete=false` means more than 500 matched and the answer is unknown: the CLI
+    prints `incomplete: more than 500 matching writers; absence is unknown` on stderr and exits 1,
+    unlike `admin runs --all`, which only prints a note and exits 0. An empty, complete result proves
+    no matching writer at that database snapshot only: a writer may start after the read.
+  - **Output.** A table (RUN, KIND, STATUS, OWNER, REPO, BRANCH, MR), or with `--json` the
+    decoded `{writers, complete}` document.
+  - **Landing scripts.** The uzi-lander scripts use this lookup and, when it answers 401, 403 or 404 or
+    the CLI predates the verb, fall back to the owner-scoped `uzi run list` check and print
+    `VISIBILITY=owner_only`.
 - **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
   `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
   metadata-only). `run discard` and `uzi run held expire` stay owner-only too. The TUI shows no steer controls on a foreign run.
@@ -2961,29 +2988,41 @@ on the `status`/`bucket` enums.
 
 ## Model providers: `uzi provider`
 
-A [model provider](./providers.md) is a named Anthropic-compatible gateway with its own key
-and model map. The CLI manages the parts that never handle a credential:
+A [model provider](./providers.md) is a named gateway with its own key and model map: an
+Anthropic-compatible one for the Claude engine, or a Responses-compatible one for the Codex
+engine. The CLI manages the parts that never handle a credential:
 
 ```sh
-uzi provider list                              # NAME, URL, AUTH, MODELS, KEY, TEST, RETIRED
+uzi provider list                              # NAME, ENGINE, URL, AUTH, MODELS, KEY, TEST, RETIRED
 uzi provider create --name corp-gw --base-url https://gw.example.com/anthropic \
   --model haiku=corp-haiku:200000 --model sonnet=corp-sonnet:200000
+uzi provider create --engine codex --name code-gw --base-url https://gw.example.com/openai \
+  --model default=gw-model-a:200000 --model gpt-6-sol=gw-model-b:200000
 uzi provider edit corp-gw --name corp --model haiku=corp-haiku:200000
 uzi provider test corp                         # auth and tool-call results, separately
 uzi provider retire corp
-uzi provider use corp                          # select as your Claude source; --none clears it
+uzi provider use corp                          # select as the source of the provider's own engine
+uzi provider use --none --engine claude        # clear one engine's source (or --engine codex)
 ```
 
 `<name|id>` matches an id exactly or a name without regard to case. `create` needs `--name`,
 `--base-url` (exactly one of the URLs your operator allowed; `uzi provider list --json` shows
-them as `allowed_base_urls`) and `--model haiku=...`. `--auth-style` is `bearer` (default) or
-`x_api_key`. `--model` is `alias=model[:context_window]` and repeatable; `edit --model` replaces
-the whole map. A trailing `:0` stays part of the model id; any other all-digit suffix after the
-last colon is read as the context window.
+them as `allowed_base_urls`) and a model map with its required key. `--engine` is `claude`
+(default) or `codex`. `--auth-style` is `bearer` (default) or `x_api_key`; a Codex provider
+accepts `bearer` only. `--model` is `alias=model[:context_window]` and repeatable; `edit --model`
+replaces the whole map. A trailing `:0` stays part of the model id; any other all-digit suffix
+after the last colon is read as the context window.
+
+The `--model` vocabulary is per engine. Claude: `haiku` (required), `sonnet`, `opus`, `fable`.
+Codex: `default` (required) plus the optional Codex model ids `gpt-6-astra`, `gpt-5.6-sol`,
+`gpt-6-sol`, `gpt-6.1-sol` and `gpt-6-luna`. A Codex model the map does not name resolves through
+`default` when uzi picks it, but an explicit `--model` on a run or a schedule pin needs its own key
+(`provider_model_unmapped` otherwise); see [Use a provider as your Codex
+source](./providers.md#use-a-provider-as-your-codex-source).
 
 `test` prints an `auth:` line (`ok`, `rejected`, `inconclusive`) and a `tools:` line (`passed`,
 `not_supported`, `inconclusive`, `not_run`), then "Neither result certifies full compatibility
-with Claude." `--json` carries the same fields. Tests are limited to one at a time and 30 per hour
+with its engine." `--json` carries the same fields. Tests are limited to one at a time and 30 per hour
 per user.
 
 Web-only, deliberately: the **API key** (add, replace, remove, enable), a **base URL or auth
@@ -2992,15 +3031,25 @@ cannot mint or redirect a credential. `create` ends by pointing you at Settings 
 A server without `UZI_PROVIDER_ALLOWED_BASE_URLS` has the feature off: `list` says so
 (`--json` gives `enabled: false`); `create` is refused with `provider_base_url_not_allowed` (exit 2), and `edit`, `test` and `retire` exit 5. A refusal prints the server's
 `reason` (for example `provider_base_url_not_allowed`) after the message. Selecting a provider
-as your Claude source is `uzi provider use <name|id>`; `uzi provider use --none` clears it so Claude
-runs use your Anthropic token again (see
-[Use a provider as your Claude source](./providers.md#use-a-provider-as-your-claude-source)). It
-applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 2 for usage errors
-(pass a name or id, or `--none`, not both), 4 when the provider is not found, 5 when it is retired,
-has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
-(`use --none` only clears the selection, so it succeeds even with the feature off).
-`--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
-"unknown (custom provider)". Runs start on workers that advertise `claude_provider_v1`; an older worker leaves them queued ("no worker that supports model providers is online"). See [Model providers](./providers.md).
+as a source is `uzi provider use <name|id>`: it sets the source of the provider's own engine
+(`users.claude_provider_id` for a Claude provider, `users.codex_provider_id` for a Codex one), and
+an optional `--engine` must match the provider. Each engine has its own selection, so clearing
+names the engine: `uzi provider use --none --engine claude|codex` (`--none` alone is a usage
+error). Clearing Claude means Claude runs use your Anthropic token again; clearing Codex means
+Codex runs use your Codex login or OpenAI key again (see
+[Use a provider as your Claude source](./providers.md#use-a-provider-as-your-claude-source) and
+[Use a provider as your Codex source](./providers.md#use-a-provider-as-your-codex-source)). It
+applies to runs you start afterwards, and one engine's selection never affects the other's runs.
+Exit codes: 2 for usage errors (pass a name or id, or `--none --engine ...`, not both; an
+`--engine` that does not match the provider), 4 when the provider is not found, 5 when it is
+retired, has no key or a disabled key, the feature is off, or the server answers
+`provider_source_unusable` (`use --none` only clears the selection, so it succeeds even with the
+feature off). `--json` prints `{"<engine>_provider_id", "name"}`, for example
+`{"codex_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as "unknown (custom
+provider)". Claude provider runs start on workers that advertise `claude_provider_v1` and Codex
+ones on workers that advertise `codex_provider_v1` together with the Codex harness capabilities; an
+older worker leaves them queued ("no worker that supports model providers is online"). See [Model
+providers](./providers.md).
 
 ## Anthropic tokens
 
@@ -3415,7 +3464,7 @@ The human table shows the Plan and Code cross-check cells: stage, harness,
 active/inactive status, stored model and effort, worker default model,
 resolved model and effort, and each resolved field's source. Stored null
 fields show `Default`; explicit choices show `Pin · value`. All
-cells are active and editable in **Settings → Run defaults → Cross-check**:
+cells are active and editable in **Settings → Models → Cross-check**:
 in each stage the Codex cell configures the checker of a Claude lead, the Claude cell the
 checker of a Codex lead. Pin or clear a cell from the CLI with `uzi settings
 set|reset cross-check` ([Changing model and effort
@@ -3478,7 +3527,7 @@ claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
 `unknown`). `resolved_effort` is `null` exactly when
 `mode` is `runtime_default`. Change effort with `uzi settings set effort`
 ([Changing model and effort settings](#changing-model-and-effort-settings)) or in
-**Settings → Run defaults → Reasoning effort**. See
+**Settings → Models**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
 
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
@@ -3512,7 +3561,7 @@ uzi settings reset cross-check --stage plan --harness codex
 `uzi settings set <setting> <value>` and `uzi settings reset <setting>` write
 your own model and effort defaults for new runs (`PUT /api/me/model-settings`,
 which accepts a `uzc_` or `uza_` Bearer token). They write the same stored
-values as the matching **Settings → Run defaults** controls; the other users and
+values as the matching **Settings → Models** controls; the other users and
 the instance defaults are untouched.
 
 | Setting | `--harness` | Value | Web control |
@@ -3556,8 +3605,12 @@ the write did (`your choice` after a set; the default's own source after a
 reset). `judge-runs-on` prints the `Judge runs on:` line instead, and
 `cross-check` prints that cell's row of the cross-check table (stored pin,
 resolved value and source). `--json` prints
-the server's `{"settings": {...}}` envelope unchanged, without the effective
-read.
+the server's response envelope unchanged: `{"settings": {...}, "effective":
+{...}}`, where `effective` is the same effective-settings view
+[`uzi settings get`](#effective-settings) shows. If the server's own effective
+read fails after the save committed, the envelope is `{"settings": {...},
+"effective": null, "effective_error": "settings_effective_readback_failed"}`
+and the write still exits 0.
 
 A saved setting applies to runs that resolve it after the save. It never changes
 a run that froze its own choice, such as a run-level `--model` or `--effort`.
@@ -3580,10 +3633,31 @@ server could not confirm or read back the write, while the exit 0 line means
 the server confirmed the write and only the CLI's own effective-settings read
 failed.
 
-The route is an allowlist of fourteen fields (the two worker-model lanes, the two
-effort lanes, the two judge-model lanes, the two summary-model lanes, the two
-task-review-model lanes, the two task-review-effort lanes, `judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
-are written in one transaction. Consent switches (enabling the judge, cross-check
+The route is an allowlist of nineteen fields: `default_harness`, the two
+worker-model lanes (`default_claude_model`, `default_codex_model`), the two
+effort lanes (`default_effort`, `default_codex_effort`), the four planning fields
+(`planning_claude_model`, `planning_claude_effort`, `planning_codex_model`,
+`planning_codex_effort`), `judge_runs_on`, the two judge-model lanes
+(`judge_model`, `codex_judge_model`), the two summary-model lanes
+(`summary_model`, `codex_summary_model`), the two task-review-model lanes
+(`task_review_model`, `codex_task_review_model`), the two task-review-effort lanes
+(`task_review_effort`, `codex_task_review_effort`) and `cross_check_pins`. The
+**Settings → Models** page saves through this same route, so a Bearer token can
+now also write `default_harness` and the planning fields, though the CLI has no
+command for them. Any other key is a 400 naming it, and the fields of one request
+are written in one transaction.
+
+A 400 keeps the `error` and `field` of the first problem and adds an `errors`
+array with one entry per problem: `{"field", "message"}` plus, where they apply,
+`stage`, `harness` and `member` (the web page uses them to mark the cell). For
+unknown keys only the first five, sorted, are listed, and caller text echoed
+back is clipped to 64 bytes. The 200 body is `{"settings", "effective"}`. The
+guarantee is that the writes commit together or not at all; the response reads
+run as separate queries after the commit, not as a snapshot, so a concurrent
+save from another client can interleave and the returned values may include it.
+A failed prediction read after the commit is still a 200 with `effective: null`
+and `effective_error`; the two 500 reasons (`settings_commit_unknown`,
+`settings_saved_readback_failed`) are unchanged. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
 `judge-runs-on`, `judge-model`, `summary-model`, `task-review-model` and `task-review-effort` choose which harness, model or effort
 already-enabled judge, summary and task-review work uses, and cannot turn that work on.
@@ -3772,6 +3846,28 @@ On a run the reserve touches, `uzi run get` shows:
 - a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
   `run pause` above.
 
+### Weekly warning margin
+
+```sh
+uzi settings warning-margin 15
+uzi settings warning-margin off
+```
+
+`uzi settings warning-margin <0..50|off>` sets how many percentage points below its
+effective weekly limit a credential must be before the [early
+warning](./rate-limits.md#early-warning-before-the-weekly-limit) shows. The
+default is 15; `0` (or `off`) turns early warnings off, including the [Slack
+warning](./rate-limits.md#slack-warning) (park explanations stay).
+A value outside 0..50 is a usage error. It posts to `PUT /api/me/weekly-warning-margin`
+(`{"margin_pts": <0..50>}`), which accepts a `uzc_` Bearer token; the response
+is `{"weekly_warning_margin_pts": <n>}`. Human output prints `Weekly warning
+margin: 15 points`, or a `Weekly warning margin: 0 (off ...)` line when off;
+`--json` returns `weekly_warning_margin_pts`. `uzi settings get` prints the same
+`Weekly warning margin:` line and its `--json` carries the field.
+
+For a run that is near its weekly limit but not yet parked, `uzi run get` shows
+the same `WEEKLY_LIMIT` and `FIX` rows as for a park.
+
 ### Codex account mode
 
 ```sh
@@ -3864,7 +3960,7 @@ run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
 `judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
 `judge_harness` cell. Change it with `uzi settings set judge-runs-on`
 ([Changing model and effort settings](#changing-model-and-effort-settings)) or in
-**Settings → Run defaults → Run judge**.
+**Settings → Models → Helper runs**.
 
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your

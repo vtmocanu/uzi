@@ -634,6 +634,14 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 
 	st.pollCount++
 
+	// Target verification reads the bound MR directly and does not need a fresh
+	// issue cache. Run it even when unlinked issue sync fails.
+	syncActiveMRTargets := func() {
+		if err := e.svc.SyncActiveMRTargets(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+			slog.Error("poller: sync active MR targets", "repo", r.PathWithNamespace, "error", err)
+		}
+	}
+
 	if linked {
 		// A linked repo's issue sync failing (issue tracker unreachable or its link
 		// unresolvable) must never skip the code-host steps below: its MRs, pipelines
@@ -678,6 +686,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 				slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
 				settleImport(false, importErrorClass(ctx, err))
 				report(false, forge.Class(err))
+				syncActiveMRTargets()
 				return
 			}
 			settleImport(true, forge.ErrorClassOther)
@@ -690,6 +699,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 			if err != nil {
 				slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
 				report(false, forge.Class(err))
+				syncActiveMRTargets()
 				return
 			}
 			// Already clamped inside, and held at the caller's pair on any fetch error.
@@ -722,6 +732,8 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	if err := e.svc.SyncBoardFreeMRStatesWithIssueSide(ctx, r.ID, r.ForgeProjectID, f, tr); err != nil {
 		slog.Error("poller: sync board-free MR states", "repo", r.PathWithNamespace, "error", err)
 	}
+
+	syncActiveMRTargets()
 
 	// PRD-link patch (PRD #72 M5): once a run's MR has merged, rewrite the issue's
 	// own `prds/*.md` link to the path the run moved the file to. Placed HERE — after

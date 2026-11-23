@@ -30,6 +30,7 @@
   "default_harness": null,
   "judge_runs_on": null,
   "claude_provider_id": null,
+  "codex_provider_id": null,
   "judge_models": null,
   "summary_models": null,
   "effort_settings": null,
@@ -41,6 +42,7 @@
   "planning_efforts": null,
   "weekly_reserve_pct": null,
   "weekly_reserve_pause_running": false,
+  "weekly_warning_margin_pts": 0,
   "codex_account_mode": "",
   "harness_overflow_enabled": false
 }

@@ -80,6 +80,50 @@ waiting out the reset — two ways:
   [Claude rate limits](rate-limits.md#choosing-a-token-near-its-limit). The
   run page's token picker does the same switch.
 
+## Why the run did not move to another token
+
+A run parked on a **7-day** window (`limit_wait` with window `seven_day`), or paused by the [weekly usage reserve](run-pause.md#paused-by-the-weekly-usage-reserve), carries a weekly-limit block that says why it did not move to another token, what you can do about it, and what will happen if you do nothing. It is owner-only and computed by the server, so every surface shows the same answer. 5-hour and per-model parks are unchanged and carry no block, as do runs on a [custom model provider](providers.md) and Codex runs authenticated with an OpenAI API key (they have no subscription window).
+
+**Reason.** One of these, shown as a plain sentence:
+
+| Reason | Meaning |
+|---|---|
+| `pinned` | The run is pinned to this token, so it never switches on its own. |
+| `not_auto` | The run's worker (or the run) is not in auto-select mode, so it never switches on its own. |
+| `can_switch` | The run can move to another token on its next claim. |
+| `selection_unchanged` | Auto-select still prefers this token even though another pooled one is usable. |
+| `headroom_outside_pool` | Another token has weekly headroom but is not in the auto-select pool. |
+| `pool_exhausted` | Every other pooled token is at its weekly limit or held by the reserve. |
+| `no_alternative` | There is no other usable token to switch to, including when this is your only token. |
+| `switch_pending` | A credential switch is already in progress for this run. |
+| `account_bound` | A Codex run, which stays on the account it was created with (see [Codex credentials](codex-credentials.md#when-a-codex-run-hits-its-weekly-limit)). |
+| `unknown` | The server could not tell whether the run can switch. |
+
+**Wait.** What happens if you do nothing, one of:
+
+- `waits`: the run resumes on its own after the reset.
+- `fails`: the run will fail on this limit rather than wait (waiting is off for the run, the wait count is spent, or the park would exceed the maximum park, see [Configuration](configuration.md)).
+- `reserve_pause`: a weekly-reserve pause. It releases itself once a fresh reading is below the reserve (or the reserve or "Also pause running runs" is cleared), or when you resume it; see [Paused by the weekly usage reserve](./run-pause.md#paused-by-the-weekly-usage-reserve).
+- `unknown`: no usable reset time is known.
+
+`fails` and `unknown` never promise a resume.
+
+**Before a park.** The block also appears on a running or queued run whose credential is near or at its weekly limit, before anything parks; the reason and fix rows read the same, and the wait statement is a preview of what would happen at the limit. It is controlled by your warning margin and omitted for stale readings, API keys and custom providers; see [Early warning before the weekly limit](rate-limits.md#early-warning-before-the-weekly-limit). If you have Slack linked, one best-effort DM per weekly period tells you too; the run page banner is the guaranteed surface ([Slack warning](rate-limits.md#slack-warning)).
+
+**Where it shows.** The run page, `uzi run get` (the `WEEKLY_LIMIT` and `FIX` rows, see [CLI](cli.md)), the TUI run detail, and the Slack park message (`⏸️ Paused · usage limit` or the weekly-reserve pause line), which appends the reason and, when there is one, a copyable fix command.
+
+**Fix commands.** Each fix appears only when it would apply to this run. Commands that name a token put every flag before a `--` and the quoted label after it, so a label such as `--auto` is read as a label, not a flag:
+
+```sh
+uzi run set-token <run-id> -- 'prod token'
+uzi token pool --on --kind anthropic -- 'spare token'
+uzi run resume <run-id>
+```
+
+Other fixes are `uzi run set-token <run-id> --auto`, `uzi worker set-token <worker-id> --auto` and `uzi settings codex-mode auto`; a weekly-reserve pause also points at the reserve setting in Settings. Advice that only helps runs created later is listed separately as future runs.
+
+A token label that cannot be copied safely (for example a legacy label that holds a tab, a newline, a control or format character, or a backtick) gets no command. The fix still names the token, with a hint to rename it in Settings to get a copyable command, because sanitizing the label would change which token the command names.
+
 ## If a run isn't waiting out limits
 
 A run that opts out fails on a recognized usage limit with a server-composed reason naming **Codex** or **Anthropic** and the window, plus the reset when known: *"Codex usage limit (seven_day) reached; resets at 2026-10-13T02:00:00Z"*. Without a usable reset, the reason makes no reset promise. Waiting uses the existing `wait_on_limit` default and per-run override; there is no new setting or migration.

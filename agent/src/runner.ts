@@ -48,6 +48,7 @@ import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sour
 import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken, RefusalReleaseGate } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
+  RecoveryOwnerBareIdentityHoldError,
   RecoveryChargeInterruptedError,
   RecoveryBudgetExhaustedError,
   RecoveryDeadlineExhaustedError,
@@ -136,6 +137,7 @@ import type {
   AgentTemplate,
   AskUserQuestion,
   ClaimCodexSecrets,
+  ClaimProviderBinding,
   ClaimConfig,
   ClaimResponse,
   GatePresentedRequirements,
@@ -246,13 +248,14 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
+import { ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { makeTextRedactor, providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
-import { selectCodexBinding } from "./codex/select.js";
+import { selectCodexBinding, selectCodexExecutionAuthority } from "./codex/select.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
@@ -2362,7 +2365,7 @@ export type ExecutorFactory = (runId: string, codex?: ClaimCodexSecrets, addr?: 
 
 /** issue #3644: which per-attempt directories an executor is built for. `generation` set = an independent restore's successor,
  *  whose HOME and provision dir are `<runId>.g<generation>`; absent = today's `<runId>` paths. */
-export interface RunExecutorAddress { generation?: number }
+export interface RunExecutorAddress { generation?: number; provider?: ClaimProviderBinding }
 
 /**
  * PRD #218 M1 — the worker-shutdown registry entry for one in-flight run. A graceful
@@ -3255,6 +3258,10 @@ interface RunFlight {
   /** issue #3644: an unsupported-predecessor owner hold was requested (or attempted) for this flight; the park teardown that would
    *  otherwise reap and drop the caches of the HOME the flight holds must not run. */
   restoreUnsupportedHold?: boolean;
+  /** issue #4627: a retained claim whose bare storage identity (device or inode) changed was refused before any source action and
+   *  an owner hold was requested (or attempted). The park teardown must not reap or drop the caches of the HOME it holds, and the
+   *  exit retains the owed tip without moving any ref that already retains it. */
+  bareIdentityHold?: boolean;
   /** issue #3644: the `status` of this flight's first `running` report's ACK. Read-only; the unsupported-predecessor park is sent
    *  only when it is `running` (a redundant client-side check of the server's own fence). */
   runningAckStatus?: string;
@@ -3388,15 +3395,33 @@ export function isFinalizeBoundResult(
     !result.phaseSwitchHeld;
 }
 
-/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are clipped
- *  and stripped of control characters; nothing else from the runtime reaches the feed. */
+/** Whether the claim runs on the Codex engine, vendor block or Codex provider binding alike. Uses the
+ *  engine-aware selector; a malformed Codex block or binding throws there (fail-closed executor), so it
+ *  counts as Codex-bound here too. */
+function isCodexBoundClaim(claim: ClaimResponse): boolean {
+  let codexBound = false;
+  try {
+    codexBound = selectCodexExecutionAuthority(claim.secrets).kind === "codex";
+  } catch {
+    codexBound = true;
+  }
+  return codexBound;
+}
+
+/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are
+ *  stripped of control and non-ASCII characters first (so a character inserted inside a key cannot hide
+ *  it from the exact-match redactor and then be removed, rebuilding the key), then redacted (every
+ *  registered secret form, including a provider key's encodings), then clipped; nothing else from the
+ *  runtime reaches the feed. The clip runs last, on already-redacted text, so a registered secret form is
+ *  never cut into a leftover prefix that the redactor could no longer match. */
 function phaseSwitchHoldText(
   phase: "plan" | "implement",
   cause: PhaseSwitchCause,
   requested: PhaseSettings,
   observed: PhaseSettings,
+  redact: (text: string) => string,
 ): string {
-  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : v.replace(/[^\x20-\x7e]/g, "").slice(0, 80));
+  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : redact(v.replace(/[^\x20-\x7e]/g, "")).slice(0, 80));
   const tail = "Resume retries on a new claim; Cancel ends the run.";
   const kept = phase === "implement" ? "planning" : "implementation";
   const mismatch = (noun: "model" | "effort"): string => {
@@ -6333,7 +6358,7 @@ export class RunRunner {
   private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
     ownMemory: (operation: Promise<void>) => void): Promise<void> {
     const eligible = this.client.supportsPolicyHold && !!this.outbox && !!this.snapshotRegistry &&
-      !!claim.secrets.codex && Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
+      isCodexBoundClaim(claim) && Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
       claim.interactive !== true &&
       ["issue", "task", "prompt", "self_improve"].includes(claim.kind ?? "issue");
     const reservation = eligible ? this.outbox!.reservePolicyFlight(claim.run_id, claim.claim_generation ?? 0) : undefined;
@@ -6342,6 +6367,27 @@ export class RunRunner {
       await this.executeReservedPolicyClaim(claim, onFlight, ownMemory, reservation);
     } finally {
       if (reservation) this.outbox!.releasePolicyFlight(reservation);
+    }
+  }
+
+  private makeClaimExecutor(runId: string, codex: ClaimCodexSecrets | undefined, addr?: RunExecutorAddress): RunExecution {
+    try {
+      // Preserve the vendor factory's original argument count.
+      return addr === undefined ? this.makeExecutor(runId, codex) : this.makeExecutor(runId, codex, addr);
+    } catch (error) {
+      if (error instanceof ProviderLaneUnsupportedError) throw new ProviderLaneUnsupportedError();
+      const canaries = [
+        ...(codex ? [codex.access_token, codex.capability] : []),
+        ...(addr?.provider ? providerKeyForms(addr.provider.credential) : []),
+      ];
+      if (canaries.length === 0) throw error;
+      const redact = makeTextRedactor(canaries);
+      // Even reading an unknown error message may throw; never let that exception
+      // bypass redaction when the claim's registrations are about to be evicted.
+      let message: string;
+      try { message = errMessage(error); } catch { message = "executor construction failed"; }
+      // Never carry an original cause or arbitrary object fields past secret eviction.
+      throw new Error(redactThenSanitize(redact, message));
     }
   }
 
@@ -6361,8 +6407,18 @@ export class RunRunner {
     for (const s of codexCanaries) this.log.addSecret(s);
     // This run's OWN executor + private HOME (PRD #42 Decisions 4/5), built fresh
     // per execution so nothing subprocess-scoped is shared with a concurrent run. The
-    // DARK Codex selection seam reads claim.secrets.codex (absent ⇒ the literal Claude path).
-    const initialExecutor = this.makeExecutor(runId, claim.secrets.codex);
+    // provider binding is forwarded by identity alongside the native vendor credential.
+    const providerForms = claim.secrets.provider ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const s of providerForms) this.log.addSecret(s);
+    let initialExecutor: RunExecution;
+    try {
+      initialExecutor = this.makeClaimExecutor(runId, claim.secrets.codex,
+        claim.secrets.provider ? { provider: claim.secrets.provider } : undefined);
+    } catch (error) {
+      // makeClaimExecutor detaches diagnostics before reference-counted eviction.
+      for (const s of [...providerForms, ...codexCanaries]) this.log.removeSecret(s);
+      throw error;
+    }
     // Issue #1324 M5: a publication-only claim still needs its executor object (quiescence, capture and the
     // finalize boundary read it) but no model work may ever start on it.
     let executor = publicationOnlyExecutor(claim, initialExecutor.executor);
@@ -6385,13 +6441,12 @@ export class RunRunner {
     // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
     // this registration (with the redactors' below) is the only protection for it.
     // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
-    if (claim.secrets.provider?.credential) runScopedSecrets.push(...providerKeyForms(claim.secrets.provider.credential));
     for (const s of runScopedSecrets) this.log.addSecret(s);
-    // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
+    // Codex canaries and provider forms were ALREADY registered before construction; append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
     // exactly ONCE yet still evicted at the terminal (removeSecret is ref-counted, so a
     // second add here would leave a dangling registration the single eviction can't clear).
-    runScopedSecrets.push(...codexCanaries);
+    runScopedSecrets.push(...codexCanaries, ...providerForms);
 
     const flight = this.buildFlight(
       claim,
@@ -7259,7 +7314,7 @@ export class RunRunner {
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchSignal) {
         // The Codex executor has unwound: neither continuation A nor Claude release is safe.
-        if (claim.secrets.codex) {
+        if (isCodexBoundClaim(claim)) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.keepGuardedInventoryOpen = true;
@@ -7845,10 +7900,19 @@ export class RunRunner {
           const retain = async () =>
             this.git.retainCurrentOwedCandidate(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
           // Retained-flight cleanup must not requeue behind a lock its lifecycle just cancelled.
+          // issue #4627: a bare-identity hold first asks whether an exact owed pin already retains the tip (no write); only an
+          // `unretained` answer falls back to today's retainCurrentOwedCandidate (exception E1, additive pin).
+          const retainForExit = async () => {
+            if (flight.bareIdentityHold === true && typeof this.git.owedTipRetained === "function") {
+              const probed = await this.git.owedTipRetained(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
+              if (probed.kind !== "unretained") return probed;
+            }
+            return retain();
+          };
           const retained = await this.runCancellationMaintenance(flight, () => flight.retainedLocalCustody
             ? this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
-              async () => { this.retainedLifecycleGuard(flight); return retain(); })
-            : retain());
+              async () => { this.retainedLifecycleGuard(flight); return retainForExit(); })
+            : retainForExit());
           sourceOwedJoined = retained.kind === "updated";
           if (!sourceOwedJoined) flight.sourceJoinFailed = true;
           if (retained.kind === "not_updated" && claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
@@ -8025,7 +8089,7 @@ export class RunRunner {
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
       if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety && !flight.providerParkUnproven &&
-          !flight.restoreUnsupportedHold && !predecessorHome) {
+          !flight.restoreUnsupportedHold && !flight.bareIdentityHold && !predecessorHome) {
         parkReapApplied = true;
         // "Only a park that ended the run's processes drops": the park's process-group reap misses
         // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
@@ -8865,8 +8929,9 @@ export class RunRunner {
    */
   private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
     // issue #4058: a predecessor-remediation hold reports no terminal state and aborts nothing; the flight stops
-    // retained through holdForPredecessorRemediation.
-    if (flight.orphanRemediationHold) return;
+    // retained through holdForPredecessorRemediation. issue #4627: a bare-identity hold is likewise nonterminal and keeps its
+    // source; a permanent refusal of its guidance flush (the batcher breaker) must not turn the held park into a `failed` report.
+    if (flight.orphanRemediationHold || flight.bareIdentityHold) return;
     if (flight.policyHold || flight.iterationParkState !== "none") return;
     if (flight.workerMemory?.hold) {
       this.retainWorkerMemoryCustody(flight);
@@ -15595,7 +15660,7 @@ export class RunRunner {
     flight.publicationFloor = flight.runnerClone?.publicationFloor ?? { kind: "unverified" };
     flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
     flight.checkpointFloor = flight.publishedTip;
-    if (this.recovery.enabled && claim.secrets.codex && isCodePublishingKind(resolveRunKind(claim.kind)) && !flight.predecessorCapture) {
+    if (this.recovery.enabled && isCodexBoundClaim(claim) && isCodePublishingKind(resolveRunKind(claim.kind)) && !flight.predecessorCapture) {
       const privateHead = await this.git.worktreeHead(flight.worktreePath!);
       const configuredDefaultTip = claim.repo.default_branch?.trim()
         ? await this.git.originBranchTip(barePath, claim.repo.default_branch.trim())
@@ -15657,7 +15722,7 @@ export class RunRunner {
       return;
     }
     if (!claim.session_id) throw new PolicyContinuationRejected("session_missing", true);
-    if (claim.secrets.codex &&
+    if (isCodexBoundClaim(claim) &&
         (!flight.runHome || await CodexSessionStore.inspectSession(join(flight.runHome, "codex-session-store"), claim.session_id) !== "present"))
       throw new PolicyContinuationRejected("transcript_unknown", true);
   }
@@ -15910,7 +15975,7 @@ export class RunRunner {
           reason: "cwd_changed_attempt_path",
         },
       });
-    } else if (!sessionId && claim.secrets.codex && flight.retainedEpisode) {
+    } else if (!sessionId && isCodexBoundClaim(claim) && flight.retainedEpisode) {
       // Retained work proves a predecessor existed, but its conversation id was
       // never reported. Do not imply that the recovered work carries its context.
       runLog.info("retained Codex conversation id unavailable; starting a fresh thread", {
@@ -15924,7 +15989,7 @@ export class RunRunner {
     if (
       sessionId &&
       runHome &&
-      (claim.secrets.codex
+      (isCodexBoundClaim(claim)
         ? (await CodexSessionStore.inspectSession(join(runHome, "codex-session-store"), sessionId)) !== "present"
         : !(await sessionTranscriptResolvable(runHome, sessionId, runLog)))
     ) {
@@ -15983,7 +16048,7 @@ export class RunRunner {
     // Codex can only re-present the persisted gate with its preflighted conversation.
     // Without it the executor replans, so buffered approval must not inherit the old gate.
     // SDK retains its existing session-less gate recovery behaviour.
-    if (claim.secrets.codex && !sessionId && claim.plan_approved !== true && claim.plan_md?.trim()) {
+    if (isCodexBoundClaim(claim) && !sessionId && claim.plan_approved !== true && claim.plan_md?.trim()) {
       this.gatedRuns.add(runId);
       this.gateResumes.delete(runId);
     }
@@ -16098,7 +16163,7 @@ export class RunRunner {
       claim,
       barePath,
       flight.defaultBranchTip,
-      claim.secrets.codex ? "codex" : "claude",
+      isCodexBoundClaim(claim) ? "codex" : "claude",
       batcher,
       runLog,
     );
@@ -16197,12 +16262,7 @@ export class RunRunner {
     // A Codex-bound claim never reads, writes or shows the memo (Codex has no seam for it), so
     // skip the GET entirely. Same discriminator makeExecutor's seam uses; a malformed Codex
     // block throws there (fail-closed executor), so it counts as Codex-bound here too.
-    let codexBound = false;
-    try {
-      codexBound = selectCodexBinding({ codex: claim.secrets.codex }).kind === "codex";
-    } catch {
-      codexBound = true;
-    }
+    const codexBound = isCodexBoundClaim(claim);
     if (isDecisionsMemoKind(claimKind) && !codexBound) {
       try {
         const parsed = parseDecisionsMemoResponse(
@@ -17122,13 +17182,13 @@ export class RunRunner {
             steering,
             claim: {
               kind: resolveRunKind(claim.kind),
-              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.provider),
+              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || claim.secrets.provider?.engine === "claude"),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex,
-                claim.secrets.codex && this.nowSummaryOpts.codexAdviceHarnessFactory
+                codexBound && this.nowSummaryOpts.codexAdviceHarnessFactory
                   ? executor.bindCodexSummaryFactory?.(this.nowSummaryOpts.codexAdviceHarnessFactory)
                     ?? this.nowSummaryOpts.codexAdviceHarnessFactory
                   : this.nowSummaryOpts.codexAdviceHarnessFactory,
-                claim.claim_generation),
+                claim.claim_generation, claim.secrets),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,
@@ -17979,7 +18039,7 @@ export class RunRunner {
         // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
         if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
         // This hook belongs to Claude, including its give-up and v1 release outcomes.
-        if (claim.secrets.codex) {
+        if (isCodexBoundClaim(claim)) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.keepGuardedInventoryOpen = true;
@@ -18161,7 +18221,7 @@ export class RunRunner {
         const eligible = requiredEligible || gatedEligible;
         // Older api (no plan_cross_check_codex_lead): do not submit a Codex lead's check, park at
         // the human gate. This is a capability check, NOT a mapping of 409 refusals.
-        const codexLeadUnsupported = !!claim.secrets.codex && claim.plan_cross_check_codex_lead !== true;
+        const codexLeadUnsupported = isCodexBoundClaim(claim) && claim.plan_cross_check_codex_lead !== true;
         let crossCheckReason: string | undefined;
         let checkedApproval: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"] | undefined;
         let checkedFields: PlanCrossCheckStateRequest | undefined;
@@ -24342,7 +24402,7 @@ export class RunRunner {
 
   private isCredentialFreeOwnerCancel(claim: ClaimResponse, flight: RunFlight): boolean {
     return this.recovery.enabled && !!flight.worktreePath && !!flight.barePath &&
-      isCodePublishingKind(resolveRunKind(claim.kind)) && !!claim.secrets.codex &&
+      isCodePublishingKind(resolveRunKind(claim.kind)) && isCodexBoundClaim(claim) &&
       flight.steering.isCancelled();
   }
 
@@ -27422,7 +27482,7 @@ export class RunRunner {
       }
     }
     // 3. Status line, flushed ahead of the hold request.
-    batcher.emit({ kind: "status", agent: "worker", payload: { text: phaseSwitchHoldText(phase, cause, requested, observed) } });
+    batcher.emit({ kind: "status", agent: "worker", payload: { text: phaseSwitchHoldText(phase, cause, requested, observed, flight.redactText) } });
     await batcher.flush(AbortSignal.timeout(this.completionHoldReconcileTimeoutMs)).catch(() => undefined);
     // 4. The hold request, retried against ownership evidence.
     const deadline = Date.now() + this.phaseSwitchHoldDeadlineMs;
@@ -31204,6 +31264,60 @@ export class RunRunner {
   }
 
   /**
+   * issue #4627: a retained claim's first reservation found the bare's storage identity (device or inode) changed while the owner
+   * record's path, branch, key and run still match, on a journal that is not blocked. Execution stays refused and nothing is
+   * written to the journal, owner record or ledger; the run is parked for its owner at `recovery_wait` /
+   * `retained_recovery_adoption_failed`, modelled on {@link holdUnsupportedRestore}. Always ends in {@link RetainedRecoveryStop};
+   * a stale claim, a credential switch, a lost ownership and an owner Cancel propagate as there.
+   */
+  private async holdForBareIdentityChange(claim: ClaimResponse, flight: RunFlight, error: RecoveryOwnerBareIdentityHoldError): Promise<never> {
+    flight.bareIdentityHold = true;
+    const detail = { recorded_dev: error.recorded.dev, recorded_ino: error.recorded.ino, current_dev: error.current.dev,
+      current_ino: error.current.ino, claim_generation: claim.claim_generation };
+    flight.runLog.warn("retained recovery bare storage identity changed; execution refused", detail);
+    const emitCorrected = () => flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
+      "The owner hold for the changed storage identity was not confirmed; the run is not failed and its work and custody stay on " +
+      "this worker. Unless the hold was applied without its acknowledgement, automatic retries follow the ordinary requeue accounting."), 600) } });
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
+      "The retained work's storage identity changed (for example a pod replacement remounted the volume), so execution was refused " +
+      "before any source action. The work and custody stay on this worker. The worker is requesting an owner hold; the run's " +
+      "status shows whether it was applied. Inspect the run with `uzi run recovery <run>`, and export or recover its work (`uzi run export` or the recovery routes) rather than Resume: a claimed " +
+      "Resume holds again unchanged and adds a custody hold, up to the custody hold limit. Cancel ends the run."), 1200) } });
+    try {
+      const delivered = await flight.batcher.flushOwned(
+        AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+      if (!delivered) {
+        this.retainedLifecycleGuard(flight);
+        flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
+      }
+    } catch (flushError) {
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("guidance_unconfirmed", { reason: "flush_error", ...formatRetainedRecoveryDiagnostic(flushError, flight.redactText) });
+    }
+    this.retainedLifecycleGuard(flight);
+    let held = false;
+    try { held = await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed"); }
+    catch (parkError) {
+      if (!(parkError instanceof RetainedRecoveryStop) || parkError instanceof RetainedRecoveryCancelled) throw parkError;
+      // Same disposition as holdUnsupportedRestore: a stale claim, a credential switch and a cancel own an executeClaim arm each;
+      // a lost ownership is rethrown as the nonterminal RetainedRecoveryStop wrapper.
+      const cause = parkError.cause;
+      if (cause instanceof StaleClaimError || cause instanceof RetainedRecoveryCancelled || cause instanceof CredentialSwitchSignal) throw cause;
+      if (isRunOwnershipLost(cause, flight.runId)) throw parkError;
+    }
+    if (held) {
+      flight.runLog.info("retained recovery bare identity change held", detail);
+      throw new RetainedRecoveryStop();
+    }
+    flight.runLog.warn("retained recovery bare identity change hold unconfirmed", detail);
+    emitCorrected();
+    try {
+      await flight.batcher.flushOwned(AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+    } catch { /* best effort: the stop below is nonterminal either way */ }
+    throw new RetainedRecoveryStop();
+  }
+
+  /**
    * issue #3644 plan 3.6 (ii): the successor's executor and HOME, installed BEFORE the seed so the seed's own quiescence uses
    * them and nothing of the predecessor's HOME is ever reachable from the flight again. Built at `{generation}` (HOME
    * agent-home/<runId>.g<N>, provision/<runId>.g<N>); a Codex (safety-bearing) initial executor is disposed BEFORE the
@@ -31214,7 +31328,7 @@ export class RunRunner {
   private async swapRestoreExecutor(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const generation = flight.claimGeneration;
     const initialHome = flight.runHome;
-    const built = this.makeExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation });
+    const built = this.makeClaimExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation, ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}) });
     if (initialHome !== undefined && built.homeDir === initialHome) throw new Error("the successor executor was built on the predecessor's HOME");
     const next = publicationOnlyExecutor(claim, built.executor);
     const prior = flight.executor;
@@ -31503,6 +31617,8 @@ export class RunRunner {
     // A park may carry the capacity-only marker only when every consumed reservation ended in a data
     // volume capacity refusal and the window began here (see the authorization in fail()).
     let startedHere: boolean | undefined;
+    // issue #4627: true once this claim's first reservation succeeded; a bare-identity hold is only for a claim with no source action.
+    let reservedThisClaim = false;
     let lastWitnessed: Pick<import("./recovery-progress.js").RecoveryProgress, "startedAt" | "deadline" | "attempts" | "episode" | "claimGeneration"> | undefined;
     let observed = 0;
     let allCapacity = true;
@@ -31743,6 +31859,12 @@ export class RunRunner {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         if (error instanceof RecoveryChargeInterruptedError) throw new RetainedRecoveryStop({ cause: error });
+        // issue #4627: a changed bare storage identity on the first reservation of a not-blocked journal is held for the owner,
+        // only when the read-only probe produced the hold form; a base-class error from any other owner read takes fail().
+        if (error instanceof RecoveryOwnerBareIdentityHoldError &&!reservedThisClaim && source.recovery?.stage !== "blocked" &&
+            this.client.hasFeature(RETAINED_ADOPTION_FAILED_FEATURE) &&
+            Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 && flight.runningAckStatus === "running")
+          return this.holdForBareIdentityChange(claim, flight, error);
         // A spent window or clock is not evidence against a capacity-only history; any other reservation
         // failure is, because the journal may hold a reservation this flight never witnessed.
         if (!(error instanceof RecoveryBudgetExhaustedError || error instanceof RecoveryDeadlineExhaustedError)) allCapacity = false;
@@ -31752,6 +31874,7 @@ export class RunRunner {
         await fail();
       }
       const iteration = reservation!;
+      reservedThisClaim = true;
       episode = iteration;
       startedHere ??= iteration.attempts === 1;
       lastWitnessed = { startedAt: iteration.startedAt, deadline: iteration.deadline, attempts: iteration.attempts,
@@ -32065,7 +32188,7 @@ export class RunRunner {
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal);
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
-            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex).executor);
+            flight.executor = publicationOnlyExecutor(claim, this.makeClaimExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex, claim.secrets.provider ? { provider: claim.secrets.provider } : undefined).executor);
             this.registerEvidenceExecutor(flight);
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.

@@ -1800,7 +1800,7 @@ describe("IssueView — run-start preview (#3261)", () => {
     expect(button.getAttribute("aria-expanded")).toBe("true");
     const panel = document.getElementById(button.getAttribute("aria-controls")!)!;
     expect(within(panel).getByText("Model").nextElementSibling?.textContent).toContain("opus");
-    expect(within(panel).getByRole("link", { name: "Run defaults" }).getAttribute("href")).toBe("/settings/run-defaults");
+    expect(within(panel).getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
     expect([gets(), posts()]).toEqual([1, 1]);
     expect(mockApi.previewStartSettings.mock.calls[0][0]).toEqual({ harness: null, credential_override: null });
   });

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -831,12 +832,25 @@ func (s *Service) ownerJudgeBindMode(ctx context.Context, userID uuid.UUID) (str
 // pool-wait resume) can ask the same question the full-row claimExclude asks, without
 // materialising a whole store.Run. uuid.Nil means "exclude nothing".
 func (s *Service) claimExcludeFor(limitDead pgtype.UUID, retryNotBefore pgtype.Timestamptz) uuid.UUID {
+	// The clock is read only when there is something to compare: a bare-literal Service (several
+	// direct-assembly tests) has no clock and a run with no dead credential never needed one.
+	if !limitDead.Valid || !retryNotBefore.Valid {
+		return uuid.Nil
+	}
+	return claimExcludeAt(limitDead, retryNotBefore, s.now())
+}
+
+// claimExcludeAt is claimExcludeFor evaluated at an explicit instant, with no Service and no clock,
+// so the next-claim preview and the claim path share one rule. A window still closed keeps
+// excluding the dead credential; once retry_not_before has reopened (or when there is no reset stamp
+// to wait on) the exclusion relaxes to uuid.Nil.
+func claimExcludeAt(limitDead pgtype.UUID, retryNotBefore pgtype.Timestamptz, now time.Time) uuid.UUID {
 	if !limitDead.Valid {
 		return uuid.Nil
 	}
 	// Window still closed → keep excluding. Relax (Nil) once retry_not_before has
 	// reopened, and also when there is no reset stamp to wait on.
-	if retryNotBefore.Valid && retryNotBefore.Time.After(s.now()) {
+	if retryNotBefore.Valid && retryNotBefore.Time.After(now) {
 		return uuid.UUID(limitDead.Bytes)
 	}
 	return uuid.Nil
@@ -929,42 +943,95 @@ func (s *Service) autoChoice(ctx context.Context, run store.Run) (secretChoice, 
 	}
 	// PRD #3522 M3: with the weekly usage reserve enforced for this run, a pooled token the reserve
 	// blocks is never a candidate (the pool is not crossed to find another: only the owner's own
-	// pooled tokens below their threshold remain). allCands keeps the unfiltered pool so the
-	// failure path below can tell a pool the reserve emptied (hold) from a pool that was empty
-	// anyway (pool_wait, as today).
-	gate := reserveGateFrom(ctx)
-	allCands := cands
-	if gate != nil {
-		cands = gate.dropBlocked(cands)
+	// pooled tokens below their threshold remain). decideAuto keeps the unfiltered pool so the
+	// failure path can tell a pool the reserve emptied (hold) from a pool that was empty anyway
+	// (pool_wait, as today).
+	dec := decideAuto(autoInput{cands: cands, exclude: exclude, gate: reserveGateFrom(ctx), policy: s.p.Autoselect, now: s.now()})
+	switch dec.kind {
+	case autoPicked:
+		id := dec.id
+		h := dec.headroom
+		return secretChoice{secretID: &id, reason: dec.reason, headroom: &h}, nil
+	case autoFloor:
+		id := dec.id
+		return secretChoice{secretID: &id, reason: dec.reason}, nil
+	case autoReserveHeld:
+		return secretChoice{}, dec.heldErr
 	}
-	out := autoselect.Select(cands, exclude, s.p.Autoselect, s.now())
+	return secretChoice{}, errAutoPoolEmpty
+}
+
+// autoInput is everything decideAuto reads: the owner's pooled candidates as the claim read them,
+// the run's dead-credential exclusion, the reserve gate (nil when the reserve does not apply), the
+// operator policy and the instant. It carries no store, no context and no clock.
+type autoInput struct {
+	cands   []autoselect.Candidate
+	exclude uuid.UUID
+	gate    *reserveGate
+	policy  autoselect.Policy
+	now     time.Time
+}
+
+type autoDecisionKind int
+
+const (
+	// autoPicked: the selector named a measurable pooled token (id, reason, headroom).
+	autoPicked autoDecisionKind = iota
+	// autoFloor: nothing was measurable but a pooled token remains; the best one is spent as
+	// pool_stale with no headroom.
+	autoFloor
+	// autoReserveHeld: something pooled was spendable and only the weekly reserve took it away
+	// (heldErr is the reserve hold the claim requeues on).
+	autoReserveHeld
+	// autoPoolEmpty: genuinely nothing pooled to spend (errAutoPoolEmpty).
+	autoPoolEmpty
+)
+
+// autoDecision is decideAuto's answer. id, reason and headroom are set for autoPicked and autoFloor
+// (headroom only for autoPicked); heldErr for autoReserveHeld.
+type autoDecision struct {
+	kind     autoDecisionKind
+	id       uuid.UUID
+	reason   string
+	headroom int16
+	heldErr  error
+}
+
+// decideAuto is the pure heart of autoChoice: the steps after the candidate read, in order. It is
+// shared with the next-claim preview (NextClaimReason) so the preview names the credential the claim
+// would spend, by construction.
+func decideAuto(in autoInput) autoDecision {
+	cands := in.cands
+	allCands := cands
+	if in.gate != nil {
+		cands = in.gate.dropBlocked(cands)
+	}
+	out := autoselect.Select(cands, in.exclude, in.policy, in.now)
 	if out.Picked {
-		id := out.SecretID
 		// The gauge is a SMALLINT 0..100 and headroom is derived from it by subtraction,
 		// so the value is in range by construction and the narrowing cannot truncate.
 		// runs.anthropic_headroom_pct carries a CHECK BETWEEN 0 AND 100 as the backstop.
 		h := int16(out.Headroom) //nolint:gosec // G115: Headroom is 0..100 by construction (see comment above; DB CHECK 0..100), so the narrowing cannot truncate
-		return secretChoice{secretID: &id, reason: string(out.Reason), headroom: &h}, nil
+		return autoDecision{kind: autoPicked, id: out.SecretID, reason: string(out.Reason), headroom: h}
 	}
 	// NOT picked. The auto lane NEVER resolves the non-pooled owner default (#754).
 	// Floor spends the best pooled token — always unmeasured here, since a measurable
 	// one would have been Picked as best_of_pool — recorded as pool_stale, no headroom.
-	if floorID, ok := autoselect.Floor(cands, exclude, s.now()); ok {
-		id := floorID
-		return secretChoice{secretID: &id, reason: string(autoselect.ReasonPoolStale)}, nil
+	if floorID, ok := autoselect.Floor(cands, in.exclude, in.now); ok {
+		return autoDecision{kind: autoFloor, id: floorID, reason: string(autoselect.ReasonPoolStale)}
 	}
 	// PRD #3522 M3: something pooled WAS spendable and only the weekly reserve took it away: hold
 	// the run (queued, with the reserve reason) instead of waiting in pool_wait for a pool that is
 	// not empty.
-	if gate != nil {
-		if _, ok := autoselect.Floor(allCands, exclude, s.now()); ok {
-			return secretChoice{}, gate.autoHeldErr(exclude)
+	if in.gate != nil {
+		if _, ok := autoselect.Floor(allCands, in.exclude, in.now); ok {
+			return autoDecision{kind: autoReserveHeld, heldErr: in.gate.autoHeldErr(in.exclude)}
 		}
 	}
 	// Genuinely nothing pooled to spend (empty pool, or the only pooled token is the
 	// excluded dead credential). Do NOT spend the default and do NOT hard-fail — signal
 	// an empty-pool hold that finishRunClaim holds in pool_wait (PRD #754 M4).
-	return secretChoice{}, errAutoPoolEmpty
+	return autoDecision{kind: autoPoolEmpty}
 }
 
 // autoFloorRetry recomputes an auto credential after a picked (or floored) token

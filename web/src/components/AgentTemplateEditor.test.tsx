@@ -23,8 +23,8 @@ function renderEditor(name: string) {
   return screen.getByLabelText("Claude model") as HTMLSelectElement;
 }
 
-const LEAD_MODEL_HELP = "A model chosen at start or a schedule's model, then your Run defaults model for that harness, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses gpt-6.2-sol.";
-const LEAD_EFFORT_HELP = "An effort chosen at start, then your Run defaults effort for that harness (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.";
+const LEAD_MODEL_HELP = "A model chosen at start or a schedule's model, then your worker model for that harness in Settings → Models, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses gpt-6.2-sol.";
+const LEAD_EFFORT_HELP = "An effort chosen at start, then your worker effort for that harness in Settings → Models (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.";
 const MODEL_HELP = "Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.";
 
 describe("AgentTemplateEditor model Default label (#3255)", () => {

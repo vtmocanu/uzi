@@ -2,6 +2,7 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Recorded-call test (PRD 4173 M4): for an enabled repo with no issue-tracker
@@ -28,6 +30,9 @@ import (
 //   - a prompt run with MR 21 and no issue, read by SyncBoardFreeMRStates;
 //   - issue 8: a run whose merged MR 31 declared a moved PRD, so
 //     SyncPRDLinkPatches reads the live description and rewrites it;
+//   - a queued ci_fix bound to MR 51 (ci_fix_mr_iid only), read by
+//     SyncActiveMRTargets, which hands the verified merged MR to a recording
+//     canceller;
 //   - issue 5: carries the autopilot label, so the autopilot detector reads its
 //     label events and captures its issue input. The detector is the real
 //     poller.Autopilot over the real store; only the run starter is a fake,
@@ -45,6 +50,9 @@ type recordedPollForge struct {
 	// getProjectErr is what GetProject returns (nil: the project reads fine), the linked
 	// repo's code-host probe.
 	getProjectErr error
+	// ciBranch is the source branch the forge reports for MR 51 (the seeded ci_fix's ref).
+	ciBranch      string
+	listIssuesErr error
 }
 
 func (f *recordedPollForge) GetProject(context.Context, int64) (forge.Project, error) {
@@ -53,7 +61,10 @@ func (f *recordedPollForge) GetProject(context.Context, int64) (forge.Project, e
 
 var recordedPollAt = time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
 
-func (*recordedPollForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
+func (f *recordedPollForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
+	if f.listIssuesErr != nil {
+		return nil, f.listIssuesErr
+	}
 	if len(opts.Labels) == 1 && opts.Labels[0] == "agent-found" {
 		// One agent-found issue so the finding mark is non-zero and tick 2's
 		// incremental finding fetch carries its UpdatedAfter bound.
@@ -68,6 +79,31 @@ func (*recordedPollForge) GetMergeRequest(_ context.Context, _, iid int64) (forg
 	state := map[int64]string{13: forge.MRStateClosed, 21: forge.MRStateOpened, 31: forge.MRStateMerged}[iid]
 	return forge.MergeRequest{IID: iid, State: state}, nil
 }
+
+// recordedPollCIBranch is the source branch of MR 51, the target of the seeded ci_fix.
+func recordedPollCIBranch(repo uuid.UUID) string { return "agent/ci-fix-" + repo.String() }
+
+func (f *recordedPollForge) GetMergeRequestSummary(_ context.Context, _, iid int64) (forge.MergeRequestSummary, error) {
+	if iid != 51 {
+		return forge.MergeRequestSummary{}, forge.ErrMergeRequestNotFound
+	}
+	return forge.MergeRequestSummary{
+		IID: 51, State: forge.MRStateMerged, SourceBranch: f.ciBranch,
+		HeadSHA: "0123456789abcdef0123456789abcdef01234567",
+	}, nil
+}
+
+// recordedTerminalCanceller records the observations SyncActiveMRTargets hands it; the real
+// fenced cancel is covered by the forgesvc live-DB tests.
+type recordedTerminalCanceller struct {
+	obs []workersvc.TerminalTargetObservation
+}
+
+func (c *recordedTerminalCanceller) CancelRunForTerminalTarget(_ context.Context, _ uuid.UUID, obs workersvc.TerminalTargetObservation) error {
+	c.obs = append(c.obs, obs)
+	return nil
+}
+
 func (*recordedPollForge) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error) {
 	desc := "see the issue"
 	if iid == 8 {
@@ -111,7 +147,8 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := forgetest.NewRecorder(&recordedPollForge{})
+	pollForge := &recordedPollForge{}
+	rec := forgetest.NewRecorder(pollForge)
 	svc := forgesvc.NewWithForgeBuilder(q, box, time.Second, nil, func(forge.Type, string, string, time.Duration) (forge.Forge, error) {
 		return rec, nil
 	})
@@ -130,6 +167,7 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 	exec("INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,human_username,token_ciphertext) VALUES($1,$2,'gitlab',$3,'bot',1,'alice',$4)", conn, user, "https://"+uuid.NewString()+".forge.test", sealed)
 	exec("INSERT INTO user_secrets(user_id,kind,label,is_default,ciphertext,sealed_with) VALUES($1,'anthropic_token','default',true,$2,'master')", user, []byte{2})
 	exec("INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled) VALUES($1,$2,42,$3,'https://forge.test/g/r','main',true)", repo, conn, repo.String())
+	pollForge.ciBranch = recordedPollCIBranch(repo)
 	exec("INSERT INTO board_columns(repo_id,label_name,position) VALUES($1,'In Progress',0),($1,'Human Review',1)", repo)
 	const runCols = "INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,prd_done_path,status,created_at) "
 	// Board lane: issue 7's card is in Human Review, MR 13 recorded opened.
@@ -138,6 +176,9 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 	exec(runCols+"VALUES($1,$2,$3,'prompt',NULL,'t','d',$4,21,NULL,NULL,'completed','2020-01-01')", uuid.New(), user, repo, "uzi/prompt-"+repo.String())
 	// PRD link patch: issue 8's run merged MR 31 after moving its PRD.
 	exec(runCols+"VALUES($1,$2,$3,'issue',8,'t','Implements prds/72-x.md end to end.',$4,31,'merged','prds/done/72-x.md','completed','2020-01-01')", uuid.New(), user, repo, "agent/issue-8-"+repo.String())
+	// Active MR target: a queued ci_fix bound to MR 51 (no mr_iid, no issue, no watch row).
+	ciFix := uuid.New()
+	exec("INSERT INTO runs(id,user_id,repo_id,kind,pipeline_id,pipeline_ref,ci_fix_mr_iid,status,issue_title,issue_description) VALUES($1,$2,$3,'ci_fix',99,$4,51,'queued','t','d')", ciFix, user, repo, recordedPollCIBranch(repo))
 
 	// reconcileEvery 3: tick 1 is the first poll (full reconcile), tick 2 is
 	// incremental.
@@ -145,6 +186,8 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 	engine.SetPipelineWatch(time.Hour, 5)
 	starter := &apRuns{}
 	engine.SetAutopilot(NewAutopilot(q, starter, nil))
+	canceller := &recordedTerminalCanceller{}
+	svc.SetTerminalTargetCanceller(canceller)
 
 	var lines []string
 	for i, label := range []string{"tick 1 (full reconcile)", "tick 2 (incremental)"} {
@@ -160,5 +203,40 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 	if len(starter.calls) != 1 || starter.calls[0].iid != 5 {
 		t.Fatalf("autopilot run starter calls = %+v, want exactly one, for issue 5", starter.calls)
 	}
+	// One verified merged observation per tick for the bound ci_fix.
+	if len(canceller.obs) != 2 || canceller.obs[0].RunID != ciFix || canceller.obs[0].TargetMRIID != 51 || canceller.obs[0].State != forge.MRStateMerged {
+		t.Fatalf("terminal-target canceller observations = %+v, want two merged observations of ci_fix %s on MR 51", canceller.obs, ciFix)
+	}
 	forgetest.AssertGolden(t, "recorded_calls_poller_tick.golden", lines)
+
+	workerSvc := workersvc.New(q, nil, workersvc.Params{})
+	workerSvc.SetTxBeginner(pool)
+	svc.SetTerminalTargetCanceller(workerSvc)
+	pollForge.listIssuesErr = errors.New("issue listing failed")
+	for _, tc := range []struct {
+		name      string
+		pollCount int
+	}{{"full", 0}, {"incremental", 1}} {
+		t.Run(tc.name+"_issue_sync_failure_still_cancels", func(t *testing.T) {
+			fix := uuid.New()
+			pollForge.ciBranch = recordedPollCIBranch(repo) + "-" + tc.name
+			exec("INSERT INTO runs(id,user_id,repo_id,kind,pipeline_id,pipeline_ref,ci_fix_mr_iid,status,issue_title,issue_description) VALUES($1,$2,$3,'ci_fix',99,$4,51,'queued','t','d')", fix, user, repo, pollForge.ciBranch)
+			engine.states[repo].pollCount = tc.pollCount
+			var syncReported, syncOK bool
+			engine.SetSyncAttempt(func(uuid.UUID) func(bool, forge.ErrorClass) {
+				return func(ok bool, _ forge.ErrorClass) { syncReported, syncOK = true, ok }
+			})
+			engine.PollOnce(ctx)
+			if !syncReported || syncOK {
+				t.Fatalf("issue sync report: called=%t ok=%t, want a failed sync", syncReported, syncOK)
+			}
+			run, err := q.GetRunByID(ctx, fix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.Status != "cancelled" || run.StopReason.String != workersvc.TerminalTargetStopReason(forge.MRStateMerged) {
+				t.Fatalf("verified merged target: status=%q, stop reason=%q, want terminal-target cancellation", run.Status, run.StopReason.String)
+			}
+		})
+	}
 }

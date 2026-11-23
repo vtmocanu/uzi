@@ -121,7 +121,7 @@ describe("AgentNew real editor model pins", () => {
     expect(within(claude).getAllByRole("option").map((o) => o.textContent)).toEqual([
       "Default · follows the run's effort", "low", "medium (uzi default)", "high", "xhigh", "max",
     ]);
-    const leadEffortHelp = /^An effort chosen at start, then your Run defaults effort/;
+    const leadEffortHelp = /^An effort chosen at start, then your worker effort for that harness in Settings → Models/;
     expect(screen.queryByText(leadEffortHelp)).toBeNull();
     expect(screen.getByText(/^Leave a harness on Default so this subagent/)).toBeTruthy();
     fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "lead" } });

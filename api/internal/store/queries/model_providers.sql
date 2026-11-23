@@ -29,8 +29,9 @@ RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created
 -- A revision is immutable: this is the ONLY statement that writes model_provider_revisions rows
 -- (there is no UPDATE; TestNoModelProviderRevisionOrKeyAssociationUpdate pins that over every
 -- query file). An edit inserts the next revision.
-INSERT INTO model_provider_revisions (provider_id, revision, protocol, base_url, auth_style, model_map)
-VALUES (@provider_id, @revision, @protocol, @base_url, @auth_style, @model_map);
+INSERT INTO model_provider_revisions (provider_id, revision, protocol, base_url, auth_style, model_map, engine)
+SELECT p.id, @revision, @protocol, @base_url, @auth_style, @model_map, p.engine
+FROM model_providers p WHERE p.id = @provider_id;
 
 -- name: GetModelProviderRevision :one
 SELECT provider_id, revision, protocol, base_url, auth_style, model_map, created_at
@@ -132,7 +133,7 @@ ON CONFLICT (provider_id, revision) DO UPDATE
 SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, probed_at = EXCLUDED.probed_at;
 
 -- name: InsertProviderKeySecret :one
--- Stores a provider's gateway key (kind anthropic_compatible_key), the ONLY writer of that kind.
+-- Stores a provider's gateway key; derives its kind from the owned provider engine.
 -- Deliberately NOT InsertUserSecret: that statement forces the first secret of a kind to be the
 -- default and the first anthropic_token into the auto-select pool, and a provider key must be
 -- neither (is_default=false, auto_eligible=false), so it never enters a default slot, the poller,
@@ -140,18 +141,23 @@ SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, prob
 -- foreign key (user_id, provider_id) keeps the key under the provider's owner; the unique index
 -- user_secrets_one_provider_key allows one key per (user, provider). The label is the provider id.
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id)
-VALUES (@user_id, 'anthropic_compatible_key', @label, false, false, @ciphertext, @sealed_with, @provider_id)
+SELECT @user_id, CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END,
+       @label, false, false, @ciphertext, @sealed_with, @provider_id
+FROM model_providers p
+WHERE p.id = @provider_id AND p.owner_user_id = @user_id
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 
 -- name: GetProviderKeyForUpdate :one
 -- The provider key's identity and enablement, locked inside a mutation transaction.
-SELECT id, disabled_at, enablement_rev FROM user_secrets
-WHERE user_id = $1 AND provider_id = $2 AND kind = 'anthropic_compatible_key'
-FOR UPDATE;
+SELECT k.id, k.disabled_at, k.enablement_rev FROM user_secrets k
+JOIN model_providers p ON p.id = k.provider_id AND p.owner_user_id = k.user_id
+WHERE k.user_id = $1 AND k.provider_id = $2
+  AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+FOR UPDATE OF k;
 
 -- name: DeleteProviderKeySecret :execrows
 DELETE FROM user_secrets
-WHERE user_id = $1 AND provider_id = $2 AND kind = 'anthropic_compatible_key';
+WHERE user_id = $1 AND provider_id = $2 AND kind IN ('anthropic_compatible_key', 'openai_compatible_key');
 
 -- name: GetUserClaudeProviderSource :one
 -- The owner's Claude provider source with everything run creation needs to judge it usable in ONE
@@ -194,7 +200,7 @@ FOR SHARE NOWAIT;
 -- which the finishers do not retry). NOWAIT turns that contention into 55P03, which finishRunClaim /
 -- finishChatClaim already retry as a bounded whole-transaction retry. A missing row is
 -- pgx.ErrNoRows (stale).
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -207,7 +213,7 @@ FOR KEY SHARE OF r NOWAIT;
 -- the transaction and does not by itself keep the revision. What keeps PruneModelProviderRevisions off
 -- a revision is the source run row's own reference (model_provider_revision), which stays true while
 -- run rows are never deleted.
-SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
@@ -222,3 +228,42 @@ UPDATE users
 SET claude_provider_id = CASE WHEN @set_source::bool THEN sqlc.narg('provider_id')::uuid ELSE claude_provider_id END
 WHERE id = @id
 RETURNING claude_provider_id;
+
+-- name: GetUserProviderSource :one
+SELECT u.claude_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id AND p.owner_user_id = u.id AND p.engine = @engine
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = @id AND @engine::text = 'claude'
+UNION ALL
+SELECT u.codex_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.codex_provider_id AND p.owner_user_id = u.id AND p.engine = @engine
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = @id AND @engine::text = 'codex';
+
+
+-- name: GetUserProviderLaneSources :one
+-- One owner snapshot, without opening keys or resolving either source.
+SELECT claude_provider_id, codex_provider_id FROM users WHERE id = $1;
+
+-- name: SetUserProviderSource :one
+-- Owner and engine must match for a non-null selection; clearing is explicit.
+UPDATE users u
+SET claude_provider_id = CASE WHEN @engine::text = 'claude' THEN sqlc.narg('provider_id')::uuid ELSE claude_provider_id END,
+    codex_provider_id = CASE WHEN @engine::text = 'codex' THEN sqlc.narg('provider_id')::uuid ELSE codex_provider_id END
+WHERE u.id = @id AND @engine::text IN ('claude', 'codex')
+  AND (sqlc.narg('provider_id')::uuid IS NULL OR EXISTS (
+      SELECT 1 FROM model_providers p WHERE p.id = sqlc.narg('provider_id')::uuid
+        AND p.owner_user_id = u.id AND p.engine = @engine::text))
+RETURNING claude_provider_id, codex_provider_id;

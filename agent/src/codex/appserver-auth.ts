@@ -14,11 +14,89 @@
 import { randomUUID } from "node:crypto";
 
 import type { HarnessError } from "../harness.js";
-import type { CodexNotification, CodexTransport } from "./transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "./transport.js";
 import { RunResidueBlockedError, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 
 /** Outer bridge budget: above WorkerClient's 8s cap, below app-server's hard 10s cap. */
 export const CODEX_REFRESH_BRIDGE_BUDGET_MS = 9_000;
+
+/** Provider-only first-model-response allowance, started once turn/start is acknowledged. Queued
+ * gateways and slow reasoning models may stay silent well past local setup. Earlier run, idle,
+ * advice and cancellation bounds keep their own outcomes through the caller's abort signal. */
+export const CODEX_PROVIDER_FIRST_RESPONSE_MS = 120_000;
+
+/** Internal per-root local app-server setup allowance (launch through the turn/start
+ * acknowledgment); no provider configuration can extend it. The transport owns timer cleanup.
+ * Abort signals retain any earlier run bound. */
+export function codexConnectionBudget(mode: CodexAppServerAuthMode | undefined): (() => number) | undefined {
+  if (mode !== "provider") return undefined;
+  const end = performance.now() + 10_000;
+  return () => {
+    const remaining = end - performance.now();
+    if (remaining <= 0) {
+      throw new CodexTransportError({ category: "timeout", message: "codex provider setup deadline exceeded" });
+    }
+    return Math.ceil(remaining);
+  };
+}
+
+/**
+ * Initial model response only, on its own provider allowance started at the turn/start
+ * acknowledgment (`timeoutMs`, undefined = unbounded), separate from the local setup budget.
+ * Later turns (and HTTP reconnects inside them) are not bounded here.
+ * The timer only wakes the consumer: transport/root cleanup remains with its owner.
+ */
+export function codexInitialResponseWait(timeoutMs: number | undefined, threadId: string, turnId: string) {
+  let expired = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const ready = new Promise<void>(resolve => {
+    if (timeoutMs !== undefined) timer = setTimeout(() => { expired = true; resolve(); }, timeoutMs);
+  });
+  const clear = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  return {
+    ready,
+    clear,
+    assertOpen(): void {
+      if (expired) throw new CodexTransportError({
+        category: "timeout", message: "codex provider initial response deadline exceeded",
+      });
+    },
+    observe(note: CodexNotification): void {
+      if (expired || timer === undefined) return;
+      if (note.kind === "turn_completed") {
+        if (note.threadId === threadId && note.turnId === turnId) clear();
+        return;
+      }
+      if (note.kind !== "activity") return;
+      const p = note.params as Record<string, unknown> | null;
+      if (!p || p.threadId !== threadId || (p.turnId !== undefined && p.turnId !== turnId)) return;
+      // Lifecycle, logs, auth refresh and retry errors do not prove a model response.
+      if (note.method === "item/tool/call" && note.requestId !== undefined && p.turnId === turnId && typeof p.tool === "string") {
+        clear();
+        return;
+      }
+      if ((note.method === "item/agentMessage/delta" ||
+          note.method === "item/reasoning/textDelta" ||
+          note.method === "item/reasoning/summaryTextDelta") &&
+          typeof p.delta === "string" && p.delta.length > 0) {
+        clear();
+        return;
+      }
+      const item = p.item as Record<string, unknown> | null;
+      if (!item) return;
+      if (note.method === "item/started" &&
+          ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(String(item.type))) clear();
+      if (note.method === "item/completed" &&
+          ["agentMessage", "assistantMessage", "agent_message", "reasoning"].includes(String(item.type)) &&
+          (typeof item.text === "string" && item.text.length > 0 ||
+           Array.isArray(item.content) && item.content.some(part =>
+             part && typeof part.text === "string" && part.text.length > 0))) clear();
+    },
+  };
+}
 
 const INITIALIZE_METHOD = "initialize";
 const INITIALIZED_METHOD = "initialized";
@@ -32,7 +110,7 @@ const MAX_INTERCEPTED_AUTH_BYTES = 16 * 1024;
 const MAX_PREVIOUS_ACCOUNT_ID_BYTES = 256;
 const BRIDGE_CANCEL_SETTLEMENT_MS = 250;
 
-export type CodexAppServerAuthMode = "api_key" | "subscription";
+export type CodexAppServerAuthMode = "api_key" | "subscription" | "provider";
 
 /**
  * Access-token/account identity already verified by the uzi API. The adapter must not
@@ -56,7 +134,7 @@ export interface CodexSubscriptionRefreshBridge {
 
 export type CodexAppServerAuthConfig =
   | {
-      readonly mode: "api_key";
+      readonly mode: "api_key" | "provider";
       readonly apiKey: string;
     }
   | {
@@ -81,7 +159,7 @@ export interface CodexAuthSuspensionLease {
 export interface CodexAppServerAuthSession {
   readonly mode: CodexAppServerAuthMode;
   /** Initialize and authenticate exactly this app-server connection. */
-  authenticate(transport: CodexTransport, signal?: AbortSignal): Promise<void>;
+  authenticate(transport: CodexTransport, signal?: AbortSignal, connectionBudget?: () => number): Promise<void>;
   /** Handle only the pinned subscription-refresh server request. */
   handleServerRequest(
     transport: CodexTransport,
@@ -166,8 +244,8 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
   constructor(config: CodexAppServerAuthConfig) {
     // Snapshot the discriminant and secret values. A caller retaining and mutating its
     // input object cannot switch this root to another credential mode after construction.
-    this.config = config.mode === "api_key"
-      ? { mode: "api_key", apiKey: config.apiKey }
+    this.config = config.mode !== "subscription"
+      ? { mode: config.mode, apiKey: config.apiKey }
       : {
           mode: "subscription",
           initial: { accessToken: config.initial.accessToken, accountId: config.initial.accountId },
@@ -177,7 +255,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     this.mode = config.mode;
   }
 
-  authenticate(transport: CodexTransport, signal?: AbortSignal): Promise<void> {
+  authenticate(transport: CodexTransport, signal?: AbortSignal, connectionBudget?: () => number): Promise<void> {
     if (this.interceptedClosed) {
       return Promise.reject(transportError("codex authentication request admission is closed"));
     }
@@ -191,7 +269,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
 
     this.transport = transport;
     this.state = "starting";
-    const startup = this.start(transport, signal).then(
+    const startup = this.start(transport, signal, connectionBudget).then(
       () => {
         if (this.state === "poisoned") throw protocolError("codex authentication session is poisoned");
         this.state = "ready";
@@ -199,6 +277,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       (error: unknown) => {
         this.poison();
         if (error instanceof CodexAppServerAuthError) throw error;
+        if (error instanceof CodexTransportError && error.failure.category === "timeout") throw error;
         // issue #2213: the quarantine refusal reaches the runner as itself, never as a transport fault.
         if (error instanceof RunResidueBlockedError) throw error;
         throw transportError("codex authentication startup failed");
@@ -221,7 +300,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     if (this.state !== "ready" || this.transport !== transport) {
       this.poisonAndRespond(transport, note.requestId, "codex authentication refresh arrived outside the active session");
     }
-    if (this.config.mode === "api_key") {
+    if (this.config.mode !== "subscription") {
       this.poisonAndRespond(transport, note.requestId, "codex api-key session received a subscription refresh request");
     }
     this.validateRefreshParams(transport, note.requestId, note.params);
@@ -397,14 +476,14 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     }
   }
 
-  private async start(transport: CodexTransport, signal?: AbortSignal): Promise<void> {
+  private async start(transport: CodexTransport, signal?: AbortSignal, connectionBudget?: () => number): Promise<void> {
     const initialized = await transport.request<unknown>(
       INITIALIZE_METHOD,
       {
         clientInfo: { name: "uzi", title: "uzi", version: "0.1.0-m4" },
         capabilities: { experimentalApi: true, requestAttestation: false },
       },
-      { signal },
+      { signal, deadlineMs: connectionBudget?.() },
     );
     const init = asObject(initialized);
     if (
@@ -427,7 +506,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
     // The pump waits for `startup` (and therefore validated login) before answering.
     this.installRefreshPump(transport);
 
-    const loginParams = this.config.mode === "api_key"
+    const loginParams = this.config.mode !== "subscription"
       ? { type: "apiKey", apiKey: this.config.apiKey }
       : {
           type: "chatgptAuthTokens",
@@ -437,8 +516,8 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
         };
     // issue #2213: a quarantined worker sends no provider credential (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
-    const response = await transport.request<unknown>(LOGIN_METHOD, loginParams, { signal });
-    const expected = this.config.mode === "api_key" ? "apiKey" : "chatgptAuthTokens";
+    const response = await transport.request<unknown>(LOGIN_METHOD, loginParams, { signal, deadlineMs: connectionBudget?.() });
+    const expected = this.config.mode !== "subscription" ? "apiKey" : "chatgptAuthTokens";
     if (asObject(response)?.type !== expected) {
       throw protocolError("codex account/login/start returned an unexpected authentication mode");
     }
@@ -457,7 +536,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
           if (this.interceptedClosed) {
             this.poisonAndRespond(transport, requestId, "codex authentication request admission is closed");
           }
-          if (this.config.mode === "api_key") {
+          if (this.config.mode !== "subscription") {
             this.poisonAndRespond(transport, requestId, "codex api-key session received a subscription refresh request");
           }
           // Validate and discard the untrusted hint synchronously, before an async task
@@ -667,7 +746,13 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
 
 /** Create one immutable auth owner for one app-server root. */
 export function createCodexAppServerAuth(config: CodexAppServerAuthConfig): CodexAppServerAuthSession {
-  if (config.mode === "api_key") {
+  if (config.mode !== "provider" && config.mode !== "api_key" && config.mode !== "subscription") {
+    throw protocolError("codex authentication mode is unsupported");
+  }
+  if (config.mode === "provider" && Object.keys(config).some(key => key !== "mode" && key !== "apiKey")) {
+    throw protocolError("codex provider auth received mixed authority or unsupported options");
+  }
+  if (config.mode !== "subscription") {
     if (!isNonEmptyString(config.apiKey)) throw protocolError("codex api-key credential is empty");
   } else if (validateVerifiedTokens(config.initial) === undefined) {
     throw protocolError("codex subscription credential is incomplete");

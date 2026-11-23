@@ -381,7 +381,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 
 	holdClass := false
 	var authorityErr error
-	if run.Harness == harnessCodex {
+	if run.Harness == harnessCodex && !providerBoundRun(locked) {
 		holdClass, authorityErr, err = classifyLockedCodexClaim(ctx, q, locked)
 		if err != nil {
 			return nil, "", err

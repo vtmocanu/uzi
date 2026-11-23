@@ -37,7 +37,7 @@ func TestIterationSlackPresentation(t *testing.T) {
 					rc.MilestonesFrozen = []byte(`[]`)
 				}
 				root, rootFallback := rootBlocks(rc, "https://uzi.example")
-				thread, threadFallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+				thread, threadFallback, ok := renderThreadBlocks(rc, "https://uzi.example", nil)
 				if !ok {
 					t.Fatal("missing nonterminal thread")
 				}
@@ -98,7 +98,7 @@ func TestIterationSlackFrozenWallGuidance(t *testing.T) {
 			for _, thread := range []bool{false, true} {
 				blocks, _ := rootBlocks(rc, "https://uzi.example")
 				if thread {
-					blocks, _, _ = renderThreadBlocks(rc, "https://uzi.example")
+					blocks, _, _ = renderThreadBlocks(rc, "https://uzi.example", nil)
 				}
 				encoded, err := json.Marshal(blocks)
 				if err != nil {

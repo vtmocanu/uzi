@@ -229,7 +229,7 @@ func claudeAutoSide(cands []autoselect.Candidate, defaultID uuid.UUID, blocked f
 }
 
 func (s *Service) claudeAutoSideDB(ctx context.Context, q *store.Queries, userID uuid.UUID, now time.Time) (autoSide, error) {
-	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals())
+	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals(), false)
 	if err != nil {
 		return autoSide{}, err
 	}

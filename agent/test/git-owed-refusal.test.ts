@@ -559,7 +559,7 @@ describe("issue4481 recording failure latch", { timeout: 300_000 }, () => {
     const internals = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
     const original = internals.runGit.bind(cache);
     if (failRef) internals.runGit = async (cwd, args, ...rest) => {
-      if (args[0] === "update-ref" && String(args[1]).includes("/refused-")) throw new Error("injected refused-ref failure");
+      if (args[0] === "update-ref" && args.some((a) => String(a).includes("/refused-"))) throw new Error("injected refused-ref failure");
       return original(cwd, args, ...rest);
     };
     if (failLedger) fs.chmodSync(refDir(), 0o500);
@@ -614,7 +614,7 @@ describe("issue4481 recording failure latch", { timeout: 300_000 }, () => {
       const original = internals.runGit.bind(cache);
       // The write "succeeds" but leaves nothing behind, so the read-back finds no ref.
       internals.runGit = async (cwd, args, ...rest) =>
-        args[0] === "update-ref" && String(args[1]).includes("/refused-") ? "" : original(cwd, args, ...rest);
+        args[0] === "update-ref" && args.some((a) => String(a).includes("/refused-")) ? "" : original(cwd, args, ...rest);
       return () => { internals.runGit = original; };
     });
     assert.equal(incomingRefs().some((r) => r.includes("/refused-")), false);
@@ -955,7 +955,7 @@ describe("issue4481 durable incomplete marker and seal comparison", { timeout: 3
     };
     const runGit = internals.runGit.bind(cache), write = internals.writeOwedFile.bind(cache);
     internals.runGit = async (cwd, args, ...rest) => {
-      if (args[0] === "update-ref" && String(args[1]).includes("/refused-")) throw new Error("injected ref failure");
+      if (args[0] === "update-ref" && args.some((a) => String(a).includes("/refused-"))) throw new Error("injected ref failure");
       return runGit(cwd, args, ...rest);
     };
     internals.writeOwedFile = async (b, name, value, dir, runId) => {
@@ -1031,7 +1031,7 @@ describe("issue4481 owed-path marker (restart residual)", { timeout: 300_000 }, 
     const internals = cache as unknown as Internals;
     const runGit = internals.runGit.bind(cache), write = internals.writeOwedFile.bind(cache);
     internals.runGit = async (cwd, args, ...rest) => {
-      if (args[0] === "update-ref" && String(args[1]).includes("/refused-")) throw new Error("injected ref failure");
+      if (args[0] === "update-ref" && args.some((a) => String(a).includes("/refused-"))) throw new Error("injected ref failure");
       return runGit(cwd, args, ...rest);
     };
     internals.writeOwedFile = async (b, name, value, dir, runId) => {
@@ -1549,7 +1549,7 @@ describe("issue4481 the incoming head's refusal is recorded before a soft-deadli
     const original = internals.runGit.bind(cache);
     internals.runGit = async (cwd, args, ...rest) => {
       const out = await original(cwd, args, ...rest);
-      if (args[0] === "update-ref" && String(args[1]).includes(`/refused-${tracking}`)) clock = 100;
+      if (args[0] === "update-ref" && args.some((a) => String(a).includes(`/refused-${tracking}`))) clock = 100;
       return out;
     };
     let result: TrackingUpdateResult;
@@ -1764,7 +1764,7 @@ describe("issue4481 at-cap duplicate stage release requires a verified refused r
     const c = cache as unknown as { runGit: (dir: string, args: string[]) => Promise<string> };
     const original = c.runGit;
     c.runGit = function (this: unknown, dir: string, args: string[]) {
-      if (args[0] === "update-ref" && args.length === 3 && /\/refused-[0-9a-f]{40}$/.test(args[1]!)) return Promise.reject(new Error("injected refused ref write failure"));
+      if (args[0] === "update-ref" && args.some((a) => /\/refused-[0-9a-f]{40}$/.test(a))) return Promise.reject(new Error("injected refused ref write failure"));
       return original.call(this, dir, args);
     } as typeof c.runGit;
     return () => { c.runGit = original; };

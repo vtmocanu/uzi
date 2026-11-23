@@ -186,7 +186,7 @@ func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
 	case "codex_pool_unavailable":
 		why = "no pooled Codex account was available."
 	case "provider_lane_unsupported":
-		why = "the Claude source is a model provider, which the judge does not support yet."
+		why = "the selected source is a model provider, which the judge does not support yet."
 	default:
 		why = "the judge could not run."
 	}

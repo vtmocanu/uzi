@@ -185,7 +185,7 @@ func TestCodexReadingNotCurrentAfterReenableLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	upsert := func(acc uuid.UUID) {
 		t.Helper()
-		n, err := q.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+		n, err := upsertCodexRows(ctx, q, store.UpsertCodexAccountRateLimitsParams{
 			UserID: user, ProviderAccountID: acc, Buckets: []byte(`[{"id":"primary"}]`), AttemptStatus: "ok",
 			EnablementSig: codexEnablementSig(ctx, t, q, user, acc),
 		})

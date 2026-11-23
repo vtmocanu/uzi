@@ -22,7 +22,7 @@ import { RunRunner } from "../src/runner.js";
 import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { CodexExecutor, CODEX_PRODUCTION_PROVIDER, createCodexEpochAuthority, type CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
-import { selectCodexBinding } from "../src/codex/select.js";
+import { selectCodexExecutionAuthority } from "../src/codex/select.js";
 import { ownedSummaryFactories, summaryOwnership } from "../src/codex/summary-ownership.js";
 import type { AdviceRequest, AdviceResult, AdviceResultPolicy } from "../src/harness.js";
 
@@ -878,13 +878,18 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     }) as unknown as CodexAdviceHarnessFactory;
   }
 
-  it("M2 Runner composes the Codex Now factory through its executor", async () => {
-    const claim = claimFor(2619, { secrets: CODEX_SECRETS });
+  for (const providerMode of [false, true]) it(`M2 Runner composes the Codex Now factory through its executor provider=${providerMode}`, async () => {
+    const secrets = providerMode ? { forge_pat: "fixture-forge-pat-000000", provider: {
+      provider_id: "now-provider", revision: 2, engine: "codex" as const, protocol: "openai_responses" as const,
+      base_url: "https://gateway.example/v1", auth_style: "bearer" as const,
+      credential: "now-provider-fixture-key", model_map: { default: { model: "gateway-model" } },
+    } } : CODEX_SECRETS;
+    const claim = claimFor(2619, { secrets });
     api.nowSummary.set(claim.run_id, true);
     const rec = { builds: [] as unknown[], requests: [] as AdviceRequest[] };
     const raw = lunaFactory(rec);
     let bindings = 0, calls = 0;
-    const selection = selectCodexBinding(CODEX_SECRETS);
+    const selection = selectCodexExecutionAuthority(secrets);
     assert.equal(selection.kind, "codex");
     if (selection.kind !== "codex") throw new Error("Codex fixture binding missing");
     const executor = new CodexExecutor(nullLogger(), fx.dataDir, { binding: selection.binding, client, provider: CODEX_PRODUCTION_PROVIDER });
@@ -909,10 +914,14 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     };
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
     try {
-      await runnerFor(executor, { homeRoot, queryFn: summaryQuery([]), codexAdviceHarnessFactory: raw }).execute(claim);
+      await runnerFor(executor, { homeRoot, queryFn: (() => { assert.fail("Claude route"); }) as SdkQueryFn, codexAdviceHarnessFactory: raw }).execute(claim);
     } finally { fs.rmSync(homeRoot, { recursive: true, force: true }); }
     assert.equal(bindings, 1);
     assert.equal(calls, 1);
+    const built = rec.builds[0] as { binding: unknown; refresh?: string };
+    assert.deepEqual(built.binding, selection.binding, "Now retains the executor-bound authority");
+    assert.equal(built.refresh, "deny");
+    assert.equal(rec.requests.length, 1);
     assert.equal(notesOf(claim.run_id).length, 1);
   });
 

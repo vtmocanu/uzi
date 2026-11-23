@@ -388,6 +388,32 @@ Only genuinely new comments count against a rework's trigger: a comment
 already consumed by a previous cycle is never re-acted on, so the watcher
 can't loop on the same finding.
 
+## When the merge request merges or closes mid-rework
+
+If the MR a run targets is merged or closed while an `mr_rework` run is still
+active, uzi stops that run: there is nothing left to rework. The MR watcher
+does this when it sees the change, and the forge poller's early-polling pass
+also checks active `mr_rework` runs, 32 per repo per pass, cancelling one only
+when the forge confirms the same MR number, a safe source branch equal to the
+run's branch, a full 40-hex head SHA and a merged or closed state. A run with a
+live worker gets a cancel the worker drains and ends `cancelled`; an existing
+stop verdict (an operator cancel, stop or auto-stop) is never overwritten. If
+the worker asks for publication context after the MR has merged or closed, the
+server refuses with `target_terminal` (when the rest of the publication context
+resolves; otherwise the existing refusal is returned and nothing is stamped),
+nothing is pushed and the run normally lands `cancelled`. Its work is not
+discarded; it stays recoverable under the usual held-publication and recovery
+rules (`uzi run held` / `uzi run recovery`).
+
+`mr_rework` runs, parked `paused` and `recovery_wait` ones included, are
+cancelled by the MR watcher. The recorded stop reason is "target MR merged;
+further publication stopped." or "target MR closed; further publication
+stopped.", replacing the earlier "MR merged/closed during rework". The same
+early polling and backstop apply to a bound `ci_fix`, but the limit that a
+`paused` or `recovery_wait` run is not cancelled while parked is `ci_fix`-only;
+see
+[Automatic CI fix](./ci-autofix.md#when-the-pull-request-merges-or-closes-mid-fix).
+
 ## Rework on demand
 
 You don't have to wait out the cap. On a completed run whose MR is still

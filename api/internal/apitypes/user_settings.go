@@ -96,6 +96,7 @@ type UserSettingsDTO struct {
 	// ClaudeProviderID is the CLI decode mirror of the provider the owner's Claude lane runs on
 	// (PRD #4320); null = the vendor Claude ladder. Read-only: set via the provider source route.
 	ClaudeProviderID *string `json:"claude_provider_id"`
+	CodexProviderID  *string `json:"codex_provider_id"`
 	// DefaultClaudeModel and DefaultCodexModel are the CLI decode mirrors of the retained
 	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
 	DefaultClaudeModel *string `json:"default_claude_model"`
@@ -124,6 +125,10 @@ type UserSettingsDTO struct {
 	// written through PUT /api/me/settings; PUT /api/me/usage-reserve owns the write.
 	WeeklyReservePct          *int `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool `json:"weekly_reserve_pause_running"`
+	// WeeklyWarningMarginPts is the weekly-limit early-warning margin in percentage points (PRD
+	// #4123), 0..50 with 0 = off, default 15. Not written through PUT /api/me/settings;
+	// PUT /api/me/weekly-warning-margin owns the write.
+	WeeklyWarningMarginPts int `json:"weekly_warning_margin_pts"`
 	// CodexAccountMode is the user's Codex account mode (issue #3719): "default" binds the
 	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
 	// PUT /api/me/codex-account-mode owns the write.

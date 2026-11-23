@@ -6501,6 +6501,15 @@ func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
 	}
 }
 
+func (f *fakeStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}
+
+// GetUserProviderLaneSources preserves the fixture's unselected-source policy.
+func (f *fakeStore) GetUserProviderLaneSources(context.Context, uuid.UUID) (store.GetUserProviderLaneSourcesRow, error) {
+	return store.GetUserProviderLaneSourcesRow{}, nil
+}
+
 func TestAgentsFromTemplatesEffortProjection(t *testing.T) {
 	rows := []store.AgentTemplate{
 		{Name: "claude-only", Effort: pgconv.TextOrNull("high")},

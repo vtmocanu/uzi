@@ -17,6 +17,7 @@
 // model must never take instructions from (Decision 10).
 
 import os from "node:os";
+import { decodeProviderBinding, PROVIDER_LANE_UNSUPPORTED, ProviderLaneUnsupportedError } from "./provider-binding.js";
 import { diagramEvent, type DiagramParserReason, type DiagramReason } from "./diagram-diagnostic.js";
 
 import { fenceNonce } from "./prompt.js";
@@ -24,7 +25,7 @@ import { defaultQueryFn } from "./sdk-messages.js";
 import { ModelPassCredentialError, runReadOnlyModelPass, type ModelPassCredentialReason, type ReadOnlyModelPassOpts } from "./model-pass.js";
 import { extractJsonObject } from "./judge-runner.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
+import { selectCodexExecutionAuthority } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only: the injected seam, never constructed here
 import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; // leaf value import (no runtime dep on codex-executor)
 import { CODEX_SUMMARY_EFFORT, DEFAULT_CODEX_SUMMARY_MODEL } from "./codex/summary-model.js"; // leaf value import
@@ -41,6 +42,7 @@ export type SummarySkipReason = ModelPassCredentialReason;
 export type SummaryPassName = "intent" | "plan" | "pr_description";
 import { isValidModel } from "./models.js";
 import { errMessage } from "./util.js";
+import { makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
 import { summaryModelTimeoutMs } from "./config.js";
 import type { Logger } from "./log.js";
 
@@ -97,7 +99,7 @@ export interface PlanSummaryResult {
 export interface IntentSummaryInput {
   /** Claim shape selects Codex when present and valid; malformed Codex fails closed.
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
-  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
+  claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown; readonly provider?: ClaimProviderBinding; readonly anthropic_oauth_token?: string } };
   token: string;
   /** PRD #4320: the provider binding of a provider-bound run; the pass then runs under it (not `token`) and
    *  its model resolves through the bound map, so an unmapped summary model skips the pass. */
@@ -289,6 +291,7 @@ export class SummaryRunner {
       "Codex claim but no Codex advice-harness factory is wired": "missing_factory",
       "the claim carries no Anthropic token": "missing_credential",
       "the model pass failed": "pass_failed",
+      [PROVIDER_LANE_UNSUPPORTED]: "pass_failed",
       "unparseable output": "unparseable",
       "the output had no usable summary": "missing_summary",
     } as const satisfies Record<string, DiagramReason>;
@@ -307,6 +310,7 @@ export class SummaryRunner {
     try {
       harness = this.deliveryHarness(input.claim, fail, input.claimGeneration);
     } catch (err) {
+      if (err instanceof ProviderLaneUnsupportedError) return fail(PROVIDER_LANE_UNSUPPORTED);
       return fail("the claim's codex block is invalid", err);
     }
     if (harness === null) return null;
@@ -354,7 +358,7 @@ export class SummaryRunner {
     fail: (reason: "Codex claim but no Codex advice-harness factory is wired" | "the claim carries no Anthropic token") => null,
     claimGeneration?: number,
   ): Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "codex"> | null {
-    const selection = selectCodexBinding({ codex: claim.secrets.codex });
+    const selection = selectCodexExecutionAuthority(claim.secrets);
     if (selection.kind === "codex") {
       if (!this.codexAdviceHarnessFactory) return fail("Codex claim but no Codex advice-harness factory is wired");
       return {
@@ -404,16 +408,19 @@ export class SummaryRunner {
       this.log.warn("plan summary generation failed", { error: errMessage(err) });
       return null;
     }
-    return this.parsePlanSummary(text);
+    const provider = input.claim ? input.claim.secrets.provider : input.provider;
+    return this.parsePlanSummary(text, provider?.credential);
   }
 
   /** Parse + defensively coerce the plan turn's JSON. Never throws: a parse failure or a
    *  missing/blank `summary` returns null (the summary is the load-bearing field); a
    *  non-array `deltas` degrades to []; malformed delta elements are dropped. */
-  private parsePlanSummary(text: string): PlanSummaryResult | null {
+  private parsePlanSummary(text: string, providerCredential?: string): PlanSummaryResult | null {
     let obj: unknown;
     try {
       obj = extractJsonObject(text);
+      // JSON decoding can reveal encoded key forms; scrub names and values before clipping.
+      if (providerCredential) obj = redactStrings(obj, makeTextRedactor(providerKeyForms(providerCredential)));
     } catch (err) {
       this.log.warn("plan summary JSON parse failed", { error: errMessage(err) });
       return null;
@@ -440,10 +447,23 @@ export class SummaryRunner {
    *  throws into the caller. Returns the accumulated text; THROWS on timeout or an error
    *  result so the public methods can catch → null. */
   private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
+
     const reportUsage = this.usageReporter(pass, input.onUsage);
     let onCodex = false;
     try {
-      const selection = selectCodexBinding({ codex: input.claim?.secrets.codex });
+      // A claim owns execution authority; a separate binding may only repeat it.
+      const secrets = input.claim ? input.claim.secrets : (input.provider ? { provider: input.provider } : {});
+      const selection = selectCodexExecutionAuthority(secrets);
+      if (input.claim && input.provider !== undefined) {
+        try {
+          const claimed = decodeProviderBinding(input.claim.secrets);
+          const supplied = decodeProviderBinding({ provider: input.provider });
+          if (!claimed || JSON.stringify(claimed) !== JSON.stringify(supplied)) throw new ProviderLaneUnsupportedError();
+        } catch {
+          throw new ProviderLaneUnsupportedError();
+        }
+      }
+      const provider = secrets.provider;
       let harness: Pick<ReadOnlyModelPassOpts, "token" | "provider" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
         onCodex = true;
@@ -464,7 +484,7 @@ export class SummaryRunner {
           },
         };
       } else {
-        harness = { token: input.token, ...(input.provider ? { provider: input.provider } : {}), model: input.model };
+        harness = { token: input.token, ...(provider ? { provider } : {}), model: input.model };
       }
       return await runReadOnlyModelPass({
         ...harness,

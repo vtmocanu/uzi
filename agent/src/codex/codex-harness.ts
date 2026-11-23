@@ -63,6 +63,7 @@ import { CATALOG_PROBE_LIMIT, parseCatalogEntry, type CodexCatalogEntry } from "
 export type { CodexCatalogEntry } from "./catalog-probe.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
+import { isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT } from "../provider-binding.js";
 import { PhaseSwitchUnverifiedError } from "../phase-switch-unverified.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { DRAFT_PLAN_ACK } from "../draft-plan.js";
@@ -123,7 +124,7 @@ import {
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
-import type { CodexAuthSuspensionLease, CodexAppServerAuthMode, CodexAppServerAuthSession } from "./appserver-auth.js";
+import { CODEX_PROVIDER_FIRST_RESPONSE_MS, codexInitialResponseWait, codexConnectionBudget, type CodexAuthSuspensionLease, type CodexAppServerAuthMode, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -171,7 +172,9 @@ export interface CodexProviderConfig {
  *  app-server auth keeps the credential out of this shape; the optional legacy
  *  transitional credential remains private and never becomes model-visible. */
 export interface CodexLaunchRootSpec {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   readonly kind: "provider";
+  readonly providerBinding?: import("../protocol.js").ClaimCodexProviderBinding;
   readonly provider: CodexProviderConfig;
   readonly model: string;
   /** The canonical project / launch cwd (provisioned untrusted). */
@@ -267,6 +270,10 @@ export interface CodexHarnessOptions {
    *  API-equivalent estimates from the pinned Standard price table when usage fully reconciles.
    *  When absent, entries and run cost stay unreported while token totals are retained. */
   readonly authMode?: CodexAppServerAuthMode;
+  /** Provider first-response allowance per owned root (default
+   *  {@link CODEX_PROVIDER_FIRST_RESPONSE_MS}). Internal test seam only: no env, claim or provider
+   *  configuration reaches it. */
+  readonly providerFirstResponseMs?: number;
   /** PRD #1332 C4a / CodeRabbit 4004800880: the executor-claim-leg token accountant, INJECTED so it
    *  survives provider-epoch recreation (plan approval, cooperative-checkpoint reaps). Each epoch
    *  builds a FRESH {@link CodexHarness}, but the accountant keeps the claim leg's cumulative
@@ -572,6 +579,7 @@ export class CodexHarness implements RunHarness {
   // PRD #1332 C4b / D5: the run's immutable auth mode, used ONLY to project the terminal cost
   // semantics from the accountant. Undefined leaves the terminal price-free (unreported).
   private readonly authMode?: CodexAppServerAuthMode;
+  private readonly providerFirstResponseMs: number;
 
   // Run-level provider root state (launched once, reused across turns; a reused
   // notifications() iterator is single-consumer so it is obtained exactly once).
@@ -857,6 +865,7 @@ export class CodexHarness implements RunHarness {
     this.appServerAuth = opts.appServerAuth;
     this.credentialValue = opts.credentialValue;
     this.authMode = opts.authMode;
+    this.providerFirstResponseMs = opts.providerFirstResponseMs ?? CODEX_PROVIDER_FIRST_RESPONSE_MS;
     this.accountant = opts.accountant ?? new CodexUsageAccountant();
     this.phaseTransition = opts.phaseTransition;
     this.onTokenUsageIncomplete = opts.onTokenUsageIncomplete;
@@ -1508,6 +1517,7 @@ export class CodexHarness implements RunHarness {
       if (note.kind === "activity" && note.requestId !== undefined)
         this.safeRespond(transport, note.requestId, { ok: false, code: "not_active_turn", message: "callback does not match the active turn" });
     };
+    let responseWait: ReturnType<typeof codexInitialResponseWait> | undefined;
     const refuseDeferred = (): void => {
       const transport = this.transport;
       if (transport) for (const entry of deferred) refuse(transport, entry.note);
@@ -1551,6 +1561,11 @@ export class CodexHarness implements RunHarness {
             threadId, ordinal, transition: this.verifiedTransition?.pending ? this.verifiedTransition : undefined,
           };
         });
+      // Local setup ends at the turn/start acknowledgment. The first model response gets its own
+      // provider allowance, once per owned root (a present setup budget marks a fresh provider root).
+      responseWait = codexInitialResponseWait(
+        this.connectionBudget === undefined ? undefined : this.providerFirstResponseMs, threadId, this.activeTurnId);
+      this.connectionBudget = undefined;
       // PRD #3244: report only once turn/start was accepted, so `codex_sent` never describes a turn
       // that was cancelled or refused before dispatch.
       if (this.runtimeConfigPending) {
@@ -1610,6 +1625,7 @@ export class CodexHarness implements RunHarness {
           yield* this.drainOutbox();
           return;
         }
+        responseWait.assertOpen();
         // A retained read can fail while the consumer is suspended at a yield.
         // Keep normal readiness/drain ordering, but never admit a queued callback
         // once EOF or failure is already known.
@@ -1633,7 +1649,10 @@ export class CodexHarness implements RunHarness {
           this.pendingNote = source;
           const state: ReadState = { source, promise: Promise.resolve() };
           state.promise = source.then(
-            step => { state.step = step; state.ready = ++this.readinessOrdinal; },
+            step => {
+              if (!step.done) responseWait?.observe(step.value);
+              state.step = step; state.ready = ++this.readinessOrdinal;
+            },
             error => { state.error = error; state.failed = true; state.ready = ++this.readinessOrdinal; },
           );
           read = state;
@@ -1701,7 +1720,7 @@ export class CodexHarness implements RunHarness {
         }
         if (readReady === Infinity) {
           await Promise.race([
-            abortPromise, this.outboxReady(),
+            abortPromise, this.outboxReady(), responseWait.ready,
             ...(read ? [read.promise] : []),
             ...(mapping ? [mapping.promise] : []),
             ...(observation ? [observation.promise] : []),
@@ -1799,6 +1818,7 @@ export class CodexHarness implements RunHarness {
         yield this.emitted(await this.mapNote(transport, step.value, request.signal));
       }
     } finally {
+      responseWait?.clear();
       refuseDeferred();
       // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
       // A later epoch must not baseline that work away as history of this same claim.
@@ -1830,17 +1850,20 @@ export class CodexHarness implements RunHarness {
     try { await this.onTokenUsageIncomplete(text); } catch { /* diagnostic delivery is nonfatal */ }
   }
 
+  private connectionBudget?: () => number;
+
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
     this.registry.assertWorkAdmission();
     if (this.transport) {
       // A prior startup may have failed after the root was registered. Re-enter the
       // pinned auth owner so its poison state remains the explicit failure, and never
       // proceed merely because a transport object exists.
-      await this.appServerAuth?.authenticate(this.transport, signal);
+      await this.appServerAuth?.authenticate(this.transport, signal, this.connectionBudget);
       this.assertOpen();
       if (!this.notes) this.notes = this.transport.notifications();
       return;
     }
+    this.connectionBudget = codexConnectionBudget(this.authMode);
     const reservation = this.registry.reserveLaunch("provider");
     if (reservation.kind !== "reserved") {
       throw new CodexHarnessError({ category: "protocol", message: "codex provider launch admission is closed" });
@@ -1911,7 +1934,7 @@ export class CodexHarness implements RunHarness {
     };
     // The pinned initialize/initialized/login sequence completes before any thread/model
     // work. The auth owner has no reference to the model callback broker.
-    await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal) ?? Promise.resolve());
+    await this.registry.admitWork(() => this.appServerAuth?.authenticate(this.transport!, signal, this.connectionBudget) ?? Promise.resolve());
     this.assertOpen();
     // Single-consumer: obtain the notifications iterator exactly once for the root.
     this.notes = this.transport.notifications();
@@ -1985,7 +2008,7 @@ export class CodexHarness implements RunHarness {
         config: this.threadConfig(),
         developerInstructions: rendered.leadPrompt.systemPrompt,
       },
-      { signal },
+      { signal, deadlineMs: this.connectionBudget?.() },
     );
     const id = res?.thread?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -2017,7 +2040,7 @@ export class CodexHarness implements RunHarness {
           config: this.threadConfig(),
           developerInstructions: rendered.leadPrompt.systemPrompt,
         },
-        { signal: request.signal },
+        { signal: request.signal, deadlineMs: this.connectionBudget?.() },
       );
     } catch (error) {
       // Only a provider rejection of thread/resume is a lost lineage. Transport
@@ -2068,7 +2091,7 @@ export class CodexHarness implements RunHarness {
     this.dispatchStartedAt = this.nowMs();
     // A sent RPC can spend even if its acknowledgement never arrives.
     this.assertOpen();
-    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
+    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal, deadlineMs: this.connectionBudget?.() });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexHarnessError({ category: "protocol", message: "codex turn/start returned no turn id" });
@@ -2753,16 +2776,25 @@ export class CodexHarness implements RunHarness {
     // usage was reconciled and no model is incomplete, aggregateByModel() is undefined and the
     // terminal usage is left byte-identical to before C4a. `now` is the real clock at the terminal point; the price
     // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
-    const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
+    // Custom providers remain unpriced even when their model IDs match vendor IDs.
+    const pricing = this.authMode === undefined || this.authMode === "provider"
+      ? undefined : { authMode: this.authMode, now: new Date() };
     const modelUsage = this.accountant.aggregateByModel(pricing);
     // An ambiguous base turn usage must not bypass the incomplete claim accounting.
     const usage = attachModelUsage(this.accountant.usageIncomplete
       ? undefined : normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
     // The RUN-level API-equivalent cost: metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
-    const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
+    const cost = pricing === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);
     const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
-    const limitEvidence = usageLimit ? this.rateLimits.classify(this.authMode) : undefined;
+    // Only the selected closed classification can identify a provider gateway limit.
+    // Normalized HTTP status exists only on accepted structured transport variants.
+    const gatewayLimit = outcome === "failed" && this.authMode === "provider" && (
+      classification?.classification === "rateLimitExceeded" ||
+      classification?.classification === "serverOverloaded" ||
+      (classification?.category === "transport" && isGatewayLimitStatus(classification.httpStatus))
+    );
+    const limitEvidence = usageLimit && this.authMode !== "provider" ? this.rateLimits.classify(this.authMode) : undefined;
     const durationMs = Math.max(0, Math.floor(this.nowMs() - (this.dispatchStartedAt ?? this.nowMs())));
     return {
       outcome,
@@ -2780,6 +2812,10 @@ export class CodexHarness implements RunHarness {
         // there is no classification the message stays based on the CLOSED subtype alone and
         // the category defaults to "unknown", byte-identical to before #1534.
         materialize: (limit): HarnessThrownFailure => {
+          if (gatewayLimit) {
+            const original = new LimitReachedError({ rateLimitType: PROVIDER_GATEWAY_LIMIT });
+            return { failure: { category: "rate_limit", message: original.message }, original };
+          }
           if (usageLimit && limit !== undefined) {
             const original = new LimitReachedError({ resetsAtMs: limit.resetsAtMs, rateLimitType: limit.window });
             return { failure: { category: "rate_limit", message: original.message, limit }, original };

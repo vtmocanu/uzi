@@ -1128,8 +1128,8 @@ newer worker image.
 - Ask your admin to upgrade or roll the hosted worker fleet to an image that
   advertises `codex_custom_model_v1`. An old worker never claims the run and
   never silently substitutes `gpt-6-astra`; it stays queued instead.
-- Or switch to one of the curated Codex models in [Settings → Run
-  defaults](./worker-model.md#harness-and-worker-models) if you don't need
+- Or switch to one of the curated Codex models in [Settings →
+  Models](./worker-model.md#harness-and-worker-models) if you don't need
   the custom ID right now.
 
 A resumed run can stay tied to its previous worker until the configured
@@ -1164,7 +1164,7 @@ custom models and the required separate-planning capability.
   capability when needed). Ephemeral and hosted placement provisions
   a current worker for such a run on its own once hosting can supply one.
 - Or clear the planning model and planning effort for the run's harness in
-  [Settings → Run defaults](./worker-model.md#planning-model-and-effort) if you
+  [Settings → Models](./worker-model.md#planning-model-and-effort) if you
   don't need them right now. A run that already queued uses the settings
   resolved when a worker claims it, so the change reaches it at its next claim.
 

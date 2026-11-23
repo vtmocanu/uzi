@@ -43,7 +43,7 @@ function mount(width?: number) {
   );
 }
 
-const RUN_DEFAULTS = "Run defaults (opens in new tab)";
+const MODELS_LINK = "Models (opens in new tab)";
 
 const heading = () => screen.findByRole("heading", { name: "If fired and claimed now" });
 
@@ -55,9 +55,9 @@ it("has the accessible heading and a definition list of rows", async () => {
   expect(region.querySelectorAll("dt").length).toBeGreaterThan(3);
 });
 
-it("the Run defaults link is at least 24px tall", async () => {
+it("the Models link is at least 24px tall", async () => {
   mount();
-  const link = await screen.findByRole("link", { name: RUN_DEFAULTS });
+  const link = await screen.findByRole("link", { name: MODELS_LINK });
   expect(link.getBoundingClientRect().height).toBeGreaterThanOrEqual(24);
 });
 
@@ -160,7 +160,7 @@ function luminance([r, g, b]: RGBA | [number, number, number]): number {
 it.each(["dawn", "ember"])("labels, values, hint and link read at WCAG AA contrast in %s", async (theme) => {
   document.documentElement.setAttribute("data-theme", theme);
   mount();
-  const link = await screen.findByRole("link", { name: RUN_DEFAULTS });
+  const link = await screen.findByRole("link", { name: MODELS_LINK });
   const region = await screen.findByRole("region", { name: "If fired and claimed now" });
   await vi.waitFor(() => expect(region.querySelector("dl")).not.toBeNull());
   const targets = [

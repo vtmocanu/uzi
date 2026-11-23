@@ -19,7 +19,7 @@ import { WorkerClient, RequestError } from "./client.js";
 import { GitCache, readRetireScratchOutcomesActivation, readRetireScratchReclaimActivation, type GitCacheOptions } from "./git.js";
 import { StubExecutor, waitForStubOutboxCut } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
-import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
+import { createCodexProviderExecutionAuthority, selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
@@ -287,6 +287,7 @@ const SHUTDOWN_RESULT_DEADLINE_MS = 35_000;
  *  supplies lightweight stand-ins (a `nullLogger()`, a throwaway `WorkerClient`, a
  *  temp dir, a fabricated `DockerWiring`). */
 export interface BuildRunExecutorDeps {
+  codexExtraCa?: import("./codex/extra-ca.js").ValidatedExtraCa;
   codexAdviceHarnessFactory?: import("./codex/codex-executor.js").CodexAdviceHarnessFactory;
   log: Logger;
   client: WorkerClient;
@@ -304,6 +305,9 @@ export interface BuildRunExecutorDeps {
   /** Issue #3675: per-run command-cache rotation threshold in bytes (0 disables;
    *  absent leaves the executor's rotation off). */
   codexCommandCacheRunBytes?: number;
+  /** Provider first-response allowance override for the baked private-CA fixture only;
+   *  `main()` never sets it, so production keeps the 120 s default. */
+  codexProviderFirstResponseMs?: number;
 }
 
 /**
@@ -355,12 +359,18 @@ export function buildIsolatedExecutor(deps: { log: Logger; executorKind: Executo
 }
 
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps, addr: RunExecutorAddress = {}): RunExecution {
+  // Provider authority is exclusive and cannot fall back to vendor credentials.
+  if (addr.provider && (!(["claude", "codex"] as string[]).includes(addr.provider.engine) || codex !== undefined)) {
+    return { executor: new FailClosedExecutor("provider_lane_unsupported") };
+  }
   const dirKey = runDirKey(runId, addr.generation);
   const keyOpt = addr.generation === undefined ? {} : { dirKey };
   const { log, client, sdkHomeRoot, executorKind, stubPlanGate, workerTokenFile, dockerWiring, codexCommandSandbox, codexSandboxDegraded } = deps;
   let selection;
   try {
-    selection = selectCodexBinding({ codex });
+    selection = addr.provider?.engine === "codex"
+      ? { kind: "codex" as const, binding: createCodexProviderExecutionAuthority(addr.provider) }
+      : selectCodexBinding({ codex });
   } catch (err) {
     if (err instanceof CodexSelectionError) {
       return { executor: new FailClosedExecutor(err.message) };
@@ -400,6 +410,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
       runHome,
       {
         binding: selection.binding,
+        codexExtraCa: deps.codexExtraCa,
         summaryClaimCodex: codex,
         codexAdviceHarnessFactory: deps.codexAdviceHarnessFactory,
         client,
@@ -427,6 +438,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // once the last sink settles — so run()'s finally must leave the registry ALIVE.
         deferRegistryTeardown: true,
         ...(deps.codexCommandCacheRunBytes === undefined ? {} : { commandCacheRunBytes: deps.codexCommandCacheRunBytes }),
+        ...(deps.codexProviderFirstResponseMs === undefined ? {} : { providerFirstResponseMs: deps.codexProviderFirstResponseMs }),
       },
     );
     return { executor, homeDir: runHome };
@@ -808,6 +820,7 @@ async function mainBody(): Promise<void> {
     client,
     sdkHomeRoot,
     executorKind: config.executor,
+    codexExtraCa: config.codexExtraCa,
     codexAdviceHarnessFactory,
     stubPlanGate: config.stubPlanGate,
     workerTokenFile: config.workerTokenFile,
@@ -840,7 +853,7 @@ async function mainBody(): Promise<void> {
   // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
   // reaches the codex branch. Only this judge/review advice lane keeps the old
   // always-real-CodexAdviceHarness shape.)
-  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
+  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot, { codexExtraCa: config.codexExtraCa });
 
   // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
   const diskLocks = new RunDiskLocks();

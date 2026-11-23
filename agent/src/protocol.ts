@@ -1206,7 +1206,7 @@ export interface ClaimProviderModel {
  *  PRD #4320 module 5): the frozen provider revision, the destination (`base_url`, an operator
  *  allowlist entry), the auth style and the usable gateway key (`credential`: never logged).
  *  `model_map` keys are the Claude aliases `opus`, `sonnet`, `haiku` (always present) and `fable`. */
-export interface ClaimProviderBinding {
+export interface ClaimClaudeProviderBinding {
   provider_id: string;
   revision: number;
   engine: "claude";
@@ -1221,6 +1221,22 @@ export interface ClaimProviderBinding {
     fable?: ClaimProviderModel;
   };
 }
+
+/** Codex provider wire contract. The worker accepts it only when its registration advertised
+ *  codex_provider_v1 with the Codex harness and runtime v2 (client.ts requireProviderCapability). */
+export interface ClaimCodexProviderBinding {
+  provider_id: string;
+  revision: number;
+  engine: "codex";
+  protocol: "openai_responses";
+  base_url: string;
+  auth_style: "bearer";
+  credential: string;
+  model_map: { default: ClaimProviderModel } & Partial<Record<
+    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna", ClaimProviderModel>>;
+}
+
+export type ClaimProviderBinding = ClaimClaudeProviderBinding | ClaimCodexProviderBinding;
 
 /** PRD #3244: provenance tokens of a lead agent's requested model / effort. Closed sets, pinned to
  *  `vocabulary.model_sources` / `effort_sources` in fixtures/lead-config/contract.json (the Go

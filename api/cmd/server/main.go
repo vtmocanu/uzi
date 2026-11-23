@@ -58,6 +58,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/toolseed"
 	"github.com/vtmocanu/uzi/api/internal/usagepoller"
 	"github.com/vtmocanu/uzi/api/internal/vault"
+	"github.com/vtmocanu/uzi/api/internal/weeklylimit"
+	"github.com/vtmocanu/uzi/api/internal/weeklywarn"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -114,6 +116,13 @@ var (
 // its collector, and a failed assertion silently skips the recovery pass. The production
 // collector is the workersvc Service, so this keeps a signature drift a build error.
 var _ codexusagepoller.Recoverer = (*workersvc.Service)(nil)
+
+// Both pollers hand each written reading to the weekly-limit warning (PRD #4123 M3); a signature
+// drift on either hook must be a build error, not a silently unwired warning.
+var (
+	_ usagepoller.WeeklyWarner      = (*weeklywarn.Warner)(nil)
+	_ codexusagepoller.WeeklyWarner = (*weeklywarn.Warner)(nil)
+)
 
 // codexProviderRequestTimeout bounds nonrotating identity and usage reads in the
 // production codexauth.Client (PRD #1171 M1).
@@ -701,6 +710,8 @@ func run() error {
 	// failure is logged redacted and never affects the run. Unconfigured users are
 	// dropped silently, so this is a strict no-op until linking is set up.
 	const notificationUserCap = notifysvc.DefaultUserCap
+	// PRD #4123: one read-only weekly-limit block source for the run DTO and Slack park lines.
+	weeklyLimits := weeklylimit.NewLoader(wsvc)
 	slackNotifier := slacksvc.NewNotifier(
 		q,
 		slackPoster,
@@ -714,6 +725,9 @@ func run() error {
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
 		slacksvc.WithRunWallCeiling(cfg.RunWallCeiling),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
+		// PRD #4123: the seven_day / weekly-reserve park lines append the next-claim switch
+		// reason and the fix command, computed by the same weeklylimit function the run DTO uses.
+		slacksvc.WithWeeklyLimit(weeklyLimits.ForRunID),
 	)
 	// Notifications write seam (PRD #46 M2): the one place that creates notification
 	// rows. It persists the row first, then delivers best-effort through slackNotifier
@@ -731,6 +745,9 @@ func run() error {
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
 	svc.SetReworkCanceller(wsvc)
+	// Wire the early-polling terminal-target cancel (#4616): the poller stops active ci_fix /
+	// mr_rework runs whose bound MR merged or closed (workersvc re-validates under row locks).
+	svc.SetTerminalTargetCanceller(wsvc)
 
 	// A failed run lands no notification row (PRD #1650 D2): the slacksvc failed-run DM
 	// (notifier_state.go) reaches Slack-linked users, and the run page plus the Runs list
@@ -1080,6 +1097,7 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	h.SetWeeklyLimit(weeklyLimits)
 	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
 	// the reconnect rule run in transactions on the pool. An empty allowlist
 	// (ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
@@ -1432,11 +1450,18 @@ func run() error {
 	// skipped and a master-sealed token still polled. 0 disables it entirely; the
 	// Boot pass runs inside the goroutine (poller precedent) so a slow Anthropic can't
 	// delay serve. Held in an outer var so the token-save handler can poke it (D3b).
+	// PRD #4123 M3: the once-per-observed-weekly-period near-limit DM. Both pollers hand it each
+	// written reading; it shares their configured cadences for its freshness gate.
+	weeklyWarner := weeklywarn.New(weeklywarn.Config{
+		Pool: pool, Queries: q, Publisher: notifier, Blocks: weeklyLimits,
+		ClaudeInterval: cfg.UsagePollInterval, CodexInterval: cfg.CodexUsagePollInterval,
+	})
 	var usageEngine *usagepoller.Engine
 	if cfg.UsagePollInterval > 0 {
 		anthropicClient := anthropic.New(&http.Client{Timeout: cfg.AnthropicHTTPTimeout})
 		usageEngine = usagepoller.New(q, secretopen.NewOpener(vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
 		usageEngine.SetNotifier(notifier) // PRD #1020 M2: deliver the loud early-reset DM
+		usageEngine.SetWeeklyWarner(weeklyWarner)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
@@ -1466,6 +1491,7 @@ func run() error {
 			codexauth.NewClient(codexauth.WithPerRequestTimeout(codexProviderRequestTimeout)), pool)
 		codexUsageEngine = codexusagepoller.New(q, wsvc, codexReconciler, cfg.CodexUsagePollInterval, slog.Default())
 		codexUsageEngine.SetNotifier(notifier)
+		codexUsageEngine.SetWeeklyWarner(weeklyWarner)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()

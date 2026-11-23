@@ -523,6 +523,11 @@ describe("issue1924 M2 owed candidates", () => {
       restore();
       assert.equal(tip(), h);
       assert.equal(stamp(), RUN);
+      if (kind === "metadata") {
+        assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname)", `refs/uzi-owed/${RUN}/${h2}`]), "",
+          "a faulted candidate/context write leaves no owed ref for the new head");
+        assert.ok(!(await pins()).includes(h2));
+      }
       assert.ok(gitIn(bare, ["for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"]).includes(h2),
         "incoming staging anchor remains after pin failure");
     });

@@ -1159,3 +1159,23 @@ UPDATE repos SET
  cross_check_repo_instructions_enabled = COALESCE(sqlc.narg('instructions_enabled')::boolean, cross_check_repo_instructions_enabled)
 WHERE repos.id = @id AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = @user_id)
 RETURNING repos.*;
+
+-- name: ListActiveMRTargetRuns :many
+-- Issue #4616 early-polling enumeration: the active ci_fix / mr_rework runs of one repo
+-- that carry a verified MR target, so the poller can cancel them once that MR merges or
+-- closes. repo_id leads uq_runs_one_active_branch_ref (migration 00167) and
+-- idx_runs_repo (00020), so the scan is repo-scoped through an index. The
+-- caller takes 32 rows and keeps a keyset cursor (id > @after_id); LIMIT 33 lets it tell
+-- whether another page exists. An unbound ci_fix (NULL ci_fix_mr_iid) is deliberately
+-- excluded: there is no branch-to-MR inference here.
+SELECT id, kind, status, worker_id, claim_generation, pipeline_ref,
+       (CASE kind WHEN 'ci_fix' THEN ci_fix_mr_iid ELSE mr_iid END)::bigint AS target_mr_iid
+FROM runs
+WHERE repo_id = @repo_id::uuid
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND ((kind = 'ci_fix' AND ci_fix_mr_iid IS NOT NULL)
+       OR (kind = 'mr_rework' AND mr_iid IS NOT NULL))
+  AND id > @after_id::uuid
+ORDER BY id
+LIMIT 33;

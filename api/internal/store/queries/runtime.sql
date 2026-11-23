@@ -1530,9 +1530,11 @@ WITH checker_template_pins AS MATERIALIZED (
            OR 'codex_completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause (standalone, outside fn_worker_can_claim,
       -- required_capabilities and @capability_aware). A provider-bound run (model_provider_key_mode set)
-      -- is claimable only by a worker reporting 'claude_provider_v1': an older worker would ignore the
+      -- requires its engine's provider protocol capability: an older worker would ignore the
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
-      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(@worker_protocol_caps::text[])))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1833,8 +1835,10 @@ WITH checker_template_pins AS MATERIALIZED (
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
-                -- provider-bound run to a peer that lacks 'claude_provider_v1' and could never claim it.
-                AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(p.protocol_capabilities))
+                -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
+                AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -11543,7 +11547,7 @@ WHERE id = @id;
 -- implements the completion protocol — the non-bypassable claim clause can never be satisfied.
 -- PRD #4320 module 5: model_provider_key_mode rides this read so the queued arm can surface a
 -- provider-capability reason for a PROVIDER-BOUND run that no online worker advertises
--- 'claude_provider_v1' for: the non-bypassable provider claim clause can never be satisfied.
+-- its engine's provider capability for: the non-bypassable provider claim clause cannot be satisfied.
 -- PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
 -- queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 -- that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
@@ -12024,7 +12028,9 @@ WHERE run.id = @run_id
   -- Issue #4476: Codex claim provenance, mirrored (see ClaimRun).
   AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (run.model_provider_key_mode IS NULL
+           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -12350,15 +12356,10 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities);
 
--- name: CountOnlineWorkersSatisfyingClaudeProvider :one
--- PRD #4320 module 5: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
--- 'claude_provider_v1' PROTOCOL capability (the worker advertises it since #4505). It drives the queued-reason resolver's provider rung
--- (reasonNoProviderCapableWorker): a 0 here for a PROVIDER-BOUND queued run (model_provider_key_mode
--- set) means every online worker predates provider claims, so ClaimRun's NON-BYPASSABLE provider clause
--- ('claude_provider_v1' = ANY(@worker_protocol_caps)) can never be satisfied. Same filters as
--- CountOnlineWorkersSatisfyingCodexHarness, the twin this mirrors; only called for a provider-bound
--- queued run already past its health threshold (or one the early docker-allowlist probe found
--- online-but-ineligible), so it is off the hot path.
+-- name: CountOnlineWorkersSatisfyingProvider :one
+-- Provider-bound queued health uses the frozen engine. Codex needs its provider,
+-- harness and current runtime on the same worker; Claude retains its legacy rule.
+-- Unknown engines fail closed. Keep the Codex-harness count's intake/lane filters.
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
   AND w.status = 'online'
@@ -12367,7 +12368,13 @@ WHERE w.user_id = @user_id
   -- The lane half of ClaimRun's isolated-lane clause: these rungs only run for an UNBOUND run, and a
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
-  AND 'claude_provider_v1' = ANY(w.protocol_capabilities);
+  AND (
+    (@engine::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+    OR (@engine::text = 'codex'
+        AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
+        AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))
+  );
 
 -- name: CountOnlineWorkersSatisfyingCodexRuntime :one
 -- Current Codex baseline for the worker-roll queued reason.
@@ -12849,7 +12856,9 @@ WHERE r.status = 'queued'
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -12963,7 +12972,9 @@ WHERE r.status = 'queued'
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -14135,3 +14146,110 @@ UPDATE runs SET codex_switch_target_secret_id = sqlc.narg('secret_id')::uuid,
     codex_switch_target_account_revision = sqlc.narg('account_revision')::bigint
 WHERE id = @id AND user_id = @user_id AND credential_switch_requested_at IS NOT NULL
   AND credential_switch_generation = sqlc.narg('generation')::bigint AND harness = 'codex';
+
+-- name: StampTerminalTargetStop :execrows
+-- Issue #4616 publication-context backstop: a server-owned stop stamp for an active
+-- ci_fix / mr_rework run whose target MR is terminal. It inserts NO cancel input; the
+-- run's own publication path reads stop_kind and ends the run as cancelled. stop_kind IS
+-- NULL preserves any operator or earlier verdict (stop, cancel, auto_stopped) untouched.
+-- The worker/generation fence and the unreleased-claim check bind it to the live claim.
+UPDATE runs SET stop_kind = 'cancelled', stop_reason = @stop_reason::text,
+    failure_reason = NULL, fail_origin = NULL, updated_at = now()
+WHERE id = @id
+  AND worker_id = @worker_id
+  AND claim_generation = @claim_generation
+  AND claim_released_at IS NULL
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status IN ('claimed', 'running')
+  AND stop_kind IS NULL;
+
+-- name: StampTerminalTargetCancelInput :one
+-- Issue #4616 live-worker early cancel: stamp stop_kind AND enqueue the kind='cancel'
+-- steering input in ONE statement (the CreateStopVerdictInput atomicity pattern), so the
+-- stamp and the input the live worker drains can never diverge. A guard miss stamps
+-- nothing and inserts nothing, which surfaces as pgx.ErrNoRows: the caller treats that as
+-- a no-op. Parked/queued statuses are excluded (no live poller to drain the input);
+-- stop_kind IS NULL means a second call is a no-op, so no duplicate input is written.
+-- The input body reuses @stop_reason (same value as the stamped reason).
+WITH stamped AS (
+    UPDATE runs SET stop_kind = 'cancelled', stop_reason = @stop_reason::text,
+        failure_reason = NULL, fail_origin = NULL, updated_at = now()
+    WHERE runs.id = @id
+      AND runs.worker_id = @worker_id
+      AND runs.claim_generation = @claim_generation
+      AND runs.claim_released_at IS NULL
+      AND runs.kind IN ('ci_fix', 'mr_rework')
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled', 'queued', 'limit_wait',
+                              'pool_wait', 'recovery_wait', 'paused')
+      AND runs.stop_kind IS NULL
+    RETURNING runs.id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT stamped.id, 'cancel', @stop_reason::text FROM stamped
+RETURNING *;
+
+-- name: CancelRunServerSideForTerminalTarget :execrows
+-- Issue #4616 fenced non-live cancel: server-side cancel of an active ci_fix / mr_rework
+-- run (no live poller) whose verified target MR is terminal. Same lock-ordered CTE shape
+-- and terminal-run cleanup as CancelRunServerSide, but server-owned (no user_id) and
+-- fenced on the observed status and claim_generation (equality admits 0 for a
+-- never-claimed queued run) plus the target MR iid, so a run that moved since it was
+-- listed is left alone. stop_kind IS NULL: an existing stop_kind (operator cancel
+-- included) is never overwritten. failure_reason / fail_origin are cleared: a cancel is
+-- not a failure.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id
+      AND runs.status = @observed_status::text
+      AND runs.claim_generation = @observed_generation
+      AND runs.stop_kind IS NULL
+      AND runs.kind IN ('ci_fix', 'mr_rework')
+      AND ((runs.kind = 'ci_fix' AND runs.ci_fix_mr_iid = @mr_iid::bigint)
+           OR (runs.kind = 'mr_rework' AND runs.mr_iid = @mr_iid::bigint))
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    stop_reason = @stop_reason::text,
+    failure_reason = NULL, fail_origin = NULL,
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
+    updated_at = now()
+WHERE runs.id = @id
+  AND runs.status = @observed_status::text
+  AND runs.claim_generation = @observed_generation
+  AND runs.stop_kind IS NULL
+  AND runs.kind IN ('ci_fix', 'mr_rework')
+  AND ((runs.kind = 'ci_fix' AND runs.ci_fix_mr_iid = @mr_iid::bigint)
+       OR (runs.kind = 'mr_rework' AND runs.mr_iid = @mr_iid::bigint))
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.id IN (SELECT run_id FROM eligible_candidates);

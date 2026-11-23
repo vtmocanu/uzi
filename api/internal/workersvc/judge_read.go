@@ -271,6 +271,13 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		return store.Run{}, err
 	}
 	judgeHarness := judgeHarnessFor(owner.JudgeRunsOn, Harness(target.Harness))
+	rq, ok := s.q.(providerLaneSourceReader)
+	if !ok {
+		return store.Run{}, errHarnessStoreUnavailable
+	}
+	if err := s.refuseProviderLane(ctx, rq, target.UserID, judgeHarness); err != nil {
+		return store.Run{}, err
+	}
 	// PRD #1429 M3 (D4): a Claude judge keeps the existing Anthropic-token presence check
 	// (byte-identical to before this repair), keyed on the RESOLVED judge harness; a Codex
 	// judge's usability is enforced by the atomic create below, not a hardcoded Anthropic
@@ -315,7 +322,7 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: target.RepoID}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
+	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: target.RepoID}) // Enforce the engine-aware unsupported-lane selection policy.
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

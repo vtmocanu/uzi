@@ -114,6 +114,9 @@ var d7UntrustedFields = []string{
 	// oscLink; it must reach a draw only inside a sanitizeTTY(...) call (issueLink does so).
 	"IssueWebURL",
 	"AgentLabel",
+	// Owner-authored credential labels of the weekly-limit block (PRD #4123), drawn only through
+	// weeklyLimitTUILine and renderer.Plain.
+	"CredentialLabel", "AlternativeLabel", "TargetLabel",
 	"HealthReason",
 	"FailureReason",
 	// Structural completion's unmet milestone ids are model-authored and now render below

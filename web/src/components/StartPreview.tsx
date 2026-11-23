@@ -19,7 +19,8 @@ import { ChevronDownIcon, ChevronRightIcon } from "./icons";
 
 export type StartPreviewVariant = "compact" | "open" | "static";
 
-const RUN_DEFAULTS_PATH = "/settings/run-defaults";
+// The previewed harness, model and effort are all chosen in Settings → Models (PRD #3263).
+const MODELS_PATH = "/settings/models";
 const LOADING_TEXT = "Resolving…";
 const ERROR_TEXT = "Preview unavailable; Start will validate your choices.";
 
@@ -133,7 +134,7 @@ function Panel({
       <div className="space-y-0.5 text-muted">
         {showNote && <Note view={view} />}
         <p>
-          <RunDefaultsLink />
+          <ModelsLink />
         </p>
       </div>
     </div>
@@ -141,14 +142,14 @@ function Panel({
 }
 
 // The link is its own >= 24px target; a bare 12px text line is too small to hit.
-function RunDefaultsLink() {
+function ModelsLink() {
   return (
     <Link
-      to={RUN_DEFAULTS_PATH}
+      to={MODELS_PATH}
       draggable={false}
       className="inline-flex min-h-6 items-center text-brand hover:text-brand-hover"
     >
-      Run defaults
+      Models
     </Link>
   );
 }
@@ -200,7 +201,7 @@ export function StartPreview({
           </p>
         ))}
         <p>
-          <RunDefaultsLink />
+          <ModelsLink />
         </p>
       </div>,
     );

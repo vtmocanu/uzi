@@ -1236,6 +1236,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"codex_judge_model", "judge_models", "judge_runs_on",
 		// PRD #4320: the provider the Claude lane runs on (null ⇒ vendor ladder).
 		"claude_provider_id",
+		// Issue #4323: the Codex provider source (null ⇒ vendor ladder).
+		"codex_provider_id",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
 		// PRD #1570: the per-harness task-review models (null ⇒ built-in) and their read-only cells.
@@ -1248,6 +1250,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"planning_claude_model", "planning_claude_effort", "planning_codex_model", "planning_codex_effort", "planning_models", "planning_efforts",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running",
+		// PRD #4123: the weekly-limit early-warning margin in points (0 = off).
+		"weekly_warning_margin_pts",
 		// Issue #3719: the user's Codex account mode (default|auto).
 		"codex_account_mode", "harness_overflow_enabled")
 }

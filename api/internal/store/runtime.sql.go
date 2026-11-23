@@ -998,6 +998,95 @@ func (q *Queries) CancelRunServerSide(ctx context.Context, arg CancelRunServerSi
 	return result.RowsAffected(), nil
 }
 
+const cancelRunServerSideForTerminalTarget = `-- name: CancelRunServerSideForTerminalTarget :execrows
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = $2
+      AND runs.status = $3::text
+      AND runs.claim_generation = $4
+      AND runs.stop_kind IS NULL
+      AND runs.kind IN ('ci_fix', 'mr_rework')
+      AND ((runs.kind = 'ci_fix' AND runs.ci_fix_mr_iid = $5::bigint)
+           OR (runs.kind = 'mr_rework' AND runs.mr_iid = $5::bigint))
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation, lead.recovery_wait_detail, lead.credential_switch_op_id, lead.credential_switch_hold_op_id, lead.credential_switch_hold_generation, lead.credential_switch_hold_worker_id, lead.credential_switch_hold_register_nonce, lead.effort, lead.model_source, lead.effort_source, lead.checkpoint_withheld_since, lead.checkpoint_withheld_status_since, lead.checkpoint_withheld_worker_id, lead.checkpoint_withheld_generation, lead.checkpoint_withheld_nonce, lead.checkpoint_withheld_report_seq, lead.model_provider_id, lead.model_provider_revision, lead.model_provider_key_mode, lead.model_provider_key_secret_id, lead.model_provider_key_rev, lead.model_provider_limit_streak, lead.claim_provenance_worker_id, lead.claim_provenance_generation, lead.health_owner_hold_since, lead.followup_park_seq, lead.followup_finalize_generation, lead.codex_switch_target_secret_id, lead.codex_switch_target_generation, lead.codex_switch_target_op_id, lead.codex_switch_target_auth_mode, lead.codex_switch_target_material_revision, lead.codex_switch_target_account_key, lead.codex_switch_target_account_revision FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+)
+UPDATE runs SET plan_cross_check_gate_reason = NULL,
+    status = 'cancelled', status_since = now(), stop_kind = 'cancelled', move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    stop_reason = $1::text,
+    failure_reason = NULL, fail_origin = NULL,
+    -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+    -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
+    updated_at = now()
+WHERE runs.id = $2
+  AND runs.status = $3::text
+  AND runs.claim_generation = $4
+  AND runs.stop_kind IS NULL
+  AND runs.kind IN ('ci_fix', 'mr_rework')
+  AND ((runs.kind = 'ci_fix' AND runs.ci_fix_mr_iid = $5::bigint)
+       OR (runs.kind = 'mr_rework' AND runs.mr_iid = $5::bigint))
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.id IN (SELECT run_id FROM eligible_candidates)
+`
+
+type CancelRunServerSideForTerminalTargetParams struct {
+	StopReason         string    `json:"stop_reason"`
+	ID                 uuid.UUID `json:"id"`
+	ObservedStatus     string    `json:"observed_status"`
+	ObservedGeneration int64     `json:"observed_generation"`
+	MrIid              int64     `json:"mr_iid"`
+}
+
+// Issue #4616 fenced non-live cancel: server-side cancel of an active ci_fix / mr_rework
+// run (no live poller) whose verified target MR is terminal. Same lock-ordered CTE shape
+// and terminal-run cleanup as CancelRunServerSide, but server-owned (no user_id) and
+// fenced on the observed status and claim_generation (equality admits 0 for a
+// never-claimed queued run) plus the target MR iid, so a run that moved since it was
+// listed is left alone. stop_kind IS NULL: an existing stop_kind (operator cancel
+// included) is never overwritten. failure_reason / fail_origin are cleared: a cancel is
+// not a failure.
+func (q *Queries) CancelRunServerSideForTerminalTarget(ctx context.Context, arg CancelRunServerSideForTerminalTargetParams) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelRunServerSideForTerminalTarget,
+		arg.StopReason,
+		arg.ID,
+		arg.ObservedStatus,
+		arg.ObservedGeneration,
+		arg.MrIid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const cancelRunServerSideWithPendingOutcome = `-- name: CancelRunServerSideWithPendingOutcome :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
@@ -1413,9 +1502,11 @@ WITH checker_template_pins AS MATERIALIZED (
            OR 'codex_completion_interlock_v1' = ANY($28::text[]))
       -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause (standalone, outside fn_worker_can_claim,
       -- required_capabilities and @capability_aware). A provider-bound run (model_provider_key_mode set)
-      -- is claimable only by a worker reporting 'claude_provider_v1': an older worker would ignore the
+      -- requires its engine's provider protocol capability: an older worker would ignore the
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
-      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY($28::text[]))
+      AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY($28::text[]))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($28::text[])))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY($28::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1716,8 +1807,10 @@ WITH checker_template_pins AS MATERIALIZED (
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
-                -- provider-bound run to a peer that lacks 'claude_provider_v1' and could never claim it.
-                AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(p.protocol_capabilities))
+                -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
+                AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -3112,7 +3205,9 @@ WHERE run.id = $1
   -- Issue #4476: Codex claim provenance, mirrored (see ClaimRun).
   AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (run.model_provider_key_mode IS NULL
+           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -3440,33 +3535,6 @@ func (q *Queries) CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg Coun
 	return count, err
 }
 
-const countOnlineWorkersSatisfyingClaudeProvider = `-- name: CountOnlineWorkersSatisfyingClaudeProvider :one
-SELECT count(*) FROM workers w
-WHERE w.user_id = $1
-  AND w.status = 'online'
-  AND fn_worker_accepts_new_intake(w)
-  AND NOT w.ephemeral
-  -- The lane half of ClaimRun's isolated-lane clause: these rungs only run for an UNBOUND run, and a
-  -- lane worker never claims an unbound run, so it is never a satisfier here.
-  AND NOT w.isolated_lane
-  AND 'claude_provider_v1' = ANY(w.protocol_capabilities)
-`
-
-// PRD #4320 module 5: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
-// 'claude_provider_v1' PROTOCOL capability (the worker advertises it since #4505). It drives the queued-reason resolver's provider rung
-// (reasonNoProviderCapableWorker): a 0 here for a PROVIDER-BOUND queued run (model_provider_key_mode
-// set) means every online worker predates provider claims, so ClaimRun's NON-BYPASSABLE provider clause
-// ('claude_provider_v1' = ANY(@worker_protocol_caps)) can never be satisfied. Same filters as
-// CountOnlineWorkersSatisfyingCodexHarness, the twin this mirrors; only called for a provider-bound
-// queued run already past its health threshold (or one the early docker-allowlist probe found
-// online-but-ineligible), so it is off the hot path.
-func (q *Queries) CountOnlineWorkersSatisfyingClaudeProvider(ctx context.Context, userID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingClaudeProvider, userID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const countOnlineWorkersSatisfyingCodexCompletion = `-- name: CountOnlineWorkersSatisfyingCodexCompletion :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
@@ -3701,6 +3769,39 @@ WHERE w.user_id = $1
 // probe found online-but-ineligible), so it is off the hot path.
 func (q *Queries) CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProtocol, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingProvider = `-- name: CountOnlineWorkersSatisfyingProvider :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  -- The lane half of ClaimRun's isolated-lane clause: these rungs only run for an UNBOUND run, and a
+  -- lane worker never claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
+  AND (
+    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+    OR ($2::text = 'codex'
+        AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
+        AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+        AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))
+  )
+`
+
+type CountOnlineWorkersSatisfyingProviderParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	Engine string    `json:"engine"`
+}
+
+// Provider-bound queued health uses the frozen engine. Codex needs its provider,
+// harness and current runtime on the same worker; Claude retains its legacy rule.
+// Unknown engines fail closed. Keep the Codex-harness count's intake/lane filters.
+func (q *Queries) CountOnlineWorkersSatisfyingProvider(ctx context.Context, arg CountOnlineWorkersSatisfyingProviderParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProvider, arg.UserID, arg.Engine)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -12978,7 +13079,7 @@ type ListActiveRunsForHealthRow struct {
 // implements the completion protocol — the non-bypassable claim clause can never be satisfied.
 // PRD #4320 module 5: model_provider_key_mode rides this read so the queued arm can surface a
 // provider-capability reason for a PROVIDER-BOUND run that no online worker advertises
-// 'claude_provider_v1' for: the non-bypassable provider claim clause can never be satisfied.
+// its engine's provider capability for: the non-bypassable provider claim clause cannot be satisfied.
 // PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
 // queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 // that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
@@ -16130,7 +16231,9 @@ WHERE r.status = 'queued'
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -16244,7 +16347,9 @@ WHERE r.status = 'queued'
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
-  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+  AND (r.model_provider_key_mode IS NULL
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -31039,6 +31144,104 @@ func (q *Queries) StampHeldCredentialSwitch(ctx context.Context, arg StampHeldCr
 		arg.ID,
 		arg.UserID,
 		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const stampTerminalTargetCancelInput = `-- name: StampTerminalTargetCancelInput :one
+WITH stamped AS (
+    UPDATE runs SET stop_kind = 'cancelled', stop_reason = $1::text,
+        failure_reason = NULL, fail_origin = NULL, updated_at = now()
+    WHERE runs.id = $2
+      AND runs.worker_id = $3
+      AND runs.claim_generation = $4
+      AND runs.claim_released_at IS NULL
+      AND runs.kind IN ('ci_fix', 'mr_rework')
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled', 'queued', 'limit_wait',
+                              'pool_wait', 'recovery_wait', 'paused')
+      AND runs.stop_kind IS NULL
+    RETURNING runs.id
+)
+INSERT INTO run_user_inputs (run_id, kind, body)
+SELECT stamped.id, 'cancel', $1::text FROM stamped
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
+`
+
+type StampTerminalTargetCancelInputParams struct {
+	StopReason      string      `json:"stop_reason"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+// Issue #4616 live-worker early cancel: stamp stop_kind AND enqueue the kind='cancel'
+// steering input in ONE statement (the CreateStopVerdictInput atomicity pattern), so the
+// stamp and the input the live worker drains can never diverge. A guard miss stamps
+// nothing and inserts nothing, which surfaces as pgx.ErrNoRows: the caller treats that as
+// a no-op. Parked/queued statuses are excluded (no live poller to drain the input);
+// stop_kind IS NULL means a second call is a no-op, so no duplicate input is written.
+// The input body reuses @stop_reason (same value as the stamped reason).
+func (q *Queries) StampTerminalTargetCancelInput(ctx context.Context, arg StampTerminalTargetCancelInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, stampTerminalTargetCancelInput,
+		arg.StopReason,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.QuestionID,
+		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
+		&i.GateBinding,
+		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
+	)
+	return i, err
+}
+
+const stampTerminalTargetStop = `-- name: StampTerminalTargetStop :execrows
+UPDATE runs SET stop_kind = 'cancelled', stop_reason = $1::text,
+    failure_reason = NULL, fail_origin = NULL, updated_at = now()
+WHERE id = $2
+  AND worker_id = $3
+  AND claim_generation = $4
+  AND claim_released_at IS NULL
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status IN ('claimed', 'running')
+  AND stop_kind IS NULL
+`
+
+type StampTerminalTargetStopParams struct {
+	StopReason      string      `json:"stop_reason"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+// Issue #4616 publication-context backstop: a server-owned stop stamp for an active
+// ci_fix / mr_rework run whose target MR is terminal. It inserts NO cancel input; the
+// run's own publication path reads stop_kind and ends the run as cancelled. stop_kind IS
+// NULL preserves any operator or earlier verdict (stop, cancel, auto_stopped) untouched.
+// The worker/generation fence and the unreleased-claim check bind it to the live claim.
+func (q *Queries) StampTerminalTargetStop(ctx context.Context, arg StampTerminalTargetStopParams) (int64, error) {
+	result, err := q.db.Exec(ctx, stampTerminalTargetStop,
+		arg.StopReason,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
 	)
 	if err != nil {
 		return 0, err

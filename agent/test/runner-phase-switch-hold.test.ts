@@ -8,6 +8,7 @@ import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { PhaseSwitchUnverifiedError } from "../src/phase-switch-unverified.js";
 import type { PhaseSwitchHoldOutcome } from "../src/protocol.js";
 import { PHASE_SWITCH_HOLD_REASON } from "../src/protocol.js";
+import { providerKeyForms } from "../src/redact.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, gitlabClaim, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
 
@@ -45,6 +46,8 @@ interface HoldOptions {
   cancelDuringPost?: number;
   /** Production configuration: no independent hold deadline (the default tests set a TEST-ONLY one). */
   noDeadline?: boolean;
+  /** Extra claim fields (for example a provider-bound `secrets`). */
+  claimOver?: Record<string, unknown>;
 }
 
 const IMPLEMENT_HELD = {
@@ -58,6 +61,7 @@ async function runHold(opts: HoldOptions) {
   const claim = gitlabClaim(opts.iid, {
     plan_approved: true, plan_source: "seeded", plan_md: "# Seeded plan\n- do it", session_id: null, claim_generation: generation,
     ...(opts.runId !== undefined ? { run_id: opts.runId } : {}),
+    ...opts.claimOver,
   });
   const order: string[] = [];
   const posts: Post[] = [];
@@ -306,6 +310,83 @@ describe("phase-switch hold (issue #3252 m4)", () => {
     const r = await runHold({ iid: 32562, throws: err, post: [unknown], cancelDuringPost: 1, ownership: [ownRow(1)] });
     assert.equal(r.cancelReports, 1, `one cancelled report was sent: ${r.states.join(",")}`);
     assert.equal(r.cloneKept, false);
+  });
+});
+
+// Issue #4323: the hold's status line is built from gateway-supplied model text. On a provider-bound run
+// every encoded form of the provider key is scrubbed from that text BEFORE it is clipped for the feed, so a
+// clip cannot leave a key prefix that no longer matches a registered form.
+describe("phase-switch hold redaction on a provider-bound run (issue #4323)", () => {
+  const KEY = ["Zq9x", "Lm/4", "tR+7", "&kQ2", "<w8>", "vN3d"].join("");
+  const claimOver = {
+    secrets: {
+      forge_pat: "fixture-forge-pat-000000",
+      provider: {
+        provider_id: "hold-redaction", revision: 1, engine: "codex", protocol: "openai_responses",
+        base_url: "https://gateway.example.test/v1", auth_style: "bearer", credential: KEY,
+        model_map: { default: { model: "corp-code" } },
+      },
+    },
+  };
+  const forms = providerKeyForms(KEY);
+  const heldWith = (observedModel: string) => ({
+    cause: "model_mismatch" as const, phase: "implement" as const,
+    requested: { model: "corp-code", effort: "medium" }, observed: { model: observedModel, effort: "medium" },
+  });
+  const leaks = (visible: string): string[] => forms.flatMap((form) => [form, JSON.stringify(form).slice(1, -1), form.slice(0, 8)])
+    .filter((needle) => visible.includes(needle));
+
+  it("a clean gateway model keeps the exact hold text (control)", async () => {
+    const r = await runHold({ iid: 43230, post: [held], claimOver, held: heldWith("corp-observed") });
+    assert.ok(r.feed.includes("Paused: the runtime kept the planning model corp-observed instead of switching to corp-code. Resume retries on a new claim; Cancel ends the run."), r.feed.join(" | "));
+    assert.deepEqual(r.posts.map((p) => p.phase), ["implement"]);
+  });
+
+  for (const [index, form] of forms.entries()) {
+    for (const [where, make] of [
+      ["alone", (f: string) => f],
+      ["after a long prefix the 80-character clip would cut into", (f: string) => "m".repeat(70) + f],
+    ] as const) {
+      it(`key form ${index} in the observed model (${where}) never reaches the feed or the hold request`, async () => {
+        const r = await runHold({ iid: 43231 + index, post: [held], claimOver, held: heldWith(make(form)) });
+        assert.deepEqual(r.posts.map((p) => p.phase), ["implement"], "the run is still held");
+        assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), `a hold line was emitted: ${r.feed.join(" | ")}`);
+        assert.deepEqual(leaks(r.feed.join("\n")), [], "feed");
+        assert.deepEqual(leaks(JSON.stringify(r.posts)), [], "hold request");
+      });
+    }
+  }
+
+  it("a key form in the requested model of a plan-phase hold is scrubbed too", async () => {
+    const err = new PhaseSwitchUnverifiedError("model_mismatch", { model: "p".repeat(70) + KEY, effort: "high" }, { model: "corp-observed", effort: "high" });
+    const r = await runHold({ iid: 43299, throws: err, post: [held], claimOver });
+    assert.deepEqual(r.posts.map((p) => p.phase), ["plan"]);
+    assert.deepEqual(leaks(r.feed.join("\n")), []);
+  });
+
+  // A non-ASCII character inside the key defeats the exact-match redactor; stripping it afterwards would
+  // rebuild the key and the clip would leave a prefix. The strip must therefore precede redaction.
+  const prefixLeaks = (visible: string): string[] => {
+    const found: string[] = [];
+    for (let n = 8; n <= KEY.length; n++) if (visible.includes(KEY.slice(0, n))) found.push(KEY.slice(0, n));
+    return found;
+  };
+  const spliced = "m".repeat(60) + KEY[0] + "\u00e9" + KEY.slice(1);
+
+  it("a key split by a non-ASCII character in the observed model leaves no key prefix in the feed or hold request", async () => {
+    const r = await runHold({ iid: 43300, post: [held], claimOver, held: heldWith(spliced) });
+    assert.deepEqual(r.posts.map((p) => p.phase), ["implement"], "the run is still held");
+    assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), `a hold line was emitted: ${r.feed.join(" | ")}`);
+    assert.deepEqual(prefixLeaks(r.feed.join("\n")), [], "feed");
+    assert.deepEqual(prefixLeaks(JSON.stringify(r.posts)), [], "hold request");
+  });
+
+  it("a key split by a non-ASCII character in the requested model of a plan-phase hold leaves no key prefix", async () => {
+    const err = new PhaseSwitchUnverifiedError("model_mismatch", { model: spliced, effort: "high" }, { model: "corp-observed", effort: "high" });
+    const r = await runHold({ iid: 43301, throws: err, post: [held], claimOver });
+    assert.deepEqual(r.posts.map((p) => p.phase), ["plan"]);
+    assert.deepEqual(prefixLeaks(r.feed.join("\n")), []);
+    assert.deepEqual(prefixLeaks(JSON.stringify(r.posts)), []);
   });
 });
 

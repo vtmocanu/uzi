@@ -210,7 +210,7 @@ func (s *Service) scoreCodexCandidates(ctx context.Context, q *store.Queries, us
 	for _, r := range inflightRows {
 		inflight[r.ProviderAccountID] = int(r.InFlight)
 	}
-	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals())
+	snap, err := buildReserveSnapshot(ctx, q, userID, now, s.reserveIntervals(), false)
 	if err != nil {
 		return nil, fmt.Errorf("codex pool select: %w", err)
 	}

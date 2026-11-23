@@ -13,6 +13,7 @@ import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./c
 // the structured findings POSTed to `POST /worker/runs/{target}/task-review`.
 
 import os from "node:os";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 
 import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
@@ -33,8 +34,8 @@ import {
 import type { Outbox } from "./outbox.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { extractJsonObject } from "./judge-runner.js";
-import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
-import type { CodexBinding } from "./codex/select.js";
+import { selectCodexExecutionAuthority } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
+import type { CodexExecutionAuthority } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { CODEX_TASK_REVIEW_MODEL } from "./codex/task-review-model.js"; // PRD #1551 M2: leaf value import (no runtime dep on the heavy codex-executor)
 import { isHarnessEffort, type HarnessEffort } from "./harness.js";
@@ -152,15 +153,22 @@ export class ReviewRunner {
    *  run failed (and, where possible, posts a `failed` review) and returns, so the
    *  worker's claim loop keeps going. */
   async execute(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
-    const scope = claim.secrets.codex?.auth_mode === "subscription"
-      ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
-    scope?.own();
-    // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
+    // PRD #4320: key redaction is independent of provider engine, including refused claims.
     const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
     for (const k of providerKeys) this.log.addSecret(k);
-    try { await this.executeClaim(claim, signal); }
-    finally {
-      scope?.close();
+    try {
+      try { if (claim.secrets.provider) selectCodexExecutionAuthority(claim.secrets); }
+      catch {
+        await safeReportFailed(this.client, this.log, "review", claim.run_id,
+          PROVIDER_LANE_UNSUPPORTED, undefined, claim.claim_generation, this.terminalDeps);
+        return;
+      }
+      const scope = claim.secrets.codex?.auth_mode === "subscription"
+        ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
+      scope?.own();
+      try { await this.executeClaim(claim, signal); }
+      finally { scope?.close(); }
+    } finally {
       for (const k of providerKeys) this.log.removeSecret(k);
     }
   }
@@ -261,7 +269,7 @@ export class ReviewRunner {
         // Anthropic-token check — the SAME pure, fail-closed discriminator the run lane
         // uses (agent/src/main.ts's makeExecutor). A malformed codex block falls through
         // to the outer catch's failed-review fallback exactly like any other prep failure.
-        const selection = selectCodexBinding({ codex: claim.secrets.codex });
+        const selection = selectCodexExecutionAuthority(claim.secrets);
         const onUsage = (snapshot: AdviceUsageSnapshot): void => {
           // The Claude result fold assumes a provider cost. Token-only interrupted
           // evidence would otherwise fabricate metered zero; keep that gap explicit.
@@ -416,7 +424,7 @@ export class ReviewRunner {
    *  factory (a wiring gap) fails closed the same way any other model failure does: a
    *  `failed` review still lands, never a silent Claude substitution. */
   private async reviewCodex(
-    claim: ClaimResponse, diff: string, binding: CodexBinding,
+    claim: ClaimResponse, diff: string, binding: CodexExecutionAuthority,
     onUsage: (snapshot: AdviceUsageSnapshot) => void,
     signal?: AbortSignal,
   ): Promise<TaskReviewRequest> {

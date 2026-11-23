@@ -21,6 +21,11 @@ func (f *fakeNotifStore) IsCodexEarlyResetCurrent(_ context.Context, p store.IsC
 	return f.codexCurrent, f.codexErr
 }
 
+func (f *fakeNotifStore) IsCodexWeeklyWarningCurrent(_ context.Context, p store.IsCodexWeeklyWarningCurrentParams) (bool, error) {
+	f.weeklyAsked = append(f.weeklyAsked, p)
+	return f.codexCurrent, f.codexErr
+}
+
 func codexDeliveryFence() notifysvc.CodexAccountFence {
 	return notifysvc.CodexAccountFence{OwnerID: uuid.New(), AccountID: uuid.New(), EnablementSig: "private-alias-signature"}
 }
@@ -249,6 +254,9 @@ func TestCodexRechecksImmediatelyBeforePost(t *testing.T) {
 
 type codexCreationStore struct{ *sqlMirror }
 
+func (*codexCreationStore) IsCodexWeeklyWarningCurrent(context.Context, store.IsCodexWeeklyWarningCurrentParams) (bool, error) {
+	return true, nil
+}
 func (*codexCreationStore) IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error) {
 	return true, nil
 }

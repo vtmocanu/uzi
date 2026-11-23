@@ -25,15 +25,19 @@ import (
 
 // AnthropicPriceTableVersion identifies this table. It changes whenever a rate, a model row or a
 // pricing rule changes, so a stored-nothing estimate can say which table produced it.
-const AnthropicPriceTableVersion = "anthropic-standard-2026-11-04"
+const AnthropicPriceTableVersion = "anthropic-standard-2026-11-23"
 
 // AnthropicPriceSourceURL is the official pricing page the rates were transcribed from.
 const AnthropicPriceSourceURL = "https://platform.claude.com/docs/en/about-claude/pricing"
 
-// AnthropicPriceFetchedAt is the date the pricing page (and the model-id pages named in
-// pricing-source notes: https://platform.claude.com/docs/en/about-claude/models/overview and
-// https://platform.claude.com/docs/en/build-with-claude/fast-mode) were fetched.
-const AnthropicPriceFetchedAt = "2026-11-04"
+// AnthropicPriceFetchedAt is the date the pricing page and the model-id pages were last fetched
+// and every row below was checked against them (rates and exact API id): the models overview
+// (https://platform.claude.com/docs/en/about-claude/models/overview), the fast-mode page
+// (https://platform.claude.com/docs/en/build-with-claude/fast-mode) for claude-opus-5 and
+// claude-opus-4-8, and the per-model overview pages
+// (https://platform.claude.com/docs/en/models/<model>/overview) for fable-5-2, fable-5-1 and
+// haiku-4-5. The 2026-11-23 check (#4625) found every pre-existing row unchanged.
+const AnthropicPriceFetchedAt = "2026-11-23"
 
 // Standard-pricing markers a usage record must carry (or omit) to be priced from this table.
 const (
@@ -56,6 +60,7 @@ type rates struct {
 // table maps an exact API model id to its rates. USD per MTok, from the pricing page "Model
 // pricing" table: base input / 5m cache write / 1h cache write / cache hits / output.
 //
+//	Claude Fable 5.2    8   / 10     / 16   / 0.20 / 40
 //	Claude Fable 5.1   10   / 12.50  / 20   / 0.25 / 50
 //	Claude Opus 5.5     4   /  5     /  8   / 0.20 / 20
 //	Claude Opus 5       5   /  6.25  / 10   / 0.50 / 25
@@ -70,8 +75,10 @@ type rates struct {
 // sum within the limit proves every request was too; above it the tier mix is unknown. The other
 // 4.6-and-later rows have no long-context premium (the 1M window is at standard pricing), and
 // Haiku 4.5's window is 200K. Sonnet 5.5's cache-hit rate was corrected from the pricing page
-// on 2026-10-13; Haiku 5.5 was added on 2026-11-04 (#3920).
+// on 2026-10-13; Haiku 5.5 was added on 2026-11-04 (#3920); Fable 5.2 was added on 2026-11-23
+// (#4625).
 var table = map[string]rates{
+	"claude-fable-5-2":          {input: 8000, cacheRead: 200, cacheWrite5m: 10000, cacheWrite1h: 16000, output: 40000},
 	"claude-fable-5-1":          {input: 10000, cacheRead: 250, cacheWrite5m: 12500, cacheWrite1h: 20000, output: 50000},
 	"claude-opus-5-5":           {input: 4000, cacheRead: 200, cacheWrite5m: 5000, cacheWrite1h: 8000, output: 20000},
 	"claude-opus-5":             {input: 5000, cacheRead: 500, cacheWrite5m: 6250, cacheWrite1h: 10000, output: 25000},

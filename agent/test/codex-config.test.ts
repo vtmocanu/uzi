@@ -12,9 +12,94 @@ import {
   buildCodexConfigToml,
   buildCodexLoopbackTestConfigToml,
   buildCodexProductionConfigToml,
+  buildCodexProviderConfigToml,
   CodexUnexpectedSystemConfigError,
   type CodexConfigOptions,
 } from "../src/codex/config.js";
+
+describe("buildCodexProviderConfigToml: trusted provider binding", () => {
+  const binding = {
+    provider_id: 'openai"]\n[features]\nhooks = true',
+    revision: 3,
+    engine: "codex" as const,
+    protocol: "openai_responses" as const,
+    base_url: "https://gateway.example/v1",
+    auth_style: "bearer" as const,
+    credential: "fixture-provider-credential",
+    model_map: {
+      default: { model: "gateway/default", context_window: 32768 },
+      "gpt-6-astra": { model: "gateway/astra", context_window: 65536 },
+      "gpt-6-sol": { model: "gateway/sol" },
+    },
+  };
+  const opts = { binding, projectPath: '/work/re"po' };
+
+  it("emits managed-auth HTTP transport with mapped metadata and no credential", () => {
+    const config = parse(buildCodexProviderConfigToml(opts));
+    assert.equal(config.model, "gateway/default");
+    assert.equal(config.model_context_window, 32768);
+    assert.match(config.model_provider as string, /^uzi-provider-[a-f0-9]{64}$/);
+    const providers = config.model_providers as Record<string, unknown>;
+    assert.deepEqual(JSON.parse(JSON.stringify(providers)), {
+      [config.model_provider as string]: {
+        name: config.model_provider, base_url: binding.base_url,
+        wire_api: "responses", supports_websockets: false, requires_openai_auth: true,
+        request_max_retries: 0, stream_max_retries: 0,
+      },
+    });
+    assert.doesNotMatch(buildCodexProviderConfigToml(opts), /fixture-provider-credential|env_key/);
+    assert.equal(parse(buildCodexProviderConfigToml({ ...opts, model: "gpt-6-astra" })).model_context_window, 65536);
+    const fallback = parse(buildCodexProviderConfigToml({ ...opts, model: "gpt-6-sol" }));
+    assert.equal(fallback.model, "gateway/sol");
+    assert.equal(Object.hasOwn(fallback, "model_context_window"), false);
+  });
+
+  it("preserves native suppression and explicit untrusted project isolation", () => {
+    const config = parse(buildCodexProviderConfigToml(opts));
+    const baseline = parse(buildCodexProductionConfigToml({
+      model: "gateway/default", projectPath: opts.projectPath, authMode: "api_key",
+    }));
+    for (const key of ["features", "projects", "analytics", "feedback", "agents",
+      "project_doc_max_bytes", "check_for_update_on_startup", "web_search"]) {
+      assert.deepEqual(config[key], baseline[key], key);
+    }
+    assertNoNativeServers(config);
+    const features = parse(buildCodexProviderConfigToml({ ...opts, codeModeHost: true })).features;
+    assert.deepEqual({ ...(features as object) }, { ...(config.features as object), code_mode_host: true });
+  });
+
+  it("refuses arbitrary identity, config, environment and header options", () => {
+    for (const key of ["providerName", "provider", "baseUrl", "envKey", "env", "headers", "toml", "authMode"]) {
+      assert.throws(() => buildCodexProviderConfigToml({ ...opts, [key]: "injected" } as never), /unsupported option/);
+      assert.throws(() => buildCodexProviderConfigToml({
+        ...opts, binding: { ...binding, [key]: "injected" },
+      } as never), /unsupported option/);
+    }
+  });
+
+  it("revalidates binding shape and refuses model/config injection", () => {
+    for (const patch of [
+      { engine: "claude" }, { auth_style: "x_api_key" }, { protocol: "chat_completions" },
+      { base_url: "https://user:password@gateway.example/v1" },
+      { model_map: { default: { model: 'bad"\nhooks=true' } } },
+      { model_map: { default: { model: "ok", context_window: 1 } } },
+      { model_map: { default: { model: "ok", headers: {} } } },
+    ]) {
+      assert.throws(() => buildCodexProviderConfigToml({ ...opts, binding: { ...binding, ...patch } } as never));
+    }
+    assert.throws(() => buildCodexProviderConfigToml({ ...opts, model: "gateway/arbitrary" } as never), /unmapped/);
+  });
+
+  it("keeps vendor endpoint and identity controls closed", () => {
+    for (const authMode of ["api_key", "subscription"] as const) {
+      for (const key of ["binding", "providerName", "provider", "baseUrl", "envKey", "headers", "toml"]) {
+        assert.throws(() => buildCodexProductionConfigToml({
+          model: "gpt-6-astra", projectPath: "/work/repo", authMode, [key]: binding,
+        } as never), /unsupported option/);
+      }
+    }
+  });
+});
 
 // PRD #1156 (M3a) — the stock, native-DISABLED config builder + system-config guard.
 

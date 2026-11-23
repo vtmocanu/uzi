@@ -148,6 +148,21 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 		}, origins...)
 		return run, err
 	}
+	if len(origins) > 0 && origins[0].RefuseProviderOwner {
+		if explicit == nil {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		if *explicit != HarnessClaude && *explicit != HarnessCodex {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		q, ok := s.q.(providerLaneSourceReader)
+		if !ok {
+			return store.Run{}, errHarnessStoreUnavailable
+		}
+		if err := s.refuseProviderLane(ctx, q, userID, *explicit); err != nil {
+			return store.Run{}, err
+		}
+	}
 	// In-memory unit fakeStore: no live *store.Queries and no real transaction. Resolve to Claude
 	// (what these fakes assert) and run the insert directly. An explicit non-Claude request is
 	// still refused rather than silently downgraded, so a fake can never assert a wrong harness.

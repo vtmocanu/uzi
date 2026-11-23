@@ -421,6 +421,10 @@ type FakeClient struct {
 	LastReservePct   *int
 	LastReservePause bool
 
+	// SetWeeklyWarningMargin capture (PRD #4123): call count and the margin the command sent.
+	MarginCalls   int
+	LastMarginPts int
+
 	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
 	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
 	// what the command sent.
@@ -432,11 +436,12 @@ type FakeClient struct {
 	LastProviderID      string
 	ProviderRetireCalls int
 	ProviderTestCalls   int
-	// ProviderSourceCalls counts SetClaudeProviderSource; LastProviderSource is the id it was last
+	// ProviderSourceCalls counts provider source writes; LastProviderSource is the id it was last
 	// asked to select (nil = clear) and ProviderSourceSet says it was called at all.
-	ProviderSourceCalls int
-	ProviderSourceSet   bool
-	LastProviderSource  *string
+	LastProviderSourceEngine string
+	ProviderSourceCalls      int
+	ProviderSourceSet        bool
+	LastProviderSource       *string
 
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO
@@ -808,7 +813,11 @@ type FakeClient struct {
 	AdminRunsDebugErr         error
 	AdminListRunsDebugCalls   []AdminListRunsDebugCall
 	RunInputsAdminDebug       map[string]bool
-	RunInputsMetaCalls        int
+	// AdminRunWritersOut/Err back AdminRunWriters (issue #4618); the Err wins over the blanket Err.
+	AdminRunWritersOut   apitypes.RunWritersDTO
+	AdminRunWritersErr   error
+	AdminRunWritersCalls []AdminRunWritersCall
+	RunInputsMetaCalls   int
 
 	// Owner held-publication list + early expiry (issue #2545). HeldPublicationsResult backs
 	// HeldPublications and HeldExpireResult backs ExpireHeldPublications; HeldErr wins over the
@@ -844,6 +853,13 @@ var _ Client = (*FakeClient)(nil)
 type RecoveryHoldsScopedCall struct {
 	UserID string
 	RunID  string
+}
+
+// AdminRunWritersCall is one AdminRunWriters argument set.
+type AdminRunWritersCall struct {
+	RepoID string
+	Branch string
+	MRIID  int64
 }
 
 // AdminListRunsDebugCall is one AdminListRunsDebug filter set.

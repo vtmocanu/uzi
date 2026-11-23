@@ -19,6 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -383,6 +384,40 @@ func TestV1JobsCreateLiveDB(t *testing.T) {
 		e.want(e.call(http.MethodPost, "/api/v1/jobs", pTok.token, v1MinimalJob), http.StatusForbidden, "job_type_not_allowed")
 		e.exec(`UPDATE products SET allowed_job_types = '{research}' WHERE id = $1`, product)
 	})
+
+	t.Run("a provider-sourced owner is refused with the typed 409 and nothing is created", func(t *testing.T) {
+		// Issue #4541: jobs refuse a provider-sourced owner (provider_lane_unsupported until PRD
+		// #4322); before the fix the refusal surfaced as a logged 500.
+		provUser, provTok := e.user()
+		e.selectProvider(provUser)
+		e.want(e.call(http.MethodPost, "/api/v1/jobs", provTok, v1MinimalJob), http.StatusConflict, "provider_lane_unsupported")
+		if n := e.jobCount(provTok); n != 0 {
+			t.Fatalf("job runs = %d, want 0", n)
+		}
+		var origins int
+		if err := e.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM job_origins o JOIN runs r ON r.id = o.run_id WHERE r.user_id = $1`, provUser).Scan(&origins); err != nil {
+			t.Fatal(err)
+		}
+		if origins != 0 {
+			t.Fatalf("job origins = %d, want 0", origins)
+		}
+	})
+}
+
+// selectProvider makes the user's Claude source a model provider of their own (a bare provider row
+// is enough: any non-NULL users.claude_provider_id is a set source).
+func (e *v1JobsEnv) selectProvider(user uuid.UUID) {
+	e.t.Helper()
+	ctx := context.Background()
+	p, err := e.h.q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: user, Name: "p-" + uuid.NewString()[:8], Engine: "claude"})
+	if err != nil {
+		e.t.Fatalf("insert provider: %v", err)
+	}
+	e.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, user, p.ID)
+	// Registered after the user's cleanup, so it runs first: a selected provider cannot be deleted
+	// (RESTRICT).
+	e.t.Cleanup(func() { _, _ = e.pool.Exec(ctx, `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, user) })
 }
 
 // jobCount counts the kind='job' runs of the user behind a uzc_ token.

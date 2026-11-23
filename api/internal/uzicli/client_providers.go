@@ -75,3 +75,18 @@ func (c *HTTPClient) SetClaudeProviderSource(ctx context.Context, id *string) (*
 	}
 	return out.ClaudeProviderID, nil
 }
+
+// SetCodexProviderSource sends {"provider_id": <id>|null} and returns the selection the server
+// reports back (codex_provider_id), nil when it is cleared.
+func (c *HTTPClient) SetCodexProviderSource(ctx context.Context, id *string) (*string, error) {
+	var out struct {
+		CodexProviderID *string `json:"codex_provider_id"`
+	}
+	body := struct {
+		ProviderID *string `json:"provider_id"`
+	}{id}
+	if err := c.put(ctx, "/api/me/providers/codex-source", body, &out); err != nil {
+		return nil, err
+	}
+	return out.CodexProviderID, nil
+}

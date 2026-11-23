@@ -2,7 +2,7 @@
 //
 // PRD #3257 M2: the run-review panel's skip state. When the automatic judge was skipped because
 // the judge's harness had no usable credential, the panel says when and why from the STORED row
-// (fixed copy per reason, viewer-neutral), links to Run defaults, and keeps the Run judge button.
+// (fixed copy per reason, viewer-neutral), links to Models, and keeps the Run judge button.
 // The skip only renders when there is no review and no pending judge (read precedence review >
 // pending > skip), and a rerun refusal (422) shows inline.
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -75,7 +75,7 @@ describe("JudgePanel skip state (#3257 M2)", () => {
     [skip({ harness: "codex", reason: "credential_disabled" }), ": the Codex credential was disabled."],
     [skip({ harness: "claude", reason: "credential_disabled" }), ": the Claude credential was disabled."],
     [skip({ harness: "codex", reason: "codex_pool_unavailable" }), ": no pooled Codex account was available."],
-    [skip({ harness: "claude", reason: "provider_lane_unsupported" }), ": the Claude source is a model provider, which the judge does not support yet."],
+    [skip({ harness: "claude", reason: "provider_lane_unsupported" }), ": the selected source is a model provider, which the judge does not support yet."],
   ])("renders fixed copy for %o", async (s, cause) => {
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null, skip: s });
     renderPanel();
@@ -87,9 +87,9 @@ describe("JudgePanel skip state (#3257 M2)", () => {
     expect(p.textContent).not.toMatch(/\byour\b/i);
     // The never-judged copy is replaced, not stacked under the skip.
     expect(screen.queryByText(/hasn't been judged yet/)).toBeNull();
-    // Run defaults link + the existing, enabled Run judge button.
-    const link = screen.getByRole("link", { name: "Run defaults" });
-    expect(link.getAttribute("href")).toBe("/settings/run-defaults");
+    // Models link + the existing, enabled Run judge button.
+    const link = screen.getByRole("link", { name: "Models" });
+    expect(link.getAttribute("href")).toBe("/settings/models");
     const button = screen.getByRole("button", { name: "Run judge" }) as HTMLButtonElement;
     expect(button.disabled).toBe(false);
     expect(screen.getByText("judge skipped")).toBeTruthy();

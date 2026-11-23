@@ -268,6 +268,18 @@ provider run, which queues ("no worker that supports model providers is online")
 image overrides and Compose or separately run workers yourself, since only the chart's worker image
 pin is bumped by the release helper.
 
+**Codex providers (PRD #4323).** The same allowlist also admits Responses-compatible gateways for
+the Codex engine (engine `codex`, Bearer auth only); put the exact base URL in the list like any
+other. Workers advertise `codex_provider_v1` together with the Codex harness capabilities, and the
+api admits a Codex provider claim only to a worker advertising `codex_provider_v1`,
+`codex_harness_v1` and `codex_runtime_v2`, so **deploy the api before the workers**; until a
+capable worker is online such a run queues with the same "no worker that supports model providers
+is online" reason. The pinned Codex runtime follows redirects and can forward request bodies and the
+Bearer header beyond the approved URL, and it does not limit model-response size, so the allowlist
+is admission control, not confinement (see [Model providers](./providers.md) and
+[ADR-4320](../adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)). The worker's
+`workers.extraCA` bundle is also delivered to the Codex runtime with TLS verification on.
+
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
 fails the render). The chart checks every entry's shape (https only; no userinfo, query, fragment,
@@ -281,8 +293,8 @@ private-CA gateway always tests as inconclusive while runs may still reach it.
 
 ### The Test probe
 
-**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` with the
-provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
+**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` (a Codex
+provider: `<base_url>/responses`) with the provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
 protocol) and, only if that succeeds, a forced single-tool request (does the gateway return a
 `tool_use` block). Neither certifies full compatibility. The api must therefore be able to reach the
 gateway on the network, which is separate from any worker egress rule.
@@ -348,7 +360,7 @@ The steer queue is otherwise owner-only ([PRD #95](../prds/done/95-activity-pane
 
 | Var | Default | Notes |
 |---|---|---|
-| `UZI_ADMIN_RUN_DEBUG` | `false` | Chart: `api.adminRunDebug.enabled`. **Off by default.** When on, a request authenticated by a Bearer CLI token whose stored scope is `admin_ro` (a `uza_` token) and that belongs to a live admin may read another user's run **inputs** (steer queue; a foreign chat run still 404s), **archive metadata**, **fetches**, **held publications** (`GET /api/runs/{id}/held-publications`), **recovery holds** (`GET /api/recovery/holds?user=<uuid>` or `?run=<run-id>`, exactly one) and an all-states run listing (`GET /api/admin/runs?state=all`, optionally `user`, `since` and `status=a,b`; every status, or only the listed run statuses, newest first, at most 500 rows with a `truncated` flag, chat, judge and cross-check runs excluded; an unknown status is a `400 invalid status`, the filter is applied before the cap and echoed as `status_filter`). A request carrying `state`, `user`, `since` or `status` from a cookie-session admin, or from a `uza_` admin while the flag is off, gets `403` naming the prerequisites; a `uzc_` token or a non-admin gets `403 admin access required`. Cookies and `uzc_` tokens never qualify, and admin-ness is read live, so demotion applies on the next request. On the chart, set it only through `api.adminRunDebug.enabled` (a real boolean); setting `UZI_ADMIN_RUN_DEBUG` in `api.config` or `api.secretEnv` fails the render. |
+| `UZI_ADMIN_RUN_DEBUG` | `false` | Chart: `api.adminRunDebug.enabled`. **Off by default.** When on, a request authenticated by a Bearer CLI token whose stored scope is `admin_ro` (a `uza_` token) and that belongs to a live admin may read another user's run **inputs** (steer queue; a foreign chat run still 404s), **archive metadata**, **fetches**, **held publications** (`GET /api/runs/{id}/held-publications`), **recovery holds** (`GET /api/recovery/holds?user=<uuid>` or `?run=<run-id>`, exactly one) and an all-states run listing (`GET /api/admin/runs?state=all`, optionally `user`, `since` and `status=a,b`; every status, or only the listed run statuses, newest first, at most 500 rows with a `truncated` flag, chat, judge and cross-check runs excluded; an unknown status is a `400 invalid status`, the filter is applied before the cap and echoed as `status_filter`). The active ci_fix/mr_rework writer lookup (`GET /api/admin/run-writers?repo=<uuid>&branch=<ref>[&mr_iid=<n>]`) reads across owners with a `complete` flag. A request carrying `state`, `user`, `since` or `status` from a cookie-session admin, or from a `uza_` admin while the flag is off, gets `403` naming the prerequisites; a `uzc_` token or a non-admin gets `403 admin access required`. Cookies and `uzc_` tokens never qualify, and admin-ness is read live, so demotion applies on the next request. On the chart, set it only through `api.adminRunDebug.enabled` (a real boolean); setting `UZI_ADMIN_RUN_DEBUG` in `api.config` or `api.secretEnv` fails the render. |
 
 What stays denied on a foreign run, flag or not: every write, archive download, `uzi run export` and held-publication expiry (`uzi run held expire`). Inputs, archive-metadata and held-publications responses served this way carry `admin_debug_read: true`; fetches responses carry no marker. See [cli.md](./cli.md#admin-run-debug-reading-other-users-runs) for the commands.
 
@@ -410,7 +422,7 @@ Checker model and effort follow the child's resolved claim and are recorded as d
 
 ### Plan cross-check model and effort pins
 
-The Plan cross-check row in Run defaults stores independent model and effort pins for each family. The model's **Default · value (worker default)** follows that family's worker model; the effort's **Default · high (cross-check default)** is `high` for every checker, whatever your worker effort is. Choosing a model leaves effort independent, and choosing effort leaves model independent. Reset either field to Default to remove its pin. Curated and custom model IDs are accepted after local syntax/family validation. Both cells are active: the Claude cell configures the Claude checker that checks a Codex lead, and at Default it follows the user's Claude worker default.
+The Plan cross-check rows in **Settings → Models → Cross-check** store independent model and effort pins for each family. The model's **Default · value (worker default)** follows that family's worker model; the effort's **Default · high (cross-check default)** is `high` for every checker, whatever your worker effort is. Choosing a model leaves effort independent, and choosing effort leaves model independent. Reset either field to Default to remove its pin. Curated and custom model IDs are accepted after local syntax/family validation. Both cells are active: the Claude cell configures the Claude checker that checks a Codex lead, and at Default it follows the user's Claude worker default.
 
 `GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan" | "code"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` (`pin` or `worker default`) and `effort_source` (`pin` or `cross-check default`; records made before this default show `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.2-sol`. Effort Default is `high` for both families and both stages; it does not follow the worker effort, which still defaults to `medium` for ordinary runs. Pin a lower effort per cell to trade review depth for latency and cost.
 
@@ -500,7 +512,7 @@ Predicts a manual issue start with a given harness and token choice, validated b
 
 `harness` is `claude` or `codex`; omit it (or send null) for the default. `credential_override.mode` is `inherit`, `auto`, `default` or `pinned`; `secret_id` names the pinned token. A bad enum or uuid is a 400. Any override other than `inherit` makes the creation-time policies ineligible, as at creation.
 
-The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
+The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude or Codex source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
 
 When the harness is chosen at creation, `harness.value` and `credential` are null and `alternatives` lists Claude then Codex, neither marked as the likely choice. Each alternative is computed as if that harness were chosen and carries its own `credential`, or its own `refusal` and `refusal_detail`. The top-level `refusal` is set only when the request fails before a harness is decided, or when **every** alternative is refused for the **same** reason. When the reasons differ, the top-level `refusal` and `refusal_detail` stay null and each alternative keeps its own reason; one branch's reason is never promoted to stand for both. If one alternative is valid, nothing is promoted either.
 

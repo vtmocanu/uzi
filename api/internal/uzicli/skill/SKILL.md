@@ -187,6 +187,7 @@ uzi whoami
 uzi settings
 uzi settings get
 uzi settings reserve
+uzi settings warning-margin <0..50|off>
 uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
 uzi settings set <setting> [--harness claude|codex] <value>
@@ -312,6 +313,7 @@ uzi job files <job-id>
 uzi job file get <file-id> [-o <path>]
 uzi admin users
 uzi admin runs [--all [--user <uuid|email>] [--since <rfc3339>] [--status <s[,s]>]] [--json]
+uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]   # active ci_fix/mr_rework writers, all owners; needs UZI_ADMIN_RUN_DEBUG + admin_ro token; exits 1 when the answer is incomplete (absence unknown)
 uzi admin workers
 uzi admin health [--all] [--strict]
 uzi admin usage
@@ -403,6 +405,12 @@ uzi version
   Prints the resulting reserve; `--json` returns `weekly_reserve_pct` and
   `weekly_reserve_pause_running`. Usage exit 2 on an out-of-range threshold. A uzc_ token
   can run it.
+- `uzi settings warning-margin <0..50|off>` — set the weekly-limit warning margin: how many
+  percentage points before a credential's effective weekly limit (your reserve when set,
+  else 100%) uzi starts warning on runs. An integer from 0 to 50; `0` or `off` turns early
+  warnings off (a run parked by a weekly limit still explains why). `--json` returns
+  `weekly_warning_margin_pts`; `uzi settings get` shows it as `Weekly warning margin:`. Usage
+  exit 2 on an out-of-range value. A uzc_ token can run it.
 - `uzi settings set <setting> [--harness claude|codex] <value>` and
   `uzi settings reset <setting> [--harness claude|codex]` — write or clear one model or
   effort default for new runs (`PUT /api/me/model-settings`). Settings: `worker-model`,
@@ -411,7 +419,11 @@ uzi version
   is passed through and the server validates it; `reset` clears to the inherited value.
   Prints the changed row with its source, from a fresh effective-settings read; when
   that read fails the stored value is shown, the write still exits 0 and the read error
-  goes to stderr. `--json` prints the server's `{"settings": ...}` envelope unchanged.
+  goes to stderr. `--json` prints the server's `{"settings": ..., "effective": ...}` envelope
+  unchanged (`effective` is null with `effective_error` if the server's own read failed).
+  The route allows 19 fields (the Settings → Models page saves through it); a 400 adds an
+  `errors` array per problem. The writes commit in one transaction; the response reads
+  are separate queries after it, not a snapshot.
   Usage exit 2 (no request) on an unknown setting, a missing, invalid or unwanted
   `--harness`, or an invalid value. Exit 6 with "the save may or may not have been
   applied; check with `uzi settings get`" when the commit outcome is unknown, and with
@@ -1528,7 +1540,18 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    its own, pushes a fix commit to the same `agent/*` branch. It never merges (the
    guardrail layers still hold), but if this session also amends the branch the two
    pushes collide. So gate on it, filtering on `repo_id` as well as the MR number
-   (two repos can share an MR number):
+   (two repos can share an MR number). Prefer the complete, all-owner lookup:
+
+   ```
+   uzi admin run-writers --repo <repo-id> --branch <source-branch> --mr <mr-number> --json
+   ```
+
+   It needs the server flag `UZI_ADMIN_RUN_DEBUG` and an `admin_ro` (`uza_`) token. It
+   matches every owner's connection to the same forge project, and an empty answer with
+   `complete: true` proves no matching writer at that database snapshot only. An
+   incomplete answer (non-zero exit) or any other error is unknown, never absence. Only
+   when it answers 401, 403 or 404 (exit 3 or 4: flag off, wrong token, older server),
+   fall back to your own runs, and say the result is owner-only:
 
    ```
    uzi run list --json | jq -r '.[]|select(.repo_id=="<repo-id>" and ((.kind=="mr_rework" and .mr_iid==<mr-number>) or (.kind=="ci_fix" and .pipeline_ref=="<source-branch>")))|{id, kind, status}'
@@ -1538,10 +1561,10 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    wait, or agree to cancel the exact run and confirm terminal state. Inspect its branch
    delta, preserved patch, recovery captures and held publications; no patch does not prove
    no work. Review any changed head before merging. Refresh immediately before push or merge;
-   never bypass an active helper. The list is only the caller's newest 200 runs, so absence
-   does not exclude older or foreign-owner runs. A failed lookup is unknown. An authorized
-   admin listing can help, but truncation and owner-specific repo IDs limit it too. Coordinate
-   unresolved ownership. No snapshot locks the branch. Disabling mr-rework or cancelling one
+   never bypass an active helper. The owner-only fallback is only the caller's newest 200
+   runs, so its absence does not exclude older or foreign-owner runs. A failed lookup is
+   unknown. Coordinate unresolved ownership. No snapshot locks the branch: a writer may start
+   after either read, so refresh right before merging and merge on the exact head. Disabling mr-rework or cancelling one
    ci_fix does not disable future automatic CI fixes.
 
    **When no matching helper is active and the diff and any automated review are clean,**
@@ -2064,7 +2087,9 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   live admin's `uza_` token can read another user's run through `uzi run inputs|fetches|recovery|held`
   and `uzi admin runs --all [--user <uuid|email>] [--since <rfc3339>] [--status s[,s]]` (every
   status, newest first, at most 500 rows; `--user`, `--since` and `--status` need `--all`, exit 2
-  otherwise; an email matching no user exits 4, several exit 1; an invalid status exits 2). Each
+  otherwise; an email matching no user exits 4, several exit 1; an invalid status exits 2).
+  `uzi admin run-writers --repo <uuid> --branch <ref> [--mr <iid>]` is the flag-gated,
+  audited complete active-writer read; an incomplete answer exits 1. Each
   read writes one audit log line. A `uzc_` token masks admin, so use `uza_`; a refusal prints a
   hint naming the flag and token. `run get|logs|plan|lead-config` and `review show` are owner-or-admin
   regardless of the flag. Steers and writes, archive download, `run export`, `run discard` and

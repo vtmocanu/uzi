@@ -28,7 +28,7 @@ it("drives both effort selects on a lead template, submits the pins and shows th
     </MemoryRouter>,
   );
 
-  const help = screen.getByText(/^An effort chosen at start, then your Run defaults effort/);
+  const help = screen.getByText(/^An effort chosen at start, then your worker effort for that harness in Settings → Models/);
   expect(help.getBoundingClientRect().height).toBeGreaterThan(0);
 
   const claude = screen.getByLabelText("Claude effort") as HTMLSelectElement;

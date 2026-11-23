@@ -76,11 +76,11 @@ var (
 	ErrCredentialOverrideHarnessUnsupported = errors.New("credential override unsupported on codex harness")
 	ErrCredentialOverridePinnedNeedsSecret  = errors.New("credential override pinned mode requires a token")
 	ErrCredentialOverrideInvalidMode        = errors.New("invalid credential override mode")
-	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the owner's Claude source is a model
+	// ErrCredentialOverrideProviderSource (PRD #4320 D8): the run's source is a model
 	// provider, whose run uses the provider key, so a vendor credential override is refused. It
 	// wraps ErrCredentialOverrideHarnessUnsupported, so every consumer that already refuses that
 	// keeps refusing; the handler adds the provider wording.
-	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the Claude source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
+	ErrCredentialOverrideProviderSource = fmt.Errorf("%w: the source is a model provider; its runs use the provider key", ErrCredentialOverrideHarnessUnsupported)
 )
 
 // refuseOverrideForProviderOwner refuses a vendor credential override when the owner selected a
@@ -88,11 +88,11 @@ var (
 // a vendor run carrying an override. q is asserted for the source read; a surface that cannot read
 // the source fails closed (an error, never nil), so an override never rides an unchecked owner.
 func refuseOverrideForProviderOwner(ctx context.Context, q any, userID uuid.UUID) error {
-	r, ok := q.(providerSourceReader)
+	r, ok := q.(engineProviderSourceReader)
 	if !ok {
 		return errors.New("credential override: the query surface cannot read the provider source")
 	}
-	row, err := r.GetUserClaudeProviderSource(ctx, userID)
+	row, err := r.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: userID, Engine: "claude"})
 	if err != nil {
 		return fmt.Errorf("credential override: provider source: %w", err)
 	}
@@ -232,6 +232,16 @@ func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaRea
 	return validateCredentialOverrideCore(ctx, q, userID, kind, harness, mode, secretID, true)
 }
 
+// credentialOverrideLaneRefusal is the lane half of the validator, pure over the run kind: chat,
+// judge, self_improve and job runs follow their own ladders and are not switchable (D10).
+func credentialOverrideLaneRefusal(kind string) error {
+	switch kind {
+	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
+		return fmt.Errorf("%w: %s", ErrCredentialOverrideLaneNotSwitchable, kind)
+	}
+	return nil
+}
+
 // validateCredentialOverrideCore is the one validator. refuseProvider (create, schedule and
 // effective-settings callers) refuses every non-inherit override for an owner whose Claude source
 // is a model provider (PRD #4320 D8); the live-switch caller (SetRunCredential) passes false and
@@ -240,9 +250,8 @@ func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaRea
 func validateCredentialOverrideCore(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID, refuseProvider bool) (*CredentialOverride, error) {
 	// D10: chat, judge and self_improve follow their own ladders and are not switchable; a job
 	// (PRD #1908 D-E) resolves its credential as its owner via the worker-binding ladder, never a pin.
-	switch kind {
-	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
-		return nil, fmt.Errorf("%w: %s", ErrCredentialOverrideLaneNotSwitchable, kind)
+	if err := credentialOverrideLaneRefusal(kind); err != nil {
+		return nil, err
 	}
 	// D9: a Codex run/schedule cannot carry an Anthropic-only override; the switch keeps
 	// the harness and no cross-harness resume exists (a later PRD lifts this).

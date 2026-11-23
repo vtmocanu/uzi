@@ -18,14 +18,14 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// provider_source.go is PRD #4320 M4 (module 4, "Selection"): the owner's Claude provider source,
+// provider_source.go is PRD #4320 M4 (module 4, "Selection"): the owner's engine provider source,
 // its usability rules, the typed refusals, and the run-creation helpers (freeze, inherited
 // re-check, model-map check) createRunAtomic composes. The api is the destination authority: the
 // allowlist is read from Params, never from the worker.
 
 // Typed refusals. Every one is a sentinel (errors.Is) so the handler maps it to its stable reason.
 var (
-	// ErrProviderSourceUnusable: the owner's Claude provider source is set but cannot serve a run
+	// ErrProviderSourceUnusable: the owner's engine provider source is set but cannot serve a run
 	// (retired, URL no longer allowlisted, key missing or disabled). Never falls back to a vendor
 	// credential or to the other engine. 409 provider_source_unusable.
 	ErrProviderSourceUnusable = errors.New("provider_source_unusable")
@@ -87,8 +87,9 @@ func (e *ProviderModelUnmappedError) Error() string {
 
 func (e *ProviderModelUnmappedError) Is(target error) bool { return target == ErrProviderModelUnmapped }
 
-// providerSource is a usable Claude provider source: everything a run freezes.
+// providerSource is a usable engine provider source: everything a run freezes.
 type providerSource struct {
+	Engine      string
 	ProviderID  uuid.UUID
 	Revision    int32
 	BaseURL     string // the matched allowlist entry, the form a run is bound to
@@ -102,7 +103,7 @@ type providerSource struct {
 type ProviderSourceState int
 
 const (
-	// ProviderSourceNone: users.claude_provider_id is NULL; the whole vendor ladder applies.
+	// ProviderSourceNone: the requested engine has no selected provider; the whole vendor ladder applies.
 	ProviderSourceNone ProviderSourceState = iota
 	// ProviderSourceUsable: set and usable.
 	ProviderSourceUsable
@@ -110,7 +111,7 @@ const (
 	ProviderSourceUnusable
 )
 
-// ProviderSourceResult is the owner's Claude provider source: none | usable | unusable(reason).
+// ProviderSourceResult is the owner's engine provider source: none | usable | unusable(reason).
 type ProviderSourceResult struct {
 	State      ProviderSourceState
 	ProviderID uuid.UUID
@@ -143,6 +144,37 @@ type providerSourceReader interface {
 // revision's base URL is still allowlisted, and the provider's key row exists, is kind
 // anthropic_compatible_key for that provider, and is enabled.
 func EvaluateClaudeProviderSource(row store.GetUserClaudeProviderSourceRow, allow ProviderAllowFunc) ProviderSourceResult {
+	return EvaluateProviderSource(providers.EngineClaude, store.GetUserProviderSourceRow{
+		ProviderID: row.ProviderID, Engine: row.Engine, Protocol: pgtype.Text{String: providers.ProtocolAnth, Valid: true}, CurrentRevision: row.CurrentRevision, RetiredAt: row.RetiredAt, BaseUrl: row.BaseUrl, AuthStyle: row.AuthStyle, ModelMap: row.ModelMap, KeySecretID: row.KeySecretID, KeyKind: row.KeyKind, KeyProviderID: row.KeyProviderID, KeyDisabledAt: row.KeyDisabledAt, KeyEnablementRev: row.KeyEnablementRev,
+	}, allow)
+}
+
+func providerKeyKind(engine string) string {
+	if engine == providers.EngineCodex {
+		return store.KindOpenAICompatibleKey
+	}
+	return store.KindAnthropicCompatibleKey
+}
+
+type engineProviderSourceReader interface {
+	GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error)
+}
+
+func ResolveProviderSource(ctx context.Context, q engineProviderSourceReader, userID uuid.UUID, engine string, allow ProviderAllowFunc) (ProviderSourceResult, error) {
+	if engine != providers.EngineClaude && engine != providers.EngineCodex {
+		return ProviderSourceResult{}, fmt.Errorf("unsupported provider engine %q", engine)
+	}
+	row, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: userID, Engine: engine})
+	if err != nil {
+		return ProviderSourceResult{}, fmt.Errorf("%s provider source: %w", engine, err)
+	}
+	return EvaluateProviderSource(engine, row, allow), nil
+}
+
+func EvaluateProviderSource(engine string, row store.GetUserProviderSourceRow, allow ProviderAllowFunc) ProviderSourceResult {
+	if engine != providers.EngineClaude && engine != providers.EngineCodex {
+		return ProviderSourceResult{State: ProviderSourceUnusable, Reason: SourceUnusableInvalid}
+	}
 	if !row.ProviderID.Valid {
 		return ProviderSourceResult{State: ProviderSourceNone}
 	}
@@ -156,7 +188,7 @@ func EvaluateClaudeProviderSource(row store.GetUserClaudeProviderSourceRow, allo
 	if row.RetiredAt.Valid {
 		return unusable(SourceUnusableRetired)
 	}
-	if !row.Engine.Valid || row.Engine.String != providers.EngineClaude || !row.BaseUrl.Valid || !row.AuthStyle.Valid {
+	if !row.Engine.Valid || row.Engine.String != engine || !row.BaseUrl.Valid || !row.AuthStyle.Valid {
 		return unusable(SourceUnusableInvalid)
 	}
 	entry, ok := "", false
@@ -166,7 +198,7 @@ func EvaluateClaudeProviderSource(row store.GetUserClaudeProviderSourceRow, allo
 	if !ok {
 		return unusable(SourceUnusableBaseURL)
 	}
-	if !row.KeySecretID.Valid || !row.KeyKind.Valid || row.KeyKind.String != store.KindAnthropicCompatibleKey ||
+	if !row.KeySecretID.Valid || !row.KeyKind.Valid || row.KeyKind.String != providerKeyKind(engine) ||
 		!row.KeyProviderID.Valid || uuid.UUID(row.KeyProviderID.Bytes) != pid || !row.KeyEnablementRev.Valid {
 		return unusable(SourceUnusableKeyMissing)
 	}
@@ -177,10 +209,11 @@ func EvaluateClaudeProviderSource(row store.GetUserClaudeProviderSourceRow, allo
 		return unusable(SourceUnusableInvalid)
 	}
 	var mm providers.ModelMap
-	if err := json.Unmarshal(row.ModelMap, &mm); err != nil || providers.ValidateModelMap(mm) != nil {
+	if err := json.Unmarshal(row.ModelMap, &mm); err != nil || !row.Protocol.Valid || providers.ValidateProfile(engine, row.Protocol.String, row.AuthStyle.String, mm) != nil {
 		return unusable(SourceUnusableInvalid)
 	}
 	return ProviderSourceResult{State: ProviderSourceUsable, ProviderID: pid, Source: providerSource{
+		Engine:      engine,
 		ProviderID:  pid,
 		Revision:    row.CurrentRevision.Int32,
 		BaseURL:     entry,
@@ -191,7 +224,7 @@ func EvaluateClaudeProviderSource(row store.GetUserClaudeProviderSourceRow, allo
 	}}
 }
 
-// ResolveClaudeProviderSource reads and evaluates the owner's Claude provider source on q. It is
+// ResolveClaudeProviderSource reads and evaluates the owner's engine provider source on q. It is
 // the single helper the handler (settings route), the resolver and the freeze share.
 func ResolveClaudeProviderSource(ctx context.Context, q providerSourceReader, userID uuid.UUID, allow ProviderAllowFunc) (ProviderSourceResult, error) {
 	row, err := q.GetUserClaudeProviderSource(ctx, userID)
@@ -208,6 +241,9 @@ func (s *Service) providerAllow(candidate string) (string, bool) {
 
 // claudeProviderSource resolves the owner's source on q with the service's allowlist.
 func (s *Service) claudeProviderSource(ctx context.Context, q providerSourceReader, userID uuid.UUID) (ProviderSourceResult, error) {
+	if generic, ok := q.(engineProviderSourceReader); ok {
+		return ResolveProviderSource(ctx, generic, userID, providers.EngineClaude, s.providerAllow)
+	}
 	return ResolveClaudeProviderSource(ctx, q, userID, s.providerAllow)
 }
 
@@ -259,11 +295,15 @@ func providerBoundRun(r store.Run) bool { return r.ModelProviderID.Valid }
 // edit takes (edits hold the secret lock, then the provider row), so the two never cycle. A source
 // that turned unusable, or changed, since the pre-lock read is refused or replaced by what is
 // committed now.
-func (s *Service) freezeProviderSource(ctx context.Context, tx store.DBTX, q *store.Queries, userID uuid.UUID) (providerSource, error) {
+func (s *Service) freezeProviderSource(ctx context.Context, tx store.DBTX, q *store.Queries, userID uuid.UUID, engines ...Harness) (providerSource, error) {
+	engine := providers.EngineClaude
+	if len(engines) > 0 {
+		engine = string(engines[0])
+	}
 	if err := store.LockSecretMutationShared(ctx, tx, userID); err != nil {
 		return providerSource{}, fmt.Errorf("provider freeze: secret lock: %w", err)
 	}
-	pre, err := q.GetUserClaudeProviderSource(ctx, userID)
+	pre, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: userID, Engine: engine})
 	if err != nil {
 		return providerSource{}, fmt.Errorf("provider freeze: read source: %w", err)
 	}
@@ -279,11 +319,11 @@ func (s *Service) freezeProviderSource(ctx context.Context, tx store.DBTX, q *st
 		return providerSource{}, fmt.Errorf("provider freeze: lock provider: %w", err)
 	}
 	// Re-read under the lock: the provider row cannot change from here to the end of the tx.
-	row, err := q.GetUserClaudeProviderSource(ctx, userID)
+	row, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: userID, Engine: engine})
 	if err != nil {
 		return providerSource{}, fmt.Errorf("provider freeze: re-read source: %w", err)
 	}
-	res := EvaluateClaudeProviderSource(row, s.providerAllow)
+	res := EvaluateProviderSource(engine, row, s.providerAllow)
 	if res.State != ProviderSourceUsable {
 		if res.State == ProviderSourceNone {
 			return providerSource{}, &ProviderSourceUnusableError{Reason: SourceUnusableProviderMissing}
@@ -326,16 +366,16 @@ func (s *Service) inheritProviderBinding(ctx context.Context, tx store.DBTX, q *
 		}
 		return providerSource{}, fmt.Errorf("provider inherit: read key: %w", err)
 	}
-	if key.Kind != store.KindAnthropicCompatibleKey || !key.ProviderID.Valid || uuid.UUID(key.ProviderID.Bytes) != pid ||
+	if key.Kind != providerKeyKind(src.Harness) || !key.ProviderID.Valid || uuid.UUID(key.ProviderID.Bytes) != pid ||
 		key.DisabledAt.Valid || key.EnablementRev != src.ModelProviderKeyRev.Int64 {
 		return providerSource{}, fmt.Errorf("%w: the bound key was rotated, disabled or replaced", ErrProviderBindingStale)
 	}
 	var mm providers.ModelMap
-	if err := json.Unmarshal(rev.ModelMap, &mm); err != nil {
+	if err := json.Unmarshal(rev.ModelMap, &mm); err != nil || providers.ValidateProfile(src.Harness, rev.Protocol, rev.AuthStyle, mm) != nil {
 		return providerSource{}, errProviderBindingMismatch
 	}
 	return providerSource{
-		ProviderID: pid, Revision: rev.Revision, BaseURL: entry, AuthStyle: rev.AuthStyle, ModelMap: mm,
+		Engine: src.Harness, ProviderID: pid, Revision: rev.Revision, BaseURL: entry, AuthStyle: rev.AuthStyle, ModelMap: mm,
 		KeySecretID: uuid.UUID(src.ModelProviderKeySecretID.Bytes), KeyRev: src.ModelProviderKeyRev.Int64,
 	}, nil
 }
@@ -377,6 +417,18 @@ func modelMapped(m providers.ModelMap, model string) bool {
 // worker detects the repo roster, and models that only exist at spawn (summary, classifier, advice,
 // later agent selection) are checked at their spawn (PRD module 7; worker-side, not here).
 func (s *Service) checkProviderModels(ctx context.Context, q *store.Queries, run store.Run, src providerSource) error {
+	if src.Engine == providers.EngineCodex {
+		if providers.ValidateModelMapForEngine(src.Engine, src.ModelMap) != nil {
+			return errProviderBindingMismatch
+		}
+		if run.Model.Valid && (!run.ModelSource.Valid || run.ModelSource.String == string(leadcfg.ModelSourceRunOverride) || run.ModelSource.String == string(leadcfg.ModelSourceSchedulePin)) {
+			if _, ok := src.ModelMap[run.Model.String]; !ok {
+				return &ProviderModelUnmappedError{Model: run.Model.String, Source: "run"}
+			}
+		}
+		return nil
+	}
+
 	lanes, err := q.GetUserHarnessModelDefaults(ctx, run.UserID)
 	if err != nil {
 		return fmt.Errorf("provider model check: user defaults: %w", err)

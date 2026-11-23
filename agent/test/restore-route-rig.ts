@@ -16,6 +16,7 @@ import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { DiskGovernor, type CacheCapConfig, type GovernedRun } from "../src/cache-cap.js";
 import type { SlotSnapshot } from "../src/completion-authority.js";
 import type { Executor } from "../src/executor.js";
+import type { RunExecutorAddress } from "../src/runner.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
 import type { RunCacheDropResult } from "../src/run-caches.js";
@@ -147,7 +148,7 @@ export interface RigOptions {
   /** Replaces the executor handed to the successor build (an addr-aware factory only). */
   successorExecutor?: Executor;
   /** Replaces the factory entirely (called with the rig, whose `executor`s are set). */
-  factory?: (rig: Rig, runId: string, codex: unknown, addr: { generation?: number } | undefined) => { executor: Executor; homeDir?: string };
+  factory?: (rig: Rig, runId: string, codex: unknown, addr: RunExecutorAddress | undefined) => { executor: Executor; homeDir?: string };
 }
 
 export async function buildRig(o: RigOptions = {}): Promise<Rig> {

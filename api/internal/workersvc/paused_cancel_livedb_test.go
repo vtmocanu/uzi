@@ -145,6 +145,7 @@ func TestSubmitInputCancelPausedRunLiveDB(t *testing.T) {
 func TestCancelReworkForMRPausedRunLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	svc := New(env.q, env.box, testParams())
+	svc.SetTxBeginner(env.pool) // the fenced terminal-target cancel runs in one transaction
 	o := seedReevalOwner(t, env, BindModeAuto, false)
 	setWorkerHeartbeatFresh(t, env, o.workerID)
 

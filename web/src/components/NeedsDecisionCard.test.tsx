@@ -13,7 +13,7 @@ const NOW = Date.parse("2026-07-05T12:20:00Z");
 const SINCE = "2026-07-05T12:06:00Z";
 
 function item(kind: RunDecisionItem["kind"], over: Partial<RunSummaryItem> = {}): RunDecisionItem {
-  const verb = { plan: "Review plan", question: "Answer", park: "Resume", pr: "Review PR" }[kind] as RunDecisionItem["verb"];
+  const verb = { plan: "Review plan", question: "Answer", park: "Resume", limit: "Review fix", pr: "Review PR" }[kind] as RunDecisionItem["verb"];
   return { kind, verb, since: SINCE, run: aRun({ id: `run-${kind}`, ...over }) as RunSummaryItem };
 }
 
@@ -530,5 +530,60 @@ describe("NeedsDecisionCard", () => {
       mount([item("plan"), heldItem({ count: 2, runId: null }), prItem()]);
       expect(screen.getByText("3 decisions, 1 PR review")).toBeTruthy();
     });
+  });
+});
+
+// PRD #4123: the limit rows, one per credential.
+describe("NeedsDecisionCard limit rows (PRD #4123)", () => {
+  const limitItem = (id: string, key: string, label: string, over: Partial<RunSummaryItem> = {}) =>
+    item("limit", {
+      id,
+      status: "running",
+      weekly_limit: { tier: "warning", credential_key: key, credential_label: label },
+      ...over,
+    });
+
+  it("one run: names the credential and links its fix on the run page", () => {
+    const { container } = mount([limitItem("r1", "anthropic:sec-a", "A", { issue_title: "Batch sync" })]);
+    expect(container.querySelector("[data-kind-tile=limit]")).not.toBeNull();
+    expect(container.querySelector("[data-limit-credential]")?.textContent).toBe("Token “A” is at or near its weekly limit");
+    expect(screen.getByText("1 run on it has a fix you can apply")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review fix" }).getAttribute("href")).toBe("/runs/r1");
+    expect(screen.getByText(/Batch sync/)).toBeTruthy();
+    // A running run is not "waiting": no age line.
+    expect(screen.queryByText(/waiting/)).toBeNull();
+    expect(screen.getByText("1 decision")).toBeTruthy();
+  });
+
+  it("several runs on one credential collapse into one row that expands to per-run links", () => {
+    mount([
+      limitItem("r1", "anthropic:sec-a", "A"),
+      limitItem("r2", "anthropic:sec-a", "A"),
+    ]);
+    expect(screen.getAllByText(/is at or near its weekly limit/)).toHaveLength(1);
+    expect(screen.getByText("2 runs on it have a fix you can apply")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Review fix" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show runs" }));
+    const links = screen.getAllByRole("link", { name: "Review fix" });
+    expect(links.map((l) => l.getAttribute("href"))).toEqual(["/runs/r1", "/runs/r2"]);
+    expect(screen.getByRole("button", { name: "Show fewer" }).getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("two credentials sharing a label stay two rows, told apart by vendor", () => {
+    const { container } = mount([
+      limitItem("r1", "anthropic:sec-a", "work"),
+      limitItem("r2", "codex:acct-1", "work"),
+    ]);
+    const titles = [...container.querySelectorAll("[data-limit-credential]")].map((n) => n.textContent);
+    expect(titles).toEqual(["Token “work” is at or near its weekly limit", "Codex account “work” is at or near its weekly limit"]);
+  });
+
+  it("renders a hostile label as text, Cf characters stripped", () => {
+    const hostile = "o'k" + "`id`" + "$" + "(x)" + "<b>x</b>" + "\u202e";
+    const { container } = mount([limitItem("r1", "anthropic:sec-a", hostile)]);
+    const title = container.querySelector("[data-limit-credential]")?.textContent ?? "";
+    expect(title).toContain("o'k`id`$(x)<b>x</b>”");
+    expect(title).not.toContain("\u202e");
+    expect(container.querySelector("b")).toBeNull();
   });
 });

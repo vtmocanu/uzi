@@ -27,8 +27,8 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 9 || lines[8] != "Judge runs on: Same as the run (default)" || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || lines[5] != "Codex account mode: default" || lines[6] != "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)" || lines[7] != "Harness overflow: off (inactive: default harness is automatic)" {
-		t.Fatalf("expected header, two cells, the Now summary, reserve, Codex mode, default harness, harness overflow and Judge runs on lines: %s", out)
+	if len(lines) != 10 || lines[9] != "Judge runs on: Same as the run (default)" || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || !strings.HasPrefix(lines[5], "Weekly warning margin: 0 (off") || lines[6] != "Codex account mode: default" || lines[7] != "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)" || lines[8] != "Harness overflow: off (inactive: default harness is automatic)" {
+		t.Fatalf("expected header, two cells, the Now summary, reserve, warning margin, Codex mode, default harness, harness overflow and Judge runs on lines: %s", out)
 	}
 	want := []string{
 		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
@@ -74,7 +74,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 		"code claude inactive Default SDK/account default SDK/account default worker default Pin · low low pin",
 		"code codex active Pin · code-only code-worker code-only pin Default medium worker default",
 	}
-	if len(lines) != 11 || lines[5] != "Now summary: on (default)" {
+	if len(lines) != 12 || lines[5] != "Now summary: on (default)" {
 		t.Fatalf("four cells: %s", out)
 	}
 	for i, row := range want {
@@ -99,7 +99,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 	}
 	fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[2:]...)
 	out, _, code = runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || strings.Count(out, "\n") != 9 {
+	if code != 0 || strings.Count(out, "\n") != 10 {
 		t.Fatalf("input bound: %s", out)
 	}
 }
@@ -117,7 +117,7 @@ func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 9 {
+	if len(lines) != 10 {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
@@ -145,7 +145,7 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 8 ||
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 9 ||
 		len(out) > 3000 || !strings.Contains(out, "unknown") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe or unbounded output: %q", out)
 	}
@@ -203,9 +203,9 @@ func TestSettingsGetTokenGET(t *testing.T) {
 func TestSettingsReadOnlyAndErrors(t *testing.T) {
 	root := newRootCmd(fakeEnv(&uzicli.FakeClient{}))
 	cmd := findCmd(root, "settings")
-	if cmd == nil || len(cmd.Commands()) != 6 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil || findCmd(cmd, "codex-mode") == nil ||
+	if cmd == nil || len(cmd.Commands()) != 7 || findCmd(cmd, "get") == nil || findCmd(cmd, "reserve") == nil || findCmd(cmd, "warning-margin") == nil || findCmd(cmd, "codex-mode") == nil ||
 		findCmd(cmd, "harness-overflow") == nil || findCmd(cmd, "set") == nil || findCmd(cmd, "reset") == nil {
-		t.Fatal("settings must expose only get, reserve, codex-mode, harness-overflow, set and reset")
+		t.Fatal("settings must expose only get, reserve, warning-margin, codex-mode, harness-overflow, set and reset")
 	}
 	for _, args := range [][]string{{"settings", "set"}, {"settings", "reset"}, {"settings", "get", "extra"}} {
 		if _, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), args...); code == 0 {

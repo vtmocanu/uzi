@@ -5,12 +5,15 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
-import type { ExecutorFactory } from "../src/runner.js";
+import type { ExecutorFactory, RunExecutorAddress } from "../src/runner.js";
 import type { RecoveryCoordinator } from "../src/recovery.js";
 import { DataVolumeGuard } from "../src/disk-full.js";
 import { REPO_AGENT_SOURCE_FEATURE } from "../src/protocol.js";
-import { noProofReseed, nullLogger } from "./helpers.js";
+import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+
+import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { providerKeyForms } from "../src/redact.js";
 
 installHarness();
 function command(cwd: string, ...args: string[]): string {
@@ -437,5 +440,72 @@ for (const failure of ["status", "WIP", "tracking"] as const) {
     assert.ok(api.states.some(s => s.body.status === "failed"));
     assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  });
+}
+
+// Named selection for the capture-closing executor rebuild in retained recapture.
+for (const mode of ["provider", "constructor failure", "vendor"] as const) {
+  it(`ProviderRestoreForwarding retained recapture ${mode}`, async () => {
+    const { claim, bare, clone } = await seed();
+    const key = ["Recapture/", "key+", "&<fixture>", "opaque"].join("");
+    const provider = Object.freeze({ provider_id: "recapture-fixture", revision: 1,
+      engine: "claude" as const, protocol: "anthropic_messages" as const,
+      base_url: "https://gw.example.test/a", auth_style: "bearer" as const,
+      credential: key, model_map: { haiku: { model: "corp-haiku" } } });
+    if (mode !== "vendor") claim.secrets = { ...claim.secrets, anthropic_oauth_token: "", provider };
+    const forms = providerKeyForms(key);
+    const calls: Array<{ codex: unknown; addr: RunExecutorAddress | undefined }> = [];
+    const paths: string[] = [];
+    let releases = 0;
+    client.publishCheckpoint = async (_run, _tip, stream) => {
+      for await (const _chunk of stream) { /* consume the real pack before losing its ACK */ }
+      throw new Error("post-pack response unknown");
+    };
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+    const logs = recordingLogger();
+    const make: ExecutorFactory = (id, codex, addr) => {
+      calls.push({ codex, addr });
+      if (calls.length === 2 && mode === "constructor failure")
+        throw new Error(forms.join(" | "), { cause: new Error(forms.join(" / ")) });
+      const made = factory(async ctx => {
+        paths.push(ctx.worktreePath);
+        assert.notEqual(ctx.worktreePath, clone.path);
+        assert.equal(ctx.sessionId, undefined);
+        if (paths.length === 1) fs.writeFileSync(path.join(ctx.worktreePath, "successor-dirty"), "new work\n");
+        else assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "successor-dirty"), "utf8"), "new work\n");
+        throw new Error("model interrupted before settled evidence");
+      })(id, codex, addr);
+      // A capture-closing Claude executor uses the existing lifecycle seam.
+      const capture = codexRig();
+      made.executor = { ...made.executor, safety: capture.safety,
+        settleForCredentialFreeCapture: capture.settle, withCredentialFreeCapture: capture.capture };
+      return made;
+    };
+    const runner = runnerWith(make, fakeGitlab().gitlab, undefined, logs.logger, { recoveryRetryMs: 1 });
+    await runner.execute(claim);
+    if (mode !== "constructor failure") {
+      api.setOwnershipStatus(claim.run_id, "running", 3);
+      await runner.execute({ ...claim, claim_generation: 3 });
+      assert.equal(paths.length, 2);
+      assert.notEqual(paths[0], paths[1]);
+      assert.equal(journal(bare, clone.branch).recovery.attempts, 2);
+      assert.equal(calls.length, 4, "each flight builds initially and again after capture");
+      assert.match(paths[0]!, /-g2-/);
+      assert.match(paths[1]!, /-g3-/);
+    } else {
+      assert.equal(calls.length, 2);
+      assert.equal(paths.length, 0);
+      const publicText = JSON.stringify([logs.lines, api.states, api.messages(claim.run_id)]);
+      for (const form of forms) assert.ok(!publicText.includes(form), "constructor diagnostic was redacted");
+    }
+    for (const call of calls) {
+      assert.equal(call.codex, undefined);
+      assert.equal(call.addr?.generation, undefined, "retained rebuild preserves its native address shape");
+      assert.strictEqual(call.addr?.provider, mode === "vendor" ? undefined : provider);
+      if (mode === "vendor") assert.equal(Object.hasOwn(call.addr ?? {}, "provider"), false);
+    }
+    assert.equal(releases, 0);
+    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+    assert.ok(api.states.every(s => s.body.status !== "recovery_wait"));
   });
 }

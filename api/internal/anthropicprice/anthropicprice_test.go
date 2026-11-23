@@ -47,6 +47,7 @@ func TestPriceEveryRowMatchesTheFetchedTable(t *testing.T) {
 	// has one (Haiku 5.5's base tier ends at 100,000); output always uses 1M.
 	type row struct{ input, cacheRead, write5m, write1h, output float64 }
 	want := map[string]row{
+		"claude-fable-5-2":          {8, 0.20, 10, 16, 40},
 		"claude-fable-5-1":          {10, 0.25, 12.5, 20, 50},
 		"claude-opus-5-5":           {4, 0.20, 5, 8, 20},
 		"claude-opus-5":             {5, 0.50, 6.25, 10, 25},
@@ -156,7 +157,7 @@ func TestPriceNotAvailableInferenceGeoUsesStandardRates(t *testing.T) {
 }
 
 func TestPriceNotAvailableInferenceGeoOnCapableModelsStaysUnpriced(t *testing.T) {
-	for _, model := range []string{"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5-5", "claude-haiku-5-5"} {
+	for _, model := range []string{"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5-5", "claude-haiku-5-5"} {
 		t.Run(model, func(t *testing.T) {
 			if _, ok := Price(Usage{Model: model, InputTokens: 100, InferenceGeo: "not_available"}); ok {
 				t.Fatal("missing geography evidence on a geo-capable model must stay unpriced")
@@ -172,6 +173,43 @@ func TestPriceSonnet55CacheReadUsesFivePercentOfInput(t *testing.T) {
 	}
 }
 
+// Issue #4625: the fable alias resolves to claude-fable-5-2 since #4619, and Price matches the
+// id exactly, so a missing row left Fable 5.2 estimated tails and side passes unpriced. USD per
+// MTok (pricing page and the Fable 5.2 overview, fetched 2026-11-23): input 8, 5m cache write
+// 10, 1h cache write 16, cache read 0.20, output 40.
+func TestPriceFable52EveryTokenComponent(t *testing.T) {
+	const m = int64(1_000_000)
+	cols := []struct {
+		name string
+		u    Usage
+		want string // nanodollars
+	}{
+		{"input", Usage{Model: "claude-fable-5-2", InputTokens: m}, "8000000000"},
+		{"cache read", Usage{Model: "claude-fable-5-2", CacheReadInputTokens: m}, "200000000"},
+		{"5m write", Usage{Model: "claude-fable-5-2", CacheCreationInputTokens: m, CacheCreation5mTokens: i64(m)}, "10000000000"},
+		{"1h write", Usage{Model: "claude-fable-5-2", CacheCreationInputTokens: m, CacheCreation1hTokens: i64(m)}, "16000000000"},
+		{"output", Usage{Model: "claude-fable-5-2", OutputTokens: m}, "40000000000"},
+	}
+	for _, c := range cols {
+		if got, ok := Price(c.u); !ok || got.NanoUSD() != c.want {
+			t.Errorf("fable-5-2 %s = %s ok=%v, want %s true", c.name, got.NanoUSD(), ok, c.want)
+		}
+	}
+	// One record carrying every component: 8 + 0.20 + 10 + 16 + 40 = $74.20.
+	got, ok := Price(Usage{
+		Model:                    "claude-fable-5-2",
+		InputTokens:              m,
+		CacheReadInputTokens:     m,
+		CacheCreationInputTokens: 2 * m,
+		CacheCreation5mTokens:    i64(m),
+		CacheCreation1hTokens:    i64(m),
+		OutputTokens:             m,
+	})
+	if !ok || got.NanoUSD() != "74200000000" {
+		t.Fatalf("fable-5-2 all components = %s ok=%v, want 74200000000 true", got.NanoUSD(), ok)
+	}
+}
+
 func TestPriceHostileTokenCountsDoNotOverflow(t *testing.T) {
 	const huge = int64(1) << 62
 	c, ok := Price(Usage{Model: "claude-fable-5-1", InputTokens: huge, OutputTokens: huge})
@@ -181,7 +219,7 @@ func TestPriceHostileTokenCountsDoNotOverflow(t *testing.T) {
 }
 
 func TestProvenanceConstants(t *testing.T) {
-	if AnthropicPriceTableVersion == "" || AnthropicPriceSourceURL == "" || AnthropicPriceFetchedAt != "2026-11-04" {
+	if AnthropicPriceTableVersion == "" || AnthropicPriceSourceURL == "" || AnthropicPriceFetchedAt != "2026-11-23" {
 		t.Fatal("price provenance constants must be set")
 	}
 }

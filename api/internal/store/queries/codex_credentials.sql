@@ -154,6 +154,14 @@ RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at;
 SELECT user_secret_id, status FROM codex_credential_state
 WHERE user_id = @user_id;
 
+-- name: ListCodexAliasAccountsForUser :many
+-- Every codex alias state row this user owns with its linked provider account id (NULL when
+-- the alias is not linked), enabled or disabled. The next-claim preview maps a run's own
+-- alias id to its account through this, so a disabled alias still resolves. Owner-scoped,
+-- read-only, no secret material.
+SELECT user_secret_id, provider_account_id FROM codex_credential_state
+WHERE user_id = @user_id;
+
 -- name: CountLinkedAliasesForCodexAccount :one
 -- How many LINKED aliases this user holds for one provider account (PRD #1209 M1). The
 -- membership check the settings handler uses to validate a sidebar-codex id: an id counts

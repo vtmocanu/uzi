@@ -98,8 +98,9 @@ const (
 
 // Secret keys, and the paths they mount at.
 const (
-	tokenKey  = "worker_token"
-	caCertKey = "ca.crt"
+	tokenKey            = "worker_token"
+	caCertKey           = "ca.crt"
+	codexExtraCACertKey = "codex-extra-ca.crt"
 	// fetcherCACertKey carries the uzi-fetcher's CA in an ISOLATED lane worker's
 	// per-worker Secret (PRD #1906 M5), next to ca.crt, so it mounts at
 	// <secret mount>/fetcher-ca.crt and UZI_FETCHER_CA_FILE points there. It is relayed
@@ -771,6 +772,10 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 	if ca := cfg.workerCABundle(); len(ca) > 0 {
 		data[caCertKey] = ca
 	}
+	if !w.Isolated && len(cfg.ExtraCAPEM) > 0 {
+		// Codex gets only the operator CA, without the API trust in workerCABundle.
+		data[codexExtraCACertKey] = cfg.ExtraCAPEM
+	}
 	// The fetcher CA (PRD #1906 M5), isolated workers only. Written once at creation like
 	// the api CA, from the bundle the controller read once at boot: a rotated fetcher CA
 	// reaches only lane workers created after a controller restart, and an existing lane
@@ -1205,8 +1210,11 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	if len(cfg.workerCABundle()) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch
 		// with no custom dispatcher, so trusting the cluster CA (plus any extra CA) is
-		// pure pod spec — nothing in agent/ parses a CA today and nothing needs to.
+		// pure pod spec. Codex provider trust uses the separate extra-only bundle below.
 		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
+	}
+	if !w.Isolated && len(cfg.ExtraCAPEM) > 0 {
+		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_CA_FILE", Value: cfg.secretMountPath() + "/" + codexExtraCACertKey})
 	}
 	if len(cfg.ExtraCAPEM) > 0 && (!cfg.UIDSplit || w.Isolated) {
 		// The Claude CLI's own trust (agent/src/sdk-env.ts): only when an extra CA exists,

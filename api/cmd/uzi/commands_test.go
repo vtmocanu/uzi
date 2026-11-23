@@ -73,7 +73,7 @@ func TestCommandTree(t *testing.T) {
 		"project-sync": {"status", "resync"},
 		"handoff":      {"rm", "review"},
 		"job":          {"create", "get", "result", "cancel", "list", "files", "file"},
-		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products", "review-bots", "maintenance"},
+		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products", "review-bots", "maintenance", "run-writers"},
 		"skill":        {"status", "install"},
 		"auth":         {"token", "status"},
 	}
@@ -552,7 +552,7 @@ func TestReviewShowJudgeSkip(t *testing.T) {
 		{"codex", "no_usable_credential", "Judge skipped 2026-11-10: Codex had no usable credential."},
 		{"codex", "credential_disabled", "Judge skipped 2026-11-10: the Codex credential is disabled."},
 		{"codex", "codex_pool_unavailable", "Judge skipped 2026-11-10: no pooled Codex account was available."},
-		{"claude", "provider_lane_unsupported", "Judge skipped 2026-11-10: the Claude source is a model provider, which the judge does not support yet."},
+		{"claude", "provider_lane_unsupported", "Judge skipped 2026-11-10: the selected source is a model provider, which the judge does not support yet."},
 		{"claude", "no_usable_credential", "Judge skipped 2026-11-10: Claude had no usable credential."},
 	}
 	for _, tc := range cases {
