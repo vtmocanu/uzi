@@ -216,8 +216,8 @@ async function withSleeper(fn: (f: SleeperFixture) => Promise<void>): Promise<vo
 /**
  * Runs passes until one drops the run's caches, classifying each attempt. At most MAX_ATTEMPTS
  * attempts and MAX_WALL_MS of wall time, both checked between attempts: the caps cannot preempt
- * an in-flight scan, so the worst case is 10 s plus one scan (about 35 s: a 30 s scan budget plus
- * 5 s helper slack).
+ * an in-flight scan, so the worst case is 10 s plus one scan of up to 35 s (a 30 s scan budget
+ * plus 5 s helper slack): about 45 s.
  *
  * The only retried case is a kept pass whose scan was incomplete with zero pids. A kept pass with
  * an attributed pid (complete or not) fails at once: the child is gone, so a pid is a real finding.
@@ -234,6 +234,7 @@ async function passUntilDropped(
     const summary = await runDiskReclaimPass(base);
     const scans = records.slice(before);
     const last = scans[scans.length - 1];
+    assert.ok(scans.every((r) => r.budgetMs === 30_000), `attempt ${attempt}: every scan budget is 30 s: ${JSON.stringify(scans.map((r) => r.budgetMs))}`);
     if (summary.cachesDropped === 1) {
       if (last === undefined) throw new Error(`attempt ${attempt} dropped without a recorded scan (deadline/budget)`);
       assert.ok(last.result.complete && last.result.pids.length === 0, `attempt ${attempt} dropped on a scan that was not complete and empty: ${describeScans(scans)}`);
