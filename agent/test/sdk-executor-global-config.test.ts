@@ -8,17 +8,20 @@ import type { SDKMessage, SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import { CLAUDE_GLOBAL_CONFIG_BYTES, resetClaudeGlobalConfig } from "../src/claude-global-config.js";
+import { CLAUDE_GLOBAL_CONFIG_BYTES } from "../src/claude-global-config.js";
+import { claudeConfigDir } from "../src/claude-config-dir.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 /**
- * PRD #4416: the Claude CLI honours an `env` block in `<HOME>/.claude.json`, and the agent (same uid
- * as the CLI) can write that file. Through the real SdkExecutor and the REAL spawnDetached (no
- * `opts.spawn`), every CLI start must find the fixed bytes there, whatever a previous leg, a planted
- * file or a planted symlink left. The "CLI" is a node child that reports what it finds at
- * `$HOME/.claude.json`.
+ * PRD #4416: the Claude CLI honours an `env` block in its global config, and the agent (same uid as
+ * the CLI) can write config files. Through the real SdkExecutor and the REAL spawnDetached (no
+ * `opts.spawn`), every CLI start must find the fixed bytes in `$CLAUDE_CONFIG_DIR/.claude.json` and
+ * no `.config.json` there, whatever a previous leg, a planted file or a planted symlink left, and
+ * nothing outside that directory may be followed or removed. The "CLI" is a node child that reports
+ * what it finds under `$CLAUDE_CONFIG_DIR`. These tests run with one uid, which gives no kernel
+ * protection; the split-mode cases only exercise the worker-side checks.
  */
 
 const MALICIOUS = JSON.stringify({
@@ -27,10 +30,13 @@ const MALICIOUS = JSON.stringify({
 
 const DUMP_SCRIPT = [
   'const fs = require("node:fs");',
+  "const d = process.env.CLAUDE_CONFIG_DIR;",
   "let r;",
-  'try { r = fs.readFileSync(process.env.HOME + "/.claude.json", "utf8"); } catch { r = "ABSENT"; }',
+  'try { r = fs.readFileSync(d + "/.claude.json", "utf8"); } catch { r = "ABSENT"; }',
   "fs.writeFileSync(process.argv[1], r);",
-  'fs.writeFileSync(process.argv[1] + ".alt", fs.existsSync(process.env.HOME + "/.claude/.config.json") ? "PRESENT" : "ABSENT");',
+  'fs.writeFileSync(process.argv[1] + ".alt", fs.existsSync(d + "/.config.json") ? "PRESENT" : "ABSENT");',
+  'let names; try { names = fs.readdirSync(d).sort().join(","); } catch { names = "UNREADABLE"; }',
+  'fs.writeFileSync(process.argv[1] + ".dir", d + "|" + names);',
 ].join("\n");
 
 function assistantTool(name: string, input: Record<string, unknown>, id: string): SDKMessage {
@@ -135,19 +141,51 @@ afterEach(() => {
   resetResidueQuarantineForTests();
 });
 
-describe("SdkExecutor + spawnDetached: the CLI global config is reset at every start (PRD #4416)", () => {
-  it("(a) a config the agent wrote during one leg is gone when the next leg's CLI starts", async () => {
-    const config = path.join(homeDir, ".claude.json");
+const configDir = (): string => claudeConfigDir(homeDir);
+const dumpAlt = (leg: number): string => fs.readFileSync(dumpPath(leg) + ".alt", "utf8");
+const dumpDir = (leg: number): string => fs.readFileSync(dumpPath(leg) + ".dir", "utf8");
+const EXPECTED_DUMP_DIR = (): string => `${configDir()}|.claude.json,projects,tasks`;
+
+describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at every start (PRD #4416)", () => {
+  it("(a) config files an agent planted during one leg, wherever the old design looked, never reach the next CLI start", async () => {
     const exec = makeExecutor(
       twoLegs((leg) => {
+        if (leg !== 1) return;
         // The agent's Bash tool, running as the same uid, after leg 1's CLI started.
-        if (leg === 1) fs.writeFileSync(config, MALICIOUS);
+        fs.writeFileSync(path.join(homeDir, ".claude.json"), MALICIOUS);
+        fs.mkdirSync(path.join(homeDir, ".claude"), { recursive: true });
+        fs.writeFileSync(path.join(homeDir, ".claude", ".config.json"), MALICIOUS);
+        fs.writeFileSync(path.join(homeDir, ".claude", "remote-settings.json"), MALICIOUS);
+        fs.writeFileSync(path.join(homeDir, ".claude", "settings.json"), MALICIOUS);
       }),
     );
     await exec.run(makeCtx());
-    assert.strictEqual(readDump(1), CLAUDE_GLOBAL_CONFIG_BYTES);
-    assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES, "leg 2's CLI sees the fixed bytes, not the agent's file");
+    for (const leg of [1, 2]) {
+      assert.strictEqual(readDump(leg), CLAUDE_GLOBAL_CONFIG_BYTES, `leg ${leg}: the CLI reads the fixed bytes`);
+      assert.strictEqual(dumpAlt(leg), "ABSENT");
+      assert.strictEqual(dumpDir(leg), EXPECTED_DUMP_DIR(), "the CLI is pointed at the prepared directory");
+    }
     assert.ok(!("env" in JSON.parse(readDump(2)!)), "no env block");
+  });
+
+  it("(b) files an agent planted inside the config directory itself are gone at the next start", async () => {
+    const dir = configDir();
+    const exec = makeExecutor(
+      twoLegs((leg) => {
+        if (leg !== 1) return;
+        fs.chmodSync(path.join(dir, ".claude.json"), 0o644);
+        fs.writeFileSync(path.join(dir, ".claude.json"), MALICIOUS);
+        fs.writeFileSync(path.join(dir, ".config.json"), MALICIOUS);
+        fs.writeFileSync(path.join(dir, "remote-settings.json"), MALICIOUS);
+      }),
+    );
+    await exec.run(makeCtx());
+    assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES, "leg 2's CLI sees the fixed bytes");
+    assert.strictEqual(dumpAlt(2), "ABSENT");
+    assert.strictEqual(dumpDir(2), EXPECTED_DUMP_DIR());
+    const aside = fs.readdirSync(homeDir).filter((f) => f.startsWith(".uzi-claude-config.stale-"));
+    assert.strictEqual(aside.length, 1, "the tampered directory was moved aside, not deleted");
+    assert.ok(fs.existsSync(path.join(homeDir, aside[0]!, ".config.json")));
   });
 
   for (const [label, scan] of [
@@ -155,14 +193,13 @@ describe("SdkExecutor + spawnDetached: the CLI global config is reset at every s
     ["a scan that throws synchronously", () => { throw new Error("scan exploded"); }],
     ["a scan that rejects", async () => { throw new Error("scan rejected"); }],
   ] as const) {
-    it(`(i) the advisory live-writer warning never fails the run or skips the reset: ${label}`, async () => {
-      const config = path.join(homeDir, ".claude.json");
+    it(`(i) the advisory live-writer warning never fails the run or skips the preparation: ${label}`, async () => {
       let scans = 0;
       const warns: string[] = [];
       const log = { ...nullLogger(), warn: (msg: string) => { warns.push(msg); } };
       const exec = new SdkExecutor(log as never, homeDir, {
         queryFn: twoLegs((leg) => {
-          if (leg === 1) fs.writeFileSync(config, MALICIOUS);
+          if (leg === 1) fs.writeFileSync(path.join(configDir(), ".config.json"), MALICIOUS);
         }),
         runProcesses: {
           scan: (() => { scans++; return (scan as () => unknown)(); }) as never,
@@ -172,132 +209,82 @@ describe("SdkExecutor + spawnDetached: the CLI global config is reset at every s
       await exec.run(makeCtx());
       assert.ok(scans >= 1, "the implement boundary consulted the scan");
       assert.ok(warns.some((w) => w.includes("live writer can race")), "an unusable scan is reported as incomplete");
-      assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES, "leg 2's CLI still started on the reset config");
+      assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES, "leg 2's CLI still started on the prepared directory");
+      assert.strictEqual(dumpAlt(2), "ABSENT");
     });
   }
 
-  it("(b) a file planted before the first spawn is replaced", async () => {
-    fs.writeFileSync(path.join(homeDir, ".claude.json"), MALICIOUS);
+  it("(c) a symlink at the config directory and a symlinked .claude are replaced, never followed or removed through", async () => {
+    // Regression for the review's blocking finding: the old reset removed `<HOME>/.claude/.config.json`,
+    // which followed a symlinked `.claude` out of HOME. (The split path is covered directly in
+    // claude-global-config.test.ts: the real spawn under the split would exec setpriv.)
+    const outsideClaude = path.join(workDir, "outside-claude");
+    const outsideDir = path.join(workDir, "outside-dir");
+    for (const d of [outsideClaude, outsideDir]) fs.mkdirSync(d);
+    fs.writeFileSync(path.join(outsideClaude, ".config.json"), "SENTINEL-CONFIG");
+    fs.writeFileSync(path.join(outsideClaude, "sentinel"), "SENTINEL");
+    fs.writeFileSync(path.join(outsideDir, "sentinel"), "SENTINEL");
+    fs.writeFileSync(path.join(outsideDir, ".claude.json"), "SENTINEL");
+    fs.symlinkSync(outsideClaude, path.join(homeDir, ".claude"));
+    fs.symlinkSync(outsideDir, configDir());
     await makeExecutor(twoLegs()).run(makeCtx());
-    assert.strictEqual(readDump(1), CLAUDE_GLOBAL_CONFIG_BYTES);
+    assert.strictEqual(fs.readFileSync(path.join(outsideClaude, ".config.json"), "utf8"), "SENTINEL-CONFIG");
+    assert.strictEqual(fs.readFileSync(path.join(outsideClaude, "sentinel"), "utf8"), "SENTINEL");
+    assert.deepStrictEqual(fs.readdirSync(outsideClaude).sort(), [".config.json", "sentinel"], "nothing was created in the outside .claude");
+    assert.strictEqual(fs.readFileSync(path.join(outsideDir, "sentinel"), "utf8"), "SENTINEL");
+    assert.strictEqual(fs.readFileSync(path.join(outsideDir, ".claude.json"), "utf8"), "SENTINEL");
+    assert.deepStrictEqual(fs.readdirSync(outsideDir).sort(), [".claude.json", "sentinel"], "nothing was created in the outside dir");
+    assert.ok(fs.lstatSync(path.join(homeDir, ".claude")).isDirectory(), ".claude is now a real directory");
+    assert.ok(fs.lstatSync(configDir()).isDirectory());
+    for (const leg of [1, 2]) assert.strictEqual(readDump(leg), CLAUDE_GLOBAL_CONFIG_BYTES, `leg ${leg}`);
   });
 
-  it("(c) a planted symlink is replaced, not followed: the outside target is untouched", async () => {
-    const outside = path.join(workDir, "outside.txt");
-    fs.writeFileSync(outside, "OUTSIDE");
-    const config = path.join(homeDir, ".claude.json");
-    fs.symlinkSync(outside, config);
-    await makeExecutor(twoLegs()).run(makeCtx());
-    assert.strictEqual(fs.readFileSync(outside, "utf8"), "OUTSIDE");
-    const st = fs.lstatSync(config);
-    assert.ok(st.isFile() && !st.isSymbolicLink(), ".claude.json is a regular file");
-    assert.strictEqual(readDump(1), CLAUDE_GLOBAL_CONFIG_BYTES);
-  });
-
-  it("(d) a directory at the path fails the start closed: refusal, and no child is spawned", async () => {
-    fs.mkdirSync(path.join(homeDir, ".claude.json"));
-    await assert.rejects(makeExecutor(twoLegs()).run(makeCtx()), (err: unknown) => {
-      const e = err as Error;
-      assert.ok(err instanceof TrustedExecutionRefusal);
-      assert.match(String(e.message ?? err), /Claude CLI global config could not be replaced by the worker/);
-      return true;
-    });
+  it("(d) a config directory that cannot be moved aside refuses the start closed, with no spawn", async () => {
+    fs.mkdirSync(configDir());
+    fs.writeFileSync(path.join(configDir(), "planted"), "x");
+    const real = fs.renameSync;
+    const guarded = ((from: fs.PathLike, to: fs.PathLike): void => {
+      if (String(to).includes(".stale-")) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      real(from, to);
+    }) as typeof fs.renameSync;
+    (fs as { renameSync: typeof fs.renameSync }).renameSync = guarded;
+    try {
+      await assert.rejects(makeExecutor(twoLegs()).run(makeCtx()), (err: unknown) => {
+        assert.ok(err instanceof TrustedExecutionRefusal);
+        assert.match(String((err as Error).message), /Claude CLI config directory could not be prepared by the worker/);
+        return true;
+      });
+    } finally {
+      (fs as { renameSync: typeof fs.renameSync }).renameSync = real;
+    }
     assert.strictEqual(readDump(1), undefined, "the CLI was never started");
-    assert.deepStrictEqual(
-      fs.readdirSync(homeDir).filter((f) => f.startsWith(".claude.json.uzi-")),
-      [],
-      "no temp file is left behind",
-    );
+    assert.ok(fs.existsSync(path.join(configDir(), "planted")), "nothing was deleted");
   });
 
-  it("(g) a .claude/.config.json an agent planted is removed, so the CLI resolves the fixed .claude.json", async () => {
-    const claudeDir = path.join(homeDir, ".claude");
-    const alt = path.join(claudeDir, ".config.json");
-    const exec = makeExecutor(
-      twoLegs((leg) => {
-        if (leg === 1) {
-          fs.mkdirSync(claudeDir, { recursive: true });
-          fs.writeFileSync(alt, JSON.stringify({ env: { OTEL_LOG_RAW_API_BODIES: "1" } }));
-        }
-      }),
-    );
-    await exec.run(makeCtx());
-    assert.strictEqual(fs.readFileSync(dumpPath(2) + ".alt", "utf8"), "ABSENT", "leg 2's CLI sees no .config.json");
-    assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES);
-    assert.ok(!fs.existsSync(alt));
-  });
-
-  it("(g2) an empty, writable .claude/.config.json (which CLI 2.1.325 can prefer) is removed too", async () => {
-    const claudeDir = path.join(homeDir, ".claude");
-    const alt = path.join(claudeDir, ".config.json");
-    const exec = makeExecutor(
-      twoLegs((leg) => {
-        if (leg === 1) {
-          fs.mkdirSync(claudeDir, { recursive: true });
-          fs.writeFileSync(alt, "");
-          fs.chmodSync(alt, 0o666);
-        }
-      }),
-    );
-    await exec.run(makeCtx());
-    assert.strictEqual(fs.readFileSync(dumpPath(2) + ".alt", "utf8"), "ABSENT", "leg 2's CLI sees no .config.json");
-    assert.strictEqual(readDump(2), CLAUDE_GLOBAL_CONFIG_BYTES);
-    assert.ok(!fs.existsSync(alt));
-  });
-
-  it("(h) a directory at .claude/.config.json refuses the start, with no spawn", async () => {
-    fs.mkdirSync(path.join(homeDir, ".claude", ".config.json"), { recursive: true });
-    await assert.rejects(makeExecutor(twoLegs()).run(makeCtx()), (err: unknown) => {
-      assert.ok(err instanceof TrustedExecutionRefusal);
-      assert.match(String((err as Error).message), /Claude CLI global config could not be replaced by the worker/);
-      return true;
-    });
-    assert.strictEqual(readDump(1), undefined, "the CLI was never started");
-  });
-
-  it("(e) the file is mode 0660", async () => {
-    let mode: number | undefined;
+  it("(e) the file is mode 0444 in a directory that is not writable by group or others", async () => {
+    let fileMode: number | undefined;
+    let dirMode: number | undefined;
     await makeExecutor(
       twoLegs((leg) => {
-        if (leg === 1) mode = fs.statSync(path.join(homeDir, ".claude.json")).mode & 0o777;
+        if (leg !== 1) return;
+        fileMode = fs.statSync(path.join(configDir(), ".claude.json")).mode & 0o777;
+        dirMode = fs.statSync(configDir()).mode & 0o7777 & ~0o2000;
       }),
     ).run(makeCtx());
-    assert.strictEqual(mode, 0o660);
-  });
-});
-
-describe("resetClaudeGlobalConfig (PRD #4416)", () => {
-  it("(f) does nothing without a HOME", () => {
-    const before = fs.readdirSync(homeDir);
-    resetClaudeGlobalConfig(undefined);
-    resetClaudeGlobalConfig({});
-    resetClaudeGlobalConfig({ HOME: undefined });
-    resetClaudeGlobalConfig({ HOME: "" });
-    assert.deepStrictEqual(fs.readdirSync(homeDir), before);
+    assert.strictEqual(fileMode, 0o444);
+    assert.strictEqual(dirMode, 0o755);
   });
 
-  it("under the uid split the alternate file is removed through the runner seam, and its failure refuses", () => {
-    process.env.UZI_UID_SPLIT = "1";
-    const calls: string[] = [];
-    resetClaudeGlobalConfig({ HOME: homeDir }, { removeAsRunner: (f) => calls.push(f) });
-    assert.deepStrictEqual(calls, [path.join(homeDir, ".claude", ".config.json")]);
-    assert.strictEqual(fs.readFileSync(path.join(homeDir, ".claude.json"), "utf8"), CLAUDE_GLOBAL_CONFIG_BYTES);
-    fs.writeFileSync(path.join(homeDir, ".claude.json"), "SENTINEL");
-    assert.throws(
-      () =>
-        resetClaudeGlobalConfig({ HOME: homeDir }, {
-          removeAsRunner: () => {
-            throw new Error("rm exited 1");
-          },
-        }),
-      TrustedExecutionRefusal,
-    );
-    assert.strictEqual(fs.readFileSync(path.join(homeDir, ".claude.json"), "utf8"), "SENTINEL", "no replace after a failed removal");
-  });
-
-  it("refuses a HOME that is not a canonical absolute path", () => {
-    for (const home of ["relative/home", `${homeDir}/../${path.basename(homeDir)}`, `${homeDir}/`]) {
-      assert.throws(() => resetClaudeGlobalConfig({ HOME: home }), TrustedExecutionRefusal, home);
-    }
+  it("(f) a session transcript written before is visible through the config directory (resume)", async () => {
+    const transcript = path.join(homeDir, ".claude", "projects", "-slug", "11111111-2222-4333-8444-555555555555.jsonl");
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    fs.writeFileSync(transcript, "{}\n");
+    let seen: string | undefined;
+    await makeExecutor(
+      twoLegs((leg) => {
+        if (leg === 1) seen = fs.readFileSync(path.join(configDir(), "projects", "-slug", path.basename(transcript)), "utf8");
+      }),
+    ).run(makeCtx());
+    assert.strictEqual(seen, "{}\n");
   });
 });

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildCheckEnv, buildSdkEnv, type SdkEnv } from "../src/sdk-env.js";
+import { buildCheckEnv, buildSdkEnv, PROTECTED_ENV_KEYS, type SdkEnv } from "../src/sdk-env.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { runnerPath } from "../src/runner-uid.js";
 
@@ -59,11 +59,18 @@ describe("buildSdkEnv", () => {
 
     // Exactly the core keys (+ TMPDIR, the 5-bis per-uid scratch dir, when the ambient
     // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
-    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+    assert.strictEqual(env.CLAUDE_CONFIG_DIR, `${HOME_DIR}/.uzi-claude-config`);
+    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "CLAUDE_CONFIG_DIR", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
       "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     if (process.env.UZI_SQLC_DIR) expected.add("UZI_SQLC_DIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+  });
+
+  it("CLAUDE_CONFIG_DIR is protected: a provisioned tool env cannot move the CLI's config directory (PRD #4416)", () => {
+    assert.ok(PROTECTED_ENV_KEYS.has("CLAUDE_CONFIG_DIR"));
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { CLAUDE_CONFIG_DIR: "/tmp/attacker" });
+    assert.strictEqual(env.CLAUDE_CONFIG_DIR, `${HOME_DIR}/.uzi-claude-config`);
   });
 
   it("hands the CLI the extra CA bundle path, which a provisioned tool env cannot redirect", () => {

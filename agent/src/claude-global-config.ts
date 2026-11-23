@@ -1,138 +1,391 @@
-// Reset the Claude CLI's global config (`<HOME>/.claude.json`) before every CLI start (PRD #4416).
+// Prepare the Claude CLI's config directory before every CLI start (PRD #4416).
 //
-// Threat. The pinned Claude CLI honours an `env` block in `<HOME>/.claude.json` (for example
-// OTEL_LOG_RAW_API_BODIES, NODE_OPTIONS or ANTHROPIC_BASE_URL), and does so regardless of
-// `settingSources: []`. The CLI runs as the runner uid and so does the agent's Bash tool, so the
-// agent can write that file during one turn and the next CLI start reads it, with the provider
-// credential already in its environment. This module replaces the file with fixed bytes that carry
-// no `env` key immediately before each spawn (sdk-spawn.ts spawnDetached), and never reads or
-// parses what was there.
+// Threat. The pinned Claude CLI honours an `env` block in its global config (for example
+// OTEL_LOG_RAW_API_BODIES, NODE_OPTIONS or ANTHROPIC_BASE_URL), regardless of `settingSources: []`.
+// The CLI runs as the runner uid and so does the agent's Bash tool, so an agent that can write
+// the config can change the next CLI start's environment, with the provider credential already in
+// it. An earlier form of this module replaced `<HOME>/.claude.json` with fixed bytes before each
+// spawn and removed `<HOME>/.claude/.config.json`. Review found that the removal followed a
+// symlinked `.claude` out of HOME, and that a live runner-uid process could rewrite either file
+// between the reset and the CLI's read, or while the CLI ran, or place `.claude/remote-settings.json`.
 //
-// Form. A temp file is created exclusively (O_CREAT|O_EXCL|O_NOFOLLOW) next to the target and
-// renamed over it: rename replaces a planted symlink (it does not follow it), and the old inode is
-// never opened by the worker, so the worker never writes through a planted path. The target is
-// never unlinked first, so a failed rename leaves the previous state, not a missing file. In a
-// HOME that is not sticky a live runner-uid process can still swap the temp entry before the
-// rename and so publish a file of its own; that is part of the live-writer residual below.
+// Policy. The CLI is pointed at a directory the runner cannot change, with CLAUDE_CONFIG_DIR
+// (sdk-env.ts sets it to claudeConfigDir(HOME), a protected key; spawnDetached refuses to start a
+// CLI whose CLAUDE_CONFIG_DIR is anything else). The CLI then reads `<dir>/.claude.json` and nothing
+// under `<HOME>/.claude` that carries configuration: a planted `<HOME>/.claude.json`,
+// `<HOME>/.claude/.config.json`, `<HOME>/.claude/settings.json` and
+// `<HOME>/.claude/remote-settings.json` are not consulted. The directory holds exactly:
+//   .claude.json   the fixed bytes CLAUDE_GLOBAL_CONFIG_BYTES, mode 0444
+//   projects       symlink to ../.claude/projects  (transcripts, so resume and -c keep working)
+//   tasks          symlink to ../.claude/tasks     (the task-list tools need a writable tasks dir)
+// and is worker-owned, mode 0755 (a setgid bit inherited from HOME is tolerated), never group- or
+// world-writable. Only those two links are made: session-env and shell-snapshots (sourced by Bash),
+// plugins, hooks, skills, commands and agents (configuration and code) are deliberately not linked,
+// so the CLI finds them absent in a directory it cannot create them in. Only ONE of `.claude.json`
+// and `.config.json` is present, because the CLI prints a warning when both exist and prefers
+// `.config.json`.
 //
-// Alternate file. The pinned CLI (2.1.325; same file set as 2.1.319) resolves its global config
-// from `<CLAUDE_CONFIG_DIR or HOME/.claude>/.config.json` first: a regular file there that is
-// non-empty, or (from 2.1.325) empty with a write bit set, can win over `<HOME>/.claude.json`, so
-// an agent can plant an env block there with no process alive. The removal below is
-// unconditional, so it covers every size and mode.
-// Before the replace, that file is removed so the resolver returns `<HOME>/.claude.json`. Under
-// the uid split the `.claude` directory is normally created by the CLI as the runner uid, which
-// the worker cannot unlink inside, so the removal runs as the runner uid (`rm -f`); without the
-// split it is a plain unlink. Failure (non-zero exit, timeout, signal, a directory at the path)
-// is a refusal. Without the split, ENOTDIR (`.claude` is a file) is accepted as absent: the CLI's
-// stat of the file then fails and its resolver falls back to `.claude.json`. Under the split the
-// image's busybox `rm -f` exits non-zero on ENOTDIR, so that state refuses the start (fail closed).
-// The `.claude<oauth suffix>.json` variants are chosen only with CLAUDE_CODE_CUSTOM_OAUTH_URL,
-// and the repo-variable name rules deny the `CLAUDE_` prefix, so they are out of scope.
+// Probes (pinned CLI 2.1.325, fake API): with a non-writable directory of exactly this shape the
+// CLI starts, its saves fail silently with no temp files, Bash/Read/Write/Edit work, transcripts
+// land in `<HOME>/.claude/projects` through the link, and `--resume <id>` and `-c` find them;
+// TaskCreate works only with the `tasks` link (target writable). A directory the CLI CAN write
+// gives no protection: it renames over 0444 files. An `env` block written to the config while the
+// CLI runs has no effect (the environment is read at startup), and an unsigned remote-settings
+// env block was never applied.
 //
-// Mode. 0660 with the group the HOME hands down (runner for run and chat HOMEs; job HOMEs
-// differ; there is no setgid on single-uid). The CLI saves its config in place (open O_WRONLY,
-// truncate) after its rename is refused with EPERM; that applies to the sticky shared chat root
-// only, and the in-place write needs group write. The CLI's follow-up chmod to 0600 fails for a
-// non-owner and is ignored by the CLI.
+// Boundary. Under the uid split (uidSplitActive) HOME must be a real directory owned by the
+// worker uid; this module adds the sticky bit to it, so the group-writable runner can create
+// entries in HOME but cannot rename, replace or unlink the worker-owned config directory, and the
+// directory itself grants the runner no write. It also refuses a HOME whose parent is
+// world-writable without the sticky bit. A group-writable parent is NOT refused: the data root is
+// 2775 on a hosted volume (entrypoint.sh align_pvc_root) and the chat HOME is `<dataDir>/agent-home`
+// itself, so refusing it would stop every chat start. HOME's own entry is therefore protected by the
+// data-root layout, not by this module: per-run HOMEs live in the sticky `agent-home` root (3775),
+// job HOMEs under a 2750 root, cross-check and model-pass HOMEs in the sticky tmp dir (ADR-4416,
+// "Global CLI config input"). Within that layout the runner cannot create or change anything in the
+// config directory for the whole launch. One uid
+// (a k8s single-uid start, or these tests) gives NO protection: the CLI and the agent are the
+// worker's own uid, so the CLI can write the directory and the agent can alter it between the last
+// check and the CLI's read; the checks below then only repair what an earlier turn left. Kernel
+// enforcement of the sticky and ownership boundary cannot be shown with one uid and is not tested.
 //
-// Fail closed. A directory (or anything else rename cannot replace) at that path makes the start
-// throw a TrustedExecutionRefusal before any process is spawned.
+// Reuse and rebuild. The directory is never opened through a symlink and nothing in it is ever
+// deleted. A real directory with exactly the expected entries in the expected state is reused (so
+// concurrent chats sharing the chat HOME see no churn); a `.claude.json` with other bytes or mode
+// is replaced through a temp file and rename. Anything else (absent, a file, a symlink, another
+// owner or mode, an unexpected entry, a different link target) is renamed aside within HOME to
+// `.uzi-claude-config.stale-<hex>` (rename does not follow a symlink) and a fresh directory is
+// built under a temp name and renamed into place, so it is never visible half built and two
+// prepares cannot destroy each other's good directory. A failed rename aside refuses the start.
+// The aside copies stay until the HOME is reclaimed with the rest of it (rmtree.ts rmHomeTree).
+// Under one uid every CLI save adds entries (backups, plugins, sessions), so each later start
+// renames the directory aside again: a documented cost of having no protection there.
 //
-// Residuals: ADR-4416, section "Global CLI config input", lists them as pending owner decisions
-// (among them a live runner-uid writer racing the startup read or swapping the temp entry, and a
-// write while the CLI runs, since the CLI watches the file). The reset narrows the window to the
-// spawn; it does not close those.
+// Targets. `<HOME>/.claude/projects` and `<HOME>/.claude/tasks` must exist and be writable by the
+// CLI. Absent: created (group-writable, setgid). `.claude` that is not a real directory (a
+// symlink, a file) is renamed aside, never followed, and recreated. If `projects` is not a
+// directory, or is missing and cannot be created in a `.claude` the worker cannot write, `.claude`
+// is renamed aside and recreated: the transcripts stay in the aside copy, so a resume of that
+// session finds nothing. A missing, uncreatable `tasks` is left alone (TaskCreate then fails
+// soft). A `.claude` the worker cannot even open (a runner-private 0700 one) is left as is.
+// Creation goes through a descriptor opened with O_NOFOLLOW, so a swap of `.claude` for a symlink
+// between check and use cannot redirect a worker write.
+//
+// Not reset any more: `<HOME>/.claude.json` and `<HOME>/.claude/*` are not read by the CLI, so
+// they are no longer replaced or removed.
+//
+// No HOME in the env: no-op (the probe-style spawns that carry no HOME do not start a CLI).
 import { randomBytes } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { claudeConfigDir, CLAUDE_CONFIG_DIR_NAME } from "./claude-config-dir.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
-import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
-const RM_BIN = "/bin/rm";
-const RM_TIMEOUT_MS = 5000;
-
-/** Injectable seam; production callers pass nothing. */
-export interface ResetDeps {
-  /** Remove `file` as the runner uid (`rm -f`); must throw on any failure. */
-  removeAsRunner?: (file: string) => void;
-}
-
-function removeAsRunnerDefault(file: string): void {
-  const cmd = runnerCommand(RM_BIN, ["-f", "--", file], true);
-  const r = spawnSync(cmd.command, cmd.args, {
-    // A fixed, worker-authored argv that runs no repo- or agent-configured code: worker-marked
-    // (runner-spawn-sites.test.ts), so the run-quiescence reaper never kills it.
-    env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
-    shell: false,
-    stdio: "ignore",
-    timeout: RM_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-  });
-  if (r.error) throw r.error;
-  if (r.signal) throw new Error(`rm ended by signal ${r.signal}`);
-  if (r.status !== 0) throw new Error(`rm exited ${r.status}`);
-}
-
-function removeAlternateConfig(home: string, deps: ResetDeps): void {
-  const alt = path.join(home, ".claude", ".config.json");
-  if (uidSplitActive()) {
-    (deps.removeAsRunner ?? removeAsRunnerDefault)(alt);
-    return;
-  }
-  try {
-    fs.unlinkSync(alt);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
-  }
-}
-
-/** The bytes written to `<HOME>/.claude.json`: truthy `hasCompletedOnboarding` and `numStartups`,
+/** The bytes of `<config dir>/.claude.json`: truthy `hasCompletedOnboarding` and `numStartups`,
  *  so the CLI treats it as a populated config and uses it directly (never falling back to a
  *  backup, which it does only for an empty or whitespace file), and no `env` key. */
 export const CLAUDE_GLOBAL_CONFIG_BYTES = '{"hasCompletedOnboarding":true,"numStartups":1}\n';
 
-const REFUSAL = "Claude CLI global config could not be replaced by the worker";
+const REFUSAL = "Claude CLI config directory could not be prepared by the worker";
 
-/** Replace `<env.HOME>/.claude.json` with {@link CLAUDE_GLOBAL_CONFIG_BYTES}. No-op without a HOME. */
-export function resetClaudeGlobalConfig(
+const CONFIG_FILE = ".claude.json";
+/** The only symlinks in the config directory, name -> relative target. */
+const LINKS: ReadonlyArray<readonly [string, string]> = [
+  ["projects", "../.claude/projects"],
+  ["tasks", "../.claude/tasks"],
+];
+const EXPECTED_ENTRIES = [CONFIG_FILE, ...LINKS.map(([n]) => n)].sort();
+const MAX_ATTEMPTS = 4;
+
+const DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+const FD_DIR = "/proc/self/fd";
+
+/** Test-only seam: called with a step name before each stage, so a test can act as a hostile
+ *  process at that point. Production callers pass nothing. */
+export interface PrepareDeps {
+  onStep?: (name: string) => void;
+}
+
+const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException | undefined)?.code;
+const hex = (): string => randomBytes(8).toString("hex");
+
+function refuse(reason: string): TrustedExecutionRefusal {
+  return new TrustedExecutionRefusal(`Claude CLI config directory refused: ${reason}`);
+}
+
+/**
+ * Prepare `<env.HOME>/.uzi-claude-config` for a CLI start, or throw a TrustedExecutionRefusal
+ * before any process is spawned. No-op without a HOME. `env.CLAUDE_CONFIG_DIR` must be exactly that
+ * directory.
+ */
+export function prepareClaudeConfigDir(
   env: Record<string, string | undefined> | undefined,
-  deps: ResetDeps = {},
+  deps: PrepareDeps = {},
 ): void {
   const home = env?.HOME;
   if (home === undefined || home === "") return;
-  if (!path.isAbsolute(home) || path.resolve(home) !== home) {
-    throw new TrustedExecutionRefusal("Claude CLI global config refused: HOME is not a canonical absolute path");
-  }
-  const target = path.join(home, ".claude.json");
-  const tmp = `${target}.uzi-${randomBytes(8).toString("hex")}`;
+  if (!path.isAbsolute(home) || path.resolve(home) !== home) throw refuse("HOME is not a canonical absolute path");
+  const dir = claudeConfigDir(home);
+  if (env?.CLAUDE_CONFIG_DIR !== dir) throw refuse("CLAUDE_CONFIG_DIR is not the worker-prepared directory");
+  const step = (name: string): void => deps.onStep?.(name);
   try {
-    removeAlternateConfig(home, deps);
+    step("home");
+    guardHome(home);
+    step("targets");
+    ensureTargets(home, step);
+    ensureConfigDir(home, dir, step);
   } catch (err) {
+    if (err instanceof TrustedExecutionRefusal) throw err;
     throw new TrustedExecutionRefusal(REFUSAL, { cause: err });
   }
+}
+
+/** HOME must be a real directory; under the split it must be the worker's and sticky, and not in a
+ *  world-writable, non-sticky parent (see the header's Boundary). */
+function guardHome(home: string): void {
+  const st = fs.lstatSync(home);
+  if (!st.isDirectory()) throw refuse("HOME is not a real directory");
+  if (!uidSplitActive()) return;
+  const uid = process.getuid?.();
+  if (uid !== undefined && st.uid !== uid) throw refuse("HOME is not owned by the worker");
+  const parent = fs.statSync(path.dirname(home));
+  if ((parent.mode & 0o002) !== 0 && (parent.mode & 0o1000) === 0) {
+    throw refuse("HOME's parent is world-writable and not sticky");
+  }
+  if ((st.mode & 0o1000) === 0) fchmodDir(home, (st.mode & 0o7777) | 0o1000);
+}
+
+/** chmod a directory through a descriptor opened with O_NOFOLLOW, never through a symlink. */
+function fchmodDir(p: string, mode: number): void {
+  const fd = fs.openSync(p, DIR_FLAGS);
   try {
-    const fd = fs.openSync(
-      tmp,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-      0o660,
-    );
+    fs.fchmodSync(fd, mode);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Rename `p` to a sibling `<name>.stale-<hex>`. rename(2) does not follow a symlink at `p`. */
+function renameAside(p: string): void {
+  fs.renameSync(p, `${p}.stale-${hex()}`);
+}
+
+interface Pin {
+  fd: number;
+  /** Path of `name` inside the pinned directory: through the descriptor where /proc has one. */
+  at(name: string): string;
+}
+
+type Opened = Pin | "absent" | "notdir" | "denied";
+
+function openPinned(dirPath: string): Opened {
+  let fd: number;
+  try {
+    fd = fs.openSync(dirPath, DIR_FLAGS);
+  } catch (err) {
+    const c = errCode(err);
+    if (c === "ENOENT") return "absent";
+    if (c === "ELOOP" || c === "ENOTDIR") return "notdir";
+    if (c === "EACCES" || c === "EPERM") return "denied";
+    throw err;
+  }
+  const viaProc = fs.existsSync(FD_DIR);
+  return { fd, at: (name: string) => (viaProc ? `${FD_DIR}/${fd}/${name}` : path.join(dirPath, name)) };
+}
+
+/** Make `<HOME>/.claude/{projects,tasks}` exist, writable by the CLI (see the Targets section). */
+function ensureTargets(home: string, step: (name: string) => void): void {
+  const claude = path.join(home, ".claude");
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const opened = openPinned(claude);
+    if (opened === "denied") return;
+    if (opened === "notdir") {
+      renameAside(claude);
+      step("claude-aside");
+      continue;
+    }
+    if (opened === "absent") {
+      try {
+        fs.mkdirSync(claude, { mode: 0o2775 });
+      } catch (err) {
+        if (errCode(err) !== "EEXIST") throw err;
+      }
+      fchmodDir(claude, 0o2775);
+      continue;
+    }
+    let usable: boolean;
     try {
-      fs.writeSync(fd, CLAUDE_GLOBAL_CONFIG_BYTES);
-      fs.fchmodSync(fd, 0o660);
+      usable = ensureSubdirs(opened);
     } finally {
-      fs.closeSync(fd);
+      fs.closeSync(opened.fd);
     }
-    fs.renameSync(tmp, target);
-  } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* best effort: the temp may never have been created */
-    }
-    throw new TrustedExecutionRefusal(REFUSAL, { cause: err });
+    if (usable) return;
+    renameAside(claude);
+    step("claude-aside");
   }
+  throw refuse("the .claude targets could not be prepared");
+}
+
+/** @returns false when `projects` is unusable and `.claude` must be recreated. */
+function ensureSubdirs(pin: Pin): boolean {
+  for (const name of ["projects", "tasks"] as const) {
+    const required = name === "projects";
+    let st: fs.Stats | undefined;
+    try {
+      st = fs.lstatSync(pin.at(name));
+    } catch (err) {
+      const c = errCode(err);
+      if (c === "EACCES") continue; // a directory the worker cannot look into: not ours to judge
+      if (c !== "ENOENT") throw err;
+    }
+    if (st?.isDirectory()) continue;
+    if (st !== undefined) {
+      if (required) return false;
+      try {
+        fs.renameSync(pin.at(name), pin.at(`${name}.stale-${hex()}`));
+      } catch {
+        continue; // cannot move it: leave it, TaskCreate then fails soft
+      }
+    }
+    try {
+      fs.mkdirSync(pin.at(name), { mode: 0o2775 });
+      fchmodDir(pin.at(name), 0o2775);
+    } catch (err) {
+      const c = errCode(err);
+      if (c === "EEXIST") continue;
+      if (c === "EACCES" || c === "EPERM") {
+        if (required) return false;
+        continue;
+      }
+      throw err;
+    }
+  }
+  return true;
+}
+
+type Seen = { state: "absent" | "ok" | "rewrite" } | { state: "bad"; dev: number; ino: number };
+
+/** Classify the config directory without following anything. `rewrite`: a real, worker-owned
+ *  directory in the expected shape whose `.claude.json` has other bytes or mode. */
+function inspect(dir: string): Seen {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(dir);
+  } catch (err) {
+    if (errCode(err) === "ENOENT") return { state: "absent" };
+    throw err;
+  }
+  const bad: Seen = { state: "bad", dev: st.dev, ino: st.ino };
+  const uid = process.getuid?.();
+  if (!st.isDirectory()) return bad;
+  if (uid !== undefined && st.uid !== uid) return bad;
+  if (((st.mode & 0o7777) & ~0o2000) !== 0o755) return bad;
+  const names = fs.readdirSync(dir).sort();
+  if (names.length !== EXPECTED_ENTRIES.length || names.some((n, i) => n !== EXPECTED_ENTRIES[i])) return bad;
+  for (const [name, target] of LINKS) {
+    const l = fs.lstatSync(path.join(dir, name));
+    if (!l.isSymbolicLink() || (uid !== undefined && l.uid !== uid)) return bad;
+    if (fs.readlinkSync(path.join(dir, name)) !== target) return bad;
+  }
+  const file = path.join(dir, CONFIG_FILE);
+  const f = fs.lstatSync(file);
+  if (!f.isFile() || f.nlink !== 1 || (uid !== undefined && f.uid !== uid)) return bad;
+  if ((f.mode & 0o7777) !== 0o444 || f.size !== Buffer.byteLength(CLAUDE_GLOBAL_CONFIG_BYTES)) return { state: "rewrite" };
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    return fs.readFileSync(fd, "utf8") === CLAUDE_GLOBAL_CONFIG_BYTES ? { state: "ok" } : { state: "rewrite" };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Create `file` exclusively with the fixed bytes, mode 0444. */
+function writeConfigFile(file: string): void {
+  const fd = fs.openSync(
+    file,
+    fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+    0o444,
+  );
+  try {
+    fs.writeSync(fd, CLAUDE_GLOBAL_CONFIG_BYTES);
+    fs.fchmodSync(fd, 0o444);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Replace `<dir>/.claude.json` through a temp file next to the directory (so the directory never
+ *  shows a transient entry) and a rename. */
+function rewriteConfig(home: string, dir: string): void {
+  const tmp = path.join(home, `${CLAUDE_CONFIG_DIR_NAME}.cfg-${hex()}`);
+  try {
+    writeConfigFile(tmp);
+    fs.renameSync(tmp, path.join(dir, CONFIG_FILE));
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
+/** Build a complete config directory under a temp name in HOME. Removes it again on failure. */
+function buildTemp(home: string): string {
+  const tmp = path.join(home, `${CLAUDE_CONFIG_DIR_NAME}.tmp-${hex()}`);
+  fs.mkdirSync(tmp, { mode: 0o755 });
+  try {
+    fchmodDir(tmp, 0o755);
+    writeConfigFile(path.join(tmp, CONFIG_FILE));
+    for (const [name, target] of LINKS) fs.symlinkSync(target, path.join(tmp, name));
+  } catch (err) {
+    removeTemp(tmp);
+    throw err;
+  }
+  return tmp;
+}
+
+/** Remove a temp directory this module built (it holds one file and two symlinks, none followed). */
+function removeTemp(tmp: string): void {
+  try {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  } catch {
+    /* best effort: the temp is inert and left for the HOME's reclaim */
+  }
+}
+
+/** Leave `dir` verified, as the last action: reuse, rewrite the config, or rebuild. */
+function ensureConfigDir(home: string, dir: string, step: (name: string) => void): void {
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    step("inspect");
+    const seen = inspect(dir);
+    if (seen.state === "ok") return;
+    if (seen.state === "rewrite") {
+      rewriteConfig(home, dir);
+      step("rewritten");
+      continue;
+    }
+    const tmp = buildTemp(home);
+    let installed = false;
+    try {
+      step("built");
+      if (seen.state === "bad") {
+        // Another prepare may have replaced the bad directory since it was inspected: never move
+        // aside a directory that is no longer the one that was judged.
+        const now = fs.lstatSync(dir, { throwIfNoEntry: false });
+        if (now === undefined || now.dev !== seen.dev || now.ino !== seen.ino) continue;
+        renameAside(dir);
+        step("aside");
+      }
+      try {
+        fs.renameSync(tmp, dir);
+        installed = true;
+      } catch (err) {
+        // Someone else put a directory (or anything) there first: re-inspect, never replace it blindly.
+        if (!["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"].includes(errCode(err) ?? "")) throw err;
+      }
+      if (installed) step("installed");
+    } finally {
+      if (!installed) removeTemp(tmp);
+    }
+  }
+  throw refuse("the config directory kept changing while it was prepared");
 }

@@ -25,6 +25,7 @@
 // `bash`, and coreutils.
 
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
+import { claudeConfigDir } from "./claude-config-dir.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
@@ -37,6 +38,9 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } f
 export const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "HOME",
+  // PRD #4416: where the CLI reads its global config from (claudeConfigDir(HOME)); spawnDetached
+  // refuses any other value, and a provisioned or user variable must never move it.
+  "CLAUDE_CONFIG_DIR",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   // PRD #4320 module 6: the provider-mode routing and model keys. A provisioned tool env may never
@@ -190,6 +194,7 @@ function sdkPreFoldEnv(
   const env = {
     ...credentialEnv(credential),
     HOME: homeDir,
+    CLAUDE_CONFIG_DIR: claudeConfigDir(homeDir),
     // The RUNNER PATH (PRD #51 M4): the /nix-bearing image PATH under the split (the
     // agent's Bash resolves git/bash/coreutils + provisioned tools), NOT the worker's
     // stripped PATH. Single-uid (#58): the entrypoint exports the same image PATH there

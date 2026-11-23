@@ -23,7 +23,7 @@ import { asWriter } from "./hibernation-inventory.js";
  *      sweep confirms it (home-reclaim.ts: every kind of not-knowing skips);
  *  (b) the rebuildable caches (D2, `dropRunCaches`) of a run PARKED WITH ITS PROCESS ENDED:
  *      api status `limit_wait`, `recovery_wait` or `paused`. Everything else in that HOME
- *      (the transcript, `.claude.json`, unknown files) stays for the resume. A gate status
+ *      (the transcript, `.uzi-claude-config`, unknown files) stays for the resume. A gate status
  *      (`awaiting_approval`, `awaiting_input`, `awaiting_followup`) keeps a live executor
  *      and is never eligible; nor is `queued`, `claimed` or `running`;
  *  (c) a model-pass HOME (`uzi-judge-*`, `uzi-review-*`, `uzi-summary-*`) whose pass is

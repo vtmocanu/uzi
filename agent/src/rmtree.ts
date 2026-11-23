@@ -273,7 +273,7 @@ async function purgeChildrenAsAgents(target: string): Promise<void> {
  * relative to that HOME. Each is refilled on demand by its tool (`go build` refills the
  * build cache, `go` re-downloads modules, `npm` refills its content cache), so dropping
  * one costs a resumed run time, never state. Nothing outside this list is ever deleted
- * by {@link rmHomeSubtree}: the session transcript, `.claude.json`, `go/bin` and every
+ * by {@link rmHomeSubtree}: the session transcript, `.uzi-claude-config`, `go/bin` and every
  * unknown file stay. Adding an entry needs code evidence that it is rebuildable.
  *
  * The one other name {@link rmHomeSubtree} accepts is not a cache: the park-only managed Go

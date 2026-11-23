@@ -28,7 +28,7 @@ import type { ChildProcess } from "node:child_process";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { killRunnerGroup, killRunnerGroupOnly, runnerSpawn } from "./runner-uid.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
-import { resetClaudeGlobalConfig } from "./claude-global-config.js";
+import { prepareClaudeConfigDir, type PrepareDeps } from "./claude-global-config.js";
 
 /** The variables that carry a provider credential into the Claude CLI's environment (sdk-env.ts). */
 export const PROVIDER_CREDENTIAL_VARS = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] as const;
@@ -38,12 +38,13 @@ function carriesProviderCredential(spawnEnv: Record<string, string | undefined> 
 }
 
 /** Spawn the SDK subprocess in its own process group, under the `runner` uid. */
-export function spawnDetached(opts: SpawnOptions): ChildProcess {
-  // PRD #4416: replace the CLI's global config (an agent-writable file whose `env` block the CLI
-  // honours) with fixed bytes before every CLI start; it throws a refusal, before any spawn, when
-  // it cannot. Kept ahead of the quarantine assert so that assert stays the last statement before
-  // the spawn.
-  resetClaudeGlobalConfig(opts.env);
+export function spawnDetached(opts: SpawnOptions, prepareDeps?: PrepareDeps): ChildProcess {
+  // PRD #4416: the CLI reads its global config (whose `env` block it honours) from
+  // CLAUDE_CONFIG_DIR, a worker-owned directory the runner cannot change; prepare it before every CLI
+  // start. It throws a refusal, before any spawn, when it cannot, or when the env does not point
+  // the CLI at that directory. Kept ahead of the quarantine assert so that assert stays the last
+  // statement before the spawn. `prepareDeps` is a test seam; production callers pass one argument.
+  prepareClaudeConfigDir(opts.env, prepareDeps);
   // issue #2213 (belt): a spawn whose environment carries a provider credential is a new provider
   // turn; refuse it synchronously on a quarantined worker. The credential-free spawns (the
   // chat/readiness probes) are not turns and are unaffected.

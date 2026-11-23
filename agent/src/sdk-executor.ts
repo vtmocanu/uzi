@@ -6005,11 +6005,12 @@ export class SdkExecutor implements Executor {
   }
 
   /**
-   * PRD #4416: evidence only, never a reap or a refusal. spawnDetached replaces the CLI's global
-   * config with fixed bytes at each CLI start; a process of this run that is still alive (the
-   * HOME-attributed scan, one pass, no settle poll) can rewrite that file between the reset and the
-   * CLI's startup read. Logs the count (or an incomplete scan), nothing else. RunProcessOps.scan
-   * takes no budget option, so this scan runs under the scan's own default budget.
+   * PRD #4416: evidence only, never a reap or a refusal. spawnDetached prepares the CLI's config
+   * directory at each CLI start; under the uid split a live runner process cannot change it, but
+   * with one uid a process of this run that is still alive (the HOME-attributed scan, one pass, no
+   * settle poll) can alter it between that preparation and the CLI's startup read. Logs the count
+   * (or an incomplete scan), nothing else. RunProcessOps.scan takes no budget option, so this scan
+   * runs under the scan's own default budget.
    */
   private async warnLiveWritersAtConfigReset(): Promise<void> {
     // Advisory only: nothing here may fail the run or skip the reset that follows. A scan that
