@@ -173,7 +173,7 @@ describe("Codex171EnvControls", () => {
       ["OPENAI_IDENTITY_TOKEN_SOURCE", "OPENAI_"],
       ["OPENAI_SPIFFE_AUDIENCE", "OPENAI_"],
       ["OPENAI_SPIFFE_ID", "OPENAI_"],
-    ]) {
+    ] as const) {
       assert.ok(runEnvNameViolation(name)?.includes(`denied prefix ${prefix}:`), name);
     }
   });
