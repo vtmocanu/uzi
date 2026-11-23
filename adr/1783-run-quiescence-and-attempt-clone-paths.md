@@ -23,7 +23,9 @@ clone key and read that git as unattributed residue, failing the successor.
   end-to-end bound.
 - **Stage latch.** Work runs as tracked stages. At the deadline, an abort or the
   section's end a latch closes: no new stage or git call starts (the content
-  proof polls it before each git call), a late callback never changes the verdict,
+  proof polls it before each git call). The stage gate also checks the clock
+  (`Date.now() >= deadlineAt`) before each stage, so a continuation running after
+  `D` but before the deadline timer fires cannot start another stage. A late callback never changes the verdict,
   and abandoned work stays tracked until it settles. A section that cannot show
   its work settled refuses `source_settlement_unproven`.
 - **Forced-helper scans.** The section's scans always run through the helper
@@ -35,22 +37,41 @@ clone key and read that git as unattributed residue, failing the successor.
   after-scan was quiescent and at least 1 s remains, and a fresh observe-only
   probe reads clear. The probe never signals a process. Verdict
   (`inventoryClearVerdict`): unmarked in-scope residue blocks; processes marked
-  to another live, protected or terminal attempt, and results that are
-  unverified only through unreadable-unattributed processes, do not. An undefined
-  result, an unverified result with no processes or an unknown reason is not
-  clear. Inventory descendants are not necessarily readable by the scanner: a
-  clone-configured hook could leave a non-dumpable, unmarked descendant, which
-  reads `unreadable_unattributed`. The clear verdict treats an unreadable-only
-  result as clear, deliberately and as a recorded accepted boundary, because
-  otherwise any worker-wide non-dumpable process would strand every exclusion
-  permanently. That is measured: on the uzi worker, `uzi-codex-super` makes every
-  scan unverified. The attempt seed's own sweep already admits that same case
-  (`unverifiedOnlyByUnattributedUnreadable`), and every seed admitted by a clear
-  still runs its own unchanged sweep.
-- **Helper bounds.** Before- and after-scan helpers get their bound from the
+  to another live, protected or terminal attempt do not. Any unverified result,
+  an undefined result or an unknown reason is not clear. Inventory descendants
+  are not necessarily readable by the scanner: a clone-configured hook could
+  leave a non-dumpable, unmarked descendant, which reads
+  `unreadable_unattributed`. Revised 2026-11-23 on the owner's review of MR
+  !4643: the worker cannot establish that an unreadable process is unrelated to
+  the inventory operation, and the admitted seed's sweep can still meet it and
+  take the terminal residue path, so an unreadable-only result is not clear (this
+  replaces the earlier accepted boundary that treated it as clear). Consequence:
+  a non-dumpable runner-uid process that persists (measured on the uzi worker:
+  `uzi-codex-super`) keeps every probe unverified, so the exclusion stands.
+  Same-key seeds wait once, retry once and stop for retry nonterminally with
+  custody kept while it persists, and persistent stranding can exhaust requeues.
+  The production probe always carries a deadline (see Helper bounds), so an
+  unreadable pid there already yields unverified with no processes; the verdict
+  change is defense in depth at the verdict level.
+- **Helper bounds.** Before- and after-scan helpers also get their bound from the
   parent-side group kill at the gate deadline (`run-quiescence.ts`) and the
-  section race. `deadlineAt` is forwarded into the helper only for observe-only
-  probes, so non-observe classification stays unchanged.
+  section race. The inventory before- and after-scans (opt-in
+  `QuiesceRunRequest.helperDeadline`, set only by the runner's inventory quiesce
+  wrapper) and observe-only probes carry `deadlineAt` into the helper's
+  `ScanRequest`, so the helper's own scan and kill gates stop at `D`. Other helper
+  scans (the #3980 gate checkpoints, terminal preservation) do not carry it,
+  deliberately: forwarding it would let an attributed non-dumpable peer (the Codex
+  supervisor) block them. Effect, kept fail-closed: with a deadline set, the
+  helper's bounded table wrapper records an EACCES (or other non-ENOENT/ESRCH)
+  read of a pid's environ or cwd as a table failure, and the whole scan returns
+  unverified with no processes, after any kill an earlier pass already made.
+  Ancestry attribution of that pid, the #3915 late-root re-proof and the
+  unreadable-process reap are unreachable for these scans. A before-scan then
+  refuses `process_not_quiescent_before_git` and keeps custody, an after-scan
+  leaves the section unsettled and the key excluded, and the probe is not clear.
+  Liveness cost: any unreadable runner-uid process on the worker, including an
+  attributed peer such as the Codex supervisor, blocks inventory source proofs
+  while it lives.
 - **Ambient scopes.** The section is bound by the ambient boundary, recovery
   operation, report and maintenance-budget scopes `withLock` honours: their
   signals abort it and their remaining time caps `D`. The predecessor path also
