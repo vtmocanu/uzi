@@ -288,7 +288,9 @@ func TestRunningCodexAccountParkReloginOverlapLiveDB(t *testing.T) {
 	defer func() {
 		cancel()
 		if !joined {
-			<-done
+			if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("join canceled account writer: %v", err)
+			}
 		}
 	}()
 	observed := false

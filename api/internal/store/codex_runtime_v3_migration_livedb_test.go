@@ -196,13 +196,14 @@ func TestCodexRuntimeV3MigrationLockTimeoutLiveDB(t *testing.T) {
 	defer func() {
 		if !joined {
 			cancel()
-			<-result
+			if err := <-result; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("join canceled migration: %v", err)
+			}
 		}
 	}()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	observed := false
-	for !observed {
+	for {
 		var blocked bool
 		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
    WHERE application_name=$1 AND wait_event_type='Lock'
@@ -210,7 +211,6 @@ func TestCodexRuntimeV3MigrationLockTimeoutLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		if blocked {
-			observed = true
 			break
 		}
 		select {
