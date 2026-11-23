@@ -409,6 +409,13 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.match(text, /apk add[^\n]*\bdocker-cli\b/, `${name}/Dockerfile must apk add docker-cli`);
       assert.match(text, /apk add[^\n]*\bacl\b/, `${name}/Dockerfile must apk add acl (#4486)`);
       assert.ok(text.includes("test -x /usr/bin/getfacl"), `${name}/Dockerfile must assert /usr/bin/getfacl is executable (#4486)`);
+      // Alpine ships git-http-backend only in the git-daemon subpackage; the native
+      // smart-HTTP recovery-restore and forge-fake tests need it on the worker.
+      assert.match(text, /apk add[^\n]*\bgit-daemon\b/, `${name}/Dockerfile must apk add git-daemon (git-http-backend)`);
+      assert.ok(
+        text.includes('test -x "$(git --exec-path)/git-http-backend"'),
+        `${name}/Dockerfile must assert git-http-backend is executable in git's exec path`,
+      );
       assert.match(text, /apk add[^\n]*\bdocker-cli-compose\b/, `${name}/Dockerfile must apk add docker-cli-compose (compose v2)`);
       assert.match(text, /apk add[^\n]*\bdocker-cli-buildx\b/, `${name}/Dockerfile must apk add docker-cli-buildx`);
       assert.doesNotMatch(text, /\bapk add[^\n]*\bdockerd\b/, `${name}/Dockerfile must NOT install dockerd (the daemon is the sidecar)`);
