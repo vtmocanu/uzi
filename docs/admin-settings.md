@@ -120,7 +120,7 @@ the lane of its own harness. The four keys are `judge_model`,
   (`codex_summary_model`) takes the Codex role models, including `gpt-6-luna`,
   with no custom ID.
 - **Default · <built-in> (built-in)** resets a lane to the built-in (`opus`,
-  `gpt-6.1-sol`, `haiku`, `gpt-6-luna` for the four lanes in order), which the
+  `gpt-6.2-sol`, `haiku`, `gpt-6-luna` for the four lanes in order), which the
   lane then follows, including future changes to it. Picking a model pins it.
 - A key set from the environment shows read-only as **Set from the
   environment** and is never sent on save.
@@ -142,7 +142,7 @@ sends a model key.
 The **Run judge** card holds the global kill-switch for the [run judge](./judge.md),
 the enforcement checkbox, and the per-user spend guards below, with its own
 **Save**. That Save never sends a model key: the judge models (**Claude judge
-model**, `opus` by default, and **Codex judge model**, `gpt-6.1-sol` by default)
+model**, `opus` by default, and **Codex judge model**, `gpt-6.2-sol` by default)
 are set in the **Instance model defaults** card, see
 [Instance model defaults](#instance-model-defaults). The card shows the current
 choice as a read-only **Instance default: Claude … · Codex … · users may
@@ -178,7 +178,7 @@ own run's harness (user lane, then instance lane, then built-in):
 | Setting | Default | Controls |
 |---|---|---|
 | `judge_model` | empty (built-in `opus`) | The instance Claude judge model. Claude aliases and ids only; Codex ids are rejected. |
-| `codex_judge_model` | empty (built-in `gpt-6.1-sol`) | The instance Codex judge model. Must be one of the curated Codex models (the ones the Codex worker model picker offers); no custom ids. An empty or whitespace-only value resets it to the built-in. Users set their own value under **Settings → Run defaults → Run judge → Codex judge model**; a blank personal value inherits this one. |
+| `codex_judge_model` | empty (built-in `gpt-6.2-sol`) | The instance Codex judge model. Must be one of the curated Codex models (the ones the Codex worker model picker offers); no custom ids. An empty or whitespace-only value resets it to the built-in. Users set their own value under **Settings → Run defaults → Run judge → Codex judge model**; a blank personal value inherits this one. |
 
 A value not valid for the run's harness is skipped with a
 `harness_model_fallback` note and resolution falls through. A Codex id

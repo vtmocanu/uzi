@@ -412,7 +412,7 @@ Checker model and effort follow the child's resolved claim and are recorded as d
 
 The Plan cross-check row in Run defaults stores independent model and effort pins for each family. The model's **Default · value (worker default)** follows that family's worker model; the effort's **Default · high (cross-check default)** is `high` for every checker, whatever your worker effort is. Choosing a model leaves effort independent, and choosing effort leaves model independent. Reset either field to Default to remove its pin. Curated and custom model IDs are accepted after local syntax/family validation. Both cells are active: the Claude cell configures the Claude checker that checks a Codex lead, and at Default it follows the user's Claude worker default.
 
-`GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan" | "code"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` (`pin` or `worker default`) and `effort_source` (`pin` or `cross-check default`; records made before this default show `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.1-sol`. Effort Default is `high` for both families and both stages; it does not follow the worker effort, which still defaults to `medium` for ordinary runs. Pin a lower effort per cell to trade review depth for latency and cost.
+`GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan" | "code"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` (`pin` or `worker default`) and `effort_source` (`pin` or `cross-check default`; records made before this default show `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.2-sol`. Effort Default is `high` for both families and both stages; it does not follow the worker effort, which still defaults to `medium` for ordinary runs. Pin a lower effort per cell to trade review depth for latency and cost.
 
 The cookie-only `PUT /api/me/settings` accepts at most four keyed cells. Omitted cells or fields remain unchanged; explicit `null` resets a field to Default. Duplicate cells, unknown stages/families or fields, malformed model IDs, family mismatch and invalid effort are rejected. Submitted pin cells are validated before their transaction, so a bad cell writes no pin cells. GET metadata fields are not writable. `uzi settings set|reset cross-check` writes the same cells through `PUT /api/me/model-settings` ([CLI](./cli.md#changing-model-and-effort-settings)). Admin defaults and per-run overrides remain outside this release.
 
@@ -448,7 +448,7 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Value | Resolution (first match wins) | `source` tokens |
 |---|---|---|
 | Harness | The harness you pick for this start; else your default harness (skipped, with note `user_default_harness_unusable`, when it has no usable credential); else automatic. | `run_override`, `user_default`, `automatic`, `chosen_at_create` |
-| Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.1-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
+| Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.2-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
 | Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. The `judge_model` cell of the lane the judge will not run on (your explicit **Judge runs on** choice names the other harness) also carries note `not_used`. | `user_default`, `instance_default`, `builtin` |
 | Judge harness | Your **Judge runs on** choice (`claude` or `codex`); else the harness of the run being reviewed. | `user_default`, `same_as_run` |
 | Task-review model | Your lane for the harness (a stored value that is no longer valid is ignored); else the built-in (Codex `gpt-6-sol`; the Claude review sends no model, so the SDK decides). See [Task review model](./worker-model.md#task-review-model). | `user_default`, `builtin` |
@@ -1323,12 +1323,20 @@ fixture and 100 ms sampling; CNPG may run a different major version.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.2-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,
 which sends no effort level. See [Reasoning effort](worker-effort.md).
 
-Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
-silently use the old model/catalog or ignore the requested effort. Codex runs
-queue until the worker image rolls, on hosted workers and compose alike.
+Every Codex-indicating claim (harness `codex`, a material revision, or a secret
+binding) requires `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3`.
+This gate is independent of `required_capabilities`, the capability-aware
+switch and `fn_worker_can_claim`; clearing optional requirements cannot bypass it.
+Codex runs wait for a compatible worker on hosted workers and compose alike.
+
+With an API-first rollout, old workers leave Codex runs waiting until the worker
+roll. Worker-first retains v1/v2 compatibility with the older API. Rolling back
+the v3 migration with Down reopens the weaker baseline; operators must account
+for that admission change. This is not a zero-downtime guarantee.
+See [ADR-1106](../adr/1106-codex-harness.md) for the runtime audit.

@@ -155,7 +155,7 @@ judge itself runs on** ([Judge runs on](#judge-runs-on)), resolving in this orde
 
 1. your own value for that lane,
 2. the instance value for that lane,
-3. the built-in default: **`opus`** for Claude, **`gpt-6.1-sol`** for Codex.
+3. the built-in default: **`opus`** for Claude, **`gpt-6.2-sol`** for Codex.
 
 A value that is not valid for the run's harness is skipped (one
 `harness_model_fallback` note on the run) and resolution falls through to the

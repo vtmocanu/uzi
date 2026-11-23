@@ -3490,6 +3490,13 @@ instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Cha
 
 ### Changing model and effort settings
 
+The current Codex built-in worker fallback is `gpt-6.2-sol`; the independent
+Codex judge built-in is also `gpt-6.2-sol`. Explicit user, instance, run, schedule
+and template choices are not migrated. Task review and PR descriptions retain
+`gpt-6-sol`; summaries retain `gpt-6-luna`. See the
+[current worker baseline](./worker-model.md#current-codex-worker-baseline).
+
+
 ```sh
 uzi settings set worker-model --harness codex gpt-5.5
 uzi settings set effort --harness claude runtime

@@ -203,7 +203,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Builtin templates are the single source of truth; `.claude/agents/` is the dev team's own roster only. Decouples the former 1:1 mirror. [user, 2026-07-05, supersedes the earlier "both dirs" choice]
 - Per-user worker-model defaults are retained separately for Claude and Codex and saved together with the default harness in Settings. (AI-synced 2026-09-23)
 - Both worker-model defaults offer curated models plus a custom model ID; safe Codex custom IDs apply to worker and planning roots, with a separate custom-ID contract for the dedicated Plan cross-check checker pin, not run-start, schedule or role pins. Claude aliases are rejected in Codex model lanes. Cross-check pins also configure the Claude checker of a Codex lead. (AI-synced 2026-11-21)
-- Root model precedence: model chosen at start (#3250) → schedule override → user's lane for the run's actual harness → selected lead template's matching pin → SDK/account default (Claude) or gpt-6.1-sol (Codex). The shipped lead's Claude pin is opus; its Codex pin is empty. (AI-synced 2026-11-03)
+- Root model precedence: model chosen at start (#3250) → schedule override → user's lane for the run's actual harness → selected lead template's matching pin → SDK/account default (Claude) or gpt-6.2-sol (Codex). The shipped lead's Claude pin is opus; its Codex pin is empty. (#4626, AI-synced 2026-11-23)
 - Both harnesses use the first delivered own template named `lead` or `orchestrator`, case-insensitively; every own lead-shaped template is withheld from subagents. An unpinned checker also uses its matching lead pin after its family lane, while checker effort remains independent. (AI-synced 2026-11-03)
 - Lead effort precedence, lead lane only: effort chosen at start → the user's preference for the run's harness (a level, or Runtime default, which sends none) → the selected lead template's effort pin for that harness (source "template") → built-in medium. Only an unset or blank preference reaches the template tier; judge, chat, jobs, checkers and other lanes are unchanged. Effective settings show the same resolution. [#3258] (AI-synced 2026-11-21)
 - The lead overlaps the integration gate with the read-only review wave by default, but after review invalidates a candidate with a costly full gate it finishes repair reviews and focused checks before repeating the gate, and triages a failed gate (narrowest reproducer on candidate and base) before rerunning; prompt-level guidance, still blocking. (AI-synced 2026-10-09)
@@ -211,7 +211,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
 - Switching the default harness never clears either saved worker-model choice. [PRD #1551] (AI-synced 2026-09-23)
 - Task review has its own model per harness (Claude: any Claude id, empty = SDK default; Codex: a supported Codex role model, empty = `gpt-6-sol`), independent of the worker model; an invalid stored value falls back to the built-in. [PRD #1570] (AI-synced 2026-11-22)
-- The Codex worker fallback is `gpt-6.1-sol`, included in the curated picker; explicit model choices remain authoritative. (AI-synced 2026-10-01)
+- The Codex worker fallback is `gpt-6.2-sol`, included in the curated picker; explicit model choices remain authoritative. (#4626, AI-synced 2026-11-23)
 - Lead-lane runs show the lead's requested and runtime-reported model and effort per claim attempt and phase (run page chip, `uzi run get`, `uzi run lead-config`); rows are worker-attested and display-only, never used for billing, authorization or scheduling. [PRD #3244] (AI-synced 2026-10-30)
 - Claude and Codex keep independent reasoning-effort preferences; for the lead, an unset one falls to the lead template's effort pin, then medium (#3258, AI-synced 2026-11-21). Splitting preserves every existing explicit preference in both lanes; queued and resumed runs resolve preferences at claim time, except an effort chosen at start, which is frozen on the run (#3250). (AI-synced 2026-10-01)
 - The Settings Planning effort default ("Same as the run · high (lead template)") and the ordinary effort Default label ("Default · lead template's effort, else medium (built-in)") name the lead-template tier, matching what a run resolves. [#3262] (AI-synced 2026-11-22)
@@ -473,9 +473,9 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   (AI-synced 2026-11-10)
 - Judge model is per harness (Claude and Codex lanes), resolved user → instance
   → built-in for the judge run's harness: built-ins `opus` (Claude) and
-  `gpt-6.1-sol` (Codex, user decision 2026-10-21); Codex judge models are
+  `gpt-6.2-sol` (Codex, user decision 2026-11-23, #4626); Codex judge models are
   curated ids only. Supersedes the older "cheap default" wording above.
-  (AI-synced 2026-10-21)
+  (AI-synced 2026-11-23)
 - Intent/plan summary model is per harness (Claude and Codex lanes), resolved
   user → instance → built-in for the run's harness: built-ins `haiku` (Claude) and
   `gpt-6-luna` (Codex); the Codex lane takes only Codex role models, the Claude lane

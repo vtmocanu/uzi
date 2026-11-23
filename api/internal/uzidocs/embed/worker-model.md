@@ -27,7 +27,7 @@ Both settings live together in one **Settings → Run defaults** card:
 Each picker's empty option is a **Default · …** label naming where the value
 comes from: the Claude model picker reads `Default · lead template` (the
 `lead` template's model) and the Codex model picker reads
-`Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
+`Default · gpt-6.2-sol (built-in)`. The harness picker's empty option reads
 `Default · automatic`: uzi picks your only usable harness, or, when both are
 usable, chooses by weekly limits for eligible new issue runs (started
 manually, by autopilot or by a schedule, with no explicit harness or issue
@@ -100,15 +100,14 @@ reads that harness's model lane:
    harness.
 3. Your **worker model** for that harness, if set.
 4. The harness fallback: the `lead` template's Claude pin (`opus` by default)
-   for Claude, or its Codex pin, else `gpt-6.1-sol`, for Codex.
+   for Claude, or its Codex pin, else `gpt-6.2-sol`, for Codex.
 5. Whatever the underlying SDK/your account defaults to.
 
-The lead's Codex fallback requires a worker from this release. Older Codex
-workers fall through to the built-in provider model (`gpt-6.1-sol`) when no
-schedule or worker-model setting takes precedence. Roll out the API first,
-then the hosted worker; hosted validation of this behavior remains pending.
-The pickers' existing **Default · …** labels above are unchanged pending
-separate UI work.
+The current root/planning fallback is `gpt-6.2-sol`. Explicit user, instance,
+run, schedule and template choices are not migrated. The independent Codex
+judge built-in also uses `gpt-6.2-sol`; task review and PR descriptions retain
+`gpt-6-sol`, and summaries retain `gpt-6-luna`. See the
+[current baseline](#current-codex-worker-baseline) for rollout ordering.
 
 An incompatible frozen schedule or legacy model (e.g. a Claude alias pinned
 on a run that resolves to Codex) falls back to your lane for that harness,
@@ -143,7 +142,7 @@ choice is stored on the run and shown with the source **this run**
   override); otherwise 400.
 - **Checked against the run's harness at create.** Claude accepts a Claude
   alias or custom model ID but not a Codex model ID; Codex accepts only the
-  curated models (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`).
+  curated models (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra`).
   An incompatible pair returns 422 with `code: model_incompatible_with_harness`
   and the resolved `harness`, and creates no run. With an explicit harness the
   check runs before the forge is read. uzi never substitutes another model.
@@ -295,7 +294,7 @@ and [the CLI reference](./cli.md#waiting-for-a-state-uzi-run-wait).
 
 Saving the Claude worker lane (`default_claude_model`, or legacy
 `default_model` when resolved to Claude) rejects these known Codex role IDs:
-`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol` and `gpt-6.1-sol`.
+`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol` and `gpt-6.2-astra`.
 This is a closed list, not model-family guessing: valid custom Claude IDs
 outside it remain accepted. The Codex lane's accepted models are unchanged.
 
@@ -319,7 +318,7 @@ preference until you save a change; there is no new CLI command.
 ## Custom Codex model
 
 Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol`,
-`gpt-6-sol` and `gpt-6.1-sol`, plus **Other (custom model ID)**, the same escape hatch
+`gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol` and `gpt-6.2-astra`, plus **Other (custom model ID)**, the same escape hatch
 Claude has always had. uzi validates the string for length and unsafe
 characters but makes no provider call at save time; an unavailable or
 unsupported ID only fails visibly on your first run, exactly like an
@@ -512,7 +511,7 @@ Where to see it:
   recorded. API-equivalent cost compares work, not a bill; subscription
   users may consume purchased credits. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
 - **Separate from the judge model.** The [run judge](./judge.md) runs on
-  its own per-harness judge models (Claude `opus` and Codex `gpt-6.1-sol` by
+  its own per-harness judge models (Claude `opus` and Codex `gpt-6.2-sol` by
   default), set per user or instance-wide by an admin. Your worker-model
   settings here have no effect on them.
 - **Separate from reasoning effort.** Your [reasoning
@@ -521,13 +520,21 @@ Where to see it:
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.2-sol`
 when no schedule model, worker-model override or lead Codex pin is set.
 Explicit model preferences remain unchanged. Both harnesses inherit medium
 reasoning effort; Claude and Codex keep separate overrides, and each can
 instead be set to **Runtime default**, which sends no effort level. See
 [Reasoning effort](worker-effort.md).
 
-Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
-silently use the old model/catalog or ignore the requested effort. Codex runs
-queue until the worker image rolls, on hosted workers and compose alike.
+Every Codex-indicating claim (harness `codex`, a material revision, or a secret
+binding) requires `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3`.
+This gate is independent of `required_capabilities`, the capability-aware
+switch and `fn_worker_can_claim`; clearing optional requirements cannot bypass it.
+Codex runs wait for a compatible worker on hosted workers and compose alike.
+
+With an API-first rollout, old workers leave Codex runs waiting until the worker
+roll. Worker-first retains v1/v2 compatibility with the older API. Rolling back
+the v3 migration with Down reopens the weaker baseline; operators must account
+for that admission change. This is not a zero-downtime guarantee.
+See [ADR-1106](../adr/1106-codex-harness.md) for the runtime audit.
