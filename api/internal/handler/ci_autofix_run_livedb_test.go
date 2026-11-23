@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // ciaResp is the PUT /api/runs/{id}/ci-autofix response, decoded loosely.
@@ -106,16 +108,172 @@ func TestSetRunCIAutofixEnabledTriStateLiveDB(t *testing.T) {
 		if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
 			t.Fatalf("PUT %s: column = %v, want %v", tc.body, got, tc.want)
 		}
-		if (resp.Run.CiAutofixEnabled == nil) != (tc.want == nil) {
-			t.Fatalf("PUT %s: response run.ci_autofix_enabled = %v, want %v", tc.body, resp.Run.CiAutofixEnabled, tc.want)
+		if (resp.Run.CiAutofixEnabled == nil) != (tc.want == nil) ||
+			(tc.want != nil && *resp.Run.CiAutofixEnabled != *tc.want) {
+			t.Fatalf("PUT %s: response run.ci_autofix_enabled = %s, want %s", tc.body, fmtBoolPtr(resp.Run.CiAutofixEnabled), fmtBoolPtr(tc.want))
 		}
 	}
 	if code, _, body := ciaPut(t, router, runID, uzc, `{"enabled":`); code != http.StatusBadRequest {
 		t.Fatalf("malformed body = %d, want 400\nbody: %s", code, body)
 	}
+
+	// A wrongly typed value is a 400 and leaves an explicit override untouched.
+	if code, _, body := ciaPut(t, router, runID, uzc, `{"enabled":true}`); code != http.StatusOK {
+		t.Fatalf("seed true = %d\nbody: %s", code, body)
+	}
+	if code, _, body := ciaPut(t, router, runID, uzc, `{"enabled":"yes"}`); code != http.StatusBadRequest {
+		t.Fatalf("string enabled = %d, want 400\nbody: %s", code, body)
+	}
+	if v := ciaColumn(t, pool, runID); v == nil || !*v {
+		t.Fatalf("column after bad body = %s, want unchanged true", fmtBoolPtr(v))
+	}
+}
+
+func fmtBoolPtr(b *bool) string {
+	if b == nil {
+		return "null"
+	}
+	if *b {
+		return "true"
+	}
+	return "false"
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+// TestSetRunCIAutofixWaitsOnBranchLockLiveDB pins the run-branch advisory lock: while another
+// session holds it, the PUT blocks (visible as an ungranted advisory lock in pg_locks); a
+// ci_fix committed under that lock is therefore visible in the PUT's in-flight list.
+func TestSetRunCIAutofixWaitsOnBranchLockLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	repoID := cliSeedOwnedRepo(t, pool, owner)
+	const ref = "agent/issue-46176"
+	runA, fixID := uuid.New(), uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, branch, mr_iid)
+		 VALUES ($1, $2, $3, 46176, 't', 'd', 'completed', 'issue', $4, 7)`, runA, owner, repoID, ref)
+
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	class, objid := store.RunBranchLockClass, store.RunBranchLockObjID(repoID, ref)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, class, objid); err != nil {
+		t.Fatalf("take lock: %v", err)
+	}
+
+	type result struct {
+		code int
+		resp ciaResp
+		body string
+	}
+	done := make(chan result, 1)
+	go func() {
+		code, resp, body := ciaPut(t, router, runA, uzc, `{"enabled":false}`)
+		done <- result{code, resp, body}
+	}()
+	// collect always drains the goroutine: after a rollback its lock wait ends.
+	collect := func() result {
+		select {
+		case r := <-done:
+			return r
+		case <-time.After(30 * time.Second):
+			t.Fatalf("PUT goroutine did not finish")
+			return result{}
+		}
+	}
+
+	waiting := false
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 AND NOT granted`,
+			int64(uint32(class)), int64(uint32(objid))).Scan(&n); err != nil {
+			t.Fatalf("poll pg_locks: %v", err)
+		}
+		if n > 0 {
+			waiting = true
+			break
+		}
+		select {
+		case r := <-done:
+			t.Fatalf("PUT finished (%d) without waiting on the branch lock: %s", r.code, r.body)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !waiting {
+		_ = tx.Rollback(ctx)
+		committed = true
+		collect()
+		t.Fatalf("PUT never appeared as a waiter on the run-branch advisory lock")
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO runs (id, user_id, repo_id, issue_title, issue_description, status, kind, pipeline_ref, pipeline_id)
+		 VALUES ($1, $2, $3, 't', 'd', 'queued', 'ci_fix', $4, 9)`, fixID, owner, repoID, ref); err != nil {
+		_ = tx.Rollback(ctx)
+		committed = true
+		collect()
+		t.Fatalf("insert ci_fix: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		committed = true
+		collect()
+		t.Fatalf("commit: %v", err)
+	}
+	committed = true
+
+	r := collect()
+	if r.code != http.StatusOK {
+		t.Fatalf("PUT = %d, want 200\nbody: %s", r.code, r.body)
+	}
+	if len(r.resp.Inflight) != 1 || r.resp.Inflight[0] != fixID.String() {
+		t.Fatalf("inflight = %v, want [%s]\nbody: %s", r.resp.Inflight, fixID, r.body)
+	}
+}
+
+// TestSetRunCIAutofixHidesForeignRunsLiveDB pins that a newer run and an active ci_fix owned
+// by another user on the caller's repo and ref are not reported: governing stays null and
+// the in-flight list is empty.
+func TestSetRunCIAutofixHidesForeignRunsLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	foreign := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	repoID := cliSeedOwnedRepo(t, pool, owner)
+	const ref = "agent/issue-46177"
+	runA, foreignRun, foreignFix := uuid.New(), uuid.New(), uuid.New()
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, branch, mr_iid, created_at)
+		 VALUES ($1, $2, $3, 46177, 't', 'd', 'completed', 'issue', $4, 7, now() - interval '2 hours')`, runA, owner, repoID, ref)
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, branch, mr_iid, created_at)
+		 VALUES ($1, $2, $3, 46178, 't', 'd', 'completed', 'issue', $4, 8, now() - interval '1 hour')`, foreignRun, foreign, repoID, ref)
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_title, issue_description, status, kind, pipeline_ref, pipeline_id)
+		 VALUES ($1, $2, $3, 't', 'd', 'queued', 'ci_fix', $4, 10)`, foreignFix, foreign, repoID, ref)
+
+	code, resp, body := ciaPut(t, router, runA, uzc, `{"enabled":false}`)
+	if code != http.StatusOK {
+		t.Fatalf("PUT = %d\nbody: %s", code, body)
+	}
+	if resp.Governing != nil {
+		t.Fatalf("governing = %s, want null (the selected run is foreign)\nbody: %s", *resp.Governing, body)
+	}
+	if len(resp.Inflight) != 0 || !strings.Contains(body, `"ci_autofix_inflight_fix_run_ids":[]`) {
+		t.Fatalf("inflight = %v, want [] (foreign fix excluded)\nbody: %s", resp.Inflight, body)
+	}
+}
 
 // TestSetRunCIAutofixGoverningAndInflightLiveDB covers the response's governing run id and
 // in-flight fix list on one branch.
