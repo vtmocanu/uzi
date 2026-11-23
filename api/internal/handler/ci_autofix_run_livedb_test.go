@@ -198,7 +198,7 @@ func TestSetRunCIAutofixWaitsOnBranchLockLiveDB(t *testing.T) {
 		var n int
 		if err := pool.QueryRow(ctx,
 			`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 AND NOT granted`,
-			int64(uint32(class)), int64(uint32(objid))).Scan(&n); err != nil {
+			int64(uint32(class)), int64(uint32(objid))).Scan(&n); err != nil { //nolint:gosec // bit reinterpretation: pg_locks reports the int4 key as an unsigned oid
 			t.Fatalf("poll pg_locks: %v", err)
 		}
 		if n > 0 {
