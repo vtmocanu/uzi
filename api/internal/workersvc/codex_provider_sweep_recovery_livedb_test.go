@@ -31,21 +31,26 @@ func newSweepRecoveryFix(t *testing.T) *sweepRecoveryFix {
 	restartCodexActualClaimService(pf)
 	f := &sweepRecoveryFix{pf: pf, id: id}
 	f.frozen = f.bindingColumns(t)
-	if f.frozen == "" {
-		t.Fatal("fixture run carries no binding")
-	}
 	return f
 }
 
-// bindingColumns reads the frozen model_provider_* columns as one text value, so "byte-identical" is
-// one string comparison independent of the Go struct mapping.
+// bindingColumns reads the frozen model_provider_* columns as one composite text value, so
+// "byte-identical" is one string comparison independent of the Go struct mapping. A NULL column
+// would render as an empty field, so the five NOT NULL facts are read alongside and enforced.
 func (f *sweepRecoveryFix) bindingColumns(t *testing.T) string {
 	t.Helper()
 	var s string
-	err := f.pf.env.pool.QueryRow(f.pf.env.ctx, `SELECT concat_ws('|', model_provider_id, model_provider_revision,
-	    model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev) FROM runs WHERE id = $1`, f.id).Scan(&s)
+	var allSet bool
+	err := f.pf.env.pool.QueryRow(f.pf.env.ctx, `SELECT row(model_provider_id, model_provider_revision,
+	    model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)::text,
+	    (model_provider_id IS NOT NULL AND model_provider_revision IS NOT NULL AND model_provider_key_mode IS NOT NULL
+	     AND model_provider_key_secret_id IS NOT NULL AND model_provider_key_rev IS NOT NULL)
+	    FROM runs WHERE id = $1`, f.id).Scan(&s, &allSet)
 	if err != nil {
 		t.Fatalf("read binding columns: %v", err)
+	}
+	if !allSet {
+		t.Fatalf("binding columns %s: a frozen binding column is NULL", s)
 	}
 	return s
 }
@@ -77,6 +82,7 @@ func (f *sweepRecoveryFix) wantFrozen(t *testing.T, when string) {
 func (f *sweepRecoveryFix) sweepAt(t *testing.T, at, heartbeat time.Time) SweepResult {
 	t.Helper()
 	f.pf.env.exec(`UPDATE workers SET status = 'online', last_heartbeat_at = $2 WHERE id = $1`, f.pf.workerID, heartbeat)
+	f.wantNoCompetitors(t, at)
 	f.pf.svc.SetClock(func() time.Time { return at })
 	defer f.pf.svc.SetClock(nil)
 	res, err := f.pf.svc.Sweep(f.pf.env.ctx)
@@ -84,6 +90,30 @@ func (f *sweepRecoveryFix) sweepAt(t *testing.T, at, heartbeat time.Time) SweepR
 		t.Fatalf("Sweep: %v", err)
 	}
 	return res
+}
+
+// wantNoCompetitors fails when the shared database holds rows, other than this fixture's, that the
+// production Sweep would also act on at `at`: online workers past the stale cutoff, claimed runs past
+// the claim grace, and claimed or running runs bound to a stale worker. The Sweep is database-wide,
+// so exact counters are only meaningful when none exist.
+func (f *sweepRecoveryFix) wantNoCompetitors(t *testing.T, at time.Time) {
+	t.Helper()
+	p := f.pf.svc.p
+	staleCutoff := at.Add(-p.WorkerHeartbeatStale)
+	claimCutoff := at.Add(-p.ClaimGrace)
+	var staleWorkers, lateClaims, staleBound int
+	err := f.pf.env.pool.QueryRow(f.pf.env.ctx, `SELECT
+	    (SELECT count(*) FROM workers WHERE id <> $1 AND status = 'online' AND last_heartbeat_at < $2),
+	    (SELECT count(*) FROM runs WHERE id <> $4 AND status = 'claimed' AND claimed_at < $3),
+	    (SELECT count(*) FROM runs r JOIN workers w ON w.id = r.worker_id
+	      WHERE r.id <> $4 AND r.status IN ('claimed', 'running') AND w.id <> $1 AND w.last_heartbeat_at < $2)`,
+		f.pf.workerID, staleCutoff, claimCutoff, f.id).Scan(&staleWorkers, &lateClaims, &staleBound)
+	if err != nil {
+		t.Fatalf("competing-row count: %v", err)
+	}
+	if staleWorkers+lateClaims+staleBound != 0 {
+		t.Fatalf("shared database holds rows the database-wide Sweep would also act on (stale online workers=%d, claimed runs past grace=%d, claimed/running runs on stale workers=%d); exact sweep counters are not meaningful", staleWorkers, lateClaims, staleBound)
+	}
 }
 
 // sweepCounters is the part of SweepResult these cases pin; everything else must be zero.
@@ -222,6 +252,9 @@ func TestCodexProviderSweepRecoveryLiveDB(t *testing.T) {
 		f.claim(t, 2) // ADR-4476: the same claimant takes it back with the identical binding
 	})
 
+	// This covers the pre-open providerBindingRefusal arm of Claim (the persisted binding is already
+	// stale when the run is picked); lockedProviderRefusal's stale arm is covered by
+	// codex_provider_binding_livedb_test.go.
 	t.Run("a key rotated between the reset and the reclaim is refused before the key is opened", func(t *testing.T) {
 		f := newSweepRecoveryFix(t)
 		claimed := f.claim(t, 1)

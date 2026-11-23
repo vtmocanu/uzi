@@ -7,9 +7,10 @@ import (
 	"testing"
 )
 
-// TestProviderGatewayLimitLiteralMirror pins the one literal that four codebases spell independently:
-// the server's RateLimitTypeProviderGatewayLimit, the agent's PROVIDER_GATEWAY_LIMIT, the CLI's
-// providerGatewayLimitType, and the value the runs CHECK admits. A drift in any one parks or renders
+// TestProviderGatewayLimitLiteralMirror pins the one literal that the server, the agent, the CLI and
+// the web UI spell independently: the server's RateLimitTypeProviderGatewayLimit, the agent's
+// PROVIDER_GATEWAY_LIMIT, the CLI's providerGatewayLimitType, the web's PROVIDER_GATEWAY_LIMIT, and
+// the value the runs CHECK admits. A drift in any one parks or renders
 // a provider gateway limit_wait wrongly, and no compiler sees across the module boundary.
 func TestProviderGatewayLimitLiteralMirror(t *testing.T) {
 	const want = "provider_gateway_limit"
@@ -18,7 +19,7 @@ func TestProviderGatewayLimitLiteralMirror(t *testing.T) {
 	}
 	read := func(path string) string {
 		t.Helper()
-		b, err := os.ReadFile(path)
+		b, err := os.ReadFile(path) //nolint:gosec // G304: path is one of the fixed in-repo mirror constants below, not attacker-controlled
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
@@ -29,6 +30,8 @@ func TestProviderGatewayLimitLiteralMirror(t *testing.T) {
 			`(?m)^export const PROVIDER_GATEWAY_LIMIT = "([^"]+)";$`},
 		{"CLI providerGatewayLimitType", "../../cmd/uzi/run_render.go",
 			`(?m)^const providerGatewayLimitType = "([^"]+)"$`},
+		{"web PROVIDER_GATEWAY_LIMIT", "../../../web/src/lib/limitWait.ts",
+			`(?m)^export const PROVIDER_GATEWAY_LIMIT = "([^"]+)";$`},
 	}
 	for _, m := range mirrors {
 		sub := regexp.MustCompile(m.pattern).FindStringSubmatch(read(m.path))
