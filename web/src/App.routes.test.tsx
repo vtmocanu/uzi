@@ -18,7 +18,7 @@
 import { Component, type ReactElement, type ReactNode } from "react";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { createMemoryRouter, RouterProvider, useLocation } from "react-router-dom";
 
 // Populated by beforeAll from the mock-mode module graph. Never import these
 // statically — see the file header.
@@ -78,8 +78,16 @@ afterAll(() => {
   vi.unstubAllEnvs();
 });
 
+// renderInDataRouter mounts `element` the way main.tsx does: a data router (memory history
+// here) with ONE wildcard root route, so data-router-only hooks such as the Models page's
+// useBlocker work exactly as in the shipped app.
+function renderInDataRouter(path: string, element: ReactElement) {
+  const router = createMemoryRouter([{ path: "*", element }], { initialEntries: [path] });
+  return { router, ...render(<RouterProvider router={router} />) };
+}
+
 // mountRoute renders one path through the app's real providers (mirroring
-// main.tsx: MemoryRouter → AuthProvider → App, no StrictMode), waits for the
+// main.tsx: data router → AuthProvider → App, no StrictMode), waits for the
 // guards to settle, and returns the caught error (if any) plus the container.
 // console.error is suppressed across the render because a caught render error is
 // logged loudly by React; the Part C probe relies on that error still being
@@ -87,18 +95,17 @@ afterAll(() => {
 async function mountRoute(path: string) {
   const holder: { error: Error | null } = { error: null };
   const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-  const { container, unmount } = render(
-    <MemoryRouter initialEntries={[path]}>
-      <AuthProvider>
-        <RouteErrorBoundary
-          onError={(e) => {
-            holder.error = e;
-          }}
-        >
-          <App />
-        </RouteErrorBoundary>
-      </AuthProvider>
-    </MemoryRouter>,
+  const { container, unmount } = renderInDataRouter(
+    path,
+    <AuthProvider>
+      <RouteErrorBoundary
+        onError={(e) => {
+          holder.error = e;
+        }}
+      >
+        <App />
+      </RouteErrorBoundary>
+    </AuthProvider>,
   );
   await waitFor(() => expect(screen.queryByText(LOADING)).toBeNull());
   errSpy.mockRestore();
@@ -193,6 +200,39 @@ function RouteLocation() {
   return <output data-testid="route-location">{pathname + search + hash}</output>;
 }
 
+describe("Settings → Models route (PRD #3263)", () => {
+  it("is a protected route registered between Appearance and Run defaults", () => {
+    const paths = APP_ROUTES.map((r) => r.path);
+    const models = paths.indexOf("/settings/models");
+    expect(APP_ROUTES[models]?.guard).toBe("protected");
+    expect(paths.indexOf("/settings/appearance")).toBe(models - 1);
+    expect(paths.indexOf("/settings/run-defaults")).toBe(models + 1);
+  });
+
+  it("renders the Models grid for a signed-in user", async () => {
+    await mockApi.login("vlad@uzi.local", "x");
+    const { holder, container, unmount } = await mountRoute("/settings/models");
+    expectRenderedCleanly("protected /settings/models", holder, container);
+    expect(await screen.findByLabelText("Worker model \u2014 Claude")).toBeTruthy();
+    unmount();
+    cleanup();
+  }, 30000);
+
+  it("still sends a signed-out visitor to /login through the unchanged guard", async () => {
+    await mockApi.logout();
+    const { unmount } = renderInDataRouter(
+      "/settings/models",
+      <AuthProvider>
+        <App />
+        <RouteLocation />
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("route-location").textContent).toBe("/login"));
+    unmount();
+    cleanup();
+  }, 30000);
+});
+
 describe("Overview promotion (PRD #3877 M1)", () => {
   it("renders the new Overview at /dashboard", async () => {
     await mockApi.login("vlad@uzi.local", "x");
@@ -205,13 +245,12 @@ describe("Overview promotion (PRD #3877 M1)", () => {
 
   it("redirects the retired /overview/classic to /dashboard with query and hash intact", async () => {
     await mockApi.login("vlad@uzi.local", "x");
-    const { unmount } = render(
-      <MemoryRouter initialEntries={["/overview/classic?mock=overview-next#x"]}>
-        <AuthProvider>
-          <App />
-          <RouteLocation />
-        </AuthProvider>
-      </MemoryRouter>,
+    const { unmount } = renderInDataRouter(
+      "/overview/classic?mock=overview-next#x",
+      <AuthProvider>
+        <App />
+        <RouteLocation />
+      </AuthProvider>,
     );
     await waitFor(() => expect(screen.getByTestId("route-location").textContent).toBe("/dashboard?mock=overview-next#x"));
     expect(await screen.findByRole("region", { name: "Issue work" })).toBeTruthy();
@@ -221,13 +260,12 @@ describe("Overview promotion (PRD #3877 M1)", () => {
 
   it("redirects the preview bookmark to /dashboard with query and hash intact", async () => {
     await mockApi.login("vlad@uzi.local", "x");
-    const { unmount } = render(
-      <MemoryRouter initialEntries={["/overview/next?mock=overview-next#x"]}>
-        <AuthProvider>
-          <App />
-          <RouteLocation />
-        </AuthProvider>
-      </MemoryRouter>,
+    const { unmount } = renderInDataRouter(
+      "/overview/next?mock=overview-next#x",
+      <AuthProvider>
+        <App />
+        <RouteLocation />
+      </AuthProvider>,
     );
     await waitFor(() => expect(screen.getByTestId("route-location").textContent).toBe("/dashboard?mock=overview-next#x"));
     expect(await screen.findByRole("region", { name: "Issue work" })).toBeTruthy();

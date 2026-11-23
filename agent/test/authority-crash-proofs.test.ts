@@ -1052,7 +1052,7 @@ async function resume(w: RefusalWorld, s: { rt: AuthorityRuntime; git: GitCache 
   return s.rt.withTransaction(() => s.git.cleanupRecoveryGeneration(w.bare, w.ctx, w.frozen, [], [], covering, undefined, "archive"));
 }
 
-const refusedRefHold = (sha: string): string => `update-ref refs/uzi-incoming/${RF_RUN}/1/refused-${sha}`;
+const refusedRefHold = (sha: string): string => `update-ref --no-deref refs/uzi-incoming/${RF_RUN}/1/refused-${sha} ${sha} 0{40}`;
 const stageDeleteHold = (sha: string): string => `update-ref -d refs/uzi-incoming/${RF_RUN}/1/import-[A-Za-z0-9-]{8,64}-[0-9a-f-]{36} ${sha}`;
 const refuse = (head: string): RefusalOp => ({ op: "fetch", head });
 

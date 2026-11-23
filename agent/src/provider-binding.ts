@@ -9,12 +9,18 @@
 //   - resolveProviderModel: model resolution through the bound map. An unmapped alias or a full
 //     vendor model ID is a typed refusal; nothing is ever rewritten.
 
+import { CODEX_MODEL_IDS } from "./codex/model-vocabulary.js";
 import type { EmittedMessage } from "./executor.js";
-import type { ClaimProviderBinding } from "./protocol.js";
+import type { ClaimProviderBinding, ClaimClaudeProviderBinding, ClaimCodexProviderBinding, ClaimProviderModel } from "./protocol.js";
 import type { SdkCredential } from "./sdk-env.js";
 
 /** The protocol capability a worker must advertise (at register) to accept a provider-bound claim. */
 export const CLAUDE_PROVIDER_CAPABILITY = "claude_provider_v1";
+
+/** The protocol capability a worker must advertise (at register) to accept a Codex provider-bound
+ *  claim. Advertised only together with the Codex harness and runtime v2 capabilities (worker.ts),
+ *  and the api admits a Codex provider claim only on provider, harness and runtime v2. */
+export const CODEX_PROVIDER_CAPABILITY = "codex_provider_v1";
 
 /** The reason a claim whose lane cannot serve a provider reports (the server refuses these lanes
  *  first; this is the worker's second layer). */
@@ -74,7 +80,7 @@ function decodeModel(v: unknown, what: string): { model: string; context_window?
  * does, and THROWS a {@link ProviderBindingError} for anything else: a binding next to a vendor
  * OAuth token or a Codex block, a non-https base URL (unless a loopback host AND this worker's own
  * `UZI_PROVIDER_ALLOW_LOOPBACK=true`), userinfo, an unknown engine, protocol or auth style, a model
- * map without haiku or with an unknown alias, a model outside `[A-Za-z0-9._:/@-]{1,256}`, a
+ * map without its required slot or with an unknown slot, a model outside `[A-Za-z0-9._:/@-]{1,256}`, a
  * credential outside 16..4096 printable ASCII characters, an oversized base URL, or a context
  * window outside 8192..10000000.
  */
@@ -89,9 +95,9 @@ export function decodeProviderBinding(secrets: unknown, env: NodeJS.ProcessEnv =
   const { provider_id: providerId, revision, engine, protocol, base_url: baseUrl, auth_style: authStyle, credential } = raw;
   if (typeof providerId !== "string" || providerId === "") throw new ProviderBindingError("provider_id is missing");
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) throw new ProviderBindingError("revision is not a positive integer");
-  if (engine !== "claude") throw new ProviderBindingError("unknown engine");
-  if (protocol !== "anthropic_messages") throw new ProviderBindingError("unknown protocol");
-  if (authStyle !== "bearer" && authStyle !== "x_api_key") throw new ProviderBindingError("unknown auth_style");
+  if (engine !== "claude" && engine !== "codex") throw new ProviderBindingError("unknown engine");
+  if (protocol !== (engine === "claude" ? "anthropic_messages" : "openai_responses")) throw new ProviderBindingError("unknown protocol");
+  if (authStyle !== "bearer" && !(engine === "claude" && authStyle === "x_api_key")) throw new ProviderBindingError("unknown auth_style");
 
   if (typeof baseUrl !== "string" || baseUrl === "" || Buffer.byteLength(baseUrl, "utf8") > MAX_BASE_URL_BYTES) {
     throw new ProviderBindingError("base_url is missing or oversized");
@@ -110,9 +116,22 @@ export function decodeProviderBinding(secrets: unknown, env: NodeJS.ProcessEnv =
 
   const rawMap = raw.model_map;
   if (!isRecord(rawMap)) throw new ProviderBindingError("model_map is not an object");
+  if (engine === "codex") {
+    const ids = CODEX_MODEL_IDS;
+    for (const key of Object.keys(rawMap)) {
+      if (key !== "default" && !ids.some(id => id === key)) throw new ProviderBindingError("model_map has an unknown slot");
+    }
+    if (!Object.hasOwn(rawMap, "default")) throw new ProviderBindingError("model_map has no default");
+    const modelMap: ClaimCodexProviderBinding["model_map"] = { default: decodeModel(rawMap.default, "mapped slot") };
+    for (const id of ids) {
+      if (Object.hasOwn(rawMap, id)) modelMap[id] = decodeModel(rawMap[id], "mapped slot");
+    }
+    return { provider_id: providerId, revision, engine, protocol: "openai_responses",
+      base_url: baseUrl, auth_style: "bearer", credential, model_map: modelMap };
+  }
   for (const k of Object.keys(rawMap)) if (!(ALIASES as readonly string[]).includes(k)) throw new ProviderBindingError("model_map has an unknown alias");
   if (rawMap.haiku === undefined) throw new ProviderBindingError("model_map has no haiku");
-  const modelMap: ClaimProviderBinding["model_map"] = { haiku: decodeModel(rawMap.haiku, "haiku") };
+  const modelMap: ClaimClaudeProviderBinding["model_map"] = { haiku: decodeModel(rawMap.haiku, "haiku") };
   for (const alias of ["opus", "sonnet", "fable"] as const) {
     if (rawMap[alias] !== undefined) modelMap[alias] = decodeModel(rawMap[alias], alias);
   }
@@ -129,8 +148,18 @@ export function decodeProviderBinding(secrets: unknown, env: NodeJS.ProcessEnv =
   };
 }
 
+/** Execution refusal shared by claim admission and the Claude SDK boundary. */
+export class ProviderLaneUnsupportedError extends Error {
+  readonly reason = PROVIDER_LANE_UNSUPPORTED;
+  constructor() {
+    super(PROVIDER_LANE_UNSUPPORTED);
+    this.name = "ProviderLaneUnsupportedError";
+  }
+}
+
 /** The SdkCredential of a decoded binding. */
 export function sdkCredentialFromBinding(b: ClaimProviderBinding): SdkCredential {
+  if (b.engine !== "claude") throw new ProviderLaneUnsupportedError();
   return { kind: "provider", baseUrl: b.base_url, authStyle: b.auth_style, key: b.credential, modelMap: b.model_map };
 }
 
@@ -181,7 +210,7 @@ export class ProviderModelUnmappedError extends Error {
  * {@link ProviderModelUnmappedError}. The returned string is what the SDK `model` option receives:
  * the alias or mapped target as given, never a rewrite.
  */
-export function resolveProviderModel(model: string | undefined, modelMap: ClaimProviderBinding["model_map"]): string {
+export function resolveProviderModel(model: string | undefined, modelMap: Readonly<Partial<Record<string, ClaimProviderModel>>>): string {
   const effective = model === undefined || model.trim() === "" || model === "inherit" ? "sonnet" : model;
   if ((ALIASES as readonly string[]).includes(effective)) {
     if (modelMap[effective as Alias] !== undefined) return effective;
@@ -199,9 +228,21 @@ export function resolveProviderModel(model: string | undefined, modelMap: ClaimP
  */
 export function assertAgentModelsMapped(
   agents: Record<string, { model?: string }>,
-  modelMap: ClaimProviderBinding["model_map"],
+  modelMap: Readonly<Partial<Record<string, ClaimProviderModel>>>,
 ): void {
   for (const def of Object.values(agents)) {
     if (def.model !== undefined && def.model !== "" && def.model !== "inherit") resolveProviderModel(def.model, modelMap);
   }
+}
+
+
+/** Internal Codex selections may use default; an explicit owner pin must have its own slot. */
+export function resolveCodexProviderModelSlot(
+  model: string | undefined,
+  modelMap: ClaimCodexProviderBinding["model_map"],
+  explicit = false,
+): keyof ClaimCodexProviderBinding["model_map"] {
+  if (model !== undefined && Object.hasOwn(modelMap, model)) return model as keyof typeof modelMap;
+  if (explicit) throw new ProviderModelUnmappedError(model ?? "");
+  return "default";
 }

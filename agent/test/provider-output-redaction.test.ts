@@ -392,6 +392,50 @@ describe("provider pass thrown values", () => {
   });
 });
 
+describe("provider diagnostic graph sinks", () => {
+  it("keeps key-free cyclic identity and closes secret-bearing cyclic or unreadable edges", async () => {
+    const clean: Record<string, unknown> = {};
+    clean.self = clean;
+    const run = (value: unknown) => caught(() => runReadOnlyModelPass(passOpts({ provider: binding(ID_KEY), queryFn: throwing(value) })));
+    assert.equal(await run(clean), clean);
+    const secret = { [ID_KEY]: ID_KEY, self: clean };
+    const out = await run(secret);
+    assert.equal(carries(out, ID_KEY), false);
+    const unreadable = Object.defineProperty({}, "hidden", { enumerable: true, get() { throw new Error(ID_KEY); } });
+    const failed = await run(unreadable);
+    assert.ok(failed instanceof Error);
+    assert.equal(failed.message, "summary model call failed");
+  });
+  it("copies unconfigurable secret member names and reserves real collision suffixes", async () => {
+    const err = Object.defineProperties(new Error("clean"), {
+      [ID_KEY]: { value: "one", enumerable: true },
+      [REDACTED]: { value: "two", enumerable: true },
+      [REDACTED + "#2"]: { value: "reserved", enumerable: true },
+    });
+    const out = await caught(() => runReadOnlyModelPass(passOpts({ provider: binding(ID_KEY), queryFn: throwing(err) })));
+    assert.ok(out instanceof Error);
+    assert.notEqual(out, err);
+    assert.equal(Object.hasOwn(out, ID_KEY), false);
+    assert.equal((out as unknown as Record<string, unknown>)[REDACTED + "#3"], "two");
+    assert.equal((out as unknown as Record<string, unknown>)[REDACTED + "#2"], "reserved");
+  });
+  it("scrubs frozen member names, nested records and nonenumerable causes with shared collision accounting", async () => {
+    const encoded = encodeURIComponent(ESC_KEY);
+    const err = Object.freeze(Object.assign(new TypeError("clean", {
+      cause: new Error("clean cause", { cause: { nested: ESC_KEY } }),
+    }), {
+      details: { [encoded]: { tokens: 2 }, [REDACTED]: { tokens: 3 }, [REDACTED + "#2"]: "reserved" },
+    }));
+    const out = await caught(() => runReadOnlyModelPass(passOpts({ provider: binding(ESC_KEY), queryFn: throwing(err) }))) as typeof err;
+    assert.ok(out instanceof TypeError);
+    assert.notEqual(out, err);
+    assert.deepEqual(out.details, { [REDACTED]: { tokens: 5 }, [REDACTED + "#2"]: "reserved" });
+    assert.deepEqual((out.cause as Error).cause, { nested: REDACTED });
+    assert.equal(JSON.stringify(out).includes(encoded), false);
+    assert.equal(carries(out, ESC_KEY), false);
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Runner-level behaviour through the real SummaryRunner / ReviewRunner
 // ---------------------------------------------------------------------------------------------

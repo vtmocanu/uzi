@@ -12,6 +12,9 @@
 // This pass delivers the TYPE + the DECISION only. Wiring the decision into
 // makeExecutor / runner.ts / main.ts is a separate later unit.
 
+import type { ClaimCodexProviderBinding, ClaimProviderModel } from "../protocol.js";
+import { decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "../provider-binding.js";
+
 // --- Branded validated binding ------------------------------------------------
 // A module-private brand: the ONLY way to obtain a `CodexBinding` is through
 // {@link selectCodexBinding}'s validator, so downstream credential-bridge code can
@@ -56,9 +59,50 @@ export type CodexBinding = CodexBindingBase &
       }
   );
 
+declare const codexProviderAuthorityBrand: unique symbol;
+
+/** Separate from vendor CodexBinding: no vendor capability or credential mode.
+ * The destination, model map and key form one immutable execution snapshot. */
+export interface CodexProviderExecutionAuthority {
+  readonly [codexProviderAuthorityBrand]: true;
+  readonly authMode: "provider";
+  readonly providerBinding: Readonly<Omit<ClaimCodexProviderBinding, "model_map">> & {
+    readonly model_map: Readonly<{ default: Readonly<ClaimProviderModel> } &
+      Partial<Record<keyof ClaimCodexProviderBinding["model_map"], Readonly<ClaimProviderModel>>>>;
+  };
+}
+
+export type CodexExecutionAuthority = CodexBinding | CodexProviderExecutionAuthority;
+
+/** Mint from a decoded provider claim, defensively revalidating and copying before freezing.
+ * Exclusivity with vendor secrets remains the claim decoder caller's responsibility. */
+export function createCodexProviderExecutionAuthority(
+  binding: ClaimCodexProviderBinding,
+): CodexProviderExecutionAuthority {
+  const snapshot = decodeProviderBinding({ provider: binding });
+  if (snapshot?.engine !== "codex") throw new ProviderBindingError("expected codex engine");
+  for (const entry of Object.values(snapshot.model_map)) Object.freeze(entry);
+  Object.freeze(snapshot.model_map);
+  Object.freeze(snapshot);
+  return Object.freeze({ authMode: "provider", providerBinding: snapshot }) as CodexProviderExecutionAuthority;
+}
+
 /** The dark selection decision. `claude` is the exact legacy Claude path (absence);
  *  `codex` carries a validated binding (a complete server-owned Codex block). */
 export type CodexSelection = { kind: "claude" } | { kind: "codex"; binding: CodexBinding };
+
+/** Consumer selection validates credential exclusivity before choosing an engine. */
+export function selectCodexExecutionAuthority(
+  secrets: CodexClaimView & { readonly provider?: unknown; readonly anthropic_oauth_token?: string },
+): { kind: "claude" } | { kind: "codex"; binding: CodexExecutionAuthority } {
+  let provider;
+  try { provider = decodeProviderBinding(secrets); }
+  catch { throw new ProviderLaneUnsupportedError(); }
+  if (provider?.engine === "codex") {
+    return { kind: "codex", binding: createCodexProviderExecutionAuthority(provider) };
+  }
+  return selectCodexBinding(secrets);
+}
 
 // --- Bounded, secret-free failure ---------------------------------------------
 

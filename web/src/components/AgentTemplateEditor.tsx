@@ -291,10 +291,10 @@ export const AgentTemplateEditor = forwardRef<
         {isLead ? (
           <>
             <p id="template-model-help" className="text-xs text-muted">
-              A model chosen at start or a schedule's model, then your Run defaults model for that harness, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses {DEFAULT_CODEX_MODEL}.
+              A model chosen at start or a schedule's model, then your worker model for that harness in Settings → Models, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses {DEFAULT_CODEX_MODEL}.
             </p>
             <p id="template-effort-help" className="text-xs text-muted">
-              An effort chosen at start, then your Run defaults effort for that harness (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.
+              An effort chosen at start, then your worker effort for that harness in Settings → Models (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.
             </p>
           </>
         ) : (

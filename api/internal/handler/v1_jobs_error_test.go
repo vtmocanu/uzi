@@ -23,9 +23,9 @@ func TestWriteV1JobErrorMapsProviderLaneRefusal(t *testing.T) {
 		msg    string
 	}{
 		{"lane (sentinel)", workersvc.ErrProviderLaneUnsupported, http.StatusConflict, "provider_lane_unsupported",
-			"this run type does not support a model-provider Claude source yet"},
+			"this run type does not support a model-provider source yet"},
 		{"lane (wrapped)", fmt.Errorf("create job: %w", workersvc.ErrProviderLaneUnsupported), http.StatusConflict, "provider_lane_unsupported",
-			"this run type does not support a model-provider Claude source yet"},
+			"this run type does not support a model-provider source yet"},
 		{"invalid", workersvc.ErrJobInvalid, http.StatusUnprocessableEntity, v1ReasonInvalidRequest, ""},
 		{"unknown type", workersvc.ErrJobTypeUnknown, http.StatusUnprocessableEntity, v1ReasonUnknownJobType, ""},
 		{"over cap", workersvc.ErrJobOverCap, http.StatusTooManyRequests, v1ReasonOverCap, ""},

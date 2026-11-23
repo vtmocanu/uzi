@@ -150,8 +150,8 @@ func (s *Service) PredictHarness(ctx context.Context, userID uuid.UUID, explicit
 		switch {
 		case automaticHarnessEligible(res, explicit, origin, policy):
 			out.Harness, out.ChosenAtCreate, out.Policy = "", true, PredictPolicyAutomaticWeeklyReset
-		case res.ClaudeSourceSet || res.DefaultUnset || !policy.HarnessOverflowEnabled || !origin.eligible(policy):
-			// A set Claude provider source is excluded from automatic choice and overflow (PRD #4320
+		case res.ClaudeSourceSet || res.CodexSourceSet || res.DefaultUnset || !policy.HarnessOverflowEnabled || !origin.eligible(policy):
+			// A set provider source is excluded from automatic choice and overflow (PRD #4320
 			// D13), exactly as evaluateCreationOverflow does.
 			// The pure D11 answer stands: no policy can move the harness.
 		default:
@@ -186,8 +186,8 @@ func predictRule(r harnessRule) string {
 // creation excludes overflow when the default Codex subscription is structurally unavailable (the
 // Claude run must not fail on an unavailable destination). It reads no limit evidence.
 func (s *Service) overflowApplies(ctx context.Context, q predictStore, userID uuid.UUID, res resolvedHarness) (bool, error) {
-	if res.ClaudeSourceSet {
-		return false, nil // mirrors evaluateCreationOverflow's exclusion for a set Claude provider source
+	if res.ClaudeSourceSet || res.CodexSourceSet {
+		return false, nil // mirrors evaluateCreationOverflow's exclusion for a set provider source
 	}
 	otherHarness := HarnessClaude
 	if res.Harness == HarnessClaude {
@@ -221,7 +221,7 @@ func (s *Service) overflowApplies(ctx context.Context, q predictStore, userID uu
 // credential, or, in account mode auto with a configured pool, an account picked by headroom).
 func predictCredential(res resolvedHarness) *CredentialPrediction {
 	if res.ProviderSource != nil {
-		// A provider-sourced Claude run spends the provider's frozen key, which is neither an
+		// A provider-sourced run spends the provider's frozen key, which is neither an
 		// Anthropic token nor a Codex credential: no vendor credential is predicted.
 		return nil
 	}

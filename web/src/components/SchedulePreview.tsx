@@ -15,7 +15,8 @@ import type {
 import { useSchedulePreview } from "../lib/useSchedulePreview";
 import { Alert } from "./ui";
 
-const RUN_DEFAULTS_PATH = "/settings/run-defaults";
+// The previewed harness, model and effort are all chosen in Settings → Models (PRD #3263).
+const MODELS_PATH = "/settings/models";
 const LOADING_TEXT = "Resolving…";
 const ERROR_TEXT = "Preview unavailable; Save will validate your choices.";
 const REFUSED_NOTE = "Save will validate your choices.";
@@ -50,16 +51,16 @@ function ValueRows({ label, row, children }: { label: string; row: ValueRow | nu
 
 // The link is its own >= 24px target; a bare 12px text line is too small to hit. It opens in a
 // new tab: a same-tab navigation would close the modal and lose the draft.
-function RunDefaultsLink() {
+function ModelsLink() {
   return (
     <a
-      href={RUN_DEFAULTS_PATH}
+      href={MODELS_PATH}
       target="_blank"
       rel="noopener noreferrer"
       draggable={false}
       className="inline-flex min-h-6 items-center text-brand hover:text-brand-hover"
     >
-      Run defaults (opens in new tab)
+      Models (opens in new tab)
     </a>
   );
 }
@@ -71,7 +72,7 @@ function EffortRow({ label, row, link }: { label: string; row: ValueRow | null; 
       {link && (
         <>
           {" · "}
-          <RunDefaultsLink />
+          <ModelsLink />
         </>
       )}
     </ValueRows>
@@ -135,7 +136,7 @@ function Rows({ view }: { view: SchedulePreviewView }) {
   }
   const h = view.harness;
   const notes = view.notes.join(", ");
-  // The Run defaults link appears once: on the top-level effort row, else the first branch with one.
+  // The Models link appears once: on the top-level effort row, else the first branch with one.
   const firstWithEffort = view.effort ? null : view.alternatives.find((b) => b.effort);
   return (
     <>

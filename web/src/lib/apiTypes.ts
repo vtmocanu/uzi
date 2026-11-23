@@ -143,17 +143,15 @@ export interface SecretDependents {
 }
 
 // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
-export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable" | "default" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna";
 
 export interface ProviderModelEntry {
   model: string;
   context_window?: number;
 }
 
-// haiku is required by the server; the other roles are optional.
-export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
-  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
->;
+// The engine requires haiku (Claude) or default (Codex); remaining entries are optional.
+export type ProviderModelMap = Partial<Record<ProviderModelRole, ProviderModelEntry>>;
 
 export type ProviderAuthStyle = "bearer" | "x_api_key";
 
@@ -166,10 +164,10 @@ export interface ProviderProbe {
 export interface ProviderDTO {
   id: string;
   name: string;
-  engine: "claude";
+  engine: "claude" | "codex";
   retired: boolean;
   current_revision: number;
-  protocol: "anthropic_messages";
+  protocol: "anthropic_messages" | "openai_responses";
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
@@ -185,6 +183,8 @@ export interface ProvidersList {
 }
 
 export interface CreateProviderInput {
+  engine?: ProviderDTO["engine"];
+  protocol?: ProviderDTO["protocol"];
   name: string;
   base_url: string;
   auth_style: ProviderAuthStyle;
@@ -655,6 +655,7 @@ export interface UserSettings {
    *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
    *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
   claude_provider_id?: string | null;
+  codex_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -727,6 +728,60 @@ export interface UserSettingsPatch {
   /** Per-user "Judge runs on" (PRD #3257); same tri-state as default_harness: a value sets the
    *  judge harness, null clears back to "same as the run", absent leaves it unchanged. */
   judge_runs_on?: Harness | null;
+}
+
+/** One cross_check_pins cell of PUT /me/model-settings: omitted members stay unchanged,
+ *  null clears that member's override. */
+export interface ModelSettingsPinPatch {
+  stage: "plan" | "code";
+  harness: Harness;
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** PUT /api/me/model-settings body (PRD #3263): the closed 19-key allowlist, written in one
+ *  transaction. Omitted keys stay unchanged; null clears an override. Values are validated
+ *  server-side, so the scalars are plain strings here. */
+export interface ModelSettingsPatch {
+  default_harness?: string | null;
+  default_claude_model?: string | null;
+  default_codex_model?: string | null;
+  default_effort?: string | null;
+  default_codex_effort?: string | null;
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
+  planning_codex_model?: string | null;
+  planning_codex_effort?: string | null;
+  judge_runs_on?: string | null;
+  judge_model?: string | null;
+  codex_judge_model?: string | null;
+  summary_model?: string | null;
+  codex_summary_model?: string | null;
+  task_review_model?: string | null;
+  codex_task_review_model?: string | null;
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
+  cross_check_pins?: ModelSettingsPinPatch[];
+}
+
+/** The 200 body of PUT /me/model-settings: the canonical settings read after commit, and the
+ *  effective-settings prediction. `effective` is null, with effective_error
+ *  "settings_effective_readback_failed", when only the prediction could not be read: the save
+ *  still committed. */
+export interface ModelSettingsSaveResponse {
+  settings: UserSettings;
+  effective: EffectiveSettings | null;
+  effective_error?: string;
+}
+
+/** One entry of the 400 `errors` array of PUT /me/model-settings. stage/harness/member are set
+ *  only for a cross_check_pins cell defect. */
+export interface ModelSettingsFieldError {
+  field: string;
+  message: string;
+  stage?: "plan" | "code";
+  harness?: Harness;
+  member?: "model" | "effort";
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),

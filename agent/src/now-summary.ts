@@ -46,10 +46,11 @@ import type { Logger } from "./log.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import type { CodexSwitchBundle } from "./codex-switch-coordinator.js";
 import { ownedSummaryFactories } from "./codex/summary-ownership.js";
-import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
+import { selectCodexBinding, selectCodexExecutionAuthority, createCodexProviderExecutionAuthority } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { ReadOnlyModelPassOpts } from "./model-pass.js";
 import type { Milestone, MilestoneProgress } from "./protocol.js";
 import { fenceNonce } from "./prompt.js";
+import { makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
 import { errMessage } from "./util.js";
 import { CredentialSwitchSignal } from "./steering.js";
 
@@ -183,10 +184,11 @@ export function nowSummaryCodexClaim(
   codexBlock: unknown,
   buildHarness: CodexAdviceHarnessFactory | undefined,
   claimGeneration?: number,
+  secrets?: Parameters<typeof selectCodexExecutionAuthority>[0],
 ): { codex?: NonNullable<ReadOnlyModelPassOpts["codex"]> } {
-  if (codexBlock === undefined || buildHarness === undefined) return {};
+  if (buildHarness === undefined) return {};
   try {
-    const selection = selectCodexBinding({ codex: codexBlock });
+    const selection = selectCodexExecutionAuthority(secrets ?? { codex: codexBlock });
     return selection.kind === "codex" ? { codex: { runId, claimGeneration, binding: selection.binding, buildHarness } } : {};
   } catch {
     return {};
@@ -247,7 +249,8 @@ function validateNowBinding(binding: CodexSwitchBundle["binding"]): CodexSwitchB
 }
 
 function snapshotCodex(codex: NonNullable<ReadOnlyModelPassOpts["codex"]>, ordinal: number): NowCodexAuthority {
-  return Object.freeze({ ...codex, binding: Object.freeze({ ...codex.binding }), ordinal });
+  return Object.freeze({ ...codex, binding: codex.binding.authMode === "provider"
+    ? createCodexProviderExecutionAuthority(codex.binding.providerBinding) : Object.freeze({ ...codex.binding }), ordinal });
 }
 
 interface InFlight {
@@ -291,10 +294,13 @@ export class NowSummaryController {
   private readonly redact: (s: string) => string;
 
   constructor(private readonly deps: NowSummaryDeps) {
-    this.redact = deps.redact ?? ((s) => s);
+    const binding = deps.claim.codex?.binding;
+    const key = binding?.authMode === "provider" ? binding.providerBinding.credential : deps.pass.provider?.credential;
+    const scrub = makeTextRedactor(key ? providerKeyForms(key) : []);
+    this.redact = s => scrub(deps.redact ? deps.redact(scrub(s)) : s);
     this.authority = deps.claim.codex ? snapshotCodex(deps.claim.codex, 0) : undefined;
     try {
-      if (this.authority && !deps.claim.claude && this.authority.runId.length > 0 &&
+      if (this.authority && this.authority.binding.authMode !== "provider" && !deps.claim.claude && this.authority.runId.length > 0 &&
           Number.isSafeInteger(this.authority.claimGeneration) && (this.authority.claimGeneration ?? 0) > 0) {
         this.initialValidatedCodex = snapshotCodex({ ...this.authority, binding: validateNowBinding(this.authority.binding) }, 0);
         this.authority = this.initialValidatedCodex;
@@ -485,7 +491,7 @@ export class NowSummaryController {
     try {
       fn();
     } catch (e) {
-      this.deps.log.warn("now summary: observer failed", { error: errMessage(e) });
+      this.deps.log.warn("now summary: observer failed", { error: this.redact(errMessage(e)) });
     }
   }
 
@@ -539,7 +545,7 @@ export class NowSummaryController {
       this.toolSinceCall = 0;
       await this.begin().done;
     } catch (e) {
-      this.deps.log.warn("now summary: scheduling failed", { error: errMessage(e) });
+      this.deps.log.warn("now summary: scheduling failed", { error: this.redact(errMessage(e)) });
     }
   }
 
@@ -571,7 +577,7 @@ export class NowSummaryController {
           ...this.deps.pass,
           ...(cred ? { token: cred.token } : {}),
           // The Codex harness ignores the token, so a Codex call never carries the Anthropic one.
-          ...(codex ? { token: undefined, model: NOW_MODEL_CODEX, effort: NOW_EFFORT_CODEX, codex: { ...codex, refresh: "deny" as const } } : { model: NOW_MODEL }),
+          ...(codex ? { provider: codex.binding.authMode === "provider" ? codex.binding.providerBinding : undefined, token: undefined, model: NOW_MODEL_CODEX, effort: NOW_EFFORT_CODEX, codex: { ...codex, refresh: "deny" as const } } : { model: NOW_MODEL }),
           systemPrompt: SYSTEM_PROMPT,
           prompt: buildPrompt(this.redact(title), frames),
           homePrefix: "uzi-now-",
@@ -584,13 +590,13 @@ export class NowSummaryController {
           log: this.deps.log,
           onUsage: (u) => {
             if (authority !== this.authority || call.abandoned) return;
-            usage = u;
-            call.usage = u;
+            usage = redactStrings(u, this.redact) as AdviceUsageSnapshot;
+            call.usage = usage;
           },
         });
       } catch (e) {
         // Every failure is swallowed: a rate limit, a refusal, a timeout, an abort.
-        this.deps.log.warn("now summary: call failed", { error: errMessage(e) });
+        this.deps.log.warn("now summary: call failed", { error: this.redact(errMessage(e)) });
       } finally {
         lifecycle.removeEventListener("abort", onLifecycle);
       }
@@ -598,7 +604,7 @@ export class NowSummaryController {
       try {
         this.settle(call, milestoneId, text, usage);
       } catch (e) {
-        this.deps.log.warn("now summary: could not post the result", { error: errMessage(e) });
+        this.deps.log.warn("now summary: could not post the result", { error: this.redact(errMessage(e)) });
       }
     })();
     return call;

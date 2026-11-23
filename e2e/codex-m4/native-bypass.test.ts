@@ -2,7 +2,7 @@
 //
 // Representative top-level native dispatch probes on the real protocol. Supported config
 // suppression, explicit environments: [] and the replaced launcher environment deny effects;
-// false feature keys alone do not establish runtime suppression on pin 0.167.0.
+// false feature keys alone do not establish runtime suppression at 0.167.0 (pin 0.169.0, not re-measured).
 // Forced shell/exec/write_stdin/local_shell and direct native patch calls produce no marker,
 // worker callback, command spawn or fileop; the dynamic uzi_bash control reaches the broker.
 //

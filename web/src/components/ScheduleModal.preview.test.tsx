@@ -154,7 +154,7 @@ describe("schedule modal preview", () => {
     expect(harnessDetail.textContent).toContain("automatic · predicted · fixed when it fires");
   });
 
-  it("chosen at create: one group per alternative, and the Run defaults link appears once", async () => {
+  it("chosen at create: one group per alternative, and the Models link appears once", async () => {
     const p = fixture("default", "unpinned sweep");
     mockApi.previewScheduleSettings.mockResolvedValue(p);
     renderModal();
@@ -165,7 +165,7 @@ describe("schedule modal preview", () => {
     expect(within(r).getByText("Claude model")).toBeTruthy();
     expect(within(r).getByText("Codex model")).toBeTruthy();
     expect(within(r).getByText(p.alternatives![1].worker_model!.resolved_model)).toBeTruthy();
-    expect(within(r).getAllByRole("link", { name: "Run defaults (opens in new tab)" })).toHaveLength(1);
+    expect(within(r).getAllByRole("link", { name: "Models (opens in new tab)" })).toHaveLength(1);
   });
 
   it("a refusal shows one Refused row and no duplicate per-alternative refusals", async () => {
@@ -178,14 +178,14 @@ describe("schedule modal preview", () => {
     expect(within(r).queryByText("Model")).toBeNull();
   });
 
-  it("links the effort row to Run defaults", async () => {
+  it("links the effort row to Models", async () => {
     mockApi.previewScheduleSettings.mockResolvedValue(
       fixture("default", "sweep pinned to claude with subagents following the lead"),
     );
     renderModal();
     const r = await readyRegion();
-    const link = within(r).getByRole("link", { name: "Run defaults (opens in new tab)" });
-    expect(link.getAttribute("href")).toBe("/settings/run-defaults");
+    const link = within(r).getByRole("link", { name: "Models (opens in new tab)" });
+    expect(link.getAttribute("href")).toBe("/settings/models");
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     expect(link.closest("dd")?.textContent).toContain("schedules can't change it");

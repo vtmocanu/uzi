@@ -109,19 +109,8 @@ func decodeProviderBody(w http.ResponseWriter, r *http.Request, dst any, refusal
 type providerRow = store.ListModelProvidersForOwnerRow
 
 func modelMapDTO(raw []byte) apitypes.ModelMapDTO {
-	var m providers.ModelMap
-	_ = json.Unmarshal(raw, &m)
-	entry := func(k string) *apitypes.ModelEntryDTO {
-		e, ok := m[k]
-		if !ok {
-			return nil
-		}
-		return &apitypes.ModelEntryDTO{Model: e.Model, ContextWindow: e.ContextWindow}
-	}
-	out := apitypes.ModelMapDTO{Opus: entry("opus"), Sonnet: entry("sonnet"), Fable: entry("fable")}
-	if h := entry(providers.HaikuAlias); h != nil {
-		out.Haiku = *h
-	}
+	var out apitypes.ModelMapDTO
+	_ = json.Unmarshal(raw, &out)
 	return out
 }
 
@@ -184,6 +173,11 @@ func isPGForeignKeyViolation(err error, constraint string) bool {
 // writeProviderError maps the sentinel errors of a provider transaction to responses. It reports
 // whether it wrote one.
 func writeProviderError(w http.ResponseWriter, err error) bool {
+	var profileErr *providerProfileError
+	if errors.As(err, &profileErr) {
+		httpx.Error(w, http.StatusBadRequest, profileErr.Error())
+		return true
+	}
 	switch {
 	case errors.Is(err, errProviderNotFound):
 		httpx.Error(w, http.StatusNotFound, "provider not found")
@@ -296,22 +290,17 @@ func (h *Handler) CreateMyProvider(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "name: "+err.Error())
 		return
 	}
-	if req.Engine != "" && req.Engine != providers.EngineClaude {
-		httpx.Error(w, http.StatusBadRequest, "engine must be claude")
-		return
+	if req.Engine == "" {
+		req.Engine = providers.EngineClaude
 	}
-	if req.Protocol != "" && req.Protocol != providers.ProtocolAnth {
-		httpx.Error(w, http.StatusBadRequest, "protocol must be anthropic_messages")
-		return
+	if req.Protocol == "" && req.Engine == providers.EngineClaude {
+		req.Protocol = providers.ProtocolAnth
 	}
-	if err := providers.ValidateAuthStyle(req.AuthStyle); err != nil {
+	if err := providers.ValidateProfile(req.Engine, req.Protocol, req.AuthStyle, req.ModelMap); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := providers.ValidateModelMap(req.ModelMap); err != nil {
-		httpx.Error(w, http.StatusBadRequest, err.Error())
-		return
-	}
+
 	baseURL, ok := h.allowedProviderBaseURL(w, req.BaseURL)
 	if !ok {
 		return
@@ -335,13 +324,13 @@ func (h *Handler) CreateMyProvider(w http.ResponseWriter, r *http.Request) {
 			return errProviderCap
 		}
 		p, err := q.InsertModelProvider(r.Context(), store.InsertModelProviderParams{
-			OwnerUserID: user.ID, Name: name, Engine: providers.EngineClaude,
+			OwnerUserID: user.ID, Name: name, Engine: req.Engine,
 		})
 		if err != nil {
 			return err
 		}
 		if err := q.InsertModelProviderRevision(r.Context(), store.InsertModelProviderRevisionParams{
-			ProviderID: p.ID, Revision: 1, Protocol: providers.ProtocolAnth,
+			ProviderID: p.ID, Revision: 1, Protocol: req.Protocol,
 			BaseUrl: baseURL, AuthStyle: req.AuthStyle, ModelMap: mm,
 		}); err != nil {
 			return err
@@ -426,6 +415,13 @@ func (h *Handler) editProvider(w http.ResponseWriter, r *http.Request, userID, i
 				}
 				p.ModelMap = mm
 			}
+			var models providers.ModelMap
+			if err := json.Unmarshal(p.ModelMap, &models); err != nil {
+				return err
+			}
+			if err := providers.ValidateProfile(cur.Engine, p.Protocol, p.AuthStyle, models); err != nil {
+				return &providerProfileError{err}
+			}
 			if err := q.InsertModelProviderRevision(r.Context(), p); err != nil {
 				return err
 			}
@@ -482,7 +478,16 @@ func (h *Handler) PatchMyProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	var edit *revisionEdit
 	if req.ModelMap != nil {
-		if err := providers.ValidateModelMap(*req.ModelMap); err != nil {
+		profile, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeProviderError(w, errProviderNotFound)
+			} else {
+				internalProviderError(w, "get provider", err)
+			}
+			return
+		}
+		if err := providers.ValidateModelMapForEngine(profile.Engine, *req.ModelMap); err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -568,7 +573,7 @@ func (h *Handler) RetireMyProvider(w http.ResponseWriter, r *http.Request) {
 
 // DeleteMyProvider deletes a provider with its revisions, probe result and key. A provider that
 // any user has selected as their source cannot be deleted: 409 provider_in_use_as_source (the
-// users_claude_provider_fkey ON DELETE RESTRICT).
+// owner-bound Claude and Codex source foreign keys use ON DELETE RESTRICT).
 func (h *Handler) DeleteMyProvider(w http.ResponseWriter, r *http.Request) {
 	user, ok := userForProviderRoute(w, r)
 	if !ok {
@@ -589,7 +594,7 @@ func (h *Handler) DeleteMyProvider(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		if isPGForeignKeyViolation(err, "users_claude_provider_fkey") {
+		if isPGForeignKeyViolation(err, "users_claude_provider_fkey") || isPGForeignKeyViolation(err, "users_codex_provider_fkey") {
 			httpx.ErrorReason(w, http.StatusConflict,
 				"the provider is selected as a source; choose another source before deleting it", reasonProviderInUseAsSource)
 			return
@@ -626,7 +631,25 @@ func (h *Handler) PutMyProviderKey(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	material, err := h.sealUserSecret(r.Context(), user.ID, store.KindAnthropicCompatibleKey, []byte(key))
+	snapshot, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeProviderError(w, errProviderNotFound)
+		return
+	}
+	if err != nil {
+		internalProviderError(w, "get provider before sealing", err)
+		return
+	}
+	var models providers.ModelMap
+	if json.Unmarshal(snapshot.ModelMap, &models) != nil || providers.ValidateProfile(snapshot.Engine, snapshot.Protocol, snapshot.AuthStyle, models) != nil {
+		httpx.Error(w, http.StatusConflict, "the provider profile is invalid")
+		return
+	}
+	expectedKind := store.KindAnthropicCompatibleKey
+	if snapshot.Engine == providers.EngineCodex {
+		expectedKind = store.KindOpenAICompatibleKey
+	}
+	material, err := h.sealUserSecret(r.Context(), user.ID, expectedKind, []byte(key))
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -643,12 +666,18 @@ func (h *Handler) PutMyProviderKey(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
+		if prov.Engine != snapshot.Engine || prov.CurrentRevision != snapshot.CurrentRevision || prov.KeySecretID != snapshot.KeySecretID || prov.KeyEnablementRev != snapshot.KeyEnablementRev || prov.RetiredAt.Valid {
+			return &providerProfileError{errors.New("the provider changed while sealing its key; try again")}
+		}
 		if _, ok := h.cfg.ProviderBaseURLAllowed(prov.BaseUrl); !ok {
 			return errProviderBaseURLGone
 		}
 		cur, err := q.GetProviderKeyForUpdate(r.Context(), store.GetProviderKeyForUpdateParams{UserID: user.ID, ProviderID: pgtype.UUID{Bytes: id, Valid: true}})
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
+			if prov.KeySecretID.Valid {
+				return errProviderNoKey
+			}
 			_, err = q.InsertProviderKeySecret(r.Context(), store.InsertProviderKeySecretParams{
 				UserID: user.ID, Label: id.String(), Ciphertext: material.Ciphertext, SealedWith: material.SealedWith,
 				ProviderID: pgtype.UUID{Bytes: id, Valid: true},
@@ -754,3 +783,5 @@ func (h *Handler) PatchMyProviderKeyEnabled(w http.ResponseWriter, r *http.Reque
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"provider": providerDTO(providerRow(row))})
 }
+
+type providerProfileError struct{ error }

@@ -17,7 +17,31 @@ import (
 
 type crossCheckPinDTO = apitypes.CrossCheckPinDTO
 
+// crossCheckPinError is one cross_check_pins defect. Stage, Harness and Member (model or effort)
+// identify the offending cell and member when the defect belongs to one; a list-shape defect (too
+// many cells, not a list) carries none. Err keeps the original error so the first-error wrapper
+// returns the exact text and chain PutMySettings has always reported.
+type crossCheckPinError struct {
+	Stage, Harness, Member string
+	Err                    error
+}
+
+// decodeCrossCheckPins returns the decoded pin patches, or the FIRST defect as an error (the
+// PutMySettings contract).
 func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchUserCrossCheckPinParams, error) {
+	patches, errs := collectCrossCheckPins(raw, userID)
+	if len(errs) > 0 {
+		return nil, errs[0].Err
+	}
+	return patches, nil
+}
+
+// collectCrossCheckPins decodes like decodeCrossCheckPins but reports every defect: a list-shape
+// defect ends the walk (there are no cells to attribute), otherwise every cell is checked. A cell
+// reports only the first of its stage, harness or duplicate defect and is then skipped (its
+// members are not validated); a cell that passes those reports one defect per bad model or effort
+// member. Defects come in request order. The patches are only meaningful when no error is returned.
+func collectCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchUserCrossCheckPinParams, []crossCheckPinError) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -30,23 +54,34 @@ func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchU
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&cells); err != nil || cells == nil || len(cells) > 4 {
-		return nil, fmt.Errorf("cross_check_pins: expected at most four keyed cells")
+		return nil, []crossCheckPinError{{Err: fmt.Errorf("cross_check_pins: expected at most four keyed cells")}}
 	}
 	if err := d.Decode(new(any)); err != io.EOF {
-		return nil, fmt.Errorf("cross_check_pins: invalid list")
+		return nil, []crossCheckPinError{{Err: fmt.Errorf("cross_check_pins: invalid list")}}
 	}
+	var errs []crossCheckPinError
 	seen := map[string]bool{}
 	patches := make([]store.PatchUserCrossCheckPinParams, 0, len(cells))
 	for _, c := range cells {
-		key := c.Stage + "/" + c.Harness
+		// Stage and harness are caller text: every echo of them is clipped (clipEcho). A valid
+		// stage or harness is short, so the clip changes only the text of oversized unknown ones
+		// (and the dedupe key, which is only consulted for valid cells).
+		stage, harness := clipEcho(c.Stage), clipEcho(c.Harness)
+		key := stage + "/" + harness
+		cellErr := func(member string, err error) {
+			errs = append(errs, crossCheckPinError{Stage: stage, Harness: harness, Member: member, Err: err})
+		}
 		if c.Stage != "plan" && c.Stage != "code" {
-			return nil, fmt.Errorf("cross_check_pins %s stage: unknown stage", key)
+			cellErr("", fmt.Errorf("cross_check_pins %s stage: unknown stage", key))
+			continue
 		}
 		if c.Harness != "claude" && c.Harness != "codex" {
-			return nil, fmt.Errorf("cross_check_pins %s harness: unknown harness", key)
+			cellErr("", fmt.Errorf("cross_check_pins %s harness: unknown harness", key))
+			continue
 		}
 		if seen[key] {
-			return nil, fmt.Errorf("cross_check_pins %s: duplicate cell", key)
+			cellErr("", fmt.Errorf("cross_check_pins %s: duplicate cell", key))
+			continue
 		}
 		seen[key] = true
 		patch := store.PatchUserCrossCheckPinParams{UserID: userID, Stage: c.Stage, Harness: c.Harness,
@@ -63,14 +98,16 @@ func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchU
 			}
 			var value *string
 			if err := json.Unmarshal(field.raw, &value); err != nil {
-				return nil, fmt.Errorf("cross_check_pins %s %s: expected string or null", key, field.name)
+				cellErr(field.name, fmt.Errorf("cross_check_pins %s %s: expected string or null", key, field.name))
+				continue
 			}
 			if value == nil {
 				continue
 			}
 			normalized, err := field.validate(c.Harness, *value)
 			if err != nil {
-				return nil, fmt.Errorf("cross_check_pins %s %s: %w", key, field.name, err)
+				cellErr(field.name, fmt.Errorf("cross_check_pins %s %s: %w", key, field.name, err))
+				continue
 			}
 			*field.target = pgtype.Text{String: normalized, Valid: normalized != ""}
 		}
@@ -78,7 +115,7 @@ func decodeCrossCheckPins(raw json.RawMessage, userID uuid.UUID) ([]store.PatchU
 			patches = append(patches, patch)
 		}
 	}
-	return patches, nil
+	return patches, errs
 }
 
 // Each conditional UPSERT preserves omitted columns even when concurrent field

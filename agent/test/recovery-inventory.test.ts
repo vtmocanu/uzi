@@ -710,7 +710,7 @@ it("M3 changed immutable request and disappeared record reset local retry identi
 
 // V2 records retain original generation and preparation policy across worker drift.
 async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false,
-  runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}) {
+  runnerOptions: ConstructorParameters<typeof RunRunner>[6] = {}, providerKeyScan?: true) {
   const f = await fixture(true, os.tmpdir(), receiptModel, receiptModel ? "00000000-0000-4000-8000-000000000001" : "run-1", runnerOptions);
   const order: string[] = [];
   const holdId = "00000000-0000-4000-8000-000000000007";
@@ -757,7 +757,7 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
   const record = await f.coordinator.freezeInventory({
     context: f.context, currentSha: H, defaultBranch: "main", repoId,
     heldPolicy: { version: 1, blocked: false, everKnown: false, flaggedCommits: [],
-      ciGlobs: [".custom-ci/**"], extraFloors: [] },
+      ciGlobs: [".custom-ci/**"], extraFloors: [], ...(providerKeyScan ? { providerKeyScan } : {}) },
   });
   assert.ok(record);
   f.state.ownGeneration = 8;
@@ -1680,6 +1680,70 @@ for (const refusal of ["empty roots without source proof", "unverified head"] as
       assert.equal(f.state.open, true);
       assert.equal(f.state.pinDeletes, 0);
       assert.equal(f.state.produced, 1);
+    } finally { await f.close(); }
+  });
+}
+
+for (const providerKeyScan of [true, undefined] as const) {
+  it(`persisted held policy restart ${providerKeyScan ? "provider marker" : "vendor control"} without RAM snapshot`, async () => {
+    const f = await v2FrozenFixture("issue", true, {}, providerKeyScan);
+    try {
+      // A private archive is unscanned and may upload; it cannot replace held publication proof.
+      f.state.thin = true;
+      const candidates = structuredClone(f.state.candidates);
+      const identity = (record: RecoveryRecord) => ({
+        captureId: record.captureId, generation: record.generation, sourceSha: record.sourceSha,
+        coverageDigest: record.coverageDigest, originalRoots: record.originalRoots,
+        originalSourceSha: record.originalSourceSha, exactHoldBinding: record.exactHoldBinding,
+      });
+      const original = identity(f.record);
+      const disk = () => fs.readFile(path.join(f.root, "journal", f.record.runId,
+        f.record.captureId + ".json"), "utf8").then(bytes => JSON.parse(bytes) as RecoveryRecord);
+      const restarted = f.make(true);
+      const saved = (await restarted.inspect(f.record.runId))[0]!;
+      assert.deepEqual(identity(saved), original);
+      assert.deepEqual(identity(await disk()), original);
+      assert.equal(saved.heldPolicy?.providerKeyScan, providerKeyScan);
+      assert.equal((await disk()).heldPolicy?.providerKeyScan, providerKeyScan);
+      if (!providerKeyScan) assert.equal(Object.hasOwn(saved.heldPolicy!, "providerKeyScan"), false);
+
+      await restarted.resumePending();
+      const after = (await restarted.inspect(f.record.runId))[0]!;
+      assert.deepEqual(identity(after), original);
+      if (providerKeyScan) {
+        assert.deepEqual(f.order.filter(step => step !== "archive"), ["range"],
+          "missing provider forms must stop before the vendor scan and publication");
+        assert.equal(after.finalRequest, undefined);
+        assert.equal(after.finalAcknowledged, undefined);
+        assert.equal(f.finals.length, 0);
+        assert.equal(f.state.pinDeletes, 0);
+        assert.deepEqual(f.state.candidates, candidates);
+        assert.equal(f.state.open, true);
+
+        const second = f.make(true);
+        await second.resumePending();
+        const retained = (await second.inspect(f.record.runId))[0]!;
+        assert.deepEqual(identity(retained), original);
+        assert.deepEqual(identity(await disk()), original);
+        assert.equal(retained.heldPolicy?.providerKeyScan, true);
+        assert.equal((await disk()).heldPolicy?.providerKeyScan, true);
+        assert.equal(retained.finalRequest, undefined);
+        assert.equal(retained.finalAcknowledged, undefined);
+        assert.deepEqual(f.order.filter(step => step !== "archive"), ["range", "range"]);
+        assert.equal(f.finals.length, 0);
+        assert.equal(f.state.pinDeletes, 0);
+        assert.deepEqual(f.state.candidates, candidates);
+        assert.equal(f.state.open, true);
+      } else {
+        assert.deepEqual(f.order.filter(step => step !== "archive"),
+          ["range", "scan", "workflow", "ci", "pack", "held"]);
+        assert.equal(f.finals.length, 1);
+        assert.equal(f.finals[0]![1], original.generation);
+        assert.equal((f.finals[0]![3] as RecoveryFinalDisposition).kind, "held_publication");
+        assert.equal(after.finalRequest?.disposition.kind, "held_publication");
+        assert.equal(after.finalAcknowledged, true);
+        assert.equal(f.state.open, false);
+      }
     } finally { await f.close(); }
   });
 }

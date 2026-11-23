@@ -181,6 +181,11 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		harness = harnessClaude
 	}
 
+	// Frozen provider authority applies before either harness switch path.
+	if providerBoundRun(run) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
+	}
+
 	if harness == harnessCodex {
 		return s.requestCodexCredentialSwitch(ctx, run, mode, secretID)
 	}
@@ -192,9 +197,6 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// frozen provider key), whatever the mode, and no switch of a vendor run to `default` while the
 	// owner's Claude source is a provider. Checked before the status dispatch, so nothing is written.
 	// This covers `uzi run set-token` and `uzi approve --token`, which is a client-side SetRunCredential.
-	if rerr := anthropicBoundRefusal(run); rerr != nil {
-		return SetRunCredentialResult{}, rerr
-	}
 	resolved, err := s.validateRunSwitchOverride(ctx, userID, run.Kind, harness, mode, secretID)
 	if err != nil {
 		return SetRunCredentialResult{}, err

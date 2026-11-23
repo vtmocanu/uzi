@@ -16,6 +16,7 @@ import { AdminProducts } from "./pages/AdminProducts";
 import { Settings } from "./pages/Settings";
 import { AppearanceSettings } from "./pages/AppearanceSettings";
 import { RunDefaults } from "./pages/RunDefaults";
+import { ModelsSettings } from "./pages/ModelsSettings";
 import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
@@ -114,6 +115,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/settings", element: <Settings />, guard: "protected" },
   // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
   { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },
+  // PRD #3263: every model and effort default in one grid, saved together.
+  { path: "/settings/models", element: <ModelsSettings />, guard: "protected" },
   // Run-behavior defaults, split out of the overloaded Account tab.
   { path: "/settings/run-defaults", element: <RunDefaults />, guard: "protected" },
   { path: "/settings/forge", element: <ForgeSettings />, guard: "protected" },

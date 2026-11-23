@@ -38,6 +38,7 @@ for (const pass of ["intent", "plan"] as const) {
         const factory = (async (params) => {
           builds++;
           assert.equal(params.runId, "run-summary");
+          assert.ok(params.binding.authMode !== "provider");
           assert.equal(params.binding.authMode, binding.auth_mode);
           assert.equal(params.binding.accessToken, binding.access_token);
           assert.equal(params.binding.capability, binding.capability);

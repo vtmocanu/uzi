@@ -123,14 +123,14 @@ accepts only the Codex role models, so a Claude run is never handed a Codex
 role model and a Codex run never gets a Claude model. If a Codex run's resolved model is somehow not a Codex role
 model, the agent uses the built-in **`gpt-6-luna`** instead.
 
-Codex intent and plan summaries run at **low** effort. From **Settings → Run
-defaults → Run summaries**, the **Claude summary model** picker sets your own
-Claude value and the **Codex summary model** picker your own Codex value. The
-Codex picker shows only when you can run Codex, and the Claude picker shows
-unless Codex is the only harness you can use. Leave a picker on its **Default**
+Codex intent and plan summaries run at **low** effort. From **Settings →
+Models → Helper runs → Summary model**, the Claude picker sets your own
+Claude value and the Codex picker your own Codex value. The same card shows a
+read-only **Summaries run on: Same as the run** line, since summaries always run
+on the run's own harness. Leave a picker on its **Default**
 option (it names the model and where it comes from, for example
-`Default · haiku (built-in)`) to inherit; the line under it shows the model in
-effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
+`Default · haiku (built-in)`) to inherit; **Saved effective value** under it
+shows the model in effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
 lanes as `summary` rows. See
 [Admin settings](./admin-settings.md#instance-model-defaults) for the
 instance-wide defaults of both lanes (the **Instance model defaults** card has

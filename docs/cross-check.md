@@ -844,7 +844,7 @@ Each run takes the setting when it is created, so changing it does not affect
 runs already created. It applies to issue, prompt, self-improvement, CI fix,
 merge request rework and task runs, whether auto-approved or human-gated. An
 interactive task is checked once, when it finalises, not at each park for a
-follow-up. The **Code** row of the pin grid in Run defaults holds independent
+follow-up. The Code rows of the **Settings → Models → Cross-check** grid hold independent
 model and effort pins for each checker family, beside the Plan row (see
 [pins](./configuration.md#plan-cross-check-model-and-effort-pins)).
 

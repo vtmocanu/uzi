@@ -192,6 +192,9 @@ for (const edge of [
       if (first) await f.fetch();
       else assert.equal(fs.existsSync(f.receipt), false);
       const incoming = f.commit("edge incoming");
+      // The displaced pin write is the stop point. A pin already at the right sha is reused with no write, so drop it
+      // and let the displaced preservation re-create it under the stop trigger.
+      if (edge.operation === "displaced") git(f.bare, "update-ref", "-d", "refs/uzi-owed/" + run + "/" + first);
       if (edge.operation === "bridge") git(f.bare, "-c", "protocol.file.allow=always",
         "fetch", "--no-tags", f.clone, "refs/heads/" + branch);
       const options = { context: { ...f.options.context, generation: edge.generation } };
@@ -509,6 +512,8 @@ it("m3 D/F owned ancestor preservation finishes archive and promotion before a l
     const childBranch = branch + "/new";
     git(f.clone, "update-ref", "-d", "refs/heads/" + branch);
     git(f.clone, "branch", childBranch, f.base);
+    // The ancestor pin write is the stop point; an existing pin at the right sha is reused with no write, so drop it.
+    git(f.bare, "update-ref", "-d", "refs/uzi-owed/" + run + "/" + ancestor);
     const options = { context: { ...f.options.context, generation: 2, branch: childBranch } };
     const soft = new AbortController();
     let preserved = false, archived = false, promoted = false;
@@ -538,6 +543,31 @@ it("m3 D/F owned ancestor preservation finishes archive and promotion before a l
       { kind: "owned", sha: f.base, context: options.context });
     assert.equal(git(f.clone, "rev-parse", "refs/heads/" + childBranch), f.base);
     assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), f.base);
+  } finally { f.fx.cleanup(); }
+});
+
+it("m3 D/F owned ancestor with its setup-created pin present completes and issues no update-ref for that pin", async () => {
+  const f = await fixture();
+  try {
+    const ancestor = f.commit("owned ancestor"); await f.fetch();
+    const childBranch = branch + "/new";
+    git(f.clone, "update-ref", "-d", "refs/heads/" + branch);
+    git(f.clone, "branch", childBranch, f.base);
+    const pinRef = "refs/uzi-owed/" + run + "/" + ancestor;
+    assert.equal(git(f.bare, "rev-parse", pinRef), ancestor, "the setup fetch created the pin");
+    const options = { context: { ...f.options.context, generation: 2, branch: childBranch } };
+    let pinWrites = 0, promoted = false;
+    const spawner = realSpawner(args => {
+      if (args.includes("update-ref") && args.includes(pinRef)) pinWrites++;
+      if (args.includes("update-ref") && args.includes("refs/uzi-runner/" + childBranch)) promoted = true;
+    });
+    const result = await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+      () => f.cache.fetchAgentBranch(f.bare, f.clone, childBranch, run, options));
+    assert.equal((result as { kind: string }).kind, "updated", JSON.stringify(result));
+    assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + childBranch), f.base);
+    assert.equal(pinWrites, 0, "the existing same-SHA pin is reused with no write");
+    assert.equal(promoted, true);
+    assert.equal(git(f.bare, "rev-parse", pinRef), ancestor);
   } finally { f.fx.cleanup(); }
 });
 

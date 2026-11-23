@@ -16,6 +16,7 @@ import type { RunRunner } from "../src/runner.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, input, runnerWith } from "./runner-harness.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 
 // Preserve-only admission: a claim the server marked policy_preserve_only may only continue the held
 // conversation. Every re-hold is decided in phaseResume, before any notice, report, follow-up pull or
@@ -489,6 +490,51 @@ describe("preserve-only claim admission in phaseResume", () => {
         noLineageNotice(claim.run_id);
       });
     }
+
+    // A provider-bound Codex claim carries secrets.provider (engine codex) and no secrets.codex; the
+    // transcript rule must key on the engine, not on vendor credential presence.
+    const PROVIDER_CODEX = { forge_pat: "fixture-pat", provider: {
+      provider_id: "codex-policy-proof", revision: 1, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example.test/v1", auth_style: "bearer",
+      credential: ["pk", "-policy-proof-", "0123456789abcdef"].join(""),
+      model_map: { default: { model: "corp-codex" } },
+    } };
+    // The real Codex executor carries the safety and capture markers that classify a flight as Codex.
+    const codexMarked = (): RunRunner => {
+      const rig = codexRig();
+      return runnerWith((runId) => ({
+        homeDir: path.join(homeDir, runId),
+        executor: {
+          safety: rig.safety, sandboxesCommands: true, withCredentialFreeCapture: rig.capture,
+          settleForCredentialFreeCapture: rig.settle,
+          run: async (ctx: RunContext) => {
+            events.push("model");
+            contexts.push(ctx);
+            return Promise.reject(new Error("stop after admission"));
+          },
+        },
+      }), fakeGitlab().gitlab, undefined, nullLogger(), {
+        outbox, activeRuns: new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32),
+      });
+    };
+    for (const state of ["absent", "unknown"] as const) {
+      it(`transcript_unknown: a provider-bound Codex claim re-holds when its saved transcript is ${state}`, async () => {
+        transcript = state;
+        const claim = claimFor({ secrets: PROVIDER_CODEX });
+        await codexMarked().execute(claim);
+        assert.deepEqual(events, ["state:running", "hold:transcript_unknown"]);
+        reholdShape(holds[0], "transcript_unknown");
+        assert.equal(holds[0]!.session_id, "saved-session");
+        assert.equal(contexts.length, 0, "no model turn");
+      });
+    }
+
+    it("a provider-bound Codex claim with its saved transcript present reaches the model", async () => {
+      const claim = claimFor({ secrets: PROVIDER_CODEX });
+      await codexMarked().execute(claim);
+      assert.equal(holds.length, 0);
+      assert.equal(contexts.length, 1);
+    });
 
     it("provider_resume_rejected: a continuation rejected after the claim started re-holds with a capture, not a failure", async () => {
       const claim = claimFor();

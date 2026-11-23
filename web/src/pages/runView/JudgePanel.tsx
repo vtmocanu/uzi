@@ -116,7 +116,7 @@ const JUDGE_SKIP_HARNESS: Record<string, string> = { claude: "Claude", codex: "C
 function judgeSkipCause(skip: JudgeSkip): string {
   const harness = JUDGE_SKIP_HARNESS[skip.harness];
   if (skip.reason === "codex_pool_unavailable") return "no pooled Codex account was available.";
-  if (skip.reason === "provider_lane_unsupported") return "the Claude source is a model provider, which the judge does not support yet.";
+  if (skip.reason === "provider_lane_unsupported") return "the selected source is a model provider, which the judge does not support yet.";
   if (harness !== undefined && skip.reason === "no_usable_credential") return `${harness} had no usable credential.`;
   if (harness !== undefined && skip.reason === "credential_disabled") return `the ${harness} credential was disabled.`;
   return "the judge's harness had no usable credential.";
@@ -125,7 +125,7 @@ function judgeSkipCause(skip: JudgeSkip): string {
 // JudgeSkipNotice is the panel body for a run whose automatic judge was skipped (PRD #3257 M2):
 // one sentence saying when and why, and where the judge's harness is chosen. The existing Run
 // judge button in the header is the retry; it uses the setting and credentials current at the
-// click, which is why the copy points at Run defaults rather than restating the old choice.
+// click, which is why the copy points at Models (where Judge runs on is saved) rather than restating the old choice.
 function JudgeSkipNotice({ skip }: { skip: JudgeSkip }) {
   const at = new Date(skip.at);
   const when = Number.isNaN(at.getTime())
@@ -145,10 +145,10 @@ function JudgeSkipNotice({ skip }: { skip: JudgeSkip }) {
       <p className="mt-1 text-xs text-muted">
         The harness that runs the judge is chosen in{" "}
         <Link
-          to="/settings/run-defaults"
+          to="/settings/models"
           className="font-medium text-fg underline underline-offset-2 hover:text-brand focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-1 rounded-sm"
         >
-          Run defaults
+          Models
         </Link>
         . Run judge tries again with the current setting.
       </p>

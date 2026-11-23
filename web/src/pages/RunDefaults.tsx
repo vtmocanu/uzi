@@ -1,36 +1,39 @@
 // Settings → Run defaults: how your runs behave before any run exists — the
-// autopilot opt-in, the usage-limit park default, the run judge and its token
-// binding, automatic CI fixes, and the worker model. Split out of the old
-// "Account & token" tab, which had grown to carry credentials AND run behavior
-// in one scroll; the discriminator is that everything here shapes future runs,
-// while everything on Account is who you are and what you hold.
+// autopilot opt-in, the cross-check enables, the usage-limit park default, the run
+// judge and its token binding, the Now line, automatic CI fixes, attribution, MR
+// review rework and harness overflow. Split out of the old "Account & token" tab,
+// which had grown to carry credentials AND run behavior in one scroll; the
+// discriminator is that everything here shapes future runs, while everything on
+// Account is who you are and what you hold.
+//
+// PRD #3263 M3: every model and effort choice (default harness, worker, planning,
+// judge routing and models, summary and task-review models) is edited and saved in
+// Settings → Models. This page keeps only behavior, plus a read-only summary of what
+// the judge runs on and a link to change it there.
 
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, type UserSettingsPatch } from "../lib/api";
-import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
+import { api } from "../lib/api";
 import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import { WeeklyWarningMarginSetting } from "../components/WeeklyWarningMarginSetting";
-import type { UserSettings, BindMode, EffortSettingCell, Harness, ModelSettingCell } from "../lib/apiTypes";
+import type { UserSettings, BindMode, Harness, ModelSettingCell, SecretMeta } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
-import { DEFAULT_CODEX_MODEL, ModelSelect } from "../components/ModelSelect";
-import { EffortSelect } from "../components/EffortSelect";
-import { HarnessPicker } from "../components/HarnessPicker";
-import { modelFieldWarning } from "../lib/agentTemplates";
-import { CODEX_ROLE_MODELS } from "../lib/codexModels";
-import { codexRuntimeDefaultLabel, modelSettingSourceLabel } from "../lib/modelSettings";
+import { Alert, Card, Field, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
+import { modelSettingSourceLabel } from "../lib/modelSettings";
+import { harnessName, judgeRunsOnHelp } from "../components/models/modelsLabels";
 import { SettingsShell } from "../components/SettingsShell";
 import { hasAnthropicToken, isCodexUsable } from "../lib/hasToken";
-import {
-  bothHarnessesUsable,
-  effectiveHarnessIsCodex,
-  INHERIT_HARNESS,
-  selectionFromHarness,
-  type HarnessSelection,
-} from "../lib/harnessSelection";
+import { bothHarnessesUsable } from "../lib/harnessSelection";
+
+// The read-only judge summary's routing line. An explicit Claude or Codex choice shares
+// Models' copy; "Same as the run" drops Models' "Pick Claude or Codex" prompt, since
+// nothing is pickable here, and points at Models instead.
+function judgeSummaryHelp(choice: string): string {
+  if (choice === "claude" || choice === "codex") return judgeRunsOnHelp(choice);
+  return "Claude runs use the Claude judge model, Codex runs the Codex model. To judge every run on one harness, change it in Models.";
+}
 
 // The judge picker's "Auto-select from the pool" sentinel — the SAME value
 // WorkersSettings.tsx uses for its worker picker, deliberately a string no
@@ -38,78 +41,52 @@ import {
 // component, so it is one stable <option> identity rather than a new string per render.
 const AUTO_OPTION = "\u0000auto";
 
-// The model cells' labels (PRD #3245 judge, PRD #3248 summary): "Default · <model>
-// (<source>)" for the select's reset option and "In effect: <model> · <source>" beneath
-// it. Both read the server's judge_models / summary_models cell; an older server without
-// cells gets a neutral label.
-function modelDefaultLabel(cell: ModelSettingCell | undefined): string {
-  return cell
-    ? `Default \u00b7 ${cell.default_model} (${modelSettingSourceLabel("model", cell.default_source)})`
-    : "Default";
+const MODELS_PATH = "/settings/models";
+
+// The judge summary's model line: the server-resolved judge model for one harness and where it
+// comes from. An older server without judge_models cells falls back to the session's effective
+// (Claude) judge model; with neither the value is honestly unavailable, never guessed.
+function judgeModelSummary(cell: ModelSettingCell | undefined, fallback: string | undefined): string {
+  if (cell) return `${cell.resolved_model} · ${modelSettingSourceLabel("model", cell.source)}`;
+  return fallback || "Unavailable";
 }
 
-function modelInEffect(cell: ModelSettingCell): string {
-  return `In effect: ${cell.resolved_model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
-}
-
-// A judge lane's line under its select (PRD #3257): the In-effect line, or, when the judge
-// runs on the other harness, "Not used: ..." followed by the model this lane would use.
-function judgeLaneNote(cell: ModelSettingCell | undefined, notUsed: string): string {
-  if (!notUsed) return cell ? modelInEffect(cell) : "";
-  return cell
-    ? `${notUsed} \u00b7 ${cell.resolved_model} (${modelSettingSourceLabel("model", cell.source)})`
-    : notUsed;
-}
-
-// Harness lanes save independently, so a response may carry a stale sibling cell
-// when saves land out of order. Take only the saved lane's cell from the response and keep
-// the rest of the committed cells; a response without that cell (older server) leaves them be.
-function mergeHarnessCell<T extends { harness: ModelSettingCell["harness"] }>(
-  current: T[] | undefined,
-  fromResponse: T[] | undefined,
-  harness: ModelSettingCell["harness"],
-): T[] | undefined {
-  const saved = fromResponse?.find((c) => c.harness === harness);
-  if (!saved) return current;
-  if (!current) return [saved];
-  return current.some((c) => c.harness === harness)
-    ? current.map((c) => (c.harness === harness ? saved : c))
-    : [...current, saved];
-}
-
-// Task-review lane labels (PRD #1570). The Claude built-in is the SDK default, which the
-// server reports as an empty model, so it never reads as a bare "Default · ".
-const TASK_REVIEW_CLAUDE_DEFAULT = "SDK default (built-in)";
-const TASK_REVIEW_CODEX_BUILTIN = "gpt-6-sol";
-
-function taskReviewClaudeInEffect(cell: ModelSettingCell): string {
-  const model = cell.resolved_model === "" ? "SDK default" : cell.resolved_model;
-  return `In effect: ${model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
-}
-
-const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
-
-// PRD #3257 "Judge runs on": "" is Same as the run (stored NULL), else the one harness every
-// judge runs on. The help line under the select says what each choice does to a judged run.
-type JudgeRunsOnChoice = "" | Harness;
-const HARNESS_LABEL: Record<Harness, string> = { claude: "Claude", codex: "Codex" };
-
-function judgeRunsOnHelp(choice: JudgeRunsOnChoice): string {
-  if (choice === "") {
-    return "Claude runs use the Claude judge model, Codex runs the Codex model. Pick Claude or Codex to judge every run on one harness.";
+// The judge summary's Claude credential line, from the judge lane's OWN binding (bind mode and
+// pinned token) and the owned-token metadata the picker below already shows. It is never a
+// prediction of the lead's credential: the judge lane is bound separately (PRD #104).
+function claudeJudgeCredential(
+  user: ReturnType<typeof useAuth>["user"],
+  tokens: SecretMeta[],
+  pooledCount: number,
+  usable: boolean,
+): string {
+  if (!usable) return "No usable Anthropic token, so Claude judges are skipped";
+  const mode = user?.judge_anthropic_bind_mode;
+  if (mode === "auto") {
+    return pooledCount === 0
+      ? "Auto-select from the pool (empty, so your default token)"
+      : "Auto-select from the pool";
   }
-  const on = HARNESS_LABEL[choice];
-  const other = HARNESS_LABEL[choice === "claude" ? "codex" : "claude"];
-  return `Every run is judged on ${on}, so ${other} runs get a ${on} judge. If ${on} can't run, the judge is skipped, never charged to ${other}.`;
+  if (mode === "pinned") {
+    const pinned = tokens.find((s) => s.id === user?.judge_anthropic_secret_id);
+    const label = pinned?.label ?? user?.judge_anthropic_secret_label;
+    if (label) return `Pinned to ${label}${pinned?.enabled === false ? " (disabled)" : ""}`;
+  }
+  const fallback = tokens.find((s) => s.is_default)?.label;
+  return fallback ? `Your default token (${fallback})` : "Your default token";
 }
 
 export function RunDefaults() {
+  const { user } = useAuth();
+  return <RunDefaultsEditor key={user?.id} />;
+}
+
+function RunDefaultsEditor() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
-  // Kept local: the save handlers below still set this on failure, so it is merged
-  // with the hook's load error at the one page-level Alert.
+  // The loaded settings: the judge summary reads the saved routing and judge model cells, and
+  // harness overflow the saved default harness. The toggles below keep their own state, so
+  // their saves never write back here (none of those fields is read from it).
   const [committedSettings, setCommittedSettings] = useState<UserSettings | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [autopilotBusy, setAutopilotBusy] = useState(false);
   const [autopilotError, setAutopilotError] = useState("");
 
@@ -293,7 +270,6 @@ export function RunDefaults() {
     setMrReworkBusy(true);
     try {
       const { settings } = await api.putMySettings({ mr_rework_enabled: next });
-      setCommittedSettings(current => current && ({ ...current, mr_rework_enabled: settings.mr_rework_enabled }));
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setMrReworkError(
@@ -315,7 +291,6 @@ export function RunDefaults() {
     setNowSummaryBusy(true);
     try {
       const { settings } = await api.putMySettings({ now_summary_enabled: next });
-      setCommittedSettings(current => current && ({ ...current, now_summary_enabled: settings.now_summary_enabled }));
       setNowSummaryEnabled(settings.now_summary_enabled ?? null);
     } catch (err) {
       setNowSummaryError(errorMessage(err, "Failed to update the Now line setting"));
@@ -324,28 +299,9 @@ export function RunDefaults() {
     }
   };
 
-  // PRD #1551 M3: the grouped Harness-and-worker-models card. The default harness and
-  // the two retained per-harness model lanes are ONE user decision saved in one PUT
-  // (D1). Each of the three carries its own saved snapshot so their dirty state is
-  // independent — changing the harness never touches either model (D-log 2026-09-22),
-  // and a lane the user has not edited is not re-sent as a no-op.
-  //
-  // Model lanes: "" = inherit. The Claude lane keeps today's curated-plus-custom
-  // vocabulary; the Codex lane keeps its curated set and now also allows a custom id
-  // (D5, only here).
-  const [claudeModel, setClaudeModel] = useState("");
-  const [savedClaudeModel, setSavedClaudeModel] = useState("");
-  const [codexModel, setCodexModel] = useState("");
-  const [savedCodexModel, setSavedCodexModel] = useState("");
-
-  // The per-user default harness (PRD #1429 D3/D11 rung 2): "inherit" (no preference)
-  // is the default; a value pins new implicit run creation to that harness.
-  const [defaultHarness, setDefaultHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
-  const [savedHarness, setSavedHarness] = useState<HarnessSelection>(INHERIT_HARNESS);
-
-  // One busy flag for the whole card: the three fields save together in one request,
-  // so there is one in-flight state, not three.
-  const [defaultsBusy, setDefaultsBusy] = useState(false);
+  // Harness overflow (saved on its own endpoint, the moment it changes). Its default harness
+  // is chosen in Models; this page only reads the saved one, because overflow applies only
+  // to an explicit Claude or Codex default.
   const [overflowEnabled, setOverflowEnabled] = useState(false);
   const [overflowBusy, setOverflowBusy] = useState(false);
   const [overflowError, setOverflowError] = useState("");
@@ -355,138 +311,21 @@ export function RunDefaults() {
     try {
       const result = await api.setHarnessOverflow(enabled);
       setOverflowEnabled(result.harness_overflow_enabled);
-      // Merge this endpoint's field only: other settings may save concurrently.
-      setCommittedSettings(current => current && ({ ...current, harness_overflow_enabled: result.harness_overflow_enabled }));
     } catch (err) {
       setOverflowError(errorMessage(err, "Failed to save harness overflow"));
     } finally {
       setOverflowBusy(false);
     }
   };
-  // D2: the harness SELECTOR appears only when the user has a usable credential for
-  // BOTH harnesses; a single-harness user keeps a one-lane form with no selector.
+  // Harness-aware credential facts (PRD #1429 M4a, D3), computed on ALL secrets: they decide
+  // which judge lanes the summary shows and what each lane's credential line says.
   const [claudeUsable, setClaudeUsable] = useState(false);
   const [codexUsable, setCodexUsable] = useState(false);
 
-  // PRD #3257: "Judge runs on", saved the moment it changes. The select shows the pending
-  // choice while the PUT is in flight and falls back to the stored value on failure. It is
-  // never gated on credential usability, and nothing here rewrites it when a credential goes
-  // away: an explicit choice without a usable credential stays saved and the card says so.
-  const [judgeRunsOn, setJudgeRunsOn] = useState<JudgeRunsOnChoice>("");
-  const [judgeRunsOnBusy, setJudgeRunsOnBusy] = useState(false);
-  const [judgeRunsOnError, setJudgeRunsOnError] = useState("");
-
-  // The select stays enabled while saving (disabling the focused control drops keyboard
-  // focus to <body>), so a change made mid-save is queued, latest wins, and sent after the
-  // in-flight PUT: one request at a time, in order. A failure falls back to the last saved
-  // value and drops the queue.
-  const judgeRunsOnSaving = useRef(false);
-  const judgeRunsOnQueued = useRef<JudgeRunsOnChoice | null>(null);
-
-  const saveJudgeRunsOn = async (next: JudgeRunsOnChoice) => {
-    setJudgeRunsOnError("");
-    setJudgeRunsOn(next);
-    if (judgeRunsOnSaving.current) {
-      judgeRunsOnQueued.current = next;
-      return;
-    }
-    judgeRunsOnSaving.current = true;
-    setJudgeRunsOnBusy(true);
-    // No save is in flight, so the shown value is the stored one.
-    let stored = judgeRunsOn;
-    let target: JudgeRunsOnChoice | null = next;
-    try {
-      while (target !== null) {
-        const { settings } = await api.putMySettings({ judge_runs_on: target === "" ? null : target });
-        stored = settings.judge_runs_on ?? "";
-        setCommittedSettings(current => current && ({ ...current, judge_runs_on: settings.judge_runs_on }));
-        const queued = judgeRunsOnQueued.current;
-        judgeRunsOnQueued.current = null;
-        target = queued !== null && queued !== stored ? queued : null;
-      }
-      setJudgeRunsOn(stored);
-    } catch (err) {
-      judgeRunsOnQueued.current = null;
-      setJudgeRunsOn(stored);
-      setJudgeRunsOnError(errorMessage(err, "Failed to change where the judge runs"));
-    } finally {
-      judgeRunsOnSaving.current = false;
-      setJudgeRunsOnBusy(false);
-    }
-  };
-
-  // Per-user judge models, one per harness (PRD #69 M2, PRD #3245): "" = Default (the
-  // instance value, then the built-in). Each lane keeps its own saved snapshot so one
-  // "Save judge models" sends only the lanes that changed. Busy is shared: one request.
-  const [judgeModel, setJudgeModel] = useState("");
-  const [savedJudgeModel, setSavedJudgeModel] = useState("");
-  const [judgeModelCustom, setJudgeModelCustom] = useState(false);
-  const [codexJudgeModel, setCodexJudgeModel] = useState("");
-  const [savedCodexJudgeModel, setSavedCodexJudgeModel] = useState("");
-  const [codexJudgeModelCustom, setCodexJudgeModelCustom] = useState(false);
-  const [judgeModelBusy, setJudgeModelBusy] = useState(false);
-
-  // Per-user run-summary model (PRD #362 M2): "" = inherit the instance summary_model.
-  // Its own saved/busy pair, independent of the judge and worker models above — they
-  // write the same /me/settings endpoint but each sends only its own field.
-  const [summaryModel, setSummaryModel] = useState("");
-  const [savedSummaryModel, setSavedSummaryModel] = useState("");
-  const [summaryModelCustom, setSummaryModelCustom] = useState(false);
-  const [summaryModelBusy, setSummaryModelBusy] = useState(false);
-  // PRD #3248: the Codex lane, a closed Codex-role list with its own saved/busy pair.
-  const [codexSummaryModel, setCodexSummaryModel] = useState("");
-  const [savedCodexSummaryModel, setSavedCodexSummaryModel] = useState("");
-  const [codexSummaryModelBusy, setCodexSummaryModelBusy] = useState(false);
-  // PRD #1570: the task-review model per harness ("" = the built-in default).
-  const [taskReviewModel, setTaskReviewModel] = useState("");
-  const [savedTaskReviewModel, setSavedTaskReviewModel] = useState("");
-  const [taskReviewModelBusy, setTaskReviewModelBusy] = useState(false);
-  const [codexTaskReviewModel, setCodexTaskReviewModel] = useState("");
-  const [savedCodexTaskReviewModel, setSavedCodexTaskReviewModel] = useState("");
-  const [codexTaskReviewModelBusy, setCodexTaskReviewModelBusy] = useState(false);
-  // PRD #1570 M2: the task-review effort per harness ("" = follow the worker effort).
-  const [taskReviewEffort, setTaskReviewEffort] = useState("");
-  const [savedTaskReviewEffort, setSavedTaskReviewEffort] = useState("");
-  const [taskReviewEffortBusy, setTaskReviewEffortBusy] = useState(false);
-  const [codexTaskReviewEffort, setCodexTaskReviewEffort] = useState("");
-  const [savedCodexTaskReviewEffort, setSavedCodexTaskReviewEffort] = useState("");
-  const [codexTaskReviewEffortBusy, setCodexTaskReviewEffortBusy] = useState(false);
-
-  // Per-user default reasoning effort (PRD #617 M5): "" = inherit (a NULL/inherit value
-  // resolves to the uzi default `medium` at claim assembly, issue #1157). Its own saved/busy pair,
-  // independent of the models above — same /me/settings endpoint, own field. Unlike
-  // the model cards there is NO warning gate: the effort enum is closed, so the
-  // dropdown can only ever emit a valid token or "".
-  const [defaultEffort, setDefaultEffort] = useState("");
-  const [savedEffort, setSavedEffort] = useState("");
-  const [effortBusy, setEffortBusy] = useState(false);
-  const [defaultCodexEffort, setDefaultCodexEffort] = useState("");
-  const [savedCodexEffort, setSavedCodexEffort] = useState("");
-  const [codexEffortBusy, setCodexEffortBusy] = useState(false);
-
-  // Planning model and effort (PRD #3252): "" = "Same as the run". One shared
-  // saved/busy pair; the inline errors are keyed by the field the server names.
-  const [planningModel, setPlanningModel] = useState("");
-  const [savedPlanningModel, setSavedPlanningModel] = useState("");
-  const [planningModelCustom, setPlanningModelCustom] = useState(false);
-  const [planningEffort, setPlanningEffort] = useState("");
-  const [savedPlanningEffort, setSavedPlanningEffort] = useState("");
-  const [planningCodexModel, setPlanningCodexModel] = useState("");
-  const [savedPlanningCodexModel, setSavedPlanningCodexModel] = useState("");
-  const [planningCodexModelError, setPlanningCodexModelError] = useState("");
-  const [planningCodexEffort, setPlanningCodexEffort] = useState("");
-  const [savedPlanningCodexEffort, setSavedPlanningCodexEffort] = useState("");
-  const [planningCodexEffortError, setPlanningCodexEffortError] = useState("");
-  const [planningCodexModelCustom, setPlanningCodexModelCustom] = useState(false);
-  const [planningBusy, setPlanningBusy] = useState(false);
-  const [planningModelError, setPlanningModelError] = useState("");
-  const [planningEffortError, setPlanningEffortError] = useState("");
-
-  // secrets feed the judge token picker; settings carry the saved worker model.
-  // secrets is read-only display, set only here, so it rides in the hook's data
-  // bundle. The settings fields seed editable form state the Save handlers also
-  // write, so they stay local and are seeded as side effects exactly as before.
-  const { data, loading, error: loadError } = useAsyncData(
+  // secrets feed the judge token picker; settings carry the behavior toggles above and the
+  // read-only judge summary. secrets is read-only display, so it rides in the hook's data
+  // bundle; the settings seed state the toggles also write, so they stay local.
+  const { data, error: loadError } = useAsyncData(
     async () => {
       const [{ secrets: rows }, { settings }] = await Promise.all([
         api.listSecrets(),
@@ -494,70 +333,25 @@ export function RunDefaults() {
       ]);
       setCommittedSettings(settings);
       setOverflowEnabled(settings.harness_overflow_enabled);
-      // PRD #1551: seed each lane from its own explicit field, never from the
-      // legacy default_model projection — the two lanes are the source of truth now.
-      const claude = settings.default_claude_model ?? "";
-      setClaudeModel(claude);
-      setSavedClaudeModel(claude);
-      const codex = settings.default_codex_model ?? "";
-      setCodexModel(codex);
-      setSavedCodexModel(codex);
-      const jm = settings.judge_model ?? "";
-      setJudgeModel(jm);
-      setSavedJudgeModel(jm);
-      const cjm = settings.codex_judge_model ?? "";
-      setCodexJudgeModel(cjm);
-      setSavedCodexJudgeModel(cjm);
-      const sm = settings.summary_model ?? "";
-      setSummaryModel(sm);
-      setSavedSummaryModel(sm);
-      const csm = settings.codex_summary_model ?? "";
-      setCodexSummaryModel(csm);
-      setSavedCodexSummaryModel(csm);
-      const trm = settings.task_review_model ?? "";
-      setTaskReviewModel(trm);
-      setSavedTaskReviewModel(trm);
-      const ctrm = settings.codex_task_review_model ?? "";
-      setCodexTaskReviewModel(ctrm);
-      setSavedCodexTaskReviewModel(ctrm);
-      const tre = settings.task_review_effort ?? "";
-      setTaskReviewEffort(tre);
-      setSavedTaskReviewEffort(tre);
-      const ctre = settings.codex_task_review_effort ?? "";
-      setCodexTaskReviewEffort(ctre);
-      setSavedCodexTaskReviewEffort(ctre);
-      const codexEff = settings.default_codex_effort ?? "";
-      setDefaultCodexEffort(codexEff);
-      setSavedCodexEffort(codexEff);
-      const eff = settings.default_effort ?? "";
-      setDefaultEffort(eff);
-      setSavedEffort(eff);
-      setPlanningCodexModel(settings.planning_codex_model ?? "");
-      setSavedPlanningCodexModel(settings.planning_codex_model ?? "");
-      setPlanningCodexEffort(settings.planning_codex_effort ?? "");
-      setSavedPlanningCodexEffort(settings.planning_codex_effort ?? "");
-      const pm = settings.planning_claude_model ?? "";
-      setPlanningModel(pm);
-      setSavedPlanningModel(pm);
-      const pe = settings.planning_claude_effort ?? "";
-      setPlanningEffort(pe);
-      setSavedPlanningEffort(pe);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
       setNowSummaryEnabled(settings.now_summary_enabled ?? null);
-      setJudgeRunsOn(settings.judge_runs_on ?? "");
-      // PRD #1429 M4a, D3: harness-aware credential facts, computed on ALL secrets
-      // (not the anthropic_token-only slice below, which the judge picker uses).
       setClaudeUsable(hasAnthropicToken(rows));
       setCodexUsable(isCodexUsable(rows, settings.codex_account_mode));
-      const dh = selectionFromHarness(settings.default_harness);
-      setDefaultHarness(dh);
-      setSavedHarness(dh);
-      return { secrets: rows.filter((s) => s.kind === "anthropic_token") };
+      const aliases = rows.filter((s) => s.kind === "codex_auth");
+      const pooled = settings.codex_account_mode === "auto" ? aliases.filter((s) => s.auto_eligible) : [];
+      const judgeAliases = pooled.length > 0 ? pooled : aliases.filter((s) => s.is_default);
+      return {
+        secrets: rows.filter((s) => s.kind === "anthropic_token"),
+        hasLinkedJudgeAlias: judgeAliases.some((s) => s.enabled !== false && s.codex_status === "linked"),
+      };
     },
     [],
     { fallback: "Failed to load settings" },
   );
   const secrets = data?.secrets ?? [];
+  // The credential facts and saved settings arrive together; until they do (or when the load
+  // failed) the judge summary and overflow availability make no claim from the pre-load defaults.
+  const loaded = data !== null;
   // How many of the user's tokens are opted into the auto-selection pool. A judge
   // lane in "auto" with ZERO pooled tokens spends the DEFAULT token (D4), unlike a
   // worker which holds — so the empty-pool warning below is worded for that fallback.
@@ -565,430 +359,26 @@ export function RunDefaults() {
   // PRD #1732 D8: effective pool membership requires enabled.
   const pooledCount = secrets.filter((s) => s.auto_eligible && s.enabled !== false).length;
 
-
-  // The judge cells are server-resolved (user > instance > built-in, per harness), so
-  // the Default labels and In-effect lines describe the SAVED state.
+  // The judge summary reads the SAVED routing and the server-resolved judge cells (user >
+  // instance > built-in, per harness); both are edited in Models.
+  const judgeRunsOn: "" | Harness = committedSettings?.judge_runs_on ?? "";
   const claudeJudgeCell = committedSettings?.judge_models?.find((c) => c.harness === "claude");
   const codexJudgeCell = committedSettings?.judge_models?.find((c) => c.harness === "codex");
-  const codexEffortCell = committedSettings?.effort_settings?.find((c) => c.harness === "codex");
-  // Same validation path as the worker model (PRD #69 M2): the shared modelFieldWarning
-  // gates Save, so a judge model can't be saved to a shape the server rejects. The Claude
-  // lane also refuses a Codex id (the server's Claude-lane guard, PRD #3245).
-  const claudeJudgeTrimmed = judgeModel.trim();
-  const judgeModelWarning =
-    modelFieldWarning(judgeModel) ||
-    (CODEX_ROLE_MODELS.includes(claudeJudgeTrimmed)
-      ? `Not a Claude model: ${claudeJudgeTrimmed} is a Codex model, so Claude judges skip it. Choose Default to clear it.`
-      : "");
-  const codexJudgeModelWarning = modelFieldWarning(codexJudgeModel);
-  const judgeModelDirty = claudeJudgeTrimmed !== savedJudgeModel;
-  const codexJudgeModelDirty = codexJudgeModel.trim() !== savedCodexJudgeModel;
-  // "Other (custom model ID)" with an empty box would otherwise save as Default while
-  // the picker still shows Other, so it blocks Save with an inline error instead.
-  const judgeCustomEmpty = judgeModelCustom && claudeJudgeTrimmed === "";
-  const codexJudgeCustomEmpty = codexJudgeModelCustom && codexJudgeModel.trim() === "";
 
-  // saveJudgeModels sends ONLY the dirty lanes (null = Default) in one PUT, and adopts
-  // the response's resolved cells so the In-effect lines move with the save.
-  const saveJudgeModels = async () => {
-    setError("");
-    setNotice("");
-    setJudgeModelBusy(true);
-    try {
-      const patch: UserSettingsPatch = {};
-      if (judgeModelDirty) patch.judge_model = claudeJudgeTrimmed || null;
-      if (codexJudgeModelDirty) patch.codex_judge_model = codexJudgeModel.trim() || null;
-      const { settings } = await api.putMySettings(patch);
-      setCommittedSettings(current => current && ({
-        ...current,
-        judge_model: settings.judge_model,
-        codex_judge_model: settings.codex_judge_model,
-        judge_models: settings.judge_models,
-      }));
-      const claude = settings.judge_model ?? "";
-      setJudgeModel(claude);
-      setSavedJudgeModel(claude);
-      const codex = settings.codex_judge_model ?? "";
-      setCodexJudgeModel(codex);
-      setSavedCodexJudgeModel(codex);
-      setNotice("Judge models saved. They apply to your next judged run.");
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save judge models"));
-    } finally {
-      setJudgeModelBusy(false);
-    }
-  };
-
-  // Same validation path as the judge and worker models (PRD #362 M2): the shared
-  // modelFieldWarning gates Save, so a per-user summary model can't be saved to a
-  // shape the server rejects. The Claude lane also refuses a Codex id (the server's
-  // Claude-lane guard, PRD #3248), mirroring the Claude judge lane above.
-  const claudeSummaryCell = committedSettings?.summary_models?.find((c) => c.harness === "claude");
-  const codexSummaryCell = committedSettings?.summary_models?.find((c) => c.harness === "codex");
-  const claudeSummaryTrimmed = summaryModel.trim();
-  const summaryModelWarning =
-    modelFieldWarning(summaryModel) ||
-    (CODEX_ROLE_MODELS.includes(claudeSummaryTrimmed)
-      ? `Not a Claude model: ${claudeSummaryTrimmed} is a Codex model, so Claude summaries skip it. Choose Default to clear it.`
-      : "");
-  const summaryModelDirty = claudeSummaryTrimmed !== savedSummaryModel;
-  const summaryCustomEmpty = summaryModelCustom && claudeSummaryTrimmed === "";
-  const codexSummaryModelDirty = codexSummaryModel.trim() !== savedCodexSummaryModel;
-
-  // One Save per lane, each sending only its own field (null = Default); the response's
-  // resolved summary_models cells replace the committed ones so In-effect follows the save.
-  const saveSummaryModel = async () => {
-    setError("");
-    setNotice("");
-    setSummaryModelBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ summary_model: claudeSummaryTrimmed || null });
-      setCommittedSettings(current => current && ({
-        ...current,
-        summary_model: settings.summary_model,
-        summary_models: mergeHarnessCell(current.summary_models, settings.summary_models, "claude"),
-      }));
-      const model = settings.summary_model ?? "";
-      setSummaryModel(model);
-      setSavedSummaryModel(model);
-      setNotice(
-        model === ""
-          ? "Claude summary model cleared. Your Claude run summaries use the default."
-          : `Claude summary model set to ${model}. It applies to your next run's summaries.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save Claude summary model"));
-    } finally {
-      setSummaryModelBusy(false);
-    }
-  };
-
-  const saveCodexSummaryModel = async () => {
-    setError("");
-    setNotice("");
-    setCodexSummaryModelBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ codex_summary_model: codexSummaryModel.trim() || null });
-      setCommittedSettings(current => current && ({
-        ...current,
-        codex_summary_model: settings.codex_summary_model,
-        summary_models: mergeHarnessCell(current.summary_models, settings.summary_models, "codex"),
-      }));
-      const model = settings.codex_summary_model ?? "";
-      setCodexSummaryModel(model);
-      setSavedCodexSummaryModel(model);
-      setNotice(
-        model === ""
-          ? "Codex summary model cleared. Your Codex run summaries use the default."
-          : `Codex summary model set to ${model}. It applies to your next run's summaries.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save Codex summary model"));
-    } finally {
-      setCodexSummaryModelBusy(false);
-    }
-  };
-
-  // Task-review model (PRD #1570): the Claude lane is free text guarded like the summary
-  // lane (a Codex role id is refused by the server, so block Save here); the Codex lane
-  // is the closed Codex role list.
-  const claudeTaskReviewCell = committedSettings?.task_review_models?.find((c) => c.harness === "claude");
-  const codexTaskReviewCell = committedSettings?.task_review_models?.find((c) => c.harness === "codex");
-  const claudeTaskReviewTrimmed = taskReviewModel.trim();
-  const taskReviewModelWarning =
-    modelFieldWarning(taskReviewModel) ||
-    (CODEX_ROLE_MODELS.includes(claudeTaskReviewTrimmed)
-      ? `Not a Claude model: ${claudeTaskReviewTrimmed} is a Codex model, so the server refuses this save. Clear the field to use the default.`
-      : "");
-  const taskReviewModelDirty = claudeTaskReviewTrimmed !== savedTaskReviewModel;
-  const codexTaskReviewModelDirty = codexTaskReviewModel.trim() !== savedCodexTaskReviewModel;
-  const codexTaskReviewDefaultLabel = codexTaskReviewCell
-    ? modelDefaultLabel(codexTaskReviewCell)
-    : `Default \u00b7 ${TASK_REVIEW_CODEX_BUILTIN} (${modelSettingSourceLabel("model", "builtin")})`;
-
-  const saveTaskReviewModel = async () => {
-    setError("");
-    setNotice("");
-    setTaskReviewModelBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ task_review_model: claudeTaskReviewTrimmed || null });
-      setCommittedSettings(current => current && ({
-        ...current,
-        task_review_model: settings.task_review_model,
-        task_review_models: mergeHarnessCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "claude"),
-      }));
-      const model = settings.task_review_model ?? "";
-      setTaskReviewModel(model);
-      setSavedTaskReviewModel(model);
-      setNotice(
-        model === ""
-          ? "Claude task-review model cleared. Claude task reviews use the SDK default."
-          : `Claude task-review model set to ${model}. It applies to your next task review.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save Claude task-review model"));
-    } finally {
-      setTaskReviewModelBusy(false);
-    }
-  };
-
-  const saveCodexTaskReviewModel = async () => {
-    setError("");
-    setNotice("");
-    setCodexTaskReviewModelBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ codex_task_review_model: codexTaskReviewModel.trim() || null });
-      setCommittedSettings(current => current && ({
-        ...current,
-        codex_task_review_model: settings.codex_task_review_model,
-        task_review_models: mergeHarnessCell(current.task_review_models ?? undefined, settings.task_review_models ?? undefined, "codex"),
-      }));
-      const model = settings.codex_task_review_model ?? "";
-      setCodexTaskReviewModel(model);
-      setSavedCodexTaskReviewModel(model);
-      setNotice(
-        model === ""
-          ? "Codex task-review model cleared. Codex task reviews use the default."
-          : `Codex task-review model set to ${model}. It applies to your next task review.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save Codex task-review model"));
-    } finally {
-      setCodexTaskReviewModelBusy(false);
-    }
-  };
-
-  // Task-review effort (PRD #1570 M2): a closed enum like the worker effort, so no warning
-  // gate. The Default option follows the worker effort; the label names its current level.
-  const claudeTaskReviewEffortCell = committedSettings?.task_review_efforts?.find((c) => c.harness === "claude");
-  const codexTaskReviewEffortCell = committedSettings?.task_review_efforts?.find((c) => c.harness === "codex");
-  const taskReviewEffortDirty = taskReviewEffort !== savedTaskReviewEffort;
-  const codexTaskReviewEffortDirty = codexTaskReviewEffort !== savedCodexTaskReviewEffort;
-  const taskReviewEffortDefaultLabel = (cell: EffortSettingCell | undefined) =>
-    `Default \u00b7 follows worker effort (${
-      !cell ? "medium" : cell.default_effort === "runtime" ? "Runtime default" : cell.default_effort
-    })`;
-  const saveTaskReviewEffort = async (harness: "claude" | "codex") => {
-    setError("");
-    setNotice("");
-    const claude = harness === "claude";
-    (claude ? setTaskReviewEffortBusy : setCodexTaskReviewEffortBusy)(true);
-    try {
-      const value = (claude ? taskReviewEffort : codexTaskReviewEffort) || null;
-      const { settings } = await api.putMySettings(claude ? { task_review_effort: value } : { codex_task_review_effort: value });
-      setCommittedSettings(current => current && ({
-        ...current,
-        [claude ? "task_review_effort" : "codex_task_review_effort"]: claude ? settings.task_review_effort : settings.codex_task_review_effort,
-        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, harness),
-      }));
-      const saved = (claude ? settings.task_review_effort : settings.codex_task_review_effort) ?? "";
-      (claude ? setTaskReviewEffort : setCodexTaskReviewEffort)(saved);
-      (claude ? setSavedTaskReviewEffort : setSavedCodexTaskReviewEffort)(saved);
-      const name = claude ? "Claude" : "Codex";
-      setNotice(
-        saved === ""
-          ? `${name} task-review effort cleared. Task reviews follow your ${name} worker effort.`
-          : saved === "runtime"
-            ? `${name} task-review effort set to Runtime default. The runtime decides.`
-            : `${name} task-review effort set to ${saved}. It applies to your next task review.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, `Failed to save ${claude ? "Claude" : "Codex"} task-review effort`));
-    } finally {
-      (claude ? setTaskReviewEffortBusy : setCodexTaskReviewEffortBusy)(false);
-    }
-  };
-
-  // Per-user default reasoning effort (PRD #617 M5). No warning gate: the dropdown is a
-  // CLOSED enum, so it can only emit a valid level or "" (inherit) — there is no
-  // out-of-enum shape for the server to reject.
-  const effortDirty = defaultEffort !== savedEffort;
-
-  const saveEffort = async () => {
-    setError("");
-    setNotice("");
-    setEffortBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ default_effort: defaultEffort || null });
-      // The planning cells resolve against the worker effort, so adopt them with it.
-      setCommittedSettings(current => current && ({
-        ...current,
-        default_effort: settings.default_effort,
-        effort_settings: mergeHarnessCell(current.effort_settings, settings.effort_settings, "claude"),
-        planning_efforts: mergeHarnessCell(current.planning_efforts, settings.planning_efforts, "claude"),
-        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, "claude"),
-      }));
-      const eff = settings.default_effort ?? "";
-      setDefaultEffort(eff);
-      setSavedEffort(eff);
-      setNotice(
-        eff === ""
-          ? "Claude reasoning effort cleared. Your Claude runs use the uzi default (medium)."
-          : eff === "runtime"
-            ? "Claude reasoning effort set to Runtime default. Claude Code decides at your next run."
-            : `Reasoning effort set to ${eff}. It applies to your next run.`,
-      );
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save reasoning effort"));
-    } finally {
-      setEffortBusy(false);
-    }
-  };
-
-  const codexEffortDirty = defaultCodexEffort !== savedCodexEffort;
-  const saveCodexEffort = async () => {
-    setError("");
-    setNotice("");
-    setCodexEffortBusy(true);
-    try {
-      const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
-      setCommittedSettings(current => current && ({
-        ...current, default_codex_effort: settings.default_codex_effort,
-        effort_settings: mergeHarnessCell(current.effort_settings, settings.effort_settings, "codex"),
-        planning_efforts: mergeHarnessCell(current.planning_efforts, settings.planning_efforts, "codex"),
-        task_review_efforts: mergeHarnessCell(current.task_review_efforts ?? undefined, settings.task_review_efforts ?? undefined, "codex"),
-      }));
-      const eff = settings.default_codex_effort ?? "";
-      setDefaultCodexEffort(eff);
-      setSavedCodexEffort(eff);
-      setNotice(eff === ""
-        ? "Codex reasoning effort cleared. Your Codex runs use the uzi default (medium)."
-        : eff === "runtime"
-          ? "Codex reasoning effort set to Runtime default. Codex decides at the next claim."
-          : `Codex reasoning effort set to ${eff}. It applies at the next claim.`);
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save Codex reasoning effort"));
-    } finally {
-      setCodexEffortBusy(false);
-    }
-  };
-
-  // Planning pairs (PRD #3252). The default labels describe the SAVED state: the
-  // server-resolved cells name what "Same as the run" currently means.
-  const planningModelCell = committedSettings?.planning_models?.find((c) => c.harness === "claude");
-  const planningEffortCell = committedSettings?.planning_efforts?.find((c) => c.harness === "claude");
-  const planningModelDefaultLabel = planningModelCell
-    ? `Same as the run · ${
-        planningModelCell.default_model === ""
-          ? modelSettingSourceLabel("note", "sdk_default")
-          : `${planningModelCell.default_model} (${modelSettingSourceLabel("planning_model", planningModelCell.default_source)})`
-      }`
-    : "Same as the run";
-  const planningEffortDefaultLabel = planningEffortCell
-    ? `Same as the run · ${
-        planningEffortCell.default_effort === "runtime"
-          ? modelSettingSourceLabel("effort", "runtime_default")
-          : planningEffortCell.default_effort
-      } (${modelSettingSourceLabel("planning_effort", planningEffortCell.default_source)})`
-    : "Same as the run";
-  const planningModelTrimmed = planningModel.trim();
-  const planningModelWarning =
-    modelFieldWarning(planningModel) ||
-    (CODEX_ROLE_MODELS.includes(planningModelTrimmed)
-      ? `Not a Claude model: ${planningModelTrimmed} is a Codex model, so Claude planning skips it. Choose Same as the run to clear it.`
-      : "");
-  const planningModelDirty = planningModelTrimmed !== savedPlanningModel;
-  const planningEffortDirty = planningEffort !== savedPlanningEffort;
-  const planningCustomEmpty = planningModelCustom && planningModelTrimmed === "";
-  const planningCodexModelCell = committedSettings?.planning_models?.find(c => c.harness === "codex");
-  const planningCodexEffortCell = committedSettings?.planning_efforts?.find(c => c.harness === "codex");
-  const planningCodexModelDefaultLabel = planningCodexModelCell
-    ? `Same as the run · ${planningCodexModelCell.default_model} (${modelSettingSourceLabel("planning_model", planningCodexModelCell.default_source)})`
-    : "Same as the run";
-  const planningCodexEffortDefaultLabel = planningCodexEffortCell
-    ? `Same as the run · ${planningCodexEffortCell.default_effort === "runtime" ? modelSettingSourceLabel("effort", "runtime_default") : planningCodexEffortCell.default_effort} (${modelSettingSourceLabel("planning_effort", planningCodexEffortCell.default_source)})`
-    : "Same as the run";
-  const planningCodexModelWarning = modelFieldWarning(planningCodexModel) ||
-    (["opus", "sonnet", "haiku", "fable"].includes(planningCodexModel.trim()) ? "A Claude model is not valid for the Codex lane." : "");
-  const planningCodexCustomEmpty = planningCodexModelCustom && planningCodexModel.trim() === "";
-  const planningCodexModelDirty = planningCodexModel.trim() !== savedPlanningCodexModel;
-  const planningCodexEffortDirty = planningCodexEffort !== savedPlanningCodexEffort;
-  const planningCodexBlocked = planningCodexModelWarning !== "" || planningCodexCustomEmpty;
-  const planningBlocked = planningModelWarning !== "" || planningCustomEmpty;
-  // The messages shown under the model select, so assistive tech reads them with it.
-  const planningModelDescribedBy =
-    [
-      planningModelWarning && "planning-model-warning",
-      planningCustomEmpty && "planning-model-empty",
-      planningModelError && "planning-model-error",
-    ]
-      .filter(Boolean)
-      .join(" ") || undefined;
-
-  // One PUT carrying only the dirty fields (null = Same as the run). A 400 names its field
-  // as a planning field prefix; an unattributable message shows under all controls.
-  const savePlanning = async () => {
-    setError("");
-    setNotice("");
-    setPlanningModelError("");
-    setPlanningEffortError("");
-    setPlanningCodexModelError("");
-    setPlanningCodexEffortError("");
-    setPlanningBusy(true);
-    try {
-      const patch: UserSettingsPatch = {};
-      if (planningModelDirty) patch.planning_claude_model = planningModelTrimmed || null;
-      if (planningEffortDirty) patch.planning_claude_effort = planningEffort || null;
-      if (planningCodexModelDirty) patch.planning_codex_model = planningCodexModel.trim() || null;
-      if (planningCodexEffortDirty) patch.planning_codex_effort = planningCodexEffort || null;
-      const { settings } = await api.putMySettings(patch);
-      setCommittedSettings(current => current && ({
-        ...current,
-        planning_codex_model: settings.planning_codex_model,
-        planning_codex_effort: settings.planning_codex_effort,
-        planning_claude_model: settings.planning_claude_model,
-        planning_claude_effort: settings.planning_claude_effort,
-        planning_models: settings.planning_models,
-        planning_efforts: settings.planning_efforts,
-      }));
-      setPlanningCodexModel(settings.planning_codex_model ?? "");
-      setSavedPlanningCodexModel(settings.planning_codex_model ?? "");
-      setPlanningCodexEffort(settings.planning_codex_effort ?? "");
-      setSavedPlanningCodexEffort(settings.planning_codex_effort ?? "");
-      const pm = settings.planning_claude_model ?? "";
-      setPlanningModel(pm);
-      setSavedPlanningModel(pm);
-      const pe = settings.planning_claude_effort ?? "";
-      setPlanningEffort(pe);
-      setSavedPlanningEffort(pe);
-      setNotice("Planning defaults saved. They apply the next time a run plans.");
-    } catch (err) {
-      const message = errorMessage(err, "Failed to save planning defaults");
-      const fields = [
-        ["planning_claude_model", setPlanningModelError],
-        ["planning_claude_effort", setPlanningEffortError],
-        ["planning_codex_model", setPlanningCodexModelError],
-        ["planning_codex_effort", setPlanningCodexEffortError],
-      ] as const;
-      const field = fields.find(([name]) => message.startsWith(`${name}:`));
-      if (field) field[1](message);
-      else for (const [, setFieldError] of fields) setFieldError(message);
-    } finally {
-      setPlanningBusy(false);
-    }
-  };
-
-  // PRD #1551 M3 / D2: the harness SELECTOR appears only when both harnesses are
-  // usable. Which model LANES appear is separate: the usable ones, and — so a
-  // zero-credential user can still preconfigure — the Claude lane when neither is
-  // usable (success criterion 4). A temporarily unavailable lane stays stored
-  // server-side and simply is not shown.
-  const showHarnessSelector = bothHarnessesUsable(claudeUsable, codexUsable);
-  const showClaudeLane = claudeUsable || !codexUsable;
-  const showCodexLane = codexUsable;
-  const bothLanes = showClaudeLane && showCodexLane;
-
-  // PRD #3257: the judge-model lanes add one rule to the worker-lane rule above: the harness
-  // the judge explicitly runs on keeps its lane even without a usable credential, so the user
-  // can still see and set the model that judge would use. The other lane, when shown, is
-  // dimmed as not used.
-  const showClaudeJudgeLane = showClaudeLane || judgeRunsOn === "claude";
-  const showCodexJudgeLane = showCodexLane || judgeRunsOn === "codex";
-  const judgeOn = judgeRunsOn === "" ? null : HARNESS_LABEL[judgeRunsOn];
+  // Which judge lanes the summary shows: each usable harness (the Claude lane also when
+  // neither is usable), plus the harness the judge explicitly runs on even without a usable
+  // credential (PRD #3257), so the summary can say that judge is skipped.
+  const showClaudeJudgeLane = claudeUsable || !codexUsable || judgeRunsOn === "claude";
+  const showCodexJudgeLane = codexUsable || judgeRunsOn === "codex";
+  const judgeOn = judgeRunsOn === "" ? null : harnessName(judgeRunsOn);
   const claudeJudgeNotUsed = judgeRunsOn === "codex";
   const codexJudgeNotUsed = judgeRunsOn === "claude";
-  const judgeHarnessUnusable =
-    (judgeRunsOn === "claude" && !claudeUsable) || (judgeRunsOn === "codex" && !codexUsable);
+  const judgeProviderRestricted = Boolean(committedSettings?.claude_provider_id);
+  const providerRestriction = "Judge runs are skipped while a custom Claude provider is selected";
+  // Alias metadata does not expose the account state the queue-time resolver checks.
+  const hasCodexAlias = data?.hasLinkedJudgeAlias ?? false;
+  const judgeHarnessUnusable = !judgeProviderRestricted &&
+    ((judgeRunsOn === "claude" && !claudeUsable) || (judgeRunsOn === "codex" && !codexUsable && !hasCodexAlias));
   const notUsedCopy = judgeOn ? `Not used: the judge runs on ${judgeOn}` : "";
 
   // The enforced banner's model clause: the one model in play when the judge runs on a fixed
@@ -1006,120 +396,42 @@ export function RunDefaults() {
     enforcedJudgeModels = ` (Claude runs on ${effectiveJudgeModel})`;
   }
 
-  // The active-lane badge follows the EFFECTIVE harness (D11), the same resolver the
-  // rest of the web mirrors: "inherit" resolves to a USABLE stored default, else the
-  // sole usable harness, else Claude. So a Codex-only user (no selector) still sees the
-  // badge on their one lane, and a both-usable user sees it move as the selector changes.
-  //
-  // The stored default_harness is passed as resolveHarness's rung-2 DEFAULT, NOT as the
-  // rung-1 explicit selection — mirroring harness_resolver.go, which SKIPS an unusable
-  // stored default rather than short-circuiting on it. Passing it as `selection` would
-  // make effectiveHarnessIsCodex short-circuit unconditionally, so a stale "claude" pin
-  // with only Codex usable (or a stale "codex" pin with only Claude usable) would light
-  // NO lane's badge; feeding it as the rung-2 default lets availability win when the pin
-  // is unusable, exactly as the server resolves it. A user's LIVE selector change still
-  // moves the badge immediately when both are usable, since the pick is then a usable
-  // default.
-  const effectiveIsCodex = effectiveHarnessIsCodex(
-    "inherit",
-    claudeUsable,
-    codexUsable,
-    defaultHarness === "inherit" ? null : defaultHarness,
-  );
-  // Automatic with both harnesses usable is chosen per run by weekly limits, so no
-  // single lane is "the default"; a pinned default or a sole usable harness keeps its badge.
-  const chosenPerRun = showHarnessSelector && defaultHarness === "inherit";
-  const badgeOnClaude = showClaudeLane && !effectiveIsCodex && !chosenPerRun;
-  const badgeOnCodex = showCodexLane && effectiveIsCodex && !chosenPerRun;
   // Overflow only applies to an explicit saved default (the server ignores it when automatic).
-  const overflowNeedsExplicitDefault = savedHarness === "inherit";
+  const bothUsable = bothHarnessesUsable(claudeUsable, codexUsable);
+  const overflowNeedsExplicitDefault = loaded && !committedSettings?.default_harness;
+  const overflowUnavailable = !loaded && loadError !== "";
 
-  // Dirty state is independent per field, but Save resends BOTH model lanes together
-  // with the harness. Compare each trimmed draft to its own saved snapshot.
-  const claudeRoleModel = CODEX_ROLE_MODELS.includes(claudeModel.trim());
-  const claudeWarning = claudeRoleModel
-    ? `Not a Claude model: ${claudeModel.trim()} is a Codex model. The stored value is skipped and the existing Claude worker default is used. Reset to Default to clear it.`
-    : modelFieldWarning(claudeModel);
-  const claudeRoleRecovery = claudeRoleModel && (
-    <div className="flex flex-wrap items-center gap-3">
-      <Alert message={claudeWarning} tone="warning" />
-      <Button type="button" disabled={defaultsBusy} onClick={() => setClaudeModel("")}>
-        Reset to Default
-      </Button>
-    </div>
-  );
-  const codexWarning = modelFieldWarning(codexModel);
-  const harnessDirty = defaultHarness !== savedHarness;
-  const claudeDirty = claudeModel.trim() !== savedClaudeModel;
-  const codexDirty = codexModel.trim() !== savedCodexModel;
-  const anyDirty = harnessDirty || claudeDirty || codexDirty;
-  // A known Claude rejection also blocks when hidden, since grouped Save resends it.
-  // Shape-only warnings keep their existing visible-lane gating.
-  const blockingWarning =
-    claudeRoleModel || (showClaudeLane && claudeWarning !== "") || (showCodexLane && codexWarning !== "");
-
-  // saveDefaults writes the harness pin and BOTH lanes in one PUT (D1), never the
-  // legacy default_model (D3: new clients don't send it). Present-value sets, null
-  // clears. On success all three saved snapshots advance together; on failure the
-  // form stays dirty and shows one actionable error.
-  const saveDefaults = async () => {
-    setError("");
-    setNotice("");
-    setDefaultsBusy(true);
-    try {
-      const patch: UserSettingsPatch = {
-        default_harness: defaultHarness === "inherit" ? null : defaultHarness,
-        default_claude_model: claudeModel.trim() || null,
-        default_codex_model: codexModel.trim() || null,
-      };
-      const { settings } = await api.putMySettings(patch);
-      // Model saves refresh counterfactual metadata (cross-check worker defaults and the
-      // Codex catalog default, both computed for the saved model); retain current pins and other hints.
-      setCommittedSettings(current => current && ({
-        ...current,
-        default_harness: settings.default_harness,
-        default_claude_model: settings.default_claude_model,
-        default_codex_model: settings.default_codex_model,
-        effort_settings: settings.effort_settings,
-        // The planning defaults resolve against the worker model lane.
-        planning_models: settings.planning_models,
-        planning_efforts: settings.planning_efforts,
-        cross_check_pins: current.cross_check_pins?.map(cell => {
-          const delivered = settings.cross_check_pins?.find(p => p.stage === cell.stage && p.harness === cell.harness);
-          return delivered ? { ...cell, worker_default_model: delivered.worker_default_model } : cell;
-        }),
-      }));
-      const dh = selectionFromHarness(settings.default_harness);
-      setDefaultHarness(dh);
-      setSavedHarness(dh);
-      const claude = settings.default_claude_model ?? "";
-      setClaudeModel(claude);
-      setSavedClaudeModel(claude);
-      const codex = settings.default_codex_model ?? "";
-      setCodexModel(codex);
-      setSavedCodexModel(codex);
-      setNotice("Defaults saved. They apply to your next run.");
-    } catch (err) {
-      setError(errorMessage(err, "Failed to save defaults"));
-    } finally {
-      setDefaultsBusy(false);
-    }
-  };
-
-  // The retention explanation, worded to the current default-harness choice so it says
-  // what "stays saved" means right now (only shown when the selector — both lanes —
-  // is present). Keyed on the raw pick, which is exactly what the selector controls.
-  const retentionCopy =
-    defaultHarness === "codex"
-      ? "Codex is your default harness. Your Claude model stays saved for runs that explicitly use Claude."
-      : defaultHarness === "claude"
-        ? "Claude is your default harness. Your Codex model stays saved for runs that explicitly use Codex."
-        : "Harness selection is automatic. Both model choices stay saved; uzi uses your only usable harness, and when both are usable it chooses per run by weekly limits.";
+  // One summary row per lane in play: the model in effect and the credential it spends. A lane
+  // the saved routing leaves unused says so in full contrast rather than fading out.
+  const judgeLanes: { harness: Harness; model: string; credential: string; notUsed: boolean }[] = [];
+  if (showClaudeJudgeLane) {
+    judgeLanes.push({
+      harness: "claude",
+      model: judgeModelSummary(claudeJudgeCell, effectiveJudgeModel),
+      credential: judgeProviderRestricted ? providerRestriction : claudeJudgeCredential(user, secrets, pooledCount, claudeUsable),
+      notUsed: claudeJudgeNotUsed,
+    });
+  }
+  if (showCodexJudgeLane) {
+    judgeLanes.push({
+      harness: "codex",
+      model: judgeModelSummary(codexJudgeCell, undefined),
+      // Docs/judge.md: a Codex judge re-resolves your usable Codex credential when it is
+      // queued (subscription default first); there is no separate judge-lane pick.
+      credential: judgeProviderRestricted
+        ? providerRestriction
+        : hasCodexAlias
+        ? "Codex credential availability is checked when the judge is queued"
+        : codexUsable
+        ? "Your usable Codex credential when the judge is queued"
+        : "No usable Codex credential, so Codex judges are skipped",
+      notUsed: codexJudgeNotUsed,
+    });
+  }
 
   return (
-    <SettingsShell description="How your runs behave: autopilot, usage limits, the judge, CI fixes, the model, and reasoning effort.">
-      {(error || loadError) && <Alert message={error || loadError} />}
-      {notice && <Alert tone="success" message={notice} />}
+    <SettingsShell description="How your runs behave: autopilot, cross-check, usage limits, the judge, summaries, CI fixes, attribution, MR rework and harness overflow. Models and reasoning effort are set in Models.">
+      {loadError && <Alert message={loadError} />}
 
       <Card className="space-y-4">
         <div>
@@ -1181,7 +493,12 @@ export function RunDefaults() {
           <span className="text-fg">Code cross-check · Advisory before publication</span>
         </label>
         <p id="code-cross-check-help" className="text-sm text-muted">Adds the other model family's findings to the merge request; never blocks it</p>
-        {committedSettings && <CrossCheckDefaults settings={committedSettings} />}
+        {/* PRD #3263 M2: the checker model and effort for each stage are saved with every other
+            model choice in Models; only the enables stay here. */}
+        <p className="text-sm text-muted">
+          Model and effort for each cross-check stage are set in{" "}
+          <Link to={MODELS_PATH} className="underline underline-offset-2">Models</Link>.
+        </p>
       </Card>
 
       {/* PRD #35. Placed after Autopilot on purpose: the two compose, and this is the
@@ -1268,7 +585,7 @@ export function RunDefaults() {
           <p className="mt-2 text-sm text-muted">
             With the run judge on, each of your <strong className="text-fg">finished</strong> runs is
             reviewed by an LLM using <strong className="text-fg">your own credential for the harness it runs on</strong>,
-            chosen below: your Anthropic token on Claude, your Codex credential on Codex. It reads
+            shown below: your Anthropic token on Claude, your Codex credential on Codex. It reads
             the run trace and produces a verdict plus recommendations (a missing worker tool, an agent or
             template to improve, and so on). Results appear on the Judge page and on the run&rsquo;s page,
             plus a Slack DM when your Slack account is linked. It only recommends and never changes code. Your
@@ -1289,7 +606,7 @@ export function RunDefaults() {
               `Your admin has ENFORCED the run judge: every one of your finished runs is judged on ` +
               `your own credential for the harness the judge runs on` +
               enforcedJudgeModels +
-              `, whether or not the opt-in below is on. If you chose Claude or Codex under Judge runs on ` +
+              `, whether or not the opt-in below is on. If the judge runs on Claude or Codex for every run ` +
               `and that harness has no usable credential, the judge is skipped. The only way to opt out is ` +
               `to remove your credential for that harness.`
             }
@@ -1314,40 +631,68 @@ export function RunDefaults() {
           <span className="text-fg">Judge my finished runs</span>
         </label>
 
-        {/* PRD #3257: where the judge runs. Placed first among the judge's controls because it
-            decides which of the token picker and model lanes below are read. Always shown: it
-            is not gated on a usable credential (unlike the model lanes) nor on enforcement,
-            and its stored value is never changed for the user. */}
-        <div className="space-y-1.5">
-          <Field label="Judge runs on" htmlFor="judge-runs-on">
-            <Select
-              id="judge-runs-on"
-              className="sm:max-w-xs"
-              value={judgeRunsOn}
-              // Locked until the initial load lands: a choice made earlier would be saved, then
-              // overwritten on screen by the loaded (older) value.
-              disabled={loading}
-              aria-busy={judgeRunsOnBusy || undefined}
-              aria-describedby={`judge-runs-on-help${judgeHarnessUnusable ? " judge-runs-on-unusable" : ""}`}
-              onChange={(e) => saveJudgeRunsOn(e.target.value as JudgeRunsOnChoice)}
-            >
-              <option value="">Same as the run</option>
-              <option value="claude">Claude</option>
-              <option value="codex">Codex</option>
-            </Select>
-          </Field>
-          <p id="judge-runs-on-help" className="text-xs text-faint">
-            {judgeRunsOnHelp(judgeRunsOn)}
-          </p>
-          {judgeOn && judgeHarnessUnusable && (
+
+        {/* PRD #3263 M3: what the judge runs on, read-only. Routing and the judge models are
+            edited and saved with every other model choice in Models; the credential lines come
+            from the judge lane's own binding below (Claude) and the owned Codex credentials,
+            never from a prediction of the lead's credential. */}
+        <section
+          aria-labelledby="judge-summary-title"
+          className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4"
+        >
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <h3 id="judge-summary-title" className="text-sm font-semibold text-fg">
+              Where your judge runs
+            </h3>
+            <Link to={MODELS_PATH} className="text-sm font-medium text-brand hover:text-brand-hover">
+              Change in Models
+            </Link>
+          </div>
+          {!loaded && !loadError && (
+            <div className="space-y-2" aria-busy="true">
+              <span className="sr-only">Loading where your judge runs</span>
+              <Skeleton className="h-4 w-full max-w-sm" />
+              <Skeleton className="h-4 w-full max-w-xs" />
+              <Skeleton className="h-4 w-full max-w-sm" />
+            </div>
+          )}
+          {!loaded && loadError && (
+            <p className="text-sm text-muted">Unavailable until your settings load. Reload the page to try again.</p>
+          )}
+          {loaded && (
+            <dl className="grid gap-x-6 gap-y-0.5 text-sm sm:grid-cols-[minmax(9rem,auto)_1fr] sm:gap-y-2">
+              <div className="contents">
+                <dt className="text-muted">Runs on</dt>
+                <dd className="mb-2 text-fg sm:mb-0">
+                  {judgeOn ?? "Same as the run"}
+                  <span className="mt-0.5 block text-xs text-faint">{judgeSummaryHelp(judgeRunsOn)}</span>
+                </dd>
+              </div>
+              {/* One wrapper per dt/dd pair: a <dl> may group only a name and its values. */}
+              {judgeLanes.map((lane) => [
+                <div key={`${lane.harness}-model`} className="contents">
+                  <dt className="text-muted">{harnessName(lane.harness)} judge model</dt>
+                  <dd className="mb-2 text-fg sm:mb-0">
+                    <span className="break-words">{lane.model}</span>
+                    {lane.notUsed && <span className="mt-0.5 block text-xs text-muted">{notUsedCopy}</span>}
+                  </dd>
+                </div>,
+                <div key={`${lane.harness}-credential`} className="contents">
+                  <dt className="text-muted">{harnessName(lane.harness)} judge credential</dt>
+                  <dd className="mb-2 text-fg sm:mb-0">{lane.credential}</dd>
+                </div>,
+              ])}
+            </dl>
+          )}
+          {loaded && judgeOn && judgeHarnessUnusable && (
             <p id="judge-runs-on-unusable" className="text-xs text-warn" role="status">
               {judgeOn} has no usable credential, so the judge is skipped on every run until you add one
               in <Link to="/settings" className="underline underline-offset-2">Account &amp; tokens</Link>.
               Your choice stays saved.
             </p>
           )}
-          {judgeRunsOnError && <Alert message={judgeRunsOnError} />}
-        </div>
+        </section>
+
 
         {/* The judge token picker (PRD #104 M4/M6, #1140 M3). Without it "the judge
             lane can burn a different token, set from the web UI" is unreachable, which
@@ -1426,194 +771,25 @@ export function RunDefaults() {
             )}
           </Field>
         )}
-
-        {/* Per-user judge models, one per harness (PRD #69 M2, PRD #3245). Default
-            follows the instance value, then the built-in; pinning one here overrides it
-            for YOUR judged runs only, and applies in enforced mode too. Each lane is shown
-            by the worker-model lane rule (showClaudeLane / showCodexLane), plus the lane of
-            the harness the judge explicitly runs on (PRD #3257); the other lane is dimmed
-            as not used. The Codex lane offers only the curated models. */}
-        <div className="space-y-3">
-          <div className={`grid gap-4${showClaudeJudgeLane && showCodexJudgeLane ? " sm:grid-cols-2" : ""}`}>
-            {showClaudeJudgeLane && (
-              <div className="space-y-1.5">
-                <Field label="Claude judge model" htmlFor="judge-model">
-                  <div className={claudeJudgeNotUsed ? "opacity-45" : undefined}>
-                    <ModelSelect
-                      id="judge-model"
-                      harness="claude"
-                      value={judgeModel}
-                      onChange={setJudgeModel}
-                      onCustomModeChange={setJudgeModelCustom}
-                      defaultLabel={modelDefaultLabel(claudeJudgeCell)}
-                      customAriaLabel="Custom Claude judge model ID"
-                      ariaDescribedBy={claudeJudgeCell || claudeJudgeNotUsed ? "judge-model-effect" : undefined}
-                    />
-                  </div>
-                </Field>
-                {(claudeJudgeCell || claudeJudgeNotUsed) && (
-                  <p id="judge-model-effect" className={`text-xs ${claudeJudgeNotUsed ? "text-muted" : "text-faint"}`}>
-                    {judgeLaneNote(claudeJudgeCell, claudeJudgeNotUsed ? notUsedCopy : "")}
-                  </p>
-                )}
-                {judgeCustomEmpty && (
-                  <p className="text-xs text-danger" role="alert">
-                    {CUSTOM_EMPTY_MESSAGE}
-                  </p>
-                )}
-                {judgeModelWarning && <Alert message={judgeModelWarning} tone="warning" />}
-              </div>
-            )}
-            {showCodexJudgeLane && (
-              <div className="space-y-1.5">
-                <Field label="Codex judge model" htmlFor="codex-judge-model">
-                  <div className={codexJudgeNotUsed ? "opacity-45" : undefined}>
-                    <ModelSelect
-                      id="codex-judge-model"
-                      harness="codex"
-                      allowCustom={false}
-                      value={codexJudgeModel}
-                      onChange={setCodexJudgeModel}
-                      onCustomModeChange={setCodexJudgeModelCustom}
-                      defaultLabel={modelDefaultLabel(codexJudgeCell)}
-                      customAriaLabel="Custom Codex judge model ID"
-                      ariaDescribedBy={codexJudgeCell || codexJudgeNotUsed ? "codex-judge-model-effect" : undefined}
-                    />
-                  </div>
-                </Field>
-                {(codexJudgeCell || codexJudgeNotUsed) && (
-                  <p id="codex-judge-model-effect" className={`text-xs ${codexJudgeNotUsed ? "text-muted" : "text-faint"}`}>
-                    {judgeLaneNote(codexJudgeCell, codexJudgeNotUsed ? notUsedCopy : "")}
-                  </p>
-                )}
-                {codexJudgeCustomEmpty && (
-                  <p className="text-xs text-danger" role="alert">
-                    {CUSTOM_EMPTY_MESSAGE}
-                  </p>
-                )}
-                {codexJudgeModelWarning && <Alert message={codexJudgeModelWarning} tone="warning" />}
-              </div>
-            )}
-          </div>
-          <p className="text-xs text-faint">
-            {judgeOn
-              ? `The judge runs on ${judgeOn} for every run, so only the ${judgeOn} judge model is used; the other stays saved. `
-              : "With Same as the run, the judge runs on the harness of the run it reviews, so each harness has its own judge model. "}
-            Leave it on Default to follow your instance&rsquo;s choice; pin a cheaper model to spend less.
-          </p>
-          <Button
-            type="button"
-            disabled={
-              judgeModelBusy ||
-              !(judgeModelDirty || codexJudgeModelDirty) ||
-              (judgeModelDirty && judgeModelWarning !== "") ||
-              (codexJudgeModelDirty && codexJudgeModelWarning !== "") ||
-              judgeCustomEmpty ||
-              codexJudgeCustomEmpty
-            }
-            onClick={saveJudgeModels}
-          >
-            Save judge models
-          </Button>
-        </div>
         <p className="border-t border-edge pt-3 text-xs text-faint">
           If the judge&rsquo;s harness can&rsquo;t run, the judge is skipped, never charged to the other
           provider.
         </p>
       </Card>
 
-      {/* Per-user run-summary models (PRD #362 M2, PRD #3248), one per harness. Each run
-          generates short plain-English summaries on the harness it runs on; leave a lane
-          on Default to follow the instance setting, or pin one here to override it for
-          YOUR runs only. Lanes are shown by the same rule as the worker-model lanes
-          (showClaudeLane / showCodexLane); a bad model blocks Save rather than failing on
-          the next run. */}
+      {/* Run summaries (PRD #362, #3248, #2603). The summary model for each harness is set in
+          Models; the Now line switch is behavior, so it stays here. */}
       <Card className="space-y-4">
         <div>
           <SectionTitle>Run summaries</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             Each of your runs generates two short plain-English summaries — what it will implement, and
             what the proposed plan will do — on the same harness the run uses, with your own credential
-            for that harness. Pinning a model here overrides the default for your own runs; other users
-            are unaffected. Summaries are advisory and never block a run.
+            for that harness. Summaries are advisory and never block a run.
           </p>
-        </div>
-
-        <div className="space-y-3">
-          <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
-            {showClaudeLane && (
-              <div className="space-y-1.5">
-                <Field label="Claude summary model" htmlFor="summary-model">
-                  <ModelSelect
-                    id="summary-model"
-                    harness="claude"
-                    value={summaryModel}
-                    onChange={setSummaryModel}
-                    onCustomModeChange={setSummaryModelCustom}
-                    defaultLabel={modelDefaultLabel(claudeSummaryCell)}
-                    customAriaLabel="Custom Claude summary model ID"
-                    ariaDescribedBy={claudeSummaryCell ? "summary-model-effect" : undefined}
-                  />
-                </Field>
-                {claudeSummaryCell && (
-                  <p id="summary-model-effect" className="text-xs text-faint">
-                    {modelInEffect(claudeSummaryCell)}
-                  </p>
-                )}
-                <p className="text-xs text-faint">
-                  Used for the intent summary, the plan summary and the pull request description on
-                  Claude runs.
-                </p>
-                {summaryCustomEmpty && (
-                  <p className="text-xs text-danger" role="alert">
-                    {CUSTOM_EMPTY_MESSAGE}
-                  </p>
-                )}
-                {summaryModelWarning && <Alert message={summaryModelWarning} tone="warning" />}
-                <Button
-                  type="button"
-                  disabled={summaryModelBusy || !summaryModelDirty || summaryModelWarning !== "" || summaryCustomEmpty}
-                  onClick={saveSummaryModel}
-                >
-                  Save Claude summary model
-                </Button>
-              </div>
-            )}
-            {showCodexLane && (
-              <div className="space-y-1.5">
-                <Field label="Codex summary model" htmlFor="codex-summary-model">
-                  <ModelSelect
-                    id="codex-summary-model"
-                    harness="codex"
-                    models={CODEX_ROLE_MODELS}
-                    value={codexSummaryModel}
-                    onChange={setCodexSummaryModel}
-                    defaultLabel={modelDefaultLabel(codexSummaryCell)}
-                    ariaDescribedBy={codexSummaryCell ? "codex-summary-model-effect" : undefined}
-                  />
-                </Field>
-                {codexSummaryCell && (
-                  <p id="codex-summary-model-effect" className="text-xs text-faint">
-                    {modelInEffect(codexSummaryCell)}
-                  </p>
-                )}
-                <p className="text-xs text-faint">
-                  Used for the intent summary and the plan summary on Codex runs. Codex pull request
-                  descriptions use their own model.
-                </p>
-                <Button
-                  type="button"
-                  disabled={codexSummaryModelBusy || !codexSummaryModelDirty}
-                  onClick={saveCodexSummaryModel}
-                >
-                  Save Codex summary model
-                </Button>
-              </div>
-            )}
-          </div>
-          <p className="text-xs text-faint">
-            Neither setting changes the one-line Now status. Leave a lane on Default to follow your
-            instance&rsquo;s choice.
+          <p className="mt-2 text-sm text-muted">
+            The summary model for each harness is set in{" "}
+            <Link to={MODELS_PATH} className="underline underline-offset-2">Models</Link>.
           </p>
         </div>
 
@@ -1637,112 +813,16 @@ export function RunDefaults() {
         </div>
       </Card>
 
-      {/* Task review model (PRD #1570 M1), one per harness: the model the optional
-          `uzi handoff --review` pass uses. Lanes follow showClaudeLane / showCodexLane. */}
-      <Card className="space-y-4">
-        <div>
-          <SectionTitle>Task review</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            The model and effort the optional <code>uzi handoff --review</code> pass uses to review a task
-            run&rsquo;s work. The effort follows your worker effort unless you set one here. Applies to your own runs only.
-          </p>
-        </div>
-        <div className={`grid gap-4${showClaudeLane && showCodexLane ? " sm:grid-cols-2" : ""}`}>
-          {showClaudeLane && (
-            <div className="space-y-1.5">
-              <Field label="Claude task-review model" htmlFor="task-review-model">
-                <Input
-                  id="task-review-model"
-                  value={taskReviewModel}
-                  placeholder={TASK_REVIEW_CLAUDE_DEFAULT}
-                  autoComplete="off"
-                  spellCheck={false}
-                  aria-describedby={
-                    [claudeTaskReviewCell && "task-review-model-effect", "task-review-model-help", taskReviewModelWarning && "task-review-model-warning"]
-                      .filter(Boolean).join(" ")
-                  }
-                  onChange={(e) => setTaskReviewModel(e.target.value)}
-                />
-              </Field>
-              {claudeTaskReviewCell && (
-                <p id="task-review-model-effect" className="text-xs text-faint">
-                  {taskReviewClaudeInEffect(claudeTaskReviewCell)}
-                </p>
-              )}
-              <p id="task-review-model-help" className="text-xs text-faint">Leave empty for the SDK default.</p>
-              {taskReviewModelWarning && (
-                <div id="task-review-model-warning"><Alert message={taskReviewModelWarning} tone="warning" /></div>
-              )}
-              <Button
-                type="button"
-                disabled={taskReviewModelBusy || !taskReviewModelDirty || taskReviewModelWarning !== ""}
-                onClick={saveTaskReviewModel}
-              >
-                Save Claude task-review model
-              </Button>
-              <Field label="Claude task-review effort" htmlFor="task-review-effort">
-                <EffortSelect
-                  id="task-review-effort"
-                  value={taskReviewEffort}
-                  onChange={setTaskReviewEffort}
-                  defaultLabel={taskReviewEffortDefaultLabel(claudeTaskReviewEffortCell)}
-                  runtimeLabel="Runtime default"
-                />
-              </Field>
-              <Button
-                type="button"
-                disabled={taskReviewEffortBusy || !taskReviewEffortDirty}
-                onClick={() => saveTaskReviewEffort("claude")}
-              >
-                Save Claude task-review effort
-              </Button>
-            </div>
-          )}
-          {showCodexLane && (
-            <div className="space-y-1.5">
-              <Field label="Codex task-review model" htmlFor="codex-task-review-model">
-                <ModelSelect
-                  id="codex-task-review-model"
-                  harness="codex"
-                  models={CODEX_ROLE_MODELS}
-                  value={codexTaskReviewModel}
-                  onChange={setCodexTaskReviewModel}
-                  defaultLabel={codexTaskReviewDefaultLabel}
-                  ariaDescribedBy={codexTaskReviewCell ? "codex-task-review-model-effect" : undefined}
-                />
-              </Field>
-              {codexTaskReviewCell && (
-                <p id="codex-task-review-model-effect" className="text-xs text-faint">
-                  {modelInEffect(codexTaskReviewCell)}
-                </p>
-              )}
-              <Button
-                type="button"
-                disabled={codexTaskReviewModelBusy || !codexTaskReviewModelDirty}
-                onClick={saveCodexTaskReviewModel}
-              >
-                Save Codex task-review model
-              </Button>
-              <Field label="Codex task-review effort" htmlFor="codex-task-review-effort">
-                <EffortSelect
-                  id="codex-task-review-effort"
-                  value={codexTaskReviewEffort}
-                  onChange={setCodexTaskReviewEffort}
-                  defaultLabel={taskReviewEffortDefaultLabel(codexTaskReviewEffortCell)}
-                  runtimeLabel="Runtime default"
-                />
-              </Field>
-              <Button
-                type="button"
-                disabled={codexTaskReviewEffortBusy || !codexTaskReviewEffortDirty}
-                onClick={() => saveTaskReviewEffort("codex")}
-              >
-                Save Codex task-review effort
-              </Button>
-            </div>
-          )}
-        </div>
+      {/* Task review (PRD #1570): only a model and effort, both edited in Models, so the card
+          is a pointer for anyone who looks for it here. */}
+      <Card className="space-y-2">
+        <SectionTitle>Task review</SectionTitle>
+        <p className="text-sm text-muted">
+          The model and effort the optional <code>uzi handoff --review</code> pass uses are set in{" "}
+          <Link to={MODELS_PATH} className="underline underline-offset-2">Models</Link>.
+        </p>
       </Card>
+
 
       <Card className="space-y-4">
         <div>
@@ -1831,297 +911,67 @@ export function RunDefaults() {
         </label>
       </Card>
 
-      {/* PRD #1551 M3: the grouped Harness-and-worker-models card. Default harness on
-          top (only when both are usable), one retained model lane per usable harness
-          (plus the Claude lane in the zero-credential case), an active-lane badge that
-          follows the effective harness, a retention explanation, and one Save. */}
-      <Card className="space-y-5">
+      {/* Harness overflow (saved on its own endpoint). Behavior, so it stays here when the
+          default harness and worker models it builds on moved to Models (PRD #3263 M3). */}
+      <Card className="space-y-4">
         <div>
-          <SectionTitle>Harness and worker models</SectionTitle>
+          <SectionTitle>Harness overflow</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            Choose how new runs start, then keep a model default for each harness. The
-            worker model is what your runs use — the lead orchestrator and the subagents
-            that inherit it — and overrides the lead template for your own runs only.{" "}
-            {showHarnessSelector && (
-              <strong className="text-fg">
-                Changing the harness doesn't overwrite either model choice.
-              </strong>
-            )}
+            When your default harness is near its usage limits, a new run can start on the other
+            harness instead. Your default harness and worker models are set in{" "}
+            <Link to={MODELS_PATH} className="underline underline-offset-2">Models</Link>.
           </p>
         </div>
 
-        {loading ? (
-          <Skeleton className="h-9 w-full max-w-sm" />
-        ) : (
-          <div className="space-y-5">
-            {showHarnessSelector && (
-              <div className="space-y-1.5">
-                <Field label="Harness" htmlFor="default-harness">
-                  <HarnessPicker
-                    id="default-harness"
-                    label="Default harness"
-                    className="w-full max-w-sm"
-                    value={defaultHarness}
-                    onChange={setDefaultHarness}
-                    disabled={defaultsBusy}
-                    inheritLabel="Default · automatic"
-                  />
-                </Field>
-                <p className="text-xs text-faint">
-                  Used when a run or schedule doesn't choose a harness explicitly. Leave it
-                  on <em>Default · automatic</em> to let uzi use your only usable
-                  harness; when both are usable it chooses per run by weekly limits.
-                </p>
-                {chosenPerRun && (
-                  <Badge tone="brand" dot>
-                    Chosen per run by weekly limits
-                  </Badge>
-                )}
-              </div>
-            )}
-
-            <div className="space-y-1.5">
-              <label className="flex items-center gap-3 text-sm text-fg">
-                <Toggle
-                  checked={overflowEnabled}
-                  disabled={overflowBusy || overflowNeedsExplicitDefault}
-                  focusableWhenDisabled
-                  onChange={enabled => void toggleOverflow(enabled)}
-                  label="Overflow to the other harness when my default is near its limits"
-                  aria-describedby={overflowNeedsExplicitDefault ? "harness-overflow-scope harness-overflow-automatic" : "harness-overflow-scope"}
-                />
-                Overflow to the other harness when my default is near its limits
-              </label>
-              {overflowNeedsExplicitDefault && (
-                <p id="harness-overflow-automatic" className="text-xs text-faint">
-                  Overflow applies only when a Claude or Codex default harness is saved.
-                  {showHarnessSelector && " With Default · automatic, uzi already picks by weekly limits."}
-                </p>
-              )}
-              <p id="harness-overflow-scope" className="text-xs text-faint">
-                Saves automatically. Applies only to new issue runs started manually, by autopilot
-                or by a schedule, when both harnesses are usable. Explicit harnesses, run model pins,
-                Anthropic credential overrides and enabled plan or code cross-checks exclude overflow.
-                Existing runs and resumes never switch. Chat and other run kinds do not use overflow.
-                Stored usage and capacity holds are compared at creation time; unknown comparison
-                scores keep the preferred harness.
-              </p>
-              {overflowError && <Alert message={overflowError} />}
+        <div className="space-y-1.5">
+          <label className="flex items-center gap-3 text-sm text-fg">
+            <Toggle
+              checked={overflowEnabled}
+              disabled={overflowBusy || !loaded || overflowNeedsExplicitDefault}
+              focusableWhenDisabled
+              onChange={enabled => void toggleOverflow(enabled)}
+              label="Overflow to the other harness when my default is near its limits"
+              aria-describedby={
+                overflowNeedsExplicitDefault
+                  ? "harness-overflow-scope harness-overflow-automatic"
+                  : overflowUnavailable
+                    ? "harness-overflow-scope harness-overflow-unavailable"
+                    : !loaded
+                      ? "harness-overflow-scope harness-overflow-loading"
+                      : "harness-overflow-scope"
+              }
+            />
+            Overflow to the other harness when my default is near its limits
+          </label>
+          {!loaded && !loadError && (
+            <div aria-busy="true">
+              {/* Named by the toggle's aria-describedby: it is disabled until the load
+                  settles, and this says why (as the judge summary's loading row does). */}
+              <span id="harness-overflow-loading" className="sr-only">Loading your saved default harness</span>
+              <Skeleton className="h-3.5 w-full max-w-md" />
             </div>
-
-            <div className={bothLanes ? "grid gap-4 sm:grid-cols-2" : "space-y-4"}>
-              {showClaudeLane && (
-                <div className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-semibold text-fg">Anthropic</h3>
-                      <p className="text-xs text-faint">Used for Claude runs</p>
-                    </div>
-                    {badgeOnClaude && (
-                      <Badge tone="brand" dot>
-                        Default harness
-                      </Badge>
-                    )}
-                  </div>
-                  <Field label="Claude model" htmlFor="default-claude-model">
-                    <ModelSelect
-                      id="default-claude-model"
-                      value={claudeModel}
-                      onChange={setClaudeModel}
-                      harness="claude"
-                      defaultLabel="Default · lead template"
-                      customAriaLabel="Custom Claude model ID"
-                    />
-                  </Field>
-                  {claudeRoleModel
-                    ? claudeRoleRecovery
-                    : claudeWarning && <Alert message={claudeWarning} tone="warning" />}
-                  <p className="text-xs text-faint">
-                    Curated Claude aliases plus a custom model ID. Leave on{" "}
-                    <em>Default</em> to use the lead template's model;
-                    an unrecognized custom ID only fails on the first run.
-                  </p>
-                </div>
-              )}
-
-              {showCodexLane && (
-                <div className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-semibold text-fg">Codex</h3>
-                      <p className="text-xs text-faint">Used for Codex runs</p>
-                    </div>
-                    {badgeOnCodex && (
-                      <Badge tone="brand" dot>
-                        Default harness
-                      </Badge>
-                    )}
-                  </div>
-                  <Field label="Codex model" htmlFor="default-codex-model">
-                    <ModelSelect
-                      id="default-codex-model"
-                      value={codexModel}
-                      onChange={setCodexModel}
-                      harness="codex"
-                      allowCustom
-                      defaultLabel={`Default · ${DEFAULT_CODEX_MODEL} (built-in)`}
-                      customAriaLabel="Custom Codex model ID"
-                    />
-                  </Field>
-                  {codexWarning && <Alert message={codexWarning} tone="warning" />}
-                  <p className="text-xs text-faint">
-                    Curated Codex models plus a custom model ID. Leave on <em>Default</em>{" "}
-                    to use the Codex default (currently{" "}
-                    <code className="rounded bg-raised px-1 py-0.5 text-fg">{DEFAULT_CODEX_MODEL}</code>
-                    ); an unrecognized custom ID only fails on the first run.
-                  </p>
-                </div>
-              )}
-            </div>
-
-            {!showClaudeLane && claudeRoleRecovery}
-            {showHarnessSelector && <Alert tone="info" message={retentionCopy} />}
-
-            <Button
-              type="button"
-              disabled={defaultsBusy || !anyDirty || blockingWarning}
-              onClick={saveDefaults}
-            >
-              Save defaults
-            </Button>
-          </div>
-        )}
-      </Card>
-
-      {/* Per-user default reasoning effort (PRD #617 M5). A CLOSED dropdown — the SDK
-          reasoning-effort levels plus a Default option — with no custom mode and no warning
-          surface, because the enum is closed and the control can only emit a valid
-          level or "" (default). Default means the lead template's effort, else medium. */}
-      <Card className="space-y-5">
-        <div>
-          <SectionTitle>Reasoning effort</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            Choose reasoning effort independently for Claude and Codex runs. Leave it on{" "}
-            <em>Default</em> and the lead uses the lead template's effort for that harness when it
-            has one, else <code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>; judge,
-            chat and jobs use <code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>.
-            Higher levels reason more deeply and cost more. Claude's SDK can downgrade a level
-            its model does not support; Codex receives the selected level directly. It applies to your
-            own runs only; other users are unaffected.
+          )}
+          {overflowUnavailable && (
+            <p id="harness-overflow-unavailable" className="text-xs text-faint">
+              Unavailable until your settings load. Reload the page to try again.
+            </p>
+          )}
+          {overflowNeedsExplicitDefault && (
+            <p id="harness-overflow-automatic" className="text-xs text-faint">
+              Overflow applies only when a Claude or Codex default harness is saved in Models.
+              {bothUsable && " With Default · automatic, uzi already picks by weekly limits."}
+            </p>
+          )}
+          <p id="harness-overflow-scope" className="text-xs text-faint">
+            Saves automatically. Applies only to new issue runs started manually, by autopilot
+            or by a schedule, when both harnesses are usable. Explicit harnesses, run model pins,
+            Anthropic credential overrides and enabled plan or code cross-checks exclude overflow.
+            Existing runs and resumes never switch. Chat and other run kinds do not use overflow.
+            Stored usage and capacity holds are compared at creation time; unknown comparison
+            scores keep the preferred harness.
           </p>
-          <p className="mt-2 text-sm text-muted">
-            Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used.
-          </p>
+          {overflowError && <Alert message={overflowError} />}
         </div>
-
-        {loading ? (
-          <Skeleton className="h-9 w-full max-w-sm" />
-        ) : (
-          <div className="space-y-3">
-            <Field label="Claude effort" htmlFor="worker-effort">
-              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} defaultLabel="Default · lead template's effort, else medium (built-in)" runtimeLabel="Runtime default · value not reported" />
-            </Field>
-            <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
-              Save Claude effort
-            </Button>
-            {showCodexLane && (
-              <>
-                <Field label="Codex effort" htmlFor="codex-effort">
-                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} defaultLabel="Default · lead template's effort, else medium (built-in)" runtimeLabel={codexRuntimeDefaultLabel(codexEffortCell)} />
-                </Field>
-                <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
-                  Save Codex effort
-                </Button>
-              </>
-            )}
-          </div>
-        )}
-      </Card>
-
-      {/* Planning model and effort (PRD #3252): used while a run plans; the run
-          continues on the worker model and effort above once the plan is approved. */}
-      <Card className="space-y-5">
-        <div>
-          <SectionTitle>Planning</SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            Use a different model and reasoning effort while a run plans. When the plan is approved the run continues on your worker model and effort above; if it plans again, it uses these. Planning stays on the run's harness. Handoff (task) runs also plan first. A model chosen by a schedule or when starting the run applies to both phases.
-          </p>
-        </div>
-
-        {loading ? (
-          <Skeleton className="h-9 w-full max-w-sm" />
-        ) : (
-          <div className="space-y-3">
-            {showClaudeLane && <>
-              <Field label="Claude planning model" htmlFor="planning-claude-model">
-                <ModelSelect
-                  id="planning-claude-model"
-                  value={planningModel}
-                  onChange={(v) => { setPlanningModel(v); setPlanningModelError(""); }}
-                  harness="claude"
-                  defaultLabel={planningModelDefaultLabel}
-                  customAriaLabel="Custom Claude planning model ID"
-                  onCustomModeChange={setPlanningModelCustom}
-                  ariaDescribedBy={planningModelDescribedBy}
-                />
-              </Field>
-              {planningModelWarning && (
-                <div id="planning-model-warning">
-                  <Alert message={planningModelWarning} tone="warning" />
-                </div>
-              )}
-              {planningCustomEmpty && (
-                <p id="planning-model-empty" className="text-xs text-danger" role="alert">
-                  Enter a custom model ID, or choose Same as the run.
-                </p>
-              )}
-              {planningModelError && (
-                <p id="planning-model-error" className="text-xs text-danger" role="alert">
-                  {planningModelError}
-                </p>
-              )}
-              <Field label="Claude planning effort" htmlFor="planning-claude-effort">
-                <EffortSelect
-                  id="planning-claude-effort"
-                  value={planningEffort}
-                  onChange={(v) => { setPlanningEffort(v); setPlanningEffortError(""); }}
-                  defaultLabel={planningEffortDefaultLabel}
-                />
-              </Field>
-              {planningEffortError && (
-                <p id="planning-effort-error" className="text-xs text-danger" role="alert">
-                  {planningEffortError}
-                </p>
-              )}
-            </>}
-            {showCodexLane && <>
-              <Field label="Codex planning model" htmlFor="planning-codex-model">
-                <ModelSelect id="planning-codex-model" harness="codex" allowCustom
-                  value={planningCodexModel} defaultLabel={planningCodexModelDefaultLabel}
-                  onChange={v => { setPlanningCodexModel(v); setPlanningCodexModelError(""); }}
-                  customAriaLabel="Custom Codex planning model ID" onCustomModeChange={setPlanningCodexModelCustom}
-                  ariaDescribedBy={[planningCodexModelWarning && "planning-codex-model-warning", planningCodexCustomEmpty && "planning-codex-model-empty", planningCodexModelError && "planning-codex-model-error"].filter(Boolean).join(" ") || undefined}
-                />
-              </Field>
-              {planningCodexModelWarning && <p id="planning-codex-model-warning" className="text-xs text-danger" role="alert">{planningCodexModelWarning}</p>}
-              {planningCodexCustomEmpty && <p id="planning-codex-model-empty" className="text-xs text-danger" role="alert">Enter a custom model ID, or choose Same as the run.</p>}
-              {planningCodexModelError && <p id="planning-codex-model-error" className="text-xs text-danger" role="alert">{planningCodexModelError}</p>}
-              <Field label="Codex planning effort" htmlFor="planning-codex-effort">
-                <EffortSelect id="planning-codex-effort" value={planningCodexEffort}
-                  defaultLabel={planningCodexEffortDefaultLabel}
-                  onChange={v => { setPlanningCodexEffort(v); setPlanningCodexEffortError(""); }} />
-              </Field>
-              {planningCodexEffortError && <p id="planning-codex-effort-error" className="text-xs text-danger" role="alert">{planningCodexEffortError}</p>}
-            </>}
-            <Button
-              type="button"
-              disabled={planningBusy || (showClaudeLane && planningBlocked) || (showCodexLane && planningCodexBlocked) || !(planningModelDirty || planningEffortDirty || planningCodexModelDirty || planningCodexEffortDirty)}
-              onClick={savePlanning}
-            >
-              Save planning defaults
-            </Button>
-          </div>
-        )}
       </Card>
     </SettingsShell>
   );

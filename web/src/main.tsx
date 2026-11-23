@@ -1,8 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter } from "react-router-dom";
-import App from "./App";
-import { AuthProvider } from "./auth/AuthContext";
+import { createBrowserRouter, RouterProvider } from "react-router-dom";
+import { appRoutes } from "./appRoutes";
 import "./index.css";
 
 // Bundled IBM Plex family (PRD #1167 M6): the weights the UI uses, latin +
@@ -30,12 +29,10 @@ import "@fontsource/ibm-plex-mono/latin-ext-400.css";
 import "@fontsource/ibm-plex-mono/latin-ext-500.css";
 import "@fontsource/ibm-plex-mono/latin-ext-600.css";
 
+const router = createBrowserRouter(appRoutes);
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter>
-      <AuthProvider>
-        <App />
-      </AuthProvider>
-    </BrowserRouter>
+    <RouterProvider router={router} />
   </StrictMode>,
 );

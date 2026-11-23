@@ -384,3 +384,52 @@ func TestCodexSwitchOwnerLaneRefusals(t *testing.T) {
 		}
 	}
 }
+
+func TestSetRunCredentialCodexProviderRefusal(t *testing.T) {
+	for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "paused", "completed"} {
+		for _, mode := range []string{CredentialOverrideModeDefault, BindModePinned} {
+			t.Run(status+"/"+mode, func(t *testing.T) {
+				target := uuid.New()
+				r := store.Run{ID: uuid.New(), UserID: uuid.New(), Harness: harnessCodex, Kind: "issue", Status: status,
+					ModelProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}
+				db := &codexOwnerRequestDB{t: t, observed: r}
+				s := Service{q: store.New(db)}
+				got, err := s.SetRunCredential(context.Background(), r.UserID, r.ID, mode, &target)
+				if !errors.Is(err, ErrCredentialOverrideProviderSource) || !reflect.ValueOf(got).IsZero() || db.reads != 1 {
+					t.Fatalf("provider refusal: err=%v reads=%d", err, db.reads)
+				}
+				// The internal observed-run backstop must also precede status/mode dispatch.
+				_, err = s.requestCodexCredentialSwitch(context.Background(), r, mode, &target)
+				if !errors.Is(err, ErrCredentialOverrideProviderSource) || db.reads != 1 {
+					t.Fatal("internal provider refusal touched storage or lost typed error", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCodexSwitchLockedProviderRefusalAfterFence(t *testing.T) {
+	w := store.Worker{ID: uuid.New(), UserID: uuid.New(),
+		SnapshotRegisterNonce:      pgtype.Text{String: "registered", Valid: true},
+		CredentialSwitchApplyNonce: pgtype.Text{String: "registered", Valid: true},
+		ProtocolCapabilities:       []string{capability.CodexCredentialSwitchV1}}
+	r := store.Run{ID: uuid.New(), UserID: w.UserID, Harness: harnessCodex, Kind: "issue", Status: "running",
+		WorkerID: pgtype.UUID{Bytes: w.ID, Valid: true}, ClaimGeneration: 7,
+		ModelProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}
+	req := CodexSwitchPreflightRequest{CredentialSwitchApplyRequest: CredentialSwitchApplyRequest{
+		ClaimGeneration: 7, RegisterNonce: "registered", OpID: uuid.NewString()}, TargetSecretID: uuid.New()}
+	db := &codexOwnerRequestDB{t: t}
+	var s Service
+	for _, stale := range []bool{false, true} {
+		req.ClaimGeneration = 7
+		want, reason := ApplyOutcomeNotApplied, applyReasonProviderBound
+		if stale {
+			req.ClaimGeneration--
+			want, reason = ApplyOutcomeFenced, ""
+		}
+		got, err := s.validateCodexSwitchLocked(context.Background(), store.New(db), w, r, req)
+		if err != nil || got.Outcome != want || got.Reason != reason || db.reads != 0 {
+			t.Fatalf("stale=%v: outcome=%s reason=%s err=%v", stale, got.Outcome, got.Reason, err)
+		}
+	}
+}

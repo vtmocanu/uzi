@@ -48,3 +48,6 @@ const (
 	SealedWithMasterAAD = "master_aad"
 	SealedWithDEK       = "dek"
 )
+
+// KindOpenAICompatibleKey is a provider-only Responses gateway key, without vendor credential state.
+const KindOpenAICompatibleKey = "openai_compatible_key"

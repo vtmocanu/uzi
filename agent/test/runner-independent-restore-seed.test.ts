@@ -12,6 +12,8 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it, mock, type TestContext } from "node:test";
+import { providerKeyForms } from "../src/redact.js";
+import type { RunExecutorAddress } from "../src/runner.js";
 import type { Executor } from "../src/executor.js";
 import { StubExecutor } from "../src/executor.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
@@ -1412,3 +1414,49 @@ describe("the restored flight's repo-agent source and required base (issue #3644
     assert.equal(holds.length, 1, "the BaseAttestationMissing owner hold was requested");
   });
 });
+
+// Named selection for the provider forwarding regression at swapRestoreExecutor.
+for (const mode of ["provider", "constructor failure", "vendor"] as const) {
+  it(`ProviderRestoreForwarding independent ${mode}`, async () => {
+    resetRigRoots();
+    const key = ["Restore/", "key+", "&<fixture>", "opaque"].join("");
+    const provider = Object.freeze({ provider_id: "restore-fixture", revision: 1,
+      engine: "claude" as const, protocol: "anthropic_messages" as const,
+      base_url: "https://gw.example.test/a", auth_style: "bearer" as const,
+      credential: key, model_map: { haiku: { model: "corp-haiku" } } });
+    const forms = providerKeyForms(key);
+    const calls: Array<{ codex: unknown; addr: RunExecutorAddress | undefined }> = [];
+    const { r, seen } = await restoreRig({
+      claim: { secrets: { forge_pat: "fixture-forge", anthropic_oauth_token: mode === "vendor" ? "fixture-oauth" : "",
+        ...(mode === "vendor" ? {} : { provider }) } },
+      factory: (rig, id, codex, addr) => {
+        calls.push({ codex, addr });
+        if (addr?.generation !== undefined && mode === "constructor failure")
+          throw new Error(forms.join(" | "), { cause: new Error(forms.join(" / ")) });
+        return { executor: addr?.generation === undefined ? rig.executor : rig.successorExecutor,
+          homeDir: path.join(rig.homeRoot, addr?.generation === undefined ? id : `${id}.g${addr.generation}`) };
+      },
+    });
+    advanceP(r);
+    const before = await pFacts(r);
+    await r.runner.execute(r.claim);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(c => c.addr?.generation), [undefined, 2]);
+    for (const call of calls) {
+      assert.equal(call.codex, undefined, "Claude keeps the native Codex argument absent");
+      assert.strictEqual(call.addr?.provider, mode === "vendor" ? undefined : provider);
+      if (mode === "vendor") assert.equal(Object.hasOwn(call.addr ?? {}, "provider"), false);
+    }
+    assert.deepEqual(await pFacts(r), before);
+    if (mode === "constructor failure") {
+      assert.equal(seen.worktree, undefined);
+      const publicText = JSON.stringify([r.logs.lines, api.states, api.messages(r.runId)]);
+      for (const form of forms) assert.ok(!publicText.includes(form), "constructor diagnostic was redacted");
+      assert.ok(fs.existsSync(r.pPath));
+    } else {
+      assert.equal(seen.head, r.pinSha);
+      assert.notEqual(seen.worktree, r.pPath);
+      assert.equal(failed(r).length, 0);
+    }
+  });
+}

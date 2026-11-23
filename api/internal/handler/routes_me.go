@@ -108,6 +108,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			// refused unless the provider is the caller's, usable and allowlisted. A static path,
 			// matched ahead of /{id}.
 			r.Put("/claude-source", h.SetMyClaudeProviderSource)
+			r.Put("/codex-source", h.SetMyCodexProviderSource)
 			// The Test probe sends the stored key to the stored (allowlisted) destination and
 			// returns only two outcome words, so a Bearer caller can run it but cannot read the
 			// key or move the destination. Rate-limited by its own in-memory admission limiter.
@@ -284,10 +285,10 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	//
 	// Two different arguments cover the fields.
 	//
-	// The worker model and effort lanes are NON-ADDITIVE: per-run model/effort overrides
-	// already exist on requireUser POST /repos/{id}/runs and schedule create, so a Bearer
-	// that sets default_effort=max only raises the spend of runs the user already consented
-	// to. CAVEAT, as for /me/rate-limits (D23): this rests on those routes staying
+	// The worker model and effort lanes and default_harness are NON-ADDITIVE: per-run
+	// model/effort/harness overrides already exist on requireUser POST /repos/{id}/runs (a run
+	// can pin its harness at create) and schedule create, so a Bearer that sets
+	// default_effort=max only raises the spend of runs the user already consented to. CAVEAT, as for /me/rate-limits (D23): this rests on those routes staying
 	// RequireUser; if that authority is ever narrowed, revisit this mount.
 	//
 	// The judge, summary and task-review lanes (judge_model, codex_judge_model, summary_model,
@@ -301,6 +302,12 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// (/me/judge, /me/cross-check, autopilot, ...) stay cookie-only and the handler's
 	// allowlist rejects their keys. The authority is bounded by a token that can already
 	// create runs and spend.
+	//
+	// The planning lanes (planning_claude_model, planning_claude_effort, planning_codex_model,
+	// planning_codex_effort) are a deliberate new Bearer authority of the same kind as the
+	// judge lanes: no per-run planning override exists, so they are not covered by the
+	// non-additive argument. They are owner-only (the caller's own settings), and PRD #3263
+	// (module A) makes them reachable over the CLI token through this shared route.
 	//
 	// A uza_ admin token reaches handlers with IsAdmin=true; that is irrelevant here, the
 	// handler has no admin branch and the identity is the authenticated user, never the body.

@@ -198,8 +198,8 @@ carries it as `usage_estimated_tail`). The design is in
 `adr/2014-run-usage-estimated-tail.md`.
 
 - **It is an estimate, with provenance.** The dollar figure is priced from
-  Anthropic's official standard pricing page as fetched on 2026-11-04 and
-  recorded as a version id (`anthropic-standard-2026-11-04`), shown beside the
+  Anthropic's official standard pricing page as fetched on 2026-11-23 and
+  recorded as a version id (`anthropic-standard-2026-11-23`), shown beside the
   figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
   cent).
 - **Unpriced means unknown, never $0.** A model the table does not know, a
