@@ -17,10 +17,10 @@ import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
   NATIVE_PATCH_INERT_TITLES,
-  CODEX_P_NATIVE_ABSENT_TITLES,
+  CODEX_P_NATIVE_ABSENT_TITLE,
   CODEX_P_ISOLATION_ENV_TITLE,
-  CODEX_P_SHELL_POLICY_TITLES,
-  CODEX_P_FILE_POLICY_TITLES,
+  CODEX_P_SHELL_POLICY_TITLE,
+  CODEX_P_FILE_POLICY_TITLE,
   CODEX_U_NATIVE_DISPATCH_TITLE,
   CODEX_U_SHELL_VARIANTS_TITLE,
   CODEX_U_FILE_VARIANTS_TITLE,
@@ -212,7 +212,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "no alternate native execution authority or retained writable terminal exists on the "
       + "production path for the representative effectful deny probes; the authority-free code host "
       + "and #1566 async-question/read-only UTC exceptions remain reachable",
-    tests: Object.values(CODEX_P_NATIVE_ABSENT_TITLES),
+    tests: [CODEX_P_NATIVE_ABSENT_TITLE],
   },
   {
     id: "codex-u-native-bypass-broker-deny",
@@ -242,7 +242,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "git push and a synthetic provider-HOME secret read are denied and NEVER reach the command "
       + "spawn seam (zero spawn count), so neither runs a marker nor discloses the synthetic secret",
     intendedOutcome: "shell screening is reached on the real protocol; a forbidden command produces no effect while an allowed one does",
-    tests: Object.values(CODEX_P_SHELL_POLICY_TITLES),
+    tests: [CODEX_P_SHELL_POLICY_TITLE],
   },
   {
     id: "codex-u-shell-variants",
@@ -273,7 +273,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "an outside-worktree path and a credential/secret path (the D6 codex-data prefix) are denied "
       + "BEFORE the fileop client (no fileop op recorded against a forbidden path)",
     intendedOutcome: "production path enforcement denies before the effect on the real protocol; allowed workspace ops work",
-    tests: Object.values(CODEX_P_FILE_POLICY_TITLES),
+    tests: [CODEX_P_FILE_POLICY_TITLE],
   },
   {
     id: "codex-u-file-variants",

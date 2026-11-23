@@ -10,25 +10,14 @@
 // node:test runner.
 
 // ── P layer (real app-server) ──────────────────────────────────────────────────
-const CODEX_P_NATIVE_ABSENT_TITLE =
+export const CODEX_P_NATIVE_ABSENT_TITLE =
   "codex P native-bypass: forced native shell/exec_command/unified_exec/write_stdin/local_shell and native apply_patch produce no worker callback and no native side effect on the real protocol, while the intended worker exec runs";
 export const CODEX_P_ISOLATION_ENV_TITLE =
   "codex P isolation: the real app-server spawns under the sparse replaced env with no provider credential or worker token";
-const CODEX_P_SHELL_POLICY_TITLE =
+export const CODEX_P_SHELL_POLICY_TITLE =
   "codex P shell policy: git push is denied on the real protocol with a zero command-spawn count while a harmless command reaches its effect";
-const CODEX_P_FILE_POLICY_TITLE =
+export const CODEX_P_FILE_POLICY_TITLE =
   "codex P file policy: an outside-worktree credential path is denied before the fileop effect on the real protocol while an in-worktree op works";
-
-// Explicit serial conformance controls; independent of runtime model selection.
-export const NATIVE_BYPASS_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"] as const;
-export const POLICY_MODELS = ["gpt-6-astra", "gpt-6.2-sol", "gpt-6.2-astra"] as const;
-
-export const CODEX_P_NATIVE_ABSENT_TITLES: Readonly<Record<string, string>> = Object.fromEntries(
-  NATIVE_BYPASS_MODELS.map(model => [model, `${CODEX_P_NATIVE_ABSENT_TITLE}: ${model}`]));
-export const CODEX_P_SHELL_POLICY_TITLES: Readonly<Record<string, string>> = Object.fromEntries(
-  POLICY_MODELS.map(model => [model, `${CODEX_P_SHELL_POLICY_TITLE}: ${model}`]));
-export const CODEX_P_FILE_POLICY_TITLES: Readonly<Record<string, string>> = Object.fromEntries(
-  POLICY_MODELS.map(model => [model, `${CODEX_P_FILE_POLICY_TITLE}: ${model}`]));
 
 // ── U layer (real broker / registry / render / guardrails, direct) ───────────────
 export const CODEX_U_NATIVE_DISPATCH_TITLE =

@@ -35,7 +35,7 @@ import {
 import { loadProtocolModules, runProtocolTurn, P_SUITE_DEADLINE_MS, type ProtocolModules } from "./harness-p.js";
 import { recordEvidence } from "./evidence.js";
 import { P_LAYER_SKIP } from "./p-platform.js";
-import { CODEX_P_NATIVE_ABSENT_TITLES, NATIVE_BYPASS_MODELS, CODEX_P_ISOLATION_ENV_TITLE } from "./titles-c3.js";
+import { CODEX_P_NATIVE_ABSENT_TITLE, CODEX_P_ISOLATION_ENV_TITLE } from "./titles-c3.js";
 
 import type { RunGrants, SpawnCommandSeam, FileopClient, FileopRequest } from "../../agent/src/codex/broker.js";
 
@@ -62,13 +62,14 @@ function leadEffectGrants(): RunGrants {
  *  gpt-5.6-sol) `shell_type: "unified_exec"` but gpt-6-sol and gpt-6.1-sol `shell_type: "shell_command"` (a serde
  *  alias of the same internal type, gated by `shell_tool = false`), so these representative probes
  *  cover both catalog shapes, not only the default model. */
-for (const model of NATIVE_BYPASS_MODELS) {
-  const title = CODEX_P_NATIVE_ABSENT_TITLES[model]!;
-  test(title, { skip: P_LAYER_SKIP }, async (t) => {
+const NATIVE_BYPASS_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] as const;
+
+test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
+  for (const model of NATIVE_BYPASS_MODELS) {
     await nativeBypassFor(t, model);
-    recordEvidence(title, "pass");
-  });
-}
+  }
+  recordEvidence(CODEX_P_NATIVE_ABSENT_TITLE, "pass");
+});
 
 async function nativeBypassFor(t: { diagnostic: (message: string) => void }, model: string): Promise<void> {
   const credential = dummyCredential();
