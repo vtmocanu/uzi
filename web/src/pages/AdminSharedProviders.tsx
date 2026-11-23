@@ -315,7 +315,7 @@ function ProviderCard({
           {selected > 0 ? (
             <>
               <p data-testid={`delete-selected-${p.id}`} className="text-warn">
-                {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their Claude source. Retire it, then ask them to choose another source.`}
+                {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their Claude source. ${p.retired ? "Ask them" : "Retire it, then ask them"} to choose another source.`}
               </p>
               <p data-testid={`delete-keys-${p.id}`} className="text-muted">
                 Once nobody has it selected, deleting it would also delete {plural(keys, "personal key", "personal keys")} users

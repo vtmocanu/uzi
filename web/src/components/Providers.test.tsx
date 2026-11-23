@@ -612,8 +612,9 @@ describe("Providers — admin-shared definitions (PRD #4324)", () => {
     expect(text).toMatch(/decides which model and context window your own key pays for on your next fresh run\. An admin edit changes that/);
     // The key input is described by the disclosure it sits under.
     const keyInput = row.getByLabelText("Provider key");
-    expect(keyInput.getAttribute("aria-describedby")).toBe(box.id);
-    expect(box.id).not.toBe("");
+    const keyDesc = document.getElementById(keyInput.getAttribute("aria-describedby") ?? "");
+    expect(keyDesc && box.contains(keyDesc) && !keyDesc.hasAttribute("aria-label")).toBe(true);
+    expect(keyDesc?.textContent).toMatch(/your admin\s+cannot see it/);
     expect(row.queryByTestId("shared-disclosure-xapikey-s1")).toBeNull();
     fireEvent.change(row.getByLabelText("Provider key"), { target: { value: "k".repeat(24) } });
     fireEvent.click(row.getByRole("button", { name: "Save key" }));
@@ -650,7 +651,9 @@ describe("Providers — admin-shared definitions (PRD #4324)", () => {
     expect(document.activeElement).toBe(box);
     expect(box.getAttribute("tabindex")).toBe("-1");
     const confirm = row.getByRole("button", { name: "Confirm and use as Claude source" });
-    expect(confirm.getAttribute("aria-describedby")).toBe(box.id);
+    const confirmDesc = document.getElementById(confirm.getAttribute("aria-describedby") ?? "");
+    expect(confirmDesc && box.contains(confirmDesc) && !confirmDesc.hasAttribute("aria-label")).toBe(true);
+    expect(confirmDesc?.textContent).toMatch(/your admin\s+cannot see it/);
     const focusable = Array.from(document.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, textarea"));
     const after = focusable.filter((el) => box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
     expect(after[0]).toBe(confirm);

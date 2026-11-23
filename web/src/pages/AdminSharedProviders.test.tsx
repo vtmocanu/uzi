@@ -240,6 +240,15 @@ describe("AdminSharedProviders — delete", () => {
     expect(document.activeElement).toBe(box.getByRole("button", { name: "Cancel" }));
   });
 
+  it("does not tell the admin to retire an already-retired definition that is still selected", async () => {
+    await renderPage([shared({ retired: true, selected_user_count: 1, attached_key_count: 1 })]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete platform-gateway" }));
+    const box = within(screen.getByRole("group", { name: "Confirm deleting platform-gateway" }));
+    const lead = box.getByTestId("delete-selected-s1").textContent ?? "";
+    expect(lead).toMatch(/1 user has it selected as their Claude source\. Ask them to choose another source\./);
+    expect(lead).not.toMatch(/Retire it/);
+  });
+
   it("reloads on a 404, so a definition another admin deleted leaves no ghost card", async () => {
     mockApi.adminDeleteSharedProvider.mockRejectedValue(new ApiError(404, "not found", { error: "not found" }));
     await renderPage([shared({ selected_user_count: 0 })]);
