@@ -7272,7 +7272,7 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
     // Exercise API-equivalent pricing through the executor's API-key binding.
     const rig = makeRig();
-    // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6.1-sol")
+    // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6.2-sol")
     // with priceable buckets: input 1000 (cached 600, cacheWrite 100 → uncached 300), output 200
     // (incl. 50 reasoning). last === total (a single-response leg), so it reconciles cleanly.
     const b = { inputTokens: 1000, cachedInputTokens: 600, cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 };
@@ -7287,8 +7287,8 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
 
     const modelUsage = lastResultModelUsage(emitted);
     assert.ok(modelUsage, "the terminal carries per-model usage");
-    assert.deepEqual(Object.keys(modelUsage), ["gpt-6.1-sol"], "the root usage is charged to the configured root model");
-    const sol61 = rec(modelUsage["gpt-6.1-sol"]);
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6.2-sol"], "the root usage is charged to the configured root model");
+    const sol61 = rec(modelUsage["gpt-6.2-sol"]);
     assert.equal(sol61.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
     assert.equal(sol61.outputTokens, 200, "output rode through the accountant");
     // C4b: the api_key binding threads through `authMode: binding.authMode` so the entry is METERED
@@ -7304,7 +7304,7 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     // (not just per-agent-template child overrides). Both the persisted init event AND the per-model
     // usage key derive from that one request.model, so both must reflect the override — NOT the
     // explicit fixture-provider fallback "gpt-6-astra". The production-provider test separately
-    // pins "gpt-6.1-sol"; together these prove `?? provider.model`.
+    // pins "gpt-6.2-sol"; together these prove `?? provider.model`.
     const rig = makeRig();
     rig.transport
       .push(threadStarted())
@@ -8981,7 +8981,7 @@ describe("CodexExecutor: production provider constant (mutation evidence)", () =
       name: "openai",
       baseUrl: "https://api.openai.com/v1",
       envKey: "OPENAI_API_KEY",
-      model: "gpt-6.1-sol",
+      model: "gpt-6.2-sol",
     });
   });
 
@@ -8990,9 +8990,9 @@ describe("CodexExecutor: production provider constant (mutation evidence)", () =
     assert.notEqual(
       CODEX_TASK_REVIEW_MODEL,
       CODEX_PRODUCTION_PROVIDER.model,
-      "the review model must not silently equal the shared provider default (which is gpt-6.1-sol)",
+      "the review model must not silently equal the shared provider default (which is gpt-6.2-sol)",
     );
-    assert.equal(CODEX_PRODUCTION_PROVIDER.model, "gpt-6.1-sol", "the production fallback is GPT-6.1 Sol");
+    assert.equal(CODEX_PRODUCTION_PROVIDER.model, "gpt-6.2-sol", "the production fallback is GPT-6.2 Sol");
   });
 });
 

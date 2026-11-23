@@ -92,12 +92,12 @@ func TestAssembleJudgeClaimCodexLaneLiveDB(t *testing.T) {
 		wantModel  string
 		wantNotes  int
 	}{
-		{name: "default is the built-in with no note", wantModel: "gpt-6.1-sol"},
+		{name: "default is the built-in with no note", wantModel: "gpt-6.2-sol"},
 		{name: "user Codex lane wins over the instance value", userCodex: "gpt-6-astra", instance: instCodex("gpt-6-sol"), wantModel: "gpt-6-astra"},
 		{name: "instance Codex value is used", instance: instCodex("gpt-6-sol"), wantModel: "gpt-6-sol"},
-		{name: "instance reset row falls to the built-in", instance: instCodex(""), wantModel: "gpt-6.1-sol"},
-		{name: "the Claude user lane is ignored on a Codex judge", userClaude: "haiku", wantModel: "gpt-6.1-sol"},
-		{name: "a stored Claude alias in the Codex lane gives one note", userCodex: "opus", wantModel: "gpt-6.1-sol", wantNotes: 1},
+		{name: "instance reset row falls to the built-in", instance: instCodex(""), wantModel: "gpt-6.2-sol"},
+		{name: "the Claude user lane is ignored on a Codex judge", userClaude: "haiku", wantModel: "gpt-6.2-sol"},
+		{name: "a stored Claude alias in the Codex lane gives one note", userCodex: "opus", wantModel: "gpt-6.2-sol", wantNotes: 1},
 	} {
 		for _, enforced := range []bool{false, true} {
 			name := tc.name

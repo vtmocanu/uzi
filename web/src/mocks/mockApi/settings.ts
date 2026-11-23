@@ -638,7 +638,7 @@ function mockPlanningModelCells(planning: string | null | undefined, lane: strin
   const laneModel = lane?.trim() ?? "";
   const def = laneModel !== "" && valid(laneModel)
     ? { model: laneModel, source: "user_default" as const }
-    : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" as const };
+    : { model: harness === "codex" ? "gpt-6.2-sol" : "", source: "builtin" as const };
   const stored = planning?.trim() ?? "";
   const set = stored !== "" && valid(stored);
   return [{ harness, model: planning ?? null,
@@ -691,7 +691,7 @@ function mySettingsResponse(): { settings: UserSettings } {
     const pin = userSettings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness);
     const model = pin?.model ?? null, effort = pin?.effort ?? null;
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
-      : userSettings.default_codex_model ?? "gpt-6.1-sol";
+      : userSettings.default_codex_model ?? "gpt-6.2-sol";
     // An unpinned checker effort is the server's cross-check default, never the worker effort.
     return { stage, harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
       resolved_effort: effort ?? "high", model_source: model === null ? "worker default" : "pin",

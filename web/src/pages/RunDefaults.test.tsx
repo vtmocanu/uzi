@@ -365,7 +365,7 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
       appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       judge_models: [
         { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
       ],
     } });
     render(
@@ -423,7 +423,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
   });
   const cells = (): ModelSettingCell[] => [
     { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
   ];
   const judgeSettings = (over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
     settings: {
@@ -477,7 +477,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
     const codex = screen.getByLabelText("Codex judge model") as HTMLSelectElement;
     expect(claude.options[0].textContent).toBe("Default \u00b7 sonnet (instance default)");
-    expect(codex.options[0].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
+    expect(codex.options[0].textContent).toBe("Default \u00b7 gpt-6.2-sol (built-in)");
     const claudeEffect = document.getElementById(claude.getAttribute("aria-describedby") ?? "");
     const codexEffect = document.getElementById(codex.getAttribute("aria-describedby") ?? "");
     expect(claudeEffect?.textContent).toBe("In effect: sonnet \u00b7 instance default");
@@ -501,7 +501,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
     mockApi.getMySettings.mockResolvedValue(judgeSettings());
     const saved = cells();
-    saved[1] = { ...saved[1], model: null, resolved_model: "gpt-6.1-sol", source: "builtin" };
+    saved[1] = { ...saved[1], model: null, resolved_model: "gpt-6.2-sol", source: "builtin" };
     mockApi.putMySettings.mockResolvedValue(judgeSettings({ codex_judge_model: null, judge_models: saved }));
     renderPage();
     const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
@@ -512,7 +512,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     // Only the Codex lane changed, so only it is sent; null means Default.
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_judge_model: null }));
     await waitFor(() =>
-      expect(document.getElementById("codex-judge-model-effect")?.textContent).toBe("In effect: gpt-6.1-sol \u00b7 built-in"),
+      expect(document.getElementById("codex-judge-model-effect")?.textContent).toBe("In effect: gpt-6.2-sol \u00b7 built-in"),
     );
     expect(save.disabled).toBe(true);
   });
@@ -1646,7 +1646,7 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     const claude = await screen.findByLabelText("Claude model");
     expect(optionTexts(claude)[0]).toBe("Default · lead template");
     expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
-    expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
+    expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.2-sol (built-in)");
     expect(optionTexts(screen.getByLabelText("Claude summary model"))[0]).toBe("Default");
     expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
     expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
@@ -1669,7 +1669,7 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     // Both lanes present.
     expect(screen.getByLabelText("Claude model")).toBeTruthy();
     expect(screen.getByLabelText("Codex model")).toBeTruthy();
-    expect(within(laneOf("Codex")).getByText("gpt-6.1-sol", { selector: "code" })).toBeTruthy();
+    expect(within(laneOf("Codex")).getByText("gpt-6.2-sol", { selector: "code" })).toBeTruthy();
     expect(screen.getByLabelText("Codex effort")).toBeTruthy();
     // Automatic with both usable is chosen per run by weekly limits: no lane is marked
     // as the default, and the dedicated badge reads as such.
@@ -2066,7 +2066,7 @@ describe("B1 independent settings responses", () => {
   const modelResponse = (response: Partial<UserSettings>): UserSettings => ({ ...initial, ...response,
     cross_check_pins: initial.cross_check_pins!.map(cell => ({ ...cell,
       worker_default_model: response.cross_check_pins?.find(p => p.harness === cell.harness)?.worker_default_model === null ? null : cell.harness === "claude" ? ("default_claude_model" in response ? response.default_claude_model ?? "template-inherited" : "opus")
-        : response.default_codex_model ?? "gpt-6.1-sol",
+        : response.default_codex_model ?? "gpt-6.2-sol",
       resolved_model: "stale-pin-hint", resolved_effort: "stale-effort-hint", model_source: "pin" as const, active: !cell.active,
     })).reverse(),
   });
@@ -2604,7 +2604,7 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
   });
   const cells = (): ModelSettingCell[] => [
     { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-    { harness: "codex", model: null, default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6.1-sol", source: "builtin" },
+    { harness: "codex", model: null, default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6.2-sol", source: "builtin" },
   ];
   const judgeSettings = (judgeRunsOn: UserSettings["judge_runs_on"]): { settings: UserSettings } => ({
     settings: {
@@ -2784,7 +2784,7 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
       // Nothing rewrote the stored choice.
       expect(mockApi.putMySettings).not.toHaveBeenCalled();
       if (enforced) {
-        expect(screen.getByText(/ENFORCED/).textContent).toContain("(Codex, with gpt-6.1-sol)");
+        expect(screen.getByText(/ENFORCED/).textContent).toContain("(Codex, with gpt-6.2-sol)");
       }
     },
   );
@@ -2801,7 +2801,7 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     expect(claudeNote?.textContent).toBe("Not used: the judge runs on Codex · sonnet (instance default)");
     expect(dimmed(claudeNote!)).toBe(false);
     expect(document.getElementById(codex.getAttribute("aria-describedby") ?? "")?.textContent)
-      .toBe("In effect: gpt-6.1-sol · built-in");
+      .toBe("In effect: gpt-6.2-sol · built-in");
     expect(screen.getByText(/only the Codex judge model is used/)).toBeTruthy();
   });
 
@@ -2813,7 +2813,7 @@ describe("Run defaults — Judge runs on (PRD #3257)", () => {
     expect(dimmed(codex)).toBe(true);
     expect(dimmed(screen.getByLabelText("Claude judge model"))).toBe(false);
     expect(document.getElementById("codex-judge-model-effect")?.textContent)
-      .toBe("Not used: the judge runs on Claude · gpt-6.1-sol (built-in)");
+      .toBe("Not used: the judge runs on Claude · gpt-6.2-sol (built-in)");
     cleanup();
     mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
     const { container } = renderPage();

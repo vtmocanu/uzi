@@ -46,7 +46,7 @@ beforeEach(() => {
     judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
     planning_codex_model: null, planning_codex_effort: null,
     planning_models: [
-      { harness: "codex", model: null, default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6.1-sol", source: "builtin" },
+      { harness: "codex", model: null, default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6.2-sol", source: "builtin" },
     ],
     planning_efforts: [cell("codex", { default_effort: "runtime", resolved_effort: null, source: "user_default", mode: "runtime_default" })],
   };
@@ -65,7 +65,7 @@ it("shows the Codex-only planning lane with server defaults and no runtime effor
   mount();
   const model = await screen.findByLabelText("Codex planning model") as HTMLSelectElement;
   expect(screen.queryByLabelText("Claude planning model")).toBeNull();
-  expect(model.options[0].text).toBe("Same as the run · gpt-6.1-sol (built-in)");
+  expect(model.options[0].text).toBe("Same as the run · gpt-6.2-sol (built-in)");
   const effort = screen.getByLabelText("Codex planning effort") as HTMLSelectElement;
   expect(effort.options[0].text).toContain("runtime default");
   expect(Array.from(effort.options).map(o => o.value)).toEqual(["", "low", "medium", "high", "xhigh", "max"]);

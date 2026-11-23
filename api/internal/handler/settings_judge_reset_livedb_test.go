@@ -168,11 +168,11 @@ func TestUpdateSettingsCodexJudgeModelResetLiveDB(t *testing.T) {
 			t.Errorf("PUT %q stored %q, want exactly ''", blank, got)
 		}
 		v, src, defaults := get()
-		if v != "gpt-6.1-sol" || src != "default" {
-			t.Errorf("after reset %q: value %q source %q, want gpt-6.1-sol/default", blank, v, src)
+		if v != "gpt-6.2-sol" || src != "default" {
+			t.Errorf("after reset %q: value %q source %q, want gpt-6.2-sol/default", blank, v, src)
 		}
-		if defaults[settings.KeyCodexJudgeModel] != "gpt-6.1-sol" {
-			t.Errorf("defaults[codex_judge_model] = %q, want gpt-6.1-sol", defaults[settings.KeyCodexJudgeModel])
+		if defaults[settings.KeyCodexJudgeModel] != "gpt-6.2-sol" {
+			t.Errorf("defaults[codex_judge_model] = %q, want gpt-6.2-sol", defaults[settings.KeyCodexJudgeModel])
 		}
 	}
 	for _, bad := range []string{"opus", "gpt-6-luna", "gpt-7-x", "two words"} {

@@ -303,13 +303,13 @@ func TestCrossCheckMetadataNativeLocaleDiscriminatorLiveDB(t *testing.T) {
 			}
 			assertMetadataModel(t, cells[0].WorkerDefaultModel, want)
 			assertMetadataModel(t, cells[0].ResolvedModel, "sonnet")
-			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.1-sol")
+			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.2-sol")
 			rec = httptest.NewRecorder()
 			h.PutMySettings(rec, userReq(http.MethodPut, "/api/me/settings", "{}", user, nil))
 			cells = metadataCells(t, rec)
 			assertMetadataModel(t, cells[0].WorkerDefaultModel, want)
 			assertMetadataModel(t, cells[0].ResolvedModel, "sonnet")
-			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.1-sol")
+			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.2-sol")
 		})
 	}
 }

@@ -12,7 +12,7 @@ const CrossCheckDefaultEffort = "high"
 
 // CrossCheckDefaultSource is the effort provenance of an unpinned checker.
 const CrossCheckDefaultSource = "cross-check default"
-const DefaultCodexModel = "gpt-6.1-sol"
+const DefaultCodexModel = "gpt-6.2-sol"
 
 // CuratedCodexModels and KnownClaudeAliases are the closed family guards shared
 // by worker lanes and checker pins. Custom IDs remain provider-validated.

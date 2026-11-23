@@ -81,7 +81,7 @@ describe("AgentNew real editor model pins", () => {
 
     fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "lead" } });
     expect(within(claude).getByRole("option", { name: "Default · SDK/account default (built-in)" })).toBeTruthy();
-    expect(within(codex).getByRole("option", { name: "Default · built-in (gpt-6.1-sol)" })).toBeTruthy();
+    expect(within(codex).getByRole("option", { name: "Default · built-in (gpt-6.2-sol)" })).toBeTruthy();
   });
 
   it.each([

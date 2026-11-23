@@ -16,7 +16,7 @@ const settings: UserSettings = {
     { stage: "plan", harness: "claude", model: "custom-claude-checker", effort: "max",
       worker_default_model: "allocated-custom-model", resolved_model: "custom-claude-checker", resolved_effort: "max", model_source: "pin", effort_source: "pin", active: false },
     { stage: "plan", harness: "codex", model: "custom-codex-checker", effort: null,
-      worker_default_model: "gpt-6.1-sol", resolved_model: "custom-codex-checker", resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
+      worker_default_model: "gpt-6.2-sol", resolved_model: "custom-codex-checker", resolved_effort: "medium", model_source: "pin", effort_source: "worker default", active: true },
   ],
 };
 

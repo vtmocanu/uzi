@@ -58,7 +58,7 @@ func effectiveFixture() *apitypes.EffectiveSettingsDTO {
 		},
 		Models: []apitypes.EffectiveModelCellDTO{
 			modelCell("worker_model", "claude", nil, "opus", "template", "opus", "template"),
-			modelCell("worker_model", "codex", nil, "gpt-6.1-sol", "builtin", "gpt-6.1-sol", "builtin"),
+			modelCell("worker_model", "codex", nil, "gpt-6.2-sol", "builtin", "gpt-6.2-sol", "builtin"),
 			modelCell("judge_model", "claude", nil, "haiku", "instance_default", "haiku", "instance_default"),
 			modelCell("judge_model", "codex", nil, "gpt-6-sol", "builtin", "gpt-6-sol", "builtin"),
 			modelCell("summary_model", "claude", nil, "haiku", "builtin", "haiku", "builtin"),
@@ -112,7 +112,7 @@ func TestSettingsGetEffectiveRows(t *testing.T) {
 		"start (claude) - - - claude your choice for this run",
 		"start (codex) - - - codex your choice for this run",
 		"worker model claude Default opus opus lead template",
-		"worker model codex Default gpt-6.1-sol gpt-6.1-sol built-in",
+		"worker model codex Default gpt-6.2-sol gpt-6.2-sol built-in",
 		"worker effort claude Default medium medium built-in",
 		"worker effort codex runtime default medium runtime default (catalog default unknown) your choice",
 		"judge claude Default haiku haiku instance default",

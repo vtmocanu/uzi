@@ -542,7 +542,7 @@ export interface UserSettings {
    *  default_model, and a curated Codex id is rejected here (D3 cross-vocabulary 400). */
   default_claude_model?: string | null;
   /** Per-user Codex worker-model default (PRD #1551 M1/D2); null = inherit the Codex
-   *  fallback (gpt-6.1-sol). Optional for the same back-compat reason. Unlike the other
+   *  fallback (gpt-6.2-sol). Optional for the same back-compat reason. Unlike the other
    *  lanes it accepts a custom id (D5), but a known Claude alias is rejected here (D3). */
   default_codex_model?: string | null;
   /** Per-user default reasoning effort (PRD #617); null means the user has not chosen

@@ -14,7 +14,7 @@ import { Input, Select } from "./ui";
 // dedicated checker pins explicitly opt in.
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 // Mirror agent/src/codex/codex-executor.ts CODEX_PRODUCTION_PROVIDER.model.
-export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
+export const DEFAULT_CODEX_MODEL = "gpt-6.2-sol";
 // The curated Codex list lives in lib/codexModels.ts (PRD #3245), pinned to the shared
 // fixtures/codex-models/models.json; it includes DEFAULT_CODEX_MODEL.
 const CODEX_MODEL_ALIASES = CODEX_CURATED_MODELS;

@@ -11,8 +11,8 @@ vi.mock("../lib/api", () => ({ api: {
 } }));
 const mocked = vi.mocked(api);
 const pin = (harness: "claude" | "codex", over: Partial<CrossCheckPinDTO> = {}): CrossCheckPinDTO => ({
-  worker_default_model: harness === "claude" ? "custom-template-model" : "gpt-6.1-sol",
-  stage: "plan", harness, model: null, effort: null, resolved_model: harness === "codex" ? "gpt-6.1-sol" : "custom-template-model",
+  worker_default_model: harness === "claude" ? "custom-template-model" : "gpt-6.2-sol",
+  stage: "plan", harness, model: null, effort: null, resolved_model: harness === "codex" ? "gpt-6.2-sol" : "custom-template-model",
   resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex", ...over,
 });
 const settings = (over: Partial<UserSettings> = {}): UserSettings => ({
@@ -107,7 +107,7 @@ describe("checker defaults", () => {
     expect(screen.getByText("Checks leads running on the other model family")).toBeTruthy();
     expect(screen.queryByText(/Used once Codex-lead runs are cross-checked/)).toBeNull();
     expect(within(model("Claude")).getByRole("option", { name: "Default · custom-template-model (worker default)" })).toBeTruthy();
-    expect(within(model("Codex")).getByRole("option", { name: "Default · gpt-6.1-sol (worker default)" })).toBeTruthy();
+    expect(within(model("Codex")).getByRole("option", { name: "Default · gpt-6.2-sol (worker default)" })).toBeTruthy();
     for (const family of ["Claude", "Codex"]) {
       expect(effort(family).disabled).toBe(false);
       for (const value of ["low", "medium", "high", "xhigh", "max"]) expect(within(effort(family)).getByRole("option", { name: new RegExp(`^${value}`) })).toBeTruthy();

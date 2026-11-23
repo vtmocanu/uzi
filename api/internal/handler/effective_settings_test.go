@@ -85,7 +85,7 @@ func TestCommonAlternativeRefusal(t *testing.T) {
 }
 
 func pinCell(stage, harness string, pin, effort *string, resolvedModel *string, resolvedEffort, modelSource, effortSource string) crossCheckPinDTO {
-	def := "gpt-6.1-sol"
+	def := "gpt-6.2-sol"
 	return crossCheckPinDTO{Stage: stage, Harness: harness, Model: pin, Effort: effort, WorkerDefaultModel: &def,
 		ResolvedModel: resolvedModel, ResolvedEffort: resolvedEffort, ModelSource: modelSource, EffortSource: effortSource, Active: true}
 }
@@ -94,7 +94,7 @@ func fourPins(mut func(*crossCheckPinDTO)) []crossCheckPinDTO {
 	var out []crossCheckPinDTO
 	for _, s := range []string{"plan", "code"} {
 		for _, h := range []string{"claude", "codex"} {
-			m := "gpt-6.1-sol"
+			m := "gpt-6.2-sol"
 			c := pinCell(s, h, nil, nil, &m, "high", "worker default", "cross-check default")
 			if mut != nil {
 				mut(&c)
@@ -148,7 +148,7 @@ func TestCrossCheckEffectiveCellsMapTheTokens(t *testing.T) {
 	if m := models[1]; m.Model == nil || *m.Model != pin || m.ResolvedModel != pin || m.Source != "cross_check_pin" || m.DefaultSource != "cross_check_worker_default" {
 		t.Errorf("pinned model cell = %+v", m)
 	}
-	if m := models[0]; m.Source != "cross_check_worker_default" || m.ResolvedModel != "gpt-6.1-sol" || m.FixedAt != "claim" {
+	if m := models[0]; m.Source != "cross_check_worker_default" || m.ResolvedModel != "gpt-6.2-sol" || m.FixedAt != "claim" {
 		t.Errorf("worker-default model cell = %+v", m)
 	}
 	if m := models[2]; m.ResolvedModel != "" || len(m.Notes) != 1 || m.Notes[0] != "sdk_default" {

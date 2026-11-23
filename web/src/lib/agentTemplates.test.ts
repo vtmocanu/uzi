@@ -116,7 +116,7 @@ describe("templateModelDefaultLabel", () => {
     for (const name of ["lead", "ORCHESTRATOR"]) {
       expect(templateModelDefaultLabel(name)).toBe("Default · SDK/account default (built-in)");
       expect(templateModelDefaultLabel(name, "claude")).toBe("Default · SDK/account default (built-in)");
-      expect(templateModelDefaultLabel(name, "codex")).toBe("Default · built-in (gpt-6.1-sol)");
+      expect(templateModelDefaultLabel(name, "codex")).toBe("Default · built-in (gpt-6.2-sol)");
     }
     expect(templateModelDefaultLabel("coder")).toBe("Default · follows lead");
     for (const harness of ["claude", "codex"] as const) {
