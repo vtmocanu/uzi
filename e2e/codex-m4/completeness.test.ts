@@ -10,6 +10,7 @@ import { checkCompleteness, type RequiredCell } from "./completeness.js";
 import type { ClauseRow, OState } from "./clause.js";
 import type { EvidenceMap } from "./evidence.js";
 import { ALL_CLAUSES } from "./registry.js";
+import { ASYNC_MESSAGE_TITLES, EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import {
   CODEX_P_NATIVE_ABSENT_TITLES,
   CODEX_P_SHELL_POLICY_TITLES,
@@ -182,6 +183,7 @@ describe("M6 per-model evidence completeness", () => {
   });
 
   const maps = [
+    ["codex-p-native-async-utc-exceptions", { legacy: EXCEPTIONS_TITLE, ...ASYNC_MESSAGE_TITLES }],
     ["codex-p-native-bypass-forced-dispatch", CODEX_P_NATIVE_ABSENT_TITLES],
     ["codex-p-shell-policy", CODEX_P_SHELL_POLICY_TITLES],
     ["codex-p-file-policy", CODEX_P_FILE_POLICY_TITLES],

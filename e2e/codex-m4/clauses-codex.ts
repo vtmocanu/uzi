@@ -13,7 +13,7 @@
 import type { ClauseRow } from "./clause.js";
 import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
-import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
+import { ASYNC_MESSAGE_TITLES, EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
   NATIVE_PATCH_INERT_TITLES,
@@ -80,8 +80,8 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     seam: "harness-p: production launcher/config/auth/transport/broker; pinned async handler and clock",
     positiveControl: "lock-bound receipt/member verification + codex --version; live provider traffic and later real code-mode uzi_bash callback",
     negativeOracle: "no currentTime/read to uzi, no filesystem effect, only the control worker command; advice zero callbacks; no answer supplied",
-    intendedOutcome: "async accepted JSON text and delivery/questions; exact successful UTC formats; root start/resume, worker-created child and advice start on all three supported metadata models",
-    tests: [EXCEPTIONS_TITLE],
+    intendedOutcome: "async accepted JSON text and delivery/questions; exact successful UTC formats; root start/resume, worker-created child and advice start on the three older metadata models; both 6.2 models expose direct async messages with zero worker effects and reject nested invocation",
+    tests: [EXCEPTIONS_TITLE, ...Object.values(ASYNC_MESSAGE_TITLES)],
   },
   {
     // C1 REAL, EXECUTED P row — the startup/allowed-callback smoke (startup-smoke.test.ts).

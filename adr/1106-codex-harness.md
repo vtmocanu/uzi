@@ -1904,3 +1904,37 @@ child/review/recovery internals, inherited configuration or breakpoint behavior.
 Cache-write lifetime is not exposed by the inspected usage protocol. The
 owner-selected 30-minute estimate and accepted 12-hour underestimation risk
 therefore remain policy, not an observation or guarantee of billed lifetime.
+
+### M6 bounded native async-message compatibility (2026-11-23)
+
+Pinned 0.171.0 models-manager/models.json advertises
+`send_message_to_user_async` for gpt-6.2-sol and gpt-6.2-astra; the older curated
+controls omit it. core/src/tools/spec_plan.rs registers it when the catalog OR
+the feature enables it, subject to the root-capability restriction, with
+`ToolExposure::DirectModelOnly`. No feature or permission is enabled by this
+compatibility adjustment.
+
+core/src/tools/handlers/send_message_to_user_async.rs requires a nonempty
+`message`, trims it, emits started/completed AgentMessage items with the call
+ID, FinalAnswer phase, Async delivery and no questions, and returns
+`{"accepted":true}`. It performs no OS operation or worker RPC.
+app-server-protocol/src/protocol/v2/item.rs preserves the text, phase, delivery
+and questions in its AgentMessage projection. The bounded loopback API fixture
+in native-exceptions.test.ts observed that shape and call-linked accepted output
+on both new models, zero worker callbacks/spawn/file effects, and a TypeError
+for the unavailable nested code-mode helper.
+
+The existing caller behavior is retained: transport forwards activity,
+CodexHarness.decodeItemFrame projects active-root AgentMessage text as a text
+frame without workflow signals, and CodexAdviceHarness excludes async delivery
+from advice text. AgentMessage is absent from the root model-issued tool item
+classification. The native message is handled as assistant content there; it
+does not invoke uzi's questions callback or root workflow transition machinery.
+No external recipient is contacted by these controlled loopback probes.
+
+The pre-existing MCP resource refusal is also source-backed:
+core/src/tools/handlers/mcp_resource.rs emits the unknown-server message with
+the selected-environment suffix, and core/src/tools/code_mode/mod.rs renders
+runtime error text with the Script error prefix. These native diagnostics are
+not worker broker error codes. The fresh/cold/nested patch effect and control
+oracles remain intact.

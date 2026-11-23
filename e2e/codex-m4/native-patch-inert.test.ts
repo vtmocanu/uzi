@@ -19,7 +19,8 @@ const nested = ["apply_patch", "list_mcp_resource_templates", "list_mcp_resource
 // The real pinned gpt-5.6-sol catalog omits the DirectModelOnly async helper and nested UTC helper.
 function expectedInventory(model: string) {
   return {
-    structured: model === "gpt-5.6-sol" ? structured.filter(name => name !== "functions.request_user_input_async") : structured,
+    structured: model === "gpt-5.6-sol" ? structured.filter(name => name !== "functions.request_user_input_async")
+      : model === "gpt-6.2-sol" || model === "gpt-6.2-astra" ? [...structured, "functions.send_message_to_user_async"] : structured,
     nested: model === "gpt-5.6-sol" ? nested.filter(name => name !== "clock__curr_time") : nested,
   };
 }
@@ -54,6 +55,11 @@ ${[
     assertAcceptedInventory(fixture(), model);
     assert.throws(() => assertAcceptedInventory(fixture(true), model), /unknown_native/);
     assert.throws(() => assertAcceptedInventory(fixture(false, true), model), /unknown_native/);
+    if (model !== "gpt-6.2-sol" && model !== "gpt-6.2-astra") {
+      const extraMessage = fixture();
+      (extraMessage.tools as { tools: unknown[] }[])[0]!.tools.push({ type: "function", name: "send_message_to_user_async" });
+      assert.throws(() => assertAcceptedInventory(extraMessage, model), /send_message_to_user_async/);
+    }
   });
 }
 
