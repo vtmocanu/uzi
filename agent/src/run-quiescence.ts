@@ -1437,19 +1437,15 @@ const INVENTORY_IGNORED_REASONS: ReadonlySet<string> = new Set([
  * matter to a clear; processes carrying another attempt's marker (live, protected or terminal, including
  * a `terminal_attempt:kill_unconfirmed` candidate that was never signalled) are ignored.
  *
- * An `unverified` result with at least one process whose reasons are all `unreadable_unattributed` or ignored
- * counts as clear. That is broader than what the attempt seed itself admits (see
- * {@link unverifiedOnlyByUnattributedUnreadable}), and it is safe because every seed admitted by a clear still runs
- * its own unchanged sweep. An unreadable process is unattributable worker-wide, not
- * evidence of our in-scope residue, and our inventory git descendants are ordinary runner-uid processes the
- * scanner can read. Fails closed otherwise: an undefined result, an unverified result with no processes
- * (a table, helper or deadline error) or any unknown reason is `not_clear`.
+ * Fails closed on any unverified result: an `unverified` scan is never evidence that the key is free, whatever
+ * its processes are (unreadable pids, a table, helper or deadline error, ignored reasons), so it keeps the
+ * exclusion. An undefined result, or any process with an unknown or non-ignored reason, is also `not_clear`.
+ * A `quiescent` or `survivors` result is clear only when every process carries an ignored reason.
  */
 export function inventoryClearVerdict(p: ProcessQuiescence | undefined): "clear" | "not_clear" {
   if (p === undefined) return "not_clear";
-  if (p.state === "unverified" && p.processes.length === 0) return "not_clear";
+  if (p.state === "unverified") return "not_clear";
   for (const proc of p.processes) {
-    if (proc.reason === "unreadable_unattributed" && p.state === "unverified") continue;
     if (!INVENTORY_IGNORED_REASONS.has(proc.reason.split(":")[0]!)) return "not_clear";
   }
   return "clear";
@@ -2037,9 +2033,11 @@ async function reapProcessesViaHelper(
   // issue #3980: the absolute gate-checkpoint deadline. Every stage below is admitted only before it,
   // the helper and the private-temp commands are killed and JOINED at it, and an expiry is unverified.
   const gateDeadline = opts.deadlineAt;
-  // Observe-only probes only: the helper enforces the same absolute deadline on its own reap loop. Other
-  // requests keep their serialized scan unchanged (a helper-side gate deadline alters procfs EACCES handling).
-  if (req.observeOnly === true && gateDeadline !== undefined)
+  // Every helper scan (observe-only or signalling) carries the gate deadline, so the helper enforces the same
+  // absolute deadline on its own reap loop and never signals at or after it. A helper-side deadline also makes
+  // the reaper record a non-ENOENT/ESRCH procfs error (EACCES on environ/cwd) as a table failure; that effect is
+  // kept deliberately and fails closed: the scan returns unverified with no processes before any kill.
+  if (gateDeadline !== undefined)
     req = { ...req, deadlineAt: Math.min(gateDeadline, req.deadlineAt ?? Infinity) };
   const gateExpired = (): boolean => gateDeadline !== undefined && Date.now() >= gateDeadline;
   if (gateExpired()) return unverified("gate checkpoint deadline exhausted");
@@ -2824,11 +2822,12 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       mayKillUnreadableUnattributed:
         req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0 &&
         // An observe-only probe never signals, so an unreadable pid must classify as
-        // `unreadable_unattributed` (which inventoryClearVerdict admits), not a never-executed kill reason.
+        // `unreadable_unattributed` (an unverified result, which inventoryClearVerdict never admits), not a
+        // never-executed kill reason.
         req.observeOnly !== true,
       ...(req.workerWide === true ? { workerWide: true } : {}),
       ...(req.observeOnly === true ? { observeOnly: true } : {}),
-      ...(req.observeOnly === true && req.deadlineAt !== undefined ? { deadlineAt: req.deadlineAt } : {}),
+      ...(req.deadlineAt !== undefined ? { deadlineAt: req.deadlineAt } : {}),
       liveRoots: collected.roots,
       workerNonce: workerSpawnNonce(),
     };
@@ -2880,9 +2879,9 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
             ? { refreshAfterUnattributed: refreshInProcess } : {}),
           ...(req.reportBudget ? { reportBudget: req.reportBudget,
             deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : {}),
-          // The raw helper's gateDeadline caps TMPDIR setup, child and cleanup without
-          // changing the serialized scan. An in-process gateDeadline would change procfs
-          // EACCES handling, so that path shrinks only its existing reap deadline.
+          // The helper path forwards the deadline (reapProcessesViaHelper also serializes it into the scan); the
+          // helper-side deadline records a procfs EACCES as a table failure, which is kept deliberately and fails
+          // closed (unverified, nothing killed). The in-process path shrinks only its existing reap deadline.
           ...(retryDeadlineAt === undefined ? {} : viaHelper
             ? { deadlineAt: retryDeadlineAt,
               helperTimeoutMs: Math.max(1, Math.floor(Math.min(reapOptions.helperTimeoutMs ?? Infinity,

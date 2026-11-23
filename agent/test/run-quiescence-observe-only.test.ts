@@ -101,7 +101,7 @@ describe("observeOnly reap loop", { skip: !HAS_LINUX }, () => {
     assert.equal(inventoryClearVerdict(o.result), "not_clear");
   });
 
-  it("a persistent unreadable_unattributed process settles after at most 3 scans, keeps its reasons, and is clear", async () => {
+  it("a persistent unreadable_unattributed process settles after at most 3 scans, keeps its reasons, and is not_clear (unverified keeps the exclusion)", async () => {
     plantUnreadableUnattributed(root, 73);
     plantInScope(root, 74, CLONE, { marker: TERMINAL_MARKER, cloneKey: own.cloneKey });
     const o = await observedReap(req({ observeOnly: true }));
@@ -111,7 +111,7 @@ describe("observeOnly reap loop", { skip: !HAS_LINUX }, () => {
     assert.equal(o.result.state, "unverified");
     assert.notEqual(o.result.detail, "process proof deadline");
     assert.deepEqual(o.result.processes.map((p) => p.reason).sort(), ["terminal_attempt:kill_unconfirmed", "unreadable_unattributed"]);
-    assert.equal(inventoryClearVerdict(o.result), "clear");
+    assert.equal(inventoryClearVerdict(o.result), "not_clear");
   });
 
   it("unreadable_unattributed plus unattributed_in_scope is not_clear", async () => {
@@ -211,7 +211,7 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
     });
   }
 
-  it("an observe-only probe under uid split never files an unreadable process for a kill, so it is clear and unsignalled", async () => {
+  it("an observe-only probe under uid split never files an unreadable process for a kill, so it is unsignalled and (unverified) not_clear", async () => {
     const previous = process.env.UZI_UID_SPLIT;
     process.env.UZI_UID_SPLIT = "1";
     plantUnreadableUnattributed(root, 82);
@@ -226,26 +226,29 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
       assert.equal(fs.existsSync(path.join(root, "82")), true, "nothing is killed");
       assert.equal(out.process?.processes.some((p) => p.reason.startsWith("unreadable_no_other_claim")), false,
         JSON.stringify(out.process?.processes));
-      assert.equal(inventoryClearVerdict(out.process), "clear", out.process?.detail ?? "no process verdict");
+      assert.equal(out.process?.state, "unverified", JSON.stringify(out.process));
+      assert.equal(inventoryClearVerdict(out.process), "not_clear", out.process?.detail ?? "no process verdict");
     } finally {
       if (previous === undefined) delete process.env.UZI_UID_SPLIT;
       else process.env.UZI_UID_SPLIT = previous;
     }
   });
 
-  it("without observeOnly the serialized request carries neither field", async () => {
+  it("without observeOnly the serialized request carries the deadline (every helper scan does) but not observeOnly", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-obs-"));
     try {
       const record = path.join(tmp, "request.json");
       const registry = new LiveAttemptRegistry();
       registry.add(own);
+      const deadlineAt = Date.now() + 30_000;
       await quiesceRunAttempt({
         mode: "own", attempt: own, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
-        dockerHost: undefined, registry, forceHelper: true, deadlineAt: Date.now() + 30_000,
+        dockerHost: undefined, registry, forceHelper: true, deadlineAt,
       }, { reap: { spawnHelper: rewrapSpawn({}, record) } });
       const sent = JSON.parse(fs.readFileSync(record, "utf8")) as Record<string, unknown>;
       assert.equal("observeOnly" in sent, false);
-      assert.equal("deadlineAt" in sent, false);
+      assert.equal(typeof sent.deadlineAt, "number");
+      assert.ok((sent.deadlineAt as number) <= deadlineAt, "the serialized deadline never exceeds the gate deadline");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -271,9 +274,9 @@ describe("(e) inventoryClearVerdict", () => {
     ["undefined", undefined, "not_clear"],
     ["quiescent", q("quiescent", []), "clear"],
     ["unverified, no processes (table/helper/deadline error)", q("unverified", []), "not_clear"],
-    ["unverified with only ignored reasons", q("unverified", ["terminal_attempt"]), "clear"],
-    ["unverified unreadable_unattributed alone", q("unverified", ["unreadable_unattributed"]), "clear"],
-    ["unverified unreadable_unattributed plus ignored", q("unverified", ["unreadable_unattributed", "protected_attempt"]), "clear"],
+    ["unverified with only ignored reasons", q("unverified", ["terminal_attempt"]), "not_clear"],
+    ["unverified unreadable_unattributed alone", q("unverified", ["unreadable_unattributed"]), "not_clear"],
+    ["unverified unreadable_unattributed plus ignored", q("unverified", ["unreadable_unattributed", "protected_attempt"]), "not_clear"],
     ["unverified unreadable_unattributed plus unattributed_in_scope", q("unverified", ["unreadable_unattributed", "unattributed_in_scope"]), "not_clear"],
     ["unverified unreadable_unattributed plus unknown", q("unverified", ["unreadable_unattributed", "status_unreadable"]), "not_clear"],
     ["unverified status_unreadable", q("unverified", ["status_unreadable"]), "not_clear"],

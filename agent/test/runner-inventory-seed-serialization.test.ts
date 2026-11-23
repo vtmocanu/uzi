@@ -19,20 +19,26 @@ import { restoreJournalKey } from "../src/restore-journal.js";
 import {
   LiveAttemptRegistry,
   mintAttemptId,
+  inventoryClearVerdict,
   newRunAttempt,
+  procfsTableAt,
   quiesceRunAttempt,
+  reapProcesses,
   setQuiescenceViewForTests,
+  type ProcTable,
+  type ProcessQuiescence,
   type QuiesceRunOutcome,
   type QuiesceRunRequest,
+  type ScanRequest,
 } from "../src/run-quiescence.js";
 import { acquireWorkerLifetime, withAuthorityTransaction } from "../src/authority-lock.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { testLockOptions } from "./authority-test-support.js";
-import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 import type { RunContext, ExecutorResult } from "../src/executor.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
-import { scopedRealView } from "./fake-proc.js";
+import { makeFakeProcRoot, plantUnreadableUnattributed, scopedRealView } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
@@ -640,6 +646,137 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.ok(fs.existsSync(path.join(seeded.path, ".git")), "the seed ran after the section released B");
     assert.ok(thirdAt >= seedDoneAt && thirdAt < A_WAIT_MS, `third A acquisition at ${thirdAt} ms, inside its ${A_WAIT_MS} ms wait`);
     console.log(`latency case 12: section heldMs=${heldMs}ms seed holdsA@${seedHasA}ms seedDone@${seedDoneAt}ms thirdA@${thirdAt}ms (A wait ${A_WAIT_MS}ms)`);
+    executed++;
+  });
+
+  // ─── an unverified probe result of ANY shape keeps the exclusion (owner requirement) ───────────────────────────────
+
+  /** A ProcessQuiescence built exactly as the observe-only scan returns it for a persistent unreadable pid: the real reap loop
+   *  over a fake procfs holding one unreadable, unattributed runner-uid process (state `unverified`, one process). No gate
+   *  deadline is passed: with one the same unreadable read becomes a table failure with no processes (the EACCES case below). */
+  async function unverifiedUnreadableOutcome(req: QuiesceRunRequest): Promise<QuiesceRunOutcome> {
+    const fakeRoot = makeFakeProcRoot();
+    try {
+      plantUnreadableUnattributed(fakeRoot, 73);
+      setQuiescenceViewForTests({ procRoot: fakeRoot });
+      let t = 0;
+      const scan: ScanRequest = {
+        mode: req.mode, targetUid: process.getuid?.() ?? 0, targetKey: req.cloneKey, targetPaths: req.targetPaths,
+        liveMarkers: [], liveRoots: [], workerNonce: workerSpawnNonce(), observeOnly: true,
+      };
+      const process_ = await reapProcesses(scan, {
+        table: procfsTableAt(fakeRoot), selfPid: 1, now: () => t, sleep: async (ms) => { t += ms; }, deadlineMs: 5_000,
+        kill: () => { throw new Error("an observe-only scan never signals"); },
+      });
+      return { process: process_, docker: { state: "not_wired", removed: [], detail: "" } };
+    } finally {
+      setQuiescenceViewForTests(scopedRealView({ pidFiles: [pidFile] }));
+      fs.rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  }
+
+  it("case 13: an unverified probe result with an unreadable_unattributed process keeps the key excluded; the claim stops for retry nonterminally and a later clear probe admits", { timeout: 60_000 }, async () => {
+    const iid = 4614;
+    await git.ensureClone(fx.originPath);
+    const sibling = await plantSibling(iid);
+    const dirsBefore = attemptDirs(iid);
+    const rec = recordingLogger();
+    // The exclusion is left by a section whose git left a detached descendant in the key's sibling; the descendant then exits,
+    // so the only thing that can keep the key excluded is the probe's own verdict.
+    const sleepPid = detach(sibling, "sleep 300");
+    const lockOpts = { clonePath: canonicalOf(iid), branch: branchOf(iid), isLive: (p: string) => live.isLivePath(p) };
+    const kept = await git.withInventorySourceLock(bare(), lockOpts,
+      async (s) => { s.markGitStarted(); await s.stage(async () => 1); s.afterScanQuiescent(true); });
+    assert.equal(kept.kind === "ran" && kept.entryKept, true, "the exclusion entry was kept");
+    await killAndWait(sleepPid);
+
+    let unverifiedProbe = true;
+    const probeOutcomes: string[] = [];
+    let started = 0;
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeDir, runId),
+      executor: { run: async (_ctx: RunContext): Promise<ExecutorResult> => { started++; throw new Error("stop after the seed"); } },
+    });
+    const claimRunner = runnerWith(factory, fakeGitlab().gitlab, undefined, rec.logger, {
+      quiesceRun: async (req) => {
+        if (req.site === "inventory_source:clear_probe" && unverifiedProbe) {
+          const out = await unverifiedUnreadableOutcome(req);
+          probeOutcomes.push(`${out.process?.state}:${out.process?.processes.map((p) => p.reason).join(",")}`);
+          assert.equal(req.observeOnly, true);
+          assert.equal(req.forceHelper, true);
+          return out;
+        }
+        return quiesceRunAttempt({ ...req, dockerHost: undefined });
+      },
+      liveAttempts: live, recoveryRetryMs: 5, dockerHost: "unix:///nonexistent-4632.sock",
+    });
+    // The real verdict over exactly that outcome (not an injected "not_clear").
+    assert.equal(inventoryClearVerdict(await unverifiedUnreadableOutcome({ mode: "capture", cloneKey: keyOf(iid), targetPaths: [sibling] } as QuiesceRunRequest).then((o) => o.process)), "not_clear");
+
+    await assert.rejects(seed(iid, seedOptions(async () => {})), (e: unknown) =>
+      e instanceof InventorySourceExclusionRefusal && !(e instanceof RunResidueBlockedError) && e.reason === "excluded");
+    assert.deepEqual(attemptDirs(iid), dirsBefore, "the refused seed seeded nothing");
+    assert.ok(probeOutcomes.includes("unverified:unreadable_unattributed"), `the probe saw the unverified/unreadable result: ${JSON.stringify(probeOutcomes)}`);
+
+    await claimRunner.execute(gitlabClaim(iid));
+    assert.equal(started, 0, "no model work started");
+    assert.equal(api.states.some((s) => s.body.status === "failed"), false, "no failed report");
+    assert.equal(api.states.some((s) => s.body.fail_origin === "worker_residue_blocked"), false);
+    const warn = rec.lines.find((l) => (l as { msg?: string }).msg === "retained inventory proof still settling on this clone key; stopping claim for retry") as
+      { level?: string; cause?: string; reason?: string } | undefined;
+    assert.ok(warn, "the typed warning was logged");
+    assert.equal(warn.cause, "inventory_source_exclusion");
+    assert.equal(warn.reason, "excluded");
+
+    unverifiedProbe = false; // the same key with the real (clear) observe-only probe
+    await claimRunner.execute(gitlabClaim(iid));
+    assert.equal(started, 1, "a retry whose probe is clear seeds and starts");
+    executed++;
+  });
+
+  it("case 14: a before-scan whose helper hit EACCES (deadline forwarded) is unverified with no processes, so the proof refuses before any git and keeps custody", async () => {
+    const iid = 4615;
+    const r = await retainedClone(iid);
+    const calls: Array<{ site: string | undefined; deadlineAt: number | undefined; forceHelper: boolean; observeOnly: boolean }> = [];
+    const eaccesTable = (clone: string): ProcTable => ({
+      listPids: () => [2000],
+      readStatus: () => `Name:\tproc\nState:\tS (sleeping)\nUid:\t${process.getuid?.() ?? 0}\t${process.getuid?.() ?? 0}\t${process.getuid?.() ?? 0}\t${process.getuid?.() ?? 0}\n`,
+      readEnviron: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); },
+      readCwd: () => clone,
+      readStat: () => `2000 (proc) S 1 2000 2000 ${"0 ".repeat(15)}1000 0 0`,
+    });
+    const factory: ExecutorFactory = (runId) => ({ homeDir: path.join(homeDir, runId), executor: { run: async () => { throw new Error("no executor"); } } });
+    const runner = runnerWith(factory, fakeGitlab().gitlab, undefined, nullLogger(), {
+      liveAttempts: live, recoveryRetryMs: 5,
+      // The runner's own before-scan request (site inventory_source) run through the real reap loop with the table the helper
+      // would have seen; the deadline the runner computed is passed as the helper's reap deadline, as the helper forwards it.
+      quiesceRun: async (req) => {
+        calls.push({ site: req.site, deadlineAt: req.deadlineAt, forceHelper: req.forceHelper === true, observeOnly: req.observeOnly === true });
+        let t = 0;
+        const scan: ScanRequest = {
+          mode: req.mode, targetUid: process.getuid?.() ?? 0, targetKey: req.cloneKey, targetPaths: req.targetPaths,
+          liveMarkers: [], liveRoots: [], workerNonce: workerSpawnNonce(),
+        };
+        const killed: number[] = [];
+        const proc = await reapProcesses(scan, {
+          table: eaccesTable(req.targetPaths[0]!), selfPid: 1, excludeAllDescendants: true, now: () => t, sleep: async (ms) => { t += ms; },
+          kill: (pid) => { killed.push(pid); }, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }),
+        });
+        assert.deepEqual(killed, [], "nothing is signalled");
+        assert.equal(inventoryClearVerdict(proc), "not_clear");
+        return { process: proc as ProcessQuiescence, docker: { state: "not_wired", removed: [], detail: "" } };
+      },
+    });
+    rig = { runner, quiesceCalls: [], sections: [], statusCalls: [], results: [] };
+    scriptStatus("plain");
+    const proof = await runProof(r);
+    assert.equal(proof.outcome, "retained", "the proof refused and kept custody");
+    assert.deepEqual(proof.checks, ["process_not_quiescent_before_git"]);
+    assert.deepEqual(rig.statusCalls, [], "no git ran after the unverified before-scan");
+    assert.deepEqual(calls.map((c) => c.site), ["inventory_source"], "no after-scan or later stage ran");
+    assert.equal(calls[0]!.forceHelper, true);
+    assert.equal(calls[0]!.observeOnly, false, "a signalling (non-observe) scan");
+    assert.equal(typeof calls[0]!.deadlineAt, "number", "the signalling inventory scan carries a deadline into the helper");
     executed++;
   });
 
