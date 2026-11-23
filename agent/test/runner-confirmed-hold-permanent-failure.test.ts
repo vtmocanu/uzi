@@ -73,6 +73,10 @@ class Observer {
   totalReaps = 0;
   codexBaseline: CodexBaseline | undefined;
   memoryOverlap = false;
+  /** The representative memory hold of the memory row; the same object must stay on the flight from before the trip to settlement. */
+  readonly memoryStandIn: { hold: object; feedback: Set<unknown> } = { hold: {}, feedback: new Set() };
+  memoryAfterHandlerCall: unknown[] = [];
+  reconciles: Array<{ inHandler: number; memory: unknown }> = [];
   stopReasonAfterHandler: unknown;
   constructor(readonly trip: boolean, readonly rig: CodexRig | undefined) {}
 }
@@ -88,6 +92,10 @@ function installCloseHook(t: TestContext): void {
       obs.armed = true;
       obs.batcher = this;
       obs.queuedBefore = this.bufferedCount();
+      // The memory row installs its representative hold here: after the confirmation, immediately before the injected trip. A hold
+      // present from the start of the flight reroutes the hold exit itself (the flight stops retained before the final drain, so
+      // nothing is left to trip). From this point it stays on the flight through settlement.
+      if (obs.memoryOverlap) obs.flight!.workerMemory = obs.memoryStandIn;
       api.failMessagesNext(1, 403);
       this.emit({ kind: "status", agent: "worker", payload: { text: FRAME } });
       obs.queuedAfter = this.bufferedCount();
@@ -99,8 +107,9 @@ function installCloseHook(t: TestContext): void {
 const isFlight = (x: unknown): x is FlightView =>
   typeof x === "object" && x !== null && "holdOrWallParkConfirmed" in x && "batcher" in x && "cancel" in x;
 
-function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig): Observer {
+function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig, memoryOverlap = false): Observer {
   const obs = new Observer(trip, rig);
+  obs.memoryOverlap = memoryOverlap;
   current = obs;
   const r = run as unknown as Record<string, (...a: unknown[]) => unknown>;
   const original = (name: string) => r[name]!.bind(run);
@@ -134,11 +143,9 @@ function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig):
     const flight = a[1] as FlightView;
     obs.entries.push({ confirmed: flight.holdOrWallParkConfirmed, aborted: flight.cancel.signal.aborted });
     obs.inHandler++;
-    const saved = flight.workerMemory;
-    // The memory branch of the handler runs synchronously up to its return, so the stand-in hold exists only for that call.
-    if (obs.memoryOverlap) flight.workerMemory = { hold: {} };
-    let promise: Promise<unknown>;
-    try { promise = Promise.resolve(handler(...a)); } finally { if (obs.memoryOverlap) flight.workerMemory = saved; }
+    const promise = Promise.resolve(handler(...a));
+    // The memory branch of the handler runs synchronously up to its return, so the object is read right after the call.
+    obs.memoryAfterHandlerCall.push(flight.workerMemory);
     const settled = promise.finally(() => {
       obs.inHandler--;
       obs.abortedAfterHandler.push(flight.cancel.signal.aborted);
@@ -147,6 +154,14 @@ function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig):
     obs.handlerPromises.push(settled);
     return settled;
   });
+  if (obs.memoryOverlap) {
+    // The stand-in lacks what the real reconcile needs (the memory runtime, sink receipts), so this spy records the flight's own
+    // reconciliation call and the memory object it sees, then returns without calling the original.
+    t.mock.method(r, "reconcileWorkerMemory", async (...a: unknown[]) => {
+      const flight = a[0] as FlightView;
+      obs.reconciles.push({ inHandler: obs.inHandler, memory: flight.workerMemory });
+    });
+  }
   const terminal = original("journalAndSendTerminal");
   t.mock.method(r, "journalAndSendTerminal", (...a: unknown[]) => { obs.terminalInstalls++; return terminal(...a); });
   for (const name of ["reapRecoveryProviderForSettle", "reapForSink"]) {
@@ -160,13 +175,53 @@ function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig):
   return obs;
 }
 
+/** The real content of the retained source after one execute(): clone HEAD and tree, the seeded work files, HOME and its session files. */
+interface Retained {
+  clone: boolean;
+  home: boolean;
+  head: string | undefined;
+  parent: string | undefined;
+  tree: string | undefined;
+  paths: string[];
+  files: Record<string, string>;
+  session: Record<string, string>;
+}
+
+/**
+ * What the row's fixture seeded, so the retained content is checked against it and not only against the control. `head` is the exact
+ * commit the fixture made (or the planned base when it made none); `parent` is used instead when the executor's own commit (the
+ * StubExecutor's) is not known to the test, and then the retained HEAD must sit directly on that base.
+ */
+interface Seeded { head?: string; parent?: string; files: Record<string, string>; session: Record<string, string> }
+
+const headMatchesSeed = (r: Retained, s: Seeded): boolean => s.head !== undefined ? r.head === s.head : r.parent === s.parent;
+
 interface Built {
   run: RunRunner;
   claim: ClaimResponse;
   go: () => Promise<void>;
-  kept: () => { clone: boolean; home: boolean };
+  kept: () => Retained;
+  seeded: () => Seeded;
   cleanup: () => void;
   rig?: CodexRig;
+}
+
+const readFiles = (dir: string, names: string[]): Record<string, string> =>
+  Object.fromEntries(names.filter(n => fs.existsSync(path.join(dir, n))).map(n => [n, fs.readFileSync(path.join(dir, n), "utf8")]));
+
+/** Inspects a retained clone (HEAD sha, tree sha, the named work files) and the HOME dir (existence and the named session files). */
+function inspectRetained(cloneDir: string | undefined, workFiles: string[], homeDir: string, sessionFiles: string[], cloneProof = true): Retained {
+  const clone = cloneDir !== undefined && fs.existsSync(cloneDir) && cloneProof;
+  return {
+    clone,
+    home: fs.existsSync(homeDir),
+    head: clone ? gitIn(cloneDir!, ["rev-parse", "HEAD"]) : undefined,
+    parent: clone ? (() => { try { return gitIn(cloneDir!, ["rev-parse", "--verify", "-q", "HEAD^"]); } catch { return undefined; } })() : undefined,
+    tree: clone ? gitIn(cloneDir!, ["rev-parse", "HEAD^{tree}"]) : undefined,
+    paths: clone ? gitIn(cloneDir!, ["ls-tree", "-r", "--name-only", "HEAD"]).split("\n") : [],
+    files: clone ? readFiles(cloneDir!, workFiles) : {},
+    session: fs.existsSync(homeDir) ? readFiles(homeDir, sessionFiles) : {},
+  };
 }
 
 async function mkOutbox(tag: string): Promise<Outbox> {
@@ -178,13 +233,15 @@ async function mkOutbox(tag: string): Promise<Outbox> {
   return outbox;
 }
 
-function seedHome(): { homeDir: string; sentinel: string; root: string } {
+const SESSION_FILE = "SESSION_TRANSCRIPT";
+const SESSION_TEXT = "resumable session state\n";
+
+function seedHome(): { homeDir: string; root: string } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-4645-home-"));
   const homeDir = path.join(root, "h");
   fs.mkdirSync(homeDir, { recursive: true });
-  const sentinel = path.join(homeDir, "SESSION_TRANSCRIPT");
-  fs.writeFileSync(sentinel, "resumable session state\n");
-  return { homeDir, sentinel, root };
+  fs.writeFileSync(path.join(homeDir, SESSION_FILE), SESSION_TEXT);
+  return { homeDir, root };
 }
 
 type Builder = (iid: number, logger: ReturnType<typeof recordingLogger>["logger"], outbox: Outbox) => Promise<Built>;
@@ -194,6 +251,7 @@ const completionHold: Builder = async (iid, logger, outbox) => {
   const { gitlab } = fakeGitlab();
   const home = seedHome();
   const claim = gitlabClaim(iid);
+  const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
   api.setCompletionHoldResponse("paused", 200);
   const executor: Executor = {
     run: async (ctx: RunContext): Promise<ExecutorResult> => {
@@ -210,7 +268,8 @@ const completionHold: Builder = async (iid, logger, outbox) => {
   const run = runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, logger, { recoveryRetryMs: 1, outbox });
   return {
     run, claim, go: () => run.execute(claim),
-    kept: () => ({ clone: fs.existsSync(worktreeDirFor(iid)), home: fs.existsSync(home.sentinel) }),
+    kept: () => inspectRetained(worktreeDirFor(iid), [], home.homeDir, [SESSION_FILE]),
+    seeded: () => ({ head: planned, files: {}, session: { [SESSION_FILE]: SESSION_TEXT } }),
     cleanup: () => fs.rmSync(home.root, { recursive: true, force: true }),
   };
 };
@@ -226,17 +285,26 @@ function interlockedHold(withCodex: boolean): Builder {
     api.setPublicationState(claim.run_id, [], 1);
     api.setCompletionPermitResponse(false, { denyReason: "incomplete" });
     const rig = withCodex ? codexRig() : undefined;
+    const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    let committed: string | undefined;
     const executor: Executor = rig
       ? new FakeCodexExecutor(rig.safety, async ctx => {
         fs.writeFileSync(path.join(home.homeDir, "session.marker"), "resume evidence\n");
         commitInTree(ctx.worktreePath, "W4645.txt", "work before the hold\n");
+        committed = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
         return { branch: ctx.branch };
       }, undefined, rig.capture)
       : new StubExecutor(nullLogger());
     const run = runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, logger, { recoveryRetryMs: 1, outbox, ...(rig ? { recovery: enabledRecovery().coord } : {}) });
     return {
       run, claim, go: () => run.execute(claim), ...(rig ? { rig } : {}),
-      kept: () => ({ clone: fs.existsSync(worktreeDirFor(iid)), home: fs.existsSync(home.sentinel) || fs.existsSync(path.join(home.homeDir, "session.marker")) }),
+      kept: () => inspectRetained(worktreeDirFor(iid), ["W4645.txt"], home.homeDir, [SESSION_FILE, "session.marker"]),
+      seeded: (): Seeded => rig
+        ? {
+          head: committed, files: { "W4645.txt": "work before the hold\n" },
+          session: { [SESSION_FILE]: SESSION_TEXT, "session.marker": "resume evidence\n" },
+        }
+        : { parent: planned, files: {}, session: { [SESSION_FILE]: SESSION_TEXT } },
       cleanup: () => fs.rmSync(home.root, { recursive: true, force: true }),
     };
   };
@@ -252,10 +320,12 @@ function wallPark(withCodex: boolean): Builder {
     api.setWallParkResponse("paused");
     const claim = gitlabClaim(iid);
     const rig = withCodex ? codexRig({ authMode: "subscription" }) : undefined;
+    let committed: string | undefined;
     const behavior = async (ctx: RunContext): Promise<ExecutorResult> => {
       fs.mkdirSync(homeDir, { recursive: true });
       fs.writeFileSync(path.join(homeDir, "session.marker"), "resume me\n");
       commitInTree(ctx.worktreePath, "WORK.txt", "work before the wall\n");
+      committed = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
       await ctx.checkpoint?.({ reap: false });
       const outcome = await ctx.parkForWall?.({ completedCount: 1, total: 2 });
       assert.equal(outcome, "parked");
@@ -265,7 +335,8 @@ function wallPark(withCodex: boolean): Builder {
     const run = runnerWith(() => ({ executor, homeDir }), gitlab, undefined, logger, { outbox, ...(rig ? { recovery: enabledRecovery().coord } : {}) });
     return {
       run, claim, go: () => run.execute(claim), ...(rig ? { rig } : {}),
-      kept: () => ({ clone: fs.existsSync(worktreeDirFor(iid)), home: fs.existsSync(path.join(homeDir, "session.marker")) }),
+      kept: () => inspectRetained(worktreeDirFor(iid), ["WORK.txt"], homeDir, ["session.marker"]),
+      seeded: () => ({ head: committed!, files: { "WORK.txt": "work before the wall\n" }, session: { "session.marker": "resume me\n" } }),
       cleanup: () => { restore(); fs.rmSync(root, { recursive: true, force: true }); },
     };
   };
@@ -288,11 +359,17 @@ const phaseSwitchHold: Builder = async (iid, logger, outbox) => {
   };
   const original = client.requestPhaseSwitchHold.bind(client);
   (client as unknown as { requestPhaseSwitchHold: unknown }).requestPhaseSwitchHold = async () => ({ outcome: "held", status: "paused" });
-  const run = runnerWith(() => ({ executor }), gitlab, undefined, logger, { recoveryRetryMs: 5, phaseSwitchHoldDeadlineMs: 3_000, outbox });
+  const home = seedHome();
+  const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+  const run = runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, logger, { recoveryRetryMs: 5, phaseSwitchHoldDeadlineMs: 3_000, outbox });
   return {
     run, claim, go: () => run.execute(claim),
-    kept: () => ({ clone: fs.existsSync(worktreeDirFor(iid)), home: true }),
-    cleanup: () => { (client as unknown as { requestPhaseSwitchHold: unknown }).requestPhaseSwitchHold = original; },
+    kept: () => inspectRetained(worktreeDirFor(iid), [], home.homeDir, [SESSION_FILE]),
+    seeded: () => ({ head: planned, files: {}, session: { [SESSION_FILE]: SESSION_TEXT } }),
+    cleanup: () => {
+      (client as unknown as { requestPhaseSwitchHold: unknown }).requestPhaseSwitchHold = original;
+      fs.rmSync(home.root, { recursive: true, force: true });
+    },
   };
 };
 
@@ -302,13 +379,17 @@ const preflightHold: Builder = async (iid, logger, outbox) => {
   const { gitlab } = fakeGitlab();
   const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
   const legs: RunContext[] = [];
+  const home = seedHome();
+  let committed: string | undefined;
   const factory: ExecutorFactory = () => ({
+    homeDir: home.homeDir,
     executor: {
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         legs.push(ctx);
         fs.writeFileSync(path.join(ctx.worktreePath, `leg${legs.length}.txt`), `leg ${legs.length}\n`);
         gitIn(ctx.worktreePath, ["add", "."]);
         gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", `leg ${legs.length}`]);
+        committed = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
         if (legs.length === 1) {
           await ctx.parkForWall?.({ completedCount: 0 });
           return { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } };
@@ -358,8 +439,13 @@ const preflightHold: Builder = async (iid, logger, outbox) => {
       await run.execute(resumedClaim);
       assert.equal(legs.length, 1, "the unattested continuation never ran the executor");
     },
-    kept: () => ({ clone: cloneDirs().some(d => fs.existsSync(path.join(d, "leg1.txt")) && fs.existsSync(path.join(d, ".git"))), home: true }),
+    kept: () => {
+      const dir = cloneDirs().find(d => fs.existsSync(path.join(d, "leg1.txt")) && fs.existsSync(path.join(d, ".git")));
+      return inspectRetained(dir, ["leg1.txt"], home.homeDir, [SESSION_FILE]);
+    },
+    seeded: () => ({ head: committed!, files: { "leg1.txt": "leg 1\n" }, session: { [SESSION_FILE]: SESSION_TEXT } }),
     cleanup: () => {
+      fs.rmSync(home.root, { recursive: true, force: true });
       (client as unknown as { requestBaseAttestationHold: unknown }).requestBaseAttestationHold = origHold;
       (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = origPublish;
       fs.rmSync(freshDir, { recursive: true, force: true });
@@ -372,9 +458,15 @@ interface Outcome {
   runId: string;
   outbox: Outbox;
   lines: unknown[];
+  retained: Retained;
+  seeded: Seeded;
+  /** Compared with deepEqual between a tripped run and its no-trip control; per-run values (iid, paths, commit shas) are normalised. */
   world: {
     statuses: string[];
-    kept: { clone: boolean; home: boolean };
+    kept: {
+      clone: boolean; home: boolean; headIsSeeded: boolean; tree: string | undefined; paths: string[];
+      files: Record<string, string>; session: Record<string, string>;
+    };
     custody: Record<string, boolean | undefined>;
     dispose: string[] | undefined;
   };
@@ -387,24 +479,30 @@ async function execRow(t: TestContext, build: Builder, iid: number, trip: boolea
   const { logger, lines } = recordingLogger();
   const outbox = await mkOutbox(String(iid));
   const built = await build(iid, logger, outbox);
-  const obs = observe(t, built.run, trip, built.rig);
-  if (opts.memoryOverlap) obs.memoryOverlap = true;
-  let kept!: { clone: boolean; home: boolean };
+  const obs = observe(t, built.run, trip, built.rig, opts.memoryOverlap === true);
+  let kept!: Retained;
+  let seeded!: Seeded;
   try {
     await built.go();
     await Promise.allSettled(obs.handlerPromises);
     await obs.batcher?.awaitPermanentFailureSettled();
     kept = built.kept();
+    seeded = built.seeded();
   } finally {
     built.cleanup();
     current = undefined;
   }
   const f = obs.flight;
   return {
-    obs, runId: built.claim.run_id, outbox, lines,
+    obs, runId: built.claim.run_id, outbox, lines, retained: kept, seeded,
     world: {
       statuses: api.states.filter(s => s.runId === built.claim.run_id).map(s => String(s.body.status)),
-      kept,
+      kept: {
+        clone: kept.clone, home: kept.home, headIsSeeded: headMatchesSeed(kept, seeded),
+        // The tree sha is comparable only when the test knows the exact commit; the StubExecutor's own commit embeds per-run content.
+        tree: seeded.head !== undefined ? kept.tree : undefined, paths: kept.paths,
+        files: kept.files, session: kept.session,
+      },
       custody: {
         preserveRecoveryClone: f?.preserveRecoveryClone, preserveSession: f?.preserveSession,
         retainedLocalCustody: f?.retainedLocalCustody, keepGuardedInventoryOpen: f?.keepGuardedInventoryOpen,
@@ -419,9 +517,18 @@ function assertControl(c: Outcome): void {
   assert.equal(c.obs.entries.length, 0, "the control never tripped the breaker");
   assert.equal(failedReports(c.runId).length, 0, "the control reported no failed");
   assert.equal(c.world.custody.confirmed, true, "the control's disposition was confirmed");
-  assert.equal(c.world.kept.clone, true, "the control keeps its clone");
-  assert.equal(c.world.kept.home, true, "the control keeps its HOME / session");
+  assertRetainedContent("control", c);
   assert.equal(c.obs.terminalInstalls, 0, "the control installed no terminal");
+}
+
+/** The retained source holds the seeded content itself: the clone's HEAD sha and work files, the HOME dir and its session files. */
+function assertRetainedContent(label: string, out: Outcome): void {
+  const { retained: r, seeded: s } = out;
+  assert.equal(r.clone, true, `${label} keeps its clone`);
+  assert.equal(r.home, true, `${label} keeps its HOME dir`);
+  assert.equal(headMatchesSeed(r, s), true, `${label}: the clone's HEAD is the seeded commit (head ${r.head}, parent ${r.parent}; seeded ${JSON.stringify({ head: s.head, parent: s.parent })})`);
+  assert.deepEqual(r.files, s.files, `${label}: the retained work files hold their seeded content`);
+  assert.deepEqual(r.session, s.session, `${label}: the HOME session files hold their seeded content`);
 }
 
 /** The shared assertions of every confirmed row: the trip happened after the flag, and nothing terminal followed. */
@@ -441,6 +548,7 @@ function assertKept(tripped: Outcome, control: Outcome): void {
     "the keeping-the-disposition warning was logged");
   assert.equal(o.handlerReaps, 0, "the hook ran no terminal reap");
   assert.equal(api.messages(tripped.runId).some(m => JSON.stringify(m.payload).includes(FRAME)), false, "the injected frame was rejected, never delivered");
+  assertRetainedContent("tripped", tripped);
   assert.deepEqual(tripped.world, control.world, "retained clone, HOME, session and custody match the no-trip control");
 }
 
@@ -495,6 +603,15 @@ describe("a permanent message failure after a confirmed hold or wall park keeps 
     assert.equal(failedReports(o.runId).length, 0, "no failed report");
     assert.equal(o.obs.handlerReaps, 0, "no handler reap");
     assert.deepEqual(o.outbox.listPendingTerminals(), []);
+    // Memory reconciliation ownership: the handler neither replaced nor cleared the flight's memory, and the flight's own
+    // reconciliation still ran for that same object, outside the handler.
+    const memory = o.obs.memoryStandIn;
+    assert.equal(o.obs.flight!.workerMemory, memory, "the flight still holds the same memory object after settlement");
+    assert.deepEqual(o.obs.memoryAfterHandlerCall.map(m => m === memory), o.obs.entries.map(() => true),
+      "the handler left flight.workerMemory as the same object");
+    assert.ok(o.obs.reconciles.length >= 1, "the flight's own memory reconciliation ran");
+    assert.deepEqual(o.obs.reconciles.filter(c => c.memory !== memory), [], "every reconciliation saw the same memory object");
+    assert.deepEqual(o.obs.reconciles.filter(c => c.inHandler > 0), [], "the handler did not reconcile memory itself");
   });
 
   it("D ordinary control: a real-breaker trip on a non-held flight still installs failed, aborts and reaps", async t => {
