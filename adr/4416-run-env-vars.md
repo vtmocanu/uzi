@@ -429,14 +429,15 @@ The split-across-files and elided-context patch gaps are closed by the `multi_li
      writer is known only from deployment records.
   4. Keep every affected or unknown journal retained until an explicit owner resolution is
      recorded for it, without copying the report's contents. Manual journal deletion is not a
-     retirement mechanism. A running worker, old or upgraded, replays pending journals at boot and
-     on its sweep and deletes one on an accepting ack, on a 409 with a terminal status, or on a
-     stale-claim ack (`resolvePendingTerminal`, `agent/src/terminal-resolve.ts`); nothing holds a
-     journal for an owner. Retention until the owner resolution therefore means no worker runs on
-     a source that may hold one until that resolution is recorded. A journal deleted before the
-     inventory is identified from the run's api terminal state; it is resolved from the api-side
-     delivered report when there is one, and classed unknown when the deletion delivered nothing
-     (a terminal-status 409 or a stale-claim retirement).
+     retirement mechanism. A running worker, old or upgraded, replays pending journals itself and
+     can delete one on several api answers, some of which deliver nothing (`actOnAck`,
+     `agent/src/terminal-resolve.ts`). The holds that exist (a blocked journal, recovery custody,
+     policy hold) are set by api answers or recovery state; no mechanism lets an owner hold a
+     journal against replay. Retention until the owner resolution therefore means no worker runs
+     on a source that may hold one until that resolution is recorded. Every run on the source with
+     no remaining journal is a candidate for an earlier deletion: it is resolved only from an
+     api-side report that matches the journal's generation and outcome exactly, and is otherwise
+     unknown.
 
   The maintainers run this check through a private authenticated inventory with exact correlation
   against delivered history, and record metadata-only results with owner dispositions.
