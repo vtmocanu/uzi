@@ -6017,8 +6017,8 @@ export class SdkExecutor implements Executor {
       .catch((): RunProcessScan => ({ pids: [], complete: false }));
     if (scan.complete && scan.pids.length === 0) return;
     const what = scan.complete
-      ? `${scan.pids.length} run processes are alive before a CLI start`
-      : `the process scan was incomplete (${scan.pids.length} run processes seen) before a CLI start`;
+      ? `${scan.pids.length} run processes are alive at this turn boundary`
+      : `the process scan was incomplete (${scan.pids.length} run processes seen) at this turn boundary`;
     this.log.warn(`${what}; a live writer can race the global-config reset`, {
       count: scan.pids.length,
       scanComplete: scan.complete,

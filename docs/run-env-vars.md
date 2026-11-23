@@ -241,6 +241,12 @@ The agent can read every variable, secret or not. Store read-only, narrowly
 scoped credentials. uzi does not log in or configure tools for you; the agent
 or your repo scripts do.
 
+The agent cannot use a settings file to change how the Claude CLI runs. Before
+each CLI start the worker resets the CLI's global config under the run's home
+(`.claude.json`, and removes `.claude/.config.json`), so an `env` block the agent
+wrote there is not applied. If a directory is planted at either path, the worker
+cannot reset it and the run fails instead of starting the CLI.
+
 ## Name and value rules
 
 1. A name matches `^[A-Z_][A-Z0-9_]{0,127}$`.

@@ -22,8 +22,9 @@
 // the uid split the `.claude` directory is normally created by the CLI as the runner uid, which
 // the worker cannot unlink inside, so the removal runs as the runner uid (`rm -f`); without the
 // split it is a plain unlink. Failure (non-zero exit, timeout, signal, a directory at the path)
-// is a refusal. ENOTDIR (`.claude` is a file) is accepted as absent: the CLI's stat of the file
-// then fails and its resolver falls back to `.claude.json`. The `.claude<oauth suffix>.json`
+// is a refusal. Without the split, ENOTDIR (`.claude` is a file) is accepted as absent: the CLI's
+// stat of the file then fails and its resolver falls back to `.claude.json`. Under the split the
+// image's busybox `rm -f` exits non-zero on ENOTDIR, so that state refuses the start (fail closed). The `.claude<oauth suffix>.json`
 // variants are chosen only with CLAUDE_CODE_CUSTOM_OAUTH_URL, and the run-env `CLAUDE_` prefix is
 // denied (run-env-names.ts), so they are out of scope.
 //

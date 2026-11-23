@@ -357,6 +357,85 @@ Recorded so the PRD's plan is not read as the shipped mechanism.
 - The PRD said receipts record secret versions. They record plain versions too.
 - The PRD's AAD named the user id, scope, repo, secret flag and name; the M1 code's version-1 context binds scope, repo, secret flag and name, with the owner bound by the vault seam (`OpenSealed` takes the user id). Version 2 adds owner, `var_id` and `rev` to the context itself.
 
+## Global CLI config input
+
+The M2 audit classifies one more file input to the Claude CLI: its global config,
+`<HOME>/.claude.json`. The pinned CLI (2.1.319, SDK 0.3.319) applies an `env` block from it
+(for example `OTEL_LOG_RAW_API_BODIES`, `NODE_OPTIONS`, `ANTHROPIC_BASE_URL`) regardless of
+`settingSources: []`, with the provider credential already in its environment.
+
+**Where it lives and who writes it (Claude lead lane).**
+
+- `HOME` is `agent-home/<runId>` (`sdkHomeRoot` in `agent/src/main.ts`; the worker creates it with
+  mkdir in `agent/src/sdk-executor.ts`; `agent/src/sdk-env.ts` sets `HOME`).
+- The CLI runs as the runner uid (`spawnDetached` in `agent/src/sdk-spawn.ts`, through
+  `runnerSpawn`), and so does the agent's Bash tool and everything it runs (repo scripts,
+  package-manager hooks).
+- `HOME/.claude.json` is written by the CLI as the runner, and by anything the agent runs. It is
+  read at every CLI start, and the CLI also watches it during a process.
+- The CLI's resolver prefers a non-empty `HOME/.claude/.config.json` over `.claude.json`, so that
+  file is an equivalent input.
+
+**The `OTEL_LOG_` rule does not cover this path.** The `OTEL_LOG_` prefix in "Name rules, with
+evidence" filters run variables only. A run-written env block in this file reaches the CLI
+without passing the name rules.
+
+**Trust policy.** The file is agent-written and never a worker input. Before every Claude CLI
+start in every lane, the worker:
+
+1. removes `HOME/.claude/.config.json` (as the runner under the uid split);
+2. replaces `.claude.json` with fixed bytes that have no `env` key (temp file plus rename, never
+   followed, mode 0660);
+3. refuses the start, with no spawn, when it cannot. A directory planted at either path fails
+   the run, and its resumes, closed.
+
+`spawnDetached` is the one seam: lead, chat, isolated, advice and model-pass, job and cross-check
+all start the CLI through it. The other lanes have no Bash or Write tool (the chat tools in
+`agent/src/chat-executor.ts`; `CHECKER_SURFACE` in `agent/src/claude-cross-check.ts`), but they
+read files a lead's commands can plant, for example the chat lane's shared `agent-home` root, so
+they get the same reset. The mechanism and its limits are in the header of
+`agent/src/claude-global-config.ts`.
+
+**Codex.** There is no agent-reachable writer. Per-launch HOME and CODEX_HOME trees are
+runner-owned 0700 (`agent/src/codex/launcher.ts`), `config.toml` is rewritten from fixed text at
+every launch, commands run as `COMMAND_UID` 10003 (`agent/src/runner-uid.ts`), the screener
+denies `codex-data/`, and Codex runs only under the uid split (`agent/src/codex-capability.ts`).
+Pinned by `agent/test/codex-launcher.test.ts` "(c) creates the fresh trees 0700 as the runner uid
+via the injected step".
+
+**Tests.** `agent/test/sdk-executor-global-config.test.ts`, through the real executor and spawn
+path: a run-written env block (`OTEL_LOG_RAW_API_BODIES` and other denied names) in
+`.claude.json` or `.claude/.config.json` never reaches the next CLI process. It was shown red on
+9616b9b98 and green after.
+
+**Pending owner decision (not accepted).**
+
+- **R1: a live runner-uid writer.** A live runner-uid process (the run's own surviving background
+  process, or another run's lead on the same worker, per ADR-91) can rewrite either file between
+  the reset and the CLI's startup read, or swap the temp file before the rename. A full reap
+  before each spawn was rejected: it kills the plan leg's concurrent deps install and the
+  agent's dev servers. The lead lane logs a warning with the count of live run processes before
+  each implement turn. The robust option offered to the owner is a config file the runner cannot
+  replace (`CLAUDE_CONFIG_DIR` or a worker-owned read-only file), which first needs a CLI probe
+  that saves fail safely.
+- **R2: a write during a running CLI.** The CLI watches `.claude.json` during a process, so a
+  write while it runs may affect it.
+- **R3: a planted directory in the chat root.** A directory planted at the chat lane's shared
+  `agent-home/.claude.json` before the worker's first reset makes every later chat start on that
+  worker fail closed. That persists across restarts until the directory is removed.
+  The same holds for a regular file planted at `.claude` under the uid split (the runner-uid
+  `rm -f` exits non-zero), and for an unwritable `.claude`.
+- **R4: other agent-writable CLI inputs not fully traced.** `HOME/.claude/remote-settings.json`
+  is a stored copy the CLI may load as policy settings, whose `env` block the CLI could apply
+  regardless of `settingSources`. Whether the pinned CLI accepts an unsigned stored copy under
+  the SDK was not settled from the bundle, so it is neither reset nor shown closed. A probe of
+  the real CLI, or a reset of that file too, is the owner's call. Managed settings
+  (`/etc/claude-code`) are root-owned and absent from the image.
+
+**Unvalidated.** The CLI's in-place config save in the sticky shared root under the real uid
+split (single-uid tests cannot show it). A disk-full error on the reset is reported as this
+refusal, not as a disk park.
+
 ## Residuals
 
 Accepted, in addition to the PRD's list (agent-readable values, shared uid and daemon on a worker,
