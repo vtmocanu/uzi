@@ -1,7 +1,10 @@
-// PRD #3263 M1 in a real browser (layout needs a layout engine): below 768px the grid's
+// PRD #3263 M1 and M2 in a real browser (layout needs a layout engine): below 768px the grid's
 // cells stack under their row with a visible family label; from 768px Claude and Codex sit
 // side by side under column headers; the sticky Save bar never covers the last row; and every
-// control's computed accessible name is "<Row> — <Family>".
+// control's computed accessible name is "<Row> — <Family>". M2 lengthens the grid with the
+// helper and cross-check groups: their pairs stack the same way, the routing row spans both
+// columns, a dimmed judge lane keeps full emphasis while focused, and the bar still clears the
+// last cross-check row.
 import "../index.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
@@ -23,6 +26,11 @@ const settings = {
   default_effort: null, default_codex_effort: "runtime", judge_model: null, summary_model: null, judge_runs_on: null,
   harness_overflow_enabled: false, theme: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null,
   planning_claude_model: null, planning_claude_effort: null, planning_codex_model: null, planning_codex_effort: null,
+  cross_check_pins: (["plan", "code"] as const).flatMap((stage) => (["claude", "codex"] as const).map((harness) => ({
+    stage, harness, model: null, effort: null, worker_default_model: harness === "claude" ? "sonnet" : "gpt-6.1-sol",
+    resolved_model: harness === "claude" ? "sonnet" : "gpt-6.1-sol", resolved_effort: "high",
+    model_source: "worker default", effort_source: "cross-check default", active: true,
+  }))),
 } as UserSettings;
 
 const effective = {
@@ -48,7 +56,13 @@ const effective = {
 const NAMES = [
   "Default harness", "Worker model — Claude", "Worker model — Codex", "Worker effort — Claude", "Worker effort — Codex",
   "Planning model — Claude", "Planning model — Codex", "Planning effort — Claude", "Planning effort — Codex",
+  "Judge runs on", "Judge model — Claude", "Judge model — Codex", "Summary model — Claude", "Summary model — Codex",
+  "Task review model — Claude", "Task review model — Codex", "Task review effort — Claude", "Task review effort — Codex",
+  "Plan cross-check model — Claude", "Plan cross-check model — Codex", "Plan cross-check effort — Claude", "Plan cross-check effort — Codex",
+  "Code cross-check model — Claude", "Code cross-check model — Codex", "Code cross-check effort — Claude", "Code cross-check effort — Codex",
 ];
+// One pair row per group, to check stacking and side-by-side across the whole grid.
+const PAIR_ROWS = ["Worker model", "Planning effort", "Judge model", "Task review effort", "Code cross-check effort"];
 
 async function mount(width: number) {
   await page.viewport(width, 700);
@@ -72,6 +86,7 @@ function expectBarClearsLastRow() {
   window.scrollTo(0, document.documentElement.scrollHeight);
   const rows = document.querySelectorAll("[data-row]");
   const last = rows[rows.length - 1];
+  expect(last.getAttribute("data-row")).toBe("Code cross-check effort");
   const bar = screen.getByTestId("models-save-bar");
   expect(rect(last).bottom).toBeLessThanOrEqual(rect(bar).top + 0.5);
   // Sticky: the bar is inside the viewport.
@@ -91,7 +106,7 @@ describe("Models grid layout", () => {
   // 700px is inside the 640-768 band where three tracks would squeeze each select to ~163px.
   it.each([390, 700])("stacks the cells below 768px (%ipx), each with a visible family label", async (width) => {
     await mount(width);
-    for (const row of ["Worker model", "Planning effort"]) {
+    for (const row of PAIR_ROWS) {
       const claude = rect(cellOf(`${row} — Claude`));
       const codex = rect(cellOf(`${row} — Codex`));
       expect(codex.top, row).toBeGreaterThanOrEqual(claude.bottom);
@@ -115,13 +130,36 @@ describe("Models grid layout", () => {
 
   it.each([768, 1024])("puts Claude and Codex side by side from 768px (%ipx), labelled by the column headers", async (width) => {
     await mount(width);
-    const claude = rect(cellOf("Worker effort — Claude"));
-    const codex = rect(cellOf("Worker effort — Codex"));
-    expect(Math.abs(codex.top - claude.top)).toBeLessThan(1);
-    expect(codex.left).toBeGreaterThanOrEqual(claude.right);
+    for (const row of PAIR_ROWS) {
+      const claude = rect(cellOf(`${row} — Claude`));
+      const codex = rect(cellOf(`${row} — Codex`));
+      expect(Math.abs(codex.top - claude.top), row).toBeLessThan(1);
+      expect(codex.left, row).toBeGreaterThanOrEqual(claude.right);
+    }
+    // Judge runs on spans both family columns.
+    const routing = rect(cellOf("Judge runs on"));
+    expect(routing.left).toBeLessThanOrEqual(rect(cellOf("Judge model — Claude")).left + 1);
+    expect(routing.right).toBeGreaterThanOrEqual(rect(cellOf("Judge model — Codex")).right - 1);
     // The per-cell family label is visually hidden (sr-only) where the headers show.
     expect(rect(familyLabel("Worker effort — Claude")).width).toBeLessThanOrEqual(1);
     expectBarClearsLastRow();
+  });
+
+  it("dims the unused judge lane to reduced emphasis, restores it while focused, and keeps it editable", async () => {
+    await mount(1024);
+    fireEvent.change(screen.getByRole("combobox", { name: "Judge runs on" }), { target: { value: "claude" } });
+    const codex = screen.getByRole("combobox", { name: "Judge model — Codex" }) as HTMLSelectElement;
+    const wrapper = codex.closest("[data-field]")!.querySelector(".opacity-45") as HTMLElement;
+    expect(wrapper).not.toBeNull();
+    expect(Number(getComputedStyle(wrapper).opacity)).toBeLessThan(0.6);
+    // The reason itself is not dimmed.
+    const reason = document.getElementById(codex.getAttribute("aria-describedby")!.split(" ").find((id) => id.endsWith("-not-used"))!)!;
+    expect(reason.textContent).toBe("Not used: the judge runs on Claude");
+    expect(wrapper.contains(reason)).toBe(false);
+    codex.focus();
+    expect(document.activeElement).toBe(codex);
+    await expect.poll(() => Number(getComputedStyle(wrapper).opacity)).toBe(1);
+    expect(codex.disabled).toBe(false);
   });
 
   it("computes every control's accessible name as <Row> — <Family>", async () => {

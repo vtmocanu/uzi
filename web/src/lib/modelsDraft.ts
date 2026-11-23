@@ -3,23 +3,31 @@
 // map from a 400's field errors back to the cells that caused them. Pure and React-free, so the
 // page owns state and this file owns meaning.
 //
-// A field is a DESCRIPTOR, not a hand-written branch: M1 ships the harness, worker and planning
-// rows; M2 adds the judge, summary, task-review and cross-check rows by adding descriptors.
-// Cross-check pins already have their shape here (`pin` targets, keyed
-// `cross_check_pins:<stage>/<harness>/<member>`), so the patch builder and the error map need no
-// change when they arrive.
+// A field is a DESCRIPTOR, not a hand-written branch: the harness, worker and planning rows
+// (M1), then judge routing and models, summary models, task-review models and efforts and the
+// four cross-check pin cells (M2). A pin member is keyed
+// `cross_check_pins:<stage>/<harness>/<member>`, so the patch builder groups members of one cell
+// and the error map finds a pin error by stage/harness/member.
 //
 // Values are strings: "" is Default (a cleared override, sent as null), anything else is the
 // override, compared and sent trimmed. "runtime" is an ordinary non-empty value, so Runtime
 // default stays distinct from Default. Predictions are not part of the draft and never count.
+//
+// A field may carry a local `validate` that mirrors its server validator (the Claude helper
+// lanes refuse Codex ids, a checker refuses the other family's model): a DIRTY value it flags
+// blocks Save on its own cell. The server stays authoritative; this only spares a round trip.
 
 import type { Harness, ModelSettingsFieldError, ModelSettingsPatch, ModelSettingsPinPatch, UserSettings } from "./apiTypes";
+import { modelFieldWarning } from "./agentTemplates";
+import { CODEX_ROLE_MODELS } from "./codexModels";
+import { checkerModelWarning, normalizeCheckerValue } from "./crossCheckSettings";
 
 type ScalarKey = Exclude<keyof ModelSettingsPatch, "cross_check_pins">;
 type PinStage = ModelSettingsPinPatch["stage"];
 type PinMember = "model" | "effort";
 
-export type ModelsFieldKind = "harness" | "model" | "effort";
+/** "harness" is the default harness, "routing" the judge's Runs on choice. */
+export type ModelsFieldKind = "harness" | "routing" | "model" | "effort";
 
 export interface ModelsField {
   /** Stable identity: the patch key for a scalar, `cross_check_pins:<stage>/<harness>/<member>` for a pin. */
@@ -32,11 +40,16 @@ export interface ModelsField {
   /** The stored value in the settings DTO (null/undefined/"" all read as Default). */
   read: (settings: UserSettings) => string | null | undefined;
   target: { scalar: ScalarKey } | { pin: { stage: PinStage; harness: Harness; member: PinMember } };
+  /** The semantic form of a value (trimmed by default; a checker pin trims Unicode White_Space
+   *  as the server's strings.TrimSpace does). */
+  normalize?: (value: string) => string;
+  /** A local problem with a (non-empty) value, or "" when it is fine. */
+  validate?: (value: string) => string;
 }
 
 export type ModelsValues = Record<string, string>;
 
-function scalar(key: ScalarKey, row: string, family: Harness | null, kind: ModelsFieldKind): ModelsField {
+function scalar(key: ScalarKey, row: string, family: Harness | null, kind: ModelsFieldKind, validate?: (value: string) => string): ModelsField {
   return {
     key,
     row,
@@ -44,6 +57,18 @@ function scalar(key: ScalarKey, row: string, family: Harness | null, kind: Model
     kind,
     read: (s) => (s as unknown as Record<string, string | null | undefined>)[key],
     target: { scalar: key },
+    validate,
+  };
+}
+
+// The Claude helper lanes (judge, summary, task review) mirror ValidateClaudeLaneModel: the
+// shared model-ID syntax rules, then no Codex role id. The copy follows Run defaults'.
+function claudeHelperModel(skips: string): (value: string) => string {
+  return (value) => {
+    const syntax = modelFieldWarning(value);
+    if (syntax) return syntax;
+    const m = value.trim();
+    return CODEX_ROLE_MODELS.includes(m) ? `Not a Claude model: ${m} is a Codex model, so ${skips}. Choose Default to clear it.` : "";
   };
 }
 
@@ -51,7 +76,8 @@ function pinKey(stage: string, harness: string, member: string): string {
   return `cross_check_pins:${stage}/${harness}/${member}`;
 }
 
-/** pinField describes one member of a cross-check pin cell (the M2 rows). */
+/** pinField describes one member of a cross-check pin cell. A model member keeps the
+ *  checker's own family guard (custom IDs stay valid); efforts are a closed list. */
 export function pinField(row: string, stage: PinStage, harness: Harness, member: PinMember): ModelsField {
   return {
     key: pinKey(stage, harness, member),
@@ -60,10 +86,12 @@ export function pinField(row: string, stage: PinStage, harness: Harness, member:
     kind: member,
     read: (s) => s.cross_check_pins?.find((p) => p.stage === stage && p.harness === harness)?.[member],
     target: { pin: { stage, harness, member } },
+    normalize: normalizeCheckerValue,
+    validate: member === "model" ? (value) => checkerModelWarning(value, harness) : undefined,
   };
 }
 
-/** The M1 rows, in display order. */
+/** Every Models cell, in display order. */
 export const MODELS_FIELDS: readonly ModelsField[] = [
   scalar("default_harness", "Default harness", null, "harness"),
   scalar("default_claude_model", "Worker model", "claude", "model"),
@@ -74,11 +102,30 @@ export const MODELS_FIELDS: readonly ModelsField[] = [
   scalar("planning_codex_model", "Planning model", "codex", "model"),
   scalar("planning_claude_effort", "Planning effort", "claude", "effort"),
   scalar("planning_codex_effort", "Planning effort", "codex", "effort"),
+  scalar("judge_runs_on", "Judge runs on", null, "routing"),
+  scalar("judge_model", "Judge model", "claude", "model", claudeHelperModel("Claude judges skip it")),
+  scalar("codex_judge_model", "Judge model", "codex", "model", modelFieldWarning),
+  scalar("summary_model", "Summary model", "claude", "model", claudeHelperModel("Claude summaries skip it")),
+  scalar("codex_summary_model", "Summary model", "codex", "model"),
+  scalar("task_review_model", "Task review model", "claude", "model", claudeHelperModel("the server refuses this save")),
+  scalar("codex_task_review_model", "Task review model", "codex", "model"),
+  scalar("task_review_effort", "Task review effort", "claude", "effort"),
+  scalar("codex_task_review_effort", "Task review effort", "codex", "effort"),
+  pinField("Plan cross-check model", "plan", "claude", "model"),
+  pinField("Plan cross-check model", "plan", "codex", "model"),
+  pinField("Plan cross-check effort", "plan", "claude", "effort"),
+  pinField("Plan cross-check effort", "plan", "codex", "effort"),
+  pinField("Code cross-check model", "code", "claude", "model"),
+  pinField("Code cross-check model", "code", "codex", "model"),
+  pinField("Code cross-check effort", "code", "claude", "effort"),
+  pinField("Code cross-check effort", "code", "codex", "effort"),
 ];
 
-/** normalizeValue is the semantic form of a value: trimmed, with null/undefined as "" (Default). */
-export function normalizeValue(value: string | null | undefined): string {
-  return (value ?? "").trim();
+/** normalizeValue is the semantic form of a value: trimmed, with null/undefined as "" (Default).
+ *  Pass the field to use its own normalization (a checker pin's Unicode trim). */
+export function normalizeValue(value: string | null | undefined, field?: ModelsField): string {
+  const v = value ?? "";
+  return field?.normalize ? field.normalize(v) : v.trim();
 }
 
 /** fieldLabel is a field's accessible name, "<Row> — <Family>" (just the row without a family). */
@@ -90,20 +137,33 @@ export function fieldLabel(field: ModelsField): string {
 /** baselineFromSettings reads every field's stored value, normalized. */
 export function baselineFromSettings(settings: UserSettings, fields: readonly ModelsField[] = MODELS_FIELDS): ModelsValues {
   const values: ModelsValues = {};
-  for (const f of fields) values[f.key] = normalizeValue(f.read(settings));
+  for (const f of fields) values[f.key] = normalizeValue(f.read(settings), f);
   return values;
 }
 
 /** dirtyFields lists, in field order, every field whose draft differs semantically from the baseline. */
 export function dirtyFields(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): ModelsField[] {
-  return fields.filter((f) => normalizeValue(draft[f.key]) !== normalizeValue(baseline[f.key]));
+  return fields.filter((f) => normalizeValue(draft[f.key], f) !== normalizeValue(baseline[f.key], f));
+}
+
+/** localFieldWarnings maps each DIRTY field whose value its own validator refuses to that
+ *  warning. A stored value is never flagged: only an edit can be blocked. Dimmed cells are
+ *  validated like any other. */
+export function localFieldWarnings(baseline: ModelsValues, draft: ModelsValues, fields: readonly ModelsField[] = MODELS_FIELDS): Record<string, string> {
+  const warnings: Record<string, string> = {};
+  for (const f of dirtyFields(baseline, draft, fields)) {
+    const value = normalizeValue(draft[f.key], f);
+    const warning = value === "" || !f.validate ? "" : f.validate(draft[f.key] ?? "");
+    if (warning) warnings[f.key] = warning;
+  }
+  return warnings;
 }
 
 /** emptyCustomFields lists every model field whose picker is in "Other (custom model ID)" mode
  *  with an empty box, dirty or not: saving would send Default while the picker still shows Other,
  *  so the page blocks Save on any of them. */
 export function emptyCustomFields(draft: ModelsValues, customMode: Readonly<Record<string, boolean>>, fields: readonly ModelsField[] = MODELS_FIELDS): ModelsField[] {
-  return fields.filter((f) => f.kind === "model" && customMode[f.key] === true && normalizeValue(draft[f.key]) === "");
+  return fields.filter((f) => f.kind === "model" && customMode[f.key] === true && normalizeValue(draft[f.key], f) === "");
 }
 
 /** buildModelsPatch is the one save body: only dirty fields, trimmed, Default as null. Pin
@@ -112,7 +172,7 @@ export function buildModelsPatch(baseline: ModelsValues, draft: ModelsValues, fi
   const patch: ModelSettingsPatch = {};
   const pins: ModelSettingsPinPatch[] = [];
   for (const f of dirtyFields(baseline, draft, fields)) {
-    const value = normalizeValue(draft[f.key]) || null;
+    const value = normalizeValue(draft[f.key], f) || null;
     if ("scalar" in f.target) {
       patch[f.target.scalar] = value;
       continue;

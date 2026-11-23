@@ -9,7 +9,6 @@ import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type UserSettingsPatch } from "../lib/api";
-import { CrossCheckDefaults } from "../components/CrossCheckDefaults";
 import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import type { UserSettings, BindMode, EffortSettingCell, Harness, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
@@ -1180,7 +1179,12 @@ export function RunDefaults() {
           <span className="text-fg">Code cross-check · Advisory before publication</span>
         </label>
         <p id="code-cross-check-help" className="text-sm text-muted">Adds the other model family's findings to the merge request; never blocks it</p>
-        {committedSettings && <CrossCheckDefaults settings={committedSettings} />}
+        {/* PRD #3263 M2: the checker model and effort for each stage are saved with every other
+            model choice in Models; only the enables stay here. */}
+        <p className="text-sm text-muted">
+          Model and effort for each cross-check stage are set in{" "}
+          <Link to="/settings/models" className="underline underline-offset-2">Models</Link>.
+        </p>
       </Card>
 
       {/* PRD #35. Placed after Autopilot on purpose: the two compose, and this is the

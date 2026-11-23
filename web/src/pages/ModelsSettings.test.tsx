@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 //
-// PRD #3263 M1: the Models page against a stubbed API and a controllable viewer. One draft,
+// PRD #3263 M1 and M2: the Models page against a stubbed API and a controllable viewer. One draft,
 // one save request, server errors pinned to their cells, saved-vs-draft wording, reset
 // semantics, viewer fencing of late responses, failure reconciliation and pending-save
 // disabling. Every wait is event-driven (findBy/waitFor on rendered state), never a sleep.
@@ -8,13 +8,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { api, ApiError, type EffectiveSettings, type UserSettings } from "../lib/api";
+import type { CrossCheckPinDTO } from "../lib/apiTypes";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
 import { ModelsSettings } from "./ModelsSettings";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   return {
     ...actual,
-    api: { getMySettings: vi.fn(), getEffectiveSettings: vi.fn(), putMyModelSettings: vi.fn() },
+    // putMySettings is present only to prove the Models save never calls it.
+    api: { getMySettings: vi.fn(), getEffectiveSettings: vi.fn(), putMyModelSettings: vi.fn(), putMySettings: vi.fn() },
   };
 });
 
@@ -441,5 +444,377 @@ describe("viewer fencing", () => {
     await act(async () => pending.resolve({ settings: makeSettings({ default_codex_model: "gpt-6-sol" }), effective: makeEffective() }));
     expect(control("Worker model — Codex").value).toBe("gpt-6-astra");
     expect(within(bar()).queryByText(/Saved 1 change/)).toBeNull();
+  });
+});
+
+// ── PRD #3263 M2: helper and cross-check cells in the same draft and the same one save ──────
+
+const settingCell = (harness: "claude" | "codex", defaultModel: string, source = "builtin", model: string | null = null) => ({
+  harness, model, default_model: defaultModel, default_source: source, resolved_model: model ?? defaultModel, source: model ? "user_default" : source,
+});
+const pinDto = (stage: "plan" | "code", harness: "claude" | "codex", over: Partial<CrossCheckPinDTO> = {}): CrossCheckPinDTO => ({
+  stage, harness, model: null, effort: null,
+  worker_default_model: harness === "claude" ? "custom-template-model" : "gpt-6.1-sol",
+  resolved_model: harness === "claude" ? "custom-template-model" : "gpt-6.1-sol", resolved_effort: "high",
+  model_source: "worker default", effort_source: "cross-check default", active: true, ...over,
+});
+
+function helperSettings(over: Partial<UserSettings> = {}): UserSettings {
+  return makeSettings({
+    judge_models: [settingCell("claude", "opus", "instance_default"), settingCell("codex", "gpt-6.1-sol")],
+    summary_models: [settingCell("claude", "haiku"), settingCell("codex", "gpt-6-luna")],
+    task_review_models: [settingCell("claude", ""), settingCell("codex", "gpt-6-sol")],
+    task_review_efforts: [
+      { harness: "claude", effort: null, default_effort: "runtime", default_source: "user_default", resolved_effort: null, source: "user_default", mode: "runtime_default" },
+      { harness: "codex", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
+    ],
+    cross_check_pins: [pinDto("plan", "claude"), pinDto("plan", "codex"), pinDto("code", "claude"), pinDto("code", "codex")],
+    ...over,
+  });
+}
+
+function helperEffective(over: { judgeOn?: "claude" | "codex" | null; codexUsable?: boolean } = {}): EffectiveSettings {
+  const base = makeEffective();
+  const cell = (setting: string, harness: "claude" | "codex", resolved: string, source: string, notes: string[] = []) =>
+    ({ ...modelCell("worker_model", harness, resolved, source), setting, notes }) as EffectiveSettings["models"][number];
+  const xEffort = (setting: string, harness: "claude" | "codex") =>
+    ({ ...effortCell("worker_effort", harness, "high", "cross_check_default"), setting }) as EffectiveSettings["efforts"][number];
+  return {
+    ...base,
+    harnesses: base.harnesses.map((h) => (h.harness === "codex" ? { ...h, usable: over.codexUsable ?? false } : h)),
+    models: [
+      ...base.models,
+      cell("judge_model", "claude", "opus", "instance_default", over.judgeOn === "codex" ? ["not_used"] : []),
+      cell("judge_model", "codex", "gpt-6.1-sol", "builtin", over.judgeOn === "claude" ? ["not_used"] : []),
+      cell("summary_model", "claude", "haiku", "builtin"),
+      cell("summary_model", "codex", "gpt-6-luna", "builtin"),
+      cell("task_review_model", "claude", "", "builtin", ["sdk_default"]),
+      cell("task_review_model", "codex", "gpt-6-sol", "builtin"),
+    ],
+    efforts: [
+      ...base.efforts,
+      { ...effortCell("worker_effort", "claude", null, "user_default"), setting: "task_review_effort" } as EffectiveSettings["efforts"][number],
+      { ...effortCell("worker_effort", "codex", "medium", "builtin"), setting: "task_review_effort" } as EffectiveSettings["efforts"][number],
+    ],
+    cross_check: {
+      models: (["cross_check_plan", "cross_check_code"] as const).flatMap((s) => [
+        cell(s, "claude", "custom-template-model", "cross_check_worker_default"),
+        cell(s, "codex", "gpt-6.1-sol", "cross_check_worker_default"),
+      ]),
+      efforts: (["cross_check_plan", "cross_check_code"] as const).flatMap((s) => [xEffort(s, "claude"), xEffort(s, "codex")]),
+    },
+    judge_harness: over.judgeOn
+      ? { value: over.judgeOn, source: "user_default", fixed_at: "create", notes: [] }
+      : { value: null, source: "same_as_run", fixed_at: "create", notes: [] },
+  };
+}
+
+const HELPER_NAMES = [
+  "Judge runs on", "Judge model — Claude", "Judge model — Codex", "Summary model — Claude", "Summary model — Codex",
+  "Task review model — Claude", "Task review model — Codex", "Task review effort — Claude", "Task review effort — Codex",
+  "Plan cross-check model — Claude", "Plan cross-check model — Codex", "Plan cross-check effort — Claude", "Plan cross-check effort — Codex",
+  "Code cross-check model — Claude", "Code cross-check model — Codex", "Code cross-check effort — Claude", "Code cross-check effort — Codex",
+];
+const cellOf = (name: string) => control(name).closest("[data-field]") as HTMLElement;
+const options = (name: string) => Array.from(control(name).options).map((o) => o.value);
+
+describe("Models page — helper and cross-check rows (M2)", () => {
+  beforeEach(() => {
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings() });
+    mockApi.getEffectiveSettings.mockResolvedValue(helperEffective());
+  });
+
+  it("names every helper and checker control <Row> — <Family> with its saved effective value, and Summaries run on is read-only", async () => {
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    for (const name of HELPER_NAMES) {
+      expect(control(name).tagName, name).toBe("SELECT");
+      expect(describedText(name), name).toContain("Saved effective value:");
+    }
+    expect(describedText("Judge runs on")).toContain("Saved effective value: Same as the run");
+    expect(describedText("Judge model — Claude")).toContain("Saved effective value: opus · instance default");
+    expect(describedText("Task review model — Claude")).toContain("Saved effective value: the SDK decides · built-in");
+    expect(describedText("Task review effort — Claude")).toContain("Saved effective value: Runtime default · your choice");
+    expect(describedText("Plan cross-check model — Claude")).toContain("Saved effective value: custom-template-model · worker default");
+    expect(describedText("Code cross-check effort — Codex")).toContain("Saved effective value: high · cross-check default");
+    // Summaries run on: a fact with no control, explaining the run's engine and credential.
+    expect(screen.queryByLabelText("Summaries run on")).toBeNull();
+    const summaries = screen.getByRole("heading", { name: "Summaries run on" }).closest("[data-row]") as HTMLElement;
+    expect(within(summaries).queryByRole("combobox")).toBeNull();
+    expect(summaries.textContent).toContain("Same as the run");
+    expect(summaries.textContent).toContain("run’s own engine and credential");
+    // A missing credential is a reason, never a disabled control.
+    expect(describedText("Judge model — Codex")).toContain("No usable Codex credential");
+    for (const name of HELPER_NAMES) expect(control(name).disabled, name).toBe(false);
+  });
+
+  it("one Save sends exactly one PUT carrying exactly the changed helper, worker and pin keys, and no other save runs", async () => {
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: helperSettings(), effective: helperEffective() });
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    select("Worker model — Codex", "gpt-6-sol");
+    select("Judge runs on", "codex");
+    select("Judge model — Claude", "sonnet");
+    select("Summary model — Codex", "gpt-6-luna");
+    select("Summary model — Codex", "gpt-6-sol");
+    select("Task review effort — Codex", "runtime");
+    select("Code cross-check model — Codex", "gpt-6-astra");
+    select("Plan cross-check effort — Claude", "max");
+    expect(status()).toContain("7 unsaved changes");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText("Saved 7 changes. Your next runs use them.");
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1);
+    expect(mockApi.putMyModelSettings.mock.calls[0][0]).toEqual({
+      default_codex_model: "gpt-6-sol",
+      judge_runs_on: "codex",
+      judge_model: "sonnet",
+      codex_summary_model: "gpt-6-sol",
+      codex_task_review_effort: "runtime",
+      cross_check_pins: [
+        { stage: "plan", harness: "claude", effort: "max" },
+        { stage: "code", harness: "codex", model: "gpt-6-astra" },
+      ],
+    });
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /Save (judge|cross-check|Claude|Codex)/ })).toBeNull();
+  });
+
+  it("edits one cross-check member without touching its row, its stage sibling or the other family", async () => {
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: helperSettings(), effective: helperEffective() });
+    mount();
+    await screen.findByLabelText("Plan cross-check effort — Claude");
+    select("Plan cross-check effort — Claude", "low");
+    expect(status()).toBe("1 unsaved change: Plan cross-check effort — Claude");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ cross_check_pins: [{ stage: "plan", harness: "claude", effort: "low" }] });
+  });
+
+  it("dims the judge lane the DRAFT routing leaves unused, with a linked reason, and still saves its dirty value", async () => {
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: helperSettings({ judge_runs_on: "claude" }), effective: helperEffective({ judgeOn: "claude" }) });
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    // Same as the run: both lanes are in play.
+    expect(cellOf("Judge model — Claude").dataset.dimmed).toBeUndefined();
+    expect(cellOf("Judge model — Codex").dataset.dimmed).toBeUndefined();
+    expect(describedText("Judge runs on")).toContain("Claude runs use the Claude judge model, Codex runs the Codex model.");
+
+    select("Judge runs on", "claude");
+    expect(cellOf("Judge model — Codex").dataset.dimmed).toBe("true");
+    expect(cellOf("Judge model — Claude").dataset.dimmed).toBeUndefined();
+    const reasonId = (control("Judge model — Codex").getAttribute("aria-describedby") ?? "").split(" ").find((id) => id.endsWith("-not-used"))!;
+    expect(document.getElementById(reasonId)?.textContent).toBe("Not used: the judge runs on Claude");
+    expect(describedText("Judge runs on")).toContain("Every run is judged on Claude, so Codex runs get a Claude judge.");
+    // Dimmed, never disabled: the dormant lane is still edited, validated and saved.
+    expect(control("Judge model — Codex").disabled).toBe(false);
+    select("Judge model — Codex", "gpt-6-astra");
+    expect(describedText("Judge model — Codex")).toContain("Unsaved");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ judge_runs_on: "claude", codex_judge_model: "gpt-6-astra" });
+
+    // The saved routing now drives the dim; switching the draft to Codex moves it.
+    await waitFor(() => expect(status()).toBe("No unsaved changes"));
+    expect(describedText("Judge runs on")).toContain("Saved effective value: Claude · your setting");
+    expect(describedText("Judge model — Codex")).toContain("not used: the judge runs on the other harness");
+    select("Judge runs on", "codex");
+    expect(cellOf("Judge model — Claude").dataset.dimmed).toBe("true");
+    expect(describedText("Judge model — Claude")).toContain("Not used: the judge runs on Codex");
+    expect(cellOf("Judge model — Codex").dataset.dimmed).toBeUndefined();
+    select("Judge runs on", "");
+    expect(cellOf("Judge model — Claude").dataset.dimmed).toBeUndefined();
+  });
+
+  it("validates a dirty value in a dimmed lane and blocks Save on its cell", async () => {
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    select("Judge runs on", "codex");
+    select("Judge model — Claude", "custom");
+    fireEvent.change(screen.getByLabelText("Judge model — Claude, custom model ID"), { target: { value: "gpt-6-sol" } });
+    expect(cellOf("Judge model — Claude").dataset.dimmed).toBe("true");
+    expect(describedText("Judge model — Claude")).toContain("Not a Claude model: gpt-6-sol is a Codex model");
+    expect(control("Judge model — Claude").getAttribute("aria-invalid")).toBe("true");
+    expect(saveButton().disabled).toBe(true);
+    expect(status()).toContain("2 unsaved changes");
+  });
+
+  it("says where the judge is skipped when the drafted harness has no usable credential, without disabling it", async () => {
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    expect(describedText("Judge runs on")).not.toContain("no usable credential");
+    select("Judge runs on", "codex");
+    expect(describedText("Judge runs on")).toContain("Codex has no usable credential, so the judge is skipped until you add one. You can still save this choice.");
+    expect(control("Judge runs on").disabled).toBe(false);
+  });
+
+  it("pins helper and checker 400 errors to their cells by field and stage/harness/member", async () => {
+    const errors = [
+      { field: "codex_judge_model", message: "codex_judge_model: \"gpt-x\" is not a supported Codex model" },
+      { field: "cross_check_pins", message: "cross_check_pins[code/claude].effort: invalid effort", stage: "code" as const, harness: "claude" as const, member: "effort" as const },
+      { field: "task_review_effort", message: "task_review_effort: invalid effort" },
+    ];
+    mockApi.putMyModelSettings.mockRejectedValue(new ApiError(400, errors[0].message, { error: errors[0].message, field: errors[0].field, errors }));
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    select("Judge model — Codex", "gpt-6-astra");
+    select("Code cross-check effort — Claude", "max");
+    select("Task review effort — Claude", "high");
+    fireEvent.click(saveButton());
+    const alert = await within(bar()).findByRole("alert");
+    expect(alert.textContent).toContain("3 values need attention. Nothing was saved");
+    for (const [name, message] of [
+      ["Judge model — Codex", errors[0].message],
+      ["Code cross-check effort — Claude", errors[1].message],
+      ["Task review effort — Claude", errors[2].message],
+    ] as const) {
+      const errorId = (control(name).getAttribute("aria-describedby") ?? "").split(" ").find((id) => id.endsWith("-error"))!;
+      expect(document.getElementById(errorId)?.textContent, name).toBe(message);
+      expect(control(name).getAttribute("aria-invalid"), name).toBe("true");
+    }
+    // The neighbours are untouched: the other stage, the other family, the other member.
+    for (const name of ["Plan cross-check effort — Claude", "Code cross-check effort — Codex", "Code cross-check model — Claude", "Judge model — Claude"]) {
+      expect(control(name).hasAttribute("aria-invalid"), name).toBe(false);
+      expect(control(name).getAttribute("aria-describedby"), name).not.toContain("-error");
+    }
+    expect(control("Code cross-check effort — Claude").value).toBe("max");
+  });
+
+  it("keeps each catalog: curated Codex judge, Codex role models for summary and task review, custom IDs where allowed", async () => {
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    expect(options("Judge model — Codex")).toEqual(["inherit", ...CODEX_CURATED_MODELS]);
+    expect(options("Summary model — Codex")).toEqual(["inherit", ...CODEX_ROLE_MODELS]);
+    expect(options("Task review model — Codex")).toEqual(["inherit", ...CODEX_ROLE_MODELS]);
+    for (const name of ["Judge model — Claude", "Summary model — Claude", "Task review model — Claude"]) {
+      expect(options(name), name).toEqual(["inherit", "opus", "sonnet", "haiku", "fable", "custom"]);
+    }
+    for (const name of ["Plan cross-check model — Codex", "Code cross-check model — Claude", "Worker model — Codex"]) {
+      expect(options(name), name).toContain("custom");
+    }
+  });
+
+  it("accepts custom IDs for a checker and the Codex worker, trimmed, in the same save", async () => {
+    mockApi.putMyModelSettings.mockResolvedValue({ settings: helperSettings(), effective: helperEffective() });
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    select("Plan cross-check model — Codex", "custom");
+    fireEvent.change(screen.getByLabelText("Plan cross-check model — Codex, custom model ID"), { target: { value: "  arbitrary-codex-id  " } });
+    select("Worker model — Codex", "custom");
+    fireEvent.change(screen.getByLabelText("Worker model — Codex, custom model ID"), { target: { value: "codex-preview-x" } });
+    expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1));
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({
+      default_codex_model: "codex-preview-x",
+      cross_check_pins: [{ stage: "plan", harness: "codex", model: "arbitrary-codex-id" }],
+    });
+  });
+
+  it.each([
+    ["Code cross-check model — Claude", "gpt-6.1-sol"],
+    ["Code cross-check model — Codex", "sonnet"],
+  ])("guards %s against the other family while accepting a custom ID", async (name, invalid) => {
+    mount();
+    await screen.findByLabelText(name);
+    select(name, "custom");
+    const custom = screen.getByLabelText(`${name}, custom model ID`);
+    fireEvent.change(custom, { target: { value: invalid } });
+    expect(describedText(name)).toContain("Choose a model from the checker's model family.");
+    expect(control(name).getAttribute("aria-invalid")).toBe("true");
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.change(custom, { target: { value: "custom-checker" } });
+    expect(describedText(name)).not.toContain("model family");
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it.each(["opus", "two words", "x".repeat(101), "bad‮", "�", "é".repeat(51), "bad﻿", "a\u0085b", "a\u0001b"])(
+    "blocks the invalid checker model %j without sending anything",
+    async (value) => {
+      mount();
+      await screen.findByLabelText("Plan cross-check model — Codex");
+      select("Plan cross-check model — Codex", "custom");
+      fireEvent.change(screen.getByLabelText("Plan cross-check model — Codex, custom model ID"), { target: { value } });
+      expect(saveButton().disabled).toBe(true);
+      fireEvent.submit(saveButton().closest("form")!);
+      expect(mockApi.putMyModelSettings).not.toHaveBeenCalled();
+    },
+  );
+
+  it("labels task-review effort Default as following the worker effort (incl. Runtime default) from the server cell", async () => {
+    mount();
+    await screen.findByLabelText("Task review effort — Claude");
+    expect(control("Task review effort — Claude").options[0].text).toBe("Default · follows worker effort (Runtime default)");
+    expect(control("Task review effort — Codex").options[0].text).toBe("Default · follows worker effort (medium)");
+    expect(options("Task review effort — Claude")).toContain("runtime");
+    expect(control("Task review model — Claude").options[0].text).toBe("Default · SDK default (built-in)");
+    expect(control("Task review model — Codex").options[0].text).toBe("Default · gpt-6-sol (built-in)");
+    expect(control("Judge model — Claude").options[0].text).toBe("Default · opus (instance default)");
+  });
+
+  it("keeps the checker effort Default at the cross-check default, with no Runtime default, whatever the worker effort is", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({ default_effort: "runtime", default_codex_effort: "max" }) });
+    mount();
+    await screen.findByLabelText("Plan cross-check effort — Claude");
+    for (const name of ["Plan cross-check effort — Claude", "Plan cross-check effort — Codex", "Code cross-check effort — Claude", "Code cross-check effort — Codex"]) {
+      expect(control(name).options[0].text, name).toBe("Default · high (cross-check default)");
+      expect(options(name), name).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
+    }
+  });
+
+  it("labels the checker model Default from the stored pin's worker default, and follows it after a worker save", async () => {
+    const legacy = pinDto("code", "codex");
+    delete (legacy as Partial<CrossCheckPinDTO>).worker_default_model;
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({
+      cross_check_pins: [pinDto("plan", "claude", { worker_default_model: null }), pinDto("plan", "codex"), pinDto("code", "claude"), legacy],
+    }) });
+    mockApi.putMyModelSettings.mockResolvedValue({
+      settings: helperSettings({ default_claude_model: "haiku", cross_check_pins: [pinDto("plan", "claude", { worker_default_model: "haiku" })] }),
+      effective: helperEffective(),
+    });
+    mount();
+    await screen.findByLabelText("Plan cross-check model — Claude");
+    expect(control("Plan cross-check model — Claude").options[0].text).toBe("Default · SDK/account default (worker default)");
+    expect(control("Plan cross-check model — Codex").options[0].text).toBe("Default · gpt-6.1-sol (worker default)");
+    expect(control("Code cross-check model — Claude").options[0].text).toBe("Default · custom-template-model (worker default)");
+    expect(control("Code cross-check model — Codex").options[0].text).toBe("Default · Unavailable (worker default)");
+    select("Worker model — Claude", "haiku");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(control("Plan cross-check model — Claude").options[0].text).toBe("Default · haiku (worker default)"));
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ default_claude_model: "haiku" });
+  });
+
+  it("falls back to the saved settings cells for helper and checker predictions when the effective view is unavailable", async () => {
+    mockApi.getEffectiveSettings.mockRejectedValue(new ApiError(500, "boom"));
+    mockApi.getMySettings.mockResolvedValue({ settings: helperSettings({
+      judge_runs_on: "codex",
+      cross_check_pins: [pinDto("plan", "claude", { model: "sonnet", resolved_model: "sonnet", model_source: "pin", effort: "max", resolved_effort: "max", effort_source: "pin" })],
+    }) });
+    mount();
+    await screen.findByLabelText("Judge runs on");
+    expect(describedText("Worker model — Claude")).toContain("Saved effective value: Unavailable");
+    expect(describedText("Judge runs on")).toContain("Saved effective value: Codex · your setting");
+    expect(describedText("Summary model — Codex")).toContain("Saved effective value: gpt-6-luna · built-in");
+    expect(describedText("Task review effort — Claude")).toContain("Saved effective value: Runtime default · your choice");
+    expect(describedText("Plan cross-check model — Claude")).toContain("Saved effective value: sonnet · checker pin");
+    expect(describedText("Plan cross-check effort — Claude")).toContain("Saved effective value: max · checker pin");
+    // No stored pin for the code stage: nothing to fall back to.
+    expect(describedText("Code cross-check model — Claude")).toContain("Saved effective value: Unavailable");
+  });
+
+  it("a 400 on a retry after an unconfirmed save still says the earlier save is unconfirmed, and keeps Reload", async () => {
+    mockApi.putMyModelSettings.mockRejectedValueOnce(new ApiError(500, "may or may not", { reason: "settings_commit_unknown" }));
+    const errors = [{ field: "cross_check_pins", message: "cross_check_pins[plan/codex].model: invalid", stage: "plan" as const, harness: "codex" as const, member: "model" as const }];
+    mockApi.putMyModelSettings.mockRejectedValueOnce(new ApiError(400, errors[0].message, { error: errors[0].message, field: "cross_check_pins", errors }));
+    mount();
+    await screen.findByLabelText("Plan cross-check model — Codex");
+    select("Plan cross-check model — Codex", "gpt-6-astra");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText(/could not confirm whether this save was applied/);
+    fireEvent.click(saveButton());
+    const alert = await within(bar()).findByRole("alert");
+    expect(alert.textContent).toContain("1 value needs attention. Nothing was saved; your edits are still here. An earlier save is still unconfirmed; reload to see what is stored.");
+    expect(within(bar()).getByRole("button", { name: "Reload saved settings" })).toBeTruthy();
+    expect(describedText("Plan cross-check model — Codex")).toContain(errors[0].message);
+    expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(2);
   });
 });

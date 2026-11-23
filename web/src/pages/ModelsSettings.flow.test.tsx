@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 //
-// PRD #3263 M1, end to end in jsdom: the REAL App (AppShell, sidebar, command menu, route
+// PRD #3263 M1 and M2, end to end in jsdom: the REAL App (AppShell, sidebar, command menu, route
 // guards, AuthProvider) in a memory DATA router, as main.tsx mounts it, against the stateful
 // mockApi. Covers the settings flow (save, navigate away and back, invalid cell, injected write
 // failure) and the unsaved-changes guard (tab, sidebar, command menu, back/forward, logout, a
@@ -35,6 +35,10 @@ const RESET = {
   default_harness: null, default_claude_model: null, default_codex_model: null, default_effort: null,
   default_codex_effort: null, planning_claude_model: null, planning_claude_effort: null,
   planning_codex_model: null, planning_codex_effort: null,
+  judge_runs_on: null, judge_model: null, codex_judge_model: null, summary_model: null, codex_summary_model: null,
+  task_review_model: null, codex_task_review_model: null, task_review_effort: null, codex_task_review_effort: null,
+  cross_check_pins: (["plan", "code"] as const).flatMap((stage) =>
+    (["claude", "codex"] as const).map((harness) => ({ stage, harness, model: null, effort: null }))),
 };
 
 // Records whether the guard dialog EVER appeared, so "no dialog" also means "no flash".
@@ -148,16 +152,91 @@ describe("Models settings flow (stateful mock)", () => {
   }, 30000);
 });
 
+describe("Models settings flow: helper and cross-check cells (stateful mock)", () => {
+  it("saves helper, checker and worker cells in one save, and shows them again after leaving", async () => {
+    const put = vi.spyOn(mockApi, "putMyModelSettings");
+    const putSettings = vi.spyOn(mockApi, "putMySettings");
+    const router = await openModels();
+    select("Judge runs on", "codex");
+    select("Judge model — Claude", "sonnet");
+    select("Summary model — Codex", "gpt-6-luna");
+    select("Task review effort — Claude", "runtime");
+    select("Plan cross-check effort — Codex", "max");
+    select("Code cross-check model — Claude", "custom");
+    fireEvent.change(screen.getByLabelText("Code cross-check model — Claude, custom model ID"), { target: { value: "custom-claude-checker" } });
+    select("Worker effort — Codex", "low");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText("Saved 7 changes. Your next runs use them.", {}, { timeout: 5000 });
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(putSettings).not.toHaveBeenCalled();
+    const stored = (await mockApi.getMySettings()).settings;
+    expect(stored).toMatchObject({
+      judge_runs_on: "codex", judge_model: "sonnet", codex_summary_model: "gpt-6-luna",
+      task_review_effort: "runtime", default_codex_effort: "low",
+    });
+    expect(stored.cross_check_pins?.find((p) => p.stage === "plan" && p.harness === "codex")).toMatchObject({ model: null, effort: "max" });
+    expect(stored.cross_check_pins?.find((p) => p.stage === "code" && p.harness === "claude")).toMatchObject({ model: "custom-claude-checker", effort: null });
+
+    await act(() => router.navigate("/settings/appearance"));
+    expect(path(router)).toBe("/settings/appearance");
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Judge runs on", {}, { timeout: 5000 });
+    expect(control("Judge runs on").value).toBe("codex");
+    expect(control("Judge model — Claude").value).toBe("sonnet");
+    expect(control("Judge model — Claude").closest("[data-field]")?.getAttribute("data-dimmed")).toBe("true");
+    expect(control("Summary model — Codex").value).toBe("gpt-6-luna");
+    expect(control("Task review effort — Claude").value).toBe("runtime");
+    expect(control("Plan cross-check effort — Codex").value).toBe("max");
+    expect((screen.getByLabelText("Code cross-check model — Claude, custom model ID") as HTMLInputElement).value).toBe("custom-claude-checker");
+    expect(control("Worker effort — Codex").value).toBe("low");
+    expect(status()).toBe("No unsaved changes");
+    expect(dialogSeen).toBe(false);
+  }, 30000);
+
+  it("an invalid helper cell saves nothing: the error is on its cell, and every helper, pin and worker value is unchanged", async () => {
+    await mockApi.putMyModelSettings({ summary_model: "haiku", cross_check_pins: [{ stage: "code", harness: "codex", effort: "low" }] });
+    const before = (await mockApi.getMySettings()).settings;
+    const router = await openModels();
+    select("Summary model — Claude", "sonnet");
+    select("Code cross-check effort — Codex", "xhigh");
+    select("Worker model — Codex", "gpt-6-sol");
+    // The Codex task review lane is a closed list in the page, so drive the server-side refusal
+    // with a stored value only the server checks: a Claude alias sent through the patch.
+    const real = mockApi.putMyModelSettings.bind(mockApi);
+    vi.spyOn(mockApi, "putMyModelSettings").mockImplementationOnce((patch) => real({ ...patch, codex_task_review_model: "opus" }));
+    select("Task review model — Codex", "gpt-6-sol");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByRole("alert", {}, { timeout: 5000 });
+    const errorId = (control("Task review model — Codex").getAttribute("aria-describedby") ?? "").split(" ").find((id) => id.endsWith("-error"))!;
+    expect(document.getElementById(errorId)?.textContent).toContain("codex_task_review_model");
+    expect(control("Task review model — Codex").getAttribute("aria-invalid")).toBe("true");
+    expect(control("Summary model — Claude").hasAttribute("aria-invalid")).toBe(false);
+    expect((await mockApi.getMySettings()).settings).toEqual(before);
+
+    await act(() => router.navigate("/settings/appearance"));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+    await act(() => router.navigate("/settings/models"));
+    await screen.findByLabelText("Judge runs on", {}, { timeout: 5000 });
+    expect(control("Summary model — Claude").value).toBe("haiku");
+    expect(control("Code cross-check effort — Codex").value).toBe("low");
+    expect(control("Worker model — Codex").value).toBe("inherit");
+    expect(control("Task review model — Codex").value).toBe("inherit");
+  }, 30000);
+});
+
 describe("unsaved-changes guard", () => {
   it("tab click: Stay keeps the draft, Discard changes navigates", async () => {
     const router = await openModels();
     select("Worker model — Codex", "gpt-6-sol");
-    fireEvent.click(screen.getByRole("link", { name: "Run defaults" }));
+    // The settings tab comes first; the Cross-check group's note links to Run defaults too.
+    const tab = () => screen.getAllByRole("link", { name: "Run defaults" })[0];
+    fireEvent.click(tab());
     fireEvent.click(await screen.findByRole("button", { name: "Stay" }));
     await waitFor(() => expect(dialog()).toBeNull());
     expect(path(router)).toBe("/settings/models");
     expect(control("Worker model — Codex").value).toBe("gpt-6-sol");
-    fireEvent.click(screen.getByRole("link", { name: "Run defaults" }));
+    fireEvent.click(tab());
     fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
     await waitFor(() => expect(path(router)).toBe("/settings/run-defaults"));
   }, 30000);

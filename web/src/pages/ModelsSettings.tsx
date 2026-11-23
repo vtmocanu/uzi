@@ -9,7 +9,8 @@
 // live viewer before installing a response, so a late reply for an earlier request or viewer is
 // dropped.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import {
   api,
@@ -26,14 +27,16 @@ import {
   dirtyFields,
   emptyCustomFields,
   fieldLabel,
+  localFieldWarnings,
   mapFieldErrors,
   MODELS_FIELDS,
   type ModelsField,
   type ModelsValues,
 } from "../lib/modelsDraft";
 import { codexRuntimeDefaultLabel } from "../lib/modelSettings";
+import { CODEX_ROLE_MODELS } from "../lib/codexModels";
 import { SettingsShell } from "../components/SettingsShell";
-import { Alert, Button, Card, Select, Skeleton } from "../components/ui";
+import { Alert, Button, Card, cx, Select, Skeleton } from "../components/ui";
 import { ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { ClaudeIcon, OpenAIIcon } from "../components/icons";
@@ -41,23 +44,42 @@ import { ModelsCell, type ModelsCellIds } from "../components/models/ModelsCell"
 import { ModelsSaveBar, type SaveOutcome } from "../components/models/ModelsSaveBar";
 import { UnsavedModelsGuard } from "../components/models/UnsavedModelsGuard";
 import {
+  CHECKER_EFFORT_DEFAULT_LABEL,
+  checkerModelDefaultLabel,
+  harnessName,
   harnessReason,
+  helperModelDefaultLabel,
+  judgeNotUsedReason,
+  judgeRunsOnHelp,
   planningEffortDefaultLabel,
   planningModelDefaultLabel,
   predictionText,
+  taskReviewEffortDefaultLabel,
+  taskReviewModelDefaultLabel,
   workerEffortDefaultLabel,
   workerModelDefaultLabel,
 } from "../components/models/modelsLabels";
 
-// The grid's three-track template, shared by the header and every row so the columns align.
+// The grid's three-track template, shared by the headers and every row so the columns align.
 const ROW_GRID = "md:grid md:grid-cols-[minmax(9rem,13rem)_minmax(0,1fr)_minmax(0,1fr)] md:gap-x-6";
 
+// A row is a Claude/Codex pair, a routing choice spanning both columns (Judge runs on), or a
+// read-only fact with no control (Summaries run on). A `sub` row belongs to the routing row
+// above it: no rule between them, and a quieter name.
 interface RowDef {
   row: string;
-  description: string;
+  description: ReactNode;
+  type?: "pair" | "routing" | "fact";
+  sub?: boolean;
 }
 
-const GROUPS: { id: string; title: string; note: string; rows: RowDef[] }[] = [
+const RUN_DEFAULTS_LINK = (
+  <Link to="/settings/run-defaults" className="underline underline-offset-2 hover:text-fg">
+    Run defaults
+  </Link>
+);
+
+const GROUPS: { id: string; title: string; note: ReactNode; rows: RowDef[] }[] = [
   {
     id: "worker",
     title: "Worker runs",
@@ -74,6 +96,35 @@ const GROUPS: { id: string; title: string; note: string; rows: RowDef[] }[] = [
     rows: [
       { row: "Planning model", description: "Same as the run follows the run's worker model." },
       { row: "Planning effort", description: "Same as the run follows the run's effort, including the lead template's." },
+    ],
+  },
+  {
+    id: "helpers",
+    title: "Helper runs",
+    note: "Short jobs around a run, each on your own credential for the harness it runs on.",
+    rows: [
+      { row: "Judge runs on", type: "routing", description: "Where the judge reviews each finished run." },
+      { row: "Judge model", sub: true, description: "The model for each harness the judge may run on." },
+      { row: "Summaries run on", type: "fact", description: "The intent and plan summaries of every run." },
+      { row: "Summary model", sub: true, description: "Claude summaries also write the pull request description." },
+      { row: "Task review model", description: "The optional uzi handoff --review pass, on the harness of the task it reviews." },
+      { row: "Task review effort", description: "Default follows your worker effort for that family." },
+    ],
+  },
+  {
+    id: "cross-check",
+    title: "Cross-check",
+    note: (
+      <>
+        A checker from the other family reviews the lead: the Claude column checks Codex runs, the Codex
+        column Claude runs. Turn each check on or off in {RUN_DEFAULTS_LINK}.
+      </>
+    ),
+    rows: [
+      { row: "Plan cross-check model", description: "Reviews the plan before implementation starts." },
+      { row: "Plan cross-check effort", description: "Default is the cross-check default, not your worker effort." },
+      { row: "Code cross-check model", description: "Reviews the code before the merge request is published." },
+      { row: "Code cross-check effort", description: "Default is the cross-check default, not your worker effort." },
     ],
   },
 ];
@@ -102,7 +153,7 @@ export function ModelsSettings() {
 }
 
 function ModelsEditor({ viewerId }: { viewerId: string }) {
-  const { user } = useAuth();
+  const { user, judgeEnforcedByAdmin } = useAuth();
   const liveViewer = useRef<string | null>(user?.id ?? null);
   liveViewer.current = user?.id ?? null;
   const mounted = useRef(false);
@@ -172,6 +223,10 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // "Other (custom model ID)" with an empty box would otherwise save as Default while the
   // picker still shows Other, so any cell in that state, dirty or not, blocks Save with its own error.
   const customEmpty = useMemo(() => new Set(emptyCustomFields(draft, customMode).map((f) => f.key)), [customMode, draft]);
+  // A dirty value its own validator refuses (a Codex id in a Claude helper lane, the other
+  // family's model in a checker) blocks Save on its cell, dimmed or not.
+  const localWarnings = useMemo(() => localFieldWarnings(baseline, draft), [baseline, draft]);
+  const blocked = useMemo(() => new Set([...customEmpty, ...Object.keys(localWarnings)]), [customEmpty, localWarnings]);
 
   const setValue = (key: string, value: string) => {
     setDraft((d) => ({ ...d, [key]: value }));
@@ -194,7 +249,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
   const save = async (e?: FormEvent) => {
     e?.preventDefault();
-    if (busy || dirty.length === 0 || customEmpty.size > 0) return;
+    if (busy || dirty.length === 0 || blocked.size > 0) return;
     const seq = ++requestSeq.current;
     const count = dirty.length;
     setSaving(true);
@@ -290,14 +345,19 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     settings.effort_settings?.find((c) => c.harness === h) ??
     effective?.efforts?.find((c) => c.setting === "worker_effort" && c.harness === h);
 
+  // The judge's routing as DRAFTED: dimming follows the select before it is saved.
+  const judgeRunsOn = draft.judge_runs_on ?? "";
+
   const cellProps = (field: ModelsField) => ({
     field,
     idBase: idFor(field),
     dirty: dirtyKeys.has(field.key),
-    prediction: predictionText(field, effective),
+    prediction: predictionText(field, effective, settings),
     reason: field.family ? harnessReason(field.family, effective) : null,
+    notUsed: judgeNotUsedReason(field, judgeRunsOn),
     error:
       fieldErrors[field.key] ??
+      localWarnings[field.key] ??
       (customEmpty.has(field.key)
         ? field.row.startsWith("Planning")
           ? "Enter a custom model ID, or choose Same as the run."
@@ -305,48 +365,136 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         : null),
   });
 
-  const modelControl = (field: ModelsField, ids: ModelsCellIds) => {
-    const codex = field.family === "codex";
-    const planning = field.row.startsWith("Planning");
-    const cell = planning ? settings.planning_models?.find((c) => c.harness === field.family) : workerModelCell(field.family!);
-    return (
-      <ModelSelect
-        key={pickerGeneration}
-        id={ids.control}
-        value={draft[field.key] ?? ""}
-        onChange={(v) => setValue(field.key, v)}
-        harness={field.family!}
-        allowCustom={codex ? true : undefined}
-        defaultLabel={planning ? planningModelDefaultLabel(cell) : workerModelDefaultLabel(field.family!, cell)}
-        customAriaLabel={`${fieldLabel(field)}, custom model ID`}
-        ariaDescribedBy={ids.describedBy}
-        onCustomModeChange={(custom) => setCustomMode((m) => (m[field.key] === custom ? m : { ...m, [field.key]: custom }))}
-      />
-    );
+  const pinOf = (field: ModelsField) =>
+    "pin" in field.target
+      ? settings.cross_check_pins?.find((p) => "pin" in field.target && p.stage === field.target.pin.stage && p.harness === field.target.pin.harness)
+      : undefined;
+  const cellFor = <T extends { harness: string }>(cells: readonly T[] | null | undefined, h: string) => cells?.find((c) => c.harness === h);
+
+  // Each row keeps the catalog and Default its Run defaults card had: worker Codex and the
+  // checkers accept a custom ID; the Codex judge is the curated set only; the Codex summary and
+  // task-review lanes are the Codex role models; the Claude lanes keep the Claude aliases plus a
+  // custom ID, guarded by the field's own validator.
+  const modelPicker = (field: ModelsField): { defaultLabel: string; allowCustom?: boolean; models?: readonly string[] } => {
+    const h = field.family!;
+    const codex = h === "codex";
+    if ("pin" in field.target) return { defaultLabel: checkerModelDefaultLabel(h, pinOf(field)), allowCustom: true };
+    switch (field.row) {
+      case "Planning model":
+        return { defaultLabel: planningModelDefaultLabel(cellFor(settings.planning_models, h)), allowCustom: codex ? true : undefined };
+      case "Judge model":
+        return { defaultLabel: helperModelDefaultLabel(cellFor(settings.judge_models, h)), allowCustom: codex ? false : undefined };
+      case "Summary model":
+        return { defaultLabel: helperModelDefaultLabel(cellFor(settings.summary_models, h)), models: codex ? CODEX_ROLE_MODELS : undefined };
+      case "Task review model":
+        return { defaultLabel: taskReviewModelDefaultLabel(h, cellFor(settings.task_review_models, h)), models: codex ? CODEX_ROLE_MODELS : undefined };
+      default:
+        return { defaultLabel: workerModelDefaultLabel(h, workerModelCell(h)), allowCustom: codex ? true : undefined };
+    }
   };
 
-  const effortControl = (field: ModelsField, ids: ModelsCellIds) => {
-    const planning = field.row.startsWith("Planning");
+  const modelControl = (field: ModelsField, ids: ModelsCellIds) => (
+    <ModelSelect
+      key={pickerGeneration}
+      id={ids.control}
+      value={draft[field.key] ?? ""}
+      onChange={(v) => setValue(field.key, v)}
+      harness={field.family!}
+      {...modelPicker(field)}
+      customAriaLabel={`${fieldLabel(field)}, custom model ID`}
+      ariaDescribedBy={ids.describedBy}
+      onCustomModeChange={(custom) => setCustomMode((m) => (m[field.key] === custom ? m : { ...m, [field.key]: custom }))}
+    />
+  );
+
+  // Effort Defaults: planning is Same as the run and has no Runtime default (the server refuses
+  // it); task review follows the worker effort and keeps Runtime default; a checker's Default is
+  // the cross-check default and, like planning, offers no Runtime default.
+  const effortPicker = (field: ModelsField): { defaultLabel: string; runtimeLabel?: string } => {
     const h = field.family!;
-    return (
-      <EffortSelect
-        id={ids.control}
-        value={draft[field.key] ?? ""}
-        onChange={(v) => setValue(field.key, v)}
-        ariaDescribedBy={ids.describedBy}
-        defaultLabel={
-          planning
-            ? planningEffortDefaultLabel(settings.planning_efforts?.find((c) => c.harness === h))
-            : workerEffortDefaultLabel(effortCell(h))
-        }
-        // Planning effort has no Runtime default (the server refuses it); the worker lanes
-        // keep it distinct from Default.
-        runtimeLabel={
-          planning ? undefined : h === "codex" ? codexRuntimeDefaultLabel(settings.effort_settings?.find((c) => c.harness === "codex")) : "Runtime default · value not reported"
-        }
-      />
-    );
+    if ("pin" in field.target) return { defaultLabel: CHECKER_EFFORT_DEFAULT_LABEL };
+    switch (field.row) {
+      case "Planning effort":
+        return { defaultLabel: planningEffortDefaultLabel(cellFor(settings.planning_efforts, h)) };
+      case "Task review effort":
+        return { defaultLabel: taskReviewEffortDefaultLabel(cellFor(settings.task_review_efforts, h)), runtimeLabel: "Runtime default" };
+      default:
+        return {
+          defaultLabel: workerEffortDefaultLabel(effortCell(h)),
+          runtimeLabel: h === "codex" ? codexRuntimeDefaultLabel(cellFor(settings.effort_settings, "codex")) : "Runtime default · value not reported",
+        };
+    }
   };
+
+  const effortControl = (field: ModelsField, ids: ModelsCellIds) => (
+    <EffortSelect
+      id={ids.control}
+      value={draft[field.key] ?? ""}
+      onChange={(v) => setValue(field.key, v)}
+      ariaDescribedBy={ids.describedBy}
+      {...effortPicker(field)}
+    />
+  );
+
+  // Judge runs on: what the drafted choice does, a credential fact for an explicit harness, and,
+  // when the judge is off, where to turn it on. None of them disables the select.
+  const judgeField = fieldFor("Judge runs on", null);
+  const judgeOnHarness = judgeRunsOn === "claude" || judgeRunsOn === "codex" ? judgeRunsOn : null;
+  const judgeUnusable = judgeOnHarness ? effective?.harnesses?.find((x) => x.harness === judgeOnHarness)?.usable === false : false;
+  const judgeOff = user?.judge_enabled === false && !judgeEnforcedByAdmin;
+  const routingCell = (
+    <ModelsCell
+      {...cellProps(judgeField)}
+      reason={
+        judgeUnusable && judgeOnHarness
+          ? `${harnessName(judgeOnHarness)} has no usable credential, so the judge is skipped until you add one. You can still save this choice.`
+          : null
+      }
+      note={
+        <>
+          {judgeRunsOnHelp(judgeRunsOn)}
+          {judgeOff && <> The judge is off for your runs; turn it on in {RUN_DEFAULTS_LINK}.</>}
+        </>
+      }
+      wide
+    >
+      {(ids) => (
+        <Select
+          id={ids.control}
+          aria-describedby={ids.describedBy}
+          className="max-w-sm"
+          value={judgeRunsOn}
+          onChange={(e) => setValue(judgeField.key, e.target.value)}
+        >
+          <option value="">Same as the run</option>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </Select>
+      )}
+    </ModelsCell>
+  );
+
+  // Summaries run on is a fact, not a setting: summaries run inline on the run's own engine and
+  // credential (#4156 tracks a choice), so it reads like a cell but offers no control.
+  const summaryRoutingFact = (
+    <div className="min-w-0 space-y-1.5 border-l-2 border-transparent pl-3 md:col-span-2">
+      <p className="text-sm text-fg">Same as the run</p>
+      <p className="max-w-prose text-xs text-faint">
+        Summaries run on the run&rsquo;s own engine and credential: Claude runs use the Claude summary model,
+        Codex runs the Codex one. Choosing another engine is not available yet.
+      </p>
+    </div>
+  );
+
+  const pairCells = (row: string) =>
+    (["claude", "codex"] as const).map((h) => {
+      const field = fieldFor(row, h);
+      return (
+        <ModelsCell key={field.key} {...cellProps(field)}>
+          {(ids) => (field.kind === "model" ? modelControl(field, ids) : effortControl(field, ids))}
+        </ModelsCell>
+      );
+    });
 
   const harnessField = fieldFor("Default harness", null);
   const dirtyRows = dirty.map(fieldLabel);
@@ -397,42 +545,43 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
             </ModelsCell>
           </div>
 
-          {/* Column headers: visual only (each control names its family itself), and hidden
-              where the cells stack and carry their own family label. */}
-          <div aria-hidden="true" className={`hidden pt-6 pb-2 ${ROW_GRID}`}>
-            <span />
-            {(["claude", "codex"] as const).map((h) => (
-              <span key={h} className="flex items-center gap-2 border-l-2 border-transparent pl-3 text-sm font-semibold text-fg">
-                {h === "claude" ? <ClaudeIcon className="h-4 w-4 text-brand-claude" /> : <OpenAIIcon className="h-4 w-4" />}
-                {h === "claude" ? "Claude" : "Codex"}
-              </span>
-            ))}
-          </div>
-
           {GROUPS.map((group) => (
-            <div key={group.title} role="group" aria-labelledby={`models-group-${group.id}`} className="pt-4">
+            <div key={group.title} role="group" aria-labelledby={`models-group-${group.id}`} className="pt-6">
               <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 pb-2">
                 <h3 id={`models-group-${group.id}`} className="text-sm font-semibold text-fg">
                   {group.title}
                 </h3>
-                <p className="text-xs text-faint">{group.note}</p>
+                <p className="max-w-prose text-xs text-faint">{group.note}</p>
               </div>
-              {group.rows.map(({ row, description }) => (
-                <div key={row} data-row={row} className={`border-t border-edge py-4 ${ROW_GRID}`}>
-                  <div className="mb-3 md:mb-0">
-                    <h4 className="text-sm font-medium text-fg">{row}</h4>
+              {/* Column headers, repeated per group so a long grid never loses its columns:
+                  visual only (each control names its family itself), and hidden where the
+                  cells stack and carry their own family label. */}
+              <div aria-hidden="true" className={`hidden pb-2 ${ROW_GRID}`}>
+                <span />
+                {(["claude", "codex"] as const).map((h) => (
+                  <span key={h} className="flex items-center gap-2 border-l-2 border-transparent pl-3 text-xs font-semibold text-muted">
+                    {h === "claude" ? <ClaudeIcon className="h-3.5 w-3.5 text-brand-claude" /> : <OpenAIIcon className="h-3.5 w-3.5" />}
+                    {harnessName(h)}
+                  </span>
+                ))}
+              </div>
+              {group.rows.map(({ row, description, type = "pair", sub }) => (
+                <div
+                  key={row}
+                  data-row={row}
+                  className={`${sub ? "pt-1 pb-4" : type === "pair" ? "border-t border-edge py-4" : "border-t border-edge pt-4 pb-3"} ${ROW_GRID}`}
+                >
+                  <div className={cx("mb-3 md:mb-0", sub && "md:pl-3")}>
+                    <h4 className={cx("text-sm", sub ? "text-muted" : "font-medium text-fg")}>{row}</h4>
                     <p className="text-xs text-faint">{description}</p>
                   </div>
-                  <div className="space-y-4 md:contents">
-                    {(["claude", "codex"] as const).map((h) => {
-                      const field = fieldFor(row, h);
-                      return (
-                        <ModelsCell key={field.key} {...cellProps(field)}>
-                          {(ids) => (field.kind === "model" ? modelControl(field, ids) : effortControl(field, ids))}
-                        </ModelsCell>
-                      );
-                    })}
-                  </div>
+                  {type === "routing" ? (
+                    routingCell
+                  ) : type === "fact" ? (
+                    summaryRoutingFact
+                  ) : (
+                    <div className="space-y-4 md:contents">{pairCells(row)}</div>
+                  )}
                 </div>
               ))}
             </div>
@@ -443,7 +592,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         dirtyRows={dirtyRows}
         saving={saving}
         busy={busy}
-        blockedCount={customEmpty.size}
+        blockedCount={blocked.size}
         outcome={outcome}
         reloading={reloading}
         uncertain={uncertainty !== null}

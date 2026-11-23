@@ -6,6 +6,7 @@ import {
   dirtyFields,
   emptyCustomFields,
   fieldLabel,
+  localFieldWarnings,
   mapFieldErrors,
   MODELS_FIELDS,
   normalizeValue,
@@ -20,15 +21,84 @@ const settings = (over: Partial<UserSettings> = {}): UserSettings =>
   }) as UserSettings;
 
 describe("MODELS_FIELDS", () => {
-  it("describes exactly the nine M1 cells, each named <Row> — <Family>", () => {
+  it("describes every Models cell in grid order, each named <Row> — <Family>", () => {
     expect(MODELS_FIELDS.map((f) => f.key)).toEqual([
       "default_harness", "default_claude_model", "default_codex_model", "default_effort", "default_codex_effort",
       "planning_claude_model", "planning_codex_model", "planning_claude_effort", "planning_codex_effort",
+      "judge_runs_on", "judge_model", "codex_judge_model", "summary_model", "codex_summary_model",
+      "task_review_model", "codex_task_review_model", "task_review_effort", "codex_task_review_effort",
+      "cross_check_pins:plan/claude/model", "cross_check_pins:plan/codex/model",
+      "cross_check_pins:plan/claude/effort", "cross_check_pins:plan/codex/effort",
+      "cross_check_pins:code/claude/model", "cross_check_pins:code/codex/model",
+      "cross_check_pins:code/claude/effort", "cross_check_pins:code/codex/effort",
     ]);
     expect(MODELS_FIELDS.map(fieldLabel)).toEqual([
       "Default harness", "Worker model — Claude", "Worker model — Codex", "Worker effort — Claude", "Worker effort — Codex",
       "Planning model — Claude", "Planning model — Codex", "Planning effort — Claude", "Planning effort — Codex",
+      "Judge runs on", "Judge model — Claude", "Judge model — Codex", "Summary model — Claude", "Summary model — Codex",
+      "Task review model — Claude", "Task review model — Codex", "Task review effort — Claude", "Task review effort — Codex",
+      "Plan cross-check model — Claude", "Plan cross-check model — Codex", "Plan cross-check effort — Claude", "Plan cross-check effort — Codex",
+      "Code cross-check model — Claude", "Code cross-check model — Codex", "Code cross-check effort — Claude", "Code cross-check effort — Codex",
     ]);
+  });
+
+  it("sends a mixed helper, worker and pin draft as one patch with exactly the changed keys", () => {
+    const base = baselineFromSettings(settings({
+      cross_check_pins: [{ stage: "code", harness: "codex", model: "gpt-6-sol", effort: "max" } as never],
+    }));
+    const draft = {
+      ...base,
+      default_codex_model: "gpt-6-sol",
+      judge_runs_on: "claude",
+      codex_judge_model: "gpt-6-astra",
+      task_review_effort: "runtime",
+      "cross_check_pins:plan/claude/effort": "low",
+      "cross_check_pins:code/codex/model": "",
+    };
+    expect(buildModelsPatch(base, draft)).toEqual({
+      default_codex_model: "gpt-6-sol",
+      judge_runs_on: "claude",
+      codex_judge_model: "gpt-6-astra",
+      task_review_effort: "runtime",
+      cross_check_pins: [
+        { stage: "plan", harness: "claude", effort: "low" },
+        { stage: "code", harness: "codex", model: null },
+      ],
+    });
+  });
+});
+
+describe("localFieldWarnings", () => {
+  it("flags only dirty values its own validator refuses, dormant judge lanes included", () => {
+    const base = baselineFromSettings(settings({ summary_model: "gpt-6-sol" }));
+    // A stored refused value is not flagged: only an edit can be blocked.
+    expect(localFieldWarnings(base, base)).toEqual({});
+    const draft = {
+      ...base,
+      judge_runs_on: "codex",
+      judge_model: "gpt-6.1-sol", // the dormant Claude lane is still validated
+      task_review_model: "two words",
+      "cross_check_pins:plan/claude/model": "gpt-6-sol",
+      "cross_check_pins:code/codex/model": "sonnet",
+      "cross_check_pins:plan/codex/model": "custom-codex-checker",
+      default_claude_model: "gpt-6-sol", // the worker lanes are left to the server
+    };
+    const warnings = localFieldWarnings(base, draft);
+    expect(Object.keys(warnings)).toEqual([
+      "judge_model", "task_review_model", "cross_check_pins:plan/claude/model", "cross_check_pins:code/codex/model",
+    ]);
+    expect(warnings.judge_model).toBe("Not a Claude model: gpt-6.1-sol is a Codex model, so Claude judges skip it. Choose Default to clear it.");
+    expect(warnings.task_review_model).toBe("Model must be a single token with no spaces.");
+    expect(warnings["cross_check_pins:code/codex/model"]).toBe("Choose a model from the checker's model family.");
+  });
+
+  it("trims a checker pin as the server does (Unicode White_Space), so U+FEFF is refused, not trimmed away", () => {
+    const base = baselineFromSettings(settings());
+    const key = "cross_check_pins:plan/codex/model";
+    expect(localFieldWarnings(base, { ...base, [key]: "bad\uFEFF" })).toEqual({ [key]: "Invalid model ID." });
+    expect(buildModelsPatch(base, { ...base, [key]: "\u2003custom-id\u2003" })).toEqual({
+      cross_check_pins: [{ stage: "plan", harness: "codex", model: "custom-id" }],
+    });
   });
 });
 

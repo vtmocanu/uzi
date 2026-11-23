@@ -1144,16 +1144,11 @@ function stageSettingsPatch(base: UserSettings, patch: UserSettingsPatch): UserS
     next = { ...next, planning_claude_effort: mockPlanningEffort(patch.planning_claude_effort) };
   }
   if (patch.judge_model !== undefined) {
-    // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with
-    // internal whitespace is rejected, mirroring the server's ValidateModel.
+    // Blank clears to inherit; otherwise validateClaudeJudgeModel's ValidateClaudeLaneModel
+    // (the byte cap, no control/format characters or whitespace, no Codex role id, PRD #3245).
     const trimmed = patch.judge_model?.trim() ?? "";
-    if (trimmed !== "" && /\s/.test(trimmed)) {
-      throw new ApiError(400, "judge_model must be a single token with no spaces");
-    }
-    // The Claude-lane guard (PRD #3245), mirroring validateClaudeJudgeModel.
-    if (CODEX_ROLE_MODELS.includes(trimmed)) {
-      throw new ApiError(400, "judge_model: model is a Codex model id");
-    }
+    const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+    if (modelError !== "") throw new ApiError(400, `judge_model: ${modelError}`);
     next = { ...next, judge_model: trimmed === "" ? null : trimmed };
   }
   if (patch.codex_judge_model !== undefined) {
@@ -1166,16 +1161,10 @@ function stageSettingsPatch(base: UserSettings, patch: UserSettingsPatch): UserS
     next = { ...next, codex_judge_model: trimmed === "" ? null : trimmed };
   }
   if (patch.summary_model !== undefined) {
-    // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with
-    // internal whitespace is rejected, mirroring the server's ValidateModel.
+    // Same rules as judge_model (PRD #362 M2, PRD #3248): the server's Claude-lane validator.
     const trimmed = patch.summary_model?.trim() ?? "";
-    if (trimmed !== "" && /\s/.test(trimmed)) {
-      throw new ApiError(400, "summary_model must be a single token with no spaces");
-    }
-    // The Claude-lane guard (PRD #3248), like judge_model above.
-    if (CODEX_ROLE_MODELS.includes(trimmed)) {
-      throw new ApiError(400, "summary_model: model is a Codex model id");
-    }
+    const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+    if (modelError !== "") throw new ApiError(400, `summary_model: ${modelError}`);
     next = { ...next, summary_model: trimmed === "" ? null : trimmed };
   }
   if (patch.codex_summary_model !== undefined) {

@@ -1,8 +1,12 @@
 // One cell of the Models grid (PRD #3263): a family's control for one row, its saved
-// prediction, an optional reason, and an optional field error, each wired to the control
-// through aria-describedby. The prediction line is the grid's signature: it always says what
-// is SAVED ("Saved effective value: …"), and a draft that differs from it marks the cell
+// prediction, an optional note, reason, Not used reason and field error, each wired to the
+// control through aria-describedby. The prediction line is the grid's signature: it always says
+// what is SAVED ("Saved effective value: …"), and a draft that differs from it marks the cell
 // Unsaved with a brand rail and border rather than pretending to predict the unsaved edit.
+//
+// A cell the draft routing leaves unused (the Codex judge model while the judge runs on Claude)
+// is DIMMED, never disabled: its control drops to reduced emphasis until it is hovered or holds
+// focus, it keeps its stored and draft values, and it is validated and saved like any other.
 
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 import type { ModelsField } from "../../lib/modelsDraft";
@@ -20,6 +24,8 @@ export function ModelsCell({
   dirty,
   prediction,
   reason,
+  note,
+  notUsed,
   error,
   wide = false,
   children,
@@ -30,6 +36,10 @@ export function ModelsCell({
   /** The saved prediction, or null when it is unavailable. */
   prediction: string | null;
   reason?: string | null;
+  /** Neutral context for the control (what a routing choice does, where a toggle lives). */
+  note?: ReactNode;
+  /** Why the draft leaves this cell unused; dims the control and is read as its description. */
+  notUsed?: string | null;
   error?: string | null;
   /** Spans both family columns (a row with one control). */
   wide?: boolean;
@@ -39,7 +49,11 @@ export function ModelsCell({
   const predictionId = `${idBase}-saved`;
   const reasonId = `${idBase}-reason`;
   const errorId = `${idBase}-error`;
-  const describedBy = [predictionId, reason ? reasonId : "", error ? errorId : ""].filter(Boolean).join(" ");
+  const noteId = `${idBase}-note`;
+  const notUsedId = `${idBase}-not-used`;
+  const describedBy = [predictionId, notUsed ? notUsedId : "", note ? noteId : "", reason ? reasonId : "", error ? errorId : ""]
+    .filter(Boolean)
+    .join(" ");
   const family = field.family ? harnessName(field.family) : null;
   const root = useRef<HTMLDivElement>(null);
   // An errored cell marks its controls aria-invalid. ModelSelect and EffortSelect are shared
@@ -56,6 +70,7 @@ export function ModelsCell({
       ref={root}
       data-field={field.key}
       data-dirty={dirty ? "true" : undefined}
+      data-dimmed={notUsed ? "true" : undefined}
       className={cx(
         // scroll-mb keeps a keyboard-focused control clear of the sticky Save bar.
         "min-w-0 space-y-1.5 border-l-2 pl-3 transition-colors motion-reduce:transition-none [&_input]:scroll-mb-40 [&_select]:scroll-mb-40",
@@ -84,7 +99,15 @@ export function ModelsCell({
           field.row
         )}
       </label>
-      {children({ control, describedBy })}
+      {notUsed ? (
+        // Hover or focus restores full emphasis, so a keyboard user editing a dormant choice
+        // sees the control (and its focus ring) at full contrast.
+        <div className="opacity-45 transition-opacity hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none">
+          {children({ control, describedBy })}
+        </div>
+      ) : (
+        children({ control, describedBy })
+      )}
       <p id={predictionId} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-faint">
         <span>
           Saved effective value:{" "}
@@ -96,6 +119,16 @@ export function ModelsCell({
           </span>
         )}
       </p>
+      {notUsed && (
+        <p id={notUsedId} className="text-xs text-muted">
+          {notUsed}
+        </p>
+      )}
+      {note && (
+        <p id={noteId} className="text-xs text-faint">
+          {note}
+        </p>
+      )}
       {reason && (
         <p id={reasonId} className="text-xs text-warn">
           {reason}

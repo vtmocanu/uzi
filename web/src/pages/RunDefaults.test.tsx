@@ -14,7 +14,6 @@ import { api, ApiError, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import type { ModelSettingCell, UserSettings } from "../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
-import { mockTemplates } from "../mocks/data";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -58,15 +57,6 @@ vi.mock("../lib/api", async (importActual) => {
       testMySlackDM: vi.fn(),
     },
   };
-});
-// Observe the public parent/child settings seam while rendering the real grid.
-const deliveredSettings = vi.hoisted(() => vi.fn<(settings: UserSettings) => void>());
-vi.mock("../components/CrossCheckDefaults", async importActual => {
-  const actual = await importActual<typeof import("../components/CrossCheckDefaults")>();
-  return { ...actual, CrossCheckDefaults: (props: Parameters<typeof actual.CrossCheckDefaults>[0]) => {
-    deliveredSettings(props.settings);
-    return <actual.CrossCheckDefaults {...props} />;
-  } };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
@@ -2052,190 +2042,21 @@ it("usage-limit provider regression #2360: shared default has neutral copy", () 
   expect((screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement).checked).toBe(false);
 });
 
-describe("B1 independent settings responses", () => {
-  const initial: UserSettings = {
-    default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_claude_model: "opus", default_codex_model: "gpt-6.1-sol",
-    default_effort: "low", default_codex_effort: "low", judge_model: null, summary_model: null,
-    appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-    cross_check_pins: [
-      { stage: "plan", harness: "claude", model: null, effort: null, worker_default_model: "opus", resolved_model: "opus",
-        resolved_effort: "low", model_source: "worker default", effort_source: "worker default", active: false },
-      { stage: "plan", harness: "codex", model: null, effort: null, worker_default_model: "gpt-6.1-sol", resolved_model: "gpt-6.1-sol", resolved_effort: "low", model_source: "worker default", effort_source: "worker default", active: true },
-    ],
-  };
-  const modelResponse = (response: Partial<UserSettings>): UserSettings => ({ ...initial, ...response,
-    cross_check_pins: initial.cross_check_pins!.map(cell => ({ ...cell,
-      worker_default_model: response.cross_check_pins?.find(p => p.harness === cell.harness)?.worker_default_model === null ? null : cell.harness === "claude" ? ("default_claude_model" in response ? response.default_claude_model ?? "template-inherited" : "opus")
-        : response.default_codex_model ?? "gpt-6.1-sol",
-      resolved_model: "stale-pin-hint", resolved_effort: "stale-effort-hint", model_source: "pin" as const, active: !cell.active,
-    })).reverse(),
-  });
-  const currentSettings = () => deliveredSettings.mock.calls[deliveredSettings.mock.calls.length - 1][0];
-  const expectHints = (response?: Partial<UserSettings>) => {
-    const metadata = response ? modelResponse(response).cross_check_pins! : initial.cross_check_pins!;
-    expect(currentSettings().cross_check_pins).toEqual(initial.cross_check_pins!.map(cell => ({ ...cell,
-      worker_default_model: metadata.find(p => p.harness === cell.harness)!.worker_default_model,
-    })));
-  };
-  const cases = [
-    { name: "model", label: "Claude model", value: "haiku", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: "haiku", default_codex_model: "gpt-6.1-sol" },
-      response: { default_claude_model: "haiku" }, checker: "Claude checker model", expected: "haiku" },
-    { name: "Codex model", label: "Codex model", value: "gpt-6-sol", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: "opus", default_codex_model: "gpt-6-sol" },
-      response: { default_codex_model: "gpt-6-sol" }, checker: "Codex checker model", expected: "gpt-6-sol" },
-    { name: "model reset", label: "Claude model", value: "inherit", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: null, default_codex_model: "gpt-6.1-sol" },
-      response: { default_claude_model: null }, checker: "Claude checker model", expected: "template-inherited" },
-    { name: "SDK model reset", label: "Claude model", value: "inherit", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: null, default_codex_model: "gpt-6.1-sol" },
-      response: { default_claude_model: null, cross_check_pins: [{ ...initial.cross_check_pins![0], worker_default_model: null }] }, checker: "Claude checker model", expected: "SDK/account default" },
-    { name: "Claude effort reset", label: "Claude effort", value: "", button: "Save Claude effort",
-      patch: { default_effort: null }, response: { default_effort: null }, checker: "Claude checker effort", expected: "high" },
-    { name: "Codex effort", label: "Codex effort", value: "max", button: "Save Codex effort",
-      patch: { default_codex_effort: "max" }, response: { default_codex_effort: "max" }, checker: "Codex checker effort", expected: "high" },
-    { name: "Claude effort", label: "Claude effort", value: "max", button: "Save Claude effort",
-      patch: { default_effort: "max" }, response: { default_effort: "max" }, checker: "Claude checker effort", expected: "high" },
-    { name: "Codex effort reset", label: "Codex effort", value: "", button: "Save Codex effort",
-      patch: { default_codex_effort: null }, response: { default_codex_effort: null }, checker: "Codex checker effort", expected: "high" },
-  ];
-  beforeEach(() => {
-    mockApi.getMySettings.mockResolvedValue({ settings: initial });
-    mockApi.listAgentTemplates.mockResolvedValue({ templates: [{ ...mockTemplates[0], id: "lead", name: "lead", scope: "global", user_id: null, model: "template-inherited" }] });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [{ id: "lead", name: "lead", description: "", scope: "global", is_builtin: false, global_default: true, my_override: null, effective: true }] });
-    mockApi.listSecrets.mockResolvedValue({ secrets: ["anthropic_token", "openai_api_key"].map(kind => ({
-      id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
-      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
-    })) });
-  });
-  // A checker effort Default is the cross-check default whatever the worker effort is.
-  const label = (checker: string, value: string) =>
-    expect(within(screen.getByLabelText(checker)).getByRole("option", {
-      name: `Default · ${value} (${checker.endsWith("effort") ? "cross-check default" : "worker default"})`,
-    })).toBeTruthy();
-  const start = (label: string, value: string, button: string) => {
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-    const save = screen.getByRole("button", { name: button }) as HTMLButtonElement;
-    expect(save.disabled).toBe(false);
-    fireEvent.click(save);
-  };
-  const finish = async (reply: (v: { settings: UserSettings }) => void, settings: UserSettings, button: string) => {
-    reply({ settings });
-    await waitFor(() => expect((screen.getByRole("button", { name: button }) as HTMLButtonElement).disabled).toBe(true));
-  };
-  for (const worker of cases) {
-    for (const sibling of ["grid", "judge", "summary", "MR"] as const) {
-      it.each([true, false])(`${worker.name} with ${sibling}, worker first=%s`, async workerFirst => {
-        const replies: Array<(v: { settings: UserSettings }) => void> = [];
-        mockApi.putMySettings.mockImplementation(() => new Promise(resolve => { replies.push(resolve); }));
-        render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-        await screen.findByLabelText("Claude checker model");
-        expect(currentSettings()).toEqual(initial);
-        if (sibling === "grid") start("Claude checker model", "sonnet", "Save cross-check defaults");
-        if (sibling === "judge") start("Claude judge model", "sonnet", "Save judge models");
-        if (sibling === "summary") start("Claude summary model", "sonnet", "Save Claude summary model");
-        if (sibling === "MR") fireEvent.click(screen.getByLabelText("Auto-rework MR review comments on my runs"));
-        start(worker.label, worker.value, worker.button);
-        expect(mockApi.putMySettings).toHaveBeenLastCalledWith(worker.patch);
-        const siblingSettings: UserSettings = { ...initial, judge_model: "sonnet", summary_model: "sonnet", mr_rework_enabled: false,
-          cross_check_pins: [{ ...initial.cross_check_pins![0], model: "sonnet", resolved_model: "sonnet", model_source: "pin" }] };
-        const finishSibling = async () => {
-          replies[0]({ settings: siblingSettings });
-          if (sibling === "MR") await waitFor(() => expect((screen.getByLabelText("Auto-rework MR review comments on my runs") as HTMLInputElement).disabled).toBe(false));
-          else await waitFor(() => expect((screen.getByRole("button", { name: sibling === "grid" ? "Save cross-check defaults" : sibling === "judge" ? "Save judge models" : "Save Claude summary model" }) as HTMLButtonElement).disabled).toBe(true));
-        };
-        if (workerFirst) {
-          await finish(replies[1], worker.button === "Save defaults" ? modelResponse(worker.response) : { ...initial, ...worker.response }, worker.button);
-          await waitFor(() => label(worker.checker, worker.expected));
-          await finishSibling();
-        } else {
-          await finishSibling();
-          await finish(replies[1], worker.button === "Save defaults" ? modelResponse(worker.response) : { ...initial, ...worker.response }, worker.button);
-        }
-        await waitFor(() => label(worker.checker, worker.expected));
-        expect((screen.getByLabelText(worker.label) as HTMLSelectElement).value).toBe(worker.value);
-        expectHints(worker.button === "Save defaults" ? worker.response : undefined);
-        expect(mockApi.listAgentTemplates).not.toHaveBeenCalled();
-        expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
-        if (sibling === "grid") expect((screen.getByLabelText("Claude checker model") as HTMLSelectElement).value).toBe("sonnet");
-        if (sibling === "judge") expect((screen.getByLabelText("Claude judge model") as HTMLSelectElement).value).toBe("sonnet");
-        if (sibling === "summary") expect((screen.getByLabelText("Claude summary model") as HTMLSelectElement).value).toBe("sonnet");
-      });
-    }
-  }
-  for (const model of cases.filter(c => c.button === "Save defaults")) {
-  for (const effort of cases.filter(c => c.name.includes("effort"))) {
-    it.each([true, false])(`${model.name} and ${effort.name}, model first=%s`, async modelFirst => {
-      const replies: Array<(v: { settings: UserSettings }) => void> = [];
-      mockApi.putMySettings.mockImplementation(() => new Promise(resolve => { replies.push(resolve); }));
-      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-      await screen.findByLabelText("Claude checker model");
-      start(model.label, model.value, model.button);
-      start(effort.label, effort.value, effort.button);
-      expect(mockApi.putMySettings).toHaveBeenNthCalledWith(1, model.patch);
-      expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, effort.patch);
-      const modelDone = () => finish(replies[0], modelResponse(model.response), model.button);
-      const effortDone = () => finish(replies[1], { ...initial, ...effort.response }, effort.button);
-      if (modelFirst) { await modelDone(); await waitFor(() => label(model.checker, model.expected)); await effortDone(); }
-      else { await effortDone(); await waitFor(() => label(effort.checker, effort.expected)); await modelDone(); }
-      await waitFor(() => label(model.checker, model.expected));
-      await waitFor(() => label(effort.checker, effort.expected));
-      expectHints(model.response);
-      expect(currentSettings().default_effort).toBe("default_effort" in effort.response ? effort.response.default_effort : initial.default_effort);
-      expect(currentSettings().default_codex_effort).toBe("default_codex_effort" in effort.response ? effort.response.default_codex_effort : initial.default_codex_effort);
-      expect(mockApi.listAgentTemplates).not.toHaveBeenCalled();
-      expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
-    });
-  }
-  }
-});
-
-describe("checker effort selects stay free of the preference-only runtime token (PRD #3247)", () => {
-  it("offers runtime on the worker select but not on the checker select", async () => {
-    mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "runtime",
-      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-      cross_check_pins: [
-        { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "high", model_source: "worker default" as const, effort_source: "cross-check default" as const, active: false },
-      ] } });
+// PRD #3263 M2: the checker model/effort grid moved to Models, saved with every other model
+// choice there (ModelsSettings.test.tsx covers its Defaults, guards and custom IDs). Run
+// defaults keeps only the plan/code cross-check enables and links to Models.
+describe("cross-check model and effort live in Models", () => {
+  it("shows the enables and a Models link, and no checker controls or separate save", async () => {
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const checker = await screen.findByLabelText("Claude checker effort") as HTMLSelectElement;
-    expect(Array.from(checker.options).map((o) => o.value)).not.toContain("runtime");
-    expect(Array.from((screen.getByLabelText("Claude effort") as HTMLSelectElement).options).map((o) => o.value)).toContain("runtime");
-    expect(within(checker).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
-  });
-});
-
-describe("checker defaults follow committed worker settings", () => {
-  it("refreshes the worker model and effort Defaults while retaining checker drafts", async () => {
-    const initial = { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_claude_model: "opus",
-      default_effort: null, judge_model: null, summary_model: null, appearance_mode: null,
-      light_theme: null, dark_theme: null, typeface: null, theme: null, cross_check_pins: [
-      { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "medium", model_source: "worker default" as const, effort_source: "worker default" as const, active: false },
-    ] };
-    mockApi.getMySettings.mockResolvedValue({ settings: initial });
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const checker = await screen.findByLabelText("Claude checker model") as HTMLSelectElement;
-    fireEvent.change(checker, { target: { value: "sonnet" } });
-    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "haiku" } });
-    expect(within(checker).getByRole("option", { name: "Default · opus (worker default)" })).toBeTruthy();
-    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", cross_check_pins: initial.cross_check_pins.map(cell => ({ ...cell, worker_default_model: "haiku" })) } });
-    fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
-    await waitFor(() => expect(within(checker).getByRole("option", { name: "Default · haiku (worker default)" })).toBeTruthy());
-    expect(checker.value).toBe("sonnet");
-    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
-    const checkerEffort = screen.getByLabelText("Claude checker effort");
-    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
-    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", default_effort: "max" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save Claude effort" }));
-    await waitFor(() => expect((screen.getByRole("button", { name: "Save Claude effort" }) as HTMLButtonElement).disabled).toBe(true));
-    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
-    expect(checker.value).toBe("sonnet");
-    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, cross_check_pins: [
-      { stage: "plan", harness: "claude", model: "sonnet", effort: null, worker_default_model: "haiku", resolved_model: "sonnet",
-        resolved_effort: "max", model_source: "pin", effort_source: "worker default", active: false },
-    ] } });
-    fireEvent.click(screen.getByRole("button", { name: "Save cross-check defaults" }));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ cross_check_pins: [{ stage: "plan", harness: "claude", model: "sonnet" }] }));
+    await screen.findByLabelText("Judge runs on");
+    expect(screen.getByText(/Plan cross-check · Required before implementation/)).toBeTruthy();
+    expect(screen.getByText(/Code cross-check · Advisory before publication/)).toBeTruthy();
+    const pointer = screen.getByText(/Model and effort for each cross-check stage are set in/);
+    expect(pointer.textContent).toBe("Model and effort for each cross-check stage are set in Models.");
+    expect(within(pointer).getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
+    expect(screen.queryByLabelText(/checker (model|effort)/)).toBeNull();
+    expect(screen.queryByRole("table", { name: "Cross-check defaults" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save cross-check defaults" })).toBeNull();
   });
 });
 
@@ -2585,12 +2406,13 @@ describe("harness overflow autosave", () => {
     const overflow = () => finishOverflow({ harness_overflow_enabled: true });
     const settings = () => finishSettings({ settings: { ...initial, now_summary_enabled: false } });
     (overflowFirst ? overflow : settings)();
-    await waitFor(() => expect(overflowFirst ? checked() : deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(overflowFirst ? true : false));
+    const nowLine = () => screen.getByLabelText("Model-written Now line") as HTMLInputElement;
+    await waitFor(() => expect(overflowFirst ? checked() : nowLine().checked).toBe(overflowFirst ? true : false));
     (overflowFirst ? settings : overflow)();
     await waitFor(() => {
       expect(checked()).toBe(true);
-      expect(deliveredSettings.mock.lastCall?.[0].harness_overflow_enabled).toBe(true);
-      expect(deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(false);
+      expect(nowLine().checked).toBe(false);
+      expect(nowLine().disabled).toBe(false);
     });
   });
 });

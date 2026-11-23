@@ -38,6 +38,8 @@ function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
     </div>
   );
   const reloadIfUncertain = (alert: ReactNode) => (uncertain ? withReload(alert) : alert);
+  // A failed retry says nothing about the earlier, unconfirmed save: keep saying so.
+  const earlier = uncertain ? " An earlier save is still unconfirmed; reload to see what is stored." : "";
   switch (outcome.kind) {
     case "saved":
       return <Alert tone="success" message={`Saved ${plural(outcome.count, "change", "changes")}. Your next runs use ${outcome.count === 1 ? "it" : "them"}.`} />;
@@ -53,7 +55,7 @@ function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
         <div role="alert" className="space-y-1 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
           <p>
             {plural(outcome.count, "value needs", "values need")} attention. Nothing was saved; your edits are still
-            here.
+            here.{earlier}
           </p>
           {outcome.unmatched.map((m) => (
             <p key={m} className="text-xs">
@@ -64,7 +66,7 @@ function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
       );
     case "not_saved":
       return reloadIfUncertain(
-        <Alert message={`The save failed and nothing was changed: ${outcome.message}. Your edits are still here.`} />,
+        <Alert message={`The save failed and nothing was changed: ${outcome.message}. Your edits are still here.${earlier}`} />,
       );
     case "unknown":
       return withReload(

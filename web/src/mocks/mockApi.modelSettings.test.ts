@@ -119,4 +119,68 @@ describe("mock putMyModelSettings", () => {
     expect(res).toMatchObject({ effective: null, effective_error: "settings_effective_readback_failed" });
     expect(res.settings.default_claude_model).toBe("haiku");
   });
+
+  // PRD #3263 M2: the helper lanes and the four checker cells validate like the server, all
+  // before anything is written, and pin errors carry their stage/harness/member.
+  it("saves helper and checker choices with worker ones in one step", async () => {
+    const { api } = await reload();
+    const { settings } = await api.putMyModelSettings({
+      default_codex_model: "gpt-6-sol",
+      judge_runs_on: "claude", judge_model: "sonnet", codex_judge_model: "gpt-6-astra",
+      summary_model: "haiku", codex_summary_model: "gpt-6-luna",
+      task_review_model: "custom-reviewer", codex_task_review_model: "gpt-6-sol",
+      task_review_effort: "runtime", codex_task_review_effort: "high",
+      cross_check_pins: [
+        { stage: "plan", harness: "claude", effort: "max" },
+        { stage: "code", harness: "codex", model: " custom-codex-checker " },
+      ],
+    });
+    expect(settings).toMatchObject({
+      default_codex_model: "gpt-6-sol",
+      judge_runs_on: "claude", judge_model: "sonnet", codex_judge_model: "gpt-6-astra",
+      summary_model: "haiku", codex_summary_model: "gpt-6-luna",
+      task_review_model: "custom-reviewer", codex_task_review_model: "gpt-6-sol",
+      task_review_effort: "runtime", codex_task_review_effort: "high",
+    });
+    const pin = (stage: string, harness: string) => settings.cross_check_pins?.find((p) => p.stage === stage && p.harness === harness);
+    expect(pin("plan", "claude")).toMatchObject({ model: null, effort: "max" });
+    expect(pin("code", "codex")).toMatchObject({ model: "custom-codex-checker", effort: null });
+    expect(pin("plan", "codex")).toMatchObject({ model: null, effort: null });
+  });
+
+  it("refuses every helper and pin defect in one 400 with cell identity, writing nothing", async () => {
+    const { api } = await reload();
+    await api.putMyModelSettings({ judge_model: "opus", cross_check_pins: [{ stage: "code", harness: "claude", effort: "low" }] });
+    const before = (await api.getMySettings()).settings;
+    const err = await rejection(api.putMyModelSettings({
+      default_claude_model: "haiku", // valid, but must not be written
+      judge_runs_on: "gemini",
+      judge_model: "gpt-6-sol", // a Codex id in the Claude lane
+      codex_judge_model: "gpt-6-luna", // a Codex role model, but not in the curated judge set
+      summary_model: "bad\u202e", // a format character, as ValidateModel refuses
+      codex_summary_model: "sonnet",
+      task_review_model: "two words",
+      codex_task_review_model: "custom-codex",
+      codex_task_review_effort: "turbo",
+      cross_check_pins: [
+        { stage: "plan", harness: "claude", model: "gpt-6.1-sol", effort: "runtime" },
+        { stage: "code", harness: "codex", model: "opus" },
+      ],
+    }));
+    const body = err.body as { field: string; errors: { field: string; message: string; stage?: string; harness?: string; member?: string }[] };
+    expect(body.errors.map((e) => e.field)).toEqual([
+      "judge_model", "codex_judge_model", "summary_model", "codex_summary_model", "task_review_model",
+      "codex_task_review_model", "codex_task_review_effort", "judge_runs_on",
+      "cross_check_pins", "cross_check_pins", "cross_check_pins",
+    ]);
+    expect(body.field).toBe("judge_model");
+    expect(body.errors[0].message).toBe("judge_model: model is a Codex model id");
+    expect(body.errors[2].message).toContain("summary_model:");
+    expect(body.errors.slice(8).map(({ stage, harness, member }) => ({ stage, harness, member }))).toEqual([
+      { stage: "plan", harness: "claude", member: "model" },
+      { stage: "plan", harness: "claude", member: "effort" },
+      { stage: "code", harness: "codex", member: "model" },
+    ]);
+    expect((await api.getMySettings()).settings).toEqual(before);
+  });
 });
