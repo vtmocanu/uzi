@@ -614,6 +614,22 @@ func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
 	}
 }
 
+// Models saves the harness and planning fields through the same RequireUser route.
+func TestCLIModelSettingsHarnessAndPlanningOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	token := cliMintToken(t, pool, user, clitoken.ScopeUser)
+	rec := bearerReqBody(router, http.MethodPut, "/api/me/model-settings", token, `{"default_harness":"codex","planning_codex_effort":"high"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/me/model-settings = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var harness, effort *string
+	err := pool.QueryRow(context.Background(), `SELECT default_harness, planning_codex_effort FROM users WHERE id = $1`, user).Scan(&harness, &effort)
+	if err != nil || harness == nil || *harness != "codex" || effort == nil || *effort != "high" {
+		t.Fatalf("stored harness=%v planning effort=%v, want codex and high (err=%v)", harness, effort, err)
+	}
+}
+
 // TestCLIReachesModelSettingsOverBearerLiveDB pins the PRD #3264 mount: PUT /api/me/model-settings is
 // RequireUser, so a uzc_ Bearer writes the caller's own model defaults (the write is real: the
 // stored column changes), a cookie without the CSRF header is refused, and an unauthenticated

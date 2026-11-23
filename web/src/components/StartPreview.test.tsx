@@ -71,13 +71,13 @@ describe("StartPreview compact", () => {
     expect(panel.hidden).toBe(true);
   });
 
-  it("words the note from fixed_at and links to Run defaults", async () => {
+  it("words the note from fixed_at and links to Models", async () => {
     renderPreview("compact");
     fireEvent.click(await screen.findByRole("button", { name: /If started now/ }));
     // The claude preview mixes a claim-fixed model and credential with a run_override harness.
     expect(screen.getByText(/A prediction: claim-time settings are resolved when a worker picks the run up/)).toBeTruthy();
     expect(screen.getByText(/A choice made here is fixed on the run now/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Run defaults" }).getAttribute("href")).toBe("/settings/run-defaults");
+    expect(screen.getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
   });
 
   it("chosen at create: summary says so and the panel lists one entry per alternative", async () => {
@@ -116,7 +116,7 @@ describe("StartPreview compact", () => {
     await screen.findByRole("button", { name: /If it started now/ });
     expect(screen.queryByText(/A prediction/)).toBeNull();
     expect(screen.queryByText(/A choice made here/)).toBeNull();
-    expect(screen.getByRole("link", { name: "Run defaults" }).className).toContain("min-h-6");
+    expect(screen.getByRole("link", { name: "Models" }).className).toContain("min-h-6");
   });
 
   it("keeps the server's harness notes when the harness is undecided (panel and static)", async () => {
@@ -194,13 +194,13 @@ describe("StartPreview open", () => {
 });
 
 describe("StartPreview static", () => {
-  it("is one line with the sources and the Run defaults link, no disclosure", async () => {
+  it("is one line with the sources and the Models link, no disclosure", async () => {
     renderPreview("static");
     const line = await screen.findByText(/If started now:/);
     expect(line.textContent).toContain("Claude · opus · medium");
     expect(line.textContent).toContain("model: ");
     expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.getByRole("link", { name: "Run defaults" }).getAttribute("href")).toBe("/settings/run-defaults");
+    expect(screen.getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
   });
 
   it("chosen at create: one line per alternative, naming no chosen harness", async () => {

@@ -78,6 +78,10 @@ type Handler struct {
 	// are nil in production: New leaves them unset.
 	modelSettingsBeginTx  func(ctx context.Context) (pgx.Tx, error)
 	modelSettingsReadback func(r *http.Request, userID uuid.UUID) (userSettingsDTO, error)
+	// modelSettingsEffectiveReadback replaces the post-commit effective-settings read of the same
+	// route (h.buildEffectiveSettings when nil), so a test can fail it and prove the saved write
+	// still answers 200 with effective null. nil in production.
+	modelSettingsEffectiveReadback func(ctx context.Context, userID uuid.UUID) (apitypes.EffectiveSettingsDTO, error)
 	// templatePinsBeginTx and templatePinsReadback are the same kind of test seams for
 	// PUT /api/me/agent-templates/{id}/model-pins (PRD #3264 M3): a non-nil begin replaces
 	// h.pool.Begin, a non-nil readback replaces the post-commit row read. Both nil in production.

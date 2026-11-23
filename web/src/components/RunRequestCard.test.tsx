@@ -106,12 +106,12 @@ describe("RunRequestCard — start preview", () => {
     mockApi.previewStartSettings.mockResolvedValue(preview("claude"));
   });
 
-  it("shows the prediction with its sources and the Run defaults link while pending", async () => {
+  it("shows the prediction with its sources and the Models link while pending", async () => {
     renderWithPreview(aRequest());
     const line = await screen.findByText(/If started now:/);
     expect(line.textContent).toContain("Claude · opus · medium");
     expect(line.textContent).toContain("model: lead template");
-    expect(screen.getByRole("link", { name: "Run defaults" }).getAttribute("href")).toBe("/settings/run-defaults");
+    expect(screen.getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
   });
 
   it("chosen at create: one line per alternative and no chosen harness", async () => {

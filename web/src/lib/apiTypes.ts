@@ -729,6 +729,60 @@ export interface UserSettingsPatch {
   judge_runs_on?: Harness | null;
 }
 
+/** One cross_check_pins cell of PUT /me/model-settings: omitted members stay unchanged,
+ *  null clears that member's override. */
+export interface ModelSettingsPinPatch {
+  stage: "plan" | "code";
+  harness: Harness;
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** PUT /api/me/model-settings body (PRD #3263): the closed 19-key allowlist, written in one
+ *  transaction. Omitted keys stay unchanged; null clears an override. Values are validated
+ *  server-side, so the scalars are plain strings here. */
+export interface ModelSettingsPatch {
+  default_harness?: string | null;
+  default_claude_model?: string | null;
+  default_codex_model?: string | null;
+  default_effort?: string | null;
+  default_codex_effort?: string | null;
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
+  planning_codex_model?: string | null;
+  planning_codex_effort?: string | null;
+  judge_runs_on?: string | null;
+  judge_model?: string | null;
+  codex_judge_model?: string | null;
+  summary_model?: string | null;
+  codex_summary_model?: string | null;
+  task_review_model?: string | null;
+  codex_task_review_model?: string | null;
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
+  cross_check_pins?: ModelSettingsPinPatch[];
+}
+
+/** The 200 body of PUT /me/model-settings: the canonical settings read after commit, and the
+ *  effective-settings prediction. `effective` is null, with effective_error
+ *  "settings_effective_readback_failed", when only the prediction could not be read: the save
+ *  still committed. */
+export interface ModelSettingsSaveResponse {
+  settings: UserSettings;
+  effective: EffectiveSettings | null;
+  effective_error?: string;
+}
+
+/** One entry of the 400 `errors` array of PUT /me/model-settings. stage/harness/member are set
+ *  only for a cross_check_pins cell defect. */
+export interface ModelSettingsFieldError {
+  field: string;
+  message: string;
+  stage?: "plan" | "code";
+  harness?: Harness;
+  member?: "model" | "effort";
+}
+
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
 // global (admin, visible to all), user (self-service, owner-visible).
 export type AgentTemplateScope = "builtin" | "global" | "user";

@@ -85,10 +85,10 @@ a note above the table (**For your lead runs**). It refreshes after you change
 stored-pin cells are shared and never change per viewer.
 
 For the lead, the editor help states the precedence. Model: a model chosen when
-starting the run or a schedule's model, then your **Run defaults** model, beat
+starting the run or a schedule's model, then your **Settings → Models** worker model, beat
 the pin; with none and no pin, Claude uses the SDK/account default and Codex
 uses gpt-6.1-sol. Effort: an effort chosen when starting the run, then your
-**Run defaults** effort (a level or Runtime default), beat the pin; otherwise
+**Settings → Models** worker effort (a level or Runtime default), beat the pin; otherwise
 the built-in medium. The subagent help keeps that **Use the run's resolved model
 for subagents too** overrides model pins only.
 

@@ -3,8 +3,9 @@
 // SettingsShell so tokens/forge/access are one discoverable area. The token
 // LIST itself is AnthropicTokens (PRD #104 M6) — this page owns the fetch so the
 // list and the rate-limit meters refresh together. Run-behavior defaults
-// (autopilot, usage-limit park, judge, CI autofix, MR review rework, worker
-// model) moved to the Run defaults tab (RunDefaults.tsx), and appearance +
+// (autopilot, usage-limit park, judge, CI autofix, MR review rework) moved to the
+// Run defaults tab (RunDefaults.tsx), model choices to the Models tab
+// (ModelsSettings.tsx), and appearance +
 // demo-mode moved to the Appearance tab (AppearanceSettings.tsx): this tab is
 // who you are and what you hold, those are how your runs behave and how uzi looks.
 

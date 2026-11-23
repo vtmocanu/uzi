@@ -27,19 +27,20 @@ import (
 // Write invariant the route's row lock relies on: every column it SETs (default_claude_model,
 // default_codex_model, the legacy default_model mirror, default_effort, default_codex_effort,
 // judge_model, codex_judge_model, judge_runs_on, summary_model, codex_summary_model, task_review_model,
-// codex_task_review_model, task_review_effort, codex_task_review_effort) is a plain
-// non-key column. users.id is never in a SET list, and the only unique or foreign-key-referenced
+// codex_task_review_model, task_review_effort, codex_task_review_effort, default_harness and the four
+// planning_* columns) is a plain non-key column. users.id is never in a SET list, and the only unique or foreign-key-referenced
 // columns of users are id, email, (oidc_issuer, oidc_subject) and the slack resolved id
 // (migrations 00001, 00056, 00044), none of which is written here. That is why FOR NO KEY UPDATE,
 // the mode a plain UPDATE of such columns takes anyway, is the right lock.
 
 // modelSettingsColumns are the users columns the tests snapshot: every column the route may
-// write, plus default_harness (never writable here) and the consent switches it must not touch.
+// write, plus the consent switches it must not touch.
 var modelSettingsColumns = []string{
 	"default_claude_model", "default_codex_model", "default_model", "default_harness",
 	"default_effort", "default_codex_effort", "judge_model", "codex_judge_model", "judge_runs_on",
 	"summary_model", "codex_summary_model", "task_review_model", "codex_task_review_model",
 	"task_review_effort", "codex_task_review_effort",
+	"planning_claude_model", "planning_claude_effort", "planning_codex_model", "planning_codex_effort",
 	"judge_enabled", "autopilot_enabled", "plan_cross_check_enabled", "code_cross_check_enabled",
 }
 
@@ -78,17 +79,45 @@ func (f *effFix) clearModelColumns() {
 		default_harness = NULL, default_effort = NULL, default_codex_effort = NULL, judge_model = NULL,
 		codex_judge_model = NULL, judge_runs_on = NULL, summary_model = NULL, codex_summary_model = NULL,
 		task_review_model = NULL, codex_task_review_model = NULL,
-		task_review_effort = NULL, codex_task_review_effort = NULL
+		task_review_effort = NULL, codex_task_review_effort = NULL,
+		planning_claude_model = NULL, planning_claude_effort = NULL,
+		planning_codex_model = NULL, planning_codex_effort = NULL
 		WHERE id = $1`, f.user)
 }
 
+// modelErrBody returns the flat string members of an error body (error, field, reason); the
+// structured "errors" array of a 400 is read through modelErrList.
 func modelErrBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]string {
 	t.Helper()
-	var m map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode error body %q: %v", rec.Body.String(), err)
 	}
-	return m
+	out := map[string]string{}
+	for _, k := range []string{"error", "field", "reason"} {
+		v, ok := raw[k]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			t.Fatalf("error body member %s is not a string: %s", k, v)
+		}
+		out[k] = s
+	}
+	return out
+}
+
+// modelErrList returns the "errors" array of a 400 body. A body without the key yields nil.
+func modelErrList(t *testing.T, rec *httptest.ResponseRecorder) []modelSettingsError {
+	t.Helper()
+	var body struct {
+		Errors []modelSettingsError `json:"errors"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body %q: %v", rec.Body.String(), err)
+	}
+	return body.Errors
 }
 
 func (f *effFix) wireSettings() map[string]json.RawMessage {
@@ -222,6 +251,34 @@ func TestPutMyModelSettingsParityWithPutMySettingsLiveDB(t *testing.T) {
 		{"codex_task_review_effort", `"bogus"`, false},
 		{"codex_task_review_effort", `"hi\u0007gh"`, false},
 		{"codex_task_review_effort", `["high"]`, false},
+		{"default_harness", `"claude"`, true},
+		{"default_harness", `"codex"`, true},
+		{"default_harness", `null`, true},
+		{"default_harness", `"gemini"`, false},
+		{"default_harness", `7`, false},
+		{"planning_claude_model", `"opus"`, true},
+		{"planning_claude_model", `"  claude-custom-9  "`, true},
+		{"planning_claude_model", `null`, true},
+		{"planning_claude_model", `""`, true},
+		{"planning_claude_model", `"gpt-6-sol"`, false},
+		{"planning_claude_model", `"has space"`, false},
+		{"planning_claude_model", `7`, false},
+		{"planning_claude_effort", `"high"`, true},
+		{"planning_claude_effort", `"max"`, true},
+		{"planning_claude_effort", `null`, true},
+		{"planning_claude_effort", `""`, true},
+		{"planning_claude_effort", `"runtime"`, false},
+		{"planning_claude_effort", `"bogus"`, false},
+		{"planning_claude_effort", `["high"]`, false},
+		{"planning_codex_model", `"gpt-6-sol"`, true},
+		{"planning_codex_model", `"custom-codex-1"`, true},
+		{"planning_codex_model", `null`, true},
+		{"planning_codex_model", `"sonnet"`, false},
+		{"planning_codex_model", `["x"]`, false},
+		{"planning_codex_effort", `"xhigh"`, true},
+		{"planning_codex_effort", `null`, true},
+		{"planning_codex_effort", `"runtime"`, false},
+		{"planning_codex_effort", `"bogus"`, false},
 		{"cross_check_pins", `[{"stage":"plan","harness":"claude","effort":"high"}]`, true},
 		{"cross_check_pins", `[]`, true},
 		{"cross_check_pins", `null`, false},
@@ -286,6 +343,15 @@ func TestPutMyModelSettingsParityFirstOfTwoErrorsLiveDB(t *testing.T) {
 	for _, body := range []string{
 		`{"default_codex_effort":"bogus","judge_model":"gpt-6-sol"}`,
 		`{"judge_model":"gpt-6-sol","default_codex_effort":"bogus"}`,
+		// default_harness decodes before judge_runs_on, which decodes before the planning fields,
+		// which decode before the pins, whatever order the body lists them in.
+		`{"judge_runs_on":"other","default_harness":"gemini"}`,
+		`{"default_harness":"gemini","judge_runs_on":"other"}`,
+		`{"planning_claude_model":"gpt-6-sol","judge_runs_on":"other"}`,
+		`{"planning_codex_effort":"bogus","planning_claude_effort":"bogus"}`,
+		`{"planning_codex_model":"sonnet","planning_codex_effort":"bogus"}`,
+		`{"cross_check_pins":null,"planning_codex_effort":"bogus"}`,
+		`{"planning_claude_model":"gpt-6-sol","default_codex_effort":"bogus"}`,
 	} {
 		old := f.putSettings(body)
 		cur := f.putModel(body)
@@ -415,7 +481,9 @@ func TestPutMyModelSettingsRejectsWithoutWritingLiveDB(t *testing.T) {
 
 	for _, tc := range []struct{ body, field string }{
 		{`{"default_effort":"high","zzz_unknown":1}`, "zzz_unknown"},
-		{`{"default_effort":"high","default_harness":"codex"}`, "default_harness"},
+		{`{"default_effort":"high","default_harness":"gemini"}`, "default_harness"},
+		{`{"default_effort":"high","planning_claude_effort":"runtime"}`, "planning_claude_effort"},
+		{`{"default_harness":"codex","planning_codex_model":"sonnet"}`, "planning_codex_model"},
 		{`{"default_effort":"high","default_model":"opus"}`, "default_model"},
 		{`{"default_effort":"high","cross_check_pins":null}`, "cross_check_pins"},
 		{`{"default_effort":"high","theme":"mission"}`, "theme"},

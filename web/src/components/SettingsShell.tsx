@@ -1,5 +1,5 @@
 // SettingsShell: one header + tab bar shared by the user-scoped settings
-// surfaces (Account & tokens, Run defaults, Forge, Access, Memory). Kills the old
+// surfaces (Account & tokens, Appearance, Models, Run defaults, Forge, Access, Memory). Kills the old
 // discoverability problem where the /settings/* pages were URL siblings wired
 // together only by hand-placed corner links — the drift a unified layout
 // header exists to prevent.
@@ -9,14 +9,15 @@
 // home here + in the sidebar required AppShell's excludeSubpath active-state
 // hack. It now lives at /workers as a first-class Factory page.
 
-import { NavLink } from "react-router-dom";
-import type { ReactNode } from "react";
+import { NavLink, useLocation } from "react-router-dom";
+import { useEffect, useRef, type ReactNode } from "react";
 import { PageHeader } from "./ui";
-import { PinnedBlock, TabRow, tabClass } from "./TabRow";
+import { keepInRowView, PinnedBlock, TabRow, tabClass } from "./TabRow";
 
 export const TABS = [
   { to: "/settings", label: "Account & tokens", end: true },
   { to: "/settings/appearance", label: "Appearance", end: false },
+  { to: "/settings/models", label: "Models", end: false },
   { to: "/settings/run-defaults", label: "Run defaults", end: false },
   { to: "/settings/forge", label: "Forge", end: false },
   { to: "/settings/access", label: "Access", end: false },
@@ -24,6 +25,16 @@ export const TABS = [
 ];
 
 export function SettingsShell({ description, children }: { description: string; children: ReactNode }) {
+  // With seven tabs the strip overflows on a phone (at 390px Run defaults sat past the
+  // right edge with scrollLeft 0), so keep the active tab in view on mount and on every
+  // tab switch. keepInRowView moves only the row's scrollLeft, never the window (#4419);
+  // AdminShell uses the same pattern.
+  const stripRef = useRef<HTMLDivElement>(null);
+  const { pathname } = useLocation();
+  useEffect(() => {
+    keepInRowView(stripRef.current, stripRef.current?.querySelector<HTMLElement>('[aria-current="page"]'));
+  }, [pathname]);
+
   return (
     <div className="space-y-6">
       {/* Constant across tabs so the strip never jumps on a switch — the per-tab
@@ -38,7 +49,7 @@ export function SettingsShell({ description, children }: { description: string; 
           `shrink-0`/`whitespace-nowrap` so they overflow-and-scroll rather than compress
           to fit (which would defeat overflow-x). */}
       <PinnedBlock>
-        <TabRow>
+        <TabRow ref={stripRef}>
           {TABS.map((t) => (
             <NavLink key={t.to} to={t.to} end={t.end} className={({ isActive }) => tabClass(isActive)}>
               {t.label}

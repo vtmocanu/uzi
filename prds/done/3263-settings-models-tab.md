@@ -1,6 +1,7 @@
 # PRD #3263: Settings Models, one grid and one atomic save
 
-**Issue:** #3263. **Parent:** #1703. **Status:** Draft r2, anchors refreshed 2026-11-23.  
+**Issue:** #3263. **Parent:** #1703. **Status:** Complete (implemented 2026-11-23 on branch agent/issue-3263; M1-M3 delivered, exact-head PR CI pending at landing).
+
 **Baseline:** main `939c0e2b`, including merged #4599 (Codex planning) and #4608 (task-review settings).  
 **Blocked by:** none. The prerequisite implementations are landed. #3247 remains open only for maintainer-owned hosted catalog timing; its settings/runtime implementation landed in #3672, and that observation does not block this editor.  
 **Delivery:** one PRD, one run, one PR, three serial vertical slices. No migration, new column, worker capability or runtime policy. Neither implementation nor validation changes `.github/workflows/**`.
@@ -132,3 +133,4 @@ Exact-head PR CI supplies the full repository/API/web validation, including the 
 - **D5:** Show saved predictions separately from unsaved edits. No draft-preview endpoint or duplicated browser precedence engine is needed. Reconcile uncertain saves explicitly; no new CAS/versioning subsystem.
 - **D6:** Use the router's supported blocker with a minimal bootstrap adaptation. No existing guard can be reused; retaining BrowserRouter and patching navigation would add fragile parallel routing behavior.
 - **D7:** Dependency means landed implementation, not closing an unrelated maintainer observation. #3247's PRD records implemented M1/M2 and pending hosted timing; #3263 neither performs nor waives that observation.
+- **D8, 2026-11-23 (implementation):** A prediction read that fails after commit returns 200 with `effective: null` and `effective_error: settings_effective_readback_failed` rather than a 500, so the CLI's exit-0 contract for a confirmed save holds; a failed settings readback and a commit-unknown save stay distinct 500s. The 400 `errors` array reports at most five unknown keys and clips echoed caller text to 64 bytes (security review). Predictions are shown only from `/me/effective-settings` cells, never a browser fallback. The cross-check grid component was replaced by Models cells rather than refactored.

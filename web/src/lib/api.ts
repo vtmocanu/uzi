@@ -67,6 +67,9 @@ import type {
   AdminOAuthConnection,
   OAuthRedirect,
   EffectiveSettings,
+  ModelSettingsFieldError,
+  ModelSettingsPatch,
+  ModelSettingsSaveResponse,
   ScheduleSettingsPreview,
   ScheduleSettingsPreviewRequest,
   StartPreview,
@@ -383,6 +386,35 @@ export function egressProfileProblems(err: unknown): EgressProfileProblem[] | nu
       typeof (p as EgressProfileProblem).message === "string",
   );
   return problems.length > 0 ? problems : null;
+}
+
+// modelSettingsFieldErrors returns every defect of a PUT /me/model-settings 400 (PRD #3263).
+// The additive `errors` array is preferred; a body without it (an older server, or an invalid
+// body) falls back to the flat field/error pair, and a 400 naming no field yields one entry with
+// an empty field so the caller can still show the message. Anything but a 400 is [].
+export function modelSettingsFieldErrors(err: unknown): ModelSettingsFieldError[] {
+  if (!(err instanceof ApiError) || err.status !== 400) return [];
+  const body = err.body as { errors?: unknown; field?: unknown } | null;
+  if (Array.isArray(body?.errors)) {
+    const listed = body.errors.filter(
+      (e): e is ModelSettingsFieldError =>
+        typeof e === "object" && e !== null &&
+        typeof (e as ModelSettingsFieldError).field === "string" &&
+        typeof (e as ModelSettingsFieldError).message === "string",
+    );
+    if (listed.length > 0) return listed;
+  }
+  return [{ field: typeof body?.field === "string" ? body.field : "", message: err.message }];
+}
+
+// The two 500 reasons PUT /me/model-settings distinguishes from a plain failure, so the Models
+// page can say whether the save may have happened (commit_unknown) or did happen (readback).
+export type ModelSettingsFailureReason = "settings_commit_unknown" | "settings_saved_readback_failed";
+
+export function modelSettingsFailureReason(err: unknown): ModelSettingsFailureReason | null {
+  if (!(err instanceof ApiError) || err.status !== 500) return null;
+  const reason = (err.body as { reason?: unknown } | null)?.reason;
+  return reason === "settings_commit_unknown" || reason === "settings_saved_readback_failed" ? reason : null;
 }
 
 async function request<T>(
@@ -893,6 +925,11 @@ const realApi = {
     }),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
+  // PRD #3263: the Models tab's one atomic save. A 400 lists every defect; read them with
+  // modelSettingsFieldErrors. A 500 reason distinguishes an unknown commit outcome from a
+  // committed save whose readback failed (modelSettingsFailureReason).
+  putMyModelSettings: (patch: ModelSettingsPatch) =>
+    request<ModelSettingsSaveResponse>("PUT", "/me/model-settings", patch),
   // Slack linking (PRD #25 M3), own-user only. member_id null clears the override
   // (falls back to email auto-match). A 409 from setMySlackOverride means the id is
   // already linked to another account.

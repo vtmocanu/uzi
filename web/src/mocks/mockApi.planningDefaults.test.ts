@@ -83,9 +83,18 @@ describe("mock planning defaults vs fixtures/settings/planning-defaults-cases.js
   it("serves both harness planning cells, resolving like the server", async () => {
     const api = await reload();
     let { settings } = await api.getMySettings();
-    expect(settings.planning_models?.filter(c => c.harness === "claude")).toEqual([
-      { harness: "claude", model: null, default_model: "", default_source: "builtin", resolved_model: "", source: "builtin" },
+    // The default recording was taken with a lead template pinned (opus / gpt-6-sol), and the
+    // server resolves the planning Default through that pin (planningModelCells' leadClaudePin).
+    expect(settings.planning_models).toEqual([
+      { harness: "claude", model: null, default_model: "opus", default_source: "template", resolved_model: "opus", source: "template" },
+      { harness: "codex", model: null, default_model: "gpt-6-sol", default_source: "template", resolved_model: "gpt-6-sol", source: "template" },
     ]);
+    const effective = await api.getEffectiveSettings();
+    for (const h of ["claude", "codex"] as const) {
+      const worker = effective.models.find(c => c.setting === "worker_model" && c.harness === h)!;
+      expect(settings.planning_models!.find(c => c.harness === h), `${h} planning default matches the effective worker default`)
+        .toMatchObject({ default_model: worker.default_model, default_source: worker.default_source });
+    }
     expect(settings.planning_efforts?.filter(c => c.harness === "claude")).toEqual([
       { harness: "claude", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
     ]);
