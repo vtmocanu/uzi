@@ -13,7 +13,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runenv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // A Codex run whose assembly found its receipted history unavailable parks even when the
@@ -70,11 +69,7 @@ func TestAttachRunEnvRefusesRowsOfAnotherOwner(t *testing.T) {
 	}
 	ct := sealForRunOwner(t, box, run.UserID, kind, envSecretValue("x"))
 	newSvc := func(fs *fakeStore) *Service {
-		svc := New(fs, box, testParams())
-		svc.SetVault(vault.New(box, nil, func(context.Context, func(context.Context, vault.Store) error) error {
-			return errors.New("no transactions in this test")
-		}))
-		return svc
+		return newOffModeService(fs, box, testParams())
 	}
 
 	t.Run("control: the run owner's own row is delivered", func(t *testing.T) {

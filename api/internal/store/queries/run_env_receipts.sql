@@ -5,9 +5,12 @@
 -- The versions a claim of this run delivers: the enabled, live repo-scope rows of the
 -- run's owner and repo. The ciphertext and the columns its AAD is rebuilt from come back
 -- with each row; the caller opens them (a locked vault withholds the claim, never a value).
+-- vault_epoch is read in the same statement as the ciphertext so the caller opens the pair
+-- with secretopen.OpenSealedAtEpoch (a rewrap between read and open is a stale seal).
 SELECT e.id, e.var_id, e.rev, e.name, e.secret, e.description, e.ciphertext, e.sealed_with,
-       e.aad_version, e.repo_id, e.user_id
+       e.aad_version, e.repo_id, e.user_id, u.vault_epoch
 FROM runs r
+JOIN users u ON u.id = r.user_id
 JOIN run_env_vars e ON e.user_id = r.user_id AND e.repo_id = r.repo_id
 WHERE r.id = @run_id
   AND e.disabled_at IS NULL AND e.retired_at IS NULL AND e.pending_delete_at IS NULL
@@ -27,11 +30,14 @@ ORDER BY e.name;
 -- disabled, deleted or retired since): the worker still masks them. The row columns come
 -- back NULL when no run_env_vars row of the run's owner holds the version any more, which
 -- the caller reads as missing (the run cannot be masked completely). One row per receipt.
+-- vault_epoch rides in the same statement as the ciphertext (see ListRunEnvEffectiveForRun).
 SELECT rc.var_id, rc.rev, rc.name, rc.scope,
        v.id AS row_id, v.ciphertext, v.sealed_with, v.aad_version, v.secret AS row_secret,
-       v.repo_id AS row_repo_id, v.user_id AS row_user_id, v.name AS row_name
+       v.repo_id AS row_repo_id, v.user_id AS row_user_id, v.name AS row_name,
+       u.vault_epoch
 FROM run_env_receipts rc
 JOIN runs r ON r.id = rc.run_id
+JOIN users u ON u.id = r.user_id
 LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_id = r.user_id
 WHERE rc.run_id = @run_id AND rc.secret
   AND NOT EXISTS (
@@ -45,11 +51,14 @@ ORDER BY rc.var_id, rc.rev;
 -- Every secret version this run was ever delivered, current or not, with the owner's stored
 -- row (NULL row columns when no row of the run's owner holds it): the maintenance endpoint that
 -- hands a worker everything it must mask for the run. One row per secret receipt.
+-- vault_epoch rides in the same statement as the ciphertext (see ListRunEnvEffectiveForRun).
 SELECT rc.var_id, rc.rev, rc.name, rc.scope,
        v.id AS row_id, v.ciphertext, v.sealed_with, v.aad_version, v.secret AS row_secret,
-       v.repo_id AS row_repo_id, v.user_id AS row_user_id, v.name AS row_name
+       v.repo_id AS row_repo_id, v.user_id AS row_user_id, v.name AS row_name,
+       u.vault_epoch
 FROM run_env_receipts rc
 JOIN runs r ON r.id = rc.run_id
+JOIN users u ON u.id = r.user_id
 LEFT JOIN run_env_vars v ON v.var_id = rc.var_id AND v.rev = rc.rev AND v.user_id = r.user_id
 WHERE rc.run_id = @run_id AND rc.secret
 ORDER BY rc.var_id, rc.rev;

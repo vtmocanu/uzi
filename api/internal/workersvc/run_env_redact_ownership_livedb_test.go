@@ -183,6 +183,7 @@ func TestRunEnvRedactRefusesWhenHistoryCannotBeOpenedLiveDB(t *testing.T) {
 	t.Run("locked vault", func(t *testing.T) {
 		fx, runID, keyVar := redactFix(t)
 		fx.env.exec(`UPDATE run_env_vars SET sealed_with = 'dek' WHERE var_id = $1`, keyVar)
+		fx.env.exec(`UPDATE users SET vault_mode='protected' WHERE id=$1`, fx.userID) // a dek row is a protected owner's
 		if _, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); !errors.Is(err, ErrRunEnvVaultLocked) {
 			t.Fatalf("err = %v, want ErrRunEnvVaultLocked", err)
 		}

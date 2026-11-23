@@ -67,30 +67,66 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 	if !leadLane {
 		return s.attachCrossCheckRedact(ctx, run, governing, capable, payload)
 	}
+	// A ciphertext read here is opened at the vault epoch read in the same statement. A stale
+	// seal (the owner enabled protection, rewrapped or locked between the read and the open) is
+	// re-read once; a second one withholds the claim as a locked vault. No value is delivered
+	// from a failed or retried pass: the payload fields are assigned only after every open.
+	var snap *runEnvSnapshot
+	err := retryOnSealStale(func() error {
+		var err error
+		snap, err = s.openLeadRunEnv(ctx, run, capable, payload)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	payload.runEnv = snap
+	return nil
+}
+
+// retryOnSealStale runs read (the query plus the opens of its rows) and, on a stale vault seal,
+// runs it once more against a fresh read. A second stale seal is errVaultLocked (a requeue).
+func retryOnSealStale(read func() error) error {
+	err := read()
+	if !errors.Is(err, store.ErrVaultSealStale) {
+		return err
+	}
+	err = read()
+	if errors.Is(err, store.ErrVaultSealStale) {
+		return errVaultLocked
+	}
+	return err
+}
+
+// openLeadRunEnv is one read-and-open pass of the lead lane. The snapshot is returned (and the
+// payload filled) only when every value opened. A pass that finds nothing to deliver returns
+// the empty snapshot, which finishRunClaimTx still re-checks.
+func (s *Service) openLeadRunEnv(ctx context.Context, run store.Run, capable bool, payload *ClaimPayload) (*runEnvSnapshot, error) {
 	eff, err := s.q.ListRunEnvEffectiveForRun(ctx, run.ID)
 	if err != nil {
-		return fmt.Errorf("run env effective: %w", err)
+		return nil, fmt.Errorf("run env effective: %w", err)
 	}
 	red, err := s.q.ListRunEnvRedactForRun(ctx, run.ID)
 	if err != nil {
-		return fmt.Errorf("run env redact: %w", err)
+		return nil, fmt.Errorf("run env redact: %w", err)
 	}
 	snap := &runEnvSnapshot{capable: capable}
-	payload.runEnv = snap
 	// The gate predicate of ClaimRun: an enabled live repo variable, or a secret receipt.
 	// A redact row exists only for a secret receipt, and a secret receipt that is not redact
 	// is in the effective set, so the two lists decide it.
 	if len(eff) == 0 && len(red) == 0 {
-		return nil
+		return snap, nil
 	}
 	if !capable {
-		return errRunEnvCapabilityMissing
+		return nil, errRunEnvCapabilityMissing
 	}
+	var runEnv []ClaimRunEnvVar
+	var runEnvRedact []ClaimRunEnvRedact
 	for _, row := range eff {
 		// The run's owner is the only owner a value is opened for: a row of another owner is
 		// never delivered, whatever the query returned.
 		if row.UserID != run.UserID {
-			return errRunEnvHistoryUnavailable
+			return nil, errRunEnvHistoryUnavailable
 		}
 		scope := runenv.ScopeUser
 		var repoID *uuid.UUID
@@ -101,15 +137,14 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 		}
 		kind, aerr := runenv.AADFor(row.AadVersion, run.UserID, scope, repoID, row.Secret, row.Name, row.VarID, row.Rev)
 		if aerr != nil {
-			return fmt.Errorf("%w: %w", errRunEnvHistoryUnavailable, aerr)
+			return nil, fmt.Errorf("%w: %w", errRunEnvHistoryUnavailable, aerr)
 		}
-		plain, oerr := secretopen.OpenSealed(s.vlt, s.box, run.UserID, kind, row.SealedWith, row.Ciphertext)
+		plain, oerr := secretopen.OpenSealedAtEpoch(ctx, s.vlt, s.box, run.UserID, kind, row.SealedWith, row.Ciphertext, row.VaultEpoch)
 		if oerr != nil {
-			return mapRunEnvOpenError(oerr)
+			return nil, mapRunEnvOpenError(oerr)
 		}
-		entry := runEnvEntry{VarID: row.VarID, Rev: row.Rev, Scope: scope, Name: row.Name, Secret: row.Secret}
-		snap.effective = append(snap.effective, entry)
-		payload.Secrets.RunEnv = append(payload.Secrets.RunEnv, ClaimRunEnvVar{
+		snap.effective = append(snap.effective, runEnvEntry{VarID: row.VarID, Rev: row.Rev, Scope: scope, Name: row.Name, Secret: row.Secret})
+		runEnv = append(runEnv, ClaimRunEnvVar{
 			VarID: row.VarID.String(), Scope: scope, Rev: row.Rev, Name: row.Name,
 			Value: string(plain), Secret: row.Secret, Description: row.Description,
 		})
@@ -121,20 +156,22 @@ func (s *Service) attachRunEnv(ctx context.Context, wkr store.Worker, run store.
 			continue
 		}
 		seen[k] = true
-		plain, err := s.openRunEnvRedact(run.UserID, runEnvRedactRow{
+		plain, err := s.openRunEnvRedact(ctx, run.UserID, runEnvRedactRow{
 			VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
 			SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
-			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName,
+			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName, VaultEpoch: row.VaultEpoch,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		snap.redact = append(snap.redact, runEnvEntry{VarID: row.VarID, Rev: row.Rev, Scope: row.Scope, Name: row.Name, Secret: true})
-		payload.Secrets.RunEnvRedact = append(payload.Secrets.RunEnvRedact, ClaimRunEnvRedact{
+		runEnvRedact = append(runEnvRedact, ClaimRunEnvRedact{
 			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
 		})
 	}
-	return nil
+	payload.Secrets.RunEnv = runEnv
+	payload.Secrets.RunEnvRedact = runEnvRedact
+	return snap, nil
 }
 
 // runEnvGoverningRun answers which run's receipts govern what this run's output must mask: a
@@ -174,23 +211,51 @@ func (s *Service) attachCrossCheckRedact(ctx context.Context, run store.Run, tar
 	if !capable {
 		return errCheckerRunEnvUnavailable
 	}
-	for _, row := range rows {
-		plain, err := s.openRunEnvRedact(run.UserID, runEnvRedactRow{
-			VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
-			SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
-			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName,
-		})
-		switch {
-		case errors.Is(err, errVaultLocked):
-			return err
-		case err != nil:
-			return errCheckerRunEnvUnavailable
-		}
-		payload.Secrets.RunEnvRedact = append(payload.Secrets.RunEnvRedact, ClaimRunEnvRedact{
-			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
-		})
+	versions, err := s.openReceiptVersions(ctx, run.UserID, target, rows)
+	switch {
+	case errors.Is(err, errVaultLocked):
+		return err
+	case err != nil:
+		return errCheckerRunEnvUnavailable
 	}
+	payload.Secrets.RunEnvRedact = append(payload.Secrets.RunEnvRedact, versions...)
 	return nil
+}
+
+// openReceiptVersions opens every receipted secret version of the governing run for the owner.
+// rows were read just before; a stale vault seal re-reads them once (retryOnSealStale) and a
+// second one is errVaultLocked. Nothing is returned unless every version opened.
+func (s *Service) openReceiptVersions(ctx context.Context, owner, governing uuid.UUID, rows []store.ListRunEnvSecretReceiptVersionsForRunRow) ([]ClaimRunEnvRedact, error) {
+	var out []ClaimRunEnvRedact
+	first := true
+	err := retryOnSealStale(func() error {
+		if !first {
+			var err error
+			if rows, err = s.q.ListRunEnvSecretReceiptVersionsForRun(ctx, governing); err != nil {
+				return fmt.Errorf("run env redact receipts: %w", err)
+			}
+		}
+		first = false
+		out = make([]ClaimRunEnvRedact, 0, len(rows))
+		for _, row := range rows {
+			plain, err := s.openRunEnvRedact(ctx, owner, runEnvRedactRow{
+				VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
+				SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
+				RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName, VaultEpoch: row.VaultEpoch,
+			})
+			if err != nil {
+				return err
+			}
+			out = append(out, ClaimRunEnvRedact{
+				VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // runEnvRedactRow is a receipt with the owner's stored row, as both redact reads return it.
@@ -207,6 +272,8 @@ type runEnvRedactRow struct {
 	RowRepoID  pgtype.UUID
 	RowUserID  pgtype.UUID
 	RowName    pgtype.Text
+	// VaultEpoch is the owner's users.vault_epoch read in the same statement as Ciphertext.
+	VaultEpoch int64
 }
 
 // openRunEnvRedact opens one receipted secret version for masking. The value is opened for the
@@ -215,7 +282,7 @@ type runEnvRedactRow struct {
 // another owner means the history cannot be masked completely (errRunEnvHistoryUnavailable).
 // The AAD binds the owner, scope, repo, secret flag, name, var id and rev (v2), so a ciphertext
 // copied from another version of the variable fails to open here.
-func (s *Service) openRunEnvRedact(owner uuid.UUID, row runEnvRedactRow) (string, error) {
+func (s *Service) openRunEnvRedact(ctx context.Context, owner uuid.UUID, row runEnvRedactRow) (string, error) {
 	if !row.RowID.Valid || !row.RowName.Valid || row.RowName.String != row.Name ||
 		!row.RowSecret.Valid || !row.RowSecret.Bool || !row.SealedWith.Valid ||
 		!row.AadVersion.Valid || !row.RowUserID.Valid || uuid.UUID(row.RowUserID.Bytes) != owner {
@@ -232,7 +299,7 @@ func (s *Service) openRunEnvRedact(owner uuid.UUID, row runEnvRedactRow) (string
 	if aerr != nil {
 		return "", fmt.Errorf("%w: %w", errRunEnvHistoryUnavailable, aerr)
 	}
-	plain, oerr := secretopen.OpenSealed(s.vlt, s.box, owner, kind, row.SealedWith.String, row.Ciphertext)
+	plain, oerr := secretopen.OpenSealedAtEpoch(ctx, s.vlt, s.box, owner, kind, row.SealedWith.String, row.Ciphertext, row.VaultEpoch)
 	if oerr != nil {
 		return "", mapRunEnvOpenError(oerr)
 	}
@@ -304,29 +371,24 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	if !open {
 		return RunEnvRedactResponse{}, ErrRunEnvRedactClosed
 	}
-	out := RunEnvRedactResponse{Protected: true, Versions: make([]ClaimRunEnvRedact, 0, len(rows))}
-	for _, row := range rows {
-		plain, err := s.openRunEnvRedact(run.UserID, runEnvRedactRow{
-			VarID: row.VarID, Rev: row.Rev, Name: row.Name, RowID: row.RowID, Ciphertext: row.Ciphertext,
-			SealedWith: row.SealedWith, AadVersion: row.AadVersion, RowSecret: row.RowSecret,
-			RowRepoID: row.RowRepoID, RowUserID: row.RowUserID, RowName: row.RowName,
-		})
-		switch {
-		case errors.Is(err, errVaultLocked):
-			return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
-		case err != nil:
-			return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
-		}
-		out.Versions = append(out.Versions, ClaimRunEnvRedact{
-			VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
-		})
+	versions, err := s.openReceiptVersions(ctx, run.UserID, governing, rows)
+	switch {
+	case errors.Is(err, errVaultLocked):
+		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
+	case err != nil:
+		return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
 	}
-	return out, nil
+	return RunEnvRedactResponse{Protected: true, Versions: versions}, nil
 }
 
 // mapRunEnvOpenError maps a secretopen failure to the claim lane's domain errors: a locked
-// vault requeues, anything that cannot be opened parks the run.
+// vault requeues, a stale vault seal passes through for the caller's single re-read
+// (retryOnSealStale), and anything else (including a missing or failing vault) cannot be
+// opened and parks the run: never a fallback to an epoch-less open.
 func mapRunEnvOpenError(err error) error {
+	if errors.Is(err, store.ErrVaultSealStale) {
+		return store.ErrVaultSealStale
+	}
 	if errors.Is(err, secretopen.ErrVaultLocked) {
 		return errVaultLocked
 	}

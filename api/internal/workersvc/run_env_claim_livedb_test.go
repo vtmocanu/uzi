@@ -331,6 +331,11 @@ func TestRunEnvClaimLockedVaultRequeuesLiveDB(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A dek row means a protected owner: the owner turns protected after the claim gate (which
+	// idles a locked owner before any assembly) and before the values are opened.
+	fx.svc.claimHooks = &claimTestHooks{beforeAssembly: func(context.Context, store.Run) {
+		fx.env.exec(`UPDATE users SET vault_mode='protected' WHERE id=$1`, fx.userID)
+	}}
 	if p := fx.claim(t); p != nil {
 		t.Fatalf("delivered %+v", p.Secrets.RunEnv)
 	}

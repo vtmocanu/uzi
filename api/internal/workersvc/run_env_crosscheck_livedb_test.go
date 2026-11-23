@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -170,6 +171,11 @@ func TestRunEnvCrossCheckLockedVaultRequeuesLiveDB(t *testing.T) {
 	crossCheckEnvCapable(f, true)
 	varID := seedLeadSecret(t, f, "API_KEY", envSecretValue("lead"))
 	f.env.exec(`UPDATE run_env_vars SET sealed_with = 'dek' WHERE var_id = $1`, varID)
+	// A dek row means a protected owner: the owner turns protected after the claim gate and
+	// before the values are opened.
+	f.svc.claimHooks = &claimTestHooks{beforeAssembly: func(context.Context, store.Run) {
+		f.env.exec(`UPDATE users SET vault_mode='protected' WHERE id=$1`, f.userID)
+	}}
 	if p := laneClaim(t, f, "cross_check", nil); p != nil {
 		t.Fatal("a checker was delivered with the vault locked")
 	}
