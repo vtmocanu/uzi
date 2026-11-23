@@ -375,7 +375,8 @@ describe("Models page", () => {
     await screen.findByLabelText("Worker model — Claude");
     select("Worker model — Claude", "custom");
     select("Worker model — Codex", "gpt-6-sol");
-    expect(status()).toBe("1 unsaved change: Worker model — Codex");
+    // Save is disabled by the empty box, and the bar says so after the count.
+    expect(status()).toBe("1 unsaved change: Worker model — Codex · fix 1 before saving");
     expect(describedText("Worker model — Claude")).toContain("Enter a custom model ID, or choose Default.");
     // The errored cell's controls are aria-invalid; a clean neighbour's are not.
     expect(control("Worker model — Claude").getAttribute("aria-invalid")).toBe("true");
@@ -616,8 +617,13 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     // The saved routing now drives the dim; switching the draft to Codex moves it.
     await waitFor(() => expect(status()).toBe("No unsaved changes"));
     expect(describedText("Judge runs on")).toContain("Saved effective value: Claude · your setting");
-    expect(describedText("Judge model — Codex")).toContain("not used: the judge runs on the other harness");
+    // The dimmed cell says Not used once: its own line, not the saved prediction's server note too.
+    expect(describedText("Judge model — Codex")).toContain("Not used: the judge runs on Claude");
+    expect(describedText("Judge model — Codex")).not.toContain("not used: the judge runs on the other harness");
     select("Judge runs on", "codex");
+    // Undimmed, the saved prediction keeps the server's note (it describes the saved routing).
+    expect(describedText("Judge model — Codex")).toContain("not used: the judge runs on the other harness");
+    expect(describedText("Judge model — Codex")).not.toContain("Not used: the judge runs on");
     expect(cellOf("Judge model — Claude").dataset.dimmed).toBe("true");
     expect(describedText("Judge model — Claude")).toContain("Not used: the judge runs on Codex");
     expect(cellOf("Judge model — Codex").dataset.dimmed).toBeUndefined();
@@ -635,7 +641,7 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     expect(describedText("Judge model — Claude")).toContain("Not a Claude model: gpt-6-sol is a Codex model");
     expect(control("Judge model — Claude").getAttribute("aria-invalid")).toBe("true");
     expect(saveButton().disabled).toBe(true);
-    expect(status()).toContain("2 unsaved changes");
+    expect(status()).toBe("2 unsaved changes: Judge runs on, Judge model — Claude · fix 1 before saving");
   });
 
   it("says where the judge is skipped when the drafted harness has no usable credential, without disabling it", async () => {
@@ -773,7 +779,7 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     });
     mount();
     await screen.findByLabelText("Plan cross-check model — Claude");
-    expect(control("Plan cross-check model — Claude").options[0].text).toBe("Default · SDK/account default (worker default)");
+    expect(control("Plan cross-check model — Claude").options[0].text).toBe("Default · SDK/account default");
     expect(control("Plan cross-check model — Codex").options[0].text).toBe("Default · gpt-6.1-sol (worker default)");
     expect(control("Code cross-check model — Claude").options[0].text).toBe("Default · custom-template-model (worker default)");
     expect(control("Code cross-check model — Codex").options[0].text).toBe("Default · Unavailable (worker default)");

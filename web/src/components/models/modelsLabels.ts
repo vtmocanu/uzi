@@ -56,9 +56,10 @@ function effortValue(cell: Pick<EffortSettingCell, "mode" | "resolved_effort">):
 }
 
 // A server note worth showing after the source ("not used: the judge runs on the other
-// harness"); sdk_default is already the value itself.
-function noteSuffix(notes: readonly string[] | undefined, model: string): string {
-  const shown = (notes ?? []).filter((n) => !(n === "sdk_default" && model === ""));
+// harness"); sdk_default is already the value itself, and not_used is dropped when the cell
+// already says so in its own "Not used" line (omitNotUsed), so it is announced once.
+function noteSuffix(notes: readonly string[] | undefined, model: string, omitNotUsed: boolean): string {
+  const shown = (notes ?? []).filter((n) => !(n === "sdk_default" && model === "") && !(omitNotUsed && n === "not_used"));
   return shown.map((n) => ` · ${modelSettingSourceLabel("note", n)}`).join("");
 }
 
@@ -89,7 +90,12 @@ function pinPrediction(field: ModelsField, effective: EffectiveSettings): string
 // prefix. It reads ONLY the server's effective view (buildEffectiveSettings, from PredictLead and
 // the stored pins' server resolution): with no view (a failed read) or no cell for this row in
 // it, the answer is null and the cell reads Unavailable, never a guess from /me/settings.
-export function predictionText(field: ModelsField, effective: EffectiveSettings | null): string | null {
+// omitNotUsed drops the server's not_used note, for a cell that shows its own Not used reason.
+export function predictionText(
+  field: ModelsField,
+  effective: EffectiveSettings | null,
+  { omitNotUsed = false }: { omitNotUsed?: boolean } = {},
+): string | null {
   if (!effective) return null;
   if ("pin" in field.target) return pinPrediction(field, effective);
   if (field.kind === "routing") {
@@ -109,7 +115,7 @@ export function predictionText(field: ModelsField, effective: EffectiveSettings 
   if (field.kind === "model") {
     const cell = effective.models?.find((c) => c.setting === MODEL_SETTING[field.row] && c.harness === field.family);
     if (!cell) return null;
-    const notes = NOTED_MODEL_ROWS.has(field.row) ? noteSuffix(cell.notes, cell.resolved_model) : "";
+    const notes = NOTED_MODEL_ROWS.has(field.row) ? noteSuffix(cell.notes, cell.resolved_model, omitNotUsed) : "";
     return `${modelValue(cell.resolved_model)} · ${modelSettingSourceLabel(sourceField(field), cell.source)}${notes}`;
   }
   const cell = effective.efforts?.find((c) => c.setting === EFFORT_SETTING[field.row] && c.harness === field.family);
@@ -182,8 +188,10 @@ export function taskReviewEffortDefaultLabel(cell: EffortSettingCell | undefined
 // unpinned checker runs at the cross-check default (agenttmpl.CrossCheckDefaultEffort).
 export function checkerModelDefaultLabel(harness: Harness, pin: CrossCheckPinDTO | undefined): string {
   const worker = pin?.worker_default_model;
-  const shown = worker === undefined || (worker === null && harness === "codex") ? "Unavailable" : worker ?? "SDK/account default";
-  return `Default · ${shown} (worker default)`;
+  if (worker === undefined || (worker === null && harness === "codex")) return "Default · Unavailable (worker default)";
+  // The SDK/account default IS the Claude worker default, so the source is not repeated: the
+  // shorter label fits the select without truncating at desktop widths.
+  return worker === null ? "Default · SDK/account default" : `Default · ${worker} (worker default)`;
 }
 
 export const CHECKER_EFFORT_DEFAULT_LABEL = "Default · high (cross-check default)";

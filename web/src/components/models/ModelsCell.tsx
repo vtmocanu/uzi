@@ -5,8 +5,9 @@
 // Unsaved with a brand rail and border rather than pretending to predict the unsaved edit.
 //
 // A cell the draft routing leaves unused (the Codex judge model while the judge runs on Claude)
-// is DIMMED, never disabled: its control drops to reduced emphasis until it is hovered or holds
-// focus, it keeps its stored and draft values, and it is validated and saved like any other.
+// is DIMMED, never disabled: its control drops its fill and takes a dashed border (the value
+// stays at AA contrast) until it is hovered or holds focus, it keeps its stored and draft values,
+// and it is validated and saved like any other.
 
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 import type { ModelsField } from "../../lib/modelsDraft";
@@ -89,12 +90,12 @@ export function ModelsCell({
           : dirty
             ? "border-brand [&_input]:border-brand/70 [&_select]:border-brand/70"
             : "border-transparent",
-        wide && "md:col-span-2",
+        wide && "@[49rem]:col-span-2",
       )}
     >
       {/* The accessible name is "<Row> — <Family>"; the visible part is the family alone, and
-          only below md, where the column headers are hidden and the cells stack. */}
-      <label htmlFor={control} className={cx("block text-xs font-medium text-muted", family ? "md:sr-only" : "sr-only")}>
+          only where the cells stack and the column headers are hidden (a card under 49rem). */}
+      <label htmlFor={control} className={cx("block text-xs font-medium text-muted", family ? "@[49rem]:sr-only" : "sr-only")}>
         {family ? (
           <>
             <span className="sr-only">{field.row} {"—"} </span>
@@ -105,9 +106,18 @@ export function ModelsCell({
         )}
       </label>
       {notUsed ? (
-        // Hover or focus restores full emphasis, so a keyboard user editing a dormant choice
-        // sees the control (and its focus ring) at full contrast.
-        <div className="opacity-45 transition-opacity hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none">
+        // Dormant, not faded: the control loses its fill and its border turns dashed, while the
+        // value stays readable in text-muted (>= 4.5:1 on the card in every theme; an opacity
+        // fade took it to 2.86:1 on the light themes). Hover or focus restores the full control,
+        // so a keyboard user editing a dormant choice sees it at full emphasis.
+        <div
+          data-dim=""
+          className={cx(
+            "[&_input]:border-dashed [&_input]:bg-transparent [&_input]:text-muted [&_select]:border-dashed [&_select]:bg-transparent [&_select]:text-muted",
+            "[&:focus-within_input]:border-solid [&:focus-within_input]:bg-raised [&:focus-within_input]:text-fg [&:focus-within_select]:border-solid [&:focus-within_select]:bg-raised [&:focus-within_select]:text-fg",
+            "[&:hover_input]:border-solid [&:hover_input]:bg-raised [&:hover_input]:text-fg [&:hover_select]:border-solid [&:hover_select]:bg-raised [&:hover_select]:text-fg",
+          )}
+        >
           {children({ control, describedBy })}
         </div>
       ) : (

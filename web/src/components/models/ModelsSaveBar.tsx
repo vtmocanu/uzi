@@ -152,6 +152,8 @@ export function ModelsSaveBar({
               <span className="font-semibold text-fg">{plural(count, "unsaved change", "unsaved changes")}</span>
               {/* Which values changed; below sm the count alone keeps the bar one line tall. */}
               <span className="text-muted max-sm:sr-only">: {dirtyRows.join(", ")}</span>
+              {/* Why Save is disabled, kept visible at every width. */}
+              {blocked && <span className="font-medium text-danger"> {"·"} fix {blockedCount} before saving</span>}
             </>
           )}
         </p>

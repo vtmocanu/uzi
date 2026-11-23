@@ -61,8 +61,16 @@ import {
   workerModelDefaultLabel,
 } from "../components/models/modelsLabels";
 
-// The grid's three-track template, shared by the headers and every row so the columns align.
-const ROW_GRID = "md:grid md:grid-cols-[minmax(9rem,13rem)_minmax(0,1fr)_minmax(0,1fr)] md:gap-x-6";
+// The grid template, shared by the headers and every row so the columns align. It answers the
+// CARD's width, not the viewport's: the 15rem sidebar appears at lg, so a viewport breakpoint
+// widened the grid exactly when the card narrowed and truncated select values. A select needs
+// ~345px for its longest common value ("Same as the run · gpt-6-sol (lead template)"), so:
+// below a 49rem card each family stacks under the row; from 49rem Claude and Codex sit side by
+// side with the row name above them; from 60rem the name takes its own (narrow) track.
+const ROW_GRID =
+  "@[49rem]:grid @[49rem]:grid-cols-2 @[49rem]:gap-x-6 @[60rem]:grid-cols-[minmax(8rem,10rem)_minmax(0,1fr)_minmax(0,1fr)]";
+// A row's name block: above the pair below 60rem, its own track from there.
+const ROW_NAME = "mb-3 @[49rem]:col-span-2 @[60rem]:col-span-1 @[60rem]:mb-0";
 
 // A row is a Claude/Codex pair, a routing choice spanning both columns (Judge runs on), or a
 // read-only fact with no control (Summaries run on). A `sub` row belongs to the routing row
@@ -352,23 +360,28 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // The judge's routing as DRAFTED: dimming follows the select before it is saved.
   const judgeRunsOn = draft.judge_runs_on ?? "";
 
-  const cellProps = (field: ModelsField) => ({
-    field,
-    idBase: idFor(field),
-    dirty: dirtyKeys.has(field.key),
-    prediction: predictionText(field, effective),
-    reason: field.family ? harnessReason(field.family, effective) : null,
-    notUsed: judgeNotUsedReason(field, judgeRunsOn),
-    storedWarning: storedWarnings[field.key] ?? null,
-    error:
-      fieldErrors[field.key] ??
-      localWarnings[field.key] ??
-      (customEmpty.has(field.key)
-        ? field.row.startsWith("Planning")
-          ? "Enter a custom model ID, or choose Same as the run."
-          : "Enter a custom model ID, or choose Default."
-        : null),
-  });
+  const cellProps = (field: ModelsField) => {
+    const notUsed = judgeNotUsedReason(field, judgeRunsOn);
+    return {
+      field,
+      idBase: idFor(field),
+      dirty: dirtyKeys.has(field.key),
+      // A cell showing its own Not used line drops the saved prediction's not_used note, so a
+      // screen reader hears it once.
+      prediction: predictionText(field, effective, { omitNotUsed: notUsed !== null }),
+      reason: field.family ? harnessReason(field.family, effective) : null,
+      notUsed,
+      storedWarning: storedWarnings[field.key] ?? null,
+      error:
+        fieldErrors[field.key] ??
+        localWarnings[field.key] ??
+        (customEmpty.has(field.key)
+          ? field.row.startsWith("Planning")
+            ? "Enter a custom model ID, or choose Same as the run."
+            : "Enter a custom model ID, or choose Default."
+          : null),
+    };
+  };
 
   const pinOf = (field: ModelsField) =>
     "pin" in field.target
@@ -482,7 +495,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // Summaries run on is a fact, not a setting: summaries run inline on the run's own engine and
   // credential (#4156 tracks a choice), so it reads like a cell but offers no control.
   const summaryRoutingFact = (
-    <div className="min-w-0 space-y-1.5 border-l-2 border-transparent pl-3 md:col-span-2">
+    <div className="min-w-0 space-y-1.5 border-l-2 border-transparent pl-3 @[49rem]:col-span-2">
       <p className="text-sm text-fg">Same as the run</p>
       <p className="max-w-prose text-xs text-faint">
         Summaries run on the run&rsquo;s own engine and credential: Claude runs use the Claude summary model,
@@ -518,7 +531,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       />
       <fieldset disabled={busy} className="min-w-0 space-y-4 disabled:opacity-80">
         <legend className="sr-only">Model settings</legend>
-        <Card className="space-y-1">
+        {/* A little less side padding below sm, so a phone-width select fits its Default value. */}
+        <Card className="@container space-y-1 max-sm:px-4">
           <p id="models-precedence" className="max-w-prose text-sm text-muted">
             Explicit run choices win in both phases, and a compatible schedule model pin overrides these
             defaults. Each cell shows the saved effective value and where it comes from; an edit
@@ -527,7 +541,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
           {/* Default harness: one choice for both families. */}
           <div className={`border-t border-edge pt-4 mt-4 ${ROW_GRID}`}>
-            <div className="mb-3 md:mb-0">
+            <div className={ROW_NAME}>
               <h3 className="text-sm font-medium text-fg">Default harness</h3>
               <p className="text-xs text-faint">
                 Used when a run or schedule doesn't choose one. Switching keeps both families' choices below.
@@ -562,7 +576,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
                   visual only (each control names its family itself), and hidden where the
                   cells stack and carry their own family label. */}
               <div aria-hidden="true" className={`hidden pb-2 ${ROW_GRID}`}>
-                <span />
+                <span className="hidden @[60rem]:block" />
                 {(["claude", "codex"] as const).map((h) => (
                   <span key={h} className="flex items-center gap-2 border-l-2 border-transparent pl-3 text-xs font-semibold text-muted">
                     {h === "claude" ? <ClaudeIcon className="h-3.5 w-3.5 text-brand-claude" /> : <OpenAIIcon className="h-3.5 w-3.5" />}
@@ -576,7 +590,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
                   data-row={row}
                   className={`${sub ? "pt-1 pb-4" : type === "pair" ? "border-t border-edge py-4" : "border-t border-edge pt-4 pb-3"} ${ROW_GRID}`}
                 >
-                  <div className={cx("mb-3 md:mb-0", sub && "md:pl-3")}>
+                  <div className={cx(ROW_NAME, sub && "@[60rem]:pl-3")}>
                     <h4 className={cx("text-sm", sub ? "text-muted" : "font-medium text-fg")}>{row}</h4>
                     <p className="text-xs text-faint">{description}</p>
                   </div>
@@ -585,7 +599,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
                   ) : type === "fact" ? (
                     summaryRoutingFact
                   ) : (
-                    <div className="space-y-4 md:contents">{pairCells(row)}</div>
+                    <div className="space-y-4 @[49rem]:contents">{pairCells(row)}</div>
                   )}
                 </div>
               ))}
