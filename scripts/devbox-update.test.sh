@@ -36,7 +36,7 @@ check contract '.on.workflow_dispatch.inputs.dry_run.default == false and (.jobs
 
 # #3311: the worker relock is the staged, manifest-preserving refresh, never a full
 # `devbox update` (which migrates raw package keys to @latest on Devbox 0.17.5).
-check contract '[.jobs.validate.steps[] | select(.name == "Refresh the worker lock (staged, manifest-preserving)") | .run | (contains("python3 scripts/refresh-worker-lock.py") and (test("(^|\\n)\\s*devbox +update"; "") | not))] == [true]'
+check contract '[.jobs.validate.steps[] | select(.id == "refresh_worker_lock") | .run | (contains("python3 scripts/refresh-worker-lock.py") and (test("(^|\\n)\\s*devbox +update"; "") | not))] == [true]'
 # A failed scheduled refresh surfaces as one tracking issue, from its own job whose
 # token can only write issues and never sees validation or proposal credentials.
 check contract '.jobs.report_failure.permissions == {"issues":"write"} and .jobs.report_failure.needs == ["validate","validate_tools","propose"]'

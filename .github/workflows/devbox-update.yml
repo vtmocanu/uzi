@@ -116,6 +116,7 @@ jobs:
       # rewrites, partial installs and mismatched keys leave both originals untouched.
       # This realizes the refreshed packages; the image build remains the final guard.
       - name: Refresh the worker lock (staged, manifest-preserving)
+        id: refresh_worker_lock
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -492,7 +493,7 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="Weekly devbox toolchain refresh failing"
-          NOTE="$(printf 'Scheduled run failed: %s\n\nJob results: `%s`. Until it is green the worker toolchain stays on its committed nixpkgs pin. Close this issue once a scheduled run succeeds.' "${RUN_URL}" "${RESULTS}")"
+          NOTE="$(printf 'Scheduled run failed: %s\n\nJob results: `%s`. A failed `validate` keeps the worker toolchain on its committed nixpkgs pin; a failed `validate_tools` keeps only the uxlab lock on its pin. Close this issue once a scheduled run succeeds.' "${RUN_URL}" "${RESULTS}")"
           existing="$(gh issue list --state open --search "\"${TITLE}\" in:title" --json number,title \
             | jq -r --arg t "${TITLE}" '[.[] | select(.title == $t)][0].number // empty')"
           if [ -n "${existing}" ]; then

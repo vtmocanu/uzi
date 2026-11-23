@@ -35,7 +35,7 @@ class RefreshTests(unittest.TestCase):
         for name in ('check-worker-toolchain.py', 'refresh-worker-lock.py'):
             shutil.copyfile(PROJECT / 'scripts' / name, scripts / name)
         workflow = json.loads(subprocess.check_output(['yq', '-o=json', str(PROJECT / '.github/workflows/devbox-update.yml')]))
-        step = next(step for step in workflow['jobs']['validate']['steps'] if step['name'].startswith('devbox update ('))
+        step = next(step for step in workflow['jobs']['validate']['steps'] if step.get('id') == 'refresh_worker_lock')
         self.command = step['run']
         self.cwd = self.root / step.get('working-directory', '.')
         self.before_manifest = (self.root / 'agent/devbox-global/devbox.json').read_bytes()
@@ -76,6 +76,10 @@ elif args[0] in ('install', 'update'):
                 'systems': {'x86_64-linux': {'outputs': [{'path': '/nix/store/' + suffix, 'default': True}]}}}
     if mode == 'go-change':
         data['packages'][os.environ['PIN_KEY']]['resolved'] += '?changed=true'
+    if mode == 'install-go-drift' and args[0] == 'install':
+        data['packages'][os.environ['PIN_KEY']]['resolved'] += '?changed=true'
+    if mode == 'install-raw-drift' and args[0] == 'install':
+        data['packages']['gcc']['resolved'] = 'github:NixOS/nixpkgs/' + 'a' * 40 + '#gcc'
     if mode == 'orphan' and args[0] == 'install':
         data['packages']['jq.bin@latest'] = {}
     if mode == 'output-change' and args[0] == 'install':
@@ -180,6 +184,19 @@ else:
         result = self.invoke('go-change')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('pin metadata changed', result.stderr)
+        self.assert_originals()
+
+    def test_install_cannot_drift_the_explicit_pin_with_unchanged_outputs(self):
+        result = self.invoke('install-go-drift')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('pin metadata changed', result.stderr)
+        self.assert_originals()
+
+    def test_install_cannot_leave_a_raw_package_off_the_refreshed_stdenv(self):
+        result = self.invoke('install-raw-drift')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('raw packages not on stdenv', result.stderr)
+        self.assertIn('gcc', result.stderr)
         self.assert_originals()
 
 

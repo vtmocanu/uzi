@@ -45,6 +45,25 @@ def require_public_cache(config, packages):
     return system, paths
 
 
+STDENV = 'github:NixOS/nixpkgs/nixpkgs-unstable'
+
+
+def verify_resolution(lock, raw, pinned):
+    """Every explicit pin matches the ORIGINAL lock, and every raw package resolves
+    through the one refreshed stdenv revision, immediately before publication."""
+    packages = lock['packages']
+    if any(packages.get(key) != entry for key, entry in pinned.items()):
+        raise ValueError('explicit pin metadata changed; no lock published')
+    match = re.fullmatch(r'github:NixOS/nixpkgs/([0-9a-f]{40})(\?.*)?', packages.get(STDENV, {}).get('resolved', ''))
+    if not match:
+        raise ValueError('refreshed stdenv revision missing; no lock published')
+    revision = match.group(1)
+    drifted = sorted(key for key in raw if packages.get(key, {}).get('source') != 'nixpkg'
+                     or packages[key].get('resolved') != f'github:NixOS/nixpkgs/{revision}#{key}')
+    if drifted:
+        raise ValueError(f'raw packages not on stdenv {revision[:12]}: {", ".join(drifted)}; no lock published')
+
+
 def refresh(root, devbox):
     directory = root / 'agent/devbox-global'
     manifest_path, lock_path = directory / 'devbox.json', directory / 'devbox.lock'
@@ -58,6 +77,8 @@ def refresh(root, devbox):
     raw = [key for key in packages if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.+-]*', key)]
     if not raw:
         raise ValueError('worker manifest has no raw attributes to refresh')
+    original_entries = json.loads(original_lock)['packages']
+    pinned = {key: original_entries[key] for key in packages if key not in raw}
     with tempfile.TemporaryDirectory(prefix='worker-lock-refresh-') as temporary:
         stage = Path(temporary)
         config = stage / 'agent/devbox-global'
@@ -81,7 +102,6 @@ def refresh(root, devbox):
         if len(raw) < 2 or not anchors:
             raise ValueError('metadata-only refresh requires two raw attributes and a nixpkg anchor')
         anchor = anchors[0]
-        pinned = {key: lock['packages'][key] for key in packages if key not in raw}
         for key in raw:
             if key != anchor:
                 del lock['packages'][key]
@@ -104,14 +124,13 @@ def refresh(root, devbox):
         (config / 'devbox.lock').write_text(json.dumps(lock, indent=2) + '\n')
         run('update', other, '--no-install')
         CHECK.check(stage)
-        final = json.loads((config / 'devbox.lock').read_text())
-        if any(final['packages'][key] != entry for key, entry in pinned.items()):
-            raise ValueError('explicit pin metadata changed; no lock published')
+        verify_resolution(json.loads((config / 'devbox.lock').read_text()), raw, pinned)
         system, cached_paths = require_public_cache(config, packages)
         run('install', '--tidy-lockfile')
         CHECK.check(stage)
         if selected_output_paths(config, packages, system) != cached_paths:
             raise ValueError('worker outputs changed after cache verification; no lock published')
+        verify_resolution(json.loads((config / 'devbox.lock').read_text()), raw, pinned)
         if (manifest_path.read_bytes() != original_manifest or lock_path.read_bytes() != original_lock
                 or any(path.read_bytes() != contents for path, contents in modules.items())):
             raise ValueError('worker inputs changed during refresh; no lock published')
