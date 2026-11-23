@@ -4,10 +4,8 @@
 // OTEL_LOG_RAW_API_BODIES, NODE_OPTIONS or ANTHROPIC_BASE_URL), regardless of `settingSources: []`.
 // The CLI runs as the runner uid and so does the agent's Bash tool, so an agent that can write
 // the config can change the next CLI start's environment, with the provider credential already in
-// it. An earlier form of this module replaced `<HOME>/.claude.json` with fixed bytes before each
-// spawn and removed `<HOME>/.claude/.config.json`. Review found that the removal followed a
-// symlinked `.claude` out of HOME, and that a live runner-uid process could rewrite either file
-// between the reset and the CLI's read, or while the CLI ran, or place `.claude/remote-settings.json`.
+// it. The same holds for a config the CLI reads from `<HOME>/.claude.json`, `<HOME>/.claude/.config.json`
+// and `<HOME>/.claude/remote-settings.json` when CLAUDE_CONFIG_DIR is unset.
 //
 // Policy. The CLI is pointed at a directory the runner cannot change, with CLAUDE_CONFIG_DIR
 // (sdk-env.ts sets it to claudeConfigDir(HOME), a protected key; spawnDetached refuses to start a
@@ -24,7 +22,7 @@
 // is then the directory's owner and would otherwise write it; with 0555 the pinned CLI saves and
 // creates nothing, see the probes below, so the next start finds it unchanged and reuses it).
 // Only those two links are made: session-env and shell-snapshots (sourced by Bash),
-// plugins, hooks, skills, commands and agents (configuration and code) are deliberately not linked,
+// plugins, hooks, skills, commands and agents (configuration and code) are not linked,
 // so the CLI finds them absent in a directory it cannot create them in. Only ONE of `.claude.json`
 // and `.config.json` is present, because the CLI prints a warning when both exist and prefers
 // `.config.json`.
@@ -39,25 +37,31 @@
 // applied, and an unsigned remote-settings env block was not applied (no positive control); the
 // scope of both is in ADR-4416.
 //
-// Boundary. Under the uid split (uidSplitActive) HOME must be a real directory owned by the
-// worker uid; this module adds the sticky bit to it, so the group-writable runner can create
-// entries in HOME but cannot rename, replace or unlink the worker-owned config directory, and the
-// directory itself grants the runner no write. It also refuses a HOME whose parent is
-// world-writable without the sticky bit. A group-writable parent whose group is not one of the
-// runner's is NOT refused: the data root is
-// 2775 on a hosted volume (entrypoint.sh align_pvc_root) and the chat HOME is `<dataDir>/agent-home`
-// itself, so refusing it would stop every chat start. HOME's own entry is therefore protected by the
-// data-root layout, not by this module: per-run HOMEs live in the sticky `agent-home` root (3775),
-// job HOMEs under a 2750 root, cross-check and model-pass HOMEs (mkdtemp) in that same sticky
-// `agent-home` root (main.ts `homeRoot: sdkHomeRoot`; ADR-4416, "Global CLI config input"). A
-// group-writable, non-sticky parent whose group is one the runner holds (runner 10002, runner-cmd
-// 10003, codex-session 10004) IS refused, since the runner could rename HOME's entry; the hosted
-// 2775 data root (group worker, 10001) is not. Within that layout the runner cannot create or
-// change anything in the config directory for the whole launch. One uid
-// (a k8s single-uid start, or these tests) gives NO protection: the CLI and the agent are the
-// worker's own uid, so the agent can alter the directory between the last check and the CLI's
-// read; the checks below then only repair what an earlier turn left. Kernel
-// enforcement of the sticky and ownership boundary cannot be shown with one uid and is not tested.
+// Boundary. Under the uid split (uidSplitActive) the trusted layout is:
+//   - HOME is a real directory (fs.realpathSync(HOME) === HOME, lstat is not a symlink) owned by the
+//     worker uid; this module adds the sticky bit to it, so the group-writable runner can create
+//     entries in HOME but cannot rename, replace or unlink the worker-owned config directory, and
+//     the directory itself grants the runner no write.
+//   - HOME's parent and every ancestor up to `/` is a real directory (lstat, not a symlink) owned by
+//     uid 0 or the worker uid, not world-writable unless sticky, and not group-writable by a runner
+//     group (runner 10002, runner-cmd 10003, codex-session 10004) unless sticky. A group-writable
+//     ancestor whose group is not a runner group is accepted: the data root is 2775 group worker
+//     (10001) on a hosted volume (entrypoint.sh align_pvc_root) and the chat HOME is
+//     `<dataDir>/agent-home` itself. Per-run HOMEs live in the sticky `agent-home` root (3775), job
+//     HOMEs under a 2750 root, cross-check and model-pass HOMEs (mkdtemp) in that same sticky root
+//     (main.ts `homeRoot: sdkHomeRoot`; ADR-4416, "Global CLI config input").
+// Any other layout refuses the start before anything is built. Within the trusted layout the runner
+// cannot create or change anything in the config directory for the whole launch. One uid (a k8s
+// single-uid start, or these tests) gives NO protection: the CLI and the agent are the worker's own
+// uid, so the agent can alter the directory between the last check and the CLI's read; the checks
+// below then only repair what an earlier turn left, and no ownership or ancestor check is made.
+// Kernel enforcement of the sticky and ownership boundary cannot be shown with one uid and is not
+// tested there.
+//
+// Run variables. A run's user variables reach the CLI environment only under the split
+// (sdk-executor.ts refuses a run that carries any when uidSplitActive() is false, and sdk-env.ts
+// buildSdkEnv throws the same refusal): with one uid this directory gives no protection, so a
+// variable could carry the same effect as a planted config `env` block.
 //
 // Reuse and rebuild. The directory is never opened through a symlink and nothing in it is ever
 // deleted. A real directory with exactly the expected entries in the expected state is reused (so
@@ -67,38 +71,55 @@
 // owner or mode, an unexpected entry, a different link target) is renamed aside within HOME to
 // `.uzi-claude-config.stale-<hex>` (rename does not follow a symlink) and a fresh directory is
 // built under a temp name and renamed into place, so it is never visible half built and two
-// prepares cannot destroy each other's good directory. A failed rename aside refuses the start.
-// The aside copies stay until the HOME is reclaimed with the rest of it (rmtree.ts rmHomeTree).
+// prepares cannot destroy each other's good directory. A failed rename aside refuses the start. When
+// the final rename fails (macOS can report EACCES where Linux reports EEXIST), the directory is
+// inspected again: a valid directory another prepare installed is reused; a changed entry or
+// EEXIST/ENOTEMPTY/ENOTDIR/EISDIR re-enters the loop; any other error with no valid directory
+// there refuses the start. The aside copies stay until the HOME is reclaimed with the rest of it
+// (rmtree.ts rmHomeTree).
 //
 // Targets. `<HOME>/.claude/projects` and `<HOME>/.claude/tasks` must exist and be writable by the
 // CLI. Missing ones are created AS THE RUNNER UID (a fixed worker-authored `/bin/mkdir -p -m 700`
-// argv through runnerCommand, workerSpawnEnv on a minimal PATH env, no shell; the spawnSync timeout
-// is not a hard bound, see defaultMkdirAsRunner; exit status 1 is the planted-entry signal, any
-// other non-zero exit, a signal or a spawn error is a transient refusal), so they are runner-owned and private (0700) exactly as when the CLI created them, and
-// neither runner-cmd (the Codex command uid, which shares group runner) nor the worker ever holds
-// a write path into a Claude transcript directory. The worker never writes or renames anything
-// under `.claude`; the only thing it ever moves is the `.claude` entry itself in HOME. That mkdir
-// follows a runner-planted symlink only with the runner's own permissions, so it needs no
-// confinement. With one uid the same argv is spawned directly (worker == runner). `.claude` that
-// is not a real directory (a symlink, a file) is renamed aside (rename does not follow) and
-// recreated. Where the worker can look inside `.claude`, a `projects` or `tasks` that is not a real
-// directory makes it rename `.claude` aside and recreate it (the transcripts stay in the aside
-// copy, so a resume of that session finds nothing). A `.claude` the worker cannot open
-// (runner-private, the split's normal state) is not inspected and the mkdir is simply repeated (it
-// is idempotent); when that mkdir exits 1 (a file or dangling symlink at a target, an unsearchable
-// `.claude`), `.claude` is renamed aside ONCE and the mkdir retried, and a second exit 1 refuses
-// the start. That keeps a runner-planted target from refusing every later start of a HOME, the
-// shared chat HOME included. Residual: exit 1 is not proof of a planted entry. mkdir also exits 1
-// on ENOSPC/EDQUOT/EIO, and setpriv exits 1 when it cannot resolve the runner user (for example
-// under descriptor or memory exhaustion); such a failure moves `.claude` aside once. The start is
-// then refused if the retry fails too, and otherwise proceeds with a fresh `.claude`; nothing is
-// deleted, and earlier sessions' resume history stays in the aside copy.
+// argv, workerSpawnEnv on a minimal PATH env, no shell), so they are runner-owned and private
+// (0700), and neither runner-cmd (the Codex command uid, which shares group runner) nor the worker
+// ever holds a write path into a Claude transcript directory. The worker never writes or renames
+// anything under `.claude`; the only thing it ever moves is the `.claude` entry itself in HOME. The
+// mkdir follows a runner-planted symlink only with the runner's own permissions. `.claude` that is
+// not a real directory (a symlink, a file) is renamed aside (rename does not follow) and recreated.
+// Where the worker can look inside `.claude`, a `projects` or `tasks` that is not a real directory
+// makes it rename `.claude` aside and recreate it (the transcripts stay in the aside copy, so a
+// resume of that session finds nothing). A `.claude` the worker cannot open (runner-private, the
+// split's normal state) is not inspected and the mkdir is repeated (it is idempotent).
 //
-// Not reset any more: `<HOME>/.claude.json` and the configuration files under `<HOME>/.claude`
-// (`.config.json`, `settings.json`, `remote-settings.json`) were not applied in the probes once
-// CLAUDE_CONFIG_DIR is set, so they are no longer replaced or removed. The CLI does read the linked
-// `<HOME>/.claude/projects` (transcripts, per-project memory) and `<HOME>/.claude/tasks`, which stay
-// runner-writable data, as before this change.
+// Obstruction. A non-zero mkdir exit status alone moves nothing: exit 1 also comes from ENOSPC,
+// EDQUOT, EIO and from setpriv failing to resolve the runner user. After a runner mkdir of the
+// targets exits non-zero, the module establishes a POSITIVE obstruction and only then moves
+// `.claude` aside, once; a second obstruction refuses the start. Under the split a second fixed
+// runner-uid helper, `/bin/stat -c '%u|%a|%F|%n' -- <HOME>/.claude <missing targets>`, prints one
+// line per entry that exists; its stdout is captured (utf8, 64 KiB) and its exit status ignored.
+// Lines are matched by exact `%n` equal to a path that was passed. An obstruction is: a matched line
+// whose `%F` is not exactly `directory` (a regular file, a symlink, ...), or the `.claude` line
+// showing an owner other than RUNNER_UID, or an owner mode without rwx. No lines (the helper was
+// killed, setpriv could not resolve the user, the paths are absent), a lookup failure and a full
+// disk are not an obstruction: the start is refused and `.claude` stays in place. With one uid there
+// is no stat or timeout helper: the worker is the runner, lstat-inspects `.claude` and the missing
+// targets itself and applies the same rule (the owner is compared with the worker's uid), and mkdir
+// is spawned directly.
+//
+// Bound. Under the split each helper is `runnerCommand("/usr/bin/timeout", ["-s", "KILL", "2",
+// <bin>, ...args])` run by spawnSync with a 4 s timeout and SIGKILL. The whole preparation has one
+// absolute deadline of 10 s, read from PrepareDeps.now and checked before each helper spawn: past
+// it the start is refused and the tree is kept. A helper stuck in uninterruptible I/O is not
+// terminated by SIGKILL until the I/O returns, so neither limit shortens a call that is already
+// blocked; they bound how many helpers start and how long a responsive one runs. A spawn error, a
+// signal, a null status, and (for mkdir) any status other than 0 and 1, including those of timeout
+// itself (124, 125, 126, 127, 137), are transient: they refuse this start and move nothing.
+//
+// The CLI reads the linked `<HOME>/.claude/projects` (transcripts, per-project memory) and
+// `<HOME>/.claude/tasks`, which stay runner-writable data. `<HOME>/.claude.json` and the
+// configuration files under `<HOME>/.claude` (`.config.json`, `settings.json`,
+// `remote-settings.json`) are neither replaced nor removed: they were not applied in the probes once
+// CLAUDE_CONFIG_DIR is set.
 //
 // No HOME in the env: no-op (the probe-style spawns that carry no HOME do not start a CLI). A spawn
 // that carries a provider credential but no HOME is refused by spawnDetached (sdk-spawn.ts) before
@@ -129,22 +150,44 @@ const EXPECTED_ENTRIES = [CONFIG_FILE, ...LINKS.map(([n]) => n)].sort();
 const MAX_ATTEMPTS = 4;
 
 const DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
-/** Groups the runner uids hold: a group-writable non-sticky parent in one of them lets the runner
- *  rename HOME's entry. runner (10002), runner-cmd (10003), codex-session (10004). */
+/** Groups the runner uids hold: a group-writable non-sticky ancestor in one of them lets the runner
+ *  rename the entry below it. runner (10002), runner-cmd (10003), codex-session (10004). */
 const RUNNER_GIDS: readonly number[] = [RUNNER_UID, COMMAND_UID, CODEX_SESSION_GID];
 const MKDIR_BIN = "/bin/mkdir";
-const MKDIR_TIMEOUT_MS = 5_000;
-/** The exit status of a mkdir that ran and failed (a planted file, an unsearchable directory). */
-const MKDIR_PLANTED_STATUS = 1;
+const STAT_BIN = "/bin/stat";
+const TIMEOUT_BIN = "/usr/bin/timeout";
+/** The helper's own kill after this many seconds (timeout -s KILL). */
+const HELPER_KILL_AFTER_S = "2";
+/** spawnSync's timeout for one helper, longer than timeout's own kill. */
+const HELPER_SPAWN_TIMEOUT_MS = 4_000;
+/** The absolute limit for one whole preparation, measured from its start. */
+const PREPARE_DEADLINE_MS = 10_000;
+const HELPER_MAX_BUFFER = 64 * 1024;
+/** The exit status of a mkdir that ran and failed (a planted file, an unsearchable directory, ENOSPC). */
+const MKDIR_FAILED_STATUS = 1;
+const STAT_FORMAT = "%u|%a|%F|%n";
+
+/** The outcome of one helper run: its exit status (null when it did not exit), the signal that ended
+ *  it, and its captured stdout. */
+export interface HelperResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+}
 
 /** Test-only seams. `onStep` is called with a step name before each stage, so a test can act as a
- *  hostile process at that point. `mkdirAsRunner` replaces the runner-uid `mkdir` (it receives the
- *  mkdir arguments and returns its exit status: 0, or 1 for a planted entry; any other value or a
- *  throw is a transient refusal). Production callers pass nothing. */
+ *  hostile process at that point. Production callers pass nothing. */
 export interface PrepareDeps {
   onStep?: (name: string) => void;
-  /** Run `/bin/mkdir <args>` as the runner: returns its exit status; throws on a transient failure. */
-  mkdirAsRunner?: (args: readonly string[]) => number;
+  /** Run `<bin> <args>` as the runner uid, bounded (the production implementation is {@link runBounded}
+   *  with the uid-split wrapper); throws on a transient failure. */
+  runAsRunner?: (bin: string, args: readonly string[]) => HelperResult;
+  /** lstat of HOME's parent and each ancestor (default `fs.lstatSync`). */
+  lstatAncestor?: (p: string) => fs.Stats;
+  /** The final rename of the built temp directory into place (default `fs.renameSync`). */
+  rename?: (from: string, to: string) => void;
+  /** The clock for the preparation deadline, in milliseconds (default `Date.now`). */
+  now?: () => number;
 }
 
 const errCode = (err: unknown): string | undefined => (err as NodeJS.ErrnoException | undefined)?.code;
@@ -152,6 +195,13 @@ const hex = (): string => randomBytes(8).toString("hex");
 
 function refuse(reason: string): TrustedExecutionRefusal {
   return new TrustedExecutionRefusal(`Claude CLI config directory refused: ${reason}`);
+}
+
+/** What one preparation carries: the helper runner, the clock and its absolute deadline. */
+interface Prep {
+  run: (bin: string, args: readonly string[]) => HelperResult;
+  now: () => number;
+  deadline: number;
 }
 
 /**
@@ -169,32 +219,39 @@ export function prepareClaudeConfigDir(
   const dir = claudeConfigDir(home);
   if (env?.CLAUDE_CONFIG_DIR !== dir) throw refuse("CLAUDE_CONFIG_DIR is not the worker-prepared directory");
   const step = (name: string): void => deps.onStep?.(name);
+  const now = deps.now ?? Date.now;
+  const prep: Prep = { run: deps.runAsRunner ?? defaultRunAsRunner, now, deadline: now() + PREPARE_DEADLINE_MS };
   try {
     step("home");
-    guardHome(home);
+    guardHome(home, deps.lstatAncestor ?? ((p) => fs.lstatSync(p)));
     step("targets");
-    ensureTargets(home, deps.mkdirAsRunner ?? defaultMkdirAsRunner, step);
-    ensureConfigDir(home, dir, step);
+    ensureTargets(home, prep, step);
+    ensureConfigDir(home, dir, step, deps.rename ?? ((from, to) => fs.renameSync(from, to)));
   } catch (err) {
     if (err instanceof TrustedExecutionRefusal) throw err;
     throw new TrustedExecutionRefusal(REFUSAL, { cause: err });
   }
 }
 
-/** HOME must be a real directory; under the split it must be the worker's and sticky, and not in a
- *  world-writable, non-sticky parent (see the header's Boundary). */
-function guardHome(home: string): void {
+/** HOME must be a real directory; under the split it must be the worker's and sticky, and sit under
+ *  ancestors that are all trusted (see the header's Boundary). */
+function guardHome(home: string, lstatAncestor: (p: string) => fs.Stats): void {
   const st = fs.lstatSync(home);
   if (!st.isDirectory()) throw refuse("HOME is not a real directory");
   if (!uidSplitActive()) return;
   const uid = process.getuid?.();
   if (uid !== undefined && st.uid !== uid) throw refuse("HOME is not owned by the worker");
-  const parent = fs.statSync(path.dirname(home));
-  if ((parent.mode & 0o002) !== 0 && (parent.mode & 0o1000) === 0) {
-    throw refuse("HOME's parent is world-writable and not sticky");
-  }
-  if ((parent.mode & 0o020) !== 0 && (parent.mode & 0o1000) === 0 && RUNNER_GIDS.includes(parent.gid)) {
-    throw refuse("HOME's parent is group-writable by a runner group and not sticky");
+  if (fs.realpathSync(home) !== home) throw refuse("HOME is not its own real path");
+  for (let p = path.dirname(home); ; p = path.dirname(p)) {
+    const a = lstatAncestor(p);
+    if (!a.isDirectory()) throw refuse(`an ancestor of HOME is not a real directory (${p})`);
+    if (a.uid !== 0 && a.uid !== uid) throw refuse(`an ancestor of HOME is owned by neither root nor the worker (${p})`);
+    const sticky = (a.mode & 0o1000) !== 0;
+    if ((a.mode & 0o002) !== 0 && !sticky) throw refuse(`an ancestor of HOME is world-writable and not sticky (${p})`);
+    if ((a.mode & 0o020) !== 0 && !sticky && RUNNER_GIDS.includes(a.gid)) {
+      throw refuse(`an ancestor of HOME is group-writable by a runner group and not sticky (${p})`);
+    }
+    if (path.dirname(p) === p) break;
   }
   if ((st.mode & 0o1000) === 0) fchmodDir(home, (st.mode & 0o7777) | 0o1000);
 }
@@ -214,37 +271,103 @@ function renameAside(p: string): void {
   fs.renameSync(p, `${p}.stale-${hex()}`);
 }
 
-/** Run `/bin/mkdir <args>` as the runner uid (directly with one uid). A fixed worker-authored argv:
- *  workerSpawnEnv on a minimal PATH env, no shell; returns 0 or 1 (mkdir's failure); anything else
- *  (spawn error, signal, timeout, another exit status) throws. The spawnSync timeout and
- *  SIGKILL only bound the wait until the kill is attempted: under the split the child is the runner
- *  uid after setpriv and the worker cannot kill(2) it (EPERM, see runner-uid.ts), so no stronger
- *  bound is claimed. The argv is fixed and the command short-lived. */
-function defaultMkdirAsRunner(args: readonly string[]): number {
-  const wrapped = runnerCommand(MKDIR_BIN, args);
-  const r = spawnSync(wrapped.command, wrapped.args, {
+/** Spawn `command` with the helper bounds: a fixed worker-authored argv on workerSpawnEnv with a
+ *  minimal PATH, no shell, stdout captured (utf8, bounded), spawnSync's 4 s timeout and SIGKILL. A
+ *  spawn error (including a timeout or an exceeded buffer) throws a refusal. */
+export function runBounded(command: string, args: readonly string[]): HelperResult {
+  const r = spawnSync(command, [...args], {
     env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
     shell: false,
-    stdio: "ignore",
-    timeout: MKDIR_TIMEOUT_MS,
+    stdio: ["ignore", "pipe", "ignore"],
+    encoding: "utf8",
+    maxBuffer: HELPER_MAX_BUFFER,
+    timeout: HELPER_SPAWN_TIMEOUT_MS,
     killSignal: "SIGKILL",
   });
-  // A spawn error, a signal or a timeout is transient: it refuses this start only, so a burst of
-  // load never moves the shared chat root's transcripts aside. Only mkdir's own failure status 1
-  // (a planted file, an unsearchable directory) is returned as such; setpriv's other failures (126,
-  // 127 on a failed credential change or execve, e.g. RLIMIT_NPROC EAGAIN) are transient too. Its
-  // user-lookup failure also exits 1 and is read as planted (see the header's Residual).
-  if (r.error || r.signal || r.status === null) throw refuse("the runner mkdir of the .claude targets did not complete");
-  if (r.status !== 0 && r.status !== MKDIR_PLANTED_STATUS) {
-    throw refuse("the runner mkdir of the .claude targets did not complete");
+  if (r.error) throw refuse("a runner helper did not complete");
+  return { status: r.status, signal: r.signal, stdout: typeof r.stdout === "string" ? r.stdout : "" };
+}
+
+/** The argv the helper runs as: under the split the runner uid via setpriv around `timeout -s KILL 2`,
+ *  with one uid the binary directly. */
+export function helperCommand(bin: string, args: readonly string[], split: boolean): { command: string; args: string[] } {
+  if (!split) return { command: bin, args: [...args] };
+  return runnerCommand(TIMEOUT_BIN, ["-s", "KILL", HELPER_KILL_AFTER_S, bin, ...args], true);
+}
+
+function defaultRunAsRunner(bin: string, args: readonly string[]): HelperResult {
+  const wrapped = helperCommand(bin, args, uidSplitActive());
+  return runBounded(wrapped.command, wrapped.args);
+}
+
+/** Run one helper after checking the preparation deadline. */
+function runHelper(prep: Prep, bin: string, args: readonly string[]): HelperResult {
+  if (prep.now() > prep.deadline) throw refuse("the preparation exceeded its time limit");
+  return prep.run(bin, args);
+}
+
+/** `/bin/mkdir <args>` as the runner: true when it exited 0, false when it exited 1 (it ran and
+ *  failed); any other outcome is transient and throws. */
+function mkdirAsRunner(prep: Prep, args: readonly string[]): boolean {
+  const r = runHelper(prep, MKDIR_BIN, args);
+  if (r.signal !== null || r.status === null) throw refuse("the runner mkdir of the .claude targets did not complete");
+  if (r.status === 0) return true;
+  if (r.status === MKDIR_FAILED_STATUS) return false;
+  throw refuse("the runner mkdir of the .claude targets did not complete");
+}
+
+interface EntryFact {
+  path: string;
+  uid: number;
+  mode: number;
+  kind: string;
+}
+
+/** True when `facts` show a positive obstruction (see the header's Obstruction). */
+function obstructs(claude: string, facts: readonly EntryFact[], runnerUid: number | undefined): boolean {
+  for (const f of facts) {
+    if (f.kind !== "directory") return true;
+    if (f.path === claude && ((runnerUid !== undefined && f.uid !== runnerUid) || (f.mode & 0o700) !== 0o700)) return true;
   }
-  return r.status;
+  return false;
+}
+
+/** Parse the stat helper's stdout into facts for the exact paths asked about. */
+function parseStat(stdout: string, asked: readonly string[]): EntryFact[] {
+  const facts: EntryFact[] = [];
+  for (const line of stdout.split("\n")) {
+    const m = /^(\d+)\|([0-7]+)\|([^|]*)\|(.*)$/.exec(line);
+    if (m === null || !asked.includes(m[4]!)) continue;
+    facts.push({ path: m[4]!, uid: Number(m[1]), mode: Number.parseInt(m[2]!, 8), kind: m[3]! });
+  }
+  return facts;
+}
+
+/** Whether `.claude` or one of the missing targets is positively obstructed, after a failed mkdir. */
+function positiveObstruction(prep: Prep, claude: string, missing: readonly string[]): boolean {
+  const asked = [claude, ...missing];
+  if (uidSplitActive()) {
+    const r = runHelper(prep, STAT_BIN, ["-c", STAT_FORMAT, "--", ...asked]);
+    if (r.signal !== null || r.status === null) throw refuse("the runner stat of the .claude targets did not complete");
+    return obstructs(claude, parseStat(r.stdout, asked), RUNNER_UID);
+  }
+  const facts: EntryFact[] = [];
+  for (const p of asked) {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(p);
+    } catch {
+      continue;
+    }
+    facts.push({ path: p, uid: st.uid, mode: st.mode & 0o7777, kind: st.isDirectory() ? "directory" : "other" });
+  }
+  return obstructs(claude, facts, process.getuid?.());
 }
 
 /** Make `<HOME>/.claude/{projects,tasks}` exist, writable by the CLI (see the Targets section). */
-function ensureTargets(home: string, mkdir: (args: readonly string[]) => number, step: (name: string) => void): void {
+function ensureTargets(home: string, prep: Prep, step: (name: string) => void): void {
   const claude = path.join(home, ".claude");
-  let retriedAfterMkdirFailure = false;
+  let movedAfterObstruction = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const st = fs.lstatSync(claude, { throwIfNoEntry: false });
     if (st !== undefined && !st.isDirectory()) {
@@ -252,10 +375,9 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => number,
       step("claude-aside");
       continue;
     }
-    if (st === undefined && mkdir(["-p", "-m", "700", "--", claude]) !== 0) {
+    if (st === undefined && !mkdirAsRunner(prep, ["-p", "-m", "700", "--", claude])) {
       throw refuse("the runner could not create .claude");
     }
-    // (any non-zero status here refuses without moving anything: HOME holds no .claude to move)
     const missing: string[] = [];
     let aside = false;
     for (const name of ["projects", "tasks"] as const) {
@@ -279,22 +401,14 @@ function ensureTargets(home: string, mkdir: (args: readonly string[]) => number,
       step("claude-aside");
       continue;
     }
-    if (missing.length > 0) {
-      const status = mkdir(["-p", "-m", "700", "--", ...missing]);
-      if (status !== 0) {
-        // Under the split the worker cannot look into the runner-private .claude, so a non-directory
-        // (or an unsearchable .claude) shows up only as mkdir's own failure status 1. Only that moves
-        // the HOME entry aside, once, and rebuilds; a second such exit refuses the start. Any other
-        // status (setpriv's 126/127 on a failed credential change or execve under load, a seam's
-        // other value) is transient: it refuses this start and keeps .claude in place. A setpriv
-        // user-lookup failure exits 1 and lands above (the header's Residual).
-        if (status !== MKDIR_PLANTED_STATUS) throw refuse("the runner mkdir of the .claude targets did not complete");
-        if (retriedAfterMkdirFailure) throw refuse("the runner could not create the .claude targets");
-        retriedAfterMkdirFailure = true;
-        renameAside(claude);
-        step("claude-aside");
-        continue;
-      }
+    if (missing.length > 0 && !mkdirAsRunner(prep, ["-p", "-m", "700", "--", ...missing])) {
+      // Only a positive obstruction moves the HOME entry aside, once; anything else refuses this start.
+      if (!positiveObstruction(prep, claude, missing)) throw refuse("the runner mkdir of the .claude targets did not complete");
+      if (movedAfterObstruction) throw refuse("the runner could not create the .claude targets");
+      movedAfterObstruction = true;
+      renameAside(claude);
+      step("claude-aside");
+      continue;
     }
     return;
   }
@@ -402,7 +516,7 @@ function removeTemp(tmp: string): void {
 }
 
 /** Leave `dir` verified, as the last action: reuse, rewrite the config, or rebuild. */
-function ensureConfigDir(home: string, dir: string, step: (name: string) => void): void {
+function ensureConfigDir(home: string, dir: string, step: (name: string) => void, rename: (from: string, to: string) => void): void {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     step("inspect");
     const seen = inspect(dir);
@@ -425,11 +539,22 @@ function ensureConfigDir(home: string, dir: string, step: (name: string) => void
         step("aside");
       }
       try {
-        fs.renameSync(tmp, dir);
+        rename(tmp, dir);
         installed = true;
       } catch (err) {
-        // Someone else put a directory (or anything) there first: re-inspect, never replace it blindly.
-        if (!["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"].includes(errCode(err) ?? "")) throw err;
+        // The entry at `dir` is absent here (never replaced blindly). If it is now a valid
+        // directory another prepare installed, reuse it; if anything else appeared, or the error is
+        // an exists-class one, inspect again; any other error with nothing there refuses.
+        let after: Seen | undefined;
+        try {
+          after = inspect(dir);
+        } catch {
+          after = undefined;
+        }
+        if (after?.state === "ok") return;
+        const existsClass = ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"].includes(errCode(err) ?? "");
+        const changed = fs.lstatSync(dir, { throwIfNoEntry: false }) !== undefined;
+        if (!existsClass && !changed) throw err;
       }
       if (installed) step("installed");
     } finally {

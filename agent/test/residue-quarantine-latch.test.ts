@@ -16,6 +16,7 @@ import { classifyForgeError } from "../src/forge-retry.js";
 import { failOriginForReason } from "../src/runner.js";
 import { GitCache, gitEnv } from "../src/git.js";
 import { defaultQueryFn } from "../src/sdk-messages.js";
+import { claudeConfigDir } from "../src/claude-config-dir.js";
 import { spawnDetached } from "../src/sdk-spawn.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -210,7 +211,7 @@ describe("the Claude provider belts (issue #2213)", () => {
     assert.throws(() => defaultQueryFn({ prompt: (async function* () {})(), options: {} }), ResidueQuarantinedError);
   });
 
-  it("spawnDetached refuses a spawn whose env carries a provider credential, and spawns nothing", () => {
+  it("spawnDetached refuses a spawn whose env carries a provider credential before any other check, and spawns nothing", () => {
     latchResidueQuarantine({ cause: "c", site: "t" }, nullLogger());
     const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-spawn-")), "ran");
     try {
@@ -235,14 +236,16 @@ describe("the Claude provider belts (issue #2213)", () => {
   });
 
   it("control: while open the same spawn starts; and a credential-free spawn is not a turn", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-spawn-"));
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2213-spawn-")));
     const marker = path.join(dir, "ran");
+    const home = path.join(dir, "home");
+    fs.mkdirSync(home);
     try {
       const child = spawnDetached({
         command: "/bin/sh",
         args: ["-c", `echo ran > '${marker}'`],
         cwd: "/",
-        env: { PATH: "/usr/bin:/bin", CLAUDE_CODE_OAUTH_TOKEN: "a-provider-credential-value" },
+        env: { PATH: "/usr/bin:/bin", HOME: home, CLAUDE_CONFIG_DIR: claudeConfigDir(home), CLAUDE_CODE_OAUTH_TOKEN: "a-provider-credential-value" },
         signal: new AbortController().signal,
       });
       await new Promise((r) => child.once("exit", r));
@@ -259,6 +262,7 @@ describe("the Claude provider belts (issue #2213)", () => {
       await new Promise((r) => free.once("exit", r));
       assert.equal(fs.existsSync(marker), true, "a credential-free spawn is untouched");
     } finally {
+      fs.chmodSync(claudeConfigDir(home), 0o755); // the one-uid config directory is 0555
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

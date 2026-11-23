@@ -375,9 +375,9 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await assertSentinelIntact();
   });
 
-  // PRD #4416 review: under the split HOME/.claude is runner-private, so the worker cannot look
-  // inside it. A runner-planted file at a target must not refuse every later start of that HOME
-  // (the shared chat root): the failed runner mkdir moves .claude aside once and recreates it.
+  // Under the split HOME/.claude is runner-private, so the worker cannot look inside it. A
+  // runner-planted file at a target does not refuse the start: the failed runner mkdir is followed by
+  // the runner-uid stat probe, which shows the file, and .claude is moved aside once and recreated.
   it("a runner-planted file at .claude/projects does not refuse the start: .claude is moved aside and rebuilt (#4416)", async () => {
     const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004417");
     await fs.mkdir(home);
@@ -396,6 +396,51 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
       home,
     );
     assert.equal(await fs.readFile(path.join(cliEnv.CLAUDE_CONFIG_DIR, ".claude.json"), "utf8"), config.CLAUDE_GLOBAL_CONFIG_BYTES);
+    await rmtree.rmHomeTree(home);
+    assert.equal(await exists(home), false);
+  });
+
+  // The runner creates a world-writable sticky directory; a worker HOME inside it has a parent the
+  // runner owns, so the runner could rename the HOME's entry. The trusted layout refuses it.
+  it("a worker HOME whose parent the runner created is refused before anything is built (#4416)", async () => {
+    const outer = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004418");
+    await fs.mkdir(outer);
+    await fs.chmod(outer, 0o2770);
+    const runnerDir = path.join(outer, "runner-made");
+    asRunner(`set -e; umask 000; mkdir "$1"; chmod 1777 "$1"`, runnerDir);
+    const home = path.join(runnerDir, "home");
+    await fs.mkdir(home);
+    const cliEnv = { HOME: home, CLAUDE_CONFIG_DIR: configDir.claudeConfigDir(home) };
+
+    assert.throws(() => config.prepareClaudeConfigDir(cliEnv), /ancestor of HOME is owned by neither root nor the worker/);
+
+    assert.deepEqual(await fs.readdir(home), [], "no .claude, config directory or temp was created");
+    await rmtree.rmHomeTree(outer);
+    assert.equal(await exists(outer), false);
+  });
+
+  // The runner-uid helpers the preparation runs, in their real wrapper: the stat probe prints the
+  // exact line format the module parses, and a helper that does not finish is killed within the bound.
+  it("the runner-uid stat helper prints the parsed line format, and a sleeping helper is killed within the bound (#4416)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004419");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    asRunner(`set -e; umask 077; mkdir -p "$1/.claude"; echo x > "$1/.claude/projects"`, home);
+    const claude = path.join(home, ".claude");
+    const projects = path.join(claude, "projects");
+
+    const stat = config.helperCommand("/bin/stat", ["-c", "%u|%a|%F|%n", "--", claude, projects], true);
+    const r = config.runBounded(stat.command, stat.args);
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, `10002|700|directory|${claude}\n10002|600|regular file|${projects}\n`);
+
+    const sleep = config.helperCommand("/bin/sleep", ["10"], true);
+    const t0 = Date.now();
+    const killed = config.runBounded(sleep.command, sleep.args);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 3500, `the helper returned after ${elapsed} ms`);
+    assert.ok(killed.signal === "SIGKILL" || killed.status === 124 || killed.status === 137, `killed, got ${String(killed.status)} / ${String(killed.signal)}`);
+
     await rmtree.rmHomeTree(home);
     assert.equal(await exists(home), false);
   });

@@ -5,7 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage, SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, type SdkExecutorOptions, type SdkQueryFn } from "../src/sdk-executor.js";
+import { REASON_RUN_ENV_NEEDS_SPLIT } from "../src/sdk-env.js";
 import type { RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { CLAUDE_GLOBAL_CONFIG_BYTES } from "../src/claude-global-config.js";
@@ -226,9 +227,9 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
   }
 
   it("(c) a symlink at the config directory and a symlinked .claude are replaced, never followed or removed through", async () => {
-    // Regression for the review's blocking finding: the old reset removed `<HOME>/.claude/.config.json`,
-    // which followed a symlinked `.claude` out of HOME. (The split path is covered directly in
-    // claude-global-config.test.ts: the real spawn under the split would exec setpriv.)
+    // A symlinked `.claude` and a symlinked config directory are renamed aside, never followed. (The
+    // split path is covered directly in claude-global-config.test.ts: the real spawn under the split
+    // would exec setpriv.)
     const outsideClaude = path.join(workDir, "outside-claude");
     const outsideDir = path.join(workDir, "outside-dir");
     for (const d of [outsideClaude, outsideDir]) fs.mkdirSync(d);
@@ -297,5 +298,42 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
       }),
     ).run(makeCtx());
     assert.strictEqual(seen, "{}\n");
+  });
+});
+
+describe("SdkExecutor: run variables need the uid split (PRD #4416)", () => {
+  const runEnvCtx = (): RunContext => ({
+    ...makeCtx(),
+    runEnv: [{ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "REGION", value: "eu-west", secret: false, description: "" }],
+  });
+
+  it("without the split the run is refused before provisioning, before any CLI start", async () => {
+    let provisioned = 0;
+    let queried = 0;
+    const provision: SdkExecutorOptions["provision"] = async () => {
+      provisioned++;
+      return { toolEnv: {} };
+    };
+    const queryFn: SdkQueryFn = twoLegs();
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: (params) => {
+        queried++;
+        return queryFn(params);
+      },
+      provision,
+    });
+    await assert.rejects(
+      () => exec.run({ ...runEnvCtx(), config: { tool_packages: ["jq"] } }),
+      (err: unknown) => err instanceof TrustedExecutionRefusal && err.message === REASON_RUN_ENV_NEEDS_SPLIT,
+    );
+    assert.strictEqual(provisioned, 0, "nothing was provisioned");
+    assert.strictEqual(queried, 0, "no CLI was started");
+    assert.strictEqual(fs.existsSync(dumpPath(1)), false);
+    assert.ok(!fs.existsSync(configDir()), "no config directory was prepared");
+  });
+
+  it("a run without variables is unaffected without the split", async () => {
+    await makeExecutor(twoLegs()).run(makeCtx());
+    assert.strictEqual(readDump(1), CLAUDE_GLOBAL_CONFIG_BYTES);
   });
 });

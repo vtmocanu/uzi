@@ -45,7 +45,7 @@ import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, SecretRem
 import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
-import { buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "./sdk-env.js";
+import { assertRunEnvDeliverable, buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "./sdk-env.js";
 import { runEnvDropText } from "./run-env-inject.js";
 import { buildRunEnvBlock } from "./run-env-prompt.js";
 import { assertAgentModelsMapped, isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
@@ -1669,6 +1669,8 @@ export class SdkExecutor implements Executor {
    * closes over the same `state`/`depsAbort` objects it stores on the carrier.
    */
   private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
+    // PRD #4416 M2: run variables are delivered only under the uid split; refuse before anything is provisioned or started.
+    assertRunEnvDeliverable(ctx.runEnv);
     const oauthToken = ctx.oauthToken?.trim();
     if (!oauthToken && !ctx.provider) {
       // OAuth is the sole supported credential (no API keys). Detect its

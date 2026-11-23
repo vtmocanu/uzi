@@ -322,6 +322,7 @@ export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "NPM_CONFIG_CACHE",
   // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (exported there; copied here, not imported).
   "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CONFIG_DIR",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   // PRD #4320 module 6: the provider-mode routing, model and context-window keys.
