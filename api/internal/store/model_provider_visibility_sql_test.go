@@ -188,6 +188,9 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 						out = append(out, name+": codex part lacks "+m)
 					}
 				}
+				if ownerOrRE.MatchString(part) {
+					out = append(out, name+": codex part attaches an OR to the owner arm")
+				}
 				if strings.Contains(part, "credential_mode") || strings.Contains(part, "owner_user_id IS NULL") {
 					out = append(out, name+": codex part must stay owner-only (no credential_mode, no owner_user_id IS NULL)")
 				}
@@ -267,6 +270,12 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 		{"SetUserProviderSource codex arm shared",
 			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE p.credential_mode = 'per_user_key' AND p.engine = 'codex'));",
 			map[string]visEntry{"S": {class: classVIS, id: "u.id", codexFrom: "(@engine::text = 'codex' AND EXISTS", codexMust: []string{"p.owner_user_id = u.id", "p.engine = 'codex'"}}}, "S: codex part lacks p.owner_user_id = u.id"},
+		{"GetUserProviderSource codex arm ORs the engine",
+			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON (p.owner_user_id = u.id OR p.engine = @engine) WHERE @engine::text = 'codex';",
+			map[string]visEntry{"G": {class: classVIS, id: "u.id", codexFrom: " UNION ALL ", codexMust: []string{"p.owner_user_id = u.id", "@engine::text = 'codex'"}}}, "G: codex part attaches an OR to the owner arm"},
+		{"SetUserProviderSource codex arm ORs TRUE",
+			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR TRUE) AND p.engine = 'codex'));",
+			map[string]visEntry{"S": {class: classVIS, id: "u.id", codexFrom: "(@engine::text = 'codex' AND EXISTS", codexMust: []string{"p.owner_user_id = u.id", "p.engine = 'codex'"}}}, "S: codex part attaches an OR to the owner arm"},
 		{"shared-admin lost scope", "-- name: S :one\nSELECT 1 FROM model_providers p WHERE p.id = @id;",
 			map[string]visEntry{"S": {class: classShared, caller: "x"}}, "S: shared-admin query lacks"},
 		{"shared-admin without caller", "-- name: S :one\nSELECT 1 FROM model_providers p WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key';",

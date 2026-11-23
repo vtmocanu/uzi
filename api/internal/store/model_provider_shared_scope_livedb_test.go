@@ -406,7 +406,8 @@ func TestSharedScopeRecipientQueriesLiveDB(t *testing.T) {
 	if got := scalar[string](ctx, t, pool, `SELECT claude_provider_scope_id::text FROM users WHERE id = $1`, b); got != nilScope {
 		t.Errorf("selecting a Codex source changed the Claude scope to %s", got)
 	}
-	// With no runs there are no run names to resolve (the shared-binding case is covered with the run lane).
+	// With no runs there are no run names to resolve (the shared-binding and inaccessible-binding cases
+	// are covered by TestRunProviderNamesForSharedAndInaccessibleBindingsLiveDB in internal/workersvc).
 	names, err := q.ListRunProviderNames(ctx, nil)
 	if err != nil || len(names) != 0 {
 		t.Errorf("ListRunProviderNames(no runs) = %v (%v)", names, err)
@@ -708,8 +709,8 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	// With a personal Claude source already selected, the old image switching to another of the same
 	// user's personal providers keeps the scope and succeeds; switching away from a SHARED selection
 	// would leave the shared scope behind and is refused.
-	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(pk.ID), a); err != nil {
-		t.Errorf("the old image switching between personal Claude providers: %v", err)
+	if tag, err := pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(pk.ID), a); err != nil || tag.RowsAffected() != 1 {
+		t.Errorf("the old image switching between personal Claude providers: rows=%d err=%v, want one row", tag.RowsAffected(), err)
 	}
 	sh, err := q.InsertSharedModelProvider(ctx, "rollback-shared")
 	if err != nil {
