@@ -363,6 +363,31 @@ describe("phase-switch hold redaction on a provider-bound run (issue #4323)", ()
     assert.deepEqual(r.posts.map((p) => p.phase), ["plan"]);
     assert.deepEqual(leaks(r.feed.join("\n")), []);
   });
+
+  // A non-ASCII character inside the key defeats the exact-match redactor; stripping it afterwards would
+  // rebuild the key and the clip would leave a prefix. The strip must therefore precede redaction.
+  const prefixLeaks = (visible: string): string[] => {
+    const found: string[] = [];
+    for (let n = 8; n <= KEY.length; n++) if (visible.includes(KEY.slice(0, n))) found.push(KEY.slice(0, n));
+    return found;
+  };
+  const spliced = "m".repeat(60) + KEY[0] + "\u00e9" + KEY.slice(1);
+
+  it("a key split by a non-ASCII character in the observed model leaves no key prefix in the feed or hold request", async () => {
+    const r = await runHold({ iid: 43300, post: [held], claimOver, held: heldWith(spliced) });
+    assert.deepEqual(r.posts.map((p) => p.phase), ["implement"], "the run is still held");
+    assert.ok(r.feed.some((t) => PAUSED_TEXT.test(t)), `a hold line was emitted: ${r.feed.join(" | ")}`);
+    assert.deepEqual(prefixLeaks(r.feed.join("\n")), [], "feed");
+    assert.deepEqual(prefixLeaks(JSON.stringify(r.posts)), [], "hold request");
+  });
+
+  it("a key split by a non-ASCII character in the requested model of a plan-phase hold leaves no key prefix", async () => {
+    const err = new PhaseSwitchUnverifiedError("model_mismatch", { model: spliced, effort: "high" }, { model: "corp-observed", effort: "high" });
+    const r = await runHold({ iid: 43301, throws: err, post: [held], claimOver });
+    assert.deepEqual(r.posts.map((p) => p.phase), ["plan"]);
+    assert.deepEqual(prefixLeaks(r.feed.join("\n")), []);
+    assert.deepEqual(prefixLeaks(JSON.stringify(r.posts)), []);
+  });
 });
 
 describe("WorkerClient.requestPhaseSwitchHold classification (issue #3252 m4)", () => {

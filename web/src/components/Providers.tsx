@@ -387,9 +387,12 @@ function ProviderRow({
   // Claude only: the worker sets one process-wide window, the smallest configured one across all
   // mapped models, or uzi's 200k fallback when none is configured (agent/src/sdk-env.ts).
   const configured = p.engine === "claude" ? mapped.map(({ role }) => p.model_map[role]!.context_window).filter((w): w is number => !!w) : [];
-  const blankLabel = configured.length
-    ? ` (no context window: uzi requests the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens)`
-    : " (no context window: 200k assumed)";
+  // Codex omits model_context_window, so its runtime fallback applies (agent/src/codex/config.ts).
+  const blankLabel = p.engine === "codex"
+    ? " (no context window: Codex runtime fallback)"
+    : configured.length
+      ? ` (no context window: uzi requests the smallest configured one, ${Math.min(...configured).toLocaleString()} tokens)`
+      : " (no context window: 200k assumed)";
   const rowBusy = busy || testing;
   const blocked = sourceBlockedReason(p);
 

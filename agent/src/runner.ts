@@ -3403,10 +3403,12 @@ function isCodexBoundClaim(claim: ClaimResponse): boolean {
   return codexBound;
 }
 
-/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are redacted
- *  (every registered secret form, including a provider key's encodings), then stripped of control
- *  characters and clipped; nothing else from the runtime reaches the feed. Redaction precedes the clip so
- *  a clip can never leave a prefix of a secret that no longer matches a registered form. */
+/** Issue #3252: the owner-facing status line of a phase-switch hold. Runtime-reported ids are
+ *  stripped of control and non-ASCII characters first (so a character inserted inside a key cannot hide
+ *  it from the exact-match redactor and then be removed, rebuilding the key), then redacted (every
+ *  registered secret form, including a provider key's encodings), then clipped; nothing else from the
+ *  runtime reaches the feed. The clip runs last, on already-redacted text, so a registered secret form is
+ *  never cut into a leftover prefix that the redactor could no longer match. */
 function phaseSwitchHoldText(
   phase: "plan" | "implement",
   cause: PhaseSwitchCause,
@@ -3414,7 +3416,7 @@ function phaseSwitchHoldText(
   observed: PhaseSettings,
   redact: (text: string) => string,
 ): string {
-  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : redact(v).replace(/[^\x20-\x7e]/g, "").slice(0, 80));
+  const clip = (v: string | undefined): string => (v === undefined || v === "" ? "an unknown value" : redact(v.replace(/[^\x20-\x7e]/g, "")).slice(0, 80));
   const tail = "Resume retries on a new claim; Cancel ends the run.";
   const kept = phase === "implement" ? "planning" : "implementation";
   const mismatch = (noun: "model" | "effort"): string => {

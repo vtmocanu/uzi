@@ -97,6 +97,14 @@ describe("Providers — list", () => {
     expect(within(row).getAllByText(/\(no context window: 200k assumed\)/)).toHaveLength(2);
   });
 
+  it("never claims a 200k assumption for a Codex provider without context windows", async () => {
+    await renderCard(list({ providers: [provider({ id: "cx", engine: "codex", protocol: "openai_responses", model_map: { default: { model: "gw-code" } } })] }));
+    const row = await screen.findByTestId("provider-cx");
+    expect(within(row).getByText("gw-code")).toBeTruthy();
+    expect(within(row).queryByText(/200k/)).toBeNull();
+    expect(within(row).getAllByText(/\(no context window: Codex runtime fallback\)/)).toHaveLength(1);
+  });
+
   it("renders name, URL, auth style, models, key state and retired badge as text", async () => {
     await renderCard(
       list({
