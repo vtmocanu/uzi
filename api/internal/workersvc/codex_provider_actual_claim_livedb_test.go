@@ -51,6 +51,13 @@ func newCodexActualClaimFix(t *testing.T) (*pcFix, uuid.UUID) {
 		t.Fatal(err)
 	}
 	id := created.ID
+	if created.DispatchedAt.Valid {
+		t.Fatal("new task must remain undispatched until explicit dispatch")
+	}
+	dispatched, err := pf.svc.DispatchTaskRun(pf.env.ctx, pf.userID, id)
+	if err != nil || !dispatched.DispatchedAt.Valid || bindingOfRun(dispatched) != bindingOfRun(created) {
+		t.Fatalf("dispatch did not preserve the created binding: err=%v", err)
+	}
 	frozen := mustRun(t, pf.env, id)
 	if !frozen.RepoAgentSourceRequired {
 		t.Fatal("real creation must retain the repository-source protocol fence")
