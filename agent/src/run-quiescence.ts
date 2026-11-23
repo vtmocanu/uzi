@@ -884,6 +884,10 @@ export interface ScanRequest {
    *  none is ever signalled: the scan only reports the runner-uid processes whose env and cwd
    *  cannot be read and that nothing ties to another live attempt. */
   workerWide?: boolean;
+  /** Observe-only probe: the reap loop never signals a process and ends once nothing is unverified. */
+  observeOnly?: boolean;
+  /** Epoch-ms bound for the whole scan loop (forwarded to the helper as its reap `deadlineAt`). */
+  deadlineAt?: number;
   /** Deny-only terminal-maintenance proof. Unlike workerWide, every UID and
    * readable orphan is in scope. Never shares ordinary mark/group exemptions. */
   exclusiveIdle?: true;
@@ -1422,6 +1426,37 @@ export interface ProcessQuiescence {
   rootContext?: RootContext;
 }
 
+/** Reason bases (text before any `:`) an inventory probe ignores: processes tied to another attempt. */
+const INVENTORY_IGNORED_REASONS: ReadonlySet<string> = new Set([
+  "live_attempt_conflict", "protected_attempt", "terminal_attempt",
+]);
+
+/**
+ * Verdict of an observe-only inventory probe. The inventory's own runner git runs unmarked, so only
+ * unmarked residue (`unattributed_in_scope`, `unmarked_in_scope`, `own_attempt`, unreadable pids) can
+ * matter to a clear; processes carrying another attempt's marker (live, protected or terminal, including
+ * a `terminal_attempt:kill_unconfirmed` candidate that was never signalled) are ignored.
+ *
+ * An `unverified` result with at least one process whose reasons are all `unreadable_unattributed` or ignored
+ * counts as clear: this matches what the attempt seed itself admits (see
+ * {@link unverifiedOnlyByUnattributedUnreadable}). An unreadable process is unattributable worker-wide, not
+ * evidence of our in-scope residue, and our inventory git descendants are ordinary runner-uid processes the
+ * scanner can read. Fails closed otherwise: an undefined result, an unverified result with no processes
+ * (a table, helper or deadline error) or any unknown reason is `not_clear`.
+ */
+export function inventoryClearVerdict(p: ProcessQuiescence | undefined): "clear" | "not_clear" {
+  if (p === undefined) return "not_clear";
+  if (p.state === "unverified" && p.processes.length === 0) return "not_clear";
+  for (const proc of p.processes) {
+    if (proc.reason === "unreadable_unattributed" && p.state === "unverified") continue;
+    if (!INVENTORY_IGNORED_REASONS.has(proc.reason.split(":")[0]!)) return "not_clear";
+  }
+  return "clear";
+}
+
+/** Extra scans an observe-only reap makes after the first one that leaves unverified entries. */
+const OBSERVE_SETTLE_RESCANS = 2;
+
 const REAP_DEADLINE_MS = 5_000;
 const REAP_INTERVAL_MS = 100;
 const HELPER_TIMEOUT_MS = 10_000;
@@ -1537,6 +1572,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       (MaintenanceResources.discoveryActive() && exclusiveScans !== 1)))
     return { state: "unverified", processes: [], killed: [], detail: "exclusive idle scan count invalid" };
   let scans = 0;
+  let observeRescans = 0;
   const kill = deps.kill ?? view?.kill ?? defaultKill;
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
@@ -1584,8 +1620,13 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     }
     // An unreadable pid is rescanned too: a process caught mid-execve (or mid-exit) can read
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
-    if ((last.kill.length === 0 && last.unverified.length === 0) || (reportBudget ? now() >= deadline : remaining ? remaining() <= 0 : now() >= deadline)) break;
-    for (const p of last.kill) {
+    // Observe-only: kill candidates never keep the loop alive (nothing is signalled), only unverified entries do.
+    const observeOnly = scanRequest.observeOnly === true;
+    if (((observeOnly ? true : last.kill.length === 0) && last.unverified.length === 0) || (reportBudget ? now() >= deadline : remaining ? remaining() <= 0 : now() >= deadline)) break;
+    // Observe-only: a persistent unreadable pid (a non-dumpable process) settles after a bounded rescan count and
+    // returns this scan's classified result, rather than polling to the deadline and losing the reasons.
+    if (observeOnly && last.unverified.length > 0 && observeRescans++ >= OBSERVE_SETTLE_RESCANS) break;
+    for (const p of observeOnly ? [] : last.kill) {
       const statRead = tryRead(() => table.readStat(p.pid));
       const currentStartTime = statRead.ok ? parseStat(statRead.value)?.startTime : undefined;
       if (p.startTime === undefined || currentStartTime !== p.startTime) continue;
@@ -1995,6 +2036,10 @@ async function reapProcessesViaHelper(
   // issue #3980: the absolute gate-checkpoint deadline. Every stage below is admitted only before it,
   // the helper and the private-temp commands are killed and JOINED at it, and an expiry is unverified.
   const gateDeadline = opts.deadlineAt;
+  // Observe-only probes only: the helper enforces the same absolute deadline on its own reap loop. Other
+  // requests keep their serialized scan unchanged (a helper-side gate deadline alters procfs EACCES handling).
+  if (req.observeOnly === true && gateDeadline !== undefined)
+    req = { ...req, deadlineAt: Math.min(gateDeadline, req.deadlineAt ?? Infinity) };
   const gateExpired = (): boolean => gateDeadline !== undefined && Date.now() >= gateDeadline;
   if (gateExpired()) return unverified("gate checkpoint deadline exhausted");
   const gateBudget = gateDeadline === undefined ? undefined
@@ -2542,6 +2587,10 @@ export interface QuiesceRunRequest {
    *  read, scan, helper, scoped lane and Docker request is admitted only while time is left and ends at
    *  it; an expiry is `unverified`. Absent: byte-for-byte the unbounded behaviour. */
   deadlineAt?: number;
+  /** Run the process scan through the helper even when the uid split is inactive. Never used by the scoped reaper. */
+  forceHelper?: true;
+  /** Observe-only probe: see {@link ScanRequest.observeOnly}. The process verdict never signals anything. */
+  observeOnly?: true;
 }
 
 /** The two halves' results. `process` is undefined when the process half was skipped. */
@@ -2757,7 +2806,8 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
     return { process: { state: "unverified", processes: [], killed: [], detail: (err as Error).message },
       docker: { state: "not_wired", removed: [], detail: "" } };
   }
-  const reapOptions = { ...deps.reap, producerWorkLimits, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }) };
+  const reapOptions = { ...deps.reap, producerWorkLimits, ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }),
+    ...(req.forceHelper === true ? { viaHelper: true } : {}) };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
     const collected = collectLiveRoots(others, workerRunnerRootPids());
@@ -2773,6 +2823,8 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       mayKillUnreadableUnattributed:
         req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
       ...(req.workerWide === true ? { workerWide: true } : {}),
+      ...(req.observeOnly === true ? { observeOnly: true } : {}),
+      ...(req.observeOnly === true && req.deadlineAt !== undefined ? { deadlineAt: req.deadlineAt } : {}),
       liveRoots: collected.roots,
       workerNonce: workerSpawnNonce(),
     };
@@ -2913,6 +2965,8 @@ function isScanRequest(v: unknown): v is HelperScanRequest {
     (o.protectedMarkers === undefined || strings(o.protectedMarkers)) &&
     (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&
     (o.workerWide === undefined || typeof o.workerWide === "boolean") &&
+    (o.observeOnly === undefined || typeof o.observeOnly === "boolean") &&
+    (o.deadlineAt === undefined || (typeof o.deadlineAt === "number" && Number.isFinite(o.deadlineAt) && o.deadlineAt > 0)) &&
     (o.exclusiveIdle === undefined || o.exclusiveIdle === true) &&
     (o.exclusiveIdleRoots === undefined || (Array.isArray(o.exclusiveIdleRoots) &&
       o.exclusiveIdleRoots.length <= 32 && o.exclusiveIdleRoots.every(r => r && typeof r === "object" &&
@@ -2965,7 +3019,9 @@ async function helperMain(): Promise<ProcessQuiescence> {
   if (!isScanRequest(req)) return { state: "unverified", processes: [], killed: [], detail: "helper request invalid" };
   const reap = () => {
     const view = req.view === undefined ? {} : viewReapDeps(req.view);
-    return reapProcesses(req, { ...view, excludeAllDescendants: true });
+    // observeOnly rides on the request itself (reapProcesses reads it from scanRequest); the deadline is a dep.
+    return reapProcesses(req, { ...view, excludeAllDescendants: true,
+      ...(req.deadlineAt === undefined ? {} : { deadlineAt: req.deadlineAt }) });
   };
   return req.workLimits === undefined ? reap() : helperWork.run(new HelperWork(req.workLimits), reap);
 }
