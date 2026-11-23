@@ -1241,7 +1241,7 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #3247: the read-only resolved ordinary effort cells.
 		"effort_settings",
 		// PRD #3252: the Claude planning pair (null ⇒ "Same as the run") and its read-only cells.
-		"planning_claude_model", "planning_claude_effort", "planning_models", "planning_efforts",
+		"planning_claude_model", "planning_claude_effort", "planning_codex_model", "planning_codex_effort", "planning_models", "planning_efforts",
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		// PRD #4123: the weekly-limit early-warning margin in points (0 = off).

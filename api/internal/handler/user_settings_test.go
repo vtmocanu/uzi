@@ -61,8 +61,10 @@ type fakeSettingsDB struct {
 	codexModel      pgtype.Text
 	// planningModel and planningEffort are users.planning_claude_model / planning_claude_effort
 	// (PRD #3252), written by SetUserPlanningClaude.
-	planningModel  pgtype.Text
-	planningEffort pgtype.Text
+	planningModel       pgtype.Text
+	planningEffort      pgtype.Text
+	planningCodexModel  pgtype.Text
+	planningCodexEffort pgtype.Text
 	// prunedCodexIDs is PruneUserSidebarCodexAccounts's RETURNING (the pruned set the GET
 	// path threads into the response); pruneCodexErr, when set, makes that prune UPDATE
 	// fail so a test can exercise GetMySettings's best-effort fallback (PRD #1209 M1).
@@ -142,6 +144,19 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		if set, _ := args[2].(bool); set {
 			if v, ok := args[3].(pgtype.Text); ok {
 				f.planningEffort = v
+			}
+		}
+	case strings.Contains(sql, "SET planning_codex_model = CASE") && len(args) >= 5:
+		// SetUserPlanningCodex: $1=set_model, $2=planning_codex_model, $3=set_effort,
+		// $4=planning_codex_effort, $5=id. A field is written only when its set flag is true.
+		if set, _ := args[0].(bool); set {
+			if v, ok := args[1].(pgtype.Text); ok {
+				f.planningCodexModel = v
+			}
+		}
+		if set, _ := args[2].(bool); set {
+			if v, ok := args[3].(pgtype.Text); ok {
+				f.planningCodexEffort = v
 			}
 		}
 	case strings.Contains(sql, "UPDATE users SET default_codex_effort") && len(args) >= 1:
@@ -229,62 +244,66 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 		}
 	}
 	return fakeSettingsRow{
-		model:           f.model,
-		effort:          f.effort,
-		codexEffort:     f.codexEffort,
-		judge:           f.judge,
-		codexJudge:      f.codexJudge,
-		judgeRunsOn:     f.judgeRunsOn,
-		summary:         f.summary,
-		codexSummary:    f.codexSummary,
-		theme:           f.theme,
-		mrRework:        f.mrRework,
-		nowSummary:      f.nowSummary,
-		weeklyPct:       f.weeklyPct,
-		weeklyPause:     f.weeklyPause,
-		weeklyMargin:    f.weeklyMargin,
-		sidebarIDs:      f.sidebarIDs,
-		sidebarCodexIDs: f.sidebarCodexIDs,
-		apprMode:        f.apprMode,
-		lightTheme:      f.lightTheme,
-		darkTheme:       f.darkTheme,
-		typeface:        f.typeface,
-		sidebarMotion:   f.sidebarMotion,
-		defaultHarness:  f.defaultHarness,
-		claudeModel:     f.claudeModel,
-		codexModel:      f.codexModel,
-		planningModel:   f.planningModel,
-		planningEffort:  f.planningEffort,
+		model:               f.model,
+		effort:              f.effort,
+		codexEffort:         f.codexEffort,
+		judge:               f.judge,
+		codexJudge:          f.codexJudge,
+		judgeRunsOn:         f.judgeRunsOn,
+		summary:             f.summary,
+		codexSummary:        f.codexSummary,
+		theme:               f.theme,
+		mrRework:            f.mrRework,
+		nowSummary:          f.nowSummary,
+		weeklyPct:           f.weeklyPct,
+		weeklyPause:         f.weeklyPause,
+		weeklyMargin:        f.weeklyMargin,
+		sidebarIDs:          f.sidebarIDs,
+		sidebarCodexIDs:     f.sidebarCodexIDs,
+		apprMode:            f.apprMode,
+		lightTheme:          f.lightTheme,
+		darkTheme:           f.darkTheme,
+		typeface:            f.typeface,
+		sidebarMotion:       f.sidebarMotion,
+		defaultHarness:      f.defaultHarness,
+		claudeModel:         f.claudeModel,
+		codexModel:          f.codexModel,
+		planningModel:       f.planningModel,
+		planningEffort:      f.planningEffort,
+		planningCodexModel:  f.planningCodexModel,
+		planningCodexEffort: f.planningCodexEffort,
 	}
 }
 
 type fakeSettingsRow struct {
-	model           pgtype.Text
-	effort          pgtype.Text
-	codexEffort     pgtype.Text
-	judge           pgtype.Text
-	codexJudge      pgtype.Text
-	judgeRunsOn     pgtype.Text
-	summary         pgtype.Text
-	codexSummary    pgtype.Text
-	theme           pgtype.Text
-	mrRework        pgtype.Bool
-	nowSummary      pgtype.Bool
-	weeklyPct       pgtype.Int2
-	weeklyPause     bool
-	weeklyMargin    int16
-	sidebarIDs      []uuid.UUID
-	sidebarCodexIDs []uuid.UUID
-	apprMode        pgtype.Text
-	lightTheme      pgtype.Text
-	darkTheme       pgtype.Text
-	typeface        pgtype.Text
-	sidebarMotion   pgtype.Bool
-	defaultHarness  pgtype.Text
-	claudeModel     pgtype.Text
-	codexModel      pgtype.Text
-	planningModel   pgtype.Text
-	planningEffort  pgtype.Text
+	model               pgtype.Text
+	effort              pgtype.Text
+	codexEffort         pgtype.Text
+	judge               pgtype.Text
+	codexJudge          pgtype.Text
+	judgeRunsOn         pgtype.Text
+	summary             pgtype.Text
+	codexSummary        pgtype.Text
+	theme               pgtype.Text
+	mrRework            pgtype.Bool
+	nowSummary          pgtype.Bool
+	weeklyPct           pgtype.Int2
+	weeklyPause         bool
+	weeklyMargin        int16
+	sidebarIDs          []uuid.UUID
+	sidebarCodexIDs     []uuid.UUID
+	apprMode            pgtype.Text
+	lightTheme          pgtype.Text
+	darkTheme           pgtype.Text
+	typeface            pgtype.Text
+	sidebarMotion       pgtype.Bool
+	defaultHarness      pgtype.Text
+	claudeModel         pgtype.Text
+	codexModel          pgtype.Text
+	planningModel       pgtype.Text
+	planningEffort      pgtype.Text
+	planningCodexModel  pgtype.Text
+	planningCodexEffort pgtype.Text
 }
 
 func (r fakeSettingsRow) Scan(dest ...any) error {
@@ -321,7 +340,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 27: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion, the planning pair (PRD #3252) and the weekly warning margin (PRD #4123)
+	case 28: // GetUserSettings: 22 settings columns + claude_provider_id (PRD #4320 M4, always NULL here), sidebar_motion and both planning pairs (PRDs #3252/#3253)
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -411,8 +430,10 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[25].(*pgtype.Text); ok {
 			*p = r.planningEffort
 		}
-		// weekly_warning_margin_pts (PRD #4123) is the 27th column.
-		if p, ok := dest[26].(*int16); ok {
+		*dest[26].(*pgtype.Text) = r.planningCodexModel
+		*dest[27].(*pgtype.Text) = r.planningCodexEffort
+		// weekly_warning_margin_pts (PRD #4123) is the 29th column, after #3253's planning_codex_*.
+		if p, ok := dest[28].(*int16); ok {
 			*p = r.weeklyMargin
 		}
 	}

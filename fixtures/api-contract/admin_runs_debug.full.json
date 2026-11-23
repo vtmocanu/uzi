@@ -597,5 +597,8 @@
       "cross_check_active": "x"
     }
   ],
-  "truncated": true
+  "truncated": true,
+  "status_filter": [
+    "x"
+  ]
 }

@@ -81,8 +81,13 @@ func adrlListed(t *testing.T, body string) (runs []map[string]json.RawMessage, r
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
 		t.Fatalf("decode listing envelope: %v (body %.300s)", err, body)
 	}
-	if len(env) != 2 {
-		t.Errorf("envelope has keys %v, want exactly runs and truncated", env)
+	// status_filter is the one optional key: present only when the request carried ?status=.
+	want := 2
+	if _, has := env["status_filter"]; has {
+		want = 3
+	}
+	if len(env) != want {
+		t.Errorf("envelope has keys %v, want runs and truncated (plus status_filter only on a filtered request)", env)
 	}
 	rawRuns = string(env["runs"])
 	if err := json.Unmarshal(env["runs"], &runs); err != nil {
@@ -425,6 +430,174 @@ func TestAdminRunDebugListRunsTruncationLiveDB(t *testing.T) {
 	}
 }
 
+// adrlStatusFilter returns the envelope's status_filter and whether the key was present.
+func adrlStatusFilter(t *testing.T, body string) ([]string, bool) {
+	t.Helper()
+	var env struct {
+		StatusFilter *[]string `json:"status_filter"`
+	}
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		t.Fatalf("decode status_filter: %v", err)
+	}
+	if env.StatusFilter == nil {
+		return nil, false
+	}
+	return *env.StatusFilter, true
+}
+
+// TestAdminRunDebugListRunsStatusFilterLiveDB: ?status= narrows server-side, before the
+// 500-row cap, so a rare status is not crowded out by 500+ newer rows of other statuses; it
+// combines with user and since, is echoed as status_filter, is audited, and a malformed
+// value is a 400 with no audit.
+func TestAdminRunDebugListRunsStatusFilterLiveDB(t *testing.T) {
+	f := adrlNewListFixture(t)
+	pool := f.pool
+	start := time.Now()
+	a, b, bulk := adrlSeedOwner(t, pool), adrlSeedOwner(t, pool), adrlSeedOwner(t, pool)
+	t.Cleanup(func() {
+		// Leave no bulk rows behind for the unfiltered listings of other tests.
+		_, _ = pool.Exec(context.Background(), `DELETE FROM runs WHERE user_id = ANY($1)`, []uuid.UUID{a.user, b.user, bulk.user})
+	})
+	// Far-future seeding keeps the failed rows clear of other tests' leftovers; the bulk rows
+	// are newer than every failed row, so an unfiltered page is full of them.
+	tLate := time.Now().UTC().Truncate(time.Second).Add(60 * 24 * time.Hour)
+	tEarly := tLate.Add(-time.Hour)
+	bulkBase := tLate.Add(30 * 24 * time.Hour)
+	cliMustExec(t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, created_at)
+		 SELECT gen_random_uuid(), $1, $2, $3 + g, 'Do X', 'desc', 'completed', 'issue', $4::timestamptz - g * interval '1 second'
+		 FROM generate_series(1, 520) AS g`, bulk.user, bulk.repo, adrlIssueIID.Add(1000), bulkBase)
+
+	aEarly, aLate, bEarly, bLate, aCancelled := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	adrlSeedIssueRun(t, pool, a, aEarly, "failed", tEarly)
+	adrlSeedIssueRun(t, pool, a, aLate, "failed", tLate)
+	adrlSeedIssueRun(t, pool, b, bEarly, "failed", tEarly.Add(time.Second))
+	adrlSeedIssueRun(t, pool, b, bLate, "failed", tLate.Add(time.Second))
+	adrlSeedIssueRun(t, pool, a, aCancelled, "cancelled", tEarly.Add(2*time.Second))
+	t.Logf("fixture seeded in %s", time.Since(start))
+	seeded := map[string]bool{}
+	for _, id := range []uuid.UUID{aEarly, aLate, bEarly, bLate, aCancelled} {
+		seeded[id.String()] = true
+	}
+
+	wantFilter := func(t *testing.T, body string, want ...string) {
+		t.Helper()
+		got, has := adrlStatusFilter(t, body)
+		if !has || strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("status_filter = %v (present=%v), want %v", got, has, want)
+		}
+	}
+
+	t.Run("rare status is not crowded out by newer rows", func(t *testing.T) {
+		body := f.get(t, "/api/admin/runs?state=all&status=failed")
+		runs, _, truncated := adrlListed(t, body)
+		if truncated {
+			t.Errorf("truncated = true on a status=failed listing")
+		}
+		got := adrlIDsIn(t, runs, seeded)
+		if !adrlSameOrder(got, bLate, aLate, bEarly, aEarly) {
+			t.Errorf("served seeded ids = %v, want the four failed rows newest first (bLate=%s aLate=%s bEarly=%s aEarly=%s)", got, bLate, aLate, bEarly, aEarly)
+		}
+		wantFilter(t, body, "failed")
+		adrlCheckWithheld(t, "status=failed", body, runs)
+		rec := f.oneAudit(t, "status=failed listing")
+		if rec["status_filter"] != "failed" || rec["returned"] != float64(len(runs)) {
+			t.Errorf("audit = %v, want status_filter=failed and returned=%d", rec, len(runs))
+		}
+	})
+
+	t.Run("absent status is unfiltered", func(t *testing.T) {
+		body := f.get(t, "/api/admin/runs?state=all")
+		_, _, truncated := adrlListed(t, body)
+		if !truncated {
+			t.Errorf("truncated = false without a status filter, want true (520 newer rows)")
+		}
+		if _, has := adrlStatusFilter(t, body); has {
+			t.Errorf("status_filter present without a status request: %s", body[:min(len(body), 200)])
+		}
+		rec := f.oneAudit(t, "unfiltered listing")
+		if _, has := rec["status_filter"]; has {
+			t.Errorf("audit carries status_filter on an unfiltered request: %v", rec)
+		}
+	})
+
+	t.Run("several statuses, duplicates collapsed", func(t *testing.T) {
+		body := f.get(t, "/api/admin/runs?state=all&status=failed,cancelled,failed")
+		runs, _, truncated := adrlListed(t, body)
+		if truncated {
+			t.Errorf("truncated = true")
+		}
+		got := adrlIDsIn(t, runs, seeded)
+		if !adrlSameOrder(got, bLate, aLate, aCancelled, bEarly, aEarly) {
+			t.Errorf("served seeded ids = %v, want failed and cancelled rows newest first", got)
+		}
+		wantFilter(t, body, "failed", "cancelled")
+		rec := f.oneAudit(t, "failed,cancelled listing")
+		if rec["status_filter"] != "failed,cancelled" {
+			t.Errorf("audit status_filter = %v, want failed,cancelled", rec["status_filter"])
+		}
+	})
+
+	t.Run("combined with user", func(t *testing.T) {
+		body := f.get(t, "/api/admin/runs?state=all&status=failed&user="+a.user.String())
+		runs, _, _ := adrlListed(t, body)
+		var got []string
+		for _, r := range runs {
+			got = append(got, adrlRunID(t, r))
+		}
+		if !adrlSameOrder(got, aLate, aEarly) {
+			t.Errorf("served ids = %v, want owner A's two failed rows (aLate=%s aEarly=%s)", got, aLate, aEarly)
+		}
+		rec := f.oneAudit(t, "status+user listing")
+		if rec["status_filter"] != "failed" || rec["owner_filter"] != a.user.String() {
+			t.Errorf("audit = %v, want status_filter=failed and owner_filter=%s", rec, a.user)
+		}
+	})
+
+	t.Run("combined with since", func(t *testing.T) {
+		since := tLate.Add(-time.Minute).Format(time.RFC3339)
+		body := f.get(t, "/api/admin/runs?state=all&status=failed&since="+since)
+		runs, _, _ := adrlListed(t, body)
+		var got []string
+		for _, r := range runs {
+			got = append(got, adrlRunID(t, r))
+		}
+		if !adrlSameOrder(got, bLate, aLate) {
+			t.Errorf("served ids = %v, want the two late failed rows (bLate=%s aLate=%s)", got, bLate, aLate)
+		}
+		rec := f.oneAudit(t, "status+since listing")
+		if rec["status_filter"] != "failed" || rec["since"] == nil {
+			t.Errorf("audit = %v, want status_filter=failed and a since", rec)
+		}
+	})
+
+	t.Run("malformed status is a 400 with no audit", func(t *testing.T) {
+		for _, q := range []string{"status=", "status=bogus", "status=failed,", "status=,failed", "status=failed,,cancelled", "status=Failed"} {
+			rec := bearerReq(f.router, http.MethodGet, "/api/admin/runs?state=all&"+q, f.adminRO)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid status") {
+				t.Errorf("%s = %d %s, want 400 invalid status", q, rec.Code, rec.Body.String())
+			}
+		}
+		if recs := f.audit.take(t); len(recs) != 0 {
+			t.Errorf("malformed status wrote %d audit records, want 0: %v", len(recs), recs)
+		}
+	})
+
+	t.Run("status without state takes the debug path", func(t *testing.T) {
+		rec := bearerReq(f.router, http.MethodGet, "/api/admin/runs?status=failed", f.adminUzc)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("non-admin_ro with ?status= = %d %s, want 403", rec.Code, rec.Body.String())
+		}
+		rec = bearerReq(f.router, http.MethodGet, "/api/admin/runs?status=failed", f.adminRO)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "state must be 'all'") {
+			t.Errorf("admin_ro with ?status= and no state = %d %s, want 400 state must be 'all'", rec.Code, rec.Body.String())
+		}
+		if recs := f.audit.take(t); len(recs) != 0 {
+			t.Errorf("refusals wrote %d audit records, want 0: %v", len(recs), recs)
+		}
+	})
+}
+
 // TestAdminRunDebugListRunsRefusedLiveDB: every caller that is not a live admin's admin_ro
 // Bearer on a flag-on deployment is refused, before parameter validation, with no audit;
 // valid-credential validation errors audit nothing; the legacy listing is untouched.
@@ -496,6 +669,11 @@ func TestAdminRunDebugListRunsRefusedLiveDB(t *testing.T) {
 			{"user empty", "/api/admin/runs?state=all&user="},
 			{"since not RFC3339", "/api/admin/runs?state=all&since=yesterday"},
 			{"since empty", "/api/admin/runs?state=all&since="},
+			{"status empty", "/api/admin/runs?state=all&status="},
+			{"status unknown", "/api/admin/runs?state=all&status=bogus"},
+			{"status trailing comma", "/api/admin/runs?state=all&status=failed,"},
+			{"status leading comma", "/api/admin/runs?state=all&status=,failed"},
+			{"status without state", "/api/admin/runs?status=failed"},
 		} {
 			rec := bearerReq(f.router, http.MethodGet, tc.path, f.adminRO)
 			if rec.Code != http.StatusBadRequest {

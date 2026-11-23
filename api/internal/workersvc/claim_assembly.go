@@ -473,15 +473,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			LaneModel:       laneModel,
 			TemplateEffort:  leadTemplateEffort(templates, harness),
 		}
-		// PRD #3252: the owner's Claude planning pair is read (strictly) only for a Claude lead-lane
-		// claim, so no other claim pays the read or can fail on it.
-		if harness == HarnessClaude && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-			planning, perr := s.q.GetUserPlanningClaude(ctx, run.UserID)
+		// Only lead-lane claims read planning defaults; errors fail the claim.
+		if leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
+			model, effort, perr := s.readPlanningDefaults(ctx, run.UserID, harness)
 			if perr != nil {
 				return nil, fmt.Errorf("planning defaults lookup: %w", perr)
 			}
-			leadInput.PlanningModel = planning.PlanningClaudeModel
-			leadInput.PlanningEffort = planning.PlanningClaudeEffort
+			leadInput.PlanningModel, leadInput.PlanningEffort = model, effort
 		}
 		leadSettings = resolveLeadSettings(leadInput)
 		// PRD #3250: a run_override model or effort the claim cannot honor parks the run (never a
@@ -566,10 +564,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// precedence rule stays in resolvePlanPhase.
 		leadInput.UserEffort = defaultEffort
 		leadSettings.Plan = resolvePlanPhase(leadInput, leadSettings)
-		// A claim carrying a plan_phase needs the worker capability. The requeue is non-looping: the
-		// next ClaimRun pass excludes this worker once the owner's planning value is set.
-		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, capability.ClaudePhaseModelsV1) {
+		// A claim carrying a plan_phase needs its harness capability, including when the owner's
+		// planning setting changed after SQL admission. Requeue retains Codex claim provenance
+		// (ADR-4476), so another worker cannot take over a rejected Codex claim.
+		if leadSettings.Plan != nil && !slices.Contains(wkr.ProtocolCapabilities, phaseModelsCapability(harness)) {
 			return nil, errPhaseModelsCapabilityMissing
+		}
+		// Resolve the final plan before checking custom passthrough: effort-only planning inherits
+		// the effective root model, and a planning model may differ from the implementation root.
+		if harness == HarnessCodex && leadSettings.Plan != nil && leadSettings.Plan.Model != nil &&
+			!harnessModelCompatible(HarnessCodex, *leadSettings.Plan.Model) &&
+			!slices.Contains(wkr.ProtocolCapabilities, capability.CodexCustomModelV1) {
+			return nil, errCustomModelCapabilityMissing
 		}
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
@@ -1552,4 +1558,12 @@ func linkedIssueKey(run store.Run, projectShort pgtype.Text) string {
 		return ""
 	}
 	return projectShort.String + "-" + strconv.FormatInt(run.IssueIid.Int64, 10)
+}
+
+// phaseModelsCapability selects the protocol for the run's harness.
+func phaseModelsCapability(h Harness) string {
+	if h == HarnessCodex {
+		return capability.CodexPhaseModelsV1
+	}
+	return capability.ClaudePhaseModelsV1
 }

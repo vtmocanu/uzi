@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -80,18 +81,66 @@ func TestAdminListRunsDebugRequestAndDecode(t *testing.T) {
 	var uri string
 	srv := serveJSON(t, &uri, `{"runs":null,"truncated":true}`)
 	c := newTestClient(srv)
-	out, err := c.AdminListRunsDebug(context.Background(), "", "")
+	out, err := c.AdminListRunsDebug(context.Background(), "", "", nil)
 	if err != nil {
 		t.Fatalf("AdminListRunsDebug: %v", err)
 	}
 	if uri != "/api/admin/runs?state=all" || !out.Truncated || out.Runs == nil || len(out.Runs) != 0 {
 		t.Errorf("uri=%q out=%+v; want the bare state=all query, truncated, a non-nil empty runs", uri, out)
 	}
-	if _, err := c.AdminListRunsDebug(context.Background(), "0b8b6a8a-0000-4000-8000-000000000001", "2026-01-02T03:04:05Z"); err != nil {
+	if _, err := c.AdminListRunsDebug(context.Background(), "0b8b6a8a-0000-4000-8000-000000000001", "2026-01-02T03:04:05Z", nil); err != nil {
 		t.Fatalf("filtered: %v", err)
 	}
 	if uri != "/api/admin/runs?since=2026-01-02T03%3A04%3A05Z&state=all&user=0b8b6a8a-0000-4000-8000-000000000001" {
 		t.Errorf("filtered uri = %q", uri)
+	}
+}
+
+func TestAdminListRunsDebugStatusQueryAndGuard(t *testing.T) {
+	var rawQuery string
+	body := `{"runs":[{"id":"r1","status":"failed"}],"truncated":false,"status_filter":["failed","cancelled"]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	c := newTestClient(srv)
+	if _, err := c.AdminListRunsDebug(context.Background(), "", "", []string{"failed", "cancelled"}); err != nil {
+		t.Fatalf("status request: %v", err)
+	}
+	if rawQuery != "state=all&status=failed%2Ccancelled" {
+		t.Errorf("raw query = %q, want state=all&status=failed%%2Ccancelled", rawQuery)
+	}
+	// The server decodes %2C to a comma; the wire form is the joined list.
+	if v, _ := url.ParseQuery(rawQuery); v.Get("status") != "failed,cancelled" {
+		t.Errorf("decoded status = %q", v.Get("status"))
+	}
+	body = `{"runs":[],"truncated":false}`
+	if _, err := c.AdminListRunsDebug(context.Background(), "", "", nil); err != nil {
+		t.Fatalf("no status: %v", err)
+	}
+	if strings.Contains(rawQuery, "status") {
+		t.Errorf("raw query = %q, want no status key when none requested", rawQuery)
+	}
+}
+
+func TestAdminListRunsDebugRefusesAServerThatIgnoredStatus(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing status_filter":  `{"runs":[],"truncated":false}`,
+		"mismatched filter":      `{"runs":[],"truncated":false,"status_filter":["failed","running"]}`,
+		"subset filter":          `{"runs":[],"truncated":false,"status_filter":["failed"]}`,
+		"superset filter":        `{"runs":[],"truncated":false,"status_filter":["failed","cancelled","running"]}`,
+		"row outside the filter": `{"runs":[{"id":"r1","status":"completed"}],"truncated":false,"status_filter":["failed","cancelled"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var uri string
+			srv := serveJSON(t, &uri, body)
+			_, err := newTestClient(srv).AdminListRunsDebug(context.Background(), "", "", []string{"failed", "cancelled"})
+			if ExitCodeFor(err) != ExitGeneric || err == nil || !strings.Contains(err.Error(), "this uzi server does not support --status; upgrade the server") {
+				t.Errorf("err = %v (exit %d), want the upgrade refusal at ExitGeneric", err, ExitCodeFor(err))
+			}
+		})
 	}
 }
 
@@ -105,7 +154,7 @@ func TestAdminListRunsDebugRefusesAnOlderServer(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var uri string
 			srv := serveJSON(t, &uri, body)
-			_, err := newTestClient(srv).AdminListRunsDebug(context.Background(), "", "")
+			_, err := newTestClient(srv).AdminListRunsDebug(context.Background(), "", "", nil)
 			if err == nil || !strings.Contains(err.Error(), "this server does not support admin run debug listing (needs a server with UZI_ADMIN_RUN_DEBUG support)") {
 				t.Errorf("err = %v, want the unsupported-server error", err)
 			}
@@ -119,7 +168,7 @@ func TestAdminListRunsDebugForbiddenIsAuthExit(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"admin run debug reads require the server flag"}`))
 	}))
 	defer srv.Close()
-	_, err := newTestClient(srv).AdminListRunsDebug(context.Background(), "", "")
+	_, err := newTestClient(srv).AdminListRunsDebug(context.Background(), "", "", nil)
 	if ExitCodeFor(err) != ExitAuth || !strings.Contains(err.Error(), "admin run debug reads require the server flag") {
 		t.Errorf("err = %v (exit %d), want the server message at ExitAuth", err, ExitCodeFor(err))
 	}

@@ -228,15 +228,17 @@ class ClarificationTransport implements CodexTransport {
     else this.queue.push(value);
   }
   request<T>(method: string, params?: unknown): Promise<T> {
-    const p = params as { type?: string; input?: { text?: string }[] };
+    const p = params as { type?: string; model?: string; input?: { text?: string }[] };
     let result: unknown = {};
     if (method === "initialize") result = { userAgent: "codex/0.153.2", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
     if (method === "account/login/start") result = { type: p.type };
     if (method === "thread/resume") this.resumed = true;
-    if (method === "thread/start" || method === "thread/resume") result = { thread: { id: "th-clarify" } };
+    if (method === "thread/start" || method === "thread/resume") result = { thread: { id: "th-clarify" }, model: p.model };
     if (method === "turn/start") {
       this.turns++;
       this.prompts.push(p.input?.[0]?.text ?? "");
+      this.push({ kind: "turn_started", method: "turn/started", threadId: "th-clarify", turnId: "tn-clarify",
+        params: { threadId: "th-clarify", turn: { id: "tn-clarify" } } });
       this.startTurn(this);
       result = { turn: { id: "tn-clarify" } };
     }

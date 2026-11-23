@@ -29,7 +29,7 @@ WHERE id = $2 AND worker_id = $3
   AND status IN ('running', 'awaiting_approval')
   AND claim_released_at IS NULL
   AND claim_generation = $4::bigint
-  AND harness = 'claude'
+  AND harness IN ('claude', 'codex')
   AND kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'mr_rework', 'task')
   AND review_target_run_id IS NULL
   AND egress_profile_id IS NULL

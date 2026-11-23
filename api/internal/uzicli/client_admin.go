@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -92,7 +93,10 @@ const errAdminRunDebugUnsupported = "this server does not support admin run debu
 // AdminListRunsDebug is GET /api/admin/runs?state=all (issue #4198). A server without the feature
 // ignores the query: it answers a bare JSON array or its active-runs envelope, which has no
 // "truncated" key. Either is refused so a partial listing is never shown as every run.
-func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error) {
+//
+// statuses, when non-empty, is sent as status=a,b and the reply is checked with
+// CheckAdminRunsDebugStatusFilter, because a server that predates the filter ignores it.
+func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since string, statuses []string) (apitypes.AdminRunsDebugDTO, error) {
 	q := url.Values{}
 	q.Set("state", "all")
 	if userID != "" {
@@ -100,6 +104,9 @@ func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since strin
 	}
 	if since != "" {
 		q.Set("since", since)
+	}
+	if len(statuses) > 0 {
+		q.Set("status", strings.Join(statuses, ","))
 	}
 	path := "/api/admin/runs?" + q.Encode()
 	resp, body, err := c.doJSONRead(ctx, http.MethodGet, path, nil)
@@ -127,7 +134,46 @@ func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since strin
 	if out.Runs == nil {
 		out.Runs = []apitypes.RunSummaryItemDTO{}
 	}
+	if err := CheckAdminRunsDebugStatusFilter(out, statuses); err != nil {
+		return apitypes.AdminRunsDebugDTO{}, err
+	}
 	return out, nil
+}
+
+// errAdminRunsStatusUnsupported is the refusal for a server that ignored the status filter.
+const errAdminRunsStatusUnsupported = "this uzi server does not support --status; upgrade the server"
+
+// CheckAdminRunsDebugStatusFilter refuses a reply that does not prove the server applied the
+// requested status filter: the echoed status_filter must equal the requested set and every row's
+// status must be in it. No statuses requested is always fine. HTTPClient and FakeClient both call
+// it, so the CLI and the HTTP client share one guard.
+func CheckAdminRunsDebugStatusFilter(out apitypes.AdminRunsDebugDTO, statuses []string) error {
+	if len(statuses) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(statuses))
+	for _, s := range statuses {
+		want[s] = struct{}{}
+	}
+	got := make(map[string]struct{}, len(out.StatusFilter))
+	for _, s := range out.StatusFilter {
+		got[s] = struct{}{}
+	}
+	ok := len(got) == len(want)
+	for s := range want {
+		if _, in := got[s]; !in {
+			ok = false
+		}
+	}
+	for _, r := range out.Runs {
+		if _, in := want[r.Status]; !in {
+			ok = false
+		}
+	}
+	if !ok {
+		return Exitf(ExitGeneric, "%s", errAdminRunsStatusUnsupported)
+	}
+	return nil
 }
 
 // AdminHealth reads the admin health document (PRD #1484 M3): GET /api/admin/health,

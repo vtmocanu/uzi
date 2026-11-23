@@ -337,3 +337,40 @@ func TestCheckProviderModelsRequiresMappedPlanningModelLiveDB(t *testing.T) {
 		t.Fatalf("a task review never plans, so the planning model needs no mapping: %v", err)
 	}
 }
+
+func TestCodexClaimPlanCapabilitiesLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	cf := newSubscriptionFixture(t, env)
+	resealBotPAT(t, env, cf.userID)
+	svc := New(env.q, env.box, testParams())
+	svc.SetVault(env.vlt)
+	env.exec(`UPDATE users SET planning_codex_model='private-plan', planning_codex_effort='high' WHERE id=$1`, cf.userID)
+	base := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  error
+	}{
+		{"missing phase", []string{capability.CodexCustomModelV1}, errPhaseModelsCapabilityMissing},
+		{"missing custom", []string{capability.CodexPhaseModelsV1}, errCustomModelCapabilityMissing},
+		{"both", []string{capability.CodexPhaseModelsV1, capability.CodexCustomModelV1}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := store.Worker{ID: cf.workerID, UserID: cf.userID, ProtocolCapabilities: append(append([]string{}, base...), tc.extra...)}
+			p, err := svc.assembleClaim(env.ctx, w, mustRun(t, env, cf.runID))
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) || p != nil {
+					t.Fatalf("claim=(%v,%v) want %v", p != nil, err, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan := planPhaseOnWire(t, p)
+			if plan["model"] != "private-plan" || plan["effort"] != "high" || plan["model_source"] != "user_planning_default" {
+				t.Fatalf("plan=%v", plan)
+			}
+		})
+	}
+}

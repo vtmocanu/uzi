@@ -275,8 +275,8 @@ const (
 	// so the more general "no Codex-capable worker" reason keeps precedence when the fleet has no
 	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
 	reasonNoCustomCodexCapableWorker = "no worker supporting custom Codex models is online"
-	// reasonNoPhaseModelsCapableWorker (PRD #3252) is emitted for a queued Claude lead-lane run whose
-	// owner has a planning value set and has NO online worker advertising claude_phase_models_v1:
+	// reasonNoPhaseModelsCapableWorker (PRDs #3252/#3253) is emitted for a queued lead-lane run whose
+	// owner has a planning value set and has NO online worker advertising the harness's phase-models capability:
 	// ClaimRun's phase-models clause can never be satisfied until a current worker comes online.
 	reasonNoPhaseModelsCapableWorker     = "no worker supporting separate planning settings is online"
 	reasonNoCodexCompletionCapableWorker = "no online worker implements the Codex completion interlock (codex_completion_interlock_v1); provision a capable worker"
@@ -1745,17 +1745,17 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// capable worker" block must not be hidden behind a yield/restored message.
 	// Aged runs and the gated early Docker probe reach this lookup; read errors fall through.
 	if r.CodexCustomRoot {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingCustomCodex(ctx, r.UserID)
+		c, cerr := s.q.CountOnlineWorkersSatisfyingCustomCodex(ctx, store.CountOnlineWorkersSatisfyingCustomCodexParams{UserID: r.UserID, PhaseModelsRequired: r.PhaseModelsRequired})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying custom codex", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCustomCodexCapableWorker
 		}
 	}
-	// PRD #3252: a Claude lead-lane run whose owner has a planning value set needs a worker advertising
-	// claude_phase_models_v1. r.PhaseModelsRequired is the SQL projection of ClaimRun's clause.
+	// A lead-lane run with planning settings needs its harness-specific phase capability.
+	// r.PhaseModelsRequired is the SQL projection of ClaimRun's clause.
 	if r.PhaseModelsRequired {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingPhaseModels(ctx, r.UserID)
+		c, cerr := s.q.CountOnlineWorkersSatisfyingPhaseModels(ctx, store.CountOnlineWorkersSatisfyingPhaseModelsParams{UserID: r.UserID, Harness: r.Harness})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying phase models", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
@@ -1856,7 +1856,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 						slices.Contains(worker.ProtocolCapabilities, requiredProtocol) &&
 						(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
 						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
-						(!r.PhaseModelsRequired || slices.Contains(worker.ProtocolCapabilities, capability.ClaudePhaseModelsV1)) &&
+						(!r.PhaseModelsRequired || slices.Contains(worker.ProtocolCapabilities, phaseModelsCapability(Harness(r.Harness)))) &&
 						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
 						capableIgnoringCodexLead = true
 						if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {

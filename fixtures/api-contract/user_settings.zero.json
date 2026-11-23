@@ -29,6 +29,8 @@
   "effort_settings": null,
   "planning_claude_model": null,
   "planning_claude_effort": null,
+  "planning_codex_model": null,
+  "planning_codex_effort": null,
   "planning_models": null,
   "planning_efforts": null,
   "weekly_reserve_pct": null,

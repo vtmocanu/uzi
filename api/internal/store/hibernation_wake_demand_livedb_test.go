@@ -70,6 +70,7 @@ func wakeDemandWith(fx *fleetFixture, allow []uuid.UUID, maxRows int32, lease pg
 	fx.t.Helper()
 	now := time.Now()
 	rows, err := fx.q.ListHibernationWakeDemand(fx.ctx, store.ListHibernationWakeDemandParams{
+		CodexCuratedModels:       []string{"gpt-6-sol"},
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
 		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
 		AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Hour), Valid: true},
@@ -117,6 +118,7 @@ func claimsAfterWake(fx *fleetFixture, worker, run uuid.UUID, allow []uuid.UUID,
 			WorkerID:                 pgtype.UUID{Bytes: worker, Valid: true},
 			Lane:                     lane,
 			UserID:                   fx.userID,
+			CodexCuratedModels:       []string{"gpt-6-sol"},
 			CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
 			CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
 			HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true},
@@ -489,4 +491,28 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 			t.Fatalf("control: run %s demanded %s, want the sleeper %s", follow, got, h)
 		}
 	})
+}
+
+func TestCodexPlanningHibernationConsumersLiveDB(t *testing.T) {
+	for _, capable := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing phase", true: "phase capable"}[capable], func(t *testing.T) {
+			fx := newFleetFixture(t)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE users SET planning_codex_model='gpt-6-sol' WHERE id=$1`, fx.userID)
+			run := phaseRun(fx, phaseMatrixCase{kind: "issue", harness: "codex", noCaps: true})
+			w := hostedWorker(fx, wakeWorkerOpts{protocol: phaseProtocols("codex", capable)})
+			setHibernated(fx, w, "hibernated")
+			if got := wakeDemandFor(fx, nil)[run]; (got == w) != capable {
+				t.Fatalf("wake target=%v capable=%v", got, capable)
+			}
+			setHibernated(fx, w, "waking")
+			mustExec(fx.ctx, t, fx.pool, `INSERT INTO hibernation_wakes(run_id,worker_id,first_woken_at) VALUES($1,$2,now())`, run, w)
+			suppressed, err := fx.q.HibernationWakeSuppresses(fx.ctx, store.HibernationWakeSuppressesParams{
+				RunID: run, CodexCuratedModels: []string{"gpt-6-sol"}, WakeTimeout: leaseInterval(leaseTwoHours), EphemeralLease: leaseInterval(leaseTwoHours),
+				CrossCheckEvaluatedAt: planCrossCheckTime(time.Now()), CrossCheckAffinityCutoff: planCrossCheckTime(time.Now().Add(-time.Hour)),
+			})
+			if err != nil || suppressed != capable {
+				t.Fatalf("wake suppression=(%v,%v) capable=%v", suppressed, err, capable)
+			}
+		})
+	}
 }

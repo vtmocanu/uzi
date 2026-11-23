@@ -3,6 +3,7 @@ package handler
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -185,11 +186,11 @@ type adminRunRow struct {
 // Powers the Agents-status overview. ?view=summary serves the compact rows exactly
 // as ListRuns does.
 //
-// Issue #4198: a request that carries any of the query keys state, user or since (even with
+// Issue #4198: a request that carries any of the query keys state, user, since or status (even with
 // an empty value) is a debug request and takes adminRunDebugListRuns instead.
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	if q.Has("state") || q.Has("user") || q.Has("since") {
+	if q.Has("state") || q.Has("user") || q.Has("since") || q.Has("status") {
 		h.adminRunDebugListRuns(w, r)
 		return
 	}
@@ -212,7 +213,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	writeRunList(w, r, out)
 }
 
-// adminRunDebugListRuns serves GET /api/admin/runs with ?state=all[&user=<uuid>][&since=<RFC3339>]
+// adminRunDebugListRuns serves GET /api/admin/runs with ?state=all[&user=<uuid>][&since=<RFC3339>][&status=a,b]
 // (issue #4198): runs of every status, newest first, capped at adminRunDebugMaxRows with a
 // truncated flag. It always serves the summary projection in a {runs, truncated} envelope,
 // whatever ?view says. The predicate is checked before any validation, so a caller who may
@@ -246,7 +247,21 @@ func (h *Handler) adminRunDebugListRuns(w http.ResponseWriter, r *http.Request) 
 		}
 		since = &ts
 	}
-	rows, err := h.wsvc.ListRunsAdminDebug(r.Context(), ownerFilter, since, adminRunDebugMaxRows+1)
+	var statuses []string // nil = unfiltered
+	if q.Has("status") {
+		seen := map[string]bool{}
+		for _, s := range strings.Split(q.Get("status"), ",") {
+			if !apitypes.IsRunStatus(s) { // also rejects an empty element
+				httpx.Error(w, http.StatusBadRequest, "invalid status")
+				return
+			}
+			if !seen[s] {
+				seen[s] = true
+				statuses = append(statuses, s)
+			}
+		}
+	}
+	rows, err := h.wsvc.ListRunsAdminDebug(r.Context(), ownerFilter, since, statuses, adminRunDebugMaxRows+1)
 	if err != nil {
 		slog.Error("admin debug list runs", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -276,8 +291,8 @@ func (h *Handler) adminRunDebugListRuns(w http.ResponseWriter, r *http.Request) 
 		s.ReportMd = nil
 		summaries = append(summaries, s)
 	}
-	auditRunsListDebugRead(r, actor, tokenID, adminRunDebugRouteRuns, ownerFilter, since, len(summaries))
-	httpx.JSON(w, http.StatusOK, apitypes.AdminRunsDebugDTO{Runs: summaries, Truncated: truncated})
+	auditRunsListDebugRead(r, actor, tokenID, ownerFilter, since, statuses, len(summaries))
+	httpx.JSON(w, http.StatusOK, apitypes.AdminRunsDebugDTO{Runs: summaries, Truncated: truncated, StatusFilter: statuses})
 }
 
 // buildAdminRunList decorates the admin rows into list items: plan-revising flag, the "now"

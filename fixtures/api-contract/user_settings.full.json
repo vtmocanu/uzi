@@ -81,6 +81,8 @@
   ],
   "planning_claude_model": "x",
   "planning_claude_effort": "x",
+  "planning_codex_model": "x",
+  "planning_codex_effort": "x",
   "planning_models": [
     {
       "harness": "x",

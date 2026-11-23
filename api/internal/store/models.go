@@ -2056,6 +2056,8 @@ type User struct {
 	PlanningClaudeModel       pgtype.Text        `json:"planning_claude_model"`
 	PlanningClaudeEffort      pgtype.Text        `json:"planning_claude_effort"`
 	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
+	PlanningCodexModel        pgtype.Text        `json:"planning_codex_model"`
+	PlanningCodexEffort       pgtype.Text        `json:"planning_codex_effort"`
 }
 
 type UserCrossCheckPin struct {

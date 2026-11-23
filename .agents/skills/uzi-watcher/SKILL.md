@@ -10,8 +10,8 @@ running, plan-approved run; then hand it to `uzi-lander`, which lands the PR. Ma
 once is the normal case. This repo is **GitHub**: use `gh` only (never `glab`/`tea`), and
 CI is **GitHub Actions** (`.github/workflows/`).
 
-uzi never touches `main` (four guardrail layers). The merge and every CI fix are a local
-session's job, not uzi's; that session runs `uzi-lander`.
+uzi never touches `main` (four guardrail layers). `uzi-lander` owns repair coordination
+and merging. Use one fixer per target: local, branch `ci_fix`, or scheduled `ci_watch`.
 
 ## Load the tools; do not duplicate them
 

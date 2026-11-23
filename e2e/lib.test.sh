@@ -1593,6 +1593,10 @@ custody_case "autoselect cancel POST failure cannot proceed to teardown" fail 'c
 custody_case "autoselect unexpected failed outcome cannot proceed to teardown" fail "entered 'failed'" autoselect_cancel_boundary failed
 
 eval "$(awk '/^resolve_fixture_source_hold\(\) \{/,/^\}/' "$LIB")"
+# The shipped limiter resolver (a one-liner; an awk range would over-capture) bounds the
+# helper's receipt-timeout agent log tail.
+eval "$(grep '^_docker_wire_diag_limiter() {' "$LIB")"
+type _docker_wire_diag_limiter >/dev/null 2>&1 || { echo 'FAIL: _docker_wire_diag_limiter not extracted from lib.sh'; exit 1; }
 fixture_owner_decision() {
   local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 sibling=b4dec5cf-e6d4-413b-b3a8-0005a2835771
   local other=b4dec5cf-e6d4-413b-b3a8-0005a2835772 status=completed
@@ -1703,9 +1707,31 @@ fixture_archive_receipt() {
   # A capture that settles first spends a second of the shared deadline before the
   # receipt wait starts, and no read starts once the deadline is reached.
   [ "$mode" != capturing-available ] || budget=3
+  # The receipt-timeout agent log tail runs under the real limiter (#4606), which cannot exec a
+  # shell function: COMPOSE is an executable script. timeout-* modes pick its behaviour; every
+  # invocation appends its argv to compose-logs.argv, so a retry or a skipped call is visible.
+  local logs_mode=ok real_limiter wall_start elapsed
+  case "$mode" in timeout-*) logs_mode="${mode#timeout-}" ;; esac
+  rm -f "$SEQ_DIR/compose-logs" "$SEQ_DIR/compose-logs.argv" "$SEQ_DIR/compose-logs.started" \
+    "$SEQ_DIR/compose-logs.finished" "$SEQ_DIR/limiter-wrap" "$SEQ_DIR/limiter-wrap.argv"
+  : > "$SEQ_DIR/receipt-dispositions"
+  case "$logs_mode" in
+    hang) printf '#!/bin/sh\necho "$*" >> "$0.argv"\n: > "$0.started"\nsleep 30 >/dev/null 2>&1\n: > "$0.finished"\n' > "$SEQ_DIR/compose-logs" ;;
+    error) printf '#!/bin/sh\necho "$*" >> "$0.argv"\nexit 1\n' > "$SEQ_DIR/compose-logs" ;;
+    *) printf '#!/bin/sh\necho "$*" >> "$0.argv"\necho "recreated agent log tail"\n' > "$SEQ_DIR/compose-logs" ;;
+  esac
+  chmod +x "$SEQ_DIR/compose-logs"
   # shellcheck disable=SC2034  # read by the extracted real helper on timeout
-  local COMPOSE=(fixture_agent_log)
-  fixture_agent_log() { echo 'recreated agent log tail'; }
+  local COMPOSE=("$SEQ_DIR/compose-logs")
+  if [ "$logs_mode" = no-limiter ]; then
+    _docker_wire_diag_limiter() { :; }
+  else
+    # The real limiter behind a wrapper that records its argv, pinning `-k 2 5`.
+    real_limiter="$(_docker_wire_diag_limiter)"
+    printf '#!/bin/sh\necho "$*" >> "$0.argv"\nexec "%s" "$@"\n' "$real_limiter" > "$SEQ_DIR/limiter-wrap"
+    chmod +x "$SEQ_DIR/limiter-wrap"
+    _docker_wire_diag_limiter() { echo "$SEQ_DIR/limiter-wrap"; }
+  fi
   echo 0 > "$SEQ_DIR/receipt-polls"
   echo 0 > "$SEQ_DIR/receipt-hold-reads"
   apiget() {
@@ -1724,7 +1750,7 @@ fixture_archive_receipt() {
     esac
   }
   apiget_before() { apiget "$2"; }
-  uzi_cli() { fail 'captured hold must never be discarded'; }
+  uzi_cli() { echo "$*" >> "$SEQ_DIR/receipt-dispositions"; fail 'captured hold must never be discarded'; }
   db_psql() { fail 'unexpected receipt SQL: unbounded db_psql'; }
   # The receipt SQL is bounded by the remaining shared deadline (db_psql_rows SECS).
   db_psql_rows() {
@@ -1740,27 +1766,59 @@ fixture_archive_receipt() {
       {run_id:$run,run_status:"cancelled",holds:[{id:$id,run_id:$run,generation:1,inventory_guarded:true,
         state:"open",final_disposition:null,release_evidence:null,captures:[{state:"available"}],
         worker:{last_heartbeat_at:"fixture-heartbeat",updated_at:"fixture-register"}}]}
-      | if $n>0 and $mode!="timeout" then .holds[0] += {state:"released",final_disposition:"archive",release_evidence:"archive",archive_matches:true} else . end
+      | if $n>0 and ($mode|startswith("timeout")|not) then .holds[0] += {state:"released",final_disposition:"archive",release_evidence:"archive",archive_matches:true} else . end
       | if $n>0 and $mode=="discarded" then .holds[0].state="discarded"
         elif $n>0 and $mode=="no-proof" then .holds[0].archive_matches=false
         elif $n>0 and $mode=="wrong-id" then .holds[0].id="changed"
         else . end'
   }
-  if [ "$mode" = timeout ]; then
+  if [[ "$mode" == timeout* ]]; then
     local output
+    # custody_case's SECONDS is virtual; the log diagnostic's bound is measured on the wall clock.
+    wall_start="$(date +%s)"
     if output="$(resolve_fixture_source_hold "$UUID" 1 2 '2026-10-08T09:08:20Z' 2>&1)"; then
       fail 'captured fixture unexpectedly settled'
     fi
-    [[ "$output" == *'restore_at=2026-10-08T09:08:20Z'* && "$output" == *'fixture-heartbeat'* \
-      && "$output" == *'fixture-register'* && "$output" == *'"captures"'* \
-      && "$output" == *'recreated agent log tail'* && "$output" == *'receipt timeout'* \
-      && "$output" == *'read_rc=28'* ]] \
+    elapsed=$(( $(date +%s) - wall_start ))
+    # The original evidence line and failure, whatever the diagnostic did.
+    [[ "$output" == *'fixture receipt timeout evidence: restore_at=2026-10-08T09:08:20Z snapshot='* \
+      && "$output" == *'fixture-heartbeat'* && "$output" == *'fixture-register'* && "$output" == *'"captures"'* \
+      && "$output" == *' read_rc=28'* \
+      && "$output" == *'fixture archive custody receipt timeout after 2s; evidence preserved'* ]] \
       || fail "timeout diagnostic omitted evidence: $output"
     # Polls at 0s and 1s; at the 2s deadline no receipt SQL starts at all.
     [ "$(cat "$SEQ_DIR/receipt-polls")" -eq 2 ] || fail "expected exactly 2 receipt polls before the deadline: $(cat "$SEQ_DIR/receipt-polls")"
+    [ ! -s "$SEQ_DIR/receipt-dispositions" ] || fail "receipt timeout made a disposition call: $(cat "$SEQ_DIR/receipt-dispositions")"
+    if [ "$logs_mode" = no-limiter ]; then
+      [[ "$output" == *'fixture receipt diagnostic: agent log tail skipped (no timeout command)'* ]] \
+        || fail "missing-limiter skip note absent: $output"
+      [ ! -e "$SEQ_DIR/compose-logs.argv" ] || fail "agent logs ran without a limiter: $(cat "$SEQ_DIR/compose-logs.argv")"
+    else
+      # Exactly one bounded call (never retried) with the exact log arguments, under `-k 2 5`.
+      [ "$(cat "$SEQ_DIR/compose-logs.argv" 2>/dev/null)" = 'logs --no-color --since 2026-10-08T09:08:20Z --tail 80 agent' ] \
+        || fail "agent logs not called exactly once with the log arguments: [$(cat "$SEQ_DIR/compose-logs.argv" 2>/dev/null)]"
+      [ "$(cat "$SEQ_DIR/limiter-wrap.argv" 2>/dev/null)" = "-k 2 5 $SEQ_DIR/compose-logs logs --no-color --since 2026-10-08T09:08:20Z --tail 80 agent" ] \
+        || fail "agent logs not bounded by -k 2 5: [$(cat "$SEQ_DIR/limiter-wrap.argv" 2>/dev/null)]"
+      case "$logs_mode" in
+        ok)
+          [[ "$output" == *'recreated agent log tail'* && "$output" != *'fixture receipt diagnostic:'* ]] \
+            || fail "normal timeout lost the agent log tail: $output" ;;
+        error)
+          [[ "$output" == *'fixture receipt diagnostic: agent log tail unavailable or timed out (rc=1)'* ]] \
+            || fail "failed agent logs note absent: $output" ;;
+        hang)
+          [[ "$output" == *'fixture receipt diagnostic: agent log tail unavailable or timed out (rc=124)'* \
+            || "$output" == *'fixture receipt diagnostic: agent log tail unavailable or timed out (rc=137)'* ]] \
+            || fail "hung agent logs were not killed by the limiter: $output"
+          [ -f "$SEQ_DIR/compose-logs.started" ] && [ ! -e "$SEQ_DIR/compose-logs.finished" ] \
+            || fail "hung agent logs did not start or ran to completion: $output"
+          [ "$elapsed" -ge 4 ] && [ "$elapsed" -lt 10 ] \
+            || fail "hung agent logs were not bounded at 5s (+2s grace): ${elapsed}s" ;;
+      esac
+    fi
     # A marker only this path prints: the failure message above embeds the helper's own
     # output, so matching on any evidence text would let a missing conjunct read green.
-    echo 'receipt timeout evidence complete'
+    echo "receipt timeout evidence complete: logs $logs_mode"
     return 1
   fi
   resolve_fixture_source_hold "$UUID" 1 "$budget" '2026-10-08T09:08:20Z'
@@ -1770,7 +1828,17 @@ custody_case "captured fixture waits for exact archive FINAL without discard" pa
 custody_case "captured fixture refuses mid-wait discard" fail 'unexpected disposition' fixture_archive_receipt discarded
 custody_case "captured fixture requires matching archive proof" fail 'lacks archive proof' fixture_archive_receipt no-proof
 custody_case "captured fixture preserves exact hold identity" fail 'changed identity' fixture_archive_receipt wrong-id
-custody_case "captured fixture timeout retains row worker and recreation log" fail 'receipt timeout evidence complete' fixture_archive_receipt timeout
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  custody_case "captured fixture timeout retains row worker and recreation log" fail 'receipt timeout evidence complete: logs ok' fixture_archive_receipt timeout
+  custody_case "a hung receipt-timeout agent log tail is killed at 5s, failure and evidence unchanged" fail 'receipt timeout evidence complete: logs hang' \
+    fixture_archive_receipt timeout-hang
+  custody_case "a failed receipt-timeout agent log tail keeps the failure and evidence" fail 'receipt timeout evidence complete: logs error' \
+    fixture_archive_receipt timeout-error
+else
+  echo "SKIP: receipt-timeout agent log tail cases under the real limiter (neither timeout nor gtimeout installed)"
+fi
+custody_case "without a limiter the receipt-timeout agent log tail is skipped, failure unchanged" fail 'receipt timeout evidence complete: logs no-limiter' \
+  fixture_archive_receipt timeout-no-limiter
 custody_case "capturing fixture that never settles times out on the shared deadline" fail 'still capturing after 2s' fixture_archive_receipt capturing-timeout
 custody_case "capturing fixture that becomes available waits for archive FINAL" pass 'fixture archive custody receipt:' fixture_archive_receipt capturing-available
 

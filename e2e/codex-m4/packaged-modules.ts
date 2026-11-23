@@ -26,6 +26,8 @@ export type AppServerAuthModule = typeof import("../../agent/src/codex/appserver
 export type DynamicToolsModule = typeof import("../../agent/src/codex/dynamic-tools.js");
 /** The pure execution registry (idempotency/poison + root/epoch bookkeeping). */
 export type RegistryModule = typeof import("../../agent/src/codex/registry.js");
+/** The credential-free production rollout store. */
+export type SessionStateModule = typeof import("../../agent/src/codex/session-state.js");
 /** The run-lane turn reducer (a pure, SDK-free fold) — used to assert reduced signal state. */
 export type ReducerModule = typeof import("../../agent/src/harness-reducer.js");
 
@@ -65,6 +67,10 @@ export function loadPackagedAppServerAuth(): Promise<AppServerAuthModule> {
 
 export function loadPackagedDynamicTools(): Promise<DynamicToolsModule> {
   return load<DynamicToolsModule>("codex/dynamic-tools.ts");
+}
+
+export function loadPackagedSessionState(): Promise<SessionStateModule> {
+  return load<SessionStateModule>("codex/session-state.ts");
 }
 
 export function loadPackagedRegistry(): Promise<RegistryModule> {

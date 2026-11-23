@@ -118,10 +118,11 @@ describe("codex U repository trust construction (real config builders + real exe
 
     // RESUME + subsequent TURN: a resumed run (sessionId) re-asserts untrusted on thread/resume.
     const resumeRig = makeExecRig(execMods, (c) => {
-      if (c.method === "thread/resume") return { thread: { id: "resumed-1" } };
+      if (c.method === "thread/resume") return { thread: { id: rec(c.params).threadId }, model: rec(c.params).model };
       if (c.method === "thread/start") return { thread: { id: "th-1" } };
       if (c.method === "turn/start") {
-        c.transport.push(threadStarted("resumed-1")).push(signalDone("resumed-1", "tn-1")).push(turnCompleted("completed", "resumed-1", "tn-1"));
+        const threadId = rec(c.params).threadId as string;
+        c.transport.push(threadStarted(threadId)).push(signalDone(threadId, "tn-1")).push(turnCompleted("completed", threadId, "tn-1"));
         return { turn: { id: "tn-1" } };
       }
       return {};
@@ -132,6 +133,11 @@ describe("codex U repository trust construction (real config builders + real exe
     assert.deepEqual(rec(resume.params).config, untrustedConfig, "thread/resume RE-asserts the project untrusted with project_doc_max_bytes=0");
     const resumeTurn = resumeRig.transport.requests.find((r) => r.method === "turn/start");
     assert.ok(resumeTurn, "the resumed run issued a subsequent turn/start");
+    assert.equal(resumeRig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+    assert.equal(resumeRig.transport.requests.filter(r => r.method === "turn/start").length, 1);
+    assert.equal(rec(resume.params).threadId, "prior-session");
+    assert.equal(rec(resumeTurn.params).threadId, "prior-session", "the sole turn continues the saved thread");
+    assert.equal(resumeRig.transport.requests.some(r => r.method === "thread/start"), false, "no fresh fallback");
     assert.deepEqual(rec(resumeTurn.params).environments, [], "the subsequent turn/start reasserts an empty environment selection");
 
     // NEGATIVE ORACLE: no repo AGENTS.md/.codex content or trust promotion rode ANY construction

@@ -315,7 +315,7 @@ type EffectiveModelSetting = "worker_model" | "planning_model" | "judge_model" |
 type EffectiveEffortSetting = "worker_effort" | "planning_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
 
 /** PRD #3252: the lead model and effort of every turn before plan approval, exactly the claim's
- *  `plan_phase`. Present on a preview only for a Claude run whose owner's Claude planning model or
+ *  `plan_phase`. Present on a preview only for a run whose owner's harness planning model or
  *  effort applies; omitted otherwise. `model` / `effort` are omitted when the plan side ships none
  *  (it then follows the implement side, the preview's own worker cells). The sources are the claim's
  *  provenance tokens: `user_planning_default` for a planning value, else the implement value's
@@ -425,7 +425,7 @@ export interface StartPreviewAlternative {
   /** Present only when the request carried an effort (source run_override). There is no worker_model
    *  here: a request with a model never leaves the harness undecided (D22). */
   worker_effort?: EffortSettingCell;
-  /** PRD #3252: the Claude plan-phase pair; present only when the planning lane applies. */
+  /** PRD #3252: the harness plan-phase pair; present only when the planning lane applies. */
   plan_phase?: EffectivePlanPhase;
 }
 
@@ -445,7 +445,7 @@ export interface StartPreview {
    *  run_override, effort mode explicit); with an undecided harness each alternative carries its own. */
   worker_model?: ModelSettingCell;
   worker_effort?: EffortSettingCell;
-  /** PRD #3252: the Claude plan-phase pair; present only when the harness is decided as Claude and
+  /** PRD #3252: the harness plan-phase pair; present only when the harness is decided and
    *  the planning lane applies. */
   plan_phase?: EffectivePlanPhase;
   alternatives?: StartPreviewAlternative[];
@@ -502,7 +502,7 @@ export interface ScheduleAlternative {
   subagents: EffectiveSubagents | null;
   refusal: ScheduleRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
-  /** PRD #3252: the Claude plan-phase pair; omitted unless the planning lane applies. */
+  /** PRD #3252: the harness plan-phase pair; omitted unless the planning lane applies. */
   plan_phase?: EffectivePlanPhase;
 }
 
@@ -522,7 +522,7 @@ export interface ScheduleSettingsPreview {
   subagents: EffectiveSubagents | null;
   notes: string[];
   alternatives?: ScheduleAlternative[];
-  /** PRD #3252: the Claude plan-phase pair of a fire on Claude; omitted unless the planning lane
+  /** PRD #3252: the harness plan-phase pair of a fire on its harness; omitted unless the planning lane
    *  applies (carried per alternative when the harness is chosen at creation). */
   plan_phase?: EffectivePlanPhase;
 }
@@ -574,11 +574,13 @@ export interface UserSettings {
   /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   summary_models?: ModelSettingCell[];
-  /** Per-user Claude planning model and effort (PRD #3252); null inherits. Optional for
+  /** Per-user planning model and effort (PRD #3252); null inherits. Optional for
    *  older servers. */
   planning_claude_model?: string | null;
   planning_claude_effort?: string | null;
-  /** Read-only resolved planning cells (PRD #3252), one claude cell each (Q-codex adds the codex cells). Never sent on a PUT. */
+  planning_codex_model?: string | null;
+  planning_codex_effort?: string | null;
+  /** Read-only resolved planning cells (PRD #3252), Claude then Codex cells. Never sent on a PUT. */
   planning_models?: ModelSettingCell[];
   planning_efforts?: EffortSettingCell[];
   theme: string | null;
@@ -662,9 +664,11 @@ export interface UserSettingsPatch {
   /** Per-user reasoning effort (PRD #617); present-null clears back to inherit. */
   default_effort?: string | null;
   default_codex_effort?: string | null;
-  /** Per-user Claude planning model and effort (PRD #3252); present-null clears to "Same as the run". */
+  /** Per-user planning model and effort (PRD #3252); present-null clears to "Same as the run". */
   planning_claude_model?: string | null;
   planning_claude_effort?: string | null;
+  planning_codex_model?: string | null;
+  planning_codex_effort?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
   /** Per-user Codex judge model (PRD #3245); present-null clears back to inherit. */
@@ -5181,6 +5185,9 @@ export interface RunInputsEnvelope {
 export interface AdminRunsDebug {
   runs: RunSummaryItem[];
   truncated: boolean;
+  /** Echo of the applied ?status= filter. Absent when no filter was sent, and also from an
+   *  older server that ignored the filter, so a client that asked for one can detect that. */
+  status_filter?: string[];
 }
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -6576,10 +6583,13 @@ export interface HeldPublication {
   refusal_reason?: string;
 }
 
-// HeldPublications is the owner GET /api/runs/{id}/held-publications response. publications
-// is always an array on the wire, never null.
+// HeldPublications is the owner GET /api/runs/{id}/held-publications response, also served to
+// an admin_ro token on another user's run as an audited admin debug read (admin_debug_read).
+// publications is always an array on the wire, never null.
 export interface HeldPublications {
   publications: HeldPublication[];
+  /** True only on an admin run debug read of another user's run (issue #4198); absent otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the

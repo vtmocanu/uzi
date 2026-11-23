@@ -1229,11 +1229,11 @@ type Store interface {
 	// 'codex_harness_v1' AND 'codex_custom_model_v1' gets reasonNoCustomCodexCapableWorker — the
 	// run's non-bypassable custom-model claim clause can never be satisfied. A per-run lookup like
 	// CountOnlineWorkersSatisfyingCodexHarness above, and off the hot path for the same reason.
-	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error)
-	// CountOnlineWorkersSatisfyingPhaseModels backs PRD #3252's queued-reason rung: a Claude lead-lane
-	// run whose owner has a planning value set needs a worker advertising 'claude_phase_models_v1'
+	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCustomCodexParams) (int64, error)
+	// CountOnlineWorkersSatisfyingPhaseModels backs the queued-reason rung: a lead-lane run
+	// whose owner has planning settings needs its harness-specific phase capability
 	// (reasonNoPhaseModelsCapableWorker when none is online).
-	CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingPhaseModels(ctx context.Context, arg store.CountOnlineWorkersSatisfyingPhaseModelsParams) (int64, error)
 	// CountOnlineWorkersSatisfyingJobRunner backs PRD #1908's (D-A) queued-reason rung: a queued
 	// kind='job' run whose owner has NO online non-docker worker advertising 'job_runner_v1' gets
 	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
@@ -1486,6 +1486,7 @@ type Store interface {
 	// The owner's Claude planning model and effort (PRD #3252): read strictly at lead-lane Claude
 	// claim assembly, beside the lane read; blank = "Same as the run".
 	GetUserPlanningClaude(ctx context.Context, id uuid.UUID) (store.GetUserPlanningClaudeRow, error)
+	GetUserPlanningCodex(ctx context.Context, id uuid.UUID) (store.GetUserPlanningCodexRow, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
 	// default `medium` at claim assembly (issue #1157).
@@ -4030,12 +4031,12 @@ var errRunRepoOwnerMismatch = errors.New("the run's repository is not owned by t
 // no secret bytes.
 var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_model_v1 for a custom Codex root model")
 
-// errPhaseModelsCapabilityMissing marks a Claude lead-lane claim that carries a plan_phase (PRD
-// #3252) on a worker that does not advertise claude_phase_models_v1: the owner set a planning
+// errPhaseModelsCapabilityMissing marks a lead-lane claim that carries a plan_phase (PRD
+// #3253) on a worker that does not advertise its harness phase capability: the owner set a planning
 // value between ClaimRun's SQL gate and assembly. Transient like errCustomModelCapabilityMissing:
 // the run returns to queued, and the next ClaimRun pass excludes the worker. Its message carries no
 // secret bytes.
-var errPhaseModelsCapabilityMissing = errors.New("worker lacks claude_phase_models_v1 for a Claude planning phase")
+var errPhaseModelsCapabilityMissing = errors.New("worker lacks the harness phase-models capability for a planning phase")
 
 // errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
 // the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the
@@ -9007,11 +9008,15 @@ func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRuns
 // ListRunsAdminDebug returns up to maxRows runs of every status across all users (or
 // one user when userID is non-nil), newest first, optionally created at or after since,
 // excluding chat, judge, and cross-check runs (issue #4198 admin run debug listing).
-func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
+// statuses narrows to those run statuses: nil means unfiltered (pgx encodes a nil slice
+// as NULL), while an empty non-nil slice matches nothing, so callers pass nil when the
+// filter is absent.
+func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, statuses []string, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
 	return s.q.ListRunsAdminDebug(ctx, store.ListRunsAdminDebugParams{
 		BackgroundGraceCutoff: s.activeRunsPriorityCutoff(),
 		UserID:                pgconv.UUIDPtr(userID),
 		Since:                 pgconv.TimePtr(since),
+		Statuses:              statuses,
 		MaxRows:               maxRows,
 	})
 }

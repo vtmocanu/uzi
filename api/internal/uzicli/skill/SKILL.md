@@ -312,7 +312,7 @@ uzi job list [--limit <n>] [--cursor <cursor>]
 uzi job files <job-id>
 uzi job file get <file-id> [-o <path>]
 uzi admin users
-uzi admin runs
+uzi admin runs [--all [--user <uuid|email>] [--since <rfc3339>] [--status <s[,s]>]] [--json]
 uzi admin workers
 uzi admin health [--all] [--strict]
 uzi admin usage
@@ -1113,7 +1113,9 @@ uzi version
   (`refs/uzi-held/<run-id>/<generation>`) its committed work was published to before custody was
   released, with each ref's state, the tip it holds and when it is deleted. Fetch one before then
   with `git fetch origin <ref>`. `uzi run recovery <run-id>` shows the same ref as a released
-  hold's held receipt. Owner-only (a foreign run is a 404, exit 4).
+  hold's held receipt. Owner-only (a foreign run is a 404, exit 4), except that a live admin's
+  `uza_` token on a server with `UZI_ADMIN_RUN_DEBUG` on reads another user's run as an audited,
+  read-only admin debug read (stderr notice, no expire hint; `--json` stays the bare array).
 - `uzi run held expire <run-id> [--yes]` — make the run's acknowledged held refs due for deletion
   now; the server's cleanup deletes them shortly after (this command deletes nothing itself).
   **Destructive:** fetch the work first. It prompts for confirmation interactively; `--yes` is
@@ -1238,6 +1240,7 @@ nothing a manual start cannot.
   text from dependencies, tests or outside contributors. `get <id> --episodes-cursor <c>`
   prints the next page (`--json` prints the page incl. `next_cursor`). Enable the
   catalog default with `uzi schedule catalog enable ci-repair --repo <id>`.
+  Before starting a local repair of the same failure, agree one fixer. Inspect the schedule's episode run IDs, including gated prompt runs. For authorized local takeover, pause the exact schedule, wait for or cancel its existing run with custody review, and record who restores the prior schedule state. Pausing a schedule does not stop its run.
   When the schedule has fired at least once it also prints a **Last fire** block: a
   summary line (`fired <time> · examined N · started M · skipped K`), one line per started
   run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt schedule), one
@@ -1374,13 +1377,13 @@ nothing a manual start cannot.
 mean this: drive a repo's PRD issue all the way to a merged, green MR, asking the
 user *once* up front how much to automate. It is an orchestration **recipe you run
 in the local session**, composing the `uzi` verbs above with the forge's own CLI,
-and it is session-bound (the merge and the post-merge CI fixing are done by THIS
-session and stop when it ends). **Seed it to uzi** names one narrower mode, the
+and it is session-bound: own merges and CI-repair coordination locally; factory
+runs and schedules have independent lifecycles. **Seed it to uzi** names one narrower mode, the
 pre-written `--plan-file` path in *Authoring a seeded plan* below.
 
 uzi itself never merges and never touches `main` (four guardrail layers enforce
-that), so the merge in step 8 and the CI fixing in step 9 are done **locally, by
-you**, with the forge CLI, not by uzi.
+that). Merge with the forge CLI in step 8; in step 9 coordinate one local or factory
+repair, then review and merge its PR.
 
 **Ask the mode first.** Present one `AskUserQuestion`, "How much should the skill
 handle on its own?", with these options. **Auto is the recommended default:**
@@ -1525,8 +1528,9 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    legitimate — distinguish it from a genuine block (a failing required check, or a
    live unresolved thread), which still stops you.
 
-   **Before you fix any finding locally OR merge, check whether uzi is already
-   reworking this MR.** uzi's MR review-watcher (`mr_rework`, on by default for
+   **Before local fixes, pushes, rebases or merge, check both branch writers:**
+   `ci_fix` on the exact repo and PR source branch (`pipeline_ref`), and `mr_rework` on
+   the exact repo and MR number. uzi's MR review-watcher (`mr_rework`, on by default for
    opted-in users) reads the review comments on a completed issue run's MR and, on
    its own, pushes a fix commit to the same `agent/*` branch. It never merges (the
    guardrail layers still hold), but if this session also amends the branch the two
@@ -1534,16 +1538,20 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    (two repos can share an MR number):
 
    ```
-   uzi run list --json | jq -r '.[]|select(.kind=="mr_rework" and .repo_id=="<repo-id>" and .mr_iid==<mr-number>)|{id, status}'
+   uzi run list --json | jq -r '.[]|select(.repo_id=="<repo-id>" and ((.kind=="mr_rework" and .mr_iid==<mr-number>) or (.kind=="ci_fix" and .pipeline_ref=="<source-branch>")))|{id, kind, status}'
    ```
 
-   A non-terminal match means uzi is on it: defer, let it finish, then review the
-   commit it pushed (uzi acting is not uzi being right), and re-check this list
-   right before you merge. The check narrows the collision window, it does not lock
-   the branch, so the re-check just before merging is what actually keeps the two
-   pushes apart.
+   Treat only `completed`, `failed` and `cancelled` as terminal. For any active match,
+   wait, or agree to cancel the exact run and confirm terminal state. Inspect its branch
+   delta, preserved patch, recovery captures and held publications; no patch does not prove
+   no work. Review any changed head before merging. Refresh immediately before push or merge;
+   never bypass an active helper. The list is only the caller's newest 200 runs, so absence
+   does not exclude older or foreign-owner runs. A failed lookup is unknown. An authorized
+   admin listing can help, but truncation and owner-specific repo IDs limit it too. Coordinate
+   unresolved ownership. No snapshot locks the branch. Disabling mr-rework or cancelling one
+   ci_fix does not disable future automatic CI fixes.
 
-   **When no rework is running and the diff and any automated review are clean,**
+   **When no matching helper is active and the diff and any automated review are clean,**
    merge with the forge's own tool, picked by the repo's remote host: GitLab uses
    `glab mr merge` (on this host GitLab needs `env -u GITLAB_TOKEN glab`), GitHub
    uses `gh pr merge`, Forgejo or Gitea uses `tea pr merge`. uzi has no merge verb;
@@ -1565,9 +1573,12 @@ never forces past a bad plan, a blocked merge, or an unfixable pipeline.
    A blocked merge or a conflict stops here; report it.
 9. **Watch CI, fix failures locally.** Poll the post-merge pipeline with the forge
    CLI (`glab ci status`, `gh run watch`, or the `tea` equivalent) until it
-   settles. On red, read each failed job's log and classify:
-   - **code, merge-conflict, or missing-file**: fix in a local clone, commit, push
-     to the branch, and re-watch.
+   settles. Before a local repair, inspect matching `ci_watch` schedules and episode run IDs;
+   agree one fixer and follow the schedule takeover rule above. These repairs are prompt
+   runs on their own branches, may be auto-approved, and never push directly to `main`.
+   On red, read each failed job's log and classify:
+   - **code, merge-conflict, or missing-file**: fix on a local branch, open a PR,
+     review and merge it, then re-watch. Never push code directly to `main`.
    - **flaky** (passes on an isolated re-run, or a known-unstable test): file an
      issue on the forge describing it, and do not chase it.
    - **can't fix** (infra, external, or unclear): report and stop.
@@ -2056,6 +2067,16 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   exit 4; a name that is not a lowercase slug: exit 2, nothing sent. Creating and editing a list is web-only (cookie-only admin writes). Same
   `uza_`-token ceiling as every other `uzi admin` verb.
 
+- **Admin run debug** (read-only, flag-gated). With the server flag `UZI_ADMIN_RUN_DEBUG` on, a
+  live admin's `uza_` token can read another user's run through `uzi run inputs|fetches|recovery|held`
+  and `uzi admin runs --all [--user <uuid|email>] [--since <rfc3339>] [--status s[,s]]` (every
+  status, newest first, at most 500 rows; `--user`, `--since` and `--status` need `--all`, exit 2
+  otherwise; an email matching no user exits 4, several exit 1; an invalid status exits 2). Each
+  read writes one audit log line. A `uzc_` token masks admin, so use `uza_`; a refusal prints a
+  hint naming the flag and token. `run get|logs|plan|lead-config` and `review show` are owner-or-admin
+  regardless of the flag. Steers and writes, archive download, `run export`, `run discard` and
+  `run held expire` stay owner-only. Detail: `uzi docs show cli`, "Admin run debug".
+
 ### PR and CI views
 
 Read a repo's forge PR/MR and CI state through the api's stored connection PAT — no
@@ -2085,6 +2106,8 @@ choices.
   cached pipeline is failed. The server re-validates that precondition, so a ref that
   is not failed (or has no cached pipeline) is refused with a 409 (exit 5) and a
   reason. Prints the created run id.
+  Before dispatch, check whether another session or uzi run owns the same repo/ref and
+  failing execution. Agree one fixer; the server cannot detect an unpublished local repair.
 
 ### Handoff — ephemeral branch-scoped task runs
 
