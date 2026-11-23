@@ -679,6 +679,8 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	name := chi.URLParam(r, "name")
+	// PRD 4416: disabling must always cut a compromised or newly denied variable
+	// off, so it checks only the grammar; enabling keeps the full denylist.
 	validate := runenv.ValidateName
 	if disabled {
 		validate = runenv.ValidateNameShape
@@ -727,6 +729,7 @@ func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := chi.URLParam(r, "name")
+	// PRD 4416: delete, like disable, must work for a name denied after it was saved.
 	if err := runenv.ValidateNameShape(name); err != nil {
 		writeRunEnvRule(w, err)
 		return

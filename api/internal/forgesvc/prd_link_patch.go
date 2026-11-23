@@ -183,7 +183,7 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, ch 
 
 	if err := tr.UpdateIssueDescription(ctx, forgeProjectID, c.IssueIid.Int64, desc); err != nil {
 		if IssueWriteSkippable(err) {
-			s.settlePRDLink(ctx, lg, c.ID, "PRD link patch: issue writes are not offered for this repo; nothing to patch")
+			s.settlePRDLink(ctx, lg, c.ID, "PRD link patch: the linked issue is gone; nothing to patch")
 			return
 		}
 		// Leave the marker: the write is what we are retrying.

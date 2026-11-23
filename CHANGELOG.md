@@ -360,6 +360,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Adding a worker size no longer overwrites a size another admin just added ([#4515](https://github.com/vtmocanu/uzi/pull/4515), [#4589](https://github.com/vtmocanu/uzi/pull/4589)).**
   The add is refused as a name conflict, the form keeps your values and the list refreshes; editing a size is unchanged.
 
+- **CI repair guidance coordinates one fixer before branch work or merge ([#4615](https://github.com/vtmocanu/uzi/pull/4615)).**
+  The bundled CLI skill checks CI-fix and rework ownership and scheduled default-branch repairs, preserving held work during local takeover.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -560,6 +563,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Operator docs on database connection memory and an opt-in pool memory measurement harness ([#4591](https://github.com/vtmocanu/uzi/pull/4591), [#4593](https://github.com/vtmocanu/uzi/pull/4593)).**
   No runtime default changed (the api keeps pgx's 512-statement cache); the synthetic measurement in ADR-4591 was inconclusive, and the docs describe the `DATABASE_URL` overrides and a sizing estimate.
 
+- **Codex runs can plan with a separate model and effort ([#3253](https://github.com/vtmocanu/uzi/pull/3253), [#4599](https://github.com/vtmocanu/uzi/pull/4599)).**
+  Save per-harness planning defaults together; implementation resumes the same conversation, verifies its model before starting, and attributes usage to each phase's model.
+
+- **Admins can read another user's held publications and filter the debug run listing by status ([#4614](https://github.com/vtmocanu/uzi/pull/4614), [#4620](https://github.com/vtmocanu/uzi/pull/4620)).**
+  `uzi run held <id>` joins the flag-gated, audited admin run debug reads (`UZI_ADMIN_RUN_DEBUG`, `uza_` token), and `uzi admin runs --all` gains `--status s[,s]` and `--user <email>`; held expiry stays owner-only.
+
 ### Changed
 
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
@@ -747,6 +756,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Animated sidebar icons default on for users who have not chosen ([#4510](https://github.com/vtmocanu/uzi/pull/4510) follow-up) ([#4590](https://github.com/vtmocanu/uzi/pull/4590)).**
   New and unchosen accounts get animated icons; saved on/off choices and reduced-motion preferences remain respected.
+
+- **Overview Usage card explanations move into info tips ([#4601](https://github.com/vtmocanu/uzi/pull/4601)).**
+  The scope notes open from an (i) beside the Usage title and the outcome line, and each fail rate shows its finished-run count on hover or focus, keeping By user rows to one line.
+
+- **Idle workers no longer run the full claim query when their owner has nothing queued ([#4602](https://github.com/vtmocanu/uzi/pull/4602), [#4607](https://github.com/vtmocanu/uzi/pull/4607)).**
+  A cheap per-owner queued-run check now precedes `ClaimRun` on each poll; a queued run the worker cannot claim still runs it, and `plan_cache_mode` stays `auto`.
+
+- **Agents list shows per-harness model and effort with honest Default labels ([#3262](https://github.com/vtmocanu/uzi/pull/3262), [#4604](https://github.com/vtmocanu/uzi/pull/4604)).**
+  Empty subagent pins read Default · follows lead (model) and Default · follows the run's effort (effort), empty lead pins name the built-in defaults, the list adds a personalized lead line from your effective settings, and the Run defaults and Planning effort Defaults name the lead-template tier.
+
+- **The worker's Codex runtime moves to rust-v0.169.0 ([#4605](https://github.com/vtmocanu/uzi/pull/4605)).**
+  Every registered Codex version and digest pin follows the new package lock.
 
 ### Security
 

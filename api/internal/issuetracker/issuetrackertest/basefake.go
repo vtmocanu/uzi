@@ -55,6 +55,11 @@ func (*BaseFake) UpdateIssueLabels(context.Context, int64, int64, []string, []st
 	return notStubbed("UpdateIssueLabels")
 }
 
+// MoveToColumn implements issuetracker.Driver.
+func (*BaseFake) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
+	return notStubbed("MoveToColumn")
+}
+
 // UpdateIssueDescription implements issuetracker.Driver.
 func (*BaseFake) UpdateIssueDescription(context.Context, int64, int64, string) error {
 	return notStubbed("UpdateIssueDescription")

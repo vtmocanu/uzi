@@ -728,6 +728,38 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// Run-summary model for this claim's harness (see resolveClaimSummaryModel).
 	summaryModel := s.resolveClaimSummaryModel(ctx, run)
 
+	// PRD #1570: a REVIEW run resolves the owner's task-review settings (ResolveTaskReview, the rule
+	// the effective-settings view also uses). They ride the claim only to a worker advertising
+	// task_review_settings_v1; for one that lacks it, a configured value is withheld and the feed
+	// notice is recorded at the end of assembly. A non-review claim never carries them.
+	var taskReviewModel, taskReviewEffort *string
+	var taskReviewWithheld []string
+	if isReviewRun {
+		tr, terr := s.resolveUserTaskReview(ctx, run.UserID, harness)
+		if terr != nil {
+			return nil, terr
+		}
+		if slices.Contains(wkr.ProtocolCapabilities, capability.TaskReviewSettingsV1) {
+			// Omitted when unset (PRD #1570): the worker's own built-in applies, so the wire carries
+			// only an owner's configured, re-validated model.
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault && tr.Model != "" {
+				m := tr.Model
+				taskReviewModel = &m
+			}
+			// The resolved level (inherited from the worker effort when unset), nil for Runtime default.
+			taskReviewEffort = tr.EffortLevelPtr()
+		} else {
+			if tr.ModelSource == agenttmpl.WorkerDefaultSourceUserDefault {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewModelSettingName)
+			}
+			// An inherited built-in level counts: the old worker sends none, a change from the
+			// resolved view. No notice when the resolved effort is Runtime default.
+			if tr.EffortLevelPtr() != nil {
+				taskReviewWithheld = append(taskReviewWithheld, taskReviewEffortSettingName)
+			}
+		}
+	}
+
 	// PRD #517 M5: deliver the interactive-task park idle backstop ONLY on an interactive
 	// task claim (the sole path that parks on awaitFollowUp). Left zero for every other run
 	// so omitempty keeps its claim byte-identical to today's wire; the worker falls back to
@@ -976,7 +1008,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.
-		SummaryModel: summaryModel,
+		SummaryModel:     summaryModel,
+		TaskReviewModel:  taskReviewModel,
+		TaskReviewEffort: taskReviewEffort,
 		// PRD #362 M3c (Decision 3): tell the worker whether the intent summary is
 		// already set, so a resume/re-claim skips INTENT generation rather than
 		// re-spending the owner's token. Derived straight off the run row.
@@ -1199,6 +1233,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// leaves a feed line naming pins the claim never carried.
 	if !templateEffortSupported && !isolated && len(payload.Agents) > 0 && hasWithheldTemplateEffort(templates, run.Harness) {
 		payload.LastSeq = s.recordTemplateEffortOmittedNote(ctx, run, payload.LastSeq)
+	}
+	// PRD #1570: also last, for the same reason; no notice when nothing configured was withheld.
+	if len(taskReviewWithheld) > 0 {
+		payload.LastSeq = s.recordTaskReviewSettingsOmittedNote(ctx, run, payload.LastSeq, taskReviewWithheld)
 	}
 	return payload, nil
 }

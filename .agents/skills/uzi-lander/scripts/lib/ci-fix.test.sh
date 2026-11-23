@@ -67,4 +67,78 @@ if ci_fix_snapshot "$future" repo x "$now" 2>/dev/null; then fail 'accepted a fi
 [ "$CI_FIX_ACTIVE" = unknown ] && [ "$CI_FIX_RECENT" = unknown ] || fail 'future finish became none'
 # land-prep only needs active exclusion; historical terminal timestamps are irrelevant there.
 [ -z "$(ci_fix_active_ids '[{"id":"r","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"completed"}]' repo x)" ] || fail 'terminal blocked land-prep'
+# Only exact terminal tokens establish that a writer has stopped.
+[ "$(ci_fix_active_ids '[{"id":"r","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"not_completed"}]' repo x)" = r ] || fail 'substring status concealed a writer'
+helpers='[{"id":"fix","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"running"},{"id":"rework","kind":"mr_rework","repo_id":"repo","mr_iid":42,"status":"paused"},{"id":"other","kind":"mr_rework","repo_id":"repo","mr_iid":43,"status":"running"}]'
+[ "$(branch_helper_active_runs "$helpers" repo x 42 | jq -r 'map(.id)|join(" ")')" = 'fix rework' ] || fail 'shared helper predicate lost or widened writers'
+if branch_helper_active_runs '[{"id":null,"kind":"mr_rework","repo_id":"repo","mr_iid":42,"status":"running"}]' repo x 42 2>/dev/null; then fail 'malformed matching rework accepted'; fi
+for docs in '[][]' '[] []' ''; do
+  if branch_helper_active_runs "$docs" repo x 42 >/dev/null 2>&1; then fail "run list '$docs' (not one document) accepted"; fi
+done
+# Whole-list validation: a malformed row that does NOT match the target still fails closed.
+for bad in '[{}]' '[1]' '[{"id":"o","kind":"issue","repo_id":"elsewhere","status":"Running"}]' \
+  '[{"id":"o","kind":7,"repo_id":"repo","status":"running"}]' '[{"id":"o","kind":"issue","repo_id":3,"status":"running"}]' \
+  '[{"id":"o","kind":"issue","repo_id":"repo","status":"running","mr_iid":"7"}]' \
+  '[{"id":"o","kind":"issue","repo_id":"repo","status":"running","pipeline_ref":5}]'; do
+  if branch_helper_active_runs "$bad" repo x 7 >/dev/null 2>&1; then fail "accepted malformed list $bad"; fi
+  if ci_fix_snapshot "$bad" repo x "$now" 2>/dev/null; then fail "snapshot accepted $bad"; fi
+done
+# Absent pipeline_ref/mr_iid are null (the CLI may omit empty fields).
+branch_helper_active_runs '[{"id":"o","kind":"issue","repo_id":null,"status":"running"}]' repo x 7 >/dev/null || fail 'null repo_id/absent keys refused'
+
+# branch_writers_read against a fake uzi that models cobra: unknown subcommands print the parent help (rc 0).
+ADMIN_RW=1; WRITERS_RC=0; WRITERS_OUT='{"writers":[],"complete":true}'; RUNS_OUT='[]'; RUNS_RC=0
+uzi() {
+  case "$1 $2" in
+    'admin --help') printf 'Available Commands:\n  review   x\n'; [ "$ADMIN_RW" != 1 ] || printf '  run-writers  y\n' ;;
+    'admin run-writers') [ "$WRITERS_RC" -eq 0 ] || return "$WRITERS_RC"; printf '%s' "$WRITERS_OUT" ;;
+    'run list') [ "$RUNS_RC" -eq 0 ] || return "$RUNS_RC"; printf '%s' "$RUNS_OUT" ;;
+    *) return 1 ;;
+  esac
+}
+w='{"run_id":"w1","kind":"ci_fix","status":"running","owner_id":"o","repo_id":"repo","pipeline_ref":"x","mr_iid":null,"created_at":"t"}'
+WRITERS_OUT="{\"writers\":[$w],\"complete\":true}"; RUNS_OUT='[]'
+branch_writers_read repo x 7 || fail 'authorized read refused'
+[ "$WRITERS_VISIBILITY" = all_owners ] && [ "$(printf '%s' "$WRITERS" | jq -c .)" = '[{"id":"w1","kind":"ci_fix","status":"running"}]' ] || fail 'authorized writers not mapped'
+writers_summarize; [ "$CI_FIX_ACTIVE" = 'w1 running' ] && [ "$CI_FIX_ACTIVE_COUNT" = 1 ] && [ "$WRITERS_MRW_COUNT" = 0 ] || fail 'summary wrong'
+for rc in 1 2 6; do WRITERS_RC=$rc; if branch_writers_read repo x 7; then fail "rc $rc accepted"; fi; [ -n "$WRITERS_ERR" ] || fail 'no reason'; done
+WRITERS_RC=0
+for body in 'junk' '{"writers":[],"complete":false}' '{"writers":[],"complete":"true"}' '{"writers":[{"run_id":"a","kind":"ci_fix","status":"running","pipeline_ref":"other"}],"complete":true}' \
+  '{"writers":[{"run_id":"a","kind":"mr_rework","status":"running","mr_iid":8}],"complete":true}'; do
+  WRITERS_OUT=$body; if branch_writers_read repo x 7; then fail "accepted $body"; fi
+done
+# Two concatenated documents (even individually valid) and an empty body are refused.
+WRITERS_OUT='{"writers":[],"complete":true}{"writers":[],"complete":true}'
+if branch_writers_read repo x 7; then fail 'two concatenated documents accepted'; fi
+WRITERS_OUT=''
+if branch_writers_read repo x 7; then fail 'empty body accepted'; fi
+WRITERS='[][]'; if writers_summarize; then fail 'summarize accepted two documents'; fi
+# Without an MR number an mr_rework entry cannot match.
+WRITERS_OUT='{"writers":[{"run_id":"a","kind":"mr_rework","status":"running","mr_iid":7}],"complete":true}'
+if branch_writers_read repo x; then fail 'mr_rework accepted without an MR'; fi
+# rc 3/4 and an older CLI fall back to the owner list (owner_only); a failed fallback refuses.
+WRITERS_OUT='{"writers":[],"complete":true}'
+RUNS_OUT='[{"id":"o1","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"queued"}]'
+for rc in 3 4; do
+  WRITERS_RC=$rc; branch_writers_read repo x 7 || fail "rc $rc did not fall back"
+  [ "$WRITERS_VISIBILITY" = owner_only ] && [ "$(printf '%s' "$WRITERS" | jq -r '.[0].id')" = o1 ] && [ -n "$WRITERS_RUNS" ] || fail "rc $rc fallback result"
+done
+WRITERS_RC=0; ADMIN_RW=0; branch_writers_read repo x 7 || fail 'older CLI did not fall back'
+[ "$WRITERS_VISIBILITY" = owner_only ] || fail 'older CLI visibility'
+RUNS_RC=1; if branch_writers_read repo x 7; then fail 'failed fallback accepted'; fi
+RUNS_RC=0; RUNS_OUT='[{}]'; if branch_writers_read repo x 7; then fail 'malformed fallback accepted'; fi
+unset -f uzi
+WRITERS='[{"id":"foreign","kind":"ci_fix","status":"claimed"}]'
+CI_FIX_RECENT=unchanged
+owner='[{"id":"owner","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"running"}]'
+writers_include_owner_active "$owner" repo x 7 || fail 'union observations'
+[ "$CI_FIX_ACTIVE_COUNT" -eq 2 ] || fail 'union lost an active observation'
+[ "$CI_FIX_ACTIVE" = 'foreign claimed; owner running' ] || fail 'union IDs missing'
+[ "$CI_FIX_RECENT" = unchanged ] || fail 'union changed the recent advisory'
+WRITERS='[{"id":"owner","kind":"ci_fix","status":"claimed"}]'
+writers_include_owner_active "$owner" repo x 7 || fail 'deduplicate observations'
+[ "$CI_FIX_ACTIVE_COUNT" -eq 1 ] && [ "$CI_FIX_ACTIVE" = 'owner running' ] || fail 'union duplicated an ID or lost its later status'
+WRITERS='[]'
+writers_include_owner_active '[]' repo x 7 || fail 'empty union'
+[ "$CI_FIX_ACTIVE_COUNT" -eq 0 ] && [ "$CI_FIX_ACTIVE" = none ] || fail 'empty union invented a writer'
 echo 'PASS ci-fix: exact branch/repo predicate, active/terminal split, 24h boundary, timestamps and unknowns'

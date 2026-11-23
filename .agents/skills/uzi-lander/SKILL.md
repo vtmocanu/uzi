@@ -192,14 +192,13 @@ For `unknown`/exit 9 caused by `uzi run list` reporting "cannot reach", "no such
 `takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
 repo/branch. Recent is the newest terminal run finished within 24 hours, including failed
 and cancelled runs; `unknown` blocks branch work.
-The lookup uses the owner's latest 200 runs; older active runs and other owners' runs
-are outside its visibility, so `none` is not a global exclusion guarantee.
+`VISIBILITY=owner_only` means `none` is not factory-wide: references/merge-mechanics.md.
 
-Before any local fix, push or rebase, refresh the snapshot. With an active ci_fix, decide
+Before any local fix, push, rebase or merge, refresh the snapshot. With an active ci_fix, decide
 with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`
 and wait for authoritative terminal state before fixing locally. Never both. Record
 `ci_fix waiting ID` or `ci_fix cancelled ID` with `S/trail.sh '#PR' 'STATE'`, then re-snapshot.
-For ci_fix triggered solely by a main-side breakage now fixed on main, agree with the buddy to cancel; confirm terminal state, unchanged branch head and no `preserved_patch`, then rebase. Preserve and review any delta instead.
+Before rebasing or merging after cancellation, confirm terminal state and inspect branch changes, `preserved_patch`, recovery captures and held publications. Preserve unresolved work even without a patch. Never bypass an active helper.
 
 `CI_FIX_RECENT` triggers review of the pushed delta against the last reviewed SHA before
 merge, even with green CI. Require the same exact-head buddy review as a small local fix;
@@ -493,7 +492,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    For `vtmocanu/uzi` main, exit 12 means main changed changelog-policy files since the PR's merge-base: rebase or merge main, wait for fresh exact-head CI, re-run `merge.sh`; merges outside it bypass this guard.
    That check uses the helper's own checkout and an exact GitHub origin URL allowlist for `vtmocanu/uzi`.
    Exit 13 (`MIGRATION_COLLISION`) means an added, renamed or copied migration destination is at or below the live base head: run `land-prep.sh` to renumber, then require fresh exact-head CI and review. Unreadable PR files or base migrations refuse with exit 2. The final check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
-   It refuses on a moved head, an active rework, red, pending or no passing required checks, a
+   Exit 14 (`ACTIVE_HELPER`): wait or cancel with terminal/custody verification. Exit 4: ownership unreadable. Neither permits out-of-band merge.
+   It refuses on a moved head, an active helper, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI that a merge would still supersede on
    `main`: a pending run, or a running one in a workflow that still cancels (a running `ci.yml`/`kind-smoke.yml` run finishes since #4107 and is allowed when the PR leaves that file alone; also allowed when its tag is already on origin and `release-ci-coverage.py` reports it covered without that run: the line names the rule), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
@@ -509,7 +509,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
    through GitHub and exits 3 before polling when it is invalid or unknown.
    Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
-   per-job live-log commands it prints, then fix on a branch, never `main`; flake → file, and
+   per-job live-log commands it prints, then follow the repair-ownership check below before fixing on a branch, never `main`; flake → file, and
    rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no run appeared
    or lookup failed. `--follow` prints each
    `FOLLOW sha=OLD -> NEW` switch to the current branch head without resetting `--max-ticks`;
@@ -517,6 +517,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
    (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line. Read
    the poller's own `EXIT=` line before reporting any of them (*Waiting, uniformly*).
+
+   **Main-CI repair ownership.** Before local default-branch repair, follow references/ci-red.md: inspect scheduled repairs and agree one fixer. A snapshot is not a lease.
    A post-merge publish step (a workflow dispatch, tag push, or tap publish) follows
    references/merge-mechanics.md, *Post-merge publish steps*.
 8. **Finish.** Remove the worktrees and branches you or your local reviewer created

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -92,7 +94,10 @@ const errAdminRunDebugUnsupported = "this server does not support admin run debu
 // AdminListRunsDebug is GET /api/admin/runs?state=all (issue #4198). A server without the feature
 // ignores the query: it answers a bare JSON array or its active-runs envelope, which has no
 // "truncated" key. Either is refused so a partial listing is never shown as every run.
-func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error) {
+//
+// statuses, when non-empty, is sent as status=a,b and the reply is checked with
+// CheckAdminRunsDebugStatusFilter, because a server that predates the filter ignores it.
+func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since string, statuses []string) (apitypes.AdminRunsDebugDTO, error) {
 	q := url.Values{}
 	q.Set("state", "all")
 	if userID != "" {
@@ -100,6 +105,9 @@ func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since strin
 	}
 	if since != "" {
 		q.Set("since", since)
+	}
+	if len(statuses) > 0 {
+		q.Set("status", strings.Join(statuses, ","))
 	}
 	path := "/api/admin/runs?" + q.Encode()
 	resp, body, err := c.doJSONRead(ctx, http.MethodGet, path, nil)
@@ -127,7 +135,92 @@ func (c *HTTPClient) AdminListRunsDebug(ctx context.Context, userID, since strin
 	if out.Runs == nil {
 		out.Runs = []apitypes.RunSummaryItemDTO{}
 	}
+	if err := CheckAdminRunsDebugStatusFilter(out, statuses); err != nil {
+		return apitypes.AdminRunsDebugDTO{}, err
+	}
 	return out, nil
+}
+
+// AdminRunWriters is GET /api/admin/run-writers (issue #4618): the active ci_fix / mr_rework
+// writers for a repo and branch (and optionally an MR), across all owners. mrIID 0 means no MR.
+// The body is decoded strictly: it must be a JSON object whose "complete" key is a boolean and
+// whose "writers" key is an array, so an unrelated or partial reply is never read as "no writers".
+func (c *HTTPClient) AdminRunWriters(ctx context.Context, repoID, branch string, mrIID int64) (apitypes.RunWritersDTO, error) {
+	const route = "/api/admin/run-writers"
+	q := url.Values{}
+	q.Set("repo", repoID)
+	q.Set("branch", branch)
+	if mrIID > 0 {
+		q.Set("mr_iid", strconv.FormatInt(mrIID, 10))
+	}
+	resp, body, err := c.doJSONRead(ctx, http.MethodGet, route+"?"+q.Encode(), nil)
+	if err != nil {
+		return apitypes.RunWritersDTO{}, err
+	}
+	if resp.StatusCode/100 != 2 {
+		return apitypes.RunWritersDTO{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
+	}
+	malformed := Exitf(ExitGeneric, "malformed response from uzi (%s)", route)
+	var keys map[string]json.RawMessage
+	if json.Unmarshal(body, &keys) != nil || keys == nil {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	// "complete" must be a JSON boolean (a string, number or null is refused) and "writers" an
+	// array (null or absent is refused).
+	// A key that matches these names only case-insensitively is refused: encoding/json would
+	// otherwise match it as well, so the DTO fields are decoded from the validated raw values.
+	for k := range keys {
+		if k != "writers" && k != "complete" && (strings.EqualFold(k, "writers") || strings.EqualFold(k, "complete")) {
+			return apitypes.RunWritersDTO{}, malformed
+		}
+	}
+	var out apitypes.RunWritersDTO
+	if raw, ok := keys["complete"]; !ok || json.Unmarshal(raw, &out.Complete) != nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	if raw, ok := keys["writers"]; !ok || !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) || json.Unmarshal(raw, &out.Writers) != nil {
+		return apitypes.RunWritersDTO{}, malformed
+	}
+	if out.Writers == nil {
+		out.Writers = []apitypes.RunWriterDTO{}
+	}
+	return out, nil
+}
+
+// errAdminRunsStatusUnsupported is the refusal for a server that ignored the status filter.
+const errAdminRunsStatusUnsupported = "this uzi server does not support --status; upgrade the server"
+
+// CheckAdminRunsDebugStatusFilter refuses a reply that does not prove the server applied the
+// requested status filter: the echoed status_filter must equal the requested set and every row's
+// status must be in it. No statuses requested is always fine. HTTPClient and FakeClient both call
+// it, so the CLI and the HTTP client share one guard.
+func CheckAdminRunsDebugStatusFilter(out apitypes.AdminRunsDebugDTO, statuses []string) error {
+	if len(statuses) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(statuses))
+	for _, s := range statuses {
+		want[s] = struct{}{}
+	}
+	got := make(map[string]struct{}, len(out.StatusFilter))
+	for _, s := range out.StatusFilter {
+		got[s] = struct{}{}
+	}
+	ok := len(got) == len(want)
+	for s := range want {
+		if _, in := got[s]; !in {
+			ok = false
+		}
+	}
+	for _, r := range out.Runs {
+		if _, in := want[r.Status]; !in {
+			ok = false
+		}
+	}
+	if !ok {
+		return Exitf(ExitGeneric, "%s", errAdminRunsStatusUnsupported)
+	}
+	return nil
 }
 
 // AdminHealth reads the admin health document (PRD #1484 M3): GET /api/admin/health,

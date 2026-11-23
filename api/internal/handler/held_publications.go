@@ -19,8 +19,9 @@ import (
 // Owner surface of held-work publication (issue #2545): the refs a failed run's work was
 // published to (refs/uzi-held/<run-id>/<generation>), and an early expiry. Both routes sit in the
 // RequireUser /runs group, so the web run page and the CLI (uzc_ Bearer) reach them; a worker
-// token is refused by the middleware. Ownership is the strict GetRun owner-or-404 gate (an admin
-// acting on a foreign run is refused, as for the archive and hold routes beside them). The
+// token is refused by the middleware. The list is an owner-or-404 read that a foreign admin_ro
+// debug caller may also take (adminRunDebugForeignRun, audited, marked admin_debug_read); the
+// expiry write stays strictly owner-only (heldOwnerRun, GetRun owner-or-404). The
 // publication switch (UZI_HELD_PUBLICATION) gates only new step A and B work, so these routes
 // answer with it off too: refs already published must stay visible and releasable.
 
@@ -59,17 +60,47 @@ func heldPublicationDTOs(rows []store.RunHeldPublication) []apitypes.HeldPublica
 
 // ListRunHeldPublications answers GET /api/runs/{id}/held-publications.
 func (h *Handler) ListRunHeldPublications(w http.ResponseWriter, r *http.Request) {
-	runID, user, ok := h.heldOwnerRun(w, r, "held publications list")
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "run")
 	if !ok {
 		return
 	}
-	rows, err := h.q.ListHeldPublicationsForRun(r.Context(), store.ListHeldPublicationsForRunParams{RunID: runID, UserID: user})
+	// Owner-or-404 first (GetRun ignores IsAdmin); only ErrRunNotFound may fall through to
+	// the admin run debug predicate (see adminRunDebugForeignRun).
+	ownerID := user.ID
+	var (
+		debugActor store.User
+		debugToken uuid.UUID
+		debug      bool
+	)
+	if _, err := h.wsvc.GetRun(r.Context(), user.ID, id); err != nil {
+		if !errors.Is(err, workersvc.ErrRunNotFound) {
+			slog.Error("held publications list: get run", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		run, actor, tokenID, ok := h.adminRunDebugForeignRun(w, r, id, "held publications list")
+		if !ok {
+			return
+		}
+		ownerID, debugActor, debugToken, debug = run.UserID, actor, tokenID, true
+	}
+	rows, err := h.q.ListHeldPublicationsForRun(r.Context(), store.ListHeldPublicationsForRunParams{RunID: id, UserID: ownerID})
 	if err != nil {
 		slog.Error("held publications list", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, apitypes.HeldPublicationsDTO{Publications: heldPublicationDTOs(rows)})
+	dto := apitypes.HeldPublicationsDTO{Publications: heldPublicationDTOs(rows)}
+	if debug {
+		auditRunDebugRead(r, debugActor, debugToken, adminRunDebugRouteHeld, id, ownerID)
+		dto.AdminDebugRead = true
+	}
+	httpx.JSON(w, http.StatusOK, dto)
 }
 
 // ExpireRunHeldPublications answers POST /api/runs/{id}/held-publications/expire: every

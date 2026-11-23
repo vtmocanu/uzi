@@ -172,22 +172,21 @@ log "branch=$BRANCH base=$BASE head=${HEAD0:0:8}"
 # repo is not connected to uzi skips the check; --no-rework-check is the explicit bypass
 # for a repo that is not on uzi at all.
 mrw_check() {
-  local rl repo_id runs n
+  local rl repo_id active n
   [ "$REWORK_CHECK" -eq 1 ] || { log "rework check skipped by --no-rework-check"; return 0; }
   command -v uzi >/dev/null 2>&1 || { log "uzi CLI absent; cannot rule out an active mr_rework (pass --no-rework-check for a repo not on uzi)"; return 4; }
   rl=$(uzi repo list --json 2>/dev/null) && printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1 \
     || { log "uzi repo list failed; cannot rule out an active mr_rework"; return 4; }
   repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' | head -1)
   [ -n "$repo_id" ] || { log "$REPO is not connected to uzi; mr_rework check skipped"; return 0; }
-  runs=$(uzi run list --json 2>/dev/null) && printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1 \
-    || { log "uzi run list failed; cannot rule out an active mr_rework"; return 4; }
-  n=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-    '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length') \
-    || { log "could not parse uzi run list; cannot rule out an active mr_rework"; return 4; }
-  if [ "${n:-0}" -gt 0 ]; then log "an mr_rework run is ACTIVE on #$PR — defer (scripts/wait-mrrework.sh)"; return 4; fi
+  branch_writers_read "$repo_id" "$BRANCH" "$PR" \
+    || { log "$WRITERS_ERR; cannot rule out active helpers"; return 4; }
+  active=$WRITERS
+  print_writers_visibility | while IFS= read -r l; do log "$l"; done
+  n=$(printf '%s' "$active" | jq -r '[.[] | select(.kind=="mr_rework") | .id] | join(" ")')
+  if [ -n "$n" ]; then log "an mr_rework run is ACTIVE on #$PR ($n) — defer (scripts/wait-mrrework.sh)"; return 4; fi
   # ci_fix shares the worker-owned branch; match pipeline_ref rather than the PR number.
-  n=$(ci_fix_active_ids "$runs" "$repo_id" "$BRANCH" 2>/dev/null) \
-    || { log "could not parse uzi run list; cannot rule out an active ci_fix"; return 4; }
+  n=$(printf '%s' "$active" | jq -r '[.[] | select(.kind=="ci_fix") | .id] | join(" ")')
   if [ -n "$n" ]; then log "a ci_fix run is ACTIVE on $BRANCH ($n); decide wait/cancel with the buddy and confirm terminal state before local branch work"; return 4; fi
   return 0
 }

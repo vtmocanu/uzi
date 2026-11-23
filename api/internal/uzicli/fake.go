@@ -808,7 +808,11 @@ type FakeClient struct {
 	AdminRunsDebugErr         error
 	AdminListRunsDebugCalls   []AdminListRunsDebugCall
 	RunInputsAdminDebug       map[string]bool
-	RunInputsMetaCalls        int
+	// AdminRunWritersOut/Err back AdminRunWriters (issue #4618); the Err wins over the blanket Err.
+	AdminRunWritersOut   apitypes.RunWritersDTO
+	AdminRunWritersErr   error
+	AdminRunWritersCalls []AdminRunWritersCall
+	RunInputsMetaCalls   int
 
 	// Owner held-publication list + early expiry (issue #2545). HeldPublicationsResult backs
 	// HeldPublications and HeldExpireResult backs ExpireHeldPublications; HeldErr wins over the
@@ -846,10 +850,18 @@ type RecoveryHoldsScopedCall struct {
 	RunID  string
 }
 
-// AdminListRunsDebugCall is one AdminListRunsDebug filter pair.
+// AdminRunWritersCall is one AdminRunWriters argument set.
+type AdminRunWritersCall struct {
+	RepoID string
+	Branch string
+	MRIID  int64
+}
+
+// AdminListRunsDebugCall is one AdminListRunsDebug filter set.
 type AdminListRunsDebugCall struct {
-	UserID string
-	Since  string
+	UserID   string
+	Since    string
+	Statuses []string
 }
 
 // FindingIssueDraft records the evidence id and returns its canned draft, or a not-found exit

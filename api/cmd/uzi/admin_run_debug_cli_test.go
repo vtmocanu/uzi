@@ -389,10 +389,10 @@ func TestAdminRunsAllRendersTableAndTruncationNote(t *testing.T) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}
 	}
-	if !strings.Contains(errb, "note: showing the newest 500 runs; narrow with --user or --since") {
+	if !strings.Contains(errb, "note: showing the newest 500 runs; narrow with --user, --since or --status") {
 		t.Errorf("stderr = %q, want the truncation note", errb)
 	}
-	if !reflect.DeepEqual(fc.AdminListRunsDebugCalls, []uzicli.AdminListRunsDebugCall{{UserID: debugOwnerID, Since: "2026-01-02T03:04:05Z"}}) {
+	if !reflect.DeepEqual(fc.AdminListRunsDebugCalls, []uzicli.AdminListRunsDebugCall{{UserID: debugOwnerID, Since: "2026-01-02T03:04:05Z", Statuses: nil}}) {
 		t.Errorf("calls = %+v", fc.AdminListRunsDebugCalls)
 	}
 	if fc.AdminListRunsCalls != 0 {
@@ -417,15 +417,20 @@ func TestAdminRunsAllJSONEnvelope(t *testing.T) {
 
 func TestAdminRunsFlagValidation(t *testing.T) {
 	for name, args := range map[string][]string{
-		"user without all":  {"admin", "runs", "--user", debugOwnerID},
-		"since without all": {"admin", "runs", "--since", "2026-01-02T03:04:05Z"},
-		"bad user":          {"admin", "runs", "--all", "--user", "alice"},
-		"bad since":         {"admin", "runs", "--all", "--since", "yesterday"},
-		"date only since":   {"admin", "runs", "--all", "--since", "2026-01-02"},
-		"empty user":        {"admin", "runs", "--user", ""},
-		"empty since":       {"admin", "runs", "--since", ""},
-		"all empty user":    {"admin", "runs", "--all", "--user", ""},
-		"all empty since":   {"admin", "runs", "--all", "--since", ""},
+		"user without all":   {"admin", "runs", "--user", debugOwnerID},
+		"since without all":  {"admin", "runs", "--since", "2026-01-02T03:04:05Z"},
+		"bad user":           {"admin", "runs", "--all", "--user", "alice"},
+		"bad since":          {"admin", "runs", "--all", "--since", "yesterday"},
+		"date only since":    {"admin", "runs", "--all", "--since", "2026-01-02"},
+		"empty user":         {"admin", "runs", "--user", ""},
+		"empty since":        {"admin", "runs", "--since", ""},
+		"all empty user":     {"admin", "runs", "--all", "--user", ""},
+		"all empty since":    {"admin", "runs", "--all", "--since", ""},
+		"status without all": {"admin", "runs", "--status", "failed"},
+		"empty status":       {"admin", "runs", "--all", "--status", ""},
+		"bogus status":       {"admin", "runs", "--all", "--status", "exploded"},
+		"trailing comma":     {"admin", "runs", "--all", "--status", "failed,"},
+		"user neither":       {"admin", "runs", "--all", "--user", "not-a-uuid-or-email"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			fc := &uzicli.FakeClient{}

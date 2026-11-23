@@ -17,7 +17,10 @@ import (
 // card: these runs are issue-less (no card) or share a non-board-promoted tracking issue. It
 // only records runs.mr_state (via the existing recordMRState, the sole SQL writer — invariant
 // preserved) and, on the opened->closed / ->merged edge, cancels an in-flight rework via the
-// existing cancelReworkOnClosedMR (issue #853 contract, reused verbatim). Reads the run set
+// existing cancelReworkOnClosedMR (issue #853 contract, reused verbatim). It is
+// SyncBoardFreeMRStatesWithIssueSide with no issue tracker, which is the whole of its
+// behaviour on an unlinked repo; it is the tr=nil seam kept for the board-free tests and
+// equals the pre-M5 behaviour. Reads the run set
 // from ListBoardFreeMRStateWatchCandidates, which self-evicts a run once its mr_state is
 // terminal, except a linked repo's closed issue-lane run (below).
 //
@@ -33,13 +36,58 @@ import (
 // Like SyncMRStates it never returns a per-candidate error (log-and-skip); only a failure
 // to enumerate candidates surfaces to the poller.
 func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.CodeHost) error {
+	return s.SyncBoardFreeMRStatesWithIssueSide(ctx, repoID, forgeProjectID, f, nil)
+}
+
+// SyncBoardFreeMRStatesWithIssueSide is SyncBoardFreeMRStates for a repo whose issue side
+// may be a linked issue tracker (PRD #4173 M5). When tr is a real linked issue tracker, a candidate
+// that is an issue-lane run (issue_iid set, kind not prompt/self_improve) is reconciled
+// through syncOneMRState, the board lane's edge switch, so a linked card moves Human Review
+// -> In Progress when its MR closes and back when it reopens, exactly as an unlinked card
+// does. The card moves only for the issue's latest such run (the board lane's DISTINCT ON
+// semantics): a superseded run records its MR state with no move. A transient error from the
+// real linked driver defers the edge and retries it next tick, like the board lane.
+//
+// Every other candidate goes through recordBoardFreeMRState unchanged: that is every
+// candidate when tr is nil or is not a linked issue tracker (an unlinked repo's forge driver, whose
+// issue-lane runs the candidate query keeps out anyway), and every candidate when tr is the
+// UnavailableIssueTracker the poller hands a linked repo whose resolver failed. Recording
+// consumes the close edge (mr_state advances, so no later tick sees it and the card is
+// never moved for it). That is the trade-off: the cause can be permanent (a connection
+// removed from the allowlist), and deferring would leave mr_state opened and the rework gate
+// open on a closed MR forever, so the edge is recorded without a move. The one exception is a
+// failed repo-source database read (errRepoSourceRead), which is transient: the linked
+// issue-lane candidates are skipped this tick, neither recorded nor moved, and retried next
+// tick. Candidates that are not linked issue-lane runs are recorded as usual.
+//
+// A missing cached issue row skips the move (the MR state is still recorded) rather than
+// deferring it: this lane's candidates do not JOIN the issue cache, so deferring would poll
+// an evicted issue's MR forever. A move the issue tracker refuses (ColumnMoveRefused) is
+// likewise consumed without a move; see guardedMRMove.
+func (s *Service) SyncBoardFreeMRStatesWithIssueSide(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.CodeHost, tr forge.IssueTracker) error {
 	candidates, err := s.q.ListBoardFreeMRStateWatchCandidates(ctx, repoID)
 	if err != nil {
 		return err
 	}
+	movesCard := tr != nil && isLinkedTracker(tr) && !isUnavailableTracker(tr)
+	deferLinked := tr != nil && isTransientUnavailableTracker(tr)
+	deferLogged := false
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if movesCard && c.IssueIid.Valid && c.Kind != "prompt" && c.Kind != "self_improve" {
+			s.syncOneMRState(ctx, repoID, forgeProjectID, f, tr, mrWatchCandidate{
+				RunID: c.ID, IssueIID: c.IssueIid.Int64, MrIID: c.MrIid.Int64, MrState: c.MrState,
+			}, mrLane{missingRow: moveSkipped, noMove: !c.IsLatest})
+			continue
+		}
+		if deferLinked && c.IssueIid.Valid && c.Kind != "prompt" && c.Kind != "self_improve" {
+			if !deferLogged {
+				slog.Warn("forgesvc: repo issue source unreadable, deferring linked MR edges to the next tick", "repo", repoID)
+				deferLogged = true
+			}
+			continue
 		}
 		s.recordBoardFreeMRState(ctx, repoID, forgeProjectID, f, c)
 	}
@@ -48,7 +96,8 @@ func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, f
 
 // recordBoardFreeMRState reconciles one board-free run's MR state against the stored value,
 // board-free. It is a second implementation of syncOneMRState's observe->persist->cancel
-// contract WITHOUT the board move; the two must agree on: unknown-state -> no write; the
+// contract WITHOUT the board move (a linked repo's issue-lane runs use syncOneMRState itself,
+// see SyncBoardFreeMRStatesWithIssueSide); the two must agree on: unknown-state -> no write; the
 // NULL bootstrap records without acting; opened->closed and ->merged cancel exactly once;
 // locked is transient (no cancel); a forge read failure or a cancel failure leaves mr_state
 // unadvanced so the next tick retries.
@@ -85,7 +134,7 @@ func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, 
 		// records `closed` (self-evicting the run from the candidate set) without ever
 		// cancelling. No board move (board-free). On cancel failure leave mr_state
 		// unadvanced so the next tick re-observes the edge and retries.
-		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
+		if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64, observed); err != nil {
 			slog.Warn("forgesvc: cancel board-free rework on MR terminal state failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed, "error", err)
 			return
 		}

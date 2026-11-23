@@ -245,7 +245,7 @@ func TestAuditRunsListDebugRead(t *testing.T) {
 
 	t.Run("all owners no since", func(t *testing.T) {
 		c := captureAdminRunDebug(t)
-		auditRunsListDebugRead(req, actor, tok, adminRunDebugRouteRuns, nil, nil, 7)
+		auditRunsListDebugRead(req, actor, tok, nil, nil, nil, 7)
 		assertAttrs(t, requireOneAudit(t, c), map[string]any{
 			"actor_user_id": actor.ID.String(), "token_id": tok.String(), "route": "admin.runs",
 			"owner_filter": "all", "returned": int64(7),
@@ -255,10 +255,18 @@ func TestAuditRunsListDebugRead(t *testing.T) {
 		c := captureAdminRunDebug(t)
 		owner := uuid.New()
 		since := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-		auditRunsListDebugRead(req, actor, tok, adminRunDebugRouteRuns, &owner, &since, 0)
+		auditRunsListDebugRead(req, actor, tok, &owner, &since, nil, 0)
 		assertAttrs(t, requireOneAudit(t, c), map[string]any{
 			"actor_user_id": actor.ID.String(), "token_id": tok.String(), "route": "admin.runs",
 			"owner_filter": owner.String(), "since": "2026-01-02T03:04:05Z", "returned": int64(0),
+		})
+	})
+	t.Run("status filter", func(t *testing.T) {
+		c := captureAdminRunDebug(t)
+		auditRunsListDebugRead(req, actor, tok, nil, nil, []string{"failed", "cancelled"}, 2)
+		assertAttrs(t, requireOneAudit(t, c), map[string]any{
+			"actor_user_id": actor.ID.String(), "token_id": tok.String(), "route": "admin.runs",
+			"owner_filter": "all", "status_filter": "failed,cancelled", "returned": int64(2),
 		})
 	})
 }

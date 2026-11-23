@@ -574,6 +574,19 @@ export interface UserSettings {
   /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
    *  Never sent on a PUT. Optional for older servers. */
   summary_models?: ModelSettingCell[];
+  /** Per-user task-review model for the optional `uzi handoff --review` pass (PRD #1570);
+   *  null inherits the built-in default. Claude lane: any non-Codex model id. */
+  task_review_model?: string | null;
+  /** Per-user Codex task-review model (PRD #1570); null inherits the built-in default. */
+  codex_task_review_model?: string | null;
+  /** Read-only resolved view of both task-review lanes (PRD #1570), claude then codex. */
+  task_review_models?: ModelSettingCell[] | null;
+  /** Per-user task-review effort per harness (PRD #1570 M2): a level, "runtime", or null =
+   *  inherit the worker effort. */
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
+  /** Read-only resolved task-review effort cells, claude then codex. Never sent on a PUT. */
+  task_review_efforts?: EffortSettingCell[] | null;
   /** Per-user planning model and effort (PRD #3252); null inherits. Optional for
    *  older servers. */
   planning_claude_model?: string | null;
@@ -673,6 +686,12 @@ export interface UserSettingsPatch {
   summary_model?: string | null;
   /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
   codex_summary_model?: string | null;
+  /** Per-user task-review models (PRD #1570); present-null clears back to the built-in. */
+  task_review_model?: string | null;
+  codex_task_review_model?: string | null;
+  /** Task-review efforts (PRD #1570 M2): a level or "runtime"; present-null clears to inherit. */
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it
@@ -5138,6 +5157,9 @@ export interface RunInputsEnvelope {
 export interface AdminRunsDebug {
   runs: RunSummaryItem[];
   truncated: boolean;
+  /** Echo of the applied ?status= filter. Absent when no filter was sent, and also from an
+   *  older server that ignored the filter, so a client that asked for one can detect that. */
+  status_filter?: string[];
 }
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -6533,10 +6555,13 @@ export interface HeldPublication {
   refusal_reason?: string;
 }
 
-// HeldPublications is the owner GET /api/runs/{id}/held-publications response. publications
-// is always an array on the wire, never null.
+// HeldPublications is the owner GET /api/runs/{id}/held-publications response, also served to
+// an admin_ro token on another user's run as an audited admin debug read (admin_debug_read).
+// publications is always an array on the wire, never null.
 export interface HeldPublications {
   publications: HeldPublication[];
+  /** True only on an admin run debug read of another user's run (issue #4198); absent otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the

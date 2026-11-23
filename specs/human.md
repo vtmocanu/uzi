@@ -127,6 +127,7 @@ Tracked as GitLab issue vtmocanu/uzi#6; PRD at `prds/done/6-ci-status-integratio
 - When CI is broken, spin up an agent to review what happened and fix it if it can.
 - If the code was bad, uzi verifies its own fix (the fix's pipeline must pass).
 - Source: plan.md line 52.
+- An active `ci_fix` bound to a PR, or `mr_rework`, run is stopped from publishing once its target MR is merged or closed, by forge polling or by a server refusal (`target_terminal`) at publication, and normally ends cancelled with its work retained under the usual recovery rules; an existing stop verdict is never overwritten (#4616). (AI-synced 2026-11-22)
 
 ## uzi CI + GitLab demo / self-host example
 
@@ -216,7 +217,7 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - On a memory-guard Claude run, guarded shell calls are serialized by the CLI, so the lead keeps that overlap by delegating the gate to one gate owner in the review Agent batch (worktree frozen until it reports; the delegated run is the gate, still blocking; lead runs it after the wave when no suitable subagent exists). The sequencing policy itself is unchanged, and the guarded tool never declares readOnlyHint. (AI-synced 2026-10-31, #3722)
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
 - Switching the default harness never clears either saved worker-model choice. [PRD #1551] (AI-synced 2026-09-23)
-- Task review uses its own built-in model (Codex: `gpt-6-sol`) independent of these saved defaults; there is no setting to choose the task-review model in this release. [PRD #1551] (AI-synced 2026-09-23)
+- Task review has its own model per harness (Claude: any Claude id, empty = SDK default; Codex: a supported Codex role model, empty = `gpt-6-sol`), independent of the worker model; an invalid stored value falls back to the built-in. [PRD #1570] (AI-synced 2026-11-22)
 - The Codex worker fallback is `gpt-6.1-sol`, included in the curated picker; explicit model choices remain authoritative. (AI-synced 2026-10-01)
 - Lead-lane runs show the lead's requested and runtime-reported model and effort per claim attempt and phase (run page chip, `uzi run get`, `uzi run lead-config`); rows are worker-attested and display-only, never used for billing, authorization or scheduling. [PRD #3244] (AI-synced 2026-10-30)
 - Claude and Codex keep independent reasoning-effort preferences; for the lead, an unset one falls to the lead template's effort pin, then medium (#3258, AI-synced 2026-11-21). Splitting preserves every existing explicit preference in both lanes; queued and resumed runs resolve preferences at claim time, except an effort chosen at start, which is frozen on the run (#3250). (AI-synced 2026-10-01)
@@ -719,7 +720,7 @@ Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/done/95-activity-pane-v2.m
   - Show a real "who's alive": glance at the pane and see each agent's state — working / waiting / done / blocked. [user 2026-07-20]
   - A follow-up must not vanish silently — show that it exists and whether the worker has picked it up. [user 2026-07-20]
   - The steer queue distinguishes received by the worker, routed by steering, and included in a prompt; it never says "delivered" for a follow-up no prompt included, and never claims the agent acted on it. Owner follow-ups reach the lead on both harnesses. (AI-synced 2026-10-01, issue #1800)
-  - An opt-in deployment flag (off by default) lets a live admin's `admin_ro` CLI token read other users' non-chat run inputs, archive metadata, fetches, recovery holds and an all-states run listing; reads are audited and read-only, and are the exception to the owner-only steer queue. Foreign chat-run inputs stay owner-only (404). (AI-synced 2026-11-13, #4198)
+  - An opt-in deployment flag (off by default) lets a live admin's `admin_ro` CLI token read other users' non-chat run inputs, archive metadata, fetches, recovery holds and an all-states run listing; reads are audited and read-only, and are the exception to the owner-only steer queue. Foreign chat-run inputs stay owner-only (404). (AI-synced 2026-11-13, #4198) The same flag and token also serve a read-only lookup of active ci_fix/mr_rework writers for a branch across all owners; an incomplete answer is unknown, never absence. (AI-synced 2026-11-22, #4618)
 - Authorized behavior change: collapse-by-default logs + an opt-in "Follow live" toggle REPLACE the global auto-scroll. [user 2026-07-20, supersedes the Feature #11 default "activity feed auto-scrolls (follows) live runs"]
 
 ## Feature #108 — Worker retry loop: stop losing runs to unsaveable messages

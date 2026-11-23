@@ -6,7 +6,7 @@
 /** Harness versions the lists below were derived from. A bump of either harness must
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
-  claude_agent_sdk: "0.3.319",
+  claude_agent_sdk: "0.3.325",
   codex: "0.169.0",
 } as const;
 
@@ -212,6 +212,10 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "AWS_ENDPOINT_URL_STS", invariant: "network_wiring", note: "AWS STS endpoint override; it redirects credential exchange" },
   { value: "AWS_ENDPOINT_URL_SSO", invariant: "network_wiring", note: "AWS SSO endpoint override; it redirects credential acquisition" },
   { value: "AWS_ENDPOINT_URL_SSO_OIDC", invariant: "network_wiring", note: "AWS SSO OIDC endpoint override; it redirects credential acquisition" },
+  { value: "NODE_INSPECTOR_IPC", invariant: "harness_control", note: "TypeScript debug-mode selector read by the bundled Claude CLI" },
+  { value: "VSCODE_INSPECTOR_OPTIONS", invariant: "harness_control", note: "TypeScript debug-mode selector read by the bundled Claude CLI" },
+  { value: "SYSTEMDRIVE", invariant: "managed_dirs", note: "system directory selection (uppercase spelling of the Windows SystemDrive)" },
+  { value: "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", invariant: "provider_auth", note: "makes the Claude CLI treat the worker-set gateway as the first-party Anthropic API" },
 ];
 
 /** Name prefixes reserved for the worker and the agent harnesses. */
@@ -242,7 +246,7 @@ export const RUN_ENV_DENIED_PREFIXES: readonly RunEnvDeniedRule[] = [
   { value: "CCR_", invariant: "harness_control", note: "Claude CLI internal controls (CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR is auth)" },
   { value: "SELF_HOSTED_RUNNER_", invariant: "harness_control", note: "Claude CLI internal controls" },
   { value: "BUGHUNTER_", invariant: "harness_control", note: "Claude CLI internal controls" },
-  { value: "_CLAUDE_", invariant: "harness_control", note: "Claude CLI internal settings (_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL is a provider endpoint switch)" },
+  { value: "_CLAUDE_", invariant: "harness_control", note: "Claude CLI internal settings behind a leading underscore" },
   { value: "ANT_OTEL_", invariant: "harness_control", note: "Claude CLI internal telemetry exporter settings (ANT_OTEL_*); narrower than ANT_ so Apache Ant's ANT_OPTS and ANT_HOME stay allowed" },
   { value: "ANT_CLAUDE_", invariant: "harness_control", note: "Claude CLI internal metrics endpoint (ANT_CLAUDE_CODE_METRICS_ENDPOINT)" },
   { value: "OTEL_LOG_", invariant: "harness_control", note: "Claude CLI telemetry content switches (OTEL_LOG_RAW_API_BODIES, OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_CONTENT)" },

@@ -205,6 +205,10 @@ var deniedNames = []deniedRule{
 	{"AWS_ENDPOINT_URL_STS", "network_wiring", "AWS STS endpoint override; it redirects credential exchange"},
 	{"AWS_ENDPOINT_URL_SSO", "network_wiring", "AWS SSO endpoint override; it redirects credential acquisition"},
 	{"AWS_ENDPOINT_URL_SSO_OIDC", "network_wiring", "AWS SSO OIDC endpoint override; it redirects credential acquisition"},
+	{"NODE_INSPECTOR_IPC", "harness_control", "TypeScript debug-mode selector read by the bundled Claude CLI"},
+	{"VSCODE_INSPECTOR_OPTIONS", "harness_control", "TypeScript debug-mode selector read by the bundled Claude CLI"},
+	{"SYSTEMDRIVE", "managed_dirs", "system directory selection (uppercase spelling of the Windows SystemDrive)"},
+	{"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "provider_auth", "makes the Claude CLI treat the worker-set gateway as the first-party Anthropic API"},
 }
 
 // deniedPrefixes are name prefixes reserved for the worker and the agent harnesses.
@@ -235,7 +239,7 @@ var deniedPrefixes = []deniedRule{
 	{"CCR_", "harness_control", "Claude CLI internal controls (CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR is auth)"},
 	{"SELF_HOSTED_RUNNER_", "harness_control", "Claude CLI internal controls"},
 	{"BUGHUNTER_", "harness_control", "Claude CLI internal controls"},
-	{"_CLAUDE_", "harness_control", "Claude CLI internal settings (_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL is a provider endpoint switch)"},
+	{"_CLAUDE_", "harness_control", "Claude CLI internal settings behind a leading underscore"},
 	{"ANT_OTEL_", "harness_control", "Claude CLI internal telemetry exporter settings (ANT_OTEL_*); narrower than ANT_ so Apache Ant's ANT_OPTS and ANT_HOME stay allowed"},
 	{"ANT_CLAUDE_", "harness_control", "Claude CLI internal metrics endpoint (ANT_CLAUDE_CODE_METRICS_ENDPOINT)"},
 	{"OTEL_LOG_", "harness_control", "Claude CLI telemetry content switches (OTEL_LOG_RAW_API_BODIES, OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_CONTENT)"},

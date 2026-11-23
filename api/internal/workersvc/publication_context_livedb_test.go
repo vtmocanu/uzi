@@ -200,8 +200,18 @@ func TestPublicationContextResolverLiveDB(t *testing.T) {
 				if scenario == "completed_unstamped_drift" && result.Reason != "authority_changed" {
 					t.Fatalf("unstamped drift barrier: %+v", result)
 				}
-				if scenario == "completed_unstamped_forge_mismatch" && result.Reason != "forge_mismatch" {
-					t.Fatalf("unstamped forge mismatch: %+v", result)
+				if scenario == "completed_unstamped_forge_mismatch" {
+					// A closed bound MR is now a server-owned stop (issue #4616), not a forge mismatch.
+					if result.Reason != "target_terminal" {
+						t.Fatalf("unstamped closed target: %+v", result)
+					}
+					var stopKind, stopReason string
+					if err := f.e.pool.QueryRow(f.e.ctx, "SELECT coalesce(stop_kind,''), coalesce(stop_reason,'') FROM runs WHERE id=$1", requestID).Scan(&stopKind, &stopReason); err != nil {
+						t.Fatal(err)
+					}
+					if stopKind != "cancelled" || stopReason != "target MR closed; further publication stopped." {
+						t.Fatalf("stop stamp = %q/%q", stopKind, stopReason)
+					}
 				}
 				if scenario == "source_drift" && result.Reason != "authority_changed" {
 					t.Fatalf("source barrier: %+v", result)

@@ -271,6 +271,9 @@ denied:
   `ANT_CLAUDE_`, `OTEL_LOG_`, `LC_`, `GCM_`, `OTEL_EXPORTER_OTLP_`,
   `GCE_METADATA_`, `AWS_ENDPOINT_URL_BEDROCK` (which also covers
   `AWS_ENDPOINT_URL_BEDROCK_AGENT*`).
+  The `BUN_` prefix also refuses Bun application settings such as `BUN_INSTALL`
+  and `BUN_CONFIG_REGISTRY` as repo variables: the bundled Claude CLI is a Bun
+  executable whose runtime reads `BUN_*` controls.
 - Any name ending in `_PROXY`.
 - Process, shell, Docker, Go, Node, Java, curl and browser settings such as
   `PATH`, `HOME`, `TMPDIR`, `SHELL`, `DOCKER_HOST`, `DOCKER_CONFIG`, `GOFLAGS`,
@@ -286,7 +289,24 @@ denied:
   `AWS_ENDPOINT_URL_BEDROCK*` name. The other per-service names, such as
   `AWS_ENDPOINT_URL_S3`, stay allowed.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
-  `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`.
+  `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`,
+  `NODE_INSPECTOR_IPC`, `VSCODE_INSPECTOR_OPTIONS`, `API_FORCE_IDLE_TIMEOUT`,
+  `ENABLE_TOOL_SEARCH`, `SLASH_COMMAND_TOOL_CHAR_BUDGET`, `AUTOMODE_DECISION_LOG`,
+  `NODE_USE_SYSTEM_CA`, and `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` (a
+  provider selector whose leading underscore escapes the `CLAUDE_` prefix).
+- Telemetry switches the Claude CLI reads outside the denied prefixes:
+  `ENABLE_BETA_TRACING_DETAILED`, `ENABLE_ENHANCED_TELEMETRY_BETA`,
+  `BETA_TRACING_ENDPOINT`. Other `OTEL_*` names are allowed for your own
+  application for now: the CLI starts no third-party OpenTelemetry exporter
+  unless `CLAUDE_CODE_ENABLE_TELEMETRY` (denied by the `CLAUDE_` prefix) or the
+  beta tracing pair above is set, and the worker never sets them. One exception:
+  `OTEL_LOG_RAW_API_BODIES=file:<dir>` makes the CLI write raw API request and
+  response bodies to that directory, so the `OTEL_LOG_` and `OTEL_EXPORTER_OTLP_`
+  prefixes are denied (above).
+- Managed directories the sandbox reads: `TEMP`, `TMP`, `SYSTEMDRIVE`. These
+  are the uppercase spellings of Windows variables (the Windows environment
+  lookup is case-insensitive); API names stay uppercase-only, so the mixed-case
+  `SystemDrive`, `Temp` and `Tmp` are rejected by the name rule.
 
 Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and `GOOGLE_APPLICATION_CREDENTIALS`,

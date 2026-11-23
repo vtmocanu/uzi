@@ -484,17 +484,17 @@ func TestDriverForOpensTokenAndPassesOptions(t *testing.T) {
 		ProjectID:      4173,
 		EligibilityTag: issuetracker.TagRef{ID: "5-3", Name: "uzi"},
 	}
-	if _, err := h.svc.DriverFor(ctx, user, c.ID, binding, "State", "Open", "Done"); err != nil {
+	if _, err := h.svc.DriverFor(ctx, user, c.ID, binding, issuetracker.StateMapping{Field: "State", Open: "Open", Closed: "Done"}); err != nil {
 		t.Fatal(err)
 	}
 	want := issuetracker.Options{
 		BaseURL: testHost, Token: tok, Project: binding.Project, ProjectID: 4173, EligibilityTag: binding.EligibilityTag,
 		StateField: "State", OpenState: "Open", ClosedState: "Done",
 	}
-	if len(h.built) != 1 || h.built[0] != want {
+	if len(h.built) != 1 || !reflect.DeepEqual(h.built[0], want) {
 		t.Errorf("built = %+v, want %+v", h.built, want)
 	}
-	_, err = h.svc.DriverFor(ctx, uuid.New(), c.ID, binding, "", "", "")
+	_, err = h.svc.DriverFor(ctx, uuid.New(), c.ID, binding, issuetracker.StateMapping{})
 	_ = wantKind(t, err, KindNotFound)
 }
 
@@ -508,7 +508,7 @@ func TestDriverForFailsClosedWhenAllowlistEmptied(t *testing.T) {
 	}
 	h.built = nil
 	h.allow = map[string]bool{}
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Error("driver built after the allowlist was emptied")
@@ -530,7 +530,7 @@ func TestDriverForRefusesTamperedRow(t *testing.T) {
 	// A row whose base URL was rewritten no longer opens: the AAD differs.
 	h.allow["https://evil.example.com"] = true
 	h.q.rows[0].BaseUrl = "https://evil.example.com"
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	e := wantKind(t, err, KindInternal)
 	if e.Message != "internal error" || len(h.built) != 0 {
 		t.Errorf("message = %q, built = %d", e.Message, len(h.built))
@@ -538,7 +538,7 @@ func TestDriverForRefusesTamperedRow(t *testing.T) {
 	// A row with a non-strict URL is refused before opening.
 	h.allow["https://evil.example.com/x"] = true
 	h.q.rows[0].BaseUrl = "https://evil.example.com/x"
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	_ = wantKind(t, err, KindBadRequest)
 }
 
@@ -554,7 +554,7 @@ func TestDriverForRefusesNonCanonicalStoredURL(t *testing.T) {
 	// Strict-valid and allowlisted, but not the canonical stored form.
 	h.allow["https://ISSUES.example.com"] = true
 	h.q.rows[0].BaseUrl = "https://ISSUES.example.com"
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Error("driver built for a non-canonical stored URL")
@@ -591,7 +591,7 @@ func TestDriverForRefusesPartialOrMalformedBinding(t *testing.T) {
 		"bad tag name":        mutate(func(b *issuetracker.Binding) { b.EligibilityTag.Name = "a}b" }),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := h.svc.DriverFor(ctx, user, c.ID, b, "", "", "")
+			_, err := h.svc.DriverFor(ctx, user, c.ID, b, issuetracker.StateMapping{})
 			_ = wantKind(t, err, KindBadRequest)
 		})
 	}

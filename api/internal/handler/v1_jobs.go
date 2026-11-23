@@ -135,6 +135,9 @@ func writeV1JobError(w http.ResponseWriter, op string, err error) {
 		httpx.ErrorReason(w, http.StatusNotFound, "job not found", v1ReasonNotFound)
 	case errors.Is(err, workersvc.ErrJobTerminal):
 		httpx.ErrorReason(w, http.StatusConflict, "the job has already finished", v1ReasonJobTerminal)
+	case writeProviderCreateRefusal(w, err):
+		// Issue #4541: the typed provider refusals of run creation (a provider-sourced owner is
+		// provider_lane_unsupported until PRD #4322), answered by the shared helper, not copied.
 	default:
 		slog.Error("v1 jobs: "+op, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

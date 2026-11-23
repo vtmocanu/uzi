@@ -1,6 +1,7 @@
 package forgesvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -27,6 +29,9 @@ type fakeForge struct {
 	issues    []forge.Issue
 	listErr   error
 	listCalls []forge.ListIssuesOptions
+	// states scripts the issue tracker State name ListIssuesWithState reports per issue
+	// iid (PRD #4173 M5); a missing iid reports "" (no readable State).
+	states map[int64]string
 
 	// PRD #102 M6 Decision 9 made both sync paths issue TWO ListIssues calls: the
 	// PRD-labelled one (state=all) and an additive open, no-label one. openIssues /
@@ -271,6 +276,23 @@ func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove
 	}
 	return f.updateErr
 }
+
+// MoveToColumn performs the label-backed move over this fake's own label
+// methods; the embedded BaseFake cannot dispatch to them.
+func (f *fakeForge) ListIssuesWithState(ctx context.Context, p int64, opts forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
+	issues, err := f.ListIssues(ctx, p, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]issuesource.StatedIssue, 0, len(issues))
+	for _, is := range issues {
+		out = append(out, issuesource.StatedIssue{Issue: is, State: f.states[is.IID]})
+	}
+	return out, nil
+}
+func (f *fakeForge) MoveToColumn(ctx context.Context, p, i int64, m forge.ColumnMove) error {
+	return forge.MoveByLabels(ctx, f, p, i, m)
+}
 func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.MergeRequest, error) {
 	f.mrCalls = append(f.mrCalls, mrIID)
 	if err, ok := f.mrErrByIID[mrIID]; ok {
@@ -316,8 +338,12 @@ type fakeStore struct {
 	upserts       []store.UpsertIssueParams
 	// changedUpserts counts the UpsertIssueIfChanged calls (the linked sync's write); they also land in upserts.
 	changedUpserts int
-	labelUpserts   []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
-	deleteCalls    []store.DeleteIssuesNotInParams
+	// changedColumns is the issue_tracker_column each UpsertIssueIfChanged call carried (PRD #4173 M5).
+	changedColumns []pgtype.Text
+	// columnWrites records SetIssueTrackerColumn calls (a linked move's cache write).
+	columnWrites []store.SetIssueTrackerColumnParams
+	labelUpserts []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
+	deleteCalls  []store.DeleteIssuesNotInParams
 
 	// Close/reopen state flips (PRD #1034 M2). stateUpdates records UpdateIssueState
 	// (bare close) calls, reopens records ReopenIssueState calls — each by identity so a
@@ -336,6 +362,9 @@ type fakeStore struct {
 
 	boardFreeCandidates    []store.ListBoardFreeMRStateWatchCandidatesRow
 	boardFreeCandidatesErr error
+	activeTargetRuns       []store.ListActiveMRTargetRunsRow
+	activeTargetErr        error
+	activeTargetArgs       []store.ListActiveMRTargetRunsParams
 	issue                  store.Issue
 	issueErr               error
 	columns                []store.BoardColumn
@@ -392,7 +421,12 @@ func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) 
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
 }
 func (s *fakeStore) UpsertIssueIfChanged(_ context.Context, arg store.UpsertIssueIfChangedParams) error {
-	s.upserts = append(s.upserts, store.UpsertIssueParams(arg))
+	s.upserts = append(s.upserts, store.UpsertIssueParams{
+		RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, Title: arg.Title, State: arg.State,
+		Labels: arg.Labels, AssigneeIds: arg.AssigneeIds, WebUrl: arg.WebUrl, Author: arg.Author,
+		HasPrdLink: arg.HasPrdLink, ForgeUpdatedAt: arg.ForgeUpdatedAt, IssueKey: arg.IssueKey,
+	})
+	s.changedColumns = append(s.changedColumns, arg.IssueTrackerColumn)
 	s.changedUpserts++
 	return nil
 }
@@ -448,6 +482,13 @@ func (s *fakeStore) ReopenIssueState(_ context.Context, arg store.ReopenIssueSta
 	// (the real query leaves them untouched); default empty mimics a card with no column.
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: string(forge.StateOpened), Labels: s.reopenLabels}, nil
 }
+func (s *fakeStore) SetIssueTrackerColumn(_ context.Context, arg store.SetIssueTrackerColumnParams) (store.Issue, error) {
+	s.columnWrites = append(s.columnWrites, arg)
+	row := s.issue
+	row.RepoID, row.ForgeIssueIid = arg.RepoID, arg.ForgeIssueIid
+	row.IssueTrackerColumn = pgtype.Text{String: arg.IssueTrackerColumn, Valid: arg.IssueTrackerColumn != ""}
+	return row, nil
+}
 func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesNotInParams) (int64, error) {
 	s.deleteCalls = append(s.deleteCalls, arg)
 	return 0, nil
@@ -457,6 +498,25 @@ func (s *fakeStore) ListMRWatchCandidates(context.Context, uuid.UUID) ([]store.L
 }
 func (s *fakeStore) ListBoardFreeMRStateWatchCandidates(context.Context, uuid.UUID) ([]store.ListBoardFreeMRStateWatchCandidatesRow, error) {
 	return s.boardFreeCandidates, s.boardFreeCandidatesErr
+}
+
+// ListActiveMRTargetRuns mimics the store query: runs with id > AfterID in id order, LIMIT 33.
+// activeTargetRuns must be seeded in ascending id order.
+func (s *fakeStore) ListActiveMRTargetRuns(_ context.Context, arg store.ListActiveMRTargetRunsParams) ([]store.ListActiveMRTargetRunsRow, error) {
+	s.activeTargetArgs = append(s.activeTargetArgs, arg)
+	if s.activeTargetErr != nil {
+		return nil, s.activeTargetErr
+	}
+	var out []store.ListActiveMRTargetRunsRow
+	for _, r := range s.activeTargetRuns {
+		if bytes.Compare(r.ID[:], arg.AfterID[:]) > 0 {
+			out = append(out, r)
+		}
+	}
+	if len(out) > 33 {
+		out = out[:33]
+	}
+	return out, nil
 }
 func (s *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
 	return s.issue, s.issueErr
@@ -561,12 +621,14 @@ func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, 
 // cancel, in order, and can be forced to fail (err) to exercise the leave-unadvanced
 // retry contract on the opened->closed / ->merged cancel path.
 type fakeReworkCanceller struct {
-	calls []int64 // mrIIDs cancelled, in order
-	err   error   // when non-nil, forces every CancelReworkForMR to fail
+	calls   []int64  // mrIIDs cancelled, in order
+	reasons []string // the reason passed with each call, in order (issue #4616)
+	err     error    // when non-nil, forces every CancelReworkForMR to fail
 }
 
-func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, mrIID int64, _ string) error {
+func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, mrIID int64, reason string) error {
 	c.calls = append(c.calls, mrIID)
+	c.reasons = append(c.reasons, reason)
 	return c.err
 }
 
@@ -887,6 +949,45 @@ func TestAutoMoveEnsuresTargetColumnLabel(t *testing.T) {
 			t.Fatalf("expected no EnsureLabels call (empty add), got %+v", f.ensureCalls)
 		}
 	})
+}
+
+// moveRecordingForge records the ColumnMove each MoveToColumn receives, then
+// delegates to fakeForge's label-backed move.
+type moveRecordingForge struct {
+	fakeForge
+	moves []forge.ColumnMove
+}
+
+func (f *moveRecordingForge) MoveToColumn(ctx context.Context, p, i int64, m forge.ColumnMove) error {
+	f.moves = append(f.moves, m)
+	return f.fakeForge.MoveToColumn(ctx, p, i, m)
+}
+
+// TestAutoMovePassesTargetAsMoveColumn pins the Column AutoMove hands to the
+// issue tracker: the target column's name, and "" for the Open target. An issue
+// tracker with its own workflow field reads only this field.
+func TestAutoMovePassesTargetAsMoveColumn(t *testing.T) {
+	for _, tc := range []struct {
+		name, target string
+		labels       []string
+	}{
+		{"named column", "Planned", nil},
+		{"open target", "", []string{"Planned"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService(&fakeStore{})
+			f := &moveRecordingForge{}
+			if _, err := svc.AutoMove(context.Background(), f, 7, autoMoveIssue(t, tc.labels...), boardColumns(), tc.target); err != nil {
+				t.Fatalf("AutoMove: %v", err)
+			}
+			if len(f.moves) != 1 {
+				t.Fatalf("MoveToColumn calls = %d, want 1: %+v", len(f.moves), f.moves)
+			}
+			if f.moves[0].Column != tc.target {
+				t.Fatalf("ColumnMove.Column = %q, want %q", f.moves[0].Column, tc.target)
+			}
+		})
+	}
 }
 
 // assertBound compares one fetch's UpdatedAfter against a want, where nil means

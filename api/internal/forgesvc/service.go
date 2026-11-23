@@ -25,6 +25,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PromoteLabelColor is the color EnsureLabels pins when Promote (PRD #102 Decision
@@ -127,11 +128,15 @@ type IssueStore interface {
 	// board_position so a reopened card lands at the bottom of its lane.
 	UpdateIssueState(ctx context.Context, arg store.UpdateIssueStateParams) (store.Issue, error)
 	ReopenIssueState(ctx context.Context, arg store.ReopenIssueStateParams) (store.Issue, error)
+	// SetIssueTrackerColumn writes only a linked card's cached board column (PRD #4173 M5).
+	SetIssueTrackerColumn(ctx context.Context, arg store.SetIssueTrackerColumnParams) (store.Issue, error)
 	DeleteIssuesNotIn(ctx context.Context, arg store.DeleteIssuesNotInParams) (int64, error)
 	// Used by the MR-close watcher (mr_watch.go).
 	ListMRWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListMRWatchCandidatesRow, error)
 	// Used by the board-free MR-state recorder (board_free_mr_watch.go, PRD #908).
 	ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]store.ListBoardFreeMRStateWatchCandidatesRow, error)
+	// Used by the active-MR-target enumeration (active_mr_targets.go, issue #4616).
+	ListActiveMRTargetRuns(ctx context.Context, arg store.ListActiveMRTargetRunsParams) ([]store.ListActiveMRTargetRunsRow, error)
 	GetIssueByIID(ctx context.Context, arg store.GetIssueByIIDParams) (store.Issue, error)
 	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
 	SetRunMRState(ctx context.Context, arg store.SetRunMRStateParams) (int64, error)
@@ -207,6 +212,16 @@ type Service struct {
 	// the mid-flight abort is skipped — every other MR-sync behaviour is unaffected.
 	reworkCanceller ReworkCanceller
 
+	// terminalTargetCanceller stops an active ci_fix / mr_rework run whose verified target
+	// MR merged or closed (issue #4616). Optional (nil-safe): unset skips SyncActiveMRTargets.
+	terminalTargetCanceller TerminalTargetCanceller
+
+	// activeMRTargetCursor is SyncActiveMRTargets' per-repo keyset cursor (the last run id
+	// taken from an overflowing page). It is pure rotation state and carries no cancellation
+	// authority: every cancel is re-verified from live forge data and fenced in the store.
+	activeTargetMu     sync.Mutex
+	activeTargetCursor map[uuid.UUID]uuid.UUID
+
 	// cappedRepos remembers which repos' pipeline watch dropped branches at the ref
 	// cap on their last sync, so SyncPipelines logs the transition into and out of
 	// the capped state rather than once per tick (issue #1483). Lazily initialised;
@@ -220,6 +235,13 @@ type Service struct {
 // means the mid-flight abort is skipped and every other sync behaviour is unchanged.
 type ReworkCanceller interface {
 	CancelReworkForMR(ctx context.Context, repoID uuid.UUID, mrIID int64, reason string) error
+}
+
+// TerminalTargetCanceller stops one active ci_fix / mr_rework run whose verified target MR
+// merged or closed (issue #4616). *workersvc.Service satisfies it; it re-validates the
+// observation under row locks.
+type TerminalTargetCanceller interface {
+	CancelRunForTerminalTarget(ctx context.Context, repoID uuid.UUID, obs workersvc.TerminalTargetObservation) error
 }
 
 // New constructs a Service. box encrypts/decrypts stored PATs; timeout bounds
@@ -468,6 +490,16 @@ func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.
 // the abort; the rest of the sync is unchanged.
 func (s *Service) SetReworkCanceller(c ReworkCanceller) { s.reworkCanceller = c }
 
+// SetTerminalTargetCanceller wires the terminal-target cancel collaborator (issue #4616).
+// Call once at startup, before the poller runs. A nil canceller (the default) disables
+// SyncActiveMRTargets. A typed-nil *workersvc.Service is also treated as unset.
+func (s *Service) SetTerminalTargetCanceller(c TerminalTargetCanceller) {
+	if v, ok := c.(*workersvc.Service); ok && v == nil {
+		c = nil
+	}
+	s.terminalTargetCanceller = c
+}
+
 // uziLabel resolves the configured uzi run-eligibility label for the sync filters,
 // falling back to the compiled-in default when unconfigured or on a settings read
 // error (the accessor already returns the default alongside a cold error, so this
@@ -518,7 +550,8 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 // AutoMove plans a column label delta, writes it forge-first, then applies it to
 // the current cached row. Forge errors leave the cache untouched; a driver can
 // partially change remote labels before returning an error. No compensation is
-// attempted. The returned issue is the re-cached row. Caller guards own closed
+// attempted. The returned issue is the re-cached row. On a linked repo the cache
+// write is SetIssueTrackerColumn instead of the label write. Caller guards own closed
 // issue and manual-drag policy.
 func (s *Service) AutoMove(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
 	var current []string
@@ -537,21 +570,28 @@ func (s *Service) AutoMove(ctx context.Context, f forge.IssueTracker, forgeProje
 	// be missing or drifted (e.g. the Upcoming→Planned rename, #176). add is the
 	// target column and has at most one element; an empty add (already in the target
 	// column, or a move to Open) ensures nothing and keeps the cheap no-forge-call path.
+	move := forge.ColumnMove{Column: target, Add: add, Remove: remove}
 	if len(add) > 0 {
-		labels := make([]forge.Label, 0, len(add))
+		move.Ensure = make([]forge.Label, 0, len(add))
 		for _, name := range add {
-			labels = append(labels, forge.Label{Name: name, Color: ColumnColor(name)})
-		}
-		if err := f.EnsureLabels(ctx, forgeProjectID, labels); err != nil {
-			return store.Issue{}, err
+			move.Ensure = append(move.Ensure, forge.Label{Name: name, Color: ColumnColor(name)})
 		}
 	}
 
-	// Forge-first: apply the label change remotely before touching the cache. On
-	// failure the cache is untouched (UpdateIssueLabels no-ops on empty sets, so a
-	// move to a column the card already sits in costs no forge call).
-	if err := f.UpdateIssueLabels(ctx, forgeProjectID, issue.ForgeIssueIid, add, remove); err != nil {
+	// Forge-first: apply the move remotely before touching the cache. On failure
+	// the cache is untouched (a label-backed issue tracker's UpdateIssueLabels
+	// no-ops on empty sets, so a move to a column the card already sits in costs
+	// no forge call).
+	if err := f.MoveToColumn(ctx, forgeProjectID, issue.ForgeIssueIid, move); err != nil {
 		return store.Issue{}, err
+	}
+	if isLinkedTracker(f) {
+		// A linked card's column is not a label: cache it in issue_tracker_column and
+		// touch nothing else (PRD #4173 M5), so a stale snapshot of state or labels is
+		// never written back.
+		return s.q.SetIssueTrackerColumn(ctx, store.SetIssueTrackerColumnParams{
+			RepoID: issue.RepoID, ForgeIssueIid: issue.ForgeIssueIid, IssueTrackerColumn: target,
+		})
 	}
 
 	labelsJSON, err := json.Marshal(append([]string{}, newLabels...))
@@ -846,13 +886,13 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	}
 	advanceGroups()
 
-	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, "", nil); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, extra, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, extra, "", nil); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, findingExtra, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, findingExtra, "", nil); err != nil {
 		return Marks{}, err
 	}
 	// A clean SET of fetches that legitimately returns zero issues DOES evict
@@ -946,13 +986,13 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	// deliberately ignored), so incremental passes cannot shift which page the
 	// next FullSync examines. Recorded-op settlement on later pages therefore
 	// happens as FullSync rotates to them.
-	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, "", nil); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel), ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel), "", nil); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel), ""); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel), "", nil); err != nil {
 		return m, err
 	}
 	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues), Finding: maxUpdatedAt(findingIssues)}), nil
@@ -1010,10 +1050,12 @@ func maxUpdatedAt(issues []forge.Issue) time.Time {
 // upsertIssues writes each forge issue into the cache, computing has_prd_link at
 // write time. issueKeyShort is the linked repo's issue tracker project short name:
 // non-empty, every row is stored with issue_key = short + "-" + iid (D10); empty (the
-// forge sync), issue_key is written NULL. It reports only an error: no high-water mark is read off this path,
+// forge sync), issue_key is written NULL. columns maps an issue iid to its cached board
+// column and is read only on the linked path (nil from the forge sync, which never
+// writes the column). It reports only an error: no high-water mark is read off this path,
 // deliberately, because the time.Now() substitution below would put one past the
 // instant its fetch observed (see maxUpdatedAt).
-func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, issueKeyShort string) error {
+func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, issueKeyShort string, columns map[int64]string) error {
 	for _, is := range issues {
 		labelsJSON, err := json.Marshal(is.Labels)
 		if err != nil {
@@ -1053,8 +1095,27 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		}
 		if issueKeyShort != "" {
 			// The linked sync re-reads every tagged issue each tick, so it writes only rows
-			// that changed; the forge sync keeps the unconditional write.
-			err = s.q.UpsertIssueIfChanged(ctx, store.UpsertIssueIfChangedParams(params))
+			// that changed; the forge sync keeps the unconditional write. The cached board
+			// column has three writers: this linked upsert, SetIssueTrackerColumn (a move) and
+			// ClearIssueTrackerColumnsNotIn (a linked ConfigureColumns); an empty column (the
+			// Open lane) is stored as NULL.
+			changed := store.UpsertIssueIfChangedParams{
+				RepoID:         params.RepoID,
+				ForgeIssueIid:  params.ForgeIssueIid,
+				Title:          params.Title,
+				State:          params.State,
+				Labels:         params.Labels,
+				AssigneeIds:    params.AssigneeIds,
+				WebUrl:         params.WebUrl,
+				Author:         params.Author,
+				HasPrdLink:     params.HasPrdLink,
+				ForgeUpdatedAt: params.ForgeUpdatedAt,
+				IssueKey:       params.IssueKey,
+			}
+			if col := columns[is.IID]; col != "" {
+				changed.IssueTrackerColumn = pgtype.Text{String: col, Valid: true}
+			}
+			err = s.q.UpsertIssueIfChanged(ctx, changed)
 		} else {
 			_, err = s.q.UpsertIssue(ctx, params)
 		}

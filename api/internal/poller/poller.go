@@ -715,10 +715,20 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// mr_rework detector reading candidates later this same tick. Reads live forge state
 	// (needs the forge reachable: guaranteed by the early returns above on an unlinked repo,
 	// and by the forge client having been built on a linked one); records mr_state
-	// and cancels an in-flight rework on close/merge, but moves NO board card. Per-candidate
+	// and cancels an in-flight rework on close/merge. It moves NO board card, except that on
+	// a linked repo an issue-lane run's MR close/reopen moves the card through the issue
+	// tracker (PRD #4173 M5), which is why it takes the issue side. Per-candidate
 	// errors are log-and-skipped inside; only a candidate-enumeration failure surfaces here.
-	if err := e.svc.SyncBoardFreeMRStates(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+	if err := e.svc.SyncBoardFreeMRStatesWithIssueSide(ctx, r.ID, r.ForgeProjectID, f, tr); err != nil {
 		slog.Error("poller: sync board-free MR states", "repo", r.PathWithNamespace, "error", err)
+	}
+
+	// Active MR-target cancel (issue #4616): stop active ci_fix / mr_rework runs whose bound
+	// MR has merged or closed, from live forge data keyed on the run's own MR binding (no
+	// board or run-row mr_state needed). Per-run errors are log-and-skipped inside; only an
+	// enumeration failure surfaces here.
+	if err := e.svc.SyncActiveMRTargets(ctx, r.ID, r.ForgeProjectID, f); err != nil {
+		slog.Error("poller: sync active MR targets", "repo", r.PathWithNamespace, "error", err)
 	}
 
 	// PRD-link patch (PRD #72 M5): once a run's MR has merged, rewrite the issue's

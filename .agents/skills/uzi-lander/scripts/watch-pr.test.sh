@@ -21,6 +21,9 @@ cat > "$WORK/bin/uzi" <<'STUB'
 set -eu
 if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then [ "${UZI_REPO_FAIL:-}" = 1 ] && exit 1; echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
 if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
+# cobra prints the parent help (rc 0) for any admin subcommand; the verb line exists only on a new CLI.
+if [ "${1:-}" = admin ] && [ "${2:-}" = --help ]; then printf 'Available Commands:\n  review       x\n'; [ -z "${UZI_ADMIN_RW:-}" ] || printf '  run-writers  y\n'; exit 0; fi
+if [ "${1:-}" = admin ] && [ "${2:-}" = run-writers ]; then [ "${UZI_WRITERS_RC:-0}" -eq 0 ] || exit "$UZI_WRITERS_RC"; printf '%s\n' "$UZI_WRITERS_OUT"; exit 0; fi
 echo "unexpected uzi call: $*" >&2
 exit 1
 STUB
@@ -179,6 +182,23 @@ export COMMENTS="$WORK/comments.json"
 export UZI_LANDER_STATE_DIR="$WORK/state"
 export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
 MODE="full"; export MODE
+
+# The owner read is later than the complete snapshot. It may reveal a newly
+# admitted writer that must not be erased by the earlier complete empty result.
+export MODE=greptile_clean CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+export UZI_REPO_JSON='[{"id":"r1","path_with_namespace":"test/repo"}]'
+export UZI_ADMIN_RW=1 UZI_WRITERS_OUT='{"writers":[],"complete":true}'
+export UZI_RUNS_JSON='[{"id":"owner-later","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"running"}]'
+printf '[]\n' > "$COMMENTS"
+set +e
+bash "$SCRIPT" test/repo 42 0 1 --reviewer none --max-unknown 1 > "$WORK/owner-later.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 10 ] || fail "complete empty lookup hid owner ci_fix, rc=$rc: $(cat "$WORK/owner-later.out")"
+grep -qxF 'CI_FIX_ACTIVE=owner-later running' "$WORK/owner-later.out" || fail 'owner writer observation lost'
+grep -qxF 'RESULT=ci_fix_active' "$WORK/owner-later.out" || fail 'owner writer did not block readiness'
+unset UZI_REPO_JSON UZI_ADMIN_RW UZI_WRITERS_OUT UZI_RUNS_JSON CHECKS_JSON
+MODE=full; export MODE
 
 jq -n '[
   {user:{login:"tester"},body:"@coderabbitai review",created_at:"2026-09-18T11:12:00Z"},
@@ -990,6 +1010,41 @@ for failure in repo runs malformed; do
   grep -qxF 'CI_FIX_RECENT=unknown' "$WORK/ci-unknown-$failure.out" || fail 'unknown recent list became none'
   unset UZI_REPO_FAIL UZI_RUN_LIST_FAIL
 done
+# Authorized all-owners read (uzi admin run-writers).
+export UZI_ADMIN_RW=1 CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UZI_RUNS_JSON=$(jq -nc --arg at "$at" '[{id:"fix-recent",kind:"ci_fix",repo_id:"r1",pipeline_ref:"agent/issue-1",status:"failed",finished_at:$at}]'); export UZI_RUNS_JSON
+export UZI_WRITERS_OUT='{"writers":[{"run_id":"foreign-fix","kind":"ci_fix","status":"running","owner_id":"o2","repo_id":"r1","pipeline_ref":"agent/issue-1","mr_iid":null,"created_at":"t"}],"complete":true}'
+ci_watch wr-active 10
+grep -qxF 'CI_FIX_ACTIVE=foreign-fix running' "$WORK/ci-wr-active.out" || fail 'foreign ci_fix missing from watch output'
+grep -qxF 'RESULT=ci_fix_active' "$WORK/ci-wr-active.out" || fail 'foreign ci_fix did not stop readiness'
+grep -qxF 'VISIBILITY=all_owners' "$WORK/ci-wr-active.out" || fail 'visibility line missing'
+grep -qxF "CI_FIX_RECENT=fix-recent failed $at" "$WORK/ci-wr-active.out" || fail 'owner-scoped recent advisory lost'
+export UZI_WRITERS_OUT='{"writers":[{"run_id":"foreign-rw","kind":"mr_rework","status":"running","owner_id":"o2","repo_id":"r1","pipeline_ref":null,"mr_iid":42,"created_at":"t"}],"complete":true}'
+ci_watch wr-rw 4
+grep -qxF 'RESULT=mr_rework_active' "$WORK/ci-wr-rw.out" || fail 'authorized mr_rework did not defer'
+export UZI_WRITERS_OUT='{"writers":[],"complete":true}'
+ci_watch wr-empty 0
+grep -qxF 'VISIBILITY=all_owners' "$WORK/ci-wr-empty.out" && grep -qxF 'CI_FIX_ACTIVE=none' "$WORK/ci-wr-empty.out" || fail 'complete empty read not reported'
+for bad in 'junk' '{"writers":[],"complete":false}' '{"writers":[{"run_id":"a","kind":"mr_rework","status":"running","mr_iid":9}],"complete":true}'; do
+  UZI_WRITERS_OUT=$bad ci_watch wr-bad 9
+  grep -qxF 'CI_FIX_ACTIVE=unknown' "$WORK/ci-wr-bad.out" || fail 'bad authorized result became none'
+done
+for rc_ in 1 2 6; do UZI_WRITERS_RC=$rc_ ci_watch wr-rc 9; done
+export UZI_RUNS_JSON='[{"id":"own-fix","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"running"}]'
+for rc_ in 3 3 4; do
+  UZI_WRITERS_RC=$rc_ ci_watch wr-fb 10
+  grep -qxF 'VISIBILITY=owner_only' "$WORK/ci-wr-fb.out" || fail 'owner_only visibility missing'
+  grep -qxF 'note: owner-only visibility; foreign or older writers are not excluded' "$WORK/ci-wr-fb.out" || fail 'owner-only note missing'
+done
+UZI_RUNS_JSON='[]'; export UZI_RUNS_JSON
+UZI_WRITERS_RC=3 ci_watch wr-fb-empty 0
+grep -qxF 'VISIBILITY=owner_only' "$WORK/ci-wr-fb-empty.out" || fail 'owner_only visibility missing on empty fallback'
+UZI_WRITERS_RC=3 UZI_RUN_LIST_FAIL=1 ci_watch wr-fb-fail 9
+# Authorized read succeeded (complete, empty) but the owner run list failed: unknown path, never ready.
+UZI_WRITERS_OUT='{"writers":[],"complete":true}' UZI_RUN_LIST_FAIL=1 ci_watch wr-ok-listfail 9
+grep -qxF 'CI_FIX_RECENT=unknown' "$WORK/ci-wr-ok-listfail.out" || fail 'run-list failure after an authorized read did not leave CI_FIX_RECENT unknown'
+unset UZI_ADMIN_RW UZI_WRITERS_OUT UZI_WRITERS_RC
 unset UZI_REPO_JSON UZI_RUNS_JSON CHECKS_JSON
 
 # Author mode is isolated from readiness fixtures. Unexpected gate or write calls fail.

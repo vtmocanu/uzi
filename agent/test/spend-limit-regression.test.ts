@@ -32,7 +32,7 @@ function spendResult(): SDKMessage {
   } as unknown as SDKMessage;
 }
 
-// Issue #4426: the credit-depletion lead terminal, characterized at the pinned SDK 0.3.319 (CLI
+// Issue #4426: the credit-depletion lead terminal, characterized at SDK 0.3.319 (CLI
 // 2.1.319) from the SDK's own handling in its bundled `claude` binary:
 // - the error mapper turns any error whose message contains "credit balance is too low"
 //   (case-insensitive) into an assistant API-error message with content exactly

@@ -139,6 +139,8 @@ func (f *FakeClient) PutModelSettings(_ context.Context, patch map[string]*strin
 		"judge_model": &f.Settings.JudgeModel, "codex_judge_model": &f.Settings.CodexJudgeModel,
 		"judge_runs_on": &f.Settings.JudgeRunsOn,
 		"summary_model": &f.Settings.SummaryModel, "codex_summary_model": &f.Settings.CodexSummaryModel,
+		"task_review_model": &f.Settings.TaskReviewModel, "codex_task_review_model": &f.Settings.CodexTaskReviewModel,
+		"task_review_effort": &f.Settings.TaskReviewEffort, "codex_task_review_effort": &f.Settings.CodexTaskReviewEffort,
 	}
 	for k, v := range patch {
 		if dst, ok := fields[k]; ok {

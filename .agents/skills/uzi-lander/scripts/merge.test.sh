@@ -90,9 +90,9 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
     *'-q .state'*) printf '%s\n' "\$st" ;;
     *-q*)  printf '%s\n' "\$oid" ;;   # the retry: gh -q '.mergeCommit.oid // empty' prints the oid
     *)     if [ -n "\$oid" ]; then
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"},"baseRefName":"main"}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","headRefName":"agent/issue-42","mergeStateStatus":"CLEAN","mergeable":"MERGEABLE","mergeCommit":{"oid":"'"\$oid"'"},"baseRefName":"main"}'
            else
-             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","mergeStateStatus":"BLOCKED","mergeable":"'"\${MERGEABLE:-MERGEABLE}"'","mergeCommit":null,"baseRefName":"main"}'
+             echo '{"state":"'"\$st"'","headRefOid":"$HEAD","headRefName":"agent/issue-42","mergeStateStatus":"BLOCKED","mergeable":"'"\${MERGEABLE:-MERGEABLE}"'","mergeCommit":null,"baseRefName":"main"}'
            fi ;;
   esac
   exit 0
@@ -386,6 +386,132 @@ grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "pass+ski
 CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
 merge_run green
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
+# A green head is still owned by an active helper. The second lookup models a
+# helper appearing while the other merge preflights run; no real factory is used.
+cat > "$WORK/bin/uzi" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+case "$*" in
+  'repo list --json') echo '[{"id":"repo","path_with_namespace":"test/repo"}]' ;;
+  'run list --json')
+    n=0; [ ! -f "$HELPER_CALLS" ] || n=$(cat "$HELPER_CALLS")
+    n=$((n+1)); echo "$n" > "$HELPER_CALLS"
+    [ "${HELPER_RUNS_RC:-0}" -eq 0 ] || exit "$HELPER_RUNS_RC"
+    if [ "${HELPER_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '[]'
+    else printf '%s\n' "$HELPER_RUNS"; fi ;;
+  # cobra prints the parent help (rc 0) for any subcommand; the verb line exists only on a new CLI.
+  'admin --help')
+    printf 'Admin commands\n\nUsage:\n  uzi admin [command]\n\nAvailable Commands:\n  review      Review backlog\n'
+    [ -z "${ADMIN_RW:-}" ] || printf '  run-writers List active ci_fix and mr_rework writers\n'
+    printf '\nFlags:\n  -h, --help   help for admin\n' ;;
+  'admin run-writers '*)
+    echo "$*" >> "$WRITERS_ARGS"
+    n=0; [ ! -f "$WRITERS_CALLS" ] || n=$(cat "$WRITERS_CALLS")
+    n=$((n+1)); echo "$n" > "$WRITERS_CALLS"
+    if [ "${WRITERS_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '{"writers":[],"complete":true}'; exit 0; fi
+    [ "${WRITERS_RC:-0}" -eq 0 ] || { echo "HTTP ${WRITERS_HTTP:-500}" >&2; exit "$WRITERS_RC"; }
+    printf '%s\n' "$WRITERS_OUT" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$WORK/bin/uzi"
+export HELPER_CALLS="$WORK/helper.calls" WRITERS_CALLS="$WORK/writers.calls" WRITERS_ARGS="$WORK/writers.args" CONFIRM_AFTER_MERGE=1
+helper_merge() {
+  rm -f "$WORK/merge.log" "$HELPER_CALLS" "$WRITERS_CALLS" "$WRITERS_ARGS"
+  set +e
+  bash "$SCRIPT" test/repo 42 > "$WORK/m.helper" 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq "$1" ] || fail "helper guard rc=$rc, want $1: $(cat "$WORK/m.helper")"
+  if [ "$1" -ne 0 ]; then [ ! -e "$WORK/merge.log" ] || fail 'helper refusal merged'; fi
+}
+export HELPER_RUNS='[{"id":"fix-active","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-42","status":"running"}]'
+helper_merge 14
+grep -qF 'fix-active' "$WORK/m.helper" || fail 'active ci_fix id missing'
+export HELPER_LATE=1
+helper_merge 14
+[ "$(cat "$HELPER_CALLS")" -eq 2 ] || fail 'merge did not refresh ownership'
+unset HELPER_LATE
+export HELPER_RUNS='[{"id":"rework-active","kind":"mr_rework","repo_id":"repo","mr_iid":42,"status":"awaiting_approval"}]'
+helper_merge 14
+grep -qF 'wait-mrrework.sh' "$WORK/m.helper" || fail 'rework wait guidance missing'
+export HELPER_RUNS='not-json'
+helper_merge 4
+export HELPER_RUNS='[{"id":"bad","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-42","status":null}]'
+helper_merge 4
+export HELPER_RUNS='[{"id":"unrelated","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-420","status":"running"}]'
+helper_merge 0
+[ -s "$WORK/merge.log" ] || fail 'unrelated branch prevented merge'
+# Authorized all-owners read (uzi admin run-writers). Owner list is empty or unparseable in every
+# case below, proving the decision comes from the authorized read and never downgrades.
+export ADMIN_RW=1 HELPER_RUNS='not-json'
+wrow() { jq -nc --arg id "$1" --arg kind "$2" --arg st "$3" --arg ref "$4" --argjson mr "$5" \
+  '{run_id:$id,kind:$kind,status:$st,owner_id:"other-owner",repo_id:"repo",pipeline_ref:(if $ref=="" then null else $ref end),mr_iid:$mr,created_at:"2026-01-01T00:00:00Z"}'; }
+wout() { jq -nc --argjson w "$1" --argjson c "${2:-true}" '{writers:$w,complete:$c}'; }
+export WRITERS_OUT; WRITERS_OUT=$(wout "[$(wrow foreign-fix ci_fix running agent/issue-42 null)]")
+helper_merge 14
+grep -qF 'ACTIVE_HELPER=foreign-fix kind=ci_fix' "$WORK/m.helper" || fail 'foreign ci_fix not named'
+grep -qF 'VISIBILITY=all_owners' "$WORK/m.helper" || fail 'all_owners visibility missing'
+grep -qF -- '--repo repo --branch agent/issue-42 --mr 42 --json' "$WORK/writers.args" || fail "run-writers args: $(cat "$WORK/writers.args")"
+WRITERS_OUT=$(wout "[$(wrow foreign-rw mr_rework awaiting_approval '' 42)]")
+helper_merge 14
+grep -qF 'ACTIVE_HELPER=foreign-rw kind=mr_rework' "$WORK/m.helper" || fail 'authorized mr_rework not named'
+# A writer that appears between the preflight and the final refresh stops the merge (no gh pr merge).
+export WRITERS_LATE=1
+WRITERS_OUT=$(wout "[$(wrow late-fix ci_fix queued agent/issue-42 null)]")
+helper_merge 14
+[ "$(cat "$WRITERS_CALLS")" -eq 2 ] || fail 'authorized read was not refreshed before the merge'
+grep -qF 'late-fix' "$WORK/m.helper" || fail 'late writer not named'
+unset WRITERS_LATE
+# Complete empty result proceeds, and the merge still pins the head.
+WRITERS_OUT=$(wout '[]')
+helper_merge 0
+grep -qF 'VISIBILITY=all_owners' "$WORK/m.helper" || fail 'empty authorized read lacks visibility line'
+grep -q -- '--match-head-commit' "$WORK/merge.log" || fail 'merge lost --match-head-commit'
+# Anything but a clean complete result refuses (exit 4), never a downgrade to the owner list.
+export HELPER_RUNS='[]'
+refuse_case() { # name rc out
+  WRITERS_RC=$2 WRITERS_OUT=$3 helper_merge 4
+  grep -qF 'cannot rule out active helpers' "$WORK/m.helper" || fail "$1: refusal not explained: $(cat "$WORK/m.helper")"
+  [ ! -s "$HELPER_CALLS" ] || fail "$1: downgraded to the owner run list"
+}
+refuse_case malformed 0 'not-json'
+refuse_case incomplete-rc0 0 "$(wout '[]' false)"
+refuse_case incomplete-rc1 1 "$(wout '[]' false)"
+refuse_case rc1 1 ''
+refuse_case rc2 2 ''
+refuse_case rc6 6 ''
+refuse_case rc5 5 "$(wout '[]')"
+refuse_case terminal-entry 0 "$(wout "[$(wrow finished ci_fix completed agent/issue-42 null)]")"
+refuse_case bad-id 0 "$(wout "[$(wrow 'a b' ci_fix running agent/issue-42 null)]")"
+refuse_case bad-kind 0 "$(wout "[$(wrow k issue running agent/issue-42 null)]")"
+refuse_case ci_fix-other-branch 0 "$(wout "[$(wrow k ci_fix running agent/issue-43 null)]")"
+refuse_case rework-other-mr 0 "$(wout "[$(wrow k mr_rework running '' 43)]")"
+refuse_case writers-not-array 0 '{"writers":{},"complete":true}'
+# 401/403 (CLI rc 3) and 404 (rc 4) fall back to the owner-scoped list; owner-only is labelled.
+for pair in 401:3 403:3 404:4; do
+  export WRITERS_HTTP=${pair%%:*} WRITERS_RC=${pair##*:}
+  export HELPER_RUNS='[{"id":"own-fix","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-42","status":"running"}]'
+  helper_merge 14
+  grep -qF 'ACTIVE_HELPER=own-fix' "$WORK/m.helper" || fail "$pair: owner writer not refused"
+  export HELPER_RUNS='[]'
+  helper_merge 0
+  grep -qF 'VISIBILITY=owner_only' "$WORK/m.helper" || fail "$pair: owner_only not printed"
+  grep -qxF 'note: owner-only visibility; foreign or older writers are not excluded' "$WORK/m.helper" || fail "$pair: owner-only note missing"
+done
+unset WRITERS_HTTP WRITERS_RC
+# A failed or malformed fallback refuses, whatever row is malformed (even a non-matching one).
+export HELPER_RUNS='[]'; WRITERS_RC=3 HELPER_RUNS_RC=1 helper_merge 4
+for bad in '[{}]' '[1]' '[{"id":"x","kind":"mr_rework","repo_id":"repo","mr_iid":"7","status":"running"}]' \
+  '[{"id":"o","kind":"issue","repo_id":"elsewhere","status":"RUNNING"}]' '[{"id":"o","kind":"issue","repo_id":7,"status":"running"}]'; do
+  WRITERS_RC=4 HELPER_RUNS=$bad helper_merge 4
+done
+# An older CLI (no run-writers line in admin help) falls back without calling the verb.
+unset ADMIN_RW WRITERS_RC
+export HELPER_RUNS='[{"id":"old-fix","kind":"ci_fix","repo_id":"repo","pipeline_ref":"agent/issue-42","status":"running"}]'
+helper_merge 14
+[ ! -e "$WRITERS_ARGS" ] || fail 'older CLI still called run-writers'
+unset HELPER_RUNS HELPER_CALLS WRITERS_CALLS WRITERS_ARGS WRITERS_OUT CONFIRM_AFTER_MERGE
 # A required context the base branch's rules name but the head has not reported is pending:
 # right after a push only the fast required checks have registered.
 export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"},{"context":"slow"}]}}]'

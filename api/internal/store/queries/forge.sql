@@ -552,11 +552,14 @@ RETURNING *;
 -- board_position omission, with the same reason), but a row whose cached values are all
 -- unchanged is left untouched, so a tick that finds nothing new rewrites nothing and
 -- issues.synced_at is not refreshed by it. Nothing reads issues.synced_at. issue_key is
--- compared as written (the linked sync always passes it).
+-- compared as written (the linked sync always passes it). It is also the one upsert that
+-- writes issues.issue_tracker_column (PRD #4173 M5), the card's board column read from its
+-- issue tracker State: NULL is the Open lane, and the column is part of the change check so
+-- a changed State mapping is cached again. UpsertIssue and UpsertIssueLabels never touch it.
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, issue_key, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+    has_prd_link, forge_updated_at, issue_key, issue_tracker_column, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -567,12 +570,33 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     issue_key        = EXCLUDED.issue_key,
+    issue_tracker_column = EXCLUDED.issue_tracker_column,
     synced_at        = now()
 WHERE (issues.title, issues.state, issues.labels, issues.assignee_ids, issues.web_url, issues.author,
-       issues.has_prd_link, issues.forge_updated_at, issues.issue_key)
+       issues.has_prd_link, issues.forge_updated_at, issues.issue_key, issues.issue_tracker_column)
       IS DISTINCT FROM
       (EXCLUDED.title, EXCLUDED.state, EXCLUDED.labels, EXCLUDED.assignee_ids, EXCLUDED.web_url, EXCLUDED.author,
-       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key);
+       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key, EXCLUDED.issue_tracker_column);
+
+-- name: SetIssueTrackerColumn :one
+-- The cached board column of a linked card after a successful move (PRD #4173 M5):
+-- writes ONLY issue_tracker_column (an empty column is the Open lane and is stored as
+-- NULL, because the table's CHECK refuses an empty string) and synced_at, never state, labels or
+-- board_position. Forge-first like every cache write here: the caller has already moved
+-- the issue in the issue tracker. RETURNING * for the single-card re-render.
+UPDATE issues
+SET issue_tracker_column = NULLIF(@issue_tracker_column::text, ''), synced_at = now()
+WHERE repo_id = @repo_id AND forge_issue_iid = @forge_issue_iid
+RETURNING *;
+
+-- name: ClearIssueTrackerColumnsNotIn :exec
+-- Clears the cached column of every issue of the repo whose column is no longer one of
+-- the board's columns (PRD #4173 M5), so a removed column puts its cards back in the Open
+-- lane instead of leaving a column no board shows. keep is never NULL (NULL would match
+-- nothing): an empty array clears every cached column.
+UPDATE issues
+SET issue_tracker_column = NULL
+WHERE repo_id = @repo_id AND issue_tracker_column <> ALL(@keep::text[]);
 
 -- name: UpsertIssueLabels :one
 -- Labels is the INSERT seed only. On conflict, remove from CURRENT issues.labels,
@@ -904,9 +928,9 @@ JOIN issues i ON i.repo_id = @repo_id AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
   -- A repo linked to an external issue tracker (PRD #4173 M4) is owned by
-  -- ListBoardFreeMRStateWatchCandidates entirely: uzi moves no card there (writes arrive
-  -- in M5), so its MR state must not depend on the issue cache or a column label. Excluding
-  -- the repo here keeps the two lanes disjoint.
+  -- ListBoardFreeMRStateWatchCandidates entirely: that lane moves the card through the
+  -- issue tracker (PRD #4173 M5), so its MR state must not depend on the issue cache or a
+  -- column label. Excluding the repo here keeps the two lanes disjoint.
   AND NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = @repo_id AND lr.issue_tracker_connection_id IS NOT NULL)
   AND (
     -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
@@ -950,16 +974,27 @@ LIMIT 100;
 -- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
 -- external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
 -- belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
--- rework with no board card; an unlinked repo matches exactly as before. On a linked repo the
+-- rework, and the issue's latest run moves the linked card on a close or reopen (M5); an unlinked repo matches exactly as before. On a linked repo the
 -- lane also keeps watching an issue-lane run recorded mr_state='closed', so a reopen is recorded
 -- back to 'opened' (the board lane's Lane A reopen-edge watch, Decision 10), bounded as Lane A is:
 -- only the issue's LATEST run (no newer non-scheduled run of the issue, so a superseded rework
 -- MR is not watched) and only while the cached issue exists AND is opened (an evicted or closed
 -- issue is not polled forever). Live rows (NULL/opened/locked mr_state) sort ahead of closed
 -- reopen-watch rows so the latter can never starve them under the LIMIT; among live rows the
--- order is created_at DESC as before, so an unlinked repo's order is unchanged. Keep this rationale
--- ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
-SELECT id, branch, mr_iid, mr_state
+-- order is created_at DESC as before, so an unlinked repo's order is unchanged. The output also
+-- carries issue_iid, kind and is_latest (PRD #4173 M5): the caller tells an issue-lane run from a
+-- scheduled or issue-less one by the first two, and is_latest is true iff no newer run of the same
+-- repo and issue_iid with kind NOT IN ('prompt','self_improve') exists, regardless of its status
+-- (the board lane's DISTINCT ON (issue_iid) ORDER BY created_at DESC semantics: every status
+-- counts), so a linked card moves only for its issue's latest run. They add no filter and change
+-- no ordering. Keep this rationale ABOVE the statement — a comment trailing after the `;` is
+-- grabbed by sqlc as the NEXT query's doc.
+SELECT id, branch, mr_iid, mr_state, issue_iid, kind,
+       (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
+        OR NOT EXISTS (SELECT 1 FROM runs nl
+                       WHERE nl.repo_id = runs.repo_id AND nl.issue_iid = runs.issue_iid
+                         AND nl.kind NOT IN ('prompt', 'self_improve')
+                         AND nl.created_at > runs.created_at))::boolean AS is_latest
 FROM runs
 WHERE repo_id = @repo_id::uuid
   AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
@@ -1124,3 +1159,23 @@ UPDATE repos SET
  cross_check_repo_instructions_enabled = COALESCE(sqlc.narg('instructions_enabled')::boolean, cross_check_repo_instructions_enabled)
 WHERE repos.id = @id AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = @user_id)
 RETURNING repos.*;
+
+-- name: ListActiveMRTargetRuns :many
+-- Issue #4616 early-polling enumeration: the active ci_fix / mr_rework runs of one repo
+-- that carry a verified MR target, so the poller can cancel them once that MR merges or
+-- closes. repo_id leads uq_runs_one_active_branch_ref (migration 00167) and
+-- idx_runs_repo (00020), so the scan is repo-scoped through an index. The
+-- caller takes 32 rows and keeps a keyset cursor (id > @after_id); LIMIT 33 lets it tell
+-- whether another page exists. An unbound ci_fix (NULL ci_fix_mr_iid) is deliberately
+-- excluded: there is no branch-to-MR inference here.
+SELECT id, kind, status, worker_id, claim_generation, pipeline_ref,
+       (CASE kind WHEN 'ci_fix' THEN ci_fix_mr_iid ELSE mr_iid END)::bigint AS target_mr_iid
+FROM runs
+WHERE repo_id = @repo_id::uuid
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND ((kind = 'ci_fix' AND ci_fix_mr_iid IS NOT NULL)
+       OR (kind = 'mr_rework' AND mr_iid IS NOT NULL))
+  AND id > @after_id::uuid
+ORDER BY id
+LIMIT 33;

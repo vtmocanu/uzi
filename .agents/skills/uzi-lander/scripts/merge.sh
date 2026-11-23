@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# merge.sh — the guarded merge: re-check the head and the rework lane at the last moment,
+# merge.sh: the guarded merge, re-check the head and helper lanes at the last moment,
 # admin-merge past the ruleset, then CONFIRM it merged and print the merge SHA for the
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
@@ -18,7 +18,7 @@
 #                   Negated prose ("does not close" + an issue ref) counts everywhere.
 #                   Unreadable or an incomplete commit list refuses (exit 2). Without the
 #                   flag, CLOSES= is printed only.
-#   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
+#   --no-rework-check  skip helper guards (ONLY for a repo that is not on uzi).
 #   --confirm-only  do NOT merge: the PR was already merged OUT OF BAND (e.g. the harness
 #                   classifier refused the in-script `gh pr merge --admin` and the user ran it
 #                   via a `!` line, so merge.sh's own confirm/trail block never executed).
@@ -51,7 +51,7 @@
 #      checks because GitHub runs no pull_request CI on a conflicting PR: run land-prep.sh
 #      Also an unverifiable merge-lock owner identity: no merge attempted and no
 #      alternate command to execute; reconcile native identity or explicit owner overrides.
-#   4  an mr_rework run is active on this MR — defer
+#   4  helper ownership cannot be read or parsed — no merge
 #   5  every-author blockers live (lib/pr-comments.sh): ANY unresolved, non-outdated review
 #      thread (CodeRabbit, Greptile, CodeQL, a human, any other author), an open
 #      code-scanning alert on the head, or an unacknowledged comment / review body (listed
@@ -76,6 +76,8 @@
 #      require fresh exact-head CI before retrying
 #  13  MIGRATION_COLLISION: an added/renamed/copied migration is at or below the live base head;
 #      renumber with land-prep.sh, then require fresh exact-head CI and review
+#  14  active mr_rework on this MR or ci_fix on its branch — wait, or cancel and
+#      confirm terminal state and inspect preserved work before retrying
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,6 +91,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/pr-comments.sh"
 # shellcheck source=lib/migrations.sh
 . "$HERE/lib/migrations.sh"
+# shellcheck source=lib/ci-fix.sh
+. "$HERE/lib/ci-fix.sh"
 
 REPO=""; PR=""; EXPECT=""; EXPECT_CLOSES=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
 while [ $# -gt 0 ]; do
@@ -118,7 +122,7 @@ if ! [[ "$REPO" =~ ^[a-z0-9][a-z0-9-]*/[a-z0-9_.-]+$ ]]; then
 fi
 case "${REPO#*/}" in .|..|*.git) echo 'repository name must not be a dot path or end in .git'; exit 2 ;; esac
 
-pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,mergeStateStatus,mergeable,mergeCommit,baseRefName 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
+pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,headRefName,mergeStateStatus,mergeable,mergeCommit,baseRefName 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
 ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -r .mergeable)
 base=$(printf '%s' "$pj" | jq -r '.baseRefName // empty')
@@ -223,25 +227,36 @@ else
   [ -z "$EXPECT_CLOSES" ] || { echo "closing references unreadable; not merging"; exit 2; }
 fi
 
-# mr_rework guard, last moment — FAIL CLOSED: an absent uzi, a failed listing or unreadable
-# JSON cannot rule out an active rework (exit 4). Only a successful listing that shows the
-# repo is not connected skips it; --no-rework-check is the explicit bypass for such a repo.
-if [ "$REWORK_CHECK" -eq 1 ]; then
-  command -v uzi >/dev/null 2>&1 || { echo "uzi CLI absent; cannot rule out an active mr_rework (pass --no-rework-check for a repo not on uzi)"; exit 4; }
+# Helper guard: repeat after the expensive preflights. A snapshot is not a lease.
+# Keep --no-rework-check restricted to repos not on uzi; no active-run bypass.
+helper_guard() {
+  local rl repo_id branch active n
+  [ "$REWORK_CHECK" -eq 1 ] || return 0
+  command -v uzi >/dev/null 2>&1 || { echo "uzi CLI absent; cannot rule out active helpers (pass --no-rework-check for a repo not on uzi)"; return 4; }
   rl=$(uzi repo list --json 2>/dev/null) && printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1 \
-    || { echo "uzi repo list failed; cannot rule out an active mr_rework"; exit 4; }
+    || { echo "uzi repo list failed; cannot rule out active helpers"; return 4; }
   repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '.[]|select(.path_with_namespace==$p)|.id' | head -1)
   if [ -n "$repo_id" ]; then
-    runs=$(uzi run list --json 2>/dev/null) && printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1 \
-      || { echo "uzi run list failed; cannot rule out an active mr_rework"; exit 4; }
-    n=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-      '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length') \
-      || { echo "could not parse uzi run list; cannot rule out an active mr_rework"; exit 4; }
-    [ "${n:-0}" -gt 0 ] && { echo "mr_rework ACTIVE on #$PR — defer"; exit 4; }
+    branch=$(printf '%s' "$pj" | jq -er '.headRefName | select(type=="string" and length>0)') \
+      || { echo "PR source branch unreadable; cannot rule out active helpers"; return 4; }
+    branch_writers_read "$repo_id" "$branch" "$PR" \
+      || { echo "$WRITERS_ERR; cannot rule out active helpers"; return 4; }
+    active=$WRITERS
+    print_writers_visibility
+    n=$(printf '%s' "$active" | jq -se 'if length == 1 and (.[0] | type) == "array" then .[0] | length else error("bad") end' 2>/dev/null) \
+      && case "$n" in ''|*[!0-9]*) false;; esac \
+      || { echo "could not parse helper writers; cannot rule out active helpers"; return 4; }
+    if [ "$n" -gt 0 ]; then
+      printf '%s' "$active" | jq -r '.[] | "ACTIVE_HELPER=\(.id) kind=\(.kind) status=\(.status)"'
+      echo "wait (mr_rework: scripts/wait-mrrework.sh), or cancel the exact run and confirm terminal state; inspect branch delta, preserved_patch, recovery and held publications before retrying"
+      return 14
+    fi
   else
     echo "note: $REPO is not connected to uzi; rework check skipped"
   fi
-fi
+  return 0
+}
+helper_guard || exit "$?"
 
 # A conflicting PR gets no pull_request CI at all, so its checks read as "none reported":
 # name the real cause first. UNKNOWN (GitHub still computing) falls through to the checks.
@@ -506,6 +521,7 @@ fi
 
 # --match-head-commit makes GitHub itself refuse the merge if the head moved after the
 # preflight above (a push in the window), so --expect-head is enforced server-side too.
+helper_guard || exit "$?"
 cmd=(gh pr merge "$PR" --repo "$REPO" "--$METHOD" --match-head-commit "$head")
 [ "$DELETE" -eq 1 ] && cmd+=(--delete-branch)
 [ "$ADMIN" -eq 1 ] && cmd+=(--admin)

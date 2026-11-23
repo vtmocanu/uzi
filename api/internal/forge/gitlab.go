@@ -431,6 +431,11 @@ func (g *gitLab) UpdateIssueLabels(ctx context.Context, projectID, issueIID int6
 	return nil
 }
 
+// MoveToColumn moves the issue to a board column through its labels.
+func (g *gitLab) MoveToColumn(ctx context.Context, projectID, issueIID int64, move ColumnMove) error {
+	return MoveByLabels(ctx, g, projectID, issueIID, move)
+}
+
 // SetIssueState closes or reopens an issue via GitLab's state_event verb.
 // gitlab.UpdateIssueOptions.StateEvent is a *string with `omitempty` and takes
 // the MUTATE vocabulary "close"/"reopen" (not the query-filter opened/closed the

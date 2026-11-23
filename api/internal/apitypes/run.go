@@ -152,6 +152,29 @@ func IsTerminalRunStatus(status string) bool {
 	}
 }
 
+// RunStatuses is the ordered set of every value the runs.status column accepts (the
+// live runs_status_check constraint, migrations 00206/00207). Parity tests pin it to
+// the migration and to the CLI's copies.
+var RunStatuses = []string{
+	"queued", "claimed", "running", "awaiting_approval", "awaiting_input",
+	"awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait",
+	"completed", "failed", "cancelled",
+}
+
+var runStatusSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(RunStatuses))
+	for _, s := range RunStatuses {
+		m[s] = struct{}{}
+	}
+	return m
+}()
+
+// IsRunStatus reports whether s is a member of RunStatuses.
+func IsRunStatus(s string) bool {
+	_, ok := runStatusSet[s]
+	return ok
+}
+
 // CompletionDeferredDTO is one owner-deferred (out-of-scope) milestone on a revised completion
 // contract (PRD #1227 M1, D2): the milestone id, the owner's reason, and the contract revision the
 // deferral was recorded at. A milestone deferred in an earlier revision keeps its original
@@ -2859,4 +2882,28 @@ func (r *RunSummaryItemDTO) UnmarshalJSON(data []byte) error {
 type AdminRunsDebugDTO struct {
 	Runs      []RunSummaryItemDTO `json:"runs"`
 	Truncated bool                `json:"truncated"`
+	// StatusFilter echoes the applied status filter so a client can detect an older
+	// server that ignored it (the key is then absent). Omitted when no filter was sent.
+	StatusFilter []string `json:"status_filter,omitempty"`
+}
+
+// RunWriterDTO is one active ci_fix / mr_rework run in the GET /api/admin/run-writers
+// response (issue #4618). Metadata only: no plan, report, log or patch text.
+type RunWriterDTO struct {
+	RunID       string    `json:"run_id"`
+	Kind        string    `json:"kind"`
+	Status      string    `json:"status"`
+	OwnerID     string    `json:"owner_id"`
+	RepoID      string    `json:"repo_id"`
+	PipelineRef *string   `json:"pipeline_ref"`
+	MRIID       *int64    `json:"mr_iid"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// RunWritersDTO is the GET /api/admin/run-writers response. Writers is always a JSON array,
+// never null. Complete is false when more matching writers existed than the server serves,
+// in which case the absence of a writer from the list proves nothing.
+type RunWritersDTO struct {
+	Writers  []RunWriterDTO `json:"writers"`
+	Complete bool           `json:"complete"`
 }

@@ -9,6 +9,10 @@ import (
 // maxNestedItems caps the tags of one issue or one activity.
 const maxNestedItems = 1000
 
+// maxCustomFields caps the custom fields of one issue. A listing whose issue
+// carries more fails; it is never read in part.
+const maxCustomFields = 64
+
 // errNestedCeiling is returned when one object carries more than maxNestedItems
 // nested entries.
 var errNestedCeiling = errors.New("issuetracker: an item carries more nested entries than the ceiling allows")
@@ -25,6 +29,11 @@ var errNestedCeiling = errors.New("issuetracker: an item carries more nested ent
 // allowed 16*maxNestedItems+256. A single object (an issue holds one tags
 // array, plus a few members of its own) is allowed 8*maxNestedItems+256, which
 // holds 8*maxNestedItems for the tags.
+// An issue also carries up to maxCustomFields custom fields, each a "$type",
+// a name and a value object with its own "$type" and name: 6 values (two
+// braces, three commas inside, one between fields), allowed 10 for a value that
+// is an array. So a single object is allowed 8*maxNestedItems +
+// 10*maxCustomFields + 256; an element of a page already has the room.
 // The real-shaped tests pin that headroom. Three totals are enforced:
 // pageValueBudget for a whole list page, itemValueBudget for each element of
 // it and objectValueBudget for one single-object response. The budgets bound
@@ -35,7 +44,7 @@ var errNestedCeiling = errors.New("issuetracker: an item carries more nested ent
 // one element, at most itemValueBudget values, to amplify.
 const (
 	itemValueBudget   = 16*maxNestedItems + 256
-	objectValueBudget = 8*maxNestedItems + 256
+	objectValueBudget = 8*maxNestedItems + 10*maxCustomFields + 256
 	pageValueBudget   = pageSize * itemValueBudget
 )
 
@@ -49,9 +58,17 @@ var errNotArray = errors.New("issuetracker: response is not a JSON array")
 // errTrailingData is returned when a list response has data after its array.
 var errTrailingData = errors.New("issuetracker: response has data after the JSON array")
 
+// errCustomFieldCeiling is returned when one issue carries more than
+// maxCustomFields custom fields.
+var errCustomFieldCeiling = errors.New("issuetracker: an issue carries more custom fields than the ceiling allows")
+
 // errTagNotObject is returned when a tags array holds an element that is not an
 // object, refused before decoding so a bad element costs no error value.
 var errTagNotObject = errors.New("issuetracker: a tag is not a JSON object")
+
+// errCustomFieldNotObject is returned when a customFields array holds an
+// element that is not an object.
+var errCustomFieldNotObject = errors.New("issuetracker: a custom field is not a JSON object")
 
 // ytTags is a nested tag array. Its UnmarshalJSON counts the elements with a
 // byte scan and refuses above maxNestedItems before anything is decoded, so one
@@ -350,4 +367,56 @@ func forEachElement(b []byte, f func(elem []byte) bool) {
 			}
 		}
 	}
+}
+
+// ytCustomField is one custom field of an issue, as asked for by issueFields.
+type ytCustomField struct {
+	Name  string        `json:"name"`
+	Type  string        `json:"$type"`
+	Value ytCustomValue `json:"value"`
+}
+
+// ytCustomValue is the name of a custom field's value. A field's value is an
+// object for a state, enum or user field, and a scalar, an array or null for
+// others; only an object's name is kept, and anything else leaves Name empty so
+// a field the driver does not read cannot fail the listing.
+type ytCustomValue struct{ Name string }
+
+// UnmarshalJSON implements json.Unmarshaler. b is already-validated JSON.
+func (v *ytCustomValue) UnmarshalJSON(b []byte) error {
+	*v = ytCustomValue{}
+	if t := trimJSONSpace(b); len(t) == 0 || t[0] != '{' {
+		return nil
+	}
+	var o struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal(b, &o) == nil {
+		v.Name = o.Name
+	}
+	return nil
+}
+
+// ytCustomFields is a nested custom field array. Like ytTags, its UnmarshalJSON
+// counts the elements with a byte scan and refuses above maxCustomFields before
+// anything is decoded, and builds no json.Decoder, because encoding/json calls
+// it once per repeated "customFields" key.
+type ytCustomFields []ytCustomField
+
+// UnmarshalJSON implements json.Unmarshaler. b is already-validated JSON.
+func (c *ytCustomFields) UnmarshalJSON(b []byte) error {
+	// See ytTags.UnmarshalJSON: reused elements are cleared so a repeated key
+	// leaves nothing of an earlier one.
+	clear((*c)[:cap(*c)])
+	if trimmed := trimJSONSpace(b); string(trimmed) == "null" {
+		*c = (*c)[:0]
+		return nil
+	}
+	if n, _ := topLevelCount(b); n > maxCustomFields {
+		return errCustomFieldCeiling
+	}
+	if !onlyObjects(b) {
+		return errCustomFieldNotObject
+	}
+	return json.Unmarshal(b, (*[]ytCustomField)(c))
 }

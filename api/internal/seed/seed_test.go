@@ -396,7 +396,7 @@ func TestForgeConnectionBoardColumnDatabaseErrorIsFatal(t *testing.T) {
 }
 
 // A project linked to an issue tracker before it was removed cannot be enabled
-// again (migration 00467). The seed skips it before any forge label write and
+// again (migration 00475). The seed skips it before any forge label write and
 // boot succeeds, instead of failing on every restart.
 func TestForgeConnectionSourceLockedRepoIsSkipped(t *testing.T) {
 	st := &fakeStore{user: store.User{ID: uuid.New(), Email: "admin@uzi.test"}, sourceLocked: true}

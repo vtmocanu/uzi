@@ -731,6 +731,9 @@ func run() error {
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
 	svc.SetReworkCanceller(wsvc)
+	// Wire the early-polling terminal-target cancel (#4616): the poller stops active ci_fix /
+	// mr_rework runs whose bound MR merged or closed (workersvc re-validates under row locks).
+	svc.SetTerminalTargetCanceller(wsvc)
 
 	// A failed run lands no notification row (PRD #1650 D2): the slacksvc failed-run DM
 	// (notifier_state.go) reaches Slack-linked users, and the run page plus the Runs list

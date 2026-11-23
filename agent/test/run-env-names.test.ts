@@ -22,7 +22,10 @@ const fixture = JSON.parse(
   denied_names: Rule[];
   denied_prefixes: Rule[];
   denied_suffixes: Rule[];
+  overlaps: { name: string; harness: string; decision: "allowed" | "denied"; reason: string }[];
 };
+
+const NAME_GRAMMAR = /^[A-Z_][A-Z0-9_]{0,127}$/;
 
 describe("run-env name rules match the shared fixture", () => {
   it("denied names, prefixes and suffixes are identical, in order, with invariant and note", () => {
@@ -64,8 +67,29 @@ describe("recorded harness versions track the pinned harnesses", () => {
 
 describe("runEnvNameViolation", () => {
   for (const { value: name } of fixture.denied_names) {
-    it(`denies name ${name}`, () => {
-      assert.notEqual(runEnvNameViolation(name), null);
+    // npm_config_cache fails the name grammar, which rejects it before any list is consulted.
+    if (!NAME_GRAMMAR.test(name)) continue;
+    it(`denies name ${name} by the exact-name rule`, () => {
+      const v = runEnvNameViolation(name);
+      assert.ok(v !== null && v.includes("(denied name)"), String(v));
+    });
+  }
+  for (const o of fixture.overlaps) {
+    it(`overlap ${o.name} (${o.harness}) is ${o.decision}`, () => {
+      const v = runEnvNameViolation(o.name);
+      assert.ok(o.reason.trim() !== "");
+      if (o.decision === "allowed") assert.equal(v, null);
+      else assert.ok(v !== null && !v.startsWith("must match "), `denied overlap must be refused by a reserved rule, got ${String(v)}`);
+    });
+  }
+  for (const name of ["SystemDrive", "Temp", "Tmp"]) {
+    it(`rejects ${name} by the name grammar`, () => {
+      assert.ok(runEnvNameViolation(name)?.startsWith("must match "));
+    });
+  }
+  for (const name of ["TSC_WATCHFILE", "TSC_WATCHDIRECTORY", "TSC_NONPOLLING_WATCHER"]) {
+    it(`allows ${name}`, () => {
+      assert.equal(runEnvNameViolation(name), null);
     });
   }
   for (const { value: prefix } of fixture.denied_prefixes) {

@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // SyncMRStates is the MR-close watcher (PRD #24 M3). The poller calls it once per
@@ -35,9 +36,43 @@ func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProje
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s.syncOneMRState(ctx, repoID, forgeProjectID, ch, tr, c)
+		s.syncOneMRState(ctx, repoID, forgeProjectID, ch, tr, mrWatchCandidate{
+			RunID: c.ID, IssueIID: c.IssueIid.Int64, MrIID: c.MrIid.Int64, MrState: c.MrState,
+		}, mrLane{missingRow: moveDeferred})
 	}
 	return nil
+}
+
+// mrWatchCandidate is the part of a watch candidate syncOneMRState reads, so the
+// board lane (ListMRWatchCandidates) and the linked issue-lane of the board-free
+// recorder (ListBoardFreeMRStateWatchCandidates) share one edge switch.
+type mrWatchCandidate struct {
+	RunID    uuid.UUID
+	IssueIID int64
+	MrIID    int64
+	MrState  pgtype.Text
+}
+
+// mrLane is how a lane differs in the card moves syncOneMRState asks for. The edge
+// logic itself is identical across lanes.
+type mrLane struct {
+	// missingRow is what a move reports when the issue has no cached row. The board
+	// lane defers (its candidates JOIN the issue cache, so a vanished row self-heals
+	// next tick); the linked board-free lane skips, because its candidate set does
+	// not require the row and an evicted issue's MR must not be polled forever.
+	missingRow moveOutcome
+	// noMove records the edge without moving the card: a superseded run of the issue
+	// (a newer issue-lane run owns the card) never moves it.
+	noMove bool
+}
+
+// laneMRMove runs one guarded card move for the candidate, or skips it on a lane that does
+// not move (the edge is consumed).
+func (s *Service) laneMRMove(ctx context.Context, lane mrLane, repoID uuid.UUID, forgeProjectID, issueIID int64, tr forge.IssueTracker, wantSource, target string) moveOutcome {
+	if lane.noMove {
+		return moveSkipped
+	}
+	return s.guardedMRMove(ctx, repoID, forgeProjectID, issueIID, tr, wantSource, target, lane.missingRow)
 }
 
 // syncOneMRState reconciles one candidate's MR state against the stored value.
@@ -56,11 +91,11 @@ func (s *Service) SyncMRStates(ctx context.Context, repoID uuid.UUID, forgeProje
 // read, or the move itself) mr_state is LEFT as-is, so the next poller tick
 // re-observes the same edge and retries — the poller cadence is the retry loop.
 // Consuming the edge on failure would re-create the stuck-card bug this PRD fixes.
-func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ch forge.CodeHost, tr forge.IssueTracker, c store.ListMRWatchCandidatesRow) {
-	mr, err := ch.GetMergeRequest(ctx, forgeProjectID, c.MrIid.Int64)
+func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, ch forge.CodeHost, tr forge.IssueTracker, c mrWatchCandidate, lane mrLane) {
+	mr, err := ch.GetMergeRequest(ctx, forgeProjectID, c.MrIID)
 	if err != nil {
 		// A read failure is not an edge: log-and-skip, leave mr_state for next tick.
-		slog.Warn("forgesvc: MR-state read failed", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", err)
+		slog.Warn("forgesvc: MR-state read failed", "repo", repoID, "issue", c.IssueIID, "mr", c.MrIID, "error", err)
 		return
 	}
 	observed := mr.State
@@ -73,7 +108,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 	// baseline; ignoring it instead lets a transient glitch self-heal
 	// (stored="opened" → glitch skipped → a later real "closed" still fires).
 	if !forge.IsKnownMRState(observed) {
-		slog.Warn("forgesvc: ignoring unknown MR state", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "state", observed)
+		slog.Warn("forgesvc: ignoring unknown MR state", "repo", repoID, "issue", c.IssueIID, "mr", c.MrIID, "state", observed)
 		return
 	}
 
@@ -82,7 +117,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// Acting on NULL→closed cannot distinguish "closed and stuck" from "closed
 		// yesterday, already triaged elsewhere", so pre-existing closed MRs at
 		// upgrade time never cause a wave of moves — a manual drag fixes those.
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.RunID, observed)
 		return
 	}
 	stored := c.MrState.String
@@ -103,27 +138,26 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// Attempt it every tick, ahead of the move. Re-attempts converge: once the
 		// run is terminal (server-side path) GetActiveMRReworkRunForMR returns no
 		// rows → no-op nil; while a live worker's run is still non-terminal a
-		// re-entry re-stamps stop_kind and re-enqueues a cancel verdict, which is
-		// harmless (the worker cancels on the first it consumes) and only occurs in
-		// the narrow window where the move keeps deferring before the worker acks.
-		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64)
+		// re-entry is also a no-op: the fenced cancel writes only when stop_kind IS
+		// NULL, and the first stamp already set it.
+		cancelErr := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIID, observed)
 		if cancelErr != nil {
-			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "error", cancelErr)
+			slog.Warn("forgesvc: cancel rework on MR close failed, will retry", "repo", repoID, "issue", c.IssueIID, "mr", c.MrIID, "error", cancelErr)
 		}
-		moved := s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, tr, board.ColumnHumanReview, board.ColumnInProgress)
+		moved := s.laneMRMove(ctx, lane, repoID, forgeProjectID, c.IssueIID, tr, board.ColumnHumanReview, board.ColumnInProgress)
 		if moved == moveDeferred || cancelErr != nil {
 			// forge failure / vanished card, or a cancel that must be retried: leave
 			// mr_state unadvanced so the next tick re-observes the edge and retries.
 			return
 		}
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.RunID, observed)
 	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
 		// reopen-edge (Decision 6): restore the card Human Review-ward,
 		// symmetrically, guarded from In Progress (where the close-edge left it).
-		if s.guardedMRMove(ctx, repoID, forgeProjectID, c.IssueIid.Int64, tr, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
+		if s.laneMRMove(ctx, lane, repoID, forgeProjectID, c.IssueIID, tr, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
 			return
 		}
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.RunID, observed)
 	default:
 		// A KNOWN non-edge transition: record, never move (this arm makes no board
 		// move). Unknown states never reach here — they are ignored before the
@@ -142,12 +176,12 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// `locked` was mid-merge. A `locked`->`opened` settle is a non-terminal
 		// transition and must NOT cancel — the rework gate stays open.
 		if observed == forge.MRStateMerged || observed == forge.MRStateClosed {
-			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIid.Int64); err != nil {
-				slog.Warn("forgesvc: cancel rework on MR terminal state failed, will retry", "repo", repoID, "issue", c.IssueIid.Int64, "mr", c.MrIid.Int64, "state", observed, "error", err)
+			if err := s.cancelReworkOnClosedMR(ctx, repoID, c.MrIID, observed); err != nil {
+				slog.Warn("forgesvc: cancel rework on MR terminal state failed, will retry", "repo", repoID, "issue", c.IssueIID, "mr", c.MrIID, "state", observed, "error", err)
 				return // leave mr_state unadvanced so the next tick retries
 			}
 		}
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.RunID, observed)
 	}
 }
 
@@ -155,11 +189,11 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 // (issue #853). Returns nil when no canceller is wired or no active rework exists.
 // A non-nil error means the caller must LEAVE mr_state unadvanced (don't consume the
 // edge) so the next poller tick retries — same contract as a forge-side failure.
-func (s *Service) cancelReworkOnClosedMR(ctx context.Context, repoID uuid.UUID, mrIID int64) error {
+func (s *Service) cancelReworkOnClosedMR(ctx context.Context, repoID uuid.UUID, mrIID int64, observed string) error {
 	if s.reworkCanceller == nil {
 		return nil
 	}
-	return s.reworkCanceller.CancelReworkForMR(ctx, repoID, mrIID, "MR merged/closed during rework")
+	return s.reworkCanceller.CancelReworkForMR(ctx, repoID, mrIID, workersvc.TerminalTargetStopReason(observed))
 }
 
 // moveOutcome is the result of a guarded MR-state move, distinguishing the two
@@ -185,15 +219,18 @@ const (
 // source-column guard makes the retry a no-op (the card already moved) — except
 // the narrow case where a human dragged the card back to wantSource in the crash
 // window, which then gets re-moved once; accepted (crash-window-sized exposure).
-func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProjectID, issueIID int64, tr forge.IssueTracker, wantSource, target string) moveOutcome {
+func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProjectID, issueIID int64, tr forge.IssueTracker, wantSource, target string, missingRow moveOutcome) moveOutcome {
 	issue, err := s.q.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repoID, ForgeIssueIid: issueIID})
 	if err != nil {
-		// No cached card (evicted/de-labeled since the candidate scan): leave the
-		// edge. If the issue is genuinely gone it stops being a candidate next tick
-		// (the query JOINs issues), so this does not retry forever.
-		if !errors.Is(err, pgx.ErrNoRows) {
-			slog.Warn("forgesvc: MR-state load issue", "repo", repoID, "issue", issueIID, "error", err)
+		// No cached card (evicted/de-labeled since the candidate scan): the caller's
+		// lane decides. The board lane leaves the edge: if the issue is genuinely gone
+		// it stops being a candidate next tick (the query JOINs issues), so this does
+		// not retry forever. The linked board-free lane skips (its query does not JOIN
+		// issues) so the MR state is still recorded and the run stops being polled.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return missingRow
 		}
+		slog.Warn("forgesvc: MR-state load issue", "repo", repoID, "issue", issueIID, "error", err)
 		return moveDeferred
 	}
 	// Never auto-move a closed issue: Closed is a terminal placement, not a
@@ -216,7 +253,7 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	current, _, _ := board.ResolveColumn(labels, issue.State, position)
+	current, _, _ := board.ResolveColumn(board.CardColumnLabels(isLinkedTracker(tr), labels, issue.IssueTrackerColumn.String), issue.State, position)
 	if current != wantSource {
 		// A human placed the card elsewhere since the run parked it — manual drags
 		// win (same baseline discipline as runlifecycle.apply). Consume the edge;
@@ -226,10 +263,26 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 
 	if _, err := s.AutoMove(ctx, tr, forgeProjectID, issue, cols, target); err != nil {
 		if IssueWriteSkippable(err) {
-			// A linked repo's card is never moved by uzi (writes arrive in M5) or its
-			// issue is gone: consume the edge so recordMRState still records the MR
-			// state, and never retry forever (PRD #4173 D10).
+			// The linked issue is gone or the write is not offered:
+			// consume the edge so recordMRState still records the MR state, and never
+			// retry forever (PRD #4173 D10).
 			slog.Info("forgesvc: MR-state move skipped for a linked repo", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
+			return moveSkipped
+		}
+		if LinkedIssueResolved(err) {
+			// A person resolved the issue in the issue tracker since the last sync, so the
+			// cache still shows it open. Their resolution wins: consume the edge without a
+			// move, as for a closed issue in the cache.
+			slog.Info("forgesvc: MR-state move skipped, the issue is resolved in the issue tracker", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
+			return moveSkipped
+		}
+		if ColumnMoveRefused(err) {
+			// The linked issue tracker refused the move before any request: the target
+			// column has no State mapped, the mapping is unset, or the State is not
+			// allowed. Unlike the run lifecycle, the MR watch does not replay it: the
+			// MR state is recorded and the card stays where it is (a manual drag
+			// fixes it). Accepted exception, PRD #4173 M5.
+			slog.Info("forgesvc: MR-state move refused by the issue tracker, edge consumed without a move", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
 			return moveSkipped
 		}
 		// Forge error: leave mr_state unadvanced so the next tick re-observes this
@@ -248,7 +301,8 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 // while ListBoardFreeMRStateWatchCandidates owns exactly the complement
 // (issue_iid IS NULL OR kind IN ('prompt','self_improve'), plus EVERY run of a repo linked
 // to an external issue tracker, which the board lane excludes — PRD #4173 M4) — a run
-// cannot satisfy both predicates at once. Best-effort: a write failure only means the same edge is
+// cannot satisfy both predicates at once. A linked repo's issue-lane runs are still
+// reconciled by syncOneMRState, through SyncBoardFreeMRStatesWithIssueSide (PRD #4173 M5). Best-effort: a write failure only means the same edge is
 // re-observed next tick, and the guards make the retry a no-op if the card has
 // already moved.
 func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, state string) {

@@ -38,6 +38,7 @@ import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "..
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
 import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
+import { claudeReviewModelError, mockTaskReviewEffort, mockTaskReviewEffortCells, mockTaskReviewModelCells } from "./taskReviewModels";
 import { mockDefaultClaudeModel, mockLeadTemplateEfforts } from "./agents";
 import { workersApi } from "./workers";
 import { mockSizeSpec } from "./workerSizes";
@@ -100,6 +101,12 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #3248: the Codex summary lane; null = inherit. Resolved per harness into
   // summary_models (mockSummaryModelCells) and edited on Run defaults.
   codex_summary_model: null,
+  // PRD #1570: the task-review lanes; null = the built-in. Resolved into task_review_models.
+  task_review_model: null,
+  codex_task_review_model: null,
+  // PRD #1570 M2: the task-review efforts; null = inherit the worker effort.
+  task_review_effort: null,
+  codex_task_review_effort: null,
   theme: null,
   // PRD #1167 "Lights on" m2: the four raw appearance overrides, all null = inherit
   // the instance defaults.
@@ -703,6 +710,7 @@ function mySettingsResponse(): { settings: UserSettings } {
     { claude: userSettings.summary_model, codex: userSettings.codex_summary_model },
     { claude: appSettings.summary_model, codex: appSettings.codex_summary_model },
   );
+  const task_review_models = mockTaskReviewModelCells(userSettings.task_review_model, userSettings.codex_task_review_model);
   const effort_settings = [
     mockEffortCell("claude", userSettings.default_effort),
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
@@ -710,6 +718,10 @@ function mySettingsResponse(): { settings: UserSettings } {
   const leadEfforts = state.session ? mockLeadTemplateEfforts() : { claude: null, codex: null };
   const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex")];
   const planning_efforts = [...mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort, "claude", leadEfforts.claude), ...mockPlanningEffortCells(userSettings.planning_codex_effort, userSettings.default_codex_effort, "codex", leadEfforts.codex)];
+  const task_review_efforts = mockTaskReviewEffortCells(
+    { claude: userSettings.task_review_effort, codex: userSettings.codex_task_review_effort },
+    { claude: effort_settings[0], codex: effort_settings[1] },
+  );
   // PRD #3522: the reserve lives on the user row (written by setUsageReserve), and the
   // server's GET /me/settings reads it from there, so project it from the session user.
   const me = state.session;
@@ -720,7 +732,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, effort_settings, planning_models, planning_efforts,
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts,
     planning_claude_model: userSettings.planning_claude_model ?? null,
     planning_claude_effort: userSettings.planning_claude_effort ?? null,
     planning_codex_model: userSettings.planning_codex_model ?? null,
@@ -1901,6 +1913,29 @@ export const settingsApi = {
         throw new ApiError(400, `codex_summary_model: "${trimmed}" is not a supported Codex model`);
       }
       next = { ...next, codex_summary_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.task_review_model !== undefined) {
+      // PRD #1570: blank clears to the built-in; the Claude lane refuses a Codex role id,
+      // mirroring the server's Claude-lane validator.
+      const trimmed = patch.task_review_model?.trim() ?? "";
+      const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+      if (modelError !== "") {
+        throw new ApiError(400, `task_review_model: ${modelError}`);
+      }
+      next = { ...next, task_review_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.codex_task_review_model !== undefined) {
+      const trimmed = patch.codex_task_review_model?.trim() ?? "";
+      if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
+        throw new ApiError(400, `codex_task_review_model: "${trimmed}" is not a supported Codex model`);
+      }
+      next = { ...next, codex_task_review_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.task_review_effort !== undefined) {
+      next = { ...next, task_review_effort: mockTaskReviewEffort(patch.task_review_effort, "task_review_effort") };
+    }
+    if (patch.codex_task_review_effort !== undefined) {
+      next = { ...next, codex_task_review_effort: mockTaskReviewEffort(patch.codex_task_review_effort, "codex_task_review_effort") };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

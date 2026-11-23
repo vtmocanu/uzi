@@ -6,8 +6,8 @@ import path from "node:path";
 import { query, type SDKUserMessage, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { buildSdkOptions } from "../src/claude-harness.js";
 
-export const CLAUDE_PHASE_SDK = "0.3.319";
-export const CLAUDE_PHASE_CLI = "2.1.319";
+export const CLAUDE_PHASE_SDK = "0.3.325";
+export const CLAUDE_PHASE_CLI = "2.1.325";
 
 /** Test/probe driver only. Nothing from the contributor's HOME or repository is loaded. */
 export class PhaseClaude {

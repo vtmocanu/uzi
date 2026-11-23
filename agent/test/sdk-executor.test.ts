@@ -10857,7 +10857,8 @@ describe("SdkExecutor settings barrier on a phase switch (PRD #3252 m4)", () => 
     };
     const { queryFn, turns } = barrierTurns(
       [[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]],
-      (o) => (o.model === "fable" ? { model: "claude-fable-5-1", effort: "high" } : { model: PLANNING_ID, effort: "high" }),
+      // The fake applies whatever the pin characterizes for fable, so the case tracks the table on a CLI bump.
+      (o) => (o.model === "fable" ? { model: CLAUDE_CANONICAL_MODELS.fable ?? "claude-fable-5-2", effort: "high" } : { model: PLANNING_ID, effort: "high" }),
     );
     const { ctx } = makeCtx({ agents: [lead, coder], config }, approve);
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, ...fast }).run(ctx);

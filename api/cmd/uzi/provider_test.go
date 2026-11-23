@@ -126,15 +126,23 @@ func TestProviderWarnsContextWindowOnClaudeNames(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, stderr %q", code, errOut)
 	}
-	if !strings.Contains(errOut, "warning: --model sonnet: context_window may not take effect for model names containing 'claude'") {
+	const wantTail = "the Claude CLI may ignore the context window (configured or uzi's 200000 default) for model names it recognizes as Anthropic models, such as claude-sonnet-4-5 (measured at Claude Code 2.1.325)"
+	if !strings.Contains(errOut, "warning: --model sonnet: "+wantTail) {
 		t.Errorf("create stderr lacks the sonnet warning: %q", errOut)
 	}
-	if strings.Contains(errOut, "--model haiku") || strings.Contains(errOut, "--model opus") {
-		t.Errorf("warned for a name without a window or without claude: %q", errOut)
+	// A claude-named model with no window warns too.
+	if !strings.Contains(errOut, "warning: --model opus: "+wantTail) {
+		t.Errorf("create stderr lacks the windowless opus warning: %q", errOut)
+	}
+	if strings.Contains(errOut, "--model haiku") {
+		t.Errorf("warned for a non-claude name: %q", errOut)
+	}
+	if strings.Contains(errOut, "us.anthropic.Claude") || strings.Contains(errOut, "claude-opus") {
+		t.Errorf("echoed an untrusted model name: %q", errOut)
 	}
 	fc = &uzicli.FakeClient{ProviderList: enabledList(providerFixture("corp")), ProviderResult: providerFixture("corp")}
 	_, errOut, code = runCLI(t, fakeEnv(fc), "provider", "edit", providerTestID, "--model", "haiku=claude-haiku-4-5:100000")
-	if code != uzicli.ExitOK || !strings.Contains(errOut, "warning: --model haiku: context_window may not take effect") {
+	if code != uzicli.ExitOK || !strings.Contains(errOut, "warning: --model haiku: the Claude CLI may ignore the context window") {
 		t.Errorf("edit: code %d stderr %q", code, errOut)
 	}
 	_, errOut, _ = runCLI(t, fakeEnv(fc), "provider", "edit", providerTestID, "--model", "haiku=corp-haiku:100000")

@@ -34,17 +34,34 @@ func (f *FakeClient) AdminListRunSummaries(context.Context) ([]apitypes.RunSumma
 	return summariesOf(f.AdminRuns), nil
 }
 
-// AdminListRunsDebug records the (user, since) filters and returns AdminRunsDebugResult
-// (AdminRunsDebugErr, then the blanket Err, win).
-func (f *FakeClient) AdminListRunsDebug(_ context.Context, userID, since string) (apitypes.AdminRunsDebugDTO, error) {
-	f.AdminListRunsDebugCalls = append(f.AdminListRunsDebugCalls, AdminListRunsDebugCall{UserID: userID, Since: since})
+// AdminListRunsDebug records the (user, since, statuses) filters and returns AdminRunsDebugResult
+// (AdminRunsDebugErr, then the blanket Err, win). Like the HTTP client, it refuses a result that
+// does not prove the requested status filter was applied.
+func (f *FakeClient) AdminListRunsDebug(_ context.Context, userID, since string, statuses []string) (apitypes.AdminRunsDebugDTO, error) {
+	f.AdminListRunsDebugCalls = append(f.AdminListRunsDebugCalls, AdminListRunsDebugCall{UserID: userID, Since: since, Statuses: statuses})
 	if f.AdminRunsDebugErr != nil {
 		return apitypes.AdminRunsDebugDTO{}, f.AdminRunsDebugErr
 	}
 	if f.Err != nil {
 		return apitypes.AdminRunsDebugDTO{}, f.Err
 	}
+	if err := CheckAdminRunsDebugStatusFilter(f.AdminRunsDebugResult, statuses); err != nil {
+		return apitypes.AdminRunsDebugDTO{}, err
+	}
 	return f.AdminRunsDebugResult, nil
+}
+
+// AdminRunWriters records its arguments and returns AdminRunWritersOut (AdminRunWritersErr,
+// then the blanket Err, win).
+func (f *FakeClient) AdminRunWriters(_ context.Context, repoID, branch string, mrIID int64) (apitypes.RunWritersDTO, error) {
+	f.AdminRunWritersCalls = append(f.AdminRunWritersCalls, AdminRunWritersCall{RepoID: repoID, Branch: branch, MRIID: mrIID})
+	if f.AdminRunWritersErr != nil {
+		return apitypes.RunWritersDTO{}, f.AdminRunWritersErr
+	}
+	if f.Err != nil {
+		return apitypes.RunWritersDTO{}, f.Err
+	}
+	return f.AdminRunWritersOut, nil
 }
 
 func (f *FakeClient) AdminHealth(context.Context) (apitypes.HealthDocDTO, error) {

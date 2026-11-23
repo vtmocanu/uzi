@@ -241,6 +241,26 @@ func (q *Queries) ClearBoardOrderExcept(ctx context.Context, arg ClearBoardOrder
 	return err
 }
 
+const clearIssueTrackerColumnsNotIn = `-- name: ClearIssueTrackerColumnsNotIn :exec
+UPDATE issues
+SET issue_tracker_column = NULL
+WHERE repo_id = $1 AND issue_tracker_column <> ALL($2::text[])
+`
+
+type ClearIssueTrackerColumnsNotInParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	Keep   []string  `json:"keep"`
+}
+
+// Clears the cached column of every issue of the repo whose column is no longer one of
+// the board's columns (PRD #4173 M5), so a removed column puts its cards back in the Open
+// lane instead of leaving a column no board shows. keep is never NULL (NULL would match
+// nothing): an empty array clears every cached column.
+func (q *Queries) ClearIssueTrackerColumnsNotIn(ctx context.Context, arg ClearIssueTrackerColumnsNotInParams) error {
+	_, err := q.db.Exec(ctx, clearIssueTrackerColumnsNotIn, arg.RepoID, arg.Keep)
+	return err
+}
+
 const clearRepoGuardrailOverride = `-- name: ClearRepoGuardrailOverride :one
 UPDATE repos
 SET guardrail_override_reason = NULL,
@@ -692,7 +712,7 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 }
 
 const getIssueByIID = `-- name: GetIssueByIID :one
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
 `
 
 type GetIssueByIIDParams struct {
@@ -718,6 +738,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -1072,6 +1093,70 @@ func (q *Queries) InsertDefaultBoardColumns(ctx context.Context, arg InsertDefau
 	return err
 }
 
+const listActiveMRTargetRuns = `-- name: ListActiveMRTargetRuns :many
+SELECT id, kind, status, worker_id, claim_generation, pipeline_ref,
+       (CASE kind WHEN 'ci_fix' THEN ci_fix_mr_iid ELSE mr_iid END)::bigint AS target_mr_iid
+FROM runs
+WHERE repo_id = $1::uuid
+  AND kind IN ('ci_fix', 'mr_rework')
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND ((kind = 'ci_fix' AND ci_fix_mr_iid IS NOT NULL)
+       OR (kind = 'mr_rework' AND mr_iid IS NOT NULL))
+  AND id > $2::uuid
+ORDER BY id
+LIMIT 33
+`
+
+type ListActiveMRTargetRunsParams struct {
+	RepoID  uuid.UUID `json:"repo_id"`
+	AfterID uuid.UUID `json:"after_id"`
+}
+
+type ListActiveMRTargetRunsRow struct {
+	ID              uuid.UUID   `json:"id"`
+	Kind            string      `json:"kind"`
+	Status          string      `json:"status"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+	PipelineRef     pgtype.Text `json:"pipeline_ref"`
+	TargetMrIid     int64       `json:"target_mr_iid"`
+}
+
+// Issue #4616 early-polling enumeration: the active ci_fix / mr_rework runs of one repo
+// that carry a verified MR target, so the poller can cancel them once that MR merges or
+// closes. repo_id leads uq_runs_one_active_branch_ref (migration 00167) and
+// idx_runs_repo (00020), so the scan is repo-scoped through an index. The
+// caller takes 32 rows and keeps a keyset cursor (id > @after_id); LIMIT 33 lets it tell
+// whether another page exists. An unbound ci_fix (NULL ci_fix_mr_iid) is deliberately
+// excluded: there is no branch-to-MR inference here.
+func (q *Queries) ListActiveMRTargetRuns(ctx context.Context, arg ListActiveMRTargetRunsParams) ([]ListActiveMRTargetRunsRow, error) {
+	rows, err := q.db.Query(ctx, listActiveMRTargetRuns, arg.RepoID, arg.AfterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListActiveMRTargetRunsRow{}
+	for rows.Next() {
+		var i ListActiveMRTargetRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Status,
+			&i.WorkerID,
+			&i.ClaimGeneration,
+			&i.PipelineRef,
+			&i.TargetMrIid,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAllForgeConnections = `-- name: ListAllForgeConnections :many
 SELECT id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext, created_at, last_verified_at, privilege_report, privilege_checked_at, privilege_status, human_username FROM forge_connections ORDER BY created_at ASC
 `
@@ -1144,7 +1229,12 @@ func (q *Queries) ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]Boa
 }
 
 const listBoardFreeMRStateWatchCandidates = `-- name: ListBoardFreeMRStateWatchCandidates :many
-SELECT id, branch, mr_iid, mr_state
+SELECT id, branch, mr_iid, mr_state, issue_iid, kind,
+       (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
+        OR NOT EXISTS (SELECT 1 FROM runs nl
+                       WHERE nl.repo_id = runs.repo_id AND nl.issue_iid = runs.issue_iid
+                         AND nl.kind NOT IN ('prompt', 'self_improve')
+                         AND nl.created_at > runs.created_at))::boolean AS is_latest
 FROM runs
 WHERE repo_id = $1::uuid
   AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
@@ -1167,10 +1257,13 @@ LIMIT 100
 `
 
 type ListBoardFreeMRStateWatchCandidatesRow struct {
-	ID      uuid.UUID   `json:"id"`
-	Branch  pgtype.Text `json:"branch"`
-	MrIid   pgtype.Int8 `json:"mr_iid"`
-	MrState pgtype.Text `json:"mr_state"`
+	ID       uuid.UUID   `json:"id"`
+	Branch   pgtype.Text `json:"branch"`
+	MrIid    pgtype.Int8 `json:"mr_iid"`
+	MrState  pgtype.Text `json:"mr_state"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
+	Kind     string      `json:"kind"`
+	IsLatest bool        `json:"is_latest"`
 }
 
 // Board-FREE MR-state watch for every issue-less MR-bearing run — PRD #908, widened in
@@ -1190,15 +1283,21 @@ type ListBoardFreeMRStateWatchCandidatesRow struct {
 // ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
 // external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
 // belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
-// rework with no board card; an unlinked repo matches exactly as before. On a linked repo the
+// rework, and the issue's latest run moves the linked card on a close or reopen (M5); an unlinked repo matches exactly as before. On a linked repo the
 // lane also keeps watching an issue-lane run recorded mr_state='closed', so a reopen is recorded
 // back to 'opened' (the board lane's Lane A reopen-edge watch, Decision 10), bounded as Lane A is:
 // only the issue's LATEST run (no newer non-scheduled run of the issue, so a superseded rework
 // MR is not watched) and only while the cached issue exists AND is opened (an evicted or closed
 // issue is not polled forever). Live rows (NULL/opened/locked mr_state) sort ahead of closed
 // reopen-watch rows so the latter can never starve them under the LIMIT; among live rows the
-// order is created_at DESC as before, so an unlinked repo's order is unchanged. Keep this rationale
-// ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
+// order is created_at DESC as before, so an unlinked repo's order is unchanged. The output also
+// carries issue_iid, kind and is_latest (PRD #4173 M5): the caller tells an issue-lane run from a
+// scheduled or issue-less one by the first two, and is_latest is true iff no newer run of the same
+// repo and issue_iid with kind NOT IN ('prompt','self_improve') exists, regardless of its status
+// (the board lane's DISTINCT ON (issue_iid) ORDER BY created_at DESC semantics: every status
+// counts), so a linked card moves only for its issue's latest run. They add no filter and change
+// no ordering. Keep this rationale ABOVE the statement — a comment trailing after the `;` is
+// grabbed by sqlc as the NEXT query's doc.
 func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListBoardFreeMRStateWatchCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listBoardFreeMRStateWatchCandidates, repoID)
 	if err != nil {
@@ -1213,6 +1312,9 @@ func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoI
 			&i.Branch,
 			&i.MrIid,
 			&i.MrState,
+			&i.IssueIid,
+			&i.Kind,
+			&i.IsLatest,
 		); err != nil {
 			return nil, err
 		}
@@ -1509,7 +1611,7 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 }
 
 const listIssuesByRepo = `-- name: ListIssuesByRepo :many
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key FROM issues WHERE repo_id = $1
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column FROM issues WHERE repo_id = $1
 ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC
 `
 
@@ -1556,6 +1658,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 			&i.BoardPosition,
 			&i.AssigneeIds,
 			&i.IssueKey,
+			&i.IssueTrackerColumn,
 		); err != nil {
 			return nil, err
 		}
@@ -1751,9 +1854,9 @@ JOIN issues i ON i.repo_id = $1 AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
   -- A repo linked to an external issue tracker (PRD #4173 M4) is owned by
-  -- ListBoardFreeMRStateWatchCandidates entirely: uzi moves no card there (writes arrive
-  -- in M5), so its MR state must not depend on the issue cache or a column label. Excluding
-  -- the repo here keeps the two lanes disjoint.
+  -- ListBoardFreeMRStateWatchCandidates entirely: that lane moves the card through the
+  -- issue tracker (PRD #4173 M5), so its MR state must not depend on the issue cache or a
+  -- column label. Excluding the repo here keeps the two lanes disjoint.
   AND NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1 AND lr.issue_tracker_connection_id IS NOT NULL)
   AND (
     -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
@@ -2047,7 +2150,7 @@ SET labels = COALESCE((SELECT jsonb_agg(value ORDER BY ordinal)
     FROM jsonb_array_elements(labels) WITH ORDINALITY AS item(value, ordinal)
     WHERE value <> to_jsonb($1::text)), '[]'::jsonb)
 WHERE repo_id = $2 AND forge_issue_iid = $3
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type RemoveCachedIssueLabelParams struct {
@@ -2076,6 +2179,7 @@ func (q *Queries) RemoveCachedIssueLabel(ctx context.Context, arg RemoveCachedIs
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -2084,7 +2188,7 @@ const reopenIssueState = `-- name: ReopenIssueState :one
 UPDATE issues
 SET state = 'opened', board_position = NULL, synced_at = now()
 WHERE repo_id = $1 AND forge_issue_iid = $2
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type ReopenIssueStateParams struct {
@@ -2118,6 +2222,7 @@ func (q *Queries) ReopenIssueState(ctx context.Context, arg ReopenIssueStatePara
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -2204,6 +2309,47 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 		&i.PrivilegeCheckedAt,
 		&i.PrivilegeStatus,
 		&i.HumanUsername,
+	)
+	return i, err
+}
+
+const setIssueTrackerColumn = `-- name: SetIssueTrackerColumn :one
+UPDATE issues
+SET issue_tracker_column = NULLIF($1::text, ''), synced_at = now()
+WHERE repo_id = $2 AND forge_issue_iid = $3
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
+`
+
+type SetIssueTrackerColumnParams struct {
+	IssueTrackerColumn string    `json:"issue_tracker_column"`
+	RepoID             uuid.UUID `json:"repo_id"`
+	ForgeIssueIid      int64     `json:"forge_issue_iid"`
+}
+
+// The cached board column of a linked card after a successful move (PRD #4173 M5):
+// writes ONLY issue_tracker_column (an empty column is the Open lane and is stored as
+// NULL, because the table's CHECK refuses an empty string) and synced_at, never state, labels or
+// board_position. Forge-first like every cache write here: the caller has already moved
+// the issue in the issue tracker. RETURNING * for the single-card re-render.
+func (q *Queries) SetIssueTrackerColumn(ctx context.Context, arg SetIssueTrackerColumnParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, setIssueTrackerColumn, arg.IssueTrackerColumn, arg.RepoID, arg.ForgeIssueIid)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.ForgeIssueIid,
+		&i.Title,
+		&i.State,
+		&i.Labels,
+		&i.WebUrl,
+		&i.Author,
+		&i.HasPrdLink,
+		&i.ForgeUpdatedAt,
+		&i.SyncedAt,
+		&i.BoardPosition,
+		&i.AssigneeIds,
+		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -3242,7 +3388,7 @@ const updateIssueState = `-- name: UpdateIssueState :one
 UPDATE issues
 SET state = $3, synced_at = now()
 WHERE repo_id = $1 AND forge_issue_iid = $2
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type UpdateIssueStateParams struct {
@@ -3278,6 +3424,7 @@ func (q *Queries) UpdateIssueState(ctx context.Context, arg UpdateIssueStatePara
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -3384,7 +3531,7 @@ SET title            = EXCLUDED.title,
     -- A forge-only writer passes NULL; it must not erase the key of a linked row.
     issue_key        = COALESCE(EXCLUDED.issue_key, issues.issue_key),
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type UpsertIssueParams struct {
@@ -3442,6 +3589,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -3449,8 +3597,8 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 const upsertIssueIfChanged = `-- name: UpsertIssueIfChanged :exec
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, issue_key, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+    has_prd_link, forge_updated_at, issue_key, issue_tracker_column, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -3461,33 +3609,38 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     issue_key        = EXCLUDED.issue_key,
+    issue_tracker_column = EXCLUDED.issue_tracker_column,
     synced_at        = now()
 WHERE (issues.title, issues.state, issues.labels, issues.assignee_ids, issues.web_url, issues.author,
-       issues.has_prd_link, issues.forge_updated_at, issues.issue_key)
+       issues.has_prd_link, issues.forge_updated_at, issues.issue_key, issues.issue_tracker_column)
       IS DISTINCT FROM
       (EXCLUDED.title, EXCLUDED.state, EXCLUDED.labels, EXCLUDED.assignee_ids, EXCLUDED.web_url, EXCLUDED.author,
-       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key)
+       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key, EXCLUDED.issue_tracker_column)
 `
 
 type UpsertIssueIfChangedParams struct {
-	RepoID         uuid.UUID          `json:"repo_id"`
-	ForgeIssueIid  int64              `json:"forge_issue_iid"`
-	Title          string             `json:"title"`
-	State          string             `json:"state"`
-	Labels         []byte             `json:"labels"`
-	AssigneeIds    []byte             `json:"assignee_ids"`
-	WebUrl         string             `json:"web_url"`
-	Author         pgtype.Text        `json:"author"`
-	HasPrdLink     bool               `json:"has_prd_link"`
-	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
-	IssueKey       pgtype.Text        `json:"issue_key"`
+	RepoID             uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid      int64              `json:"forge_issue_iid"`
+	Title              string             `json:"title"`
+	State              string             `json:"state"`
+	Labels             []byte             `json:"labels"`
+	AssigneeIds        []byte             `json:"assignee_ids"`
+	WebUrl             string             `json:"web_url"`
+	Author             pgtype.Text        `json:"author"`
+	HasPrdLink         bool               `json:"has_prd_link"`
+	ForgeUpdatedAt     pgtype.Timestamptz `json:"forge_updated_at"`
+	IssueKey           pgtype.Text        `json:"issue_key"`
+	IssueTrackerColumn pgtype.Text        `json:"issue_tracker_column"`
 }
 
 // The linked issue sync's write (PRD #4173): the same columns as UpsertIssue (and the same
 // board_position omission, with the same reason), but a row whose cached values are all
 // unchanged is left untouched, so a tick that finds nothing new rewrites nothing and
 // issues.synced_at is not refreshed by it. Nothing reads issues.synced_at. issue_key is
-// compared as written (the linked sync always passes it).
+// compared as written (the linked sync always passes it). It is also the one upsert that
+// writes issues.issue_tracker_column (PRD #4173 M5), the card's board column read from its
+// issue tracker State: NULL is the Open lane, and the column is part of the change check so
+// a changed State mapping is cached again. UpsertIssue and UpsertIssueLabels never touch it.
 func (q *Queries) UpsertIssueIfChanged(ctx context.Context, arg UpsertIssueIfChangedParams) error {
 	_, err := q.db.Exec(ctx, upsertIssueIfChanged,
 		arg.RepoID,
@@ -3501,6 +3654,7 @@ func (q *Queries) UpsertIssueIfChanged(ctx context.Context, arg UpsertIssueIfCha
 		arg.HasPrdLink,
 		arg.ForgeUpdatedAt,
 		arg.IssueKey,
+		arg.IssueTrackerColumn,
 	)
 	return err
 }
@@ -3536,7 +3690,7 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type UpsertIssueLabelsParams struct {
@@ -3603,6 +3757,7 @@ func (q *Queries) UpsertIssueLabels(ctx context.Context, arg UpsertIssueLabelsPa
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
