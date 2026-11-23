@@ -406,7 +406,7 @@ func TestSharedScopeRecipientQueriesLiveDB(t *testing.T) {
 	if got := scalar[string](ctx, t, pool, `SELECT claude_provider_scope_id::text FROM users WHERE id = $1`, b); got != nilScope {
 		t.Errorf("selecting a Codex source changed the Claude scope to %s", got)
 	}
-	// Run names resolve for a shared binding and never for a foreign private one.
+	// With no runs there are no run names to resolve (the shared-binding case is covered with the run lane).
 	names, err := q.ListRunProviderNames(ctx, nil)
 	if err != nil || len(names) != 0 {
 		t.Errorf("ListRunProviderNames(no runs) = %v (%v)", names, err)
@@ -704,6 +704,24 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	wantViolation(t, "the old image selecting a Claude source", err, "23514", "users_claude_provider_scope_check")
 	_, err = pool.Exec(ctx, baseSetUserProviderSource, "claude", pgtype.UUID{}, a)
 	wantViolation(t, "the old image clearing a selected Claude source", err, "23514", "users_claude_provider_scope_check")
+
+	// With a personal Claude source already selected, the old image switching to another of the same
+	// user's personal providers keeps the scope and succeeds; switching away from a SHARED selection
+	// would leave the shared scope behind and is refused.
+	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(pk.ID), a); err != nil {
+		t.Errorf("the old image switching between personal Claude providers: %v", err)
+	}
+	sh, err := q.InsertSharedModelProvider(ctx, "rollback-shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, _ := newProductUser(ctx, t, pool)
+	sp := newProvider(ctx, t, q, sel, "sel-gw")
+	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: sel, Engine: "claude", ProviderID: pgUUID(sh.ID)}); err != nil {
+		t.Fatalf("selecting the shared definition: %v", err)
+	}
+	_, err = pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(sp.ID), sel)
+	wantViolation(t, "the old image switching away from a shared selection", err, "23503", "users_claude_provider_fkey")
 
 	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "codex", pgUUID(cx.ID), a); err != nil {
 		t.Errorf("the old image selecting a Codex source: %v", err)

@@ -45,6 +45,12 @@ func (s *chatStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDFor
 func (s *chatStore) CreateChatRun(_ context.Context, arg store.CreateChatRunParams) (store.Run, error) {
 	return store.Run{ID: uuid.New(), UserID: arg.UserID, Kind: runkind.Chat, Status: "queued", IssueTitle: arg.IssueTitle}, nil
 }
+
+// GetUserProviderSource reports no selected provider source, so CreateChatRun takes the
+// unbound vendor path these tests exercise.
+func (s *chatStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}
 func (s *chatStore) CountChatFollowUps(context.Context, uuid.UUID) (int64, error) {
 	return s.followUps, nil
 }
