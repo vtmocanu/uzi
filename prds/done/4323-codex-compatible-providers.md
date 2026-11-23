@@ -6,8 +6,8 @@
 **Dependencies**: Entry prerequisites satisfied at edf9e0b18594149ef7aae72c8581e227c9a4eb93. #4320 implementation merged in #4464; #4321 completed in #4493; #4505 activation and output/publication protections merged in #4551; #4509 native-authority hardening merged in #4526. #4505 remains open as a tracking issue, but its implementation merge gate is satisfied. #4473 is separate maintainer-owned real-gateway/hosted acceptance and is not an implementation prerequisite. Re-read the merged code and ADRs when starting. The 2026-11-19 owner decision accepts the measured redirect risk; it does not waive ADR-1106 execution isolation or key protections.
 **Follow-up**: Codex providers on judge and plan/code cross-check, PRD prds/4574-codex-providers-judge-cross-check.md (#4574), blocked by this PRD.
 **Disposition**: The historical 2026-11-19 owner dispatch grant remains recorded; no on-deck sweep enrollment.
-**Execution status (owner amendment, 2026-11-22)**: Implementation continues. Model-response HTTP/SSE ingestion is accepted unbounded for bound providers, without a runtime patch, relay or pin change. This supersedes only the earlier bounds blocker and oversized-enforcement requirements; it is not proof those requirements passed. Capability advertisement was gated on completed delivery and all remaining mandatory proofs under Owner revision 3.
-**Status**: Complete (2026-11-23). Delivery, proofs and activation are recorded under "Delivery record (2026-11-23)" below. Hosted acceptance #4473 is pending, not verified, and per Landing obligations does not block merge.
+**Execution status (owner amendment, 2026-11-22)**: Implementation continued. Model-response HTTP/SSE ingestion is accepted unbounded for bound providers, without a runtime patch, relay or pin change. This supersedes only the earlier bounds blocker and oversized-enforcement requirements; it is not proof those requirements passed. Capability advertisement was gated on completed delivery and all remaining mandatory proofs under Owner revision 3.
+**Status**: Complete (2026-11-23). Delivery, proofs and activation are recorded under "Delivery record (2026-11-23)" below. Hosted acceptance #4473 is pending, not verified, and per Landing obligations does not block merge. The before/after M4 step-time comparison (Testing decisions) is UNMET: no valid pre-agent-change baseline can be produced on the worker (see the delivery record).
 
 **Terms of use**: Follow the umbrella's maintainer terms-of-use note before shipping. Providers accept API/cloud/gateway keys only; `codex_auth` subscription credentials are never forwarded. The OpenAI terms re-check is a maintainer obligation, not an offline worker investigation.
 
@@ -172,6 +172,17 @@ The final run integrated main at `776af85a1` with a merge, not a rebase. It took
 - **Client admission:** the client admits a Codex provider claim only when this worker registered `codex_provider_v1`, `codex_harness_v1` and `codex_runtime_v2`.
 - **New M4 row:** drives the production advice-harness factory and the summary runner against the pinned app-server and the authenticated fake. It asserts Bearer-only bound key, the mapped model and `model_context_window`, redaction with a clean control, and zero vendor release, refresh or admission. Supervisor spawn, provisioning and shared-directory ownership are simulated, as in the root row.
 
+**Evidence for clauses that the test names above do not spell out.**
+- **Cold resume at the frozen binding:** the private-CA fixture row "private CA completes Responses" (`e2e/codex-private-ca/fixture.test.ts`) resumes the persisted runtime session in a fresh root. It asserts that the old root stays absent and that the resumed request reaches the same bound destination. Reclaim and actual-claim LiveDB tests cover the frozen columns.
+- **Codex-only sinks:** covered by tests in `agent/test/codex-executor.test.ts` added with commits:
+  - `d67aadf96`: runtime model reports.
+  - `a3655e961` and `a5c56bb18`: catalog-default reporting.
+  - `fe6370ad7`: failure reports and app-server stderr.
+  - `2eb686102`: root RPC output boundaries.
+
+  The phase-switch hold text is covered by `agent/test/runner-phase-switch-hold.test.ts`.
+- **Web save/test/select:** Vitest evidence only (`web/src/components/Providers.test.tsx` and the mock API tests). The Providers browser case is pending exact-head CI.
+
 **Correction to the rollout paragraph.** Health reports the generic "no worker that supports model providers is online" reason; it does not name the specific missing capability.
 
 **In-run checks at the final code revision.**
@@ -193,7 +204,7 @@ The native existing-root creator test noted above is a pre-existing vendor-path 
 
 ## Decision Log
 
-- **2026-11-23: Inherit main's Codex 0.169.0 pin (owner answer).** "No runtime patch, relay or pin change" means this feature adds none. It does not freeze the pin against main's independent bump (#4605). Maintainer-verified at tag `rust-v0.169.0` (commit `d32063f96c2dff1dc96af839b3952abb6acfeda4`): `codex-rs/codex-client/src/provider.rs:87` is still `response_body_limit_bytes: None`, and the bounded stream exists only for callers that set a limit (`codex-rs/http-client/src/transport.rs:241`, `:255`). The accepted unbounded-ingestion residual applies unchanged and is not bounded; the revisit trigger is #4600. The static request/HTTP/SSE inventory above remains 0.167.0 historical evidence. Every executable provider row was re-proven at 0.169.0.
+- **2026-11-23: Inherit main's Codex 0.169.0 pin (owner answer).** "No runtime patch, relay or pin change" means this feature adds none. It does not freeze the pin against main's independent bump (#4605). Maintainer-verified at tag `rust-v0.169.0` (commit `d32063f96c2dff1dc96af839b3952abb6acfeda4`): `codex-rs/codex-client/src/provider.rs:87` is still `response_body_limit_bytes: None`, and the bounded stream exists only for callers that set a limit (`codex-rs/http-client/src/transport.rs:241`, `:255`, as cited by the maintainer; a fact-check at the same tag reads `:226` and `:255` as the limit-gated branches and `:241` as the unbounded `None` arm). The accepted unbounded-ingestion residual applies unchanged and is not bounded; the revisit trigger is #4600. The static request/HTTP/SSE inventory above remains 0.167.0 historical evidence. Every executable provider row was re-proven at 0.169.0.
 - **2026-11-23: Model sources on provider-bound Codex runs.** Only `run_override` and `schedule_pin` are explicit. They resolve through their own key, or else fail with `provider_model_unmapped` before any credential is sent. The planning default and task-review model are uzi-selected: own key, else `default`. They cause no create-time refusal and no custom-model capability refusal. `codex_phase_models_v1` is still required when a planning value applies. Effort passes through unchanged. Main's observed-model verification on resume is kept for provider runs, with no exemption.
 - **2026-11-23: Resource amendment (owner).** One serial gate owner and command-scoped `GOFLAGS=-p=2 GOMAXPROCS=4`. The individual API static targets replace `check:api`. `deadcode:api` is pending the landing maintainer on the exact PR head. Full `test:api` and the unfiltered LiveDB sweep stay in exact-head PR CI.
 - **2026-11-23: Provisional migration numbers.** 00511–00518 sit above main's 00510. At landing, re-read main's migration head and latest placement body; if either moved, renumber all eight together and rerun the numbering, additivity and Up/Down parity checks.
