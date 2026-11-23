@@ -2018,15 +2018,15 @@ PRD at `prds/done/3264-cli-model-settings.md` (milestones M1 to M3 shipped).
 
 ## Feature #3263 — Settings Models tab
 
-PRD at `prds/3263-settings-models-tab.md`.
+PRD at `prds/done/3263-settings-models-tab.md`.
 
 - Settings has a Models tab between Appearance and Run defaults. (AI-synced 2026-11-23)
 - One grid holds default harness, worker model/effort, planning model/effort, judge routing and models, summary models, task-review models/efforts and Plan/Code cross-check model/effort per family. Summary routing is read-only "Same as the run" (#4156). (AI-synced 2026-11-23)
-- One sticky Save commits every change in one transaction; an invalid cell or failed write leaves everything unchanged and shows the error on the cell. (AI-synced 2026-11-23)
+- One sticky Save commits every change in one transaction; an invalid cell or failed write leaves everything unchanged; field errors show on their cell and a failed write in the save bar. (AI-synced 2026-11-23)
 - Cells show the saved effective value and source from the server; when predictions fail they read Unavailable. (AI-synced 2026-11-23)
 - Unsaved changes block in-app navigation (Stay/Discard) and prompt on reload or close. (AI-synced 2026-11-23)
 - An uncertain save (commit unknown, or saved but unreadable) never offers discard as if nothing was saved. (AI-synced 2026-11-23)
-- Run defaults keeps only behavior settings and links to Models. (AI-synced 2026-11-23)
+- Run defaults keeps only behavior settings (plus the judge token binding and a read-only judge routing/model summary) and links to Models. (AI-synced 2026-11-23)
 
 ## Feature #4510: Sidebar icon animations
 

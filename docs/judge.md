@@ -189,10 +189,11 @@ Where to set each lane:
 - **Your Claude judge model:** **Settings → Models → Helper runs → Judge
   model**, the Claude column; leave it on its **Default** option to use the
   instance value.
-- **Your Codex judge model:** the same row's Codex column, shown only if you can
-  run Codex. A judge model for a harness the judge never runs on (because of
+- **Your Codex judge model:** the same row's Codex column. It is always shown;
+  without a usable Codex credential it notes that you can still save the choice.
+  A judge model for a harness the judge never runs on (because of
   **Judge runs on**) is dimmed with a **Not used** reason. The page's one
-  **Save** bar saves every lane you changed along with the rest of the page.
+  **Save changes** bar saves every lane you changed along with the rest of the page.
   Under each field, **Saved effective value** names what a judge run would
   resolve to and where that came from (**Unavailable** if the server could not
   read it).
@@ -477,8 +478,8 @@ stays live and reads **Run judge** (or **Re-run judge**).
 When the automatic judge is skipped because the judge's harness has no usable
 credential, the run page says so instead of showing an empty panel: it names
 the reason (no usable credential for the harness, the credential is disabled,
-or no pooled Codex account was available), links to **Run defaults**, which shows your judge routing and links on to
-**Models**, where [Judge runs on](#judge-runs-on) is chosen (the Claude judge token is chosen in Run defaults; Codex
+or no pooled Codex account was available), links to **Models**, where
+[Judge runs on](#judge-runs-on) is chosen (the Claude judge token is chosen in Run defaults; Codex
 accounts are linked and pooled in Settings), and offers **Run judge**. The skip is recorded only after every other check has passed, so
 a run the judge would never review (see [Which runs are judged](#which-runs-are-judged))
 shows nothing.

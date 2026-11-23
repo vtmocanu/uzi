@@ -1514,6 +1514,61 @@ describe("Run defaults — judge summary (PRD #3263 M3)", () => {
     ]);
   });
 
+  // Before the credential facts and saved settings load (and when that load fails) the
+  // pre-load defaults would read as "no usable token" and "no saved default harness": the
+  // summary and overflow make neither claim.
+  const FALSE_CLAIMS = [
+    /No usable Anthropic token/,
+    /No usable Codex credential/,
+    /has no usable credential/,
+    /Overflow applies only when a Claude or Codex default harness is saved in Models/,
+  ];
+  const overflowSwitch = () => screen.getByRole("switch", { name: /Overflow to the other harness/ });
+  const expectNoFalseClaims = () => {
+    for (const claim of FALSE_CLAIMS) expect(screen.queryByText(claim), String(claim)).toBeNull();
+    expect(summary().querySelector("dl")).toBeNull();
+    expect(overflowSwitch().getAttribute("aria-disabled")).toBe("true");
+  };
+
+  it("shows a loading skeleton and no credential or overflow claim while settings load", async () => {
+    mockApi.listSecrets.mockReturnValue(new Promise(() => {}));
+    mockApi.getMySettings.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    expect(summary().querySelector("[aria-busy='true']")).not.toBeNull();
+    expect(summary().querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
+    expectNoFalseClaims();
+    expect(summary().textContent).not.toContain("Unavailable");
+    fireEvent.click(overflowSwitch());
+    expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
+  });
+
+  it("says Unavailable, and makes no credential or overflow claim, when settings fail to load", async () => {
+    mockApi.listSecrets.mockRejectedValue(new ApiError(500, "secrets unavailable"));
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex"));
+    renderPage();
+    await screen.findByText("secrets unavailable");
+    expect(summary().textContent).toContain("Unavailable until your settings load");
+    expect(summary().querySelectorAll(".animate-pulse")).toHaveLength(0);
+    expectNoFalseClaims();
+    const note = document.getElementById("harness-overflow-unavailable");
+    expect(note?.textContent).toContain("Unavailable until your settings load");
+    expect(overflowSwitch().getAttribute("aria-describedby")?.split(" ")).toContain("harness-overflow-unavailable");
+    fireEvent.click(overflowSwitch());
+    expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
+  });
+
+  it("wraps each dt/dd pair in its own group", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    renderPage();
+    await waitFor(() => expect(pairs()).toHaveLength(5));
+    const groups = Array.from(summary().querySelector("dl")!.children);
+    expect(groups).toHaveLength(5);
+    for (const g of groups) {
+      expect(Array.from(g.children).map((c) => c.tagName)).toEqual(["DT", "DD"]);
+    }
+  });
+
   it("closes the card with the skip footnote", async () => {
     mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
     renderPage();

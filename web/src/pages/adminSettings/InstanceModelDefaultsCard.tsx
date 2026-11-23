@@ -85,7 +85,7 @@ function FamilyLabel({ family }: { family: Family }) {
 // InstanceModelDefaultsCard is the one admin surface for the per-harness judge and summary
 // model defaults (issue #3259): a Setting x (Claude | Codex) grid saved by a single PUT that
 // carries only the changed keys. Default (the empty value) follows uzi's built-in model; a
-// user's own choice under Run defaults wins over these. Worker models have no instance default.
+// user's own choice under Settings → Models wins over these. Worker models have no instance default.
 export function InstanceModelDefaultsCard({
   settings,
   sources,
@@ -311,7 +311,7 @@ export function InstanceModelDefaultsCard({
         <p className="border-t border-edge pt-3 text-xs text-faint">
           Default follows uzi&rsquo;s built-in model, including future changes to it; picking a model pins it.
           Each column offers only that harness&rsquo;s models, with the same validation users get. A user&rsquo;s
-          own choice under Settings &rarr; Run defaults wins over these. Worker models have no instance default.
+          own choice under Settings &rarr; Models wins over these. Worker models have no instance default.
         </p>
 
         <Button type="submit" disabled={busy || !dirty || blocked}>

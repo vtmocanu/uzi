@@ -19,7 +19,7 @@ import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import type { UserSettings, BindMode, Harness, ModelSettingCell, SecretMeta } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Card, Field, SectionTitle, Select, Toggle } from "../components/ui";
+import { Alert, Card, Field, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
 import { modelSettingSourceLabel } from "../lib/modelSettings";
 import { harnessName, judgeRunsOnHelp } from "../components/models/modelsLabels";
 import { SettingsShell } from "../components/SettingsShell";
@@ -69,8 +69,9 @@ function claudeJudgeCredential(
 
 export function RunDefaults() {
   const { user, refresh, judgeEnforcedByAdmin, effectiveJudgeModel, uziLabel } = useAuth();
-  // The loaded settings, kept local because the toggles below merge their own saved field
-  // into it; the judge summary reads the saved routing and judge model cells from it.
+  // The loaded settings: the judge summary reads the saved routing and judge model cells, and
+  // harness overflow the saved default harness. The toggles below keep their own state, so
+  // their saves never write back here (none of those fields is read from it).
   const [committedSettings, setCommittedSettings] = useState<UserSettings | null>(null);
   const [autopilotBusy, setAutopilotBusy] = useState(false);
   const [autopilotError, setAutopilotError] = useState("");
@@ -255,7 +256,6 @@ export function RunDefaults() {
     setMrReworkBusy(true);
     try {
       const { settings } = await api.putMySettings({ mr_rework_enabled: next });
-      setCommittedSettings(current => current && ({ ...current, mr_rework_enabled: settings.mr_rework_enabled }));
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
     } catch (err) {
       setMrReworkError(
@@ -277,7 +277,6 @@ export function RunDefaults() {
     setNowSummaryBusy(true);
     try {
       const { settings } = await api.putMySettings({ now_summary_enabled: next });
-      setCommittedSettings(current => current && ({ ...current, now_summary_enabled: settings.now_summary_enabled }));
       setNowSummaryEnabled(settings.now_summary_enabled ?? null);
     } catch (err) {
       setNowSummaryError(errorMessage(err, "Failed to update the Now line setting"));
@@ -298,8 +297,6 @@ export function RunDefaults() {
     try {
       const result = await api.setHarnessOverflow(enabled);
       setOverflowEnabled(result.harness_overflow_enabled);
-      // Merge this endpoint's field only: other settings may save concurrently.
-      setCommittedSettings(current => current && ({ ...current, harness_overflow_enabled: result.harness_overflow_enabled }));
     } catch (err) {
       setOverflowError(errorMessage(err, "Failed to save harness overflow"));
     } finally {
@@ -332,6 +329,9 @@ export function RunDefaults() {
     { fallback: "Failed to load settings" },
   );
   const secrets = data?.secrets ?? [];
+  // The credential facts and saved settings arrive together; until they do (or when the load
+  // failed) the judge summary and overflow availability make no claim from the pre-load defaults.
+  const loaded = data !== null;
   // How many of the user's tokens are opted into the auto-selection pool. A judge
   // lane in "auto" with ZERO pooled tokens spends the DEFAULT token (D4), unlike a
   // worker which holds — so the empty-pool warning below is worded for that fallback.
@@ -374,7 +374,8 @@ export function RunDefaults() {
 
   // Overflow only applies to an explicit saved default (the server ignores it when automatic).
   const bothUsable = bothHarnessesUsable(claudeUsable, codexUsable);
-  const overflowNeedsExplicitDefault = !committedSettings?.default_harness;
+  const overflowNeedsExplicitDefault = loaded && !committedSettings?.default_harness;
+  const overflowUnavailable = !loaded && loadError !== "";
 
   // One summary row per lane in play: the model in effect and the credential it spends. A lane
   // the saved routing leaves unused says so in full contrast rather than fading out.
@@ -468,7 +469,7 @@ export function RunDefaults() {
             model choice in Models; only the enables stay here. */}
         <p className="text-sm text-muted">
           Model and effort for each cross-check stage are set in{" "}
-          <Link to="/settings/models" className="underline underline-offset-2">Models</Link>.
+          <Link to={MODELS_PATH} className="underline underline-offset-2">Models</Link>.
         </p>
       </Card>
 
@@ -607,27 +608,43 @@ export function RunDefaults() {
               Change in Models
             </Link>
           </div>
-          <dl className="grid gap-x-6 gap-y-0.5 text-sm sm:grid-cols-[minmax(9rem,auto)_1fr] sm:gap-y-2">
-            <div className="contents">
-              <dt className="text-muted">Runs on</dt>
-              <dd className="mb-2 text-fg sm:mb-0">
-                {judgeOn ?? "Same as the run"}
-                <span className="mt-0.5 block text-xs text-faint">{judgeRunsOnHelp(judgeRunsOn)}</span>
-              </dd>
+          {!loaded && !loadError && (
+            <div className="space-y-2" aria-busy="true">
+              <span className="sr-only">Loading where your judge runs</span>
+              <Skeleton className="h-4 w-full max-w-sm" />
+              <Skeleton className="h-4 w-full max-w-xs" />
+              <Skeleton className="h-4 w-full max-w-sm" />
             </div>
-            {judgeLanes.map((lane) => (
-              <div key={lane.harness} className="contents">
-                <dt className="text-muted">{harnessName(lane.harness)} judge model</dt>
+          )}
+          {!loaded && loadError && (
+            <p className="text-sm text-muted">Unavailable until your settings load. Reload the page to try again.</p>
+          )}
+          {loaded && (
+            <dl className="grid gap-x-6 gap-y-0.5 text-sm sm:grid-cols-[minmax(9rem,auto)_1fr] sm:gap-y-2">
+              <div className="contents">
+                <dt className="text-muted">Runs on</dt>
                 <dd className="mb-2 text-fg sm:mb-0">
-                  <span className="break-words">{lane.model}</span>
-                  {lane.notUsed && <span className="mt-0.5 block text-xs text-muted">{notUsedCopy}</span>}
+                  {judgeOn ?? "Same as the run"}
+                  <span className="mt-0.5 block text-xs text-faint">{judgeRunsOnHelp(judgeRunsOn)}</span>
                 </dd>
-                <dt className="text-muted">{harnessName(lane.harness)} judge credential</dt>
-                <dd className="mb-2 text-fg sm:mb-0">{lane.credential}</dd>
               </div>
-            ))}
-          </dl>
-          {judgeOn && judgeHarnessUnusable && (
+              {/* One wrapper per dt/dd pair: a <dl> may group only a name and its values. */}
+              {judgeLanes.map((lane) => [
+                <div key={`${lane.harness}-model`} className="contents">
+                  <dt className="text-muted">{harnessName(lane.harness)} judge model</dt>
+                  <dd className="mb-2 text-fg sm:mb-0">
+                    <span className="break-words">{lane.model}</span>
+                    {lane.notUsed && <span className="mt-0.5 block text-xs text-muted">{notUsedCopy}</span>}
+                  </dd>
+                </div>,
+                <div key={`${lane.harness}-credential`} className="contents">
+                  <dt className="text-muted">{harnessName(lane.harness)} judge credential</dt>
+                  <dd className="mb-2 text-fg sm:mb-0">{lane.credential}</dd>
+                </div>,
+              ])}
+            </dl>
+          )}
+          {loaded && judgeOn && judgeHarnessUnusable && (
             <p id="judge-runs-on-unusable" className="text-xs text-warn" role="status">
               {judgeOn} has no usable credential, so the judge is skipped on every run until you add one
               in <Link to="/settings" className="underline underline-offset-2">Account &amp; tokens</Link>.
@@ -870,14 +887,26 @@ export function RunDefaults() {
           <label className="flex items-center gap-3 text-sm text-fg">
             <Toggle
               checked={overflowEnabled}
-              disabled={overflowBusy || overflowNeedsExplicitDefault}
+              disabled={overflowBusy || !loaded || overflowNeedsExplicitDefault}
               focusableWhenDisabled
               onChange={enabled => void toggleOverflow(enabled)}
               label="Overflow to the other harness when my default is near its limits"
-              aria-describedby={overflowNeedsExplicitDefault ? "harness-overflow-scope harness-overflow-automatic" : "harness-overflow-scope"}
+              aria-describedby={
+                overflowNeedsExplicitDefault
+                  ? "harness-overflow-scope harness-overflow-automatic"
+                  : overflowUnavailable
+                    ? "harness-overflow-scope harness-overflow-unavailable"
+                    : "harness-overflow-scope"
+              }
             />
             Overflow to the other harness when my default is near its limits
           </label>
+          {!loaded && !loadError && <Skeleton className="h-3.5 w-full max-w-md" />}
+          {overflowUnavailable && (
+            <p id="harness-overflow-unavailable" className="text-xs text-faint">
+              Unavailable until your settings load. Reload the page to try again.
+            </p>
+          )}
           {overflowNeedsExplicitDefault && (
             <p id="harness-overflow-automatic" className="text-xs text-faint">
               Overflow applies only when a Claude or Codex default harness is saved in Models.

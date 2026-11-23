@@ -95,11 +95,11 @@ const SEED_USER_SETTINGS: UserSettings = {
   // while an explicit null resets that field to "Same as the run".
   judge_model: null,
   // PRD #3245: the Codex judge lane; null = inherit. Resolved per harness into
-  // judge_models (mockJudgeModelCells) and edited on Run defaults.
+  // judge_models (mockJudgeModelCells) and edited on Models.
   codex_judge_model: null,
   summary_model: null,
   // PRD #3248: the Codex summary lane; null = inherit. Resolved per harness into
-  // summary_models (mockSummaryModelCells) and edited on Run defaults.
+  // summary_models (mockSummaryModelCells) and edited on Models.
   codex_summary_model: null,
   // PRD #1570: the task-review lanes; null = the built-in. Resolved into task_review_models.
   task_review_model: null,
@@ -566,7 +566,7 @@ let userSettings: UserSettings = loadedSettings.userSettings;
 // PRD #1551 D3: the effective-harness lane the deprecated default_model projects to and
 // bridges through. A codex pin resolves to Codex, a claude pin to Claude; with no pin it
 // follows D11 — Codex only when it is the SOLE usable harness — and falls back to Claude
-// when no harness is usable at all. The grouped Run Defaults card never sends or reads
+// when no harness is usable at all. The Models tab never sends or reads
 // default_model, so this serves only the bounded stale-client bridge and the response
 // projection, mirroring the server.
 function effectiveLegacyLane(harness: UserSettings["default_harness"]): "claude" | "codex" {
@@ -1280,7 +1280,7 @@ function stageSettingsPatch(base: UserSettings, patch: UserSettingsPatch): UserS
     // Tri-state (PRD #1429 M1/D3, review fix M4a): present-null clears to "no
     // preference" (implicit run creation falls through D11); a claude|codex value
     // sets the pin; anything else is a 400 — mirrors the server's validateHarness so
-    // Run Defaults saves (and its notice text) match the real handler in the demo.
+    // Models saves (and their notice text) match the real handler in the demo.
     if (patch.default_harness !== null && patch.default_harness !== "claude" && patch.default_harness !== "codex") {
       throw new ApiError(400, "default_harness: must be one of claude, codex");
     }

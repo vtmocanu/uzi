@@ -48,7 +48,7 @@ function deriveMode(value: string, aliases: readonly string[]): Mode {
 // PRD #1551 M3: `allowCustom` is an explicit opt-in that overrides the harness default.
 // Historically custom entry was "Claude yes, Codex no" (PRD #1429 D6). Codex's picker
 // stays closed for schedule/template callers. The per-user Codex worker-model lane
-// and dedicated plan cross-check pins on Run Defaults opt into the "Other…" escape
+// and dedicated plan cross-check pins on Models opt into the "Other…" escape
 // hatch. Callers that omit allowCustom keep the harness-derived default.
 export function ModelSelect({
   value,
@@ -77,7 +77,7 @@ export function ModelSelect({
   harness?: Harness;
   // Whether the "Other… (custom model ID)" menu entry is offered. Omitted ⇒ the
   // historical harness default (Claude allows custom, Codex does not), so
-  // ScheduleModal / AgentTemplateEditor render unchanged. Run Defaults' Codex lane
+  // ScheduleModal / AgentTemplateEditor render unchanged. Models' Codex lane
   // and dedicated plan cross-check pins pass `allowCustom` to open that escape hatch
   // (PRD #1551 D5 and #2151).
   allowCustom?: boolean;
