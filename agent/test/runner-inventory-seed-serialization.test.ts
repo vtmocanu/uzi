@@ -25,6 +25,9 @@ import {
   type QuiesceRunOutcome,
   type QuiesceRunRequest,
 } from "../src/run-quiescence.js";
+import { acquireWorkerLifetime, withAuthorityTransaction } from "../src/authority-lock.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { testLockOptions } from "./authority-test-support.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import type { RunContext, ExecutorResult } from "../src/executor.js";
 import type { ExecutorFactory } from "../src/runner.js";
@@ -164,8 +167,11 @@ interface QuiesceCall { site: string | undefined; mode: string; forceHelper: boo
 interface Rig {
   runner: ReturnType<typeof runnerWith>;
   quiesceCalls: QuiesceCall[];
-  sections: Array<{ heldMs: number; totalMs: number }>;
+  /** `heldMs` is the section's own measure of how long B was held (the result's `heldMs`); `bodyMs` is the older body-start clock. */
+  sections: Array<{ heldMs: number; bodyMs: number; totalMs: number }>;
   statusCalls: string[];
+  /** Every result the REAL section returned (kind `ran` rows carry `aborted`/`timedOut`/`entryKept`). */
+  results: Array<{ kind: string; aborted?: boolean; timedOut?: boolean; entryKept?: boolean; keptReason?: string; heldMs?: number }>;
 }
 let rig: Rig;
 type BoundaryRunner = {
@@ -189,17 +195,22 @@ function makeRig(opts: { deadlineMs?: number; log?: ReturnType<typeof recordingL
     ...(opts.claim ? { dockerHost: "unix:///nonexistent-4632.sock" } : {}),
   });
   const sections: Rig["sections"] = [];
-  const real = GitCache.prototype.withInventorySourceLock.bind(git);
+  const results: Rig["results"] = [];
+  const real =GitCache.prototype.withInventorySourceLock.bind(git);
   git.withInventorySourceLock = (async (barePath: string, o: InventorySourceLockOptions, body: (s: InventorySection) => Promise<unknown>) => {
     const startedAt = Date.now();
     let acquiredAt = startedAt;
+    let held: number | undefined;
     try {
-      return await real(barePath, { ...o, ...(opts.deadlineMs === undefined ? {} : { deadlineMs: opts.deadlineMs }) }, (s) => { acquiredAt = Date.now(); return body(s); });
+      const res = await real(barePath, { ...o, ...(opts.deadlineMs === undefined ? {} : { deadlineMs: opts.deadlineMs }) }, (s) => { acquiredAt = Date.now(); return body(s); });
+      held = res.heldMs;
+      results.push(res as Rig["results"][number]);
+      return res;
     } finally {
-      sections.push({ heldMs: Date.now() - acquiredAt, totalMs: Date.now() - startedAt });
+      sections.push({ heldMs: held ?? Number.NaN, bodyMs: Date.now() - acquiredAt, totalMs: Date.now() - startedAt });
     }
   }) as typeof git.withInventorySourceLock;
-  return { runner, quiesceCalls, sections, statusCalls: [] };
+  return { runner, quiesceCalls, sections, statusCalls: [], results };
 }
 
 /** Script the proof's git: the FIRST status call leaves a detached unmarked `cat <fifo>` in `where` and returns only once that
@@ -258,8 +269,16 @@ afterEach(async () => {
   await tick(20);
 });
 
-const log = (label: string, rows: Array<{ heldMs: number; totalMs: number }>): void => {
-  console.log(`latency ${label}: ${rows.map((r) => `held=${r.heldMs}ms total=${r.totalMs}ms`).join("; ")}`);
+const log = (label: string, rows: Rig["sections"]): void => {
+  console.log(`latency ${label}: ${rows.map((r) => `heldMs=${r.heldMs}ms bodyClock=${r.bodyMs}ms total=${r.totalMs}ms`).join("; ")}`);
+};
+/** The latency bound, read from the section's own `heldMs` (B held, acquisition to return), never the body-start clock. */
+const assertHeldBounded = (rows: Rig["sections"]): void => {
+  assert.ok(rows.length > 0, "at least one section ran");
+  for (const s of rows) {
+    assert.ok(Number.isFinite(s.heldMs), "the section result carries heldMs");
+    assert.ok(s.heldMs < LATENCY_CAP_MS, `B held ${s.heldMs} ms (section result heldMs)`);
+  }
 };
 
 describe("issue #4632: the inventory proof and a same-key attempt seed serialize", { skip: SKIP }, () => {
@@ -296,7 +315,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.ok(fs.existsSync(path.join(seeded.path, ".git")), "the seed succeeded");
     assert.equal(alive(heldPid), false);
     log("case 1", rig.sections);
-    for (const s of rig.sections) assert.ok(s.heldMs < LATENCY_CAP_MS, `B held ${s.heldMs} ms`);
+    assertHeldBounded(rig.sections);
     executed++;
   });
 
@@ -324,7 +343,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.ok(proofCalls.length >= 2 && proofCalls.every((c) => c.at >= releasedAt), "every proof stage ran after the seed released the lock");
     assert.equal(rig.statusCalls.length >= 1, true);
     log("case 2", rig.sections);
-    for (const s of rig.sections) assert.ok(s.heldMs < LATENCY_CAP_MS, `B held ${s.heldMs} ms`);
+    assertHeldBounded(rig.sections);
     executed++;
   });
 
@@ -358,7 +377,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     assert.ok(fs.existsSync(path.join(seeded.path, ".git")), "the lazy clear admitted the seed once the process exited");
     assert.ok(rig.quiesceCalls.some((c) => c.site === "inventory_source:clear_probe" && c.observeOnly && c.forceHelper), "the clear ran the observe-only helper probe");
     log("case 3", rig.sections);
-    for (const s of rig.sections) assert.ok(s.heldMs < LATENCY_CAP_MS, `B held ${s.heldMs} ms`);
+    assertHeldBounded(rig.sections);
     executed++;
   });
 
@@ -385,7 +404,7 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     const seeded = await seed(iid, seedOptions());
     assert.ok(fs.existsSync(path.join(seeded.path, ".git")), "admitted once the descendant is gone");
     log("case 4", rig.sections);
-    for (const s of rig.sections) assert.ok(s.heldMs < LATENCY_CAP_MS, `B held ${s.heldMs} ms`);
+    assertHeldBounded(rig.sections);
     executed++;
   });
 
@@ -461,6 +480,166 @@ describe("issue #4632: the inventory proof and a same-key attempt seed serialize
     await killAndWait(sleepPid);
     await claimRunner.execute(gitlabClaim(iid));
     assert.equal(started, 1, "a retry after the descendant exited seeds and starts");
+    executed++;
+  });
+
+  // ─── real git: the proof's own `git status` runs a planted fsmonitor hook that leaves a detached unmarked process ───
+
+  /** A `filter.x.clean` driver in the retained clone (`core.fsmonitor` cannot be used: the runner's git env pins it to false, so
+   *  the hook never runs; the clean filter is not pinnable and runs UNMARKED). The filter double-forks (setsid + background) an
+   *  unmarked FIFO-blocked `cat` whose cwd is the clone (git runs filters at the work-tree root), records its pid in the
+   *  quiescence pid file, then blocks itself on the same FIFO and finally passes the file through unchanged. A tracked file
+   *  is made stat-dirty (mtime) so the runner's real `worktreeStatus` (runGitAsRunner/execScoped, `status --porcelain` with
+   *  GIT_OPTIONAL_LOCKS=0) must re-hash it, i.e. run the filter. Nothing about git is scripted. */
+  function plantCleanFilterHook(clonePath: string, fifo: string): void {
+    const hook = path.join(scratch, "clean-filter.sh");
+    fs.writeFileSync(hook, [
+      "#!/bin/sh",
+      `setsid sh -c "cat '${fifo}' </dev/null >/dev/null 2>&1 & echo \\$! >> '${pidFile}'" </dev/null >/dev/null 2>&1`,
+      `cat '${fifo}' >/dev/null`,
+      "cat", "",
+    ].join("\n"), { mode: 0o755 });
+    const g = (...args: string[]): string => execFileSync("git", ["-C", clonePath, ...args], { env: GIT_ENV, stdio: "pipe" }).toString();
+    const tracked = g("ls-files").split("\n").filter(Boolean)[0]!;
+    g("config", "filter.x.clean", hook);
+    fs.appendFileSync(path.join(clonePath, ".git", "info", "attributes"), `${tracked} filter=x\n`);
+    const later = new Date(Date.now() + 60_000);
+    fs.utimesSync(path.join(clonePath, tracked), later, later);
+  }
+  const pidsWritten = (): number[] => fs.readFileSync(pidFile, "utf8").split("\n").filter(Boolean).map(Number);
+  /** Unblocks every reader of `fifo` until all of `pids` are gone (a reader that had not reached its open yet is released by a later pass). */
+  async function releaseAll(fifo: string, pids: number[]): Promise<void> {
+    const end = Date.now() + 10_000;
+    while (pids.some(alive)) {
+      if (Date.now() > end) throw new Error("timed out releasing the fifo readers");
+      release(fifo);
+      await tick(50);
+    }
+  }
+  const sites = (site: string): number => rig.quiesceCalls.filter((c) => c.site === site).length;
+
+  it("case 10 (real git, ambient cancellation): an abort mid-git keeps the entry, starts no later stage, and the seed is admitted only after the real processes exit", { timeout: 90_000 }, async () => {
+    const iid = 4611;
+    const r = await retainedClone(iid);
+    rig = makeRig();
+    const fifo = mkfifo("c10.fifo");
+    plantCleanFilterHook(r.clonePath, fifo);
+    const ac = new AbortController();
+    let proof: ProofResult | undefined;
+    // The abort reaches the section only through the ambient scope (withLock honours the same scopes), not through opts.signal.
+    const scoped = MaintenanceBudget.runProducer(async () => { proof = await runProof(r); }, { signal: ac.signal, durationMs: 60_000 }).catch(() => undefined);
+    await until(() => pidsWritten().length >= 1, 20_000, "the clean filter to leave its detached child");
+    const child = pidsWritten()[0]!;
+    spawned.push(child);
+    assert.equal(alive(child), true);
+    assert.equal(fs.readlinkSync(`/proc/${child}/cwd`), fs.realpathSync(r.clonePath), "the child's cwd is inside the retained clone");
+    assert.equal(sites("inventory_source"), 1, "only the before-scan ran so far");
+    ac.abort();
+    await scoped;
+    assert.ok(proof, "the proof returned");
+    assert.equal(proof.outcome, "retained");
+    // An ambient abort is also seen by withLock itself, which rejects the locked call after fn (post-read interruption), so the
+    // section's own `aborted` result is never returned here and the boundary reports a thrown abort: a retained proof either way.
+    // (`aborted: true` itself is asserted through opts.signal in case 11.)
+    assert.equal(proof.checks.length, 1, `one refusal reported (${proof.checks.join(",")})`);
+    assert.ok(["boundary_exception", "source_settlement_unproven"].includes(proof.checks[0]!), `refusal ${proof.checks[0]}`);
+    assert.equal(alive(child), true, "the detached process outlived the abort");
+    // Let the real git status settle (killed by its own timeout or by the abort): still no later stage may have started.
+    await git.inventoryExclusionSettled(bare(), keyOf(iid));
+    await tick(100);
+    assert.equal(sites("inventory_source:after_runner_git"), 0, "no after-scan started");
+    assert.equal(sites("inventory_source:clear_probe"), 0, "no step-7 stage started");
+    assert.equal(sites("inventory_source"), 1);
+
+    const attempts = attemptDirs(iid);
+    await assert.rejects(seed(iid, seedOptions()), (e: unknown) => e instanceof InventorySourceExclusionRefusal && e.reason === "excluded");
+    assert.deepEqual(attemptDirs(iid), attempts, "the refused seed seeded nothing");
+    assert.equal(alive(child), true, "nothing signalled the process");
+
+    // (b) release the FIFO, let everything exit: the lazy clear admits the seed.
+    await releaseAll(fifo, [child]);
+    const seeded = await seed(iid, seedOptions());
+    assert.ok(fs.existsSync(path.join(seeded.path, ".git")), "admitted once the real processes exited");
+    assert.ok(sites("inventory_source:clear_probe") >= 1, "the seed's clear ran the observe-only probe");
+    executed++;
+  });
+
+  it("case 11 (real git, caller signal): the same topology cancelled through opts.signal behaves identically", { timeout: 90_000 }, async () => {
+    const iid = 4612;
+    const r = await retainedClone(iid);
+    const ac = new AbortController();
+    rig = makeRig();
+    const wrapped = git.withInventorySourceLock;
+    git.withInventorySourceLock = ((b: string, o: InventorySourceLockOptions, body: Parameters<typeof wrapped>[2]) =>
+      wrapped.call(git, b, { ...o, signal: ac.signal }, body)) as typeof git.withInventorySourceLock;
+    const fifo = mkfifo("c11.fifo");
+    plantCleanFilterHook(r.clonePath, fifo);
+    const proofP = runProof(r);
+    await until(() => pidsWritten().length >= 1, 20_000, "the clean filter to leave its detached child");
+    const child = pidsWritten()[0]!;
+    spawned.push(child);
+    ac.abort();
+    const proof = await proofP;
+    assert.equal(proof.outcome, "retained");
+    assert.deepEqual(proof.checks, ["source_settlement_unproven"]);
+    assert.equal(rig.results.at(-1)?.kind, "ran");
+    assert.equal(rig.results.at(-1)?.aborted, true, "the section reports the abort");
+    assert.equal(rig.results.at(-1)?.timedOut, false);
+    assert.equal(rig.results.at(-1)?.entryKept, true, "the entry is kept");
+    assert.equal(alive(child), true, "the detached process outlived the abort");
+    await git.inventoryExclusionSettled(bare(), keyOf(iid));
+    await tick(100);
+    assert.equal(sites("inventory_source:after_runner_git"), 0);
+    assert.equal(sites("inventory_source:clear_probe"), 0);
+    await assert.rejects(seed(iid, seedOptions()), (e: unknown) => e instanceof InventorySourceExclusionRefusal);
+    await releaseAll(fifo, [child]);
+    const seeded = await seed(iid, seedOptions());
+    assert.ok(fs.existsSync(path.join(seeded.path, ".git")));
+    log("case 11", rig.sections);
+    assertHeldBounded(rig.sections);
+    executed++;
+  });
+
+  it("case 12 (A-wait, k=1): a section held until D under a seed that holds A queued on B still lets a third 30 s A acquisition succeed", { timeout: 60_000 }, async () => {
+    const iid = 4613;
+    await git.ensureClone(fx.originPath);
+    const authRoot = path.join(scratch, "authority");
+    fs.mkdirSync(authRoot, { recursive: true });
+    const lifetime = await acquireWorkerLifetime(authRoot, testLockOptions());
+    const A_WAIT_MS = 30_000;
+    const D_MS = 12_000; // INVENTORY_SECTION_BUDGET_MS, the real default
+    const gate = deferred();
+    // A body that never finishes on its own: the section is held for the whole of D and is then ended by it.
+    const sectionP = git.withInventorySourceLock(bare(), { clonePath: canonicalOf(iid), branch: branchOf(iid), isLive: () => false },
+      async () => { await gate.promise; });
+    await tick(300);
+    const t0 = Date.now();
+    let seedHasA = 0;
+    let seedDoneAt = 0;
+    // The seed runs inside A (as the runner's inFlightAuthority transaction does) and queues on B behind the section.
+    const seedP = withAuthorityTransaction(lifetime, { timeoutMs: A_WAIT_MS }, async () => {
+      seedHasA = Date.now() - t0;
+      const clone = await seed(iid, seedOptions(async () => {}));
+      seedDoneAt = Date.now() - t0;
+      return clone;
+    });
+    await until(() => seedHasA > 0 || Date.now() - t0 > 2_000, 5_000, "the seed to hold A");
+    assert.ok(seedHasA > 0, "the seed took A while the section still held B");
+    let thirdAt = 0;
+    const thirdP = withAuthorityTransaction(lifetime, { timeoutMs: A_WAIT_MS }, async () => { thirdAt = Date.now() - t0; });
+    await tick(D_MS - 1_500 - (Date.now() - t0));
+    assert.equal(seedDoneAt, 0, "the seed is still queued on B near D");
+    assert.equal(thirdAt, 0, "the third A acquisition is still waiting near D");
+    const section = await sectionP;
+    gate.resolve();
+    assert.equal(section.kind === "ran" && section.timedOut, true, "D ended the section");
+    const heldMs = section.kind === "ran" ? section.heldMs : Number.NaN;
+    assert.ok(heldMs >= D_MS - 500 && heldMs < D_MS + 1_000, `B held ${heldMs} ms, bounded by D (${D_MS} ms)`);
+    const seeded = await seedP;
+    await thirdP;
+    assert.ok(fs.existsSync(path.join(seeded.path, ".git")), "the seed ran after the section released B");
+    assert.ok(thirdAt >= seedDoneAt && thirdAt < A_WAIT_MS, `third A acquisition at ${thirdAt} ms, inside its ${A_WAIT_MS} ms wait`);
+    console.log(`latency case 12: section heldMs=${heldMs}ms seed holdsA@${seedHasA}ms seedDone@${seedDoneAt}ms thirdA@${thirdAt}ms (A wait ${A_WAIT_MS}ms)`);
     executed++;
   });
 

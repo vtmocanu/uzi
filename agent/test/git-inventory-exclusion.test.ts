@@ -16,6 +16,7 @@ import {
   type InventorySourceLockOptions,
 } from "../src/git.js";
 import {
+  INVENTORY_LOCK_ACQUIRE_MS,
   InventoryExclusionRegistry,
   InventorySourceExclusionRefusal,
   detectNamespaceRestartBoundary,
@@ -38,6 +39,7 @@ interface Priv {
   nonLiveKeyPaths(...a: unknown[]): Promise<string[]>;
   pathPresent(p: string): Promise<boolean>;
   assertBareClear(bare: string, op: string): Promise<void>;
+  holdsLock(key: string): boolean;
 }
 
 const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -519,6 +521,221 @@ describe("worktreeStatus and the content proof", () => {
       assert.equal(stopped, "unreadable");
       assert.ok(polls >= 1);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("a probe that ignores its deadline and settles only after a gate", () => {
+  const attemptOpts = (id: string) => ({ attemptId: id, isLive: () => false, beforeSeed: async () => {} });
+  /** Time to take and release B from outside: B must be free once the section or clear returned. */
+  const bFreeMs = async (): Promise<number> => { const t0 = Date.now(); await git.withBareLock(bare, async () => {}); return Date.now() - t0; };
+  const seedRefused = (iid: number): Promise<void> =>
+    assert.rejects(git.createOrAttachRunnerClone(bare, iid, noProofReseed, `run-${iid}`, false, undefined, attemptOpts(mintAttemptId(1))),
+      (e: unknown) => e instanceof InventorySourceExclusionRefusal && e.reason === "excluded");
+  const immediateClear = (): void => { git.setInventoryExclusionProbe(async () => "clear"); };
+
+  it("step 7: past D, B is free, the entry stays, a seed refuses, a late clear removes nothing, and a fresh clear removes it", async () => {
+    const iid = 60;
+    const key = `issue-${iid}`;
+    const k = keyOf(key);
+    const gate = deferred<"clear">();
+    let calls = 0;
+    git.setInventoryExclusionProbe(() => { calls++; return gate.promise; });
+    const r = await section(key, async (s) => { s.markGitStarted(); await s.stage(async () => 1); s.afterScanQuiescent(true); }, { deadlineMs: 1_300 });
+    assert.equal(r.kind, "ran");
+    assert.equal(r.kind === "ran" && r.entryKept, true, "a verdict that never arrived in time keeps the entry");
+    assert.equal(calls, 1, "step 7 did probe");
+    assert.ok(await bFreeMs() < 500, "B was released at the deadline");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true);
+    await seedRefused(iid);
+    assert.equal(calls, 1, "the seed did not probe while the abandoned probe is unsettled");
+    gate.resolve("clear");
+    await git.inventoryExclusionSettled(bare, k);
+    await tick(20);
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true, "a late clear verdict never removes the entry");
+    immediateClear();
+    assert.equal(await git.withBareLock(bare, () => priv.clearExclusion(bare, branch, canonicalOf(key), () => false, "full", Date.now() + 1_000)), "admit");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), false, "a fresh clear after the gate removes it");
+  });
+
+  it("lazy clear inside a section: past its budget the section refuses, B is free, the entry stays, and a fresh clear removes it", async () => {
+    const key = "issue-61";
+    const k = keyOf(key);
+    await leaveEntry(key, "not_clear");
+    const gate = deferred<"clear">();
+    git.setInventoryExclusionProbe(() => gate.promise);
+    const r = await section(key, async () => "never", { deadlineMs: 300 });
+    assert.equal(r.kind === "refused" && r.check, "source_settlement_unproven");
+    assert.ok(r.kind === "refused" && r.heldMs !== undefined && r.heldMs < 1_500, `the refusal reports heldMs (${r.kind === "refused" ? r.heldMs : "n/a"})`);
+    assert.ok(await bFreeMs() < 500, "B free after the refusal");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true);
+    gate.resolve("clear");
+    await git.inventoryExclusionSettled(bare, k);
+    await tick(20);
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true, "the late verdict removed nothing");
+    immediateClear();
+    const again = await section(key, async () => "ok");
+    assert.equal(again.kind === "ran" && again.value, "ok", "the next section clears lazily and runs");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), false);
+  });
+
+  it("full clear at a seed: the budget expires, B is free, the entry stays, the seed refuses, and the seed after the gate clears and seeds", { timeout: 20_000 }, async () => {
+    const iid = 62;
+    const key = `issue-${iid}`;
+    const k = keyOf(key);
+    await leaveEntry(key, "not_clear");
+    const gate = deferred<"clear">();
+    let calls = 0;
+    git.setInventoryExclusionProbe(() => { calls++; return gate.promise; });
+    await seedRefused(iid);
+    assert.equal(calls, 1);
+    assert.ok(await bFreeMs() < 500, "B free after the refused seed");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true);
+    await seedRefused(iid);
+    assert.equal(calls, 1, "no second probe while the first is unsettled");
+    gate.resolve("clear");
+    await git.inventoryExclusionSettled(bare, k);
+    await tick(20);
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true, "the late verdict removed nothing");
+    immediateClear();
+    const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, `run-${iid}`, false, undefined, attemptOpts(mintAttemptId(2)));
+    assert.ok(fs.existsSync(path.join(clone.path, ".git")));
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), false);
+  });
+
+  it("restore-class clear: past the deadline it is not_clear, a repeat while pending does not probe, and after the gate it admits but removes nothing", async () => {
+    const key = "issue-63";
+    const k = keyOf(key);
+    priv.inventoryExclusion.addEntry(bare, k, { id: "x", clonePath: "/c", gitStarted: true, pending: new Set() });
+    const gate = deferred<"clear">();
+    let calls = 0;
+    git.setInventoryExclusionProbe(() => { calls++; return gate.promise; });
+    const restore = (ms: number) => git.withBareLock(bare, () => priv.clearExclusion(bare, branch, canonicalOf(key), () => false, "restore", Date.now() + ms, new Set()));
+    assert.equal(await restore(80), "not_clear");
+    assert.ok(await bFreeMs() < 500, "B free after the deadline");
+    assert.equal(await restore(500), "not_clear");
+    assert.equal(calls, 1, "no second probe while the first is unsettled");
+    gate.resolve("clear");
+    await git.inventoryExclusionSettled(bare, k);
+    await tick(20);
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true, "the late verdict removed nothing");
+    immediateClear();
+    assert.equal(await restore(500), "admit");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), true, "a restore-class admission never removes the entry");
+    assert.equal(await git.withBareLock(bare, () => priv.clearExclusion(bare, branch, canonicalOf(key), () => false, "full", Date.now() + 500)), "admit");
+    assert.equal(priv.inventoryExclusion.excluded(bare, k), false, "a fresh full clear removes it");
+  });
+});
+
+describe("cross-kind reclaim admission (5g): the lookup is keyed by each target's own path", () => {
+  const ownerPath = (n: number): string => canonicalOf(`issue-${n}`);
+  const claimantPath = (n: number): string => canonicalOf(`agent-issue-${n}`);
+  const entry = (id: string) => ({ id, clonePath: "/c", gitStarted: true, pending: new Set<Promise<unknown>>() });
+
+  it("an entry under the owner's key refuses a claimant whose own key differs, for the canonical and an attempt path", async () => {
+    verdict = "not_clear";
+    priv.inventoryExclusion.addEntry(bare, keyOf("issue-70"), entry("owner"));
+    for (const targetPath of [ownerPath(70), `${ownerPath(70)}.attempt-${mintAttemptId(1)}`]) {
+      let ran = false;
+      await assert.rejects(
+        git.withReclaimAdmission(bare, [{ path: targetPath, branch: "agent/issue-70" }], () => false, async () => { ran = true; }),
+        (e: unknown) => e instanceof InventorySourceExclusionRefusal && e.reason === "excluded" && e.key === keyOf("issue-70"));
+      assert.equal(ran, false);
+    }
+    assert.notEqual(keyOf("issue-70"), keyOf("agent-issue-70"), "the claimant's own key is a different key");
+    assert.equal(priv.inventoryExclusion.admissionAge(bare, keyOf("issue-70")), undefined);
+  });
+
+  it("the refusal comes from ANY target, not only the first", async () => {
+    verdict = "not_clear";
+    priv.inventoryExclusion.addEntry(bare, keyOf("issue-71"), entry("owner"));
+    await assert.rejects(
+      git.withReclaimAdmission(bare, [{ path: claimantPath(71), branch: "agent/issue-71" }, { path: ownerPath(71), branch: "agent/issue-71" }], () => false, async () => {}),
+      (e: unknown) => e instanceof InventorySourceExclusionRefusal && e.key === keyOf("issue-71"));
+  });
+
+  it("an entry only under the claimant's key does not refuse a reclaim of the owner's paths", async () => {
+    verdict = "not_clear";
+    priv.inventoryExclusion.addEntry(bare, keyOf("agent-issue-72"), entry("claimant"));
+    let ran = false;
+    await git.withReclaimAdmission(bare, [{ path: ownerPath(72), branch: "agent/issue-72" }], () => false, async () => { ran = true; });
+    assert.equal(ran, true);
+    assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("agent-issue-72")), true, "the claimant's own entry is untouched");
+  });
+});
+
+describe("withReclaimAdmission lifecycle", () => {
+  const target = (n: number) => ({ path: canonicalOf(`issue-${n}`), branch });
+
+  it("removes the admission when the lock call rejects after the locked registration step ran", async (t) => {
+    const k = keyOf("issue-80");
+    const real = git.withBareLock.bind(git) as <T>(b: string, fn: () => Promise<T>) => Promise<T>;
+    t.mock.method(git, "withBareLock", async <T,>(b: string, fn: () => Promise<T>): Promise<T> => {
+      await real(b, fn);
+      assert.notEqual(priv.inventoryExclusion.admissionAge(bare, k), undefined, "the registration step had installed the admission");
+      throw new Error("lock call rejected after the step");
+    });
+    let ran = false;
+    await assert.rejects(git.withReclaimAdmission(bare, [target(80)], () => false, async () => { ran = true; }), /lock call rejected after the step/);
+    assert.equal(ran, false);
+    assert.equal(priv.inventoryExclusion.admissionAge(bare, k), undefined, "no admission leaked");
+  });
+
+  it("removes the admission when fn throws synchronously", async () => {
+    const k = keyOf("issue-81");
+    await assert.rejects(git.withReclaimAdmission(bare, [target(81)], () => false, (() => { throw new Error("sync boom"); }) as () => Promise<void>), /sync boom/);
+    assert.equal(priv.inventoryExclusion.admissionAge(bare, k), undefined);
+  });
+
+  it("fn runs without holding B: it can take the bare lock itself, and holdsLock is false", async () => {
+    const k = keyOf("issue-82");
+    let held: boolean | undefined;
+    let took = false;
+    const inner = git.withReclaimAdmission(bare, [target(82)], () => false, async () => {
+      held = priv.holdsLock(bare);
+      assert.notEqual(priv.inventoryExclusion.admissionAge(bare, k), undefined, "the admission stands inside fn");
+      await git.withBareLock(bare, async () => { took = true; });
+    });
+    await Promise.race([inner, tick(3_000).then(() => { throw new Error("deadlock: fn could not take B"); })]);
+    assert.equal(held, false);
+    assert.equal(took, true);
+  });
+
+  it("the acquisition timeout is INVENTORY_LOCK_ACQUIRE_MS, and a section refuses when B cannot be taken in time", async (t) => {
+    const seen: number[] = [];
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    // Observe the configured value, then substitute a short one so the wait ends at once.
+    t.mock.method(AbortSignal, "timeout", (ms: number) => { seen.push(ms); return realTimeout(20); });
+    const release = deferred();
+    const held = git.withBareLock(bare, () => release.promise);
+    let called = false;
+    const r = await section("issue-83", async () => { called = true; });
+    assert.equal(r.kind === "refused" && r.check, "source_lock_unavailable");
+    assert.match(r.kind === "refused" ? r.detail : "", /not acquired in time/);
+    assert.equal(called, false);
+    assert.deepEqual(seen, [INVENTORY_LOCK_ACQUIRE_MS], "the section waited with the configured acquire timeout");
+    release.resolve();
+    await held;
+  });
+
+  it("the restart-boundary warning is logged once per GitCache across two sections, and a fresh GitCache starts with an empty registry", async (t) => {
+    const real = fs.readlinkSync;
+    t.mock.method(fs, "readlinkSync", ((p: fs.PathLike, ...rest: unknown[]) =>
+      String(p) === "/proc/1/exe" ? "/usr/lib/systemd/systemd" : (real as (...a: unknown[]) => unknown)(p, ...rest)) as typeof fs.readlinkSync);
+    const warnings = (lines: typeof rec.lines): number => lines.filter((l) => String((l as { msg?: string }).msg).startsWith("inventory exclusion: restart boundary not namespace-scoped")).length;
+    await leaveEntry("issue-84", "not_clear");
+    await section("issue-85", async () => "second");
+    assert.equal(warnings(rec.lines), 1, "two sections, one warning");
+    assert.equal(priv.inventoryExclusion.excluded(bare, keyOf("issue-84")), true);
+
+    const fresh = recordingLogger();
+    const other = new GitCache(fx.dataDir, fresh.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+    const otherPriv = other as unknown as Priv;
+    assert.equal(otherPriv.inventoryExclusion.excluded(bare, keyOf("issue-84")), false, "a fresh cache remembers no exclusion");
+    other.setInventoryExclusionProbe(async () => "clear");
+    const r = await other.withInventorySourceLock(bare, { clonePath: canonicalOf("issue-84"), branch, isLive: () => false }, async () => "fresh");
+    assert.equal(r.kind === "ran" && r.value, "fresh", "the key is unexcluded for the fresh cache, so its section runs");
+    assert.equal(warnings(fresh.lines), 1, "the fresh cache warns for itself");
+    assert.equal(warnings(rec.lines), 1, "and the first cache's count did not move");
   });
 });
 

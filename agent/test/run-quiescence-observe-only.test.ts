@@ -190,6 +190,27 @@ describe("observeOnly and deadlineAt reach the helper", { skip: !HAS_LINUX }, ()
     }
   });
 
+  for (const [name, spawnHelper] of [
+    ["the spawn throws", ((): never => { throw new Error("spawn failed (test)"); }) as HelperSpawn],
+    ["the helper binary does not exist", ((_c, _a, opts) => spawn("/nonexistent-uzi-helper-4632", [], { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"] })) as HelperSpawn],
+  ] as const) {
+    it(`a forced-helper observe-only scan whose helper fails (${name}) is unverified, never clear, and nothing is signalled`, async () => {
+      // A process the scan could otherwise only observe: it must stay alive and the verdict must not be clear.
+      plantInScope(root, 83, CLONE, { marker: TERMINAL_MARKER, cloneKey: own.cloneKey });
+      const registry = new LiveAttemptRegistry();
+      registry.add(own);
+      const out = await quiesceRunAttempt({
+        mode: "own", attempt: own, cloneKey: own.cloneKey, targetPaths: [CLONE], processes: true,
+        dockerHost: undefined, registry, forceHelper: true, observeOnly: true, deadlineAt: Date.now() + 30_000,
+      }, { reap: { spawnHelper } });
+      assert.equal(out.process?.state, "unverified", JSON.stringify(out.process));
+      assert.deepEqual(out.process?.processes, [], "a helper failure names no process");
+      assert.deepEqual(out.process?.killed ?? [], []);
+      assert.equal(inventoryClearVerdict(out.process), "not_clear", out.process?.detail ?? "no process verdict");
+      assert.equal(fs.existsSync(path.join(root, "83")), true, "nothing is signalled");
+    });
+  }
+
   it("an observe-only probe under uid split never files an unreadable process for a kill, so it is clear and unsignalled", async () => {
     const previous = process.env.UZI_UID_SPLIT;
     process.env.UZI_UID_SPLIT = "1";
