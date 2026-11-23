@@ -345,7 +345,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		if errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
 			// PRD #4320: a provider-sourced owner has no judge until PRD #4322; not a failure, and
 			// (PRD #1429 D4) the refusal needs a visible reason.
-			slog.Info("judge enqueue: owner's Claude source is a model provider, no judge created", "run", run.ID, "error", err)
+			slog.Info("judge enqueue: owner's provider source is a model provider, no judge created", "run", run.ID, "error", err)
 			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
 			return
 		}

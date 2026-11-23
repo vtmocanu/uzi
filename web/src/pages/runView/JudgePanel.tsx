@@ -116,7 +116,7 @@ const JUDGE_SKIP_HARNESS: Record<string, string> = { claude: "Claude", codex: "C
 function judgeSkipCause(skip: JudgeSkip): string {
   const harness = JUDGE_SKIP_HARNESS[skip.harness];
   if (skip.reason === "codex_pool_unavailable") return "no pooled Codex account was available.";
-  if (skip.reason === "provider_lane_unsupported") return "the Claude source is a model provider, which the judge does not support yet.";
+  if (skip.reason === "provider_lane_unsupported") return "the selected source is a model provider, which the judge does not support yet.";
   if (harness !== undefined && skip.reason === "no_usable_credential") return `${harness} had no usable credential.`;
   if (harness !== undefined && skip.reason === "credential_disabled") return `the ${harness} credential was disabled.`;
   return "the judge's harness had no usable credential.";
