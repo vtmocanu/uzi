@@ -161,7 +161,7 @@ func TestPutMyModelSettingsPinErrorsCarryCellIdentity(t *testing.T) {
 }
 
 // decodeCrossCheckPins (PutMySettings) keeps returning the FIRST defect
-// with the text it has always had, even though the collector now sees every defect.
+// with the text it has always had (for stage/harness values of at most 64 bytes; longer ones are now clipped), even though the collector now sees every defect.
 func TestDecodeCrossCheckPinsFirstErrorTextUnchanged(t *testing.T) {
 	user := uuid.New()
 	for _, tc := range []struct{ raw, want string }{

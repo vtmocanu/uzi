@@ -149,7 +149,7 @@ func writeModelSettingsErrors(w http.ResponseWriter, errs []modelSettingsError) 
 // write paths accept and reject identically.
 //
 // Order: decode and validate everything, collecting every defect (nothing written; a 400 lists
-// them all in "errors", the first also in "error" and "field"), resolve the settings harness (the
+// them in "errors", unknown keys capped at maxUnknownFieldErrors, the first also in "error" and "field"), resolve the settings harness (the
 // same accepted pre-write race as PutMySettings), then Begin, lock the users row, write, commit,
 // and only then read the settings back, then the effective settings, for the response
 // {"settings": ..., "effective": ...}.
@@ -237,7 +237,7 @@ func (h *Handler) readModelSettingsEffective(ctx context.Context, userID uuid.UU
 
 // decodeModelSettingsRequest is phase 1 of PUT /api/me/model-settings: it checks the keys against
 // the allowlist, then decodes and validates every present field, collecting EVERY defect instead
-// of stopping at the first. An unknown key is reported before any decoding (sorted, all of them).
+// of stopping at the first. An unknown key is reported before any decoding (the first maxUnknownFieldErrors in sorted order, each clipped).
 // Otherwise fields are decoded in PutMySettings' order, with default_harness inserted where
 // PutMySettings decodes it (just before judge_runs_on) and cross_check_pins last, so the first
 // error is the one PutMySettings would report. The returned write is meaningful only when no
