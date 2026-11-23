@@ -561,8 +561,10 @@ it("m3 D/F owned ancestor with its setup-created pin present completes and issue
       if (args.includes("update-ref") && args.includes(pinRef)) pinWrites++;
       if (args.includes("update-ref") && args.includes("refs/uzi-runner/" + childBranch)) promoted = true;
     });
-    await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+    const result = await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
       () => f.cache.fetchAgentBranch(f.bare, f.clone, childBranch, run, options));
+    assert.equal((result as { kind: string }).kind, "updated", JSON.stringify(result));
+    assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + childBranch), f.base);
     assert.equal(pinWrites, 0, "the existing same-SHA pin is reused with no write");
     assert.equal(promoted, true);
     assert.equal(git(f.bare, "rev-parse", pinRef), ancestor);

@@ -332,10 +332,19 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     assert.equal(r.flights.length, 0, why);
   };
 
+  const PRESERVE = "Retained recovery blocked: preservation failed; blocker persistence unavailable; local work and custody retained";
+  const CORRUPT = "Retained recovery blocked: corrupt journal or unsafe local recovery storage; persistence unavailable; local work and custody retained";
+  /** Today's disposition: exactly one failed report with this reason, and nothing parked. */
+  const failedWith = (r: Rig, reason: string): void => {
+    assert.deepEqual(failures(r).map(f => f.body.failure_reason), [reason]);
+    assert.equal(r.parks.length, 0, "no park of any cause");
+  };
+
   it("a changed path is not the typed error and takes today's path", async t => {
     const { r } = await armedHold(t, {}, "path");
     await r.execute();
     notHeld(r, "path");
+    failedWith(r, PRESERVE);
     assert.equal(typedRejections(r).length, 0);
     assert.equal(r.counts.rejections.length, 1);
     assert.match(String((r.counts.rejections[0] as Error).message), /^recovery owner binding changed$/);
@@ -353,6 +362,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
       execFileSync("git", ["-C", r.bare, "config", "--local", r.ownerKey, JSON.stringify(record)], { env: GIT_ENV, stdio: "pipe" });
       await r.execute();
       notHeld(r, name);
+      failedWith(r, PRESERVE);
       assert.equal(typedRejections(r).length, 0);
     });
   }
@@ -362,6 +372,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     execFileSync("git", ["-C", r.bare, "config", "--local", r.ownerKey, "{not json"], { env: GIT_ENV, stdio: "pipe" });
     await r.execute();
     notHeld(r, "malformed");
+    failedWith(r, PRESERVE);
   });
 
   it("a duplicate owner record takes today's path", async t => {
@@ -369,6 +380,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     execFileSync("git", ["-C", r.bare, "config", "--local", "--add", r.ownerKey, r.rawOwner()], { env: GIT_ENV, stdio: "pipe" });
     await r.execute();
     notHeld(r, "duplicate");
+    failedWith(r, PRESERVE);
   });
 
   it("precedence: a duplicate owner record plus a stale claim fence keeps today's error", async t => {
@@ -377,6 +389,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     r.setJournal(j => { j.recovery!.claimGeneration = 9; });
     await r.execute();
     notHeld(r, "duplicate and stale");
+    failedWith(r, PRESERVE);
     assert.equal(typedRejections(r).length, 0);
     assert.match(String((r.counts.rejections[0] as Error).message), /stale recovery claim fence/);
   });
@@ -391,6 +404,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     });
     await r.execute();
     notHeld(r, "duplicate and missing source");
+    failedWith(r, PRESERVE);
     assert.equal(typedRejections(r).length, 0);
   });
 
@@ -409,6 +423,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     execFileSync("git", ["-C", r.bare, "config", "--local", r.ownerKey, JSON.stringify(record)], { env: GIT_ENV, stdio: "pipe" });
     await r.execute();
     notHeld(r, "pending");
+    failedWith(r, PRESERVE);
   });
 
   for (const field of ["attempts", "deadline", "startedAt", "episode"] as const) {
@@ -417,6 +432,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
       r.setJournal(j => { j.recovery![field] = Number(j.recovery![field] ?? 0) + 1; });
       await r.execute();
       notHeld(r, field);
+      failedWith(r, field === "deadline" || field === "startedAt" ? CORRUPT : PRESERVE);
     });
   }
 
@@ -429,6 +445,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     });
     await r.execute();
     notHeld(r, "source");
+    failedWith(r, PRESERVE);
   });
 
   it("a stale claim fence is not held", async t => {
@@ -436,6 +453,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     r.setJournal(j => { j.recovery!.claimGeneration = 9; });
     await r.execute();
     notHeld(r, "stale fence");
+    failedWith(r, PRESERVE);
   });
 
   it("a later iteration of the same claim takes today's path", async t => {
@@ -450,6 +468,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     await r.execute();
     assert.ok(calls >= 2, "a second reservation happened");
     notHeld(r, "later iteration");
+    failedWith(r, PRESERVE);
     assert.equal(adoptionParks(r).length, 0);
   });
 
@@ -457,6 +476,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     const { r, before } = await armedHold(t, { features: [] });
     await r.execute();
     notHeld(r, "no feature");
+    failedWith(r, PRESERVE);
     assert.equal(adoptionParks(r).length, 0);
     assert.equal(fs.existsSync(r.clonePath), true);
     assert.equal(fs.readFileSync(path.join(r.clonePath, "retained.txt"), "utf8"), "local retained work\n");
@@ -469,6 +489,7 @@ describe("controls: only the exact typed first-iteration mismatch is held", () =
     await r.execute();
     api.stateAckWire = undefined;
     notHeld(r, "ACK status");
+    failedWith(r, PRESERVE);
   });
 });
 

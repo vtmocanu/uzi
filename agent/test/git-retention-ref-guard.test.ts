@@ -99,7 +99,7 @@ async function trackedHead(): Promise<string> {
   return h;
 }
 
-describe("issue4627 retention ref guard: owed pin", { timeout: 300_000 }, () => {
+describe("issue4627 retention ref guard: owed pin", () => {
   it("creates an absent pin with exactly update-ref --no-deref REF SHA ZERO, after the candidate write", async () => {
     const h = await trackedHead();
     gitIn(bare, ["update-ref", "-d", owedRef(h)]);
@@ -181,7 +181,7 @@ describe("issue4627 retention ref guard: owed pin", { timeout: 300_000 }, () => 
   });
 });
 
-describe("issue4627 retention ref guard: refusal ref", { timeout: 300_000 }, () => {
+describe("issue4627 retention ref guard: refusal ref", () => {
   /** At the cap with the tracking head's pin removed, so pinning it again hits the cap. */
   async function atCapUnpinned(): Promise<string> {
     let last = base;
@@ -213,12 +213,15 @@ describe("issue4627 retention ref guard: refusal ref", { timeout: 300_000 }, () 
     assert.equal(gitIn(bare, ["rev-parse", refusedRef(tip)]), base);
     assert.equal(internals().refusalRecordingFailed.has(RUN), true);
     assert.ok(fs.existsSync(path.join(refusalDir(), `incomplete-${RUN}.json`)));
-    assert.ok(fs.existsSync(path.join(refusalDir(), `refusals-${RUN}.json`)), "the ledger row step still runs");
+    const ledgerFile = path.join(refusalDir(), `refusals-${RUN}.json`);
+    assert.ok(fs.existsSync(ledgerFile), "the ledger row step still runs");
+    const ledger = JSON.parse(fs.readFileSync(ledgerFile, "utf8")) as { entries: { sha: string }[] };
+    assert.ok(ledger.entries.some((e) => e.sha === tip), "the ledger records the refused tip: " + JSON.stringify(ledger.entries));
     assert.ok(warnings.some((w) => /retention ref target mismatch; ref left untouched/.test(w) && w.includes(refusedRef(tip))));
   });
 });
 
-describe("issue4627 owedTipRetained", { timeout: 300_000 }, () => {
+describe("issue4627 owedTipRetained", () => {
   it("is not_updated when the tracking ref is not owned by this run", async () => {
     commit("H");
     const before = everything();
