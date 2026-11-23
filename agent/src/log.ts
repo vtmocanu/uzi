@@ -112,16 +112,19 @@ class ConsoleLogger implements Logger {
 
   private emit(level: LogLevel, msg: string, fields?: Record<string, unknown>): void {
     if (LEVEL_ORDER[level] < this.minLevel) return;
+    const ts = new Date().toISOString();
     const record = {
-      ts: new Date().toISOString(),
+      ts,
       level,
       msg,
       ...this.base,
       ...fields,
     };
     // Over the redaction work budget the whole record is withheld: a fixed, valid JSON line with no base or fields.
+    // The fallback is unscrubbed by design and writes only logger-generated values (ts, level, LOG_WITHHELD_MSG);
+    // `record.ts` is not used because a base or call-field `ts` overrides it.
     const line = this.registry.scrub(JSON.stringify(record)) ??
-      JSON.stringify({ ts: record.ts, level, msg: LOG_WITHHELD_MSG });
+      JSON.stringify({ ts, level, msg: LOG_WITHHELD_MSG });
     // stderr for warn/error, stdout otherwise — keeps machine-readable logs
     // greppable and lets a supervisor split streams.
     if (level === "warn" || level === "error") process.stderr.write(line + "\n");

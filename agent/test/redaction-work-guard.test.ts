@@ -178,6 +178,37 @@ describe("the matcher's work guard, per redaction consumer", () => {
     }
   });
 
+  it("the logger: a ts in base or call fields never replaces the logger's timestamp on the withheld line", () => {
+    const TS_SECRET = ["ts", "leak", "secret", "0042"].join("-");
+    const cases: Array<[string, (log: ReturnType<typeof createLogger>) => void]> = [
+      ["call field", (log) => log.info("x", { ts: TS_SECRET, out: PERIODIC })],
+      ["child base", (log) => log.child({ ts: TS_SECRET }).info("x", { out: PERIODIC })],
+    ];
+    for (const [label, call] of cases) {
+      const log = createLogger("info");
+      log.addSecret(LONG);
+      log.addSecret(TS_SECRET);
+      observed.length = 0;
+      const before = Date.now();
+      const lines = captureLines(() => call(log));
+      const after = Date.now();
+      assert.equal(lines.length, 1, label);
+      const rec = JSON.parse(lines[0]!) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(rec).sort(), ["level", "msg", "ts"], label);
+      assert.equal(rec.msg, "log record withheld: redaction work budget exceeded", label);
+      assert.equal(rec.level, "info", label);
+      const ts = String(rec.ts);
+      assert.notEqual(ts, TS_SECRET, label);
+      assert.match(ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, label);
+      const parsed = Date.parse(ts);
+      assert.ok(parsed >= before && parsed <= after, `${label}: ts ${ts}`);
+      assert.ok(!lines[0]!.includes(TS_SECRET), label);
+      const overBudget = observed.filter((w) => w.charged > REDACTION_WORK_BUDGET);
+      assert.equal(overBudget.length, 1, `${label}: exactly one over-budget redaction, saw ${observed.length} total`);
+      assert.equal(observed.length, 1, `${label}: no second scrub`);
+    }
+  });
+
   it("the logger: redactDiagnostic returns the marker for an over-budget diagnostic", () => {
     const log = createLogger("info");
     log.addSecret(LONG);
