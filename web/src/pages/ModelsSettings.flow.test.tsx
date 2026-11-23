@@ -394,6 +394,51 @@ describe("unsaved-changes guard", () => {
     expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: null });
   }, 30000);
 
+  // #4639: a save whose response was lost may still commit after anything the page does next,
+  // so the standing warning survives a successful retry, Reload, an edit, the leave dialog,
+  // Discard and a later save.
+  it("a lost-response save keeps its warning through retry, Reload, edit, leave dialog, Discard and a later save", async () => {
+    const WARNING = "models-earlier-request-warning";
+    const put = vi.spyOn(mockApi, "putMyModelSettings").mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    const reloadButtons = () => within(bar()).getAllByRole("button", { name: "Reload saved settings" });
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/could not confirm whether this save was applied/, {}, { timeout: 5000 });
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
+
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText("Saved 1 change.", {}, { timeout: 5000 });
+    expect(within(bar()).queryByText(/Your next runs/)).toBeNull();
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
+
+    fireEvent.click(reloadButtons()[0]);
+    await within(bar()).findByText("Reloaded the saved settings.", {}, { timeout: 5000 });
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
+    expect(reloadButtons()).toHaveLength(1);
+
+    select("Worker effort — Claude", "high");
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
+
+    await act(() => router.navigate("/settings/appearance"));
+    const open = await screen.findByRole("dialog", { name: "An earlier model settings save may still finish" });
+    expect(within(open).queryByRole("button", { name: "Discard changes" })).toBeNull();
+    fireEvent.click(within(open).getByRole("button", { name: "Stay" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(path(router)).toBe("/settings/models");
+
+    fireEvent.click(within(bar()).getByRole("button", { name: "Discard" }));
+    await within(bar()).findByText(/Your edits were discarded here/);
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
+
+    const before = put.mock.calls.length;
+    select("Worker effort — Claude", "low");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText("Saved 1 change.", {}, { timeout: 5000 });
+    expect(put.mock.calls.length).toBe(before + 1);
+    expect(within(bar()).getByTestId(WARNING)).toBeTruthy();
+  }, 30000);
+
   // A save that may have committed keeps the draft dirty, but leaving is then not a discard:
   // the dialog says the changes may already be saved, recommends Stay + Reload saved settings,
   // and its leave button makes no "Discard changes" (rollback) claim.

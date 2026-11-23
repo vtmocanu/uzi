@@ -2027,6 +2027,7 @@ PRD at `prds/done/3263-settings-models-tab.md`.
 - Cells show the saved effective value and source from the server; when predictions fail they read Unavailable. (AI-synced 2026-11-23)
 - Unsaved changes block in-app navigation (Stay/Discard) and prompt on reload or close. (AI-synced 2026-11-23)
 - An uncertain save (commit unknown, or saved but unreadable) never offers discard as if nothing was saved. (AI-synced 2026-11-23)
+- A save whose response was lost keeps a "may still finish" warning visible for the life of the open Models page, whatever the later outcome: a successful retry confirms only its own save without promising next runs use it, and neither a retry nor Reload clears the warning. (AI-synced 2026-11-23, #4639)
 - Run defaults keeps only behavior settings (plus the judge token binding and a read-only judge routing/model summary) and links to Models. (AI-synced 2026-11-23)
 
 ## Feature #4510: Sidebar icon animations

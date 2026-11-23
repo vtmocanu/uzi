@@ -97,6 +97,51 @@ describe("UnsavedModelsGuard", () => {
     expect(router.state.location.pathname).toBe("/schedules");
   });
 
+  it("a lost-response request that may still finish gets its own title and copy, and no discard", async () => {
+    const onDiscard = vi.fn();
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/settings/models",
+          element: (
+            <UnsavedModelsGuard dirtyCount={2} saveUncertainty="unknown" requestMayStillFinish viewerId="u1" onDiscard={onDiscard} />
+          ),
+        },
+        { path: "*", element: <p>elsewhere</p> },
+      ],
+      { initialEntries: ["/settings/models"] },
+    );
+    render(<RouterProvider router={router} />);
+    await act(() => router.navigate("/schedules"));
+    const open = screen.getByRole("dialog", { name: "An earlier model settings save may still finish" });
+    expect(open.textContent).toContain(
+      "An earlier save whose response was lost may still finish and change what is stored. Stay and choose Reload saved settings to see what is stored. Leaving does not undo anything the server stores.",
+    );
+    expect(screen.queryByRole("button", { name: "Discard changes" })).toBeNull();
+    act(() => screen.getByRole("button", { name: "Leave anyway" }).click());
+    expect(router.state.location.pathname).toBe("/schedules");
+  });
+
+  it("while saving, the saving copy wins over the may-still-finish copy", async () => {
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/settings/models",
+          element: (
+            <UnsavedModelsGuard dirtyCount={2} saving saveUncertainty="unknown" requestMayStillFinish viewerId="u1" onDiscard={vi.fn()} />
+          ),
+        },
+        { path: "*", element: <p>elsewhere</p> },
+      ],
+      { initialEntries: ["/settings/models"] },
+    );
+    render(<RouterProvider router={router} />);
+    await act(() => router.navigate("/schedules"));
+    const open = screen.getByRole("dialog", { name: DIALOG });
+    expect(open.textContent).toContain("Saving 2 changes");
+    expect(open.textContent).not.toContain("may still finish");
+  });
+
   it("does not block /login, a same-path change, or a clean page", async () => {
     const dirty = mount(1);
     await act(() => dirty.router.navigate("/settings/models?tab=x#planning"));

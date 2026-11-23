@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 import { Alert, Button, cx } from "../ui";
 
 export type SaveOutcome =
-  | { kind: "saved"; count: number }
+  | { kind: "saved"; count: number; earlierMayStillFinish?: boolean }
   | { kind: "saved_no_prediction" }
   | { kind: "invalid"; count: number; unmatched: string[] }
   | { kind: "not_saved"; message: string }
@@ -20,30 +20,42 @@ function plural(n: number, one: string, many: string): string {
   return n === 1 ? `1 ${one}` : `${n} ${many}`;
 }
 
-function OutcomeAlert({ outcome, onReload, busy, reloading, uncertain }: {
+function ReloadButton({ onReload, busy, reloading }: { onReload: () => void; busy: boolean; reloading: boolean }) {
+  return (
+    <Button type="button" variant="secondary" size="sm" disabled={busy} onClick={onReload}>
+      {reloading ? "Reloading…" : "Reload saved settings"}
+    </Button>
+  );
+}
+
+function OutcomeAlert({ outcome, onReload, busy, reloading, uncertain, requestMayStillFinish }: {
   outcome: SaveOutcome;
   onReload: () => void;
   busy: boolean;
   reloading: boolean;
   /** An earlier save is still unconfirmed: keep Reload reachable even after a failed retry. */
   uncertain: boolean;
+  /** The standing warning (with the only Reload button) is shown, so no alert adds its own. */
+  requestMayStillFinish: boolean;
 }) {
-  const reload = (
-    <Button type="button" variant="secondary" size="sm" disabled={busy} onClick={onReload}>
-      {reloading ? "Reloading…" : "Reload saved settings"}
-    </Button>
-  );
-  const withReload = (alert: ReactNode) => (
-    <div className="flex flex-wrap items-start gap-2">
-      <div className="min-w-0 flex-1">{alert}</div>
-      {reload}
-    </div>
-  );
+  const withReload = (alert: ReactNode) =>
+    requestMayStillFinish ? (
+      alert
+    ) : (
+      <div className="flex flex-wrap items-start gap-2">
+        <div className="min-w-0 flex-1">{alert}</div>
+        <ReloadButton onReload={onReload} busy={busy} reloading={reloading} />
+      </div>
+    );
   const reloadIfUncertain = (alert: ReactNode) => (uncertain ? withReload(alert) : alert);
-  // A failed retry says nothing about the earlier, unconfirmed save: keep saying so.
-  const earlier = uncertain ? " An earlier save is still unconfirmed; reload to see what is stored." : "";
+  // A failed retry says nothing about the earlier, unconfirmed save: keep saying so. The
+  // standing warning already says it while a lost-response request may still finish.
+  const earlier = uncertain && !requestMayStillFinish ? " An earlier save is still unconfirmed; reload to see what is stored." : "";
   switch (outcome.kind) {
     case "saved":
+      if (outcome.earlierMayStillFinish) {
+        return <Alert tone="success" message={`Saved ${plural(outcome.count, "change", "changes")}.`} />;
+      }
       return <Alert tone="success" message={`Saved ${plural(outcome.count, "change", "changes")}. Your next runs use ${outcome.count === 1 ? "it" : "them"}.`} />;
     case "saved_no_prediction":
       return withReload(
@@ -86,7 +98,7 @@ function OutcomeAlert({ outcome, onReload, busy, reloading, uncertain }: {
       );
     case "reloaded":
       if (outcome.requestMayStillFinish) {
-        return withReload(<Alert tone="warning" message="Reloaded the saved settings. The previous request may still finish, so these values are a snapshot." />);
+        return <Alert tone="info" message="Reloaded the saved settings." />;
       }
       return (
         <Alert
@@ -120,6 +132,7 @@ export function ModelsSaveBar({
   outcome,
   reloading,
   uncertain = false,
+  requestMayStillFinish = false,
   onDiscard,
   onReload,
 }: {
@@ -135,6 +148,9 @@ export function ModelsSaveBar({
   reloading: boolean;
   /** An earlier save may have committed without confirmation (see UnsavedModelsGuard). */
   uncertain?: boolean;
+  /** A save whose response was lost may still commit: a standing warning, with the only Reload
+   *  button, stays above every outcome for the life of the page. */
+  requestMayStillFinish?: boolean;
   onDiscard: () => void;
   onReload: () => void;
 }) {
@@ -149,7 +165,27 @@ export function ModelsSaveBar({
         count > 0 ? "border-brand/50" : "border-edge",
       )}
     >
-      {outcome && <OutcomeAlert outcome={outcome} onReload={onReload} busy={busy} reloading={reloading} uncertain={uncertain} />}
+      {requestMayStillFinish && (
+        <div data-testid="models-earlier-request-warning" className="flex flex-wrap items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <Alert
+              tone="warning"
+              message="An earlier save whose response was lost may still finish and replace the values shown here. Reloading shows a snapshot; it cannot confirm that request has finished."
+            />
+          </div>
+          <ReloadButton onReload={onReload} busy={busy} reloading={reloading} />
+        </div>
+      )}
+      {outcome && (
+        <OutcomeAlert
+          outcome={outcome}
+          onReload={onReload}
+          busy={busy}
+          reloading={reloading}
+          uncertain={uncertain}
+          requestMayStillFinish={requestMayStillFinish}
+        />
+      )}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
         <p role="status" aria-live="polite" data-testid="models-save-status" className="min-w-0 text-sm sm:flex-1">
           {saving ? (

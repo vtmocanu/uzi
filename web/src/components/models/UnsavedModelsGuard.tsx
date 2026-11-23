@@ -16,6 +16,7 @@ import { Button } from "../ui";
 
 const UNSAVED_TITLE = "You have unsaved model changes";
 const UNCONFIRMED_TITLE = "Your model changes may already be saved";
+const MAY_FINISH_TITLE = "An earlier model settings save may still finish";
 
 /** The last save's outcome when it may have committed: "unknown" (commit not confirmed,
  *  network or gateway failure) or "saved_unreadable" (committed, readback failed). */
@@ -25,6 +26,7 @@ export function UnsavedModelsGuard({
   dirtyCount,
   saving = false,
   saveUncertainty = null,
+  requestMayStillFinish = false,
   viewerId,
   onDiscard,
 }: {
@@ -36,6 +38,9 @@ export function UnsavedModelsGuard({
   /** The last save may have been stored although the draft is still dirty, so leaving is not
    *  a discard: the dialog explains the uncertainty and offers "Leave anyway". */
   saveUncertainty?: SaveUncertainty | null;
+  /** An earlier save's response was lost, so it may still commit later: the "unknown" copy
+   *  says that instead of claiming the save was merely unconfirmed. */
+  requestMayStillFinish?: boolean;
   /** The viewer whose draft this is. */
   viewerId: string;
   /** Drops the draft back to the saved baseline before the blocked navigation proceeds. */
@@ -101,9 +106,12 @@ export function UnsavedModelsGuard({
   // undo it, so the copy says so, points at Stay + Reload saved settings, and the leave
   // button makes no discard (rollback) claim.
   const uncertain = !saving && saveUncertainty ? saveUncertainty : null;
-  const title = uncertain ? UNCONFIRMED_TITLE : UNSAVED_TITLE;
+  const lostResponse = uncertain === "unknown" && requestMayStillFinish;
+  const title = lostResponse ? MAY_FINISH_TITLE : uncertain ? UNCONFIRMED_TITLE : UNSAVED_TITLE;
   const message = saving
     ? `Saving ${changes}… You continue once the save finishes.`
+    : lostResponse
+      ? "An earlier save whose response was lost may still finish and change what is stored. Stay and choose Reload saved settings to see what is stored. Leaving does not undo anything the server stores."
     : uncertain === "unknown"
       ? `The server could not confirm whether an earlier save was applied, so ${changes} may already be saved. Stay and choose Reload saved settings to see what is stored. Leaving does not undo anything the server stored.`
       : uncertain === "saved_unreadable"
