@@ -29,8 +29,12 @@ const waitUntil = async (fn: () => boolean, timeoutMs = 4000): Promise<boolean> 
   return fn();
 };
 
+// spawnDetached replaces `$HOME/.claude.json` before every spawn (PRD #4416), so these spawns get
+// a throwaway HOME rather than the developer's real one.
+const spawnHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-spawn-home-")));
+
 function spawnOpts(command: string, args: string[]): SpawnOptions {
-  return { command, args, env: { ...process.env }, signal: new AbortController().signal };
+  return { command, args, env: { ...process.env, HOME: spawnHome }, signal: new AbortController().signal };
 }
 
 describe("killProcessGroup", () => {

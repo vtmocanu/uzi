@@ -3602,6 +3602,7 @@ export class SdkExecutor implements Executor {
         // park, whatever the soft layer concluded.
         throwIfDiskStop(ctx);
         if (capVerdict === "park") throw new DiskParkSignal(true);
+        await this.warnLiveWritersAtConfigReset();
         // Checkpoints bypass the post-turn limit. Refresh budget/history and honor
         // controls first; a clarification still owns the uncompleted current turn.
         if (iteration - 1 >= maxIterations && !state.tripReason && state.wallRemainingMs > 0 &&
@@ -6001,6 +6002,23 @@ export class SdkExecutor implements Executor {
       if (Date.now() - started >= this.quietSettleMs) return true;
       await sleep(QUIET_POLL_MS);
     }
+  }
+
+  /**
+   * PRD #4416: evidence only, never a reap or a refusal. spawnDetached replaces the CLI's global
+   * config with fixed bytes at each CLI start; a process of this run that is still alive (the
+   * HOME-attributed scan, one pass, no settle poll) can rewrite that file between the reset and the
+   * CLI's startup read. Logs the count (or an incomplete scan), nothing else.
+   */
+  private async warnLiveWritersAtConfigReset(): Promise<void> {
+    const scan = await this.runProcesses
+      .scan(this.homeDir, this.runWorktree, [...this.spawnedPids])
+      .catch((): RunProcessScan => ({ pids: [], complete: false }));
+    if (scan.complete && scan.pids.length === 0) return;
+    this.log.warn(
+      `global CLI config replaced while ${scan.pids.length} run processes are alive; a live writer can race the CLI start`,
+      { count: scan.pids.length, scanComplete: scan.complete },
+    );
   }
 
   /**
