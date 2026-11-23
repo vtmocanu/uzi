@@ -145,7 +145,8 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 
 func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
-	if err := store.Migrate(ctx, dsn); err != nil {
+	// The test pins the 00521 definition, so it stands the database at 00521 rather than at the head.
+	if err := store.MigrateTo(ctx, dsn, 521); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)

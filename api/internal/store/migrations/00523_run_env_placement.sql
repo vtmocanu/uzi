@@ -1,7 +1,9 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
 
--- PRD #4416 M2: fn_placement_admitting_workers gains the run_env_v1 claim clause.
+-- PRD #4416 M2: composes on 00521_placement_codex_provider_capability.sql: fn_placement_admitting_workers
+-- keeps every 00521 clause (including the engine-aware provider clause) and gains the run_env_v1 claim clause.
+-- Down restores the 00521 Up definition.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -54,9 +56,10 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-                 -- PRD #4320 module 5: the provider claim clause (see ClaimRun's NON-BYPASSABLE provider clause): a
-                 -- provider-bound run is placeable only on a worker reporting 'claude_provider_v1'.
-                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                 -- Provider-bound placement requires the capability for the run's engine.
+                 AND (r.model_provider_key_mode IS NULL
+                      OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                      OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
                  -- requires its harness's phase-models capability. ClaimRun enforces the same clause;
                  -- the kind list is pinned to leadcfg.LeadLane by a test.
@@ -117,7 +120,6 @@ $$;
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 
--- Restores the predecessor placement function body (migration 00507) without the run_env_v1 clause.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -166,9 +168,10 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
-                 -- PRD #4320 module 5: the provider claim clause (see ClaimRun's NON-BYPASSABLE provider clause): a
-                 -- provider-bound run is placeable only on a worker reporting 'claude_provider_v1'.
-                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                 -- Provider-bound placement requires the capability for the run's engine.
+                 AND (r.model_provider_key_mode IS NULL
+                      OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                      OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
                  -- requires its harness's phase-models capability. ClaimRun enforces the same clause;
                  -- the kind list is pinned to leadcfg.LeadLane by a test.
