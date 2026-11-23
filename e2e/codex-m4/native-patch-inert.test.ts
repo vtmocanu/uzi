@@ -117,7 +117,7 @@ for (const model of models) {
             } else if (goals.includes(id as typeof goals[number])) {
               assert.ok(output.includes(`TypeError: tools.${id} is not a function`), output);
             } else if (id === "read_mcp_resource") {
-              assert.ok(outputs.includes("Script error:\nunknown MCP server 'offline-fixture'"), output);
+              assert.ok(outputs.includes("Script error:\nunknown MCP server 'offline-fixture' for the selected environment"), output);
             } else {
               const expected = id === "list_mcp_resources" ? { resources: [] } : { resourceTemplates: [] };
               assert.ok(outputs.includes(JSON.stringify(expected)), `${id}: exact empty JSON result: ${output}`);
