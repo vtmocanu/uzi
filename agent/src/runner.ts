@@ -48,6 +48,7 @@ import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sour
 import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken, RefusalReleaseGate } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
+  RecoveryOwnerBareIdentityError,
   RecoveryChargeInterruptedError,
   RecoveryBudgetExhaustedError,
   RecoveryDeadlineExhaustedError,
@@ -3255,6 +3256,10 @@ interface RunFlight {
   /** issue #3644: an unsupported-predecessor owner hold was requested (or attempted) for this flight; the park teardown that would
    *  otherwise reap and drop the caches of the HOME the flight holds must not run. */
   restoreUnsupportedHold?: boolean;
+  /** issue #4627: a retained claim whose bare storage identity (device or inode) changed was refused before any source action and
+   *  an owner hold was requested (or attempted). The park teardown must not reap or drop the caches of the HOME it holds, and the
+   *  exit retains the owed tip without moving any ref that already retains it. */
+  bareIdentityHold?: boolean;
   /** issue #3644: the `status` of this flight's first `running` report's ACK. Read-only; the unsupported-predecessor park is sent
    *  only when it is `running` (a redundant client-side check of the server's own fence). */
   runningAckStatus?: string;
@@ -7845,10 +7850,19 @@ export class RunRunner {
           const retain = async () =>
             this.git.retainCurrentOwedCandidate(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
           // Retained-flight cleanup must not requeue behind a lock its lifecycle just cancelled.
+          // issue #4627: a bare-identity hold first asks whether an exact owed pin already retains the tip (no write); only an
+          // `unretained` answer falls back to today's retainCurrentOwedCandidate (exception E1, additive pin).
+          const retainForExit = async () => {
+            if (flight.bareIdentityHold === true && typeof this.git.owedTipRetained === "function") {
+              const probed = await this.git.owedTipRetained(flight.barePath!, await this.owedOptions(flight, flight.barePath!, flight.branch!));
+              if (probed.kind !== "unretained") return probed;
+            }
+            return retain();
+          };
           const retained = await this.runCancellationMaintenance(flight, () => flight.retainedLocalCustody
             ? this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
-              async () => { this.retainedLifecycleGuard(flight); return retain(); })
-            : retain());
+              async () => { this.retainedLifecycleGuard(flight); return retainForExit(); })
+            : retainForExit());
           sourceOwedJoined = retained.kind === "updated";
           if (!sourceOwedJoined) flight.sourceJoinFailed = true;
           if (retained.kind === "not_updated" && claim.inventory_guarded === true) flight.preserveRecoveryClone = true;
@@ -8025,7 +8039,7 @@ export class RunRunner {
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
       if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety && !flight.providerParkUnproven &&
-          !flight.restoreUnsupportedHold && !predecessorHome) {
+          !flight.restoreUnsupportedHold && !flight.bareIdentityHold && !predecessorHome) {
         parkReapApplied = true;
         // "Only a park that ended the run's processes drops": the park's process-group reap misses
         // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
@@ -31204,6 +31218,60 @@ export class RunRunner {
   }
 
   /**
+   * issue #4627: a retained claim's first reservation found the bare's storage identity (device or inode) changed while the owner
+   * record's path, branch, key and run still match, on a journal that is not blocked. Execution stays refused and nothing is
+   * written to the journal, owner record or ledger; the run is parked for its owner at `recovery_wait` /
+   * `retained_recovery_adoption_failed`, modelled on {@link holdUnsupportedRestore}. Always ends in {@link RetainedRecoveryStop};
+   * a stale claim, a credential switch, a lost ownership and an owner Cancel propagate as there.
+   */
+  private async holdForBareIdentityChange(claim: ClaimResponse, flight: RunFlight, error: RecoveryOwnerBareIdentityError): Promise<never> {
+    flight.bareIdentityHold = true;
+    const detail = { recorded_dev: error.recorded.dev, recorded_ino: error.recorded.ino, current_dev: error.current.dev,
+      current_ino: error.current.ino, claim_generation: claim.claim_generation };
+    flight.runLog.warn("retained recovery bare storage identity changed; execution refused", detail);
+    const emitCorrected = () => flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
+      "The owner hold for the changed storage identity was not confirmed; the run is not failed and its work and custody stay on " +
+      "this worker. Automatic retries follow the ordinary requeue accounting."), 600) } });
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: sanitizeForLog(flight.redactText(
+      "The retained work's storage identity changed (for example a pod replacement remounted the volume), so execution was refused " +
+      "before any source action. The work and custody stay on this worker. The worker is requesting an owner hold; the run's " +
+      "status shows whether it was applied. Export or recover the work with `uzi run recovery <run>` rather than Resume: a claimed " +
+      "Resume holds again unchanged and adds a custody hold, up to the custody hold limit. Cancel ends the run."), 1200) } });
+    try {
+      const delivered = await flight.batcher.flushOwned(
+        AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+      if (!delivered) {
+        this.retainedLifecycleGuard(flight);
+        flight.runLog.warn("guidance_unconfirmed", { reason: "not_confirmed" });
+      }
+    } catch (flushError) {
+      this.retainedLifecycleGuard(flight);
+      flight.runLog.warn("guidance_unconfirmed", { reason: "flush_error", ...formatRetainedRecoveryDiagnostic(flushError, flight.redactText) });
+    }
+    this.retainedLifecycleGuard(flight);
+    let held = false;
+    try { held = await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed"); }
+    catch (parkError) {
+      if (!(parkError instanceof RetainedRecoveryStop) || parkError instanceof RetainedRecoveryCancelled) throw parkError;
+      // Same disposition as holdUnsupportedRestore: a stale claim, a credential switch and a cancel own an executeClaim arm each;
+      // a lost ownership is rethrown as the nonterminal RetainedRecoveryStop wrapper.
+      const cause = parkError.cause;
+      if (cause instanceof StaleClaimError || cause instanceof RetainedRecoveryCancelled || cause instanceof CredentialSwitchSignal) throw cause;
+      if (isRunOwnershipLost(cause, flight.runId)) throw parkError;
+    }
+    if (held) {
+      flight.runLog.info("retained recovery bare identity change held", detail);
+      throw new RetainedRecoveryStop();
+    }
+    flight.runLog.warn("retained recovery bare identity change hold unconfirmed", detail);
+    emitCorrected();
+    try {
+      await flight.batcher.flushOwned(AbortSignal.any([this.retainedLifecycleSignal(flight), AbortSignal.timeout(GUIDANCE_FLUSH_MS)]));
+    } catch { /* best effort: the stop below is nonterminal either way */ }
+    throw new RetainedRecoveryStop();
+  }
+
+  /**
    * issue #3644 plan 3.6 (ii): the successor's executor and HOME, installed BEFORE the seed so the seed's own quiescence uses
    * them and nothing of the predecessor's HOME is ever reachable from the flight again. Built at `{generation}` (HOME
    * agent-home/<runId>.g<N>, provision/<runId>.g<N>); a Codex (safety-bearing) initial executor is disposed BEFORE the
@@ -31503,6 +31571,8 @@ export class RunRunner {
     // A park may carry the capacity-only marker only when every consumed reservation ended in a data
     // volume capacity refusal and the window began here (see the authorization in fail()).
     let startedHere: boolean | undefined;
+    // issue #4627: true once this claim's first reservation succeeded; a bare-identity hold is only for a claim with no source action.
+    let reservedThisClaim = false;
     let lastWitnessed: Pick<import("./recovery-progress.js").RecoveryProgress, "startedAt" | "deadline" | "attempts" | "episode" | "claimGeneration"> | undefined;
     let observed = 0;
     let allCapacity = true;
@@ -31743,6 +31813,11 @@ export class RunRunner {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         if (error instanceof RecoveryChargeInterruptedError) throw new RetainedRecoveryStop({ cause: error });
+        // issue #4627: a changed bare storage identity on the first reservation of a not-blocked journal is held for the owner.
+        if (error instanceof RecoveryOwnerBareIdentityError && !reservedThisClaim && source.recovery?.stage !== "blocked" &&
+            this.client.hasFeature(RETAINED_ADOPTION_FAILED_FEATURE) &&
+            Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 && flight.runningAckStatus === "running")
+          return this.holdForBareIdentityChange(claim, flight, error);
         // A spent window or clock is not evidence against a capacity-only history; any other reservation
         // failure is, because the journal may hold a reservation this flight never witnessed.
         if (!(error instanceof RecoveryBudgetExhaustedError || error instanceof RecoveryDeadlineExhaustedError)) allCapacity = false;
@@ -31752,6 +31827,7 @@ export class RunRunner {
         await fail();
       }
       const iteration = reservation!;
+      reservedThisClaim = true;
       episode = iteration;
       startedHere ??= iteration.attempts === 1;
       lastWitnessed = { startedAt: iteration.startedAt, deadline: iteration.deadline, attempts: iteration.attempts,
