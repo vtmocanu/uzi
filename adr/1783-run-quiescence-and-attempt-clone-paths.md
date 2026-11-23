@@ -25,8 +25,9 @@ clone key and read that git as unattributed residue, failing the successor.
   section's end a latch closes: no new stage or git call starts (the content
   proof polls it before each git call). The stage gate also checks the clock
   (`Date.now() >= deadlineAt`) before each stage, so a continuation running after
-  `D` but before the deadline timer fires cannot start another stage. A late callback never changes the verdict,
-  and abandoned work stays tracked until it settles. A section that cannot show
+  `D` but before the deadline timer fires cannot start another stage. A late
+  callback never changes the verdict, and abandoned work stays tracked until it
+  settles. A section that cannot show
   its work settled refuses `source_settlement_unproven`.
 - **Forced-helper scans.** The section's scans always run through the helper
   (`forceHelper`), because the in-process scan exempts the scanner's own
@@ -58,7 +59,7 @@ clone key and read that git as unattributed residue, failing the successor.
   section race. The inventory before- and after-scans (opt-in
   `QuiesceRunRequest.helperDeadline`, set only by the runner's inventory quiesce
   wrapper) and observe-only probes carry `deadlineAt` into the helper's
-  `ScanRequest`, so the helper's own scan and kill gates stop at `D`. Other helper
+  `ScanRequest`, so the helper's own scan and kill gates stop no later than `D`. Other helper
   scans (the #3980 gate checkpoints, terminal preservation) do not carry it,
   deliberately: forwarding it would let an attributed non-dumpable peer (the Codex
   supervisor) block them. Effect, kept fail-closed: with a deadline set, the
@@ -68,7 +69,8 @@ clone key and read that git as unattributed residue, failing the successor.
   Ancestry attribution of that pid, the #3915 late-root re-proof and the
   unreadable-process reap are unreachable for these scans. A before-scan then
   refuses `process_not_quiescent_before_git` and keeps custody, an after-scan
-  leaves the section unsettled and the key excluded, and the probe is not clear.
+  refuses `process_not_quiescent_after_git` and the exclusion is retained (full
+  probe skipped), and the probe is not clear.
   Liveness cost: any unreadable runner-uid process on the worker, including an
   attributed peer such as the Codex supervisor, blocks inventory source proofs
   while it lives.

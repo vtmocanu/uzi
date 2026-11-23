@@ -1508,7 +1508,7 @@ operation it started has settled and a fresh observe-only probe over the full
 same-key seed scope reads clear. The probe ignores marked processes of other
 attempts; unmarked residue in scope keeps the exclusion, and so does a probe that
 cannot verify the scan (for example an unreadable process owned by the runner
-user), so a persistent one strands same-key seeds until requeues run out. The
+user), so a persistent one can strand same-key seeds until requeues run out. The
 helper scans in the section enforce the section deadline themselves, and no
 stage starts after it.
 
