@@ -29,6 +29,7 @@ import { Skills } from "./pages/Skills";
 import { ToolAllowlist } from "./pages/ToolAllowlist";
 import { AdminBlockedRepos } from "./pages/AdminBlockedRepos";
 import { AdminEgressProfiles } from "./pages/AdminEgressProfiles";
+import { AdminSharedProviders } from "./pages/AdminSharedProviders";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
@@ -164,6 +165,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin/products", element: <AdminProducts />, guard: "admin" },
   // PRD #1906 M1w: egress profiles ("site lists"), the only write surface for them.
   { path: "/admin/egress-profiles", element: <AdminEgressProfiles />, guard: "admin" },
+  // PRD #4324: admin-shared Claude provider definitions (users attach their own keys).
+  { path: "/admin/shared-providers", element: <AdminSharedProviders />, guard: "admin" },
   // PRD #1484 M4: the Admin → Health tab. LAST row (D1), guarded admin like its siblings.
   { path: "/admin/health", element: <AdminHealth />, guard: "admin" },
 ];

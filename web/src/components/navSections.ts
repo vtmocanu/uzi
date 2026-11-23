@@ -44,6 +44,7 @@ const ADMIN_TABS: SectionDef[] = [
   { label: "Workers", to: "/admin/workers", keywords: ["fleet", "hosted", "docker", "ephemeral", "hibernation", "capability", "scheduling"] },
   { label: "Branding", to: "/admin/branding", keywords: ["logo", "company", "brand"] },
   { label: "Site lists", to: "/admin/egress-profiles", keywords: ["egress", "profiles", "domains", "network"] },
+  { label: "Shared providers", to: "/admin/shared-providers", keywords: ["provider", "gateway", "claude", "shared", "keys"] },
   { label: "Products", to: "/admin/products", keywords: ["external", "jobs"] },
   { label: "Health", to: "/admin/health", keywords: ["status", "checks", "diagnostics"] },
 ];
