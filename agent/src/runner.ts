@@ -6351,7 +6351,7 @@ export class RunRunner {
   private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
     ownMemory: (operation: Promise<void>) => void): Promise<void> {
     const eligible = this.client.supportsPolicyHold && !!this.outbox && !!this.snapshotRegistry &&
-      !!claim.secrets.codex && Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
+      isCodexBoundClaim(claim) && Number.isSafeInteger(claim.claim_generation) && (claim.claim_generation ?? 0) > 0 &&
       claim.interactive !== true &&
       ["issue", "task", "prompt", "self_improve"].includes(claim.kind ?? "issue");
     const reservation = eligible ? this.outbox!.reservePolicyFlight(claim.run_id, claim.claim_generation ?? 0) : undefined;
@@ -7307,7 +7307,7 @@ export class RunRunner {
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchSignal) {
         // The Codex executor has unwound: neither continuation A nor Claude release is safe.
-        if (claim.secrets.codex) {
+        if (isCodexBoundClaim(claim)) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.keepGuardedInventoryOpen = true;
@@ -15643,7 +15643,7 @@ export class RunRunner {
     flight.publicationFloor = flight.runnerClone?.publicationFloor ?? { kind: "unverified" };
     flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
     flight.checkpointFloor = flight.publishedTip;
-    if (this.recovery.enabled && claim.secrets.codex && isCodePublishingKind(resolveRunKind(claim.kind)) && !flight.predecessorCapture) {
+    if (this.recovery.enabled && isCodexBoundClaim(claim) && isCodePublishingKind(resolveRunKind(claim.kind)) && !flight.predecessorCapture) {
       const privateHead = await this.git.worktreeHead(flight.worktreePath!);
       const configuredDefaultTip = claim.repo.default_branch?.trim()
         ? await this.git.originBranchTip(barePath, claim.repo.default_branch.trim())
@@ -15705,7 +15705,7 @@ export class RunRunner {
       return;
     }
     if (!claim.session_id) throw new PolicyContinuationRejected("session_missing", true);
-    if (claim.secrets.codex &&
+    if (isCodexBoundClaim(claim) &&
         (!flight.runHome || await CodexSessionStore.inspectSession(join(flight.runHome, "codex-session-store"), claim.session_id) !== "present"))
       throw new PolicyContinuationRejected("transcript_unknown", true);
   }
@@ -15958,7 +15958,7 @@ export class RunRunner {
           reason: "cwd_changed_attempt_path",
         },
       });
-    } else if (!sessionId && claim.secrets.codex && flight.retainedEpisode) {
+    } else if (!sessionId && isCodexBoundClaim(claim) && flight.retainedEpisode) {
       // Retained work proves a predecessor existed, but its conversation id was
       // never reported. Do not imply that the recovered work carries its context.
       runLog.info("retained Codex conversation id unavailable; starting a fresh thread", {
@@ -15972,7 +15972,7 @@ export class RunRunner {
     if (
       sessionId &&
       runHome &&
-      (claim.secrets.codex
+      (isCodexBoundClaim(claim)
         ? (await CodexSessionStore.inspectSession(join(runHome, "codex-session-store"), sessionId)) !== "present"
         : !(await sessionTranscriptResolvable(runHome, sessionId, runLog)))
     ) {
@@ -16146,7 +16146,7 @@ export class RunRunner {
       claim,
       barePath,
       flight.defaultBranchTip,
-      claim.secrets.codex ? "codex" : "claude",
+      isCodexBoundClaim(claim) ? "codex" : "claude",
       batcher,
       runLog,
     );
@@ -18022,7 +18022,7 @@ export class RunRunner {
         // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
         if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
         // This hook belongs to Claude, including its give-up and v1 release outcomes.
-        if (claim.secrets.codex) {
+        if (isCodexBoundClaim(claim)) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
           flight.keepGuardedInventoryOpen = true;
@@ -18204,7 +18204,7 @@ export class RunRunner {
         const eligible = requiredEligible || gatedEligible;
         // Older api (no plan_cross_check_codex_lead): do not submit a Codex lead's check, park at
         // the human gate. This is a capability check, NOT a mapping of 409 refusals.
-        const codexLeadUnsupported = !!claim.secrets.codex && claim.plan_cross_check_codex_lead !== true;
+        const codexLeadUnsupported = isCodexBoundClaim(claim) && claim.plan_cross_check_codex_lead !== true;
         let crossCheckReason: string | undefined;
         let checkedApproval: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"] | undefined;
         let checkedFields: PlanCrossCheckStateRequest | undefined;
@@ -24385,7 +24385,7 @@ export class RunRunner {
 
   private isCredentialFreeOwnerCancel(claim: ClaimResponse, flight: RunFlight): boolean {
     return this.recovery.enabled && !!flight.worktreePath && !!flight.barePath &&
-      isCodePublishingKind(resolveRunKind(claim.kind)) && !!claim.secrets.codex &&
+      isCodePublishingKind(resolveRunKind(claim.kind)) && isCodexBoundClaim(claim) &&
       flight.steering.isCancelled();
   }
 
