@@ -1009,13 +1009,7 @@ func TestRunEnvListPlainValueOpensAtRowEpochLiveDB(t *testing.T) {
 		t.Fatalf("list rows = %d, %v", len(rows), err)
 	}
 	row := rows[0]
-	asRow := func(r store.ListRunEnvVarsForRepoRow) runEnvRow {
-		return runEnvRow{
-			ID: r.ID, VarID: r.VarID, Name: r.Name, Secret: r.Secret, Description: r.Description, Ciphertext: r.Ciphertext,
-			SealedWith: r.SealedWith, ValueBytes: r.ValueBytes, Rev: r.Rev, DisabledAt: r.DisabledAt,
-			PendingDeleteAt: r.PendingDeleteAt, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, AadVersion: r.AadVersion,
-		}
-	}
+	asRow := runEnvRowFromList
 	epoch := row.VaultEpoch
 	// Control: at the epoch the row was read at, the value opens.
 	dto, locked := h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)

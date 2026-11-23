@@ -96,9 +96,21 @@ func runEnvHeadroomConflict(code string, err error) error {
 	return &runEnvConflictError{code, fmt.Sprintf("saving this would bring your stored credentials and variables to %d records and %d bytes, over the vault's storage limit; disable or delete a variable, or remove a credential, first", limit.Rows, limit.Bytes)}
 }
 
-// runEnvRow is the shape every run_env_vars read returns, whichever generated query
-// produced it.
+// runEnvRow is the shape the run_env_vars write queries return, and the one the response view
+// (runEnvDTOAt) takes. The list read, ListRunEnvVarsForRepoRow, carries one more column (VaultEpoch,
+// read in the same statement as the ciphertext); runEnvRowFromList drops it into the epoch the
+// caller passes to runEnvDTOAt.
 type runEnvRow = store.InsertRunEnvVarRow
+
+// runEnvRowFromList is the list row's runEnvRow; its VaultEpoch is the caller's to pass along.
+func runEnvRowFromList(row store.ListRunEnvVarsForRepoRow) runEnvRow {
+	return runEnvRow{
+		ID: row.ID, VarID: row.VarID, Name: row.Name, Secret: row.Secret, Description: row.Description,
+		Ciphertext: row.Ciphertext, SealedWith: row.SealedWith, ValueBytes: row.ValueBytes, Rev: row.Rev,
+		DisabledAt: row.DisabledAt, PendingDeleteAt: row.PendingDeleteAt, CreatedAt: row.CreatedAt,
+		UpdatedAt: row.UpdatedAt, AadVersion: row.AadVersion,
+	}
+}
 
 // runEnvOwner resolves the caller and the repo they own, answering 401/400/404 itself
 // (the same preflight as GetRepoToolProfile: a foreign or unknown repo is a 404).
@@ -279,11 +291,18 @@ func (h *Handler) runEnvDTOAt(ctx context.Context, userID, repoID uuid.UUID, row
 	return dto, false
 }
 
-// runEnvWriteDTO builds a write response's view of the saved row. It asks the vault for
-// its lock state after the write committed, so an enable+lock that lands between the
+// runEnvWriteDTO builds a write response's view of the saved row. A non-nil epoch is the vault
+// epoch the row was written or read at under the owner's users-row lock: the plain value is opened
+// at that epoch, so an enable+lock or rewrap that lands after the commit withholds it (a stale or
+// locked result, as the list does). With a nil epoch (a no-op save that wrote nothing) it asks the
+// vault for its lock state after the write committed, so an enable+lock that lands between the
 // commit and this response still withholds the plain value (the row may carry master_aad
 // material the master key opens).
-func (h *Handler) runEnvWriteDTO(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow) apitypes.RunEnvVarDTO {
+func (h *Handler) runEnvWriteDTO(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow, epoch *int64) apitypes.RunEnvVarDTO {
+	if epoch != nil {
+		dto, _ := h.runEnvDTOAt(ctx, userID, repoID, row, false, epoch)
+		return dto
+	}
 	vaultLocked := h.vault != nil && h.vault.RequiresUnlock(ctx, userID)
 	dto, _ := h.runEnvDTO(userID, repoID, row, vaultLocked)
 	return dto
@@ -322,12 +341,7 @@ func (h *Handler) ListRepoEnvVars(w http.ResponseWriter, r *http.Request) {
 	vaultLocked := out.VaultLocked
 	for _, row := range rows {
 		epoch := row.VaultEpoch
-		dto, locked := h.runEnvDTOAt(r.Context(), userID, repoID, runEnvRow{
-			ID: row.ID, VarID: row.VarID, Name: row.Name, Secret: row.Secret, Description: row.Description,
-			Ciphertext: row.Ciphertext, SealedWith: row.SealedWith, ValueBytes: row.ValueBytes, Rev: row.Rev,
-			DisabledAt: row.DisabledAt, PendingDeleteAt: row.PendingDeleteAt, CreatedAt: row.CreatedAt,
-			UpdatedAt: row.UpdatedAt, AadVersion: row.AadVersion,
-		}, vaultLocked, &epoch)
+		dto, locked := h.runEnvDTOAt(r.Context(), userID, repoID, runEnvRowFromList(row), vaultLocked, &epoch)
 		out.VaultLocked = out.VaultLocked || locked
 		out.Variables = append(out.Variables, dto)
 		out.Counts.Total++
@@ -630,7 +644,9 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		h.writeRunEnvTxError(w, err, "write run env var")
 		return
 	}
-	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, saved)
+	// FenceVaultWrite checked material's epoch under the owner's lock, so the saved row is sealed at it.
+	savedEpoch := material.Epoch
+	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, saved, &savedEpoch)
 	status := http.StatusOK
 	if !exists {
 		status = http.StatusCreated
@@ -648,9 +664,11 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 		DisabledAt: cur.DisabledAt, PendingDeleteAt: cur.PendingDeleteAt, CreatedAt: cur.CreatedAt, UpdatedAt: cur.UpdatedAt,
 		AadVersion: cur.AadVersion,
 	}
+	var epoch *int64
 	if description != cur.Description {
 		var err error
-		row, err = h.mutateLiveRunEnv(ctx, userID, repoID, cur.Name, cur, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
+		var e int64
+		row, e, err = h.mutateLiveRunEnv(ctx, userID, repoID, cur.Name, cur, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
 			updated, err := q.UpdateRunEnvVarDescription(ctx, store.UpdateRunEnvVarDescriptionParams{ID: live.ID, UserID: userID, Description: description})
 			return runEnvRow(updated), err
 		})
@@ -658,8 +676,9 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 			h.writeRunEnvTxError(w, err, "update run env description")
 			return
 		}
+		epoch = &e
 	}
-	dto := h.runEnvWriteDTO(ctx, userID, repoID, row)
+	dto := h.runEnvWriteDTO(ctx, userID, repoID, row, epoch)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
@@ -667,13 +686,17 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 // mutateLiveRunEnv runs a metadata-only change on the live row of a name in a locked
 // transaction: the advisory lock, then the users-row fence (without a seal snapshot,
 // since no ciphertext is written). expect, when set, is the row the caller planned
-// against; a moved row is errRunEnvChanged. A missing row is pgx.ErrNoRows.
-func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID, name string, expect store.RunEnvVar, fn func(*store.Queries, store.RunEnvVar) (runEnvRow, error)) (runEnvRow, error) {
+// against; a moved row is errRunEnvChanged. A missing row is pgx.ErrNoRows. It also returns the
+// vault epoch read under the users-row lock, the epoch the returned row's ciphertext is sealed at.
+func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID, name string, expect store.RunEnvVar, fn func(*store.Queries, store.RunEnvVar) (runEnvRow, error)) (runEnvRow, int64, error) {
 	var out runEnvRow
+	var epoch int64
 	err := h.withSecretLock(ctx, userID, nil, func(q *store.Queries) error {
-		if _, err := q.LockUserVaultState(ctx, userID); err != nil {
+		state, err := q.LockUserVaultState(ctx, userID)
+		if err != nil {
 			return err
 		}
+		epoch = state.VaultEpoch
 		if err := lockRunEnvRepo(ctx, q, repoID); err != nil {
 			return err
 		}
@@ -687,7 +710,7 @@ func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID
 		out, err = fn(q, live)
 		return err
 	})
-	return out, err
+	return out, epoch, err
 }
 
 // SetRepoEnvVarDisabled is POST /api/repos/{id}/env/{name}/disable and .../enable:
@@ -710,7 +733,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		writeRunEnvRule(w, err)
 		return
 	}
-	row, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
+	row, epoch, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
 		updated, err := q.SetRunEnvVarDisabled(r.Context(), store.SetRunEnvVarDisabledParams{ID: live.ID, UserID: userID, Disabled: disabled})
 		return runEnvRow(updated), err
 	})
@@ -722,7 +745,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		h.writeRunEnvTxError(w, err, "disable run env var")
 		return
 	}
-	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, row)
+	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, row, &epoch)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
@@ -756,7 +779,7 @@ func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := apitypes.RunEnvStateDisabled // overwritten below
-	_, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
+	_, _, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
 		retain := false
 		if live.Secret {
 			var err error

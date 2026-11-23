@@ -241,6 +241,48 @@ func TestRunEnvCrossCheckStaleEpochDeliversNothingLiveDB(t *testing.T) {
 	}
 }
 
+// The window after the open, cross-check lane: the child's redact versions are opened at epoch E,
+// then the owner enables protection (epoch E+1) and locks before the claim commits. The finish
+// fences the epoch like the lead lane: nothing is delivered and the check is not decided.
+func TestRunEnvCrossCheckEpochChangeAfterOpenDeliversNothingLiveDB(t *testing.T) {
+	f, w := admissionCheckerBase(t, "plan")
+	f, _ = admissionCheckerSubmit(t, f, w, "plan", 0, nil)
+	crossCheckEnvCapable(f, true)
+	armProtection(t, f.env, f.userID)
+	secret := envSecretValue("child-window")
+	seedLeadSecret(t, f, "API_KEY", secret)
+	assembled := false
+	f.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
+		if err != nil || p == nil || !payloadHasValue(p, secret) {
+			t.Errorf("assembly did not open the redact value: payload=%v err=%v", p != nil, err)
+		}
+		assembled = true
+		if err := f.env.vlt.Enable(f.env.ctx, f.userID, codexRacePassword); err != nil {
+			t.Errorf("enable protection: %v", err)
+		}
+		f.env.vlt.Lock(f.userID)
+	}}
+	p := laneClaim(t, f, "cross_check", nil)
+	if !assembled {
+		t.Fatal("assembly hook never ran")
+	}
+	if p != nil {
+		t.Fatalf("checker claimed with redact=%+v after the epoch changed before the commit", p.Secrets.RunEnvRedact)
+	}
+	child := mustRun(t, f.env, f.runID)
+	if child.Status != "queued" || child.FailOrigin.Valid || child.HoldReason.Valid {
+		t.Fatalf("child status=%s fail=%v hold=%v, want queued with no failure origin", child.Status, child.FailOrigin, child.HoldReason)
+	}
+	var verdict, outcome, reason string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT COALESCE(verdict,''), COALESCE(outcome,''), COALESCE(reason_class,'')
+	    FROM cross_checks WHERE checker_run_id=$1`, f.runID).Scan(&verdict, &outcome, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if verdict == "failed" || outcome == "failed" || reason == "checker_unavailable" {
+		t.Fatalf("check decided: verdict %q outcome %q reason %q, want it still open", verdict, outcome, reason)
+	}
+}
+
 // Redact route: the receipted versions are read unprotected; the owner protects and locks before
 // the open. The route answers ErrRunEnvVaultLocked and no version.
 func TestRunEnvRedactRouteStaleEpochIsVaultLockedLiveDB(t *testing.T) {

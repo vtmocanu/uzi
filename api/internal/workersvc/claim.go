@@ -495,6 +495,11 @@ type ClaimPayload struct {
 	// neither the wire nor any outbox. finishRunClaimTx recomputes both lists under the owner's
 	// users-row lock and compares them with this snapshot.
 	runEnv *runEnvSnapshot
+	// redactEpoch is the vault epoch a cross-check child's RunEnvRedact versions were opened at
+	// (valid only when redactEpochSet). Unexported like runEnv; the finish compares it with the
+	// epoch read under the users-row lock and requeues on a mismatch.
+	redactEpoch    int64
+	redactEpochSet bool
 }
 
 // ClaimIsolatedFetch is the per-run fetch grant: Credential is the plaintext uzf_ token

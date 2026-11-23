@@ -93,7 +93,7 @@ func TestRunEnvWriteDTOWithholdsWhenVaultLocked(t *testing.T) {
 	if dto, _ := h.runEnvDTO(userID, repoID, row, false); dto.Value == nil {
 		t.Fatalf("control: the row must open when not reported locked: %+v", dto)
 	}
-	dto := h.runEnvWriteDTO(context.Background(), userID, repoID, row)
+	dto := h.runEnvWriteDTO(context.Background(), userID, repoID, row, nil)
 	if dto.Value != nil || !dto.ValueWithheld {
 		t.Fatalf("write response under a locked vault: %+v", dto)
 	}

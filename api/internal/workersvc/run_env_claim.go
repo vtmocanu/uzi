@@ -221,8 +221,10 @@ var errCheckerRunEnvUnavailable = fmt.Errorf("%w: the lead's run environment can
 
 // attachCrossCheckRedact fills payload.Secrets.RunEnvRedact for a cross-check child with every
 // secret version the target (lead) run holds a receipt for, and nothing else: never run_env, and
-// no snapshot, so the finish records no receipts for the child. A locked vault is the claim
-// lane's transient requeue (errVaultLocked).
+// no key snapshot, so the finish records no receipts for the child. A locked vault is the claim
+// lane's transient requeue (errVaultLocked). The epoch the versions were opened at is recorded
+// (payload.redactEpoch) so the finish fences it under the users-row lock like the lead lane.
+// A reader failure is returned as is: transient, never checker_unavailable.
 func (s *Service) attachCrossCheckRedact(ctx context.Context, run store.Run, target uuid.UUID, capable bool, payload *ClaimPayload) error {
 	rows, err := s.q.ListRunEnvSecretReceiptVersionsForRun(ctx, target)
 	if err != nil {
@@ -234,25 +236,36 @@ func (s *Service) attachCrossCheckRedact(ctx context.Context, run store.Run, tar
 	if !capable {
 		return errCheckerRunEnvUnavailable
 	}
-	versions, err := s.openReceiptVersions(ctx, run.UserID, target, rows)
+	versions, epoch, hasEpoch, err := s.openReceiptVersions(ctx, run.UserID, target, rows)
 	switch {
-	case errors.Is(err, errVaultLocked), errors.Is(err, secretopen.ErrReaderFailure):
-		// Transient: the check stays queued and a later claim retries it.
+	case errors.Is(err, errVaultLocked):
+		// Transient: the claim is requeued and a later claim retries it.
+		return err
+	case errors.Is(err, secretopen.ErrReaderFailure):
+		// Transient too, but not a requeue: the child stays claimed until
+		// SweepClaimedNeverStarted requeues it. It never decides the check.
 		return err
 	case err != nil:
 		return errCheckerRunEnvUnavailable
 	}
 	payload.Secrets.RunEnvRedact = append(payload.Secrets.RunEnvRedact, versions...)
+	if hasEpoch {
+		payload.redactEpoch, payload.redactEpochSet = epoch, true
+	}
 	return nil
 }
 
 // openReceiptVersions opens every receipted secret version of the governing run for the owner.
 // rows were read just before; a stale vault seal re-reads them once (retryOnSealStale) and a
 // second one is errVaultLocked. Nothing is returned unless every version opened.
-func (s *Service) openReceiptVersions(ctx context.Context, owner, governing uuid.UUID, rows []store.ListRunEnvSecretReceiptVersionsForRunRow) ([]ClaimRunEnvRedact, error) {
-	var out []ClaimRunEnvRedact
+//
+// It also returns the vault epoch the versions of the successful pass were opened at (valid only
+// when hasEpoch): the cross-check claim finish compares it with the epoch under the users-row lock.
+func (s *Service) openReceiptVersions(ctx context.Context, owner, governing uuid.UUID, rows []store.ListRunEnvSecretReceiptVersionsForRunRow) (out []ClaimRunEnvRedact, epoch int64, hasEpoch bool, err error) {
+	var pass runEnvSnapshot
 	first := true
-	err := retryOnSealStale(func() error {
+	err = retryOnSealStale(func() error {
+		pass = runEnvSnapshot{}
 		if !first {
 			var err error
 			if rows, err = s.q.ListRunEnvSecretReceiptVersionsForRun(ctx, governing); err != nil {
@@ -270,6 +283,9 @@ func (s *Service) openReceiptVersions(ctx context.Context, owner, governing uuid
 			if err != nil {
 				return err
 			}
+			if err := pass.noteEpoch(row.VaultEpoch); err != nil {
+				return err
+			}
 			out = append(out, ClaimRunEnvRedact{
 				VarID: row.VarID.String(), Scope: row.Scope, Rev: row.Rev, Name: row.Name, Value: plain,
 			})
@@ -277,9 +293,9 @@ func (s *Service) openReceiptVersions(ctx context.Context, owner, governing uuid
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
-	return out, nil
+	return out, pass.epoch, pass.hasEpoch, nil
 }
 
 // runEnvRedactRow is a receipt with the owner's stored row, as both redact reads return it.
@@ -395,7 +411,7 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	if !open {
 		return RunEnvRedactResponse{}, ErrRunEnvRedactClosed
 	}
-	versions, err := s.openReceiptVersions(ctx, run.UserID, governing, rows)
+	versions, _, _, err := s.openReceiptVersions(ctx, run.UserID, governing, rows)
 	switch {
 	case errors.Is(err, errVaultLocked):
 		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked

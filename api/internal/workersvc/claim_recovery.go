@@ -392,6 +392,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// A lead-lane claim whose assembly carries a run-environment snapshot takes the owner's
 	// users-row lock immediately before the recompute below (see checkRunEnv's lock).
 	runEnvLocked := assemblyErr == nil && payload != nil && payload.runEnv != nil
+	// A cross-check child that carries the lead's redact versions takes the same lock and compares
+	// the epoch they were opened at; it has no key snapshot and records no receipts.
+	redactFenced := assemblyErr == nil && payload != nil && payload.runEnv == nil && payload.redactEpochSet
 
 	holdClass := false
 	var authorityErr error
@@ -548,7 +551,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// plain update of a non-key users column does not conflict. 55P03 rolls the transaction back
 	// into finishRunClaim's bounded retry: the claim never waits, parks or fails on the lock.
 	runEnvPark := runEnvHistory || errors.Is(decision, errRunEnvHistoryUnavailable)
-	if decision == nil && runEnvLocked {
+	if decision == nil && (runEnvLocked || redactFenced) {
 		vaultState, err := q.LockUserVaultStateForKeyShareNowait(ctx, locked.UserID)
 		if err != nil {
 			return nil, "", err
@@ -556,9 +559,14 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		if h := s.claimHooks; h != nil && h.afterRunEnvLock != nil {
 			h.afterRunEnvLock(ctx, run)
 		}
-		envDecision, err := checkRunEnv(ctx, q, locked, payload.runEnv, vaultState.VaultEpoch)
-		if err != nil {
-			return nil, "", err
+		var envDecision error
+		if runEnvLocked {
+			envDecision, err = checkRunEnv(ctx, q, locked, payload.runEnv, vaultState.VaultEpoch)
+			if err != nil {
+				return nil, "", err
+			}
+		} else if payload.redactEpoch != vaultState.VaultEpoch {
+			envDecision = errRunEnvStale
 		}
 		if envDecision != nil {
 			decision, payload = envDecision, nil

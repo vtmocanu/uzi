@@ -166,4 +166,5 @@ func stripForIsolation(p *ClaimPayload) {
 	p.Secrets.RunEnv = nil
 	p.Secrets.RunEnvRedact = nil
 	p.runEnv = nil
+	p.redactEpochSet = false
 }
