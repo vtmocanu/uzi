@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // Inconsistent legacy indicators cannot be inserted under today's coherence CHECK.
@@ -17,6 +18,7 @@ func TestCodexRuntimeV3LegacyIndicatorsLiveDB(t *testing.T) {
 		for _, query := range []string{"claim", "claimable"} {
 			t.Run(indicator+"/"+query, func(t *testing.T) {
 				env := isolatedCoordinateDatabase(t)
+				env.vlt = vault.NewPostgres(env.box, env.pool)
 				binding := newSubscriptionFixture(t, env)
 				bound := mustRun(t, env, binding.runID)
 				env.exec("UPDATE runs SET status='completed' WHERE id=$1", binding.runID)
