@@ -1012,18 +1012,18 @@ func TestRunEnvListPlainValueOpensAtRowEpochLiveDB(t *testing.T) {
 	asRow := runEnvRowFromList
 	epoch := row.VaultEpoch
 	// Control: at the epoch the row was read at, the value opens.
-	dto, locked := h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)
+	dto, locked := h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, epoch)
 	if locked || dto.Value == nil || *dto.Value != "https://sandbox.example.test" {
-		t.Fatalf("control open = %+v locked=%v", dto, locked)
+		t.Fatalf("control open: value present=%v withheld=%v locked=%v", dto.Value != nil, dto.ValueWithheld, locked)
 	}
 
 	if err := h.vault.Enable(ctx, owner, password); err != nil {
 		t.Fatal(err)
 	}
 	h.vault.Lock(owner)
-	dto, locked = h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)
+	dto, locked = h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, epoch)
 	if !locked || dto.Value != nil || !dto.ValueWithheld {
-		t.Fatalf("a row read before the owner protected and locked opened: %+v locked=%v", dto, locked)
+		t.Fatalf("a row read before the owner protected and locked opened: value present=%v withheld=%v locked=%v", dto.Value != nil, dto.ValueWithheld, locked)
 	}
 	// A list read after the change carries the new epoch and withholds because the vault is locked.
 	if l := f.list(); !l.VaultLocked {

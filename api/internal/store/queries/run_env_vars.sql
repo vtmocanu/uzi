@@ -23,6 +23,18 @@ FROM run_env_vars
 WHERE user_id = @user_id AND repo_id = @repo_id AND name = @name
   AND retired_at IS NULL AND pending_delete_at IS NULL;
 
+-- name: GetLiveRunEnvVarByNameWithEpoch :one
+-- The live row of a repo-scope name with the owner's users.vault_epoch read in the same
+-- statement, so the handler opens a plain value at the epoch its ciphertext was read at
+-- (secretopen.OpenSealedAtEpoch). A plain read outside any transaction.
+SELECT r.id, r.var_id, r.user_id, r.repo_id, r.name, r.secret, r.description, r.ciphertext, r.sealed_with,
+       r.value_bytes, r.rev, r.retired_at, r.disabled_at, r.pending_delete_at, r.created_at, r.updated_at,
+       r.aad_version, u.vault_epoch
+FROM run_env_vars r
+JOIN users u ON u.id = r.user_id
+WHERE r.user_id = @user_id AND r.repo_id = @repo_id AND r.name = @name
+  AND r.retired_at IS NULL AND r.pending_delete_at IS NULL;
+
 -- name: GetLiveRunEnvVarByNameForUpdate :one
 -- The same row, locked for the write that follows inside the secret-mutation transaction.
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
