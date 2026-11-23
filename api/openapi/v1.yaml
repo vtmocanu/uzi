@@ -88,6 +88,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "422":
@@ -475,7 +477,10 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: The job has already finished (reason job_terminal).
+      description: >-
+        The job has already finished (reason job_terminal). On POST /jobs, the owner's
+        Claude source is a model provider, which jobs do not support yet (reason
+        provider_lane_unsupported).
       content:
         application/json:
           schema:
