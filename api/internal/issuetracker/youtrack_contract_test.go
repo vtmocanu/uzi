@@ -1,10 +1,12 @@
 package issuetracker_test
 
 import (
+	"context"
 	"reflect"
 	"slices"
 	"testing"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/issuetrackertest"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
@@ -19,13 +21,21 @@ const contractProjectID = 4173
 func TestYouTrackContract(t *testing.T) {
 	issuetrackertest.RunContract(t, func(t *testing.T) issuetrackertest.Subject {
 		srv := youtracktest.NewServer(t)
+		const openState = "Open"
+		// Two columns mapped to unresolved State values the fake's bundle holds.
+		columns := []string{"contract-column-a", "contract-column-b"}
+		stateOf := map[string]string{columns[0]: "Contract State A", columns[1]: "Contract State B"}
+		for _, state := range stateOf {
+			srv.SeedState(state, false)
+		}
 		y, err := issuetracker.NewYouTrackOver(issuetracker.Options{
-			BaseURL:     srv.URL,
-			Token:       srv.Token,
-			Project:     issuetracker.ProjectRef{ID: youtracktest.ProjectID, ShortName: youtracktest.ProjectShortName},
-			ProjectID:   contractProjectID,
-			OpenState:   "Open",
-			ClosedState: "Fixed",
+			BaseURL:      srv.URL,
+			Token:        srv.Token,
+			Project:      issuetracker.ProjectRef{ID: youtracktest.ProjectID, ShortName: youtracktest.ProjectShortName},
+			ProjectID:    contractProjectID,
+			OpenState:    openState,
+			ClosedState:  "Fixed",
+			ColumnStates: stateOf,
 			EligibilityTag: issuetracker.TagRef{
 				ID: youtracktest.EligibilityTagID, Name: youtracktest.EligibilityTagName,
 			},
@@ -36,6 +46,23 @@ func TestYouTrackContract(t *testing.T) {
 		return issuetrackertest.Subject{
 			IssueTracker: y,
 			ProjectID:    contractProjectID,
+			Columns:      columns,
+			PlanMove: func(_ *testing.T, _ int64, column string) forge.ColumnMove {
+				return forge.ColumnMove{Column: column}
+			},
+			ColumnOf: func(_ context.Context, iid int64) (string, error) {
+				state := srv.IssueState(iid)
+				for column, name := range stateOf {
+					if name == state {
+						return column, nil
+					}
+				}
+				if state == openState {
+					return "", nil
+				}
+				// Any other unmapped State is a failure, not the Open column.
+				return "unmapped State " + state, nil
+			},
 			SeedHumanComment: func(t *testing.T, iid int64, username, body string) {
 				srv.SeedComment(iid, username, body)
 			},

@@ -242,8 +242,14 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility label
 	// (PRD #764), never from the request body.
-	uziLabel, _ := h.settings.UziLabel(ctx)
-	labels := []string{uziLabel}
+	// On a linked repo the link's stored eligibility name (PRD #4173 D14). A label settings
+	// read error is refused before the claim and before any write (PRD #4173 M5 review).
+	labels, err := h.createLabels(ctx, repo)
+	if err != nil {
+		slog.Error("admin file issue: read the label settings", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 
 	// Claim-first (Decision 7): the claim lands on the RESOLVED occurrence's coordinate, so that
 	// owner's row moves to `filed`. A lost claim — already filed or mid-filing — is 409.

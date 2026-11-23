@@ -25,7 +25,7 @@ func TestAccountCooldownBoardReaders(t *testing.T) {
 			if !mine {
 				viewer = uuid.New()
 			}
-			cards := assembleCards([]store.Issue{{ForgeIssueIid: 1}}, []store.ListLatestRunsForRepoRow{row}, nil, nil, nil, viewer, "github", nil, 0)
+			cards := assembleCards([]store.Issue{{ForgeIssueIid: 1}}, []store.ListLatestRunsForRepoRow{row}, nil, nil, nil, viewer, "github", false, nil, 0)
 			dto := cards[0].LatestRun
 			if mine {
 				if dto.Health != "waiting_account_cooldown" || dto.AccountCooldownClass == nil || string(*dto.AccountCooldownClass) != class || !dto.AccountCooldownEligibleAt.Equal(at) {
@@ -81,7 +81,7 @@ func TestAccountCooldownBoardPrecedenceAndExpiry(t *testing.T) {
 				at = time.Now().Add(-time.Second)
 			}
 			row := store.ListLatestRunsForRepoRow{ID: uuid.New(), UserID: owner, Kind: "issue", Status: "running", IssueIid: pgtype.Int8{Int64: 1, Valid: true}, Health: health, AccountCooldownClass: pgconv.TextOrNull("overload"), AccountCooldownEligibleAt: pgconv.Time(at)}
-			cards := assembleCards([]store.Issue{{ForgeIssueIid: 1}}, []store.ListLatestRunsForRepoRow{row}, nil, nil, nil, owner, "github", nil, 0)
+			cards := assembleCards([]store.Issue{{ForgeIssueIid: 1}}, []store.ListLatestRunsForRepoRow{row}, nil, nil, nil, owner, "github", false, nil, 0)
 			dto := cards[0].LatestRun
 			want := health
 			if health == "ok" && future {

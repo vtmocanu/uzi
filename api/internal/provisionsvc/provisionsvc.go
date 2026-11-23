@@ -377,13 +377,13 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		}
 		// A project linked to an issue tracker before it was removed keeps that issue source: it
 		// is refused here, before any label work reaches the forge (the repos trigger from
-		// migration 00467 refuses the flip too, and enableError maps it the same way).
+		// migration 00475 refuses the flip too, and enableError maps it the same way).
 		if lock.SourceLocked {
 			return removedLinkedRepoError()
 		}
 		// PRD #4173 D3: board columns are labels, on the issue-tracker half. A repo linked to an
-		// external issue tracker records the column rows only: uzi creates no labels or tags
-		// there (writes arrive in M5), and the forge's project is not where its issues live.
+		// external issue tracker records the column rows only: uzi creates no column labels or
+		// tags there (a column is not a tag, D9), and the forge's project is not where its issues live.
 		// The choice reads the locked row, not the one read before the guard.
 		if lock.IssueTrackerConnectionID.Valid {
 			if err := forgesvc.EnsureBoardColumnRows(ctx, q, row.ID); err != nil {
@@ -416,7 +416,7 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 	return repo, nil
 }
 
-// removedLinkedRepoSQLState is the SQLSTATE the repos trigger from migration 00467 raises when
+// removedLinkedRepoSQLState is the SQLSTATE the repos trigger from migration 00475 raises when
 // a repo that was linked to an issue tracker before its removal is enabled unlinked.
 const removedLinkedRepoSQLState = "UZ414"
 

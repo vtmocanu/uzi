@@ -55,7 +55,12 @@ func (s *Service) CloseIssue(ctx context.Context, f forge.IssueTracker, forgePro
 // Partial failure: if the move half fails, the reopened-but-unmoved row (state opened,
 // board_position nulled) is returned with the error so the handler can surface a 502
 // for the move while the card still renders open — never lost.
+//
+// A linked repo reopens through reopenLinkedIssue instead, with a single write.
 func (s *Service) ReopenIssue(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, columns []store.BoardColumn, target string) (store.Issue, error) {
+	if isLinkedTracker(f) {
+		return s.reopenLinkedIssue(ctx, f, forgeProjectID, issue, target)
+	}
 	if issue.State != string(forge.StateOpened) {
 		// Forge-first: reopen remotely before touching the cache. On failure the cache
 		// is untouched (no ReopenIssueState, no UpsertIssueLabels) and the card snaps back.
@@ -77,6 +82,42 @@ func (s *Service) ReopenIssue(ctx context.Context, f forge.IssueTracker, forgePr
 	if err != nil {
 		// Reopened-but-unmoved: return the opened row so the handler 502s the move half
 		// while the card still renders open.
+		return issue, err
+	}
+	return moved, nil
+}
+
+// reopenLinkedIssue reopens an issue of a repo linked to an issue tracker (PRD
+// #4173 M5). It calls MoveToColumn directly and makes no separate SetIssueState: the
+// driver checks the column mapping and the State bundle before its single State write,
+// and every column State is unresolved, so that one write reopens the issue. A refused
+// or failed move therefore changes neither the issue tracker nor the cache. Only on
+// success does the cache change: ReopenIssueState (state opened, board_position
+// nulled), then SetIssueTrackerColumn. A failure between the two statements leaves
+// the row opened in the Open lane, the same partial-failure contract as the unlinked
+// reopen. The target "" is the Open column and uses the stored open State. The move
+// sets Reopen, so the driver writes over an issue resolved in the issue tracker; an
+// automatic move leaves it false and is refused for such an issue.
+func (s *Service) reopenLinkedIssue(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, target string) (store.Issue, error) {
+	if err := f.MoveToColumn(ctx, forgeProjectID, issue.ForgeIssueIid, forge.ColumnMove{Column: target, Reopen: true}); err != nil {
+		return store.Issue{}, err
+	}
+	if issue.State != string(forge.StateOpened) {
+		reopened, err := s.q.ReopenIssueState(ctx, store.ReopenIssueStateParams{
+			RepoID:        issue.RepoID,
+			ForgeIssueIid: issue.ForgeIssueIid,
+		})
+		if err != nil {
+			return store.Issue{}, err
+		}
+		issue = reopened
+	}
+	moved, err := s.q.SetIssueTrackerColumn(ctx, store.SetIssueTrackerColumnParams{
+		RepoID: issue.RepoID, ForgeIssueIid: issue.ForgeIssueIid, IssueTrackerColumn: target,
+	})
+	if err != nil {
+		// Reopened-but-unplaced: return the opened row with the error, as the unlinked
+		// reopen does for its move half.
 		return issue, err
 	}
 	return moved, nil

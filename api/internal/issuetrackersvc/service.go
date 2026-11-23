@@ -26,6 +26,11 @@ type Querier interface {
 	LockRepoForLinkForUser(ctx context.Context, arg store.LockRepoForLinkForUserParams) (store.LockRepoForLinkForUserRow, error)
 	RepoStoresIssueNumber(ctx context.Context, repoID uuid.UUID) (bool, error)
 	SetRepoIssueTrackerLink(ctx context.Context, arg store.SetRepoIssueTrackerLinkParams) (store.Repo, error)
+	LockRepoForStateMappingForUser(ctx context.Context, arg store.LockRepoForStateMappingForUserParams) (store.LockRepoForStateMappingForUserRow, error)
+	ListBoardColumns(ctx context.Context, repoID uuid.UUID) ([]store.BoardColumn, error)
+	UpsertRepoIssueTrackerStates(ctx context.Context, arg store.UpsertRepoIssueTrackerStatesParams) (store.RepoIssueTrackerState, error)
+	DeleteRepoIssueTrackerColumnStates(ctx context.Context, repoID uuid.UUID) error
+	InsertRepoIssueTrackerColumnState(ctx context.Context, arg store.InsertRepoIssueTrackerColumnStateParams) error
 }
 
 var _ Querier = (*store.Queries)(nil)

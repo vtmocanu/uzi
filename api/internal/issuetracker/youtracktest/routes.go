@@ -156,7 +156,11 @@ func (s *Server) listBundleValues(w http.ResponseWriter, r *http.Request) {
 	}
 	var items []map[string]any
 	for _, v := range s.m.states {
-		items = append(items, map[string]any{"$type": "StateBundleElement", "id": v.id, "name": v.name, "isResolved": v.resolved, "ordinal": v.ordinal})
+		var localized any
+		if v.localizedName != "" {
+			localized = v.localizedName
+		}
+		items = append(items, map[string]any{"$type": "StateBundleElement", "id": v.id, "name": v.name, "isResolved": v.resolved, "archived": v.archived, "localizedName": localized, "ordinal": v.ordinal})
 	}
 	writePage(w, r, spec, items)
 }
@@ -398,6 +402,7 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 			Name  string `json:"name"`
 			Type  string `json:"$type"`
 			Value struct {
+				ID   string `json:"id"`
 				Name string `json:"name"`
 			} `json:"value"`
 		} `json:"customFields"`
@@ -411,13 +416,19 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catDescription, timestamp: i.updated, author: BotLogin})
 	}
 	for _, cf := range body.CustomFields {
-		v := s.m.stateByName(cf.Value.Name)
+		// A State value must be addressed by id: a write by name is refused, so
+		// a driver that sends only a name fails its tests.
+		var v *stateValue
+		if cf.Value.ID != "" {
+			v = s.m.stateByID(cf.Value.ID)
+		}
 		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil {
 			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported custom field update")
 			return
 		}
 		ts := s.m.now()
 		i.updated = ts
+		i.stateID = v.id
 		if v.resolved {
 			if i.resolved == nil {
 				i.resolved = &ts

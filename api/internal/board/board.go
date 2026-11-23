@@ -41,6 +41,22 @@ func ResolveColumn(labels []string, state string, position map[string]int) (colu
 	return best, false, matches > 1
 }
 
+// CardColumnLabels returns the labels a column-inferring ResolveColumn call
+// should read. A card of a repo linked to an issue tracker sits in the column
+// cached from its State (issues.issue_tracker_column), never in a label, because
+// columns are not tags there (D9, D14): it returns just that column, or nil for
+// the Open lane (column ""). On any other repo it returns labels unchanged.
+// linked is the repo's linkage, never a property of one issue's key.
+func CardColumnLabels(linked bool, labels []string, column string) []string {
+	if !linked {
+		return labels
+	}
+	if column == "" {
+		return nil
+	}
+	return []string{column}
+}
+
 // PlanLabelMove computes the atomic add/remove sets for a single-column move and
 // the resulting label set for the cache. add is the target column (if not
 // already present); remove is every OTHER column label the issue currently

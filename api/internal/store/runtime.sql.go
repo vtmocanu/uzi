@@ -8571,6 +8571,7 @@ SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move
        r.auto_approve, r.mr_iid,
        rp.forge_project_id, rp.web_url AS repo_web_url,
        rp.issue_tracker_connection_id, rp.awaiting_first_enable,
+       rp.eligibility_tag_name, -- PRD #4173 M5: the lifecycle's uncached-issue probe
        c.forge_type, c.base_url, c.token_ciphertext,
        r.user_id
 FROM runs r
@@ -8592,6 +8593,7 @@ type GetRunMoveContextRow struct {
 	RepoWebUrl               string             `json:"repo_web_url"`
 	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
 	AwaitingFirstEnable      bool               `json:"awaiting_first_enable"`
+	EligibilityTagName       pgtype.Text        `json:"eligibility_tag_name"`
 	ForgeType                string             `json:"forge_type"`
 	BaseUrl                  string             `json:"base_url"`
 	TokenCiphertext          []byte             `json:"token_ciphertext"`
@@ -8627,6 +8629,7 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 		&i.RepoWebUrl,
 		&i.IssueTrackerConnectionID,
 		&i.AwaitingFirstEnable,
+		&i.EligibilityTagName,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,

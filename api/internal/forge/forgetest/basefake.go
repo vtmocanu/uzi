@@ -103,6 +103,11 @@ func (*BaseFake) UpdateIssueLabels(context.Context, int64, int64, []string, []st
 	return notStubbed("UpdateIssueLabels")
 }
 
+// MoveToColumn implements forge.Forge.
+func (*BaseFake) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
+	return notStubbed("MoveToColumn")
+}
+
 // UpdateIssueDescription implements forge.Forge.
 func (*BaseFake) UpdateIssueDescription(context.Context, int64, int64, string) error {
 	return notStubbed("UpdateIssueDescription")

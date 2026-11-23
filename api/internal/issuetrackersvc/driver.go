@@ -15,8 +15,9 @@ import (
 // AAD, used only to build the driver, and never returned or logged. binding is
 // the empty issuetracker.Binding for a connection-level driver, or all of the
 // project, the repository's forge project id and the eligibility tag; a partial
-// or malformed one is refused before anything is read.
-func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, binding issuetracker.Binding, stateField, open, closed string) (issuetracker.Driver, error) {
+// or malformed one is refused before anything is read. states is the repo's
+// stored state mapping, or the zero StateMapping for a connection-level driver.
+func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, binding issuetracker.Binding, states issuetracker.StateMapping) (issuetracker.Driver, error) {
 	if issuetracker.ValidBinding(binding) != nil {
 		return nil, &Error{Kind: KindBadRequest, Message: "invalid project binding"}
 	}
@@ -47,9 +48,10 @@ func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, bindi
 		Project:        binding.Project,
 		ProjectID:      binding.ProjectID,
 		EligibilityTag: binding.EligibilityTag,
-		StateField:     stateField,
-		OpenState:      open,
-		ClosedState:    closed,
+		StateField:     states.Field,
+		OpenState:      states.Open,
+		ClosedState:    states.Closed,
+		ColumnStates:   states.Columns,
 	})
 	if err != nil {
 		s.log.Error("build issue tracker driver", "kind", row.Kind, "error", err)
@@ -60,7 +62,7 @@ func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, bindi
 
 // ListProjects lists the projects the connection's token can see.
 func (s *Service) ListProjects(ctx context.Context, userID, connID uuid.UUID) ([]issuetracker.Project, error) {
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +78,7 @@ func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, proj
 	if !issuetracker.ValidProjectID(projectID) {
 		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
 	}
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +92,7 @@ func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, proj
 // ListTags lists the tags the connection's token can see, with their owners and
 // sharing settings.
 func (s *Service) ListTags(ctx context.Context, userID, connID uuid.UUID) ([]issuetracker.Tag, error) {
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	if err != nil {
 		return nil, err
 	}

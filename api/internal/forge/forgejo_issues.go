@@ -132,6 +132,11 @@ func (f *forgejo) UpdateIssueDescription(ctx context.Context, projectID, issueII
 		}{Body: description})
 }
 
+// MoveToColumn moves the issue to a board column through its labels.
+func (f *forgejo) MoveToColumn(ctx context.Context, projectID, issueIID int64, move ColumnMove) error {
+	return MoveByLabels(ctx, f, projectID, issueIID, move)
+}
+
 // SetIssueState closes or reopens an issue.
 //
 // This sends a STATE-ONLY PATCH and does NOT read the issue first, for the same
