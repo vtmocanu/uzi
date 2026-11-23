@@ -557,6 +557,10 @@ function ensureConfigDir(home: string, dir: string, step: (name: string) => void
     if (seen.state === "rewrite") {
       rewriteConfig(home, dir);
       step("rewritten");
+      // A rewrite on the last attempt is verified here: falling out of the loop would refuse a
+      // directory that is now good.
+      step("inspect");
+      if (inspect(dir).state === "ok") return;
       continue;
     }
     const tmp = buildTemp(home);

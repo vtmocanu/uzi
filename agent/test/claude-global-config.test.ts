@@ -251,6 +251,26 @@ describe("prepareClaudeConfigDir: build and reuse", () => {
     assert.deepStrictEqual(staleNames(), []);
   });
 
+  it("under the split, a successful rewrite on the last attempt after three re-corruptions is not a refusal", () => {
+    process.env.UZI_UID_SPLIT = "1";
+    prep(envOf());
+    const file = path.join(dirOf(), ".claude.json");
+    fs.chmodSync(file, 0o644);
+    fs.writeFileSync(file, MALICIOUS);
+    let rewrites = 0;
+    prep(envOf(), {
+      onStep: (name) => {
+        if (name !== "rewritten") return;
+        if (++rewrites <= 3) {
+          fs.chmodSync(file, 0o644);
+          fs.writeFileSync(file, MALICIOUS);
+        }
+      },
+    });
+    assert.strictEqual(rewrites, 4);
+    assertFixedDir(dirOf());
+  });
+
   it("a session transcript under HOME/.claude/projects is visible through the directory (resume)", () => {
     const t = path.join(home, ".claude", "projects", "-slug", "sid.jsonl");
     fs.mkdirSync(path.dirname(t), { recursive: true });
@@ -942,16 +962,23 @@ describe("the bounded runner helper", () => {
     assert.ok(fs.statSync(claude).isDirectory());
   });
 
-  it("a command that does not exist is a status the preparation treats as transient, not a success", () => {
+  it("a command that does not exist returns status 127", () => {
     const r = runBounded(path.join(root, "no-such-binary"), []);
     assert.strictEqual(r.status, 127);
   });
 
   it("leaves no output directory behind", () => {
-    const before = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("uzi-helper-")).length;
-    runBounded("/bin/sh", ["-c", "true"]);
-    assert.throws(() => runBounded("/bin/sh", ["-c", "head -c 70000 /dev/zero"]));
-    assert.strictEqual(fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("uzi-helper-")).length, before);
+    const savedTmp = process.env.TMPDIR;
+    const priv = fs.mkdtempSync(path.join(root, "tmpdir-"));
+    process.env.TMPDIR = priv;
+    try {
+      runBounded("/bin/sh", ["-c", "true"]);
+      assert.throws(() => runBounded("/bin/sh", ["-c", "head -c 70000 /dev/zero"]));
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+    }
+    assert.deepStrictEqual(fs.readdirSync(priv), []);
   });
 });
 

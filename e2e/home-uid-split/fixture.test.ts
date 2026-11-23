@@ -473,6 +473,20 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     ].join("\n");
     const wrapped = runnerUid.runnerCommand("/bin/sh", ["-c", stopper, "sh", "STOP", "45"]);
     const watcher = spawn(wrapped.command, wrapped.args, { stdio: "ignore" });
+    // The watcher runs as the runner uid, which the worker cannot signal: it ends on its own after
+    // its fixed number of passes, and the test only waits for that exit.
+    watcher.on("error", () => undefined);
+    const watcherExited = new Promise<void>((resolve) => {
+      const bound = setTimeout(resolve, 20_000);
+      watcher.once("exit", () => {
+        clearTimeout(bound);
+        resolve();
+      });
+      watcher.once("error", () => {
+        clearTimeout(bound);
+        resolve();
+      });
+    });
     const stuck = config.helperCommand("/bin/sleep", ["7"], true);
     const t1 = Date.now();
     try {
@@ -481,7 +495,7 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
       assert.ok(stoppedElapsed < 5000, `the stopped helper returned after ${stoppedElapsed} ms`);
     } finally {
       asRunner(stopper, "KILL", "3");
-      watcher.kill();
+      await watcherExited;
     }
   });
 
