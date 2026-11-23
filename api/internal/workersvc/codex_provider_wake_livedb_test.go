@@ -235,8 +235,8 @@ func TestCodexProviderWakeReadinessActualClaimLiveDB(t *testing.T) {
 			if term := f.row(w).LastManualWakeSettledAt; !term.Valid || !term.Time.Equal(lease) {
 				t.Fatal("demand readiness renewed the manual lease")
 			}
-			if got := mustRun(t, f.env, r.ID); got.Status != "queued" || got.WorkerID.Valid {
-				t.Fatal("readiness claimed the run before Service.Claim")
+			if got := mustRun(t, f.env, r.ID); got.Status != "queued" || got.WorkerID.Valid || got.ClaimGeneration != r.ClaimGeneration {
+				t.Fatal("readiness claimed the run or advanced generation before Service.Claim")
 			}
 			if change == "key_disabled" {
 				p.env.exec(`UPDATE user_secrets SET disabled_at=now(), enablement_rev=enablement_rev+1 WHERE id=$1`, p.key)
@@ -249,6 +249,9 @@ func TestCodexProviderWakeReadinessActualClaimLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := mustRun(t, f.env, r.ID)
+			if got.ClaimGeneration != r.ClaimGeneration+1 {
+				t.Fatal("actual claim did not advance exactly one generation")
+			}
 			if change == "key_disabled" {
 				if payload != nil || got.Status != "paused" || got.HoldReason.String != holdProviderBindingStale {
 					t.Fatal("disabled frozen key did not produce the stale-binding refusal")
