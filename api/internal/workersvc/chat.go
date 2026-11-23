@@ -16,6 +16,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
@@ -560,19 +561,23 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 	// PRD #4320: a chat is Claude-only, so the owner's Claude source decides. NULL is today's
 	// non-transactional insert with no binding (byte-identical); a set source (usable or not)
 	// needs the freeze transaction, and an unusable one is a typed refusal, never a vendor chat.
-	if r, ok := s.q.(providerSourceReader); ok {
-		src, err := s.claudeProviderSource(ctx, r, userID)
+	// A store that cannot read the engine source fails closed (an error, never an unchecked vendor chat),
+	// as refuseOverrideForProviderOwner does.
+	r, ok := s.q.(engineProviderSourceReader)
+	if !ok {
+		return store.Run{}, errors.New("create chat run: the query surface cannot read the provider source")
+	}
+	src, err := ResolveProviderSource(ctx, r, userID, providers.EngineClaude, s.providerAllow)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if src.Set() {
+		run, err := s.createChatRunBound(ctx, params)
 		if err != nil {
 			return store.Run{}, err
 		}
-		if src.Set() {
-			run, err := s.createChatRunBound(ctx, params)
-			if err != nil {
-				return store.Run{}, err
-			}
-			logRunCreated(run)
-			return run, nil
-		}
+		logRunCreated(run)
+		return run, nil
 	}
 	run, err := s.q.CreateChatRun(ctx, params)
 	if err != nil {

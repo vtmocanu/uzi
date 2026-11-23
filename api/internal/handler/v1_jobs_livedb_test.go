@@ -414,10 +414,14 @@ func (e *v1JobsEnv) selectProvider(user uuid.UUID) {
 	if err != nil {
 		e.t.Fatalf("insert provider: %v", err)
 	}
-	e.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, user, p.ID)
+	e.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, user, p.ID)
 	// Registered after the user's cleanup, so it runs first: a selected provider cannot be deleted
 	// (RESTRICT).
-	e.t.Cleanup(func() { _, _ = e.pool.Exec(ctx, `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, user) })
+	e.t.Cleanup(func() {
+		if _, err := e.pool.Exec(ctx, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, user); err != nil {
+			e.t.Errorf("clear the Claude source in cleanup: %v", err)
+		}
+	})
 }
 
 // jobCount counts the kind='job' runs of the user behind a uzc_ token.

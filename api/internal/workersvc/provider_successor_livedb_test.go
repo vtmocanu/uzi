@@ -49,10 +49,10 @@ func TestProviderSuccessorConstructorsCopyTheBindingLiveDB(t *testing.T) {
 		{"source still selected", func() {}},
 		{"owner switched to another provider", func() {
 			other, _ := seedProviderFor(t, fx.env, fx.userID, pvDefaultMap)
-			fx.env.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, fx.userID, other)
+			fx.env.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, fx.userID, other)
 		}},
 		{"owner cleared the source", func() {
-			fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+			fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 		}},
 	}
 	for i, st := range stages {
@@ -90,9 +90,11 @@ func providerOwnerLead(t *testing.T, f crossCheckContentionFixture) {
 	t.Helper()
 	f.svc.p.ProviderAllowedBaseURLs = []string{pvBase}
 	provider, _ := seedProviderFor(t, f.env, f.userID, pvDefaultMap)
-	f.env.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, f.userID, provider)
+	f.env.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, f.userID, provider)
 	t.Cleanup(func() {
-		_, _ = f.env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, f.userID)
+		if _, err := f.env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, f.userID); err != nil {
+			t.Errorf("clear the Claude source in cleanup: %v", err)
+		}
 	})
 	if lead := mustRun(t, f.env, f.lead); providerBoundRun(lead) {
 		t.Fatalf("fixture lead is provider-bound; the test needs a vendor lead")

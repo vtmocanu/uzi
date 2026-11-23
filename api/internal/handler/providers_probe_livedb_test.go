@@ -196,7 +196,7 @@ func TestProviderTestProbeLiveDB(t *testing.T) {
 	}
 	var rows int
 	if err := f.pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM model_provider_probe_results WHERE provider_id = $1`, p.ID).Scan(&rows); err != nil || rows != 1 {
+		`SELECT count(*) FROM model_provider_key_test_results WHERE provider_id = $1`, p.ID).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("probe result rows = %d, %v; want 1", rows, err)
 	}
 
@@ -211,7 +211,7 @@ func TestProviderTestProbeLiveDB(t *testing.T) {
 	}
 	var rev int
 	if err := f.pool.QueryRow(context.Background(),
-		`SELECT count(*), max(revision) FROM model_provider_probe_results WHERE provider_id = $1`, p.ID).Scan(&rows, &rev); err != nil || rows != 1 || rev != 2 {
+		`SELECT count(*), max(revision) FROM model_provider_key_test_results WHERE provider_id = $1`, p.ID).Scan(&rows, &rev); err != nil || rows != 1 || rev != 2 {
 		t.Fatalf("probe rows = %d at revision %d, %v; want 1 at revision 2", rows, rev, err)
 	}
 }
