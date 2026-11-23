@@ -3258,6 +3258,10 @@ interface RunFlight {
   /** issue #3644: an unsupported-predecessor owner hold was requested (or attempted) for this flight; the park teardown that would
    *  otherwise reap and drop the caches of the HOME the flight holds must not run. */
   restoreUnsupportedHold?: boolean;
+  /** issue #4644: the batcher breaker tripped while the restore route's predecessor was still guarded (`restorePredecessor` set).
+   *  Written only by handlePermanentFailure; read by restoreTransportGuard so the flight stops nonterminally even when its cancel
+   *  signal was already spent (a PauseNowSignal or a settled switch) and the abort could not land. */
+  restoreTransportStopped?: boolean;
   /** issue #4627: a retained claim whose bare storage identity (device or inode) changed was refused before any source action and
    *  an owner hold was requested (or attempted). The park teardown must not reap or drop the caches of the HOME it holds, and the
    *  exit retains the owed tip without moving any ref that already retains it. */
@@ -8931,11 +8935,23 @@ export class RunRunner {
     // issue #4058: a predecessor-remediation hold reports no terminal state and aborts nothing; the flight stops
     // retained through holdForPredecessorRemediation. issue #4627: a bare-identity hold is likewise nonterminal and keeps its
     // source; a permanent refusal of its guidance flush (the batcher breaker) must not turn the held park into a `failed` report.
-    if (flight.orphanRemediationHold || flight.bareIdentityHold) return;
+    // issue #4644: the #3644 unsupported-predecessor owner hold is nonterminal too; every exit from holdUnsupportedRestore throws,
+    // and its park is sent through reportState, so a tripped guidance flush still reaches the intended park.
+    if (flight.orphanRemediationHold || flight.bareIdentityHold || flight.restoreUnsupportedHold) return;
     if (flight.policyHold || flight.iterationParkState !== "none") return;
     if (flight.workerMemory?.hold) {
       this.retainWorkerMemoryCustody(flight);
       flight.cancel.abort(new RetainedRecoveryStop());
+      return;
+    }
+    // issue #4644: from restore-route selection until the seed hands off, P's process, clone and HOME belong to the other
+    // incarnation (#3644 amendment 15, ADR-1197): no `failed`, no terminal reap (on Codex its withBoundary would run before
+    // quiesceRun's predecessor guard). Stop nonterminally with custody kept. The sticky flag covers a cancel that was already spent,
+    // where this abort cannot land; steering's lifecycle is deliberately left alone so an active credential switch keeps precedence.
+    if (flight.restorePredecessor !== undefined) {
+      flight.restoreTransportStopped = true;
+      this.retainWorkerMemoryCustody(flight);
+      if (!flight.cancel.signal.aborted) flight.cancel.abort(new RetainedRecoveryStop());
       return;
     }
     if (flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
@@ -19834,6 +19850,9 @@ export class RunRunner {
     //   not reached    the shutdown arm's reapForSink -> quiesceOrBlockSink: RestoreRouteStop / RetainedRecoveryStop are excluded from
     //                  that arm, so it is unreachable in the window. Were it ever reached on a Codex executor, safety.withBoundary
     //                  would run BEFORE this guard, so the guard alone would not protect P there.
+    //   not reached    handlePermanentFailure's terminal reapRecoveryProviderForSettle -> reapForSink (the batcher breaker): the
+    //                  handler IS reached in the window, but behind its policyHold/iterationParkState returns it returns for
+    //                  restoreUnsupportedHold and stops nonterminally while restorePredecessor is set, before any reap (#4644).
     //   permitted      the seed's own beforeSeed sweep (S's executor, explicit P-free targets).
     //   covered else   settleForCredentialCapture and the credential switch: enterRetainedCredentialSwitch stops before settling
     //                  (3.4 b), and escapedInPlaceSwitch (the closed-route arm) skips settlement and goes straight to the op-fenced
@@ -29424,10 +29443,17 @@ export class RunRunner {
   private retainedLifecycleGuard(flight: RunFlight): void {
     this.retainedTerminalGuard(flight);
     const signals = this.retainedLifecycleSignals(flight);
+    this.restoreTransportGuard(flight, signals, true);
+    if (signals.some(signal => signal.aborted)) throw new RetainedRecoveryStop();
+  }
+
+  /** An active credential switch first, then issue #4644's sticky restore-window stop. `windowOnly` reads the flag only while the
+   *  restore route's predecessor is still guarded; the explicit post-seed check reads it unconditionally. */
+  private restoreTransportGuard(flight: RunFlight, signals: AbortSignal[] = this.retainedLifecycleSignals(flight), windowOnly = false): void {
     for (const signal of signals) {
       if (signal.aborted && signal.reason instanceof CredentialSwitchSignal) throw signal.reason;
     }
-    if (signals.some(signal => signal.aborted)) throw new RetainedRecoveryStop();
+    if (flight.restoreTransportStopped && (!windowOnly || flight.restorePredecessor !== undefined)) throw new RetainedRecoveryStop();
   }
 
   /** Outcome-safety predicate for the held-predecessor seam: true only when every synchronous
@@ -31511,6 +31537,8 @@ export class RunRunner {
     flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
     flight.checkpointFloor = flight.publishedTip;
     try {
+      // issue #4644: a breaker trip during the seed stops here with S kept (the catch below), an active switch first.
+      this.restoreTransportGuard(flight);
       // The legacy handoff's re-check after adoption, mirrored: the server may have moved the claim while the seed ran. The seed
       // is already durable, so a lost claim stops with S kept (the catch below); the live restore entry refuses later claims.
       await this.confirmPostAdoptionOwnership(flight, Date.now() + this.codexBoundaryDeadlineMs, lifecycle);
