@@ -272,9 +272,15 @@ pin is bumped by the release helper.
 the Codex engine (engine `codex`, Bearer auth only); put the exact base URL in the list like any
 other. Workers advertise `codex_provider_v1` together with the Codex harness capabilities, and the
 api admits a Codex provider claim only to a worker advertising `codex_provider_v1`,
-`codex_harness_v1` and `codex_runtime_v2`, so **deploy the api before the workers**; until a
+`codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3` on the same worker, so
+**deploy the api before the workers**; until a
 capable worker is online such a run queues with the same "no worker that supports model providers
-is online" reason. The pinned Codex runtime follows redirects and can forward request bodies and the
+is online" reason. Update worker image overrides and separately managed workers too. A registered
+ephemeral worker missing v3 may be reaped and replaced only while its bound Codex provider run is
+queued and never claimed; missing v3 alone does not authorize reaping a previously claimed run's
+worker, and busy/custody guards remain in force. Replacement cycles can continue until the image
+is updated (see [Operator rollout and keys](./providers.md#operators-rollout-and-keys)).
+The pinned Codex runtime follows redirects and can forward request bodies and the
 Bearer header beyond the approved URL, and it does not limit model-response size, so the allowlist
 is admission control, not confinement (see [Model providers](./providers.md) and
 [ADR-4320](../adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)). The worker's

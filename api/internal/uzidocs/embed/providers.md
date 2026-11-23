@@ -289,9 +289,15 @@ Codex providers on the judge and cross-check lanes are tracked in #4574.
 
 - **Capability.** Workers advertise `codex_provider_v1` together with the Codex harness
   capabilities. The api admits a Codex provider claim only to a worker advertising
-  `codex_provider_v1`, `codex_harness_v1` and `codex_runtime_v2`; otherwise the run stays queued
-  and its health reads "no worker that supports model providers is online" (it counts only
-  workers with all three). Deploy the api before the workers.
+  `codex_provider_v1`, `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3` on the same
+  worker; otherwise the run stays queued and its health reads "no worker that supports model
+  providers is online" (it counts only workers with all four). Deploy the api before the workers.
+  Update worker image overrides and separately managed workers to the current runtime too.
+- **Old ephemeral workers.** A registered worker missing v3 can be reaped and replaced when its
+  bound Codex provider run is queued and has never been claimed. Missing v3 alone does not
+  authorize reaping a previously claimed run's worker; active assignments and open custody also
+  prevent reaping. Provision/reap ticks and per-user caps bound rate and concurrency, but
+  replacement cycles can continue indefinitely until the provisioned image advertises v3.
 - **Credential delivery.** A Codex provider claim carries the gateway key only in its provider
   object, with no vendor Codex credential block, so there is no vendor release or refresh for it
   (`/codex/release` and `/codex/refresh` refuse provider runs).
@@ -299,9 +305,10 @@ Codex providers on the judge and cross-check lanes are tracked in #4574.
   percent-encoded) from model, review and summary output, PR text and forge pushes. Transformed
   encodings are not detected, and the private recovery archive is not scanned, as for Claude
   providers (#4505).
-- **Runtime.** The pinned Codex runtime is 0.169.0. The owner-accepted unbounded model-response
-  ingestion above applies unchanged at that pin: the maintainer verified on 2026-11-23, at tag
-  `rust-v0.169.0`, that the response body limit is still unset, so it is **not** bounded.
+- **Runtime.** The pinned Codex runtime is 0.171.0. The cited maintainer observation that the
+  response body limit was unset was made on 2026-11-23 at tag `rust-v0.169.0`; it is historical
+  evidence, not a response-size guarantee for the current pin. Updating the pin does not by
+  itself remove the owner-accepted model-response ingestion risk above.
 
 ## Gateways behind a private CA
 
