@@ -88,7 +88,7 @@ func TestCrossCheckMetadataSettings(t *testing.T) {
 				h.PutMySettings(rec, req)
 			}
 			cells := metadataCells(t, rec)
-			claude, codex := "", "gpt-6.1-sol"
+			claude, codex := "", "gpt-6.2-sol"
 			if saved {
 				claude, codex = "haiku", "gpt-6-sol"
 			}
@@ -200,7 +200,7 @@ func TestCrossCheckMetadataCorpusLiveDB(t *testing.T) {
 				want = "opus"
 			}
 			assertMetadataModel(t, c.Get[0].WorkerDefaultModel, want)
-			codex := "gpt-6.1-sol"
+			codex := "gpt-6.2-sol"
 			if c.Codex != nil {
 				codex = *c.Codex
 			}
