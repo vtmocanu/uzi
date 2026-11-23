@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ownerFixture } from "./recovery-owner-fixture.js";
+import { RecoveryOwnerBareIdentityError } from "../src/git.js";
 
 test("raw zero baseline permits one owner resume with a newer generation; fresh generation and derived rises do not", async () => {
   const f = ownerFixture();
@@ -361,3 +362,145 @@ for (const baseline of [0, 3]) {
     await assert.rejects(f.reserve(4, baseline + 1, 100), /blocked/);
   });
 }
+
+// ---- issue #4627: typed bare-storage-identity classification and the read-only reservation probe ----
+
+const TYPED = /^recovery owner binding changed: bare storage identity$/;
+const GENERIC = /^recovery owner binding changed$/;
+
+function setBare(f: ReturnType<typeof ownerFixture>, bare: string): void {
+  const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+  record.bare = bare;
+  f.values.set(f.ownerKey, [JSON.stringify(record)]);
+}
+
+for (const [label, dev, ino] of [["dev-only", "9", "2"], ["ino-only", "1", "9"]] as const) {
+  test(`typed bare identity error on a ${label} change reaches reserve, renewal check and snapshot`, async () => {
+    const f = ownerFixture();
+    const reservation = await f.reserve();
+    setBare(f, JSON.stringify([f.bare, dev, ino]));
+    const before = f.read();
+    const valuesBefore = JSON.stringify([...f.values]);
+    const expectTyped = (error: unknown) => {
+      assert.ok(error instanceof RecoveryOwnerBareIdentityError);
+      assert.match(error.message, TYPED);
+      assert.deepEqual(error.recorded, { dev, ino });
+      assert.deepEqual(error.current, { dev: "1", ino: "2" });
+      assert.equal(error.record.runId, f.source.runId);
+      return true;
+    };
+    await assert.rejects(f.reserve(1, 0, 7), expectTyped);
+    await assert.rejects(f.recreate().recoveryReservationSnapshot(f.bare, f.branch, f.key, f.source, reservation), expectTyped);
+    await assert.rejects(f.recreate().canRenewRecoveryAdoption(f.bare, f.branch, f.key, before, 2, 1), expectTyped);
+    assert.equal(JSON.stringify([...f.values]), valuesBefore, "the probe and the reads write nothing");
+  });
+}
+
+for (const control of ["path", "unparsable", "not-array", "not-strings", "branch", "key", "typed-plus-key"] as const) {
+  test(`${control} owner binding mismatch keeps the generic error`, async () => {
+    const f = ownerFixture();
+    await f.reserve();
+    const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    if (control === "path") record.bare = JSON.stringify(["/elsewhere", "1", "2"]);
+    if (control === "unparsable") record.bare = "other-bare";
+    if (control === "not-array") record.bare = JSON.stringify({ dev: "1" });
+    if (control === "not-strings") record.bare = JSON.stringify([f.bare, 1, 2]);
+    if (control === "branch") record.branch = "other-branch";
+    if (control === "key") record.key = "other-key";
+    if (control === "typed-plus-key") { record.bare = JSON.stringify([f.bare, "9", "2"]); record.key = "other-key"; }
+    f.values.set(f.ownerKey, [JSON.stringify(record)]);
+    const before = JSON.stringify([...f.values]);
+    await assert.rejects(f.reserve(1, 0, 7), (error: unknown) => {
+      assert.ok(!(error instanceof RecoveryOwnerBareIdentityError));
+      assert.match((error as Error).message, GENERIC);
+      return true;
+    });
+    assert.equal(JSON.stringify([...f.values]), before);
+  });
+}
+
+test("the typed probe is read-only: legacy repair is disabled and values stay byte-identical", async () => {
+  const f = ownerFixture();
+  await f.reserve();
+  setBare(f, JSON.stringify([f.bare, "9", "2"]));
+  const cache = f.recreate();
+  const calls: unknown[][] = [];
+  const stub = (cache as unknown as { checkedRecovery: (...a: unknown[]) => Promise<unknown> }).checkedRecovery;
+  Object.assign(cache, { checkedRecovery: (...a: unknown[]) => { calls.push(a); return stub(...a); } });
+  const before = JSON.stringify([...f.values]);
+  await assert.rejects(f.reserve(1, 0, 7, cache), { message: TYPED });
+  assert.equal(JSON.stringify([...f.values]), before);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]!.slice(4), [false, undefined, false], "allowMissing=false, no detached, allowLegacyRepair=false");
+});
+
+test("a changed source is refused before the typed error", async () => {
+  const f = ownerFixture();
+  await f.reserve();
+  setBare(f, JSON.stringify([f.bare, "9", "2"]));
+  await assert.rejects(f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key,
+    { ...f.source, clonePath: f.source.clonePath + "-other" }, 1000, 1, 7, 0), { message: /^recovery identity changed$/ });
+});
+
+test("a stale claim fence is refused before the typed error", async () => {
+  const f = ownerFixture();
+  await f.reserve();
+  setBare(f, JSON.stringify([f.bare, "9", "2"]));
+  await assert.rejects(f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key, f.read(), 1000, undefined, 7, 0),
+    { message: /^stale recovery claim fence$/ });
+});
+
+test("an episode-only or pending owner reservation change keeps the generic error under a typed mismatch", async () => {
+  for (const change of ["episode", "attempts", "pending"] as const) {
+    const f = ownerFixture();
+    await f.reserve();
+    const record = JSON.parse(f.values.get(f.ownerKey)![0]!);
+    record.bare = JSON.stringify([f.bare, "9", "2"]);
+    if (change === "episode") record.after.episode++;
+    if (change === "attempts") record.after.attempts++;
+    if (change === "pending") record.state = "pending";
+    f.values.set(f.ownerKey, [JSON.stringify(record)]);
+    await assert.rejects(f.reserve(1, 0, 7), (error: unknown) => {
+      assert.ok(!(error instanceof RecoveryOwnerBareIdentityError), change);
+      assert.match((error as Error).message, GENERIC);
+      return true;
+    });
+  }
+});
+
+test("a blocked journal never surfaces the typed error: renewable blockers get the generic error, others today's blocked error", async () => {
+  for (const blocker of ["adoption_failed", "budget_exhausted", "clock_invalid", "capture_failed"] as const) {
+    const f = ownerFixture();
+    await f.reserve();
+    if (blocker === "adoption_failed") await f.block();
+    else if (blocker === "budget_exhausted") {
+      await f.reserve(); await f.reserve();
+      await assert.rejects(f.reserve(), /budget/);
+    } else {
+      const j = f.read();
+      await f.recreate().blockRecoveryEpisode(f.bare, f.branch, f.key, j, blocker, j.recovery);
+    }
+    assert.equal(f.read().recovery!.blocker, blocker);
+    setBare(f, JSON.stringify([f.bare, "9", "2"]));
+    const before = JSON.stringify([...f.values]);
+    const renewable = blocker === "adoption_failed" || blocker === "budget_exhausted";
+    await assert.rejects(f.reserve(2, 1, 8), (error: unknown) => {
+      assert.ok(!(error instanceof RecoveryOwnerBareIdentityError), blocker);
+      assert.match((error as Error).message, renewable ? GENERIC : /^recovery episode is blocked$/);
+      return true;
+    });
+    assert.equal(JSON.stringify([...f.values]), before);
+  }
+});
+
+test("owner record error precedence is preserved: a duplicate record loses to a missing source and to a stale fence", async () => {
+  const f = ownerFixture();
+  await f.reserve();
+  const raw = f.values.get(f.ownerKey)![0]!;
+  f.values.set(f.ownerKey, [raw, raw]);
+  await assert.rejects(f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key,
+    { ...f.source, clonePath: f.source.clonePath + "-other" }, 1000, 1, 7, 0), { message: /^recovery identity changed$/ });
+  await assert.rejects(f.recreate().reserveRecoveryIteration(f.bare, f.branch, f.key, f.read(), 1000, undefined, 7, 0),
+    { message: /^stale recovery claim fence$/ });
+  await assert.rejects(f.reserve(1, 0, 7), { message: /^duplicate or missing recovery owner record$/ });
+});

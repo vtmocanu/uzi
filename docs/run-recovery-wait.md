@@ -454,10 +454,56 @@ receive this retry treatment.
 
 Owner authorization remains bound to the recorded repository path, device and
 inode. A changed storage identity refuses execution; Resume cannot override that
-check. With the source journal still valid, the run re-holds instead of failing
-and keeps its local work and custody. Export/recover the retained work rather than
-expecting Resume alone to rebind changed storage. Reholding does
-not rebind the owner record or consume the pending execution grant.
+check. Two holds cover it:
+
+- Every journal that is already blocked keeps today's disposition unchanged.
+  For an `adoption_failed` or `budget_exhausted` blocker that is the existing
+  re-hold: with the source journal still valid, the run re-holds instead of
+  failing and keeps its local work and custody. Any other blocker still ends
+  the run failed with local work and custody kept, as today. Export/recover the retained work
+  rather than expecting Resume alone to rebind changed storage. Reholding does
+  not rebind the owner record or consume the pending execution grant. On the
+  renewal-check path the logged warning is still
+  `retained adoption renewal evidence unavailable`; only its diagnostic cause
+  now reads `recovery owner binding changed: bare storage identity`, and only
+  for an `adoption_failed` blocker. The disposition is unchanged.
+- A device or inode change alone (for example a pod replacement remounting the
+  data volume) found on the first reservation of a claim on a journal that is
+  not blocked now parks at `recovery_wait` / `retained_recovery_adoption_failed`
+  with guidance, instead of failing. The recorded path, branch, key and run must
+  still match, and the journal's reservation must be the recorded one. Execution
+  stays refused: the owner record is not rebound, no execution grant is consumed
+  and nothing is captured or sent to a model. A Resume holds again and adds a
+  custody hold, up to the custody hold limit, so inspect with
+  `uzi run recovery <run>` and export/recover the work rather than Resume. The
+  hold needs the API feature and a running acknowledgement, as for the other
+  adoption-failed holds. A definitive refusal (400) of the park leaves the run
+  nonterminal, and the ordinary missing-flight requeue accounting applies. A
+  park that cannot be confirmed may still have been applied with its
+  acknowledgement lost, in which case the owner hold stands; otherwise the same
+  requeue accounting applies. At the cap the disposition is the owner hold
+  `recovery_wait` / `worker_requeue_exhausted` when recovery evidence or
+  unresolved custody is recorded (which a retained run normally has), otherwise
+  `worker_lost`. A storage-identity change detected later in the same
+  reservation, after the read-only check passed, is not held: it fails closed as
+  `preservation_failed` with work and custody kept on the worker.
+
+The claim's exit keeps the predecessor's refs unchanged when the owed tip is
+already pinned. Otherwise it performs the usual single additive owed pin. On an
+inventory-guarded exit the existing refusal-provenance admission record is
+written as on any guarded exit. A Codex exit whose terminal disposal is unproven
+skips owed retention, as before. The park does not reap the run's processes or
+drop its Claude caches. See the
+[ADR-1197 #4627 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-23-4627-a-changed-bare-storage-identity-holds-for-its-owner).
+
+An owed (`refs/uzi-owed/...`) or refusal
+(`refs/uzi-incoming/.../refused-...`) retention ref found at a wrong target is
+no longer silently moved. The worker logs
+`retention ref target mismatch; ref left untouched` and leaves it: the run's
+owed inventory stays fail-closed and custody is kept. Inspect the run with
+`uzi run recovery <run>`, then export or recover its work, or discard or settle
+the run's holds through the existing routes. This applies wherever a retention
+ref is written, not only to the storage-identity hold.
 
 The adoption path (not the issue #4058 remediation hold) requires API feature
 support, exact persisted `adoption_failed` evidence, current ownership and proven quiescence. Missing support or unconfirmed
@@ -470,6 +516,10 @@ Other permanent blockers end the run **failed**, keeping local work and
 custody, without automatic reclaim or failed-run Resume. The adoption retry
 does not clear missing source, invalid clock, preservation failure, missing
 needed prerequisites, oversized fallback or decoded-history blockers.
+A first-iteration storage-identity mismatch on a journal that is not blocked is
+no longer among them (see above). A mismatch on a later iteration, a changed
+reservation, and a not-blocked adopting journal that would need legacy
+attribution repair still end on this path.
 Actual quiescence failure uses `worker_residue_blocked`.
 Transient capture, forge or disk failures consume the same reserved budget.
 These bounds do not change the healthy provider/empty-turn park budgets or
