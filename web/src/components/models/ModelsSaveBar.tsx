@@ -12,7 +12,7 @@ export type SaveOutcome =
   | { kind: "not_saved"; message: string }
   | { kind: "unknown" }
   | { kind: "saved_unreadable" }
-  | { kind: "reloaded"; stillDirty: number }
+  | { kind: "reloaded"; stillDirty: number; adopted?: boolean }
   | { kind: "reload_failed"; message: string }
   | { kind: "discarded_unconfirmed" };
 
@@ -88,7 +88,9 @@ function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
         <Alert
           tone="info"
           message={
-            outcome.stillDirty === 0
+            outcome.adopted
+              ? "Reloaded the saved settings. The page now shows what is stored."
+              : outcome.stillDirty === 0
               ? "Reloaded the saved settings. They match your edits."
               : `Reloaded the saved settings. ${plural(outcome.stillDirty, "edit differs", "edits differ")} from what is stored.`
           }

@@ -329,7 +329,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
       }
       setFieldErrors({});
       setUncertainty(null);
-      setOutcome({ kind: "reloaded", stillDirty: clean ? 0 : dirtyFields(values, draft).length });
+      setOutcome(clean ? { kind: "reloaded", stillDirty: 0, adopted: true } : { kind: "reloaded", stillDirty: dirtyFields(values, draft).length });
     } catch (err) {
       if (isCurrent(seq)) setOutcome({ kind: "reload_failed", message: errorMessage(err, "request failed") });
     } finally {

@@ -359,10 +359,28 @@ describe("Models page", () => {
     // pending "revert" edit from the discarded pre-save draft.
     mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_codex_model: "gpt-6-sol" }) });
     fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
-    await within(bar()).findByText("Reloaded the saved settings. They match your edits.");
+    await within(bar()).findByText("Reloaded the saved settings. The page now shows what is stored.");
     expect(status()).toBe("No unsaved changes");
     expect(control("Worker model — Codex").value).toBe("gpt-6-sol");
     expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("a clean reload after Discard never claims the discarded edit was stored", async () => {
+    mockApi.putMyModelSettings.mockRejectedValueOnce(
+      new ApiError(500, "the save may or may not have been applied", { reason: "settings_commit_unknown" }),
+    );
+    mount();
+    await screen.findByLabelText("Worker model — Codex");
+    select("Worker model — Codex", "gpt-6-sol");
+    fireEvent.click(saveButton());
+    await within(bar()).findByText(/could not confirm whether this save was applied/);
+    fireEvent.click(discardButton());
+    // The save did NOT commit: the server still holds the pre-save value.
+    fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
+    await within(bar()).findByText("Reloaded the saved settings. The page now shows what is stored.");
+    expect(within(bar()).queryByText(/They match your edits/)).toBeNull();
+    expect(control("Worker model — Codex").value).toBe("inherit");
+    expect(status()).toBe("No unsaved changes");
   });
 
   it("takes the worker effort Default from the template-aware effective cell, not the preference-only settings cell", async () => {
