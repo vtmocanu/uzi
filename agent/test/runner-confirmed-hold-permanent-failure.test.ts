@@ -74,9 +74,11 @@ class Observer {
   codexBaseline: CodexBaseline | undefined;
   memoryOverlap = false;
   /** The representative memory hold of the memory row; the same object must stay on the flight from before the trip to settlement. */
-  readonly memoryStandIn: { hold: object; feedback: Set<unknown> } = { hold: {}, feedback: new Set() };
-  memoryAfterHandlerCall: unknown[] = [];
-  reconciles: Array<{ inHandler: number; memory: unknown }> = [];
+  /** Kept apart from the stand-in so a handler that clears `memoryStandIn.hold` cannot also move the expected value. */
+  readonly memoryHold: object = Object.freeze({});
+  readonly memoryStandIn: { hold?: object; feedback: Set<unknown> } = { hold: this.memoryHold, feedback: new Set() };
+  memoryAfterHandlerCall: Array<{ memory: unknown; hold: unknown }> = [];
+  reconciles: Array<{ inHandler: number; memory: unknown; hold: unknown }> = [];
   stopReasonAfterHandler: unknown;
   constructor(readonly trip: boolean, readonly rig: CodexRig | undefined) {}
 }
@@ -94,7 +96,9 @@ function installCloseHook(t: TestContext): void {
       obs.queuedBefore = this.bufferedCount();
       // The memory row installs its representative hold here: after the confirmation, immediately before the injected trip. A hold
       // present from the start of the flight reroutes the hold exit itself (the flight stops retained before the final drain, so
-      // nothing is left to trip). From this point it stays on the flight through settlement.
+      // nothing is left to trip). From this point it stays on the flight through settlement. Unlike production (preparePreservation
+      // retains custody before it sets `hold`), custody is NOT pre-retained here, so the row's custody flags can come only from the
+      // handler's memory branch.
       if (obs.memoryOverlap) obs.flight!.workerMemory = obs.memoryStandIn;
       api.failMessagesNext(1, 403);
       this.emit({ kind: "status", agent: "worker", payload: { text: FRAME } });
@@ -145,7 +149,7 @@ function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig, 
     obs.inHandler++;
     const promise = Promise.resolve(handler(...a));
     // The memory branch of the handler runs synchronously up to its return, so the object is read right after the call.
-    obs.memoryAfterHandlerCall.push(flight.workerMemory);
+    obs.memoryAfterHandlerCall.push({ memory: flight.workerMemory, hold: (flight.workerMemory as { hold?: unknown } | undefined)?.hold });
     const settled = promise.finally(() => {
       obs.inHandler--;
       obs.abortedAfterHandler.push(flight.cancel.signal.aborted);
@@ -159,7 +163,7 @@ function observe(t: TestContext, run: RunRunner, trip: boolean, rig?: CodexRig, 
     // reconciliation call and the memory object it sees, then returns without calling the original.
     t.mock.method(r, "reconcileWorkerMemory", async (...a: unknown[]) => {
       const flight = a[0] as FlightView;
-      obs.reconciles.push({ inHandler: obs.inHandler, memory: flight.workerMemory });
+      obs.reconciles.push({ inHandler: obs.inHandler, memory: flight.workerMemory, hold: (flight.workerMemory as { hold?: unknown } | undefined)?.hold });
     });
   }
   const terminal = original("journalAndSendTerminal");
@@ -606,11 +610,14 @@ describe("a permanent message failure after a confirmed hold or wall park keeps 
     // Memory reconciliation ownership: the handler neither replaced nor cleared the flight's memory, and the flight's own
     // reconciliation still ran for that same object, outside the handler.
     const memory = o.obs.memoryStandIn;
+    const hold = o.obs.memoryHold;
     assert.equal(o.obs.flight!.workerMemory, memory, "the flight still holds the same memory object after settlement");
-    assert.deepEqual(o.obs.memoryAfterHandlerCall.map(m => m === memory), o.obs.entries.map(() => true),
-      "the handler left flight.workerMemory as the same object");
+    assert.equal((o.obs.flight!.workerMemory as { hold?: unknown }).hold, hold, "the memory hold is still set after settlement");
+    assert.deepEqual(o.obs.memoryAfterHandlerCall.map(m => m.memory === memory && m.hold === hold), o.obs.entries.map(() => true),
+      "the handler left flight.workerMemory as the same object with its hold set");
     assert.ok(o.obs.reconciles.length >= 1, "the flight's own memory reconciliation ran");
-    assert.deepEqual(o.obs.reconciles.filter(c => c.memory !== memory), [], "every reconciliation saw the same memory object");
+    assert.deepEqual(o.obs.reconciles.filter(c => c.memory !== memory || c.hold !== hold), [],
+      "every reconciliation saw the same memory object with its hold set");
     assert.deepEqual(o.obs.reconciles.filter(c => c.inHandler > 0), [], "the handler did not reconcile memory itself");
   });
 
