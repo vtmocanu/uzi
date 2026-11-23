@@ -355,7 +355,7 @@ describe("Run defaults — judge enforced banner (PRD #69 M4)", () => {
       appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       judge_models: [
         { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
       ],
     } });
     render(
@@ -1423,7 +1423,7 @@ describe("Run defaults — judge summary (PRD #3263 M3)", () => {
   });
   const cells = (): ModelSettingCell[] => [
     { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
   ];
   const judgeSettings = (judgeRunsOn: UserSettings["judge_runs_on"], over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
     settings: {
