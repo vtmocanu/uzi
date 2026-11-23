@@ -371,8 +371,12 @@ describe("a large retained secret history", () => {
     }
     assert.equal(missingAdded, 0, "every form registered");
     assert.equal(missingRemoved, 0, "every form evicted at terminal");
-    assert.ok(redacted !== undefined && !redacted.includes(lineA) && !redacted.includes(lineB), "redactText hides both retained lines");
-    assert.ok(typeof (completed as { report_md?: unknown }).report_md === "string", "the completed state carries report_md");
+    // Exact masks, not mere absence: a withheld marker or an empty string would also hide the lines.
+    const M = "***REDACTED***";
+    assert.equal(redacted, `before ${M} middle ${M} after`, "redactText masks both retained lines in place");
+    const reportMd = (completed as { report_md?: unknown }).report_md;
+    assert.equal(typeof reportMd, "string", "the completed state carries report_md");
+    assert.ok((reportMd as string).includes(`report ${M} and ${M}`), `report_md masks both retained lines: ${String(reportMd).slice(0, 200)}`);
     const json = JSON.stringify(completed);
     assert.ok(!json.includes(lineA) && !json.includes(lineB), "the completed state carries neither retained line");
   });
