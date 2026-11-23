@@ -341,7 +341,15 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
   return (
     <form onSubmit={(e) => void save(e)} className="space-y-4 pb-6" noValidate>
-      <UnsavedModelsGuard dirtyCount={dirty.length} saving={saving} viewerId={viewerId} onDiscard={discard} />
+      <UnsavedModelsGuard
+        dirtyCount={dirty.length}
+        saving={saving}
+        // The PUT may have committed: leaving must not read as a discard (PRD: explain the
+        // uncertainty, never claim a rollback). A reload replaces this outcome.
+        saveUncertainty={outcome?.kind === "unknown" || outcome?.kind === "saved_unreadable" ? outcome.kind : null}
+        viewerId={viewerId}
+        onDiscard={discard}
+      />
       <fieldset disabled={busy} className="min-w-0 space-y-4 disabled:opacity-80">
         <legend className="sr-only">Model settings</legend>
         <Card className="space-y-1">

@@ -632,9 +632,9 @@ function mockPlanningModel(raw: string | null | undefined, harness: Harness = "c
   return trimmed;
 }
 
-// Each default follows the server's agenttmpl.ResolveWorkerDefaultModel, as planningModelCells
-// composes it: the worker lane (user_default), else the lead template's pin for the harness
-// (template), else the built-in.
+// Each default uses the order the server's planningModelCells composes: the worker lane
+// (user_default), else the given lead pin for the harness (template), else the built-in. The pin
+// comes from mockLeadModelPins, which only approximates the server's lead pins (see there).
 function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude", leadPin: string | null = null): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" | "template" })[] {
   const valid = (m: string) => harness === "codex" ? !KNOWN_CLAUDE_ALIASES.includes(m) : !CODEX_ROLE_MODELS.includes(m);
   const laneModel = lane?.trim() ?? "";
@@ -651,10 +651,12 @@ function mockPlanningModelCells(planning: string | null | undefined, lane: strin
     resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source }];
 }
 
-// The lead template's per-harness model pin the planning Defaults resolve through (the server's
-// leadClaudePin / leadCodexPin). A delivered mock lead template's Claude model wins; otherwise the
-// active recording's template-sourced worker default, since each recording was taken with its
-// lead template pinned. So the planning cells name the same default the effective view predicts.
+// A mock stand-in for the lead template's per-harness model pin the planning Defaults resolve
+// through; it does not reproduce the server's leadClaudePin / leadCodexPin. Claude: a delivered
+// mock lead template's non-null Claude model, else the active recording's template-sourced worker
+// default. Codex: only that recorded fallback. Not modelled: a delivered lead template whose model
+// is null (the mock still falls back to the recording, where the server would have no pin) and a
+// lead template's Codex model.
 function mockLeadModelPins(): Record<Harness, string | null> {
   const recorded = (h: Harness) => {
     const c = recordedEffectiveScenario().get.models?.find(m => m.setting === "worker_model" && m.harness === h);

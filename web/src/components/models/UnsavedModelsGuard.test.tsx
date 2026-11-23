@@ -71,6 +71,32 @@ describe("UnsavedModelsGuard", () => {
     expect(onDiscard).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["unknown", "could not confirm whether your last save was applied"],
+    ["saved_unreadable", "Your last save was stored"],
+  ] as const)("after a %s save, leaving is Leave anyway, never a discard claim", async (kind, copy) => {
+    const onDiscard = vi.fn();
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/settings/models",
+          element: <UnsavedModelsGuard dirtyCount={2} saveUncertainty={kind} viewerId="u1" onDiscard={onDiscard} />,
+        },
+        { path: "*", element: <p>elsewhere</p> },
+      ],
+      { initialEntries: ["/settings/models"] },
+    );
+    render(<RouterProvider router={router} />);
+    await act(() => router.navigate("/schedules"));
+    const open = screen.getByRole("dialog", { name: "Your model changes may already be saved" });
+    expect(open.textContent).toContain(copy);
+    expect(open.textContent).toContain("2 changes may already be saved");
+    expect(open.textContent).not.toMatch(/not saved yet|discard and continue|continue once the save finishes/);
+    expect(screen.queryByRole("button", { name: "Discard changes" })).toBeNull();
+    act(() => screen.getByRole("button", { name: "Leave anyway" }).click());
+    expect(router.state.location.pathname).toBe("/schedules");
+  });
+
   it("does not block /login, a same-path change, or a clean page", async () => {
     const dirty = mount(1);
     await act(() => dirty.router.navigate("/settings/models?tab=x#planning"));

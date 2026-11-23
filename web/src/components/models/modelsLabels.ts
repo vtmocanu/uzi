@@ -61,7 +61,7 @@ export function predictionText(field: ModelsField, effective: EffectiveSettings 
     // weekly reset") says how it is chosen without repeating "chosen".
     const shown = value.value === "claude" || value.value === "codex" ? HARNESS_NAME[value.value] : "Automatic";
     const source = notes.length > 0 ? notes.join(", ") : modelSettingSourceLabel("harness", value.source);
-    return shown === source ? shown : `${shown} · ${source}`;
+    return `${shown} · ${source}`;
   }
   if (field.kind === "model") {
     const setting = MODEL_SETTING[field.row];

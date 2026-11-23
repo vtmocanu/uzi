@@ -14,9 +14,17 @@ import { useAuth } from "../../auth/AuthContext";
 import { Modal } from "../Modal";
 import { Button } from "../ui";
 
+const UNSAVED_TITLE = "You have unsaved model changes";
+const UNCONFIRMED_TITLE = "Your model changes may already be saved";
+
+/** The last save's outcome when it may have committed: "unknown" (commit not confirmed,
+ *  network or gateway failure) or "saved_unreadable" (committed, readback failed). */
+type SaveUncertainty = "unknown" | "saved_unreadable";
+
 export function UnsavedModelsGuard({
   dirtyCount,
   saving = false,
+  saveUncertainty = null,
   viewerId,
   onDiscard,
 }: {
@@ -25,6 +33,9 @@ export function UnsavedModelsGuard({
    *  "discarded" values, so Discard waits. A success leaves nothing dirty and the blocked
    *  navigation proceeds; a failure re-enables Discard. */
   saving?: boolean;
+  /** The last save may have been stored although the draft is still dirty, so leaving is not
+   *  a discard: the dialog explains the uncertainty and offers "Leave anyway". */
+  saveUncertainty?: SaveUncertainty | null;
   /** The viewer whose draft this is. */
   viewerId: string;
   /** Drops the draft back to the saved baseline before the blocked navigation proceeds. */
@@ -74,21 +85,32 @@ export function UnsavedModelsGuard({
     onDiscard();
     blocker.proceed();
   };
+  const changes = dirtyCount === 1 ? "1 change" : `${dirtyCount} changes`;
+  // An uncertain save is never "not saved": the PUT may have committed, and leaving cannot
+  // undo it, so the copy says so, points at Stay + Reload saved settings, and the leave
+  // button makes no discard (rollback) claim.
+  const uncertain = !saving && saveUncertainty ? saveUncertainty : null;
+  const title = uncertain ? UNCONFIRMED_TITLE : UNSAVED_TITLE;
+  const message = saving
+    ? `Saving ${changes}… You continue once the save finishes.`
+    : uncertain === "unknown"
+      ? `The server could not confirm whether your last save was applied, so ${changes} may already be saved. Stay and choose Reload saved settings to see what is stored. Leaving does not undo anything the server stored.`
+      : uncertain === "saved_unreadable"
+        ? `Your last save was stored, but reading it back failed, so ${changes} may already be saved and could not be confirmed. Stay and choose Reload saved settings to see what is stored. Leaving does not undo the save.`
+        : `${dirtyCount === 1 ? "1 change is" : `${dirtyCount} changes are`} not saved yet. Stay to review and save, or discard and continue.`;
   return (
-    <Modal label="You have unsaved model changes" onClose={stay}>
+    <Modal label={title} onClose={stay}>
       <div className="w-full max-w-md space-y-4 rounded-xl border border-edge bg-surface p-5 shadow-2xl">
-        <h2 className="text-base font-semibold text-fg">You have unsaved model changes</h2>
+        <h2 className="text-base font-semibold text-fg">{title}</h2>
         <p role="status" aria-live="polite" className="text-sm text-muted">
-          {saving
-            ? `Saving ${dirtyCount === 1 ? "1 change" : `${dirtyCount} changes`}… You continue once the save finishes.`
-            : `${dirtyCount === 1 ? "1 change is" : `${dirtyCount} changes are`} not saved yet. Stay to review and save, or discard and continue.`}
+          {message}
         </p>
         <div className="flex flex-wrap justify-end gap-2">
-          <Button type="button" variant="secondary" onClick={stay}>
+          <Button type="button" variant={uncertain ? "primary" : "secondary"} onClick={stay}>
             Stay
           </Button>
-          <Button type="button" variant="danger" disabled={saving} onClick={discard}>
-            Discard changes
+          <Button type="button" variant={uncertain ? "secondary" : "danger"} disabled={saving} onClick={discard}>
+            {uncertain ? "Leave anyway" : "Discard changes"}
           </Button>
         </div>
       </div>

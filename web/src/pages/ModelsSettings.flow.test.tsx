@@ -301,6 +301,64 @@ describe("unsaved-changes guard", () => {
     expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: null });
   }, 30000);
 
+  // A save that may have committed keeps the draft dirty, but leaving is then not a discard:
+  // the dialog says the changes may already be saved, recommends Stay + Reload saved settings,
+  // and its leave button makes no "Discard changes" (rollback) claim.
+  const UNCONFIRMED = "Your model changes may already be saved";
+  const expectUncertainCopy = (open: HTMLElement) => {
+    expect(open.textContent).toContain("1 change may already be saved");
+    expect(open.textContent).toContain("Reload saved settings");
+    expect(open.textContent).not.toContain("not saved yet");
+    expect(open.textContent).not.toContain("discard and continue");
+    expect(open.textContent).not.toContain("You continue once the save finishes");
+    expect(within(open).queryByRole("button", { name: "Discard changes" })).toBeNull();
+    expect((within(open).getByRole("button", { name: "Leave anyway" }) as HTMLButtonElement).disabled).toBe(false);
+  };
+
+  it("a readback failure (saved, not confirmed) shows the uncertain dialog; Leave anyway leaves with the stored values", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    const release = deferNextSave();
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await act(() => router.navigate("/settings/appearance"));
+    const saving = await screen.findByRole("dialog", { name: DIALOG });
+    expect(saving.textContent).toContain("You continue once the save finishes");
+    failNextMockModelSettingsWrite("saved_readback_failed");
+    await act(async () => release());
+    const open = await screen.findByRole("dialog", { name: UNCONFIRMED }, { timeout: 5000 });
+    expectUncertainCopy(open);
+    expect(open.textContent).toContain("Your last save was stored");
+    fireEvent.click(within(open).getByRole("button", { name: "Leave anyway" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+    expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: "gpt-6-sol" });
+  }, 30000);
+
+  it("an unknown commit outcome shows the uncertain dialog when it opens later; Stay then Reload restores the normal guard", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    failNextMockModelSettingsWrite("commit_unknown");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/could not confirm whether this save was applied/, {}, { timeout: 5000 });
+    await act(() => router.navigate("/settings/appearance"));
+    const open = await screen.findByRole("dialog", { name: UNCONFIRMED });
+    expectUncertainCopy(open);
+    expect(open.textContent).toContain("could not confirm whether your last save was applied");
+    fireEvent.click(within(open).getByRole("button", { name: "Stay" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: UNCONFIRMED })).toBeNull());
+    expect(path(router)).toBe("/settings/models");
+
+    // The mock did not apply it: after Reload the edit is known to be unsaved, so the normal
+    // "not saved yet … Discard changes" guard is honest again.
+    fireEvent.click(within(bar()).getByRole("button", { name: "Reload saved settings" }));
+    await within(bar()).findByText(/Reloaded the saved settings/, {}, { timeout: 5000 });
+    await act(() => router.navigate("/settings/appearance"));
+    const normal = await screen.findByRole("dialog", { name: DIALOG });
+    expect(normal.textContent).toContain("1 change is not saved yet");
+    fireEvent.click(within(normal).getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
+    expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: null });
+  }, 30000);
+
   it("logout while dirty reaches /login without the dialog", async () => {
     const router = await openModels();
     select("Worker model — Codex", "gpt-6-sol");
