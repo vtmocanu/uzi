@@ -196,7 +196,7 @@ Probe quotas and downstream worker frame/queue/advice/child budgets do not estab
 - **Gateway limits and private CA.** A gateway 429 or overload parks as `provider_gateway_limit` (D6 schedule: 1, 5, 15 minutes, then owner Resume). The worker's extra-CA bundle is delivered to the Codex runtime with TLS verification on; a stalled connection fails with a typed timeout, not a certificate error unless the runtime reports one.
 - **Accepted risks (owner decisions).** The pinned runtime follows redirects and can forward request bodies and the Bearer header beyond the approved URL; the allowlist is admission control, not confinement, and the API probe refuses redirects (2026-11-19). Model-response HTTP/SSE ingestion is unbounded for bound providers (amendment 2026-11-22, limiter #4600, verified unchanged at 0.169.0 above). The key is redacted by its exact encodings from model, review and summary output, PR text and forge pushes; transformed encodings are not detected and the private recovery archive is not scanned, as for Claude providers (#4505).
 
-Not shipped here: Codex providers on the judge and cross-check lanes (#4574), Codex jobs and chat, admin-shared Codex providers (PRD #4324), and a bounded-ingestion limiter (#4600). Real-gateway and hosted-tier acceptance remains owner acceptance (#4473).
+Not shipped here: Codex providers on the judge and cross-check lanes (#4574), Codex jobs and chat, admin-shared Codex providers (#4633), and a bounded-ingestion limiter (#4600). Real-gateway and hosted-tier acceptance remains owner acceptance (#4473).
 
 ## Consequences
 
