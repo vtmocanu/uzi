@@ -93,7 +93,9 @@ A handoff can end with a second opinion instead of ending with your pull:
   `uzi/task/<run-id>`, diffs it against its base, and produces structured
   findings (file, symbol, line, severity, summary, rationale). Fetch them
   with `uzi handoff review <run-id>` (`--json` for the machine-readable
-  form). The findings are never committed to the branch — they're something
+  form). The review model and effort are configurable per harness; see [Task review
+  model](./worker-model.md#task-review-model) and [Task review
+  effort](./worker-model.md#task-review-effort). The findings are never committed to the branch — they're something
   you read, not a diff the worker writes onto your work.
 - **`--then-fix`** (which turns `--review` on for you) chains a follow-on fix
   run once the review lands: it consumes the findings and pushes fixes for

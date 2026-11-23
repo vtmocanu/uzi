@@ -213,9 +213,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -253,25 +251,23 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "claude",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "codex",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "catalog_default": {
             "state": "known",
             "effort": "low",
@@ -281,9 +277,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "claude",
@@ -2005,9 +1999,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -2045,25 +2037,23 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "claude",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "codex",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "catalog_default": {
             "state": "unknown",
             "effort": null,
@@ -2073,9 +2063,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "claude",
@@ -2746,9 +2734,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -2786,25 +2772,23 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "claude",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "codex",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "catalog_default": {
             "state": "known",
             "effort": "low",
@@ -2814,9 +2798,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "claude",
@@ -3378,9 +3360,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -3418,25 +3398,23 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "claude",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "codex",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "catalog_default": {
             "state": "known",
             "effort": "low",
@@ -3446,9 +3424,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "claude",
@@ -4142,9 +4118,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "setting": "task_review_model",
           "fixed_at": "claim",
           "ignored": null,
-          "notes": [
-            "not_configurable"
-          ]
+          "notes": []
         }
       ],
       "efforts": [
@@ -4182,24 +4156,22 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "claude",
           "effort": null,
-          "default_effort": "",
+          "default_effort": "medium",
           "default_source": "builtin",
-          "resolved_effort": null,
+          "resolved_effort": "medium",
           "source": "builtin",
-          "mode": "runtime_default",
+          "mode": "explicit",
           "setting": "task_review_effort",
           "fixed_at": "claim",
-          "notes": [
-            "not_sent"
-          ]
+          "notes": []
         },
         {
           "harness": "codex",
           "effort": null,
-          "default_effort": "",
-          "default_source": "builtin",
+          "default_effort": "runtime",
+          "default_source": "user_default",
           "resolved_effort": null,
-          "source": "builtin",
+          "source": "user_default",
           "mode": "runtime_default",
           "catalog_default": {
             "state": "known",

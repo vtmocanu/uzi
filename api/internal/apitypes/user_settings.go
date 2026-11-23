@@ -44,6 +44,18 @@ type UserSettingsDTO struct {
 	// instance Codex summary model. SummaryModels is the read-only resolved view of both
 	// summary lanes, ordered claude then codex.
 	CodexSummaryModel *string `json:"codex_summary_model"`
+	// TaskReviewModel and CodexTaskReviewModel mirror the owner's per-harness model for the
+	// handoff review pass (PRD #1570); null = the built-in review model. TaskReviewModels is the
+	// read-only resolved view, ordered claude then codex.
+	TaskReviewModel      *string               `json:"task_review_model"`
+	CodexTaskReviewModel *string               `json:"codex_task_review_model"`
+	TaskReviewModels     []ModelSettingCellDTO `json:"task_review_models"`
+	// TaskReviewEffort and CodexTaskReviewEffort mirror the owner's per-harness effort for the review
+	// pass (PRD #1570): a level or `runtime`; null = inherit the worker effort. TaskReviewEfforts is
+	// the read-only resolved view, ordered claude then codex.
+	TaskReviewEffort      *string                `json:"task_review_effort"`
+	CodexTaskReviewEffort *string                `json:"codex_task_review_effort"`
+	TaskReviewEfforts     []EffortSettingCellDTO `json:"task_review_efforts"`
 	// Theme is the DEPRECATED legacy single-theme override mirror (PRD #21); kept
 	// one release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`

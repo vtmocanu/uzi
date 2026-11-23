@@ -203,6 +203,12 @@ a running one.
   and no agent-source sync replaced, so admin edits survive restarts and future
   releases add or upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
   a non-builtin row already occupies a builtin's name.
+- **Task-review settings ride review claims behind a capability (PRD #1570).** A
+  task-review claim carries the owner's configured, re-validated `task_review_model`
+  and `task_review_effort` (resolved per harness; the worker effort when unset) only to a worker advertising `task_review_settings_v1`; absent, the worker runs its
+  built-in. For an older worker the api withholds it and writes one
+  `task_review_settings_omitted` run-feed notice per claim generation; the review still
+  runs, on the built-in.
 - **Effort pins are projected per family, behind a capability.** The claim
   carries a subagent's `effort` for the run's harness only, and only to a worker
   advertising `template_effort_v1`; for an older worker the api omits the pins

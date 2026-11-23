@@ -1504,6 +1504,9 @@ type Store interface {
 	// (PRD #3248): read at ISSUE-run claim assembly, keyed on the run owner. NULL ⇒
 	// inherit the instance value for that harness.
 	GetUserSummaryModels(ctx context.Context, id uuid.UUID) (store.GetUserSummaryModelsRow, error)
+	// The owner's task-review model per harness (PRD #1570): read at REVIEW-run claim assembly and
+	// by the effective-settings prediction, keyed on the run owner. NULL = the built-in.
+	GetUserTaskReviewSettings(ctx context.Context, id uuid.UUID) (store.GetUserTaskReviewSettingsRow, error)
 	// ListClaimAgentTemplates resolves template allocations for the run owner
 	// (PRD #18 M7): only the builtin/global defaults ± the owner's overlay + the
 	// owner's own allocated user templates ride the claim, not every template.
