@@ -118,7 +118,9 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   const [outcome, setOutcome] = useState<SaveOutcome | null>(null);
   // An earlier save may have committed without confirmation. Kept apart from `outcome`, which a
   // later failed reload or failed retry replaces: only a successful save, a successful reload or
-  // Discard reconciles it, so the guard never offers "Discard changes" while a commit is unconfirmed.
+  // Discard reconciles it, so a dialog shown while a commit is unconfirmed never offers "Discard
+  // changes". (A draft that becomes clean again, by editing back or the bar's Discard, is not
+  // guarded: the bar's Discard explicitly accepts the last loaded values.)
   const [uncertainty, setUncertainty] = useState<"unknown" | "saved_unreadable" | null>(null);
   const [customMode, setCustomMode] = useState<Record<string, boolean>>({});
   // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
@@ -355,7 +357,8 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         dirtyCount={dirty.length}
         saving={saving}
         // The PUT may have committed: leaving must not read as a discard (PRD: explain the
-        // uncertainty, never claim a rollback). A reload replaces this outcome.
+        // uncertainty, never claim a rollback). Cleared only by a successful save, a successful
+        // reload or Discard.
         saveUncertainty={uncertainty}
         viewerId={viewerId}
         onDiscard={discard}
@@ -443,6 +446,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
         blockedCount={customEmpty.size}
         outcome={outcome}
         reloading={reloading}
+        uncertain={uncertainty !== null}
         onDiscard={discard}
         onReload={() => void reload()}
       />

@@ -327,7 +327,7 @@ describe("unsaved-changes guard", () => {
     await act(async () => release());
     const open = await screen.findByRole("dialog", { name: UNCONFIRMED }, { timeout: 5000 });
     expectUncertainCopy(open);
-    expect(open.textContent).toContain("Your last save was stored");
+    expect(open.textContent).toContain("An earlier save was stored");
     fireEvent.click(within(open).getByRole("button", { name: "Leave anyway" }));
     await waitFor(() => expect(path(router)).toBe("/settings/appearance"));
     expect((await mockApi.getMySettings()).settings).toMatchObject({ default_codex_model: "gpt-6-sol" });
@@ -342,7 +342,7 @@ describe("unsaved-changes guard", () => {
     await act(() => router.navigate("/settings/appearance"));
     const open = await screen.findByRole("dialog", { name: UNCONFIRMED });
     expectUncertainCopy(open);
-    expect(open.textContent).toContain("could not confirm whether your last save was applied");
+    expect(open.textContent).toContain("could not confirm whether an earlier save was applied");
     fireEvent.click(within(open).getByRole("button", { name: "Stay" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: UNCONFIRMED })).toBeNull());
     expect(path(router)).toBe("/settings/models");
@@ -376,6 +376,22 @@ describe("unsaved-changes guard", () => {
     await act(() => router.navigate("/settings/appearance"));
     const open = await screen.findByRole("dialog", { name: UNCONFIRMED });
     expectUncertainCopy(open);
+    expect(within(open).queryByRole("button", { name: "Discard changes" })).toBeNull();
+  }, 30000);
+
+  it("a failed retry after an unknown commit keeps Reload reachable and the guard uncertain", async () => {
+    const router = await openModels();
+    select("Worker model — Codex", "gpt-6-sol");
+    failNextMockModelSettingsWrite("commit_unknown");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/could not confirm whether this save was applied/, {}, { timeout: 5000 });
+    failNextMockModelSettingsWrite("write_failed");
+    fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
+    await within(bar()).findByText(/The save failed and nothing was changed/, {}, { timeout: 5000 });
+    expect(within(bar()).getByRole("button", { name: "Reload saved settings" })).toBeTruthy();
+    await act(() => router.navigate("/settings/appearance"));
+    const open = await screen.findByRole("dialog", { name: UNCONFIRMED });
+    expect(open.textContent).toContain("could not confirm whether an earlier save was applied");
     expect(within(open).queryByRole("button", { name: "Discard changes" })).toBeNull();
   }, 30000);
 

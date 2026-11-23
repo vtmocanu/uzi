@@ -19,7 +19,13 @@ function plural(n: number, one: string, many: string): string {
   return n === 1 ? `1 ${one}` : `${n} ${many}`;
 }
 
-function OutcomeAlert({ outcome, onReload, reloading }: { outcome: SaveOutcome; onReload: () => void; reloading: boolean }) {
+function OutcomeAlert({ outcome, onReload, reloading, uncertain }: {
+  outcome: SaveOutcome;
+  onReload: () => void;
+  reloading: boolean;
+  /** An earlier save is still unconfirmed: keep Reload reachable even after a failed retry. */
+  uncertain: boolean;
+}) {
   const reload = (
     <Button type="button" variant="secondary" size="sm" disabled={reloading} onClick={onReload}>
       {reloading ? "Reloading…" : "Reload saved settings"}
@@ -31,6 +37,7 @@ function OutcomeAlert({ outcome, onReload, reloading }: { outcome: SaveOutcome; 
       {reload}
     </div>
   );
+  const reloadIfUncertain = (alert: ReactNode) => (uncertain ? withReload(alert) : alert);
   switch (outcome.kind) {
     case "saved":
       return <Alert tone="success" message={`Saved ${plural(outcome.count, "change", "changes")}. Your next runs use ${outcome.count === 1 ? "it" : "them"}.`} />;
@@ -42,7 +49,7 @@ function OutcomeAlert({ outcome, onReload, reloading }: { outcome: SaveOutcome; 
         />,
       );
     case "invalid":
-      return (
+      return reloadIfUncertain(
         <div role="alert" className="space-y-1 rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
           <p>
             {plural(outcome.count, "value needs", "values need")} attention. Nothing was saved; your edits are still
@@ -53,10 +60,12 @@ function OutcomeAlert({ outcome, onReload, reloading }: { outcome: SaveOutcome; 
               {m}
             </p>
           ))}
-        </div>
+        </div>,
       );
     case "not_saved":
-      return <Alert message={`The save failed and nothing was changed: ${outcome.message}. Your edits are still here.`} />;
+      return reloadIfUncertain(
+        <Alert message={`The save failed and nothing was changed: ${outcome.message}. Your edits are still here.`} />,
+      );
     case "unknown":
       return withReload(
         <Alert
@@ -94,6 +103,7 @@ export function ModelsSaveBar({
   blockedCount,
   outcome,
   reloading,
+  uncertain = false,
   onDiscard,
   onReload,
 }: {
@@ -106,6 +116,8 @@ export function ModelsSaveBar({
   blockedCount: number;
   outcome: SaveOutcome | null;
   reloading: boolean;
+  /** An earlier save may have committed without confirmation (see UnsavedModelsGuard). */
+  uncertain?: boolean;
   onDiscard: () => void;
   onReload: () => void;
 }) {
@@ -120,7 +132,7 @@ export function ModelsSaveBar({
         count > 0 ? "border-brand/50" : "border-edge",
       )}
     >
-      {outcome && <OutcomeAlert outcome={outcome} onReload={onReload} reloading={reloading} />}
+      {outcome && <OutcomeAlert outcome={outcome} onReload={onReload} reloading={reloading} uncertain={uncertain} />}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
         <p role="status" aria-live="polite" data-testid="models-save-status" className="min-w-0 text-sm sm:flex-1">
           {saving ? (

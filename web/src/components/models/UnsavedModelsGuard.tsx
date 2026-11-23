@@ -94,9 +94,9 @@ export function UnsavedModelsGuard({
   const message = saving
     ? `Saving ${changes}… You continue once the save finishes.`
     : uncertain === "unknown"
-      ? `The server could not confirm whether your last save was applied, so ${changes} may already be saved. Stay and choose Reload saved settings to see what is stored. Leaving does not undo anything the server stored.`
+      ? `The server could not confirm whether an earlier save was applied, so ${changes} may already be saved. Stay and choose Reload saved settings to see what is stored. Leaving does not undo anything the server stored.`
       : uncertain === "saved_unreadable"
-        ? `Your last save was stored, but reading it back failed, so ${changes} may already be saved and could not be confirmed. Stay and choose Reload saved settings to see what is stored. Leaving does not undo the save.`
+        ? `An earlier save was stored, but reading it back failed, so ${changes} may already be saved and could not be confirmed. Stay and choose Reload saved settings to see what is stored. Leaving does not undo the save.`
         : `${dirtyCount === 1 ? "1 change is" : `${dirtyCount} changes are`} not saved yet. Stay to review and save, or discard and continue.`;
   return (
     <Modal label={title} onClose={stay}>

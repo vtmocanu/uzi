@@ -72,8 +72,8 @@ describe("UnsavedModelsGuard", () => {
   });
 
   it.each([
-    ["unknown", "could not confirm whether your last save was applied"],
-    ["saved_unreadable", "Your last save was stored"],
+    ["unknown", "could not confirm whether an earlier save was applied"],
+    ["saved_unreadable", "An earlier save was stored"],
   ] as const)("after a %s save, leaving is Leave anyway, never a discard claim", async (kind, copy) => {
     const onDiscard = vi.fn();
     const router = createMemoryRouter(
