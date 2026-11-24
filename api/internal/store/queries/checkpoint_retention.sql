@@ -487,8 +487,11 @@ WHERE id = @run_id
 -- ever sent without its row.
 -- attested_source (issue #3194) is the push's frozen attestation, NULL when the publisher sent
 -- none; the reconcilers write exactly this row's value with its tip, never the run's current one.
-INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip, attested_source)
-VALUES (@run_id, @branch::text, @ref::text, @tip::text, sqlc.narg(attested_source)::text)
+-- claim_generation (#4628) is the fenced claim generation of the push (NULL for an unfenced publish);
+-- the confirmation and re-record paths stamp it onto runs.checkpoint_tip_generation.
+INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip, attested_source, claim_generation)
+VALUES (@run_id, @branch::text, @ref::text, @tip::text, sqlc.narg(attested_source)::text,
+        sqlc.narg(claim_generation)::bigint)
 RETURNING id;
 
 -- name: MarkCheckpointPublishAttemptReady :execrows
@@ -549,6 +552,12 @@ SELECT * FROM checkpoint_retentions WHERE run_id = @run_id FOR UPDATE;
 -- while the forge list was in flight. They do not reserve against future competing attempts.
 UPDATE runs r
 SET checkpoint_tip = @tip::text,
+    -- #4628: the tip's own generation (the attempt's fenced claim generation) and the tip it binds to,
+    -- in the same statement. A NULL attempt generation keeps an existing binding of the same tip.
+    checkpoint_tip_generation = COALESCE(
+        (SELECT att.claim_generation FROM checkpoint_publish_attempts att WHERE att.id = @attempt_id AND att.run_id = r.id),
+        CASE WHEN r.checkpoint_tip_generation_tip = @tip::text THEN r.checkpoint_tip_generation END),
+    checkpoint_tip_generation_tip = @tip::text,
     checkpoint_tip_at = GREATEST(r.checkpoint_tip_at, now()),
     -- Issue #3194: set-only, from the confirmed attempt row's own frozen value (bound below).
     checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, r.checkpoint_attested_source)
@@ -668,6 +677,11 @@ RETURNING checkpoint_retentions.state;
 -- the writer's own frozen value (Publish's request, or the reconciled attempt row), never cleared
 -- by a NULL (a legacy or unattested publish) and never copied from the run's current value.
 UPDATE runs SET checkpoint_tip = @checkpoint_tip::text, checkpoint_tip_at = now(),
+    -- #4628: stamp the tip's own generation (NULL when the publish was unfenced; an existing binding of the
+    -- same tip is kept) and the tip it binds to, in the same statement.
+    checkpoint_tip_generation = COALESCE(sqlc.narg(tip_generation)::bigint,
+        CASE WHEN checkpoint_tip_generation_tip = @checkpoint_tip::text THEN checkpoint_tip_generation END),
+    checkpoint_tip_generation_tip = @checkpoint_tip::text,
     checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, checkpoint_attested_source)
 WHERE id = @id
   AND (checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text

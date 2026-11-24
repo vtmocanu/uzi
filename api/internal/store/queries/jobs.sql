@@ -301,10 +301,11 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE id = @run_id
-  AND kind = 'job'
-  AND status = 'queued'
-  AND worker_id IS NULL
+WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+  AND runs.id = @run_id
+  AND runs.kind = 'job'
+  AND runs.status = 'queued'
+  AND runs.worker_id IS NULL
 RETURNING id, user_id, status;
 
 -- name: FailJobsPastWallDeadline :many
@@ -324,7 +325,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
-WHERE kind = 'job'
+WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+  AND kind = 'job'
   AND status IN ('claimed', 'running')
   AND COALESCE(started_at, claimed_at) < (sqlc.arg('now')::timestamptz
         - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)

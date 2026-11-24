@@ -7510,6 +7510,9 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
 	push := &checkpointPush{s: s, runID: runID, run: owned, checkpointKey: branch, ref: ref, opts: opts, routedAt: routedAt,
 		attestedSource: pgconv.TextPtr(attestedSource)}
+	if generation != nil {
+		push.tipGeneration = pgtype.Int8{Int64: *generation, Valid: true}
+	}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
@@ -7729,6 +7732,7 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 			CheckpointTip:  pgtype.Text{String: tipOid, Valid: true},
 			ID:             runID,
 			AttestedSource: push.attestedSource,
+			TipGeneration:  push.tipGeneration,
 		}); err != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
 			return false
@@ -7737,6 +7741,7 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 	}
 	n, err := s.q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
 		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip, AttestedSource: push.attestedSource,
+		TipGeneration: push.tipGeneration,
 	})
 	if err != nil {
 		slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)

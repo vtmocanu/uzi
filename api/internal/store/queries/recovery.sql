@@ -162,6 +162,8 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
   );
 
 -- name: DiscardCaptureForOwner :one
+-- #4628: a capture a pending or claimed fresh resume references is not discarded (0 rows; the service
+-- tells this apart from a foreign id with CaptureHasActiveFreshResume and answers 409).
 -- D7: owner-initiated explicit discard of one capture. Deletes its byte chunks (freeing
 -- storage) and marks the capture 'discarded' in ONE statement — the data-modifying del CTE
 -- always runs to completion, and :execrows reports the capture UPDATE's row count (1 when
@@ -169,6 +171,7 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
 WITH owned AS (
     SELECT rc.id FROM recovery_captures rc
     WHERE rc.id = @id AND rc.run_id = @run_id AND rc.user_id = @user_id
+      AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.capture_id = rc.id AND frt.state IN ('pending', 'claimed'))
     FOR UPDATE
 ), discarded AS (
     UPDATE recovery_captures c SET state = 'discarded', updated_at = now()
@@ -198,6 +201,7 @@ WITH expiring AS (
     SELECT rc.id AS capture_id FROM recovery_captures rc
     WHERE rc.state = 'available' AND rc.expires_at IS NOT NULL AND rc.expires_at < @now
       AND rc.local_replica_worker_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.capture_id = rc.id AND frt.state IN ('pending', 'claimed'))
     ORDER BY rc.id FOR UPDATE
 ),
 del AS (
@@ -853,11 +857,14 @@ DELETE FROM custody_episode_notices WHERE user_id = @user_id;
 -- at-most-once and reads GetCustodyAggregateForOwner for the exact DM facts, so this returns only
 -- the user_id. Callers pass the custody_hold_limit admin setting (#3150), always 1..1000, and skip
 -- the query when it cannot be read; a non-positive limit here would match every owner.
-SELECT h.user_id
-FROM recovery_custody_holds h
-WHERE h.state = 'open'
-GROUP BY h.user_id
-HAVING fn_custody_admission_count(h.user_id, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit::int;
+-- Owners with an outstanding fresh-resume transfer row are candidates too: the count carries their
+-- reserved units (00523) even when every open hold was discarded.
+SELECT o.user_id
+FROM (SELECT h.user_id FROM recovery_custody_holds h WHERE h.state = 'open'
+      UNION
+      SELECT t.user_id FROM run_fresh_resumes t
+      WHERE t.state IN ('pending', 'claimed', 'seeded', 'superseded')) o
+WHERE fn_custody_admission_count(o.user_id, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit::int;
 
 -- name: ListOwnersWithClearedCustodyEpisode :many
 -- PRD #1349 M6 (D10): the already-notified owners whose admission-counted holds have dropped
@@ -947,6 +954,7 @@ WITH fenced AS (
           AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
           AND h.final_disposition IS NULL AND h.final_capture_id IS NULL)
       AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_capture_id = c.id)
+      AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.capture_id = c.id AND frt.state IN ('pending', 'claimed'))
     RETURNING c.id
 ), deleted AS (
     DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM fenced)
@@ -1108,6 +1116,7 @@ WITH flipped AS (
           AND h.inventory_guarded AND h.state = 'released' AND h.completion_identity = @identity::jsonb
           AND r.status = 'completed' AND r.claim_generation = h.generation AND r.worker_id = h.original_worker_id
           AND r.completion_final_head = h.completion_identity->>'final_head')
+      AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.capture_id = c.id AND frt.state IN ('pending', 'claimed'))
     RETURNING c.id
 ), deleted AS (
     DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM flipped)

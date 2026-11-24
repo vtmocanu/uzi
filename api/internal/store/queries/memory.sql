@@ -104,7 +104,8 @@ UPDATE runs SET
     released_worker_nonce= @register_nonce,
     codex_cap_hash=NULL, codex_claim_epoch=codex_claim_epoch+1,
     health='ok', health_reason=NULL, health_since=NULL, updated_at=now()
-WHERE runs.id= @id AND runs.worker_id= @worker_id AND runs.claim_generation= @claim_generation
+WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+  AND runs.id= @id AND runs.worker_id= @worker_id AND runs.claim_generation= @claim_generation
     AND runs.memory_episode= @memory_episode AND runs.claim_released_at IS NULL
     AND runs.pause_requested_at IS NULL AND runs.credential_switch_requested_at IS NULL
     AND (runs.status IN ('claimed','running') OR (runs.status = 'awaiting_approval' AND EXISTS (
