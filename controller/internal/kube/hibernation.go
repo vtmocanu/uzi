@@ -695,9 +695,9 @@ func wakeRollAdmitted(ctx context.Context, id string) bool {
 }
 
 // wakeAnnotationPermitted reports whether an unadmitted wake may still write its op
-// annotation. It keeps every non-image-admission guard of wakeRollAdmitted (no
-// hibernation-owned entry, no block, complete snapshot, no uncertain coverage, no
-// migration fence) and drops only e.admitted. Some terms repeat the pass-2 caller's
+// annotation. It keeps wakeRollAdmitted's uncertainty and migration fences, adds the
+// entry-block, snapshot-complete and retained-history-retirement guards, and drops only
+// e.admitted. Some terms repeat the pass-2 caller's
 // filters and are kept for direct-call safety. historyRetireUnknown is set only by
 // retireHibernationHistory, which skips non-preparing workers, so for a waking entry it
 // is defensive only. A pool-level hold (blocker or poolReason with e.blocked == "")
@@ -713,11 +713,11 @@ func wakeAnnotationPermitted(ctx context.Context, id string) bool {
 
 // patchWakeOpAnnotation sends one merge patch that sets only the hibernation-op
 // annotation, preconditioned on the observed uid and resourceVersion. Unlike
-// conditionedPatch it adds no operator labels or annotations. A Conflict returns
-// (true, nil); any response that does not prove the advanced resourceVersion is an error.
-func (m *Materializer) patchWakeOpAnnotation(ctx context.Context, ns string, obs reconcile.ObservedWorker, name, op string) (bool, error) {
+// conditionedPatch it adds no operator labels or annotations. A Conflict writes nothing
+// and returns nil; any response that does not prove the advanced resourceVersion is an error.
+func (m *Materializer) patchWakeOpAnnotation(ctx context.Context, ns string, obs reconcile.ObservedWorker, name, op string) error {
 	if obs.DeploymentUID == "" || obs.DeploymentResourceVersion == "" {
-		return false, fmt.Errorf("hibernation mutation requires observed UID/resourceVersion")
+		return fmt.Errorf("hibernation mutation requires observed UID/resourceVersion")
 	}
 	body, err := json.Marshal(map[string]any{"metadata": map[string]any{
 		"uid":             obs.DeploymentUID,
@@ -725,19 +725,19 @@ func (m *Materializer) patchWakeOpAnnotation(ctx context.Context, ns string, obs
 		"annotations":     map[string]string{annotationHibernationOp: op},
 	}})
 	if err != nil {
-		return false, err
+		return err
 	}
 	got, err := m.client.AppsV1().Deployments(ns).Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
 	if err != nil {
 		if apierrors.IsConflict(err) {
-			return true, nil
+			return nil
 		}
-		return false, fmt.Errorf("patch deployment: %w", err)
+		return fmt.Errorf("patch deployment: %w", err)
 	}
 	if got == nil || string(got.UID) != obs.DeploymentUID || got.ResourceVersion == "" || got.ResourceVersion == obs.DeploymentResourceVersion {
-		return false, fmt.Errorf("patch deployment: response lacks the advanced resourceVersion")
+		return fmt.Errorf("patch deployment: response lacks the advanced resourceVersion")
 	}
-	return false, nil
+	return nil
 }
 
 // hibernateWake brings a hibernated worker back at its current template. It
@@ -790,10 +790,7 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 			// template, an older op. Nothing else is written.
 			if op != "" && obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 1 &&
 				!drifted && obs.HibernationOp != op && wakeAnnotationPermitted(ctx, w.ID) {
-				conflict, err := m.patchWakeOpAnnotation(ctx, ns, obs, dep.Name, op)
-				if err != nil || conflict {
-					return err
-				}
+				return m.patchWakeOpAnnotation(ctx, ns, obs, dep.Name, op)
 			}
 			return nil
 		}

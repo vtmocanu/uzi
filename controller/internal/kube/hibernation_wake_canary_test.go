@@ -191,12 +191,135 @@ func TestWakeCanaryBindsOpWithoutAdmissionThenReportsReady(t *testing.T) {
 	}
 }
 
+// driveWake plans a tick against the fixture and calls hibernateWake for w1 directly with
+// that tick's context, the way the pass-2 unadmitted branch does. mut may adjust the entry
+// or tick first (a guard the Reconcile caller filters before the call, so only a direct
+// call reaches the guard in hibernateWake); opID overrides the wake's op.
+func (wc *wakeCanary) driveWake(t *testing.T, opID string, mut func(e *rollEntry, tick *rollTick)) error {
+	t.Helper()
+	ctx := context.Background()
+	obs, err := wc.m.Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]reconcile.ObservedWorker{}
+	for _, o := range obs {
+		byID[o.ID] = o
+	}
+	tick, _ := wc.m.planRoll(ctx, wc.workers, byID)
+	e := tick.entries["w1"]
+	if e == nil {
+		t.Fatal("w1 has no roll entry")
+	}
+	// Force the unadmitted, non-hibernation entry: a zero-replica Deployment plans as a
+	// hibernation-owned entry, which wakeRollAdmitted admits, so Reconcile cannot reach
+	// the unadmitted branch with it.
+	e.admitted, e.hibernation = false, false
+	if mut != nil {
+		mut(e, tick)
+	}
+	w := *wc.at("w1")
+	h := *w.Hibernation
+	h.OpID = opID
+	w.Hibernation = &h
+	ns, err := wc.m.cfg.Placement(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := wc.m.resolveWorker(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wc.m.hibernateWake(context.WithValue(ctx, rollTickKey{}, tick), w, e.o, ns, spec)
+}
+
+// TestWakeCanaryDirectWakeGuards drives hibernateWake past the pass-2 filters: the same
+// state that binds the op with a clean tick (control) must write nothing when the entry is
+// blocked, its coverage is uncertain or migration-fenced, or the wake carries no op.
+func TestWakeCanaryDirectWakeGuards(t *testing.T) {
+	zero := int32(0)
+	cases := map[string]struct {
+		op      string
+		mut     func(e *rollEntry, tick *rollTick)
+		patches int
+		zero    bool // Deployment at zero replicas with its pod removed, so no pod holds the wake
+	}{
+		"clean control": {op: wakeCanaryOp, patches: 1},
+		"replicas zero": {op: wakeCanaryOp, zero: true},
+		"blocked":       {op: wakeCanaryOp, mut: func(e *rollEntry, _ *rollTick) { e.blocked = "held" }},
+		"uncertain": {op: wakeCanaryOp, mut: func(e *rollEntry, tick *rollTick) {
+			tick.uncertain[coverageKey(e.coverage)] = true
+		}},
+		"migration fenced": {op: wakeCanaryOp, mut: func(e *rollEntry, tick *rollTick) {
+			tick.migrationFences[migrationLane(e.coverage)] = true
+		}},
+		"empty op": {op: ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var mutate func(*appsv1.Deployment)
+			if tc.zero {
+				mutate = func(d *appsv1.Deployment) { d.Spec.Replicas = &zero }
+			}
+			wc := newWakeCanary(t, mutate)
+			if tc.zero {
+				if err := wc.c.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), wc.m.cfg.Namespace, "pod-w1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wc.c.ClearActions()
+			if err := wc.driveWake(t, tc.op, tc.mut); err != nil {
+				t.Fatal(err)
+			}
+			if n := len(wc.wakePatches(t)); n != tc.patches {
+				t.Fatalf("op patches = %d, want %d; trace %v", n, tc.patches, actionTrace(wc.c))
+			}
+			if n := len(wc.readyCalls()); n != 0 {
+				t.Fatalf("ready reported: %d", n)
+			}
+		})
+	}
+}
+
+// TestWakeCanaryOpBindingRejectsUnprovenResponse: a patch response that does not prove the
+// advanced resourceVersion on the same Deployment is an error, and no ready follows.
+func TestWakeCanaryOpBindingRejectsUnprovenResponse(t *testing.T) {
+	for name, tweak := range map[string]func(d *appsv1.Deployment){
+		"unchanged resourceVersion": func(*appsv1.Deployment) {},
+		"different uid":             func(d *appsv1.Deployment) { d.UID += "-other"; d.ResourceVersion += "-next" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			wc := newWakeCanary(t, nil)
+			wc.requireUnadmitted(t)
+			wc.c.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				p := a.(k8stesting.PatchAction)
+				if p.GetName() != deploymentName("w1") {
+					return false, nil, nil
+				}
+				// Read the tracker, not the clientset: the fake holds its lock in a reactor.
+				obj, err := wc.c.Tracker().Get(appsv1.SchemeGroupVersion.WithResource("deployments"), p.GetNamespace(), p.GetName())
+				if err != nil {
+					return true, nil, err
+				}
+				d := obj.(*appsv1.Deployment).DeepCopy()
+				tweak(d)
+				return true, d, nil
+			})
+			if err := wc.tick(t); err == nil {
+				t.Fatal("unproven patch response was not an error")
+			}
+			if n := len(wc.readyCalls()); n != 0 {
+				t.Fatalf("ready reported after an unproven binding: %d", n)
+			}
+		})
+	}
+}
+
 func TestWakeCanaryOpBindingControlsStayUnwritten(t *testing.T) {
-	zero, two := int32(0), int32(2)
+	two := int32(2)
 	for name, mutate := range map[string]func(*appsv1.Deployment){
-		"replicas zero": func(d *appsv1.Deployment) { d.Spec.Replicas = &zero },
-		"replicas two":  func(d *appsv1.Deployment) { d.Spec.Replicas = &two },
-		"replicas nil":  func(d *appsv1.Deployment) { d.Spec.Replicas = nil },
+		"replicas two": func(d *appsv1.Deployment) { d.Spec.Replicas = &two },
+		"replicas nil": func(d *appsv1.Deployment) { d.Spec.Replicas = nil },
 		"drifted hash": func(d *appsv1.Deployment) {
 			d.Spec.Template.Annotations[AnnotationSpecHash] = "stale-hash"
 		},
@@ -300,8 +423,7 @@ func TestWakeAnnotationPermittedGuards(t *testing.T) {
 	if !wakeAnnotationPermitted(build(nil), "w") {
 		t.Fatal("clean entry was refused")
 	}
-	// A pool-level hold without a block on the entry does not stop the write, and neither
-	// does a missing image admission.
+	// A missing image admission does not stop the write.
 	if !wakeAnnotationPermitted(build(func(e *rollEntry, _ *rollTick) { e.admitted = false }), "w") {
 		t.Fatal("an unadmitted entry was refused")
 	}

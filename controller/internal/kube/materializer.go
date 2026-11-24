@@ -805,8 +805,9 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				continue // Unknown mutations require a new observation before sibling work.
 			}
 			if !e.admitted {
-				// Independent fenced maintenance and mutation-free wake settlement
-				// are allowed even while image admission waits.
+				// Independent fenced maintenance, wake settlement and its
+				// annotation-only op binding are allowed even while image admission
+				// waits; no replica or template mutation is.
 				if ns, err := m.cfg.Placement(w); err == nil {
 					if spec, err := m.resolveWorker(w); err == nil {
 						if e.blocked == "" {
