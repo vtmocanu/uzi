@@ -1004,6 +1004,16 @@ export const judgeApi = {
     // no_credential_for_harness body) and the panel shows it inline. No judge is created on
     // the other harness.
     const skip = judgeSkips[id];
+    // A provider_* skip mirrors writeRerunJudgeError's 409 reason codes and messages.
+    const providerRefusal: Record<string, string> = {
+      provider_source_unusable: "your source is a model provider that cannot serve a run",
+      provider_model_unmapped: "the provider's model map does not map a model this run uses",
+      provider_lane_unsupported: "this run type does not support a model-provider source yet",
+    };
+    if (skip && providerRefusal[skip.reason] !== undefined) {
+      const message = providerRefusal[skip.reason];
+      throw new ApiError(409, message, { error: message, reason: skip.reason });
+    }
     if (skip) {
       const message = `the judge's harness (${skip.harness}) has no usable credential`;
       throw new ApiError(422, message, { error: message, code: "no_credential_for_harness" });

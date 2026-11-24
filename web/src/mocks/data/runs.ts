@@ -2331,6 +2331,17 @@ mockRuns.push({
   mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/44", mr_iid: 44,
 });
 
+// Provider-source judge skips (#4322), each paired with a mockJudgeSkips row of the same id.
+for (const [suffix, iid] of [["claude", 3722], ["codex", 3723], ["unusable", 3724], ["unmapped", 3725]] as const) {
+  mockRuns.push({
+    ...mockRuns.find((r) => r.id === "run-judge-skipped")!,
+    id: `run-judge-skipped-provider-${suffix}`, issue_iid: iid,
+    issue_title: `Judge skipped on a model provider (${suffix})`,
+    branch: `agent/issue-${iid}`,
+    mr_web_url: `https://gitlab.example.com/myorg/uzi/-/merge_requests/${iid}`, mr_iid: iid,
+  });
+}
+
 // PRD #3708: gated plan cross-check runs (checked before your review), from the parked gate.
 mockRuns.push(...gatedCrossCheckRuns(mockRuns.find((r) => r.id === "run-awaiting")!));
 
