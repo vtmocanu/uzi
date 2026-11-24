@@ -471,6 +471,29 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     await assertStoppedUntouched(c.r, before, traps);
   });
 
+  it("Path A budget control: an unreachable api ends the CredentialSwitchSignal arm's hold within the verification allowance", async () => {
+    const c = await arrangeSwitch({ ledger: false, extra: { retainedSwitchVerificationMs: BUDGET_MS, recoveryRetryMs: 5 } });
+    c.onAttribution = async () => {
+      await trip(c, true);
+      api.requestCredentialSwitch(c.flight!.runId, gen(c), OP);
+      await until("the credential switch to trip", () => c.flight!.steering.pendingCredentialSwitch() === gen(c));
+      api.failStateNext(100_000, 503);
+    };
+    const outcome = await Promise.race([
+      drive(c.r).then(() => "done"),
+      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGET_MS + HOLD_SLACK_MS + SETTLED_ACK_SLACK_MS)),
+    ]);
+    assert.equal(outcome, "done", "the Path A hold ended within its budget instead of retrying without end");
+    await settle(c);
+    assert.ok(api.stateWire.some(s => s.runId === c.r.runId && s.body.status === "credential_switch_held"), "the hold report was attempted");
+    assert.equal(logged(c.r, HELD_LOG).length, 0, "no hold was confirmed");
+    assert.equal(logged(c.r, HOOK_LOG).length, 0, "the late hook was not needed on Path A");
+    assert.equal(reason(c), "RestoreTransportStop");
+    assertNoTerminalEffects(c);
+    assertCustodyKept(c);
+    unseeded(c);
+  });
+
   /** Requests the switch from inside the batcher's first close after the stop line, i.e. after the RetainedRecoveryStop arm began. */
   function switchAtStopClose(c: Ctx, before?: () => void): void {
     c.onRoute = flight => {

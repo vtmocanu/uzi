@@ -7438,7 +7438,11 @@ export class RunRunner {
         const escaped = this.inPlaceSwitchContext(claim, flight) ?? this.closedInPlaceSwitch(claim, flight);
         if (escaped) {
           try {
-            await this.escapedInPlaceSwitch(flight, runLog, escaped);
+            // Issue #4652: after a restore transport stop, the identity check tolerates RestoreTransportStop, so this hold gets the
+            // same finite budget as the late hook (holdSwitchAfterTransportStop) instead of retrying without end.
+            await this.escapedInPlaceSwitch(flight, runLog, escaped, undefined, this.transportStopSwitchEligible(claim, flight)
+              ? { deadline: Date.now() + this.retainedSwitchVerificationMs }
+              : undefined);
           } catch (stop) {
             // A cancel, fence, shutdown or lost ownership during the escaped proof or its reports.
             await dispatchFailure(stop);
