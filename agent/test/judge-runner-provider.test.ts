@@ -154,6 +154,16 @@ describe("provider judge: deterministic result-frame settlement", () => {
     assert.equal(calls.states.some(s => s.status === "failed"), false);
   });
 
+  it("a prompt-build failure keeps the fallback review and completes with no model call", async () => {
+    const malformed = { ...trace, inputs: null } as unknown as JudgeTraceResponse;
+    const { calls, seen } = await run([assistant(verdict()), success()], providerClaim(), { client: fakeClient({ getTrace: async () => malformed }) });
+    assert.equal(seen.calls, 0, "no model call");
+    assert.equal(calls.review?.status, "failed");
+    assert.equal(calls.review?.recommendations[0]?.target, "jq");
+    assert.equal(calls.states.at(-1)?.status, "completed");
+    assert.equal(calls.states.some(s => s.status === "failed"), false);
+  });
+
   it("EOF with no result frame is a terminal no-result failure", async () => {
     const { calls } = await run([assistant(verdict())]);
     assertFailedNoReview(calls, "provider judge model returned no result");

@@ -636,8 +636,12 @@ export class JudgeRunner {
     };
     let usageMessage: EmittedMessage | undefined;
     let text: string;
+    // A prompt-build failure is a prep failure, not a model outcome: as in `judge`, it keeps the
+    // deterministic fallback review and `completed`, with no model call. Built outside the catch-all
+    // below so it cannot become a terminal provider failure.
+    let prompt: string;
     try {
-      const prompt = buildJudgePrompt(
+      prompt = buildJudgePrompt(
         trace,
         claim.judge_signal ?? null,
         claim.known_improve_uzi_targets ?? [],
@@ -645,6 +649,13 @@ export class JudgeRunner {
         claim.target_cost_status ?? null,
         claim.target_cost_usd ?? null,
       );
+    } catch (err) {
+      this.log.warn("judge prompt build failed; using deterministic fallback", { run_id: claim.run_id, error: scrub(errMessage(err)) });
+      const fb = redactStrings(fallbackReview(claim.judge_signal), scrub);
+      fb.model = scrub(model);
+      return { review: fb };
+    }
+    try {
       text = await runReadOnlyModelPass({
         provider: binding,
         model: mapped,
