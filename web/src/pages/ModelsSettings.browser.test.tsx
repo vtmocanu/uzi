@@ -268,6 +268,47 @@ describe("Models grid layout", () => {
     },
   );
 
+  // #4665: the saved prediction is a tag; a long custom model ID wraps inside it on a phone
+  // instead of widening the page, and the tag's text stays at AA contrast on its own fill.
+  it("wraps a long custom model ID inside its saved-prediction tag at 390px", async () => {
+    const long = "acme-internal-finetune-claude-opus-distilled-2026-11-24-experiment-b";
+    mockApi.getEffectiveSettings.mockResolvedValue({
+      ...effective,
+      models: effective.models.map((m) =>
+        m.setting === "worker_model" && m.harness === "claude" ? { ...m, resolved_model: long } : m,
+      ),
+    } as EffectiveSettings);
+    await mount(390);
+    const cell = cellOf("Worker model — Claude");
+    const tag = cell.querySelector<HTMLElement>("[data-prediction]")!;
+    expect(tag.textContent).toContain(long);
+    expect(rect(tag).right).toBeLessThanOrEqual(rect(cell).right + 0.5);
+    // Wrapped: taller than one line of its own text.
+    expect(rect(tag).height).toBeGreaterThan(parseFloat(getComputedStyle(tag).lineHeight) * 1.5);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+  });
+
+  it.each(["dawn", "hall", "shadow", "ember", "mission"])("keeps the saved-prediction tag at AA contrast on %s", async (theme) => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      await mount(1280);
+      for (const name of ["Default harness", "Worker model — Claude", "Worker model — Codex"]) {
+        const tag = cellOf(name).querySelector<HTMLElement>("[data-prediction]")!;
+        expect(textContrast(tag), `${theme} ${name}`).toBeGreaterThanOrEqual(4.5);
+      }
+    } finally {
+      document.documentElement.removeAttribute("data-theme");
+    }
+  });
+
+  // #4665: the tag splits the prediction line visually; the COMPUTED description must still be
+  // one sentence, clean and dirty (mount() leaves Worker model — Codex changed).
+  it("computes the saved prediction as one description sentence, clean and dirty", async () => {
+    await mount(1280);
+    expect(screen.getByRole("combobox", { name: "Worker model — Claude", description: /^Saved effective value: sonnet · your choice$/ })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Worker model — Codex", description: /^Saved effective value: gpt-6\.2-sol · built-in, Unsaved$/ })).toBeTruthy();
+  });
+
   it("computes every control's accessible name as <Row> — <Family>", async () => {
     await mount(1024);
     for (const name of NAMES) {

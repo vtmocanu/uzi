@@ -40,7 +40,7 @@ import { SettingsShell } from "../components/SettingsShell";
 import { Alert, Button, Card, cx, Select, Skeleton } from "../components/ui";
 import { ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
-import { ClaudeIcon, OpenAIIcon } from "../components/icons";
+import { BotIcon, ClaudeIcon, FileTextIcon, GearIcon, OpenAIIcon, ScaleIcon } from "../components/icons";
 import { ModelsCell, type ModelsCellIds } from "../components/models/ModelsCell";
 import { ModelsSaveBar, type SaveOutcome } from "../components/models/ModelsSaveBar";
 import { UnsavedModelsGuard } from "../components/models/UnsavedModelsGuard";
@@ -140,6 +140,14 @@ const GROUPS: { id: string; title: string; note: ReactNode; rows: RowDef[] }[] =
 
 const fieldFor = (row: string, family: "claude" | "codex" | null) =>
   MODELS_FIELDS.find((f) => f.row === row && f.family === family)!;
+
+// A glyph per group card, decorative only (the heading names the group).
+const GROUP_ICONS: Record<string, typeof BotIcon> = {
+  worker: BotIcon,
+  planning: FileTextIcon,
+  helpers: GearIcon,
+  "cross-check": ScaleIcon,
+};
 
 function idFor(field: ModelsField): string {
   return `models-${field.key.replace(/[^a-z0-9]+/gi, "-")}`;
@@ -609,48 +617,67 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
             </ModelsCell>
           </div>
 
-          {GROUPS.map((group) => (
-            <div key={group.title} role="group" aria-labelledby={`models-group-${group.id}`} className="pt-6">
-              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 pb-2">
-                <h3 id={`models-group-${group.id}`} className="text-sm font-semibold text-fg">
-                  {group.title}
-                </h3>
-                <p className="max-w-prose text-xs text-faint">{group.note}</p>
-              </div>
-              {/* Column headers, repeated per group so a long grid never loses its columns:
-                  visual only (each control names its family itself), and hidden where the
-                  cells stack and carry their own family label. */}
-              <div aria-hidden="true" className={`hidden pb-2 ${ROW_GRID}`}>
-                <span className="hidden @[60rem]:block" />
-                {(["claude", "codex"] as const).map((h) => (
-                  <span key={h} className="flex items-center gap-2 border-l-2 border-transparent pl-3 text-xs font-semibold text-muted">
-                    {h === "claude" ? <ClaudeIcon className="h-3.5 w-3.5 text-brand-claude" /> : <OpenAIIcon className="h-3.5 w-3.5" />}
-                    {harnessName(h)}
+        </Card>
+
+        {/* One card per group (#4665): a section edge is the strongest break the page can draw,
+            so a group never reads as just another row. Still one form, one draft and one Save
+            bar: the cards are presentation only. Each card is its own @container, so the
+            ROW_GRID breakpoints keep answering the card's width. */}
+        {GROUPS.map((group) => {
+          const Icon = GROUP_ICONS[group.id];
+          return (
+            <Card key={group.title} id={`models-card-${group.id}`} className="@container max-sm:px-4">
+              <div role="group" aria-labelledby={`models-group-${group.id}`}>
+                <div className="flex items-start gap-3 pb-2">
+                  <span aria-hidden="true" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-raised text-muted">
+                    <Icon className="h-4 w-4" />
                   </span>
+                  <div className="min-w-0">
+                    <h3 id={`models-group-${group.id}`} className="text-base font-semibold text-fg">
+                      {group.title}
+                    </h3>
+                    <p className="max-w-prose text-xs text-faint">{group.note}</p>
+                  </div>
+                </div>
+                {/* Column headers, one per card: visual only (each control names its family
+                    itself), and hidden where the cells stack and carry their own family label. */}
+                <div aria-hidden="true" className={`hidden pt-2 pb-2 ${ROW_GRID}`}>
+                  <span className="hidden @[60rem]:block" />
+                  {(["claude", "codex"] as const).map((h) => (
+                    <span key={h} className="flex items-center gap-2 border-l-2 border-transparent pl-3 text-xs font-semibold text-muted">
+                      {h === "claude" ? <ClaudeIcon className="h-3.5 w-3.5 text-brand-claude" /> : <OpenAIIcon className="h-3.5 w-3.5" />}
+                      {harnessName(h)}
+                    </span>
+                  ))}
+                </div>
+                {group.rows.map(({ row, description, type = "pair", sub }, i) => (
+                  <div
+                    key={row}
+                    data-row={row}
+                    className={cx(
+                      sub ? "pt-1 pb-4" : type === "pair" ? "py-4" : "pt-4 pb-3",
+                      !sub && "border-t border-edge",
+                      i === group.rows.length - 1 && "pb-0",
+                      ROW_GRID,
+                    )}
+                  >
+                    <div className={cx(ROW_NAME, sub && "@[60rem]:pl-3")}>
+                      <h4 className={cx("text-sm", sub ? "text-muted" : "font-medium text-fg")}>{row}</h4>
+                      <p className="text-xs text-faint">{description}</p>
+                    </div>
+                    {type === "routing" ? (
+                      routingCell
+                    ) : type === "fact" ? (
+                      summaryRoutingFact
+                    ) : (
+                      <div className="space-y-4 @[49rem]:contents">{pairCells(row)}</div>
+                    )}
+                  </div>
                 ))}
               </div>
-              {group.rows.map(({ row, description, type = "pair", sub }) => (
-                <div
-                  key={row}
-                  data-row={row}
-                  className={`${sub ? "pt-1 pb-4" : type === "pair" ? "border-t border-edge py-4" : "border-t border-edge pt-4 pb-3"} ${ROW_GRID}`}
-                >
-                  <div className={cx(ROW_NAME, sub && "@[60rem]:pl-3")}>
-                    <h4 className={cx("text-sm", sub ? "text-muted" : "font-medium text-fg")}>{row}</h4>
-                    <p className="text-xs text-faint">{description}</p>
-                  </div>
-                  {type === "routing" ? (
-                    routingCell
-                  ) : type === "fact" ? (
-                    summaryRoutingFact
-                  ) : (
-                    <div className="space-y-4 @[49rem]:contents">{pairCells(row)}</div>
-                  )}
-                </div>
-              ))}
-            </div>
-          ))}
-        </Card>
+            </Card>
+          );
+        })}
       </fieldset>
       <ModelsSaveBar
         dirtyRows={dirtyRows}

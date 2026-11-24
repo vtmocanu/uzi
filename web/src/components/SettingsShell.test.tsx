@@ -55,21 +55,31 @@ describe("SettingsShell tabs", () => {
   });
 
   // The Appearance tab (theme/mode/typeface + demo mode, split out of Account &
-  // tokens) is the SECOND tab, immediately after Account & tokens, and lights on
-  // its own route without keeping the end-matched Account & tokens active.
-  it("puts Appearance second and lights it on /settings/appearance only", () => {
+  // tokens) is cosmetic, so it closes the strip (#4665; Models follows the credentials it
+  // depends on), and lights on its own route without keeping the end-matched Account &
+  // tokens active.
+  it("puts Appearance last and lights it on /settings/appearance only", () => {
     renderAt("/settings/appearance");
     const tabs = screen.getAllByRole("link");
-    expect(tabs[1].textContent).toBe("Appearance");
+    expect(tabs.map((a) => a.textContent)).toEqual([
+      "Account & tokens",
+      "Models",
+      "Run defaults",
+      "Forge",
+      "Access",
+      "Memory",
+      "Appearance",
+    ]);
     expect(current("Appearance")).toBe("page");
     expect(current("Account & tokens")).toBeNull();
   });
 
-  // PRD #3263: Models sits between Appearance and Run defaults and lights on its own route.
-  it("puts Models between Appearance and Run defaults and lights it on /settings/models", () => {
+  // Models sits right after Account & tokens (the credentials that decide which models a run can
+  // use) and before Run defaults (which links back to it), and lights on its own route.
+  it("puts Models between Account & tokens and Run defaults and lights it on /settings/models", () => {
     renderAt("/settings/models");
     const labels = screen.getAllByRole("link").map((a) => a.textContent);
-    expect(labels.slice(1, 4)).toEqual(["Appearance", "Models", "Run defaults"]);
+    expect(labels.slice(0, 3)).toEqual(["Account & tokens", "Models", "Run defaults"]);
     expect(current("Models")).toBe("page");
     expect(current("Run defaults")).toBeNull();
     expect(current("Account & tokens")).toBeNull();
@@ -95,7 +105,7 @@ describe("SettingsShell tabs", () => {
     }
   });
 
-  // Seven tabs overflow a phone strip: at 390px the active Run defaults tab sat past the
+  // Seven tabs overflow a phone strip: at 390px an active later tab sat past the
   // right edge with scrollLeft 0. The shell reveals the active tab on mount and on every
   // switch by writing the ROW's scrollLeft only, never the window's. jsdom has no layout,
   // so geometry is stubbed: the row spans 0-358 and each tab is 110px wide in order.
@@ -115,15 +125,15 @@ describe("SettingsShell tabs", () => {
     });
     const windowScroll = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
 
-    renderAt("/settings/run-defaults");
-    const row = screen.getByRole("link", { name: "Run defaults" }).parentElement as HTMLElement;
-    // Run defaults is the fourth tab (330-440): its right edge is 82px past the row's.
+    renderAt("/settings/forge");
+    const row = screen.getByRole("link", { name: "Forge" }).parentElement as HTMLElement;
+    // Forge is the fourth tab (330-440): its right edge is 82px past the row's.
     expect(writes).toEqual([{ el: row, value: 82 }]);
 
     writes.length = 0;
-    fireEvent.click(screen.getByRole("link", { name: "Memory" }));
-    expect(current("Memory")).toBe("page");
-    // Memory is the seventh tab (660-770): 412px past the row's right edge.
+    fireEvent.click(screen.getByRole("link", { name: "Appearance" }));
+    expect(current("Appearance")).toBe("page");
+    // Appearance is the seventh tab (660-770): 412px past the row's right edge.
     expect(writes).toEqual([{ el: row, value: 412 }]);
     expect(windowScroll).not.toHaveBeenCalled();
   });

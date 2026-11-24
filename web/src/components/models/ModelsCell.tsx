@@ -1,5 +1,5 @@
 // One cell of the Models grid (PRD #3263): a family's control for one row, its saved
-// prediction, an optional note, reason, Not used reason and field error, each wired to the
+// prediction (a compact tag, #4665), an optional note, reason, Not used reason and field error, each wired to the
 // control through aria-describedby. The prediction line is the grid's signature: it always says
 // what is SAVED ("Saved effective value: …"), and a draft that differs from it marks the cell
 // Unsaved with a brand rail and border rather than pretending to predict the unsaved edit.
@@ -123,14 +123,30 @@ export function ModelsCell({
       ) : (
         children({ control, describedBy })
       )}
+      {/* A compact tag, not a sentence under every control (#4665): the visible text is the
+          prediction itself ("opus · your choice"), and the full "Saved effective value:" wording
+          stays in the accessible description. */}
       <p id={predictionId} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-faint">
-        <span>
-          Saved effective value:{" "}
-          <span className={prediction ? "text-muted" : "italic"}>{prediction ?? "Unavailable"}</span>
+        {/* Assistive tech gets ONE text run, "Saved effective value: <prediction>[, Unsaved]":
+            computed descriptions trim each text node, so a sentence split across spans reads
+            "Savedeffective value:…". The visible tag and markers are aria-hidden duplicates. */}
+        <span className="sr-only">
+          {`Saved effective value: ${prediction ?? "Unavailable"}${dirty ? ", Unsaved" : ""}`}
+        </span>
+        {dirty && <span aria-hidden="true">Saved</span>}
+        <span
+          aria-hidden="true"
+          data-prediction=""
+          className={cx(
+            "min-w-0 max-w-full rounded-full border border-edge bg-raised px-2 py-px [overflow-wrap:anywhere]",
+            prediction ? "text-muted" : "italic",
+          )}
+        >
+          {prediction ?? "Unavailable"}
         </span>
         {dirty && (
-          <span className="rounded border border-brand/40 bg-brand/10 px-1 text-[11px] font-medium text-brand">
-            <span className="sr-only">, </span>Unsaved
+          <span aria-hidden="true" className="rounded border border-brand/40 bg-brand/10 px-1 text-[11px] font-medium text-brand">
+            Unsaved
           </span>
         )}
       </p>

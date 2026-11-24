@@ -201,12 +201,11 @@ function RouteLocation() {
 }
 
 describe("Settings → Models route (PRD #3263)", () => {
-  it("is a protected route registered between Appearance and Run defaults", () => {
-    const paths = APP_ROUTES.map((r) => r.path);
-    const models = paths.indexOf("/settings/models");
-    expect(APP_ROUTES[models]?.guard).toBe("protected");
-    expect(paths.indexOf("/settings/appearance")).toBe(models - 1);
-    expect(paths.indexOf("/settings/run-defaults")).toBe(models + 1);
+  // Registration and protection only: the tab ORDER is the Settings shell's, pinned in
+  // SettingsShell.test.tsx (APP_ROUTES order never reaches the screen).
+  it("is a registered, protected route", () => {
+    const models = APP_ROUTES.find((r) => r.path === "/settings/models");
+    expect(models?.guard).toBe("protected");
   });
 
   it("renders the Models grid for a signed-in user", async () => {

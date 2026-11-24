@@ -25,12 +25,12 @@ const SEP = " › ";
 // /workers is canonical; /settings/workers only redirects to it.
 const SETTINGS_TABS: SectionDef[] = [
   { label: "Account & tokens", to: "/settings", keywords: ["account", "token", "profile", "password", "api"] },
-  { label: "Appearance", to: "/settings/appearance", keywords: ["theme", "dark", "light", "typeface", "mode"] },
   { label: "Models", to: "/settings/models", keywords: ["model", "models", "effort", "harness", "planning", "cross-check", "judge", "summary"] },
   { label: "Run defaults", to: "/settings/run-defaults", keywords: ["run", "defaults", "harness", "overflow"] },
   { label: "Forge", to: "/settings/forge", keywords: ["github", "gitlab", "connection", "repo"] },
   { label: "Access", to: "/settings/access", keywords: ["tokens", "permissions", "sharing", "oauth"] },
   { label: "Memory", to: "/settings/memory", keywords: ["notes", "context", "remember"] },
+  { label: "Appearance", to: "/settings/appearance", keywords: ["theme", "dark", "light", "typeface", "mode"] },
   { label: "Workers", to: "/workers", keywords: ["fleet", "hosted", "docker", "runner"] },
 ];
 
