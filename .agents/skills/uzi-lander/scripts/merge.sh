@@ -564,10 +564,11 @@ if [ "$REPO" = vtmocanu/uzi ] && [ "$base" = main ]; then
         || { echo "cannot read $frag_path at the PR head; not merging"; exit 2; }
       frag_heads+=$(printf '%s\n' "$frag_blob" | LC_ALL=C grep -a '^- \*\*' || true)$'\n'
     done <<< "$frags"
-    # A cite is "#<digits>" whose next byte is not a word byte (the release oracle's word()
-    # byte rule, scripts/assert-changelog-covers-release.sh) and whose run of word, ".", "/",
-    # "-" bytes immediately before "#" is empty or exactly this repository's owner/repo. That
-    # prefix rule is deliberately stricter than the oracle, which ignores the byte before "#".
+    # A cite is "#<digits>" whose next byte is not a word byte (word() from the release
+    # oracle's subject parser, scripts/assert-changelog-covers-release.sh) and whose run of
+    # word, ".", "/", "-" bytes immediately before "#" is empty or exactly this repository's
+    # owner/repo. Both sides are deliberately stricter than the oracle: its section match
+    # ends a number at any non-digit, and its subject parser ignores the byte before "#".
     if ! printf '%s' "$frag_heads" | LC_ALL=C awk -v repo="$REPO" -v accept="$frag_accept" '
         function word(c) { return c ~ /[[:alnum:]_]/ || c > "\177" }
         function pfx(c) { return word(c) || c == "." || c == "/" || c == "-" }

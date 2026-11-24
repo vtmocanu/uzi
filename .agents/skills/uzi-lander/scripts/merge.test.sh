@@ -1245,13 +1245,13 @@ export POLICY_BASE_JSON=true; policy_run; pol_want 'non-string base' 2 0
 # The old `jq -r` read stringified it ("of true"); the new read has no base at all.
 grep -qF 'cannot read the required checks of the base branch' "$WORK/policy.out" \
   || fail "non-string base was read as a branch name: $(cat "$WORK/policy.out")"
-# 17. Only added changelog.d/<uuid>.md paths count: a new README.md beside one fragment is one.
+# 15b. Only added changelog.d/<uuid>.md paths count: a new README.md beside one fragment is one.
 pol_reset; pol_pr frag-17 '1=Fix a (#4626).'
 printf 'notes\n' > "$POLICY_ROOT/changelog.d/README.md"
 git -C "$POLICY_ROOT" add changelog.d; git -C "$POLICY_ROOT" commit -qm 'docs: changelog readme'
 POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
 policy_run; pol_want 'non-uuid added path' 0 1
-# 18. Editing two inherited fragments (main's 3 and 4 from case 9) adds none.
+# 15c. Editing two inherited fragments (main's 3 and 4 from case 9) adds none.
 pol_reset; git -C "$POLICY_ROOT" checkout -q -B frag-18 main
 for n in 3 4; do
   printf '### Fixed\n\n- **Main fix %s reworded (#4626).**\n  Description line.\n' "$n" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
@@ -1266,7 +1266,7 @@ rm -f "$CLOSES_SEQ_FILE"
 policy_run vtmocanu/uzi --expect-closes none; pol_want 'single closing read' 15 0
 [ "$(cat "$CLOSES_SEQ_FILE")" = 1 ] || fail "closing metadata read $(cat "$CLOSES_SEQ_FILE") times, want 1"
 pol_reset
-echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips; fragment guard refuses uncited multi-fragment PRs (15) and incomplete metadata (2)'
+echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips; fragment guard refuses uncited multi-fragment PRs (15) and incomplete metadata (2), counting only added <uuid>.md fragments'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
