@@ -3,11 +3,15 @@ package uzicli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
 // TestRecoveryArchivesDecodes: the summary read hits the owner path and decodes the DTO.
@@ -232,5 +236,40 @@ func TestRecoveryHoldsAdmissionCountPresence(t *testing.T) {
 				t.Fatalf("aggregate=%+v err=%v, want total=11 counted=%d", got.Aggregate, err, tc.want)
 			}
 		})
+	}
+}
+
+// TestFreshResumeClientRoutesAndReason: preview is GET and start is POST on
+// /api/runs/{id}/fresh-resume with the token and request id in the body; a typed 409 carries its
+// reason on the ExitError (issue #4628).
+func TestFreshResumeClientRoutesAndReason(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/runs/r1/fresh-resume" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"status":"available","selection_token":"tok","uncovered_generations":[],"notes":[]}`))
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"stale","reason":"stale_selection"}`))
+	}))
+	defer srv.Close()
+	c := newTestClient(srv)
+	prev, err := c.FreshResumePreview(context.Background(), "r1")
+	if err != nil || prev.SelectionToken != "tok" {
+		t.Fatalf("preview = %+v, %v", prev, err)
+	}
+	_, err = c.StartFreshResume(context.Background(), "r1", apitypes.FreshResumeStartRequest{SelectionToken: "tok", RequestID: "rid"})
+	var ee *ExitError
+	if !errors.As(err, &ee) || ee.Code != ExitConflict || ee.Reason != "stale_selection" {
+		t.Fatalf("err = %#v", err)
+	}
+	if gotBody != `{"selection_token":"tok","request_id":"rid"}` {
+		t.Errorf("body = %s", gotBody)
 	}
 }

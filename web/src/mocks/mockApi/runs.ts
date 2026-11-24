@@ -1326,6 +1326,27 @@ export const runsApi = {
   // other run reports the honest supported-but-empty aggregate (which renders nothing
   // unless the run actually failed). A missing run 404s, which the section treats as
   // "no recovery data".
+  // Fresh resume (issue #4628) demo: a run held at recovery_wait previews as available, any other run
+  // as ineligible; a start succeeds. No selection or request id is validated.
+  getFreshResumePreview: async (id: string) => {
+    const r = getRun(id);
+    if (!r) throw new ApiError(404, "run not found");
+    if (r.status !== "recovery_wait") return delay({ status: "ineligible" as const, uncovered_generations: [], notes: [] }, 60);
+    return delay({
+      status: "available" as const, selection_token: "mock-selection-token",
+      evidence_generation: 2, claim_generation: 3, kind: "checkpoint_ref" as const,
+      checkpoint_ref: `refs/uzi-checkpoints/agent/issue-${r.issue_iid ?? 0}`,
+      sha: "0123456789abcdef0123456789abcdef01234567", uncovered_generations: [3], notes: [],
+    }, 60);
+  },
+  startFreshResume: async (id: string, body: { selection_token: string; request_id: string }) => {
+    if (!getRun(id)) throw new ApiError(404, "run not found");
+    return delay({
+      id: "00000000-0000-0000-0000-00000000f001", run_id: id, request_id: body.request_id, state: "pending", replay: false,
+      evidence_generation: 2, kind: "checkpoint_ref", sha: "0123456789abcdef0123456789abcdef01234567",
+      admission_deadline: new Date(Date.now() + 5 * 60_000).toISOString(),
+    }, 60);
+  },
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");

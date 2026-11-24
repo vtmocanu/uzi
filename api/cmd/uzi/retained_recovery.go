@@ -98,7 +98,8 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 	}
 	return state + guidance + " · owner Resume now: uzi run resume " + cellText(r.ID) +
 		"; Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)" +
-		" · Resume requests an attempt; success is not assured · source/archive availability and latest edits unverified"
+		" · Resume requests an attempt; success is not assured · source/archive availability and latest edits unverified" +
+		freshResumeHintSuffix(r)
 }
 
 // secretRemediationActiveDetail reports an adoption-failed park classified secret_remediation_active,
@@ -253,4 +254,13 @@ func idleStallResumeGuidance(r apitypes.RunDTO) string {
 		return ""
 	}
 	return "Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run"
+}
+
+// freshResumeHintSuffix points a held run at `uzi run fresh-resume` (issue #4628). Only an owner-held
+// recovery decision gets it; a timed retry will resume by itself.
+func freshResumeHintSuffix(r apitypes.RunDTO) string {
+	if !isRecoveryDecisionHold(r) {
+		return ""
+	}
+	return " · " + freshResumeHint(r.ID)
 }

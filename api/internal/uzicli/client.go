@@ -862,6 +862,10 @@ type Client interface {
 	// absent, or already-settled hold) maps to ExitNotFound; a 200 means the hold was
 	// discarded. Mounted under the same RequireUser /runs group as the archive DELETE.
 	DiscardRecoveryHold(ctx context.Context, runID, holdID string) error
+	// FreshResumePreview and StartFreshResume are the owner's fresh resume read and confirm
+	// (issue #4628). The start's request id is one per confirm action; see StartFreshResume.
+	FreshResumePreview(ctx context.Context, runID string) (apitypes.FreshResumePreviewDTO, error)
+	StartFreshResume(ctx context.Context, runID string, req apitypes.FreshResumeStartRequest) (apitypes.FreshResumeStartDTO, error)
 	// HeldPublications lists a run's held-work publications (issue #2545):
 	// GET /api/runs/{runID}/held-publications. RequireUser and owner-or-404, so a uzc_ CLI token
 	// reaches its OWN runs only; an admin_ro (uza_) token may also read a foreign run's list when

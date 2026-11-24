@@ -6719,3 +6719,46 @@ export interface PolicyHoldResumeResponse {
   run: Run;
   replay?: true;
 }
+
+// ── Fresh resume (issue #4628) ────────────────────────────────────────────────
+// The Go source is api/internal/apitypes/fresh_resume.go. GET /api/runs/{id}/fresh-resume answers
+// 200 for every status; only "available" carries a selection token.
+export type FreshResumeStatus =
+  | "available" | "disabled" | "no_destination" | "custody_limit" | "no_evidence" | "expired"
+  | "unbound" | "prereq_unproven" | "ambiguous" | "in_progress" | "ineligible";
+
+export interface FreshResumePreview {
+  status: FreshResumeStatus;
+  selection_token?: string;
+  /** The claim generation the evidence was saved under (Ge). */
+  evidence_generation?: number;
+  /** The run's latest claim generation. */
+  claim_generation?: number;
+  kind?: "capture" | "checkpoint_ref";
+  capture_id?: string;
+  checkpoint_ref?: string;
+  sha?: string;
+  /** Generations after the evidence's that saved nothing; never null on the wire. */
+  uncovered_generations: number[];
+  notes: string[];
+}
+
+export interface FreshResumeStartRequest {
+  selection_token: string;
+  /** Client-generated UUID, one per confirm action. */
+  request_id: string;
+}
+
+export interface FreshResumeStart {
+  id: string;
+  run_id: string;
+  request_id: string;
+  state: string;
+  replay: boolean;
+  evidence_generation: number;
+  kind: string;
+  capture_id?: string;
+  checkpoint_ref?: string;
+  sha: string;
+  admission_deadline: string;
+}
