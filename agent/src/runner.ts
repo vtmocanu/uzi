@@ -29911,10 +29911,12 @@ export class RunRunner {
   private async holdSwitchAfterTransportStop(claim: ClaimResponse, flight: RunFlight, runLog: Logger, err: unknown): Promise<void> {
     if (err instanceof RetainedRecoveryCancelled || !this.transportStopSwitchEligible(claim, flight)) return;
     try {
-      // No pending op-fenced switch: nothing to hold, and nothing to warn about. A cancel, fence or shutdown that already
-      // decided the exit is refused by the retainedTerminalGuard inside escapedInPlaceSwitch's identity check.
+      // No pending op-fenced switch: nothing to hold, and nothing to warn about. With one pending, a cancel, fence or shutdown
+      // that already decided the exit refuses here (and again inside escapedInPlaceSwitch's identity check), before the
+      // "held" line is logged.
       const closed = this.closedInPlaceSwitch(claim, flight);
       if (closed === undefined) return;
+      this.retainedTerminalGuard(flight);
       runLog.info("restore transport stopped; a pending credential switch is held through the op-fenced fence", {
         run_id: flight.runId, op_id: closed.opId,
       });

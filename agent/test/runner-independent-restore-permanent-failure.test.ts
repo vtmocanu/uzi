@@ -481,7 +481,8 @@ describe("an op-fenced credential switch after the restore transport stopped rea
           armed = false;
           before?.();
           api.requestCredentialSwitch(flight.runId, gen(c), OP);
-          await until("the late switch to trip", () => flight.steering.pendingCredentialSwitch() === gen(c));        }
+          await until("the late switch to trip", () => flight.steering.pendingCredentialSwitch() === gen(c));
+        }
         return original(...a);
       };
     };
