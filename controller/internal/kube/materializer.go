@@ -812,8 +812,10 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 						if e.blocked == "" {
 							var err error
 							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
-								// The wake's own mutation guard still requires e.admitted.
-								// A ready participant needs only to report settlement.
+								// Template and replica mutations of the wake still require
+								// e.admitted. The one unadmitted write is the annotation-only
+								// op binding (patchWakeOpAnnotation); a bound participant
+								// then reports settlement.
 								err = m.hibernateWake(ctx, w, e.o, ns, spec)
 							} else {
 								_, err = m.reconcileDinD(ctx, w, obs, ns, spec)
