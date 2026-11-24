@@ -7,7 +7,7 @@ SET LOCAL lock_timeout = '5s';
 -- therefore never accepts the shared scope. This file touches user_secrets only. Ciphertext, ids and
 -- enablement_rev are untouched.
 --
--- The foreign key below references model_providers_scope_owner_id_key (00524). Refuse an invalid
+-- The foreign key below references model_providers_scope_owner_id_key (00526). Refuse an invalid
 -- index explicitly rather than rely on the planner's own refusal.
 -- +goose StatementBegin
 DO $$
@@ -17,7 +17,7 @@ BEGIN
         WHERE i.indexrelid = to_regclass('model_providers_scope_owner_id_key')
           AND i.indisvalid AND i.indisunique
     ) THEN
-        RAISE EXCEPTION 'refusing to apply 00525: model_providers_scope_owner_id_key is missing or invalid; roll 00524 back and apply it again';
+        RAISE EXCEPTION 'refusing to apply 00527: model_providers_scope_owner_id_key is missing or invalid; roll 00526 back and apply it again';
     END IF;
 END
 $$;
@@ -33,7 +33,7 @@ ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_scope_check
             AND (provider_scope_id = user_id
                  OR (provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid AND kind = 'anthropic_compatible_key')))) NOT VALID;
 
--- One statement so no window exists without a provider foreign key. Validated in 00527.
+-- One statement so no window exists without a provider foreign key. Validated in 00529.
 ALTER TABLE user_secrets
     DROP CONSTRAINT user_secrets_provider_fkey,
     ADD CONSTRAINT user_secrets_provider_fkey
@@ -48,7 +48,7 @@ LOCK TABLE user_secrets IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM user_secrets WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) THEN
-        RAISE EXCEPTION 'refusing to roll back 00525: provider key(s) attached to shared definitions still exist; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00527: provider key(s) attached to shared definitions still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;

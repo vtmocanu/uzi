@@ -24,9 +24,9 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 		"00479_users_claude_provider_source.sql":     {"users", "ACCESS EXCLUSIVE"},
 		"00481_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
 		"00488_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
-		"00522_model_providers_shared_scope.sql":     {"model_providers", "ACCESS EXCLUSIVE"},
-		"00525_user_secrets_provider_scope.sql":      {"user_secrets", "ACCESS EXCLUSIVE"},
-		"00526_users_claude_provider_scope.sql":      {"users", "ACCESS EXCLUSIVE"},
+		"00524_model_providers_shared_scope.sql":     {"model_providers", "ACCESS EXCLUSIVE"},
+		"00527_user_secrets_provider_scope.sql":      {"user_secrets", "ACCESS EXCLUSIVE"},
+		"00528_users_claude_provider_scope.sql":      {"users", "ACCESS EXCLUSIVE"},
 	} {
 		table := spec.table
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.

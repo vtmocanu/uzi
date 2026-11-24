@@ -14,7 +14,7 @@ BEGIN
         WHERE i.indexrelid = to_regclass('model_providers_scope_owner_id_key')
           AND i.indisvalid AND i.indisunique
     ) THEN
-        RAISE EXCEPTION 'refusing to apply 00526: model_providers_scope_owner_id_key is missing or invalid; roll 00524 back and apply it again';
+        RAISE EXCEPTION 'refusing to apply 00528: model_providers_scope_owner_id_key is missing or invalid; roll 00526 back and apply it again';
     END IF;
 END
 $$;
@@ -30,7 +30,7 @@ ALTER TABLE users ADD CONSTRAINT users_claude_provider_scope_check
             AND claude_provider_scope_id IN (id, '00000000-0000-0000-0000-000000000000'::uuid))) NOT VALID;
 
 -- ON DELETE RESTRICT is kept: deleting a selected definition is refused, never silently nulled.
--- Validated in 00528.
+-- Validated in 00530.
 ALTER TABLE users
     DROP CONSTRAINT users_claude_provider_fkey,
     ADD CONSTRAINT users_claude_provider_fkey
@@ -46,7 +46,7 @@ LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM users WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) THEN
-        RAISE EXCEPTION 'refusing to roll back 00526: user(s) still have a shared Claude provider source selected; clear it explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00528: user(s) still have a shared Claude provider source selected; clear it explicitly before downgrading';
     END IF;
 END
 $$;

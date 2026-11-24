@@ -17,7 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4324 M1 against real Postgres: the ownership/reference migrations 00522-00529, the shared
+// PRD #4324 M1 against real Postgres: the ownership/reference migrations 00524-00531, the shared
 // catalogue queries and the per-key Test evidence fence. Every test stands its own isolated database
 // (standIsolatedDB), so shared definitions never leak into the sweep's shared database. Skipped
 // unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
@@ -105,7 +105,7 @@ func appliedVersion(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64
         WHERE g.is_applied AND NOT EXISTS (SELECT 1 FROM goose_db_version d WHERE d.version_id = g.version_id AND NOT d.is_applied AND d.id > g.id)`)
 }
 
-// seedLegacy writes personal data with the 00521 schema (no scope columns): a Claude provider with two
+// seedLegacy writes personal data with the 00523 schema (no scope columns): a Claude provider with two
 // revisions, its key and a selection, a Codex provider with its key and selection for another user, and
 // a legacy probe row. It returns the ids and the key ciphertext it wrote.
 type legacySeed struct {
@@ -140,12 +140,12 @@ func seedLegacy(ctx context.Context, t *testing.T, pool *pgxpool.Pool) legacySee
 	return s
 }
 
-// TestSharedScopeUpgradePreservesPersonalDataLiveDB: upgrading a 00521 database keeps every personal
+// TestSharedScopeUpgradePreservesPersonalDataLiveDB: upgrading a 00523 database keeps every personal
 // provider, key (byte-equal ciphertext), selection and revision, backfills the scope columns to the
 // owner, discards the legacy provider-wide probe cache, and leaves every new constraint validated.
 func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "shared_scope_upgrade_")
-	migrateTo(ctx, t, dsn, 521)
+	migrateTo(ctx, t, dsn, 523)
 	pool := openSharedPool(ctx, t, dsn)
 	s := seedLegacy(ctx, t, pool)
 	migrateTo(ctx, t, dsn, 0)
@@ -199,7 +199,7 @@ func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 		t.Errorf("a user with no Claude source must keep a NULL scope")
 	}
 	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM model_provider_probe_results`); got != 0 {
-		t.Errorf("legacy probe rows after 00529 = %d, want 0 (provider-wide cache discarded)", got)
+		t.Errorf("legacy probe rows after 00531 = %d, want 0 (provider-wide cache discarded)", got)
 	}
 	var unvalidated []string
 	rows, err := pool.Query(ctx, `SELECT conrelid::regclass::text || '.' || conname FROM pg_constraint
@@ -515,7 +515,7 @@ func diffFingerprints(want, got []string) string {
 // the 00477 and 00479 foreign keys and leaves no orphan index, column or table. A re-upgrade then works.
 func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 	refCtx, refDSN := standIsolatedDB(t, "shared_scope_ref_")
-	migrateTo(refCtx, t, refDSN, 521)
+	migrateTo(refCtx, t, refDSN, 523)
 	want := schemaFingerprint(refCtx, t, openSharedPool(refCtx, t, refDSN))
 
 	ctx, dsn, pool := sharedDB(t, "shared_scope_down_", 0)
@@ -538,30 +538,30 @@ func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 			t.Fatalf("Down to %d = %v, want a refusal containing %q", to, err, snippet)
 		}
 	}
-	// 00529-00527 roll back freely; 00526 refuses while B's source is the shared definition.
-	refuses(525, "refusing to roll back 00526")
-	if v := appliedVersion(ctx, t, pool); v != 526 {
-		t.Fatalf("version after the refused 00526 Down = %d, want 526", v)
+	// 00531-00529 roll back freely; 00528 refuses while B's source is the shared definition.
+	refuses(527, "refusing to roll back 00528")
+	if v := appliedVersion(ctx, t, pool); v != 528 {
+		t.Fatalf("version after the refused 00528 Down = %d, want 528", v)
 	}
 	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: b, Engine: "claude"}); err != nil {
 		t.Fatal(err)
 	}
-	refuses(524, "refusing to roll back 00525")
+	refuses(526, "refusing to roll back 00527")
 	if _, err := q.DeleteSharedProviderKeys(ctx, shared.ID); err != nil {
 		t.Fatal(err)
 	}
-	refuses(521, "refusing to roll back 00522")
-	if v := appliedVersion(ctx, t, pool); v != 522 {
-		t.Fatalf("version after the refused 00522 Down = %d, want 522", v)
+	refuses(523, "refusing to roll back 00524")
+	if v := appliedVersion(ctx, t, pool); v != 524 {
+		t.Fatalf("version after the refused 00524 Down = %d, want 524", v)
 	}
 	if n, err := q.DeleteSharedModelProvider(ctx, shared.ID); err != nil || n != 1 {
 		t.Fatalf("delete shared provider = %d (%v)", n, err)
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 521); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 523); err != nil {
 		t.Fatalf("full Down: %v", err)
 	}
 	if got := schemaFingerprint(ctx, t, pool); diffFingerprints(want, got) != "" {
-		t.Errorf("schema after the full Down differs from a 00521 database:\n%s", diffFingerprints(want, got))
+		t.Errorf("schema after the full Down differs from a 00523 database:\n%s", diffFingerprints(want, got))
 	}
 	for _, f := range []string{"model_providers_scope_owner_id_key", "model_providers_shared_name_lower_key", "users_claude_provider_id_idx"} {
 		if scalar[bool](ctx, t, pool, `SELECT to_regclass($1) IS NOT NULL`, f) {
@@ -573,8 +573,8 @@ func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 	}
 }
 
-// TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB: the scope key index is the parent of the 00525
-// and 00526 foreign keys. An invalid one (an interrupted concurrent build) makes 00525 refuse with no
+// TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB: the scope key index is the parent of the 00527
+// and 00528 foreign keys. An invalid one (an interrupted concurrent build) makes 00527 refuse with no
 // partial change, and re-running the index migration rebuilds it VALID so the rest completes.
 func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 	invalidate := func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
@@ -585,38 +585,38 @@ func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 			t.Fatal("the index is still valid after the injection")
 		}
 	}
-	t.Run("00525 refuses an invalid parent index", func(t *testing.T) {
-		ctx, dsn, pool := sharedDB(t, "shared_scope_inv_a_", 524)
+	t.Run("00527 refuses an invalid parent index", func(t *testing.T) {
+		ctx, dsn, pool := sharedDB(t, "shared_scope_inv_a_", 526)
 		invalidate(ctx, t, pool)
 		err := store.Migrate(ctx, dsn)
-		if err == nil || !strings.Contains(err.Error(), "refusing to apply 00525") {
-			t.Fatalf("Migrate over an invalid index = %v, want the 00525 refusal", err)
+		if err == nil || !strings.Contains(err.Error(), "refusing to apply 00527") {
+			t.Fatalf("Migrate over an invalid index = %v, want the 00527 refusal", err)
 		}
-		if v := appliedVersion(ctx, t, pool); v != 524 {
-			t.Errorf("version after the refusal = %d, want 524", v)
+		if v := appliedVersion(ctx, t, pool); v != 526 {
+			t.Errorf("version after the refusal = %d, want 526", v)
 		}
 		if scalar[bool](ctx, t, pool, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'user_secrets' AND column_name = 'provider_scope_id')`) {
-			t.Errorf("00525 left provider_scope_id behind after refusing")
+			t.Errorf("00527 left provider_scope_id behind after refusing")
 		}
 		if scalar[string](ctx, t, pool, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'user_secrets_provider_fkey'`) != "FOREIGN KEY (user_id, provider_id) REFERENCES model_providers(owner_user_id, id) ON DELETE CASCADE" {
-			t.Errorf("00525 left the provider foreign key changed after refusing")
+			t.Errorf("00527 left the provider foreign key changed after refusing")
 		}
 		// Recovery: roll the index migration back and apply it again, which drops and rebuilds the index.
-		if err := store.MigrateDownTo(ctx, dsn, 523); err != nil {
+		if err := store.MigrateDownTo(ctx, dsn, 525); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.Migrate(ctx, dsn); err != nil {
-			t.Fatalf("Migrate after rolling 00524 back: %v", err)
+			t.Fatalf("Migrate after rolling 00526 back: %v", err)
 		}
 		if !scalar[bool](ctx, t, pool, `SELECT indisvalid AND indisunique FROM pg_index WHERE indexrelid = 'model_providers_scope_owner_id_key'::regclass`) {
 			t.Errorf("the index is not valid after recovery")
 		}
-		if v := appliedVersion(ctx, t, pool); v != 529 {
-			t.Errorf("version after recovery = %d, want 529", v)
+		if v := appliedVersion(ctx, t, pool); v != 531 {
+			t.Errorf("version after recovery = %d, want 531", v)
 		}
 	})
-	t.Run("00524 replaces an invalid index it finds", func(t *testing.T) {
-		ctx, dsn, pool := sharedDB(t, "shared_scope_inv_b_", 523)
+	t.Run("00526 replaces an invalid index it finds", func(t *testing.T) {
+		ctx, dsn, pool := sharedDB(t, "shared_scope_inv_b_", 525)
 		mustExec(ctx, t, pool, `CREATE UNIQUE INDEX model_providers_scope_owner_id_key ON model_providers (scope_owner_id, id)`)
 		invalidate(ctx, t, pool)
 		if err := store.Migrate(ctx, dsn); err != nil {
@@ -628,30 +628,30 @@ func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 	})
 }
 
-// TestSharedScopeNilUserRollsBack00522LiveDB: the nil UUID is the shared scope, so a user row carrying it
-// makes 00522 refuse and roll back completely, with its version unrecorded; removing the row lets it apply.
-func TestSharedScopeNilUserRollsBack00522LiveDB(t *testing.T) {
-	ctx, dsn, pool := sharedDB(t, "shared_scope_nil_", 521)
+// TestSharedScopeNilUserRollsBack00524LiveDB: the nil UUID is the shared scope, so a user row carrying it
+// makes 00524 refuse and roll back completely, with its version unrecorded; removing the row lets it apply.
+func TestSharedScopeNilUserRollsBack00524LiveDB(t *testing.T) {
+	ctx, dsn, pool := sharedDB(t, "shared_scope_nil_", 523)
 	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, 'nil@example.com', 'x')`, nilScope)
 	err := store.Migrate(ctx, dsn)
-	if err == nil || !strings.Contains(err.Error(), "refusing to apply 00522") {
-		t.Fatalf("Migrate with a nil-UUID user = %v, want the 00522 refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "refusing to apply 00524") {
+		t.Fatalf("Migrate with a nil-UUID user = %v, want the 00524 refusal", err)
 	}
-	if v := appliedVersion(ctx, t, pool); v != 521 {
-		t.Errorf("version after the refusal = %d, want 521 (00522 unrecorded)", v)
+	if v := appliedVersion(ctx, t, pool); v != 523 {
+		t.Errorf("version after the refusal = %d, want 523 (00524 unrecorded)", v)
 	}
 	if got := scalar[string](ctx, t, pool, `SELECT is_nullable FROM information_schema.columns WHERE table_name = 'model_providers' AND column_name = 'owner_user_id'`); got != "NO" {
-		t.Errorf("owner_user_id is nullable after a refused 00522; the migration did not roll back")
+		t.Errorf("owner_user_id is nullable after a refused 00524; the migration did not roll back")
 	}
 	if scalar[bool](ctx, t, pool, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'model_providers' AND column_name IN ('credential_mode', 'scope_owner_id'))`) {
-		t.Errorf("a refused 00522 left its columns behind")
+		t.Errorf("a refused 00524 left its columns behind")
 	}
 	mustExec(ctx, t, pool, `DELETE FROM users WHERE id = $1`, nilScope)
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatalf("Migrate after removing the nil-UUID user: %v", err)
 	}
-	if v := appliedVersion(ctx, t, pool); v != 529 {
-		t.Errorf("version after the retry = %d, want 529", v)
+	if v := appliedVersion(ctx, t, pool); v != 531 {
+		t.Errorf("version after the retry = %d, want 531", v)
 	}
 }
 
