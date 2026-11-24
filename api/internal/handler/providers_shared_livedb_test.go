@@ -1152,10 +1152,31 @@ func (db *providerProbeRereadInterleave) QueryRow(ctx context.Context, sql strin
 func TestSharedProviderProbeRejectsRetirementAfterEvidenceCommitLiveDB(t *testing.T) {
 	s := newSharedFx(t, true)
 	s.b.putKeyFor(t, s.shared.ID, testProviderKey)
+	ctx := context.Background()
+	var keyID uuid.UUID
+	var keyRev int64
+	if err := s.f.pool.QueryRow(ctx, `SELECT id, enablement_rev FROM user_secrets WHERE user_id = $1 AND provider_id = $2`,
+		s.b.user, s.shared.ID).Scan(&keyID, &keyRev); err != nil {
+		t.Fatal(err)
+	}
 	retire := cookieReqPrepared(t, s.admin.router, http.MethodPost, adminProvidersPath+"/"+s.shared.ID+"/retire", s.admin.jwt, "")
 	hook := &providerProbeRereadInterleave{DBTX: s.f.pool, beforeFinalRead: func() {
 		if n := countRows(t, s, `SELECT count(*) FROM model_provider_key_test_results WHERE provider_id = $1`, s.shared.ID); n != 1 {
 			t.Fatalf("evidence rows before interleaved retirement = %d, want 1", n)
+		}
+		var owner, storedKey uuid.UUID
+		var revision int
+		var storedKeyRev int64
+		var auth, tool string
+		if err := s.f.pool.QueryRow(ctx, `SELECT user_id, revision, key_secret_id, key_enablement_rev, auth_result, tool_result
+			FROM model_provider_key_test_results WHERE provider_id = $1`, s.shared.ID).
+			Scan(&owner, &revision, &storedKey, &storedKeyRev, &auth, &tool); err != nil {
+			t.Fatal(err)
+		}
+		if owner != s.b.user || revision != s.shared.CurrentRevision || storedKey != keyID || storedKeyRev != keyRev ||
+			auth != "ok" || tool != "passed" {
+			t.Fatalf("stored evidence = (%s, %d, %s, %d, %q, %q), want (%s, %d, %s, %d, ok, passed)",
+				owner, revision, storedKey, storedKeyRev, auth, tool, s.b.user, s.shared.CurrentRevision, keyID, keyRev)
 		}
 		if rec := retire(); rec.Code != http.StatusOK {
 			t.Fatalf("interleaved retire = %d %s", rec.Code, rec.Body.String())
