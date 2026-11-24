@@ -29908,9 +29908,11 @@ export class RunRunner {
    * Issue #4652: the late hold. The RetainedRecoveryStop arm of executeClaim calls this once, after the batcher closed. When the
    * restore transport was stopped by a permanent failure and an op-fenced switch is pending (it arrived after the window's last
    * poll was served, or was latched and served by the catch), report the op-fenced hold, retrying within the
-   * retainedSwitchVerificationMs budget. It never waits for a switch, never reports a terminal state and never clears
-   * flight.retainedSwitchSettlement: a `hold_pending` left by an expired hold is settled by the existing finally join. Every
-   * failure is logged and swallowed; the flight stays nonterminal with custody kept.
+   * retainedSwitchVerificationMs budget. It never waits for a switch and never clears flight.retainedSwitchSettlement: a
+   * `hold_pending` left by an expired hold is settled by the existing finally join. One exception reports a state: an owner
+   * cancel observed while the hold retries is reported as the RetainedRecoveryStop arm reports one ("run cancelled", custody
+   * kept), unless shutdown or a claim fence decided the exit. Every other failure is logged and swallowed; the flight stays
+   * nonterminal with custody kept.
    */
   private async holdSwitchAfterTransportStop(claim: ClaimResponse, flight: RunFlight, runLog: Logger, err: unknown): Promise<void> {
     if (err instanceof RetainedRecoveryCancelled || !this.transportStopSwitchEligible(claim, flight)) return;
@@ -29926,6 +29928,14 @@ export class RunRunner {
       });
       await this.escapedInPlaceSwitch(flight, runLog, closed, undefined, { deadline: Date.now() + this.retainedSwitchVerificationMs });
     } catch (error) {
+      // An owner cancel observed while the hold retried is reported as the RetainedRecoveryStop arm reports one, with custody
+      // kept; flight.retainedSwitchSettlement is left for the finally join. Shutdown and a claim fence keep the plain stop.
+      if (error instanceof RetainedRecoveryCancelled) {
+        if (!flight.active?.shuttingDown && !this.shuttingDownGlobal && flight.steering.claimFence() === undefined) {
+          await this.reportGenericFailure(claim, flight, new Error("run cancelled"), { keepCustody: true });
+        }
+        return;
+      }
       runLog.warn("late credential switch hold after the restore transport stopped did not complete; run left non-terminal, custody kept",
         { run_id: flight.runId, error: errMessage(error) });
     }

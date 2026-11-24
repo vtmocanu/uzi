@@ -11,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
+import type * as http from "node:http";
 import type { Executor } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { CredentialSwitchOpLedger } from "../src/credential-switch-op-ledger.js";
@@ -572,6 +573,56 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     assert.deepEqual(atJoin, ["hold_pending"], "the owed settle was preserved up to the join");
     assert.equal(runner.pendingHoldSettled.has(`${c.r.runId}:${gen(c)}`), true, "the failed settled acknowledgement is retried later");
     unseeded(c);
+  });
+
+  it("Order 2a cancel: an owner cancel observed while the late hold retries is reported once, custody kept", async () => {
+    const c = await arrangeSwitch({ ledger: true, extra: { retainedSwitchVerificationMs: 20_000, recoveryRetryMs: 5 } });
+    // The in-place server drains inputs (a cancel included) while the switch is pending.
+    api.inPlaceInputDrain = true;
+    let holdFailure: { mock: { restore(): void } } | undefined;
+    try {
+      c.onAttribution = () => trip(c, true);
+      // Only the hold reports fail (a transient 503), so the cancellation report itself can land.
+      let failHolds = false;
+      let holdAttempts = 0;
+      const fake = api as unknown as { handleState: (res: http.ServerResponse, runId: string, json: Record<string, unknown>) => Promise<void> };
+      const handleState = fake.handleState.bind(api);
+      holdFailure = mock.method(fake, "handleState", async (res: http.ServerResponse, runId: string, json: Record<string, unknown>) => {
+        if (failHolds && runId === c.r.runId && json.status === "credential_switch_held") {
+          holdAttempts++;
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "injected failure" }));
+          return;
+        }
+        return handleState(res, runId, json);
+      });
+      let cancelling: Promise<void> | undefined;
+      switchAtStopClose(c, () => {
+        failHolds = true;
+        cancelling = (async () => {
+          await until("a hold report attempt", () => holdAttempts > 0);
+          api.appendInputs(c.r.runId, [{ id: 1, kind: "cancel", body: null }]);
+          await until("the cancel", () => c.flight!.steering.isCancelled());
+        })();
+      });
+      await drive(c.r);
+      await cancelling;
+      await settle(c);
+      assert.equal(logged(c.r, HOOK_LOG).length, 1, "the late hook attempted the hold");
+      assert.equal(logged(c.r, HELD_LOG).length, 0, "no hold was confirmed");
+      const cancelled = failed(c.r);
+      assert.equal(cancelled.length, 1, "exactly one cancellation report");
+      assert.equal((cancelled[0]!.body as { failure_reason?: string }).failure_reason, "run cancelled", "it reports the owner cancel");
+      assert.equal(logged(c.r, HOOK_FAILED_LOG).length, 0, "the cancel is not logged as an incomplete hold");
+      assert.equal(c.counts.models, 0, "no model start");
+      assert.equal(alive(c.child), true, "P's process survived");
+      assertCustodyKept(c);
+      assert.ok(holds(c, "credential_switch_hold_settled").length >= 1 || (c.r.runner as unknown as { pendingHoldSettled: Map<string, unknown> }).pendingHoldSettled.has(`${c.r.runId}:${gen(c)}`),
+        "the owed hold_pending settle was sent or queued by the join");
+    } finally {
+      holdFailure?.mock.restore();
+      api.inPlaceInputDrain = false;
+    }
   });
 
   it("Order 2b: a switch that arrives only after the flight ended holds nothing", async () => {
