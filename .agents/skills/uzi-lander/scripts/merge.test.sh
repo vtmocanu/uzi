@@ -1242,6 +1242,23 @@ done
 # 15. A non-string base is no base: refused before any merge.
 pol_reset; pol_pr frag-15 '1=Fix a (#4626).' '2=Fix b (#4626).'
 export POLICY_BASE_JSON=true; policy_run; pol_want 'non-string base' 2 0
+# The old `jq -r` read stringified it ("of true"); the new read has no base at all.
+grep -qF 'cannot read the required checks of the base branch' "$WORK/policy.out" \
+  || fail "non-string base was read as a branch name: $(cat "$WORK/policy.out")"
+# 17. Only added changelog.d/<uuid>.md paths count: a new README.md beside one fragment is one.
+pol_reset; pol_pr frag-17 '1=Fix a (#4626).'
+printf 'notes\n' > "$POLICY_ROOT/changelog.d/README.md"
+git -C "$POLICY_ROOT" add changelog.d; git -C "$POLICY_ROOT" commit -qm 'docs: changelog readme'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
+policy_run; pol_want 'non-uuid added path' 0 1
+# 18. Editing two inherited fragments (main's 3 and 4 from case 9) adds none.
+pol_reset; git -C "$POLICY_ROOT" checkout -q -B frag-18 main
+for n in 3 4; do
+  printf '### Fixed\n\n- **Main fix %s reworded (#4626).**\n  Description line.\n' "$n" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+done
+git -C "$POLICY_ROOT" commit -qam 'docs: reword inherited fragments'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
+policy_run; pol_want 'modified inherited fragments' 0 1
 # 16. One captured read: a later forge answer cannot change the guard's closing set.
 pol_reset; pol_pr frag-16 '1=Fix a (#4626).' '2=Fix b (#4626).'
 export CLOSES_SEQ_FILE="$WORK/closes-seq" CLOSES_JSON='[]' CLOSES_JSON_LATER; CLOSES_JSON_LATER=$(pol_same_repo 4626)
