@@ -1178,8 +1178,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// strict owner-or-404 gate as the archive routes above (admin refused), so the CLI
 				// (uzc_ Bearer) and the web reach it. UZI_FRESH_RESUME off: the preview says disabled
 				// and the start is a 409 disabled; neither writes.
-				r.Get("/{id}/fresh-resume", h.PreviewFreshResume)
-				r.Post("/{id}/fresh-resume", h.StartFreshResume)
+				// Both call the forge (the selection's prerequisite proofs), so they sit behind the
+				// same per-user forge limiter as /{id}/rework.
+				r.With(forgeLimiter.PerUserMiddleware).Get("/{id}/fresh-resume", h.PreviewFreshResume)
+				r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/fresh-resume", h.StartFreshResume)
 				// Exact owner custody-hold DISCARD (PRD #1349 M5, D7). Same RequireUser /runs
 				// group and same strict GetRun owner-or-404 gate as the archive DELETE above, so
 				// both the web dialog and the `uzi run discard` CLI (uzc_/uza_ Bearer) reach it;

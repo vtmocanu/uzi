@@ -342,7 +342,8 @@ func (s *Service) freshLockCandidate(ctx context.Context, q *store.Queries, run 
 		return "", err
 	}
 	if holds == 0 {
-		return apitypes.FreshResumeStatusExpired, nil
+		// The same status the preview gives a stamped tip at Ge on a run with no open hold.
+		return apitypes.FreshResumeStatusNoEvidence, nil
 	}
 	return "", nil
 }
@@ -390,15 +391,28 @@ func (s *Service) ResumeWorkerRecoveryFresh(ctx context.Context, userID uuid.UUI
 	if s.txBeginner == nil {
 		return false, nil
 	}
+	// Only the run kinds fn_fresh_resume_run_base admits can carry a transfer row (the guard trigger is
+	// the backstop). Any other kind, a cross_check checker above all, takes the plain path: this
+	// function locks the run before ResumeWorkerRecoveryEpisode locks a checker's parent lead, and
+	// parents lock before checkers.
+	switch observed.Kind {
+	case "issue", "mr_rework", "self_improve":
+	default:
+		return false, nil
+	}
 	if !s.p.FreshResume {
+		// Fail closed: an unreadable probe is handled=true with the error, so the caller answers 500
+		// rather than taking the plain path past a possible pending transfer.
 		probe, err := s.beginReadCommitted(ctx)
 		if err != nil {
-			return false, err
+			slog.Error("fresh resume: owner resume probe", "error", err, "run", observed.ID.String())
+			return true, err
 		}
 		outstanding, err := store.New(probe).OwnerHasOutstandingFreshResume(ctx, userID)
 		_ = probe.Rollback(ctx)
 		if err != nil {
-			return false, err
+			slog.Error("fresh resume: owner resume probe", "error", err, "run", observed.ID.String())
+			return true, err
 		}
 		if !outstanding {
 			return false, nil

@@ -6,6 +6,7 @@ package handler
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +75,13 @@ func newFreshHandlerFix(t *testing.T, gate bool) *freshHandlerFix {
 	cliMustExec(t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, $3, $4, 'online')`, w2, owner, "dest-"+w2.String(), w2[:])
 	cliMustExec(t, pool, `UPDATE workers SET kind='hosted', hosted_size='m', template_declared='base', protocol_capabilities=$2, last_heartbeat_at=now() WHERE id=$1`,
 		w2, []string{capability.FreshResumeV1, capability.RecoveryInventoryV1})
+	// run_fresh_resumes.capture_id is ON DELETE RESTRICT, so a row left behind makes a later test's
+	// unscoped DELETE FROM recovery_captures fail with 23503. Cleanup runs in the context the test ended.
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `DELETE FROM run_fresh_resumes WHERE run_id=$1`, run); err != nil {
+			t.Errorf("cleanup run_fresh_resumes: %v", err)
+		}
+	})
 	return &freshHandlerFix{t: t, router: router, pool: pool, owner: owner, token: cliMintToken(t, pool, owner, clitoken.ScopeUser),
 		jwt: cliMintJWT(t, pool, owner), run: run, w1: w1, w2: w2, cap: capID}
 }
@@ -286,6 +294,49 @@ func TestFreshResumeOwnerResumeRoutesLiveDB(t *testing.T) {
 			t.Fatalf("run status = %s, want untouched", f.runStatus())
 		}
 	})
+}
+
+// Owner writers whose SQL changes none of status, worker_id or claim_generation (pause_mode, extend,
+// the token switch) never reach the guard trigger, so each handler reads the transfer itself: a pending
+// row is 409 fresh_resume_in_progress and nothing is written, and the same request goes through once
+// the row is closed.
+func TestFreshResumeOwnerWritersRefuseLiveDB(t *testing.T) {
+	cases := []struct {
+		name, path, body string
+	}{
+		{"extend", "/inputs", `{"kind":"extend","body":"7200"}`},
+		{"pause", "/inputs", `{"kind":"pause","body":"now"}`},
+		{"pause_cancel", "/inputs", `{"kind":"pause_cancel"}`},
+		{"set-token", "/credential", `{"mode":"default"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFreshHandlerFix(t, true)
+			cliMustExec(t, f.pool, `INSERT INTO run_fresh_resumes (run_id,user_id,request_id,evidence_generation,evidence_kind,checkpoint_ref,sha,candidate_token)
+			    VALUES ($1,$2,$3,2,'checkpoint_ref','refs/uzi-checkpoints/x',$4,'tok')`, f.run, f.owner, uuid.New(), freshHandlerSha)
+			var before time.Time
+			if err := f.pool.QueryRow(t.Context(), `SELECT updated_at FROM runs WHERE id=$1`, f.run).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			url := fmt.Sprintf("/api/runs/%s%s", f.run, c.path)
+			rec := bearerReqBody(f.router, http.MethodPost, url, f.token, c.body)
+			if rec.Code != http.StatusConflict || freshReasonOf(t, rec) != "fresh_resume_in_progress" {
+				t.Fatalf("%s with a pending transfer = %d %s, want 409 fresh_resume_in_progress", c.name, rec.Code, rec.Body.String())
+			}
+			var after time.Time
+			if err := f.pool.QueryRow(t.Context(), `SELECT updated_at FROM runs WHERE id=$1`, f.run).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if !after.Equal(before) {
+				t.Fatalf("%s wrote the run despite the transfer", c.name)
+			}
+			cliMustExec(t, f.pool, `UPDATE run_fresh_resumes SET state='refused', refusal_reason='test', closed_at=now() WHERE run_id=$1`, f.run)
+			rec = bearerReqBody(f.router, http.MethodPost, url, f.token, c.body)
+			if rec.Code == http.StatusConflict && strings.Contains(rec.Body.String(), "fresh_resume_in_progress") {
+				t.Fatalf("%s after the transfer closed is still refused: %s", c.name, rec.Body.String())
+			}
+		})
+	}
 }
 
 // TestWriteFreshResumeInProgressMapping pins the one helper every owner path uses: the guard's two

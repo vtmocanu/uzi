@@ -323,7 +323,11 @@ WHERE w.user_id = @user_id AND w.kind = 'hosted' AND NOT w.ephemeral AND w.statu
   AND w.id IS DISTINCT FROM r.worker_id AND w.id IS DISTINCT FROM r.released_worker_id
   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h
                   WHERE h.run_id = r.id AND h.state = 'open'
-                    AND w.id IN (h.live_worker_id, h.original_worker_id));
+                    AND w.id IN (h.live_worker_id, h.original_worker_id))
+  -- the excluded predecessor of the run's seeded (or superseded) transfer: the guard refuses it as W2.
+  AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes s
+                  WHERE s.run_id = r.id AND s.state IN ('seeded', 'superseded')
+                    AND s.predecessor_worker_id = w.id);
 
 -- name: LockCaptureForFreshResume :one
 -- Start's capture lock: FOR SHARE, with every admission fact in the SAME statement so a concurrent expiry

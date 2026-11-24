@@ -1099,6 +1099,13 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Issue #4628: pause, pause_cancel and extend write no runs column the fresh resume guard watches,
+	// so an active transfer is read here and refused before the write.
+	if (req.Kind == "pause" || req.Kind == "pause_cancel" || req.Kind == "extend") &&
+		h.refuseIfFreshResumeActive(w, r, user.ID, id) {
+		return
+	}
+
 	// PRD #84 M4 4c: the "run without the capability" user override (Decision 12). When the
 	// owner approves WITH override_capabilities, the override entry point BYPASSES the
 	// capability approval gate and clears the run's inferred/hinted required_capabilities —

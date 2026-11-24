@@ -898,6 +898,10 @@ var wantRouteMounts = []routeMount{
 	// On-demand MR rework (PRD #1202): reads the MR's review comments off the forge on
 	// every call, so it carries the per-user forge limiter, like ci-fix-runs.
 	{"POST", "/api/runs/{id}/rework", limForge},
+	// Issue #4628: fresh resume preview and start prove the evidence's prerequisite commits on the
+	// forge, so both carry the per-user forge limiter, like rework above.
+	{"GET", "/api/runs/{id}/fresh-resume", limForge},
+	{"POST", "/api/runs/{id}/fresh-resume", limForge},
 	{"POST", "/api/skills/", noLimiter},
 	{"POST", "/api/skills/{id}/reset", noLimiter},
 	{"POST", "/api/tool-allowlist/", noLimiter},

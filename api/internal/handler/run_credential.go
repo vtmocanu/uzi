@@ -57,6 +57,10 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 		secretID = &id
 	}
 
+	// Issue #4628: a held run's token switch can change no guarded column, so read the transfer first.
+	if h.refuseIfFreshResumeActive(w, r, user.ID, runID) {
+		return
+	}
 	res, err := h.wsvc.SetRunCredential(r.Context(), user.ID, runID, req.Mode, secretID)
 	if err != nil {
 		// For either Codex refusal, an unresolved policy episode still names the

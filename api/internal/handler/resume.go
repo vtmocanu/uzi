@@ -403,6 +403,9 @@ type policyResumeBody struct {
 // resumePolicyHold resolves one exact applied policy episode. Every refusal is zero-mutation: the
 // service transaction repeats owner, status, hold reason, episode id and lane predicates.
 func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID, raw []byte) {
+	if h.refuseIfFreshResumeActive(w, r, userID, runID) {
+		return
+	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	var body policyResumeBody
 	if err := httpx.DecodeJSONStrictBounded(r, &body, policyResumeBodyLimit); err != nil {

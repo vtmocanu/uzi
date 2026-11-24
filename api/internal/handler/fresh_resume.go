@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -150,6 +151,33 @@ func (h *Handler) writeFreshResumeError(w http.ResponseWriter, what string, err 
 // freshResumeInProgressReason is the 409 reason of an owner write refused because a fresh resume
 // transfer owns the run's status, worker and claim generation.
 const freshResumeInProgressReason = "fresh_resume_in_progress"
+
+// refuseIfFreshResumeActive answers 409 fresh_resume_in_progress and reports true when the owner's run
+// has a pending or claimed fresh resume transfer. It is the explicit pre-read of the owner writers whose
+// SQL changes neither status, worker_id nor claim_generation (pause_mode, extend, set-token, policy
+// holds), which the guard trigger therefore never sees; a write that does change them is still refused
+// by the guard (writeFreshResumeInProgress), the backstop for the autocommit race. A run that is not the
+// caller's is left to the service's own 404, so the pre-read answers nothing about it.
+func (h *Handler) refuseIfFreshResumeActive(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID) bool {
+	if _, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: userID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false
+		}
+		slog.Error("fresh resume: owner write pre-read", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return true
+	}
+	if _, err := h.q.GetActiveFreshResumeForRun(r.Context(), runID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false
+		}
+		slog.Error("fresh resume: owner write pre-read", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return true
+	}
+	httpx.ErrorReason(w, http.StatusConflict, freshResumeInProgressReason, freshResumeInProgressReason)
+	return true
+}
 
 // writeFreshResumeInProgress answers 409 and reports true when err is the fresh resume guard refusing an
 // owner write (store.IsFreshResumeInProgress: SQLSTATE UZ416, rule 1) or the service's own in-progress

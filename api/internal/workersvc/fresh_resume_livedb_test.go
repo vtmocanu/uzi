@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -106,6 +107,14 @@ func newFreshFix(t *testing.T, gate bool, gen int64) *freshFix {
 		t.Fatal(err)
 	}
 	f.w2 = f.destination(user, capability.FreshResumeV1, capability.RecoveryInventoryV1)
+	// run_fresh_resumes.capture_id is ON DELETE RESTRICT: rows left behind would fail a later package
+	// test's unscoped DELETE FROM recovery_captures on the shared database. Several tests seed more
+	// than one run, so the cleanup is by owner.
+	t.Cleanup(func() {
+		if _, err := env.pool.Exec(context.Background(), `DELETE FROM run_fresh_resumes WHERE user_id=$1`, user); err != nil {
+			t.Errorf("cleanup run_fresh_resumes: %v", err)
+		}
+	})
 	return f
 }
 
@@ -831,16 +840,35 @@ func TestRefuseFreshResumeInTxLiveDB(t *testing.T) {
 			}
 			return
 		}
+		// Every column but the fences: the restored row must equal the pre-claim row.
+		stable := func() string {
+			var s string
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT (to_jsonb(r) - 'fresh_hold_version' - 'claim_generation' - 'updated_at'
+			    - 'codex_claim_epoch' - 'codex_cap_hash')::text FROM runs r WHERE r.id=$1`, f.run).Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}
+		preClaim := stable()
 		orig, _, _, v0 := read()
 		f.claimTo(res.Row.ID, 3)
 		if mid, _, _, _ := read(); mid.Status != "claimed" || mid.Worker.Bytes != f.w2 {
 			t.Fatalf("claimed run = %+v", mid)
 		}
+		// The claim advanced the codex epoch; a refusal must not roll it back.
+		f.env.exec(`UPDATE runs SET codex_claim_epoch = codex_claim_epoch + 7 WHERE id=$1`, f.run)
+		_, _, epochAfterClaim, _ := read()
 		out, err := f.refuse(res.Row.ID, "assembly_refused")
 		if err != nil || out != FreshRefusedRestored {
 			t.Fatalf("refuse: %v %v", out, err)
 		}
-		got, gen, _, v1 := read()
+		got, gen, epoch, v1 := read()
+		if post := stable(); post != preClaim {
+			t.Fatalf("run row not restored:\npre  %s\npost %s", preClaim, post)
+		}
+		if epoch != epochAfterClaim {
+			t.Fatalf("codex_claim_epoch = %d, want it kept at its post-claim %d", epoch, epochAfterClaim)
+		}
 		// paused-time credit is the only tuple field the claim legitimately advanced and the restore reverts it.
 		if got != orig {
 			t.Fatalf("tuple not restored:\norig %+v\ngot  %+v", orig, got)
@@ -893,6 +921,42 @@ func TestRefuseFreshResumeInTxLiveDB(t *testing.T) {
 		}
 		row := f.transfer(res.Row.ID)
 		if row.State != "refused" || row.RefusalReason.String != "run_moved" {
+			t.Fatalf("row = %+v", row)
+		}
+	})
+
+	t.Run("run moved to another worker at the same generation", func(t *testing.T) {
+		f := newFreshFix(t, true, 2)
+		f.capture(2, "available", freshSha('a'), nil, 2*time.Hour)
+		res, err := f.start(f.preview().SelectionToken, uuid.New())
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.claimTo(res.Row.ID, 3)
+		// worker_id moves to another worker while claim_generation stays at G'.
+		other := f.destination(f.user, capability.FreshResumeV1, capability.RecoveryInventoryV1)
+		moveTx, err := f.env.pool.Begin(f.env.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.New(moveTx).OptInFreshResume(f.env.ctx, res.Row.ID.String()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := moveTx.Exec(f.env.ctx, `UPDATE runs SET worker_id=$2 WHERE id=$1`, f.run, other); err != nil {
+			t.Fatal(err)
+		}
+		if err := moveTx.Commit(f.env.ctx); err != nil {
+			t.Fatal(err)
+		}
+		before, v := f.runJSON(), f.version()
+		out, err := f.refuse(res.Row.ID, "assembly_refused")
+		if err != nil || out != FreshRefusedRunMoved {
+			t.Fatalf("refuse: %v %v, want run_moved", out, err)
+		}
+		if f.runJSON() != before || f.version() != v {
+			t.Fatalf("run_moved wrote the run (version %d -> %d)", v, f.version())
+		}
+		if row := f.transfer(res.Row.ID); row.State != "refused" || row.RefusalReason.String != "run_moved" {
 			t.Fatalf("row = %+v", row)
 		}
 	})
@@ -985,6 +1049,223 @@ func TestFreshResumeAutocommitResumeRacesUncommittedStartLiveDB(t *testing.T) {
 	var status string
 	if err := f.env.pool.QueryRow(ctx, `SELECT status FROM runs WHERE id=$1`, f.run).Scan(&status); err != nil || status != "recovery_wait" {
 		t.Fatalf("run status = %q err=%v, want it still held", status, err)
+	}
+}
+
+// A chained run's only other eligible worker being the predecessor of its seeded transfer is no
+// destination: the guard refuses that worker as W2, so the count must not offer it.
+func TestFreshResumeDestinationExcludesSeededPredecessorLiveDB(t *testing.T) {
+	f := newFreshFix(t, true, 2)
+	f.capture(2, "available", freshSha('a'), nil, 2*time.Hour)
+	res, err := f.start(f.preview().SelectionToken, uuid.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.claimTo(res.Row.ID, 3) // W1 is the saved predecessor; the run is now W2's claim at generation 3
+	if _, err := f.env.q.MarkFreshResumeSeeded(f.env.ctx, store.MarkFreshResumeSeededParams{
+		ID: res.Row.ID, AttemptID: "20260101T000000Z-g3-0123456789abcdef",
+		WorkerID: pgtype.UUID{Bytes: f.w2, Valid: true}, ClaimGeneration: pgtype.Int8{Int64: 3, Valid: true}}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// W1 is otherwise fully eligible: hosted, capable, online, no open hold of the run.
+	f.env.exec(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL, released_at=now() WHERE run_id=$1`, f.run)
+	f.env.exec(`UPDATE workers SET kind='hosted', hosted_size='m', template_declared='base', protocol_capabilities=$2, last_heartbeat_at=now() WHERE id=$1`,
+		f.w1, []string{capability.FreshResumeV1, capability.RecoveryInventoryV1})
+	// The run is held again, bound to W2, so W2 is excluded as the current worker.
+	count := func() int64 {
+		n, err := f.env.q.CountFreshResumeDestinations(f.env.ctx, store.CountFreshResumeDestinationsParams{
+			RunID: f.run, UserID: f.user, HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count(); n != 0 {
+		t.Fatalf("destinations = %d, want 0: the seeded row's predecessor must not be offered", n)
+	}
+	// Control: a worker that is not the predecessor is counted alone.
+	f.destination(f.user, capability.FreshResumeV1, capability.RecoveryInventoryV1)
+	if n := count(); n != 1 {
+		t.Fatalf("destinations = %d, want exactly the unrelated worker", n)
+	}
+}
+
+// The headroom arm AdmissionCountedHolds+1 > limit decides alone: the run's own holds are few, but the
+// owner's counted units are at the limit.
+func TestFreshResumeCustodyLimitOwnerWideArmLiveDB(t *testing.T) {
+	f := newFreshFix(t, true, 2)
+	f.capture(2, "available", freshSha('a'), nil, 2*time.Hour) // one own hold
+	for i := 0; i < 2; i++ {
+		other := seedOutageRun(t, f.env, f.user, f.repo, f.w1, "recovery_wait", "issue", 1, 0)
+		f.env.exec(`INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id)
+		            VALUES($1,$2,$3,$4,1,'open',$5,'fresh-other',$5,$4)`, uuid.New(), f.user, f.repo, other, f.w1)
+	}
+	f.limit.n = 3
+	adm, err := f.env.q.GetCustodyAdmissionForRun(f.env.ctx, store.GetCustodyAdmissionForRunParams{
+		UserID: f.user, RunID: f.run, CustodyHoldLimit: 3, HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adm.AdmissionCountedHolds != 3 || adm.OwnOpenHolds+2 > 3 {
+		t.Fatalf("fixture: counted=%d own=%d, want counted 3 at the limit and the own-holds arm quiet", adm.AdmissionCountedHolds, adm.OwnOpenHolds)
+	}
+	dto := f.preview()
+	if dto.Status != apitypes.FreshResumeStatusCustodyLimit {
+		t.Fatalf("preview = %+v, want custody_limit from the owner-wide arm", dto)
+	}
+	_, err = f.start("anything", uuid.New())
+	wantRefusal(t, "start", err, apitypes.FreshResumeStatusCustodyLimit)
+	// One unit of room and the same run is admitted.
+	f.limit.n = 4
+	if got := f.preview().Status; got != apitypes.FreshResumeStatusAvailable {
+		t.Fatalf("limit 4 status = %q, want available", got)
+	}
+}
+
+// Two held runs of one owner with room for one more start: concurrent starts serialize on the owner
+// advisory lock, so exactly one succeeds and the other sees the first one's reservation. A blocker holds
+// both captures so each start has passed its headroom read before either can insert.
+func TestFreshResumeOwnerLockSerializesStartsLiveDB(t *testing.T) {
+	f := newFreshFix(t, true, 2)
+	capA := f.capture(2, "available", freshSha('a'), nil, 2*time.Hour)
+	runA := f.run
+	runB := seedOutageRun(t, f.env, f.user, f.repo, f.w1, "recovery_wait", "issue", 2, 0)
+	f.env.exec(`UPDATE runs SET recovery_wait_cause='worker_requeue_exhausted', claim_released_at=now(), released_worker_id=$2 WHERE id=$1`, runB, f.w1)
+	f.run = runB
+	capB := f.capture(2, "available", freshSha('b'), nil, 2*time.Hour)
+	tokB := f.preview().SelectionToken
+	f.run = runA
+	tokA := f.preview().SelectionToken
+	// Two own-run holds plus the two units: counted 2, so a limit of 3 admits one reservation, not two.
+	f.limit.n = 3
+	if tokA == "" || tokB == "" {
+		t.Fatal("no selection tokens")
+	}
+
+	ctx := f.env.ctx
+	blocker, err := f.env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx, `SELECT 1 FROM recovery_captures WHERE id = ANY($1) FOR UPDATE`, []uuid.UUID{capA, capB}); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 2)
+	for _, c := range []struct {
+		run uuid.UUID
+		tok string
+	}{{runA, tokA}, {runB, tokB}} {
+		go func() {
+			_, err := f.svc.StartFreshResume(ctx, f.user, c.run, c.tok, uuid.New())
+			errs <- err
+		}()
+	}
+	// Both starts are parked on a lock: one on the capture, the other on the capture (no owner lock) or
+	// on the owner advisory lock.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		if err := f.env.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+		    WHERE datname=current_database() AND pid <> pg_backend_pid() AND wait_event_type='Lock'
+		      AND (query LIKE '%FOR SHARE OF c%' OR query LIKE '%pg_advisory_xact_lock%')`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d starts parked on a lock", waiting)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ok, limited := 0, 0
+	for i := 0; i < 2; i++ {
+		err := <-errs
+		var refused *FreshResumeRefused
+		switch {
+		case err == nil:
+			ok++
+		case errors.As(err, &refused) && refused.Reason == apitypes.FreshResumeStatusCustodyLimit:
+			limited++
+		default:
+			t.Fatalf("start err = %v", err)
+		}
+	}
+	if ok != 1 || limited != 1 {
+		t.Fatalf("%d succeeded and %d were custody_limit, want exactly one of each", ok, limited)
+	}
+}
+
+type freshFailingBeginner struct{}
+
+func (freshFailingBeginner) Begin(context.Context) (pgx.Tx, error) {
+	return nil, errors.New("begin refused")
+}
+
+// ResumeWorkerRecoveryFresh declines every run kind a transfer row can never carry, so a cross_check
+// checker is never locked ahead of its parent lead; and with the gate off an unreadable outstanding-
+// transfer probe fails closed rather than taking the plain path past a possible pending row.
+func TestResumeWorkerRecoveryFreshKindAndFailClosedLiveDB(t *testing.T) {
+	f := newFreshFix(t, true, 2)
+	run, err := f.env.q.GetRunByIDForUser(f.env.ctx, store.GetRunByIDForUserParams{ID: f.run, UserID: f.user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker := run
+	checker.Kind = "cross_check"
+	if handled, err := f.svc.ResumeWorkerRecoveryFresh(f.env.ctx, f.user, checker, 36000); handled || err != nil {
+		t.Fatalf("cross_check with the gate on: handled=%v err=%v, want the plain path", handled, err)
+	}
+	var status string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT status FROM runs WHERE id=$1`, f.run).Scan(&status); err != nil || status != "recovery_wait" {
+		t.Fatalf("the declined kind wrote the run: status=%q err=%v", status, err)
+	}
+	if handled, err := f.svc.ResumeWorkerRecoveryFresh(f.env.ctx, f.user, run, 36000); !handled || err != nil {
+		t.Fatalf("issue run with the gate on: handled=%v err=%v, want the locked path", handled, err)
+	}
+
+	off := newFreshFix(t, false, 2)
+	offRun, err := off.env.q.GetRunByIDForUser(off.env.ctx, store.GetRunByIDForUserParams{ID: off.run, UserID: off.user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	off.svc.SetTxBeginner(freshFailingBeginner{})
+	handled, err := off.svc.ResumeWorkerRecoveryFresh(off.env.ctx, off.user, offRun, 36000)
+	if !handled || err == nil {
+		t.Fatalf("gate off, probe failed: handled=%v err=%v, want handled with the error", handled, err)
+	}
+}
+
+// Preview and start name the same status for a stamped tip at Ge on a run with no open hold: no_evidence.
+func TestFreshResumeHoldlessStampedTipStatusLiveDB(t *testing.T) {
+	f := newFreshFix(t, true, 2)
+	f.tip(freshSha('c'), 2)
+	f.fg.refs[f.ref()] = freshSha('c')
+	holdID := f.hold(2, f.w1)
+	dto := f.preview()
+	if dto.Status != apitypes.FreshResumeStatusAvailable || dto.Kind != apitypes.FreshResumeKindCheckpointRef {
+		t.Fatalf("baseline preview = %+v", dto)
+	}
+	f.env.exec(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL, released_at=now() WHERE id=$1`, holdID)
+	f.env.exec(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL, released_at=now() WHERE run_id=$1 AND state='open'`, f.run)
+	if got := f.preview().Status; got != apitypes.FreshResumeStatusNoEvidence {
+		t.Fatalf("preview = %q, want no_evidence", got)
+	}
+	_, err := f.start(dto.SelectionToken, uuid.New())
+	wantRefusal(t, "start", err, apitypes.FreshResumeStatusNoEvidence)
+	// The start's own re-check under the run lock (a hold that closes after the facts were read) agrees.
+	run, err := f.env.q.GetRunByIDForUser(f.env.ctx, store.GetRunByIDForUserParams{ID: f.run, UserID: f.user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason, err := f.svc.freshLockCandidate(f.env.ctx, f.env.q, run, freshSelection{
+		Ge: 2, Chosen: freshCandidate{kind: apitypes.FreshResumeKindCheckpointRef, ref: f.ref(), sha: freshSha('c')}})
+	if err != nil || reason != apitypes.FreshResumeStatusNoEvidence {
+		t.Fatalf("freshLockCandidate = %q, %v, want no_evidence", reason, err)
 	}
 }
 
