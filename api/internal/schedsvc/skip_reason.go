@@ -129,8 +129,9 @@ const (
 	// advancing (the fire starts no run and never falls back to a vendor credential or the other
 	// engine); a recurring row re-fires next cadence once the owner repairs the provider.
 	// provider_source_unusable ← ErrProviderSourceUnusable (retired, URL off the allowlist, key
-	// missing or disabled); provider_lane_unsupported ← ErrProviderLaneUnsupported (judge, job,
-	// cross-check or isolated run); provider_model_unmapped ← ErrProviderModelUnmapped;
+	// missing or disabled); provider_lane_unsupported ← ErrProviderLaneUnsupported (job,
+	// cross-check or isolated run, or a Codex judge for a Codex source; a Claude judge runs on the
+	// provider since PRD #4322 M1a); provider_model_unmapped ← ErrProviderModelUnmapped;
 	// provider_binding_stale / provider_destination_not_allowed ← the inherited-binding re-check;
 	// credential_override_provider_source ← ErrCredentialOverrideProviderSource (a stored
 	// credential override cannot ride a provider-sourced owner).
