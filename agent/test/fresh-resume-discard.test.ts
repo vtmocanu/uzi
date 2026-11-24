@@ -8,6 +8,7 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, parseAttemptLedgerEntry, type RetainedDiscardOptions, type RetainedHoldsSnapshot } from "../src/git.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import { freshJournalKey } from "../src/fresh-journal.js";
+import { RetainedSourceServer } from "../src/ops/retained-source-server.js";
 
 // issue #4628 m3-B: the guarded fresh discard. A fresh_unbound attempt (the server took the transfer back or refused it before any
 // seed) is retired by the ordinary guarded discard together with its refs/uzi-fresh/<frid> ref and its fresh journal; a
@@ -109,5 +110,62 @@ describe("the guarded fresh discard", () => {
     assert.equal(result.kind, "done");
     assert.equal(refExists(s.ref), true, "this attempt's capture ref is not the journal's: left alone");
     assert.notEqual(await cache.readFreshJournal(bare, BRANCH), undefined);
+  });
+});
+
+describe("RetainedSourceServer.readFreshNegative (N-6)", () => {
+  const negative = { state: "refused", seeded_at: null, destination_attempt_id: null, seeded_generation: null, current_authority: false };
+  type Evidence = { kind: string; ledgerState: string; barePath: string; branch: string; attempt: string; runId: string; generation?: number };
+  const evidenceFor = (s: Seeded, over: Partial<Evidence> = {}): Evidence =>
+    ({ kind: "attempt", ledgerState: "fresh_pending", barePath: bare, branch: BRANCH, attempt: s.attemptId, runId: RUN, generation: 7, ...over });
+
+  function serverWith(state: (runId: string, frid: string, generation: number) => Promise<unknown>) {
+    const calls: Array<{ runId: string; frid: string; generation: number }> = [];
+    const server = new RetainedSourceServer({
+      dataDir: fx.dataDir, git: cache, gate: undefined, isIdle: () => true, log: nullLogger(),
+      runner: {} as never,
+      client: {
+        listRecoveryHolds: async () => ({ run_id: RUN, holds: [] }), getRunOwnership: async () => ({ status: "completed", claim_generation: 1 }),
+        getFreshResumeState: async (runId: string, frid: string, generation: number) => { calls.push({ runId, frid, generation }); return state(runId, frid, generation); },
+      } as never,
+    });
+    const read = (ev: Evidence): Promise<ReadonlySet<string> | undefined> =>
+      (server as unknown as { readFreshNegative(ev: Evidence): Promise<ReadonlySet<string> | undefined> }).readFreshNegative(ev);
+    return { read, calls };
+  }
+
+  it("names the attempt when its own journal's transfer is negative, asking with the evidence's live generation", async () => {
+    const s = await seeded();
+    const { read, calls } = serverWith(async () => negative);
+    assert.deepEqual([...(await read(evidenceFor(s)))!], [s.attemptId]);
+    assert.deepEqual(calls, [{ runId: RUN, frid: s.frid, generation: 7 }]);
+  });
+
+  it("falls back to the journal's generation when the evidence carries none", async () => {
+    const s = await seeded();
+    const { read, calls } = serverWith(async () => negative);
+    const { generation: _omit, ...noGeneration } = evidenceFor(s);
+    assert.ok(await read(noGeneration));
+    assert.equal(calls[0]!.generation, GENERATION);
+  });
+
+  it("answers nothing, and asks nothing, for a journal that names another attempt or an attempt that is not fresh_pending", async () => {
+    const s = await seeded();
+    const { read, calls } = serverWith(async () => negative);
+    assert.equal(await read(evidenceFor(s, { attempt: mintAttemptId(GENERATION) })), undefined);
+    assert.equal(await read(evidenceFor(s, { ledgerState: "fresh_unbound" })), undefined);
+    assert.equal(await read(evidenceFor(s, { kind: "canonical" })), undefined);
+    assert.deepEqual(calls, [], "the state route is never asked for these");
+  });
+
+  it("is not negative for a non-negative answer, and fails closed when the state route throws", async () => {
+    const s = await seeded();
+    const claimed = serverWith(async () => ({ ...negative, state: "claimed" }));
+    assert.equal(await claimed.read(evidenceFor(s)), undefined);
+    const missing = serverWith(async () => null);
+    assert.equal(await missing.read(evidenceFor(s)), undefined);
+    const broken = serverWith(async () => { throw new Error("state route unavailable"); });
+    assert.equal(await broken.read(evidenceFor(s)), undefined);
+    assert.equal(broken.calls.length, 1);
   });
 });

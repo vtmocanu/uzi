@@ -9,7 +9,7 @@ import { parseAttemptLedgerEntry } from "../src/git.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import { quiesceRunAttempt, setQuiescenceViewForTests, type QuiesceRunOutcome, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { freshJournalKey, parseFreshJournal } from "../src/fresh-journal.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 import { HERMETIC_VIEW, restoreHermeticView } from "./setup/hermetic-proc.js";
 import { nullLogger } from "./helpers.js";
 
@@ -112,6 +112,25 @@ describe("a fresh resume claim on the destination flight", () => {
     assert.equal(parseAttemptLedgerEntry(config(`uzi-attempts.${branch}.entry`).at(-1)!)?.state, "fresh_pending");
     assert.equal(parseFreshJournal(config(freshJournalKey(branch)).at(-1)!).stage, "seeding");
     assert.equal(reported(claim.run_id).includes("failed"), false, "failed is never reported from a fresh stop");
+  });
+
+  it("N-7: a 200 receipt that names another attempt is not a receipt: no L4, no model, no abandon, never failed", async () => {
+    const sha = publishCheckpoint();
+    const { claim } = freshClaimFor(8109, sha);
+    const branch = "agent/issue-8109";
+    const real = client.reportFreshResumeSeeded.bind(client);
+    const patched = mock.method(client, "reportFreshResumeSeeded", async (...args: Parameters<typeof real>) => ({
+      ...(await real(...args)), destination_attempt_id: "20200101T000000Z-g3-0123456789abcdef" }));
+    try {
+      const { factory, started } = factoryFor(() => {});
+      await run(factory).execute(claim);
+      assert.equal(patched.mock.callCount(), 1);
+      assert.equal(started(), 0, "no model start on a mismatched receipt");
+      assert.deepEqual(config(`uzi-recovery.${branch}.clone`), [], "no L4");
+      assert.equal(parseFreshJournal(config(freshJournalKey(branch)).at(-1)!).stage, "seeding");
+      assert.equal(api.freshResumeCalls.some(c => c.route === "abandon"), false, "the server holds a seed: it is not abandoned");
+      assert.equal(reported(claim.run_id).includes("failed"), false);
+    } finally { patched.mock.restore(); }
   });
 
   it("a bare that already holds local state for the branch abandons with the claim generation, seeds nothing and reports no failure", async () => {

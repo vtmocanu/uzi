@@ -133,14 +133,40 @@ function ackParks(confirm: boolean): void {
 }
 
 describe("the crash rig: a process kill at each step of a fresh seed, then a restart", () => {
-  it("a kill after L0 (journal only): the restart stops nonterminally, asks nothing and writes nothing", async () => {
+  it("a kill after L0 (journal only) and the state route says nothing decisive (404): the restart stops nonterminally and writes nothing", async () => {
     const s = await scene(9101, "L0");
     const before = bareConfigBytes(s);
     const { factory, started } = factoryFor();
     await run(factory).execute(s.claim);
     assert.equal(started(), 0);
-    assert.equal(stateCalls().length, 0, "no ledger entry, so there is no attempt to ask about");
+    assert.equal(stateCalls().length, 1, "the journal's own transfer is asked about; there is no attempt to discard");
+    assert.equal(stateCalls()[0]!.frid, s.frid);
     assert.equal(bareConfigBytes(s), before, "the bare is byte-identical");
+    assert.equal(reported(s.runId).includes("failed"), false);
+  });
+
+  for (const state of ["refused", "cancelled"] as const) {
+    it(`N-2: a kill after L0 and the server says ${state} with no seed: the journal and its artifact ref are cleared and the claim goes on`, async () => {
+      const s = await scene(state === "refused" ? 9170 : 9171, "L0");
+      const ref = `refs/uzi-fresh/${s.frid}`;
+      sh(s.bare, ["update-ref", ref, s.sha]);
+      script(terminalReply(state));
+      const { factory, started } = factoryFor();
+      await run(factory).execute(s.claim);
+      assert.equal(freshStage(s), undefined, "the journal is cleared");
+      assert.throws(() => sh(s.bare, ["rev-parse", "--verify", "-q", ref]), "the artifact ref is gone");
+      assert.equal(stateCalls().length, 1);
+      assert.equal(started(), 1, "the ordinary path went on to start the model");
+    });
+  }
+
+  it("N-2: a kill after L0 and the server's row records a seed: the journal stays and the claim stops", async () => {
+    const s = await scene(9172, "L0");
+    script(terminalReply("cancelled", "2026-01-01T00:00:00Z"));
+    const { factory, started } = factoryFor();
+    await run(factory).execute(s.claim);
+    assert.equal(started(), 0);
+    assert.equal(freshStage(s), "seeding");
     assert.equal(reported(s.runId).includes("failed"), false);
   });
 
@@ -156,8 +182,8 @@ describe("the crash rig: a process kill at each step of a fresh seed, then a res
     assert.equal(stateCalls()[0]!.frid, s.frid);
     assert.equal(stateCalls()[0]!.query.live_generation, String(RESTART_GENERATION), "asked with this claim's generation");
     assert.equal(started(), 1, "the unbound attempt is set aside and the ordinary claim goes on to start the model");
-    assert.equal(parseAttemptLedgerEntry(cfg(s, `uzi-attempts.${s.branch}.entry`).at(-1) ?? "")?.attemptId === s.attemptId ||
-      cfg(s, `uzi-attempts.${s.branch}.entry`).length > 1, true);
+    const entries = cfg(s, `uzi-attempts.${s.branch}.entry`).map(v => parseAttemptLedgerEntry(v)!);
+    assert.equal(entries.filter(e => e.attemptId === s.attemptId).at(-1)?.state, "fresh_unbound", "A's last entry stays fresh_unbound");
   });
 
   it("a kill during L2 (a partial clone, server still claimed): not decisive, so a stop; A stays pending and the clone is untouched", async () => {
@@ -198,7 +224,52 @@ describe("the crash rig: a process kill at each step of a fresh seed, then a res
     await run(again.factory).execute(gitlabClaim(9105, { claim_generation: RESTART_GENERATION + 1, run_id: s.runId } as never));
     assert.deepEqual([recoveryJournal(s), cfg(s, `uzi-attempts.${s.branch}.entry`).slice(0, journalsBefore[1]!.length), cfg(s, freshJournalKey(s.branch))],
       journalsBefore, "L0 to L4 are not rewritten by a later claim");
-    assert.ok(stateCalls().length >= 2, "each claim asked the server");
+    assert.equal(stateCalls().length, 1, "only the first claim (journal seeding) asked the server; a ready journal is decided locally");
+  });
+
+  it("B-1: after L4, A retired and its path gone and compacted away, a later claim still starts and asks the server nothing", async () => {
+    const s = await scene(9107, "L2");
+    // L4 exactly as the receipt commit writes it, without a flight that would go on to fail and retain the clone for recovery.
+    await git.commitFreshReceipt({ barePath: s.bare, branch: s.branch, runId: s.runId, clonePath: s.clonePath, attemptId: s.attemptId,
+      frid: s.frid, generation: SEED_GENERATION, sha: s.sha });
+    assert.equal(freshStage(s), "ready");
+    const ref = `refs/uzi-fresh/${s.frid}`;
+    sh(s.bare, ["update-ref", ref, s.sha]);
+    const asked = stateCalls().length;
+    // The attempt's run leaves it: retired, path removed. Leaving `live` ends the transfer, so the journal and its ref go with it.
+    await git.retireRunnerClone(s.bare, s.clonePath, s.branch, s.runId, { discard: true, attemptId: s.attemptId });
+    assert.equal(fs.existsSync(s.clonePath), false);
+    assert.equal(ledgerState(s), "retired");
+    assert.equal(freshStage(s), undefined, "the retire cleared the ready journal");
+    assert.throws(() => sh(s.bare, ["rev-parse", "--verify", "-q", ref]), "and its artifact ref");
+    // Two later claims (the first compacts A out of the ledger through its ordinary seed): neither stops or asks.
+    for (const generation of [RESTART_GENERATION + 1, RESTART_GENERATION + 2]) {
+      const next = factoryFor();
+      await run(next.factory).execute(gitlabClaim(9107, { claim_generation: generation, run_id: s.runId } as never));
+      assert.equal(next.started(), 1, `claim at generation ${generation} starts the model`);
+    }
+    assert.equal(stateCalls().length, asked, "no state-route call for a ready or cleared journal");
+  });
+
+  it("B-1: a ready journal whose attempt left the ledger (retired by a path that never cleared it) is cleared by compaction", async () => {
+    const s = await scene(9108, "L2");
+    script(seededReply(s));
+    await run(factoryFor().factory).execute(s.claim);
+    assert.equal(freshStage(s), "ready");
+    const ref = `refs/uzi-fresh/${s.frid}`;
+    sh(s.bare, ["update-ref", ref, s.sha]);
+    // Retired behind the journal's back, then the path goes: the next ordinary seed's compaction drops A's entry.
+    sh(s.bare, ["config", "--local", "--add", `uzi-attempts.${s.branch}.entry`,
+      JSON.stringify({ attemptId: s.attemptId, runId: s.runId, clonePath: s.clonePath, state: "retired" })]);
+    sh(s.bare, ["config", "--local", `uzi-recovery.${s.branch}.clone`, ""]);
+    fs.rmSync(s.clonePath, { recursive: true, force: true });
+    const asked = stateCalls().length;
+    const next = factoryFor();
+    await run(next.factory).execute(gitlabClaim(9108, { claim_generation: RESTART_GENERATION + 1, run_id: s.runId } as never));
+    assert.equal(next.started(), 1);
+    assert.equal(freshStage(s), undefined, "the journal of a gone attempt is cleared");
+    assert.throws(() => sh(s.bare, ["rev-parse", "--verify", "-q", ref]));
+    assert.equal(stateCalls().length, asked);
   });
 
   it("a kill between link and rename inside the L4 rewrite: the stale config.lock is never removed and never retried; the stop takes the hold", async () => {
@@ -390,6 +461,7 @@ describe("F1: the proofs the destination must never skip", () => {
     assert.deepEqual(ids(differing), [differing.attemptId], "no other attempt id was minted");
 
     const missing = await scene(9162, "L2");
+    script({ status: 404, body: { error: "fresh resume transfer not found", reason: "fresh_resume_not_found" } });
     const b = factoryFor();
     await run(b.factory).execute(missing.claim);
     assert.equal(b.started(), 0);

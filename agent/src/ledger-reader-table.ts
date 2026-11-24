@@ -101,11 +101,17 @@ export const LEDGER_READER_TABLE: readonly LedgerReaderRow[] = [
   { caller: "src/git.ts#classifyOwnerClonePathFromSnapshot", role: "consumer", disposition: "set_aside",
     note: "identity only (run id and path); the orphan reclaim that follows still refuses a path a journal names" },
   { caller: "src/git.ts#evaluateRetained", role: "consumer", disposition: "kept",
-    note: "a fresh attempt adds the ledger_fresh blocker, so the ordinary discard never retires it" },
+    note: "a fresh_pending attempt adds the ledger_fresh blocker unless its id is named in freshTransferNegative (the guarded fresh " +
+      "discard); fresh_unbound is already proven negative and adds none, so it is the one fresh state an ordinary discard may retire" },
   { caller: "src/git.ts#discardRetainedSource", role: "consumer", disposition: "kept",
     note: "retires any non-retired entry; reachable for a fresh entry only once evaluateRetained has no blocker, i.e. through the guarded fresh discard" },
   { caller: "src/terminal-inventory.ts#readTerminalSourceUniverse", role: "consumer", disposition: "kept",
     note: "a state other than retired or abandoned whose clone vanished refuses the universe (fail closed), so a fresh attempt is never silently dropped" },
+  { caller: "src/runner.ts#freshResumeDiscovery", role: "consumer", disposition: "set_aside",
+    note: "a ready journal is decided locally and sets the ledger aside; a seeding journal reads A's entry: fresh_unbound is set aside, " +
+      "fresh_pending is reconciled with the server's answer, and a missing entry is cleared only on a proven negative" },
+  { caller: "src/ops/retained-source-server.ts#readFreshNegative", role: "consumer", disposition: "kept",
+    note: "asks the server about a fresh_pending attempt's own journal transfer only; any other state or failure leaves the attempt blocked" },
   { caller: "src/pod-epoch-run-retention.ts#judgeRetainedEvidence", role: "consumer", disposition: "kept",
     note: "a fresh state keeps the run's retention active (ledger_fresh_pending, ledger_fresh_unbound)" },
   { caller: "src/pod-epoch-reclaim.ts#journalShape", role: "consumer", disposition: "kept",

@@ -124,7 +124,8 @@ export async function abandonFresh(deps: FreshDeps, runId: string, fr: FreshResu
 }
 
 /** Preemption: a fresh claim skips retained discovery, and abandons when the bare holds any attribution for the branch. A bare
- *  that does not exist yet holds none. Throws {@link FreshAbandoned}`("local_state_present")` after the abandon. */
+ *  that does not exist yet holds none. Throws {@link FreshAbandoned} after the abandon: `local_state_present` when the bare holds
+ *  local state, `local_state_unreadable` when it cannot be read (an unreadable bare cannot prove it is clear). */
 export async function preemptFresh(deps: FreshDeps, p: {
   runId: string; fr: FreshResumeClaim; generation: number; barePath: string; branch: string; cachePresent: boolean; outcome?: FreshAbandonOutcome;
 }): Promise<void> {

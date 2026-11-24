@@ -19166,7 +19166,7 @@ export class GitCache {
 
       // Read-only, for both artifact kinds: nothing is written while a deletion on this bare is still unresolved.
       step = "bare_clear";
-      await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("authority_refused", err));
+      await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("bare_not_clear", err));
       step = "L0";
       const journal: FreshJournal = { frid: input.frid, attemptId: aId, generation: input.generation, sha: artifact.artifactSha, stage: "seeding" };
       await this.freshConfigWrite(barePath, [freshJournalKey(branch), freshJournalJson(journal)]);
@@ -19223,8 +19223,12 @@ export class GitCache {
 
   /** issue #4628: A's ledger entry `fresh_pending` to `fresh_unbound`: its seed did not reach the receipt commit. Only a pending
    *  entry of this run moves; anything else (including an already live attempt) is left as it is. One write under the bare lock. */
-  markFreshUnbound(input: { barePath: string; branch: string; key: string; runId: string; attemptId: string }): Promise<boolean> {
+  markFreshUnbound(input: { barePath: string; branch: string; key: string; runId: string; attemptId: string; expectedJournal?: FreshJournal }): Promise<boolean> {
     return this.withLock(input.barePath, async () => {
+      // The journal must still name this attempt (and be exactly `expectedJournal` when the caller read one), checked in this section.
+      const journal = this.readFreshJournalUnderLock(await this.configEntries(input.barePath), input.branch);
+      if (journal?.attemptId !== input.attemptId) return false;
+      if (input.expectedJournal !== undefined && freshJournalJson(journal) !== freshJournalJson(input.expectedJournal)) return false;
       const entry = (await this.readAttemptLedger(input.barePath, input.branch)).get(input.attemptId);
       if (entry?.state !== "fresh_pending" || entry.runId !== input.runId) return false;
       await this.freshConfigWrite(input.barePath, ["--add", attemptLedgerKey(input.branch), attemptLedgerValue({ ...entry, state: "fresh_unbound" })]);
@@ -19357,6 +19361,42 @@ export class GitCache {
    *  every caller already holds the bare lock. The field order is the documented contract. */
   private async appendAttemptLedger(barePath: string, branch: string, entry: AttemptLedgerEntry): Promise<void> {
     await this.runGit(barePath, ["config", "--local", "--add", attemptLedgerKey(branch), attemptLedgerValue(entry)]);
+    // issue #4628: an attempt that leaves `live` ends the transfer its ready fresh journal records.
+    if (entry.state === "retired" || entry.state === "reclaimed") await this.clearReadyFreshJournal(barePath, branch, entry.attemptId);
+  }
+
+  /** issue #4628: under the caller's bare lock, clear the branch's fresh journal and its `refs/uzi-fresh/<frid>` ref when it is
+   *  `ready` and `shouldClear` accepts it. Best effort: a failure is logged and leaves the journal (it is cleared by a later call). */
+  private async clearReadyFreshJournalIf(barePath: string, branch: string, shouldClear: (journal: FreshJournal) => boolean): Promise<void> {
+    try {
+      const journal = this.readFreshJournalUnderLock(await this.configEntries(barePath), branch);
+      if (journal === undefined || journal.stage !== "ready" || !shouldClear(journal)) return;
+      await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-fresh/${journal.frid}`]);
+      await this.freshConfigWrite(barePath, [freshJournalKey(branch), ""]);
+    } catch (err) {
+      this.log.warn("a ready fresh journal could not be cleared; it stays", { branch, error: gitErrorMessage(err) });
+    }
+  }
+
+  private clearReadyFreshJournal(barePath: string, branch: string, attemptId: string): Promise<void> {
+    return this.clearReadyFreshJournalIf(barePath, branch, journal => journal.attemptId === attemptId);
+  }
+
+  private clearGoneReadyFreshJournal(barePath: string, branch: string, keptLedgerValues: readonly string[]): Promise<void> {
+    return this.clearReadyFreshJournalIf(barePath, branch, journal => !keptLedgerValues.some(v => v.includes(journal.attemptId)));
+  }
+
+  /** issue #4628: clear the branch's fresh journal and its artifact ref under one bare lock, only while the journal is still exactly
+   *  `expected` (compared by its canonical JSON). Returns whether it cleared. Used when the server proved a never-seeded transfer
+   *  that left no ledger entry (a crash between L0 and L1). */
+  clearFreshJournal(barePath: string, branch: string, expected: FreshJournal): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      const journal = this.readFreshJournalUnderLock(await this.configEntries(barePath), branch);
+      if (journal === undefined || freshJournalJson(journal) !== freshJournalJson(expected)) return false;
+      await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-fresh/${journal.frid}`]);
+      await this.freshConfigWrite(barePath, [freshJournalKey(branch), ""]);
+      return true;
+    });
   }
 
   /**
@@ -19496,8 +19536,9 @@ export class GitCache {
           (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId))) && !isFreshLedgerState(e.state);
         if (!droppable) kept.push(attemptLedgerValue(e));
       }
-      if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
-      await this.rewriteLedgerAtomically(barePath, key, kept);
+      if (!(kept.length === raw.length && kept.every((v, i) => v === raw[i]))) await this.rewriteLedgerAtomically(barePath, key, kept);
+      // issue #4628: a ready fresh journal whose attempt is no longer in the ledger names nothing: clear it with its artifact ref.
+      await this.clearGoneReadyFreshJournal(barePath, branch, kept);
     } catch (err) {
       this.checkRecoveryInterruption();
       this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });

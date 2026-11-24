@@ -31729,6 +31729,9 @@ export class RunRunner {
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
       await this.bindFlightSource(flight, runnerClone.path);
+      // A 200 is not enough: the server's row must name this A and G' as seeded, else nothing here is confirmed (no L4, no start).
+      const receiptOutcome = classifyFreshState({ attemptId, generation }, result.receipt);
+      if (receiptOutcome.kind !== "positive") throw new FreshUnresolved(`receipt_${receiptOutcome.reason}`);
       if (!result.receipt.current_authority) throw new FreshNoAuthority(result.receipt);
     } catch (error) {
       this.keepFreshCustody(flight);
@@ -31766,10 +31769,13 @@ export class RunRunner {
   /**
    * issue #4628: restart reconciliation and Proof A for a run whose branch carries a fresh journal (L0). The journal is read first,
    * the server's state route is asked OUTSIDE every lock, and only then does the worker act, rechecking the journal's digest:
-   *   positive (`seeded` for this A and G')   L4 runs if it has not (only with current authority, and only while the slot is not
+   *   ready journal (L4 landed)   decided locally and never asked about: L4 follows only a positive receipt with authority, so the
+   *       ordinary same-worker path goes on and the flight's own running ACK fences authority.
+   *   positive (`seeded` for this A and G')   L4 runs (only with current authority, and only while the slot is not
    *       foreign-active); a foreign-active slot (a hard restart), an end of source use that was kept, or a stale `config.lock` stops
    *       and takes the owner hold through {@link holdFreshResumeRetained}. Otherwise the ordinary discovery goes on.
-   *   negative (`refused`/`cancelled`, never seeded)   A is marked `fresh_unbound`: never adopted, kept for the guarded discard.
+   *   negative (`refused`/`cancelled`, never seeded)   A is marked `fresh_unbound`: never adopted, kept for the guarded discard. With
+   *       no ledger entry at all (a crash between L0 and L1) the journal and its artifact ref are cleared instead.
    *   anything else (404, a differing A, an unavailable or malformed reply, an unknown state)   a nonterminal stop, custody kept,
    *       and never `fresh_unbound`.
    */
@@ -31781,6 +31787,10 @@ export class RunRunner {
     };
     const journal = await readJournal();
     if (journal === undefined) return;
+    // A ready journal was written by L4, which lands only after a positive receipt with current authority: it is decided locally.
+    // It asks the server nothing and needs no fresh ledger entry (A is live, or retired and gone); the ordinary same-worker path
+    // goes on, and the live flight's own running ACK fences authority.
+    if (journal.stage === "ready") return;
     const generation = claim.claim_generation;
     if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0)
       throw this.freshStop(flight, new FreshUnresolved("no_claim_generation"));
@@ -31788,7 +31798,7 @@ export class RunRunner {
       .catch((error: unknown) => { throw this.freshStop(flight, new FreshUnresolved("ledger_unreadable", { cause: error })); });
     // An attempt already proven unbound needs no further question; every later claim sets it aside.
     if (entry?.state === "fresh_unbound") return;
-    if (entry === undefined || entry.runId !== flight.runId) throw this.freshStop(flight, new FreshUnresolved("ledger_missing"));
+    if (entry !== undefined && entry.runId !== flight.runId) throw this.freshStop(flight, new FreshUnresolved("ledger_missing"));
     let state: FreshResumeState | null;
     try {
       state = await this.client.getFreshResumeState(flight.runId, journal.frid, generation, this.retainedLifecycleSignal(flight));
@@ -31801,10 +31811,20 @@ export class RunRunner {
     // The locks are taken only now: the journal must still be the one the answer was asked about.
     const again = await readJournal();
     if (again === undefined || freshJournalJson(again) !== freshJournalJson(journal)) throw this.freshStop(flight, new FreshUnresolved("journal_changed"));
+    if (entry === undefined) {
+      // L0 without L1 (a crash between them, or a failed L1 write): there is no attempt to discard. Only the server's proof that the
+      // transfer was never seeded frees the branch; anything else stops, nonterminally.
+      if (outcome.kind !== "negative") throw this.freshStop(flight, new FreshUnresolved("ledger_missing"));
+      const cleared = await this.git.clearFreshJournal(barePath, branch, journal)
+        .catch((error: unknown) => { throw this.freshStop(flight, new FreshUnresolved("unbind_failed", { cause: error })); });
+      if (!cleared) throw this.freshStop(flight, new FreshUnresolved("journal_changed"));
+      flight.runLog.warn("fresh resume transfer was never seeded and left no attempt; its journal is cleared", { transfer: journal.frid, server_state: outcome.reason });
+      return;
+    }
     if (outcome.kind === "stop") throw this.freshStop(flight, new FreshUnresolved(outcome.reason));
     if (outcome.kind === "negative") {
-      if (journal.stage !== "seeding" || entry.state !== "fresh_pending") throw this.freshStop(flight, new FreshUnresolved("negative_after_commit"));
-      await this.git.markFreshUnbound({ barePath, branch, key, runId: flight.runId, attemptId: journal.attemptId })
+      if (entry.state !== "fresh_pending") throw this.freshStop(flight, new FreshUnresolved("negative_after_commit"));
+      await this.git.markFreshUnbound({ barePath, branch, key, runId: flight.runId, attemptId: journal.attemptId, expectedJournal: journal })
         .catch((error: unknown) => { throw this.freshStop(flight, new FreshUnresolved("unbind_failed", { cause: error })); });
       flight.runLog.warn("fresh resume transfer was never seeded; the destination attempt is unbound", { transfer: journal.frid, server_state: outcome.reason });
       return;
@@ -31825,17 +31845,15 @@ export class RunRunner {
       }
     }
     if (slotHold !== undefined) return this.holdFreshResumeRetained(claim, flight, slotHold);
-    if (journal.stage === "seeding") {
-      if (!receipt.current_authority) throw this.freshStop(flight, new FreshNoAuthority(receipt));
-      try {
-        await commitFreshReceipt({ git: this.git }, receipt, { barePath, branch, runId: flight.runId, clonePath: entry.clonePath,
-          attemptId: journal.attemptId, frid: journal.frid, generation: journal.generation, sha: journal.sha });
-        flight.runLog.info("fresh resume receipt committed on restart", { transfer: journal.frid, attempt: journal.attemptId });
-      } catch (error) {
-        this.retainedLifecycleGuard(flight);
-        if (error instanceof FreshConfigLockedError) return this.holdFreshResumeRetained(claim, flight, "config_locked");
-        throw this.freshStop(flight, error);
-      }
+    if (!receipt.current_authority) throw this.freshStop(flight, new FreshNoAuthority(receipt));
+    try {
+      await commitFreshReceipt({ git: this.git }, receipt, { barePath, branch, runId: flight.runId, clonePath: entry.clonePath,
+        attemptId: journal.attemptId, frid: journal.frid, generation: journal.generation, sha: journal.sha });
+      flight.runLog.info("fresh resume receipt committed on restart", { transfer: journal.frid, attempt: journal.attemptId });
+    } catch (error) {
+      this.retainedLifecycleGuard(flight);
+      if (error instanceof FreshConfigLockedError) return this.holdFreshResumeRetained(claim, flight, "config_locked");
+      throw this.freshStop(flight, error);
     }
   }
 
