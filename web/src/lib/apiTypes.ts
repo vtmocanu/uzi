@@ -6647,6 +6647,9 @@ export interface RecoveryCustodyAggregate {
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;
+  // #4628: how many admission units are fresh-resume reservations rather than holds; the
+  // per-hold counted flags plus this sum to admission_counted_holds. Optional for older servers.
+  fresh_reserved_units?: number;
 }
 
 // HeldPublication is one held-work publication of a failed run (issue #2545), mirroring

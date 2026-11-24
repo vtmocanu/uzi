@@ -48,8 +48,11 @@ LIMIT @row_limit::int;
 -- worker_recovery_episode is untouched: ADR-1197's grant and high-water mark are kept, and
 -- codex_cap_hash / codex_claim_epoch stay monotonic for ClaimRun). Requires the opt-in for this row.
 WITH cur AS MATERIALIZED (
+    -- FOR UPDATE: lock the run before the transfer row (run -> transfer, the order every other
+    -- transfer writer uses), and read the saved tuple from the post-lock row version.
     SELECT r.* FROM runs r
     WHERE r.id = @run_id AND r.status = 'recovery_wait'
+    FOR UPDATE
 ), saved AS (
     UPDATE run_fresh_resumes t SET
         saved_worker_id = cur.worker_id,

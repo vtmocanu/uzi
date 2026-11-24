@@ -100,3 +100,34 @@ func TestDiscardForeignCaptureReportsFalseLiveDB(t *testing.T) {
 		t.Fatalf("Discard of an absent capture: ok=%v err=%v", ok, err)
 	}
 }
+
+// m1 review B1: a pending fresh-resume reservation counts one admission unit that matches no hold row.
+// The owner list surfaces it as FreshReservedUnits, so the per-hold counted flags plus that field
+// still sum to AdmissionCountedHolds.
+func TestListHoldsSurfacesFreshReservationUnitsLiveDB(t *testing.T) {
+	e := newInventoryEnv(t)
+	sum := func() (flags, reserved, total int) {
+		t.Helper()
+		dto, err := e.svc.ListHoldsForOwner(e.ctx, e.w.UserID, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range dto.Holds {
+			if h.CountsTowardAdmission != nil && *h.CountsTowardAdmission {
+				flags++
+			}
+		}
+		return flags, dto.Aggregate.FreshReservedUnits, dto.Aggregate.AdmissionCountedHolds
+	}
+	f0, r0, t0 := sum()
+	if r0 != 0 || f0 != t0 {
+		t.Fatalf("before any transfer: flags=%d reserved=%d total=%d", f0, r0, t0)
+	}
+	e.exec(`INSERT INTO run_fresh_resumes (run_id, user_id, request_id, evidence_generation, evidence_kind, checkpoint_ref, sha, candidate_token)
+ VALUES ($1,$2,$3,1,'checkpoint_ref','refs/uzi-checkpoints/x','aaaa1111','tok')`, e.run, e.w.UserID, uuid.New())
+	t.Cleanup(func() { e.exec("DELETE FROM run_fresh_resumes WHERE run_id=$1", e.run) })
+	f1, r1, t1 := sum()
+	if r1 != 1 || t1 != t0+1 || f1+r1 != t1 {
+		t.Fatalf("with a pending transfer: flags=%d reserved=%d total=%d (before total %d)", f1, r1, t1, t0)
+	}
+}

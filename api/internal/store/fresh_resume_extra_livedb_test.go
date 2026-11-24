@@ -395,3 +395,53 @@ func TestFreshResumeOldClaimRunPredecessorLiveDB(t *testing.T) {
 		}
 	})
 }
+
+// DBA m1 R1: the fresh claim (only_run_id) of a run with no open hold of its own is not charged its
+// own pending reservation by ClaimRun's owner-count arm; any other reservation still counts.
+func TestFreshResumeClaimNotChargedOwnReservationLiveDB(t *testing.T) {
+	setup := func(t *testing.T) (*freshFx, uuid.UUID, uuid.UUID) {
+		f := newFreshFx(t)
+		f.exec(`UPDATE runs SET status = 'cancelled' WHERE id = $1`, f.queued)
+		w2 := f.newWorker()
+		f.exec(`UPDATE workers SET status = 'online', last_heartbeat_at = now() WHERE id = $1`, w2)
+		run := f.run("queued", uuid.Nil, 3)
+		return f, w2, run
+	}
+	claim := func(f *freshFx, w2, run uuid.UUID, optIn uuid.UUID) error {
+		tx, q := f.claimPreamble(w2)
+		if optIn != uuid.Nil {
+			if err := q.OptInFreshResume(f.ctx, optIn.String()); err != nil {
+				f.t.Fatal(err)
+			}
+		}
+		p := claimParamsFor(w2, f.owner)
+		p.OnlyRunID = pgtype.UUID{Bytes: run, Valid: true}
+		p.CustodyHoldLimit = 1
+		got, err := q.ClaimRun(f.ctx, p)
+		if err == nil && got.ID != run {
+			f.t.Fatalf("claimed %v, want %v", got.ID, run)
+		}
+		_ = tx.Rollback(f.ctx)
+		return err
+	}
+
+	t.Run("own pending reservation at the limit claims", func(t *testing.T) {
+		f, w2, run := setup(t)
+		tid := f.transfer(run, "pending", uuid.Nil, 0)
+		if n := f.count(pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true}); n != 1 {
+			t.Fatalf("admission count = %d, want 1 (the run's own reservation)", n)
+		}
+		if err := claim(f, w2, run, tid); err != nil {
+			t.Fatalf("fresh claim charged its own reservation: %v", err)
+		}
+	})
+
+	t.Run("another run's reservation at the limit refuses", func(t *testing.T) {
+		f, w2, run := setup(t)
+		other := f.run("recovery_wait", uuid.Nil, 2)
+		f.transfer(other, "pending", uuid.Nil, 0)
+		if err := claim(f, w2, run, uuid.Nil); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("claim over the limit: want no row, got %v", err)
+		}
+	})
+}

@@ -36,9 +36,12 @@ const maxPrerequisiteShas = 64
 var ErrAmbiguous = errors.New("recovery: ambiguous open custody generation")
 
 // ErrCaptureInFreshResume: a pending or claimed fresh-resume transfer references the capture, so
-// its bytes may not be discarded (#4628). The handler should answer 409; it currently maps any
-// Discard error to 500 and is outside the store-layer milestone that added this sentinel.
+// its bytes may not be discarded (#4628). The handler answers 409 fresh_resume_in_progress.
 var ErrCaptureInFreshResume = errors.New("recovery: capture is referenced by a fresh resume transfer")
+
+// freshReservationReason is the admission-member reason fn_custody_admission_members (migration
+// 00523) gives each synthetic fresh-resume reservation row.
+const freshReservationReason = "fresh_reservation"
 
 // ── Worker-facing operations (D2/D6/D7). Each enforces the ORIGINAL worker identity and
 // an OPEN hold; none mutates run state or retargets another owner/repo/run. ──────────────
@@ -1006,7 +1009,8 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		agg     store.GetCustodyAggregateForOwnerRow
 	)
 	// Issue #2970: the list, the per-hold membership and the aggregate are read from one
-	// snapshot with one cutoff, so the per-hold flags always sum to AdmissionCountedHolds.
+	// snapshot with one cutoff, so the per-hold flags plus FreshReservedUnits (#4628: the synthetic
+	// fresh_reservation members, which match no hold row) always sum to AdmissionCountedHolds.
 	err = s.ownerRead(ctx, func(q Store) error {
 		var err error
 		if rows, err = q.ListCustodyHoldsForOwner(ctx, params); err != nil {
@@ -1029,7 +1033,14 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		return apitypes.RecoveryCustodyHoldsDTO{}, err
 	}
 	memberByHold := make(map[uuid.UUID]store.ListCustodyAdmissionMembersForOwnerRow, len(members))
+	freshReserved := 0
 	for _, m := range members {
+		if m.Reason == freshReservationReason {
+			if m.Counted {
+				freshReserved++
+			}
+			continue
+		}
 		memberByHold[m.HoldID] = m
 	}
 	holds := make([]apitypes.RecoveryCustodyHoldDTO, 0, len(rows))
@@ -1061,6 +1072,7 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 			CustodyHoldLimit:      int(custodyLimit),
 			DecisionNeeded:        decisionNeeded,
 			BlockedRuns:           int(agg.BlockedRuns),
+			FreshReservedUnits:    freshReserved,
 		},
 		Holds: holds,
 	}, nil
