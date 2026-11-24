@@ -78,6 +78,19 @@
 #      renumber with land-prep.sh, then require fresh exact-head CI and review
 #  14  active mr_rework on this MR or ci_fix on its branch — wait, or cancel and
 #      confirm terminal state and inspect preserved work before retrying
+#  15  CHANGELOG_FRAGMENTS_UNCITED (vtmocanu/uzi into main): the PR adds two or more
+#      changelog.d/<uuid>.md fragments and no added fragment's headline (the "- **" line)
+#      cites this PR number or a same-repo issue the merge closes (the CLOSES= set). Whole
+#      references only: "#N", "owner/repo#N" for this repo; another repo's, "#N" followed by
+#      a word byte (#420, #42x) or attached to a word (abc#42) never count. Add the PR
+#      number to one headline, e.g. (#4626, #4649). 0 or 1 fragment is not checked.
+#      Also exit 2 for that check: fragment list or blob unreadable, incomplete closing
+#      metadata (no commits, null message, repository-less reference, null page), or a
+#      non-numeric PR. A baseRefName that is not a string reads as no base (exit 2 at the
+#      required-checks read). Residual gap: the closing set accepts commit-message keyword
+#      forms (e.g. "Fixes: #12") that the release oracle's body grammar rejects, and a PR
+#      number citation satisfies the oracle only when it recognises the PR as the released
+#      commit's identity (default squash subject "(#PR)").
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -125,7 +138,7 @@ case "${REPO#*/}" in .|..|*.git) echo 'repository name must not be a dot path or
 pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,headRefName,mergeStateStatus,mergeable,mergeCommit,baseRefName 2>/dev/null) || { echo "gh pr view failed" >&2; exit 3; }
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
 ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -r .mergeable)
-base=$(printf '%s' "$pj" | jq -r '.baseRefName // empty')
+base=$(printf '%s' "$pj" | jq -r 'if (.baseRefName|type) == "string" then .baseRefName else empty end')
 
 # The terminal evidence contract, from the ONE place that knows the true merge SHA: print
 # MERGED + MERGE_SHA, append the trail's merge line (trail.sh dedupes an identical last line),
@@ -200,15 +213,21 @@ fi
 # case-insensitive, optional colon, then #N or OWNER/REPO#N. A same-repo reference prints as
 # N; another repo's keeps its OWNER/REPO#N identity. Commits come from the paginated REST list
 # and must number exactly the PR's commit count (REST lists at most 250), or the read fails.
-closes_read() {
-  local meta n pages
-  meta=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences,title 2>/dev/null) || return 1
-  n=$(gh api "repos/$REPO/pulls/$PR" --jq .commits 2>/dev/null) || return 1
-  pages=$(gh api "repos/$REPO/pulls/$PR/commits?per_page=100" --paginate --slurp 2>/dev/null) || return 1
-  { printf '%s\n' "$meta"; printf '%s\n' "$n"; printf '%s\n' "$pages"; } | jq -ser --arg repo "$REPO" '
+# The three reads happen exactly once (closes_fetch) into CR_*; closes_compute and the
+# changelog fragment guard's closes_strict both work over those same captured strings, so
+# no later check can see a different forge answer.
+CR_META=""; CR_N=""; CR_PAGES=""
+closes_fetch() {
+  CR_META=$(gh pr view "$PR" --repo "$REPO" --json closingIssuesReferences,title 2>/dev/null) || return 1
+  CR_N=$(gh api "repos/$REPO/pulls/$PR" --jq .commits 2>/dev/null) || return 1
+  CR_PAGES=$(gh api "repos/$REPO/pulls/$PR/commits?per_page=100" --paginate --slurp 2>/dev/null) || return 1
+}
+CLOSES_JQ_DEFS='
     def norm($o; $num): if ($o // "") == "" or (($o|ascii_downcase) == ($repo|ascii_downcase))
       then ($num|tonumber|tostring) else "\($o)#\($num|tonumber)" end;
-    def kw: [scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b(?:\\s*:\\s*|\\s+|(?=#))([\\w.-]+/[\\w.-]+)?#([0-9]+)") | norm(.[0]; .[1])];
+    def kw: [scan("(?i)\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b(?:\\s*:\\s*|\\s+|(?=#))([\\w.-]+/[\\w.-]+)?#([0-9]+)") | norm(.[0]; .[1])];'
+closes_compute() {
+  { printf '%s\n' "$CR_META"; printf '%s\n' "$CR_N"; printf '%s\n' "$CR_PAGES"; } | jq -ser --arg repo "$REPO" "$CLOSES_JQ_DEFS"'
     .[0] as $meta | .[1] as $n | ((.[2] // []) | add // []) as $cs
     | if (($meta|type) != "object") or ($meta|has("closingIssuesReferences")|not) or ($meta|has("title")|not)
          or (($n|type) != "number") or (($cs|length) != $n) then error("incomplete") else . end
@@ -217,7 +236,37 @@ closes_read() {
        + ([$meta.title // "", ($cs[] | .commit.message // "")] | map(kw) | add))
     | unique | sort_by([test("/"), (if test("/") then . else tonumber end)]) | join(",")'
 }
-if closes=$(closes_read); then
+# The strict variant for the changelog fragment guard: the same grammar and set over the same
+# CR_* strings, but any shape the lenient read tolerates (null message, repository-less
+# reference, null page, zero commits) errors instead of being read as "closes nothing".
+closes_strict() {
+  # Each captured response must be exactly one JSON value: the joined stream below reads only
+  # its first three values, so a trailing extra value would otherwise be ignored silently.
+  local one
+  for one in "$CR_META" "$CR_N" "$CR_PAGES"; do
+    printf '%s\n' "$one" | jq -se 'length == 1' >/dev/null 2>&1 || return 1
+  done
+  { printf '%s\n' "$CR_META"; printf '%s\n' "$CR_N"; printf '%s\n' "$CR_PAGES"; } | jq -ser --arg repo "$REPO" "$CLOSES_JQ_DEFS"'
+    def bad_ref: (type != "object") or ((.number|type) != "number") or ((.repository|type) != "object")
+      or ((.repository.owner|type) != "object") or ((.repository.owner.login|type) != "string")
+      or ((.repository.name|type) != "string");
+    def bad_commit: (type != "object") or ((.commit|type) != "object") or ((.commit.message|type) != "string");
+    .[0] as $meta | .[1] as $n | .[2] as $pages
+    | if (($meta|type) != "object") or (($meta.title|type) != "string")
+         or (($meta.closingIssuesReferences|type) != "array") or ([$meta.closingIssuesReferences[] | select(bad_ref)] | length > 0)
+         or (($n|type) != "number") or ($n < 1) or ($n != ($n|floor))
+         or (($pages|type) != "array") or ($pages|length) == 0 or ([$pages[] | select(type != "array")] | length > 0)
+      then error("incomplete") else . end
+    | ($pages | add) as $cs
+    | if (($cs|length) != $n) or ([$cs[] | select(bad_commit)] | length > 0) then error("incomplete") else . end
+    | ([$meta.closingIssuesReferences[]
+         | norm("\(.repository.owner.login)/\(.repository.name)"; (.number|tostring))]
+       + ([$meta.title, ($cs[] | .commit.message)] | map(kw) | add))
+    | unique | sort_by([test("/"), (if test("/") then . else tonumber end)]) | join(",")'
+}
+closes_known=0
+if closes_fetch && closes=$(closes_compute); then
+  closes_known=1
   echo "CLOSES=${closes:-none}"
 if [ -n "$EXPECT_CLOSES" ] && [ "$closes" != "$want_closes" ]; then
     echo "CLOSING REFERENCES MISMATCH: merging would close [${closes:-none}], expected [${want_closes:-none}]; fix the PR body (a negated \"does not close #N\" still closes) and re-run"; exit 11
@@ -493,6 +542,68 @@ if [ "$REPO" = vtmocanu/uzi ] && [ "$base" = main ]; then
     printf 'CHANGELOG_POLICY_STALE: main changed policy since this PR merge-base:\n%s\n' "$policy_changed"
     echo 'Rebase or merge origin/main into the PR branch, then require fresh exact-head CI and review before retrying merge.sh.'
     exit 12
+  fi
+  # Changelog fragment citation guard (#4669). Two or more fragments added by this PR
+  # can each only be credited to the release commit through a cited identity, and the squash
+  # commit carries one PR number: refuse unless some added fragment's HEADLINE cites this PR
+  # or a same-repo issue the merge closes. Whole references only; every unreadable input
+  # refuses (exit 2) rather than reading as "no fragments" or "cited".
+  frag_list=$(git -C "$policy_root" diff --no-ext-diff --no-textconv --no-renames --diff-filter=A --name-only \
+    "$policy_base" "$head" -- changelog.d) \
+    || { echo 'cannot list the changelog fragments this PR adds; not merging'; exit 2; }
+  # grep: 0 = matches, 1 = no fragment path (an empty list), anything else = a failed filter.
+  frag_rc=0
+  frags=$(printf '%s\n' "$frag_list" | grep -E '^changelog\.d/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$') || frag_rc=$?
+  [ "$frag_rc" -le 1 ] || { echo 'cannot filter the changelog fragments this PR adds; not merging'; exit 2; }
+  frag_count=$(printf '%s' "$frags" | awk 'END { print NR }') && [[ "$frag_count" =~ ^[0-9]+$ ]] \
+    || { echo 'cannot count the changelog fragments this PR adds; not merging'; exit 2; }
+  if [ "$frag_count" -ge 2 ]; then
+    [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "PR number '$PR' is not numeric; cannot check the changelog fragment citations; not merging"; exit 2; }
+    # Same captured closing metadata as CLOSES= above (no second forge read), validated strictly.
+    if [ "$closes_known" -ne 1 ] || ! frag_closes=$(closes_strict) || [ "$frag_closes" != "$closes" ]; then
+      echo 'closing metadata incomplete for the changelog fragment check; not merging'; exit 2
+    fi
+    frag_accept=" $PR "
+    for frag_ref in ${closes//,/ }; do
+      case "$frag_ref" in */*) ;; *) frag_accept+="$frag_ref ";; esac
+    done
+    frag_heads=""
+    while IFS= read -r frag_path; do
+      [ -n "$frag_path" ] || continue
+      frag_blob=$(git -C "$policy_root" cat-file blob "$head:$frag_path") \
+        || { echo "cannot read $frag_path at the PR head; not merging"; exit 2; }
+      frag_heads+=$(printf '%s\n' "$frag_blob" | LC_ALL=C grep -a '^- \*\*' || true)$'\n'
+    done <<< "$frags"
+    # A cite is "#<digits>" whose next byte is not a word byte (word() from the release
+    # oracle's subject parser, scripts/assert-changelog-covers-release.sh) and whose run of
+    # word, ".", "/", "-" bytes immediately before "#" is empty or exactly this repository's
+    # owner/repo. Both sides are deliberately stricter than the oracle: its section match
+    # ends a number at any non-digit, and its subject parser ignores the byte before "#".
+    if ! printf '%s' "$frag_heads" | LC_ALL=C awk -v repo="$REPO" -v accept="$frag_accept" '
+        function word(c) { return c ~ /[[:alnum:]_]/ || c > "\177" }
+        function pfx(c) { return word(c) || c == "." || c == "/" || c == "-" }
+        {
+          for (i = 1; i <= length($0); i++) {
+            if (substr($0, i, 1) != "#") continue
+            j = i + 1
+            while (substr($0, j, 1) ~ /^[0-9]$/) j++
+            if (j == i + 1) continue
+            if (j <= length($0) && word(substr($0, j, 1))) continue
+            num = substr($0, i + 1, j - i - 1); sub(/^0+/, "", num)
+            if (num == "") continue
+            k = i - 1
+            while (k >= 1 && pfx(substr($0, k, 1))) k--
+            p = substr($0, k + 1, i - k - 1)
+            if (p == "" || (p ~ /^[^\/]+\/[^\/]+$/ && tolower(p) == repo))
+              if (index(accept, " " num " ")) found = 1
+          }
+        }
+        END { exit found ? 0 : 1 }'; then
+      echo "CHANGELOG_FRAGMENTS_UNCITED: this PR adds $frag_count changelog fragments and no headline cites #$PR or an issue it closes:"
+      printf '%s\n' "$frags" | sed 's/^/  /'
+      echo "Add the PR number to one headline, for example (#<issue>, #$PR); then re-run merge.sh on the new head."
+      exit 15
+    fi
   fi
 fi
 

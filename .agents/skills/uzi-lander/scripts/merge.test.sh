@@ -84,7 +84,14 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
   case "\$*" in
     *closingIssuesReferences*)
       [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
-      printf '{"closingIssuesReferences":%s,"title":%s}\n' "\${CLOSES_JSON:-[]}" "\$(jq -n --arg t "\${PR_TITLE:-fix(x): y}" '\$t')"; exit 0 ;;
+      cj_now=\${CLOSES_JSON:-[]}
+      # CLOSES_SEQ_FILE counts metadata reads; from the second read on CLOSES_JSON_LATER is returned.
+      if [ -n "\${CLOSES_SEQ_FILE:-}" ]; then
+        sq=0; [ -f "\$CLOSES_SEQ_FILE" ] && sq=\$(cat "\$CLOSES_SEQ_FILE"); sq=\$((sq+1)); echo "\$sq" > "\$CLOSES_SEQ_FILE"
+        [ "\$sq" -lt 2 ] || cj_now=\${CLOSES_JSON_LATER:-[]}
+      fi
+      [ -z "\${PR_META_JSON:-}" ] || { printf '%s\n' "\$PR_META_JSON"; exit 0; }
+      printf '{"closingIssuesReferences":%s,"title":%s}\n' "\$cj_now" "\$(jq -n --arg t "\${PR_TITLE:-fix(x): y}" '\$t')"; exit 0 ;;
   esac
   case "\$*" in
     *'-q .state'*) printf '%s\n' "\$st" ;;
@@ -118,7 +125,9 @@ if [ "\${1:-}" = api ]; then
       [ "\${BASE_MIG_FAIL:-0}" = 1 ] && exit 1
       printf '%s\n' "\${BASE_MIG_JSON:-[]}"
       exit 0 ;;
-    *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1; printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
+    *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
+      [ -z "\${COMMIT_PAGES_JSON:-}" ] || { printf '%s\n' "\$COMMIT_PAGES_JSON"; exit 0; }
+      printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
     *'/pulls/42 --jq .commits'*) printf '%s\n' "\${COMMIT_COUNT:-\$(printf '%s' "\${COMMITS_JSON:-[]}" | jq length)}"; exit 0 ;;
     *'/protection/required_status_checks'*)
       printf 'HTTP/2.0 %s Test\r\n\r\n' "\${CLASSIC_HTTP:-404}"
@@ -941,7 +950,11 @@ case " $* " in
     fi
     printf '%s\n' "$*" >> "$POLICY_GIT_LOG"
     [ "${POLICY_FETCH_FAIL:-0}" != 1 ] || exit 88 ;;
-  *' diff '*) [ "${POLICY_DIFF_FAIL:-0}" != 1 ] || exit 89 ;;
+  *' diff '*)
+    [ "${POLICY_DIFF_FAIL:-0}" != 1 ] || exit 89
+    # Fails only the fragment listing (its pathspec is changelog.d), not the policy diff.
+    if [ "${POLICY_FRAGMENT_DIFF_FAIL:-0}" = 1 ] && [[ " $* " == *' -- changelog.d '* ]]; then exit 90; fi ;;
+  *' cat-file blob '*) [ "${POLICY_FRAGMENT_BLOB_FAIL:-0}" != 1 ] || exit 91 ;;
 esac
 exec "$REAL_GIT" -c core.fsmonitor=false -c "url.${POLICY_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "$@"
 STUB
@@ -949,13 +962,30 @@ cat > "$WORK/policy-bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$POLICY_GH_LOG"
+# POLICY_BASE_REF serves another base branch (its rules answer as main's); POLICY_BASE_JSON
+# sets a raw baseRefName value (a non-string).
+args=()
+for a in "$@"; do
+  if [ -n "${POLICY_BASE_REF:-}" ] && [[ "$a" == */rules/branches/"$POLICY_BASE_REF" ]]; then a=${a%/*}/main; fi
+  args+=("$a")
+done
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ] && [[ "$*" == *headRefOid* ]]; then
-  "$POLICY_BASE_GH" "$@" | jq --arg h "$POLICY_HEAD" '.headRefOid=$h'
+  "$POLICY_BASE_GH" "${args[@]}" | jq --arg h "$POLICY_HEAD" --argjson b "${POLICY_BASE_JSON:-null}" --arg r "${POLICY_BASE_REF:-}" \
+    '.headRefOid=$h | if $b != null then .baseRefName=$b elif $r != "" then .baseRefName=$r else . end'
 else
-  exec "$POLICY_BASE_GH" "$@"
+  exec "$POLICY_BASE_GH" "${args[@]}"
 fi
 STUB
-chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh"
+REAL_GREP=$(command -v grep); export REAL_GREP
+cat > "$WORK/policy-bin/grep" <<'STUB'
+#!/usr/bin/env bash
+# POLICY_FRAGMENT_GREP_FAIL fails only the fragment path filter (its uuid pattern), as a grep error.
+if [ "${POLICY_FRAGMENT_GREP_FAIL:-0}" = 1 ]; then
+  for a in "$@"; do case "$a" in *'changelog\.d/[0-9a-f]{8}'*) exit 2 ;; esac; done
+fi
+exec "$REAL_GREP" "$@"
+STUB
+chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh" "$WORK/policy-bin/grep"
 export PATH="$WORK/policy-bin:$PATH" CONFIRM_AFTER_MERGE=1 MERGE_STATE=OPEN
 export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
 export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
@@ -1089,7 +1119,167 @@ set -e
 [ "$(wc -l < "$POLICY_GIT_LOG")" = "$fetches_before" ] || fail 'confirm-only fetched policy after an out-of-band merge'
 unset POLICY_FETCH_FAIL
 [ -s "$POLICY_GIT_LOG" ] || fail 'policy freshness never fetched under the merge lock'
-echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips'
+
+# Changelog fragment citation guard (#4669): two or more fragments added by the PR need one
+# headline citing the PR number or a same-repo issue the merge closes. PR is #42.
+export MERGE_STATE=OPEN
+pol_reset() {
+  unset CLOSES_JSON CLOSES_JSON_LATER CLOSES_SEQ_FILE CLOSES_FAIL COMMITS_JSON COMMIT_COUNT COMMIT_PAGES_JSON PR_META_JSON \
+    PR_TITLE FRAG_DESC POLICY_BASE_REF POLICY_BASE_JSON POLICY_FRAGMENT_DIFF_FAIL POLICY_FRAGMENT_BLOB_FAIL POLICY_FRAGMENT_GREP_FAIL
+  MERGE_ARGS=()
+}
+pol_commits() { # [message of the first commit]: a stub commit list matching the topic branch
+  local n; n=$(git -C "$POLICY_ROOT" rev-list --count main..HEAD)
+  COMMITS_JSON=$(jq -cn --argjson n "$n" --arg m "${1:-docs: fixture}" '[range(0;$n) | {commit:{message:(if . == 0 then $m else "docs: fixture" end)}}]')
+  COMMIT_COUNT=$n; export COMMITS_JSON COMMIT_COUNT
+}
+pol_pr() { # branch, then N=headline per fragment (one commit each); none = a docs-only commit
+  local name=$1 spec n; shift
+  git -C "$POLICY_ROOT" checkout -q -B "$name" main
+  mkdir -p "$POLICY_ROOT/changelog.d"
+  for spec in "$@"; do
+    n=${spec%%=*}
+    printf '### Fixed\n\n- **%s**\n  %s\n' "${spec#*=}" "${FRAG_DESC:-Description line.}" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+    git -C "$POLICY_ROOT" add changelog.d
+    git -C "$POLICY_ROOT" commit -qm "docs: fragment $n"
+  done
+  if [ "$#" -eq 0 ]; then printf '%s\n' "$name" > "$POLICY_ROOT/api/doc.md"; git -C "$POLICY_ROOT" commit -qam 'docs: no fragment'; fi
+  POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD
+  pol_commits
+}
+pol_want() { # label, rc, 1 = merged | 0 = not merged
+  [ "$rc" -eq "$2" ] || fail "fragment guard $1: want rc $2, got $rc: $(cat "$WORK/policy.out")"
+  if [ "$3" = 1 ]; then
+    [ -s "$WORK/merge.log" ] || fail "fragment guard $1: did not merge: $(cat "$WORK/policy.out")"
+  else
+    [ ! -e "$WORK/merge.log" ] || fail "fragment guard $1: reached the forge merge"
+  fi
+}
+pol_same_repo() { printf '[{"number":%s,"repository":{"owner":{"login":"vtmocanu"},"name":"uzi"}}]' "$1"; }
+F1=$(printf 'changelog.d/%08x-1111-4111-8111-%012x.md' 1 1); F2=$(printf 'changelog.d/%08x-1111-4111-8111-%012x.md' 2 2)
+
+# 1. Regression: two fragments citing only the issue, nothing closed, no PR number.
+pol_reset; pol_pr frag-1 '1=Fix a (#4626).' '2=Fix b (#4626).'
+policy_run; pol_want uncited 15 0
+grep -qF "$F1" "$WORK/policy.out" && grep -qF "$F2" "$WORK/policy.out" || fail "uncited refusal omitted a fragment path: $(cat "$WORK/policy.out")"
+grep -qF 'CHANGELOG_FRAGMENTS_UNCITED' "$WORK/policy.out" || fail 'uncited refusal lacks its marker'
+grep -qF 'add the PR number to one headline' "$WORK/policy.out" || grep -qF 'Add the PR number to one headline' "$WORK/policy.out" || fail 'uncited refusal lacks the fix'
+grep -qF '(#<issue>, #42)' "$WORK/policy.out" || fail 'uncited refusal lacks the example'
+# 2./3. The PR number, bare or as this repository's owner/repo#N, in any one headline.
+for cite in '(#4626, #42)' 'vtmocanu/uzi#42' 'Vtmocanu/Uzi#42' '(#042)' '#42.' '[#42]'; do
+  pol_reset; pol_pr frag-2 "1=Fix a $cite" '2=Fix b (#4626).'
+  policy_run; pol_want "cite $cite" 0 1
+done
+# 4. A same-repo issue the merge closes (body reference or commit-message keyword) counts.
+pol_reset; pol_pr frag-4 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_JSON; CLOSES_JSON=$(pol_same_repo 4626)
+policy_run vtmocanu/uzi --expect-closes 4626; pol_want 'closed same-repo issue' 0 1
+pol_reset; pol_pr frag-4b '1=Fix a (#4626).' '2=Fix b (#4626).'; pol_commits 'fix(x): y
+
+Closes #4626'
+policy_run vtmocanu/uzi --expect-closes 4626; pol_want 'closed by a commit keyword' 0 1
+# 5. Another repository's reference never counts, as a citation or as a closing reference.
+pol_reset; pol_pr frag-5 '1=Fix a (other/repo#42).' '2=Fix b (#4626).'
+policy_run; pol_want 'foreign cite' 15 0
+pol_reset; pol_pr frag-5b '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_JSON; CLOSES_JSON=$(pol_same_repo 4626 | sed 's/"vtmocanu"/"other"/; s/"uzi"/"repo"/')
+policy_run; pol_want 'foreign closing reference' 15 0
+# 6. Whole references only.
+for cite in '#420' '#42suffix' '#42_name' '#42é' 'café#42' 'abc#42' 'a/b/vtmocanu/uzi#42' '#46260'; do
+  pol_reset; pol_pr frag-6 "1=Fix a ($cite)." '2=Fix b (#9999).'
+  if [ "$cite" = '#46260' ]; then export CLOSES_JSON; CLOSES_JSON=$(pol_same_repo 4626); fi
+  policy_run; pol_want "partial cite $cite" 15 0
+done
+# 7. Only the headline counts, not the description.
+pol_reset; FRAG_DESC='Related to #42.' pol_pr frag-7 '1=Fix a (#4626).' '2=Fix b (#4626).'
+policy_run; pol_want 'description-only cite' 15 0
+# 8. Zero or one fragment is never checked.
+pol_reset; pol_pr frag-8 '1=Fix a (#4626).'
+policy_run; pol_want 'one fragment' 0 1
+pol_reset; pol_pr frag-8b
+policy_run; pol_want 'no fragment' 0 1
+# 9. Fragments that main gained after the branch point are not the PR's.
+pol_reset; pol_pr frag-9
+git -C "$POLICY_ROOT" checkout -q main
+for n in 3 4; do
+  printf '### Fixed\n\n- **Main fix %s (#4626).**\n  Description line.\n' "$n" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+done
+git -C "$POLICY_ROOT" add changelog.d; git -C "$POLICY_ROOT" commit -qm 'docs: main fragments'; git -C "$POLICY_ROOT" push -q origin main
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse frag-9); export POLICY_HEAD
+policy_run; pol_want 'fragments added on main' 0 1
+# 10. Other repositories and other base branches are out of scope.
+pol_reset; pol_pr frag-10 '1=Fix a (#4626).' '2=Fix b (#4626).'
+policy_run vtmocanu/other; pol_want 'another repository' 0 1
+export POLICY_BASE_REF=release
+policy_run; pol_want 'non-main base' 0 1
+# 11. An unreadable fragment list or blob refuses.
+pol_reset; pol_pr frag-11 '1=Fix a (#42).' '2=Fix b (#4626).'
+export POLICY_FRAGMENT_DIFF_FAIL=1; policy_run; pol_want 'fragment list unreadable' 2 0
+unset POLICY_FRAGMENT_DIFF_FAIL
+export POLICY_FRAGMENT_BLOB_FAIL=1; policy_run; pol_want 'fragment blob unreadable' 2 0
+unset POLICY_FRAGMENT_BLOB_FAIL
+export POLICY_FRAGMENT_GREP_FAIL=1; policy_run; pol_want 'fragment filter failed' 2 0
+grep -qF 'cannot filter the changelog fragments' "$WORK/policy.out" || fail "fragment filter failure: wrong refusal: $(cat "$WORK/policy.out")"
+unset POLICY_FRAGMENT_GREP_FAIL
+# 12. Unreadable closing metadata refuses, cited or not.
+export CLOSES_FAIL=1
+policy_run; pol_want 'closes unreadable, cited' 2 0
+pol_reset; pol_pr frag-12 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_FAIL=1
+policy_run; pol_want 'closes unreadable, uncited' 2 0
+# 13./14. Metadata the lenient CLOSES= read tolerates is incomplete for the guard (even when
+# the PR is cited), while a one-fragment PR keeps the lenient behaviour.
+pol_fixture() { # name -> exports that fixture's environment (after pol_reset)
+  case "$1" in
+    a) export COMMITS_JSON='[{}]' COMMIT_COUNT=1 ;;
+    b) export COMMITS_JSON='[{"commit":{"message":null}}]' COMMIT_COUNT=1 ;;
+    c) export PR_META_JSON='{"closingIssuesReferences":[],"title":null}' ;;
+    d) export COMMIT_PAGES_JSON='[null,[{"commit":{"message":"x"}}]]' COMMIT_COUNT=1 ;;
+    e) export CLOSES_JSON='[{"number":4626}]' ;;
+    f) export COMMIT_PAGES_JSON='[[]]' COMMIT_COUNT=0 ;;
+    g) export COMMIT_PAGES_JSON='[[{"commit":{"message":"x"}}]] {"extra":1}' COMMIT_COUNT=1 ;;
+  esac
+}
+for fx in a b c d e f g; do
+  cite='(#42)'; [ "$fx" = e ] && cite='(#4626)'
+  pol_reset; pol_pr "frag-13$fx" "1=Fix a $cite." "2=Fix b $cite."; pol_fixture "$fx"
+  policy_run; pol_want "incomplete metadata $fx" 2 0
+  grep -qF 'closing metadata incomplete for the changelog fragment check' "$WORK/policy.out" || fail "incomplete metadata $fx: wrong refusal: $(cat "$WORK/policy.out")"
+  want=none; [ "$fx" = e ] && want=4626
+  pol_reset; pol_pr "frag-14$fx" "1=Fix a $cite."; pol_fixture "$fx"
+  policy_run vtmocanu/uzi --expect-closes "$want"; pol_want "one fragment $fx with flag" 0 1
+  grep -qxF "CLOSES=$want" "$WORK/policy.out" || fail "one fragment $fx: CLOSES= line changed: $(cat "$WORK/policy.out")"
+  policy_run; pol_want "one fragment $fx without flag" 0 1
+  grep -qxF "CLOSES=$want" "$WORK/policy.out" || fail "one fragment $fx without flag: CLOSES= line changed: $(cat "$WORK/policy.out")"
+done
+# 15. A non-string base is no base: refused before any merge.
+pol_reset; pol_pr frag-15 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export POLICY_BASE_JSON=true; policy_run; pol_want 'non-string base' 2 0
+# The old `jq -r` read stringified it ("of true"); the new read has no base at all.
+grep -qF 'cannot read the required checks of the base branch' "$WORK/policy.out" \
+  || fail "non-string base was read as a branch name: $(cat "$WORK/policy.out")"
+# 15b. Only added changelog.d/<uuid>.md paths count: a new README.md beside one fragment is one.
+pol_reset; pol_pr frag-17 '1=Fix a (#4626).'
+printf 'notes\n' > "$POLICY_ROOT/changelog.d/README.md"
+git -C "$POLICY_ROOT" add changelog.d; git -C "$POLICY_ROOT" commit -qm 'docs: changelog readme'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
+policy_run; pol_want 'non-uuid added path' 0 1
+# 15c. Editing two inherited fragments (main's 3 and 4 from case 9) adds none.
+pol_reset; git -C "$POLICY_ROOT" checkout -q -B frag-18 main
+for n in 3 4; do
+  printf '### Fixed\n\n- **Main fix %s reworded (#4626).**\n  Description line.\n' "$n" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+done
+git -C "$POLICY_ROOT" commit -qam 'docs: reword inherited fragments'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
+policy_run; pol_want 'modified inherited fragments' 0 1
+# 16. One captured read: a later forge answer cannot change the guard's closing set.
+pol_reset; pol_pr frag-16 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_SEQ_FILE="$WORK/closes-seq" CLOSES_JSON='[]' CLOSES_JSON_LATER; CLOSES_JSON_LATER=$(pol_same_repo 4626)
+rm -f "$CLOSES_SEQ_FILE"
+policy_run vtmocanu/uzi --expect-closes none; pol_want 'single closing read' 15 0
+[ "$(cat "$CLOSES_SEQ_FILE")" = 1 ] || fail "closing metadata read $(cat "$CLOSES_SEQ_FILE") times, want 1"
+pol_reset
+echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips; fragment guard refuses uncited multi-fragment PRs (15) and incomplete metadata (2), counting only added <uuid>.md fragments'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
 echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
