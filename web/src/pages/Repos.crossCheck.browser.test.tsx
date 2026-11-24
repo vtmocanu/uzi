@@ -120,7 +120,8 @@ it("explains both code and plan CLAUDE.md consent and saves with the new notice"
   });
   const panel = await openCrossCheckPanel();
 
-  expect(within(panel).getByText(SWITCH, { selector: "p" })).toBeTruthy();
+  // The heading renders &rsquo; (U+2019); SWITCH (ASCII apostrophe) is the Toggle's accessible name.
+  expect(within(panel).getByText("Give the cross-checkers this repository\u2019s CLAUDE.md", { selector: "p" })).toBeTruthy();
   const text = panel.textContent ?? "";
   expect(text).toContain("Code checks read the root CLAUDE.md at a freshly fetched default-branch tip");
   expect(text).toContain("consent is frozen when the check is created");

@@ -128,19 +128,39 @@ describe("readPlanRepoInstructions against real git", () => {
 
   it("bounds the caller's wait when the read ignores its signal", async () => {
     const hung = { readBare: () => new Promise<never>(() => {}) };
-    const t0 = Date.now();
-    const r = await readPlanRepoInstructions(hung, "/bare", plan("a".repeat(40)), { claudemd_enabled: true }, { budgetMs: 30, signal: live });
-    assert.deepEqual(r, { status: "unknown" });
-    assert.ok(Date.now() - t0 < 3000);
+    // AbortSignal.timeout is unref'ed; retain a handle while deliberately waiting on a hung read.
+    const keepAlive = setInterval(() => {}, 1000);
+    try {
+      const t0 = Date.now();
+      const r = await readPlanRepoInstructions(hung, "/bare", plan("a".repeat(40)), { claudemd_enabled: true }, { budgetMs: 30, signal: live });
+      assert.deepEqual(r, { status: "unknown" });
+      assert.ok(Date.now() - t0 < 3000);
+    } finally { clearInterval(keepAlive); }
+  });
+
+  it("maps a caller cancellation to unknown well before a long budget expires", async () => {
+    const hung = { readBare: () => new Promise<never>(() => {}) };
+    const caller = new AbortController();
+    const keepAlive = setInterval(() => {}, 1000);
+    try {
+      const t0 = Date.now();
+      const pending = readPlanRepoInstructions(hung, "/bare", plan("a".repeat(40)), { claudemd_enabled: true }, { budgetMs: 60_000, signal: caller.signal });
+      setTimeout(() => caller.abort(), 20);
+      assert.deepEqual(await pending, { status: "unknown" });
+      assert.ok(Date.now() - t0 < 5000, "caller abort, not the 60 s budget, must end the wait");
+    } finally { clearInterval(keepAlive); }
   });
 
   it("does not leave an unhandled rejection when a late read fails", async () => {
     let fail!: (e: Error) => void;
     const late = { readBare: () => new Promise<never>((_, rej) => { fail = rej; }) };
-    const r = await readPlanRepoInstructions(late, "/bare", plan("a".repeat(40)), { claudemd_enabled: true }, { budgetMs: 20, signal: live });
-    assert.deepEqual(r, { status: "unknown" });
-    fail(new Error("late"));
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    const keepAlive = setInterval(() => {}, 1000);
+    try {
+      const r = await readPlanRepoInstructions(late, "/bare", plan("a".repeat(40)), { claudemd_enabled: true }, { budgetMs: 20, signal: live });
+      assert.deepEqual(r, { status: "unknown" });
+      fail(new Error("late"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally { clearInterval(keepAlive); }
   });
 });
 
