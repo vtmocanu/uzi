@@ -616,6 +616,7 @@ const INVENTORY_SOURCE_CHECKS = [
   "non_linux_host", "live_attempt_path", "process_not_quiescent_before_git",
   "process_not_quiescent_after_git", "worktree_status_dirty", "worktree_status_unreadable",
   "source_identity_changed", "physical_sources_without_boundary",
+  "source_lock_unavailable", "source_settlement_unproven",
 ] as const;
 type InventorySourceCheck = typeof INVENTORY_SOURCE_CHECKS[number];
 type ProcessSourceCheck = "process_not_quiescent_before_git" | "process_not_quiescent_after_git";
