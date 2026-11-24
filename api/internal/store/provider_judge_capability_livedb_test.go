@@ -477,6 +477,12 @@ func TestProviderJudgeCapabilityReapLiveDB(t *testing.T) {
 					mustExec(fx.ctx, t, fx.pool, `INSERT INTO recovery_custody_holds
  (id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id)
  SELECT $1,user_id,repo_id,id,1,'open',$2,'ident',$2,id FROM runs WHERE id=$3`, uuid.New(), w, run)
+					// The hold's live_worker_id FK is ON DELETE RESTRICT: drop it before the fixture
+					// cleanup (registered earlier, so it runs later) or the worker, run and user leak
+					// into the shared LiveDB database.
+					t.Cleanup(func() {
+						mustExec(fx.ctx, t, fx.pool, "DELETE FROM recovery_custody_holds WHERE run_id=$1", run)
+					})
 				}
 				reaped(fx, now)
 				if !workerExists(fx, w) {

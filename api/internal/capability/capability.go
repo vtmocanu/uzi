@@ -310,7 +310,7 @@ const ClaudeProviderV1 = "claude_provider_v1"
 
 // ClaudeProviderJudgeV1 identifies workers whose judge runner can run a provider-bound Claude
 // judge (PRD #4322 M1a): a judge claim carrying one `provider` binding and no Anthropic OAuth
-// token. A protocol capability and a NON-BYPASSABLE ClaimRun, ClaimChatRun and placement clause,
+// token. A protocol capability and a NON-BYPASSABLE ClaimRun and placement clause,
 // layered on ClaudeProviderV1 for kind 'judge' only: a worker that has only claude_provider_v1
 // would run the judge with the vendor judge runner, so a provider-bound judge is claimable and
 // placeable only on a worker that advertises both.
