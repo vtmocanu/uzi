@@ -155,8 +155,16 @@ describe("provider judge: deterministic result-frame settlement", () => {
   });
 
   it("a prompt-build failure keeps the fallback review and completes with no model call", async () => {
-    const malformed = { ...trace, inputs: null } as unknown as JudgeTraceResponse;
-    const { calls, seen } = await run([assistant(verdict()), success()], providerClaim(), { client: fakeClient({ getTrace: async () => malformed }) });
+    // A page fetchTrace accepts but buildJudgePrompt cannot render (a non-string plan_md makes the
+    // prompt clip throw), so this reaches judgeProvider's prompt-build branch, not the outer
+    // trace/prep catch in executeClaim.
+    const malformed = { ...trace, target: { ...trace.target, plan_md: { length: 7000 } } } as unknown as JudgeTraceResponse;
+    const warns: string[] = [];
+    const base = nullLogger();
+    const log: Logger = { ...base, warn: (msg: string, ...rest: unknown[]) => { warns.push(msg); return (base.warn as (...a: unknown[]) => void)(msg, ...rest); } };
+    const { calls, seen } = await run([assistant(verdict()), success()], providerClaim(), { log, client: fakeClient({ getTrace: async () => malformed }) });
+    assert.ok(warns.some(w => /judge prompt build failed/.test(w)), `the prompt-build branch ran: ${JSON.stringify(warns)}`);
+    assert.ok(!warns.some(w => /judge trace\/prep failed/.test(w)), "not the outer trace/prep catch");
     assert.equal(seen.calls, 0, "no model call");
     assert.equal(calls.review?.status, "failed");
     assert.equal(calls.review?.recommendations[0]?.target, "jq");

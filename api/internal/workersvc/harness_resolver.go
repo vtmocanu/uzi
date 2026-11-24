@@ -904,11 +904,13 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
 	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
-	// A guarded vendor lane (judge on the vendor branch, job, cross-check) does the same: the guard
-	// above allowed its source snapshot, and a vendor lane insert stamps no binding, so a second
-	// source read here could only see a source selected in between and then fail the binding assertion
-	// as an internal mismatch. A provider judge never reaches resolve(): it stamps all five binding
-	// columns from the source frozen under the shared lock (freezeProviderJudge).
+	// A guarded vendor lane (job, cross-check) does the same: the guard above allowed its source
+	// snapshot, and a vendor lane insert stamps no binding, so a second source read here could only
+	// see a source selected in between and then fail the binding assertion as an internal mismatch.
+	// A vendor judge needs vendorOnly for a different reason: its pin policy can choose vendor while
+	// a Claude source IS selected (pinned with a credential), so the resolver must not consult the
+	// source. A provider judge never reaches resolve(): it stamps all five binding columns from the
+	// source frozen under the shared lock (freezeProviderJudge).
 	vendorOnly := inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane
 	resolve := func() (resolvedHarness, error) {
 		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)

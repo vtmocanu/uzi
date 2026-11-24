@@ -400,7 +400,6 @@ function recordingClient(): { client: WorkerClient; states: { id: string; body: 
 describe("JudgeRunner in provider mode (no longer a refused lane)", () => {
   // Settlement, redaction and failure paths live in judge-runner-provider.test.ts; this pins only that
   // the judge spawn site routes its model pass through the provider binding like the other sites.
-  // (Typed settlement and redaction cases: judge-runner-provider.test.ts.)
   it("judge: the model call carries the provider env and mapped model, the review is posted, the key is scrubbed", async () => {
     const posted: { review?: unknown } = {};
     const states: { status?: string }[] = [];
