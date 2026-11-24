@@ -166,24 +166,35 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 // claim then returns an error (a 500; the agent's next claim poll retries) or provisionOne errors
 // (the next provisioning pass retries). Neither corrupts state, and there is no retry here. A lease-off service, a non-ephemeral worker or an unleased one passes the
 // no-lease params (NULL columns), where ClaimRun's lease arm admits nothing.
-func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, *MemoryParkReference, bool, error) {
+//
+// Issue #4628: for an eligible hosted worker the fresh claim (claimFreshResume) runs first, in this same
+// transaction, and a claim it takes is returned with its transfer row (non-nil fresh); every other poll
+// goes on to the ordinary claim.
+func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, *MemoryParkReference, *store.RunFreshResume, bool, error) {
+	if frun, frow, ok, ferr := s.claimFreshResume(ctx, tx, qtx, reread, claimParamsFromLockedWorker(params, reread, report)); ferr != nil {
+		return store.Run{}, nil, nil, false, ferr
+	} else if ok {
+		ref, rerr := s.memoryParkClaimReference(ctx, qtx, reread, frun)
+		if rerr != nil {
+			return store.Run{}, nil, nil, false, rerr
+		}
+		return frun, ref, &frow, true, nil
+	}
 	run, claimed, err := s.claimRunInTxCore(ctx, tx, qtx, workerID, reread, params, report)
 	if err != nil || !claimed {
-		return run, nil, claimed, err
+		return run, nil, nil, claimed, err
 	}
 	// Issue #3639: built in the claim transaction, so a read error fails (and rolls back) the claim.
 	ref, err := s.memoryParkClaimReference(ctx, qtx, reread, run)
 	if err != nil {
-		return store.Run{}, nil, false, err
+		return store.Run{}, nil, nil, false, err
 	}
-	return run, ref, true, nil
+	return run, ref, nil, true, nil
 }
 
-func (s *Service) claimRunInTxCore(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, bool, error) {
-	params.ClaimantDraining = !store.WorkerAcceptsNewIntake(reread)
-	if reread.MaintenanceFenced {
-		return store.Run{}, false, nil
-	}
+// claimParamsFromLockedWorker overlays the facts the locked, re-read claimant row decides onto the claim's
+// params, the part of ClaimRun's input that must come from the row the transaction holds locked.
+func claimParamsFromLockedWorker(params store.ClaimRunParams, reread store.Worker, report MemoryAuthorityReport) store.ClaimRunParams {
 	params.WorkerProtocolCaps = reread.ProtocolCapabilities
 	// Issue #3142: judged against the locked re-read capabilities, run/ordinary lanes only.
 	params.MemoryAuthorityLost = params.Lane != "cross_check" && memoryAuthorityLost(reread.ProtocolCapabilities, report)
@@ -193,6 +204,14 @@ func (s *Service) claimRunInTxCore(ctx context.Context, tx pgx.Tx, qtx *store.Qu
 	params.IsEphemeral = reread.Ephemeral
 	params.EphemeralRunID = reread.EphemeralRunID
 	params.IsDockerWorker = reread.DockerEnabled.Valid && reread.DockerEnabled.Bool
+	return params
+}
+
+func (s *Service) claimRunInTxCore(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, bool, error) {
+	if reread.MaintenanceFenced {
+		return store.Run{}, false, nil
+	}
+	params = claimParamsFromLockedWorker(params, reread, report)
 	// params.EphemeralLease is the one lease read Claim made for this claim (Valid only when the
 	// lease is on), so this decision and the ClaimRun lease arm below never see two values.
 	leased := params.EphemeralLease.Valid && reread.Ephemeral && reread.LeaseSince.Valid &&
@@ -294,7 +313,7 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	if err != nil {
 		return nil, err
 	}
-	run, ref, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)
+	run, ref, fresh, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -305,5 +324,5 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	if !claimed {
 		return nil, nil // idle
 	}
-	return s.assembleAndFinishRunClaimRef(ctx, locked, run, params.RecoveryCapable, ref)
+	return s.assembleAndFinishRunClaimRef(ctx, locked, run, params.RecoveryCapable, ref, fresh)
 }

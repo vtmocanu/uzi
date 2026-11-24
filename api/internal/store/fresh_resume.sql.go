@@ -171,6 +171,17 @@ func (q *Queries) FreshResumeRunBaseEligible(ctx context.Context, arg FreshResum
 	return eligible, err
 }
 
+const freshResumeWorkerExists = `-- name: FreshResumeWorkerExists :one
+SELECT EXISTS (SELECT 1 FROM workers w WHERE w.id = $1)::boolean AS present
+`
+
+func (q *Queries) FreshResumeWorkerExists(ctx context.Context, id uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, freshResumeWorkerExists, id)
+	var present bool
+	err := row.Scan(&present)
+	return present, err
+}
+
 const getActiveFreshResumeForRun = `-- name: GetActiveFreshResumeForRun :one
 SELECT id, run_id, user_id, request_id, evidence_generation, evidence_kind, capture_id, checkpoint_ref, sha, candidate_token, predecessor_worker_id, destination_worker_id, saved_worker_id, saved_tuple, claim_generation, destination_attempt_id, seeded_generation, state, refusal_reason, admission_deadline, transfer_deadline, created_at, claimed_at, seeded_at, closed_at FROM run_fresh_resumes WHERE run_id = $1 AND state IN ('pending', 'claimed')
 `
@@ -523,57 +534,81 @@ func (q *Queries) ListFreshResumeCaptureEvidence(ctx context.Context, arg ListFr
 }
 
 const listPendingFreshResumeCandidates = `-- name: ListPendingFreshResumeCandidates :many
-SELECT t.id, t.run_id, t.user_id, t.request_id, t.evidence_generation, t.evidence_kind, t.capture_id, t.checkpoint_ref, t.sha, t.candidate_token, t.predecessor_worker_id, t.destination_worker_id, t.saved_worker_id, t.saved_tuple, t.claim_generation, t.destination_attempt_id, t.seeded_generation, t.state, t.refusal_reason, t.admission_deadline, t.transfer_deadline, t.created_at, t.claimed_at, t.seeded_at, t.closed_at FROM run_fresh_resumes t
+SELECT t.id, t.run_id, COALESCE(r.worker_id, r.released_worker_id, '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS w1_id
+FROM run_fresh_resumes t
 JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
 WHERE t.user_id = $1 AND t.state = 'pending' AND t.admission_deadline > now()
   AND r.status = 'recovery_wait'
+  AND (r.worker_id IS NULL OR r.worker_id <> $2::uuid)
+  AND (r.released_worker_id IS NULL OR r.released_worker_id <> $2::uuid)
+  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h
+                  WHERE h.run_id = r.id AND h.state = 'open'
+                    AND $2::uuid IN (h.live_worker_id, h.original_worker_id))
+  AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes s
+                  WHERE s.run_id = r.id AND s.state IN ('seeded', 'superseded')
+                    AND s.predecessor_worker_id = $2::uuid)
+  AND fn_worker_can_claim($3::boolean, $4::uuid[], r.repo_id, r.kind,
+                          $5::text[], r.required_capabilities, $6::boolean)
+  AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  AND EXISTS (SELECT 1 FROM workers c WHERE c.id = $2::uuid AND fn_forge_origin_eligible(c, r, now()))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = r.id AND a.worker_id = r.worker_id
+                    AND a.claim_generation = r.claim_generation
+                    AND r.claim_released_at IS NULL
+                    AND (a.reported_at >= $7::timestamptz
+                         OR (a.terminal_pending AND a.terminal_pending_until > now())))
+  AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
 ORDER BY t.created_at, t.id
-LIMIT $2::int
+LIMIT $8::int
 `
 
 type ListPendingFreshResumeCandidatesParams struct {
-	UserID   uuid.UUID `json:"user_id"`
-	RowLimit int32     `json:"row_limit"`
+	UserID              uuid.UUID          `json:"user_id"`
+	WorkerID            uuid.UUID          `json:"worker_id"`
+	IsDockerWorker      bool               `json:"is_docker_worker"`
+	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
+	WorkerCaps          []string           `json:"worker_caps"`
+	CapabilityAware     bool               `json:"capability_aware"`
+	SnapshotFreshCutoff pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
+	RowLimit            int32              `json:"row_limit"`
 }
 
-// Unlocked read of the owner's pending, unexpired rows, oldest first. Candidates only: every
-// condition is rechecked under the run and transfer locks before a claim.
-func (q *Queries) ListPendingFreshResumeCandidates(ctx context.Context, arg ListPendingFreshResumeCandidatesParams) ([]RunFreshResume, error) {
-	rows, err := q.db.Query(ctx, listPendingFreshResumeCandidates, arg.UserID, arg.RowLimit)
+type ListPendingFreshResumeCandidatesRow struct {
+	ID    uuid.UUID `json:"id"`
+	RunID uuid.UUID `json:"run_id"`
+	W1ID  uuid.UUID `json:"w1_id"`
+}
+
+// The fresh claim's unlocked candidate read (plan section 4, step 1) for the claimant @worker_id (W2):
+// the owner's pending, unexpired rows, oldest first, that W2 may take. Candidates only: the facts that
+// decide a claim are rechecked under the run and transfer locks, and ClaimRun itself re-evaluates every
+// gate it owns (capability, intake, reserve, forge origin, custody) on the claimed row.
+// Pre-filters here: fn_worker_can_claim, the intake pause, the forge origin admission, the W1-keyed
+// snapshot / terminal_pending / overflow dedupe (ClaimRun's own copies of those are keyed on the run's
+// worker_id, which is W2 once the tuple is prepared, so W1's rows are read here, before that), and the
+// exclusions: W2 is not the run's worker or released worker (W1), holds no open custody hold of the run
+// and is not the excluded predecessor of a seeded or superseded transfer.
+// w1_id is the predecessor the claim must lock: the run's worker, else its released worker; the nil
+// uuid when the run names neither (a deleted worker).
+func (q *Queries) ListPendingFreshResumeCandidates(ctx context.Context, arg ListPendingFreshResumeCandidatesParams) ([]ListPendingFreshResumeCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listPendingFreshResumeCandidates,
+		arg.UserID,
+		arg.WorkerID,
+		arg.IsDockerWorker,
+		arg.DockerRepoAllowlist,
+		arg.WorkerCaps,
+		arg.CapabilityAware,
+		arg.SnapshotFreshCutoff,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []RunFreshResume{}
+	items := []ListPendingFreshResumeCandidatesRow{}
 	for rows.Next() {
-		var i RunFreshResume
-		if err := rows.Scan(
-			&i.ID,
-			&i.RunID,
-			&i.UserID,
-			&i.RequestID,
-			&i.EvidenceGeneration,
-			&i.EvidenceKind,
-			&i.CaptureID,
-			&i.CheckpointRef,
-			&i.Sha,
-			&i.CandidateToken,
-			&i.PredecessorWorkerID,
-			&i.DestinationWorkerID,
-			&i.SavedWorkerID,
-			&i.SavedTuple,
-			&i.ClaimGeneration,
-			&i.DestinationAttemptID,
-			&i.SeededGeneration,
-			&i.State,
-			&i.RefusalReason,
-			&i.AdmissionDeadline,
-			&i.TransferDeadline,
-			&i.CreatedAt,
-			&i.ClaimedAt,
-			&i.SeededAt,
-			&i.ClosedAt,
-		); err != nil {
+		var i ListPendingFreshResumeCandidatesRow
+		if err := rows.Scan(&i.ID, &i.RunID, &i.W1ID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -582,6 +617,40 @@ func (q *Queries) ListPendingFreshResumeCandidates(ctx context.Context, arg List
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockCaptureForFreshClaim = `-- name: LockCaptureForFreshClaim :one
+SELECT c.id FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id
+WHERE c.id = $1 AND c.run_id = $2 AND c.user_id = $3
+  AND c.state = 'available' AND c.manifest_bound AND c.expires_at > now()
+  AND h.run_id = c.run_id AND h.user_id = c.user_id AND h.generation = $4
+  AND c.source_sha = $5
+FOR SHARE OF c NOWAIT
+`
+
+type LockCaptureForFreshClaimParams struct {
+	ID                 uuid.UUID `json:"id"`
+	RunID              uuid.UUID `json:"run_id"`
+	UserID             uuid.UUID `json:"user_id"`
+	EvidenceGeneration int64     `json:"evidence_generation"`
+	Sha                string    `json:"sha"`
+}
+
+// Plan section 4, step 2.4: the transfer's capture FOR SHARE NOWAIT (a concurrent discard or expiry holds
+// it FOR UPDATE: 55P03, the caller skips the candidate), rechecked on the locked version: still
+// available and manifest-bound, unexpired, under the evidence generation's hold, and the same source.
+func (q *Queries) LockCaptureForFreshClaim(ctx context.Context, arg LockCaptureForFreshClaimParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCaptureForFreshClaim,
+		arg.ID,
+		arg.RunID,
+		arg.UserID,
+		arg.EvidenceGeneration,
+		arg.Sha,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const lockCaptureForFreshResume = `-- name: LockCaptureForFreshResume :one
@@ -636,6 +705,52 @@ func (q *Queries) LockCaptureForFreshResume(ctx context.Context, arg LockCapture
 	return i, err
 }
 
+const lockFreshClaimTarget = `-- name: LockFreshClaimTarget :one
+SELECT t.id, t.run_id, t.capture_id, t.evidence_kind, t.evidence_generation, t.sha,
+       COALESCE(r.worker_id, r.released_worker_id, '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS w1_id
+FROM run_fresh_resumes t
+JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
+WHERE t.id = $1 AND t.user_id = $2 AND t.state = 'pending' AND t.admission_deadline > now()
+  AND r.status = 'recovery_wait'
+FOR UPDATE OF r, t SKIP LOCKED
+`
+
+type LockFreshClaimTargetParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type LockFreshClaimTargetRow struct {
+	ID                 uuid.UUID   `json:"id"`
+	RunID              uuid.UUID   `json:"run_id"`
+	CaptureID          pgtype.UUID `json:"capture_id"`
+	EvidenceKind       string      `json:"evidence_kind"`
+	EvidenceGeneration int64       `json:"evidence_generation"`
+	Sha                string      `json:"sha"`
+	W1ID               uuid.UUID   `json:"w1_id"`
+}
+
+// Plan section 4, step 2.3: the run and the transfer row locked together, SKIP LOCKED (a held row is a
+// skipped candidate, never a wait), with every fact rechecked on the locked versions: the row is still
+// pending and unexpired, the run is still held at recovery_wait and the owner's, and w1_id is the
+// predecessor the caller locked (the caller compares it; the nil uuid, no worker, is accepted only on the
+// deleted branch).
+// user_id is the claimant's owner: the destination worker and the run belong to the same user.
+func (q *Queries) LockFreshClaimTarget(ctx context.Context, arg LockFreshClaimTargetParams) (LockFreshClaimTargetRow, error) {
+	row := q.db.QueryRow(ctx, lockFreshClaimTarget, arg.ID, arg.UserID)
+	var i LockFreshClaimTargetRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.CaptureID,
+		&i.EvidenceKind,
+		&i.EvidenceGeneration,
+		&i.Sha,
+		&i.W1ID,
+	)
+	return i, err
+}
+
 const lockWorkerKeyShare = `-- name: LockWorkerKeyShare :one
 SELECT w.id FROM workers w WHERE w.id = $1 FOR KEY SHARE
 `
@@ -658,6 +773,19 @@ SELECT w.id FROM workers w WHERE w.id = $1 FOR KEY SHARE NOWAIT
 // route): it never waits, a held conflicting lock is SQLSTATE 55P03 and the caller retries.
 func (q *Queries) LockWorkerKeyShareNoWait(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, lockWorkerKeyShareNoWait, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const lockWorkerKeyShareSkipLocked = `-- name: LockWorkerKeyShareSkipLocked :one
+SELECT w.id FROM workers w WHERE w.id = $1 FOR KEY SHARE SKIP LOCKED
+`
+
+// The fresh claim's predecessor lock: FOR KEY SHARE, skipping a worker row a conflicting FOR UPDATE holder
+// has. No row is ambiguous (locked by another, or gone): FreshResumeWorkerExists tells them apart.
+func (q *Queries) LockWorkerKeyShareSkipLocked(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockWorkerKeyShareSkipLocked, id)
 	var id_2 uuid.UUID
 	err := row.Scan(&id_2)
 	return id_2, err

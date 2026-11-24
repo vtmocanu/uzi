@@ -33,14 +33,78 @@ SELECT * FROM run_fresh_resumes WHERE run_id = @run_id AND state IN ('pending', 
 SELECT * FROM run_fresh_resumes WHERE id = @id FOR UPDATE;
 
 -- name: ListPendingFreshResumeCandidates :many
--- Unlocked read of the owner's pending, unexpired rows, oldest first. Candidates only: every
--- condition is rechecked under the run and transfer locks before a claim.
-SELECT t.* FROM run_fresh_resumes t
+-- The fresh claim's unlocked candidate read (plan section 4, step 1) for the claimant @worker_id (W2):
+-- the owner's pending, unexpired rows, oldest first, that W2 may take. Candidates only: the facts that
+-- decide a claim are rechecked under the run and transfer locks, and ClaimRun itself re-evaluates every
+-- gate it owns (capability, intake, reserve, forge origin, custody) on the claimed row.
+-- Pre-filters here: fn_worker_can_claim, the intake pause, the forge origin admission, the W1-keyed
+-- snapshot / terminal_pending / overflow dedupe (ClaimRun's own copies of those are keyed on the run's
+-- worker_id, which is W2 once the tuple is prepared, so W1's rows are read here, before that), and the
+-- exclusions: W2 is not the run's worker or released worker (W1), holds no open custody hold of the run
+-- and is not the excluded predecessor of a seeded or superseded transfer.
+-- w1_id is the predecessor the claim must lock: the run's worker, else its released worker; the nil
+-- uuid when the run names neither (a deleted worker).
+SELECT t.id, t.run_id, COALESCE(r.worker_id, r.released_worker_id, '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS w1_id
+FROM run_fresh_resumes t
 JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
 WHERE t.user_id = @user_id AND t.state = 'pending' AND t.admission_deadline > now()
   AND r.status = 'recovery_wait'
+  AND (r.worker_id IS NULL OR r.worker_id <> @worker_id::uuid)
+  AND (r.released_worker_id IS NULL OR r.released_worker_id <> @worker_id::uuid)
+  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h
+                  WHERE h.run_id = r.id AND h.state = 'open'
+                    AND @worker_id::uuid IN (h.live_worker_id, h.original_worker_id))
+  AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes s
+                  WHERE s.run_id = r.id AND s.state IN ('seeded', 'superseded')
+                    AND s.predecessor_worker_id = @worker_id::uuid)
+  AND fn_worker_can_claim(@is_docker_worker::boolean, @docker_repo_allowlist::uuid[], r.repo_id, r.kind,
+                          @worker_caps::text[], r.required_capabilities, @capability_aware::boolean)
+  AND (NOT (SELECT fn_instance_intake_paused()) OR fn_run_admitted_during_intake_pause(r))
+  AND EXISTS (SELECT 1 FROM workers c WHERE c.id = @worker_id::uuid AND fn_forge_origin_eligible(c, r, now()))
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = r.id AND a.worker_id = r.worker_id
+                    AND a.claim_generation = r.claim_generation
+                    AND r.claim_released_at IS NULL
+                    AND (a.reported_at >= @snapshot_fresh_cutoff::timestamptz
+                         OR (a.terminal_pending AND a.terminal_pending_until > now())))
+  AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
 ORDER BY t.created_at, t.id
 LIMIT @row_limit::int;
+
+-- name: LockFreshClaimTarget :one
+-- Plan section 4, step 2.3: the run and the transfer row locked together, SKIP LOCKED (a held row is a
+-- skipped candidate, never a wait), with every fact rechecked on the locked versions: the row is still
+-- pending and unexpired, the run is still held at recovery_wait and the owner's, and w1_id is the
+-- predecessor the caller locked (the caller compares it; the nil uuid, no worker, is accepted only on the
+-- deleted branch).
+-- user_id is the claimant's owner: the destination worker and the run belong to the same user.
+SELECT t.id, t.run_id, t.capture_id, t.evidence_kind, t.evidence_generation, t.sha,
+       COALESCE(r.worker_id, r.released_worker_id, '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS w1_id
+FROM run_fresh_resumes t
+JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
+WHERE t.id = @id AND t.user_id = @user_id AND t.state = 'pending' AND t.admission_deadline > now()
+  AND r.status = 'recovery_wait'
+FOR UPDATE OF r, t SKIP LOCKED;
+
+-- name: LockCaptureForFreshClaim :one
+-- Plan section 4, step 2.4: the transfer's capture FOR SHARE NOWAIT (a concurrent discard or expiry holds
+-- it FOR UPDATE: 55P03, the caller skips the candidate), rechecked on the locked version: still
+-- available and manifest-bound, unexpired, under the evidence generation's hold, and the same source.
+SELECT c.id FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id
+WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id
+  AND c.state = 'available' AND c.manifest_bound AND c.expires_at > now()
+  AND h.run_id = c.run_id AND h.user_id = c.user_id AND h.generation = @evidence_generation
+  AND c.source_sha = @sha
+FOR SHARE OF c NOWAIT;
+
+-- name: LockWorkerKeyShareSkipLocked :one
+-- The fresh claim's predecessor lock: FOR KEY SHARE, skipping a worker row a conflicting FOR UPDATE holder
+-- has. No row is ambiguous (locked by another, or gone): FreshResumeWorkerExists tells them apart.
+SELECT w.id FROM workers w WHERE w.id = @id FOR KEY SHARE SKIP LOCKED;
+
+-- name: FreshResumeWorkerExists :one
+SELECT EXISTS (SELECT 1 FROM workers w WHERE w.id = @id)::boolean AS present;
 
 -- name: PrepareFreshResumeClaim :one
 -- Saves the run's pre-claim tuple into the pending transfer row, then queues the run for W2 with the

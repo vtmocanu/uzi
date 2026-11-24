@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -39,6 +40,20 @@ const FreshResumeOwnerLockClass int32 = 0x757A6672 // "uzfr"
 
 // freshResumeLockSQL is the owner lock statement, one text so every taker agrees on the objid.
 const freshResumeLockSQL = "SELECT pg_advisory_xact_lock($1, hashtext($2::text))"
+
+// freshResumeTryLockSQL is the fresh claim's non-waiting form of freshResumeLockSQL: the same class and
+// the same hashtext(owner) objid, so a holder of either blocks the other.
+const freshResumeTryLockSQL = "SELECT pg_try_advisory_xact_lock($1, hashtext($2::text))"
+
+// TryLockFreshResumeOwner is LockFreshResumeOwner without the wait: it reports whether the lock was
+// taken. The fresh claim skips a candidate whose owner lock is busy.
+func TryLockFreshResumeOwner(ctx context.Context, db interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, ownerID uuid.UUID) (bool, error) {
+	var got bool
+	err := db.QueryRow(ctx, freshResumeTryLockSQL, FreshResumeOwnerLockClass, ownerID.String()).Scan(&got)
+	return got, err
+}
 
 // LockFreshResumeOwner takes the owner's fresh resume advisory lock for the rest of the transaction.
 func LockFreshResumeOwner(ctx context.Context, db interface {

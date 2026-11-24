@@ -57,6 +57,9 @@ func (e *codexMintedClaimError) Unwrap() error { return e.cause }
 type claimRecoveryIdentity struct {
 	workerID        uuid.UUID
 	recoveryCapable bool
+	// freshID is the claimed fresh resume transfer this claim took (issue #4628); uuid.Nil for every
+	// other claim. While it is set, no assembly arm may write the run: each refuses the transfer.
+	freshID uuid.UUID
 }
 
 // claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
@@ -154,24 +157,31 @@ func runClaimOpenedCustody(run store.Run, recoveryCapable bool) bool {
 // assembleAndFinishRunClaim is the run lane's single post-ClaimRun tail, shared by both
 // Claim return paths so each outcome goes through the same exact-claim transaction.
 func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool) (*ClaimPayload, error) {
-	return s.assembleAndFinishRunClaimRef(ctx, wkr, run, recoveryCapable, nil)
+	return s.assembleAndFinishRunClaimRef(ctx, wkr, run, recoveryCapable, nil, nil)
 }
 
 // assembleAndFinishRunClaimRef is assembleAndFinishRunClaim carrying the memory-park reference
-// claimRunInTx built inside the claim transaction (issue #3639); nil attaches nothing.
-func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool, ref *MemoryParkReference) (*ClaimPayload, error) {
+// claimRunInTx built inside the claim transaction (issue #3639); nil attaches nothing. fresh is the
+// claimed transfer row of a fresh claim (issue #4628), nil for every other claim: it adds the claim
+// payload's fresh_resume object and turns every assembly refusal in finishRunClaimTx into a refusal of
+// that transfer.
+func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool, ref *MemoryParkReference, fresh *store.RunFreshResume) (*ClaimPayload, error) {
 	if h := s.claimHooks; h != nil && h.beforeAssembly != nil {
 		h.beforeAssembly(ctx, run)
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
 	if payload != nil {
 		payload.MemoryParkReference = ref
+		payload.FreshResume = freshResumePayload(fresh)
 	}
 	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
 		h.afterAssembly(ctx, run, payload, err)
 	}
-	return s.finishRunClaim(ctx, run, payload, err,
-		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable})
+	identity := claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable}
+	if fresh != nil {
+		identity.freshID = fresh.ID
+	}
+	return s.finishRunClaim(ctx, run, payload, err, identity)
 }
 
 // finishRunClaim checks even successful payloads against the exact mint and current
@@ -212,6 +222,11 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 				// transition (clients render the hold reason), published like the promoter's
 				// paused -> queued.
 				s.publishSwept(run.ID, "paused")
+			case freshRefusedSettle:
+				// Issue #4628: an assembly arm refused the fresh transfer and the run is back at its
+				// held recovery_wait. That restored state is the only transition to publish; the run
+				// neither failed nor paused, so neither of those goes out.
+				s.publishSwept(run.ID, "recovery_wait")
 			}
 			return out, nil
 		}
@@ -344,6 +359,19 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 		if checkerLead.UserID != run.UserID {
 			return nil, "", nil
+		}
+	}
+	if identity.freshID != uuid.Nil {
+		// Issue #4628: a fresh claim's refusal restores the run's pre-claim tuple, which needs the
+		// predecessor worker (W1) locked before the run row, after W2's own lock above. NOWAIT, because
+		// this transaction already holds a worker lock: a held conflicting lock is 55P03, which
+		// finishRunClaim's bounded retry handles like the alias and account locks.
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		if err := lockFreshSavedWorkerNoWait(ctx, live.Queries, identity.freshID); err != nil {
+			return nil, "", err
 		}
 	}
 	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
@@ -621,6 +649,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 				return nil, "", err
 			}
 		}
+	}
+	if identity.freshID != uuid.Nil {
+		// Issue #4628, V1: every assembly arm below would write the run (a park, a requeue, a failure),
+		// which would strand a claimed transfer or fail a run the owner can still resume from its
+		// original worker. A fresh claim refuses the transfer instead, restoring the held run. The
+		// custody release above already freed W2's generation hold, so no hold of the attempt is left.
+		return s.refuseFreshAtAssembly(ctx, q, run, identity, freshAssemblyReason(overrideUnavailable, credDisabled, holdClass, transient, decision), expected)
 	}
 	var n int64
 	var overrideMsg []byte
