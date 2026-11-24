@@ -197,6 +197,10 @@ export interface AdminSharedProvider {
   attached_key_count: number;
 }
 
+export interface AdminSharedProviderList {
+  providers: AdminSharedProvider[];
+}
+
 /** POST /api/admin/providers body: keyless, Claude only. */
 export interface AdminSharedProviderCreateInput {
   name: string;

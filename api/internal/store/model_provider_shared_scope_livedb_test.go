@@ -332,10 +332,25 @@ func TestSharedScopeRecipientQueriesLiveDB(t *testing.T) {
 	pa := newProvider(ctx, t, q, a, "a-private")
 	shared := newSharedProvider(ctx, t, q, "Shared-GW")
 
-	// B's list: the shared definition, never A's private one, and no key yet.
+	pb := newProvider(ctx, t, q, b, "b-private")
+	// Read the actual result set so an extra owner-only WHERE clause cannot
+	// make the shared row disappear while the VIS text pin still passes.
 	list, err := q.ListVisibleProviders(ctx, b)
-	if err != nil || len(list) != 1 || list[0].ID != shared.ID || list[0].OwnerUserID.Valid || list[0].CredentialMode.String != "per_user_key" || list[0].KeySecretID.Valid {
-		t.Fatalf("B's visible list = %+v (%v), want only the shared definition without a key", list, err)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("B's visible list = %+v (%v), want B's own and the shared definition", list, err)
+	}
+	byID := make(map[uuid.UUID]store.ListVisibleProvidersRow, len(list))
+	for _, row := range list {
+		byID[row.ID] = row
+	}
+	if own, ok := byID[pb.ID]; !ok || own.OwnerUserID != pgUUID(b) || own.CredentialMode.Valid {
+		t.Errorf("B's private definition = %+v, present=%v", own, ok)
+	}
+	if row, ok := byID[shared.ID]; !ok || row.OwnerUserID.Valid || row.CredentialMode.String != "per_user_key" || row.KeySecretID.Valid {
+		t.Errorf("B's shared definition = %+v, present=%v, want shared and no key", row, ok)
+	}
+	if _, ok := byID[pa.ID]; ok {
+		t.Error("B can see A's private definition")
 	}
 	if _, err := q.GetVisibleProviderForUse(ctx, store.GetVisibleProviderForUseParams{ID: pa.ID, UserID: b}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Errorf("B reading A's private definition = %v, want no rows", err)
@@ -724,12 +739,25 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	_, err = pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(sp.ID), sel)
 	wantViolation(t, "the old image switching away from a shared selection", err, "23503", "users_claude_provider_fkey")
 
+	checkSources := func(wantCodex pgtype.UUID) {
+		t.Helper()
+		var codex, claude, scope pgtype.UUID
+		if err := pool.QueryRow(ctx, `SELECT codex_provider_id, claude_provider_id, claude_provider_scope_id FROM users WHERE id = $1`, a).Scan(&codex, &claude, &scope); err != nil {
+			t.Fatal(err)
+		}
+		if codex != wantCodex || claude != pgUUID(pk.ID) || scope != pgUUID(a) {
+			t.Errorf("after old-image Codex write: codex=%v claude=%v scope=%v; want codex=%v, claude=%s, scope=%s",
+				codex, claude, scope, wantCodex, pk.ID, a)
+		}
+	}
 	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "codex", pgUUID(cx.ID), a); err != nil {
 		t.Errorf("the old image selecting a Codex source: %v", err)
 	}
+	checkSources(pgUUID(cx.ID))
 	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "codex", pgtype.UUID{}, a); err != nil {
 		t.Errorf("the old image clearing a Codex source: %v", err)
 	}
+	checkSources(pgtype.UUID{})
 	// Key disable, then delete, then retire: the application's own statements for those.
 	if _, err := pool.Exec(ctx, `UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, key.ID); err != nil {
 		t.Errorf("disabling the key: %v", err)
@@ -1008,8 +1036,12 @@ func TestProviderKeyTestEvidenceFenceLiveDB(t *testing.T) {
 		t.Fatalf("S2 provider lock: %v", err)
 	}
 	s2 := make(chan error, 1)
+	s2Ctx, cancelS2 := context.WithCancel(ctx)
+	s2Done := make(chan struct{})
+	defer func() { cancelS2(); <-s2Done }()
 	go func() {
-		_, err := q2.LockProviderKeyForEvidence(ctx, store.LockProviderKeyForEvidenceParams{KeyID: kb.ID, UserID: b, ProviderID: pgUUID(shared.ID), KeyRev: cur.EnablementRev})
+		defer close(s2Done)
+		_, err := q2.LockProviderKeyForEvidence(s2Ctx, store.LockProviderKeyForEvidenceParams{KeyID: kb.ID, UserID: b, ProviderID: pgUUID(shared.ID), KeyRev: cur.EnablementRev})
 		s2 <- err
 	}()
 	waitBlocked(ctx, t, pool, pid2, "S2 (key lock)")
@@ -1024,9 +1056,13 @@ func TestProviderKeyTestEvidenceFenceLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	s3 := make(chan error, 1)
+	s3Ctx, cancelS3 := context.WithCancel(ctx)
+	s3Done := make(chan struct{})
+	defer func() { cancelS3(); <-s3Done }()
 	var bumped int32
 	go func() {
-		n, err := store.New(tx3).BumpSharedModelProviderRevision(ctx, shared.ID)
+		defer close(s3Done)
+		n, err := store.New(tx3).BumpSharedModelProviderRevision(s3Ctx, shared.ID)
 		bumped = n
 		s3 <- err
 	}()
