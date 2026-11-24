@@ -261,6 +261,86 @@ SELECT id, state, seeded_at, destination_attempt_id, seeded_generation, claim_ge
 FROM run_fresh_resumes
 WHERE id = @id AND run_id = @run_id AND destination_worker_id = @worker_id;
 
+-- name: GetFreshResume :one
+-- Unlocked read of one transfer row by id: the caller decides its lock order (pending: run then
+-- transfer; claimed: saved worker, run, transfer) from the state it reads here, then re-reads the row
+-- under the locks it takes.
+SELECT * FROM run_fresh_resumes WHERE id = @id;
+
+-- name: LockWorkerKeyShare :one
+-- FOR KEY SHARE on one worker row (the saved predecessor of a claimed transfer): it keeps the row from
+-- being deleted while a refusal restores the tuple, and blocks behind a worker FOR UPDATE holder. No row
+-- means the worker is gone.
+SELECT w.id FROM workers w WHERE w.id = @id FOR KEY SHARE;
+
+-- name: LockWorkerKeyShareNoWait :one
+-- LockWorkerKeyShare for a caller that already holds another worker lock (the claim finisher, the abandon
+-- route): it never waits, a held conflicting lock is SQLSTATE 55P03 and the caller retries.
+SELECT w.id FROM workers w WHERE w.id = @id FOR KEY SHARE NOWAIT;
+
+-- name: OwnerHasOutstandingFreshResume :one
+-- Whether this owner has any transfer that still reserves headroom or still has a seeded successor
+-- bound to a nonterminal run. Owner Resume reads it unlocked to decide whether to take the owner lock.
+SELECT EXISTS (SELECT 1 FROM run_fresh_resumes t
+               JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
+               WHERE t.user_id = @user_id
+                 AND t.state IN ('pending', 'claimed', 'seeded', 'superseded')
+                 AND r.status NOT IN ('completed', 'failed', 'cancelled'))::boolean AS outstanding;
+
+-- name: FreshResumeRunBaseEligible :one
+-- fn_fresh_resume_run_base (00523) over one owner run. No row: not the owner's run.
+SELECT fn_fresh_resume_run_base(r, @global_timeout_seconds::int)::boolean AS eligible
+FROM runs r WHERE r.id = @id AND r.user_id = @user_id;
+
+-- name: ListFreshResumeCaptureEvidence :many
+-- Every capture of the run, in any state, with its hold's generation and binding. ttl_ok is the Start
+-- admission window: more than 30 minutes of retention left (ExpireReadyCaptures relies on it).
+SELECT c.id, c.state, c.manifest_bound, c.source_sha, c.prerequisite_shas,
+       (c.expires_at IS NOT NULL AND c.expires_at > now() + interval '30 minutes')::boolean AS ttl_ok,
+       h.generation AS hold_generation, h.run_id AS hold_run_id, h.repo_id AS hold_repo_id
+FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id
+WHERE c.run_id = @run_id AND c.user_id = @user_id
+ORDER BY h.generation DESC, c.created_at, c.id;
+
+-- name: CountOpenHoldsForFreshRun :one
+-- How many open custody holds the run has. A checkpoint-ref candidate needs at least one: the api keeps
+-- the run's checkpoint ref only while a hold is open.
+SELECT count(*)::bigint AS open_holds FROM recovery_custody_holds h
+WHERE h.run_id = @run_id AND h.user_id = @user_id AND h.state = 'open';
+
+-- name: CountFreshResumeDestinations :one
+-- The destination predicate: an online, persistent (non-ephemeral) hosted worker of the owner that
+-- advertises fresh_resume_v1 and recovery_inventory_v1, other than the worker the run is (or was)
+-- bound to and other than any holder of an open custody hold on the run. A NULL cutoff matches nothing.
+SELECT count(*)::bigint AS destinations
+FROM workers w
+JOIN runs r ON r.id = @run_id AND r.user_id = w.user_id
+WHERE w.user_id = @user_id AND w.kind = 'hosted' AND NOT w.ephemeral AND w.status = 'online'
+  AND w.last_heartbeat_at >= sqlc.narg(heartbeat_cutoff)::timestamptz
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced
+  AND w.protocol_capabilities @> ARRAY['fresh_resume_v1', 'recovery_inventory_v1']::text[]
+  AND w.id IS DISTINCT FROM r.worker_id AND w.id IS DISTINCT FROM r.released_worker_id
+  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h
+                  WHERE h.run_id = r.id AND h.state = 'open'
+                    AND w.id IN (h.live_worker_id, h.original_worker_id));
+
+-- name: LockCaptureForFreshResume :one
+-- Start's capture lock: FOR SHARE, with every admission fact in the SAME statement so a concurrent expiry
+-- or discard that commits while this waits is re-evaluated on the new row version (READ COMMITTED). No row
+-- means the capture is no longer a usable candidate: not available, not manifest-bound, inside the 30 minute
+-- retention window, bound to another hold generation, run or repo, or another source sha.
+SELECT c.id, c.source_sha, c.prerequisite_shas, c.expires_at, h.generation AS hold_generation
+FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id
+WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id
+  AND c.state = 'available' AND c.manifest_bound
+  AND c.expires_at > now() + interval '30 minutes'
+  AND h.run_id = c.run_id AND h.user_id = c.user_id AND h.generation = @evidence_generation
+  AND h.repo_id = (SELECT r.repo_id FROM runs r WHERE r.id = c.run_id)
+  AND c.source_sha = @sha
+FOR SHARE OF c;
+
 -- name: CaptureHasActiveFreshResume :one
 -- Whether a pending or claimed transfer references the capture: its bytes must not be discarded,
 -- expired or fenced while the destination may still fetch them.

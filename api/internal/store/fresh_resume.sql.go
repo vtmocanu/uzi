@@ -99,6 +99,74 @@ func (q *Queries) CloseFreshResume(ctx context.Context, arg CloseFreshResumePara
 	return i, err
 }
 
+const countFreshResumeDestinations = `-- name: CountFreshResumeDestinations :one
+SELECT count(*)::bigint AS destinations
+FROM workers w
+JOIN runs r ON r.id = $1 AND r.user_id = w.user_id
+WHERE w.user_id = $2 AND w.kind = 'hosted' AND NOT w.ephemeral AND w.status = 'online'
+  AND w.last_heartbeat_at >= $3::timestamptz
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced
+  AND w.protocol_capabilities @> ARRAY['fresh_resume_v1', 'recovery_inventory_v1']::text[]
+  AND w.id IS DISTINCT FROM r.worker_id AND w.id IS DISTINCT FROM r.released_worker_id
+  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h
+                  WHERE h.run_id = r.id AND h.state = 'open'
+                    AND w.id IN (h.live_worker_id, h.original_worker_id))
+`
+
+type CountFreshResumeDestinationsParams struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	HeartbeatCutoff pgtype.Timestamptz `json:"heartbeat_cutoff"`
+}
+
+// The destination predicate: an online, persistent (non-ephemeral) hosted worker of the owner that
+// advertises fresh_resume_v1 and recovery_inventory_v1, other than the worker the run is (or was)
+// bound to and other than any holder of an open custody hold on the run. A NULL cutoff matches nothing.
+func (q *Queries) CountFreshResumeDestinations(ctx context.Context, arg CountFreshResumeDestinationsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countFreshResumeDestinations, arg.RunID, arg.UserID, arg.HeartbeatCutoff)
+	var destinations int64
+	err := row.Scan(&destinations)
+	return destinations, err
+}
+
+const countOpenHoldsForFreshRun = `-- name: CountOpenHoldsForFreshRun :one
+SELECT count(*)::bigint AS open_holds FROM recovery_custody_holds h
+WHERE h.run_id = $1 AND h.user_id = $2 AND h.state = 'open'
+`
+
+type CountOpenHoldsForFreshRunParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// How many open custody holds the run has. A checkpoint-ref candidate needs at least one: the api keeps
+// the run's checkpoint ref only while a hold is open.
+func (q *Queries) CountOpenHoldsForFreshRun(ctx context.Context, arg CountOpenHoldsForFreshRunParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countOpenHoldsForFreshRun, arg.RunID, arg.UserID)
+	var open_holds int64
+	err := row.Scan(&open_holds)
+	return open_holds, err
+}
+
+const freshResumeRunBaseEligible = `-- name: FreshResumeRunBaseEligible :one
+SELECT fn_fresh_resume_run_base(r, $1::int)::boolean AS eligible
+FROM runs r WHERE r.id = $2 AND r.user_id = $3
+`
+
+type FreshResumeRunBaseEligibleParams struct {
+	GlobalTimeoutSeconds int32     `json:"global_timeout_seconds"`
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
+}
+
+// fn_fresh_resume_run_base (00523) over one owner run. No row: not the owner's run.
+func (q *Queries) FreshResumeRunBaseEligible(ctx context.Context, arg FreshResumeRunBaseEligibleParams) (bool, error) {
+	row := q.db.QueryRow(ctx, freshResumeRunBaseEligible, arg.GlobalTimeoutSeconds, arg.ID, arg.UserID)
+	var eligible bool
+	err := row.Scan(&eligible)
+	return eligible, err
+}
+
 const getActiveFreshResumeForRun = `-- name: GetActiveFreshResumeForRun :one
 SELECT id, run_id, user_id, request_id, evidence_generation, evidence_kind, capture_id, checkpoint_ref, sha, candidate_token, predecessor_worker_id, destination_worker_id, saved_worker_id, saved_tuple, claim_generation, destination_attempt_id, seeded_generation, state, refusal_reason, admission_deadline, transfer_deadline, created_at, claimed_at, seeded_at, closed_at FROM run_fresh_resumes WHERE run_id = $1 AND state IN ('pending', 'claimed')
 `
@@ -142,6 +210,46 @@ SELECT id, run_id, user_id, request_id, evidence_generation, evidence_kind, capt
 
 func (q *Queries) GetActiveFreshResumeForRunForUpdate(ctx context.Context, runID uuid.UUID) (RunFreshResume, error) {
 	row := q.db.QueryRow(ctx, getActiveFreshResumeForRunForUpdate, runID)
+	var i RunFreshResume
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.UserID,
+		&i.RequestID,
+		&i.EvidenceGeneration,
+		&i.EvidenceKind,
+		&i.CaptureID,
+		&i.CheckpointRef,
+		&i.Sha,
+		&i.CandidateToken,
+		&i.PredecessorWorkerID,
+		&i.DestinationWorkerID,
+		&i.SavedWorkerID,
+		&i.SavedTuple,
+		&i.ClaimGeneration,
+		&i.DestinationAttemptID,
+		&i.SeededGeneration,
+		&i.State,
+		&i.RefusalReason,
+		&i.AdmissionDeadline,
+		&i.TransferDeadline,
+		&i.CreatedAt,
+		&i.ClaimedAt,
+		&i.SeededAt,
+		&i.ClosedAt,
+	)
+	return i, err
+}
+
+const getFreshResume = `-- name: GetFreshResume :one
+SELECT id, run_id, user_id, request_id, evidence_generation, evidence_kind, capture_id, checkpoint_ref, sha, candidate_token, predecessor_worker_id, destination_worker_id, saved_worker_id, saved_tuple, claim_generation, destination_attempt_id, seeded_generation, state, refusal_reason, admission_deadline, transfer_deadline, created_at, claimed_at, seeded_at, closed_at FROM run_fresh_resumes WHERE id = $1
+`
+
+// Unlocked read of one transfer row by id: the caller decides its lock order (pending: run then
+// transfer; claimed: saved worker, run, transfer) from the state it reads here, then re-reads the row
+// under the locks it takes.
+func (q *Queries) GetFreshResume(ctx context.Context, id uuid.UUID) (RunFreshResume, error) {
+	row := q.db.QueryRow(ctx, getFreshResume, id)
 	var i RunFreshResume
 	err := row.Scan(
 		&i.ID,
@@ -351,6 +459,65 @@ func (q *Queries) InsertFreshResumePending(ctx context.Context, arg InsertFreshR
 	return i, err
 }
 
+const listFreshResumeCaptureEvidence = `-- name: ListFreshResumeCaptureEvidence :many
+SELECT c.id, c.state, c.manifest_bound, c.source_sha, c.prerequisite_shas,
+       (c.expires_at IS NOT NULL AND c.expires_at > now() + interval '30 minutes')::boolean AS ttl_ok,
+       h.generation AS hold_generation, h.run_id AS hold_run_id, h.repo_id AS hold_repo_id
+FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id
+WHERE c.run_id = $1 AND c.user_id = $2
+ORDER BY h.generation DESC, c.created_at, c.id
+`
+
+type ListFreshResumeCaptureEvidenceParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type ListFreshResumeCaptureEvidenceRow struct {
+	ID               uuid.UUID   `json:"id"`
+	State            string      `json:"state"`
+	ManifestBound    bool        `json:"manifest_bound"`
+	SourceSha        string      `json:"source_sha"`
+	PrerequisiteShas []string    `json:"prerequisite_shas"`
+	TtlOk            bool        `json:"ttl_ok"`
+	HoldGeneration   int64       `json:"hold_generation"`
+	HoldRunID        uuid.UUID   `json:"hold_run_id"`
+	HoldRepoID       pgtype.UUID `json:"hold_repo_id"`
+}
+
+// Every capture of the run, in any state, with its hold's generation and binding. ttl_ok is the Start
+// admission window: more than 30 minutes of retention left (ExpireReadyCaptures relies on it).
+func (q *Queries) ListFreshResumeCaptureEvidence(ctx context.Context, arg ListFreshResumeCaptureEvidenceParams) ([]ListFreshResumeCaptureEvidenceRow, error) {
+	rows, err := q.db.Query(ctx, listFreshResumeCaptureEvidence, arg.RunID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListFreshResumeCaptureEvidenceRow{}
+	for rows.Next() {
+		var i ListFreshResumeCaptureEvidenceRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.State,
+			&i.ManifestBound,
+			&i.SourceSha,
+			&i.PrerequisiteShas,
+			&i.TtlOk,
+			&i.HoldGeneration,
+			&i.HoldRunID,
+			&i.HoldRepoID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingFreshResumeCandidates = `-- name: ListPendingFreshResumeCandidates :many
 SELECT t.id, t.run_id, t.user_id, t.request_id, t.evidence_generation, t.evidence_kind, t.capture_id, t.checkpoint_ref, t.sha, t.candidate_token, t.predecessor_worker_id, t.destination_worker_id, t.saved_worker_id, t.saved_tuple, t.claim_generation, t.destination_attempt_id, t.seeded_generation, t.state, t.refusal_reason, t.admission_deadline, t.transfer_deadline, t.created_at, t.claimed_at, t.seeded_at, t.closed_at FROM run_fresh_resumes t
 JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
@@ -411,6 +578,85 @@ func (q *Queries) ListPendingFreshResumeCandidates(ctx context.Context, arg List
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockCaptureForFreshResume = `-- name: LockCaptureForFreshResume :one
+SELECT c.id, c.source_sha, c.prerequisite_shas, c.expires_at, h.generation AS hold_generation
+FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id
+WHERE c.id = $1 AND c.run_id = $2 AND c.user_id = $3
+  AND c.state = 'available' AND c.manifest_bound
+  AND c.expires_at > now() + interval '30 minutes'
+  AND h.run_id = c.run_id AND h.user_id = c.user_id AND h.generation = $4
+  AND h.repo_id = (SELECT r.repo_id FROM runs r WHERE r.id = c.run_id)
+  AND c.source_sha = $5
+FOR SHARE OF c
+`
+
+type LockCaptureForFreshResumeParams struct {
+	ID                 uuid.UUID `json:"id"`
+	RunID              uuid.UUID `json:"run_id"`
+	UserID             uuid.UUID `json:"user_id"`
+	EvidenceGeneration int64     `json:"evidence_generation"`
+	Sha                string    `json:"sha"`
+}
+
+type LockCaptureForFreshResumeRow struct {
+	ID               uuid.UUID          `json:"id"`
+	SourceSha        string             `json:"source_sha"`
+	PrerequisiteShas []string           `json:"prerequisite_shas"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	HoldGeneration   int64              `json:"hold_generation"`
+}
+
+// Start's capture lock: FOR SHARE, with every admission fact in the SAME statement so a concurrent expiry
+// or discard that commits while this waits is re-evaluated on the new row version (READ COMMITTED). No row
+// means the capture is no longer a usable candidate: not available, not manifest-bound, inside the 30 minute
+// retention window, bound to another hold generation, run or repo, or another source sha.
+func (q *Queries) LockCaptureForFreshResume(ctx context.Context, arg LockCaptureForFreshResumeParams) (LockCaptureForFreshResumeRow, error) {
+	row := q.db.QueryRow(ctx, lockCaptureForFreshResume,
+		arg.ID,
+		arg.RunID,
+		arg.UserID,
+		arg.EvidenceGeneration,
+		arg.Sha,
+	)
+	var i LockCaptureForFreshResumeRow
+	err := row.Scan(
+		&i.ID,
+		&i.SourceSha,
+		&i.PrerequisiteShas,
+		&i.ExpiresAt,
+		&i.HoldGeneration,
+	)
+	return i, err
+}
+
+const lockWorkerKeyShare = `-- name: LockWorkerKeyShare :one
+SELECT w.id FROM workers w WHERE w.id = $1 FOR KEY SHARE
+`
+
+// FOR KEY SHARE on one worker row (the saved predecessor of a claimed transfer): it keeps the row from
+// being deleted while a refusal restores the tuple, and blocks behind a worker FOR UPDATE holder. No row
+// means the worker is gone.
+func (q *Queries) LockWorkerKeyShare(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockWorkerKeyShare, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const lockWorkerKeyShareNoWait = `-- name: LockWorkerKeyShareNoWait :one
+SELECT w.id FROM workers w WHERE w.id = $1 FOR KEY SHARE NOWAIT
+`
+
+// LockWorkerKeyShare for a caller that already holds another worker lock (the claim finisher, the abandon
+// route): it never waits, a held conflicting lock is SQLSTATE 55P03 and the caller retries.
+func (q *Queries) LockWorkerKeyShareNoWait(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockWorkerKeyShareNoWait, id)
+	var id_2 uuid.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const markFreshResumeClaimed = `-- name: MarkFreshResumeClaimed :one
@@ -551,6 +797,23 @@ SELECT set_config('uzi.fresh_resume_id', $1::text, true)
 func (q *Queries) OptInFreshResume(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, optInFreshResume, id)
 	return err
+}
+
+const ownerHasOutstandingFreshResume = `-- name: OwnerHasOutstandingFreshResume :one
+SELECT EXISTS (SELECT 1 FROM run_fresh_resumes t
+               JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
+               WHERE t.user_id = $1
+                 AND t.state IN ('pending', 'claimed', 'seeded', 'superseded')
+                 AND r.status NOT IN ('completed', 'failed', 'cancelled'))::boolean AS outstanding
+`
+
+// Whether this owner has any transfer that still reserves headroom or still has a seeded successor
+// bound to a nonterminal run. Owner Resume reads it unlocked to decide whether to take the owner lock.
+func (q *Queries) OwnerHasOutstandingFreshResume(ctx context.Context, userID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, ownerHasOutstandingFreshResume, userID)
+	var outstanding bool
+	err := row.Scan(&outstanding)
+	return outstanding, err
 }
 
 const prepareFreshResumeClaim = `-- name: PrepareFreshResumeClaim :one

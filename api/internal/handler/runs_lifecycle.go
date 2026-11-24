@@ -1218,6 +1218,9 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// built the run-specific sentence (cap-exceeded names the per-extension maximum,
 			// limit-reached the room left), so surface it verbatim.
 			httpx.Error(w, http.StatusConflict, err.Error())
+		case writeFreshResumeInProgress(w, err):
+			// Issue #4628: a fresh resume transfer owns the run's status, worker and generation, so a
+			// pause, extend, answer or other guarded owner write is a 409, never a 500.
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):

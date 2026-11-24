@@ -301,6 +301,26 @@ func TestFilterProtocol_KeepsJobFilesV1(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_KeepsFreshResumeV1 pins issue #4628: fresh_resume_v1 survives registration
+// (the fresh resume destination predicate reads it off workers.protocol_capabilities), is not a
+// scheduler capability, and orders last in protocolOrder. Removing it from protocolVocabulary makes
+// FilterProtocol drop it, and no worker could ever be a destination.
+func TestFilterProtocol_KeepsFreshResumeV1(t *testing.T) {
+	want := []string{RecoveryInventoryV1, TaskReviewSettingsV1, FreshResumeV1}
+	if got := FilterProtocol([]string{FreshResumeV1, TaskReviewSettingsV1, RecoveryInventoryV1}); !reflect.DeepEqual(got, want) {
+		t.Errorf("FilterProtocol = %v, want %v", got, want)
+	}
+	if got := Filter([]string{FreshResumeV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", FreshResumeV1, got)
+	}
+	if got := SelfReportable([]string{FreshResumeV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", FreshResumeV1, got)
+	}
+	if FreshResumeV1 != "fresh_resume_v1" {
+		t.Errorf("FreshResumeV1 = %q, want fresh_resume_v1", FreshResumeV1)
+	}
+}
+
 // TestUnmet_SubsetPresent pins the empty result when every required capability is present
 // in the effective set — the run is approvable/claimable by that worker (PRD #84 M4 4c).
 func TestUnmet_SubsetPresent(t *testing.T) {

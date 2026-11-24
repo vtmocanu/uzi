@@ -1173,6 +1173,13 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				r.Get("/{id}/fetches", h.ListRunFetches)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
+				// Fresh resume (issue #4628): preview and start an owner's resume of a held run on a
+				// separate persistent hosted worker from durable evidence. Same RequireUser group and
+				// strict owner-or-404 gate as the archive routes above (admin refused), so the CLI
+				// (uzc_ Bearer) and the web reach it. UZI_FRESH_RESUME off: the preview says disabled
+				// and the start is a 409 disabled; neither writes.
+				r.Get("/{id}/fresh-resume", h.PreviewFreshResume)
+				r.Post("/{id}/fresh-resume", h.StartFreshResume)
 				// Exact owner custody-hold DISCARD (PRD #1349 M5, D7). Same RequireUser /runs
 				// group and same strict GetRun owner-or-404 gate as the archive DELETE above, so
 				// both the web dialog and the `uzi run discard` CLI (uzc_/uza_ Bearer) reach it;

@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -22,6 +24,28 @@ const (
 func freshResumeGuardError(err error, message string) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == freshResumeSQLState && strings.Contains(pgErr.Message, message)
+}
+
+// FreshResumeOwnerLockClass is the class half of the two-int advisory lock that serializes every path
+// consuming or checking one owner's fresh resume headroom (issue #4628): Start, and an owner Resume
+// while the feature is on or the owner has an outstanding transfer. The objid is hashtext(owner::text),
+// taken in SQL by the callers: pg_advisory_xact_lock(FreshResumeOwnerLockClass, hashtext($owner::text)).
+// It is the FIRST lock of those transactions, before any worker, run, transfer or capture row lock. The
+// fresh claim takes it with pg_try_advisory_xact_lock and skips the candidate when busy, because
+// Service.Claim already holds the claimant row. XACT-scoped. An objid collision only serializes two
+// unrelated owners for a moment. TestProductTokenMintLockClassMatchesSQL's source enumeration fails on
+// any collision with another *LockClass.
+const FreshResumeOwnerLockClass int32 = 0x757A6672 // "uzfr"
+
+// freshResumeLockSQL is the owner lock statement, one text so every taker agrees on the objid.
+const freshResumeLockSQL = "SELECT pg_advisory_xact_lock($1, hashtext($2::text))"
+
+// LockFreshResumeOwner takes the owner's fresh resume advisory lock for the rest of the transaction.
+func LockFreshResumeOwner(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, ownerID uuid.UUID) error {
+	_, err := db.Exec(ctx, freshResumeLockSQL, FreshResumeOwnerLockClass, ownerID.String())
+	return err
 }
 
 // IsFreshResumeInProgress reports whether err is rule 1 of the fresh resume guard: a runs status,

@@ -442,6 +442,8 @@ func run() error {
 		// Issue #2545 held-work publication step A switch (UZI_HELD_PUBLICATION, default on).
 		HeldPublication:   cfg.HeldPublication,
 		PublicationResume: cfg.PublicationResume,
+		// Issue #4628 fresh resume gate (UZI_FRESH_RESUME, default off).
+		FreshResume: cfg.FreshResume,
 	})
 
 	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker

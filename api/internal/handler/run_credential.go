@@ -94,6 +94,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
 	var ownerHeld *workersvc.RunOwnerHeldError
 	switch {
+	case writeFreshResumeInProgress(w, err):
+		// Issue #4628: a fresh resume transfer owns the run; the guard refused the switch write.
 	case errors.Is(err, workersvc.ErrCodexSwitchIneligible):
 		httpx.Error(w, http.StatusUnprocessableEntity, workersvc.ErrCodexSwitchIneligible.Error())
 	case errors.Is(err, workersvc.ErrRunNotFound):

@@ -1806,6 +1806,10 @@ type Params struct {
 	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) carries
 	// config.Config.PublicationResume. It gates NEW enrollment only; the zero value refuses it.
 	PublicationResume bool
+
+	// FreshResume (issue #4628, UZI_FRESH_RESUME) carries config.Config.FreshResume. It gates the
+	// owner preview and start and the sweep's gate_off drain; the zero value is off.
+	FreshResume bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
