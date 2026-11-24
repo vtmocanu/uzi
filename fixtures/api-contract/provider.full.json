@@ -28,6 +28,14 @@
       "model": "x",
       "context_window": 1
     },
+    "gpt-6.2-sol": {
+      "model": "x",
+      "context_window": 1
+    },
+    "gpt-6.2-astra": {
+      "model": "x",
+      "context_window": 1
+    },
     "gpt-6-luna": {
       "model": "x",
       "context_window": 1
