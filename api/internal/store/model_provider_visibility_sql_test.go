@@ -113,7 +113,7 @@ var visibilityTable = map[string]visEntry{
 		callers: []string{"workersvc/provider_claim.go"}},
 	// The evidence key lock runs only after LockVisibleProviderForEvidence in the same transaction
 	// (TestIdentityQueryCallersArePinned checks that order in the caller).
-	"LockProviderKeyForEvidence": {class: classIdentity, must: []string{"k.provider_id =", "k.user_id =", "k.enablement_rev =", "k.disabled_at IS NULL"},
+	"LockProviderKeyForEvidence": {class: classIdentity, must: []string{"k.id = @key_id", "k.provider_id =", "k.user_id =", "k.enablement_rev =", "k.disabled_at IS NULL"},
 		callers: []string{"handler/providers_probe.go"}},
 	"UpsertProviderKeyTestResult": {class: classIdentity, must: []string{"ON CONFLICT (provider_id, user_id)"},
 		callers: []string{"handler/providers_probe.go"}},
@@ -320,22 +320,37 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 // production files its entry records, and the evidence key lock is preceded by the provider
 // evidence fence and followed by the upsert in its one caller.
 func TestIdentityQueryCallersArePinned(t *testing.T) {
+	// Every production .go file under api/internal and api/cmd (test files, testdata and the
+	// generated store files excluded), keyed by its path relative to api/internal.
 	files := map[string]string{}
-	for _, dir := range []string{"handler", "workersvc"} {
-		entries, err := os.ReadDir(filepath.Join("..", dir))
+	for _, root := range []string{"..", filepath.Join("..", "..", "cmd")} {
+		err := filepath.WalkDir(root, func(path string, de os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if de.IsDir() {
+				if de.Name() == "testdata" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			n := de.Name()
+			if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") || strings.HasSuffix(n, ".sql.go") {
+				return nil
+			}
+			b, err := os.ReadFile(path) //nolint:gosec // G304: a path WalkDir found under this module's own source tree, read-only.
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel("..", path)
+			if err != nil {
+				return err
+			}
+			files[filepath.ToSlash(rel)] = string(b)
+			return nil
+		})
 		if err != nil {
 			t.Fatal(err)
-		}
-		for _, de := range entries {
-			n := de.Name()
-			if de.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
-				continue
-			}
-			b, err := os.ReadFile(filepath.Join("..", dir, n)) //nolint:gosec // G304: a fixed sibling package dir listed by os.ReadDir, read-only.
-			if err != nil {
-				t.Fatal(err)
-			}
-			files[dir+"/"+n] = string(b)
 		}
 	}
 	for name, e := range visibilityTable {
