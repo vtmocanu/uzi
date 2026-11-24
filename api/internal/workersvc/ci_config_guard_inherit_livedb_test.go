@@ -81,7 +81,9 @@ func TestCIFixOnGuardedBranchInheritsGuardLiveDB(t *testing.T) {
 	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, status, harness, ci_config_guard, ci_config_paths)
 	          VALUES ($1, $2, $3, 'prompt', 'repair', 'd', 'running', 'claude', true, $4)`,
 		gid, userID, repoID, []string{"b/**", ".gitlab-ci.yml"})
-	fix, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, branch, "Fix CI", "d", ciFixSnapshot(branch, 286510), configured)
+	// Manual create: guard inheritance is shared createCIFixRun code, and this fixture has no
+	// forge wired nor a recorded PR (the automatic path also needs a selected run, issue #4617).
+	fix, err := svc.CreateCIFixRun(env.ctx, userID, repoID, branch, "Fix CI", "d", ciFixSnapshot(branch, 286510), configured)
 	if err != nil {
 		t.Fatalf("ci_fix on guarded branch: %v", err)
 	}

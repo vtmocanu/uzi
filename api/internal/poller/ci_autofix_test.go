@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -558,6 +560,43 @@ func TestCIAutofixBranchInUseSwallows(t *testing.T) {
 	}
 	if len(st.records) != 1 || st.records[0].LastPipelineID.Int64 != 9001 {
 		t.Fatalf("expected a silent RecordCIAutofixPipeline of 9001, got %+v", st.records)
+	}
+}
+
+func TestCIAutofixIneligibleLeavesLedgerUntouched(t *testing.T) {
+	// Issue #4617: the starter's in-transaction recheck refused (opt-out, cancellation or an
+	// owner change since detection). Nothing was created, so the detector must write no ledger
+	// row, record no pipeline and post no comment or notification: the next tick re-evaluates.
+	// It is an expected skip, so nothing may be logged at ERROR (the default arm would).
+	// Swaps slog.SetDefault (process-global): must not run in parallel.
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var (
+		mu   sync.Mutex
+		errs int
+	)
+	slog.SetDefault(slog.New(errorCounter{mu: &mu, errors: &errs}))
+	var ops []string
+	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9001)}, ops: &ops}
+	runs := &cfRuns{err: fmt.Errorf("%w: opted out", workersvc.ErrCIAutofixIneligible), ops: &ops}
+	notifier := &cfNotifier{ops: &ops}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom", ops: &ops}
+
+	newCF(st, runs, notifier).detect(context.Background(), cfRepoRow(), f, f)
+
+	if len(runs.calls) != 1 {
+		t.Fatalf("expected one create attempt, got %d", len(runs.calls))
+	}
+	if len(st.upserts) != 0 || len(st.records) != 0 || len(st.haltSets) != 0 {
+		t.Fatalf("an ineligible create must not touch the ledger: upserts=%d records=%d halts=%d", len(st.upserts), len(st.records), len(st.haltSets))
+	}
+	if len(f.notes) != 0 || len(notifier.calls) != 0 {
+		t.Fatalf("an ineligible create must not comment/notify: notes=%d notifs=%d", len(f.notes), len(notifier.calls))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if errs != 0 {
+		t.Fatalf("an ineligible create logged %d ERROR record(s), want 0 (an expected skip)", errs)
 	}
 }
 

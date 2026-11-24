@@ -84,7 +84,7 @@ func TestRenderRunDetailWeeklyLimitRows(t *testing.T) {
 	}
 	plain := weeklyRun()
 	plain.WeeklyLimit = nil
-	if out := weeklyDetailString(t, plain); strings.Contains(out, "WEEKLY_LIMIT") || strings.Contains(out, "FIX") {
+	if out := weeklyDetailString(t, plain); strings.Contains(out, "WEEKLY_LIMIT") || strings.Contains(out, "\nFIX") {
 		t.Errorf("a run without the block gained weekly rows:\n%s", out)
 	}
 }

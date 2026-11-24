@@ -264,6 +264,8 @@ var runDTOKeys = []string{
 	// tell "no per-run opinion" (null) from an explicit true/false and render the
 	// effective inherited value.
 	"mr_rework_enabled",
+	// Issue #4617: the per-run CI-autofix override, same tri-state *bool, NOT omitempty.
+	"ci_autofix_enabled",
 	// PRD #1202 D11: the owner-only automatic-rework loop-guard view (cycles spent / live
 	// cap), both nullable *int, populated only on the owner's run-detail read.
 	"mr_rework_auto_cycles", "mr_rework_auto_cap",

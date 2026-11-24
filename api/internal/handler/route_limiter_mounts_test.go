@@ -1162,6 +1162,7 @@ var wantRouteMounts = []routeMount{
 	// write, and no status change. Unlike wait-on-limit it is mounted on RequireUser (D3),
 	// but the limiter dimension is the same.
 	{"PUT", "/api/runs/{id}/mr-rework", noLimiter},
+	{"PUT", "/api/runs/{id}/ci-autofix", noLimiter},
 	{"PUT", "/api/runs/{id}/wait-on-limit", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	{"PUT", "/api/skills/{id}", noLimiter},

@@ -1952,7 +1952,9 @@ the admission rules of the [ADR-1197 #3644 amendment](1197-transient-recovery-pa
 - **No effect on P.** The park changes none of P's bytes (journal, slot, clone, HOME,
   provision) and reaps nothing. Resume claims again, holds again unchanged on this
   release, and adds a claim and an open custody hold, except that a run already at its own `custody_hold_limit` bound is requeued with no claim and no hold (#4162). The parked run holds P's hold
-  and the current generation's.
+  and the current generation's. A permanent message failure (the batcher breaker) in this hold or
+  anywhere from route selection until the seed hands off reports no `failed` and reaps nothing (#4644; see the
+  [ADR-1197 #3644 amendment](1197-transient-recovery-park.md#amendment-2026-11-09-3644-an-unsupported-predecessor-holds-for-its-owner)).
 - **Hosted.** An owner-held hosted run blocks its worker's ordinary image roll (the run is
   non-terminal) until the owner cancels or discards it.
 - **Unchanged.** A stale claim, a credential switch, lost ownership and an owner Cancel

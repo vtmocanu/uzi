@@ -107,11 +107,92 @@ func (q *Queries) GetCIAutofixAttempt(ctx context.Context, arg GetCIAutofixAttem
 	return i, err
 }
 
+const getCIAutofixSelectedRun = `-- name: GetCIAutofixSelectedRun :one
+SELECT r.id, r.user_id,
+       r.ci_autofix_enabled AS run_ci_autofix_enabled,
+       u.ci_autofix_enabled AS owner_ci_autofix_enabled
+FROM runs r
+JOIN users u ON u.id = r.user_id
+WHERE r.repo_id = $1::uuid
+  AND r.branch IS NOT NULL AND r.branch <> ''
+  AND r.branch = $2
+  AND r.mr_iid IS NOT NULL
+  AND r.kind IN ('issue', 'ci_fix', 'prompt', 'self_improve')
+  AND r.status <> 'cancelled'
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT 1
+`
+
+type GetCIAutofixSelectedRunParams struct {
+	RepoID uuid.UUID   `json:"repo_id"`
+	Ref    pgtype.Text `json:"ref"`
+}
+
+type GetCIAutofixSelectedRunRow struct {
+	ID                    uuid.UUID   `json:"id"`
+	UserID                uuid.UUID   `json:"user_id"`
+	RunCiAutofixEnabled   pgtype.Bool `json:"run_ci_autofix_enabled"`
+	OwnerCiAutofixEnabled pgtype.Bool `json:"owner_ci_autofix_enabled"`
+}
+
+// The run ListCIAutofixCandidateRefs selects for ONE branch (issue #4617): the
+// single-branch twin of its per_branch CTE. It MUST keep the same filters and the same
+// ordering (kind set, branch/mr_iid guards, cancelled exclusion, created_at DESC then
+// id DESC); a drift test pins that. No user filter: the selected run is the newest
+// qualifying run for the branch whoever owns it. ErrNoRows = no selected run.
+func (q *Queries) GetCIAutofixSelectedRun(ctx context.Context, arg GetCIAutofixSelectedRunParams) (GetCIAutofixSelectedRunRow, error) {
+	row := q.db.QueryRow(ctx, getCIAutofixSelectedRun, arg.RepoID, arg.Ref)
+	var i GetCIAutofixSelectedRunRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RunCiAutofixEnabled,
+		&i.OwnerCiAutofixEnabled,
+	)
+	return i, err
+}
+
+const listActiveCIFixRunIDsForRef = `-- name: ListActiveCIFixRunIDsForRef :many
+SELECT id FROM runs
+WHERE repo_id = $1::uuid AND user_id = $2 AND kind = 'ci_fix'
+  AND pipeline_ref = $3
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY created_at DESC, id DESC
+`
+
+type ListActiveCIFixRunIDsForRefParams struct {
+	RepoID uuid.UUID   `json:"repo_id"`
+	UserID uuid.UUID   `json:"user_id"`
+	Ref    pgtype.Text `json:"ref"`
+}
+
+// The ids of the ACTIVE ci_fix runs on a ref owned by one user (issue #4617), newest
+// first. Same predicate as GetActiveCIFixTargetForRef plus the owner filter.
+func (q *Queries) ListActiveCIFixRunIDsForRef(ctx context.Context, arg ListActiveCIFixRunIDsForRefParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listActiveCIFixRunIDsForRef, arg.RepoID, arg.UserID, arg.Ref)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCIAutofixCandidateRefs = `-- name: ListCIAutofixCandidateRefs :many
 
 WITH per_branch AS (
     SELECT DISTINCT ON (r.branch)
-           r.branch, r.mr_iid, r.user_id
+           r.branch, r.mr_iid, r.user_id, r.ci_autofix_enabled
     FROM runs r
     WHERE r.repo_id = $1::uuid
       AND r.branch IS NOT NULL AND r.branch <> ''
@@ -125,7 +206,7 @@ WITH per_branch AS (
       -- cancelled here lets DISTINCT ON fall through to an older non-cancelled completed
       -- run on the same branch (the pre-#329 behavior), or yield no candidate.
       AND r.status <> 'cancelled'
-    ORDER BY r.branch, r.created_at DESC
+    ORDER BY r.branch, r.created_at DESC, r.id DESC
 )
 SELECT per_branch.branch AS ref,
        per_branch.mr_iid,
@@ -140,7 +221,7 @@ JOIN pipeline_statuses ps
 JOIN repos rp ON rp.id = $1::uuid
 JOIN users u ON u.id = per_branch.user_id
 WHERE per_branch.branch <> rp.default_branch
-  AND u.ci_autofix_enabled IS NOT FALSE
+  AND COALESCE(per_branch.ci_autofix_enabled, u.ci_autofix_enabled) IS NOT FALSE
   AND EXISTS (
       SELECT 1 FROM user_secrets s
       WHERE s.user_id = per_branch.user_id AND s.kind = 'anthropic_token'
@@ -185,11 +266,15 @@ type ListCIAutofixCandidateRefsRow struct {
 //     branches always carry an mr_iid and are never protected by construction, so
 //     default-branch exclusion + mr_iid IS NOT NULL is a sound stand-in for a
 //     protected-branch check.
-//  3. THE OWNER OPT-IN + TOKEN GATE. The run's owner must not have opted OUT of ci
-//     autofix AND have an Anthropic token on file. ci_autofix_enabled is a tri-state
-//     (PRD #914): NULL (inherit the admin global default, which is ON) and explicit
-//     true both pass; only an explicit false is excluded — hence `IS NOT FALSE`. The
-//     token
+//  3. THE OPT-IN + TOKEN GATE. The selected run's effective opt-in must not be OFF AND
+//     its owner must have an Anthropic token on file. ci_autofix_enabled is a tri-state
+//     (PRD #914): on the OWNER column, NULL (inherit the admin global default, which is
+//     ON) and explicit true both pass; only an explicit false is excluded — hence
+//     `IS NOT FALSE`. On the RUN column NULL is different: it means inherit the owner. Since
+//     issue #4617 the per-run override (runs.ci_autofix_enabled, carried by the
+//     per_branch CTE from the newest qualifying run) WINS over the owner default:
+//     COALESCE(run, owner) IS NOT FALSE, resolved live. The admin global gate is NOT
+//     here: it stays in the poller as a hard gate no override can lift. The token
 //     check mirrors GetAutopilotConnectionContext's has_anthropic_token: an EXISTS
 //     over user_secrets (kind = 'anthropic_token'), NOT a column on users — there is
 //     no anthropic_token_ciphertext column.

@@ -2071,6 +2071,11 @@ parked). Design and the restore itself:
   nothing is reaped. Resume claims again and holds again unchanged on this release; it grants no
   authority over the predecessor. A stale claim, a credential switch, lost ownership and an owner
   Cancel propagate unchanged.
+- **A permanent message failure (#4644).** From route selection until the seed hands off, a permanent
+  refusal of the run's messages (the batcher breaker) reports no `failed`, reaps nothing and keeps
+  custody. During this hold the park still proceeds. Elsewhere in that window the flight stops
+  nonterminally, and an active credential switch still takes its own path. A trip just before the hold
+  flag is set, or during a source-end decline report, stops nonterminally without the owner hold.
 
 **Accounting.** The park holds the predecessor's custody hold and the current generation's, and an
 owner Resume adds a claim and a hold, each counting toward `custody_hold_limit`. An owner-held hosted

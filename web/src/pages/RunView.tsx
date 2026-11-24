@@ -31,6 +31,7 @@ import {
 } from "../lib/budget";
 import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
+import { canToggleCiAutofix, effectiveCiAutofix } from "../lib/ciAutofix";
 import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripUnsafeChars } from "../lib/safeText";
 import { leadConfigView, leadConfigViewInput } from "../lib/leadConfig";
@@ -1055,6 +1056,115 @@ export function PausedPanel({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Issue #4617: the per-run "automatically fix CI failures" panel. A checkbox showing the
+ * EFFECTIVE value (run override ?? owner default ?? on) plus, once the run carries an
+ * explicit override, a "Reset to default" button that sends null. Owner-only
+ * (canSteer=false renders nothing) and limited to runs that own a fixable branch
+ * (canToggleCiAutofix). The write and its result are LOCAL to the panel: the server may
+ * answer that another run governs the branch, or that CI fixes already in flight keep their
+ * own setting, and those are states shown inline, as are errors, never the page banner.
+ * `onChanged` lets the page refresh the run after a successful write.
+ */
+export function CiAutofixPanel({
+  run,
+  busy,
+  canSteer = true,
+  userDefault,
+  onChanged,
+}: {
+  run: Run;
+  busy: boolean;
+  canSteer?: boolean;
+  userDefault: boolean | null;
+  onChanged?: () => void | Promise<unknown>;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [governingId, setGoverningId] = useState<string | null>(null);
+  const [inflightIds, setInflightIds] = useState<string[]>([]);
+
+  if (!canSteer) return null;
+  if (!canToggleCiAutofix(run)) return null;
+  const effective = effectiveCiAutofix(run, userDefault);
+  const overridden = run.ci_autofix_enabled != null;
+  const disabled = busy || saving;
+
+  const save = async (enabled: boolean | null) => {
+    setError("");
+    setGoverningId(null);
+    setInflightIds([]);
+    setSaving(true);
+    try {
+      const res = await api.setRunCiAutofix(run.id, enabled);
+      setGoverningId(res.ci_autofix_governing_run_id ?? null);
+      setInflightIds(res.ci_autofix_inflight_fix_run_ids ?? []);
+      await onChanged?.();
+    } catch (e) {
+      setError(errorMessage(e, "Could not update the CI autofix setting."));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const shortId = (id: string) => id.slice(0, 8);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-3 px-1">
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={effective}
+            disabled={disabled}
+            onChange={(e) => save(e.target.checked)}
+          />
+          <span className="text-muted">Automatically fix CI failures on this branch</span>
+        </label>
+        {overridden && (
+          <button
+            type="button"
+            className="text-xs font-medium text-muted transition-colors hover:text-fg disabled:opacity-50"
+            disabled={disabled}
+            onClick={() => save(null)}
+          >
+            Reset to default
+          </button>
+        )}
+      </div>
+      {error && (
+        <p role="status" aria-live="polite" className="px-1 text-xs font-medium text-warn">
+          {error}
+        </p>
+      )}
+      {governingId && (
+        <p role="status" className="px-1 text-xs text-muted">
+          Run{" "}
+          <Link to={`/runs/${governingId}`} className="underline hover:text-fg">
+            {shortId(governingId)}
+          </Link>{" "}
+          governs automatic CI fixes on this branch; change it there.
+        </p>
+      )}
+      {inflightIds.length > 0 && (
+        <p role="status" className="px-1 text-xs text-muted">
+          CI fixes in flight on this branch keep their own setting:{" "}
+          {inflightIds.map((id, i) => (
+            <span key={id}>
+              {i > 0 && ", "}
+              <Link to={`/runs/${id}`} className="underline hover:text-fg">
+                {shortId(id)}
+              </Link>
+            </span>
+          ))}
+          ; cancel them or set it on them too.
+        </p>
+      )}
     </div>
   );
 }
@@ -2277,6 +2387,9 @@ export function RunView() {
   // the session User, so it is fetched here. Best-effort — a failed read leaves null,
   // which effectiveMrRework treats as the default-ON state.
   const [mrReworkDefault, setMrReworkDefault] = useState<boolean | null>(null);
+  // Issue #4617: the owner's CI-autofix default. It rides the session user (User
+  // .ci_autofix_enabled, not /me/settings); null = never overrode, which reads as ON.
+  const ciAutofixDefault = useOptionalAuth()?.user?.ci_autofix_enabled ?? null;
 
   // Resolve the repo's web URL (for the MR link); the run itself does not carry
   // it. Best-effort — the MR iid is shown as text if the repo is not resolvable.
@@ -2795,6 +2908,8 @@ export function RunView() {
                 await api.setRunMrRework(run.id, enabled);
                 await refreshRun();
               })} />}
+            {!policyBlocked && <CiAutofixPanel run={run} busy={busy} canSteer={canSteer} userDefault={ciAutofixDefault}
+              onChanged={refreshRun} />}
           </RunSettingsDisclosure>
           {policyBlocked ? canSteer && <Button variant="danger" size="sm" disabled={busy} onClick={() => cancelRun()}>Cancel run</Button> : <RunControls run={run} busy={busy} canSteer={canSteer} terminal={terminal}
             onStop={() => cancelRun()} onPause={(mode) => act(async () => { await api.pauseRun(run.id, mode); await refreshRun(); })} />}
