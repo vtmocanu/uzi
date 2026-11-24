@@ -27,8 +27,8 @@ var (
 	// ErrFreshNotClaimed: the transfer is not claimed by this worker at the claim generation it sent, or
 	// the run is no longer its claim at that generation. Every fenced route's 409.
 	ErrFreshNotClaimed = errors.New("fresh resume transfer is not claimed by this worker at this generation")
-	// ErrFreshAttemptMismatch: a receipt for an attempt or generation other than the seeded one, or an
-	// attempt id that does not carry the claim generation.
+	// ErrFreshAttemptMismatch: a receipt for an attempt or generation other than the seeded one (a seeded
+	// row only; a claimed row's bad attempt id is ErrFreshNotClaimed).
 	ErrFreshAttemptMismatch = errors.New("fresh resume receipt does not match the seeded attempt")
 	// ErrFreshNoBundle: the transfer's evidence is a checkpoint ref, which has no bundle to stream.
 	ErrFreshNoBundle = errors.New("fresh resume transfer has no bundle to stream")
@@ -186,8 +186,8 @@ func (s *Service) AbandonFreshResume(ctx context.Context, wkr store.Worker, runI
 // FreshResumeReceipt is the destination's seeded receipt (plan section 4, "Receipt"). Under the locks:
 // a claimed transfer at the caller's G' whose attempt id carries -g<G'>- supersedes the run's earlier
 // seeded row and is marked seeded (the first fenced commit); a replay of the same attempt and generation
-// is a success; a different attempt or generation is ErrFreshAttemptMismatch; anything else is
-// ErrFreshNotClaimed. The reply carries current_authority, judged under the run lock against liveGen.
+// is a success; a different attempt or generation on a seeded row is ErrFreshAttemptMismatch; anything
+// else, including a claimed row whose attempt id does not carry -g<G'>-, is ErrFreshNotClaimed. The reply carries current_authority, judged under the run lock against liveGen.
 func (s *Service) FreshResumeReceipt(ctx context.Context, wkr store.Worker, runID, frid uuid.UUID, gen int64, attemptID string, liveGen int64) (apitypes.FreshResumeStateDTO, error) {
 	var dto apitypes.FreshResumeStateDTO
 	err := s.withFreshLocks(ctx, wkr, runID, frid, true, func(l freshLocked) error {
@@ -202,8 +202,10 @@ func (s *Service) FreshResumeReceipt(ctx context.Context, wkr store.Worker, runI
 				ID: frid, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgtype.Int8{Int64: gen, Valid: true}, AttemptID: attemptID,
 			})
 			if errors.Is(err, pgx.ErrNoRows) {
-				// Every other fact was just checked under the locks, so the attempt id is what failed.
-				return ErrFreshAttemptMismatch
+				// Every other fact was just checked under the locks, so the attempt id is what failed. A
+				// claimed row is not yet seeded, so the plan's receipt table answers not-claimed here;
+				// the attempt mismatch is only for an already seeded row.
+				return ErrFreshNotClaimed
 			}
 			if err != nil {
 				return err

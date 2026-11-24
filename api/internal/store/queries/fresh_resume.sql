@@ -68,6 +68,41 @@ WHERE t.user_id = @user_id AND t.state = 'pending' AND t.admission_deadline > no
                     AND (a.reported_at >= @snapshot_fresh_cutoff::timestamptz
                          OR (a.terminal_pending AND a.terminal_pending_until > now())))
   AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
+  -- ClaimRun's PRD #3522 weekly-reserve admission gate, verbatim (same @reserve_* params, from the claim's
+  -- ClaimRunParams): a reserve-held run is not even attempted.
+  AND (NOT @reserve_on::boolean
+           OR (COALESCE(r.reserve_exempt_until > @reserve_now::timestamptz, false) AND NOT (r.id = ANY(@reserve_override_ended::uuid[])))
+           OR (r.first_started_at IS NOT NULL AND NOT @reserve_pause_on::boolean)
+           OR NOT (
+               CASE
+                   WHEN r.harness = 'codex'
+                       THEN COALESCE(r.codex_secret_id = ANY(@reserve_blocked_codex::uuid[]), false)
+                   WHEN r.kind IN ('judge', 'self_improve')
+                       THEN CASE @reserve_judge_mode::text
+                           WHEN 'auto' THEN
+                               CASE
+                                   WHEN EXISTS (SELECT 1 FROM unnest(@reserve_permitted::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN false
+                                   WHEN EXISTS (SELECT 1 FROM unnest(@reserve_pooled::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN true
+                                   ELSE @reserve_owner_default_blocked::boolean
+                               END
+                           ELSE @reserve_judge_static_blocked::boolean
+                       END
+                   WHEN r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL
+                       THEN COALESCE(r.credential_override_secret_id = ANY(@reserve_blocked_claude::uuid[]), false)
+                   WHEN r.credential_override_mode = 'default'
+                       THEN @reserve_owner_default_blocked::boolean
+                   WHEN r.credential_override_mode = 'auto' OR @reserve_worker_mode::text = 'auto'
+                       THEN (EXISTS (SELECT 1 FROM unnest(@reserve_pooled::uuid[]) pp
+                                     WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false))
+                             AND NOT EXISTS (SELECT 1 FROM unnest(@reserve_permitted::uuid[]) pp
+                                             WHERE NOT COALESCE(r.retry_not_before > @reserve_now::timestamptz AND pp = r.limit_dead_secret_id, false)))
+                   ELSE @reserve_worker_static_blocked::boolean
+               END
+           ))
 ORDER BY t.created_at, t.id
 LIMIT @row_limit::int;
 
@@ -78,12 +113,26 @@ LIMIT @row_limit::int;
 -- predecessor the caller locked (the caller compares it; the nil uuid, no worker, is accepted only on the
 -- deleted branch).
 -- user_id is the claimant's owner: the destination worker and the run belong to the same user.
+-- A SKIP LOCKED zero-row result can leave r locked (t was the skipped row): the caller relies on its
+-- savepoint rollback to release it.
 SELECT t.id, t.run_id, t.capture_id, t.evidence_kind, t.evidence_generation, t.sha,
        COALESCE(r.worker_id, r.released_worker_id, '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS w1_id
 FROM run_fresh_resumes t
 JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
 WHERE t.id = @id AND t.user_id = @user_id AND t.state = 'pending' AND t.admission_deadline > now()
   AND r.status = 'recovery_wait'
+  -- The W1-keyed dedupe of ListPendingFreshResumeCandidates, rechecked on the locked versions (the
+  -- caller already holds W1 FOR KEY SHARE): a W1 snapshot or terminal_pending row committed after the
+  -- candidate read must skip the candidate.
+  AND (r.worker_id IS NULL OR r.worker_id <> @worker_id::uuid)
+  AND (r.released_worker_id IS NULL OR r.released_worker_id <> @worker_id::uuid)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = r.id AND a.worker_id = r.worker_id
+                    AND a.claim_generation = r.claim_generation
+                    AND r.claim_released_at IS NULL
+                    AND (a.reported_at >= @snapshot_fresh_cutoff::timestamptz
+                         OR (a.terminal_pending AND a.terminal_pending_until > now())))
+  AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
 FOR UPDATE OF r, t SKIP LOCKED;
 
 -- name: LockCaptureForFreshClaim :one

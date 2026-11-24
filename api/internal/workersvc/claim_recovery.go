@@ -242,8 +242,11 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 			if settleErr != nil {
 				return nil, errors.Join(err, settleErr)
 			}
-			if status == "failed" {
+			switch status {
+			case "failed":
 				s.notify(run.ID, "failed")
+			case freshRefusedSettle:
+				s.publishSwept(run.ID, "recovery_wait")
 			}
 			return nil, err
 		}
@@ -363,9 +366,10 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 	if identity.freshID != uuid.Nil {
 		// Issue #4628: a fresh claim's refusal restores the run's pre-claim tuple, which needs the
-		// predecessor worker (W1) locked before the run row, after W2's own lock above. NOWAIT, because
-		// this transaction already holds a worker lock: a held conflicting lock is 55P03, which
-		// finishRunClaim's bounded retry handles like the alias and account locks.
+		// predecessor worker (W1) locked before the run row. NOWAIT, because this transaction may already
+		// hold W2's worker row FOR UPDATE (optInRunFences takes it only for a checkpoint-coordinate or
+		// publication-enrolled run; any other run holds no worker lock here): a held conflicting lock is
+		// 55P03, which finishRunClaim's bounded retry handles like the alias and account locks.
 		live, ok := q.(pgxClaimFinishTx)
 		if !ok {
 			return nil, "", errClaimRecoveryNoTx

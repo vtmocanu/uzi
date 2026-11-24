@@ -677,19 +677,67 @@ WHERE t.user_id = $1 AND t.state = 'pending' AND t.admission_deadline > now()
                     AND (a.reported_at >= $7::timestamptz
                          OR (a.terminal_pending AND a.terminal_pending_until > now())))
   AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
+  -- ClaimRun's PRD #3522 weekly-reserve admission gate, verbatim (same @reserve_* params, from the claim's
+  -- ClaimRunParams): a reserve-held run is not even attempted.
+  AND (NOT $8::boolean
+           OR (COALESCE(r.reserve_exempt_until > $9::timestamptz, false) AND NOT (r.id = ANY($10::uuid[])))
+           OR (r.first_started_at IS NOT NULL AND NOT $11::boolean)
+           OR NOT (
+               CASE
+                   WHEN r.harness = 'codex'
+                       THEN COALESCE(r.codex_secret_id = ANY($12::uuid[]), false)
+                   WHEN r.kind IN ('judge', 'self_improve')
+                       THEN CASE $13::text
+                           WHEN 'auto' THEN
+                               CASE
+                                   WHEN EXISTS (SELECT 1 FROM unnest($14::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > $9::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN false
+                                   WHEN EXISTS (SELECT 1 FROM unnest($15::uuid[]) pp
+                                                WHERE NOT COALESCE(r.retry_not_before > $9::timestamptz AND pp = r.limit_dead_secret_id, false))
+                                       THEN true
+                                   ELSE $16::boolean
+                               END
+                           ELSE $17::boolean
+                       END
+                   WHEN r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL
+                       THEN COALESCE(r.credential_override_secret_id = ANY($18::uuid[]), false)
+                   WHEN r.credential_override_mode = 'default'
+                       THEN $16::boolean
+                   WHEN r.credential_override_mode = 'auto' OR $19::text = 'auto'
+                       THEN (EXISTS (SELECT 1 FROM unnest($15::uuid[]) pp
+                                     WHERE NOT COALESCE(r.retry_not_before > $9::timestamptz AND pp = r.limit_dead_secret_id, false))
+                             AND NOT EXISTS (SELECT 1 FROM unnest($14::uuid[]) pp
+                                             WHERE NOT COALESCE(r.retry_not_before > $9::timestamptz AND pp = r.limit_dead_secret_id, false)))
+                   ELSE $20::boolean
+               END
+           ))
 ORDER BY t.created_at, t.id
-LIMIT $8::int
+LIMIT $21::int
 `
 
 type ListPendingFreshResumeCandidatesParams struct {
-	UserID              uuid.UUID          `json:"user_id"`
-	WorkerID            uuid.UUID          `json:"worker_id"`
-	IsDockerWorker      bool               `json:"is_docker_worker"`
-	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
-	WorkerCaps          []string           `json:"worker_caps"`
-	CapabilityAware     bool               `json:"capability_aware"`
-	SnapshotFreshCutoff pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
-	RowLimit            int32              `json:"row_limit"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	WorkerID                   uuid.UUID          `json:"worker_id"`
+	IsDockerWorker             bool               `json:"is_docker_worker"`
+	DockerRepoAllowlist        []uuid.UUID        `json:"docker_repo_allowlist"`
+	WorkerCaps                 []string           `json:"worker_caps"`
+	CapabilityAware            bool               `json:"capability_aware"`
+	SnapshotFreshCutoff        pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
+	ReserveOn                  bool               `json:"reserve_on"`
+	ReserveNow                 pgtype.Timestamptz `json:"reserve_now"`
+	ReserveOverrideEnded       []uuid.UUID        `json:"reserve_override_ended"`
+	ReservePauseOn             bool               `json:"reserve_pause_on"`
+	ReserveBlockedCodex        []uuid.UUID        `json:"reserve_blocked_codex"`
+	ReserveJudgeMode           string             `json:"reserve_judge_mode"`
+	ReservePermitted           []uuid.UUID        `json:"reserve_permitted"`
+	ReservePooled              []uuid.UUID        `json:"reserve_pooled"`
+	ReserveOwnerDefaultBlocked bool               `json:"reserve_owner_default_blocked"`
+	ReserveJudgeStaticBlocked  bool               `json:"reserve_judge_static_blocked"`
+	ReserveBlockedClaude       []uuid.UUID        `json:"reserve_blocked_claude"`
+	ReserveWorkerMode          string             `json:"reserve_worker_mode"`
+	ReserveWorkerStaticBlocked bool               `json:"reserve_worker_static_blocked"`
+	RowLimit                   int32              `json:"row_limit"`
 }
 
 type ListPendingFreshResumeCandidatesRow struct {
@@ -718,6 +766,19 @@ func (q *Queries) ListPendingFreshResumeCandidates(ctx context.Context, arg List
 		arg.WorkerCaps,
 		arg.CapabilityAware,
 		arg.SnapshotFreshCutoff,
+		arg.ReserveOn,
+		arg.ReserveNow,
+		arg.ReserveOverrideEnded,
+		arg.ReservePauseOn,
+		arg.ReserveBlockedCodex,
+		arg.ReserveJudgeMode,
+		arg.ReservePermitted,
+		arg.ReservePooled,
+		arg.ReserveOwnerDefaultBlocked,
+		arg.ReserveJudgeStaticBlocked,
+		arg.ReserveBlockedClaude,
+		arg.ReserveWorkerMode,
+		arg.ReserveWorkerStaticBlocked,
 		arg.RowLimit,
 	)
 	if err != nil {
@@ -831,12 +892,26 @@ FROM run_fresh_resumes t
 JOIN runs r ON r.id = t.run_id AND r.user_id = t.user_id
 WHERE t.id = $1 AND t.user_id = $2 AND t.state = 'pending' AND t.admission_deadline > now()
   AND r.status = 'recovery_wait'
+  -- The W1-keyed dedupe of ListPendingFreshResumeCandidates, rechecked on the locked versions (the
+  -- caller already holds W1 FOR KEY SHARE): a W1 snapshot or terminal_pending row committed after the
+  -- candidate read must skip the candidate.
+  AND (r.worker_id IS NULL OR r.worker_id <> $3::uuid)
+  AND (r.released_worker_id IS NULL OR r.released_worker_id <> $3::uuid)
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = r.id AND a.worker_id = r.worker_id
+                    AND a.claim_generation = r.claim_generation
+                    AND r.claim_released_at IS NULL
+                    AND (a.reported_at >= $4::timestamptz
+                         OR (a.terminal_pending AND a.terminal_pending_until > now())))
+  AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
 FOR UPDATE OF r, t SKIP LOCKED
 `
 
 type LockFreshClaimTargetParams struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
+	ID                  uuid.UUID          `json:"id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	WorkerID            uuid.UUID          `json:"worker_id"`
+	SnapshotFreshCutoff pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 }
 
 type LockFreshClaimTargetRow struct {
@@ -855,8 +930,15 @@ type LockFreshClaimTargetRow struct {
 // predecessor the caller locked (the caller compares it; the nil uuid, no worker, is accepted only on the
 // deleted branch).
 // user_id is the claimant's owner: the destination worker and the run belong to the same user.
+// A SKIP LOCKED zero-row result can leave r locked (t was the skipped row): the caller relies on its
+// savepoint rollback to release it.
 func (q *Queries) LockFreshClaimTarget(ctx context.Context, arg LockFreshClaimTargetParams) (LockFreshClaimTargetRow, error) {
-	row := q.db.QueryRow(ctx, lockFreshClaimTarget, arg.ID, arg.UserID)
+	row := q.db.QueryRow(ctx, lockFreshClaimTarget,
+		arg.ID,
+		arg.UserID,
+		arg.WorkerID,
+		arg.SnapshotFreshCutoff,
+	)
 	var i LockFreshClaimTargetRow
 	err := row.Scan(
 		&i.ID,

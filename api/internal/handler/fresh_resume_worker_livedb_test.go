@@ -198,12 +198,12 @@ func TestFreshResumeWorkerRoutesLiveDB(t *testing.T) {
 		t.Fatalf("pre-seed wall park = %d %s", rec.Code, rec.Body.String())
 	}
 
-	// seeded: a stale claim generation is fenced out; an attempt that does not carry G' is a mismatch and
-	// leaves the row claimed; the real receipt marks it seeded.
+	// seeded: a stale claim generation is fenced out; an attempt that does not carry G' on a claimed row is
+	// not-claimed and leaves the row claimed; the real receipt marks it seeded.
 	f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(2, freshWorkerAttempt, 3)), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
 	f.wantReason(f.route(http.MethodPost, "/seeded", otherToken, freshSeededBody(3, freshWorkerAttempt, 3)), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
-	f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, "20260101T000000Z-g2-0123456789abcdef", 3)), http.StatusConflict, apitypes.FreshResumeReasonAttemptMismatch)
-	f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, "20260101T000000Z-gx-0123456789abcdef", 3)), http.StatusConflict, apitypes.FreshResumeReasonAttemptMismatch)
+	f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, "20260101T000000Z-g2-0123456789abcdef", 3)), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
+	f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, "20260101T000000Z-gx-0123456789abcdef", 3)), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
 	if got := f.transferStates(); len(got) != 1 || got[0] != "claimed" {
 		t.Fatalf("states after refused receipts = %v, want [claimed]", got)
 	}

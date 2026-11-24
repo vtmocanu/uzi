@@ -851,3 +851,168 @@ func TestFreshClaimCrossedAssemblyRefusalsLiveDB(t *testing.T) {
 		t.Fatalf("transfer B = %q, want refused", got)
 	}
 }
+
+// The W1-keyed dedupe is rechecked on the locked versions: a terminal_pending row of W1 for the run's
+// current generation that commits AFTER the unlocked candidate read must skip the candidate, claiming
+// nothing. The seam is afterFreshCandidateRead, between the candidate read and the per-candidate step.
+func TestFreshClaimRechecksW1DedupeUnderLocksLiveDB(t *testing.T) {
+	f := newFCFix(t, true)
+	frid := f.pending()
+	// A live (unreleased) W1 claim is what the dedupe protects.
+	f.env.exec(`UPDATE runs SET claim_released_at=NULL WHERE id=$1`, f.run)
+	var hookRan bool
+	afterFreshCandidateRead = func(cands []store.ListPendingFreshResumeCandidatesRow) {
+		hookRan = true
+		if len(cands) != 1 || cands[0].ID != frid {
+			t.Errorf("candidates = %+v, want the one transfer", cands)
+		}
+		f.env.exec(`INSERT INTO worker_active_runs(worker_id,run_id,claim_generation,phase,terminal_pending,terminal_pending_until,snapshot_epoch,reported_at)
+		            VALUES($1,$2,2,'running',true,now() + interval '1 hour',1,now() - interval '1 day')`, f.w1, f.run)
+	}
+	defer func() { afterFreshCandidateRead = nil }()
+
+	f.wantSkipped("terminal_pending committed after the candidate read", frid, f.w2)
+	if !hookRan {
+		t.Fatal("the candidate-read seam never ran")
+	}
+	if f.openHoldsOf(f.w2) != 0 {
+		t.Fatalf("a skipped candidate left a hold of W2")
+	}
+
+	// Control: the row gone, the same transfer is claimed.
+	afterFreshCandidateRead = nil
+	f.env.exec(`DELETE FROM worker_active_runs WHERE worker_id=$1 AND run_id=$2`, f.w1, f.run)
+	if p := f.mustClaimAs(f.w2); p == nil || p.FreshResume == nil || p.FreshResume.ID != frid.String() {
+		t.Fatalf("control: poll = %+v, want the transfer claimed", p)
+	}
+}
+
+// The candidate read carries ClaimRun's weekly-reserve gate: a reserve-held pending row is not even a
+// candidate (the seam sees an empty list); with the reserve off the same row is read and claimed.
+func TestFreshClaimCandidateReadHonorsWeeklyReserveLiveDB(t *testing.T) {
+	f := newFCFix(t, true)
+	frid := f.pending()
+	f.svc.p.UsagePollInterval = 5 * time.Minute
+	f.svc.p.CodexUsagePollInterval = 5 * time.Minute
+	if _, err := f.env.q.SetUserUsageReserve(f.env.ctx, store.SetUserUsageReserveParams{
+		ID: f.user, WeeklyReservePct: pgtype.Int2{Int16: 50, Valid: true}, WeeklyReservePauseRunning: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.env.exec(`INSERT INTO anthropic_rate_limits (user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
+	                seven_day_pct, seven_day_resets_at, source, synced_at)
+	            VALUES ($1, $2, 10, now() + interval '1 hour', 95, now() + interval '48 hours', 'usage_endpoint', now() - interval '1 minute')`,
+		f.secret, f.user)
+
+	var seen []int
+	afterFreshCandidateRead = func(cands []store.ListPendingFreshResumeCandidatesRow) { seen = append(seen, len(cands)) }
+	defer func() { afterFreshCandidateRead = nil }()
+
+	f.wantSkipped("reserve-held row", frid, f.w2)
+	if len(seen) != 1 || seen[0] != 0 {
+		t.Fatalf("candidates per poll under the reserve = %v, want [0] (not even attempted)", seen)
+	}
+
+	// Control: the reserve off, the row is a candidate and is claimed.
+	if _, err := f.env.q.SetUserUsageReserve(f.env.ctx, store.SetUserUsageReserveParams{ID: f.user, WeeklyReservePauseRunning: true}); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.mustClaimAs(f.w2); p == nil || p.FreshResume == nil || p.FreshResume.ID != frid.String() {
+		t.Fatalf("control: poll = %+v, want the transfer claimed", p)
+	}
+	if len(seen) != 2 || seen[1] != 1 {
+		t.Fatalf("candidates per poll = %v, want [0 1]", seen)
+	}
+}
+
+// The V1 finisher's lock order with W2's worker row really held: an active publication enrollment makes
+// finishRunClaimTx take W2 FOR UPDATE before the run lock, then the saved predecessor W1 FOR KEY SHARE
+// NOWAIT. A second connection holds W1 FOR UPDATE and then asks for W2 FOR UPDATE (blocking): the
+// finisher must give up W2 on its 55P03 and retry, so the second connection gets W2, commits, and the
+// finisher then completes. A blocking W1 lock (or one taken after the run lock) deadlocks here (40P01).
+func TestFreshClaimFinisherNoWaitUnderHeldWorkerLocksLiveDB(t *testing.T) {
+	f := newFCFix(t, true)
+	frid := f.pending()
+	f.env.exec(`UPDATE workers SET protocol_capabilities = protocol_capabilities || ARRAY['publication_resume_v1']::text[] WHERE id=$1`, f.w2)
+
+	var holderErr error
+	var holderDone sync.WaitGroup
+	f.svc.claimHooks = &claimTestHooks{afterAssembly: func(_ context.Context, run store.Run, p *ClaimPayload, err error) {
+		if err != nil || p == nil {
+			t.Errorf("assembly = (%v, %v), want a payload", p != nil, err)
+			return
+		}
+		f.enrollPublication(run, f.w2)
+		holder, herr := f.env.pool.Begin(f.env.ctx)
+		if herr != nil {
+			t.Errorf("holder: %v", herr)
+			return
+		}
+		if _, herr := holder.Exec(f.env.ctx, `SELECT id FROM workers WHERE id=$1 FOR UPDATE`, f.w1); herr != nil {
+			t.Errorf("holder W1 lock: %v", herr)
+			_ = holder.Rollback(f.env.ctx)
+			return
+		}
+		holderDone.Add(1)
+		go func() {
+			defer holderDone.Done()
+			// By now the finisher holds W2 and is failing its NOWAIT lock on W1 (the retry delay is longer).
+			time.Sleep(40 * time.Millisecond)
+			ctx, cancel := context.WithTimeout(f.env.ctx, 15*time.Second)
+			defer cancel()
+			if _, herr := holder.Exec(ctx, `SELECT id FROM workers WHERE id=$1 FOR UPDATE`, f.w2); herr != nil {
+				holderErr = herr
+				_ = holder.Rollback(f.env.ctx)
+				return
+			}
+			holderErr = holder.Commit(f.env.ctx)
+		}()
+	}}
+	defer func() { f.svc.claimHooks = nil }()
+
+	ctx, cancel := context.WithTimeout(f.env.ctx, 60*time.Second)
+	defer cancel()
+	p, err := f.svc.Claim(ctx, wkrRow(t, f.env, f.w2), nil)
+	holderDone.Wait()
+	if err != nil {
+		t.Fatalf("Claim = %v, want the finisher to retry its 55P03 and succeed", err)
+	}
+	if holderErr != nil {
+		t.Fatalf("second connection: %v, want it to take W2 once the finisher gave it up", holderErr)
+	}
+	if p == nil || p.FreshResume == nil || p.FreshResume.ID != frid.String() {
+		t.Fatalf("payload = %+v, want the claimed transfer delivered", p)
+	}
+}
+
+// enrollPublication writes an active publication-resume enrollment for a claimed run, so the finisher
+// locks the claiming worker's row before the run row.
+func (x *fcFix) enrollPublication(run store.Run, worker uuid.UUID) {
+	x.t.Helper()
+	tx, err := x.env.pool.Begin(x.env.ctx)
+	if err != nil {
+		x.t.Error(err)
+		return
+	}
+	defer func() { _ = tx.Rollback(x.env.ctx) }()
+	if err := store.New(tx).OptInPublicationResume(x.env.ctx); err != nil {
+		x.t.Error(err)
+		return
+	}
+	intent, _ := json.Marshal(map[string]any{
+		"run_id": run.ID, "repo_id": x.repo, "branch": "agent/issue-1", "claim_generation": run.ClaimGeneration,
+		"original_head": pubHeadA, "floor": map[string]any{"kind": "absent"}, "candidate": nil,
+	})
+	if _, err := tx.Exec(x.env.ctx, `UPDATE runs SET branch=$2 WHERE id=$1`, run.ID, "agent/issue-1"); err != nil {
+		x.t.Error(err)
+		return
+	}
+	if _, err := tx.Exec(x.env.ctx, `INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, state)
+	    VALUES ($1, 1, $2, $3, $4, 'active')`, run.ID, run.ClaimGeneration, worker, intent); err != nil {
+		x.t.Error(err)
+		return
+	}
+	if err := tx.Commit(x.env.ctx); err != nil {
+		x.t.Error(err)
+	}
+}

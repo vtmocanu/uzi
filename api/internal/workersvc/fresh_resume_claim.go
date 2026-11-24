@@ -95,9 +95,19 @@ func (s *Service) claimFreshResume(ctx context.Context, tx pgx.Tx, qtx *store.Qu
 		IsDockerWorker: params.IsDockerWorker, DockerRepoAllowlist: params.DockerRepoAllowlist,
 		WorkerCaps: params.WorkerCaps, CapabilityAware: params.CapabilityAware,
 		SnapshotFreshCutoff: params.SnapshotFreshCutoff, RowLimit: freshClaimCandidates,
+		// ClaimRun's weekly-reserve gate, from the same ClaimRunParams.
+		ReserveOn: params.ReserveOn, ReserveNow: params.ReserveNow, ReserveOverrideEnded: params.ReserveOverrideEnded,
+		ReservePauseOn: params.ReservePauseOn, ReserveBlockedCodex: params.ReserveBlockedCodex,
+		ReserveJudgeMode: params.ReserveJudgeMode, ReservePermitted: params.ReservePermitted,
+		ReservePooled: params.ReservePooled, ReserveOwnerDefaultBlocked: params.ReserveOwnerDefaultBlocked,
+		ReserveJudgeStaticBlocked: params.ReserveJudgeStaticBlocked, ReserveBlockedClaude: params.ReserveBlockedClaude,
+		ReserveWorkerMode: params.ReserveWorkerMode, ReserveWorkerStaticBlocked: params.ReserveWorkerStaticBlocked,
 	})
 	if err != nil {
 		return store.Run{}, store.RunFreshResume{}, false, err
+	}
+	if afterFreshCandidateRead != nil {
+		afterFreshCandidateRead(cands)
 	}
 	for _, cand := range cands {
 		run, row, claimed, err := s.claimFreshCandidate(ctx, tx, reread, params, cand)
@@ -111,11 +121,15 @@ func (s *Service) claimFreshResume(ctx context.Context, tx pgx.Tx, qtx *store.Qu
 	return store.Run{}, store.RunFreshResume{}, false, nil
 }
 
+// afterFreshCandidateRead is a test seam: called with the candidate list between the unlocked candidate
+// read and the per-candidate locked step. Nil in production.
+var afterFreshCandidateRead func([]store.ListPendingFreshResumeCandidatesRow)
+
 // claimFreshCandidate runs step 2 for one candidate under SAVEPOINT fr. A skip rolls the savepoint back
 // (releasing every lock and write of the attempt) and reports not claimed; a headroom refusal and a claim
 // release it so their writes persist. A statement error rolls back to the savepoint and skips the
-// candidate, so one bad row never blocks the ordinary claim behind it; only a cancelled context is
-// returned as an error.
+// candidate, so one bad row never blocks the ordinary claim behind it. Errors returned: a cancelled
+// context, and a failed Begin or RELEASE SAVEPOINT.
 func (s *Service) claimFreshCandidate(ctx context.Context, tx pgx.Tx, w2 store.Worker, params store.ClaimRunParams, cand store.ListPendingFreshResumeCandidatesRow) (run store.Run, row store.RunFreshResume, claimed bool, err error) {
 	sp, err := tx.Begin(ctx) // SAVEPOINT fr
 	if err != nil {
@@ -172,7 +186,9 @@ func (s *Service) claimFreshCandidate(ctx context.Context, tx pgx.Tx, w2 store.W
 	}
 
 	// 2.3: the run and the transfer, SKIP LOCKED, then the predecessor recheck on the locked versions.
-	tgt, lerr := q.LockFreshClaimTarget(ctx, store.LockFreshClaimTargetParams{ID: cand.ID, UserID: w2.UserID})
+	tgt, lerr := q.LockFreshClaimTarget(ctx, store.LockFreshClaimTargetParams{
+		ID: cand.ID, UserID: w2.UserID, WorkerID: w2.ID, SnapshotFreshCutoff: params.SnapshotFreshCutoff,
+	})
 	if lerr != nil {
 		if errors.Is(lerr, pgx.ErrNoRows) {
 			return skip("row locked or no longer claimable", nil)
@@ -310,7 +326,9 @@ func freshAssemblyReason(overrideUnavailable, credDisabled, holdClass, transient
 // credential, an unhonorable override, a Codex account hold, a pool wait, a terminal or transient
 // failure), so the claimed transfer is refused and the held run restored instead of the ordinary write.
 // The caller holds the run lock (after the predecessor's key-share lock) and has already released W2's
-// generation hold when it opened one. RefuseNoWait because the claim finisher holds a worker lock.
+// generation hold when it opened one. RefuseNoWait because the claim finisher may hold W2's worker row
+// FOR UPDATE (finishRunClaimTx takes it only for checkpoint-coordinate or publication-enrolled runs, see
+// optInRunFences), and the refusal must not wait on a worker lock behind it.
 // expected is the number of holds that release freed, for the retained-checkpoint settlement.
 func (s *Service) refuseFreshAtAssembly(ctx context.Context, q claimFinishTx, run store.Run, identity claimRecoveryIdentity, reason string, expected int) (*ClaimPayload, string, error) {
 	live, ok := q.(pgxClaimFinishTx)
