@@ -794,11 +794,13 @@ adv_reset
 adv_run 721 completed '"cancelled"' CI '"push"' | adv_list "$FULL_SHA"; adv_jobs 721 completed cancelled
 adv_watch adv-ctl-cancel --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
 [ "$rc" -eq 4 ] || fail "adv-control-cancelled-push-want-exit-4: rc=$rc: $(cat "$WORK/adv-ctl-cancel.out")"
+grep -Fqx 'ADVISORY: none observed in a complete listing' "$WORK/adv-ctl-cancel.out" || fail "adv-control-cancel-empty-advisory-line-missing-before-exit-4"
 # 50 green push runs stay under the 51-row window: unchanged exit 0.
 adv_reset
 n=800; while [ "$n" -lt 850 ]; do adv_run "$n" completed '"success"' CI '"push"'; adv_jobs "$n" completed success; n=$((n+1)); done | adv_list "$FULL_SHA"
 adv_watch adv-ctl-fifty --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
 [ "$rc" -eq 0 ] || fail "adv-control-fifty-green-push-want-exit-0: rc=$rc: $(tail -3 "$WORK/adv-ctl-fifty.out")"
+grep -Fqx 'ADVISORY: none observed in a complete listing' "$WORK/adv-ctl-fifty.out" || fail "adv-control-fifty-empty-advisory-line-missing-before-exit-0"
 # Run-ID mode is untouched: a failed workflow_dispatch run watched by ID is red. The stub
 # reports run 801 as workflow_dispatch to any `run view --json ...event...`, so a regression
 # that read the event here and treated dispatch as advisory would not exit 1.

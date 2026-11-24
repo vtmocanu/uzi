@@ -152,7 +152,7 @@ or `workflow_dispatch` are **advisory**: they never decide the exit, and before 
 exit the watcher prints an `ADVISORY` block listing them (`ADVISORY  <state>  <id>  <event>  <name>`;
 state is the run's status until it completes, then its conclusion). On the closing exits 2 and 3
 the block is cached from the last complete listing and its header names that tick (`from tick K`);
-when no complete listing was seen it prints `ADVISORY: none observed in a complete listing`. A run with a missing,
+whenever no advisory run is on record (on any verdict exit) it prints `ADVISORY: none observed in a complete listing`. A run with a missing,
 null or unrecognised event is gating. A manual dispatch that must gate is watched by run ID, not
 by `--sha`. A SHA with only advisory runs is never green: the watcher keeps polling for a
 gating run and ends in exit 3 if none appears.
