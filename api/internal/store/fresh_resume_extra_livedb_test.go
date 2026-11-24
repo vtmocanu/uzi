@@ -436,6 +436,16 @@ func TestFreshResumeClaimNotChargedOwnReservationLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("own pending plus another unit at the limit refuses", func(t *testing.T) {
+		f, w2, run := setup(t)
+		tid := f.transfer(run, "pending", uuid.Nil, 0)
+		other := f.run("recovery_wait", uuid.Nil, 2)
+		f.transfer(other, "pending", uuid.Nil, 0)
+		if err := claim(f, w2, run, tid); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("own reservation plus another unit at limit 1: want no row, got %v", err)
+		}
+	})
+
 	t.Run("another run's reservation at the limit refuses", func(t *testing.T) {
 		f, w2, run := setup(t)
 		other := f.run("recovery_wait", uuid.Nil, 2)

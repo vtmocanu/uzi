@@ -429,8 +429,9 @@ type RecoveryCustodyAggregateDTO struct {
 	DecisionNeeded        int `json:"decision_needed"`
 	BlockedRuns           int `json:"blocked_runs"`
 	// FreshReservedUnits (#4628) is how many of AdmissionCountedHolds are fresh-resume
-	// reservations rather than holds: a pending transfer, or a claimed/seeded one whose
-	// destination's live hold is not otherwise counted. The per-hold counted flags plus this
+	// reservations rather than holds: a pending transfer, or a claimed/seeded/superseded one
+	// while the destination's open hold at the transfer's claim generation exists and is not
+	// otherwise counted. The per-hold counted flags plus this
 	// field sum to AdmissionCountedHolds.
 	FreshReservedUnits int `json:"fresh_reserved_units"`
 }

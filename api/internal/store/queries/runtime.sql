@@ -1425,11 +1425,12 @@ WITH checker_template_pins AS MATERIALIZED (
                                    WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))
                     OR (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) < @custody_hold_limit::int
                     -- #4628: the fresh-resume claim of the targeted run. Its own pending reservation is
-                    -- already inside the owner count (admitted at Start and rechecked by the caller's
-                    -- separate R1 headroom statement), so charging it again here would refuse a run
-                    -- with no open hold of its own at limit-1. The hard per-run bound above still applies.
+                    -- already one unit of the owner count (a pending row on a nonterminal run always is),
+                    -- so the claim is charged that unit once: count <= limit rather than count < limit.
+                    -- Every other unit still counts, and the hard per-run bound above still applies.
                     OR (sqlc.narg(only_run_id)::uuid IS NOT NULL AND r.id = sqlc.narg(only_run_id)::uuid
-                        AND EXISTS (SELECT 1 FROM run_fresh_resumes ft WHERE ft.run_id = r.id AND ft.state = 'pending')))))
+                        AND EXISTS (SELECT 1 FROM run_fresh_resumes ft WHERE ft.run_id = r.id AND ft.state = 'pending')
+                        AND (SELECT fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)) <= @custody_hold_limit::int))))
       -- PRD #3522 M3: the weekly usage reserve admission gate. @reserve_on is true only when the run
       -- owner has a threshold set (users.weekly_reserve_pct); every other @reserve_* param is then
       -- precomputed in Go (workersvc/usage_reserve.go, reserveSnapshot) from the owner's fresh
