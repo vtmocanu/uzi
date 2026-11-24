@@ -18,11 +18,18 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Logger } from "./log.js";
-import { providerKeyForms } from "./redact.js";
+import { makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
 import { fenceNonce } from "./prompt.js";
-import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
+import { defaultQueryFn, isErrorResult, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
-import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
+import {
+  isGatewayLimitStatus,
+  PROVIDER_GATEWAY_LIMIT,
+  PROVIDER_LANE_UNSUPPORTED,
+  ProviderModelUnmappedError,
+  resolveProviderModel,
+  stripProviderCost,
+} from "./provider-binding.js";
 import {
   isStaleClaimRefusal,
   makeTerminalOutboxDeps,
@@ -38,6 +45,7 @@ import type { CodexBinding } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { errMessage } from "./util.js";
 import type {
+  ClaimProviderBinding,
   ClaimResponse,
   JudgeSignal,
   JudgeTraceResponse,
@@ -209,6 +217,25 @@ export interface JudgeRunnerOptions {
   codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
 }
 
+/** PRD #4322 M1a: a provider-bound judge that has no usable model outcome (an error result without a
+ *  numeric status, no result frame, a thrown pass error, an unmapped model). execute() reports the
+ *  judge run failed with this message (already redacted): no fallback review, no `completed`. */
+export class ProviderJudgeTerminalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderJudgeTerminalError";
+  }
+}
+
+/** An error result with a non-limit numeric api_error_status (401, 500, ...): the provider judge keeps
+ *  the deterministic fallback review, as the vendor judge does. Never leaves judgeProvider. */
+class ProviderJudgeStatusError extends Error {
+  constructor() {
+    super("judge model call returned an error result");
+    this.name = "ProviderJudgeStatusError";
+  }
+}
+
 export class JudgeRunner {
   private readonly queryFn: SdkQueryFn;
   private readonly homeRoot: string;
@@ -241,8 +268,15 @@ export class JudgeRunner {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
       ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     scope?.own();
+    // PRD #4322 M1a: a provider key is registered with the worker log BEFORE the first reportState and
+    // fetchTrace (their error text can echo it) and removed on every exit (stale ack, limit, terminal).
+    const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    for (const k of providerKeys) this.log.addSecret(k);
     try { await this.executeClaim(claim, signal); }
-    finally { scope?.close(); }
+    finally {
+      for (const k of providerKeys) this.log.removeSecret(k);
+      scope?.close();
+    }
   }
 
   private async executeClaim(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
@@ -325,18 +359,11 @@ export class JudgeRunner {
         review = judged.review;
         usageMessage = judged.usageMessage;
       } else if (claim.secrets?.provider) {
-        // PRD #4320: the judge lane cannot serve a provider until PRD #4322 (the server refuses it first;
-        // this is the worker's second layer). The judge is reported failed with the typed reason and no
-        // model call, no fallback review, is made.
-        const providerKeys = providerKeyForms(claim.secrets.provider.credential);
-        for (const k of providerKeys) this.log.addSecret(k);
-        this.log.warn("judge claim carried a provider binding; refusing the lane", { run_id: judgeRunId, reason: PROVIDER_LANE_UNSUPPORTED });
-        await safeReportFailed(this.client, this.log, "judge", judgeRunId, PROVIDER_LANE_UNSUPPORTED, undefined,
-          claim.claim_generation, this.terminalDeps);
-        for (const k of providerKeys) this.log.removeSecret(k);
-        required?.close();
-        this.activeRuns?.remove(judgeRunId);
-        return;
+        // PRD #4322 M1a: a Claude provider-bound judge runs through the provider path (typed raw-frame
+        // settlement, exact-key redaction); a non-Claude binding is still refused there.
+        const judged = await this.judgeProvider(claim, trace, claim.secrets.provider);
+        review = judged.review;
+        usageMessage = judged.usageMessage;
       } else {
         const token = claim.secrets?.anthropic_oauth_token?.trim();
         if (!token) {
@@ -349,6 +376,16 @@ export class JudgeRunner {
         }
       }
     } catch (err) {
+      if (err instanceof ProviderJudgeTerminalError) {
+        // PRD #4322 M1a: a provider judge with no usable model outcome fails terminally: no fallback
+        // review, no `completed`. The message was redacted where the error was made.
+        this.log.warn("provider judge failed terminally", { run_id: judgeRunId, error: err.message });
+        await safeReportFailed(this.client, this.log, "judge", judgeRunId, err.message, undefined,
+          claim.claim_generation, this.terminalDeps);
+        required?.close();
+        this.activeRuns?.remove(judgeRunId);
+        return;
+      }
       if (err instanceof LimitReachedError) {
         // Issue #1970: a judge never parks, it dies better — failed with the limit facts,
         // no review, no `completed`. A limit with neither a window nor a reset (a bare
@@ -542,6 +579,115 @@ export class JudgeRunner {
       // The Claude fallback does not retain usage evidence when runModel throws;
       // do not manufacture a zero-cost result frame.
       return { review: fb };
+    }
+  }
+
+  /** PRD #4322 M1a: the CLAUDE PROVIDER judge model call. Differences from `judge` above:
+   *
+   *  - The model resolves through the bound map first (`provider_model_unmapped`, no call).
+   *  - The pass's SDK stream is wrapped: for each RAW frame, BEFORE it is yielded, a closure-owned typed
+   *    record keeps only (a) whether a result frame was seen (sticky), (b) `isErrorResult` of the raw
+   *    frame (a non-success subtype is an error even with no is_error member), and (c) the numeric
+   *    `api_error_status` read by its original member name. The frame is then scrubbed of the key
+   *    (values AND member names) and yielded. Settlement reads ONLY that record, never the scrubbed
+   *    frame or the shim's own isError argument, so a credential that collides with a frame member
+   *    name cannot change a limit into a success.
+   *  - Gateway 429/529 -> LimitReachedError (provider_gateway_limit, no reset); an error result with no
+   *    numeric status, EOF with no result frame, and every thrown pass error (timeout, transport, size
+   *    cap, internal) -> ProviderJudgeTerminalError (failed, no review, never `completed`). An error
+   *    result with another numeric status (401, 500, ...) keeps the vendor fallback review.
+   *  - Output (text, review, usage) is scrubbed of every form of the key; cost is stripped (unknown). */
+  private async judgeProvider(
+    claim: ClaimResponse,
+    trace: ReducedJudgeTrace,
+    binding: ClaimProviderBinding,
+  ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
+    if (binding.engine !== "claude") throw new ProviderJudgeTerminalError(PROVIDER_LANE_UNSUPPORTED);
+    const model = (claim.judge_model ?? "").trim();
+    const scrub = makeTextRedactor(providerKeyForms(binding.credential));
+    let mapped: string;
+    try {
+      mapped = resolveProviderModel(model, binding.model_map);
+    } catch (err) {
+      if (err instanceof ProviderModelUnmappedError) throw new ProviderJudgeTerminalError(err.reason);
+      throw err;
+    }
+    const facts = { resultSeen: false, isError: false, status: null as number | null };
+    const base = this.queryFn;
+    const queryFn: SdkQueryFn = (params) => {
+      const inner = base(params);
+      return (async function* () {
+        for await (const raw of inner) {
+          const rec = raw as unknown as Record<string, unknown> | null;
+          if (rec?.["type"] === "result" && !facts.resultSeen) {
+            facts.isError = isErrorResult(raw);
+            facts.status = typeof rec["api_error_status"] === "number" ? rec["api_error_status"] : null;
+          }
+          if (rec?.["type"] === "result") facts.resultSeen = true;
+          yield redactStrings(raw, scrub);
+        }
+      })();
+    };
+    const settleError = (): void => {
+      if (!facts.isError) return;
+      if (isGatewayLimitStatus(facts.status)) throw new LimitReachedError({ rateLimitType: PROVIDER_GATEWAY_LIMIT });
+      if (facts.status === null) throw new ProviderJudgeTerminalError("provider judge model returned an error result without a status");
+      throw new ProviderJudgeStatusError();
+    };
+    let usageMessage: EmittedMessage | undefined;
+    let text: string;
+    try {
+      const prompt = buildJudgePrompt(
+        trace,
+        claim.judge_signal ?? null,
+        claim.known_improve_uzi_targets ?? [],
+        claim.failure_class ?? null,
+        claim.target_cost_status ?? null,
+        claim.target_cost_usd ?? null,
+      );
+      text = await runReadOnlyModelPass({
+        provider: binding,
+        model: mapped,
+        effort: claim.config?.default_effort,
+        systemPrompt: JUDGE_SYSTEM_PROMPT,
+        prompt,
+        homeRoot: this.homeRoot,
+        homePrefix: "uzi-judge-",
+        label: "judge",
+        timeoutMs: this.modelTimeoutMs,
+        queryFn,
+        denyReason: "the judge is read-only and runs no tools",
+        log: this.log,
+        // The shim reads ONLY the typed record above; its isError argument and the scrubbed frame carry
+        // no settlement authority. A provider judge never parks (see runModel).
+        onResult: (msg) => {
+          settleError();
+          const em = mapSdkMessage(msg)[0];
+          usageMessage = em ? redactStrings(stripProviderCost(em), scrub) : undefined;
+        },
+      });
+      if (!facts.resultSeen) throw new ProviderJudgeTerminalError("provider judge model returned no result");
+      settleError();
+    } catch (err) {
+      if (err instanceof LimitReachedError || err instanceof ProviderJudgeTerminalError) throw err;
+      if (err instanceof ProviderJudgeStatusError) {
+        this.log.warn("provider judge model returned a non-limit error status; using deterministic fallback", { run_id: claim.run_id });
+        const fb = redactStrings(fallbackReview(claim.judge_signal), scrub);
+        fb.model = scrub(model);
+        return { review: fb };
+      }
+      const message = scrub(errMessage(err));
+      this.log.warn("provider judge model call failed", { run_id: claim.run_id, error: message });
+      throw new ProviderJudgeTerminalError(message);
+    }
+    try {
+      const review = calibrateReview(parseReview(scrub(text), model), claim.failure_class ?? null);
+      return { review: redactStrings(review, scrub), usageMessage };
+    } catch (err) {
+      this.log.warn("judge model output unusable; using deterministic fallback", { run_id: claim.run_id, error: scrub(errMessage(err)) });
+      const fb = redactStrings(fallbackReview(claim.judge_signal), scrub);
+      fb.model = scrub(model);
+      return { review: fb, usageMessage };
     }
   }
 

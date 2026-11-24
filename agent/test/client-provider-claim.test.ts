@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { WorkerClient } from "../src/client.js";
-import { CLAUDE_PROVIDER_CAPABILITY } from "../src/provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
 import { makeClaim, recordingLogger } from "./helpers.js";
 
 // PRD #4320 module 5: the claim decoder is fail-closed on a provider binding, on the run lane
@@ -87,6 +87,28 @@ for (const [label, kind, claim] of LANES) {
     }
   });
 }
+
+// PRD #4322 M1a: a provider-bound JUDGE claim also needs claude_provider_judge_v1 on this registration;
+// the same binding on an issue claim needs only claude_provider_v1.
+describe("a provider judge claim requires claude_provider_judge_v1", () => {
+  it("refuses a provider judge claim on a registration with claude_provider_v1 alone, accepts it with both", async () => {
+    await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
+    setBody("judge", { forge_pat: "", anthropic_oauth_token: "", provider: provider() });
+    await assert.rejects(client.claimRun(), (e: Error) => /malformed provider binding on claim: judge capability not advertised/.test(e.message) && !e.message.includes(KEY));
+    setBody("issue", { forge_pat: "p", anthropic_oauth_token: "", provider: provider() });
+    assert.ok(await client.claimRun(), "the same binding on an issue claim needs only claude_provider_v1");
+    await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY]);
+    setBody("judge", { forge_pat: "", anthropic_oauth_token: "", provider: provider() });
+    const decoded = await client.claimRun();
+    assert.equal((decoded!.secrets as Secrets).provider?.credential, KEY);
+  });
+
+  it("does not refuse a vendor judge claim without the judge capability", async () => {
+    await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
+    setBody("judge", { forge_pat: "", anthropic_oauth_token: "vendor-token-do-not-scan" });
+    assert.ok(await client.claimRun());
+  });
+});
 
 describe("loopback is accepted only with the worker's own UZI_PROVIDER_ALLOW_LOOPBACK=true", () => {
   const prior = process.env.UZI_PROVIDER_ALLOW_LOOPBACK;
