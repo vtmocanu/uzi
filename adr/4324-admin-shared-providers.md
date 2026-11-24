@@ -86,13 +86,14 @@ Every path takes locks in one order, so no cycle exists:
 | Path | Order |
 |---|---|
 | Run create (freeze) and Claude source select | per-user secret-mutation lock (shared for the freeze, exclusive for select) -> provider row `FOR SHARE` -> (select only) `SetUserProviderSource` -> usability recheck, held through commit |
-| Key insert, rotate, enable, disable, delete | per-user secret-mutation lock -> provider row `FOR KEY SHARE` (`LockVisibleProviderForKeyMutation`) -> key row `FOR UPDATE` |
+| Key insert or rotate | per-user secret-mutation lock -> provider row `FOR SHARE` (`LockModelProviderForShare`) -> key row `FOR UPDATE` when present |
+| Key enable, disable or delete | per-user secret-mutation lock -> provider row `FOR KEY SHARE` (`LockVisibleProviderForKeyMutation`) -> key row lock |
 | Test evidence write | provider row `FOR SHARE` -> key row `FOR SHARE`, in a short transaction after the dial |
 | Admin edit and retire | provider row `FOR NO KEY UPDATE` (`LockSharedModelProviderForEdit`) |
 | Admin delete | provider row `FOR UPDATE`, then the selection count, then the attached keys, then the definition |
 | Admin create | the advisory catalogue lock (class `1970957680`, keyed by the nil UUID), then the count, then the insert |
 
-**No admin path takes a per-user secret-mutation lock.** A recipient's freeze or select takes that lock and then the provider row, so an admin path that held the provider row and then asked for a per-user lock would cycle with it. `FOR NO KEY UPDATE` on an edit still blocks `FOR SHARE` (the freeze), so a run is never bound to a revision edited away under it, but it does not block `FOR KEY SHARE`, so key mutations proceed through an edit. Admin delete's `FOR UPDATE` conflicts with every other row lock, so the selection and key counts it reads cannot change before the delete commits, and a key mutation holding `KEY SHARE` cannot cycle with the key delete. Claim-time rechecks keep the existing frozen-key and `NOWAIT` revision fences; no claim-time provider-row share lock was added. This is the order [ADR-4320](4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23) calls "the order every edit uses".
+**No admin path takes a per-user secret-mutation lock.** A recipient's freeze or select takes that lock and then the provider row, so an admin path that held the provider row and then asked for a per-user lock would cycle with it. `FOR NO KEY UPDATE` on an edit still blocks `FOR SHARE` (the freeze), so a run is never bound to a revision edited away under it, and key PUT takes the same share lock so its final check and write serialize with edits and retirement. Enable, disable and delete take `FOR KEY SHARE`, which can proceed through an edit. Admin delete's `FOR UPDATE` conflicts with every other row lock, so the selection and key counts it reads cannot change before the delete commits, and a key mutation holding `KEY SHARE` cannot cycle with the key delete. Claim-time rechecks keep the existing frozen-key and `NOWAIT` revision fences; no claim-time provider-row share lock was added. This is the order [ADR-4320](4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23) calls "the order every edit uses".
 
 ### D8. Deletion, retirement and chat
 

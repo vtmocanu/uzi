@@ -327,10 +327,9 @@ WHERE p.id = @id
   AND (p.owner_user_id = @user_id::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'));
 
 -- name: LockVisibleProviderForKeyMutation :one
--- Takes the definition's row lock FOR KEY SHARE before the caller's key row is locked (key PUT, enable,
--- disable, delete), so the order is always provider then key. KEY SHARE blocks a provider delete but not
--- an edit, and it does not filter retired_at: a retired definition's key can still be disabled, deleted
--- or rotated out. The definition must be visible to the CALLER.
+-- Enable, disable and delete take the visible definition's FOR KEY SHARE lock before the
+-- caller's key row. It blocks a definition delete, and retired definitions remain eligible.
+-- Key PUT instead takes LockModelProviderForShare to fence retirement and edits.
 SELECT p.id, p.engine, p.current_revision, p.retired_at, p.credential_mode, p.owner_user_id
 FROM model_providers p
 WHERE p.id = @id

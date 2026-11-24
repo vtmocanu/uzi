@@ -1106,3 +1106,66 @@ func TestSharedProviderPersonalAuditLiveDB(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedProviderKeyPutWaitsForRetirementLiveDB(t *testing.T) {
+	s := newSharedFx(t, true)
+	ctx := context.Background()
+	tx, err := s.f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if rows, err := store.New(tx).RetireSharedModelProvider(ctx, uuid.MustParse(s.shared.ID)); err != nil || rows != 1 {
+		t.Fatalf("retire inside transaction: rows=%d, err=%v", rows, err)
+	}
+
+	put := cookieReqPrepared(t, s.b.router, http.MethodPut, s.sharedPath()+"/key", s.b.jwt, `{"key":"`+testProviderKey+`"}`)
+	done := blockedRequest(put)
+	assertBlocked(t, done, "key PUT behind retirement")
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rec := awaitDone(t, done, "key PUT"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "provider changed while sealing") {
+		t.Fatalf("key PUT after retirement = %d %s, want the existing 400 refusal", rec.Code, rec.Body.String())
+	}
+	if got := s.b.getProvider(t, s.shared.ID); !got.Retired || got.HasKey {
+		t.Fatalf("retired definition after refused PUT: retired=%v, has_key=%v", got.Retired, got.HasKey)
+	}
+}
+
+type providerProbeRereadInterleave struct {
+	store.DBTX
+	reads           int
+	beforeFinalRead func()
+}
+
+func (db *providerProbeRereadInterleave) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: GetVisibleProviderForUse ") {
+		db.reads++
+		if db.reads == 3 { // The third read follows the evidence transaction's commit.
+			db.beforeFinalRead()
+		}
+	}
+	return db.DBTX.QueryRow(ctx, sql, args...)
+}
+
+func TestSharedProviderProbeRejectsRetirementAfterEvidenceCommitLiveDB(t *testing.T) {
+	s := newSharedFx(t, true)
+	s.b.putKeyFor(t, s.shared.ID, testProviderKey)
+	retire := cookieReqPrepared(t, s.admin.router, http.MethodPost, adminProvidersPath+"/"+s.shared.ID+"/retire", s.admin.jwt, "")
+	hook := &providerProbeRereadInterleave{DBTX: s.f.pool, beforeFinalRead: func() {
+		if n := countRows(t, s, `SELECT count(*) FROM model_provider_key_test_results WHERE provider_id = $1`, s.shared.ID); n != 1 {
+			t.Fatalf("evidence rows before interleaved retirement = %d, want 1", n)
+		}
+		if rec := retire(); rec.Code != http.StatusOK {
+			t.Fatalf("interleaved retire = %d %s", rec.Code, rec.Body.String())
+		}
+	}}
+	orig := s.f.h.q
+	s.f.h.q = store.New(hook)
+	defer func() { s.f.h.q = orig }()
+	rec := bearerReqBody(s.b.router, http.MethodPost, s.sharedPath()+"/test", s.b.uzc, "")
+	if hook.reads != 3 || rec.Code != http.StatusConflict {
+		t.Fatalf("probe after retirement = %d %s (reads=%d), want 409 after final reread", rec.Code, rec.Body.String(), hook.reads)
+	}
+}

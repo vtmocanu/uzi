@@ -188,7 +188,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	// No current evidence after the commit means the key rotated, or the provider changed, after the
 	// write: the same benign race as a lost write, not a server fault.
-	if err != nil || !fresh.ProbeAuthResult.Valid {
+	if err != nil || !fresh.ProbeAuthResult.Valid || fresh.RetiredAt.Valid {
 		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
 		return
 	}
