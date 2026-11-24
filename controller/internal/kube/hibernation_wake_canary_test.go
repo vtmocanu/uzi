@@ -88,24 +88,13 @@ func (wc *wakeCanary) requireUnadmitted(t *testing.T) {
 	}
 }
 
-// wakePatches returns the bodies of Deployment patches on w1 that carry the op annotation.
-func (wc *wakeCanary) wakePatches(t *testing.T) []map[string]json.RawMessage {
+// allPatches returns the bodies of every Deployment patch recorded for id, whatever it writes.
+func (wc *wakeCanary) allPatches(t *testing.T, id string) []map[string]json.RawMessage {
 	t.Helper()
 	var out []map[string]json.RawMessage
 	for _, a := range wc.c.Actions() {
 		p, ok := a.(k8stesting.PatchAction)
-		if !ok || a.GetResource().Resource != "deployments" || p.GetName() != deploymentName("w1") {
-			continue
-		}
-		var body struct {
-			Metadata struct {
-				Annotations map[string]*string `json:"annotations"`
-			} `json:"metadata"`
-		}
-		if err := json.Unmarshal(p.GetPatch(), &body); err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := body.Metadata.Annotations[annotationHibernationOp]; !ok {
+		if !ok || a.GetResource().Resource != "deployments" || p.GetName() != deploymentName(id) {
 			continue
 		}
 		var raw map[string]json.RawMessage
@@ -115,6 +104,14 @@ func (wc *wakeCanary) wakePatches(t *testing.T) []map[string]json.RawMessage {
 		out = append(out, raw)
 	}
 	return out
+}
+
+// requirePatchCount fails unless id's Deployment saw exactly want patches since the last ClearActions.
+func (wc *wakeCanary) requirePatchCount(t *testing.T, id string, want int) {
+	t.Helper()
+	if n := len(wc.allPatches(t, id)); n != want {
+		t.Fatalf("%s Deployment patches = %d, want %d; trace %v", id, n, want, actionTrace(wc.c))
+	}
 }
 
 func (wc *wakeCanary) readyCalls() []protocol.HibernationTransition {
@@ -158,14 +155,14 @@ func TestWakeCanaryBindsOpWithoutAdmissionThenReportsReady(t *testing.T) {
 	wc := newWakeCanary(t, nil)
 	wc.requireUnadmitted(t)
 	before := wc.dep(t, "w1").DeepCopy()
+	peers := wc.peerSnapshot(t)
 
 	wc.c.ClearActions()
 	wc.mustTick(t)
-	patches := wc.wakePatches(t)
-	if len(patches) != 1 {
-		t.Fatalf("want exactly one op patch on w1, got %d; trace %v", len(patches), actionTrace(wc.c))
-	}
-	requireOnlyOpBinding(t, patches[0], string(before.UID), before.ResourceVersion)
+	// The only Deployment write on w1 is the annotation-only op binding.
+	wc.requirePatchCount(t, "w1", 1)
+	requireOnlyOpBinding(t, wc.allPatches(t, "w1")[0], string(before.UID), before.ResourceVersion)
+	wc.requirePeersHeld(t, peers)
 	after := wc.dep(t, "w1")
 	if after.Annotations[annotationHibernationOp] != wakeCanaryOp {
 		t.Fatalf("op annotation = %q", after.Annotations[annotationHibernationOp])
@@ -179,15 +176,92 @@ func TestWakeCanaryBindsOpWithoutAdmissionThenReportsReady(t *testing.T) {
 	if n := len(wc.readyCalls()); n != 0 {
 		t.Fatalf("ready reported on the binding tick: %d", n)
 	}
+	wc.requireUnadmitted(t)
 
 	wc.c.ClearActions()
 	wc.mustTick(t)
-	if n := len(wc.wakePatches(t)); n != 0 {
-		t.Fatalf("second tick patched the op again: %d", n)
-	}
+	wc.requirePatchCount(t, "w1", 0)
+	wc.requirePeersHeld(t, peers)
 	ready := wc.readyCalls()
 	if len(ready) != 1 || ready[0].OpID != wakeCanaryOp || ready[0].PodUID != "pod-uid-w1" {
 		t.Fatalf("ready calls = %+v", ready)
+	}
+	wc.requireUnadmitted(t)
+}
+
+// A peer whose own Deployment template is also stale (not just its pod) is still held:
+// the canary's binding tick writes only w1's op annotation and the peer stays drifted.
+func TestWakeCanaryBindsOpWithStaleTemplatePeer(t *testing.T) {
+	wc := newWakeCanary(t, nil)
+	wc.edit(t, "w3", func(d *appsv1.Deployment) { d.Spec.Template.Annotations[AnnotationSpecHash] = "stale-hash" })
+	wc.requireUnadmitted(t)
+	before := wc.dep(t, "w1").DeepCopy()
+	peers := wc.peerSnapshot(t)
+	for i := 0; i < 2; i++ {
+		wc.c.ClearActions()
+		wc.mustTick(t)
+		if i == 0 {
+			wc.requirePatchCount(t, "w1", 1)
+			requireOnlyOpBinding(t, wc.allPatches(t, "w1")[0], string(before.UID), before.ResourceVersion)
+		} else {
+			wc.requirePatchCount(t, "w1", 0)
+		}
+		wc.requirePeersHeld(t, peers)
+		wc.requireUnadmitted(t)
+	}
+	if n := len(wc.readyCalls()); n != 1 {
+		t.Fatalf("ready calls = %d, want 1", n)
+	}
+}
+
+// peerState is what holds a peer drifted: its Deployment spec and its still-old pod.
+type peerState struct {
+	spec appsv1.DeploymentSpec
+	pods []string
+}
+
+// peerSnapshot records the drifted peers w2 and w3 of the open cohort. Their incarnations
+// are not proven, their pods still carry the old template, and they keep the canary open.
+func (wc *wakeCanary) peerSnapshot(t *testing.T) map[string]peerState {
+	t.Helper()
+	out := map[string]peerState{}
+	for _, id := range []string{"w2", "w3"} {
+		d := wc.dep(t, id)
+		list, err := wc.c.CoreV1().Pods(wc.m.cfg.Namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pods []string
+		for _, p := range list.Items {
+			if p.Name == "old-pod-"+deploymentName(id) {
+				if p.Annotations[AnnotationSpecHash] == d.Spec.Template.Annotations[AnnotationSpecHash] {
+					t.Fatalf("%s pod is not drifted from its Deployment template", id)
+				}
+				pods = append(pods, p.Name)
+			}
+		}
+		if len(pods) != 1 {
+			t.Fatalf("%s has no old pod: %v", id, pods)
+		}
+		out[id] = peerState{spec: d.Spec, pods: pods}
+	}
+	return out
+}
+
+// requirePeersHeld fails if a peer was patched, deleted or had its spec changed: the
+// canary's op binding must not roll or admit anything else.
+func (wc *wakeCanary) requirePeersHeld(t *testing.T, want map[string]peerState) {
+	t.Helper()
+	for id, w := range want {
+		wc.requirePatchCount(t, id, 0)
+		if got := wc.peerSnapshot(t)[id]; !reflect.DeepEqual(got, w) {
+			t.Fatalf("%s peer changed: %+v want %+v", id, got, w)
+		}
+	}
+	for _, a := range wc.c.Actions() {
+		if a.GetVerb() == "delete" {
+			t.Fatalf("a delete was issued: %v", actionTrace(wc.c))
+		}
 	}
 }
 
@@ -211,10 +285,12 @@ func (wc *wakeCanary) driveWake(t *testing.T, opID string, mut func(e *rollEntry
 	if e == nil {
 		t.Fatal("w1 has no roll entry")
 	}
-	// Force the unadmitted, non-hibernation entry: a zero-replica Deployment plans as a
-	// hibernation-owned entry, which wakeRollAdmitted admits, so Reconcile cannot reach
-	// the unadmitted branch with it.
-	e.admitted, e.hibernation = false, false
+	// Force the unadmitted entry the pass-2 branch would hand to hibernateWake. A
+	// zero-replica Deployment never reaches that branch through Reconcile: its open wake
+	// reservation clears e.hibernation (the rejoin loop in roll_pacing.go) and the pacer
+	// admits it, so Reconcile takes the admitted wake path instead (see
+	// TestWakeCanaryZeroReplicasThroughReconcile). e.hibernation is already false here.
+	e.admitted = false
 	if mut != nil {
 		mut(e, tick)
 	}
@@ -271,9 +347,7 @@ func TestWakeCanaryDirectWakeGuards(t *testing.T) {
 			if err := wc.driveWake(t, tc.op, tc.mut); err != nil {
 				t.Fatal(err)
 			}
-			if n := len(wc.wakePatches(t)); n != tc.patches {
-				t.Fatalf("op patches = %d, want %d; trace %v", n, tc.patches, actionTrace(wc.c))
-			}
+			wc.requirePatchCount(t, "w1", tc.patches)
 			if n := len(wc.readyCalls()); n != 0 {
 				t.Fatalf("ready reported: %d", n)
 			}
@@ -305,9 +379,12 @@ func TestWakeCanaryOpBindingRejectsUnprovenResponse(t *testing.T) {
 				tweak(d)
 				return true, d, nil
 			})
+			wc.c.ClearActions()
 			if err := wc.tick(t); err == nil {
 				t.Fatal("unproven patch response was not an error")
 			}
+			// Exactly the one op binding was attempted; nothing else was written to w1.
+			wc.requirePatchCount(t, "w1", 1)
 			if n := len(wc.readyCalls()); n != 0 {
 				t.Fatalf("ready reported after an unproven binding: %d", n)
 			}
@@ -329,9 +406,7 @@ func TestWakeCanaryOpBindingControlsStayUnwritten(t *testing.T) {
 			for i := 0; i < 3; i++ {
 				wc.c.ClearActions()
 				_ = wc.tick(t) // a control may legitimately return roll errors; only writes matter
-				if n := len(wc.wakePatches(t)); n != 0 {
-					t.Fatalf("tick %d: unadmitted wake wrote the op annotation: %v", i, actionTrace(wc.c))
-				}
+				wc.requirePatchCount(t, "w1", 0)
 				if n := len(wc.readyCalls()); n != 0 {
 					t.Fatalf("tick %d: ready reported without the op bound", i)
 				}
@@ -345,9 +420,7 @@ func TestWakeCanaryOpAlreadyBoundReportsReadyWithoutPatch(t *testing.T) {
 	wc.requireUnadmitted(t)
 	wc.c.ClearActions()
 	wc.mustTick(t)
-	if n := len(wc.wakePatches(t)); n != 0 {
-		t.Fatalf("patched an already-bound op: %d", n)
-	}
+	wc.requirePatchCount(t, "w1", 0)
 	if n := len(wc.readyCalls()); n != 1 {
 		t.Fatalf("ready calls = %d, want 1", n)
 	}
@@ -371,7 +444,10 @@ func TestWakeCanaryOpBindingConflictReobserves(t *testing.T) {
 		}
 		return false, nil, nil
 	})
+	wc.c.ClearActions()
 	wc.mustTick(t) // a Conflict is a stale observation, not a failure
+	// The one attempted patch is the conflicting op binding; nothing else was written.
+	wc.requirePatchCount(t, "w1", 1)
 	if conflicts != 1 {
 		t.Fatalf("conflict was not injected: %d", conflicts)
 	}
@@ -381,7 +457,9 @@ func TestWakeCanaryOpBindingConflictReobserves(t *testing.T) {
 	if wc.dep(t, "w1").Annotations[annotationHibernationOp] != wakeCanaryOldOp {
 		t.Fatal("conflicted patch landed")
 	}
+	wc.c.ClearActions()
 	wc.mustTick(t)
+	wc.requirePatchCount(t, "w1", 1)
 	if wc.dep(t, "w1").Annotations[annotationHibernationOp] != wakeCanaryOp {
 		t.Fatal("retry tick did not bind the op")
 	}
@@ -399,11 +477,59 @@ func TestWakeCanaryOpBindingOmitsOperatorMetadata(t *testing.T) {
 	before := wc.dep(t, "w1").DeepCopy()
 	wc.c.ClearActions()
 	wc.mustTick(t)
-	patches := wc.wakePatches(t)
-	if len(patches) != 1 {
-		t.Fatalf("want one op patch, got %d; trace %v", len(patches), actionTrace(wc.c))
+	wc.requirePatchCount(t, "w1", 1)
+	requireOnlyOpBinding(t, wc.allPatches(t, "w1")[0], string(before.UID), before.ResourceVersion)
+}
+
+// A zero-replica canary with a live pod is not the op-binding case: Reconcile writes nothing
+// to w1 and reports no ready.
+func TestWakeCanaryZeroReplicasLivePodThroughReconcile(t *testing.T) {
+	zero := int32(0)
+	wc := newWakeCanary(t, func(d *appsv1.Deployment) { d.Spec.Replicas = &zero })
+	for i := 0; i < 3; i++ {
+		wc.c.ClearActions()
+		_ = wc.tick(t)
+		wc.requirePatchCount(t, "w1", 0)
+		if n := len(wc.readyCalls()); n != 0 {
+			t.Fatalf("tick %d: ready reported", i)
+		}
 	}
-	requireOnlyOpBinding(t, patches[0], string(before.UID), before.ResourceVersion)
+}
+
+// Replicas zero with the pod removed is the premise of the direct-drive zero case: the
+// pacer admits w1, so Reconcile takes the admitted full wake path (replicas restored, op
+// bound) and reports no ready that tick.
+func TestWakeCanaryZeroReplicasNoPodTakesAdmittedWakePath(t *testing.T) {
+	zero := int32(0)
+	wc := newWakeCanary(t, func(d *appsv1.Deployment) { d.Spec.Replicas = &zero })
+	if err := wc.c.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), wc.m.cfg.Namespace, "pod-w1"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	obs, err := wc.m.Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]reconcile.ObservedWorker{}
+	for _, o := range obs {
+		byID[o.ID] = o
+	}
+	tick, _ := wc.m.planRoll(ctx, wc.workers, byID)
+	if e := tick.entries["w1"]; e == nil || !e.admitted {
+		t.Fatalf("planning did not admit w1: %+v", e)
+	}
+	wc.c.ClearActions()
+	wc.mustTick(t)
+	d := wc.dep(t, "w1")
+	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 {
+		t.Fatalf("replicas not restored to 1: %v", d.Spec.Replicas)
+	}
+	if d.Annotations[annotationHibernationOp] != wakeCanaryOp {
+		t.Fatalf("op not bound: %q", d.Annotations[annotationHibernationOp])
+	}
+	if n := len(wc.readyCalls()); n != 0 {
+		t.Fatalf("ready reported on the wake tick: %d", n)
+	}
 }
 
 func TestWakeAnnotationPermittedGuards(t *testing.T) {
