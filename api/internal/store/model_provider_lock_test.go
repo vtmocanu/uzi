@@ -47,7 +47,9 @@ var (
 	anyUpdateSetRE = regexp.MustCompile(`(?is)(?:\bUPDATE\s+(?:ONLY\s+)?\w+(?:\s+(?:AS\s+)?\w+)?\s+SET\b|\bDO\s+UPDATE\s+SET\b)(.*?)(?:\bWHERE\b|\bFROM\b|\bRETURNING\b|$)`)
 	// Assignment to a column that ties a definition or a key to its scope (PRD #4324): set at insert,
 	// never reassigned, so a definition can never move between owners or into the shared catalogue.
-	scopeAssignRE = regexp.MustCompile(`(?i)\b(owner_user_id|scope_owner_id|credential_mode|provider_scope_id|provider_id)\s*=`)
+	scopeAssignRE          = regexp.MustCompile(`(?i)\b(owner_user_id|scope_owner_id|credential_mode|provider_scope_id|provider_id)\s*=`)
+	scopeTupleAssignRE     = regexp.MustCompile(`(?i)\(([a-z_][a-z_0-9]*(?:\s*,\s*[a-z_][a-z_0-9]*)*)\)\s*=`)
+	immutableScopeColumnRE = regexp.MustCompile(`(?i)\b(owner_user_id|scope_owner_id|credential_mode|provider_scope_id|provider_id)\b`)
 )
 
 // providerImmutabilityViolations returns a description of each statement in sqlText that updates
@@ -68,6 +70,11 @@ func providerImmutabilityViolations(sqlText string) []string {
 		for _, m := range anyUpdateSetRE.FindAllStringSubmatch(stmt, -1) {
 			if col := scopeAssignRE.FindStringSubmatch(m[1]); col != nil {
 				out = append(out, "UPDATE assigns "+col[1]+": "+stmt)
+			}
+			for _, tuple := range scopeTupleAssignRE.FindAllStringSubmatch(m[1], -1) {
+				for _, col := range immutableScopeColumnRE.FindAllString(tuple[1], -1) {
+					out = append(out, "UPDATE assigns "+col+": "+stmt)
+				}
 			}
 		}
 	}
@@ -92,6 +99,13 @@ func TestNoModelProviderRevisionOrKeyAssociationUpdate(t *testing.T) {
 	for _, c := range canaries {
 		if len(providerImmutabilityViolations(c)) == 0 {
 			t.Fatalf("the scanner missed its canary:\n%s", c)
+		}
+	}
+	tuple := "UPDATE model_providers SET (name, owner_user_id, scope_owner_id) = ($1, $2, $3) WHERE id = $4;"
+	got := strings.Join(providerImmutabilityViolations(tuple), "\n")
+	for _, column := range []string{"owner_user_id", "scope_owner_id"} {
+		if !strings.Contains(got, "UPDATE assigns "+column+":") {
+			t.Errorf("tuple assignment missed %s: %q", column, got)
 		}
 	}
 	clean := "UPDATE user_secrets SET label = $1 WHERE user_id = $2 AND provider_id IS NULL RETURNING id;\n-- UPDATE model_provider_revisions SET x = 1;\n" +

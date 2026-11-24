@@ -178,6 +178,7 @@ import type {
   CodexAccountMode,
   HibernationResult,
   AdminSharedProvider,
+  AdminSharedProviderList,
   AdminSharedProviderCreateInput,
   CreateProviderInput,
   ProviderAuthStyle,
@@ -2162,7 +2163,7 @@ const realApi = {
   // PATCH changes the name and/or model map only (base_url/auth_style are a 400); DELETE is a
   // 409 provider_in_use_as_source while any user has the definition selected.
   adminListSharedProviders: () =>
-    request<{ providers: AdminSharedProvider[] }>("GET", "/admin/providers"),
+    request<AdminSharedProviderList>("GET", "/admin/providers"),
   adminCreateSharedProvider: (input: AdminSharedProviderCreateInput) =>
     request<{ provider: AdminSharedProvider }>("POST", "/admin/providers", {
       ...input,

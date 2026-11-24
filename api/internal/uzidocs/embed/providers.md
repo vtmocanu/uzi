@@ -334,8 +334,9 @@ you never see anyone else's key or Test results.
 - **Select and clear.** **Use as Claude source** opens the disclosure first; confirm to select.
   `uzi provider use <name|id>` selects it too (the CLI says "(shared by your admin)"). Clear it like
   any source (**Stop using**, or `uzi provider use --none --engine claude`). Without a key of your
-  own, selecting is refused with `provider_source_unusable` and a message saying the key is missing,
-  and new Claude runs are refused the same way: they never fall back to your Anthropic token.
+  own, selecting is refused with `provider_source_unusable` and leaves your source unchanged. If
+  your Claude source is unset, new Claude runs keep using your Anthropic token when available. If an
+  already-selected shared definition loses your key, new Claude runs are refused without falling back.
 - **You cannot change the definition.** Rename, model map, endpoint, retire and delete are not
   offered for it. `uzi provider edit` and `uzi provider retire` refuse a shared definition ("managed by
   your admin") before sending any change. You can still disable or delete your own key on it.

@@ -220,6 +220,16 @@ func TestSharedProviderRunFreezesTheRecipientsKeyLiveDB(t *testing.T) {
 	}
 }
 
+func snapshotProviderRuns(t *testing.T, env codexTestEnv, owner uuid.UUID) string {
+	t.Helper()
+	var snapshot string
+	if err := env.pool.QueryRow(env.ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY r.id), '[]')::text
+		FROM runs r WHERE r.user_id = $1`, owner).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
 // TestSharedProviderWithoutAKeyIsRefusedWithoutFallbackLiveDB: C selected the shared definition but
 // holds no key: C's run creation (issue prediction and chat) is refused key_missing with no vendor
 // fallback although C has an Anthropic default. B's key is never usable by C, and C's key never
@@ -236,12 +246,12 @@ func TestSharedProviderWithoutAKeyIsRefusedWithoutFallbackLiveDB(t *testing.T) {
 	if _, err := fx.svc.PredictHarness(fx.env.ctx, c, nil, IssueStartOrigin()); !isUnusable(err, SourceUnusableKeyMissing) {
 		t.Fatalf("C predict err = %v, want provider_source_unusable (key_missing)", err)
 	}
-	before := fx.env.countRunsForUser(t, c)
+	before := snapshotProviderRuns(t, fx.env, c)
 	if _, err := fx.svc.CreateChatRun(fx.env.ctx, c, "hello"); !isUnusable(err, SourceUnusableKeyMissing) {
 		t.Fatalf("C chat err = %v, want provider_source_unusable (key_missing), never a vendor chat", err)
 	}
-	if fx.env.countRunsForUser(t, c) != before {
-		t.Fatal("a refused creation left a run for C")
+	if snapshotProviderRuns(t, fx.env, c) != before {
+		t.Fatal("a refused creation changed C's persisted runs")
 	}
 
 	// C attaches their own key: C's chat now binds C's key, never B's.
@@ -296,15 +306,15 @@ func TestSharedProviderRetireKeepsFrozenRunsAndRefusesFreshOnesLiveDB(t *testing
 	}
 	fx.wantBound(mustRun(t, fx.env, succ.ID), 1, run.ModelProviderKeyRev.Int64)
 
-	before := fx.runCount()
+	before := snapshotProviderRuns(t, fx.env, fx.userID)
 	if _, err := fx.create(nil, nil); !isUnusable(err, SourceUnusableRetired) {
 		t.Fatalf("fresh create err = %v, want retired, never a vendor run", err)
 	}
 	if _, err := fx.svc.CreateChatRun(fx.env.ctx, fx.userID, "hi"); !isUnusable(err, SourceUnusableRetired) {
 		t.Fatalf("fresh chat err = %v, want retired", err)
 	}
-	if fx.runCount() != before {
-		t.Fatal("a refused creation left a run")
+	if snapshotProviderRuns(t, fx.env, fx.userID) != before {
+		t.Fatal("a refused creation changed persisted runs")
 	}
 	var selected uuid.UUID
 	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT claude_provider_id FROM users WHERE id = $1`, fx.userID).Scan(&selected); err != nil || selected != fx.provider {

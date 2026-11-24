@@ -1,9 +1,13 @@
 package store
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -370,9 +374,50 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 			t.Errorf("%s: callers = %v, recorded %v (review the new caller's prior visibility check, then record it)", name, got, want)
 		}
 	}
-	src := files["handler/providers_probe.go"]
-	fence, key, upsert := strings.Index(src, ".LockVisibleProviderForEvidence("), strings.Index(src, ".LockProviderKeyForEvidence("), strings.Index(src, ".UpsertProviderKeyTestResult(")
-	if fence < 0 || key < 0 || upsert < 0 || fence >= key || key >= upsert {
-		t.Errorf("providers_probe.go evidence order: provider fence %d, key lock %d, upsert %d; want fence < key < upsert", fence, key, upsert)
+	checkProviderEvidenceCalls(t, files["handler/providers_probe.go"], true)
+}
+
+// Read executable selectors in recordProviderProbeResult. Comments and calls
+// outside this function cannot satisfy the order check.
+func checkProviderEvidenceCalls(t *testing.T, source string, wantOrdered bool) {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "providers_probe.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
+	want := []string{"LockVisibleProviderForEvidence", "LockProviderKeyForEvidence", "UpsertProviderKeyTestResult"}
+	var calls []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "recordProviderProbeResult" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			method, ok := call.Fun.(*ast.SelectorExpr)
+			if ok && slices.Contains(want, method.Sel.Name) {
+				if id, ok := method.X.(*ast.Ident); !ok || id.Name != "q" {
+					t.Errorf("evidence call %s must use the transaction queries q", method.Sel.Name)
+				}
+				calls = append(calls, method.Sel.Name)
+			}
+			return true
+		})
+	}
+	if ordered := slices.Equal(calls, want); ordered != wantOrdered {
+		t.Fatalf("evidence calls = %v; want ordered=%v for %v", calls, wantOrdered, want)
+	}
+}
+
+func TestProviderEvidenceLockOrderIgnoresComments(t *testing.T) {
+	checkProviderEvidenceCalls(t, `package handler
+func recordProviderProbeResult() {
+	// q.LockVisibleProviderForEvidence()
+	q.LockProviderKeyForEvidence()
+	q.UpsertProviderKeyTestResult()
+	q.LockVisibleProviderForEvidence()
+}`, false)
 }
