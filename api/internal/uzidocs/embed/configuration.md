@@ -283,8 +283,8 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
   judge cooldown and daily budget. Update those workers yourself.
 - **Held locks after a lost connection.** The judge is created in a database transaction that holds the
   owner's secret-mutation lock. If the api loses its connection mid-create, PostgreSQL keeps that
-  transaction's locks until it notices the dead client; no `idle_in_transaction_session_timeout` or
-  TCP keepalive is configured, so the owner's credential writes (token, provider and key changes) can stall in
+  transaction's locks until it notices the dead client; no server-side `idle_in_transaction_session_timeout` or
+  PostgreSQL keepalive is configured for this transaction, so the owner's credential writes (token, provider and key changes) can stall in
   the meantime. Codex pool credential creates already have the same exposure.
 - **Weekly reserve unchanged.** The claim-time weekly-reserve check does not exempt provider-bound runs,
   so it can apply to a provider judge as it does to an ordinary provider run (tracked as #4658).

@@ -541,7 +541,7 @@ schedule and then for the owner; chat ends the turn instead. Usage is recorded w
 owners (`provider_lane_unsupported`). The judge no longer does for Claude (PRD #4322 M1a): its
 lane decision (`decideJudgeLane`, taken under the shared secret-mutation lock in `createRunAtomic`)
 freezes the owner's Claude source onto the judge in the creation transaction, unless the owner pinned
-a vendor Anthropic token (`vendorOnly`, which sends the provider run's trace to Anthropic). A provider
+a vendor Anthropic token (`judgeLaneDecision.Vendor` from `decideJudgeLane`, which sends the provider run's trace to Anthropic). A provider
 judge's claim carries only the provider binding and needs `claude_provider_judge_v1` in addition to
 `claude_provider_v1` (claim, placement, hibernation wake, both ephemeral reap predicates, health);
 revocation or an unmapped model at assembly or the final locked re-check fails it terminally

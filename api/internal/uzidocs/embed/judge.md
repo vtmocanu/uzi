@@ -491,7 +491,7 @@ a Codex judge whose owner has a Codex source (a model provider), which stays
 unsupported until #4574. Older rows with that reason and `"harness": "claude"` are
 historical, from before a Claude source could bind a judge, and are shown in the
 past tense. `provider_source_unusable` means your Claude source could not serve
-the judge (cleared, retired, off the operator allowlist, or without your enabled
+the judge (retired, off the operator allowlist, or without your enabled
 key), and `provider_model_unmapped` means the provider's model map does not map the
 judge's model. Without
 `--json`, a skipped run prints a line such as `run <id>: Judge skipped
