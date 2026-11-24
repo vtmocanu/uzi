@@ -301,6 +301,14 @@ describe("Models grid layout", () => {
     }
   });
 
+  // #4665: the tag splits the prediction line visually; the COMPUTED description must still be
+  // one sentence, clean and dirty (mount() leaves Worker model — Codex changed).
+  it("computes the saved prediction as one description sentence, clean and dirty", async () => {
+    await mount(1280);
+    expect(screen.getByRole("combobox", { name: "Worker model — Claude", description: /^Saved effective value: sonnet · your choice$/ })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Worker model — Codex", description: /^Saved effective value: gpt-6\.2-sol · built-in, Unsaved$/ })).toBeTruthy();
+  });
+
   it("computes every control's accessible name as <Row> — <Family>", async () => {
     await mount(1024);
     for (const name of NAMES) {

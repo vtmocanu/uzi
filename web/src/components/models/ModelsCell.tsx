@@ -127,11 +127,15 @@ export function ModelsCell({
           prediction itself ("opus · your choice"), and the full "Saved effective value:" wording
           stays in the accessible description. */}
       <p id={predictionId} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-faint">
-        {/* One sentence either way: "Saved effective value: <prediction>". A dirty cell shows its
-            first word, so the visible tag reads "Saved <prediction>" next to the draft. */}
-        <span className={dirty ? undefined : "sr-only"}>Saved</span>
-        <span className="sr-only"> effective value: </span>
+        {/* Assistive tech gets ONE text run, "Saved effective value: <prediction>[, Unsaved]":
+            computed descriptions trim each text node, so a sentence split across spans reads
+            "Savedeffective value:…". The visible tag and markers are aria-hidden duplicates. */}
+        <span className="sr-only">
+          {`Saved effective value: ${prediction ?? "Unavailable"}${dirty ? ", Unsaved" : ""}`}
+        </span>
+        {dirty && <span aria-hidden="true">Saved</span>}
         <span
+          aria-hidden="true"
           data-prediction=""
           className={cx(
             "min-w-0 max-w-full rounded-full border border-edge bg-raised px-2 py-px [overflow-wrap:anywhere]",
@@ -141,8 +145,8 @@ export function ModelsCell({
           {prediction ?? "Unavailable"}
         </span>
         {dirty && (
-          <span className="rounded border border-brand/40 bg-brand/10 px-1 text-[11px] font-medium text-brand">
-            <span className="sr-only">, </span>Unsaved
+          <span aria-hidden="true" className="rounded border border-brand/40 bg-brand/10 px-1 text-[11px] font-medium text-brand">
+            Unsaved
           </span>
         )}
       </p>

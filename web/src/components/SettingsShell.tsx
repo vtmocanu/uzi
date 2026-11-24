@@ -43,8 +43,8 @@ export function SettingsShell({ description, children }: { description: string; 
       <PageHeader title="Settings" description="Your personal uzi configuration." />
       {/* Issue #204: the tab row scrolls WITHIN its own container so the page body never
           scrolls horizontally. Measured when this row held five tabs: at 390px the strip
-          overflowed (scrollWidth 401 vs clientWidth 390). The row now holds six tabs
-          (Appearance was added), so `overflow-x-auto` earns its keep — it lets the strip
+          overflowed (scrollWidth 401 vs clientWidth 390). The row now holds seven tabs
+          (Appearance and Models were added), so `overflow-x-auto` earns its keep — it lets the strip
           scroll rather than forcing the page body sideways. The tabs are
           `shrink-0`/`whitespace-nowrap` so they overflow-and-scroll rather than compress
           to fit (which would defeat overflow-x). */}

@@ -233,6 +233,8 @@ describe("Models page", () => {
     expect(tag("Default harness").textContent).toBe("Claude · automatic");
     expect(visibleLine("Default harness")).toBe("Claude · automatic");
     expect(describedText("Default harness")).toContain("Saved effective value: Claude · automatic");
+    // The COMPUTED description (what assistive tech receives), not just the referenced text.
+    expect(screen.getByRole("combobox", { description: /^Saved effective value: Claude · automatic$/ })).toBe(control("Default harness"));
     expect(tag("Worker model — Claude").textContent).toBe("opus · lead template");
     expect(visibleLine("Worker model — Claude")).not.toContain("Saved effective value");
 
@@ -241,6 +243,9 @@ describe("Models page", () => {
     expect(tag("Worker model — Codex").textContent).toBe("gpt-6.2-sol · built-in");
     expect(visibleLine("Worker model — Codex")).toBe("Saved gpt-6.2-sol · built-in Unsaved");
     expect(describedText("Worker model — Codex")).toContain("Saved effective value: gpt-6.2-sol · built-in");
+    expect(
+      screen.getByRole("combobox", { description: /^Saved effective value: gpt-6\.2-sol · built-in, Unsaved\b/ }),
+    ).toBe(control("Worker model — Codex"));
   });
 
   it("labels the saved prediction as saved and marks a changed cell Unsaved", async () => {

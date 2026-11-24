@@ -1054,7 +1054,7 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 - Three light themes — Dawn, Hall, Shadow — a light option for a dark-first tool, each keeping the dark factory somewhere on screen; ship all three, Hall the recommended light default. [user 2026-09-07]
 - Theme ids and labels are English (dawn/hall/shadow), no Romanian anywhere. [user 2026-09-07]
 - Appearance mode System / Lights on / Lights off: System follows the OS; the other two hold one preferred theme per polarity, so the user picks one light theme and one dark theme. [user 2026-09-07]
-- Settings vocabulary is "Lights on" / "Lights off"; Appearance is its own Settings tab, the last one, and also holds the per-device Demo mode toggle. [user 2026-09-07; AI-synced 2026-09-08 (#1208): promoted from a card inside Account & tokens to a dedicated tab, and Demo mode moved onto it, per the user's 2026-09-08 review; user 2026-11-24 (#4665): moved from second to last, after Memory]
+- Settings vocabulary is "Lights on" / "Lights off"; Appearance is its own Settings tab, the last one, and also holds the per-device Demo mode toggle. [user 2026-09-07; AI-synced 2026-09-08 (#1208): promoted from a card inside Account & tokens to a dedicated tab, and Demo mode moved onto it, per the user's 2026-09-08 review; user 2026-11-24 (#4665): moved from second to last, after Memory; AI-synced 2026-11-24]
 - Admin sets the instance defaults (mode plus a theme per polarity plus typeface); a user override wins — extends Feature #21's server-side theme default. [user 2026-09-07]
 - Per-user typeface — System or IBM Plex — independent of theme; bundled, no external font fetch. [user 2026-09-07]
 
@@ -2023,10 +2023,10 @@ PRD at `prds/done/3264-cli-model-settings.md` (milestones M1 to M3 shipped).
 
 PRD at `prds/done/3263-settings-models-tab.md`.
 
-- Settings tabs run Account & tokens, Models, Run defaults, Forge, Access, Memory, Appearance: Models follows the credentials it depends on and precedes Run defaults, which links to it. [user 2026-11-24 (#4665); was "between Appearance and Run defaults", AI-synced 2026-11-23]
-- Each model group (Worker runs, Planning, Helper runs, Cross-check) is its own card with its own Claude/Codex column header; Default harness stays in the intro card. The cards are presentation only: one draft, one Save bar, one request. [user 2026-11-24 (#4665)]
-- A cell shows its saved effective value and source as a compact tag (`opus · your choice`, or Unavailable); the full "Saved effective value:" wording is the control's accessible description, and a changed cell labels the tag Saved. [user 2026-11-24 (#4665)]
-- One grid holds default harness, worker model/effort, planning model/effort, judge routing and models, summary models, task-review models/efforts and Plan/Code cross-check model/effort per family. Summary routing is read-only "Same as the run" (#4156). (AI-synced 2026-11-23)
+- Settings tabs run Account & tokens, Models, Run defaults, Forge, Access, Memory, Appearance: Models follows the credentials it depends on and precedes Run defaults, which links to it. [user 2026-11-24 (#4665); was "between Appearance and Run defaults"] (AI-synced 2026-11-24)
+- Each model group (Worker runs, Planning, Helper runs, Cross-check) is its own card with its own Claude/Codex column header; Default harness stays in the intro card. The cards are presentation only: one draft, one Save bar, one request. [user 2026-11-24 (#4665)] (AI-synced 2026-11-24)
+- A cell shows its saved effective value and source as a compact tag (`opus · your choice`, or Unavailable); the full "Saved effective value:" wording is the control's accessible description, and a changed cell labels the tag Saved. [user 2026-11-24 (#4665)] (AI-synced 2026-11-24)
+- The page (intro card plus the four group cards) holds default harness, worker model/effort, planning model/effort, judge routing and models, summary models, task-review models/efforts and Plan/Code cross-check model/effort per family. Summary routing is read-only "Same as the run" (#4156). (AI-synced 2026-11-23; cards AI-synced 2026-11-24, #4665)
 - One sticky Save commits every change in one transaction; an invalid cell or failed write leaves everything unchanged; field errors show on their cell and a failed write in the save bar. (AI-synced 2026-11-23)
 - Cells show the saved effective value and source from the server; when predictions fail they read Unavailable. (AI-synced 2026-11-23)
 - Unsaved changes block in-app navigation (Stay/Discard) and prompt on reload or close. (AI-synced 2026-11-23)

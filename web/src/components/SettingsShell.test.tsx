@@ -55,9 +55,9 @@ describe("SettingsShell tabs", () => {
   });
 
   // The Appearance tab (theme/mode/typeface + demo mode, split out of Account &
-  // tokens) is the SECOND tab, immediately after Account & tokens, and lights on
-  // its own route without keeping the end-matched Account & tokens active.
-  // Appearance is cosmetic, so it closes the strip; Models follows the credentials it depends on.
+  // tokens) is cosmetic, so it closes the strip (#4665; Models follows the credentials it
+  // depends on), and lights on its own route without keeping the end-matched Account &
+  // tokens active.
   it("puts Appearance last and lights it on /settings/appearance only", () => {
     renderAt("/settings/appearance");
     const tabs = screen.getAllByRole("link");
