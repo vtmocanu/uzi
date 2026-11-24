@@ -57,7 +57,7 @@ func newCrossCheckContentionFixture(t *testing.T) crossCheckContentionFixture {
 		lead, c.PlanMd, c.Milestones, c.BaseCommit, c.PlanningDiff, digest, f.runID)
 	env.exec(`UPDATE users SET default_codex_model=$2,default_codex_effort='high' WHERE id=$1`, f.userID, customCodexModel)
 	env.exec(`UPDATE workers SET protocol_capabilities=$2,snapshot_register_nonce='nonce-U2',snapshot_epoch=0 WHERE id=$1`,
-		f.workerID, []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+		f.workerID, []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3,
 			capability.RecoveryArchiveV1, capability.CodexCustomModelV1, capability.CrossCheckOwnerSteeringV1})
 	f.svc = New(env.q, env.box, testParams())
 	f.svc.SetVault(env.vlt)

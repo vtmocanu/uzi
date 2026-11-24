@@ -66,7 +66,7 @@ func newCompactPolicyFx(t *testing.T) *compactPolicyFx {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fx.caps = []string{capability.ProviderPolicyHoldV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	fx.caps = []string{capability.ProviderPolicyHoldV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	cliMustExec(t, pool, "UPDATE workers SET protocol_capabilities=$2,status='online' WHERE id=$1", worker.ID, fx.caps)
 	fx.workerID, fx.workerToken = worker.ID, token
 	fx.exec = func(sql string, args ...any) { cliMustExec(t, pool, sql, args...) }

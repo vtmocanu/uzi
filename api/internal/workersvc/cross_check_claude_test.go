@@ -150,7 +150,7 @@ func TestHealthClaudeCheckerChildCodexLeadCapability(t *testing.T) {
 			{Status: "online", ProtocolCapabilities: base}, {Status: "offline", ProtocolCapabilities: withLead}}, reasonNoCrossCheckCodexLeadCapableWorker},
 		{"claude child, no cross-check worker at all", "claude", []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: nil}}, reasonNoCrossCheckCapableWorker},
 		{"codex child ignores the capability", "codex", []store.ListWorkersByUserRow{{Status: "online",
-			ProtocolCapabilities: []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}}}, reasonWaitingWorker},
+			ProtocolCapabilities: []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}}}, reasonWaitingWorker},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := runRow("queued")

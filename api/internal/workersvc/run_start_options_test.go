@@ -22,6 +22,8 @@ func TestRunOverrideModelHonorable(t *testing.T) {
 		{HarnessClaude, "gpt-6-sol", false},
 		{HarnessClaude, "gpt-6-luna", false},
 		{HarnessClaude, "gpt-6.1-sol", false},
+		{HarnessClaude, "gpt-6.2-sol", false},
+		{HarnessClaude, "gpt-6.2-astra", false},
 		{HarnessClaude, "", false},
 		{HarnessClaude, "   ", false},
 		{HarnessClaude, "\t\n", false},
@@ -33,6 +35,8 @@ func TestRunOverrideModelHonorable(t *testing.T) {
 		{HarnessCodex, "gpt-5.6-sol", true},
 		{HarnessCodex, "gpt-6-astra", true},
 		{HarnessCodex, "gpt-6.1-sol", true},
+		{HarnessCodex, "gpt-6.2-sol", true},
+		{HarnessCodex, "gpt-6.2-astra", true},
 		{HarnessCodex, "gpt-6-luna", false},
 		{HarnessCodex, "opus", false},
 		{HarnessCodex, "gpt-foo", false},
@@ -54,7 +58,7 @@ func TestRunOverrideModelHonorable(t *testing.T) {
 
 func TestModelIncompatibleErrorText(t *testing.T) {
 	codex := &ModelIncompatibleError{Model: "opus", Harness: HarnessCodex}
-	want := "opus is not a model a Codex run can start with, and this run resolved to the codex harness; start it on the Claude harness or choose one of: gpt-5.6-sol, gpt-6-astra, gpt-6-sol, gpt-6.1-sol"
+	want := "opus is not a model a Codex run can start with, and this run resolved to the codex harness; start it on the Claude harness or choose one of: gpt-5.6-sol, gpt-6-astra, gpt-6-sol, gpt-6.1-sol, gpt-6.2-astra, gpt-6.2-sol"
 	if got := codex.Error(); got != want {
 		t.Errorf("codex text = %q, want %q", got, want)
 	}

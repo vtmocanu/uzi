@@ -7,7 +7,7 @@
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
   claude_agent_sdk: "0.3.325",
-  codex: "0.169.0",
+  codex: "0.171.0",
 } as const;
 
 /** Exact names a variable may not use. */
@@ -28,6 +28,7 @@ export const RUN_ENV_DENIED_NAMES: readonly string[] = [
   "API_FORCE_IDLE_TIMEOUT", "ENABLE_TOOL_SEARCH", "SLASH_COMMAND_TOOL_CHAR_BUDGET", "AUTOMODE_DECISION_LOG",
   "NODE_USE_SYSTEM_CA", "ENABLE_BETA_TRACING_DETAILED", "ENABLE_ENHANCED_TELEMETRY_BETA", "BETA_TRACING_ENDPOINT",
   "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+  "SPIFFE_ENDPOINT_SOCKET", "SSH2_CLIENT", "COMSPEC", "DENO_CERT", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE", "OTEL_RESOURCE_ATTRIBUTES", "AWS_ENDPOINT_URL",
 ];
 
 export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [
@@ -35,6 +36,7 @@ export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [
   "GH_", "GITHUB_", "GITLAB_", "GLAB_",
   "GIT_", "SSH_",
   "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_", "BUN_",
+  "OTEL_LOG_", "OTEL_EXPORTER_OTLP_", "AWS_ENDPOINT_URL_",
 ];
 
 export const RUN_ENV_DENIED_SUFFIXES: readonly string[] = ["_PROXY"];

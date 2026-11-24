@@ -122,7 +122,7 @@ func (fx *effFix) claim(run store.Run) *ClaimPayload {
 	fx.t.Helper()
 	fx.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, run.ID, fx.workerID)
 	w := store.Worker{ID: fx.workerID, UserID: fx.userID, ProtocolCapabilities: []string{
-		capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1, capability.ClaudePhaseModelsV1, capability.CodexPhaseModelsV1,
+		capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1, capability.ClaudePhaseModelsV1, capability.CodexPhaseModelsV1,
 	}}
 	payload, err := fx.svc.assembleClaim(fx.env.ctx, w, mustRun(fx.t, fx.env, run.ID))
 	if err != nil {

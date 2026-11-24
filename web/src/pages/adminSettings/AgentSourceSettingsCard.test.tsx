@@ -85,7 +85,7 @@ describe("AgentSourceSettingsCard staged review model label (#3255)", () => {
     const lead = within(screen.getByText("lead", { selector: "code" }).closest("li")!);
     const coder = within(screen.getByText("coder", { selector: "code" }).closest("li")!);
     expect(lead.getByText("Default · SDK/account default (built-in)")).toBeTruthy();
-    expect(lead.getByText("Default · built-in (gpt-6.1-sol)")).toBeTruthy();
+    expect(lead.getByText("Default · built-in (gpt-6.2-sol)")).toBeTruthy();
     expect(coder.getAllByText("Default · follows lead")).toHaveLength(2);
     for (const row of [lead, coder]) {
       expect(row.getByText("Claude model")).toBeTruthy();

@@ -28,7 +28,7 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		if withBusy {
 			busy := fx.worker("persistent", capOf(1), true)
 			mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`,
-				busy, []string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"})
+				busy, []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_custom_model_v1"})
 			fx.holdActive(busy, 1)
 		}
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(iid)}, 0)
@@ -46,7 +46,8 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 	}{
 		{"without codex_harness_v1 is not a placement", []string{}, false},
 		{"without codex_runtime_v2 is not a placement", []string{"codex_harness_v1"}, false},
-		{"with codex_harness_v1 is a placement", []string{"codex_harness_v1", "codex_runtime_v2"}, true},
+		{"without codex_runtime_v3 is not a placement", []string{"codex_harness_v1", "codex_runtime_v2"}, false},
+		{"with current runtime is a placement", []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" for a Codex run", func(t *testing.T) {
 			fx, run := seed(t, 190, tc.protos, false)
@@ -104,8 +105,8 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		protos []string
 		placed bool
 	}{
-		{"without codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2"}, false},
-		{"with codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"}, true},
+		{"without codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, false},
+		{"with codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_custom_model_v1"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" and a Codex run on a custom-model lane", func(t *testing.T) {
 			fx, run := seed(t, 192, tc.protos, false)

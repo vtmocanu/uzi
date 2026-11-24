@@ -37,6 +37,7 @@ import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDe
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { AuthorityRefusal, AuthorityShutdownRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
+import { InventorySourceExclusionRefusal, INVENTORY_SCAN_BUDGET_MS, INVENTORY_STATUS_TIMEOUT_MS } from "./inventory-exclusion.js";
 import { SOURCE_END_REASONS, type SourceEndReason, type AuthorityRuntime, type AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, processWorkerIncarnation, type SourceUseLease } from "./completion-authority.js";
 import { CacheTargetBinding } from "./cache-target.js";
@@ -105,6 +106,7 @@ import {
   LiveAttemptRegistry,
   describeProcesses,
   describeRootContext,
+  inventoryClearVerdict,
   mintAttemptId,
   newRunAttempt,
   quiesceRunAttempt,
@@ -368,6 +370,9 @@ const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
  *  report is produced while the run is at the `running` (finalize) phase, so this is the honest
  *  value; kept as one constant so every site agrees. */
 const TERMINAL_JOURNAL_PHASE = "running";
+/** issue #4645: warn logged when a permanent message failure lands after a confirmed hold or wall park. */
+export const CONFIRMED_DISPOSITION_TRIP_LOG =
+  "permanent message failure after a confirmed hold or wall park; keeping the accepted disposition";
 
 /** PRD #1391 Run B M4: the FIXED log line the queued-duplicate claim router emits when it ends the
  *  attempt WITHOUT executing (a terminal/held row, a different generation, a definitive not-owned, or
@@ -1484,6 +1489,9 @@ class OrphanHandoffReadmit extends Error {
 
 /** The re-admissions one claimant's clone phase takes after a handoff before it stops retained. */
 const ORPHAN_HANDOFF_MAX_READMITS = 2;
+/** issue #4632: longest a seed waits for a retained inventory proof's same-key exclusion to settle after one
+ *  InventorySourceExclusionRefusal, before it retries once and then stops the claim for a nonterminal retry. */
+const SEED_EXCLUSION_WAIT_MS = 30_000;
 
 /** issue #4058: thrown by {@link RunRunner.reclaimTerminalOrphan} when the terminal owner's journal carries an active
  *  remediation recovery record bound to this branch. Nothing was written, moved, detached or released. phaseClone maps
@@ -3024,10 +3032,12 @@ interface RunFlight {
   parked: boolean;
   /** Accepted pause ACK; delivery failures must not replace this park with a terminal. */
   pauseParkAccepted: boolean;
-  /** Issue #1784: true only once the server answered `paused` to a completion hold or a wall park on
-   *  THIS flight (enterCompletionHold / enterWallPark). A confirmed-`paused` run's credential
-   *  reconcile is refused by the server. executeClaim also bypasses the finalize boundary for
-   *  unresolved completionHeld results. An undeliverable wall park leaves this false. */
+  /** Issues #1784, #4645: true only once the server answered `paused` to a hold or wall park on THIS flight.
+   *  Set by enterCompletionHold (confirmed; also via the interlocked hold and the prepush completion-attempt
+   *  finish), enterPreflightHold and enterPhaseSwitchHold (`held`), enterWallPark (confirmedPark). Cleared by
+   *  retainForPublicationReconciliation and at enterCompletionHold request start. Read by executeClaim (finalize
+   *  bypass), canYieldMemoryToOwnerPause and handlePermanentFailure (keeps the accepted disposition on a breaker
+   *  trip). An undeliverable wall park leaves this false. */
   holdOrWallParkConfirmed: boolean;
   /** Process-local hold proof; unresolved retains artifacts without claiming a park. */
   completionHoldOutcome: "none" | "unresolved" | "confirmed" | "refused";
@@ -4038,6 +4048,19 @@ export class RunRunner {
     this.liveAttempts = opts.liveAttempts ?? new LiveAttemptRegistry();
     this.predecessorFinalForTests = opts.predecessorFinalForTests === true;
     this.quiesceImpl = opts.quiesceRun ?? ((req) => quiesceRunAttempt(req));
+    // issue #4632: the observe-only probe GitCache runs to learn that a retained-inventory proof's git is gone from a key.
+    // Any failure is not_clear (the exclusion then stays).
+    this.git.setInventoryExclusionProbe?.(async req => {
+      try {
+        const outcome = await this.quiesceImpl({
+          mode: "capture", attempt: undefined, cloneKey: req.cloneKey, targetPaths: req.targetPaths,
+          processes: process.platform === "linux", dockerHost: undefined, registry: this.liveAttempts,
+          otherClaimInFlight: false, site: "inventory_source:clear_probe", forceHelper: true, observeOnly: true,
+          deadlineAt: req.deadlineAt, ...(req.protectedMarkers ? { protectedMarkers: req.protectedMarkers } : {}),
+        });
+        return inventoryClearVerdict(outcome.process);
+      } catch { return "not_clear"; }
+    });
     this.dockerHost = opts.dockerHost;
     this.onSourceRetained = opts.onSourceRetained;
     this.attemptPaths = !!opts.dockerHost;
@@ -5389,37 +5412,93 @@ export class RunRunner {
         };
       }
       if (this.liveAttempts.isLivePath(clone.clonePath)) return fail("live_attempt_path", { check: "live_attempt_path" }, clone.clonePath);
-      const before = await this.quiesceImpl(request);
-      if (before.process?.state !== "quiescent")
-        return fail("process_not_quiescent_before_git", inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, otherClaimInFlight), clone.clonePath);
-      if (!grant) {
-        // Ordinary terminal FINAL: byte-for-byte base behaviour (worktreeStatus, no content proof, caps or budget).
-        // A record disposition leaves the source untouched, so only its cleanliness is not required.
-        const status = record ? "" : await this.git.worktreeStatus(clone.clonePath);
-        const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
-        if (status === null) return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
-        if (status.length !== 0) return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
+      // issue #4632: everything that starts runner-uid git or scans the clone runs as one section under the bare lock, with a
+      // same-key exclusion standing until the observe-only probe proves nothing it started is still in scope. The body only
+      // RECORDS a verdict; `fail` (and the grant's refusals) are called here, after the section returned, so a late
+      // continuation of an abandoned section never reports.
+      type CloneVerdict = { pass: true } | { pass: false; check: PredecessorRefusalCheck; diagnostic: InventorySourceDiagnostic };
+      const unsettled: CloneVerdict = { pass: false, check: "source_settlement_unproven", diagnostic: { check: "source_settlement_unproven" } };
+      const scopeLost = (): boolean => {
+        if (!grant) return false;
+        if (!grant.live()) return true;
+        try { this.assertHeldFreeCapture(grant.flight, grant.held); return false; } catch { return true; }
+      };
+      const sectionResult = await this.git.withInventorySourceLock(barePath, {
+        clonePath: clone.clonePath, branch: clone.branch, isLive: p => this.liveAttempts.isLivePath(p),
+        // Predecessor path: every stage start is gated on the grant (and its held capture) still being live.
+        ...(grant ? { live: () => !scopeLost() } : {}),
+      }, async (section): Promise<CloneVerdict> => {
+        const quiesce = (req: QuiesceRunRequest) => section.stage(() => this.quiesceImpl({
+          // helperDeadline: issue #4632, owner-required; set only on these inventory scans.
+          ...req, forceHelper: true, helperDeadline: true, deadlineAt:Math.min(section.deadlineAt, Date.now() + INVENTORY_SCAN_BUDGET_MS),
+        }));
+        const beforeStage = await quiesce(request);
+        if (!beforeStage.ok) return unsettled;
+        const before = beforeStage.value;
+        if (before.process?.state !== "quiescent")
+          return { pass: false, check: "process_not_quiescent_before_git",
+            diagnostic: inventoryProcessDiagnostic("process_not_quiescent_before_git", before.process, otherClaimInFlight) };
+        const afterRequest: QuiesceRunRequest = { ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" };
+        if (!grant) {
+          // Ordinary terminal FINAL: worktreeStatus, no content proof, caps or budget beyond the section's.
+          // A record disposition leaves the source untouched, so only its cleanliness is not required.
+          let statusStage: { ok: true; value: string[] | null } | { ok: false; why: "stopped" | "deadline" } = { ok: true, value: [] };
+          if (!record) {
+            section.markGitStarted();
+            statusStage = await section.stage(() => this.git.worktreeStatus(clone.clonePath, { timeoutMs: INVENTORY_STATUS_TIMEOUT_MS }));
+          }
+          if (!statusStage.ok) return unsettled;
+          const afterStage = await quiesce(afterRequest);
+          if (!afterStage.ok) return unsettled;
+          const after = afterStage.value;
+          section.afterScanQuiescent(after.process?.state === "quiescent");
+          const status = statusStage.value;
+          if (status === null) return { pass: false, check: "worktree_status_unreadable", diagnostic: { check: "worktree_status_unreadable" } };
+          if (status.length !== 0) return { pass: false, check: "worktree_status_dirty", diagnostic: { check: "worktree_status_dirty" } };
+          if (after.process?.state !== "quiescent")
+            return { pass: false, check: "process_not_quiescent_after_git",
+              diagnostic: inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight) };
+          return { pass: true };
+        }
+        // Predecessor FINAL only: the strict byte-exact proof (agent/src/git.ts inventorySourceContentProof) and the
+        // ignored-residue gate, bounded by the grant's deadline and the section's, each its own stage.
+        const bounds = {
+          ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt: Math.min(grant.deadlineAt, section.deadlineAt), stopped: () => section.stopped(),
+        };
+        section.markGitStarted();
+        const contentStage = await section.stage(() => this.git.inventorySourceContentProof(clone.clonePath, bounds));
+        if (!contentStage.ok) return unsettled;
+        if (scopeLost()) { section.noteAbort(); return unsettled; }
+        const content = contentStage.value;
+        let ignored: Awaited<ReturnType<GitCache["inventoryIgnoredResidue"]>> | "clean" = "clean";
+        if (content === "clean") {
+          const ignoredStage = await section.stage(() => this.git.inventoryIgnoredResidue(clone.clonePath, bounds));
+          if (!ignoredStage.ok) return unsettled;
+          if (scopeLost()) { section.noteAbort(); return unsettled; }
+          ignored = ignoredStage.value;
+        }
+        const afterStage = await quiesce(afterRequest);
+        if (!afterStage.ok) return unsettled;
+        const after = afterStage.value;
+        section.afterScanQuiescent(after.process?.state === "quiescent");
+        if (scopeLost()) { section.noteAbort(); return unsettled; }
+        // A process alive across the git reads makes every content verdict above untrustworthy, so it outranks
+        // dirty/unreadable/over_bound/residue (an integrity STOP, not a clean residue skip).
         if (after.process?.state !== "quiescent")
-          return fail("process_not_quiescent_after_git", inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight), clone.clonePath);
-        continue;
-      }
-      // Predecessor FINAL only: the strict byte-exact proof (agent/src/git.ts inventorySourceContentProof) and the
-      // ignored-residue gate, bounded by the grant's deadline.
-      const bounds = { ...INVENTORY_CONTENT_PROOF_BOUNDS, deadlineAt: grant.deadlineAt };
-      const content = await this.git.inventorySourceContentProof(clone.clonePath, bounds);
-      const ignored = content === "clean" ? await this.git.inventoryIgnoredResidue(clone.clonePath, bounds) : "clean";
-      const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "inventory_source:after_runner_git" });
+          return { pass: false, check: "process_not_quiescent_after_git",
+            diagnostic: inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight) };
+        if (content === "unreadable") return { pass: false, check: "worktree_status_unreadable", diagnostic: { check: "worktree_status_unreadable" } };
+        if (content === "over_bound") return { pass: false, check: "over_bound", diagnostic: { check: "worktree_status_unreadable" } };
+        if (content === "dirty") return { pass: false, check: "worktree_status_dirty", diagnostic: { check: "worktree_status_dirty" } };
+        // A build directory or node_modules the successor would lose is residue, reported as dirty.
+        if (ignored === "residue") return { pass: false, check: "ignored_residue", diagnostic: { check: "worktree_status_dirty" } };
+        if (ignored === "over_bound") return { pass: false, check: "over_bound", diagnostic: { check: "worktree_status_unreadable" } };
+        return { pass: true };
+      });
       scope();
-      // A process alive across the git reads makes every content verdict above untrustworthy, so it outranks
-      // dirty/unreadable/over_bound/residue (an integrity STOP, not a clean residue skip).
-      if (after.process?.state !== "quiescent")
-        return fail("process_not_quiescent_after_git", inventoryProcessDiagnostic("process_not_quiescent_after_git", after.process, otherClaimInFlight), clone.clonePath);
-      if (content === "unreadable") return fail("worktree_status_unreadable", { check: "worktree_status_unreadable" }, clone.clonePath);
-      if (content === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
-      if (content === "dirty") return fail("worktree_status_dirty", { check: "worktree_status_dirty" }, clone.clonePath);
-      // A build directory or node_modules the successor would lose is residue, reported as dirty.
-      if (ignored === "residue") return fail("ignored_residue", { check: "worktree_status_dirty" }, clone.clonePath);
-      if (ignored === "over_bound") return fail("over_bound", { check: "worktree_status_unreadable" }, clone.clonePath);
+      if (sectionResult.kind === "refused") return fail(sectionResult.check, { check: sectionResult.check }, clone.clonePath);
+      if (sectionResult.timedOut || sectionResult.aborted || sectionResult.value === undefined) return fail("source_settlement_unproven", { check: "source_settlement_unproven" }, clone.clonePath);
+      if (!sectionResult.value.pass) return fail(sectionResult.value.check, sectionResult.value.diagnostic, clone.clonePath);
     }
     scope();
     const afterGit = await read();
@@ -8952,6 +9031,15 @@ export class RunRunner {
       flight.restoreTransportStopped = true;
       this.retainWorkerMemoryCustody(flight);
       if (!flight.cancel.signal.aborted) flight.cancel.abort(new RetainedRecoveryStop());
+      return;
+    }
+    // issue #4645: the server already accepted a completion/preflight/phase-switch hold or a wall park (paused) on this flight, so a
+    // permanent message failure after that confirmation (in practice the final drain) must not turn that accepted disposition into a
+    // `failed` report, an abort or a terminal reap. workerMemory.hold keeps precedence (above). Not covered here (tracked in #4646):
+    // trips during an unresolved or refused hold request, the phase-switch pre-request flush, the wall pre-park flush and the
+    // reportWallPark window, and a callback already entered before the flag was set.
+    if (flight.holdOrWallParkConfirmed) {
+      flight.runLog.warn(CONFIRMED_DISPOSITION_TRIP_LOG, { run_id: flight.runId, reason });
       return;
     }
     if (flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
@@ -14936,13 +15024,19 @@ export class RunRunner {
       // rule: survivors or unverified leave journal, ledger and path untouched.
       let proof: { outcome: QuiesceRunOutcome; blocked: boolean };
       try {
-        proof = await this.quiesceRun(flight, flight.executor, {
-          mode: "capture",
-          site: "orphan_reclaim",
-          targetPaths: retained?.paths ?? [journaledPath],
-          clonePath: journaledPath,
-        });
-      } catch {
+        // issue #4632: every target shares the owner's branch. The admission clears (or refuses on) each target key under the
+        // bare lock, then holds it for the whole proof so a retained-inventory section cannot start meanwhile.
+        const targets = (retained?.paths ?? [journaledPath]).map(path => ({ path, branch }));
+        proof = await this.git.withReclaimAdmission(barePath, targets, p => this.liveAttempts.isLivePath(p), () =>
+          this.quiesceRun(flight, flight.executor, {
+            mode: "capture",
+            site: "orphan_reclaim",
+            targetPaths: retained?.paths ?? [journaledPath],
+            clonePath: journaledPath,
+          }));
+      } catch (error) {
+        // A same-key retained-inventory exclusion is nonterminal and handled by the seed loop's readmitted().
+        if (error instanceof InventorySourceExclusionRefusal) throw error;
         return refuse("quiescence", "quiescence_error");
       }
       if (proof.blocked) {
@@ -15541,21 +15635,31 @@ export class RunRunner {
     // did the preceding `running` report carry it, so the next snapshot that omits the run stamps a witnessed
     // departure charged against RUN_MAX_REQUEUES (the claimed-never-started charge), parking at
     // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) is what stops the loop.
-    const stopOnHeldSource = async (err: SourceUseHeldRefusal | AuthorityShutdownRefusal): Promise<never> =>
+    const stopOnHeldSource = async (err: SourceUseHeldRefusal | AuthorityShutdownRefusal | InventorySourceExclusionRefusal): Promise<never> =>
       this.disposeHeldSource(claim, flight, err instanceof SourceUseHeldRefusal ? err.blockedSourceKey : undefined, err);
     // The re-seed after a reclaimed terminal orphan runs inside the loop's catch, which has no handler for a
     // refusal raised there, so it maps the refusal itself.
     const reseedAfterReclaim = async (): Promise<void> => {
-      try {
-        await refreshAttemptSeed();
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
-        flight.worktreePath = runnerClone.path;
-        flight.branch = runnerClone.branch;
-        await this.bindFlightSource(flight, runnerClone.path);
-      } catch (err) {
-        if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) await stopOnHeldSource(err);
-        stopOnRetiringSlot(err);
-        throw err;
+      // issue #4632: one inline retry after the bounded wait for a same-key inventory exclusion; a second refusal stops the claim.
+      for (let waited = false; ; ) {
+        try {
+          await refreshAttemptSeed();
+          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
+          flight.worktreePath = runnerClone.path;
+          flight.branch = runnerClone.branch;
+          await this.bindFlightSource(flight, runnerClone.path);
+          return;
+        } catch (err) {
+          if (err instanceof InventorySourceExclusionRefusal) {
+            if (waited) await stopOnHeldSource(err);
+            waited = true;
+            await this.awaitInventoryExclusionSettled(flight, err);
+            continue;
+          }
+          if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) await stopOnHeldSource(err);
+          stopOnRetiringSlot(err);
+          throw err;
+        }
       }
     };
     // issue #3645: a terminal owner's journal that changed or was retired under the reclaim (OrphanHandoffReadmit) sends
@@ -15581,11 +15685,20 @@ export class RunRunner {
         "completion_retirement_pending", undefined, undefined, "completion_pending");
       throw new RetainedRecoveryStop({ cause: err });
     };
+    let readmitExclusionWaited = false;
     const readmitted = async (reclaim: () => Promise<void>): Promise<boolean> => {
       try {
         await reclaim();
         return false;
       } catch (error) {
+        // issue #4632: a same-key inventory exclusion refused the reclaim admission. Wait once (not a handoff readmit) and
+        // re-enter admission; a second refusal stops the claim for a nonterminal retry.
+        if (error instanceof InventorySourceExclusionRefusal) {
+          if (readmitExclusionWaited) await stopOnHeldSource(error);
+          readmitExclusionWaited = true;
+          await this.awaitInventoryExclusionSettled(flight, error);
+          return true;
+        }
         // issue #4058: an active remediation record on the terminal owner's journal holds this claim for the owner.
         if (error instanceof OrphanRemediationHold) return this.holdForPredecessorRemediation(flight, error);
         if (!(error instanceof OrphanHandoffReadmit)) throw error;
@@ -15603,7 +15716,7 @@ export class RunRunner {
     // issue #1786: a canonical seed refused because the key now has a kept stopped canonical source
     // (or recovered attempt mode) is retried ONCE on a fresh attempt path when the re-read mode says
     // so: the mode can land between the read above and the seed under the bare lock.
-    for (let freshRetry = false; ; ) {
+    for (let freshRetry = false, exclusionWaited = false; ; ) {
       try {
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
         flight.worktreePath = runnerClone.path;
@@ -15653,6 +15766,13 @@ export class RunRunner {
           // The SAME owner-derived validation decides; any unmet predicate fails closed.
           if (await readmitted(() => this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err))) continue;
           await reseedAfterReclaim();
+        } else if (err instanceof InventorySourceExclusionRefusal) {
+          // issue #4632: a retained inventory proof's same-key work may still be in scope. Wait once (bounded), retry the
+          // seed, and on a second refusal stop the claim for a nonterminal retry.
+          if (exclusionWaited) await stopOnHeldSource(err);
+          exclusionWaited = true;
+          await this.awaitInventoryExclusionSettled(flight, err);
+          continue;
         } else if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) {
           // The canonical clone path is shared by every run of the issue on this worker, so an earlier flight of
           // this process can still hold it with no confirmed end (held_unended).
@@ -30542,6 +30662,19 @@ export class RunRunner {
     throw new RetainedRecoveryStop({ cause: hold });
   }
 
+  /** issue #4632: wait (bounded by {@link SEED_EXCLUSION_WAIT_MS}, the flight's cancel and the worker's shutdown) until every
+   *  piece of work a retained inventory section of this key started has settled. Never throws; the caller retries either way. */
+  private async awaitInventoryExclusionSettled(flight: RunFlight, refusal: InventorySourceExclusionRefusal): Promise<void> {
+    const signal = AbortSignal.any([flight.cancel.signal, this.shutdownSignal.signal, AbortSignal.timeout(SEED_EXCLUSION_WAIT_MS)]);
+    await new Promise<void>(resolve => {
+      const done = (): void => { signal.removeEventListener("abort", done); resolve(); };
+      if (signal.aborted) return done();
+      signal.addEventListener("abort", done, { once: true });
+      this.git.inventoryExclusionSettled(refusal.bare, refusal.key).then(done, done);
+    });
+    this.retainedLifecycleGuard(flight);
+  }
+
   /** Per pass, two identical reports and at most two ownership probes; a capacity-only (marked) pass that
    * the api answers 400 is followed by at most one unmarked pass. All passes share one boundary deadline.
    * In the caller's capacity-only witness comparison, the r.* === w.* checks duplicate the
@@ -30562,7 +30695,11 @@ export class RunRunner {
     // One fixed-message warning per held disposition, including shutdown and holds
     // without declined evidence. Logging cannot change the custody decision.
     try {
-      flight.runLog.warn(cause instanceof AuthorityShutdownRefusal
+      if (cause instanceof InventorySourceExclusionRefusal) {
+        flight.runLog.warn("retained inventory proof still settling on this clone key; stopping claim for retry", {
+          claim_generation: flight.claimGeneration, cause: "inventory_source_exclusion",
+          key: sanitizeForLog(cause.key), reason: cause.reason });
+      } else flight.runLog.warn(cause instanceof AuthorityShutdownRefusal
         ? "authority sealed for worker shutdown; stopping claim for retry"
         : "clone path held by an earlier flight's unended source use; stopping claim for retry", {
         claim_generation: flight.claimGeneration });
@@ -31444,8 +31581,7 @@ export class RunRunner {
       defaultBranch: claim.repo.default_branch?.trim() || "", cloneUrl: claim.repo.clone_url, repoId: claim.repo.id });
     const lifecycle = this.retainedLifecycleSignal(flight);
     let seeded: Awaited<ReturnType<GitCache["seedIndependentAttempt"]>>;
-    try {
-      seeded = await this.inFlightAuthority(flight, () => this.recovery.withRestoreJournalLock(runId, async () => {
+    const seedOnce = () => this.inFlightAuthority(flight, () => this.recovery.withRestoreJournalLock(runId, async () => {
         // 3.4 step 3: the selected pin record, re-authenticated under J.
         if (!restorePinStillSelected(await this.recovery.restoreRecordsUnderJournalLock(runId), runId, branch, verdict))
           throw new RestoreRefused("pin_changed");
@@ -31507,9 +31643,19 @@ export class RunRunner {
           deadlineMs: RESTORE_SEED_DEADLINE_MS,
         });
       }, lifecycle), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    try {
+      try { seeded = await seedOnce(); }
+      catch (first) {
+        // issue #4632: a same-key inventory exclusion refused the seed before any write. Wait once (bounded) and re-enter the same
+        // authority wrapper with the same attempt id; a second refusal stops the route below.
+        if (!(first instanceof InventorySourceExclusionRefusal)) throw first;
+        await this.awaitInventoryExclusionSettled(flight, first);
+        seeded = await seedOnce();
+      }
     } catch (error) {
       this.retainedLifecycleGuard(flight);
       if (isControl(error)) throw error;
+      if (error instanceof InventorySourceExclusionRefusal) refuse("inventory_source_exclusion", { detail: error.reason });
       if (error instanceof RestoreSeedError) refuse(error.reason, { detail: sanitizeForLog(errMessage(error.cause ?? error)) }, { window: error.window, step: error.step });
       if (error instanceof RestoreRefused) refuse(error.reason);
       refuse("seed_failed", { detail: sanitizeForLog(errMessage(error)) });

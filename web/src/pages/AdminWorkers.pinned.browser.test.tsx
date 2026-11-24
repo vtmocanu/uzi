@@ -48,7 +48,7 @@ const settings = {
   public_base_url: "http://127.0.0.1:8080",
   judge_enabled: "false",
   judge_model: "opus",
-  codex_judge_model: "gpt-6.1-sol",
+  codex_judge_model: "gpt-6.2-sol",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",

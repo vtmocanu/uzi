@@ -17,7 +17,7 @@ function spec(ca?: ValidatedExtraCa): CodexLaunchSpec {
       model_map: { default: { model: "gateway-model", context_window: 64000 } },
     },
     authMode: "provider", useAppServerAuth: true, model: "default",
-    codexBin: "/opt/uzi-codex/0.169.0/bin/codex",
+    codexBin: "/opt/uzi-codex/0.171.0/bin/codex",
     supervisorBin: "/usr/local/bin/uzi-codex-supervisor",
     childArgv: ["app-server"], cwd: "/work/repo",
     ...(ca ? { codexExtraCa: ca } : {}),

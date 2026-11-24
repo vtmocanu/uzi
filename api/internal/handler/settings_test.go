@@ -87,11 +87,11 @@ func TestGetSettingsSurfacesDefaults(t *testing.T) {
 	if resp.Defaults[settings.KeyJudgeModel] != "opus" {
 		t.Errorf("defaults.judge_model = %q, want opus", resp.Defaults[settings.KeyJudgeModel])
 	}
-	if resp.Defaults[settings.KeyCodexJudgeModel] != "gpt-6.1-sol" {
-		t.Errorf("defaults.codex_judge_model = %q, want gpt-6.1-sol", resp.Defaults[settings.KeyCodexJudgeModel])
+	if resp.Defaults[settings.KeyCodexJudgeModel] != "gpt-6.2-sol" {
+		t.Errorf("defaults.codex_judge_model = %q, want gpt-6.2-sol", resp.Defaults[settings.KeyCodexJudgeModel])
 	}
-	if resp.Settings[settings.KeyCodexJudgeModel] != "gpt-6.1-sol" || resp.Sources[settings.KeyCodexJudgeModel] != "default" {
-		t.Errorf("codex_judge_model = %q / %q, want gpt-6.1-sol / default", resp.Settings[settings.KeyCodexJudgeModel], resp.Sources[settings.KeyCodexJudgeModel])
+	if resp.Settings[settings.KeyCodexJudgeModel] != "gpt-6.2-sol" || resp.Sources[settings.KeyCodexJudgeModel] != "default" {
+		t.Errorf("codex_judge_model = %q / %q, want gpt-6.2-sol / default", resp.Settings[settings.KeyCodexJudgeModel], resp.Sources[settings.KeyCodexJudgeModel])
 	}
 	// The summary keys (PRD #3248) surface both built-ins the same way.
 	if resp.Defaults[settings.KeySummaryModel] != "haiku" || resp.Defaults[settings.KeyCodexSummaryModel] != "gpt-6-luna" {

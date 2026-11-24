@@ -428,7 +428,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			}
 			mustExecT(ctx, t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status,last_heartbeat_at,protocol_capabilities)
 				VALUES($1,$2,$3,$4,'online',now(),$5)`, worker, owner, worker.String(), hash,
-				[]string{"codex_harness_v1", "codex_runtime_v2", "codex_completion_interlock_v1", "completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1"})
+				[]string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_completion_interlock_v1", "completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "codex_refresh_recovery_v1"})
 			password := "fixture-password"
 			setVaultFixturePassword(t, pool, owner, password)
 			if err := vlt.Unlock(ctx, owner, password); err != nil {

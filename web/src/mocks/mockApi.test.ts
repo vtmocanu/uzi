@@ -1207,16 +1207,16 @@ describe("mockApi codex_judge_model (PRD #3245)", () => {
     const api = await reload();
 
     const initial = await api.getSettings();
-    expect(initial.settings.codex_judge_model).toBe("gpt-6.1-sol");
+    expect(initial.settings.codex_judge_model).toBe("gpt-6.2-sol");
     expect(initial.sources.codex_judge_model).toBe("default");
-    expect(initial.defaults?.codex_judge_model).toBe("gpt-6.1-sol");
+    expect(initial.defaults?.codex_judge_model).toBe("gpt-6.2-sol");
 
     const pinned = await api.updateSettings({ codex_judge_model: " gpt-6-sol " });
     expect(pinned.settings.codex_judge_model).toBe("gpt-6-sol");
     expect(pinned.sources.codex_judge_model).toBe("db");
 
     const reset = await api.updateSettings({ codex_judge_model: "   " });
-    expect(reset.settings.codex_judge_model).toBe("gpt-6.1-sol");
+    expect(reset.settings.codex_judge_model).toBe("gpt-6.2-sol");
     expect(reset.sources.codex_judge_model).toBe("default");
   });
 

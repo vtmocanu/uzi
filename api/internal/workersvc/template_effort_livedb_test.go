@@ -39,8 +39,8 @@ func (fx *effFix) claimWith(run store.Run, gen int64, caps []string) *ClaimPaylo
 }
 
 var (
-	oldWorkerCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
-	newWorkerCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1, capability.TemplateEffortV1}
+	oldWorkerCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}
+	newWorkerCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1, capability.TemplateEffortV1}
 )
 
 func agentEfforts(p *ClaimPayload) map[string]string {

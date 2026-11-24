@@ -421,7 +421,7 @@ func TestAssembleClaimCodexCatalogContextLiveDB(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := setupCatalog(t, sub)
 			resealBotPAT(t, e.codexTestEnv, e.userID)
-			worker := store.Worker{ID: e.workerID, UserID: e.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+			worker := store.Worker{ID: e.workerID, UserID: e.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 			payload, err := e.svc.assembleClaim(e.ctx, worker, mustRun(t, e.codexTestEnv, e.runID))
 			if err != nil {
 				t.Fatal(err)

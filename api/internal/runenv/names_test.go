@@ -243,3 +243,36 @@ func TestValidateNameTable(t *testing.T) {
 		}
 	}
 }
+
+// Independent expectations: fixture and both mirrors changing together must not erase these controls.
+func TestCodex171EnvControls(t *testing.T) {
+	for _, name := range []string{"SPIFFE_ENDPOINT_SOCKET", "SSH2_CLIENT", "COMSPEC", "DENO_CERT", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE", "OTEL_RESOURCE_ATTRIBUTES", "AWS_ENDPOINT_URL"} {
+		if err := ValidateName(name); err == nil || !strings.Contains(err.Error(), "(denied name)") {
+			t.Errorf("ValidateName(%q) = %v, want exact denied-name rule", name, err)
+		}
+	}
+	for _, tc := range []struct{ name, prefix string }{
+		{"OTEL_LOG_", "OTEL_LOG_"},
+		{"OTEL_LOG_LEVEL", "OTEL_LOG_"},
+		{"OTEL_LOG_FUTURE_CONTROL", "OTEL_LOG_"},
+		{"OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_"},
+		{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_"},
+		{"OTEL_EXPORTER_OTLP_METRICS_HEADERS", "OTEL_EXPORTER_OTLP_"},
+		{"OTEL_EXPORTER_OTLP_FUTURE_CONTROL", "OTEL_EXPORTER_OTLP_"},
+		{"AWS_ENDPOINT_URL_", "AWS_ENDPOINT_URL_"},
+		{"AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL_"},
+		{"AWS_ENDPOINT_URL_FUTURE_SERVICE", "AWS_ENDPOINT_URL_"},
+		{"OPENAI_IDENTITY_TOKEN_SOURCE", "OPENAI_"},
+		{"OPENAI_SPIFFE_AUDIENCE", "OPENAI_"},
+		{"OPENAI_SPIFFE_ID", "OPENAI_"},
+	} {
+		if err := ValidateName(tc.name); err == nil || !strings.Contains(err.Error(), "denied prefix "+tc.prefix+":") {
+			t.Errorf("ValidateName(%q) = %v, want prefix %s", tc.name, err, tc.prefix)
+		}
+	}
+	for _, name := range []string{"OTEL_OTHER_APP", "AWS_REGION", "AWS_ACCESS_KEY_ID", "OTEL_LOG", "OTEL_LOGGER", "OTEL_EXPORTER_OTLP", "OTEL_EXPORTER_OTLPX_ENDPOINT", "AWS_ENDPOINT_URLX", "AWS_ENDPOINT_URLS", "SPIFFE_ENDPOINT_SOCKET_APP", "SSH2_CLIENT_APP", "COMSPEC_APP", "DENO_CERT_APP", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE_APP", "OTEL_RESOURCE_ATTRIBUTES_APP"} {
+		if err := ValidateName(name); err != nil {
+			t.Errorf("ValidateName(%q) = %v, want allowed neighbor", name, err)
+		}
+	}
+}

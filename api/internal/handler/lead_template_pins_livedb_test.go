@@ -22,9 +22,9 @@ func TestLeadTemplatePinSettingsLiveDB(t *testing.T) {
 		{"claude-lane", "claude-custom-template", "gpt-6-luna", "haiku", "", "haiku", "gpt-6-luna"},
 		{"codex-lane", "claude-custom-template", "gpt-6-luna", "", "gpt-6-sol", "claude-custom-template", "gpt-6-sol"},
 		{"both-lanes", "claude-custom-template", "gpt-6-luna", "sonnet", "gpt-6-astra", "sonnet", "gpt-6-astra"},
-		{"invalid-codex", "claude-custom-template", "not-a-role", "", "", "claude-custom-template", "gpt-6.1-sol"},
-		{"claude-alias-in-codex", "claude-custom-template", "opus", "", "", "claude-custom-template", "gpt-6.1-sol"},
-		{"empty-codex", "claude-custom-template", "", "", "", "claude-custom-template", "gpt-6.1-sol"},
+		{"invalid-codex", "claude-custom-template", "not-a-role", "", "", "claude-custom-template", "gpt-6.2-sol"},
+		{"claude-alias-in-codex", "claude-custom-template", "opus", "", "", "claude-custom-template", "gpt-6.2-sol"},
+		{"empty-codex", "claude-custom-template", "", "", "", "claude-custom-template", "gpt-6.2-sol"},
 		{"legacy-claude-luna", "gpt-6-luna", "gpt-6-luna", "", "", "", "gpt-6-luna"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

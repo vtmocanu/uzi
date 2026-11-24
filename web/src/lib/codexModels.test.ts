@@ -16,3 +16,13 @@ describe("codexModels vs fixtures/codex-models/models.json", () => {
     expect(new Set(CODEX_ROLE_MODELS).size).toBe(CODEX_ROLE_MODELS.length);
   });
 });
+
+
+it("includes both 6.2 models while keeping luna role-only", () => {
+  for (const model of ["gpt-6.2-sol", "gpt-6.2-astra"]) {
+    expect(CODEX_CURATED_MODELS).toContain(model);
+    expect(CODEX_ROLE_MODELS).toContain(model);
+  }
+  expect(CODEX_CURATED_MODELS).not.toContain("gpt-6-luna");
+  expect(CODEX_ROLE_MODELS).toContain("gpt-6-luna");
+});

@@ -62,7 +62,7 @@ function makeSettings(over: Partial<UserSettings> = {}): UserSettings {
     planning_claude_model: null, planning_claude_effort: null, planning_codex_model: null, planning_codex_effort: null,
     planning_models: [
       { harness: "claude", model: null, default_model: "opus", default_source: "template", resolved_model: "opus", source: "template" },
-      { harness: "codex", model: null, default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6.1-sol", source: "builtin" },
+      { harness: "codex", model: null, default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6.2-sol", source: "builtin" },
     ],
     planning_efforts: [
       { harness: "claude", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
@@ -97,9 +97,9 @@ function makeEffective(over: { claudeModel?: string; codexModel?: string; codexS
     }],
     models: [
       modelCell("worker_model", "claude", over.claudeModel ?? "opus", "template"),
-      modelCell("worker_model", "codex", over.codexModel ?? "gpt-6.1-sol", over.codexSource ?? "builtin"),
+      modelCell("worker_model", "codex", over.codexModel ?? "gpt-6.2-sol", over.codexSource ?? "builtin"),
       modelCell("planning_model", "claude", "opus", "template"),
-      modelCell("planning_model", "codex", "gpt-6.1-sol", "builtin"),
+      modelCell("planning_model", "codex", "gpt-6.2-sol", "builtin"),
     ],
     efforts: [
       effortCell("worker_effort", "claude", "medium", "builtin"),
@@ -197,7 +197,7 @@ describe("Models page", () => {
     await screen.findByLabelText("Worker model — Codex");
     select("Worker model — Codex", "gpt-6-sol");
     const text = describedText("Worker model — Codex");
-    expect(text).toContain("Saved effective value: gpt-6.1-sol · built-in");
+    expect(text).toContain("Saved effective value: gpt-6.2-sol · built-in");
     expect(text).toContain("Unsaved");
     expect(describedText("Worker model — Claude")).not.toContain("Unsaved");
     // Back to the stored value is no change at all.
@@ -261,7 +261,7 @@ describe("Models page", () => {
     mount();
     await screen.findByLabelText("Planning model — Claude");
     expect(control("Planning model — Claude").options[0].text).toBe("Same as the run · opus (lead template)");
-    expect(control("Planning model — Codex").options[0].text).toBe("Same as the run · gpt-6.1-sol (built-in)");
+    expect(control("Planning model — Codex").options[0].text).toBe("Same as the run · gpt-6.2-sol (built-in)");
     expect(control("Planning effort — Codex").options[0].text).toBe("Same as the run · medium (built-in)");
   });
 
@@ -701,14 +701,14 @@ const settingCell = (harness: "claude" | "codex", defaultModel: string, source =
 });
 const pinDto = (stage: "plan" | "code", harness: "claude" | "codex", over: Partial<CrossCheckPinDTO> = {}): CrossCheckPinDTO => ({
   stage, harness, model: null, effort: null,
-  worker_default_model: harness === "claude" ? "custom-template-model" : "gpt-6.1-sol",
-  resolved_model: harness === "claude" ? "custom-template-model" : "gpt-6.1-sol", resolved_effort: "high",
+  worker_default_model: harness === "claude" ? "custom-template-model" : "gpt-6.2-sol",
+  resolved_model: harness === "claude" ? "custom-template-model" : "gpt-6.2-sol", resolved_effort: "high",
   model_source: "worker default", effort_source: "cross-check default", active: true, ...over,
 });
 
 function helperSettings(over: Partial<UserSettings> = {}): UserSettings {
   return makeSettings({
-    judge_models: [settingCell("claude", "opus", "instance_default"), settingCell("codex", "gpt-6.1-sol")],
+    judge_models: [settingCell("claude", "opus", "instance_default"), settingCell("codex", "gpt-6.2-sol")],
     summary_models: [settingCell("claude", "haiku"), settingCell("codex", "gpt-6-luna")],
     task_review_models: [settingCell("claude", ""), settingCell("codex", "gpt-6-sol")],
     task_review_efforts: [
@@ -732,7 +732,7 @@ function helperEffective(over: { judgeOn?: "claude" | "codex" | null; codexUsabl
     models: [
       ...base.models,
       cell("judge_model", "claude", "opus", "instance_default", over.judgeOn === "codex" ? ["not_used"] : []),
-      cell("judge_model", "codex", "gpt-6.1-sol", "builtin", over.judgeOn === "claude" ? ["not_used"] : []),
+      cell("judge_model", "codex", "gpt-6.2-sol", "builtin", over.judgeOn === "claude" ? ["not_used"] : []),
       cell("summary_model", "claude", "haiku", "builtin"),
       cell("summary_model", "codex", "gpt-6-luna", "builtin"),
       cell("task_review_model", "claude", "", "builtin", ["sdk_default"]),
@@ -746,7 +746,7 @@ function helperEffective(over: { judgeOn?: "claude" | "codex" | null; codexUsabl
     cross_check: {
       models: (["cross_check_plan", "cross_check_code"] as const).flatMap((s) => [
         cell(s, "claude", "custom-template-model", "cross_check_worker_default"),
-        cell(s, "codex", "gpt-6.1-sol", "cross_check_worker_default"),
+        cell(s, "codex", "gpt-6.2-sol", "cross_check_worker_default"),
       ]),
       efforts: (["cross_check_plan", "cross_check_code"] as const).flatMap((s) => [xEffort(s, "claude"), xEffort(s, "codex")]),
     },
@@ -1026,7 +1026,7 @@ describe("Models page — helper and cross-check rows (M2)", () => {
     mount();
     await screen.findByLabelText("Plan cross-check model — Claude");
     expect(control("Plan cross-check model — Claude").options[0].text).toBe("Default · SDK/account default");
-    expect(control("Plan cross-check model — Codex").options[0].text).toBe("Default · gpt-6.1-sol (worker default)");
+    expect(control("Plan cross-check model — Codex").options[0].text).toBe("Default · gpt-6.2-sol (worker default)");
     expect(control("Code cross-check model — Claude").options[0].text).toBe("Default · custom-template-model (worker default)");
     expect(control("Code cross-check model — Codex").options[0].text).toBe("Default · Unavailable (worker default)");
     select("Worker model — Claude", "haiku");

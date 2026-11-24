@@ -6,6 +6,10 @@ import type { ResponsesBody } from "./fake-provider.js";
 export const ASYNC_QUESTIONS = [{ title: "Which validation should run?", options: ["Focused checks", "Defer"] }];
 export const ASYNC_ARGS = { questions: ASYNC_QUESTIONS };
 export const EXCEPTIONS_TITLE = "codex P #1566: pinned async questions and UTC reads complete without worker authority";
+export const ASYNC_MESSAGE_TITLES: Readonly<Record<string, string>> = {
+  "gpt-6.2-sol": "codex P native async message has no worker authority: gpt-6.2-sol",
+  "gpt-6.2-astra": "codex P native async message has no worker authority: gpt-6.2-astra",
+};
 export const INVENTORY_TITLE = "codex #1566 inventory helper includes namespace and nested code-mode tools";
 
 /** Evidence only: callers must reject unparsed evidence and missing observations before

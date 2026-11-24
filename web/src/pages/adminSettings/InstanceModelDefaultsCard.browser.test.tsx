@@ -14,7 +14,7 @@ const mockApi = vi.mocked(api);
 
 const DEFAULTS = {
   judge_model: "opus",
-  codex_judge_model: "gpt-6.1-sol",
+  codex_judge_model: "gpt-6.2-sol",
   summary_model: "haiku",
   codex_summary_model: "gpt-6-luna",
 };

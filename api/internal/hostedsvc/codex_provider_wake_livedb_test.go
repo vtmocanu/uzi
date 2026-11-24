@@ -47,7 +47,7 @@ func codexProviderWakeRun(e *wakeEnv) uuid.UUID {
 }
 
 func codexProviderWakeCaps() []string {
-	return []string{"codex_harness_v1", "codex_runtime_v2", "codex_provider_v1"}
+	return []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_provider_v1"}
 }
 
 func assertCodexProviderEphemeral(e *wakeEnv, run uuid.UUID) uuid.UUID {
@@ -255,7 +255,7 @@ func TestCodexProviderLeaseProvisionWithoutWakeLiveDB(t *testing.T) {
 }
 
 func TestCodexProviderReapProvisionLiveDB(t *testing.T) {
-	for _, guard := range []string{"none", "busy", "custody"} {
+	for _, guard := range []string{"none", "busy", "custody", "previously-claimed", "full-v3"} {
 		t.Run(guard, func(t *testing.T) {
 			e := newWakeEnv(t, true)
 			run := codexProviderWakeRun(e)
@@ -265,8 +265,12 @@ func TestCodexProviderReapProvisionLiveDB(t *testing.T) {
 			w := assertCodexProviderEphemeral(e, run)
 			// Registered recently: incompatibility, not startup timeout, must reap it.
 			e.exec(`UPDATE workers SET status='online', online_since=now(), last_heartbeat_at=now(),
-				protocol_capabilities=$2 WHERE id=$1`, w, []string{"codex_harness_v1", "codex_runtime_v2"})
+				protocol_capabilities=$2 WHERE id=$1`, w, []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"})
 			switch guard {
+			case "previously-claimed":
+				e.exec("UPDATE runs SET claim_generation=1 WHERE id=$1", run)
+			case "full-v3":
+				e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", w, codexProviderWakeCaps())
 			case "busy":
 				active := e.queuedRun()
 				e.exec(`UPDATE runs SET status='running', worker_id=$2 WHERE id=$1`, active, w)

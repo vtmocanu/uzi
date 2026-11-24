@@ -296,7 +296,8 @@ func workerSupportsProvider(w store.Worker, engine string) bool {
 	case harnessCodex:
 		return slices.Contains(w.ProtocolCapabilities, capability.CodexProviderV1) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&
-			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV2)
+			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV2) &&
+			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV3)
 	default:
 		return false
 	}

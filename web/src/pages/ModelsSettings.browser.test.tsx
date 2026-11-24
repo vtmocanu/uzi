@@ -30,8 +30,8 @@ const settings = {
   planning_claude_model: null, planning_claude_effort: null, planning_codex_model: null, planning_codex_effort: null,
   cross_check_pins: (["plan", "code"] as const).flatMap((stage) => (["claude", "codex"] as const).map((harness) => ({
     // A null Claude worker default renders the longest checker Default, "Default · SDK/account default".
-    stage, harness, model: null, effort: null, worker_default_model: harness === "claude" ? null : "gpt-6.1-sol",
-    resolved_model: harness === "claude" ? "sonnet" : "gpt-6.1-sol", resolved_effort: "high",
+    stage, harness, model: null, effort: null, worker_default_model: harness === "claude" ? null : "gpt-6.2-sol",
+    resolved_model: harness === "claude" ? "sonnet" : "gpt-6.2-sol", resolved_effort: "high",
     model_source: "worker default", effort_source: "cross-check default", active: true,
   }))),
   // The longest Default values the page shows in practice (as the mock serves them): a select
@@ -53,8 +53,8 @@ const effective = {
   ],
   start: [{ choice: "default", harness: { value: null, source: "chosen_at_create", fixed_at: "create", notes: ["automatic_weekly_reset"] }, refusal: null, refusal_detail: null, anthropic_override_allowed: true }],
   models: (["worker_model", "planning_model"] as const).flatMap((setting) => (["claude", "codex"] as const).map((harness) => ({
-    harness, setting, model: null, default_model: harness === "claude" ? "opus" : "gpt-6.1-sol", default_source: "builtin",
-    resolved_model: harness === "claude" ? "sonnet" : "gpt-6.1-sol", source: harness === "claude" ? "user_default" : "builtin",
+    harness, setting, model: null, default_model: harness === "claude" ? "opus" : "gpt-6.2-sol", default_source: "builtin",
+    resolved_model: harness === "claude" ? "sonnet" : "gpt-6.2-sol", source: harness === "claude" ? "user_default" : "builtin",
     fixed_at: "claim", ignored: null, notes: [],
   }))),
   efforts: (["worker_effort", "planning_effort"] as const).flatMap((setting) => (["claude", "codex"] as const).map((harness) => ({

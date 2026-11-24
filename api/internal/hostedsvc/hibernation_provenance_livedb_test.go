@@ -22,7 +22,7 @@ func TestHibernationWakeRechecksCodexProvenanceLiveDB(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			e := newWakeEnv(t, false)
-			caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+			caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 			a := e.sleeper(nil, caps, time.Hour)
 			b := e.sleeper(nil, caps, 2*time.Hour)
 			run := e.queuedRun()

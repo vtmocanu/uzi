@@ -3039,7 +3039,7 @@ after the last colon is read as the context window.
 
 The `--model` vocabulary is per engine. Claude: `haiku` (required), `sonnet`, `opus`, `fable`.
 Codex: `default` (required) plus the optional Codex model ids `gpt-6-astra`, `gpt-5.6-sol`,
-`gpt-6-sol`, `gpt-6.1-sol` and `gpt-6-luna`. A Codex model the map does not name resolves through
+`gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra` and `gpt-6-luna`. A Codex model the map does not name resolves through
 `default` when uzi picks it, but an explicit `--model` on a run or a schedule pin needs its own key
 (`provider_model_unmapped` otherwise); see [Use a provider as your Codex
 source](./providers.md#use-a-provider-as-your-codex-source).
@@ -3562,6 +3562,13 @@ instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Cha
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
 
 ### Changing model and effort settings
+
+The current Codex built-in worker fallback is `gpt-6.2-sol`; the independent
+Codex judge built-in is also `gpt-6.2-sol`. Explicit user, instance, run, schedule
+and template choices are not migrated. Task review and PR descriptions retain
+`gpt-6-sol`; summaries retain `gpt-6-luna`. See the
+[current worker baseline](./worker-model.md#current-codex-worker-baseline).
+
 
 ```sh
 uzi settings set worker-model --harness codex gpt-5.5

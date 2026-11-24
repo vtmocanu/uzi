@@ -101,7 +101,7 @@ func TestLeadSourceKeysAbsentForReviewClaimsLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
 	wkr := store.Worker{ID: workerID, UserID: userID,
-		ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+		ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 
 	seedReview := func(harness string) uuid.UUID {
 		target, review := uuid.New(), uuid.New()

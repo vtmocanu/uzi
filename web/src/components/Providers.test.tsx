@@ -511,7 +511,7 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
 });
 
 
-it("creates all six Codex mappings and resets incompatible engine drafts", async () => {
+it("creates all eight Codex mappings and resets incompatible engine drafts", async () => {
   await renderCard(list({ providers: [] }));
   const f = within(screen.getByRole("form", { name: "Add a provider" }));
   fireEvent.change(f.getByLabelText("Haiku model (required)"), { target: { value: "old" } });
@@ -524,7 +524,7 @@ it("creates all six Codex mappings and resets incompatible engine drafts", async
   fireEvent.click(f.getByRole("button", { name: "Add provider" }));
   expect((await screen.findByRole("alert")).textContent).toContain("Default model is required");
   const map: Record<string, { model: string; context_window: number }> = {};
-  for (const [role, label] of [["default", "Default"], ...["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"].map(r => [r, r])]) {
+  for (const [role, label] of [["default", "Default"], ...["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"].map(r => [r, r])]) {
     fireEvent.change(f.getByLabelText(label + " model" + (role === "default" ? " (required)" : "")), { target: { value: "gw-" + role } });
     if (role === "default") expect(screen.getByTestId("ctx-warning-default").textContent).toContain("runtime fallback");
     fireEvent.change(f.getByLabelText(label + " context window"), { target: { value: "32768" } });
@@ -535,7 +535,7 @@ it("creates all six Codex mappings and resets incompatible engine drafts", async
 });
 
 it("edits Codex maps without changing engine and selects only the Codex source", async () => {
-  const code = provider({ id: "code", name: "code", engine: "codex", protocol: "openai_responses", model_map: { default: { model: "gw", context_window: 32768 }, "gpt-6-luna": { model: "moon", context_window: 65536 } } });
+  const code = provider({ id: "code", name: "code", engine: "codex", protocol: "openai_responses", model_map: { default: { model: "gw", context_window: 32768 }, "gpt-6-luna": { model: "moon", context_window: 65536 }, "gpt-6.2-sol": { model: "sun", context_window: 100000 }, "gpt-6.2-astra": { model: "star", context_window: 200000 } } });
   mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1", codex_provider_id: null } } as never);
   mockApi.setCodexProviderSource.mockResolvedValue({ codex_provider_id: "code" });
   await renderCard(list({ providers: [provider(), code] }));
@@ -543,9 +543,12 @@ it("edits Codex maps without changing engine and selects only the Codex source",
   fireEvent.click(row.getByRole("button", { name: "Edit name and models" }));
   expect(row.queryByLabelText("Engine")).toBeNull();
   expect((row.getByLabelText("gpt-6-luna context window") as HTMLInputElement).value).toBe("65536");
+  for (const [slot, context] of [["gpt-6.2-sol", "100000"], ["gpt-6.2-astra", "200000"]]) {
+    expect((row.getByLabelText(slot + " context window") as HTMLInputElement).value).toBe(context);
+  }
   fireEvent.change(row.getByLabelText("Default context window"), { target: { value: "8192" } });
   fireEvent.click(row.getByRole("button", { name: "Save changes" }));
-  await waitFor(() => expect(mockApi.patchProvider).toHaveBeenCalledWith("code", { model_map: { default: { model: "gw", context_window: 8192 }, "gpt-6-luna": { model: "moon", context_window: 65536 } } }));
+  await waitFor(() => expect(mockApi.patchProvider).toHaveBeenCalledWith("code", { model_map: { default: { model: "gw", context_window: 8192 }, "gpt-6-luna": { model: "moon", context_window: 65536 }, "gpt-6.2-sol": { model: "sun", context_window: 100000 }, "gpt-6.2-astra": { model: "star", context_window: 200000 } } }));
   mockApi.getMySettings.mockRejectedValue(new Error("advisory unavailable"));
   fireEvent.click(row.getByRole("button", { name: "Use as Codex source" }));
   await waitFor(() => expect(mockApi.setCodexProviderSource).toHaveBeenCalledWith("code"));
