@@ -3093,7 +3093,7 @@ and `admin` for a shared one (`--json` carries `credential_mode: "per_user_key"`
 owned and a shared definition have the same name, `use` and `test` exit 2 and list the matching ids
 (each marked `yours` or `admin`): pass an id. `edit` and `retire` resolve only your own definitions; a
 name or id that identifies a shared one exits 5 with "managed by your admin; only an admin can change
-it", before any request. The key is still attached in Settings, and your own key and Test result are
+it", before any write request. The key is still attached in Settings, and your own key and Test result are
 the only ones the CLI shows.
 
 ## Anthropic tokens

@@ -34,7 +34,7 @@ A shared definition is a `model_providers` row with `owner_user_id IS NULL` and 
 
 It is used by the visible list and get (`ListVisibleProviders`, `GetVisibleProviderForUse`), key insert and lock, Test, source selection, the freeze and inherit reads, claim rechecks, hold promotion and run-provider names. The mode check is on every shared reader, so a later credential mode (#4540) cannot be admitted by accident. Owner mutation paths (rename, retire, delete, prune, count, the owner edit's pre-read) stay `owner_user_id = @caller`, so an owner route cannot reach a shared definition, an admin included: a rename-only PATCH on a shared id is a 404 before any write. Shared definitions are mutated only through dedicated admin queries scoped to `owner_user_id IS NULL`.
 
-The legacy owner-only Claude source readers and writers (`GetUserClaudeProviderSource`, `SetUserClaudeProviderSource`, the `claudeProviderSource` fallback) were deleted, so one source reader and one writer remain and no owner-only recipient twin can silently ignore a shared selection. `store/model_provider_visibility_sql_test.go` classifies every provider query as owner-arm, visibility-predicate or a named shared-admin exception.
+The legacy owner-only Claude source readers and writers (`GetUserClaudeProviderSource`, `SetUserClaudeProviderSource`, the `claudeProviderSource` fallback) were deleted, so one source reader and one writer remain and no owner-only recipient twin can silently ignore a shared selection. `store/model_provider_visibility_sql_test.go` classifies every provider query as owner-arm, visibility-predicate, identity-only (a named query keyed by exact ids, e.g. the evidence key lock) or a named shared-admin exception.
 
 ### D2. Personal key custody
 
@@ -85,7 +85,7 @@ Every path takes locks in one order, so no cycle exists:
 
 | Path | Order |
 |---|---|
-| Run create (freeze) and Claude source select | per-user secret-mutation lock (shared) -> provider row `FOR SHARE` -> (select only) `SetUserProviderSource` -> usability recheck, held through commit |
+| Run create (freeze) and Claude source select | per-user secret-mutation lock (shared for the freeze, exclusive for select) -> provider row `FOR SHARE` -> (select only) `SetUserProviderSource` -> usability recheck, held through commit |
 | Key insert, rotate, enable, disable, delete | per-user secret-mutation lock -> provider row `FOR KEY SHARE` (`LockVisibleProviderForKeyMutation`) -> key row `FOR UPDATE` |
 | Test evidence write | provider row `FOR SHARE` -> key row `FOR SHARE`, in a short transaction after the dial |
 | Admin edit and retire | provider row `FOR NO KEY UPDATE` (`LockSharedModelProviderForEdit`) |

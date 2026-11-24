@@ -338,7 +338,7 @@ you never see anyone else's key or Test results.
   and new Claude runs are refused the same way: they never fall back to your Anthropic token.
 - **You cannot change the definition.** Rename, model map, endpoint, retire and delete are not
   offered for it. `uzi provider edit` and `uzi provider retire` refuse a shared definition ("managed by
-  your admin") before sending anything. You can still disable or delete your own key on it.
+  your admin") before sending any change. You can still disable or delete your own key on it.
 - **When your admin changes it.** A model-map edit makes a new revision for your next fresh run;
   runs already started keep the one they froze. **Retiring** stops new selections and fresh runs. If
   you had it selected, it stays selected but is unusable until you choose another source, and Settings
