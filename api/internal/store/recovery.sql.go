@@ -208,8 +208,9 @@ type DiscardCaptureForOwnerParams struct {
 	UserID uuid.UUID `json:"user_id"`
 }
 
-// #4628: a capture a pending or claimed fresh resume references is not discarded (0 rows; the service
-// tells this apart from a foreign id with CaptureHasActiveFreshResume and answers 409).
+// #4628: a capture a pending or claimed fresh resume references is not discarded (0 rows). The
+// NOT EXISTS here is only a backstop: it is not race-free on its own (see LockCaptureForOwner), so
+// the service locks the capture and checks CaptureHasActiveFreshResume in separate statements first.
 // D7: owner-initiated explicit discard of one capture. Deletes its byte chunks (freeing
 // storage) and marks the capture 'discarded' in ONE statement — the data-modifying del CTE
 // always runs to completion, and :execrows reports the capture UPDATE's row count (1 when
@@ -320,6 +321,11 @@ WHERE c.id IN (SELECT expiring.capture_id FROM expiring)
 // hold, a pending (preparing/uploading) capture, or a needs_action capture — a ready
 // artifact's TTL must not expire uncaptured custody. The capture METADATA row is kept in state
 // 'expired' (audit + an honest owner-visible state); only its bytes go.
+//
+// #4628: the NOT EXISTS below reads the statement snapshot, which a FOR UPDATE wait does not
+// refresh, so unlike the owner discard it is not race-free against a Start that commits a pending
+// row while this statement waits. It does not need to be: Start only selects a capture whose
+// expires_at is more than 30 minutes ahead, and this sweep only touches expires_at < now.
 //
 // Ordered exactly like DiscardCaptureForOwner so the whole thing is ONE atomic statement:
 // `expiring` SELECTs the target ids under one snapshot, `del` deletes their chunks, and the
@@ -1777,6 +1783,30 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockCaptureForOwner = `-- name: LockCaptureForOwner :one
+SELECT rc.id FROM recovery_captures rc
+WHERE rc.id = $1 AND rc.run_id = $2 AND rc.user_id = $3
+FOR UPDATE
+`
+
+type LockCaptureForOwnerParams struct {
+	ID     uuid.UUID `json:"id"`
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// #4628: the capture row lock the owner discard takes as its OWN statement, before it asks
+// CaptureHasActiveFreshResume. A fresh-resume Start takes the capture FOR SHARE and commits a pending
+// row; the EXISTS guard inside DiscardCaptureForOwner shares one snapshot with its FOR UPDATE, which
+// was taken before the wait, so it could not see that row. Locking first and checking in a following
+// statement reads a post-wait snapshot.
+func (q *Queries) LockCaptureForOwner(ctx context.Context, arg LockCaptureForOwnerParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockCaptureForOwner, arg.ID, arg.RunID, arg.UserID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const lockTerminalRejectionHolds = `-- name: LockTerminalRejectionHolds :many

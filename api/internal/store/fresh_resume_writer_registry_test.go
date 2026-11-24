@@ -32,7 +32,7 @@ import (
 // writer, workersvc/milestone_reconciliation.go, is registered below) and migrations.
 
 // freshResumeRefuse lists the single-run writers guarded by the rule-1 raise alone.
-var freshResumeRefuse = map[string]string{
+var freshResumeRefuse = map[string]string{ //nolint:gosec // G101: the keys are sqlc query names, not credentials.
 	"SetRunBaseAttestationHold": "single run", "FailCodexAccountWaitRun": "single run", "SetCodexSwitchStopped": "single run",
 	"ParkCredentialDisabledRun": "assembly arm: RefuseFreshResumeInTx in m2", "ParkRunOverrideUnavailableRun": "assembly arm",
 	"ParkCredentialDisabledChatRun": "chat", "PromoteCredentialDisabledRun": "single run", "ReassignCredentialDisabledRun": "single run",
@@ -129,15 +129,30 @@ func freshResumeStatements(t *testing.T) map[string]freshStmt {
 }
 
 var (
-	freshRunsUpdate  = regexp.MustCompile(`UPDATE\s+runs(?:\s+(?:AS\s+)?\w+)?\s+SET`)
-	freshAssigns     = regexp.MustCompile(`(?:\bSET\b|,)\s*(?:\w+\.)?(status|worker_id|claim_generation|checkpoint_tip)\s*=`)
-	freshLiteral     = regexp.MustCompile(`NOT EXISTS \(SELECT 1 FROM run_fresh_resumes \w+ WHERE \w+\.(?:run_id|capture_id) = [\w.]+ AND \w+\.state IN \('pending', 'claimed'\)\)`)
-	freshSingleRunID = regexp.MustCompile(`(?:\b|\.)(?:run_)?id\s*=\s*(?:@|sqlc\.arg)`)
+	freshRunsUpdate = regexp.MustCompile(`UPDATE\s+runs(?:\s+(?:AS\s+)?\w+)?\s+SET`)
+	freshAssigns    = regexp.MustCompile(`(?:\bSET\b|,)\s*(?:\w+\.)?(status|worker_id|claim_generation|checkpoint_tip)\s*=`)
+	freshLiteral    = regexp.MustCompile(`NOT EXISTS \(SELECT 1 FROM run_fresh_resumes \w+ WHERE \w+\.(?:run_id|capture_id) = [\w.]+ AND \w+\.state IN \('pending', 'claimed'\)\)`)
+	// A statement is keyed on one run only when the runs row (the table name, its alias, or an unqualified
+	// id / run_id) is compared to a parameter. Another table's id (w.id = @worker_id) does not count.
+	freshRunsAlias = regexp.MustCompile(`UPDATE\s+runs(?:\s+(?:AS\s+)?(\w+))?\s+SET`)
 )
+
+// freshSingleRun reports whether the statement's WHERE keys the runs row on one parameter.
+func freshSingleRun(body string) bool {
+	quals := []string{"runs"}
+	for _, m := range freshRunsAlias.FindAllStringSubmatch(body, -1) {
+		if m[1] != "" && m[1] != "SET" {
+			quals = append(quals, m[1])
+		}
+	}
+	qualified := regexp.MustCompile(`\b(?:` + strings.Join(quals, "|") + `)\.(?:run_)?id\s*=\s*(?:@|sqlc\.arg)`)
+	bare := regexp.MustCompile(`(?:^|[^.\w])(?:run_)?id\s*=\s*(?:@|sqlc\.arg)`)
+	return qualified.MatchString(body) || bare.MatchString(body)
+}
 
 func TestFreshResumeWriterRegistry(t *testing.T) {
 	stmts := freshResumeStatements(t)
-	var unregistered, missingLiteral, missingStamp []string
+	var unregistered, missingLiteral, missingStamp, missingFinal []string
 	watched := 0
 	for _, s := range stmts {
 		if !freshRunsUpdate.MatchString(s.body) {
@@ -171,15 +186,20 @@ func TestFreshResumeWriterRegistry(t *testing.T) {
 		if allow {
 			continue
 		}
+		// A literal in a selector CTE does not guard the UPDATE that follows: each UPDATE runs that assigns a
+		// watched column must carry one in its own text too (ParkRunsAtWall kept a CTE copy when the UPDATE's was folded away).
+		if hasLiteral && freshWatchedUpdatesUnguarded(s.body) > 0 && !freshSelectorOnly[s.name] {
+			missingFinal = append(missingFinal, s.name)
+		}
 		// The mechanical rule: :many and not-single-run-keyed statements carry the literal, whatever the disposition.
-		if (s.kind == ":many" || !freshSingleRunID.MatchString(s.body)) && !hasLiteral {
+		if (s.kind == ":many" || !freshSingleRun(s.body)) && !hasLiteral {
 			missingLiteral = append(missingLiteral, s.name)
 		}
 	}
 	if watched < 60 {
 		t.Fatalf("only %d watched writers found: the scan is not looking at the queries", watched)
 	}
-	for _, l := range [][]string{unregistered, missingLiteral, missingStamp} {
+	for _, l := range [][]string{unregistered, missingLiteral, missingStamp, missingFinal} {
 		sort.Strings(l)
 	}
 	if len(unregistered) > 0 {
@@ -187,6 +207,9 @@ func TestFreshResumeWriterRegistry(t *testing.T) {
 	}
 	if len(missingLiteral) > 0 {
 		t.Errorf("multi-run (:many or not keyed on one run id) writers without the literal NOT EXISTS (... run_fresh_resumes ...): %v", missingLiteral)
+	}
+	if len(missingFinal) > 0 {
+		t.Errorf("exclude writers with an UPDATE runs that assigns a watched column and lacks the literal NOT EXISTS (... run_fresh_resumes ...): %v", missingFinal)
 	}
 	if len(missingStamp) > 0 {
 		t.Errorf("checkpoint_tip writers that do not stamp checkpoint_tip_generation and checkpoint_tip_generation_tip: %v", missingStamp)
@@ -235,11 +258,11 @@ func TestFreshResumeGoWritersRegistered(t *testing.T) {
 		if err != nil || info.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") || strings.HasSuffix(p, ".sql.go") {
 			return err
 		}
-		b, rerr := os.ReadFile(p)
+		b, rerr := os.ReadFile(filepath.Clean(p)) //nolint:gosec // G304: p comes from walking the store package tree.
 		if rerr != nil {
 			return rerr
 		}
-		for _, loc := range regexp.MustCompile("(?s)UPDATE\\s+runs\\s+SET.{0,1000}").FindAllString(string(b), -1) {
+		for _, loc := range regexp.MustCompile(`(?s)UPDATE\s+runs\s+SET.{0,1000}`).FindAllString(string(b), -1) {
 			end := strings.Index(loc[1:], "`")
 			if end > 0 {
 				loc = loc[:end+1]
@@ -268,6 +291,156 @@ func TestFreshResumeGoWritersRegistered(t *testing.T) {
 		}
 		if !seen {
 			t.Errorf("registered Go writer no longer writes the watched columns: %s", p)
+		}
+	}
+}
+
+// freshSelectorOnly names exclude writers whose literal legitimately sits only in a selector CTE
+// (none today). An entry owes a reason.
+var freshSelectorOnly = map[string]bool{}
+
+// freshWatchedUpdatesUnguarded returns the number of UPDATE runs ... SET blocks that assign a watched
+// column (status, worker_id, claim_generation) but whose own text, from that UPDATE to the next UPDATE
+// runs or the end, lacks the literal. A literal in a selector CTE above does not count for the block.
+func freshWatchedUpdatesUnguarded(body string) int {
+	locs := freshRunsUpdate.FindAllStringIndex(body, -1)
+	n := 0
+	for i, loc := range locs {
+		end := len(body)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		seg := body[loc[0]:end]
+		watched := false
+		for _, m := range freshAssigns.FindAllStringSubmatch(seg, -1) {
+			watched = watched || m[1] != "checkpoint_tip"
+		}
+		if watched && !freshLiteral.MatchString(seg) {
+			n++
+		}
+	}
+	return n
+}
+
+// freshSetColumns returns the columns assigned by every UPDATE runs ... SET list in the statement.
+// The list ends at the first FROM, WHERE or RETURNING outside parentheses and string literals.
+func freshSetColumns(body string) map[string]bool {
+	cols := map[string]bool{}
+	for _, loc := range freshRunsUpdate.FindAllStringIndex(body, -1) {
+		i, depth, inStr, itemStart := loc[1], 0, false, loc[1]
+		var items []string
+		for ; i < len(body); i++ {
+			c := body[i]
+			if inStr {
+				inStr = c != '\''
+				continue
+			}
+			switch c {
+			case '\'':
+				inStr = true
+			case '(':
+				depth++
+			case ')':
+				depth--
+			case ',':
+				if depth == 0 {
+					items = append(items, body[itemStart:i])
+					itemStart = i + 1
+				}
+			}
+			if depth == 0 && (c == ' ' || c == '\n' || c == '\t') {
+				rest := body[i+1:]
+				if strings.HasPrefix(rest, "FROM ") || strings.HasPrefix(rest, "WHERE ") || strings.HasPrefix(rest, "WHERE\n") || strings.HasPrefix(rest, "RETURNING ") {
+					break
+				}
+			}
+		}
+		items = append(items, body[itemStart:min(i, len(body))])
+		for _, it := range items {
+			lhs, _, ok := strings.Cut(it, "=")
+			if !ok {
+				continue
+			}
+			f := strings.Fields(lhs)
+			if len(f) == 0 {
+				continue
+			}
+			name := f[len(f)-1]
+			if _, after, found := strings.Cut(name, "."); found {
+				name = after
+			}
+			cols[name] = true
+		}
+	}
+	return cols
+}
+
+// freshTupleFenced are columns the claim writes that a refusal deliberately never restores: the
+// monotonic fences (claim_generation stays at G'; codex_claim_epoch and codex_cap_hash only advance),
+// the claim provenance, worker_id (restored from saved_worker_id, a real FK, not from the jsonb) and
+// the bookkeeping columns every restore rewrites itself.
+var freshTupleFenced = map[string]string{
+	"claim_generation": "monotonic fence", "codex_claim_epoch": "monotonic fence", "codex_cap_hash": "monotonic fence",
+	"worker_id": "saved_worker_id", "updated_at": "restore rewrites it", "fresh_hold_version": "restore bumps it",
+}
+
+// TestFreshResumeSavedTupleCoversClaimWriters asserts that every column the claim path
+// (PrepareFreshResumeClaim, ClaimRun) or W2's running advance (SetRunRunning) can write is in the saved
+// tuple and restored by RestoreFreshResumeTuple, minus the documented fences, so a refusal cannot leave a
+// claim-written value behind.
+func TestFreshResumeSavedTupleCoversClaimWriters(t *testing.T) {
+	stmts := freshResumeStatements(t)
+	prep := stmts["PrepareFreshResumeClaim"].body
+	saved := map[string]bool{}
+	for _, m := range regexp.MustCompile(`'(\w+)',\s*cur\.\w+`).FindAllStringSubmatch(prep, -1) {
+		saved[m[1]] = true
+	}
+	restored := freshSetColumns(stmts["RestoreFreshResumeTuple"].body)
+	if len(saved) < 20 || len(restored) < 20 {
+		t.Fatalf("saved tuple keys %d, restored columns %d: the parse is not reading the queries", len(saved), len(restored))
+	}
+	var notSaved, notRestored []string
+	for _, w := range []string{"PrepareFreshResumeClaim", "ClaimRun", "SetRunRunning"} {
+		cols := freshSetColumns(stmts[w].body)
+		if len(cols) < 8 {
+			t.Fatalf("%s: parsed %d SET columns: the parse is not reading the statement", w, len(cols))
+		}
+		for c := range cols {
+			if _, fenced := freshTupleFenced[c]; fenced || strings.HasPrefix(c, "claim_provenance") || strings.HasPrefix(c, "codex_claim_provenance") {
+				continue
+			}
+			if !saved[c] {
+				notSaved = append(notSaved, w+"."+c)
+			}
+			if !restored[c] {
+				notRestored = append(notRestored, w+"."+c)
+			}
+		}
+	}
+	sort.Strings(notSaved)
+	sort.Strings(notRestored)
+	if len(notSaved) > 0 {
+		t.Errorf("columns written on the claim path but missing from the saved tuple: %v", notSaved)
+	}
+	if len(notRestored) > 0 {
+		t.Errorf("columns written on the claim path but not restored by RestoreFreshResumeTuple: %v", notRestored)
+	}
+}
+
+func TestFreshResumeSingleRunClassifier(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		want       bool
+	}{
+		{"runs alias id", "UPDATE runs r SET status = 'x' WHERE r.id = @id", true},
+		{"runs table id", "UPDATE runs SET status = 'x' WHERE runs.id = sqlc.arg('id')", true},
+		{"bare id", "UPDATE runs SET status = 'x' WHERE id = @id", true},
+		{"bare run_id", "UPDATE runs SET status = 'x' WHERE run_id = @run_id", true},
+		{"worker id is not a run key", "UPDATE runs r SET status = 'x' FROM workers w WHERE r.worker_id = w.id AND w.id = @worker_id", false},
+		{"worker id only", "UPDATE runs SET status = 'x' FROM workers w WHERE runs.worker_id = w.id AND w.id = @worker_id", false},
+	} {
+		if got := freshSingleRun(c.body); got != c.want {
+			t.Errorf("%s: freshSingleRun = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

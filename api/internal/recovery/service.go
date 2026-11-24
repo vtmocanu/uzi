@@ -35,6 +35,11 @@ const maxPrerequisiteShas = 64
 // maps it to 409 Conflict with reason `ambiguous_generation` (mapRecoveryError).
 var ErrAmbiguous = errors.New("recovery: ambiguous open custody generation")
 
+// ErrCaptureInFreshResume: a pending or claimed fresh-resume transfer references the capture, so
+// its bytes may not be discarded (#4628). The handler should answer 409; it currently maps any
+// Discard error to 500 and is outside the store-layer milestone that added this sentinel.
+var ErrCaptureInFreshResume = errors.New("recovery: capture is referenced by a fresh resume transfer")
+
 // ── Worker-facing operations (D2/D6/D7). Each enforces the ORIGINAL worker identity and
 // an OPEN hold; none mutates run state or retargets another owner/repo/run. ──────────────
 
@@ -922,9 +927,37 @@ func (s *Service) Summary(ctx context.Context, userID, runID uuid.UUID) (apitype
 
 // Discard marks one owner-owned capture 'discarded' and deletes its bytes (D7). Returns
 // whether a capture was discarded (false for a foreign/absent id).
+//
+// #4628: three statements in one transaction. The capture is locked FOR UPDATE first, then
+// CaptureHasActiveFreshResume reads a snapshot taken after any wait on a concurrent fresh-resume
+// Start (which holds the capture FOR SHARE until it commits its pending row), then the discard. A
+// capture a pending or claimed transfer references is refused with ErrCaptureInFreshResume and stays
+// available with its chunks.
 func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUID) (bool, error) {
-	n, err := s.store.DiscardCaptureForOwner(ctx, store.DiscardCaptureForOwnerParams{ID: captureID, RunID: runID, UserID: userID})
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+	if _, err := qtx.LockCaptureForOwner(ctx, store.LockCaptureForOwnerParams{ID: captureID, RunID: runID, UserID: userID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	referenced, err := qtx.CaptureHasActiveFreshResume(ctx, pgtype.UUID{Bytes: captureID, Valid: true})
+	if err != nil {
+		return false, err
+	}
+	if referenced {
+		return false, ErrCaptureInFreshResume
+	}
+	n, err := qtx.DiscardCaptureForOwner(ctx, store.DiscardCaptureForOwnerParams{ID: captureID, RunID: runID, UserID: userID})
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return n > 0, nil

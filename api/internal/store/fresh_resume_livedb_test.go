@@ -61,7 +61,7 @@ func (f *freshFx) seeded(run, pred, dest uuid.UUID, gen int64, state string) uui
  checkpoint_ref, sha, candidate_token, state, predecessor_worker_id, destination_worker_id, claim_generation,
  destination_attempt_id, seeded_generation, seeded_at)
  VALUES ($1,$2,$3,$4,1,'checkpoint_ref','refs/uzi-checkpoints/x','abc','tok',$5,$6,$7,$8,$9,$8,now())`,
-		id, run, f.owner, uuid.New(), state, pred, dest, gen, fmt.Sprintf("a-g%d-x", gen))
+		id, run, f.owner, uuid.New(), state, pred, dest, gen, attemptID(gen))
 	return id
 }
 
@@ -234,7 +234,7 @@ func TestFreshResumeGuardAllowancesLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(f.ctx)
+		defer func() { _ = tx.Rollback(f.ctx) }()
 		qtx := f.q.WithTx(tx)
 		if err := qtx.OptInFreshResume(f.ctx, idA.String()); err != nil {
 			t.Fatal(err)
@@ -286,7 +286,7 @@ func TestFreshResumeGuardAllowancesLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(f.ctx)
+		defer func() { _ = tx.Rollback(f.ctx) }()
 		if _, err := tx.Exec(f.ctx, `SELECT set_config('uzi.fresh_resume_terminal', $1, true)`, run.String()); err != nil {
 			t.Fatal(err)
 		}
@@ -388,7 +388,7 @@ func TestFreshResumeWriteOnceLiveDB(t *testing.T) {
 	w1, w2 := f.newWorker(), f.newWorker()
 	run := f.runningRun(w2, 6)
 	id := f.seeded(run, w1, w2, 6, "seeded")
-	for _, set := range []string{"destination_attempt_id='other-g6-x'", "seeded_generation=7"} {
+	for _, set := range []string{"destination_attempt_id='20260101T000000Z-g6-fedcba9876543210'", "seeded_generation=7"} {
 		_, err := f.pool.Exec(f.ctx, `UPDATE run_fresh_resumes SET `+set+` WHERE id=$1`, id)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
@@ -401,6 +401,37 @@ func TestFreshResumeWriteOnceLiveDB(t *testing.T) {
 	_, err := f.pool.Exec(f.ctx, `UPDATE run_fresh_resumes SET seeded_at=NULL WHERE id=$1`, id)
 	if err == nil {
 		t.Fatal("clearing seeded_at alone must fail")
+	}
+}
+
+// The attempt-id CHECK mirrors the agent's ATTEMPT_ID_RE with a length bound.
+func TestFreshResumeAttemptIDShapeCheckLiveDB(t *testing.T) {
+	f := newFreshFx(t)
+	w1, w2 := f.newWorker(), f.newWorker()
+	run := f.runningRun(w2, 6)
+	id := f.seeded(run, w1, w2, 6, "seeded")
+	f.exec(`UPDATE run_fresh_resumes SET state='superseded' WHERE id=$1`, id)
+	for name, bad := range map[string]string{
+		"free text":            "a-g6-x",
+		"upper hex":            "20260101T000000Z-g6-0123456789ABCDEF",
+		"short hex":            "20260101T000000Z-g6-0123456789abcde",
+		"trailing newline":     "20260101T000000Z-g6-0123456789abcdef\n",
+		"generation too wide":  "20260101T000000Z-g1234567890123456789-0123456789abcdef",
+		"prefix before stamp":  "x20260101T000000Z-g6-0123456789abcdef",
+		"padded past 64 bytes": "20260101T000000Z-g6-0123456789abcdef" + strings.Repeat("0", 40),
+	} {
+		var pgErr *pgconn.PgError
+		_, err := f.pool.Exec(f.ctx, `INSERT INTO run_fresh_resumes (run_id, user_id, request_id, evidence_generation, evidence_kind,
+ checkpoint_ref, sha, candidate_token, state, destination_attempt_id, seeded_generation, seeded_at)
+ VALUES ($1,$2,$3,1,'checkpoint_ref','r','abc','tok','finished',$4,6,now())`, run, f.owner, uuid.New(), bad)
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "run_fresh_resumes_attempt_id_shape" {
+			t.Fatalf("%s: want the attempt id shape CHECK, got %v", name, err)
+		}
+	}
+	for _, ok := range []string{attemptID(6), "20260101T000000Z-gx-0123456789abcdef"} {
+		f.exec(`INSERT INTO run_fresh_resumes (run_id, user_id, request_id, evidence_generation, evidence_kind,
+ checkpoint_ref, sha, candidate_token, state, destination_attempt_id, seeded_generation, seeded_at)
+ VALUES ($1,$2,$3,1,'checkpoint_ref','r','abc','tok','finished',$4,6,now())`, run, f.owner, uuid.New(), ok)
 	}
 }
 
@@ -510,7 +541,7 @@ func TestFreshResumePrepareRestoreRoundTripLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(f.ctx)
+	defer func() { _ = tx.Rollback(f.ctx) }()
 	qtx := f.q.WithTx(tx)
 	if err := qtx.OptInFreshResume(f.ctx, pend.String()); err != nil {
 		t.Fatal(err)
@@ -704,7 +735,7 @@ func TestFreshResumeReservationCountLiveDB(t *testing.T) {
 	f.exec(`UPDATE workers SET last_heartbeat_at = $2 WHERE id=$1`, w2, cutoff.Time)
 
 	// Seeded keeps the unit while the hold is healthy, and a terminal run releases it.
-	f.exec(`UPDATE run_fresh_resumes SET state='seeded', destination_attempt_id='a-g4-x', seeded_generation=4, seeded_at=now() WHERE id=$1`, pend)
+	f.exec(`UPDATE run_fresh_resumes SET state='seeded', destination_attempt_id=$2, seeded_generation=4, seeded_at=now() WHERE id=$1`, pend, attemptID(4))
 	check("seeded", 1, 1)
 	f.exec(`UPDATE runs SET status='completed' WHERE id=$1`, run)
 	if f.count(cutoff) != 1 {
@@ -748,7 +779,7 @@ func TestFreshResumeDownGuardLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(context.Background())
+		defer func() { _ = tx.Rollback(context.Background()) }()
 		_, err = tx.Exec(context.Background(), block)
 		return err
 	}
@@ -760,7 +791,7 @@ func TestFreshResumeDownGuardLiveDB(t *testing.T) {
 	if err := runBlock(); err == nil || !strings.Contains(err.Error(), "outstanding fresh resume transfers") {
 		t.Fatalf("pending row must refuse the Down: %v", err)
 	}
-	f.exec(`UPDATE run_fresh_resumes SET state='seeded', destination_attempt_id='a-g1-x', seeded_generation=1, seeded_at=now() WHERE id=$1`, id)
+	f.exec(`UPDATE run_fresh_resumes SET state='seeded', destination_attempt_id=$2, seeded_generation=1, seeded_at=now() WHERE id=$1`, id, attemptID(1))
 	if err := runBlock(); err == nil {
 		t.Fatal("a seeded row on a live run must refuse the Down")
 	}
@@ -772,19 +803,26 @@ func TestFreshResumeDownGuardLiveDB(t *testing.T) {
 
 func TestFreshResumeIndexesServeLookupsLiveDB(t *testing.T) {
 	f := newFreshFx(t)
+	// The plain (run_id) index was redundant with UNIQUE (run_id, request_id) and is gone.
+	var plain int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'run_fresh_resumes' AND indexname = 'run_fresh_resumes_run_idx'`).Scan(&plain); err != nil || plain != 0 {
+		t.Fatalf("redundant run_fresh_resumes_run_idx present: n=%d err=%v", plain, err)
+	}
 	run := f.run("recovery_wait", uuid.Nil, 3)
 	f.transfer(run, "pending", uuid.Nil, 0)
 	tx, err := f.pool.Begin(f.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(f.ctx)
+	defer func() { _ = tx.Rollback(f.ctx) }()
 	if _, err := tx.Exec(f.ctx, `SET LOCAL enable_seqscan = off`); err != nil {
 		t.Fatal(err)
 	}
 	for _, q := range []string{
 		`SELECT 1 FROM run_fresh_resumes WHERE run_id = $1 AND state IN ('pending','claimed')`,
 		`SELECT 1 FROM run_fresh_resumes WHERE run_id = $1 AND state IN ('seeded','superseded')`,
+		// Any-state history and the request replay lookup are served by UNIQUE (run_id, request_id).
+		`SELECT 1 FROM run_fresh_resumes WHERE run_id = $1`,
 	} {
 		rows, err := tx.Query(f.ctx, `EXPLAIN `+q, run)
 		if err != nil {
@@ -805,6 +843,12 @@ func TestFreshResumeIndexesServeLookupsLiveDB(t *testing.T) {
 	}
 }
 
+// attemptID builds a destination attempt id in the agent's grammar (ATTEMPT_ID_RE in
+// agent/src/attempt-path.ts) for claim generation gen.
+func attemptID(gen int64) string {
+	return fmt.Sprintf("20260101T000000Z-g%d-0123456789abcdef", gen)
+}
+
 func TestFreshResumeStateRouteAndSeededLiveDB(t *testing.T) {
 	f := newFreshFx(t)
 	w1, w2 := f.newWorker(), f.newWorker()
@@ -812,11 +856,16 @@ func TestFreshResumeStateRouteAndSeededLiveDB(t *testing.T) {
 	id := f.transfer(run, "claimed", w2, 4)
 	wid := pgtype.UUID{Bytes: w2, Valid: true}
 	g4 := pgtype.Int8{Int64: 4, Valid: true}
-	// A mismatched attempt id and a wrong generation or worker never seed.
+	// A mismatched attempt id and a wrong generation or worker never seed. The generation is parsed from
+	// the agent's attempt-id grammar, never found by substring position.
 	for name, p := range map[string]store.MarkFreshResumeSeededParams{
-		"attempt of another generation": {ID: id, AttemptID: "a-g5-x", WorkerID: wid, ClaimGeneration: g4},
-		"wrong generation":              {ID: id, AttemptID: "a-g4-x", WorkerID: wid, ClaimGeneration: pgtype.Int8{Int64: 5, Valid: true}},
-		"wrong worker":                  {ID: id, AttemptID: "a-g4-x", WorkerID: pgtype.UUID{Bytes: w1, Valid: true}, ClaimGeneration: g4},
+		"attempt of another generation": {ID: id, AttemptID: attemptID(5), WorkerID: wid, ClaimGeneration: g4},
+		"generation with a longer tail": {ID: id, AttemptID: attemptID(14), WorkerID: wid, ClaimGeneration: g4},
+		"gx attempt has no generation":  {ID: id, AttemptID: "20260101T000000Z-gx-0123456789abcdef", WorkerID: wid, ClaimGeneration: g4},
+		"not the attempt grammar":       {ID: id, AttemptID: "a-g4-x", WorkerID: wid, ClaimGeneration: g4},
+		"generation embedded elsewhere": {ID: id, AttemptID: "x-g4-20260101T000000Z-g9-0123456789abcdef", WorkerID: wid, ClaimGeneration: g4},
+		"wrong generation":              {ID: id, AttemptID: attemptID(4), WorkerID: wid, ClaimGeneration: pgtype.Int8{Int64: 5, Valid: true}},
+		"wrong worker":                  {ID: id, AttemptID: attemptID(4), WorkerID: pgtype.UUID{Bytes: w1, Valid: true}, ClaimGeneration: g4},
 	} {
 		if _, err := f.q.MarkFreshResumeSeeded(f.ctx, p); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("%s: %v", name, err)
@@ -825,12 +874,12 @@ func TestFreshResumeStateRouteAndSeededLiveDB(t *testing.T) {
 	// Chained: an earlier seeded row is superseded first, then the new row seeds.
 	prev := uuid.New()
 	_ = prev
-	row, err := f.q.MarkFreshResumeSeeded(f.ctx, store.MarkFreshResumeSeededParams{ID: id, AttemptID: "a-g4-x", WorkerID: wid, ClaimGeneration: g4})
-	if err != nil || row.State != "seeded" || row.SeededGeneration.Int64 != 4 || row.DestinationAttemptID.String != "a-g4-x" {
+	row, err := f.q.MarkFreshResumeSeeded(f.ctx, store.MarkFreshResumeSeededParams{ID: id, AttemptID: attemptID(4), WorkerID: wid, ClaimGeneration: g4})
+	if err != nil || row.State != "seeded" || row.SeededGeneration.Int64 != 4 || row.DestinationAttemptID.String != attemptID(4) {
 		t.Fatalf("seed: %+v %v", row, err)
 	}
 	st, err := f.q.GetFreshResumeState(f.ctx, store.GetFreshResumeStateParams{ID: id, RunID: run, WorkerID: wid})
-	if err != nil || st.State != "seeded" || st.DestinationAttemptID.String != "a-g4-x" {
+	if err != nil || st.State != "seeded" || st.DestinationAttemptID.String != attemptID(4) {
 		t.Fatalf("state: %+v %v", st, err)
 	}
 	if _, err := f.q.GetFreshResumeState(f.ctx, store.GetFreshResumeStateParams{ID: id, RunID: run, WorkerID: pgtype.UUID{Bytes: w1, Valid: true}}); !errors.Is(err, pgx.ErrNoRows) {

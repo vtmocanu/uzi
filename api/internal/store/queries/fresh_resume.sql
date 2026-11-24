@@ -80,6 +80,33 @@ WITH cur AS MATERIALIZED (
             'health', cur.health,
             'health_reason', cur.health_reason,
             'health_since', cur.health_since)
+        -- jsonb_build_object takes at most 100 arguments: the SetRunRunning-written columns are a second object.
+        || jsonb_build_object(
+            'plan_cross_check_gate_reason', cur.plan_cross_check_gate_reason,
+            'open_question_id', cur.open_question_id,
+            'completion_question_at', cur.completion_question_at,
+            'started_at', cur.started_at,
+            'first_started_at', cur.first_started_at,
+            'iteration_count', cur.iteration_count,
+            'session_id', cur.session_id,
+            'policy_fresh_confirmed_generation', cur.policy_fresh_confirmed_generation,
+            'repo_agents', cur.repo_agents,
+            'repo_agent_source_commit', cur.repo_agent_source_commit,
+            'agent_source', cur.agent_source,
+            'agent_exclusions', cur.agent_exclusions,
+            'plan_agent_source', cur.plan_agent_source,
+            'required_capabilities', cur.required_capabilities,
+            'capability_inference_evidence', cur.capability_inference_evidence,
+            'required_tools', cur.required_tools,
+            'size_class', cur.size_class,
+            'milestones_frozen', cur.milestones_frozen,
+            'completion_contract', cur.completion_contract,
+            'contract_revision', cur.contract_revision,
+            'budget_max_iterations', cur.budget_max_iterations,
+            'budget_wall_seconds', cur.budget_wall_seconds,
+            'milestones_completed', cur.milestones_completed,
+            'milestones_in_progress', cur.milestones_in_progress,
+            'milestones_agents', cur.milestones_agents)
     FROM cur
     WHERE t.id = @id AND t.run_id = cur.id AND t.state = 'pending'
     RETURNING t.id
@@ -120,7 +147,10 @@ RETURNING *;
 
 -- name: RestoreFreshResumeTuple :execrows
 -- Puts the saved pre-claim tuple back on the run (worker_id comes from saved_worker_id, which the FK
--- already nulled if that worker was deleted) and bumps fresh_hold_version. Applies only while the run
+-- already nulled if that worker was deleted) and bumps fresh_hold_version. The tuple also carries every
+-- column W2's allowlisted SetRunRunning advance can write (started_at, first_started_at, session_id,
+-- open_question_id, iteration_count, the plan-freeze and budget columns, ...), so a refusal after W2
+-- reported running puts back the pre-claim values; the registry test asserts the column coverage. Applies only while the run
 -- is still the destination's claim at G'; zero rows means the run moved. It never touches
 -- claim_generation, codex_claim_epoch, codex_cap_hash or claim provenance. Requires the opt-in.
 UPDATE runs SET
@@ -150,6 +180,31 @@ UPDATE runs SET
     health = t.saved_tuple->>'health',
     health_reason = t.saved_tuple->>'health_reason',
     health_since = (t.saved_tuple->>'health_since')::timestamptz,
+    plan_cross_check_gate_reason = t.saved_tuple->>'plan_cross_check_gate_reason',
+    open_question_id = t.saved_tuple->>'open_question_id',
+    completion_question_at = (t.saved_tuple->>'completion_question_at')::timestamptz,
+    started_at = (t.saved_tuple->>'started_at')::timestamptz,
+    first_started_at = (t.saved_tuple->>'first_started_at')::timestamptz,
+    iteration_count = (t.saved_tuple->>'iteration_count')::int,
+    session_id = t.saved_tuple->>'session_id',
+    policy_fresh_confirmed_generation = (t.saved_tuple->>'policy_fresh_confirmed_generation')::bigint,
+    repo_agents = NULLIF(t.saved_tuple->'repo_agents', 'null'::jsonb),
+    repo_agent_source_commit = t.saved_tuple->>'repo_agent_source_commit',
+    agent_source = t.saved_tuple->>'agent_source',
+    agent_exclusions = NULLIF(t.saved_tuple->'agent_exclusions', 'null'::jsonb),
+    plan_agent_source = t.saved_tuple->>'plan_agent_source',
+    required_capabilities = ARRAY(SELECT jsonb_array_elements_text(t.saved_tuple->'required_capabilities')),
+    capability_inference_evidence = NULLIF(t.saved_tuple->'capability_inference_evidence', 'null'::jsonb),
+    required_tools = ARRAY(SELECT jsonb_array_elements_text(t.saved_tuple->'required_tools')),
+    size_class = t.saved_tuple->>'size_class',
+    milestones_frozen = NULLIF(t.saved_tuple->'milestones_frozen', 'null'::jsonb),
+    completion_contract = NULLIF(t.saved_tuple->'completion_contract', 'null'::jsonb),
+    contract_revision = (t.saved_tuple->>'contract_revision')::int,
+    budget_max_iterations = (t.saved_tuple->>'budget_max_iterations')::int,
+    budget_wall_seconds = (t.saved_tuple->>'budget_wall_seconds')::int,
+    milestones_completed = NULLIF(t.saved_tuple->'milestones_completed', 'null'::jsonb),
+    milestones_in_progress = NULLIF(t.saved_tuple->'milestones_in_progress', 'null'::jsonb),
+    milestones_agents = NULLIF(t.saved_tuple->'milestones_agents', 'null'::jsonb),
     worker_id = t.saved_worker_id,
     fresh_hold_version = runs.fresh_hold_version + 1,
     updated_at = now()
@@ -184,7 +239,9 @@ WHERE run_id = @run_id AND state = 'seeded' AND id <> @id;
 
 -- name: MarkFreshResumeSeeded :one
 -- The first fenced commit: claimed at the caller's G', and the attempt id carries that generation
--- ("-g<G'>-"). destination_attempt_id and seeded_generation are write-once.
+-- ("-g<G'>-"), parsed as the capture of the agent's attempt-id grammar (ATTEMPT_ID_RE in
+-- agent/src/attempt-path.ts) and compared exactly, never by substring position. A "gx" id has no
+-- generation and never matches. destination_attempt_id and seeded_generation are write-once.
 UPDATE run_fresh_resumes SET
     state = 'seeded',
     destination_attempt_id = @attempt_id::text,
@@ -192,7 +249,7 @@ UPDATE run_fresh_resumes SET
     seeded_at = now()
 WHERE id = @id AND state = 'claimed'
   AND destination_worker_id = @worker_id AND claim_generation = @claim_generation
-  AND position('-g' || claim_generation::text || '-' IN @attempt_id::text) > 0
+  AND substring(@attempt_id::text from '^[0-9]{8}T[0-9]{6}Z-g([0-9]{1,18})-[0-9a-f]{16}$')::bigint = claim_generation
 RETURNING *;
 
 -- name: GetFreshResumeState :one

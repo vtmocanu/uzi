@@ -1,5 +1,12 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
+-- Take every lock this migration needs up front, in one fixed order: CREATE TABLE ... REFERENCES takes
+-- SHARE ROW EXCLUSIVE on the referenced tables, so a later ALTER TABLE runs (ACCESS EXCLUSIVE) would be
+-- a lock upgrade that can deadlock against a concurrent writer holding ROW EXCLUSIVE and waiting on
+-- our SHARE ROW EXCLUSIVE. The strongest lock goes first; users, workers and recovery_captures are only
+-- referenced, so SHARE ROW EXCLUSIVE is already the strongest this migration takes on them.
+LOCK TABLE runs, checkpoint_publish_attempts IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE users, workers, recovery_captures IN SHARE ROW EXCLUSIVE MODE;
 -- Issue #4628 ("fresh resume"): an owner Resume of a run held at a worker-exhaustion recovery_wait
 -- can start it on a SEPARATE persistent hosted worker (W2) from durable evidence (a recovery capture
 -- or the broker-owned checkpoint ref) instead of waiting for the predecessor worker (W1). This
@@ -48,11 +55,15 @@ CREATE TABLE run_fresh_resumes (
     CONSTRAINT run_fresh_resumes_evidence_shape CHECK (
         (evidence_kind = 'capture' AND capture_id IS NOT NULL AND checkpoint_ref IS NULL)
         OR (evidence_kind = 'checkpoint_ref' AND capture_id IS NULL AND checkpoint_ref IS NOT NULL)),
+    -- The agent's ATTEMPT_ID_RE (agent/src/attempt-path.ts) with the generation digits bounded to fit bigint.
+    CONSTRAINT run_fresh_resumes_attempt_id_shape CHECK (
+        destination_attempt_id IS NULL
+        OR (length(destination_attempt_id) <= 64
+            AND destination_attempt_id ~ '^[0-9]{8}T[0-9]{6}Z-(g[0-9]{1,18}|gx)-[0-9a-f]{16}$')),
     CONSTRAINT run_fresh_resumes_seeded_shape CHECK (
         (seeded_at IS NULL) = (destination_attempt_id IS NULL)
         AND (seeded_at IS NULL) = (seeded_generation IS NULL))
 );
-CREATE INDEX run_fresh_resumes_run_idx ON run_fresh_resumes (run_id);
 CREATE INDEX run_fresh_resumes_post_seed_idx ON run_fresh_resumes (run_id)
     WHERE state IN ('seeded', 'superseded');
 CREATE UNIQUE INDEX run_fresh_resumes_one_active_idx ON run_fresh_resumes (run_id)

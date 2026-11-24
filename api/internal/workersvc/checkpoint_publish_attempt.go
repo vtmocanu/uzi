@@ -323,14 +323,10 @@ func (p *checkpointPush) clearPreparedAttempt(ctx context.Context) {
 	p.s.clearPublishAttempt(ctx, id)
 }
 
-// recordPublishAttempt writes the attempt row a push needs before it is sent. Inert (uuid.Nil, no
-// error) when supersession is not wired: then no supersession, and no reconciliation, ever runs.
-func (s *Service) recordPublishAttempt(ctx context.Context, runID uuid.UUID, branch, ref, tip string, attestedSource pgtype.Text) (uuid.UUID, error) {
-	return s.recordPublishAttemptAt(ctx, runID, branch, ref, tip, attestedSource, pgtype.Int8{})
-}
-
-// recordPublishAttemptAt is recordPublishAttempt carrying the push's fenced claim generation (invalid:
-// unfenced), which the reconcilers stamp onto runs.checkpoint_tip_generation with the tip.
+// recordPublishAttemptAt writes the attempt row a push needs before it is sent, carrying the push's
+// fenced claim generation (invalid: unfenced), which the reconcilers stamp onto
+// runs.checkpoint_tip_generation with the tip. Inert (uuid.Nil, no error) when supersession is not
+// wired: then no supersession, and no reconciliation, ever runs.
 func (s *Service) recordPublishAttemptAt(ctx context.Context, runID uuid.UUID, branch, ref, tip string, attestedSource pgtype.Text, claimGeneration pgtype.Int8) (uuid.UUID, error) {
 	if !s.supersessionWired() {
 		return uuid.Nil, nil

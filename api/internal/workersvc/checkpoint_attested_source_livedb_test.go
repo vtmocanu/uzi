@@ -183,7 +183,7 @@ func TestLiveReconcileStoresAttemptFrozenSourceLiveDB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLiveAttemptFix(t)
 			f.e.exec(t, `UPDATE runs SET checkpoint_attested_source = $2 WHERE id = $1`, f.oldRun, attestSRun)
-			id, err := f.svc1.recordPublishAttempt(f.e.ctx, f.oldRun, f.branch, f.branchRef, lateTip, tc.attempt)
+			id, err := f.svc1.recordPublishAttemptAt(f.e.ctx, f.oldRun, f.branch, f.branchRef, lateTip, tc.attempt, pgtype.Int8{})
 			if err != nil {
 				t.Fatalf("record attempt: %v", err)
 			}
@@ -215,7 +215,7 @@ func TestTerminalReconcileStoresAttemptFrozenSourceLiveDB(t *testing.T) {
 			if !f.forge.land(f.branchRef, retentionTestTip, newerTip) {
 				t.Fatal("setup: the late push did not land")
 			}
-			if _, err := f.svc1.recordPublishAttempt(f.e.ctx, f.oldRun, f.branch, f.branchRef, newerTip, tc.attempt); err != nil {
+			if _, err := f.svc1.recordPublishAttemptAt(f.e.ctx, f.oldRun, f.branch, f.branchRef, newerTip, tc.attempt, pgtype.Int8{}); err != nil {
 				t.Fatalf("record attempt: %v", err)
 			}
 			f.coolOff(t)
