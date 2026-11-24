@@ -1440,6 +1440,11 @@ class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
  *  never reported. */
 class RestoreRouteStop extends RetainedRecoveryStop {}
 
+/** issue #4652: the reason of the cancel abort that handlePermanentFailure raises in the independent-restore window (the
+ *  predecessor is still guarded). It is a RetainedRecoveryStop like any other, but distinct so an op-fenced credential switch
+ *  that arrives afterwards can still reach the predecessor-specific hold (see transportStopSwitchEligible). */
+class RestoreTransportStop extends RetainedRecoveryStop {}
+
 /** issue #3644: a change the restore's authoritative pass found under J (before any write): refuses like a seed refusal. */
 class RestoreRefused extends Error {
   constructor(readonly reason: string) { super(`independent restore refused (${reason})`); }
@@ -3661,7 +3666,9 @@ export interface RunnerOptions {
   retainedSwitchSettlementMs?: number;
   /** issue #3181: the evidence-verification allowance of a retained credential switch, started after
    *  settlement returns. Defaults to `codexBoundaryDeadlineMs`; a test shortens it without also
-   *  bounding the unrelated recovery discovery that `codexBoundaryDeadlineMs` governs. */
+   *  bounding the unrelated recovery discovery that `codexBoundaryDeadlineMs` governs.
+   *  Issue #4652: it also bounds the late op-fenced hold report that holdSwitchAfterTransportStop makes after a permanent
+   *  message failure stopped the restore transport. */
   retainedSwitchVerificationMs?: number;
   /** Issue #4201: the durable write-ahead ledger of in-place credential switch applies. ONE instance per
    *  worker data dir, shared by every runner on it (see credential-switch-op-ledger.ts). Absent ⇒ the
@@ -7371,6 +7378,7 @@ export class RunRunner {
         if (memory?.closing) {
           await this.joinWorkerMemory(closed, memory.closingDeadline!).catch(() => undefined);
         } else await closed.catch(() => undefined);
+        await this.holdSwitchAfterTransportStop(claim, flight, runLog, err);
       } else if (err instanceof CredentialSwitchRetainedStop) {
         // PRD #1247 M5b (BLOCKING-2/3 rework): the in-place ctx.attemptCredentialSwitch could not
         // CONFIRM the switch (an unverified give-up whose stamp-clear the server never confirmed, or
@@ -7430,7 +7438,11 @@ export class RunRunner {
         const escaped = this.inPlaceSwitchContext(claim, flight) ?? this.closedInPlaceSwitch(claim, flight);
         if (escaped) {
           try {
-            await this.escapedInPlaceSwitch(flight, runLog, escaped);
+            // Issue #4652: after a restore transport stop, the identity check tolerates RestoreTransportStop, so this hold gets the
+            // same finite budget as the late hook (holdSwitchAfterTransportStop) instead of retrying without end.
+            await this.escapedInPlaceSwitch(flight, runLog, escaped, undefined, this.transportStopSwitchEligible(claim, flight)
+              ? { deadline: Date.now() + this.retainedSwitchVerificationMs }
+              : undefined);
           } catch (stop) {
             // A cancel, fence, shutdown or lost ownership during the escaped proof or its reports.
             await dispatchFailure(stop);
@@ -7741,7 +7753,10 @@ export class RunRunner {
       if (flight.restoreExecutorSwapped) executor = flight.executor;
       // Issue #4201 (A.3): a flight that ends in the prologue discards its latched switch (the server stamp
       // stays pending and the next claim serves it in place).
-      flight.prologueSwitchHold?.close({ service: false });
+      // Issue #4652: a latched op-fenced switch is served, not discarded, when the restore transport stopped first.
+      flight.prologueSwitchHold?.close({
+        service: err instanceof RetainedRecoveryStop && !(err instanceof RetainedRecoveryCancelled) && this.transportStopSwitchEligible(claim, flight),
+      });
       await dispatchFailure(err, true);
     } finally {
       const diagnostic = this.sourceEndDiagnosticState(flight);
@@ -9030,7 +9045,7 @@ export class RunRunner {
     if (flight.restorePredecessor !== undefined) {
       flight.restoreTransportStopped = true;
       this.retainWorkerMemoryCustody(flight);
-      if (!flight.cancel.signal.aborted) flight.cancel.abort(new RetainedRecoveryStop());
+      if (!flight.cancel.signal.aborted) flight.cancel.abort(new RestoreTransportStop());
       return;
     }
     // issue #4645: the server already accepted a completion/preflight/phase-switch hold or a wall park (paused) on this flight, so a
@@ -29879,6 +29894,53 @@ export class RunRunner {
     return { opId: pending.opId, retained };
   }
 
+  /**
+   * Issue #4652: true only for a Claude flight on an apply-negotiated worker whose restore transport was stopped by a permanent
+   * message failure (handlePermanentFailure's independent-restore window) while the restore route's predecessor is still guarded.
+   * An op-fenced credential switch on such a flight must still reach the predecessor-specific hold rather than a plain stop.
+   */
+  private transportStopSwitchEligible(claim: ClaimResponse, flight: RunFlight): boolean {
+    return flight.restoreTransportStopped === true && flight.restorePredecessor !== undefined &&
+      !isCodexBoundClaim(claim) && !this.isCodexCapture(claim, flight) && this.client.supportsInPlaceCredentialSwitch();
+  }
+
+  /**
+   * Issue #4652: the late hold. The RetainedRecoveryStop arm of executeClaim calls this once, after the batcher closed. When the
+   * restore transport was stopped by a permanent failure and an op-fenced switch is pending (it arrived after the window's last
+   * poll was served, or was latched and served by the catch), report the op-fenced hold, retrying within the
+   * retainedSwitchVerificationMs budget. It never waits for a switch and never clears flight.retainedSwitchSettlement: a
+   * `hold_pending` left by an expired hold is settled by the existing finally join. One exception reports a state: an owner
+   * cancel observed while the hold retries is reported as the RetainedRecoveryStop arm reports one ("run cancelled", custody
+   * kept), unless shutdown or a claim fence decided the exit. Every other failure is logged and swallowed; the flight stays
+   * nonterminal with custody kept.
+   */
+  private async holdSwitchAfterTransportStop(claim: ClaimResponse, flight: RunFlight, runLog: Logger, err: unknown): Promise<void> {
+    if (err instanceof RetainedRecoveryCancelled || !this.transportStopSwitchEligible(claim, flight)) return;
+    try {
+      // No pending op-fenced switch: nothing to hold, and nothing to warn about. With one pending, a cancel, fence or shutdown
+      // that already decided the exit refuses here (and again inside escapedInPlaceSwitch's identity check), before the
+      // "held" line is logged.
+      const closed = this.closedInPlaceSwitch(claim, flight);
+      if (closed === undefined) return;
+      this.retainedTerminalGuard(flight);
+      runLog.info("restore transport stopped; a pending credential switch is held through the op-fenced fence", {
+        run_id: flight.runId, op_id: closed.opId,
+      });
+      await this.escapedInPlaceSwitch(flight, runLog, closed, undefined, { deadline: Date.now() + this.retainedSwitchVerificationMs });
+    } catch (error) {
+      // An owner cancel observed while the hold retried is reported as the RetainedRecoveryStop arm reports one, with custody
+      // kept; flight.retainedSwitchSettlement is left for the finally join. Shutdown and a claim fence keep the plain stop.
+      if (error instanceof RetainedRecoveryCancelled) {
+        if (!flight.active?.shuttingDown && !this.shuttingDownGlobal && flight.steering.claimFence() === undefined) {
+          await this.reportGenericFailure(claim, flight, new Error("run cancelled"), { keepCustody: true });
+        }
+        return;
+      }
+      runLog.warn("late credential switch hold after the restore transport stopped did not complete; run left non-terminal, custody kept",
+        { run_id: flight.runId, error: errMessage(error) });
+    }
+  }
+
   private inPlaceSwitchContext(claim: ClaimResponse, flight: RunFlight): InPlaceSwitchContext | undefined {
     const ledger = this.credentialSwitchLedger;
     const holder = flight.credential;
@@ -29906,17 +29968,39 @@ export class RunRunner {
    */
   private async escapedInPlaceSwitch(
     flight: RunFlight, runLog: Logger, fixed: { opId: string; retained: boolean }, laneSettledIn?: boolean,
+    /** Issue #4652: only holdSwitchAfterTransportStop passes it. The whole call (lifecycle and identity) ends with
+     *  RecoveryDeadlineExhaustedError once `deadline` (epoch ms) passes. */
+    budget?: { deadline: number },
   ): Promise<InPlaceSwitchOutcome> {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
     if (fixed.retained) flight.retainedLocalCustody = true;
-    const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+    // Timer pattern of requireRetainedOwnership: an AbortController aborted at the deadline, cleared in the finally.
+    const budgetAbort = budget ? new AbortController() : undefined;
+    const budgetTimer = budget
+      ? setTimeout(() => budgetAbort!.abort(new RecoveryDeadlineExhaustedError()), Math.max(0, budget.deadline - Date.now()))
+      : undefined;
+    const lifecycle = AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
+      ...(budgetAbort ? [budgetAbort.signal] : [])]);
+    // Issue #4652: handlePermanentFailure's restore-window cancel abort (RestoreTransportStop) is the only lifecycle reason
+    // tolerated, and only while a pending op-fenced switch on this generation is waiting for the predecessor hold. The claim-free
+    // checks suffice (no claim param): a restorePredecessor implies a closed route, which closedInPlaceSwitch (every caller) only
+    // answers for a non-Codex, apply-negotiated flight.
+    const transportStopTolerated = (signal: AbortSignal): boolean => {
+      if (signal !== flight.cancel.signal || !(signal.reason instanceof RestoreTransportStop)) return false;
+      const pending = flight.steering.pendingCredentialSwitchOp();
+      return flight.restoreTransportStopped === true && flight.restorePredecessor !== undefined &&
+        pending?.opId !== undefined && pending.generation === flight.claimGeneration;
+    };
     const identity = (): void => {
       this.retainedTerminalGuard(flight);
       for (const signal of this.retainedLifecycleSignals(flight)) {
-        if (signal.aborted && !(signal.reason instanceof CredentialSwitchSignal)) throw new RetainedRecoveryStop();
+        if (signal.aborted && !(signal.reason instanceof CredentialSwitchSignal) && !transportStopTolerated(signal)) {
+          throw new RetainedRecoveryStop();
+        }
       }
+      if (budget && Date.now() >= budget.deadline) throw new RecoveryDeadlineExhaustedError();
     };
     try {
       identity();
@@ -29955,6 +30039,8 @@ export class RunRunner {
         run_id: flight.runId, error: errMessage(error),
       });
       return { kind: "retained_stop" };
+    } finally {
+      if (budgetTimer !== undefined) clearTimeout(budgetTimer);
     }
   }
 
@@ -30493,7 +30579,14 @@ export class RunRunner {
     };
     for (let attempt = 0; (inPlace !== undefined || attempt < 2) && !confirmed && !refused; attempt++) {
       if (inPlace && attempt > 0) {
-        await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
+        // A lifecycle abort (an owner cancel included) can end the backoff with the bare abort reason; guard() first, so
+        // it surfaces as the same typed stop a later guard() would throw.
+        try {
+          await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
+        } catch (error) {
+          guard();
+          throw error;
+        }
         guard();
       }
       try {
