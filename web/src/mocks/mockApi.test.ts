@@ -622,7 +622,6 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     installStorage();
     const api = await reload();
     const cases = [
-      ["claude", "claude", "provider_lane_unsupported", "this run type does not support a model-provider source yet"],
       ["codex", "codex", "provider_lane_unsupported", "this run type does not support a model-provider source yet"],
       ["unusable", "claude", "provider_source_unusable", "your source is a model provider that cannot serve a run"],
       ["unmapped", "claude", "provider_model_unmapped", "the provider's model map does not map a model this run uses"],
@@ -637,6 +636,12 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
       await expect(api.rerunJudge(id)).rejects.toMatchObject({ status: 409, message, body: { reason } });
       expect((await api.getRunReview(id)).pending_judge).toBeNull();
     }
+    // A historical Claude lane row no longer refuses: a Claude judge runs on the provider source.
+    const claude = "run-judge-skipped-provider-claude";
+    expect((await api.getRunReview(claude)).skip).toMatchObject({ harness: "claude", reason: "provider_lane_unsupported" });
+    const { run } = await api.rerunJudge(claude);
+    expect(run.kind).toBe("judge");
+    expect((await api.getRunReview(claude)).pending_judge).not.toBeNull();
   });
 
   it("rerunJudge enqueues a judge run for a terminal issue run and rejects a non-terminal one", async () => {

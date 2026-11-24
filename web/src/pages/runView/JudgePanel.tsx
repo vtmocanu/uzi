@@ -122,7 +122,7 @@ function judgeSkipCause(skip: JudgeSkip): string {
     return "the selected source is a model provider, which the judge does not support yet.";
   }
   if (skip.reason === "provider_source_unusable") return "the selected model provider could not serve the judge.";
-  if (skip.reason === "provider_model_unmapped") return "the model provider does not map the judge's model.";
+  if (skip.reason === "provider_model_unmapped") return "the model provider did not map the judge's model.";
   if (harness !== undefined && skip.reason === "no_usable_credential") return `${harness} had no usable credential.`;
   if (harness !== undefined && skip.reason === "credential_disabled") return `the ${harness} credential was disabled.`;
   return "the judge's harness had no usable credential.";
@@ -470,11 +470,12 @@ export function JudgePanel({
       // error banner — because the user asked for a judge and a judge is running: that
       // is a success they are being shown, not a failure.
       //
-      // The route returns 409 for a SECOND, unrelated reason: ErrJudgeDisabled ("run
-      // judging is disabled", handler/judge.go). That one must never be swallowed — a
-      // user who turned the judge off has to see why nothing happened. The wire carries
-      // no error code to discriminate on, only the message, so we match the
-      // already-active message and let EVERYTHING else fall through to today's Alert.
+      // The route returns 409 for OTHER, unrelated reasons too: ErrJudgeDisabled ("run
+      // judging is disabled", handler/judge.go) and, since PRD #4322 M1a, the provider
+      // refusals (provider_* reasons) and judge_policy_changed. Those must never be
+      // swallowed — the user has to see why nothing happened. The already-active 409
+      // carries no reason code, only the message, so we match the already-active message
+      // and let EVERYTHING else fall through to today's Alert.
       // The match is deliberately in that direction: if the server ever rewords the
       // already-active message, this degrades to showing the error (the pre-#119
       // behaviour), never to silently eating "judging is disabled".

@@ -1003,7 +1003,10 @@ export const judgeApi = {
     // harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
     // no_credential_for_harness body) and the panel shows it inline. No judge is created on
     // the other harness.
-    const skip = judgeSkips[id];
+    // A historical Claude provider_lane_unsupported row (#4322 M1a): a Claude judge now runs on
+    // the owner's provider source, so the real server would create the judge; so does the mock.
+    const historicalClaudeLane = judgeSkips[id]?.reason === "provider_lane_unsupported" && judgeSkips[id]?.harness === "claude";
+    const skip = historicalClaudeLane ? undefined : judgeSkips[id];
     // A provider_* skip mirrors writeRerunJudgeError's 409 reason codes and messages.
     const providerRefusal: Record<string, string> = {
       provider_source_unusable: "your source is a model provider that cannot serve a run",

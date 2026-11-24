@@ -197,7 +197,7 @@ func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
 	case "provider_source_unusable":
 		why = "the selected model provider could not serve the judge."
 	case "provider_model_unmapped":
-		why = "the model provider does not map the judge's model."
+		why = "the model provider did not map the judge's model."
 	default:
 		why = "the judge could not run."
 	}
