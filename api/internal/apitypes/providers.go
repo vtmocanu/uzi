@@ -36,18 +36,43 @@ type ProviderProbeDTO struct {
 // ProviderDTO is one user-defined model provider with its current revision. It never carries the
 // key: HasKey and KeyEnabled are the only key state a client sees.
 type ProviderDTO struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Engine          string            `json:"engine"`
-	Retired         bool              `json:"retired"`
-	CurrentRevision int               `json:"current_revision"`
-	Protocol        string            `json:"protocol"`
-	BaseURL         string            `json:"base_url"`
-	AuthStyle       string            `json:"auth_style"`
-	ModelMap        ModelMapDTO       `json:"model_map"`
-	HasKey          bool              `json:"has_key"`
-	KeyEnabled      bool              `json:"key_enabled"`
-	Probe           *ProviderProbeDTO `json:"probe"`
+	ID              string      `json:"id"`
+	Name            string      `json:"name"`
+	Engine          string      `json:"engine"`
+	Retired         bool        `json:"retired"`
+	CurrentRevision int         `json:"current_revision"`
+	Protocol        string      `json:"protocol"`
+	BaseURL         string      `json:"base_url"`
+	AuthStyle       string      `json:"auth_style"`
+	ModelMap        ModelMapDTO `json:"model_map"`
+	// CredentialMode is null for a personal provider and "per_user_key" for an admin-shared
+	// definition (PRD #4324): HasKey, KeyEnabled and Probe then describe the CALLER's own key only.
+	CredentialMode *string           `json:"credential_mode"`
+	HasKey         bool              `json:"has_key"`
+	KeyEnabled     bool              `json:"key_enabled"`
+	Probe          *ProviderProbeDTO `json:"probe"`
+}
+
+// AdminSharedProviderDTO is an admin-shared provider definition as an admin reads it (PRD #4324):
+// the definition fields plus two counts. It carries no key and no per-user Test evidence.
+type AdminSharedProviderDTO struct {
+	ID                string      `json:"id"`
+	Name              string      `json:"name"`
+	Engine            string      `json:"engine"`
+	Retired           bool        `json:"retired"`
+	CurrentRevision   int         `json:"current_revision"`
+	Protocol          string      `json:"protocol"`
+	BaseURL           string      `json:"base_url"`
+	AuthStyle         string      `json:"auth_style"`
+	ModelMap          ModelMapDTO `json:"model_map"`
+	CredentialMode    string      `json:"credential_mode"`
+	SelectedUserCount int64       `json:"selected_user_count"`
+	AttachedKeyCount  int64       `json:"attached_key_count"`
+}
+
+// AdminSharedProviderListDTO is the GET /api/admin/providers response.
+type AdminSharedProviderListDTO struct {
+	Providers []AdminSharedProviderDTO `json:"providers"`
 }
 
 // ProviderCreateRequest is the POST /api/me/providers body. It never carries a key: the key is

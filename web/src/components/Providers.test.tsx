@@ -47,6 +47,7 @@ function provider(over: Partial<ProviderDTO> = {}): ProviderDTO {
     base_url: URL_A,
     auth_style: "bearer",
     model_map: { haiku: { model: "gw-small", context_window: 32768 }, sonnet: { model: "gw-large" } },
+    credential_mode: null,
     has_key: true,
     key_enabled: true,
     probe: null,
@@ -566,4 +567,153 @@ it("clears each feature-off source independently", async () => {
   fireEvent.click(stop);
   await waitFor(() => expect(screen.queryByRole("button", { name: "Stop using Codex source" })).toBeNull());
   expect(screen.getByRole("button", { name: "Stop using Claude source" })).toBeTruthy();
+});
+
+// PRD #4324: an admin-shared definition (credential_mode "per_user_key") in the user's list.
+describe("Providers — admin-shared definitions (PRD #4324)", () => {
+  const shared = (over: Partial<ProviderDTO> = {}) =>
+    provider({ id: "s1", name: "platform-gateway", credential_mode: "per_user_key", base_url: URL_B, ...over });
+  const OWNER_ACTIONS = ["Edit name and models", "Edit endpoint", "Retire", "Delete"];
+
+  it("badges a shared row and offers only key actions, Test and select", async () => {
+    await renderCard(list({ providers: [provider(), shared()] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    expect(row.getByText("Managed by your admin")).toBeTruthy();
+    for (const name of OWNER_ACTIONS) expect(row.queryByRole("button", { name })).toBeNull();
+    for (const name of ["Rotate key", "Disable key", "Delete key", "Test", "Use as Claude source"]) {
+      expect(row.getByRole("button", { name })).toBeTruthy();
+    }
+    expect(row.getByText("(fixed by your admin)")).toBeTruthy();
+    expect(row.getByText("Latest test of your key")).toBeTruthy();
+    // The personal row beside it keeps every owner action and carries no badge.
+    const own = within(screen.getByTestId("provider-p1"));
+    expect(own.queryByText("Managed by your admin")).toBeNull();
+    for (const name of OWNER_ACTIONS) expect(own.getByRole("button", { name })).toBeTruthy();
+  });
+
+  it("shows the custody disclosure before a key is attached, then saves only the key", async () => {
+    mockApi.putProviderKey.mockResolvedValue({ provider: shared({ has_key: true }) });
+    await renderCard(list({ providers: [shared({ has_key: false, key_enabled: false })] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    expect(row.queryByTestId("shared-disclosure-s1")).toBeNull();
+    fireEvent.click(row.getByRole("button", { name: "Set key" }));
+    const box = row.getByRole("region", { name: "Before you attach your key" });
+    const text = box.textContent ?? "";
+    expect(text).toContain("your key is sent as Authorization: Bearer");
+    expect(text).toContain(URL_B);
+    expect(text).toMatch(/fixed when your admin created this definition\. Your admin cannot repoint your key to a different gateway\./);
+    // No absolute promise: the gateway itself can still redirect (the line below says so).
+    expect(text).not.toMatch(/never moved/);
+    expect(text).toMatch(/Your key is personal and in your own custody/);
+    expect(text).toMatch(/your admin cannot see it/);
+    expect(text).toMatch(/Your key is sent to that endpoint on every request\. If the gateway redirects/);
+    expect(text).toMatch(/Model map: your admin chooses which gateway model serves each uzi model/);
+    // PRD #4324 trust decision: the admin's map decides what the user's own key pays for.
+    expect(text).toMatch(/decides which model and context window your own key pays for on your next fresh run\. An admin edit changes that/);
+    // The key input is described by the disclosure it sits under.
+    const keyInput = row.getByLabelText("Provider key");
+    const keyDesc = document.getElementById(keyInput.getAttribute("aria-describedby") ?? "");
+    expect(keyDesc && box.contains(keyDesc) && !keyDesc.hasAttribute("aria-label")).toBe(true);
+    expect(keyDesc?.textContent).toMatch(/your admin\s+cannot see it/);
+    expect(row.queryByTestId("shared-disclosure-xapikey-s1")).toBeNull();
+    fireEvent.change(row.getByLabelText("Provider key"), { target: { value: "k".repeat(24) } });
+    fireEvent.click(row.getByRole("button", { name: "Save key" }));
+    await waitFor(() => expect(mockApi.putProviderKey).toHaveBeenCalledWith("s1", "k".repeat(24)));
+    expect(mockApi.patchProvider).not.toHaveBeenCalled();
+    expect(mockApi.patchProviderEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("adds the cross-host line for an x-api-key definition", async () => {
+    await renderCard(list({ providers: [shared({ auth_style: "x_api_key", has_key: false, key_enabled: false })] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    fireEvent.click(row.getByRole("button", { name: "Set key" }));
+    const box = row.getByRole("region", { name: "Before you attach your key" });
+    expect(box.textContent).toContain("your key is sent as x-api-key");
+    expect(row.getByTestId("shared-disclosure-xapikey-s1").textContent).toBe(
+      "With x-api-key auth, a redirect can also forward the key itself to another host. Bearer auth limits this.",
+    );
+  });
+
+  it("selects only after the disclosure is confirmed, and names the source as admin-managed", async () => {
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: "s1" });
+    await renderCard(list({ providers: [shared({ auth_style: "x_api_key" })] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    const use = row.getByRole("button", { name: "Use as Claude source" });
+    fireEvent.click(use);
+    expect(mockApi.setClaudeProviderSource).not.toHaveBeenCalled();
+    expect(use.getAttribute("aria-expanded")).toBe("true");
+    const box = row.getByRole("region", { name: "Before you use this provider" });
+    expect(box.textContent).toMatch(/your admin cannot see it/);
+    expect(box.textContent).toMatch(/your own key pays for on your next fresh run/);
+    expect(box.textContent).not.toMatch(/never moved/);
+    expect(row.getByTestId("shared-disclosure-xapikey-s1")).toBeTruthy();
+    // Focus lands on the disclosure, so the next Tab reaches Confirm rather than Rotate/Disable/Delete/Test.
+    expect(document.activeElement).toBe(box);
+    expect(box.getAttribute("tabindex")).toBe("-1");
+    const confirm = row.getByRole("button", { name: "Confirm and use as Claude source" });
+    const confirmDesc = document.getElementById(confirm.getAttribute("aria-describedby") ?? "");
+    expect(confirmDesc && box.contains(confirmDesc) && !confirmDesc.hasAttribute("aria-label")).toBe(true);
+    expect(confirmDesc?.textContent).toMatch(/your admin\s+cannot see it/);
+    const focusable = Array.from(document.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, textarea"));
+    const after = focusable.filter((el) => box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(after[0]).toBe(confirm);
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "s1" } } as never);
+    fireEvent.click(row.getByRole("button", { name: "Confirm and use as Claude source" }));
+    await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith("s1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("claude-source").textContent).toMatch(/Current Claude source: platform-gateway \(managed by your admin\)/),
+    );
+    expect(row.queryByRole("region", { name: "Before you use this provider" })).toBeNull();
+    // Clearing a selected shared source works like a personal one; there is still no Delete.
+    expect(row.getByRole("button", { name: "Stop using Claude source" })).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("cancelling the select disclosure selects nothing", async () => {
+    await renderCard(list({ providers: [shared()] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    fireEvent.click(row.getByRole("button", { name: "Use as Claude source" }));
+    fireEvent.click(row.getByRole("button", { name: "Cancel" }));
+    expect(row.queryByRole("region", { name: "Before you use this provider" })).toBeNull();
+    expect(mockApi.setClaudeProviderSource).not.toHaveBeenCalled();
+  });
+
+  it("keeps disable and delete key on a retired shared definition, but no rotate, select or owner action", async () => {
+    await renderCard(list({ providers: [shared({ retired: true })] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    expect(row.getByRole("button", { name: "Disable key" })).toBeTruthy();
+    expect(row.getByRole("button", { name: "Delete key" })).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Rotate key" })).toBeNull();
+    for (const name of OWNER_ACTIONS) expect(row.queryByRole("button", { name })).toBeNull();
+    expect((row.getByRole("button", { name: "Use as Claude source" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((row.getByRole("button", { name: "Test" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(row.getByTestId("shared-note-s1").textContent).toMatch(/Your admin retired this definition/);
+  });
+
+  // PRD #4324 L117: retirement does not clear a source or fall back; the selection stays,
+  // unusable, and the user clears it explicitly.
+  it("keeps a retired shared definition that is the current source as the source, unusable, with only Stop using", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "s1" } } as never);
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: null });
+    await renderCard(list({ providers: [shared({ retired: true })] }));
+    await waitFor(() =>
+      expect(screen.getByTestId("claude-source").textContent).toMatch(
+        /Current Claude source: platform-gateway \(managed by your admin\), retired: new runs cannot use it/,
+      ),
+    );
+    const row = within(screen.getByTestId("provider-s1"));
+    expect(row.getByText("Claude source")).toBeTruthy();
+    expect(row.getByText("Retired")).toBeTruthy();
+    expect(row.queryByRole("button", { name: "Use as Claude source" })).toBeNull();
+    expect(row.queryByRole("button", { name: /Confirm and use/ })).toBeNull();
+    expect(row.getByTestId("shared-note-s1").textContent).toMatch(
+      /still your Claude source, so new runs cannot start on it\. Stop using it or choose another source/,
+    );
+    const stop = row.getByRole("button", { name: "Stop using Claude source" }) as HTMLButtonElement;
+    expect(stop.disabled).toBe(false);
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: null } } as never);
+    fireEvent.click(stop);
+    await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null));
+    await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/Current Claude source: Anthropic/));
+  });
 });

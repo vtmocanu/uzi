@@ -36,7 +36,9 @@ func newProvFix(t *testing.T) *provFix {
 	// Registered after the fixture's own cleanup, so it runs first: a selected provider cannot be
 	// deleted (RESTRICT), and the user delete cascades to its providers.
 	t.Cleanup(func() {
-		_, _ = fx.env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+		if _, err := fx.env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID); err != nil {
+			t.Errorf("clear the Claude source in cleanup: %v", err)
+		}
 	})
 	return &provFix{effFix: fx}
 }
@@ -73,7 +75,7 @@ func (pf *provFix) addProvider(modelMap string, selectIt bool) {
 
 func (pf *provFix) selectSource() {
 	pf.t.Helper()
-	pf.env.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, pf.userID, pf.provider)
+	pf.env.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, pf.userID, pf.provider)
 }
 
 func (pf *provFix) keyRev() int64 {
@@ -560,7 +562,7 @@ func TestProviderSuccessorCopiesBindingAndSurvivesEditLiveDB(t *testing.T) {
 
 	// An endpoint edit (revision 2) and a different owner source do not move the successor.
 	fx.editRevision("https://gw.example.com/anthropic")
-	fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 	got, err = fx.successor(src, HarnessClaude)
 	if err != nil {
 		t.Fatalf("successor after edit and with no owner source: %v", err)
@@ -662,7 +664,7 @@ func TestProviderChatCreateFreezesAndContinueCopiesLiveDB(t *testing.T) {
 
 	// Continue copies the ended chat's binding; the owner's source changing does not move it.
 	fx.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, chat.ID)
-	fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 	cont, err := fx.svc.ContinueChat(fx.env.ctx, fx.userID, chat.ID)
 	if err != nil {
 		t.Fatalf("continue: %v", err)
@@ -765,7 +767,7 @@ func TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB(t *testing.T) {
 	}
 
 	// A vendor lead of a null-source owner with a usable checker family: the report is refused.
-	fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 	vendor := mustRun(t, fx.env, mustCreate(t, fx).ID)
 	fx.wantVendor(vendor)
 	if applied, got, err = report(vendor.ID); applied || !errors.Is(err, ErrInvalidState) || got.Status != "running" {
@@ -814,7 +816,7 @@ func TestProviderOwnerRefusesCredentialOverridesLiveDB(t *testing.T) {
 		t.Errorf("validator with an unusable source: err = %v", err)
 	}
 	// No provider source: today's behaviour, byte for byte.
-	fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 	if o, err := fx.svc.ResolveCredentialOverride(fx.env.ctx, fx.userID, "issue", "claude", CredentialOverrideModeAuto, nil); err != nil || o == nil || o.Mode != CredentialOverrideModeAuto {
 		t.Errorf("null-source validator = %+v err=%v, want the auto override", o, err)
 	}
@@ -850,7 +852,7 @@ func TestProviderSetTokenRefusalsLiveDB(t *testing.T) {
 		t.Errorf("vendor run pinned switch: %v", err)
 	}
 	// Without a provider source `default` is accepted as today.
-	fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 	if _, err := fx.svc.SetRunCredential(fx.env.ctx, fx.userID, vendorRun.ID, CredentialOverrideModeDefault, nil); err != nil {
 		t.Errorf("null-source default switch: %v", err)
 	}
@@ -1023,7 +1025,7 @@ func TestProviderOwnerGetsNoJudgeLiveDB(t *testing.T) {
 	if _, _, ok := judgeForTarget(t, fx.env, vendor.ID); ok {
 		t.Fatal("the owner has a provider source, so even the vendor run's Claude judge is refused (lane unsupported)")
 	}
-	fx.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
 	judge.maybeEnqueueJudge(fx.env.ctx, mustRun(t, fx.env, vendor.ID))
 	if _, _, ok := judgeForTarget(t, fx.env, vendor.ID); !ok {
 		t.Fatal("control: with no provider source the vendor run is judged as before")
@@ -1061,9 +1063,11 @@ func TestProviderOwnerGetsNoJobLiveDB(t *testing.T) {
 	}
 	provider, _ := seedProviderFor(t, e.codexTestEnv, u, pvDefaultMap)
 	t.Cleanup(func() {
-		_, _ = e.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, u)
+		if _, err := e.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, u); err != nil {
+			t.Errorf("clear the Claude source in cleanup: %v", err)
+		}
 	})
-	e.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, u, provider)
+	e.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, u, provider)
 	before := e.jobCount(t, u)
 	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); !errors.Is(err, ErrProviderLaneUnsupported) {
 		t.Fatalf("err = %v, want provider_lane_unsupported", err)

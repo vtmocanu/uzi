@@ -80,9 +80,10 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 				rows = append(rows, []string{
 					cellText(d.Name), cellText(d.Engine), cellText(d.BaseURL), cellText(d.AuthStyle),
 					modelsCell(d.ModelMap), providerKeyCell(d), providerTestCell(d.Probe), boolStr(d.Retired),
+					providerManagedCell(d),
 				})
 			}
-			return p.Table([]string{"NAME", "ENGINE", "URL", "AUTH", "MODELS", "KEY", "TEST", "RETIRED"}, rows)
+			return p.Table([]string{"NAME", "ENGINE", "URL", "AUTH", "MODELS", "KEY", "TEST", "RETIRED", "MANAGED BY"}, rows)
 		},
 	}
 
@@ -185,7 +186,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			target, err := resolveProvider(cmd, c, args[0])
+			target, err := resolveProvider(cmd, c, args[0], resolveOwned)
 			if err != nil {
 				return err
 			}
@@ -237,7 +238,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			target, err := resolveProvider(cmd, c, args[0])
+			target, err := resolveProvider(cmd, c, args[0], resolveVisible)
 			if err != nil {
 				return err
 			}
@@ -281,7 +282,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			target, err := resolveProvider(cmd, c, args[0])
+			target, err := resolveProvider(cmd, c, args[0], resolveOwned)
 			if err != nil {
 				return err
 			}
@@ -327,8 +328,9 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			var want *string
 			var name string
+			var sharedTarget bool
 			if !useNone {
-				target, err := resolveProvider(cmd, c, args[0])
+				target, err := resolveProvider(cmd, c, args[0], resolveVisible)
 				if err != nil {
 					return err
 				}
@@ -342,7 +344,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 				if err := providerUsableRefusal(target); err != nil {
 					return err
 				}
-				want, name = &target.ID, target.Name
+				want, name, sharedTarget = &target.ID, target.Name, isSharedProvider(target)
 			}
 			var got *string
 			if useEngine == "codex" {
@@ -365,7 +367,11 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 						p.Printf("Codex runs now use their native source (no model provider selected).\n")
 					}
 				} else {
-					p.Printf("%s runs you start now use provider %q.\n", cellText(useEngine), cellText(name))
+					suffix := ""
+					if sharedTarget {
+						suffix = " (shared by your admin)"
+					}
+					p.Printf("%s runs you start now use provider %q%s.\n", cellText(useEngine), cellText(name), suffix)
 				}
 			}
 			return nil
@@ -378,10 +384,26 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 	return cmd
 }
 
-// resolveProvider lists the caller's providers and picks the one an argument names: an exact id,
-// else a name matched case-insensitively (names are unique per owner case-insensitively). A
-// feature-off server and an unknown name are distinct, readable errors raised before any write.
-func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string) (apitypes.ProviderDTO, error) {
+// providerResolveMode says which definitions an argument may name (PRD #4324).
+type providerResolveMode int
+
+const (
+	// resolveVisible: any definition the caller can see, owned or admin-shared (use, test). A name
+	// shared by an owned and a shared definition is refused as ambiguous; an id is always exact.
+	resolveVisible providerResolveMode = iota
+	// resolveOwned: only the caller's own definitions (edit, retire). A shared definition is
+	// managed by the admin, so naming only one is refused before any request.
+	resolveOwned
+)
+
+// isSharedProvider reports an admin-shared definition (a non-nil credential mode).
+func isSharedProvider(d apitypes.ProviderDTO) bool { return d.CredentialMode != nil }
+
+// resolveProvider lists the providers visible to the caller and picks the one an argument names:
+// an exact id, else a name matched case-insensitively (names are unique per owner
+// case-insensitively, but an owned and a shared definition may share one). A feature-off server and
+// an unknown name are distinct, readable errors raised before any write.
+func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode providerResolveMode) (apitypes.ProviderDTO, error) {
 	arg = strings.TrimSpace(arg)
 	out, err := c.ListProviders(cmd.Context())
 	if err != nil {
@@ -393,16 +415,65 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string) (apitypes.
 	}
 	for _, d := range out.Providers {
 		if d.ID == arg {
+			if mode == resolveOwned && isSharedProvider(d) {
+				return apitypes.ProviderDTO{}, sharedManagedRefusal(d)
+			}
 			return d, nil
 		}
 	}
+	var named []apitypes.ProviderDTO
 	for _, d := range out.Providers {
 		if strings.EqualFold(d.Name, arg) {
-			return d, nil
+			named = append(named, d)
 		}
+	}
+	if mode == resolveOwned {
+		var owned []apitypes.ProviderDTO
+		for _, d := range named {
+			if !isSharedProvider(d) {
+				owned = append(owned, d)
+			}
+		}
+		if len(owned) == 0 && len(named) > 0 {
+			return apitypes.ProviderDTO{}, sharedManagedRefusal(named[0])
+		}
+		named = owned
+	}
+	switch len(named) {
+	case 0:
+	case 1:
+		return named[0], nil
+	default:
+		ids := make([]string, 0, len(named))
+		for _, d := range named {
+			kind := "yours"
+			if isSharedProvider(d) {
+				kind = "admin"
+			}
+			ids = append(ids, fmt.Sprintf("%s (%s)", cellText(d.ID), kind))
+		}
+		return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+			// Ids first and the name capped: errors print through cellText (200-rune cap), so a
+			// long or quote-heavy name truncates itself before any id (all ids fit for up to 4 matches;
+			// 5+ EqualFold-equal names, e.g. s/U+017F variants, can still cut the last id).
+			"pass an id: %s (%d providers are named \"%s\")",
+			strings.Join(ids, ", "), len(named), capCell(cellText(arg), 40))
 	}
 	return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitNotFound,
 		"no provider named or with id %q; `uzi provider list` shows yours", cellText(arg))
+}
+
+// sharedManagedRefusal is the refusal for an edit or retire aimed at an admin-shared definition:
+// only an admin changes it (in the web UI), so no request is sent.
+func sharedManagedRefusal(d apitypes.ProviderDTO) error {
+	// Errors print through cellText, which caps at 200 runes: the name is capped at 40 runes and
+	// quoted plainly (no %q escaping growth), so the fix step is never cut off.
+	hint := "; you can select it with `uzi provider use`"
+	if d.Retired {
+		hint = ""
+	}
+	return uzicli.Exitf(uzicli.ExitConflict,
+		"provider \"%s\" is managed by your admin; only an admin can change it%s", capCell(cellText(d.Name), 40), hint)
 }
 
 // providerUsableRefusal refuses, before any write, a provider the list already shows cannot be the
@@ -611,6 +682,15 @@ func printProvider(p *uzicli.Printer, d apitypes.ProviderDTO) {
 	p.Printf("  auth:   %s\n", cellText(d.AuthStyle))
 	p.Printf("  models: %s\n", dashOr(modelsCell(d.ModelMap)))
 	p.Printf("  key:    %s\n", providerKeyCell(d))
+}
+
+// providerManagedCell renders MANAGED BY: "admin" for an admin-shared definition, "you" for your own.
+// Both values are fixed literals, so no server text is drawn here.
+func providerManagedCell(d apitypes.ProviderDTO) string {
+	if isSharedProvider(d) {
+		return "admin"
+	}
+	return "you"
 }
 
 // providerProtocol rejects absent or unknown stored engines rather than defaulting them.

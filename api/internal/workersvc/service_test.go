@@ -1019,12 +1019,6 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 	return 1, nil
 }
 
-// GetUserClaudeProviderSource answers "no provider source" (PRD #4320): the override validator
-// reads the owner's source and fails closed on a surface that cannot.
-func (f *fakeStore) GetUserClaudeProviderSource(context.Context, uuid.UUID) (store.GetUserClaudeProviderSourceRow, error) {
-	return store.GetUserClaudeProviderSourceRow{}, nil
-}
-
 // GetUserSecretMetaByIDOfKind mirrors the real kind-SCOPED by-id lookup (PRD #1247 M1):
 // owner-scoped AND kind-scoped, so a foreign id, a missing id, or a wrong-kind id all
 // yield pgx.ErrNoRows (never another tenant's or another kind's row). It reuses the

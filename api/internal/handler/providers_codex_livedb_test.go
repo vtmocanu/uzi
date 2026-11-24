@@ -147,7 +147,15 @@ func TestCodexProviderRoutesLiveDB(t *testing.T) {
 	if hits.Load() != 2 || !bytes.Equal(keyBefore, keyAfter) || revBefore != revAfter {
 		t.Errorf("wrong kind mutated key: hits=%d revision=%d -> %d ciphertext changed=%v", hits.Load(), revBefore, revAfter, !bytes.Equal(keyBefore, keyAfter))
 	}
-	cliMustExec(t, f.pool, `UPDATE user_secrets SET kind = 'openai_compatible_key' WHERE user_id = $1 AND provider_id = $2`, f.user, p.ID)
+	rec = cookieReq(t, f.router, http.MethodDelete, id+"/key", f.jwt, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete wrong-kind key: %d %s, want 204", rec.Code, rec.Body.String())
+	}
+	rec = cookieReq(t, f.router, http.MethodDelete, id+"/key", f.jwt, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete removed key: %d %s, want 404", rec.Code, rec.Body.String())
+	}
+	f.setKey(t, p.ID) // The slot is free for a correctly sealed Codex key again.
 	// A valid ciphertext sealed for the Claude kind cannot authenticate as a Codex key.
 	cliMustExec(t, f.pool, `UPDATE user_secrets SET ciphertext = (SELECT ciphertext FROM user_secrets WHERE user_id = $1 AND provider_id = $2) WHERE user_id = $1 AND provider_id = $3`, f.user, claude.ID, p.ID)
 	rec = bearerReqBody(f.router, http.MethodPost, id+"/test", f.uzc, "")

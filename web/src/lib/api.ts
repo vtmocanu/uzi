@@ -177,6 +177,9 @@ import type {
   Worker,
   CodexAccountMode,
   HibernationResult,
+  AdminSharedProvider,
+  AdminSharedProviderList,
+  AdminSharedProviderCreateInput,
   CreateProviderInput,
   ProviderAuthStyle,
   ProviderDTO,
@@ -2155,6 +2158,24 @@ const realApi = {
     ),
   adminDeleteEgressProfile: (name: string) =>
     request<null>("DELETE", `/admin/egress-profiles/${encodeURIComponent(name)}`),
+  // Admin-shared provider definitions (PRD #4324). Reads sit in the admin read group; every
+  // write is a cookie-only admin route. Create is keyless (each user attaches their own key);
+  // PATCH changes the name and/or model map only (base_url/auth_style are a 400); DELETE is a
+  // 409 provider_in_use_as_source while any user has the definition selected.
+  adminListSharedProviders: () =>
+    request<AdminSharedProviderList>("GET", "/admin/providers"),
+  adminCreateSharedProvider: (input: AdminSharedProviderCreateInput) =>
+    request<{ provider: AdminSharedProvider }>("POST", "/admin/providers", {
+      ...input,
+      engine: "claude",
+      protocol: "anthropic_messages",
+    }),
+  adminPatchSharedProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
+    request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}`, body),
+  adminRetireSharedProvider: (id: string) =>
+    request<{ provider: AdminSharedProvider }>("POST", `/admin/providers/${encodeURIComponent(id)}/retire`),
+  adminDeleteSharedProvider: (id: string) =>
+    request<{ deleted: boolean; deleted_key_count: number }>("DELETE", `/admin/providers/${encodeURIComponent(id)}`),
 
   // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
   // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')

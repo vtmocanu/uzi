@@ -5,113 +5,56 @@
 // Every string here (names, URLs, model names) is untrusted and rendered as React
 // text only. The key is never displayed or returned by the API; setting or rotating
 // it is a re-paste into a password field that is cleared on save.
+//
+// Admin-shared definitions (PRD #4324, credential_mode "per_user_key") appear in the same
+// list. The admin owns their endpoint, auth style and model map; the user owns only their
+// own key. Such a row therefore offers key actions, Test and select/clear only (the server
+// answers 404 to the owner routes), and both attaching a key and selecting it as the Claude
+// source first show SharedProviderDisclosure: who controls what, and where the key goes.
 
-import { useCallback, useEffect, useId, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type Ref } from "react";
 import {
   api,
   type ProviderAuthStyle,
   type ProviderDTO,
   type ProviderModelMap,
-  type ProviderModelRole,
   type ProviderProbe,
   type ProvidersList,
 } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
+import {
+  AUTH_LABELS,
+  AuthStyleSelect,
+  BaseUrlSelect,
+  buildModelMap,
+  emptyRows,
+  MappedModels,
+  ModelMapFields,
+  rolesFor,
+  rowsFromMap,
+  sameModelMap,
+  validName,
+  type ModelRows,
+} from "./providerFields";
 import { Alert, Badge, Button, Card, Field, Input, SectionTitle, Select, Skeleton } from "./ui";
 
-const ROLES: { role: ProviderModelRole; label: string; required: boolean }[] = [
-  { role: "haiku", label: "Haiku", required: true },
-  { role: "sonnet", label: "Sonnet", required: false },
-  { role: "opus", label: "Opus", required: false },
-  { role: "fable", label: "Fable", required: false },
-];
+const isShared = (p: ProviderDTO) => p.credential_mode === "per_user_key";
 
-const CODEX_ROLES: typeof ROLES = [
-  { role: "default", label: "Default", required: true },
-  ...(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"] as const).map(role => ({ role, label: role, required: false })),
-];
-const rolesFor = (engine: ProviderDTO["engine"]) => engine === "codex" ? CODEX_ROLES : ROLES;
+// A personal and a shared definition may carry the same name, so the source line says which.
+// A retired source stays selected (nothing falls back on its own), so the line says it is unusable.
+function sourceName(p: ProviderDTO | undefined): string {
+  if (!p) return "a provider that no longer exists";
+  const name = isShared(p) ? `${sanitizeLabel(p.name)} (managed by your admin)` : sanitizeLabel(p.name);
+  return p.retired ? `${name}, retired: new runs cannot use it until you stop using it or choose another source` : name;
+}
+
 const engineLabel = (engine: ProviderDTO["engine"]) => engine === "codex" ? "Codex" : "Claude";
 async function setSource(engine: ProviderDTO["engine"], id: string | null) {
   return engine === "codex" ? (await api.setCodexProviderSource(id)).codex_provider_id : (await api.setClaudeProviderSource(id)).claude_provider_id;
 }
 
-const AUTH_LABELS: Record<ProviderAuthStyle, string> = {
-  bearer: "Authorization: Bearer",
-  x_api_key: "x-api-key",
-};
-
-const MODEL_RE = /^[A-Za-z0-9._:/@-]{1,256}$/;
 const KEY_RE = /^[\x21-\x7E]{16,4096}$/;
-const CTX_MIN = 8192;
-const CTX_MAX = 10_000_000;
-
-const NO_CONTEXT_WARNING =
-  "No context window set. The smallest window configured on any model applies to all of them, and uzi assumes 200k tokens if none is configured; set the gateway model's real window.";
-
-const CATALOG_CONTEXT_WARNING =
-  "The Claude CLI may apply its own window to model names it recognizes as Anthropic models (for example claude-sonnet-4-5), ignoring both a configured window and uzi's 200k default (measured at Claude Code 2.1.325).";
-
-interface ModelRow {
-  model: string;
-  ctx: string;
-}
-type ModelRows = Record<ProviderModelRole, ModelRow>;
-
-const emptyRows = (): ModelRows => Object.fromEntries([...ROLES, ...CODEX_ROLES].map(({ role }) => [role, { model: "", ctx: "" }])) as ModelRows;
-
-function rowsFromMap(map: ProviderModelMap): ModelRows {
-  const rows = emptyRows();
-  for (const { role } of [...ROLES, ...CODEX_ROLES]) {
-    const e = map[role];
-    if (e) rows[role] = { model: e.model, ctx: e.context_window ? String(e.context_window) : "" };
-  }
-  return rows;
-}
-
-// buildModelMap validates the rows the way the server does (the server stays
-// authoritative) and returns either the map or the first problem found.
-function buildModelMap(rows: ModelRows, engine: ProviderDTO["engine"]): { map: ProviderModelMap } | { error: string } {
-  const out: Partial<Record<ProviderModelRole, { model: string; context_window?: number }>> = {};
-  for (const { role, label, required } of rolesFor(engine)) {
-    const model = rows[role].model.trim();
-    const ctx = rows[role].ctx.trim();
-    if (model === "") {
-      if (required) return { error: `${label} model is required.` };
-      if (ctx !== "") return { error: `${label} has a context window but no model.` };
-      continue;
-    }
-    if (!MODEL_RE.test(model)) {
-      return { error: `${label} model must be 1-256 characters from letters, digits and . _ : / @ -` };
-    }
-    const entry: { model: string; context_window?: number } = { model };
-    if (ctx !== "") {
-      const n = Number(ctx);
-      if (!/^\d+$/.test(ctx) || n < CTX_MIN || n > CTX_MAX) {
-        return { error: `${label} context window must be a whole number from ${CTX_MIN} to ${CTX_MAX}.` };
-      }
-      entry.context_window = n;
-    }
-    out[role] = entry;
-  }
-  return { map: out as ProviderModelMap };
-}
-
-function sameModelMap(a: ProviderModelMap, b: ProviderModelMap): boolean {
-  return [...ROLES, ...CODEX_ROLES].every(({ role }) => {
-    const x = a[role];
-    const y = b[role];
-    if (!x || !y) return !x && !y;
-    return x.model === y.model && (x.context_window ?? null) === (y.context_window ?? null);
-  });
-}
-
-function validName(name: string): string | null {
-  const n = name.trim();
-  if (n.length < 1 || n.length > 64) return "Name must be 1-64 characters.";
-  return null;
-}
 
 const REASON_MESSAGES: Record<string, string> = {
   provider_base_url_not_allowed: "That base URL is not on the operator's allowlist. Pick one from the list.",
@@ -168,109 +111,67 @@ function ProbeResults({ probe }: { probe: ProviderProbe | null }) {
   );
 }
 
-function ModelMapFields({
-  rows,
-  onChange,
-  idPrefix,
-  engine,
+// SharedProviderDisclosure is what a user reads before attaching their key to, or selecting,
+// an admin-shared definition (PRD #4324 "At attachment and selection"). It splits the
+// definition into what the admin decides and what the user holds, then says where the key
+// goes. Indigo (the "plan" token) marks admin-controlled things throughout: the badge, this
+// panel's frame and its left column; the user's own column stays in plain foreground.
+// It is focusable (tabIndex -1, named by its aria-label) so the select panel can move focus
+// onto it, and its id describes the control it gates (the key input, the Confirm button).
+function SharedProviderDisclosure({
+  provider: p,
+  context,
+  id,
+  ref,
 }: {
-  rows: ModelRows;
-  onChange: (rows: ModelRows) => void;
-  idPrefix: string;
-  engine: ProviderDTO["engine"];
-}) {
-  const set = (role: ProviderModelRole, part: Partial<ModelRow>) =>
-    onChange({ ...rows, [role]: { ...rows[role], ...part } });
-  return (
-    <fieldset className="space-y-3">
-      <legend className="text-sm font-medium text-muted">Model map</legend>
-      {rolesFor(engine).map(({ role, label, required }) => {
-        const row = rows[role];
-        return (
-          <div key={role} className="space-y-1">
-            <div className="grid gap-2 sm:grid-cols-[1fr_12rem]">
-              <Input
-                id={`${idPrefix}-${role}-model`}
-                aria-label={`${label} model${required ? " (required)" : ""}`}
-                placeholder={`${label} model${required ? " (required)" : " (optional)"}`}
-                autoComplete="off"
-                value={row.model}
-                onChange={(e) => set(role, { model: e.target.value })}
-              />
-              <Input
-                id={`${idPrefix}-${role}-ctx`}
-                aria-label={`${label} context window`}
-                placeholder="Context window"
-                inputMode="numeric"
-                autoComplete="off"
-                value={row.ctx}
-                onChange={(e) => set(role, { ctx: e.target.value })}
-              />
-            </div>
-            {row.model.trim() !== "" && row.ctx.trim() === "" && (
-              <p className="text-xs text-warn" data-testid={`ctx-warning-${role}`}>
-                {label}: {engine === "codex" ? "No context window set. Codex uses its runtime fallback context window, which may differ from the gateway limit." : NO_CONTEXT_WARNING}
-              </p>
-            )}
-            {engine === "claude" && row.model.toLowerCase().includes("claude") && (
-              <p className="text-xs text-warn" data-testid={`ctx-unenforced-${role}`}>
-                {label}: {CATALOG_CONTEXT_WARNING}
-              </p>
-            )}
-          </div>
-        );
-      })}
-    </fieldset>
-  );
-}
-
-function BaseUrlSelect({
-  value,
-  onChange,
-  allowed,
-  label = "Base URL",
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  allowed: string[];
-  label?: string;
-}) {
-  const options = value !== "" && !allowed.includes(value) ? [value, ...allowed] : allowed;
-  return (
-    <Field label={label}>
-      <Select value={value} onChange={(e) => onChange(e.target.value)} aria-label={label}>
-        <option value="">Select an allowed base URL…</option>
-        {options.map((u) => (
-          <option key={u} value={u}>
-            {sanitizeLabel(u)}
-            {allowed.includes(u) ? "" : " (no longer allowed)"}
-          </option>
-        ))}
-      </Select>
-    </Field>
-  );
-}
-
-function AuthStyleSelect({
-  value,
-  onChange,
-  engine,
-}: {
-  engine: ProviderDTO["engine"];
-  value: ProviderAuthStyle;
-  onChange: (v: ProviderAuthStyle) => void;
+  provider: ProviderDTO;
+  context: "attach" | "select";
+  id: string;
+  ref?: Ref<HTMLElement>;
 }) {
   return (
-    <Field label="Auth style">
-      <Select
-        aria-label="Auth style"
-        value={value}
-        onChange={(e) => onChange(e.target.value as ProviderAuthStyle)}
-      >
-        <option value="bearer">{AUTH_LABELS.bearer}</option>
-        {engine === "claude" && <option value="x_api_key">{AUTH_LABELS.x_api_key}</option>}
-      </Select>
-    </Field>
+    <section
+      ref={ref}
+      tabIndex={-1}
+      aria-label={context === "attach" ? "Before you attach your key" : "Before you use this provider"}
+      className="space-y-3 rounded-lg border border-plan/30 bg-plan/5 p-3 text-sm outline-hidden focus:ring-2 focus:ring-ring"
+      data-testid={`shared-disclosure-${p.id}`}
+    >
+      {/* The description target carries no aria-label, so assistive tech reads the disclosure text itself. */}
+      <div id={id} className="space-y-3">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="space-y-1.5 border-l-2 border-plan/60 pl-3">
+          <h4 className="font-medium text-plan">Set by your admin</h4>
+          <p>
+            Endpoint <code className="break-all">{sanitizeLabel(p.base_url)}</code>, fixed when your admin created
+            this definition. Your admin cannot repoint your key to a different gateway.
+          </p>
+          <p>Auth style: your key is sent as {AUTH_LABELS[p.auth_style]}.</p>
+          <p>
+            Model map: your admin chooses which gateway model serves each uzi model, so it decides which model and
+            context window your own key pays for on your next fresh run. An admin edit changes that without asking you;
+            runs that already started keep the map they started with.
+          </p>
+        </div>
+        <div className="space-y-1.5 border-l-2 border-edge pl-3">
+          <h4 className="font-medium text-fg">Held by you</h4>
+          <p>
+            Your key is personal and in your own custody. It is stored encrypted for your account only, your admin
+            cannot see it, and you can rotate, disable or delete it at any time.
+          </p>
+        </div>
+      </div>
+      <p className="text-muted">
+        Your key is sent to that endpoint on every request. If the gateway redirects, it can resend your prompts and
+        code to another host, and your key to another path on the same host.
+      </p>
+      {p.auth_style === "x_api_key" && (
+        <p className="text-warn" data-testid={`shared-disclosure-xapikey-${p.id}`}>
+          With x-api-key auth, a redirect can also forward the key itself to another host. Bearer auth limits this.
+        </p>
+      )}
+      </div>
+    </section>
   );
 }
 
@@ -278,7 +179,7 @@ type RunFn = (fn: () => Promise<unknown>, notice: string, fallback: string, refr
 
 const DELETE_SOURCE_REASON = "This is your model source. Stop using it before you delete it.";
 
-type Panel = "edit" | "endpoint" | "key" | null;
+type Panel = "edit" | "endpoint" | "key" | "select" | null;
 
 function ProviderRow({
   provider,
@@ -309,6 +210,14 @@ function ProviderRow({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmKeyDelete, setConfirmKeyDelete] = useState(false);
   const [testing, setTesting] = useState(false);
+  const disclosureId = `${uid}-disclosure`;
+  const disclosureRef = useRef<HTMLElement>(null);
+
+  // Opening the select panel moves focus onto its disclosure, so the next Tab reaches Confirm
+  // directly instead of walking past Rotate, Disable, Delete and Test first.
+  useEffect(() => {
+    if (panel === "select") disclosureRef.current?.focus();
+  }, [panel]);
 
   const open = (next: Panel) => {
     setFormError("");
@@ -395,12 +304,20 @@ function ProviderRow({
       : " (no context window: 200k assumed)";
   const rowBusy = busy || testing;
   const blocked = sourceBlockedReason(p);
+  const shared = isShared(p);
+  const selectAsSource = () =>
+    run(
+      async () => onSource(await setSource(p.engine, p.id)),
+      `This provider is now your ${engineLabel(p.engine)} source.`,
+      "Failed to use the provider",
+    );
 
   return (
     <li className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4" data-testid={`provider-${p.id}`}>
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-semibold text-fg">{sanitizeLabel(p.name)}</h3>
         <Badge tone="neutral">{engineLabel(p.engine)}</Badge>
+        {shared && <Badge tone="plan">Managed by your admin</Badge>}
         {isSource && <Badge tone="info">{engineLabel(p.engine)} source</Badge>}
         {p.retired && <Badge tone="neutral">Retired</Badge>}
         {!p.has_key ? (
@@ -418,24 +335,15 @@ function ProviderRow({
         <dt className="text-muted">Base URL</dt>
         <dd className="break-all">
           <code>{sanitizeLabel(p.base_url)}</code>
+          {shared && <span className="text-xs text-faint"> (fixed by your admin)</span>}
         </dd>
         <dt className="text-muted">Auth style</dt>
         <dd>{AUTH_LABELS[p.auth_style]}</dd>
         <dt className="text-muted">Models</dt>
         <dd>
-          <ul>
-            {mapped.map(({ role, label }) => {
-              const e = p.model_map[role]!;
-              return (
-                <li key={role}>
-                  {label}: <code>{sanitizeLabel(e.model)}</code>
-                  {e.context_window ? ` (${e.context_window.toLocaleString()} tokens)` : blankLabel}
-                </li>
-              );
-            })}
-          </ul>
+          <MappedModels engine={p.engine} map={p.model_map} blankLabel={blankLabel} />
         </dd>
-        <dt className="text-muted">Latest test</dt>
+        <dt className="text-muted">{shared ? "Latest test of your key" : "Latest test"}</dt>
         <dd>
           <ProbeResults probe={p.probe} />
         </dd>
@@ -462,18 +370,14 @@ function ProviderRow({
             size="sm"
             disabled={rowBusy || blocked !== null}
             title={blocked ?? undefined}
-            onClick={() =>
-              void run(
-                async () => onSource(await setSource(p.engine, p.id)),
-                `This provider is now your ${engineLabel(p.engine)} source.`,
-                "Failed to use the provider",
-              )
-            }
+            // A shared definition is selected only after its disclosure: the first click opens it.
+            aria-expanded={shared ? panel === "select" : undefined}
+            onClick={() => (shared ? open("select") : void selectAsSource())}
           >
             Use as {engineLabel(p.engine)} source
           </Button>
         )}
-        {!p.retired && (
+        {!p.retired && !shared && (
           <>
             <Button size="sm" variant="secondary" disabled={rowBusy} onClick={() => open("edit")} aria-expanded={panel === "edit"}>
               Edit name and models
@@ -481,9 +385,17 @@ function ProviderRow({
             <Button size="sm" variant="secondary" disabled={rowBusy} onClick={() => open("endpoint")} aria-expanded={panel === "endpoint"}>
               Edit endpoint
             </Button>
-            <Button size="sm" variant="secondary" disabled={rowBusy} onClick={() => open("key")} aria-expanded={panel === "key"}>
-              {p.has_key ? "Rotate key" : "Set key"}
-            </Button>
+          </>
+        )}
+        {/* A retired shared definition still lets its user disable or delete their own key: they
+            cannot delete the definition, so this is the only way to take the key back. */}
+        {(!p.retired || shared) && (
+          <>
+            {!p.retired && (
+              <Button size="sm" variant="secondary" disabled={rowBusy} onClick={() => open("key")} aria-expanded={panel === "key"}>
+                {p.has_key ? "Rotate key" : "Set key"}
+              </Button>
+            )}
             {p.has_key && (
               <>
                 <Button
@@ -515,7 +427,7 @@ function ProviderRow({
         <Button size="sm" disabled={rowBusy || !canTest} onClick={() => void test()}>
           {testing ? "Testing…" : "Test"}
         </Button>
-        {!p.retired && (
+        {!p.retired && !shared && (
           <Button
             size="sm"
             variant="secondary"
@@ -525,17 +437,28 @@ function ProviderRow({
             Retire
           </Button>
         )}
-        <Button
-          size="sm"
-          variant="danger"
-          disabled={rowBusy || isSource}
-          title={isSource ? DELETE_SOURCE_REASON : undefined}
-          onClick={() => setConfirmDelete(true)}
-        >
-          Delete
-        </Button>
+        {!shared && (
+          <Button
+            size="sm"
+            variant="danger"
+            disabled={rowBusy || isSource}
+            title={isSource ? DELETE_SOURCE_REASON : undefined}
+            onClick={() => setConfirmDelete(true)}
+          >
+            Delete
+          </Button>
+        )}
       </div>
-      {isSource && (
+      {shared && (
+        <p className="text-xs text-faint" data-testid={`shared-note-${p.id}`}>
+          {p.retired && isSource
+            ? `Your admin retired this definition, but it is still your ${engineLabel(p.engine)} source, so new runs cannot start on it. Stop using it or choose another source. You can still disable or delete your key.`
+            : p.retired
+            ? "Your admin retired this definition. It can no longer be selected or tested; you can still disable or delete your key."
+            : "Your admin manages this definition's name, endpoint and models. You manage only your own key."}
+        </p>
+      )}
+      {isSource && !shared && (
         <p className="text-xs text-faint" data-testid={`delete-blocked-${p.id}`}>{DELETE_SOURCE_REASON}</p>
       )}
       {!isSource && blocked && (
@@ -609,11 +532,13 @@ function ProviderRow({
       )}
       {panel === "key" && (
         <form onSubmit={saveKey} className="space-y-3 border-t border-edge pt-3">
+          {shared && <SharedProviderDisclosure provider={p} context="attach" id={disclosureId} />}
           <Field label={p.has_key ? "New key" : "Key"}>
             <Input
               type="password"
               autoComplete="off"
               aria-label="Provider key"
+              aria-describedby={shared ? disclosureId : undefined}
               placeholder="Paste the gateway API key"
               value={key}
               onChange={(e) => setKey(e.target.value)}
@@ -623,6 +548,26 @@ function ProviderRow({
           {formError && <Alert message={formError} />}
           <Button type="submit" disabled={rowBusy || key === ""}>Save key</Button>
         </form>
+      )}
+      {panel === "select" && shared && !isSource && (
+        <div className="space-y-3 border-t border-edge pt-3">
+          <SharedProviderDisclosure provider={p} context="select" id={disclosureId} ref={disclosureRef} />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              aria-describedby={disclosureId}
+              disabled={rowBusy || blocked !== null}
+              onClick={async () => {
+                if (await selectAsSource()) setPanel(null);
+              }}
+            >
+              Confirm and use as {engineLabel(p.engine)} source
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => setPanel(null)}>
+              Cancel
+            </Button>
+          </div>
+        </div>
       )}
     </li>
   );
@@ -757,7 +702,7 @@ export function Providers() {
       <div>
         <SectionTitle>Custom providers</SectionTitle>
         <p className="mt-2 text-sm text-muted">
-          Point Claude or Codex runs at a compatible gateway. Pick an allowed base URL, map models, then save a key and test it.
+          Point Claude or Codex runs at a compatible gateway. Pick an allowed base URL, map models, then save a key and test it. Definitions marked as managed by your admin are shared: attach your own key to use them.
         </p>
       </div>
 
@@ -784,7 +729,7 @@ export function Providers() {
         <>
           {(["claude", "codex"] as const).map(engine => (
             <div key={engine} data-testid={`${engine}-source`}>
-              Current {engineLabel(engine)} source: {sources[engine] === undefined ? "unknown" : sources[engine] === null ? (engine === "claude" ? "Anthropic" : "OpenAI") : sanitizeLabel(data.providers.find(p => p.id === sources[engine])?.name ?? "a provider that no longer exists")}
+              Current {engineLabel(engine)} source: {sources[engine] === undefined ? "unknown" : sources[engine] === null ? (engine === "claude" ? "Anthropic" : "OpenAI") : sourceName(data.providers.find(p => p.id === sources[engine]))}
               <p className="text-xs text-faint">{engine === "claude" ? "Use only a gateway you trust not to redirect: a redirect can resend your prompts and code to another host, and your key to another path on the same host (or, with x-api-key auth, to another host). Bearer auth limits this. See the Model providers docs." : "Use only a gateway you trust: Codex runtime redirects may forward request bodies and authentication headers. Allowlist admission is not confinement to that host. See the Model providers docs."}</p>
             </div>
           ))}

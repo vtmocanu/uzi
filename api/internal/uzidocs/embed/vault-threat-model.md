@@ -335,13 +335,20 @@ unlock without soliciting or reading the secret. See
    `anthropic_compatible_key` row names its provider through
    `user_secrets.provider_id`, and the provider's `base_url` lives unsealed in
    `model_provider_revisions`. A database-write adversary could re-point
-   `provider_id` at another of the same user's providers, or rewrite the
+   `provider_id` (with its `provider_scope_id`) at another provider the same
+   user may use, that is one of their own or an admin-shared definition
+   ([ADR-4324](../adr/4324-admin-shared-providers.md)), or rewrite the
    provider's `base_url`, and so redirect where the key is sent. Binding the
    provider id into the AAD would not close this: the URL is unsealed, so the
    adversary can change the destination without touching the ciphertext. The
    api limits the destination to the operator allowlist at save time; a
    database-write adversary is outside that check, which is the same threat
-   model as residual 8.
+   model as residual 8. The api fixes a shared definition's `base_url` and auth
+   style at creation and its admin edit cannot change them, but that is an api
+   rule, not a database one: a database-write adversary who rewrites a shared
+   revision's `base_url` redirects every user's key attached to it, not one
+   user's. Each user's key stays sealed under that user's own `(user, kind)`
+   AAD, and the admin never holds it.
 
 ## Hosted worker join tokens (PRD #58)
 

@@ -172,8 +172,8 @@ func (s *Service) providerBindingRefusal(run store.Run, rev *store.GetModelProvi
 // disable or delete either committed first and is seen here, or waits until this claim decision
 // commits; a held row is 55P03, which rolls the transaction back for the bounded retry instead of
 // blocking under the run lock), then reads the frozen revision FOR KEY SHARE NOWAIT too (a blocking
-// revision lock would form a lock cycle with DeleteModelProvider, which cascades the revisions before
-// the key row: 40P01, which the finishers do not retry; NOWAIT makes it 55P03, which they do), and
+// revision lock can form a lock cycle with a provider delete, which cascades the revision and key
+// rows in either order: 40P01, which the finishers do not retry; NOWAIT makes it 55P03, which they do), and
 // returns the refusal reason or "" when intact. A missing key row or revision is stale. A
 // not-provider-bound run returns "".
 func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store.Run) (string, error) {
@@ -320,8 +320,9 @@ func promotionRunBinding(r store.LockCredentialDisabledRunForPromotionRow) store
 // holdProviderDestinationNotAllowed while the URL is still off the list (stay held), and
 // holdProviderBindingStale when the binding broke while parked (frozen key or revision changed: the
 // caller rewrites the hold, whose "resumes automatically" copy is false then). Run under the owner's
-// secret mutation lock (so a rotation or disable serializes against this decision) with plain reads;
-// the claim re-checks under locks anyway. A retired provider does not block (retiring keeps bound
+// secret mutation lock (so a rotation or disable serializes against this decision); the revision read
+// takes FOR KEY SHARE (GetModelProviderRevisionForOwner) and the key read is plain. The claim
+// re-checks under locks anyway. A retired provider does not block (retiring keeps bound
 // runs). Any other hold reason never reaches here.
 func (s *Service) providerHoldRefusal(ctx context.Context, q *store.Queries, run store.Run) (string, error) {
 	if !providerBoundRun(run) {

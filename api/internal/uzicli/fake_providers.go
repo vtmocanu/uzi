@@ -17,6 +17,27 @@ func (f *FakeClient) ListProviders(context.Context) (apitypes.ProviderListDTO, e
 	return f.ProviderList, nil
 }
 
+func (f *FakeClient) AdminListSharedProviders(context.Context) ([]apitypes.AdminSharedProviderDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.SharedProviders, nil
+}
+
+func (f *FakeClient) AdminGetSharedProvider(_ context.Context, id string) (apitypes.AdminSharedProviderDTO, error) {
+	f.SharedProviderGets++
+	f.LastProviderID = id
+	if f.Err != nil {
+		return apitypes.AdminSharedProviderDTO{}, f.Err
+	}
+	for _, p := range f.SharedProviders {
+		if p.ID == id {
+			return p, nil
+		}
+	}
+	return apitypes.AdminSharedProviderDTO{}, Exitf(ExitNotFound, "provider not found")
+}
+
 func (f *FakeClient) CreateProvider(_ context.Context, req apitypes.ProviderCreateRequest) (apitypes.ProviderDTO, error) {
 	f.LastProviderCreate = &req
 	if f.Err != nil {

@@ -15,7 +15,7 @@ import (
 const bumpModelProviderRevision = `-- name: BumpModelProviderRevision :one
 UPDATE model_providers
 SET current_revision = current_revision + 1
-WHERE id = $1 AND owner_user_id = $2 AND retired_at IS NULL
+WHERE id = $1 AND owner_user_id = $2::uuid AND retired_at IS NULL
 RETURNING current_revision
 `
 
@@ -38,8 +38,24 @@ func (q *Queries) BumpModelProviderRevision(ctx context.Context, arg BumpModelPr
 	return current_revision, err
 }
 
+const bumpSharedModelProviderRevision = `-- name: BumpSharedModelProviderRevision :one
+UPDATE model_providers
+SET current_revision = current_revision + 1
+WHERE id = $1 AND owner_user_id IS NULL AND credential_mode = 'per_user_key' AND retired_at IS NULL
+RETURNING current_revision
+`
+
+// Advances a shared definition's current_revision (the caller then inserts that revision). A retired
+// definition is not edited (0 rows). Authorized caller: admin edit, after LockSharedModelProviderForEdit.
+func (q *Queries) BumpSharedModelProviderRevision(ctx context.Context, id uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, bumpSharedModelProviderRevision, id)
+	var current_revision int32
+	err := row.Scan(&current_revision)
+	return current_revision, err
+}
+
 const countModelProvidersForOwner = `-- name: CountModelProvidersForOwner :one
-SELECT count(*) FROM model_providers WHERE owner_user_id = $1
+SELECT count(*) FROM model_providers WHERE owner_user_id = $1::uuid
 `
 
 // The cap count: every provider the owner has ever created and not deleted, retired included
@@ -52,8 +68,36 @@ func (q *Queries) CountModelProvidersForOwner(ctx context.Context, ownerUserID u
 	return count, err
 }
 
+const countSharedModelProviders = `-- name: CountSharedModelProviders :one
+SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode = 'per_user_key'
+`
+
+// The shared cap count: retired definitions included (retiring must not free a slot). Run under
+// LockSharedModelProviderCatalogue. Authorized caller: the admin create path.
+func (q *Queries) CountSharedModelProviders(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countSharedModelProviders)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countSharedProviderSelections = `-- name: CountSharedProviderSelections :one
+SELECT count(*) FROM users
+WHERE claude_provider_id = $1::uuid AND claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+`
+
+// How many users have this shared definition selected as their Claude source. A delete is refused
+// while it is above zero (users_claude_provider_fkey is ON DELETE RESTRICT as the structural backstop).
+// Authorized caller: admin delete.
+func (q *Queries) CountSharedProviderSelections(ctx context.Context, id uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countSharedProviderSelections, id)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteModelProvider = `-- name: DeleteModelProvider :execrows
-DELETE FROM model_providers WHERE id = $1 AND owner_user_id = $2
+DELETE FROM model_providers WHERE id = $1 AND owner_user_id = $2::uuid
 `
 
 type DeleteModelProviderParams struct {
@@ -90,6 +134,51 @@ func (q *Queries) DeleteProviderKeySecret(ctx context.Context, arg DeleteProvide
 	return result.RowsAffected(), nil
 }
 
+const deleteSharedModelProvider = `-- name: DeleteSharedModelProvider :execrows
+DELETE FROM model_providers WHERE id = $1 AND owner_user_id IS NULL AND credential_mode = 'per_user_key'
+`
+
+// Cascades to the definition's revisions and legacy probe rows. Refused with a foreign-key violation
+// while any user has it selected. Authorized caller: admin delete.
+func (q *Queries) DeleteSharedModelProvider(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSharedModelProvider, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteSharedProviderKeys = `-- name: DeleteSharedProviderKeys :many
+DELETE FROM user_secrets
+WHERE provider_id = $1::uuid AND provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+RETURNING id
+`
+
+// Deletes every user's key attached to one shared definition and returns the ids, so the delete's
+// warning and audit record the exact count under the same provider lock. The shared scope is the nil
+// UUID, which only a Claude gateway key may carry. The cascading foreign keys then remove their Test
+// evidence. Authorized caller: admin delete, after LockSharedModelProviderForDelete and a zero
+// CountSharedProviderSelections.
+func (q *Queries) DeleteSharedProviderKeys(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, deleteSharedProviderKeys, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getModelProviderForOwner = `-- name: GetModelProviderForOwner :one
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
@@ -98,8 +187,9 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN user_secrets k ON k.user_id = p.owner_user_id AND k.provider_id = p.id
-LEFT JOIN model_provider_probe_results pr ON pr.provider_id = p.id AND pr.revision = p.current_revision
-WHERE p.id = $1 AND p.owner_user_id = $2
+LEFT JOIN model_provider_key_test_results pr ON pr.provider_id = p.id AND pr.user_id = p.owner_user_id
+     AND pr.revision = p.current_revision AND pr.key_secret_id = k.id AND pr.key_enablement_rev = k.enablement_rev
+WHERE p.id = $1 AND p.owner_user_id = $2::uuid
 `
 
 type GetModelProviderForOwnerParams struct {
@@ -190,7 +280,8 @@ const getModelProviderRevisionForOwner = `-- name: GetModelProviderRevisionForOw
 SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
-WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
+WHERE r.provider_id = $1 AND r.revision = $2
+  AND (p.owner_user_id = $3::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
 FOR KEY SHARE OF r
 `
 
@@ -210,8 +301,9 @@ type GetModelProviderRevisionForOwnerRow struct {
 	Engine     string    `json:"engine"`
 }
 
-// A frozen revision of an owner's provider (inherited creation re-checks the URL against the
-// allowlist). Owner-scoped. FOR KEY SHARE OF r only protects the prune-FIRST ordering (a prune that
+// A frozen revision of a provider visible to the CALLER (owner_user_id is the caller: their own
+// definition or a shared per-user-key one); inherited creation re-checks the URL against the
+// allowlist. FOR KEY SHARE OF r only protects the prune-FIRST ordering (a prune that
 // already took the row's key lock makes this read wait, then find the row gone): it is released with
 // the transaction and does not by itself keep the revision. What keeps PruneModelProviderRevisions off
 // a revision is the source run row's own reference (model_provider_revision), which stays true while
@@ -265,7 +357,8 @@ func (q *Queries) GetProviderBindingKeyByID(ctx context.Context, arg GetProvider
 
 const getProviderKeyForUpdate = `-- name: GetProviderKeyForUpdate :one
 SELECT k.id, k.disabled_at, k.enablement_rev FROM user_secrets k
-JOIN model_providers p ON p.id = k.provider_id AND p.owner_user_id = k.user_id
+JOIN model_providers p ON p.id = k.provider_id
+ AND (p.owner_user_id = k.user_id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
 WHERE k.user_id = $1 AND k.provider_id = $2
   AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
 FOR UPDATE OF k
@@ -282,7 +375,8 @@ type GetProviderKeyForUpdateRow struct {
 	EnablementRev int64              `json:"enablement_rev"`
 }
 
-// The provider key's identity and enablement, locked inside a mutation transaction.
+// The caller's provider key identity and enablement, locked inside a mutation transaction. user_id
+// is the CALLER; the definition must be visible to them (their own or a shared per-user-key one).
 func (q *Queries) GetProviderKeyForUpdate(ctx context.Context, arg GetProviderKeyForUpdateParams) (GetProviderKeyForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getProviderKeyForUpdate, arg.UserID, arg.ProviderID)
 	var i GetProviderKeyForUpdateRow
@@ -290,55 +384,54 @@ func (q *Queries) GetProviderKeyForUpdate(ctx context.Context, arg GetProviderKe
 	return i, err
 }
 
-const getUserClaudeProviderSource = `-- name: GetUserClaudeProviderSource :one
-SELECT u.claude_provider_id AS provider_id,
-       p.engine, p.current_revision, p.retired_at,
-       r.base_url, r.auth_style, r.model_map,
-       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
-       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
-FROM users u
-LEFT JOIN model_providers p ON p.id = u.claude_provider_id AND p.owner_user_id = u.id
-LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
-LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = 'anthropic_compatible_key'
-WHERE u.id = $1
+const getSharedModelProviderAdmin = `-- name: GetSharedModelProviderAdmin :one
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       COALESCE(su.n, 0)::bigint AS selected_user_count,
+       COALESCE(ak.n, 0)::bigint AS attached_key_count
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN (SELECT claude_provider_id AS pid, count(*) AS n FROM users
+            WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+            GROUP BY claude_provider_id) su ON su.pid = p.id
+LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
+            WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+            GROUP BY provider_id) ak ON ak.pid = p.id
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
 `
 
-type GetUserClaudeProviderSourceRow struct {
-	ProviderID       pgtype.UUID        `json:"provider_id"`
-	Engine           pgtype.Text        `json:"engine"`
-	CurrentRevision  pgtype.Int4        `json:"current_revision"`
-	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
-	BaseUrl          pgtype.Text        `json:"base_url"`
-	AuthStyle        pgtype.Text        `json:"auth_style"`
-	ModelMap         []byte             `json:"model_map"`
-	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
-	KeyKind          pgtype.Text        `json:"key_kind"`
-	KeyProviderID    pgtype.UUID        `json:"key_provider_id"`
-	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
-	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+type GetSharedModelProviderAdminRow struct {
+	ID                uuid.UUID          `json:"id"`
+	Name              string             `json:"name"`
+	Engine            string             `json:"engine"`
+	CurrentRevision   int32              `json:"current_revision"`
+	RetiredAt         pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	Protocol          string             `json:"protocol"`
+	BaseUrl           string             `json:"base_url"`
+	AuthStyle         string             `json:"auth_style"`
+	ModelMap          []byte             `json:"model_map"`
+	SelectedUserCount int64              `json:"selected_user_count"`
+	AttachedKeyCount  int64              `json:"attached_key_count"`
 }
 
-// The owner's Claude provider source with everything run creation needs to judge it usable in ONE
-// read (PRD #4320 M4): the setting, the provider, its CURRENT revision and the provider's key row.
-// Every join is owner-scoped, so a stored foreign id can never resolve. A NULL setting returns a
-// row whose provider columns are all NULL (no rows only for an unknown user). Plain read: the freeze
-// takes LockSecretMutationShared and then LockModelProviderForShare around its own re-read.
-func (q *Queries) GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID) (GetUserClaudeProviderSourceRow, error) {
-	row := q.db.QueryRow(ctx, getUserClaudeProviderSource, id)
-	var i GetUserClaudeProviderSourceRow
+// One shared definition as ListSharedModelProvidersAdmin returns it. Authorized caller: admin get.
+func (q *Queries) GetSharedModelProviderAdmin(ctx context.Context, id uuid.UUID) (GetSharedModelProviderAdminRow, error) {
+	row := q.db.QueryRow(ctx, getSharedModelProviderAdmin, id)
+	var i GetSharedModelProviderAdminRow
 	err := row.Scan(
-		&i.ProviderID,
+		&i.ID,
+		&i.Name,
 		&i.Engine,
 		&i.CurrentRevision,
 		&i.RetiredAt,
+		&i.CreatedAt,
+		&i.Protocol,
 		&i.BaseUrl,
 		&i.AuthStyle,
 		&i.ModelMap,
-		&i.KeySecretID,
-		&i.KeyKind,
-		&i.KeyProviderID,
-		&i.KeyDisabledAt,
-		&i.KeyEnablementRev,
+		&i.SelectedUserCount,
+		&i.AttachedKeyCount,
 	)
 	return i, err
 }
@@ -367,7 +460,8 @@ SELECT u.claude_provider_id AS provider_id,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
 FROM users u
-LEFT JOIN model_providers p ON p.id = u.claude_provider_id AND p.owner_user_id = u.id AND p.engine = $1
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id
+ AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = $1
 LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
 WHERE u.id = $2 AND $1::text = 'claude'
@@ -405,6 +499,13 @@ type GetUserProviderSourceRow struct {
 	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
 }
 
+// The caller's selected source for one engine with everything run creation needs to judge it usable
+// in ONE read: the setting, the provider, its CURRENT revision and the CALLER's key row for it. The
+// Claude arm resolves the caller's own definition or a shared per-user-key one; the Codex arm stays
+// owner-only (a shared definition is never a Codex source). The key join is always the caller's own
+// (k.user_id = u.id), so a shared definition never resolves another user's key. A NULL setting
+// returns a row whose provider columns are all NULL (no rows only for an unknown user). Plain read:
+// the freeze takes LockSecretMutationShared and then LockModelProviderForShare around its own re-read.
 func (q *Queries) GetUserProviderSource(ctx context.Context, arg GetUserProviderSourceParams) (GetUserProviderSourceRow, error) {
 	row := q.db.QueryRow(ctx, getUserProviderSource, arg.Engine, arg.ID)
 	var i GetUserProviderSourceRow
@@ -426,10 +527,80 @@ func (q *Queries) GetUserProviderSource(ctx context.Context, arg GetUserProvider
 	return i, err
 }
 
+const getVisibleProviderForUse = `-- name: GetVisibleProviderForUse :one
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       p.credential_mode, p.owner_user_id,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev,
+       t.auth_result AS probe_auth_result, t.tool_result AS probe_tool_result, t.probed_at AS probed_at
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = $1::uuid AND k.provider_id = p.id
+     AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+LEFT JOIN model_provider_key_test_results t ON t.provider_id = p.id AND t.user_id = $1::uuid
+     AND t.revision = p.current_revision AND t.key_secret_id = k.id AND t.key_enablement_rev = k.enablement_rev
+WHERE p.id = $2
+  AND (p.owner_user_id = $1::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+`
+
+type GetVisibleProviderForUseParams struct {
+	UserID uuid.UUID `json:"user_id"`
+	ID     uuid.UUID `json:"id"`
+}
+
+type GetVisibleProviderForUseRow struct {
+	ID               uuid.UUID          `json:"id"`
+	Name             string             `json:"name"`
+	Engine           string             `json:"engine"`
+	CurrentRevision  int32              `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	CredentialMode   pgtype.Text        `json:"credential_mode"`
+	OwnerUserID      pgtype.UUID        `json:"owner_user_id"`
+	Protocol         string             `json:"protocol"`
+	BaseUrl          string             `json:"base_url"`
+	AuthStyle        string             `json:"auth_style"`
+	ModelMap         []byte             `json:"model_map"`
+	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
+	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
+	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+	ProbeAuthResult  pgtype.Text        `json:"probe_auth_result"`
+	ProbeToolResult  pgtype.Text        `json:"probe_tool_result"`
+	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
+}
+
+// One definition visible to the CALLER, with the same columns and caller-bound key and evidence joins
+// as ListVisibleProviders. A private definition of another user is no row (404 to the caller).
+func (q *Queries) GetVisibleProviderForUse(ctx context.Context, arg GetVisibleProviderForUseParams) (GetVisibleProviderForUseRow, error) {
+	row := q.db.QueryRow(ctx, getVisibleProviderForUse, arg.UserID, arg.ID)
+	var i GetVisibleProviderForUseRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Engine,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.CreatedAt,
+		&i.CredentialMode,
+		&i.OwnerUserID,
+		&i.Protocol,
+		&i.BaseUrl,
+		&i.AuthStyle,
+		&i.ModelMap,
+		&i.KeySecretID,
+		&i.KeyDisabledAt,
+		&i.KeyEnablementRev,
+		&i.ProbeAuthResult,
+		&i.ProbeToolResult,
+		&i.ProbedAt,
+	)
+	return i, err
+}
+
 const insertModelProvider = `-- name: InsertModelProvider :one
-INSERT INTO model_providers (owner_user_id, name, engine, current_revision)
-VALUES ($1, $2, $3, 1)
-RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at
+INSERT INTO model_providers (owner_user_id, name, engine, current_revision, scope_owner_id)
+VALUES ($1::uuid, $2, $3, 1, $1::uuid)
+RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id
 `
 
 type InsertModelProviderParams struct {
@@ -438,6 +609,8 @@ type InsertModelProviderParams struct {
 	Engine      string    `json:"engine"`
 }
 
+// A personal definition: scope_owner_id is the owner (the shared scope is the nil UUID, written only
+// by InsertSharedModelProvider). credential_mode stays NULL: it is set exactly on shared rows.
 func (q *Queries) InsertModelProvider(ctx context.Context, arg InsertModelProviderParams) (ModelProvider, error) {
 	row := q.db.QueryRow(ctx, insertModelProvider, arg.OwnerUserID, arg.Name, arg.Engine)
 	var i ModelProvider
@@ -449,6 +622,8 @@ func (q *Queries) InsertModelProvider(ctx context.Context, arg InsertModelProvid
 		&i.CurrentRevision,
 		&i.RetiredAt,
 		&i.CreatedAt,
+		&i.CredentialMode,
+		&i.ScopeOwnerID,
 	)
 	return i, err
 }
@@ -484,11 +659,12 @@ func (q *Queries) InsertModelProviderRevision(ctx context.Context, arg InsertMod
 }
 
 const insertProviderKeySecret = `-- name: InsertProviderKeySecret :one
-INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id)
-SELECT $1, CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END,
-       $2, false, false, $3, $4, $5
+INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id, provider_scope_id)
+SELECT $1::uuid, CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END,
+       $2, false, false, $3, $4, $5, p.scope_owner_id
 FROM model_providers p
-WHERE p.id = $5 AND p.owner_user_id = $1
+WHERE p.id = $5
+  AND (p.owner_user_id = $1::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
 `
 
@@ -510,13 +686,18 @@ type InsertProviderKeySecretRow struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
-// Stores a provider's gateway key; derives its kind from the owned provider engine.
+// Stores the CALLER's gateway key for a definition visible to them (their own, or a shared per-user-key
+// one); derives its kind from the definition's engine. The key is always the caller's, never the
+// admin's: user_id is the caller and provider_scope_id is the definition's scope (the caller's own id,
+// or the nil UUID for a shared Claude definition).
 // Deliberately NOT InsertUserSecret: that statement forces the first secret of a kind to be the
 // default and the first anthropic_token into the auto-select pool, and a provider key must be
 // neither (is_default=false, auto_eligible=false), so it never enters a default slot, the poller,
-// the weekly reserve or pool selection. provider_id is written here and by no UPDATE. The composite
-// foreign key (user_id, provider_id) keeps the key under the provider's owner; the unique index
-// user_secrets_one_provider_key allows one key per (user, provider). The label is the provider id.
+// the weekly reserve or pool selection. provider_id and provider_scope_id are written here and by no
+// UPDATE. The composite foreign key (provider_scope_id, provider_id) keeps the key under a scope the
+// caller may use, and user_secrets_provider_scope_check pins that scope to the caller's id or, for a
+// Claude key, the shared scope; the unique index user_secrets_one_provider_key allows one key per
+// (user, provider). The label is the provider id.
 func (q *Queries) InsertProviderKeySecret(ctx context.Context, arg InsertProviderKeySecretParams) (InsertProviderKeySecretRow, error) {
 	row := q.db.QueryRow(ctx, insertProviderKeySecret,
 		arg.UserID,
@@ -538,6 +719,32 @@ func (q *Queries) InsertProviderKeySecret(ctx context.Context, arg InsertProvide
 	return i, err
 }
 
+const insertSharedModelProvider = `-- name: InsertSharedModelProvider :one
+INSERT INTO model_providers (owner_user_id, name, engine, current_revision, credential_mode, scope_owner_id)
+VALUES (NULL, $1, 'claude', 1, 'per_user_key', '00000000-0000-0000-0000-000000000000'::uuid)
+RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id
+`
+
+// A shared definition: NULL owner, per-user-key mode, the nil shared scope, Claude only. The CHECKs
+// (model_providers_shared_mode_check, _shared_engine_check, _scope_owner_check) enforce the same shape.
+// Authorized caller: the admin create path.
+func (q *Queries) InsertSharedModelProvider(ctx context.Context, name string) (ModelProvider, error) {
+	row := q.db.QueryRow(ctx, insertSharedModelProvider, name)
+	var i ModelProvider
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerUserID,
+		&i.Name,
+		&i.Engine,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.CreatedAt,
+		&i.CredentialMode,
+		&i.ScopeOwnerID,
+	)
+	return i, err
+}
+
 const listModelProvidersForOwner = `-- name: ListModelProvidersForOwner :many
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
@@ -546,8 +753,9 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN user_secrets k ON k.user_id = p.owner_user_id AND k.provider_id = p.id
-LEFT JOIN model_provider_probe_results pr ON pr.provider_id = p.id AND pr.revision = p.current_revision
-WHERE p.owner_user_id = $1
+LEFT JOIN model_provider_key_test_results pr ON pr.provider_id = p.id AND pr.user_id = p.owner_user_id
+     AND pr.revision = p.current_revision AND pr.key_secret_id = k.id AND pr.key_enablement_rev = k.enablement_rev
+WHERE p.owner_user_id = $1::uuid
 ORDER BY lower(p.name), p.id
 `
 
@@ -570,6 +778,9 @@ type ListModelProvidersForOwnerRow struct {
 	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
 }
 
+// Owner-only: the owner's own definitions with their key and the Test evidence for that exact key
+// (the evidence row joins only while its provider revision and key identity and enablement revision
+// are all current). Shared definitions are read through ListVisibleProviders.
 func (q *Queries) ListModelProvidersForOwner(ctx context.Context, ownerUserID uuid.UUID) ([]ListModelProvidersForOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listModelProvidersForOwner, ownerUserID)
 	if err != nil {
@@ -610,7 +821,8 @@ func (q *Queries) ListModelProvidersForOwner(ctx context.Context, ownerUserID uu
 const listRunProviderNames = `-- name: ListRunProviderNames :many
 SELECT r.id AS run_id, p.name
 FROM runs r
-JOIN model_providers p ON p.id = r.model_provider_id AND p.owner_user_id = r.user_id
+JOIN model_providers p ON p.id = r.model_provider_id
+ AND (p.owner_user_id = r.user_id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
 WHERE r.id = ANY($1::uuid[])
 `
 
@@ -620,9 +832,10 @@ type ListRunProviderNamesRow struct {
 }
 
 // The current name of the provider each given run was bound to (PRD #4320 run surfaces). The join
-// matches the provider only under the RUN'S owner (the composite owner key), so a name can never
-// cross users; a run with no binding, or whose provider row has since been deleted (runs carry no
-// foreign key to model_providers), returns no row.
+// matches the provider only when it is visible to the RUN'S owner: their own definition or a shared
+// per-user-key one. Another user's private definition never resolves, so a name can never cross
+// users; a run with no binding, or whose provider row has since been deleted (runs carry no foreign
+// key to model_providers), returns no row.
 func (q *Queries) ListRunProviderNames(ctx context.Context, runIds []uuid.UUID) ([]ListRunProviderNamesRow, error) {
 	rows, err := q.db.Query(ctx, listRunProviderNames, runIds)
 	if err != nil {
@@ -643,10 +856,159 @@ func (q *Queries) ListRunProviderNames(ctx context.Context, runIds []uuid.UUID) 
 	return items, nil
 }
 
+const listSharedModelProvidersAdmin = `-- name: ListSharedModelProvidersAdmin :many
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       COALESCE(su.n, 0)::bigint AS selected_user_count,
+       COALESCE(ak.n, 0)::bigint AS attached_key_count
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN (SELECT claude_provider_id AS pid, count(*) AS n FROM users
+            WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+            GROUP BY claude_provider_id) su ON su.pid = p.id
+LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
+            WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+            GROUP BY provider_id) ak ON ak.pid = p.id
+WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+ORDER BY lower(p.name), p.id
+`
+
+type ListSharedModelProvidersAdminRow struct {
+	ID                uuid.UUID          `json:"id"`
+	Name              string             `json:"name"`
+	Engine            string             `json:"engine"`
+	CurrentRevision   int32              `json:"current_revision"`
+	RetiredAt         pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	Protocol          string             `json:"protocol"`
+	BaseUrl           string             `json:"base_url"`
+	AuthStyle         string             `json:"auth_style"`
+	ModelMap          []byte             `json:"model_map"`
+	SelectedUserCount int64              `json:"selected_user_count"`
+	AttachedKeyCount  int64              `json:"attached_key_count"`
+}
+
+// The shared catalogue as an admin sees it: the current revision's fields and two counts, never a key
+// or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
+func (q *Queries) ListSharedModelProvidersAdmin(ctx context.Context) ([]ListSharedModelProvidersAdminRow, error) {
+	rows, err := q.db.Query(ctx, listSharedModelProvidersAdmin)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSharedModelProvidersAdminRow{}
+	for rows.Next() {
+		var i ListSharedModelProvidersAdminRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Engine,
+			&i.CurrentRevision,
+			&i.RetiredAt,
+			&i.CreatedAt,
+			&i.Protocol,
+			&i.BaseUrl,
+			&i.AuthStyle,
+			&i.ModelMap,
+			&i.SelectedUserCount,
+			&i.AttachedKeyCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listVisibleProviders = `-- name: ListVisibleProviders :many
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       p.credential_mode, p.owner_user_id,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev,
+       t.auth_result AS probe_auth_result, t.tool_result AS probe_tool_result, t.probed_at AS probed_at
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = $1::uuid AND k.provider_id = p.id
+     AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+LEFT JOIN model_provider_key_test_results t ON t.provider_id = p.id AND t.user_id = $1::uuid
+     AND t.revision = p.current_revision AND t.key_secret_id = k.id AND t.key_enablement_rev = k.enablement_rev
+WHERE (p.owner_user_id = $1::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+ORDER BY lower(p.name), p.id
+`
+
+type ListVisibleProvidersRow struct {
+	ID               uuid.UUID          `json:"id"`
+	Name             string             `json:"name"`
+	Engine           string             `json:"engine"`
+	CurrentRevision  int32              `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	CredentialMode   pgtype.Text        `json:"credential_mode"`
+	OwnerUserID      pgtype.UUID        `json:"owner_user_id"`
+	Protocol         string             `json:"protocol"`
+	BaseUrl          string             `json:"base_url"`
+	AuthStyle        string             `json:"auth_style"`
+	ModelMap         []byte             `json:"model_map"`
+	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
+	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
+	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+	ProbeAuthResult  pgtype.Text        `json:"probe_auth_result"`
+	ProbeToolResult  pgtype.Text        `json:"probe_tool_result"`
+	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
+}
+
+// Every definition visible to the CALLER: their own (either engine) and the shared per-user-key
+// catalogue (Claude only). The key and the Test evidence are always the CALLER's: the key join is
+// (caller, definition, the engine's key kind) and the evidence joins only while its provider revision,
+// key identity and key enablement revision are all current, so a rotated or edited definition reads as
+// not tested and another user's key or result never appears. owner_user_id is NULL on a shared row.
+func (q *Queries) ListVisibleProviders(ctx context.Context, userID uuid.UUID) ([]ListVisibleProvidersRow, error) {
+	rows, err := q.db.Query(ctx, listVisibleProviders, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListVisibleProvidersRow{}
+	for rows.Next() {
+		var i ListVisibleProvidersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Engine,
+			&i.CurrentRevision,
+			&i.RetiredAt,
+			&i.CreatedAt,
+			&i.CredentialMode,
+			&i.OwnerUserID,
+			&i.Protocol,
+			&i.BaseUrl,
+			&i.AuthStyle,
+			&i.ModelMap,
+			&i.KeySecretID,
+			&i.KeyDisabledAt,
+			&i.KeyEnablementRev,
+			&i.ProbeAuthResult,
+			&i.ProbeToolResult,
+			&i.ProbedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockModelProviderForShare = `-- name: LockModelProviderForShare :one
-SELECT id, current_revision, retired_at FROM model_providers
-WHERE id = $1 AND owner_user_id = $2
-FOR SHARE
+SELECT p.id, p.current_revision, p.retired_at FROM model_providers p
+WHERE p.id = $1
+  AND (p.owner_user_id = $2::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+FOR SHARE OF p
 `
 
 type LockModelProviderForShareParams struct {
@@ -660,9 +1022,11 @@ type LockModelProviderForShareRow struct {
 	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
 }
 
-// The freeze lock for run creation (a later milestone): a creator takes this share lock before it
-// reads the current revision, so a concurrent edit (BumpModelProviderRevision) waits until the
-// creator's transaction ends and a run is never bound to a revision that is edited away under it.
+// The freeze lock for run creation: a creator takes this share lock before it reads the current
+// revision, so a concurrent edit (BumpModelProviderRevision, BumpSharedModelProviderRevision) waits
+// until the creator's transaction ends and a run is never bound to a revision that is edited away
+// under it. owner_user_id is the CALLER: the provider must be visible to them, their own or a shared
+// per-user-key definition.
 func (q *Queries) LockModelProviderForShare(ctx context.Context, arg LockModelProviderForShareParams) (LockModelProviderForShareRow, error) {
 	row := q.db.QueryRow(ctx, lockModelProviderForShare, arg.ID, arg.OwnerUserID)
 	var i LockModelProviderForShareRow
@@ -734,7 +1098,8 @@ const lockProviderBindingRevisionForKeyShareNowait = `-- name: LockProviderBindi
 SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map, p.engine
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
-WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
+WHERE r.provider_id = $1 AND r.revision = $2
+  AND (p.owner_user_id = $3::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
 FOR KEY SHARE OF r NOWAIT
 `
 
@@ -756,8 +1121,8 @@ type LockProviderBindingRevisionForKeyShareNowaitRow struct {
 
 // The claim finisher's revision read (PRD #4320 module 5, D9): the same SELECT as
 // GetModelProviderRevisionForOwner but FOR KEY SHARE OF r NOWAIT. The finisher already holds the run
-// row and the key row FOR SHARE; DeleteModelProvider cascades the revision rows BEFORE the key row,
-// so a BLOCKING revision lock here against a provider delete mid-cascade is a lock cycle (40P01,
+// row and the key row FOR SHARE; a provider delete cascades the revision and key rows in either
+// order, so a BLOCKING revision lock here against a delete mid-cascade can be a lock cycle (40P01,
 // which the finishers do not retry). NOWAIT turns that contention into 55P03, which finishRunClaim /
 // finishChatClaim already retry as a bounded whole-transaction retry. A missing row is
 // pgx.ErrNoRows (stale).
@@ -776,12 +1141,200 @@ func (q *Queries) LockProviderBindingRevisionForKeyShareNowait(ctx context.Conte
 	return i, err
 }
 
+const lockProviderKeyForEvidence = `-- name: LockProviderKeyForEvidence :one
+SELECT k.id, k.enablement_rev FROM user_secrets k
+WHERE k.id = $1 AND k.user_id = $2 AND k.provider_id = $3
+  AND k.enablement_rev = $4 AND k.disabled_at IS NULL
+FOR SHARE
+`
+
+type LockProviderKeyForEvidenceParams struct {
+	KeyID      uuid.UUID   `json:"key_id"`
+	UserID     uuid.UUID   `json:"user_id"`
+	ProviderID pgtype.UUID `json:"provider_id"`
+	KeyRev     int64       `json:"key_rev"`
+}
+
+type LockProviderKeyForEvidenceRow struct {
+	ID            uuid.UUID `json:"id"`
+	EnablementRev int64     `json:"enablement_rev"`
+}
+
+// Second half of the Test evidence fence: the caller's key row for this definition, locked FOR SHARE,
+// only while it is the exact key the probe used (same row id and enablement revision) and enabled. A
+// rotation, disable or delete that committed first finds no row here; one still in flight holds the row
+// FOR UPDATE, so this waits for it and re-checks (READ COMMITTED), which also finds no row. Identity
+// is the exact key row id and provider id: it takes no visibility predicate because the provider lock
+// just before it already proved visibility.
+func (q *Queries) LockProviderKeyForEvidence(ctx context.Context, arg LockProviderKeyForEvidenceParams) (LockProviderKeyForEvidenceRow, error) {
+	row := q.db.QueryRow(ctx, lockProviderKeyForEvidence,
+		arg.KeyID,
+		arg.UserID,
+		arg.ProviderID,
+		arg.KeyRev,
+	)
+	var i LockProviderKeyForEvidenceRow
+	err := row.Scan(&i.ID, &i.EnablementRev)
+	return i, err
+}
+
+const lockSharedModelProviderCatalogue = `-- name: LockSharedModelProviderCatalogue :exec
+SELECT pg_advisory_xact_lock(
+    1970957680,
+    hashtext('00000000-0000-0000-0000-000000000000')
+)
+`
+
+// Serializes shared-definition creates so the shared cap (retired definitions included) cannot be passed
+// twice by two concurrent admins under READ COMMITTED: create runs this lock, then
+// CountSharedModelProviders, then InsertSharedModelProvider. The same advisory class as
+// LockModelProviderOwner (1970957680, store.ModelProviderOwnerLockClass), keyed by the nil UUID, which
+// no real owner can use (model_providers_owner_not_nil_check). XACT-scoped: it must run on a
+// transaction-bound Queries. Shared admin edits take NO per-user secret-mutation lock, and no lock
+// other than the definition row's own.
+// Authorized caller: the admin create path (cookie + CSRF) only.
+func (q *Queries) LockSharedModelProviderCatalogue(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockSharedModelProviderCatalogue)
+	return err
+}
+
+const lockSharedModelProviderForDelete = `-- name: LockSharedModelProviderForDelete :one
+SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+FOR UPDATE OF p
+`
+
+type LockSharedModelProviderForDeleteRow struct {
+	ID              uuid.UUID          `json:"id"`
+	Name            string             `json:"name"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+}
+
+// The delete transaction's first statement for a shared definition: FOR UPDATE conflicts with every other
+// row lock (including the KEY SHARE of key mutations and the FOR SHARE of run creation and evidence), so
+// the selection and key counts that follow cannot change before the delete commits. Authorized caller:
+// admin delete.
+func (q *Queries) LockSharedModelProviderForDelete(ctx context.Context, id uuid.UUID) (LockSharedModelProviderForDeleteRow, error) {
+	row := q.db.QueryRow(ctx, lockSharedModelProviderForDelete, id)
+	var i LockSharedModelProviderForDeleteRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+	)
+	return i, err
+}
+
+const lockSharedModelProviderForEdit = `-- name: LockSharedModelProviderForEdit :one
+SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+FOR NO KEY UPDATE OF p
+`
+
+type LockSharedModelProviderForEditRow struct {
+	ID              uuid.UUID          `json:"id"`
+	Name            string             `json:"name"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+}
+
+// The edit transaction's first statement for a shared definition: FOR NO KEY UPDATE takes the same lock
+// the bump and the rename would, so the order is fixed up front and a concurrent run-create share lock
+// (LockModelProviderForShare) waits for the edit. No per-user lock is involved. A retired definition is
+// returned so the handler can refuse it with the right error. Authorized caller: admin edit.
+func (q *Queries) LockSharedModelProviderForEdit(ctx context.Context, id uuid.UUID) (LockSharedModelProviderForEditRow, error) {
+	row := q.db.QueryRow(ctx, lockSharedModelProviderForEdit, id)
+	var i LockSharedModelProviderForEditRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+	)
+	return i, err
+}
+
+const lockVisibleProviderForEvidence = `-- name: LockVisibleProviderForEvidence :one
+SELECT p.id, p.engine, p.current_revision
+FROM model_providers p
+WHERE p.id = $1
+  AND (p.owner_user_id = $2::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+  AND p.current_revision = $3
+  AND p.retired_at IS NULL
+FOR SHARE OF p
+`
+
+type LockVisibleProviderForEvidenceParams struct {
+	ID       uuid.UUID `json:"id"`
+	UserID   uuid.UUID `json:"user_id"`
+	Revision int32     `json:"revision"`
+}
+
+type LockVisibleProviderForEvidenceRow struct {
+	ID              uuid.UUID `json:"id"`
+	Engine          string    `json:"engine"`
+	CurrentRevision int32     `json:"current_revision"`
+}
+
+// First half of the Test evidence fence, run in one short transaction AFTER the probe returns (no lock
+// spans the dial): the definition must still be visible to the CALLER, still at the probed revision and
+// not retired. FOR SHARE (not KEY SHARE) so a revision bump, which takes FOR NO KEY UPDATE, waits for
+// this transaction instead of committing past it. Followed by LockProviderKeyForEvidence, then
+// UpsertProviderKeyTestResult.
+func (q *Queries) LockVisibleProviderForEvidence(ctx context.Context, arg LockVisibleProviderForEvidenceParams) (LockVisibleProviderForEvidenceRow, error) {
+	row := q.db.QueryRow(ctx, lockVisibleProviderForEvidence, arg.ID, arg.UserID, arg.Revision)
+	var i LockVisibleProviderForEvidenceRow
+	err := row.Scan(&i.ID, &i.Engine, &i.CurrentRevision)
+	return i, err
+}
+
+const lockVisibleProviderForKeyMutation = `-- name: LockVisibleProviderForKeyMutation :one
+SELECT p.id, p.engine, p.current_revision, p.retired_at, p.credential_mode, p.owner_user_id
+FROM model_providers p
+WHERE p.id = $1
+  AND (p.owner_user_id = $2::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+FOR KEY SHARE OF p
+`
+
+type LockVisibleProviderForKeyMutationParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type LockVisibleProviderForKeyMutationRow struct {
+	ID              uuid.UUID          `json:"id"`
+	Engine          string             `json:"engine"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CredentialMode  pgtype.Text        `json:"credential_mode"`
+	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
+}
+
+// Enable, disable and delete take the visible definition's FOR KEY SHARE lock before the
+// caller's key row. It blocks a definition delete, and retired definitions remain eligible.
+// Key PUT instead takes LockModelProviderForShare to fence retirement and edits.
+func (q *Queries) LockVisibleProviderForKeyMutation(ctx context.Context, arg LockVisibleProviderForKeyMutationParams) (LockVisibleProviderForKeyMutationRow, error) {
+	row := q.db.QueryRow(ctx, lockVisibleProviderForKeyMutation, arg.ID, arg.UserID)
+	var i LockVisibleProviderForKeyMutationRow
+	err := row.Scan(
+		&i.ID,
+		&i.Engine,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.CredentialMode,
+		&i.OwnerUserID,
+	)
+	return i, err
+}
+
 const pruneModelProviderRevisions = `-- name: PruneModelProviderRevisions :execrows
 DELETE FROM model_provider_revisions rev
 USING model_providers p
 WHERE rev.provider_id = $1
   AND p.id = rev.provider_id
-  AND p.owner_user_id = $2
+  AND p.owner_user_id = $2::uuid
   AND rev.revision <> p.current_revision
   AND NOT EXISTS (
         SELECT 1 FROM runs r
@@ -805,18 +1358,62 @@ func (q *Queries) PruneModelProviderRevisions(ctx context.Context, arg PruneMode
 	return result.RowsAffected(), nil
 }
 
+const pruneSharedModelProviderRevisions = `-- name: PruneSharedModelProviderRevisions :execrows
+DELETE FROM model_provider_revisions rev
+USING model_providers p
+WHERE rev.provider_id = $1
+  AND p.id = rev.provider_id
+  AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+  AND rev.revision <> p.current_revision
+  AND NOT EXISTS (
+        SELECT 1 FROM runs r
+         WHERE r.model_provider_id = rev.provider_id
+           AND r.model_provider_revision = rev.revision)
+`
+
+// Deletes a shared definition's non-current revisions that NO run row references, as
+// PruneModelProviderRevisions does for a personal one: its own statement after the edit commit.
+// Authorized caller: admin edit.
+func (q *Queries) PruneSharedModelProviderRevisions(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneSharedModelProviderRevisions, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const renameModelProvider = `-- name: RenameModelProvider :execrows
-UPDATE model_providers SET name = $3 WHERE id = $1 AND owner_user_id = $2
+UPDATE model_providers SET name = $1 WHERE id = $2 AND owner_user_id = $3::uuid
 `
 
 type RenameModelProviderParams struct {
+	Name        string    `json:"name"`
 	ID          uuid.UUID `json:"id"`
 	OwnerUserID uuid.UUID `json:"owner_user_id"`
-	Name        string    `json:"name"`
 }
 
 func (q *Queries) RenameModelProvider(ctx context.Context, arg RenameModelProviderParams) (int64, error) {
-	result, err := q.db.Exec(ctx, renameModelProvider, arg.ID, arg.OwnerUserID, arg.Name)
+	result, err := q.db.Exec(ctx, renameModelProvider, arg.Name, arg.ID, arg.OwnerUserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const renameSharedModelProvider = `-- name: RenameSharedModelProvider :execrows
+UPDATE model_providers SET name = $1
+WHERE id = $2 AND owner_user_id IS NULL AND credential_mode = 'per_user_key'
+`
+
+type RenameSharedModelProviderParams struct {
+	Name string    `json:"name"`
+	ID   uuid.UUID `json:"id"`
+}
+
+// Authorized caller: admin edit. A case-insensitive name collision is a unique violation
+// (model_providers_shared_name_lower_key).
+func (q *Queries) RenameSharedModelProvider(ctx context.Context, arg RenameSharedModelProviderParams) (int64, error) {
+	result, err := q.db.Exec(ctx, renameSharedModelProvider, arg.Name, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -824,7 +1421,7 @@ func (q *Queries) RenameModelProvider(ctx context.Context, arg RenameModelProvid
 }
 
 const retireModelProvider = `-- name: RetireModelProvider :execrows
-UPDATE model_providers SET retired_at = COALESCE(retired_at, now()) WHERE id = $1 AND owner_user_id = $2
+UPDATE model_providers SET retired_at = COALESCE(retired_at, now()) WHERE id = $1 AND owner_user_id = $2::uuid
 `
 
 type RetireModelProviderParams struct {
@@ -841,38 +1438,36 @@ func (q *Queries) RetireModelProvider(ctx context.Context, arg RetireModelProvid
 	return result.RowsAffected(), nil
 }
 
-const setUserClaudeProviderSource = `-- name: SetUserClaudeProviderSource :one
-UPDATE users
-SET claude_provider_id = CASE WHEN $1::bool THEN $2::uuid ELSE claude_provider_id END
-WHERE id = $3
-RETURNING claude_provider_id
+const retireSharedModelProvider = `-- name: RetireSharedModelProvider :execrows
+UPDATE model_providers SET retired_at = COALESCE(retired_at, now())
+WHERE id = $1 AND owner_user_id IS NULL AND credential_mode = 'per_user_key'
 `
 
-type SetUserClaudeProviderSourceParams struct {
-	SetSource  bool        `json:"set_source"`
-	ProviderID pgtype.UUID `json:"provider_id"`
-	ID         uuid.UUID   `json:"id"`
-}
-
-// Sets or clears (NULL) the owner's Claude provider source. The CASE/narg shape of
-// SetUserHarnessModels, not COALESCE: a NULL provider_id CLEARS the setting. The composite foreign
-// key (users_claude_provider_fkey) rejects a provider owned by another user. Usability is checked by
-// the caller, which holds the owner's secret-mutation lock.
-func (q *Queries) SetUserClaudeProviderSource(ctx context.Context, arg SetUserClaudeProviderSourceParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, setUserClaudeProviderSource, arg.SetSource, arg.ProviderID, arg.ID)
-	var claude_provider_id pgtype.UUID
-	err := row.Scan(&claude_provider_id)
-	return claude_provider_id, err
+// Idempotent: the first retirement time is kept. Authorized caller: admin retire.
+func (q *Queries) RetireSharedModelProvider(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, retireSharedModelProvider, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setUserProviderSource = `-- name: SetUserProviderSource :one
 UPDATE users u
 SET claude_provider_id = CASE WHEN $1::text = 'claude' THEN $2::uuid ELSE claude_provider_id END,
+    claude_provider_scope_id = CASE WHEN $1::text = 'claude'
+        THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $2::uuid)
+        ELSE claude_provider_scope_id END,
     codex_provider_id = CASE WHEN $1::text = 'codex' THEN $2::uuid ELSE codex_provider_id END
 WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
-  AND ($2::uuid IS NULL OR EXISTS (
-      SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
-        AND p.owner_user_id = u.id AND p.engine = $1::text))
+  AND ($2::uuid IS NULL
+       OR ($1::text = 'claude' AND EXISTS (
+            SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
+              AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+              AND p.engine = 'claude'))
+       OR ($1::text = 'codex' AND EXISTS (
+            SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
+              AND p.owner_user_id = u.id AND p.engine = 'codex')))
 RETURNING claude_provider_id, codex_provider_id
 `
 
@@ -887,7 +1482,13 @@ type SetUserProviderSourceRow struct {
 	CodexProviderID  pgtype.UUID `json:"codex_provider_id"`
 }
 
-// Owner and engine must match for a non-null selection; clearing is explicit.
+// Sets or clears (NULL) the caller's source for one engine; a NULL provider_id CLEARS the setting and
+// the engine must be named. The Claude branch accepts a definition visible to the caller (their own
+// or a shared per-user-key one) and writes claude_provider_scope_id from that definition in the same
+// statement (NULL when clearing); the Codex branch accepts only the caller's own Codex definition and
+// never touches the Claude scope. The composite foreign keys (users_claude_provider_fkey,
+// users_codex_provider_fkey) independently reject a definition the caller may not use. Usability is
+// checked by the caller, which holds the user's secret-mutation lock.
 func (q *Queries) SetUserProviderSource(ctx context.Context, arg SetUserProviderSourceParams) (SetUserProviderSourceRow, error) {
 	row := q.db.QueryRow(ctx, setUserProviderSource, arg.Engine, arg.ProviderID, arg.ID)
 	var i SetUserProviderSourceRow
@@ -899,7 +1500,7 @@ const upsertModelProviderProbeResult = `-- name: UpsertModelProviderProbeResult 
 INSERT INTO model_provider_probe_results (provider_id, revision, auth_result, tool_result, probed_at)
 SELECT p.id, p.current_revision, $1, $2, now()
 FROM model_providers p
-WHERE p.id = $3 AND p.owner_user_id = $4 AND p.current_revision = $5
+WHERE p.id = $3 AND p.owner_user_id = $4::uuid AND p.current_revision = $5
 ON CONFLICT (provider_id, revision) DO UPDATE
 SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, probed_at = EXCLUDED.probed_at
 `
@@ -912,6 +1513,9 @@ type UpsertModelProviderProbeResultParams struct {
 	Revision    int32       `json:"revision"`
 }
 
+// LEGACY provider-wide cache, no longer written or read by the current API: Test evidence now lives
+// in model_provider_key_test_results (UpsertProviderKeyTestResult). Kept for the image-only rollback
+// test, which proves an older API image's upsert still works against the retained table.
 // Stores the latest Test probe result for the provider's CURRENT revision only (PRD #4320 section
 // 8): the row is written only while the owner's provider still has that revision as its current
 // one, so a probe that raced an edit (or a retire/delete) writes nothing and returns 0 rows. One
@@ -928,4 +1532,39 @@ func (q *Queries) UpsertModelProviderProbeResult(ctx context.Context, arg Upsert
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const upsertProviderKeyTestResult = `-- name: UpsertProviderKeyTestResult :exec
+INSERT INTO model_provider_key_test_results (provider_id, user_id, revision, key_secret_id, key_enablement_rev, auth_result, tool_result, probed_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+ON CONFLICT (provider_id, user_id) DO UPDATE
+SET revision = EXCLUDED.revision, key_secret_id = EXCLUDED.key_secret_id,
+    key_enablement_rev = EXCLUDED.key_enablement_rev, auth_result = EXCLUDED.auth_result,
+    tool_result = EXCLUDED.tool_result, probed_at = EXCLUDED.probed_at
+`
+
+type UpsertProviderKeyTestResultParams struct {
+	ProviderID       uuid.UUID   `json:"provider_id"`
+	UserID           uuid.UUID   `json:"user_id"`
+	Revision         int32       `json:"revision"`
+	KeySecretID      uuid.UUID   `json:"key_secret_id"`
+	KeyEnablementRev int64       `json:"key_enablement_rev"`
+	AuthResult       string      `json:"auth_result"`
+	ToolResult       pgtype.Text `json:"tool_result"`
+}
+
+// Records the Test evidence for one (provider, user): the exact tuple the probe ran against. Called only
+// after LockVisibleProviderForEvidence and LockProviderKeyForEvidence both returned a row in the same
+// transaction; the foreign keys (provider revision, user, user key) are the structural backstop.
+func (q *Queries) UpsertProviderKeyTestResult(ctx context.Context, arg UpsertProviderKeyTestResultParams) error {
+	_, err := q.db.Exec(ctx, upsertProviderKeyTestResult,
+		arg.ProviderID,
+		arg.UserID,
+		arg.Revision,
+		arg.KeySecretID,
+		arg.KeyEnablementRev,
+		arg.AuthResult,
+		arg.ToolResult,
+	)
+	return err
 }

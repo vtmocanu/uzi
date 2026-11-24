@@ -517,6 +517,32 @@ void _releaseCheckStatusFull;
   void _repoFull;
 }
 
+// ── Personal and admin-shared provider contracts ────────────────────────────
+import providerZero from "../../../fixtures/api-contract/provider.zero.json";
+import providerFull from "../../../fixtures/api-contract/provider.full.json";
+import sharedProviderZero from "../../../fixtures/api-contract/admin_shared_provider.zero.json";
+import sharedProviderFull from "../../../fixtures/api-contract/admin_shared_provider.full.json";
+import sharedProviderListZero from "../../../fixtures/api-contract/admin_shared_provider_list.zero.json";
+import sharedProviderListFull from "../../../fixtures/api-contract/admin_shared_provider_list.full.json";
+import type { AdminSharedProvider, AdminSharedProviderList, ProviderDTO } from "./apiTypes";
+
+{
+  type KeyDifference<A, B> = Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>;
+  const providerKeys: never = null as unknown as KeyDifference<ProviderDTO, typeof providerFull>;
+  const sharedKeys: never = null as unknown as KeyDifference<AdminSharedProvider, typeof sharedProviderFull>;
+  const listKeys: never = null as unknown as KeyDifference<AdminSharedProviderList, typeof sharedProviderListFull>;
+  const listRowKeys: never = null as unknown as KeyDifference<AdminSharedProvider, (typeof sharedProviderListFull.providers)[number]>;
+
+  const providerEmpty: ZeroOf<ProviderDTO> = providerZero;
+  const providerRecorded: Widen<ProviderDTO> = providerFull;
+  const sharedEmpty: ZeroOf<AdminSharedProvider> = sharedProviderZero;
+  const sharedRecorded: Widen<AdminSharedProvider> = sharedProviderFull;
+  // The admin handler initializes the list, including when it has zero rows.
+  const listEmpty: ZeroOf<AdminSharedProviderList, "providers"> = sharedProviderListZero;
+  const listRecorded: Widen<AdminSharedProviderList> = sharedProviderListFull;
+  void [providerKeys, sharedKeys, listKeys, listRowKeys, providerEmpty, providerRecorded, sharedEmpty, sharedRecorded, listEmpty, listRecorded];
+}
+
 // ── Admin Docker allowlist picker ───────────────────────────────────────────
 {
   const _rowMissing: never = null as unknown as Exclude<keyof AdminDockerAllowlistRepo, keyof typeof dockerAllowlistRepoFull>;

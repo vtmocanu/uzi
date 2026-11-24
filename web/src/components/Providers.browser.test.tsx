@@ -9,7 +9,7 @@ vi.mock("../lib/api", async original => {
   const actual = await original<typeof import("../lib/api")>();
   return { ...actual, api: {
     listProviders: vi.fn(), getMySettings: vi.fn(), createProvider: vi.fn(),
-    putProviderKey: vi.fn(), testProvider: vi.fn(), setCodexProviderSource: vi.fn(),
+    putProviderKey: vi.fn(), testProvider: vi.fn(), setCodexProviderSource: vi.fn(), setClaudeProviderSource: vi.fn(),
   } };
 });
 afterEach(cleanup);
@@ -23,7 +23,7 @@ it("creates, keys, tests, selects and clears Codex while preserving Claude", asy
   mock.listProviders.mockImplementation(async () => ({ enabled: true, allowed_base_urls: [url], providers }));
   mock.getMySettings.mockImplementation(async () => ({ settings: { claude_provider_id: "claude-existing", codex_provider_id: codex } }) as never);
   mock.createProvider.mockImplementation(async input => {
-    const provider: ProviderDTO = { ...input, engine: "codex", protocol: "openai_responses", id: "code", retired: false, current_revision: 1, has_key: false, key_enabled: false, probe: null };
+    const provider: ProviderDTO = { ...input, engine: "codex", protocol: "openai_responses", id: "code", retired: false, current_revision: 1, credential_mode: null, has_key: false, key_enabled: false, probe: null };
     providers = [provider];
     return { provider };
   });
@@ -61,4 +61,53 @@ it("creates, keys, tests, selects and clears Codex while preserving Claude", asy
   expect(screen.getByTestId("claude-source").textContent).toContain("a provider that no longer exists");
   expect(codex).toBeNull();
   expect(mock.putProviderKey).toHaveBeenCalledWith("code", secret);
+});
+
+// PRD #4324: an admin-shared x-api-key definition at phone width. The custody disclosure must
+// stack its two columns and never overflow the row; at desktop width they sit side by side.
+// Attach, then select through the disclosure, with no owner action anywhere on the row.
+it("lays out the shared-provider disclosure at 390px and 1100px, then attaches and selects", async () => {
+  const mock = vi.mocked(api);
+  const url = "https://gateway.example.com/a/very/long/path/that/must/wrap/inside/the/disclosure/v1";
+  let row: ProviderDTO = {
+    id: "s1", name: "platform-gateway", engine: "claude", retired: false, current_revision: 2,
+    protocol: "anthropic_messages", base_url: url, auth_style: "x_api_key",
+    model_map: { haiku: { model: "platform-small", context_window: 65536 } },
+    credential_mode: "per_user_key", has_key: false, key_enabled: false, probe: null,
+  };
+  let claude: string | null = null;
+  mock.listProviders.mockImplementation(async () => ({ enabled: true, allowed_base_urls: [url], providers: [row] }));
+  mock.getMySettings.mockImplementation(async () => ({ settings: { claude_provider_id: claude, codex_provider_id: null } }) as never);
+  mock.putProviderKey.mockImplementation(async () => { row = { ...row, has_key: true, key_enabled: true }; return { provider: row }; });
+  mock.setClaudeProviderSource.mockImplementation(async id => { claude = id; return { claude_provider_id: id }; });
+
+  await page.viewport(390, 844);
+  render(<div className="px-4"><Providers /></div>);
+  const r = within(await screen.findByTestId("provider-s1"));
+  expect(r.getByText("Managed by your admin")).toBeTruthy();
+  for (const name of ["Edit name and models", "Edit endpoint", "Retire", "Delete"]) expect(r.queryByRole("button", { name })).toBeNull();
+  await userEvent.click(r.getByRole("button", { name: "Set key" }));
+  const box = r.getByRole("region", { name: "Before you attach your key" });
+  const [admin, mine] = Array.from(box.querySelectorAll("h4")).map(h => h.parentElement!.getBoundingClientRect());
+  expect(mine.top).toBeGreaterThanOrEqual(admin.bottom - 1); // stacked on a phone
+  expect(box.scrollWidth).toBeLessThanOrEqual(box.clientWidth + 1);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+  expect(r.getByTestId("shared-disclosure-xapikey-s1")).toBeTruthy();
+
+  await page.viewport(1100, 900);
+  await waitFor(() => {
+    const [a, m] = Array.from(box.querySelectorAll("h4")).map(h => h.parentElement!.getBoundingClientRect());
+    expect(Math.abs(a.top - m.top)).toBeLessThan(2); // side by side on a desktop
+    expect(m.left).toBeGreaterThan(a.right - 1);
+  });
+
+  await userEvent.fill(r.getByLabelText("Provider key"), "k".repeat(24));
+  await userEvent.click(r.getByRole("button", { name: "Save key" }));
+  await waitFor(() => expect(r.queryByLabelText("Provider key")).toBeNull());
+  await userEvent.click(r.getByRole("button", { name: "Use as Claude source" }));
+  expect(mock.setClaudeProviderSource).not.toHaveBeenCalled();
+  await r.findByRole("region", { name: "Before you use this provider" });
+  await userEvent.click(r.getByRole("button", { name: "Confirm and use as Claude source" }));
+  await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toContain("platform-gateway (managed by your admin)"));
+  expect(claude).toBe("s1");
 });

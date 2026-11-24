@@ -237,6 +237,7 @@ uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi admin egress-profile list | show <name>
+uzi admin provider list | get <id|name>
 uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
@@ -1351,6 +1352,16 @@ A few worth knowing:
   triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
   need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
   the cross-user Mark done and Undo stay cookie-only in the web UI.
+- **`admin provider list` and `admin provider get <id|name>` read the
+  [admin-shared providers](providers.md#admin-shared-providers)** (PRD #4324),
+  model provider definitions an admin shares with every user. `list` prints `NAME`,
+  `ENGINE`, `URL`, `AUTH`, `RETIRED`, `REVISION`, `SELECTED` (users who selected it)
+  and `KEYS` (users with a key attached). `get` takes the id, or the name matched
+  without regard to case, and prints the fields plus the model map; an unknown
+  id or name exits 4 (a personal provider is never shown). `--json` carries the
+  same fields. Read-only and need an `admin_ro` (`uza_`) token; there is no write
+  verb, because creating, editing, retiring and deleting a shared definition are
+  cookie-only admin writes in the web app (Admin → Shared providers).
 - **`admin egress-profile list` and `admin egress-profile show <name>` read the
   [egress profiles](egress-profiles.md)** (PRD #1906), the named site lists for
   official-sources research. `list` prints `NAME`, `HOSTS` (entry count),
@@ -3017,7 +3028,7 @@ Anthropic-compatible one for the Claude engine, or a Responses-compatible one fo
 engine. The CLI manages the parts that never handle a credential:
 
 ```sh
-uzi provider list                              # NAME, ENGINE, URL, AUTH, MODELS, KEY, TEST, RETIRED
+uzi provider list                              # NAME, ENGINE, URL, AUTH, MODELS, KEY, TEST, RETIRED, MANAGED BY
 uzi provider create --name corp-gw --base-url https://gw.example.com/anthropic \
   --model haiku=corp-haiku:200000 --model sonnet=corp-sonnet:200000
 uzi provider create --engine codex --name code-gw --base-url https://gw.example.com/openai \
@@ -3074,6 +3085,16 @@ provider)". Claude provider runs start on workers that advertise `claude_provide
 ones on workers that advertise `codex_provider_v1` together with the Codex harness capabilities; an
 older worker leaves them queued ("no worker that supports model providers is online"). See [Model
 providers](./providers.md).
+
+**Admin-shared providers.** `list` also shows definitions your admin shares ([Admin-shared
+providers](./providers.md#admin-shared-providers)); the `MANAGED BY` column says `you` for your own
+and `admin` for a shared one (`--json` carries `credential_mode: "per_user_key"` on shared rows).
+`use` and `test` accept either kind and `use` prints "(shared by your admin)" for a shared one. When an
+owned and a shared definition have the same name, `use` and `test` exit 2 and list the matching ids
+(each marked `yours` or `admin`): pass an id. `edit` and `retire` resolve only your own definitions; a
+name or id that identifies a shared one exits 5 with "managed by your admin; only an admin can change
+it", before any write request. The key is still attached in Settings, and your own key and Test result are
+the only ones the CLI shows.
 
 ## Anthropic tokens
 

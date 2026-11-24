@@ -1,0 +1,67 @@
+{
+  "providers": [
+    {
+      "id": "x",
+      "name": "x",
+      "engine": "x",
+      "retired": true,
+      "current_revision": 1,
+      "protocol": "x",
+      "base_url": "x",
+      "auth_style": "x",
+      "model_map": {
+        "default": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-6-astra": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-5.6-sol": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-6-sol": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-6.1-sol": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-6.2-sol": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-6.2-astra": {
+          "model": "x",
+          "context_window": 1
+        },
+        "gpt-6-luna": {
+          "model": "x",
+          "context_window": 1
+        },
+        "opus": {
+          "model": "x",
+          "context_window": 1
+        },
+        "sonnet": {
+          "model": "x",
+          "context_window": 1
+        },
+        "haiku": {
+          "model": "x",
+          "context_window": 1
+        },
+        "fable": {
+          "model": "x",
+          "context_window": 1
+        }
+      },
+      "credential_mode": "x",
+      "selected_user_count": 1,
+      "attached_key_count": 1
+    }
+  ]
+}

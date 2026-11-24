@@ -341,12 +341,12 @@ func TestProviderRetireDeleteAndSourceLiveDB(t *testing.T) {
 		t.Errorf("edit of a retired provider = %d %s", rec.Code, rec.Body.String())
 	}
 	// Deleting a provider that is selected as a source is refused with a typed 409.
-	cliMustExec(t, f.pool, `UPDATE users SET claude_provider_id = $2 WHERE id = $1`, f.user, p.ID)
+	cliMustExec(t, f.pool, `UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, f.user, p.ID)
 	rec = cookieReq(t, f.router, http.MethodDelete, id, f.jwt, "")
 	if rec.Code != http.StatusConflict || providerReason(t, rec) != "provider_in_use_as_source" {
 		t.Fatalf("delete of a selected provider = %d %s, want 409 provider_in_use_as_source", rec.Code, rec.Body.String())
 	}
-	cliMustExec(t, f.pool, `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, f.user)
+	cliMustExec(t, f.pool, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, f.user)
 	if rec := cookieReq(t, f.router, http.MethodDelete, id, f.jwt, ""); rec.Code != http.StatusNoContent {
 		t.Fatalf("delete = %d %s", rec.Code, rec.Body.String())
 	}
