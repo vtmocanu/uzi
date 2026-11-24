@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -178,7 +179,56 @@ func TestProviderJudgeQueuedModelUnmappedLiveDB(t *testing.T) {
 	if err != nil || payload != nil {
 		t.Fatalf("Claim = (%v, %v), want nothing delivered", payload != nil, err)
 	}
-	p.wantFailedTerminally(judge.ID, holdProviderModelUnmapped)
+	got := p.wantFailedTerminally(judge.ID, holdProviderModelUnmapped)
+	// The token appears once: the refusal's Detail is bare text, not the typed error's own rendering.
+	if n := strings.Count(got.FailureReason.String, holdProviderModelUnmapped); n != 1 {
+		t.Fatalf("failure_reason %q carries %s %d times, want once", got.FailureReason.String, holdProviderModelUnmapped, n)
+	}
+}
+
+// TestProviderJudgeRotationBetweenAssemblyAndFinishLiveDB: the judge twin of
+// TestProviderClaimRotationBetweenAssemblyAndFinishLiveDB. The binding is intact at assembly (the
+// hook proves assembly delivered a payload) and revoked only afterwards, so the finisher's locked
+// re-check is the sole thing that can catch it: nothing is delivered and the judge fails terminally
+// (credential_unavailable), never parks, and records no vendor credential or epoch.
+func TestProviderJudgeRotationBetweenAssemblyAndFinishLiveDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		revoke func(p *pjFix)
+		reason string
+	}{
+		{"key rotated", func(p *pjFix) {
+			p.env.exec(`UPDATE user_secrets SET enablement_rev = enablement_rev + 1 WHERE id = $1`, p.key)
+		}, holdProviderBindingStale},
+		{"key disabled", func(p *pjFix) {
+			p.env.exec(`UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, p.key)
+		}, holdProviderBindingStale},
+		{"key deleted", func(p *pjFix) { p.env.exec(`DELETE FROM user_secrets WHERE id = $1`, p.key) }, holdProviderBindingStale},
+		{"url removed from the allowlist", func(p *pjFix) { p.svc.p.ProviderAllowedBaseURLs = []string{pcOtherURL} }, holdProviderDestinationNotAllowed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPJFix(t)
+			judge := p.createdJudge()
+			assembled := false
+			p.svc.claimHooks = &claimTestHooks{
+				afterAssembly: func(_ context.Context, run store.Run, payload *ClaimPayload, err error) {
+					if run.ID == judge.ID && err == nil && payload != nil && payload.Secrets.Provider != nil {
+						assembled = true
+					}
+					tc.revoke(p)
+				},
+			}
+			payload, err := p.svc.Claim(p.env.ctx, p.worker(), nil)
+			if err != nil || payload != nil {
+				t.Fatalf("Claim = (%v, %v), want nothing delivered", payload != nil, err)
+			}
+			if !assembled {
+				t.Fatal("assembly did not succeed before the revocation, so the locked re-check was not what refused")
+			}
+			p.wantFailedTerminally(judge.ID, tc.reason)
+		})
+	}
 }
 
 func TestProviderJudgeCodexBoundRefusedLiveDB(t *testing.T) {

@@ -195,7 +195,8 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// transient nor terminal, so it must pass this early return to reach the fenced park. So is
 	// errRunOverrideUnavailable (PRD #3250), which parks on its own hold.
 	// PRD #4320 module 5: a provider claim refusal (revoked binding) is its own non-terminal
-	// classification, like errCredentialDisabled: it parks the run for the owner.
+	// classification, like errCredentialDisabled: it parks the run for the owner
+	// (except a provider judge, which finishRunClaimTx fails terminally, PRD #4322 D-G).
 	_, providerRefused := isProviderClaimRefusal(assemblyErr)
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
 		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !providerRefused {
@@ -408,7 +409,8 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// above, against the frozen binding: the key row is locked FOR SHARE NOWAIT (55P03 rolls back for
 	// finishRunClaim's bounded retry, a missing row is stale) and the frozen URL must still be on the
 	// operator allowlist. A refusal (from assembly, or found now) delivers nothing and parks the run
-	// `paused` with hold_reason = the literal; it never falls back to a vendor credential. Revocation
+	// `paused` with hold_reason = the literal (a provider JUDGE is the exception: PRD #4322 D-G fails it
+	// terminally, credential_unavailable, below); it never falls back to a vendor credential. Revocation
 	// applies at this claim only: a claim already delivered is never re-checked.
 	providerRefusal, _ := isProviderClaimRefusal(assemblyErr)
 	if providerRefusal == nil && assemblyErr == nil && payload != nil && providerBoundRun(locked) {

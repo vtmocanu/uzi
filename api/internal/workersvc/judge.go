@@ -1227,7 +1227,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 			return nil, fmt.Errorf("%w: judge model: %w", errCredentialUnavailable, merr)
 		}
 		if !modelMapped(providerBinding.ModelMap, model) {
-			return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: (&ProviderModelUnmappedError{Model: model, Source: "judge"}).Error()}
+			return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: fmt.Sprintf("model %q (judge) is not mapped by the provider", model)}
 		}
 		judgeModel = &model
 		if len(dropped) > 0 {
