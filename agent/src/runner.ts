@@ -370,6 +370,9 @@ const TERMINAL_RUN_STATUSES = new Set(["cancelled", "completed", "failed"]);
  *  report is produced while the run is at the `running` (finalize) phase, so this is the honest
  *  value; kept as one constant so every site agrees. */
 const TERMINAL_JOURNAL_PHASE = "running";
+/** issue #4645: warn logged when a permanent message failure lands after a confirmed hold or wall park. */
+export const CONFIRMED_DISPOSITION_TRIP_LOG =
+  "permanent message failure after a confirmed hold or wall park; keeping the accepted disposition";
 
 /** PRD #1391 Run B M4: the FIXED log line the queued-duplicate claim router emits when it ends the
  *  attempt WITHOUT executing (a terminal/held row, a different generation, a definitive not-owned, or
@@ -3029,10 +3032,12 @@ interface RunFlight {
   parked: boolean;
   /** Accepted pause ACK; delivery failures must not replace this park with a terminal. */
   pauseParkAccepted: boolean;
-  /** Issue #1784: true only once the server answered `paused` to a completion hold or a wall park on
-   *  THIS flight (enterCompletionHold / enterWallPark). A confirmed-`paused` run's credential
-   *  reconcile is refused by the server. executeClaim also bypasses the finalize boundary for
-   *  unresolved completionHeld results. An undeliverable wall park leaves this false. */
+  /** Issues #1784, #4645: true only once the server answered `paused` to a hold or wall park on THIS flight.
+   *  Set by enterCompletionHold (confirmed; also via the interlocked hold and the prepush completion-attempt
+   *  finish), enterPreflightHold and enterPhaseSwitchHold (`held`), enterWallPark (confirmedPark). Cleared by
+   *  retainForPublicationReconciliation and at enterCompletionHold request start. Read by executeClaim (finalize
+   *  bypass), canYieldMemoryToOwnerPause and handlePermanentFailure (keeps the accepted disposition on a breaker
+   *  trip). An undeliverable wall park leaves this false. */
   holdOrWallParkConfirmed: boolean;
   /** Process-local hold proof; unresolved retains artifacts without claiming a park. */
   completionHoldOutcome: "none" | "unresolved" | "confirmed" | "refused";
@@ -9026,6 +9031,15 @@ export class RunRunner {
       flight.restoreTransportStopped = true;
       this.retainWorkerMemoryCustody(flight);
       if (!flight.cancel.signal.aborted) flight.cancel.abort(new RetainedRecoveryStop());
+      return;
+    }
+    // issue #4645: the server already accepted a completion/preflight/phase-switch hold or a wall park (paused) on this flight, so a
+    // permanent message failure after that confirmation (in practice the final drain) must not turn that accepted disposition into a
+    // `failed` report, an abort or a terminal reap. workerMemory.hold keeps precedence (above). Not covered here (tracked in #4646):
+    // trips during an unresolved or refused hold request, the phase-switch pre-request flush, the wall pre-park flush and the
+    // reportWallPark window, and a callback already entered before the flag was set.
+    if (flight.holdOrWallParkConfirmed) {
+      flight.runLog.warn(CONFIRMED_DISPOSITION_TRIP_LOG, { run_id: flight.runId, reason });
       return;
     }
     if (flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
