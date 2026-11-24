@@ -56,7 +56,9 @@ const pendingJudges: Record<string, PendingJudge> = Object.fromEntries(
 
 // The recorded automatic-judge skips (PRD #3257), the same mutable-copy pattern. getRunReview
 // reads it; rerunJudge refuses a skipped target (the demo owner still has no usable credential
-// for the judge's harness), so no mock judge is ever created over a skip row.
+// for the judge's harness, or a provider refusal still applies), so no mock judge is created
+// over a skip row, except a historical Claude provider_lane_unsupported row (#4322 M1a), which
+// the real server now judges on the owner's provider source.
 const judgeSkips: Record<string, JudgeSkip> = Object.fromEntries(
   Object.entries(mockJudgeSkips).map(([id, s]) => [id, { ...s }]),
 );
@@ -999,8 +1001,8 @@ export const judgeApi = {
     if (pendingJudges[id]) {
       throw new ApiError(409, "a judge run is already in progress for this run");
     }
-    // PRD #3257: a skipped target's owner still has no usable credential for the judge's
-    // harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
+    // PRD #3257: a skipped target's owner (other than the historical Claude lane row below)
+    // still has no usable credential for the judge's harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
     // no_credential_for_harness body) and the panel shows it inline. No judge is created on
     // the other harness.
     // A historical Claude provider_lane_unsupported row (#4322 M1a): a Claude judge now runs on
