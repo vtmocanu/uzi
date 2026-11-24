@@ -137,14 +137,21 @@ func countRows(t *testing.T, s *sharedFx, query string, args ...any) int {
 func TestSharedProviderVisibilityLiveDB(t *testing.T) {
 	s := newSharedFx(t, true)
 	priv := s.f.create(t, s.personalBody("corp-gw"))
+	own := s.b.create(t, s.personalBody("b-own-gw"))
 
 	rec := bearerReqBody(s.b.router, http.MethodGet, "/api/me/providers", s.b.uzc, "")
 	var list apitypes.ProviderListDTO
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &list) != nil {
 		t.Fatalf("B list = %d %s", rec.Code, rec.Body.String())
 	}
-	sawShared := false
+	sawShared, sawOwn := false, false
 	for _, p := range list.Providers {
+		if p.ID == own.ID {
+			sawOwn = true
+			if p.CredentialMode != nil {
+				t.Errorf("B's own provider has credential_mode %q", *p.CredentialMode)
+			}
+		}
 		if p.ID == priv.ID {
 			t.Errorf("B's list contains A's private provider")
 		}
@@ -157,6 +164,9 @@ func TestSharedProviderVisibilityLiveDB(t *testing.T) {
 	}
 	if !sawShared {
 		t.Errorf("B's list lacks the shared definition: %s", rec.Body.String())
+	}
+	if !sawOwn || len(list.Providers) != 2 {
+		t.Errorf("B's list = %d providers (own present %v), want exactly B's own and the shared one: %s", len(list.Providers), sawOwn, rec.Body.String())
 	}
 	// A personal provider has a null credential_mode on the wire.
 	rec = bearerReqBody(s.f.router, http.MethodGet, "/api/me/providers/"+priv.ID, s.f.uzc, "")
