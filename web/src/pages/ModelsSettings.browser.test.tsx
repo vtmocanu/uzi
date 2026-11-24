@@ -268,9 +268,10 @@ describe("Models grid layout", () => {
     },
   );
 
-  // #4665: the saved prediction is a tag; a long custom model ID wraps inside it on a phone
-  // instead of widening the page, and the tag's text stays at AA contrast on its own fill.
-  it("wraps a long custom model ID inside its saved-prediction tag at 390px", async () => {
+  // #4665/#4671: a long model ID in a shown saved line (here the server resolves another value
+  // than the saved choice, so the line shows) wraps on a phone instead of widening the page, and
+  // the line and the Reset to default button stay at AA contrast.
+  it("wraps a long model ID inside its saved line at 390px", async () => {
     const long = "acme-internal-finetune-claude-opus-distilled-2026-11-24-experiment-b";
     mockApi.getEffectiveSettings.mockResolvedValue({
       ...effective,
@@ -288,21 +289,26 @@ describe("Models grid layout", () => {
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
   });
 
-  it.each(["dawn", "hall", "shadow", "ember", "mission"])("keeps the saved-prediction tag at AA contrast on %s", async (theme) => {
+  it.each(["dawn", "hall", "shadow", "ember", "mission"])("keeps the saved line and Reset to default at AA contrast on %s", async (theme) => {
     document.documentElement.setAttribute("data-theme", theme);
     try {
       await mount(1280);
-      for (const name of ["Default harness", "Worker model — Claude", "Worker model — Codex"]) {
-        const tag = cellOf(name).querySelector<HTMLElement>("[data-prediction]")!;
-        expect(textContrast(tag), `${theme} ${name}`).toBeGreaterThanOrEqual(4.5);
+      // Default harness hides its value (automatic); Worker model — Codex is changed by mount().
+      for (const name of ["Default harness", "Worker model — Codex"]) {
+        const line = cellOf(name).querySelector<HTMLElement>("[data-prediction]")!;
+        expect(textContrast(line), `${theme} ${name}`).toBeGreaterThanOrEqual(4.5);
       }
+      // A saved override the select already shows: no visible line, a Reset button instead.
+      expect(cellOf("Worker model — Claude").querySelector("[data-prediction]")).toBeNull();
+      const reset = screen.getByRole("button", { name: "Reset Worker model — Claude to default" });
+      expect(textContrast(reset), `${theme} reset`).toBeGreaterThanOrEqual(4.5);
     } finally {
       document.documentElement.removeAttribute("data-theme");
     }
   });
 
-  // #4665: the tag splits the prediction line visually; the COMPUTED description must still be
-  // one sentence, clean and dirty (mount() leaves Worker model — Codex changed).
+  // #4665/#4671: the visible line is split or hidden; the COMPUTED description must still be one
+  // sentence, clean (line hidden) and dirty (mount() leaves Worker model — Codex changed).
   it("computes the saved prediction as one description sentence, clean and dirty", async () => {
     await mount(1280);
     expect(screen.getByRole("combobox", { name: "Worker model — Claude", description: /^Saved effective value: sonnet · your choice$/ })).toBeTruthy();
