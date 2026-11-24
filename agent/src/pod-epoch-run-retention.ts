@@ -71,7 +71,7 @@ export function judgeRetainedEvidence(s: RetainedEvidenceShape): RunRetention {
   if (kinds.includes("owner_hold_discard")) return activeRetention("owner_hold");
   if (kinds.includes("resolve_local_record")) return activeRetention("local_record");
   if (kinds.includes("refused")) return activeRetention("retained_refused");
-  if (s.ledgerState === "live" || s.ledgerState === "abandoned" || s.ledgerState === "reclaimed") return activeRetention(`ledger_${s.ledgerState}`);
+  if (s.ledgerState === "live" || s.ledgerState === "abandoned" || s.ledgerState === "reclaimed" || s.ledgerState === "fresh_pending" || s.ledgerState === "fresh_unbound") return activeRetention(`ledger_${s.ledgerState}`);
   if (s.presence !== "missing" || !partsMissing) return activeRetention("attempt_footprint");
   return activeRetention("retained_source");
 }

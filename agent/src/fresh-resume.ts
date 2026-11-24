@@ -1,0 +1,237 @@
+// issue #4628: fresh resume, the destination worker's side. An owner Resume of a held run starts it on a separate hosted worker W2
+// from durable evidence the server selected: an unsealed capture bundle, or the broker-owned checkpoint ref. The claim carries a
+// `fresh_resume` object; this module decides what the destination does with it, in the order the design fixes:
+//
+//   preempt  a fresh claim skips retained discovery. If the bare already holds ANY local state for the branch (another run's
+//            restore composite included) the transfer is abandoned (`local_state_present`): the destination never seeds on top.
+//   A        the destination attempt id, minted from the claim generation G' (never a `gx` id).
+//   proof    capture: stream the bundle, `git bundle verify`, fetch it; checkpoint ref: the ref must equal the server sha.
+//   L0       fresh journal {frid, A, G', sha, seeding}        one `git config --local` write
+//   L1       ledger entry A `fresh_pending`                    one write
+//   L2       refusal checks, assertBareClear + admission, seed with the fresh normalization (all under the bare lock)
+//   L3       POST seeded {G', A, live generation}              the server's receipt, which carries current_authority
+//   L4       recovery journal A + ledger `live` + fresh journal `ready`, ONE rename under the bare lock
+//
+// L4 and the model start happen only when the receipt says this worker still holds the run's live claim. Every failure before the
+// receipt abandons the transfer and stops nonterminally: the run is never reported `failed` from here. Failure model: a process or
+// container crash. No power-loss durability is claimed (no fsync of the config is added beyond what the existing rewrite does).
+//
+// FreshReconcileStop (the nonterminal stop) lives in runner.ts beside RestoreRouteStop; this module throws the typed causes below
+// and the runner wraps them.
+
+import type { Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { FreshConfigLockedError, FreshSeedError, type FreshCommitInput, type FreshSeedInput, type GitCache, type RunnerClone } from "./git.js";
+import { freshResumeRefusalReason, type FreshResumeState, type WorkerClient } from "./client.js";
+import type { Logger } from "./log.js";
+import type { StateAck } from "./protocol.js";
+import { mintAttemptId } from "./run-quiescence.js";
+
+export const FRESH_RESUME_CAPABILITY = "fresh_resume_v1";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA40_RE = /^[0-9a-f]{40}$/;
+
+/** True for a hosted slot: `UZI_POD_UID` is a UUID (the same test restore-boundary.ts applies). Only a hosted slot advertises
+ *  fresh_resume_v1, because only a hosted persistent worker is a fresh resume destination. */
+export function isHostedSlot(env: { UZI_POD_UID?: string | undefined } = process.env): boolean {
+  return typeof env.UZI_POD_UID === "string" && UUID_RE.test(env.UZI_POD_UID);
+}
+
+/** The capability list this worker adds for fresh resume: empty unless the slot is hosted. */
+export function freshResumeCapabilities(env: { UZI_POD_UID?: string | undefined } = process.env): string[] {
+  return isHostedSlot(env) ? [FRESH_RESUME_CAPABILITY] : [];
+}
+
+/** The claim's `fresh_resume` object, decoded. */
+export interface FreshResumeClaim {
+  id: string;
+  kind: "capture" | "checkpoint_ref";
+  captureId?: string;
+  checkpointRef?: string;
+  sha: string;
+  evidenceGeneration: number;
+}
+
+/** A `fresh_resume` object that is present and malformed. The run is not failed for it; the caller stops nonterminally. */
+export class FreshResumeClaimError extends Error {
+  constructor(detail: string) { super(`fresh resume claim is malformed: ${detail}`); this.name = "FreshResumeClaimError"; }
+}
+
+/** Decode the claim's `fresh_resume`. Undefined when absent; a malformed present value throws (it is never read as absent). */
+export function decodeFreshResumeClaim(raw: unknown): FreshResumeClaim | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new FreshResumeClaimError("not an object");
+  const o = raw as Record<string, unknown>;
+  if (typeof o.id !== "string" || !UUID_RE.test(o.id)) throw new FreshResumeClaimError("id");
+  if (o.kind !== "capture" && o.kind !== "checkpoint_ref") throw new FreshResumeClaimError("kind");
+  if (typeof o.sha !== "string" || !SHA40_RE.test(o.sha)) throw new FreshResumeClaimError("sha");
+  if (typeof o.evidence_generation !== "number" || !Number.isSafeInteger(o.evidence_generation) || o.evidence_generation <= 0)
+    throw new FreshResumeClaimError("evidence_generation");
+  const out: FreshResumeClaim = { id: o.id.toLowerCase(), kind: o.kind, sha: o.sha, evidenceGeneration: o.evidence_generation };
+  if (o.kind === "capture") {
+    if (typeof o.capture_id !== "string" || !UUID_RE.test(o.capture_id)) throw new FreshResumeClaimError("capture_id");
+    out.captureId = o.capture_id;
+  } else {
+    if (typeof o.checkpoint_ref !== "string" || !o.checkpoint_ref.startsWith("refs/uzi-checkpoints/") || /[\s\0]/.test(o.checkpoint_ref) ||
+        o.checkpoint_ref.includes("..")) throw new FreshResumeClaimError("checkpoint_ref");
+    out.checkpointRef = o.checkpoint_ref;
+  }
+  return out;
+}
+
+/** True for a park or fail report the server refused because this worker's transfer is claimed and not yet seeded. */
+export function isFreshPreSeedAck(ack: Pick<StateAck, "freshResumePreSeed">): boolean {
+  return ack.freshResumePreSeed === true;
+}
+
+/** The transfer was given back (abandoned) before its receipt; the flight stops nonterminally and the run stays held. */
+export class FreshAbandoned extends Error {
+  constructor(readonly reason: string, options?: ErrorOptions) { super(`fresh resume abandoned (${reason})`, options); this.name = "FreshAbandoned"; }
+}
+
+/** The receipt is valid but this worker no longer holds the run's live claim: L4 and the model start do not happen. */
+export class FreshNoAuthority extends Error {
+  constructor(readonly receipt: FreshResumeState) { super("fresh resume receipt without current authority"); this.name = "FreshNoAuthority"; }
+}
+
+export interface FreshDeps {
+  git: Pick<GitCache, "readFreshLocalState" | "fetchFreshBundle" | "seedFreshAttempt" | "commitFreshReceipt" | "markFreshUnbound">;
+  client: Pick<WorkerClient, "freshResumeBundle" | "abandonFreshResume" | "reportFreshResumeSeeded">;
+  log: Logger;
+}
+
+/** POST abandon, best effort: never throws. True when the server closed the transfer. A 409 means it is no longer ours to abandon. */
+export async function abandonFresh(deps: FreshDeps, runId: string, fr: FreshResumeClaim, generation: number, reason: string,
+  signal?: AbortSignal): Promise<boolean> {
+  try {
+    await deps.client.abandonFreshResume(runId, fr.id, generation, signal);
+    deps.log.warn("fresh resume transfer abandoned", { run_id: runId, transfer: fr.id, reason });
+    return true;
+  } catch (error) {
+    deps.log.warn("fresh resume abandon was not accepted", { run_id: runId, transfer: fr.id, reason, server_reason: freshResumeRefusalReason(error),
+      error: error instanceof Error ? error.message : String(error) });
+    return false;
+  }
+}
+
+/** Preemption: a fresh claim skips retained discovery, and abandons when the bare holds any attribution for the branch. A bare
+ *  that does not exist yet holds none. Throws {@link FreshAbandoned}`("local_state_present")` after the abandon. */
+export async function preemptFresh(deps: FreshDeps, p: {
+  runId: string; fr: FreshResumeClaim; generation: number; barePath: string; branch: string; cachePresent: boolean; signal?: AbortSignal;
+}): Promise<void> {
+  if (!p.cachePresent) return;
+  const state = await deps.git.readFreshLocalState(p.barePath, p.branch, p.runId);
+  if (state.length === 0) return;
+  deps.log.warn("fresh resume: the bare holds local state for this branch; abandoning", { run_id: p.runId, state });
+  await abandonFresh(deps, p.runId, p.fr, p.generation, "local_state_present", p.signal);
+  throw new FreshAbandoned("local_state_present");
+}
+
+/** A, the destination attempt id, from G'. A missing or non-positive generation has no valid A: never a `gx` id. */
+export function produceFreshAttemptId(generation: number | undefined, now: Date): string | undefined {
+  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return undefined;
+  return mintAttemptId(generation, now);
+}
+
+/** Make the evidence present in the bare and return the ref that must equal the server sha. A capture is streamed, verified and
+ *  fetched; a checkpoint ref is already mirrored by the clone's fetch and must resolve to the sha. Missing proof throws. */
+async function provideEvidence(deps: FreshDeps, p: { runId: string; fr: FreshResumeClaim; generation: number; barePath: string; signal?: AbortSignal }):
+  Promise<string> {
+  const { fr } = p;
+  if (fr.kind === "checkpoint_ref") return fr.checkpointRef!;
+  return deps.git.fetchFreshBundle(p.barePath, { frid: fr.id, sha: fr.sha }, async (sink: Writable) => {
+    await deps.client.freshResumeBundle(p.runId, fr.id, p.generation, body => pipeline(body, sink), p.signal);
+  });
+}
+
+export interface FreshSeedParams {
+  runId: string;
+  fr: FreshResumeClaim;
+  /** G', the claim's generation (also the live generation this worker holds now). */
+  generation: number;
+  /** A, from {@link produceFreshAttemptId}. */
+  attemptId: string;
+  barePath: string;
+  branch: string;
+  key: string;
+  selfContained: boolean;
+  isLive(clonePath: string): boolean;
+  beforeSeed: FreshSeedInput["beforeSeed"];
+  onSeeded?: FreshSeedInput["onSeeded"];
+  /** Wraps the L2 seed only (the runner's authority transaction), never the network calls around it. */
+  seedScope?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** Called between steps: it throws for a shutdown, a cancel or a lost claim, which then abandon the transfer. */
+  guard?: () => void;
+  signal?: AbortSignal;
+  deadlineMs?: number;
+}
+
+export interface FreshSeedResult {
+  attemptId: string;
+  seeded: RunnerClone;
+  receipt: FreshResumeState;
+}
+
+/**
+ * L0 to L3. Returns the seeded clone and the server's receipt; it does NOT commit (L4): the caller commits only when
+ * `receipt.current_authority` is true ({@link commitFreshReceipt}). Any failure before a valid receipt abandons the transfer (best
+ * effort) and throws {@link FreshAbandoned}; a `config.lock` that is already there throws {@link FreshConfigLockedError} untouched
+ * after the abandon, never removed and never retried.
+ */
+export async function seedFresh(deps: FreshDeps, p: FreshSeedParams): Promise<FreshSeedResult> {
+  const { fr } = p;
+  const { generation, attemptId } = p;
+  let seeded: RunnerClone | undefined;
+  // A guard failure (a shutdown, a cancel, a lost claim) abandons like any other failure and then propagates as itself, so the
+  // runner's own stop handling for it still applies.
+  let guardFailure: { error: unknown } | undefined;
+  const guard = (): void => {
+    try { p.guard?.(); } catch (error) { guardFailure = { error }; throw error; }
+  };
+  try {
+    guard();
+    const artifactRef = await provideEvidence(deps, { runId: p.runId, fr, generation, barePath: p.barePath, ...(p.signal ? { signal: p.signal } : {}) });
+    guard();
+    const seed = (): Promise<RunnerClone> => deps.git.seedFreshAttempt({
+      barePath: p.barePath, branch: p.branch, key: p.key, runId: p.runId, attemptId, frid: fr.id, generation,
+      artifact: { kind: fr.kind, artifactRef, artifactSha: fr.sha }, selfContained: p.selfContained,
+      isLive: p.isLive, beforeSeed: p.beforeSeed, ...(p.onSeeded ? { onSeeded: p.onSeeded } : {}),
+      ...(p.signal ? { signal: p.signal } : {}), ...(p.deadlineMs !== undefined ? { deadlineMs: p.deadlineMs } : {}),
+    });
+    seeded = await (p.seedScope ? p.seedScope(seed) : seed());
+    guard();
+    const receipt = await deps.client.reportFreshResumeSeeded(p.runId, fr.id,
+      { claim_generation: generation, attempt_id: attemptId, live_generation: generation }, p.signal);
+    return { attemptId, seeded, receipt };
+  } catch (error) {
+    const closed = await abandonFresh(deps, p.runId, fr, generation, errorReason(error), p.signal);
+    // The seed landed but never reached its receipt: A is unbound once the server has the transfer back.
+    if (seeded !== undefined && closed) {
+      await deps.git.markFreshUnbound({ barePath: p.barePath, branch: p.branch, key: p.key, runId: p.runId, attemptId }).catch(() => undefined);
+    }
+    if (guardFailure !== undefined) throw guardFailure.error;
+    if (error instanceof FreshConfigLockedError) throw error;
+    throw new FreshAbandoned(errorReason(error), { cause: error });
+  }
+}
+
+function errorReason(error: unknown): string {
+  if (error instanceof FreshConfigLockedError) return "config_locked";
+  if (error instanceof FreshSeedError) return error.reason;
+  const refusal = freshResumeRefusalReason(error);
+  if (refusal !== undefined) return refusal;
+  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return "aborted";
+  return "seed_failed";
+}
+
+/**
+ * L4, the receipt commit. Runs only when the server's receipt names this worker as holding the run's live claim: a valid receipt
+ * without authority throws {@link FreshNoAuthority} and writes nothing. One rename under the bare lock; a `config.lock` that already
+ * exists is a {@link FreshConfigLockedError} (never removed, never retried). m3-B's restart reconciler calls this too.
+ */
+export async function commitFreshReceipt(deps: Pick<FreshDeps, "git">, receipt: FreshResumeState, input: FreshCommitInput):
+  Promise<"committed" | "already"> {
+  if (!receipt.current_authority) throw new FreshNoAuthority(receipt);
+  return deps.git.commitFreshReceipt(input);
+}

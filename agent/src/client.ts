@@ -477,6 +477,50 @@ export class ReportPreconditionError extends Error {
   constructor(message: string) { super(message); this.name = "ReportPreconditionError"; }
 }
 
+/** Issue #4628: the stored state of a fresh resume transfer and whether the calling worker still holds the run's live claim. */
+export interface FreshResumeState {
+  state: string;
+  seeded_at: string | null;
+  destination_attempt_id: string | null;
+  seeded_generation: number | null;
+  current_authority: boolean;
+}
+
+/** Issue #4628: a state reply that is not the documented shape. Nothing is inferred from it. */
+export class FreshResumeReplyError extends Error {
+  constructor(detail: string) { super(`fresh resume state reply is malformed: ${detail}`); this.name = "FreshResumeReplyError"; }
+}
+
+/** Issue #4628: strict decode of the seeded receipt and the state route. `current_authority` must be a boolean: a missing or
+ *  non-boolean value is malformed, never read as false or true. */
+export function decodeFreshResumeState(raw: unknown): FreshResumeState {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new FreshResumeReplyError("not an object");
+  const o = raw as Record<string, unknown>;
+  if (typeof o.state !== "string" || o.state === "") throw new FreshResumeReplyError("state");
+  if (typeof o.current_authority !== "boolean") throw new FreshResumeReplyError("current_authority");
+  const text = (v: unknown, name: string): string | null => {
+    if (v === null || v === undefined) return null;
+    if (typeof v !== "string") throw new FreshResumeReplyError(name);
+    return v;
+  };
+  const seededGeneration = o.seeded_generation === null || o.seeded_generation === undefined ? null : o.seeded_generation;
+  if (seededGeneration !== null && (typeof seededGeneration !== "number" || !Number.isSafeInteger(seededGeneration) || seededGeneration <= 0))
+    throw new FreshResumeReplyError("seeded_generation");
+  return { state: o.state, seeded_at: text(o.seeded_at, "seeded_at"), destination_attempt_id: text(o.destination_attempt_id, "destination_attempt_id"),
+    seeded_generation: seededGeneration, current_authority: o.current_authority };
+}
+
+/** Issue #4628: the `reason` of a 409 from a fresh resume route (`fresh_resume_attempt_mismatch`, `fresh_resume_not_claimed`,
+ *  `fresh_resume_no_bundle`), or undefined for any other error. */
+export function freshResumeRefusalReason(err: unknown): string | undefined {
+  if (!(err instanceof RequestError) || err.status !== 409) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(err.body);
+    const reason = (parsed as { reason?: unknown } | null)?.reason;
+    return typeof reason === "string" && reason.startsWith("fresh_resume_") ? reason : undefined;
+  } catch { return undefined; }
+}
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -666,6 +710,8 @@ const PR_DESC_MAX_RETRY_AFTER_MS = 60_000;
 
 /** Bound on one whole job-input download (PRD #1909): the api caps a file at 25 MiB by default. */
 const JOB_FILE_DOWNLOAD_TIMEOUT_MS = 300_000;
+/** Issue #4628: bounds one fresh resume bundle download (the capture is at most 64 MiB). */
+const FRESH_RESUME_BUNDLE_TIMEOUT_MS = 300_000;
 /** Default per-request timeout of an output-file upload (the runner passes a size-scaled one). */
 const JOB_FILE_UPLOAD_TIMEOUT_MS = 300_000;
 
@@ -3810,6 +3856,8 @@ export class WorkerClient {
           // recovery_retry_not_before stamp ride the same {run, reason?} ack so the pre-clone
           // forge-park dispatch can tell stale_claim/custody_unsettled apart and quote the retry.
           if (fields.reason !== undefined) ack.reason = fields.reason;
+          // Issue #4628: only the 409 refusal is the pre-seed disposition; the reason string alone on a 200 is not.
+          if (res.status === 409 && fields.reason === "fresh_resume_pre_seed") ack.freshResumePreSeed = true;
           if (fields.recoveryRetryNotBefore !== undefined)
             ack.recoveryRetryNotBefore = fields.recoveryRetryNotBefore;
           // PRD #1247 M5b: fold the top-level held-state credential-switch signal and the
@@ -4831,6 +4879,66 @@ export class WorkerClient {
       gaps: Array.isArray(res?.gaps) ? res.gaps : [],
       ...(typeof res?.next_cursor === "number" ? { next_cursor: res.next_cursor } : {}),
     };
+  }
+
+  // ── Fresh resume destination routes (issue #4628) ─────────────────────────────────────────────────────────
+  // Bearer worker auth; every call names the transfer id and is fenced server-side on the claim generation.
+
+  /** GET .../fresh-resume/{frid}/bundle: stream the transfer's unsealed capture to `sink`, which must consume the stream to its
+   *  end. A body cut short rejects the stream, so a truncated 200 never reads as complete. Throws RequestError on non-2xx
+   *  (409 `fresh_resume_no_bundle` for a checkpoint-ref transfer, `fresh_resume_not_claimed` when fenced out). */
+  async freshResumeBundle(
+    runId: string, frid: string, claimGeneration: number, sink: (body: Readable) => Promise<void>,
+    signal?: AbortSignal, timeoutMs: number = FRESH_RESUME_BUNDLE_TIMEOUT_MS,
+  ): Promise<void> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/fresh-resume/${encodeURIComponent(frid)}/bundle?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const res = await fetch(this.baseUrl + path, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version },
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+    if (res.status !== 200) throw await this.toError("GET", path, res);
+    if (!res.body) throw new Error("fresh resume bundle returned no body");
+    const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>);
+    let bodyError: Error | undefined;
+    body.on("error", (err: Error) => { bodyError ??= err; });
+    try {
+      await sink(body);
+      if (bodyError) throw bodyError;
+    } finally {
+      body.destroy();
+    }
+  }
+
+  /** POST .../fresh-resume/{frid}/abandon: give the transfer back (the run returns to its held state). Throws RequestError on
+   *  non-2xx; a 409 `fresh_resume_not_claimed` means it is no longer this worker's to abandon. */
+  async abandonFreshResume(runId: string, frid: string, claimGeneration: number, signal?: AbortSignal): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/fresh-resume/${encodeURIComponent(frid)}/abandon`,
+      { claim_generation: claimGeneration }, undefined, signal, 4096);
+  }
+
+  /** POST .../fresh-resume/{frid}/seeded: the receipt that the destination's first fenced commit landed. Throws RequestError on
+   *  non-2xx (409 `fresh_resume_attempt_mismatch` or `fresh_resume_not_claimed`); a body that is not a well formed state reply
+   *  throws FreshResumeReplyError, never a guess. */
+  async reportFreshResumeSeeded(runId: string, frid: string,
+    body: { claim_generation: number; attempt_id: string; live_generation: number }, signal?: AbortSignal): Promise<FreshResumeState> {
+    const reply = await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/fresh-resume/${encodeURIComponent(frid)}/seeded`,
+      body, undefined, signal, 4096);
+    return decodeFreshResumeState(reply);
+  }
+
+  /** GET .../fresh-resume/{frid}/state: what became of a transfer, and whether this worker still holds the run's live claim at
+   *  `liveGeneration`. A 404 (no such transfer) is `null`. Any other non-2xx throws RequestError. */
+  async getFreshResumeState(runId: string, frid: string, liveGeneration: number, signal?: AbortSignal): Promise<FreshResumeState | null> {
+    try {
+      const reply = await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/fresh-resume/${encodeURIComponent(frid)}/state?live_generation=${encodeURIComponent(String(liveGeneration))}`,
+        undefined, 4096, signal);
+      return decodeFreshResumeState(reply);
+    } catch (err) {
+      if (err instanceof RequestError && err.status === 404) return null;
+      throw err;
+    }
   }
 
   /** issue #1319 — the orphan-classification read: authoritative identity of a clone-orphan

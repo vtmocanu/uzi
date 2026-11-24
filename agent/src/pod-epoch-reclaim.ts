@@ -1661,7 +1661,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         // proof, counted without an authority read, and never downgrading the verdict. Admitted shapes only:
         // (a) ledger live + strict journal, (c) ledger retired + strict journal + missing footprint,
         // (b) ledger retired + `[""]` journal + missing footprint. Anything else (reclaimed, abandoned,
-        // a no-key journal) is an unrecoverable shape.
+        // fresh_pending, fresh_unbound, a no-key journal) is an unrecoverable shape.
         let raw: string | readonly string[] | undefined;
         try {
           raw = journalShape(await owned(() => deps.git.readEpochJournalVector(admit.barePath, admit.branch),
