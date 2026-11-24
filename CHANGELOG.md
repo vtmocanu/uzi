@@ -384,6 +384,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A restored run no longer fails when the api permanently refuses its messages before the restore finishes ([#4644](https://github.com/vtmocanu/uzi/pull/4644), [#4648](https://github.com/vtmocanu/uzi/pull/4648)).**
   During the independent restore of a retained run, including its owner hold for an unsupported predecessor, the worker now holds the run or stops it without failing it, keeps the predecessor's work and reaps nothing.
 
+- **A held or time-parked run no longer turns into a failed run when the api permanently refuses its last messages ([#4645](https://github.com/vtmocanu/uzi/pull/4645), [#4655](https://github.com/vtmocanu/uzi/pull/4655)).**
+  Once the server has confirmed a preflight, completion or phase-switch hold or a wall-clock park, a permanent message refusal during the flight's last drain keeps that hold or park: the worker reports no `failed` and starts no extra abort or reap.
+
+- **A hosted worker that is an in-flight roll's canary now finishes waking ([#4659](https://github.com/vtmocanu/uzi/pull/4659), [#4668](https://github.com/vtmocanu/uzi/pull/4668)).**
+  The controller writes the wake's op annotation without roll admission when nothing else about the Deployment changes, so the wake settles instead of timing out.
+
+- **A retained clone's inventory proof no longer fails a same-key successor ([#4632](https://github.com/vtmocanu/uzi/pull/4632), [#4643](https://github.com/vtmocanu/uzi/pull/4643)).**
+  The proof runs under the repository's bare lock with an in-memory same-key exclusion, and same-key seeds wait once, retry once, then stop for retry with custody kept. An unreadable process the worker can tie to another live attempt (such as the Codex supervisor) no longer blocks the proof.
+
+- **Custom Codex providers support current model slots and runtime admission ([#4626](https://github.com/vtmocanu/uzi/pull/4626)).**
+  GPT-6.2 Sol and Astra mappings round-trip through Settings and the CLI; provider health and wake admission require a single v3-capable worker, while reaping retains previously claimed workers and custody.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -616,6 +628,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#4650](https://github.com/vtmocanu/uzi/pull/4650)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -825,6 +840,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Task reviews now send your worker effort when you set no review effort ([#1570](https://github.com/vtmocanu/uzi/pull/1570)).**
   Before, a review sent no effort; now an unset review effort follows your worker effort for that harness (Runtime default sends none), and the built-in medium is sent when that is unset too, so unconfigured owners see reviews run at medium; set the review effort to runtime to keep the old behaviour.
+
+- **Codex defaults use GPT-6.2 Sol on the current runtime ([#4626](https://github.com/vtmocanu/uzi/pull/4626), [#4649](https://github.com/vtmocanu/uzi/pull/4649)).**
+  Root/planning and the independent judge default advance with runtime 0.171.0 and v3 admission; explicit choices remain, and cache writes use the owner-selected 30-minute Standard estimate with accepted 12-hour underestimation risk.
 
 ### Security
 
