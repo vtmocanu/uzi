@@ -30579,7 +30579,14 @@ export class RunRunner {
     };
     for (let attempt = 0; (inPlace !== undefined || attempt < 2) && !confirmed && !refused; attempt++) {
       if (inPlace && attempt > 0) {
-        await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
+        // A lifecycle abort (an owner cancel included) can end the backoff with the bare abort reason; guard() first, so
+        // it surfaces as the same typed stop a later guard() would throw.
+        try {
+          await this.waitRecoveryRetry(flight, true, this.inPlaceReportBackoffMs(attempt), signal);
+        } catch (error) {
+          guard();
+          throw error;
+        }
         guard();
       }
       try {

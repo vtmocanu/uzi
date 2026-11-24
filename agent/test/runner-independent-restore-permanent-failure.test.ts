@@ -575,8 +575,9 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     unseeded(c);
   });
 
-  it("Order 2a cancel: an owner cancel observed while the late hold retries is reported once, custody kept", async () => {
-    const c = await arrangeSwitch({ ledger: true, extra: { retainedSwitchVerificationMs: 20_000, recoveryRetryMs: 5 } });
+  // recoveryRetryMs sets the in-place report backoff: 5 ms lands the cancel during a report, 3 s during the backoff wait.
+  for (const [when, recoveryRetryMs] of [["during a report", 5], ["during the backoff", 3000]] as const) it(`Order 2a cancel ${when}: an owner cancel observed while the late hold retries is reported once, custody kept`, async () => {
+    const c = await arrangeSwitch({ ledger: true, extra: { retainedSwitchVerificationMs: 20_000, recoveryRetryMs } });
     // The in-place server drains inputs (a cancel included) while the switch is pending.
     api.inPlaceInputDrain = true;
     let holdFailure: { mock: { restore(): void } } | undefined;
