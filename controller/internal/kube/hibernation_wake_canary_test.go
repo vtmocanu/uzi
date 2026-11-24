@@ -286,10 +286,15 @@ func (wc *wakeCanary) driveWake(t *testing.T, opID string, mut func(e *rollEntry
 		t.Fatal("w1 has no roll entry")
 	}
 	// Force the unadmitted entry the pass-2 branch would hand to hibernateWake. A
-	// zero-replica Deployment never reaches that branch through Reconcile: its open wake
-	// reservation clears e.hibernation (the rejoin loop in roll_pacing.go) and the pacer
-	// admits it, so Reconcile takes the admitted wake path instead (see
-	// TestWakeCanaryZeroReplicasThroughReconcile). e.hibernation is already false here.
+	// zero-replica Deployment whose pod is gone never reaches that branch through
+	// Reconcile: the pacer admits it, so Reconcile takes the admitted wake path
+	// (TestWakeCanaryZeroReplicasNoPodTakesAdmittedWakePath). With its pod still live it
+	// does reach pass 2 unadmitted, where wakeHeldForPods holds first
+	// (TestWakeCanaryZeroReplicasLivePodThroughReconcile). The open wake reservation has
+	// already cleared e.hibernation (the rejoin loop in roll_pacing.go).
+	if e.hibernation {
+		t.Fatal("w1 is still hibernation-owned; the rejoin loop did not run")
+	}
 	e.admitted = false
 	if mut != nil {
 		mut(e, tick)
@@ -486,9 +491,12 @@ func TestWakeCanaryOpBindingOmitsOperatorMetadata(t *testing.T) {
 func TestWakeCanaryZeroReplicasLivePodThroughReconcile(t *testing.T) {
 	zero := int32(0)
 	wc := newWakeCanary(t, func(d *appsv1.Deployment) { d.Spec.Replicas = &zero })
+	// This state reaches the pass-2 wake unadmitted; both the zero-replica pod hold and
+	// the op binding's replicas == 1 term keep it unwritten.
+	wc.requireUnadmitted(t)
 	for i := 0; i < 3; i++ {
 		wc.c.ClearActions()
-		_ = wc.tick(t)
+		wc.mustTick(t)
 		wc.requirePatchCount(t, "w1", 0)
 		if n := len(wc.readyCalls()); n != 0 {
 			t.Fatalf("tick %d: ready reported", i)
