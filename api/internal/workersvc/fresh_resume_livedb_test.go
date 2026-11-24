@@ -661,12 +661,11 @@ func TestFreshResumeDoubleStartLeavesOneRowLiveDB(t *testing.T) {
 	wg.Wait()
 	ok := 0
 	for _, err := range errs {
-		switch {
-		case err == nil:
+		if err == nil {
 			ok++
-		default:
-			wantRefusal(t, "racing start", err, apitypes.FreshResumeStatusInProgress)
+			continue
 		}
+		wantRefusal(t, "racing start", err, apitypes.FreshResumeStatusInProgress)
 	}
 	if ok != 1 || f.rows() != 1 {
 		t.Fatalf("%d starts succeeded and %d rows exist, want exactly one of each", ok, f.rows())
