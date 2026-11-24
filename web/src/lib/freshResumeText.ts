@@ -1,7 +1,7 @@
 // The owner-facing text of a fresh resume (issue #4628), in one place for the web surface. The CLI
 // carries the same substance in api/cmd/uzi/fresh_resume.go (freshResumeCutoffText) and the server in
-// freshNotes (api/internal/workersvc/fresh_resume_select.go); keep the three in step. A Go test pins
-// the CLI and server copies equal; the web copy is pinned by freshResumeText.test.ts.
+// freshNotes (api/internal/workersvc/fresh_resume_select.go); keep the three in step. A Go test checks
+// that each CLI line appears in the server copy; the web copy is checked by freshResumeText.test.ts.
 
 /** The cutoff text the owner confirms against. */
 export const FRESH_RESUME_CUTOFF_TEXT: readonly string[] = [
@@ -50,17 +50,27 @@ const FRESH_RESUME_CAUSES: readonly string[] = [
  * Mirrors the server's eligibility base (fn_fresh_resume_run_base in
  * api/internal/store/migrations/00523_run_fresh_resumes.sql) on the fields the page has: a
  * recovery_wait with one of four causes, no secret_remediation_active or source_end_declined detail,
- * no retry stamp, and a run kind that can seed. The server stays the authority; this only keeps the
- * offer off holds it always refuses.
+ * no retry stamp, a run kind that can seed, not a claimed Codex run (harness codex and
+ * claim_generation >= 1), no codex_policy_hold, and no pending reserve pause. Clauses only the
+ * server can check, because the page has no such field: codex_material_revision and codex_secret_id
+ * in the Codex provenance test, an active publication-resume row, policy_pending_fresh, and the wall
+ * budget. The server stays the authority; this only keeps the offer off holds it always refuses.
  */
 export function freshResumeEligible(run: {
   status: string;
   kind: string;
+  harness?: string | null;
+  claim_generation?: number | null;
+  hold_reason?: string | null;
+  pause_mode?: string | null;
   recovery_wait_cause?: string | null;
   recovery_wait_detail?: string | null;
   recovery_retry_not_before?: string | null;
 }): boolean {
   return run.status === "recovery_wait"
+    && !(run.harness === "codex" && (run.claim_generation ?? 0) >= 1)
+    && run.hold_reason !== "codex_policy_hold"
+    && run.pause_mode !== "reserve"
     && run.recovery_wait_cause != null && FRESH_RESUME_CAUSES.includes(run.recovery_wait_cause)
     && run.recovery_wait_detail !== "secret_remediation_active"
     && run.recovery_wait_detail !== "source_end_declined"

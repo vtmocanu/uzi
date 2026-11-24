@@ -160,6 +160,10 @@ func TestFreshResumeEach409ReasonRendered(t *testing.T) {
 		if code != uzicli.ExitConflict || !strings.Contains(errb, want) {
 			t.Errorf("%s: exit=%d stderr=%q", reason, code, errb)
 		}
+		// The two reasons that tell the owner to run the command again name it.
+		if reason != "fresh_resume_in_progress" && !strings.Contains(errb, "`uzi run fresh-resume`") {
+			t.Errorf("%s: message must name the command `uzi run fresh-resume`: %q", reason, errb)
+		}
 		if len(fc.FreshResumeStartCalls) != 1 {
 			t.Errorf("%s: a 409 must not be retried: %d calls", reason, len(fc.FreshResumeStartCalls))
 		}
@@ -182,7 +186,7 @@ func TestFreshResumeUntrustedCheckpointRefAndCaptureSanitized(t *testing.T) {
 	p.CaptureID = "cap\x1b[32mgreen"
 	fc := &uzicli.FakeClient{FreshResumePreviewResult: p}
 	_, errb, _ := runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes")
-	if strings.Contains(errb, "\x1b") || !strings.Contains(errb, "checkpoint ref:") {
+	if strings.Contains(errb, "\x1b") || !strings.Contains(errb, "checkpoint ref:") || !strings.Contains(errb, "capture:") {
 		t.Errorf("escape byte reached the terminal or ref missing: %q", errb)
 	}
 }
@@ -194,8 +198,27 @@ func TestFreshResumeCutoffShownBeforePromptEvenWhenQuietOrJSON(t *testing.T) {
 		env.StdinTTY = true
 		env.Stdin = strings.NewReader("n\n")
 		_, errb, _ := runCLI(t, env, append(append([]string{}, args...), "run", "fresh-resume", "run1")...)
-		if !strings.Contains(errb, "Edits made after the saved evidence may be missing") || !strings.Contains(errb, "[y/N]") {
+		cut := strings.Index(errb, "Edits made after the saved evidence may be missing")
+		prompt := strings.Index(errb, "[y/N]")
+		if cut < 0 || prompt < 0 || cut > prompt {
 			t.Errorf("%v: cutoff text must precede the prompt: %q", args, errb)
+		}
+	}
+	// The --request-id plus --selection-token replay path shows it before its prompt too.
+	{
+		fc := &uzicli.FakeClient{}
+		env := fakeEnv(fc)
+		env.StdinTTY = true
+		env.Stdin = strings.NewReader("n\n")
+		_, errb, _ := runCLI(t, env, "--quiet", "run", "fresh-resume", "run1",
+			"--request-id", "11111111-2222-4333-8444-555555555555", "--selection-token", "tokOld")
+		cut := strings.Index(errb, "Edits made after the saved evidence may be missing")
+		prompt := strings.Index(errb, "[y/N]")
+		if cut < 0 || prompt < 0 || cut > prompt {
+			t.Errorf("replay: cutoff text must precede the prompt: %q", errb)
+		}
+		if len(fc.FreshResumeStartCalls) != 0 {
+			t.Errorf("replay declined must not start: %+v", fc.FreshResumeStartCalls)
 		}
 	}
 	// With --yes there is no prompt, so --quiet stays quiet.
@@ -272,6 +295,20 @@ func freshHeldRun(cause string) apitypes.RunDTO {
 	return apitypes.RunDTO{ID: "run9", Kind: "issue", Status: statusRecoveryWait, RecoveryWaitCause: &cause, RecoveryRetryNotBeforePresent: true}
 }
 
+func TestFreshResumeClaimedCodexAndUnclaimedCodex(t *testing.T) {
+	gen := func(n int64) *int64 { return &n }
+	r := freshHeldRun(workerRequeueExhaustedCause)
+	r.Harness = "codex"
+	r.ClaimGeneration = gen(0)
+	if !freshResumeEligible(r) {
+		t.Errorf("an unclaimed codex run stays eligible")
+	}
+	r.ClaimGeneration = gen(1)
+	if freshResumeEligible(r) {
+		t.Errorf("a claimed codex run must be refused")
+	}
+}
+
 func TestRecoveryDecisionLineHintsFreshResumeOnlyWhenHeld(t *testing.T) {
 	held := freshHeldRun(retainedRecoveryExhaustedCause)
 	if got := recoveryDecisionLine(held); !strings.Contains(got, "uzi run fresh-resume run9") {
@@ -311,6 +348,27 @@ func TestFreshResumeHintFollowsServerEligibility(t *testing.T) {
 			return r
 		}(),
 		"task kind": func() apitypes.RunDTO { r := freshHeldRun(workerRequeueExhaustedCause); r.Kind = "task"; return r }(),
+		"claimed codex run": func() apitypes.RunDTO {
+			r := freshHeldRun(workerRequeueExhaustedCause)
+			one := int64(1)
+			r.Harness, r.ClaimGeneration = "codex", &one
+			return r
+		}(),
+		"codex_policy_hold": func() apitypes.RunDTO {
+			r := freshHeldRun(workerRequeueExhaustedCause)
+			r.HoldReason = str("codex_policy_hold")
+			return r
+		}(),
+		"reserve pause": func() apitypes.RunDTO {
+			r := freshHeldRun(workerRequeueExhaustedCause)
+			r.PauseMode = str("reserve")
+			return r
+		}(),
+		"retry key absent": func() apitypes.RunDTO {
+			r := freshHeldRun(workerRequeueExhaustedCause)
+			r.RecoveryRetryNotBeforePresent = false
+			return r
+		}(),
 	} {
 		if got := workerExhaustionLine(r); strings.Contains(got, hint) {
 			t.Errorf("%s: refused hold must not carry the hint: %q", name, got)

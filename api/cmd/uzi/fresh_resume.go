@@ -24,7 +24,7 @@ import (
 // freshResumeCutoffText is the cutoff text the owner confirms against. The web panel carries the same
 // substance (web/src/lib/freshResumeText.ts); the server's Notes (freshNotes in
 // api/internal/workersvc/fresh_resume_select.go) carry it too for other consumers, and a test pins
-// the CLI and server copies equal.
+// TestFreshResumeCutoffMatchesServerNotes checks each CLI line appears in the server copy.
 var freshResumeCutoffText = []string{
 	"Edits made after the saved evidence may be missing from the resumed run.",
 	"The original worker's source and custody are kept; starting a fresh resume does not delete them.",
@@ -97,7 +97,7 @@ func freshResumeBackoff(ee *uzicli.ExitError, attempt int) time.Duration {
 
 func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "fresh-resume <run-id> [--yes]",
+		Use:   "fresh-resume <run-id> [--yes] [--request-id <uuid> [--selection-token <token>]]",
 		Short: "Resume a held run on a separate hosted worker from durable evidence",
 		Long: "Resume a run held at a worker-exhaustion recovery wait on a separate persistent hosted " +
 			"worker, seeded from the run's saved evidence (issue #4628). The command shows the evidence " +
@@ -225,7 +225,7 @@ func freshResumeStartError(err error, requestID, token string) error {
 		return uzicli.Exitf(uzicli.ExitConflict, "%s", freshResumeStatusMessage(ee.Reason))
 	}
 	if ee.Code == uzicli.ExitUnreachable {
-		return uzicli.Exitf(ee.Code, "%v; the start may or may not have been recorded: retry with --request-id %s --selection-token %s", ee.Err, requestID, token)
+		return uzicli.Exitf(ee.Code, "%v; the start may or may not have been recorded: retry with --request-id %s --selection-token %s", ee.Err, cellText(requestID), cellText(token))
 	}
 	return err
 }

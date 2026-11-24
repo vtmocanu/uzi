@@ -32,6 +32,9 @@ it.each([
   ["codex_idle_stall", { recovery_wait_cause: "codex_idle_stall" }],
   ["source_end_declined", { recovery_wait_cause: "retained_recovery_adoption_failed", recovery_wait_detail: "source_end_declined" }],
   ["retry stamp", { recovery_wait_cause: "retained_recovery_exhausted", recovery_retry_not_before: "2099-01-01T00:00:00Z" }],
+  ["claimed codex run", { harness: "codex", claim_generation: 1 }],
+  ["codex policy hold", { hold_reason: "codex_policy_hold" }],
+  ["reserve pause", { pause_mode: "reserve" }],
 ] as const)("hides fresh resume for %s", (_n, over) => {
   render(<RecoveryWaitPanel run={held(over as Partial<Run>)} ownerProof />);
   expect(offer()).toBeNull();

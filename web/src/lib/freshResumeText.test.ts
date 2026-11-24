@@ -19,8 +19,15 @@ describe("freshResumeEligible", () => {
     ["task kind", { kind: "task" }],
     ["not recovery_wait", { status: "paused" }],
     ["no cause", { recovery_wait_cause: null }],
+    ["claimed codex run", { harness: "codex", claim_generation: 1 }],
+    ["codex policy hold", { hold_reason: "codex_policy_hold" }],
+    ["reserve pause", { pause_mode: "reserve" }],
   ])("refuses %s", (_name, over) => {
     expect(freshResumeEligible({ ...base, ...over })).toBe(false);
+  });
+
+  it("accepts an unclaimed codex run", () => {
+    expect(freshResumeEligible({ ...base, harness: "codex", claim_generation: 0 })).toBe(true);
   });
 
   it("keeps the cutoff copy the Go clients carry", () => {
