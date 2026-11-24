@@ -295,6 +295,85 @@ func TestJudgeCreatePolicyMixedReadRaceLiveDB(t *testing.T) {
 	}
 }
 
+// TestJudgeCreatePolicyLockBeforeReadLiveDB: the judge reads its policy only AFTER it holds the shared
+// secret-mutation lock. The owner starts with no Claude source (an unlocked read would decide vendor
+// and nothing re-checks the vendor branch). A source PUT for B holds the exclusive lock, uncommitted;
+// the judge is started and observed queued on the lock key; the writer then commits. The judge must
+// commit provider-bound to B, which is only possible if it read the policy after acquiring the lock.
+func TestJudgeCreatePolicyLockBeforeReadLiveDB(t *testing.T) {
+	for _, path := range []string{"manual", "automatic"} {
+		t.Run(path, func(t *testing.T) {
+			j := newJdFix(t)
+			j.addAlt()
+			j.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, j.userID)
+			target := j.newTarget()
+			ctx := j.env.ctx
+
+			tx, err := j.aux.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			if err != nil {
+				t.Fatalf("begin writer: %v", err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			q := store.New(tx)
+			if err := q.LockSecretMutation(ctx, j.userID); err != nil {
+				t.Fatalf("writer lock: %v", err)
+			}
+			if _, err := q.LockModelProviderForShare(ctx, store.LockModelProviderForShareParams{ID: j.altID, OwnerUserID: j.userID}); err != nil {
+				t.Fatalf("lock provider: %v", err)
+			}
+			if _, err := q.GetVisibleProviderForUse(ctx, store.GetVisibleProviderForUseParams{ID: j.altID, UserID: j.userID}); err != nil {
+				t.Fatalf("visible provider: %v", err)
+			}
+			if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{Engine: "claude", ProviderID: pgtype.UUID{Bytes: j.altID, Valid: true}, ID: j.userID}); err != nil {
+				t.Fatalf("set source: %v", err)
+			}
+			res, err := ResolveProviderSource(ctx, q, j.userID, "claude", j.judge.providerAllow)
+			if err != nil {
+				t.Fatalf("resolve source: %v", err)
+			}
+			if err := res.Err(); err != nil {
+				t.Fatalf("source unusable: %v", err)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				if path == "manual" {
+					_, err := j.manual(target)
+					done <- err
+					return
+				}
+				j.auto(target)
+				done <- nil
+			}()
+
+			deadline := time.Now().Add(10 * time.Second)
+			for j.waiters() < 1 {
+				select {
+				case err := <-done:
+					t.Fatalf("the judge returned (%v) before it was seen queued on the shared lock", err)
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the judge was never seen queued on the shared lock")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatalf("commit writer: %v", err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("judge create: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the judge did not finish after the writer committed")
+			}
+			j.wantBoundTo(j.mustJudge(target), j.altID, j.altKy, 1)
+		})
+	}
+}
+
 // TestJudgeCreatePolicyChangedDetectionLiveDB: defence in depth for a writer that bypasses the lock
 // (direct SQL in the hook, after the decision). The locked re-reads catch it: a changed pin policy or
 // a source that froze to another provider is ErrJudgePolicyChanged (no vendor fallback); a source

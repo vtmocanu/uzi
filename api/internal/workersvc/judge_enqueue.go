@@ -260,17 +260,11 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !s.judgeSpendGuardsAllow(ctx, run) {
 		return
 	}
-	// Gate 4 (PRD #1429 M3, D4; PRD #3257): usability of the JUDGE's harness. It sits after
-	// the spend guards so a credential refusal is only ever reported for a run the judge
-	// would otherwise review. The judge harness is passed to createRunResolved below as an
-	// EXPLICIT selection, so a Claude judge keeps the Anthropic-token presence check
-	// (byte-identical to before) while a Codex judge's usability is the resolver's own
-	// per-harness usability (workersvc.resolveUsableCodexCredential), enforced
-	// authoritatively by the atomic create (ErrNoCredentialForHarness for an unusable Codex
-	// harness) — presence-only here would be the same wrong shape this repair replaces, so
-	// Codex gets no separate presence pre-check. Keyed on the RESOLVED judge harness, not
-	// the target's: a Claude target judged on Codex needs no Anthropic token, a Codex target
-	// judged on Claude does.
+	// Usability of the JUDGE's harness (PRD #1429 M3, D4; PRD #3257) is not pre-checked here. The
+	// judge harness is passed to createRunResolved below as an EXPLICIT selection, keyed on the
+	// RESOLVED judge harness, not the target's. A Codex judge's usability is the resolver's own
+	// per-harness usability (workersvc.resolveUsableCodexCredential), enforced by the atomic create
+	// (ErrNoCredentialForHarness for an unusable Codex harness).
 	// No lane or token presence read happens here: the judge's lane (vendor or provider-bound), and
 	// on the vendor Claude lane the default-token presence check, are decided inside the create
 	// transaction under the shared secret-mutation lock (createRunAtomic, JudgeLane). A refusal
