@@ -240,6 +240,12 @@ closes_compute() {
 # CR_* strings, but any shape the lenient read tolerates (null message, repository-less
 # reference, null page, zero commits) errors instead of being read as "closes nothing".
 closes_strict() {
+  # Each captured response must be exactly one JSON value: the joined stream below reads only
+  # its first three values, so a trailing extra value would otherwise be ignored silently.
+  local one
+  for one in "$CR_META" "$CR_N" "$CR_PAGES"; do
+    printf '%s\n' "$one" | jq -se 'length == 1' >/dev/null 2>&1 || return 1
+  done
   { printf '%s\n' "$CR_META"; printf '%s\n' "$CR_N"; printf '%s\n' "$CR_PAGES"; } | jq -ser --arg repo "$REPO" "$CLOSES_JQ_DEFS"'
     def bad_ref: (type != "object") or ((.number|type) != "number") or ((.repository|type) != "object")
       or ((.repository.owner|type) != "object") or ((.repository.owner.login|type) != "string")
@@ -545,8 +551,12 @@ if [ "$REPO" = vtmocanu/uzi ] && [ "$base" = main ]; then
   frag_list=$(git -C "$policy_root" diff --no-ext-diff --no-textconv --no-renames --diff-filter=A --name-only \
     "$policy_base" "$head" -- changelog.d) \
     || { echo 'cannot list the changelog fragments this PR adds; not merging'; exit 2; }
-  frags=$(printf '%s\n' "$frag_list" | grep -E '^changelog\.d/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$' || true)
-  frag_count=$(printf '%s' "$frags" | awk 'END { print NR }')
+  # grep: 0 = matches, 1 = no fragment path (an empty list), anything else = a failed filter.
+  frag_rc=0
+  frags=$(printf '%s\n' "$frag_list" | grep -E '^changelog\.d/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$') || frag_rc=$?
+  [ "$frag_rc" -le 1 ] || { echo 'cannot filter the changelog fragments this PR adds; not merging'; exit 2; }
+  frag_count=$(printf '%s' "$frags" | awk 'END { print NR }') && [[ "$frag_count" =~ ^[0-9]+$ ]] \
+    || { echo 'cannot count the changelog fragments this PR adds; not merging'; exit 2; }
   if [ "$frag_count" -ge 2 ]; then
     [[ "$PR" =~ ^[1-9][0-9]*$ ]] || { echo "PR number '$PR' is not numeric; cannot check the changelog fragment citations; not merging"; exit 2; }
     # Same captured closing metadata as CLOSES= above (no second forge read), validated strictly.

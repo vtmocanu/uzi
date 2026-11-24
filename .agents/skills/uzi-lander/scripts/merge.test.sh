@@ -976,7 +976,16 @@ else
   exec "$POLICY_BASE_GH" "${args[@]}"
 fi
 STUB
-chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh"
+REAL_GREP=$(command -v grep); export REAL_GREP
+cat > "$WORK/policy-bin/grep" <<'STUB'
+#!/usr/bin/env bash
+# POLICY_FRAGMENT_GREP_FAIL fails only the fragment path filter (its uuid pattern), as a grep error.
+if [ "${POLICY_FRAGMENT_GREP_FAIL:-0}" = 1 ]; then
+  for a in "$@"; do case "$a" in *'changelog\.d/[0-9a-f]{8}'*) exit 2 ;; esac; done
+fi
+exec "$REAL_GREP" "$@"
+STUB
+chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh" "$WORK/policy-bin/grep"
 export PATH="$WORK/policy-bin:$PATH" CONFIRM_AFTER_MERGE=1 MERGE_STATE=OPEN
 export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
 export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
@@ -1116,7 +1125,7 @@ unset POLICY_FETCH_FAIL
 export MERGE_STATE=OPEN
 pol_reset() {
   unset CLOSES_JSON CLOSES_JSON_LATER CLOSES_SEQ_FILE CLOSES_FAIL COMMITS_JSON COMMIT_COUNT COMMIT_PAGES_JSON PR_META_JSON \
-    PR_TITLE FRAG_DESC POLICY_BASE_REF POLICY_BASE_JSON POLICY_FRAGMENT_DIFF_FAIL POLICY_FRAGMENT_BLOB_FAIL
+    PR_TITLE FRAG_DESC POLICY_BASE_REF POLICY_BASE_JSON POLICY_FRAGMENT_DIFF_FAIL POLICY_FRAGMENT_BLOB_FAIL POLICY_FRAGMENT_GREP_FAIL
   MERGE_ARGS=()
 }
 pol_commits() { # [message of the first commit]: a stub commit list matching the topic branch
@@ -1209,6 +1218,9 @@ export POLICY_FRAGMENT_DIFF_FAIL=1; policy_run; pol_want 'fragment list unreadab
 unset POLICY_FRAGMENT_DIFF_FAIL
 export POLICY_FRAGMENT_BLOB_FAIL=1; policy_run; pol_want 'fragment blob unreadable' 2 0
 unset POLICY_FRAGMENT_BLOB_FAIL
+export POLICY_FRAGMENT_GREP_FAIL=1; policy_run; pol_want 'fragment filter failed' 2 0
+grep -qF 'cannot filter the changelog fragments' "$WORK/policy.out" || fail "fragment filter failure: wrong refusal: $(cat "$WORK/policy.out")"
+unset POLICY_FRAGMENT_GREP_FAIL
 # 12. Unreadable closing metadata refuses, cited or not.
 export CLOSES_FAIL=1
 policy_run; pol_want 'closes unreadable, cited' 2 0
@@ -1225,9 +1237,10 @@ pol_fixture() { # name -> exports that fixture's environment (after pol_reset)
     d) export COMMIT_PAGES_JSON='[null,[{"commit":{"message":"x"}}]]' COMMIT_COUNT=1 ;;
     e) export CLOSES_JSON='[{"number":4626}]' ;;
     f) export COMMIT_PAGES_JSON='[[]]' COMMIT_COUNT=0 ;;
+    g) export COMMIT_PAGES_JSON='[[{"commit":{"message":"x"}}]] {"extra":1}' COMMIT_COUNT=1 ;;
   esac
 }
-for fx in a b c d e f; do
+for fx in a b c d e f g; do
   cite='(#42)'; [ "$fx" = e ] && cite='(#4626)'
   pol_reset; pol_pr "frag-13$fx" "1=Fix a $cite." "2=Fix b $cite."; pol_fixture "$fx"
   policy_run; pol_want "incomplete metadata $fx" 2 0
