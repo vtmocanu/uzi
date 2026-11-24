@@ -31824,8 +31824,10 @@ export class RunRunner {
     if (outcome.kind === "stop") throw this.freshStop(flight, new FreshUnresolved(outcome.reason));
     if (outcome.kind === "negative") {
       if (entry.state !== "fresh_pending") throw this.freshStop(flight, new FreshUnresolved("negative_after_commit"));
-      await this.git.markFreshUnbound({ barePath, branch, key, runId: flight.runId, attemptId: journal.attemptId, expectedJournal: journal })
+      const unbound = await this.git.markFreshUnbound({ barePath, branch, key, runId: flight.runId, attemptId: journal.attemptId, expectedJournal: journal })
         .catch((error: unknown) => { throw this.freshStop(flight, new FreshUnresolved("unbind_failed", { cause: error })); });
+      // The recheck under the lock found another journal: nothing was written, so this claim stops rather than proceeding unreconciled.
+      if (!unbound) throw this.freshStop(flight, new FreshUnresolved("journal_changed"));
       flight.runLog.warn("fresh resume transfer was never seeded; the destination attempt is unbound", { transfer: journal.frid, server_state: outcome.reason });
       return;
     }
