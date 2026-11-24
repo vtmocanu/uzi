@@ -375,6 +375,10 @@ const HELD_LOG = "retained credential switch held; run processes unproven, work 
 const HOOK_LOG = "restore transport stopped; a pending credential switch is held through the op-fenced fence";
 const HOOK_FAILED_LOG = "late credential switch hold after the restore transport stopped did not complete; run left non-terminal, custody kept";
 const BUDGET_MS = 300;
+/** Slack over BUDGET_MS for the late hold itself (one in-flight request and its retry sleep). */
+const HOLD_SLACK_MS = 2000;
+/** Separate slack for the final hold-settled ack, which runs on the shutdown signal with the client terminal retry schedule. */
+const SETTLED_ACK_SLACK_MS = 5000;
 
 describe("an op-fenced credential switch after the restore transport stopped reaches the predecessor hold: claude", procfs, () => {
   const ledgerDirs: string[] = [];
@@ -443,6 +447,7 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     const { before, traps } = await drive(c.r);
     await settle(c);
     assertHeldOnce(c);
+    assert.equal(logged(c.r, HOOK_LOG).length, 1, "the late hook held the latched switch");
     assert.equal(logged(c.r, STOPPED_LOG).length, 1);
     assert.equal(reason(c), "RestoreTransportStop");
     unseeded(c);
@@ -476,8 +481,7 @@ describe("an op-fenced credential switch after the restore transport stopped rea
           armed = false;
           before?.();
           api.requestCredentialSwitch(flight.runId, gen(c), OP);
-          await until("the late switch to trip", () => flight.steering.pendingCredentialSwitch() === gen(c));
-        }
+          await until("the late switch to trip", () => flight.steering.pendingCredentialSwitch() === gen(c));        }
         return original(...a);
       };
     };
@@ -500,11 +504,11 @@ describe("an op-fenced credential switch after the restore transport stopped rea
   it("Order 2a budget control: an unreachable api ends the late hold within the verification allowance, leaving the settle owed", async () => {
     const c = await arrangeSwitch({ ledger: true, extra: { retainedSwitchVerificationMs: BUDGET_MS, recoveryRetryMs: 5 } });
     const runner = c.r.runner as unknown as Record<string, (...a: unknown[]) => unknown> & { pendingHoldSettled: Map<string, unknown> };
-    const hook: { start?: number; end?: number } = {};
+    const hook: { start?: number; end?: number; wireAtEnd?: number } = {};
     const hookOriginal = runner.holdSwitchAfterTransportStop!.bind(runner);
     mock.method(runner, "holdSwitchAfterTransportStop", async (...args: unknown[]) => {
       hook.start = Date.now();
-      try { return await hookOriginal(...args); } finally { hook.end = Date.now(); }
+      try { return await hookOriginal(...args); } finally { hook.end = Date.now(); hook.wireAtEnd = api.stateWire.length; }
     });
     const joinOriginal = runner.joinRetainedSwitchOperations!.bind(runner);
     const atJoin: Array<string | undefined> = [];
@@ -515,21 +519,26 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     c.onAttribution = () => trip(c, true);
     let armedAt = -1;
     switchAtStopClose(c, () => { armedAt = api.stateWire.length; api.failStateNext(100_000, 503); });
-    const started = Date.now();
     const outcome = await Promise.race([
       drive(c.r).then(() => "done"),
-      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGET_MS + 5000)),
+      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGET_MS + SETTLED_ACK_SLACK_MS)),
     ]);
-    assert.equal(outcome, "done", "drive settled within the budget plus the bounded settled acknowledgement");
+    // The final credential_switch_hold_settled ack is not part of the hold budget: it runs on the shutdown signal with the
+    // client's terminal retry schedule, so it gets its own slack (SETTLED_ACK_SLACK_MS) on top of the hold allowance.
+    assert.equal(outcome, "done", "drive settled within the hold budget plus the bounded settled acknowledgement");
     await settle(c);
     assert.ok(armedAt >= 0, "the api failure was armed inside the stop arm");
-    assert.ok(hook.start !== undefined && hook.end !== undefined, "the late hook ran");
-    assert.ok(hook.end - hook.start < BUDGET_MS + 2000, `the late hold ended within its allowance (took ${hook.end - hook.start} ms)`);
-    assert.ok(hook.start - started >= 0);
+    assert.ok(hook.start !== undefined && hook.end !== undefined && hook.wireAtEnd !== undefined, "the late hook ran");
+    assert.ok(hook.end - hook.start < BUDGET_MS + HOLD_SLACK_MS, `the late hold ended within its allowance (took ${hook.end - hook.start} ms)`);
     const sent = api.stateWire.slice(armedAt).filter(s => s.runId === c.r.runId).map(s => String(s.body.status));
-    const heldAttempts = api.stateWire.slice(armedAt).filter(s => s.runId === c.r.runId && s.body.status === "credential_switch_held");
+    const own = (from: number, to?: number) => api.stateWire.slice(from, to).filter(s => s.runId === c.r.runId);
+    const heldAttempts = own(armedAt, hook.wireAtEnd).filter(s => s.body.status === "credential_switch_held");
     assert.ok(heldAttempts.length >= 1, "the hold report was attempted");
     assert.equal(heldAttempts.every(s => (s.body as { op_id?: string }).op_id === OP), true);
+    assert.equal(own(hook.wireAtEnd).some(s => s.body.status === "credential_switch_held"), false, "no hold report after the hook ended");
+    assert.equal(own(armedAt, hook.wireAtEnd).some(s => s.body.status === "credential_switch_hold_settled"), false,
+      "the settled acknowledgement is not sent inside the hold budget");
+    assert.ok(own(hook.wireAtEnd).some(s => s.body.status === "credential_switch_hold_settled"), "the settled acknowledgement was attempted after the hook ended");
     assert.deepEqual([...new Set(sent)].filter(s => s !== "credential_switch_held" && s !== "credential_switch_hold_settled"), [],
       "only hold reports were sent after the failure was armed");
     assert.equal(logged(c.r, HELD_LOG).length, 0, "no hold was confirmed");
@@ -559,7 +568,8 @@ describe("an op-fenced credential switch after the restore transport stopped rea
   });
 
   describe("controls: a lifecycle that already decided the exit is not overridden by the switch", () => {
-    interface Expect { failed: number; terminalInstalls: number }
+    /** stopArm: how often the RetainedRecoveryStop arm logs (default 1; a fence is dispatched as a stale claim, never through it). */
+    interface Expect { failed: number; terminalInstalls: number; stopArm?: number }
     /** The outcome the base (before issue #4652) produces. A cancel or fence that arrives after the switch was latched is withheld
      *  by steering (the switch keeps precedence, as in the "switch race" row), so only shutdown is also driven in that order. */
     interface Outcomes { control_first: Expect; switch_first?: Expect }
@@ -568,23 +578,31 @@ describe("an op-fenced credential switch after the restore transport stopped rea
       for (const order of orders) {
         it(`${name}: ${order}`, async () => {
           const c = await arrangeSwitch({ ledger: true });
+          let hookError: unknown;
           c.onAttribution = async () => {
-            await trip(c, true);
-            if (order === "the control, then the switch") {
-              await act(c);
-              // The switch may never be observed once the lifecycle ended; the control only needs it requested.
-              await latchSwitch(c, 300).catch(() => undefined);
-            } else {
-              await latchSwitch(c);
-              await act(c);
+            try {
+              await trip(c, true);
+              if (order === "the control, then the switch") {
+                await act(c);
+                // Steering stops polling once the lifecycle ended, so the switch can only be requested, never observed.
+                api.requestCredentialSwitch(c.flight!.runId, gen(c), OP);
+              } else {
+                await latchSwitch(c);
+                await act(c);
+              }
+            } catch (error) {
+              hookError = error;
+              throw error;
             }
           };
           await drive(c.r);
           await settle(c);
+          api.failInputReceipts("ack", undefined);
+          assert.equal(hookError, undefined, "the arrangement completed (a rejected control or latch must not pass silently)");
           assert.equal(heldReports(c).length, 0, "no credential_switch_held");
           assert.equal(holds(c, "credential_switch_hold_settled").length, 0);
-          assert.equal(logged(c.r, STOPPED_LOG).length, 1, "the stop arm ran once");
           const expectOutcome = order === "the control, then the switch" ? outcomes.control_first : outcomes.switch_first!;
+          assert.equal(logged(c.r, STOPPED_LOG).length, expectOutcome.stopArm ?? 1, "the stop arm count");
           assert.equal(failed(c.r).length, expectOutcome.failed, "failed reports");
           assert.equal(c.terminalInstalls, expectOutcome.terminalInstalls, "terminal installs");
           assert.equal(c.counts.models, 0, "no model start");
@@ -599,9 +617,10 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     }, { control_first: { failed: 1, terminalInstalls: 1 } });
     control("shutdown", async c => { c.r.runner.shutdown(); }, { control_first: { failed: 0, terminalInstalls: 0 }, switch_first: { failed: 0, terminalInstalls: 0 } });
     control("stale fence", async c => {
-      api.setInputClaimGeneration(c.r.runId, gen(c) + 1);
-      api.setInputFenceReason(c.r.runId, "stale");
-      await until("the fence", () => c.flight!.steering.claimFence() !== undefined);
-    }, { control_first: { failed: 0, terminalInstalls: 0 } });
+      // A fence is only ever observed through an input receipt: an operator row is polled, then its ACK is refused as stale.
+      api.appendInputs(c.r.runId, [{ id: 1, kind: "follow_up", body: "x" }]);
+      api.failInputReceipts("ack", 409, "stale");
+      await until("the fence", () => c.flight!.steering.claimFence() !== undefined, 3000);
+    }, { control_first: { failed: 0, terminalInstalls: 0, stopArm: 0 } });
   });
 });

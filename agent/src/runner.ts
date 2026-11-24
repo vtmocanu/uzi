@@ -7750,7 +7750,9 @@ export class RunRunner {
       // Issue #4201 (A.3): a flight that ends in the prologue discards its latched switch (the server stamp
       // stays pending and the next claim serves it in place).
       // Issue #4652: a latched op-fenced switch is served, not discarded, when the restore transport stopped first.
-      flight.prologueSwitchHold?.close({ service: this.transportStopSwitchEligible(claim, flight) });
+      flight.prologueSwitchHold?.close({
+        service: err instanceof RetainedRecoveryStop && !(err instanceof RetainedRecoveryCancelled) && this.transportStopSwitchEligible(claim, flight),
+      });
       await dispatchFailure(err, true);
     } finally {
       const diagnostic = this.sourceEndDiagnosticState(flight);
@@ -29901,16 +29903,16 @@ export class RunRunner {
   /**
    * Issue #4652: the late hold. The RetainedRecoveryStop arm of executeClaim calls this once, after the batcher closed. When the
    * restore transport was stopped by a permanent failure and an op-fenced switch is pending (it arrived after the window's last
-   * poll was served, or was latched and served by the catch), report the op-fenced hold once, bounded by
-   * retainedSwitchVerificationMs. It never waits for a switch, never reports a terminal state and never clears
+   * poll was served, or was latched and served by the catch), report the op-fenced hold, retrying within the
+   * retainedSwitchVerificationMs budget. It never waits for a switch, never reports a terminal state and never clears
    * flight.retainedSwitchSettlement: a `hold_pending` left by an expired hold is settled by the existing finally join. Every
    * failure is logged and swallowed; the flight stays nonterminal with custody kept.
    */
   private async holdSwitchAfterTransportStop(claim: ClaimResponse, flight: RunFlight, runLog: Logger, err: unknown): Promise<void> {
     if (err instanceof RetainedRecoveryCancelled || !this.transportStopSwitchEligible(claim, flight)) return;
     try {
-      // A cancel, fence or shutdown already decided this flight's exit: nothing to hold.
-      this.retainedTerminalGuard(flight);
+      // No pending op-fenced switch: nothing to hold, and nothing to warn about. A cancel, fence or shutdown that already
+      // decided the exit is refused by the retainedTerminalGuard inside escapedInPlaceSwitch's identity check.
       const closed = this.closedInPlaceSwitch(claim, flight);
       if (closed === undefined) return;
       runLog.info("restore transport stopped; a pending credential switch is held through the op-fenced fence", {
