@@ -27,6 +27,7 @@ import (
 )
 
 type freshHandlerFix struct {
+	h      *Handler
 	t      *testing.T
 	router http.Handler
 	pool   *pgxpool.Pool
@@ -55,6 +56,10 @@ func newFreshHandlerFix(t *testing.T, gate bool) *freshHandlerFix {
 	svc.SetVault(h.vault)
 	svc.SetTxBeginner(pool)
 	h.wsvc = svc
+	// The recovery service the worker bundle route streams through reads its limits from the config.
+	rc := recoveryTestCfg()
+	rc.JWTSecret, rc.AuthTokenTTL = h.cfg.JWTSecret, h.cfg.AuthTokenTTL
+	h.cfg = rc
 
 	owner := cliSeedUser(t, pool, false)
 	conn := rmSeedConn(t, pool, owner)
@@ -82,7 +87,7 @@ func newFreshHandlerFix(t *testing.T, gate bool) *freshHandlerFix {
 			t.Errorf("cleanup run_fresh_resumes: %v", err)
 		}
 	})
-	return &freshHandlerFix{t: t, router: router, pool: pool, owner: owner, token: cliMintToken(t, pool, owner, clitoken.ScopeUser),
+	return &freshHandlerFix{h: h, t: t, router: router, pool: pool, owner: owner, token: cliMintToken(t, pool, owner, clitoken.ScopeUser),
 		jwt: cliMintJWT(t, pool, owner), run: run, w1: w1, w2: w2, cap: capID}
 }
 

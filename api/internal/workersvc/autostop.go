@@ -33,6 +33,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -373,10 +374,7 @@ func (s *Service) evaluateAutoStopLocked(ctx context.Context, now time.Time, c p
 // every other server-side failed path performs. Omit either and the run rots in the
 // wrong board column with no judge.
 func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistFailCandidate, now time.Time, peers int, live bool, action string, terminal *bool, afterCommit *func()) bool {
-	rows, err := s.q.FailRunAutoStop(ctx, store.FailRunAutoStopParams{
-		ID:            c.runID,
-		FailureReason: pgconv.TextOrNull(autoStopReason),
-	})
+	rows, err := s.failRunAutoStopRows(ctx, c.runID)
 	if err != nil {
 		slog.Error("workersvc: auto-stop could not fail the run", "run_id", c.runID.String(), "error", err)
 		return false
@@ -390,6 +388,36 @@ func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistF
 	*terminal = true
 	*afterCommit = func() { s.logAutoStop(action, run, c, now, peers, live) }
 	return true
+}
+
+// failRunAutoStopRows runs FailRunAutoStop for one run. The fresh resume guard (a pending or claimed
+// transfer) refuses a status change to failed unless the same transaction set uzi.fresh_resume_terminal
+// to this run's id, so the write runs in one transaction that sets it first; the setting is
+// transaction-local and ends with the commit. The statement is id-scoped, so the setting names exactly
+// the one run it fails. Without a transaction beginner (unit wiring with a fake store) the write is the
+// plain autocommit one.
+func (s *Service) failRunAutoStopRows(ctx context.Context, runID uuid.UUID) (int64, error) {
+	params := store.FailRunAutoStopParams{ID: runID, FailureReason: pgconv.TextOrNull(autoStopReason)}
+	if s.txBeginner == nil {
+		return s.q.FailRunAutoStop(ctx, params)
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	if err := q.SetFreshResumeTerminal(ctx, runID.String()); err != nil {
+		return 0, err
+	}
+	rows, err := q.FailRunAutoStop(ctx, params)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return rows, nil
 }
 
 // logAutoStop is M7: ONE structured line per auto-stop decision, carrying every

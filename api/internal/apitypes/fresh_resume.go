@@ -62,6 +62,59 @@ type FreshResumeStartRequest struct {
 	RequestID      string `json:"request_id"`
 }
 
+// The 409 reasons of the destination worker's fresh resume routes (/api/worker/runs/{id}/fresh-resume/...).
+const (
+	// FreshResumeReasonNotClaimed: the transfer is not claimed by this worker at the claim generation it
+	// sent, or it was closed (refused, cancelled), so the call is fenced out.
+	FreshResumeReasonNotClaimed = "fresh_resume_not_claimed"
+	// FreshResumeReasonAttemptMismatch: the receipt names an attempt or generation other than the one the
+	// transfer was seeded under (or an attempt id that does not carry the claim generation).
+	FreshResumeReasonAttemptMismatch = "fresh_resume_attempt_mismatch"
+	// FreshResumeReasonNoBundle: the transfer's evidence is a checkpoint ref, which has no bundle to stream.
+	FreshResumeReasonNoBundle = "fresh_resume_no_bundle"
+	// FreshResumeReasonPreSeed: the worker's park or fail report was refused because its transfer is
+	// claimed and not yet seeded; the worker abandons the transfer instead of parking the run.
+	FreshResumeReasonPreSeed = "fresh_resume_pre_seed"
+)
+
+// FreshResumeSeededRequest is the body of POST /api/worker/runs/{id}/fresh-resume/{frid}/seeded: the
+// destination's receipt that its first fenced commit landed. ClaimGeneration is G' (the transfer's claim
+// generation), AttemptID the destination attempt, LiveGeneration the generation the worker holds now
+// (the one CurrentAuthority is judged against).
+type FreshResumeSeededRequest struct {
+	ClaimGeneration int64  `json:"claim_generation"`
+	AttemptID       string `json:"attempt_id"`
+	LiveGeneration  int64  `json:"live_generation"`
+}
+
+// FreshResumeAbandonRequest is the body of POST /api/worker/runs/{id}/fresh-resume/{frid}/abandon.
+type FreshResumeAbandonRequest struct {
+	ClaimGeneration int64 `json:"claim_generation"`
+}
+
+// FreshResumeStateDTO is the reply of the seeded receipt and of GET .../fresh-resume/{frid}/state: the
+// stored transfer state and whether the calling worker still holds the run's live claim. SeededAt is
+// null (omitted from the seeded fields) until the receipt landed; a transfer refused before seeding
+// answers state "refused" with SeededAt null. CurrentAuthority is judged under the run lock against the
+// live generation the caller sent.
+type FreshResumeStateDTO struct {
+	State                string  `json:"state"`
+	SeededAt             *string `json:"seeded_at"`
+	DestinationAttemptID *string `json:"destination_attempt_id"`
+	SeededGeneration     *int64  `json:"seeded_generation"`
+	CurrentAuthority     bool    `json:"current_authority"`
+}
+
+// FreshResumeSeededDTO is the reply of the seeded receipt: the same fields as the state route.
+type FreshResumeSeededDTO = FreshResumeStateDTO
+
+// FreshResumeAbandonDTO is the reply of the abandon route: the transfer closed refused (the run is back
+// at its held recovery_wait).
+type FreshResumeAbandonDTO struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+}
+
 // FreshResumeStartDTO is the disposition of a start: the transfer row it created, or, for a replay of a
 // request that is still active, the row that request already created.
 type FreshResumeStartDTO struct {

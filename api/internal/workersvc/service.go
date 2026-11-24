@@ -9294,6 +9294,9 @@ type SweepResult struct {
 	WallParked    int64
 	StaleFailed   int64
 	StaleRequeued int64
+	// FreshResumeRefused is the number of fresh resume transfers (issue #4628) this pass refused: an
+	// expired or gate-off pending row, or a claimed one with positive loss evidence.
+	FreshResumeRefused int64
 	// PublicationHeld is the number of queued runs moved to an owner hold because their
 	// publication custodian worker cannot serve them (issue #1324 D5).
 	PublicationHeld    int64

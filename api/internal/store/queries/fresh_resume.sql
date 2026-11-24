@@ -409,6 +409,77 @@ WHERE c.id = @id AND c.run_id = @run_id AND c.user_id = @user_id
   AND c.source_sha = @sha
 FOR SHARE OF c;
 
+-- name: SetFreshResumeTerminal :exec
+-- Transaction-local allowance for the auto-stop failure of exactly one run (guard rule 1's
+-- uzi.fresh_resume_terminal exception). Its own statement, run in the same transaction as FailRunAutoStop
+-- and gone when that transaction ends.
+SELECT set_config('uzi.fresh_resume_terminal', @run_id::text, true);
+
+-- name: FreshResumeCurrentAuthority :one
+-- Whether the calling worker still holds the run's live claim at @live_generation. Read under the run
+-- lock by the receipt and state routes. True only when the run is claimed or running for this worker at
+-- exactly that generation with the claim unreleased and no cancel or stop input still deliverable (the
+-- cancel_deliverable predicate of GetFollowupFinalizeBlockers, extended to stop): unapplied, not
+-- superseded and not covered by a milestone-reconciliation stop_cutoff. No row (the run is gone) is
+-- false by the caller.
+SELECT (r.status IN ('claimed', 'running')
+        AND r.worker_id = @worker_id::uuid
+        AND r.claim_generation = @live_generation::bigint
+        AND r.claim_released_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = r.id AND i.kind IN ('cancel', 'stop')
+              AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+              AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)))::boolean AS current_authority
+FROM runs r WHERE r.id = @run_id;
+
+-- name: ListFreshResumeSweepCandidates :many
+-- The sweep's selector: transfer rows with positive evidence that they must be refused, and the reason.
+-- Candidates only; the sweep re-runs this same query narrowed to one id (only_id) under the run and
+-- transfer locks and refuses only when the reason still holds. A snapshot that merely omits the run
+-- inside the 60 second grace is NOT loss evidence.
+--   pending:  gate_off (the instance gate is off) or admission_deadline (the row expired).
+--   claimed (claimed_enabled): transfer_deadline; destination_deleted (the destination worker row is
+--     gone); destination_stale (its heartbeat is older than @stale_cutoff); destination_reregistered (the
+--     nonce it reported its first running with is no longer its register nonce); snapshot_departed
+--     (StampSnapshotDepartures' stamp is present at G' under the worker's current nonce); snapshot_omitted
+--     (an accepted heartbeat snapshot newer than status_since + 60s does not list the run at G', and the
+--     worker is not under a pending-outcome overflow closure).
+SELECT c.id, c.run_id, c.reason
+FROM (
+    SELECT t.id, t.run_id, t.created_at,
+           (CASE
+              WHEN t.state = 'pending' AND NOT @gate_on::boolean THEN 'gate_off'
+              WHEN t.state = 'pending' AND t.admission_deadline <= now() THEN 'admission_deadline'
+              WHEN t.state <> 'claimed' OR NOT @claimed_enabled::boolean THEN NULL
+              WHEN t.transfer_deadline IS NOT NULL AND t.transfer_deadline <= now() THEN 'transfer_deadline'
+              WHEN t.destination_worker_id IS NULL OR r.worker_id IS NULL OR w.id IS NULL THEN 'destination_deleted'
+              WHEN COALESCE(w.last_heartbeat_at, '-infinity'::timestamptz) < @stale_cutoff::timestamptz THEN 'destination_stale'
+              WHEN r.registration_evidence_generation = t.claim_generation
+                   AND r.registration_evidence_nonce IS DISTINCT FROM w.snapshot_register_nonce THEN 'destination_reregistered'
+              WHEN r.snapshot_departed_generation = t.claim_generation
+                   AND w.snapshot_register_nonce IS NOT NULL
+                   AND r.snapshot_departed_nonce = w.snapshot_register_nonce
+                   AND r.snapshot_departed_epoch <= w.snapshot_epoch THEN 'snapshot_departed'
+              WHEN r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL
+                   AND w.roll_heartbeat_at IS NOT NULL
+                   AND w.roll_heartbeat_at > r.status_since + interval '60 seconds'
+                   AND (w.pending_overflow_until IS NULL OR w.pending_overflow_until <= now())
+                   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                   WHERE a.worker_id = w.id AND a.run_id = r.id
+                                     AND a.claim_generation = t.claim_generation) THEN 'snapshot_omitted'
+            END)::text AS reason
+    FROM run_fresh_resumes t
+    JOIN runs r ON r.id = t.run_id
+    LEFT JOIN workers w ON w.id = t.destination_worker_id
+    WHERE t.state IN ('pending', 'claimed')
+      AND (sqlc.narg(only_id)::uuid IS NULL OR t.id = sqlc.narg(only_id)::uuid)
+) c
+WHERE c.reason IS NOT NULL
+ORDER BY c.created_at, c.id
+LIMIT 200;
+
 -- name: CaptureHasActiveFreshResume :one
 -- Whether a pending or claimed transfer references the capture: its bytes must not be discarded,
 -- expired or fenced while the destination may still fetch them.

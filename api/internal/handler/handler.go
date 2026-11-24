@@ -1596,6 +1596,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/archives/{captureID}/redundancy", h.WorkerRecoveryArchiveRedundancy)
 		r.Post("/runs/{id}/archives/{captureID}/upload", h.WorkerRecoveryUpload)
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
+		// Issue #4628: the fresh resume destination's routes. They ignore the UZI_FRESH_RESUME gate;
+		// all but state are fenced on the calling worker, its claim generation and a claimed transfer.
+		r.Get("/runs/{id}/fresh-resume/{frid}/bundle", h.WorkerFreshResumeBundle)
+		r.Post("/runs/{id}/fresh-resume/{frid}/abandon", h.WorkerFreshResumeAbandon)
+		r.Post("/runs/{id}/fresh-resume/{frid}/seeded", h.WorkerFreshResumeSeeded)
+		r.Get("/runs/{id}/fresh-resume/{frid}/state", h.WorkerFreshResumeState)
 		// PRD #1349 M1: the post-clone generation-exact hold inventory for this worker's run.
 		r.Get("/runs/{id}/recovery-holds", h.WorkerListRecoveryHolds)
 		// Issue #1582 M1: settle ONE older-generation hold on a completed run by the api's own

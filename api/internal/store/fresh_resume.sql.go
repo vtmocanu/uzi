@@ -152,6 +152,39 @@ func (q *Queries) CountOpenHoldsForFreshRun(ctx context.Context, arg CountOpenHo
 	return open_holds, err
 }
 
+const freshResumeCurrentAuthority = `-- name: FreshResumeCurrentAuthority :one
+SELECT (r.status IN ('claimed', 'running')
+        AND r.worker_id = $1::uuid
+        AND r.claim_generation = $2::bigint
+        AND r.claim_released_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = r.id AND i.kind IN ('cancel', 'stop')
+              AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+              AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)))::boolean AS current_authority
+FROM runs r WHERE r.id = $3
+`
+
+type FreshResumeCurrentAuthorityParams struct {
+	WorkerID       uuid.UUID `json:"worker_id"`
+	LiveGeneration int64     `json:"live_generation"`
+	RunID          uuid.UUID `json:"run_id"`
+}
+
+// Whether the calling worker still holds the run's live claim at @live_generation. Read under the run
+// lock by the receipt and state routes. True only when the run is claimed or running for this worker at
+// exactly that generation with the claim unreleased and no cancel or stop input still deliverable (the
+// cancel_deliverable predicate of GetFollowupFinalizeBlockers, extended to stop): unapplied, not
+// superseded and not covered by a milestone-reconciliation stop_cutoff. No row (the run is gone) is
+// false by the caller.
+func (q *Queries) FreshResumeCurrentAuthority(ctx context.Context, arg FreshResumeCurrentAuthorityParams) (bool, error) {
+	row := q.db.QueryRow(ctx, freshResumeCurrentAuthority, arg.WorkerID, arg.LiveGeneration, arg.RunID)
+	var current_authority bool
+	err := row.Scan(&current_authority)
+	return current_authority, err
+}
+
 const freshResumeRunBaseEligible = `-- name: FreshResumeRunBaseEligible :one
 SELECT fn_fresh_resume_run_base(r, $1::int)::boolean AS eligible
 FROM runs r WHERE r.id = $2 AND r.user_id = $3
@@ -523,6 +556,92 @@ func (q *Queries) ListFreshResumeCaptureEvidence(ctx context.Context, arg ListFr
 			&i.HoldRunID,
 			&i.HoldRepoID,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFreshResumeSweepCandidates = `-- name: ListFreshResumeSweepCandidates :many
+SELECT c.id, c.run_id, c.reason
+FROM (
+    SELECT t.id, t.run_id, t.created_at,
+           (CASE
+              WHEN t.state = 'pending' AND NOT $1::boolean THEN 'gate_off'
+              WHEN t.state = 'pending' AND t.admission_deadline <= now() THEN 'admission_deadline'
+              WHEN t.state <> 'claimed' OR NOT $2::boolean THEN NULL
+              WHEN t.transfer_deadline IS NOT NULL AND t.transfer_deadline <= now() THEN 'transfer_deadline'
+              WHEN t.destination_worker_id IS NULL OR r.worker_id IS NULL OR w.id IS NULL THEN 'destination_deleted'
+              WHEN COALESCE(w.last_heartbeat_at, '-infinity'::timestamptz) < $3::timestamptz THEN 'destination_stale'
+              WHEN r.registration_evidence_generation = t.claim_generation
+                   AND r.registration_evidence_nonce IS DISTINCT FROM w.snapshot_register_nonce THEN 'destination_reregistered'
+              WHEN r.snapshot_departed_generation = t.claim_generation
+                   AND w.snapshot_register_nonce IS NOT NULL
+                   AND r.snapshot_departed_nonce = w.snapshot_register_nonce
+                   AND r.snapshot_departed_epoch <= w.snapshot_epoch THEN 'snapshot_departed'
+              WHEN r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL
+                   AND w.roll_heartbeat_at IS NOT NULL
+                   AND w.roll_heartbeat_at > r.status_since + interval '60 seconds'
+                   AND (w.pending_overflow_until IS NULL OR w.pending_overflow_until <= now())
+                   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                   WHERE a.worker_id = w.id AND a.run_id = r.id
+                                     AND a.claim_generation = t.claim_generation) THEN 'snapshot_omitted'
+            END)::text AS reason
+    FROM run_fresh_resumes t
+    JOIN runs r ON r.id = t.run_id
+    LEFT JOIN workers w ON w.id = t.destination_worker_id
+    WHERE t.state IN ('pending', 'claimed')
+      AND ($4::uuid IS NULL OR t.id = $4::uuid)
+) c
+WHERE c.reason IS NOT NULL
+ORDER BY c.created_at, c.id
+LIMIT 200
+`
+
+type ListFreshResumeSweepCandidatesParams struct {
+	GateOn         bool               `json:"gate_on"`
+	ClaimedEnabled bool               `json:"claimed_enabled"`
+	StaleCutoff    pgtype.Timestamptz `json:"stale_cutoff"`
+	OnlyID         pgtype.UUID        `json:"only_id"`
+}
+
+type ListFreshResumeSweepCandidatesRow struct {
+	ID     uuid.UUID `json:"id"`
+	RunID  uuid.UUID `json:"run_id"`
+	Reason string    `json:"reason"`
+}
+
+// The sweep's selector: transfer rows with positive evidence that they must be refused, and the reason.
+// Candidates only; the sweep re-runs this same query narrowed to one id (only_id) under the run and
+// transfer locks and refuses only when the reason still holds. A snapshot that merely omits the run
+// inside the 60 second grace is NOT loss evidence.
+//
+//	pending:  gate_off (the instance gate is off) or admission_deadline (the row expired).
+//	claimed (claimed_enabled): transfer_deadline; destination_deleted (the destination worker row is
+//	  gone); destination_stale (its heartbeat is older than @stale_cutoff); destination_reregistered (the
+//	  nonce it reported its first running with is no longer its register nonce); snapshot_departed
+//	  (StampSnapshotDepartures' stamp is present at G' under the worker's current nonce); snapshot_omitted
+//	  (an accepted heartbeat snapshot newer than status_since + 60s does not list the run at G', and the
+//	  worker is not under a pending-outcome overflow closure).
+func (q *Queries) ListFreshResumeSweepCandidates(ctx context.Context, arg ListFreshResumeSweepCandidatesParams) ([]ListFreshResumeSweepCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listFreshResumeSweepCandidates,
+		arg.GateOn,
+		arg.ClaimedEnabled,
+		arg.StaleCutoff,
+		arg.OnlyID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListFreshResumeSweepCandidatesRow{}
+	for rows.Next() {
+		var i ListFreshResumeSweepCandidatesRow
+		if err := rows.Scan(&i.ID, &i.RunID, &i.Reason); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -1144,6 +1263,18 @@ func (q *Queries) RestoreFreshResumeTuple(ctx context.Context, id uuid.UUID) (in
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setFreshResumeTerminal = `-- name: SetFreshResumeTerminal :exec
+SELECT set_config('uzi.fresh_resume_terminal', $1::text, true)
+`
+
+// Transaction-local allowance for the auto-stop failure of exactly one run (guard rule 1's
+// uzi.fresh_resume_terminal exception). Its own statement, run in the same transaction as FailRunAutoStop
+// and gone when that transaction ends.
+func (q *Queries) SetFreshResumeTerminal(ctx context.Context, runID string) error {
+	_, err := q.db.Exec(ctx, setFreshResumeTerminal, runID)
+	return err
 }
 
 const supersedePriorSeeded = `-- name: SupersedePriorSeeded :execrows

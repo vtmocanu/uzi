@@ -48,7 +48,20 @@ const (
 // RefuseOption tunes RefuseFreshResumeInTx.
 type RefuseOption func(*refuseConfig)
 
-type refuseConfig struct{ noWait bool }
+type refuseConfig struct {
+	noWait bool
+	// holds, when set, is asked once the run and the transfer row are locked and the row is still in the
+	// state the lock order was taken for; false means the condition that justified the refusal no longer
+	// holds and nothing is written (FreshRefuseNoop).
+	holds func(ctx context.Context, q *store.Queries) (bool, error)
+}
+
+// RefuseWhenHolds makes the refusal conditional: holds is evaluated under the run and transfer locks (on
+// the same transaction, so each statement sees the committed state after the lock waits), and the row is
+// refused only when it returns true. The sweep uses it to revalidate its unlocked candidate read.
+func RefuseWhenHolds(holds func(ctx context.Context, q *store.Queries) (bool, error)) RefuseOption {
+	return func(c *refuseConfig) { c.holds = holds }
+}
 
 // RefuseNoWait is for a caller that already holds a worker row lock (the claim finisher, the abandon
 // route): the predecessor lock never waits and a held conflicting lock is SQLSTATE 55P03, which the
@@ -89,7 +102,7 @@ func RefuseFreshResumeInTx(ctx context.Context, tx pgx.Tx, frid uuid.UUID, reaso
 	}
 	switch row.State {
 	case "pending":
-		return refusePendingFreshResume(ctx, q, row, reason)
+		return refusePendingFreshResume(ctx, q, row, reason, cfg)
 	case "claimed":
 		return refuseClaimedFreshResume(ctx, q, row, reason, cfg)
 	}
@@ -97,7 +110,7 @@ func RefuseFreshResumeInTx(ctx context.Context, tx pgx.Tx, frid uuid.UUID, reaso
 }
 
 // refusePendingFreshResume is step 0: run lock, transfer lock, close, bump.
-func refusePendingFreshResume(ctx context.Context, q *store.Queries, row store.RunFreshResume, reason string) (FreshRefuseOutcome, error) {
+func refusePendingFreshResume(ctx context.Context, q *store.Queries, row store.RunFreshResume, reason string, cfg refuseConfig) (FreshRefuseOutcome, error) {
 	if _, err := q.GetRunByIDForUpdate(ctx, row.RunID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return FreshRefuseNoop, nil
@@ -120,6 +133,9 @@ func refusePendingFreshResume(ctx context.Context, q *store.Queries, row store.R
 	default:
 		return FreshRefuseNoop, nil
 	}
+	if ok, err := refuseHolds(ctx, q, cfg); err != nil || !ok {
+		return FreshRefuseNoop, err
+	}
 	if _, err := q.CloseFreshResume(ctx, store.CloseFreshResumeParams{ID: locked.ID, State: "refused", Reason: reason}); err != nil {
 		return "", err
 	}
@@ -128,6 +144,14 @@ func refusePendingFreshResume(ctx context.Context, q *store.Queries, row store.R
 	}
 	slog.Info("fresh resume refused", "transfer", locked.ID.String(), "run", locked.RunID.String(), "state", "pending", "reason", reason)
 	return FreshRefusedPending, nil
+}
+
+// refuseHolds evaluates the optional RefuseWhenHolds condition; no condition holds trivially.
+func refuseHolds(ctx context.Context, q *store.Queries, cfg refuseConfig) (bool, error) {
+	if cfg.holds == nil {
+		return true, nil
+	}
+	return cfg.holds(ctx, q)
 }
 
 // refuseClaimedFreshResume is steps 1 to 7.
@@ -156,6 +180,9 @@ func refuseClaimedFreshResume(ctx context.Context, q *store.Queries, row store.R
 	}
 	if locked.State != "claimed" {
 		return FreshRefuseNoop, nil
+	}
+	if ok, err := refuseHolds(ctx, q, cfg); err != nil || !ok {
+		return FreshRefuseNoop, err
 	}
 	if err := q.OptInFreshResume(ctx, locked.ID.String()); err != nil {
 		return "", err

@@ -1693,6 +1693,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				ack["registration_evidence"] = result.RegistrationEvidence
 			}
 			httpx.JSON(w, http.StatusConflict, ack)
+		case store.IsFreshResumeInProgress(err) && req.State != "running" && run.ID == runID && h.refuseFreshPreSeed(w, r, wkr, run):
+			// Issue #4628: a park or fail writer that reached the fresh resume guard instead of
+			// skipping the run; the reply is already written.
 		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence), errors.Is(err, workersvc.ErrInvalidCheckpointPublication):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrJobNeverParks):
@@ -1744,6 +1747,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
+		//
+		// Issue #4628: a park or fail report of a fresh resume destination whose transfer is claimed
+		// and not yet seeded is not an ordinary no-op: the excluded writer skipped the run, and the
+		// worker must abandon the transfer, so it gets the typed fresh_resume_pre_seed refusal.
+		if req.State != "running" && h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 		ack, ackErr := h.workerStateAck(w, r, run)
 		if ackErr != nil {
 			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
@@ -2562,6 +2572,11 @@ func (h *Handler) WorkerRunWallPark(w http.ResponseWriter, r *http.Request) {
 	if !applied {
 		// The park was refused (the owner extended in the window, or the run moved on): 409 with the
 		// run's REAL status, which the worker reads off the body to clear the wall mode and restart.
+		// Issue #4628: unless the run's transfer is claimed for this worker and unseeded, in which case
+		// the typed fresh_resume_pre_seed refusal is the reply.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 		httpx.JSON(w, http.StatusConflict, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 		return
 	}
