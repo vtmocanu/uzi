@@ -3689,6 +3689,9 @@ export interface RetainedDiscardOptions {
   signal?: AbortSignal;
   /** The single operation deadline (default {@link RETAINED_OP_DEADLINE_MS}). */
   deadlineMs?: number;
+  /** issue #4628: attempt ids whose fresh resume transfer the server reports `refused` or `cancelled` before any seed. The guarded
+   *  discard retires a `fresh_pending` attempt only when it is named here; a `fresh_unbound` one needs no such proof. */
+  freshTransferNegative?: ReadonlySet<string>;
 }
 
 export type RetainedSourceOutcome = "removed" | "retained" | "missing" | "unknown";
@@ -16433,7 +16436,8 @@ export class GitCache {
    */
   private async evaluateRetained(
     g: GatheredBare, rec: GatheredRecord,
-    ctx: { holds: RetainedHoldsSnapshot | undefined; lifecycle?: RetainedLifecycleSnapshot; isLivePath: (p: string) => boolean },
+    ctx: { holds: RetainedHoldsSnapshot | undefined; lifecycle?: RetainedLifecycleSnapshot; isLivePath: (p: string) => boolean;
+      freshTransferNegative?: ReadonlySet<string> },
   ): Promise<{
     blockers: string[]; consumers: string[]; localRecords: RetainedLocalRecord[]; live: Map<string, boolean>;
     holdsView: RetainedSourceEvidence["holds"]; disposition: RetainedDisposition | undefined;
@@ -16475,8 +16479,11 @@ export class GitCache {
       const p = rec.parts[0]!;
       consumers.push(`ledger:${p.ledgerState}`);
       if (p.ledgerState === "live") { blockers.push("ledger_live"); ownLedgerLive = "ledger_live"; }
-      // issue #4628: a fresh-resume attempt is never discarded by this classifier; it stays until the guarded fresh discard retires it.
-      if (isFreshLedgerState(p.ledgerState)) blockers.push("ledger_fresh");
+      // issue #4628: a fresh-resume attempt is discarded only through the guarded fresh discard. `fresh_unbound` is already proven
+      // negative (the server took the transfer back or refused it before any seed); `fresh_pending` is retired only when the caller
+      // names its attempt in `freshTransferNegative`. Anything else keeps the blocker.
+      if (isFreshLedgerState(p.ledgerState) && p.ledgerState !== "fresh_unbound" &&
+          !(p.attemptId !== undefined && ctx.freshTransferNegative?.has(p.attemptId) === true)) blockers.push("ledger_fresh");
       if (p.ledgerState === "none") blockers.push("attribution_unknown");
       try {
         if (rec.key === "" || (await this.classifyOwnerClonePath(g.barePath, rec.branch, rec.key, rec.runId, p.clonePath)) !== "attempt") {
@@ -17182,6 +17189,7 @@ export class GitCache {
               } else {
                 const ev = await this.evaluateRetained(g, rec, {
                   holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
+                  ...(opts.freshTransferNegative ? { freshTransferNegative: opts.freshTransferNegative } : {}),
                 });
                 const want = mode === "protected" ? "local_protected_discard" : "local_discard";
                 const disposition = epoch ? ev.epochSettlement?.disposition : ev.disposition;
@@ -17370,6 +17378,10 @@ export class GitCache {
                   await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
                     { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
                 }
+              }
+              if (!restoreExit && rec.kind === "attempt") {
+                const only = rec.parts[0]!;
+                if (only.attemptId !== undefined && isFreshLedgerState(only.ledgerState)) await this.retireFreshTransfer(bare, rec.branch, only.attemptId);
               }
               if (rec.kind === "canonical" && rec.markerState !== "none") {
                 const target = rec.parts[0]!.clonePath;
@@ -19187,6 +19199,21 @@ export class GitCache {
       const message = err instanceof Error ? err.message : "";
       throw new FreshSeedError(/deadline/i.test(message) ? "git_deadline" : "seed_failed", step, err);
     }
+  }
+
+  /** issue #4628: A's own ledger entry (the last value for the attempt), or undefined. Under the bare lock; writes nothing. */
+  readFreshAttemptEntry(barePath: string, branch: string, attemptId: string): Promise<AttemptLedgerEntry | undefined> {
+    return this.withLock(barePath, async () => (await this.readAttemptLedger(barePath, branch)).get(attemptId));
+  }
+
+  /** issue #4628: the last step of the guarded fresh discard, under the caller's bare lock: when the branch's fresh journal still
+   *  names `attemptId`, delete its `refs/uzi-fresh/<frid>` ref and clear the journal, so the branch is free for a later transfer. A
+   *  journal that names another attempt is left alone. A ref that cannot be deleted keeps the journal (fail closed). */
+  private async retireFreshTransfer(barePath: string, branch: string, attemptId: string): Promise<void> {
+    const journal = this.readFreshJournalUnderLock(await this.configEntries(barePath), branch);
+    if (journal === undefined || journal.attemptId !== attemptId) return;
+    await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-fresh/${journal.frid}`]);
+    await this.freshConfigWrite(barePath, [freshJournalKey(branch), ""]);
   }
 
   /** issue #4628: A's ledger entry `fresh_pending` to `fresh_unbound`: its seed did not reach the receipt commit. Only a pending

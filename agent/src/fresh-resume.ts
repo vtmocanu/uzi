@@ -26,6 +26,7 @@ import { freshResumeRefusalReason, type FreshResumeState, type WorkerClient } fr
 import type { Logger } from "./log.js";
 import type { StateAck } from "./protocol.js";
 import { mintAttemptId } from "./run-quiescence.js";
+import type { FreshJournal } from "./fresh-journal.js";
 
 export const FRESH_RESUME_CAPABILITY = "fresh_resume_v1";
 
@@ -234,4 +235,34 @@ export async function commitFreshReceipt(deps: Pick<FreshDeps, "git">, receipt: 
   Promise<"committed" | "already"> {
   if (!receipt.current_authority) throw new FreshNoAuthority(receipt);
   return deps.git.commitFreshReceipt(input);
+}
+
+/** A restart's reconciliation of an L0 journal could not decide: the stop is nonterminal, custody stays, and nothing is marked unbound. */
+export class FreshUnresolved extends Error {
+  constructor(readonly reason: string, options?: ErrorOptions) { super(`fresh resume reconciliation stopped (${reason})`, options); this.name = "FreshUnresolved"; }
+}
+
+export type FreshOutcome =
+  | { kind: "positive"; state: FreshResumeState }
+  | { kind: "negative"; reason: string }
+  | { kind: "stop"; reason: string };
+
+/**
+ * What the server's answer for the journal's own transfer means. Only an exact, unambiguous answer decides:
+ *   positive  `seeded`, with this journal's attempt A and generation G'.
+ *   negative  `refused` or `cancelled` with no seed ever recorded: the transfer will never bind A.
+ *   stop      everything else: a missing record (404), a seeded row naming another attempt or generation, a terminal row that does
+ *             carry a seed, or a state this worker does not know. None of these is ever read as negative.
+ * The caller maps an unavailable or malformed reply to a stop without calling this.
+ */
+export function classifyFreshState(journal: Pick<FreshJournal, "attemptId" | "generation">, state: FreshResumeState | null): FreshOutcome {
+  if (state === null) return { kind: "stop", reason: "state_missing" };
+  if (state.state === "seeded") {
+    if (state.seeded_at === null || state.destination_attempt_id === null) return { kind: "stop", reason: "seeded_without_attempt" };
+    if (state.destination_attempt_id !== journal.attemptId) return { kind: "stop", reason: "attempt_differs" };
+    if (state.seeded_generation !== journal.generation) return { kind: "stop", reason: "generation_differs" };
+    return { kind: "positive", state };
+  }
+  if ((state.state === "refused" || state.state === "cancelled") && state.seeded_at === null) return { kind: "negative", reason: state.state };
+  return { kind: "stop", reason: "state_not_decisive" };
 }
