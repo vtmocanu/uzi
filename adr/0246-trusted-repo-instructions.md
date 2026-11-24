@@ -451,7 +451,7 @@ not a subagent.
   `repo_claudemd_enabled` and `cross_check_repo_instructions_enabled` are both
   on. The API reads both in one statement when the checker child is claimed and
   sends the conjunction as `plan_repo_instructions_enabled` on plan claims only;
-  the worker also requires its own `repo.claudemd_enabled`. There is no
+  the worker also requires the claim payload's `repo.claudemd_enabled`. There is no
   migration, and code claims are unchanged.
 - **Consent timing differs from the code check.** A plan check reads consent at
   claim, so a toggle change can affect a plan check already waiting to be

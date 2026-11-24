@@ -123,10 +123,10 @@ it("explains both code and plan CLAUDE.md consent and saves with the new notice"
   expect(within(panel).getByText(SWITCH, { selector: "p" })).toBeTruthy();
   const text = panel.textContent ?? "";
   expect(text).toContain("Code checks read the root CLAUDE.md at a freshly fetched default-branch tip");
-  expect(text).toContain("Consent is frozen when the check is created");
+  expect(text).toContain("consent is frozen when the check is created");
   expect(text).toContain("Plan checks read it at the plan’s frozen base commit");
   expect(text).toContain("only when the lead’s Repo instructions setting is also on");
-  expect(text).toContain("Consent for plan checks is read when the checker starts");
+  expect(text).toContain("Plan-check consent is read when the checker starts, so a change here also affects a plan check still waiting to start");
   expect(text).toContain("code: default-branch tip");
   expect(text).toContain("plan: frozen base commit");
 
@@ -137,5 +137,5 @@ it("explains both code and plan CLAUDE.md consent and saves with the new notice"
 
   await userEvent.click(within(panel).getByRole("button", { name: "Save" }));
   await waitFor(() => expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledTimes(1));
-  expect(await within(panel).findByText("Saved. New cross-checks use these settings.")).toBeTruthy();
+  expect(await within(panel).findByText("Saved. New code cross-checks use these settings; plan cross-checks read the CLAUDE.md setting when their checker starts.")).toBeTruthy();
 });

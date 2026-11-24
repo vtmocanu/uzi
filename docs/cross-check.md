@@ -1104,12 +1104,12 @@ unchanged. There is no migration.
   it is checked against.
 - **When nothing is supplied** the data prompt carries an explicit status:
   `disabled` (consent off, or an older API without the field), `absent`,
-  `refused` (an escaping, broken, looping or non-blob link), `too_large`, or
+  `refused` (an escaping, broken, looping or non-blob link, or a non-regular root entry such as a directory or submodule), `too_large`, or
   `unknown` (a read error, a missing commit, or the read budget expired).
 - **Read budget.** The checker waits for the read at most the shortest of 15
   seconds, the claim deadline and its remaining model time; a late result is
   discarded. The read counts against the checker's model time.
-- **Run status line.** With consent on, the run shows one line,
+- **Run status line.** With consent on, the checker child run (not the lead) shows one line,
   `plan cross-check repository instructions read: <status>`. It reports the
   read, not delivery: a later checkout failure can follow a `supplied` line. If
   the base commit is unavailable the line says `unknown`, and the existing

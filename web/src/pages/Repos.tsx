@@ -1556,7 +1556,7 @@ export function Repos() {
                         </p>
                         <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
                           <span className="rounded border border-edge px-1.5 py-0.5">root CLAUDE.md</span>
-                          <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">lead only</span>
+                          <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">lead (+ plan checker with its consent)</span>
                           <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">@-imports stripped</span>
                           <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">cannot override guardrails</span>
                           <span className="rounded border border-edge px-1.5 py-0.5">64 KB cap</span>
@@ -1683,11 +1683,11 @@ export function Repos() {
                     <p className="text-sm text-muted">
                       Code checks read the root{" "}
                       <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> at a freshly
-                      fetched default-branch tip. Consent is frozen when the check is created, so a run cannot write the
-                      instructions it is checked against. Plan checks read it at the plan&rsquo;s frozen base commit, and
-                      only when the lead&rsquo;s Repo instructions setting is also on. Consent for plan checks is read
-                      when the checker starts, and on a resumed branch that commit can include the run&rsquo;s own
-                      earlier changes.
+                      fetched default-branch tip, so a run cannot write the instructions it is checked against; their
+                      consent is frozen when the check is created. Plan checks read it at the plan&rsquo;s frozen base
+                      commit, and only when the lead&rsquo;s Repo instructions setting is also on. Plan-check consent is
+                      read when the checker starts, so a change here also affects a plan check still waiting to start.
+                      On a resumed branch that commit can include the run&rsquo;s own earlier changes.
                     </p>
                     <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
                       <span className="rounded border border-edge px-1.5 py-0.5">root CLAUDE.md</span>
@@ -1722,7 +1722,7 @@ export function Repos() {
                     Close
                   </Button>
                   <span role="status" className="text-xs text-ok">
-                    {crossCheckSaved ? "Saved. New cross-checks use these settings." : ""}
+                    {crossCheckSaved ? "Saved. New code cross-checks use these settings; plan cross-checks read the CLAUDE.md setting when their checker starts." : ""}
                   </span>
                 </div>
               </div>
