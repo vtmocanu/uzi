@@ -1728,7 +1728,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// provider protocol intersection. Keep this ahead of the priority re-label.
 	// Read errors fall through, as with the other capability rungs.
 	if r.ModelProviderKeyMode.Valid {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: r.UserID, Engine: r.Harness})
+		c, cerr := s.q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: r.UserID, Engine: r.Harness, Kind: r.Kind})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying provider", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {

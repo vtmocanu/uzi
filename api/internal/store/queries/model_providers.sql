@@ -264,6 +264,11 @@ WHERE u.id = @id AND @engine::text = 'codex';
 -- One owner snapshot, without opening keys or resolving either source.
 SELECT claude_provider_id, codex_provider_id FROM users WHERE id = $1;
 
+-- name: GetUserJudgeLanePolicy :one
+-- The judge's authoritative creation decision (PRD #4322 M1a): the pin policy and both lane sources in
+-- one statement, read under the shared secret-mutation lock so every writer of these four columns is excluded.
+SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id, claude_provider_id, codex_provider_id FROM users WHERE id = $1;
+
 -- name: SetUserProviderSource :one
 -- Sets or clears (NULL) the caller's source for one engine; a NULL provider_id CLEARS the setting and
 -- the engine must be named. The Claude branch accepts a definition visible to the caller (their own

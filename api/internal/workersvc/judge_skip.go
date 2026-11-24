@@ -23,9 +23,15 @@ const (
 	JudgeSkipNoUsableCredential   = "no_usable_credential" //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCredentialDisabled   = "credential_disabled"  //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCodexPoolUnavailable = "codex_pool_unavailable"
-	// JudgeSkipProviderLaneUnsupported (PRD #4320): the owner's selected source is a model provider,
-	// which the judge lane does not serve yet (PRD #4322).
+	// JudgeSkipProviderLaneUnsupported (PRD #4320, #4322 M1a): recorded only for a Codex judge whose
+	// owner has a Codex model-provider source (not served until PRD #4322 #4574). Historical rows also
+	// exist for a Claude judge, from before a Claude source could bind a judge.
 	JudgeSkipProviderLaneUnsupported = "provider_lane_unsupported"
+	// JudgeSkipProviderSourceUnusable (PRD #4322 M1a): the owner's Claude source is cleared, unusable,
+	// invisible or retired at the judge's locked read.
+	JudgeSkipProviderSourceUnusable = "provider_source_unusable"
+	// JudgeSkipProviderModelUnmapped (PRD #4322 M1a): the judge model has no mapping on the source.
+	JudgeSkipProviderModelUnmapped = "provider_model_unmapped"
 )
 
 // JudgeSkipReasons lists every reason the judge_skips CHECK accepts.
@@ -34,6 +40,8 @@ var JudgeSkipReasons = []string{
 	JudgeSkipCredentialDisabled,
 	JudgeSkipCodexPoolUnavailable,
 	JudgeSkipProviderLaneUnsupported,
+	JudgeSkipProviderSourceUnusable,
+	JudgeSkipProviderModelUnmapped,
 }
 
 // JudgeSkip is the recorded reason the automatic judge of a run was skipped.

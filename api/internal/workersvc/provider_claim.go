@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/providers"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -225,7 +226,7 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 // and the possibly re-keyed payload is never delivered.
 func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimProviderBinding, error) {
 	// Require the complete engine protocol before any binding read or vault open.
-	if !workerSupportsProvider(wkr, run.Harness) {
+	if !workerSupportsProvider(wkr, run.Harness, run.Kind) {
 		return nil, errProviderLaneClaimRefused
 	}
 	keyID, ok := frozenProviderKeyID(run)
@@ -288,11 +289,13 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 }
 
 // workerSupportsProvider checks only the advertised protocol for the frozen engine.
-// Wake admission and claim assembly share this conjunction without reading credentials.
-func workerSupportsProvider(w store.Worker, engine string) bool {
+// Wake admission and claim assembly share this conjunction without reading credentials. A Claude
+// judge additionally needs claude_provider_judge_v1 (PRD #4322 M1a), mirroring the SQL claim clause.
+func workerSupportsProvider(w store.Worker, engine, kind string) bool {
 	switch engine {
 	case harnessClaude:
-		return slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderV1)
+		return slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderV1) &&
+			(kind != runkind.Judge || slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderJudgeV1))
 	case harnessCodex:
 		return slices.Contains(w.ProtocolCapabilities, capability.CodexProviderV1) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&

@@ -1120,6 +1120,19 @@ func (s *Service) refuseProviderLane(ctx context.Context, q providerLaneSourceRe
 	return nil
 }
 
+// judgeLanePolicyReader reads the judge's creation policy in one owner snapshot.
+type judgeLanePolicyReader interface {
+	GetUserJudgeLanePolicy(context.Context, uuid.UUID) (store.GetUserJudgeLanePolicyRow, error)
+}
+
+// judgeLanePolicy is the one read of the judge's authoritative creation decision (PRD #4322 M1a):
+// the judge pin policy and both lane sources in a single statement. It is meant to run in the
+// create transaction under the shared secret-mutation lock, and every caller goes through it so the
+// store's caller pin for GetUserJudgeLanePolicy names exactly this file.
+func judgeLanePolicy(ctx context.Context, q judgeLanePolicyReader, userID uuid.UUID) (store.GetUserJudgeLanePolicyRow, error) {
+	return q.GetUserJudgeLanePolicy(ctx, userID)
+}
+
 // createInheritedProviderRun creates a successor of a provider-bound run (mr_rework, task child,
 // chat continuation): harness from the source run, the binding copied verbatim, the owner's
 // CURRENT source never read. The copied binding is re-validated first: a rotated or disabled key is

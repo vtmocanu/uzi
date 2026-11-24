@@ -225,7 +225,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
 		return nil, errProviderLaneClaimRefused
 	}
-	if providerBoundRun(run) && !workerSupportsProvider(wkr, run.Harness) {
+	if providerBoundRun(run) && !workerSupportsProvider(wkr, run.Harness, run.Kind) {
 		return nil, errProviderLaneClaimRefused
 	}
 	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A
