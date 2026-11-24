@@ -138,6 +138,7 @@ func TestPlanCrossCheckClaimBounds(t *testing.T) {
 		{"diff bytes", func(r *store.CrossCheck) { r.PlanningDiff.String = strings.Repeat("x", 512*1024+1) }},
 		{"milestone count", func(r *store.CrossCheck) { r.Milestones = []byte("[" + strings.Repeat("{},", 64) + "{}]") }},
 		{"base sha", func(r *store.CrossCheck) { r.BaseCommit.String = "main" }},
+		{"other valid base sha", func(r *store.CrossCheck) { r.BaseCommit.String = strings.Repeat("b", 40) }},
 		{"digest mismatch", func(r *store.CrossCheck) { r.CandidateDigest = []byte("other") }},
 		{"null milestones", func(r *store.CrossCheck) { r.Milestones = []byte("null") }},
 	} {

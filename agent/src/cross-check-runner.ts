@@ -3,6 +3,7 @@ import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./c
 import fs from "node:fs/promises";
 import { collectCodeInventory, normalizeCodeCoverage, type CodeInventory } from "./code-cross-check-coverage.js";
 import { decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
+import { planRepoInstructionsConsent, readPlanRepoInstructions } from "./plan-cross-check-instructions.js";
 import os from "node:os";
 import path from "node:path";
 import { RequestError, type WorkerClient, type PlanCrossCheckFindings } from "./client.js";
@@ -41,6 +42,8 @@ function checkerClaimRefused(err: unknown): boolean {
 interface CrossCheckRunnerOptions {
   homeRoot?: string;
   modelTimeoutMs?: number;
+  /** Test-only: budget for the plan-stage repository-instructions read (default 15s). */
+  planInstructionsReadMs?: number;
   pollMs?: number;
   activeRuns?: ActiveRunRegistry;
   outbox?: Outbox;
@@ -258,6 +261,7 @@ export class CrossCheckRunner {
         reason = "model_timeout";
         throw new Error("cross-check deadline expired");
       }
+      const armedAt = Date.now();
       armTimer(timeout);
       cancel.signal.throwIfAborted();
       steering = new ChatSteering(this.client, runId, this.opts.pollMs ?? 1000, this.log, cancel,
@@ -281,7 +285,22 @@ export class CrossCheckRunner {
         code.code_diff = diff.truncated ? (checker === this.claudeModel
           ? "Diff exceeds 1 MiB; inspect committed files through Read, Grep and Glob."
           : "Diff exceeds 1 MiB; inspect committed files through Read and Search.") : diff.text;
-      } else checkout = await this.git.runnerCloneAtCommit(bare, candidate.base_commit, runId);
+      } else {
+        if (candidate.stage === "plan") {
+          // Issue #4519: read the lead repository's CLAUDE.md from the bare repository at the frozen
+          // base_commit, before the checkout exists, bounded by the model timer and the deadline.
+          const timerRemaining = timeout - (Date.now() - armedAt);
+          const budgetMs = Math.max(1, Math.min(this.opts.planInstructionsReadMs ?? 15_000, deadline - Date.now(), timerRemaining));
+          const evidence = await readPlanRepoInstructions(this.git, bare, candidate, claim.repo,
+            { budgetMs, signal: cancel.signal });
+          candidate.repo_instructions_evidence = evidence;
+          cancel.signal.throwIfAborted();
+          if (planRepoInstructionsConsent(candidate, claim.repo)) {
+            b.emit({ kind: "status", agent: "worker", payload: { text: `plan cross-check repository instructions read: ${evidence.status}` } });
+          }
+        }
+        checkout = await this.git.runnerCloneAtCommit(bare, candidate.base_commit, runId);
+      }
       cancel.signal.throwIfAborted();
       await fs.mkdir(this.opts.homeRoot ?? os.tmpdir(), { recursive: true });
       home = await fs.mkdtemp(path.join(this.opts.homeRoot ?? os.tmpdir(), "uzi-cross-check-"));

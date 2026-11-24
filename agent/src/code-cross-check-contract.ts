@@ -203,6 +203,8 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     || typeof v.deadline_at !== "string" || !Number.isFinite(Date.parse(v.deadline_at))
     || !bounded(v.plan_md, 256 * 1024)) return invalid();
   if ("semantic_identity" in v) return invalid();
+  // Worker-produced evidence is never accepted from the server, on either stage.
+  if ("repo_instructions_evidence" in v) return invalid();
   if (v.candidate_identity_version !== undefined || v.semantic_candidate !== undefined) {
     if (v.stage !== "plan" || v.candidate_identity_version !== "semantic_v1" ||
         Buffer.byteLength(JSON.stringify(v.semantic_candidate) ?? "") > SEMANTIC_ENVELOPE_MAX_BYTES) return invalid();
@@ -211,6 +213,7 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     } catch { return invalid(); }
   }
   if (v.stage === "code") {
+    if ("plan_repo_instructions_enabled" in v) return invalid();
     if (v.coverage_supported !== undefined && typeof v.coverage_supported !== "boolean") return invalid();
     if (v.repo_instructions_commit !== undefined && (typeof v.repo_instructions_commit !== "string"
       || v.repo_instructions_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.repo_instructions_commit))) return invalid();
@@ -233,6 +236,7 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     return { ...v, guidance_snapshot: guidance } as unknown as ClaimCodeCrossCheck;
   }
   if ("repo_instructions_commit" in v || "coverage_supported" in v) return invalid();
+  if (v.plan_repo_instructions_enabled !== undefined && typeof v.plan_repo_instructions_enabled !== "boolean") return invalid();
   if (!Number.isInteger(v.round) || (v.round as number) < 1 || (v.round as number) > 5
     || !v.plan_md || !bounded(v.planning_diff, 512 * 1024)
     || !Array.isArray(v.milestones) || v.milestones.length > 64

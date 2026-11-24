@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -38,6 +39,9 @@ type ClaimPlanCrossCheck struct {
 	Round                   int32           `json:"round"`
 	CandidateDigest         string          `json:"candidate_digest"`
 	DeadlineAt              time.Time       `json:"deadline_at"`
+	// PlanRepoInstructionsEnabled is plan-only consent to deliver the repo's root CLAUDE.md; it
+	// sits on this outer struct so PlanCrossCheckCandidate.Digest is unaffected. Never set for code.
+	PlanRepoInstructionsEnabled *bool `json:"plan_repo_instructions_enabled,omitempty"`
 	PlanCrossCheckCandidate
 }
 
@@ -200,6 +204,20 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	}
 	var steering *ClaimOwnerSteering
 	if cc.Stage == "plan" {
+		// Plan-only consent for the repo's root CLAUDE.md, read when the child is claimed (code
+		// checks freeze theirs at creation). A missing repo row means no consent, not a refusal.
+		consent := false
+		if locked.RepoID.Valid {
+			consent, err = q.GetPlanCrossCheckRepoInstructionsConsent(ctx, store.GetPlanCrossCheckRepoInstructionsConsentParams{
+				RepoID: uuid.UUID(locked.RepoID.Bytes), UserID: locked.UserID})
+			if errors.Is(err, pgx.ErrNoRows) {
+				consent, err = false, nil
+			}
+			if err != nil {
+				return err
+			}
+		}
+		input.PlanRepoInstructionsEnabled = &consent
 		// Issue #3841: a round frozen with owner steering delivers those exact bytes. No row is a
 		// legacy round and carries no field; a row that fails its size, UTF-8 or digest check
 		// refuses the claim rather than deliver corrupted steering. The digest is an integrity

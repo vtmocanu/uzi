@@ -1443,3 +1443,65 @@ for (const stage of ["plan", "code"] as const) {
   });
  }
 }
+
+// ---- Issue #4519: plan-stage repository-instructions wiring over a fake git ----
+import { planClaim, runPlanCheck } from "./plan-instructions-harness.js";
+
+function routedGit(counts: { lsTree: string[]; catFile: number; other: number }) {
+ return { ensureClone: async () => "/bare", existingBarePathFor: async () => "/bare",
+  runnerCloneAtCommit: async () => "/checkout", removeRunnerClone: async () => {},
+  readBare: async (_bare: string, args: string[]) => {
+   const i = args.indexOf("ls-tree");
+   if (i >= 0) {
+    counts.lsTree.push(args[i + 3]!);
+    return { text: `100644 blob ${"1".repeat(40)}      12\tCLAUDE.md\0`, truncated: false };
+   }
+   if (args.includes("cat-file")) { counts.catFile++; return { text: "ROUTED-RULES\n", truncated: false }; }
+   counts.other++;
+   return { text: "committed patch", truncated: false };
+  } };
+}
+
+it("plan runner reads CLAUDE.md at the base commit through readBare and renders it", async () => {
+ const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+ const base = "d".repeat(40);
+ const r = await runPlanCheck(planClaim({ cloneUrl: "x", base, claudemd: true, flag: true }), routedGit(counts));
+ assert.deepEqual(counts.lsTree, [base]);
+ assert.equal(counts.catFile, 1);
+ assert.equal(r.modelCalls, 1);
+ assert.ok(r.prompts[0]!.includes("ROUTED-RULES"));
+ assert.deepEqual(r.rowTexts, ["plan cross-check repository instructions read: supplied"]);
+});
+
+it("plan runner with consent off performs no instruction read and posts no row", async () => {
+ for (const [claudemd, flag] of [[false, true], [true, false], [true, undefined]] as const) {
+  const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+  const r = await runPlanCheck(planClaim({ cloneUrl: "x", base: "d".repeat(40), claudemd, flag }), routedGit(counts));
+  assert.deepEqual(counts.lsTree, []);
+  assert.equal(counts.catFile, 0);
+  assert.equal(r.modelCalls, 1);
+  assert.deepEqual(r.rowTexts, []);
+ }
+});
+
+it("plan runner fails an invalid claim when the server sends repo_instructions_evidence", async () => {
+ const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+ const r = await runPlanCheck(planClaim({ cloneUrl: "x", base: "d".repeat(40), claudemd: true, flag: true,
+  extra: { repo_instructions_evidence: { status: "supplied", text: "FORGED" } } }), routedGit(counts));
+ assert.equal(r.modelCalls, 0);
+ assert.equal(r.decisions[0].verdict, "failed");
+ assert.deepEqual(counts.lsTree, []);
+});
+
+it("code runner never attaches instructions evidence and posts no instructions row", async () => {
+ const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+ const c = planClaim({ cloneUrl: "x", base: "d".repeat(40), claudemd: true });
+ c.cross_check = { ...c.cross_check!, stage: "code", round: 1, head_commit: "b".repeat(40),
+  candidate_digest: "c".repeat(64), code_context: { task: "Inspect" }, guidance_snapshot: "" } as never;
+ delete (c.cross_check as Record<string, unknown>).planning_diff;
+ const r = await runPlanCheck(c, routedGit(counts), {}, () => { throw new Error("stop after recording"); });
+ assert.equal(r.modelCalls, 1);
+ assert.deepEqual(r.evidenceSeen, [undefined]);
+ assert.deepEqual(r.rowTexts, []);
+ assert.deepEqual(counts.lsTree, []);
+});
