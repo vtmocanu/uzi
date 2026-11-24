@@ -61,28 +61,49 @@ if [ "${1:-}" = api ]; then
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
   case "$MODE" in
+    adv-partial)
+      # A listing that prints a green push row and then fails: the row must never count.
+      printf '501\tcompleted\tsuccess\tCI\tgating\n'
+      exit 1 ;;
+    adv-*)
+      # JSON-list mode: honour the requested --limit (like GitHub's truncation), then run
+      # the script's own --jq so the real projection and classification are exercised.
+      args=("$@"); limit=""; jqarg=""; commit=""; i=0
+      while [ "$i" -lt "${#args[@]}" ]; do
+        case "${args[$i]}" in
+          --limit) limit="${args[$((i+1))]}" ;;
+          --jq) jqarg="${args[$((i+1))]}" ;;
+          --commit) commit="${args[$((i+1))]}" ;;
+        esac
+        i=$((i+1))
+      done
+      f="$JSONDIR/$commit.json"; [ -f "$f" ] || f="$JSONDIR/empty.json"
+      jq -c --argjson n "$limit" '.[:$n]' "$f" | jq -r "$jqarg"
+      exit 0 ;;
+  esac
+  case "$MODE" in
     follow-*)
       case " $* " in
-        *" --commit $FULL_SHA "*) printf '201\tcompleted\tcancelled\tCI\n' ;;
+        *" --commit $FULL_SHA "*) printf '201\tcompleted\tcancelled\tCI\tgating\n' ;;
         *" --commit $FOLLOW_SHA "*)
           case "$MODE" in
-            follow-chain) printf '202\tcompleted\tcancelled\tCI\n' ;;
-            follow-pending) printf '202\tin_progress\t\tCI\n' ;;
+            follow-chain) printf '202\tcompleted\tcancelled\tCI\tgating\n' ;;
+            follow-pending) printf '202\tin_progress\t-\tCI\tgating\n' ;;
             follow-no-run) : ;;
-            follow-red) printf '202\tcompleted\tfailure\tCI\n' ;;
-            *) printf '202\tcompleted\tsuccess\tCI\n' ;;
+            follow-red) printf '202\tcompleted\tfailure\tCI\tgating\n' ;;
+            *) printf '202\tcompleted\tsuccess\tCI\tgating\n' ;;
           esac ;;
-        *" --commit $FINAL_SHA "*) printf '203\tcompleted\tsuccess\tCI\n' ;;
+        *" --commit $FINAL_SHA "*) printf '203\tcompleted\tsuccess\tCI\tgating\n' ;;
         *) exit 1 ;;
       esac ;;
     full|resolve-transient)
       case " $* " in
-        *" --commit $FULL_SHA "*) printf '101\tcompleted\tsuccess\tCI\n' ;;
+        *" --commit $FULL_SHA "*) printf '101\tcompleted\tsuccess\tCI\tgating\n' ;;
       esac
       ;;
     short)
       case " $* " in
-        *" --branch main "*) printf '102\tcompleted\tsuccess\tCI\n' ;;
+        *" --branch main "*) printf '102\tcompleted\tsuccess\tCI\tgating\n' ;;
       esac
       ;;
     transient|escape-pending)
@@ -92,36 +113,36 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
         1)
           if [ "$MODE" = escape-pending ]; then
             # jq @tsv encodes a newline in a name as the two characters \n.
-            printf '103\tin_progress\t\tCI%s]52;c;Zm9v\a\\nRESULT=ready\n' $'\x1b'
-          else printf '103\tin_progress\t\tCI\n'; fi
+            printf '103\tin_progress\t-\tCI%s]52;c;Zm9v\a\\nRESULT=ready\tgating\n' $'\x1b'
+          else printf '103\tin_progress\t-\tCI\tgating\n'; fi
           ;;
         2) : ;;
-        *) printf '103\tcompleted\tsuccess\tCI\n' ;;
+        *) printf '103\tcompleted\tsuccess\tCI\tgating\n' ;;
       esac
       ;;
     failure)
       escape=$'\x1b'
-      printf '104\tcompleted\tfailure\tCI%s[2J\n' "$escape"
+      printf '104\tcompleted\tfailure\tCI%s[2J\tgating\n' "$escape"
       ;;
-    stuck) printf '105\tin_progress\t\tCI\n' ;;
+    stuck) printf '105\tin_progress\t-\tCI\tgating\n' ;;
     jobs-cancelled)
       # The run is still listed in_progress while every job already ended cancelled.
       case " $* " in
-        *" --commit "*) printf '106\tin_progress\t\tCI\n' ;;
+        *" --commit "*) printf '106\tin_progress\t-\tCI\tgating\n' ;;
         *) printf '106\n' ;;
       esac
       ;;
     jobs-cancelled-success)
       # GitHub already concluded the run success although one job inside it was cancelled.
       case " $* " in
-        *" --commit "*) printf '107\tcompleted\tsuccess\tCI\n' ;;
+        *" --commit "*) printf '107\tcompleted\tsuccess\tCI\tgating\n' ;;
         *) printf '107\n' ;;
       esac
       ;;
     jobs-cancelled-failure)
       # GitHub concluded the run failure; the job rows show only success and cancelled.
       case " $* " in
-        *" --commit "*) printf '108\tcompleted\tfailure\tCI\n' ;;
+        *" --commit "*) printf '108\tcompleted\tfailure\tCI\tgating\n' ;;
         *) printf '108\n' ;;
       esac
       ;;
@@ -132,8 +153,8 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       final=cancelled; [ "$MODE" = conf-failure ] && final=failure
       case " $* " in
         *" --commit "*)
-          if [ "$n" -eq 1 ]; then printf '110\tin_progress\t\tCI\n'
-          else printf '110\tcompleted\t%s\tCI\n' "$final"; fi ;;
+          if [ "$n" -eq 1 ]; then printf '110\tin_progress\t-\tCI\tgating\n'
+          else printf '110\tcompleted\t%s\tCI\tgating\n' "$final"; fi ;;
         *) printf '110\n' ;;
       esac
       ;;
@@ -145,8 +166,8 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
       final=cancelled; [ "$MODE" = agg-failure ] && final=failure
       case " $* " in
         *" --commit "*)
-          if [ "$n" -eq 1 ]; then printf '109\tin_progress\t\tCI\n'
-          else printf '109\tcompleted\t%s\tCI\n' "$final"; fi ;;
+          if [ "$n" -eq 1 ]; then printf '109\tin_progress\t-\tCI\tgating\n'
+          else printf '109\tcompleted\t%s\tCI\tgating\n' "$final"; fi ;;
         *) printf '109\n' ;;
       esac
       ;;
@@ -155,6 +176,16 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
   exit 0
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
+  if [ "${MODE#adv-}" != "$MODE" ]; then
+    # Explicit per-run job rows; a run without a fixture is a test bug, not a green run.
+    id=""
+    for a in "$@"; do
+      case "$a" in ''|*[!0-9]*) ;; *) id="$a"; break ;; esac
+    done
+    [ -f "$JOBSDIR/$id.tsv" ] || { echo "no job fixture for run $id" >&2; exit 1; }
+    cat "$JOBSDIR/$id.tsv"
+    exit 0
+  fi
   if [ "$MODE" = follow-pending ]; then
     printf 'in_progress\t\tCI\thttps://example.invalid/job/202\t202\n'
   elif [ "$MODE" = follow-red ]; then
@@ -223,6 +254,7 @@ exit 1
 STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
+export JSONDIR="$WORK/json" JOBSDIR="$WORK/jobs"
 export CALLS="$WORK/calls" LIST_COUNT="$WORK/list-count" VIEW_COUNT="$WORK/view-count" API_COUNT="$WORK/api-count" JOB_COUNT="$WORK/job-count"
 
 # Following supersession watches the current branch head without resetting the budget.
@@ -542,5 +574,144 @@ set -e
 [ "$rc" -eq 2 ] || fail "--branch stale conclusion on an in-progress run was taken as final, rc=$rc: $(cat "$WORK/stale-read.out")"
 grep -Fq 'waiting for the run' "$WORK/stale-read.out" \
   || fail "--branch stale-read did not wait for the run: $(cat "$WORK/stale-read.out")"
+
+# ---- event classification: schedule/workflow_dispatch runs are advisory ----------------
+# The stub's JSON-list modes apply the requested --limit and then the script's own --jq,
+# so the real projection, limit window and classification run end to end.
+adv_reset() {
+  rm -rf "$JSONDIR" "$JOBSDIR"; mkdir -p "$JSONDIR" "$JOBSDIR"
+  printf '[]\n' > "$JSONDIR/empty.json"
+  : > "$CALLS"
+}
+# adv_run ID STATUS CONCLUSION_JSON NAME EVENT_JSON  -> one run object on stdout
+adv_run() {
+  jq -nc --argjson id "$1" --arg st "$2" --argjson cc "$3" --arg wn "$4" --argjson ev "$5" \
+    '{databaseId:$id,status:$st,conclusion:$cc,workflowName:$wn,event:$ev}'
+}
+# adv_jobs ID STATUS CONCLUSION  -> the run's single job row (CONCLUSION may be empty)
+adv_jobs() {
+  printf '%s\t%s\tCI\thttps://example.invalid/job/%s\t%s\n' "$2" "$3" "$1" "$1" > "$JOBSDIR/$1.tsv"
+}
+# adv_list SHA < run objects  -> the JSON list GitHub would return for that commit
+adv_list() { jq -s . > "$JSONDIR/$1.json"; }
+# adv_watch NAME ARGS...  -> runs the script, sets rc, output in $WORK/NAME.out
+adv_watch() {
+  _n="$1"; shift
+  set +e
+  bash "$SCRIPT" "$@" > "$WORK/$_n.out" 2>&1
+  rc=$?
+  set -e
+}
+adv_calls() { grep -c "$1" "$CALLS" || true; }
+MODE=adv-json; export MODE
+
+# Case 1: a green push run plus a schedule run with a confirmed failed job: exit 0, the
+# failure is only reported.
+adv_reset
+{ adv_run 401 completed '"success"' CI '"push"'; adv_run 402 completed '"failure"' Nightly '"schedule"'; } | adv_list "$FULL_SHA"
+adv_jobs 401 completed success; adv_jobs 402 completed failure
+adv_watch adv1 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 0 ] || fail "adv-case1-schedule-failure-not-gating: want exit 0, rc=$rc: $(cat "$WORK/adv1.out")"
+grep -Fxq '  ADVISORY  failure  402  schedule  Nightly' "$WORK/adv1.out" \
+  || fail "adv-case1-advisory-line-missing: $(cat "$WORK/adv1.out")"
+grep -Fq 'every run terminal' "$WORK/adv1.out" || fail "adv-case1-green-summary-missing: $(cat "$WORK/adv1.out")"
+# Case 4: the listing request carries the 51-row limit and the event field.
+grep -F 'run list' "$CALLS" | grep -Fq -- '--limit 51 --json databaseId,status,conclusion,workflowName,event' \
+  || fail "adv-case4-limit-or-json-fields: $(cat "$CALLS")"
+
+# Case 2: a green push run plus a workflow_dispatch run still in progress: exit 0 within
+# two ticks, and the advisory state is the status, not a stale conclusion.
+adv_reset
+{ adv_run 411 completed '"success"' CI '"push"'; adv_run 412 in_progress null Manual '"workflow_dispatch"'; } | adv_list "$FULL_SHA"
+adv_jobs 411 completed success; adv_jobs 412 in_progress ""
+adv_watch adv2 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 0 ] || fail "adv-case2-dispatch-pending-not-gating: want exit 0, rc=$rc: $(cat "$WORK/adv2.out")"
+grep -Fxq '  ADVISORY  in_progress  412  workflow_dispatch  Manual' "$WORK/adv2.out" \
+  || fail "adv-case2-advisory-state-not-status: $(cat "$WORK/adv2.out")"
+
+# Case 3: only a green schedule run never yields green: exit 3 with the ADVISORY block.
+adv_reset
+adv_run 421 completed '"success"' Nightly '"schedule"' | adv_list "$FULL_SHA"
+adv_jobs 421 completed success
+adv_watch adv3 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 3 ] || fail "adv-case3-advisory-only-want-exit-3: rc=$rc: $(cat "$WORK/adv3.out")"
+grep -Fq 'NO GATING RUN APPEARED' "$WORK/adv3.out" || fail "adv-case3-no-gating-line-missing: $(cat "$WORK/adv3.out")"
+grep -Fq 'waiting for a gating run' "$WORK/adv3.out" || fail "adv-case3-waiting-line-missing: $(cat "$WORK/adv3.out")"
+grep -Fxq 'ADVISORY (schedule/workflow_dispatch: reported, never gating) from tick 1' "$WORK/adv3.out" \
+  || fail "adv-case3-advisory-header-missing: $(cat "$WORK/adv3.out")"
+grep -Fxq '  ADVISORY  success  421  schedule  Nightly' "$WORK/adv3.out" || fail "adv-case3-advisory-line-missing: $(cat "$WORK/adv3.out")"
+if grep -Fq 'every run terminal' "$WORK/adv3.out"; then fail "adv-case3-advisory-only-went-green"; fi
+
+# Case 5: a listing that prints a row and then fails is unreadable, never a partial verdict.
+adv_reset
+MODE=adv-partial; export MODE
+adv_watch adv5 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 3 ] || fail "adv-case5-partial-listing-want-exit-3: rc=$rc: $(cat "$WORK/adv5.out")"
+grep -Fq "run listing failed for sha=$SHORT_SHA; retrying" "$WORK/adv5.out" || fail "adv-case5-retry-line-missing: $(cat "$WORK/adv5.out")"
+if grep -Fq 'every run terminal' "$WORK/adv5.out"; then fail "adv-case5-partial-rows-gave-verdict"; fi
+[ "$(adv_calls '^run view ')" -eq 0 ] || fail "adv-case5-partial-rows-were-classified: $(cat "$CALLS")"
+MODE=adv-json; export MODE
+
+# Case 6: a full 51-row window yields no verdict even though row 1 is green and every
+# visible advisory run is green: a failed push run sits at row 51.
+adv_reset
+{
+  adv_run 501 completed '"success"' CI '"push"'
+  n=502; while [ "$n" -le 550 ]; do
+    ev='"schedule"'; [ $((n % 2)) -eq 0 ] || ev='"workflow_dispatch"'
+    adv_run "$n" completed '"success"' "Adv$n" "$ev"; n=$((n+1))
+  done
+  adv_run 551 completed '"failure"' CI '"push"'
+} | adv_list "$FULL_SHA"
+n=501; while [ "$n" -le 550 ]; do adv_jobs "$n" completed success; n=$((n+1)); done
+adv_jobs 551 completed failure
+adv_watch adv6 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 2 ] || fail "adv-case6-limit-window-want-exit-2: rc=$rc: $(tail -3 "$WORK/adv6.out")"
+[ "$(grep -c '^\[tick [0-9]*\] run listing for sha=.* reached --limit 51 (may be truncated); no verdict this tick$' "$WORK/adv6.out" || true)" -eq 2 ] \
+  || fail "adv-case6-want-exactly-2-limit-lines: $(cat "$WORK/adv6.out")"
+[ "$(adv_calls '^run view ')" -eq 0 ] || fail "adv-case6-limit-tick-classified-runs: $(grep '^run view ' "$CALLS" | head -3)"
+if grep -Fq 'every run terminal' "$WORK/adv6.out"; then fail "adv-case6-limit-window-gave-green"; fi
+grep -Fq "=== sha $SHORT_SHA: run listing reached --limit 51 on the last tick (may be truncated): no verdict; re-arming will not clear this" "$WORK/adv6.out" \
+  || fail "adv-case6-closing-limit-line-missing: $(tail -3 "$WORK/adv6.out")"
+grep -Fxq 'ADVISORY: none observed in a complete listing' "$WORK/adv6.out" || fail "adv-case6-advisory-cache-was-updated: $(tail -3 "$WORK/adv6.out")"
+
+# Case 7: --follow clears the advisory cache on a SHA switch: A's advisory run must not
+# be reported at the end of B's watch (a guard if the base already behaves this way).
+adv_reset
+{ adv_run 601 completed '"cancelled"' CI '"push"'; adv_run 602 completed '"success"' Nightly '"schedule"'; } | adv_list "$FULL_SHA"
+adv_jobs 601 completed cancelled; adv_jobs 602 completed success
+printf '[]\n' > "$JSONDIR/$FOLLOW_SHA.json"
+adv_watch adv7 --sha "$FULL_SHA" --follow --branch release/next --repo test/repo --interval 0 --max-ticks 3
+[ "$rc" -eq 3 ] || fail "adv-case7-follow-want-exit-3: rc=$rc: $(cat "$WORK/adv7.out")"
+grep -Fxq "FOLLOW sha=$FULL_SHA -> $FOLLOW_SHA" "$WORK/adv7.out" || fail "adv-case7-no-follow-switch: $(cat "$WORK/adv7.out")"
+if grep -Eq '^  ADVISORY  .* 602 ' "$WORK/adv7.out"; then fail "adv-case7-stale-advisory-after-switch: $(cat "$WORK/adv7.out")"; fi
+grep -Fxq 'ADVISORY: none observed in a complete listing' "$WORK/adv7.out" || fail "adv-case7-advisory-not-cleared: $(cat "$WORK/adv7.out")"
+
+# Controls: a run whose event is absent, unknown, an object or malformed stays gating.
+for ev in 'null' '"repository_dispatch"' '{"x":1}' '"\u0000schedule"'; do
+  adv_reset
+  adv_run 701 completed '"failure"' CI "$ev" | adv_list "$FULL_SHA"
+  adv_jobs 701 completed failure
+  adv_watch adv-ctl-ev --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+  [ "$rc" -eq 1 ] || fail "adv-control-event-$ev-stays-gating: want exit 1, rc=$rc: $(cat "$WORK/adv-ctl-ev.out")"
+done
+adv_reset
+adv_run 711 completed '"failure"' CI '"push"' | adv_list "$FULL_SHA"; adv_jobs 711 completed failure
+adv_watch adv-ctl-push-fail --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 1 ] || fail "adv-control-failed-push-want-exit-1: rc=$rc: $(cat "$WORK/adv-ctl-push-fail.out")"
+adv_reset
+adv_run 721 completed '"cancelled"' CI '"push"' | adv_list "$FULL_SHA"; adv_jobs 721 completed cancelled
+adv_watch adv-ctl-cancel --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 4 ] || fail "adv-control-cancelled-push-want-exit-4: rc=$rc: $(cat "$WORK/adv-ctl-cancel.out")"
+# 50 green push runs stay under the 51-row window: unchanged exit 0.
+adv_reset
+n=800; while [ "$n" -lt 850 ]; do adv_run "$n" completed '"success"' CI '"push"'; adv_jobs "$n" completed success; n=$((n+1)); done | adv_list "$FULL_SHA"
+adv_watch adv-ctl-fifty --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 0 ] || fail "adv-control-fifty-green-push-want-exit-0: rc=$rc: $(tail -3 "$WORK/adv-ctl-fifty.out")"
+# Run-ID mode is untouched: a failed workflow_dispatch run watched by ID is red.
+adv_reset
+adv_jobs 801 completed failure
+adv_watch adv-ctl-runid 801 --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 1 ] || fail "adv-control-runid-dispatch-failure-want-exit-1: rc=$rc: $(cat "$WORK/adv-ctl-runid.out")"
 
 echo "PASS watch-run-ci: bounded SHA following, final-head verdicts, SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green, aggregator red beside cancelled shards waits for the run verdict"
