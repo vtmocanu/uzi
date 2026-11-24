@@ -706,6 +706,32 @@ function assertClosedThenFenced(r: Awaited<ReturnType<typeof scenario>>, status:
  assert.deepEqual(r.landed.map((m) => m.seq), r.landed.map((_m, i) => i + 1), "stream is contiguous");
 }
 
+// Issue #4676: the model timer can abort before a fake checker reaches its wait, and an
+// "abort" listener added after the abort never fires, so a bare listener wait hangs.
+const untilAborted = (signal: AbortSignal) => new Promise<void>((resolve) => {
+ if (signal.aborted) resolve();
+ else signal.addEventListener("abort", () => resolve(), { once: true });
+});
+const settlesWithin = async (p: Promise<void>, ms: number) => {
+ let t: ReturnType<typeof setTimeout> | undefined;
+ try {
+  return await Promise.race([p.then(() => true), new Promise<boolean>((r) => { t = setTimeout(() => r(false), ms); })]);
+ } finally { clearTimeout(t); }
+};
+
+it("untilAborted settles for a signal aborted before the call, and waits for a later abort", async () => {
+ const early = new AbortController();
+ early.abort();
+ assert.equal(await settlesWithin(untilAborted(early.signal), 2000), true, "already-aborted signal settled (not the watchdog)");
+ const late = new AbortController();
+ let settled = false;
+ const pending = untilAborted(late.signal).then(() => { settled = true; });
+ await new Promise<void>((r) => setTimeout(r, 0));
+ assert.equal(settled, false, "live signal stays pending until abort()");
+ late.abort();
+ assert.equal(await settlesWithin(pending, 2000), true, "live signal settled after abort() (not the watchdog)");
+});
+
 it("checker delivery: marker, activity, usage and summary go through the batcher with redaction before verdict and terminal", async () => {
  const pat = "forge-pat-secret-0123456789";
  const r = await scenario({ forgePat: pat, checker: async ({ usage, activity }) => {
@@ -743,7 +769,7 @@ it("checker delivery: a model timeout closes the batcher before its terminal rep
  const r = await scenario({ modelTimeoutMs: 30, checker: async ({ signal, usage, activity }) => {
   await usage(initFrame);
   activity!.begin("pending", "read", "a.ts");
-  await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  await untilAborted(signal);
   signal.throwIfAborted();
   return verdict;
  } });
