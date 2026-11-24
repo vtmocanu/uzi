@@ -380,6 +380,12 @@ const BUDGET_MS = 300;
 const HOLD_SLACK_MS = 2000;
 /** Separate slack for the final hold-settled ack, which runs on the shutdown signal with the client terminal retry schedule. */
 const SETTLED_ACK_SLACK_MS = 5000;
+/** Allowance for the snapshot and restore setup that runs inside drive() before the hold starts. */
+const DRIVE_SETUP_SLACK_MS = 3000;
+/** Loopback latency between a hold report passing its deadline guard and the fake api receiving it. */
+const WIRE_TOLERANCE_MS = 250;
+/** Outer watchdog for a drive whose hold is budgeted: the hold, the settled acknowledgement and the setup, each named. */
+const BUDGETED_DRIVE_MS = BUDGET_MS + HOLD_SLACK_MS + SETTLED_ACK_SLACK_MS + DRIVE_SETUP_SLACK_MS;
 
 describe("an op-fenced credential switch after the restore transport stopped reaches the predecessor hold: claude", procfs, () => {
   const ledgerDirs: string[] = [];
@@ -482,7 +488,7 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     };
     const outcome = await Promise.race([
       drive(c.r).then(() => "done"),
-      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGET_MS + HOLD_SLACK_MS + SETTLED_ACK_SLACK_MS)),
+      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGETED_DRIVE_MS)),
     ]);
     assert.equal(outcome, "done", "the Path A hold ended within its budget instead of retrying without end");
     await settle(c);
@@ -543,11 +549,24 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     });
     c.onAttribution = () => trip(c, true);
     let armedAt = -1;
+    // Arrival time of every hold report, so each send can be checked against the hook's verification deadline.
+    const heldAt: number[] = [];
+    const fake = api as unknown as { handleState: (res: http.ServerResponse, runId: string, json: Record<string, unknown>) => Promise<void> };
+    const handleState = fake.handleState.bind(api);
+    const heldClock = mock.method(fake, "handleState", async (res: http.ServerResponse, runId: string, json: Record<string, unknown>) => {
+      if (runId === c.r.runId && json.status === "credential_switch_held") heldAt.push(Date.now());
+      return handleState(res, runId, json);
+    });
     switchAtStopClose(c, () => { armedAt = api.stateWire.length; api.failStateNext(100_000, 503); });
-    const outcome = await Promise.race([
-      drive(c.r).then(() => "done"),
-      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGET_MS + SETTLED_ACK_SLACK_MS)),
-    ]);
+    let outcome: string;
+    try {
+      outcome = await Promise.race([
+        drive(c.r).then(() => "done"),
+        new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGETED_DRIVE_MS)),
+      ]);
+    } finally {
+      heldClock.mock.restore();
+    }
     // The final credential_switch_hold_settled ack is not part of the hold budget: it runs on the shutdown signal with the
     // client's terminal retry schedule, so it gets its own slack (SETTLED_ACK_SLACK_MS) on top of the hold allowance.
     assert.equal(outcome, "done", "drive settled within the hold budget plus the bounded settled acknowledgement");
@@ -560,6 +579,8 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     const heldAttempts = own(armedAt, hook.wireAtEnd).filter(s => s.body.status === "credential_switch_held");
     assert.ok(heldAttempts.length >= 1, "the hold report was attempted");
     assert.equal(heldAttempts.every(s => (s.body as { op_id?: string }).op_id === OP), true);
+    const lateHolds = heldAt.filter(t => t >= hook.start! + BUDGET_MS + WIRE_TOLERANCE_MS);
+    assert.deepEqual(lateHolds.map(t => t - hook.start!), [], "every hold report was sent before the verification deadline");
     assert.equal(own(hook.wireAtEnd).some(s => s.body.status === "credential_switch_held"), false, "no hold report after the hook ended");
     assert.equal(own(armedAt, hook.wireAtEnd).some(s => s.body.status === "credential_switch_hold_settled"), false,
       "the settled acknowledgement is not sent inside the hold budget");
