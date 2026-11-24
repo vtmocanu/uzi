@@ -1,5 +1,5 @@
 // SettingsShell: one header + tab bar shared by the user-scoped settings
-// surfaces (Account & tokens, Appearance, Models, Run defaults, Forge, Access, Memory). Kills the old
+// surfaces (Account & tokens, Models, Run defaults, Forge, Access, Memory, Appearance). Kills the old
 // discoverability problem where the /settings/* pages were URL siblings wired
 // together only by hand-placed corner links — the drift a unified layout
 // header exists to prevent.
@@ -16,16 +16,16 @@ import { keepInRowView, PinnedBlock, TabRow, tabClass } from "./TabRow";
 
 export const TABS = [
   { to: "/settings", label: "Account & tokens", end: true },
-  { to: "/settings/appearance", label: "Appearance", end: false },
   { to: "/settings/models", label: "Models", end: false },
   { to: "/settings/run-defaults", label: "Run defaults", end: false },
   { to: "/settings/forge", label: "Forge", end: false },
   { to: "/settings/access", label: "Access", end: false },
   { to: "/settings/memory", label: "Memory", end: false },
+  { to: "/settings/appearance", label: "Appearance", end: false },
 ];
 
 export function SettingsShell({ description, children }: { description: string; children: ReactNode }) {
-  // With seven tabs the strip overflows on a phone (at 390px Run defaults sat past the
+  // With seven tabs the strip overflows on a phone (at 390px the later tabs sat past the
   // right edge with scrollLeft 0), so keep the active tab in view on mount and on every
   // tab switch. keepInRowView moves only the row's scrollLeft, never the window (#4419);
   // AdminShell uses the same pattern.

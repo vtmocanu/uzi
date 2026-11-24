@@ -137,6 +137,21 @@ function describedText(name: string): string {
   return ids.map((id) => document.getElementById(id)?.textContent ?? "").join(" | ");
 }
 
+// The visible saved-prediction tag (#4665), apart from the accessible description around it.
+function tag(name: string): HTMLElement {
+  const [savedId] = (control(name).getAttribute("aria-describedby") ?? "").split(" ");
+  const el = document.getElementById(savedId)?.querySelector<HTMLElement>("[data-prediction]");
+  if (!el) throw new Error(`${name}: no saved-prediction tag`);
+  return el;
+}
+
+// The words of the prediction line a sighted user sees: everything outside .sr-only.
+function visibleLine(name: string): string {
+  const line = tag(name).parentElement!.cloneNode(true) as HTMLElement;
+  line.querySelectorAll(".sr-only").forEach((el) => el.remove());
+  return Array.from(line.children).map((el) => el.textContent).join(" ");
+}
+
 beforeEach(() => {
   auth.set({ id: "u1" });
   mockApi.getMySettings.mockResolvedValue({ settings: makeSettings() });
@@ -190,6 +205,42 @@ describe("Models page", () => {
     expect(describedText("Worker model — Codex")).toContain("Saved effective value: gpt-6-sol · your choice");
     expect(describedText("Worker model — Codex")).not.toContain("Unsaved");
     expect(saveButton().disabled).toBe(true);
+  });
+
+  // #4665: one card per group, each its own container-query context, so a group never reads
+  // as just another row; Default harness stays in the intro card above them.
+  it("renders each model group in its own card", async () => {
+    mount();
+    await screen.findByLabelText("Worker model — Claude");
+    const cards = ["Worker runs", "Planning", "Helper runs", "Cross-check"].map((name) => {
+      const card = screen.getByRole("group", { name }).closest<HTMLElement>("[id^='models-card-']");
+      expect(card, name).not.toBeNull();
+      expect(card!.className, name).toContain("@container");
+      expect(screen.getByRole("heading", { name }).closest("[id^='models-card-']"), name).toBe(card);
+      return card;
+    });
+    expect(new Set(cards).size).toBe(4);
+    expect(control("Default harness").closest("[id^='models-card-']")).toBeNull();
+    expect(control("Worker model — Claude").closest("[id^='models-card-']")).toBe(cards[0]);
+    expect(control("Code cross-check effort — Codex").closest("[id^='models-card-']")).toBe(cards[3]);
+  });
+
+  // #4665: the cell shows its prediction as a compact tag; the "Saved effective value:" wording
+  // lives only in the accessible description.
+  it("shows the saved prediction as a tag and keeps the full wording for assistive tech", async () => {
+    mount();
+    await screen.findByLabelText("Default harness");
+    expect(tag("Default harness").textContent).toBe("Claude · automatic");
+    expect(visibleLine("Default harness")).toBe("Claude · automatic");
+    expect(describedText("Default harness")).toContain("Saved effective value: Claude · automatic");
+    expect(tag("Worker model — Claude").textContent).toBe("opus · lead template");
+    expect(visibleLine("Worker model — Claude")).not.toContain("Saved effective value");
+
+    // A dirty cell keeps the SAVED prediction, says so visibly, and marks itself Unsaved.
+    select("Worker model — Codex", "gpt-6-sol");
+    expect(tag("Worker model — Codex").textContent).toBe("gpt-6.2-sol · built-in");
+    expect(visibleLine("Worker model — Codex")).toBe("Saved gpt-6.2-sol · built-in Unsaved");
+    expect(describedText("Worker model — Codex")).toContain("Saved effective value: gpt-6.2-sol · built-in");
   });
 
   it("labels the saved prediction as saved and marks a changed cell Unsaved", async () => {
@@ -588,6 +639,7 @@ describe("Models page", () => {
     mount();
     await screen.findByLabelText("Worker model — Codex");
     expect(describedText("Worker model — Claude")).toContain("Saved effective value: Unavailable");
+    expect(tag("Worker model — Claude").textContent).toBe("Unavailable");
     select("Worker model — Codex", "gpt-6-sol");
     fireEvent.click(saveButton());
     await within(bar()).findByText(/Saved\. Every change committed, but the new effective values could not be read/);

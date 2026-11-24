@@ -194,9 +194,9 @@ Where to set each lane:
   A judge model for a harness the judge never runs on (because of
   **Judge runs on**) is dimmed with a **Not used** reason. The page's one
   **Save changes** bar saves every lane you changed along with the rest of the page.
-  Under each field, **Saved effective value** names what a judge run would
-  resolve to and where that came from (**Unavailable** if the server could not
-  read it).
+  The tag under each field shows the saved effective value: what a judge run
+  would resolve to and where that came from (**Unavailable** if the server
+  could not read it).
 - **Instance Claude and Codex judge models:** **Admin → Instance → Instance
   model defaults** (the Judge model row, with the same two fields; their Default option reads **Default · <model>
   (built-in)**). The Claude field shows a **Not a Claude model** warning when
