@@ -307,6 +307,8 @@ func TestFreshResumeOwnerWritersRefuseLiveDB(t *testing.T) {
 		{"extend", "/inputs", `{"kind":"extend","body":"7200"}`},
 		{"pause", "/inputs", `{"kind":"pause","body":"now"}`},
 		{"pause_cancel", "/inputs", `{"kind":"pause_cancel"}`},
+		{"scope", "/inputs", `{"kind":"scope","body":"1"}`},
+		{"stop", "/inputs", `{"kind":"stop"}`},
 		{"set-token", "/credential", `{"mode":"default"}`},
 	}
 	for _, c := range cases {

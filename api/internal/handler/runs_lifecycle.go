@@ -1099,9 +1099,10 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Issue #4628: pause, pause_cancel and extend write no runs column the fresh resume guard watches,
-	// so an active transfer is read here and refused before the write.
-	if (req.Kind == "pause" || req.Kind == "pause_cancel" || req.Kind == "extend") &&
+	// Issue #4628: pause, pause_cancel, extend, scope and a milestone stop (a scope-ceiling write) can
+	// write runs columns the fresh resume guard does not watch, so an active transfer is read here and
+	// refused before the write. Cancel stays allowed (the guard admits it).
+	if (req.Kind == "pause" || req.Kind == "pause_cancel" || req.Kind == "extend" || req.Kind == "scope" || req.Kind == "stop") &&
 		h.refuseIfFreshResumeActive(w, r, user.ID, id) {
 		return
 	}

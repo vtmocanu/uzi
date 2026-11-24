@@ -154,10 +154,16 @@ const freshResumeInProgressReason = "fresh_resume_in_progress"
 
 // refuseIfFreshResumeActive answers 409 fresh_resume_in_progress and reports true when the owner's run
 // has a pending or claimed fresh resume transfer. It is the explicit pre-read of the owner writers whose
-// SQL changes neither status, worker_id nor claim_generation (pause_mode, extend, set-token, policy
-// holds), which the guard trigger therefore never sees; a write that does change them is still refused
-// by the guard (writeFreshResumeInProgress), the backstop for the autocommit race. A run that is not the
-// caller's is left to the service's own 404, so the pre-read answers nothing about it.
+// SQL may change neither status, worker_id nor claim_generation (pause_mode, extend, scope ceiling,
+// set-token, policy holds), which the guard trigger therefore never sees. A write that does change them
+// is still refused by the guard (writeFreshResumeInProgress).
+//
+// The read is unlocked and the write is a separate statement, so a Start that commits in between is not
+// refused here. That race is accepted because each such write is harmless to a pending or claimed
+// transfer: extend only adds wall budget; pause on a held run is refused by the service anyway;
+// set-token is re-resolved at claim assembly (a disabled credential is a V1 refusal); scope_ceiling is
+// outside the saved tuple, so a refusal never overwrites it; a policy-hold Resume changes status and
+// meets the guard. A run that is not the caller's is left to the service's own 404.
 func (h *Handler) refuseIfFreshResumeActive(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID) bool {
 	if _, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

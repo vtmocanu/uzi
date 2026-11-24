@@ -578,6 +578,11 @@ func TestRecoveryOwnerHoldsAdmissionMembershipLiveDB(t *testing.T) {
 	// so the per-hold flags plus FreshReservedUnits, not the flags alone, sum to the aggregate.
 	cliMustExec(t, pool, `INSERT INTO run_fresh_resumes (run_id,user_id,request_id,evidence_generation,evidence_kind,checkpoint_ref,sha,candidate_token)
 	    VALUES ($1,$2,$3,1,'checkpoint_ref','refs/uzi-checkpoints/x','abababababababababababababababababababab','tok')`, runB, owner, uuid.New())
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `DELETE FROM run_fresh_resumes WHERE run_id = $1`, runB); err != nil {
+			t.Errorf("cleanup run_fresh_resumes: %v", err)
+		}
+	})
 
 	for _, path := range []string{"/api/recovery/holds", "/api/recovery/holds?state=open"} {
 		rec := bearerReq(router, http.MethodGet, path, uzc)
