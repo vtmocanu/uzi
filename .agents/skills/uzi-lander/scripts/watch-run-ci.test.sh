@@ -77,7 +77,14 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
         esac
         i=$((i+1))
       done
-      f="$JSONDIR/$commit.json"; [ -f "$f" ] || f="$JSONDIR/empty.json"
+      f="$JSONDIR/$commit.json"
+      if [ -f "$JSONDIR/$commit.1.json" ]; then
+        # Per-call listings: <sha>.<n>.json is the n-th list call; past the last, empty.
+        n=0; [ -f "$JSONDIR/listn" ] && n=$(cat "$JSONDIR/listn")
+        n=$((n+1)); printf '%s' "$n" > "$JSONDIR/listn"
+        f="$JSONDIR/$commit.$n.json"
+      fi
+      [ -f "$f" ] || f="$JSONDIR/empty.json"
       jq -c --argjson n "$limit" '.[:$n]' "$f" | jq -r "$jqarg"
       exit 0 ;;
   esac
@@ -686,6 +693,63 @@ adv_watch adv7 --sha "$FULL_SHA" --follow --branch release/next --repo test/repo
 grep -Fxq "FOLLOW sha=$FULL_SHA -> $FOLLOW_SHA" "$WORK/adv7.out" || fail "adv-case7-no-follow-switch: $(cat "$WORK/adv7.out")"
 if grep -Eq '^  ADVISORY  .* 602 ' "$WORK/adv7.out"; then fail "adv-case7-stale-advisory-after-switch: $(cat "$WORK/adv7.out")"; fi
 grep -Fxq 'ADVISORY: none observed in a complete listing' "$WORK/adv7.out" || fail "adv-case7-advisory-not-cleared: $(cat "$WORK/adv7.out")"
+
+# Case 8a: a confirmed-failed gating run beside an advisory run exits 1 and still prints
+# the ADVISORY block.
+adv_reset
+{ adv_run 901 completed '"failure"' CI '"push"'; adv_run 902 completed '"success"' Nightly '"schedule"'; } | adv_list "$FULL_SHA"
+adv_jobs 901 completed failure; adv_jobs 902 completed success
+adv_watch adv8a --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 1 ] || fail "adv-case8a-failed-gating-want-exit-1: rc=$rc: $(cat "$WORK/adv8a.out")"
+grep -Fxq '  ADVISORY  success  902  schedule  Nightly' "$WORK/adv8a.out" \
+  || fail "adv-case8a-advisory-block-missing-before-exit-1: $(cat "$WORK/adv8a.out")"
+# Case 8a2: the other exit-1 path, a concluded-failure run whose jobs show only a
+# cancelled job, also prints the ADVISORY block.
+adv_reset
+{ adv_run 903 completed '"failure"' CI '"push"'; adv_run 904 completed '"success"' Nightly '"schedule"'; } | adv_list "$FULL_SHA"
+adv_jobs 903 completed cancelled; adv_jobs 904 completed success
+adv_watch adv8a2 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 1 ] || fail "adv-case8a2-concluded-failure-want-exit-1: rc=$rc: $(cat "$WORK/adv8a2.out")"
+grep -Fq 'concluded failure with a cancelled job (exit 1)' "$WORK/adv8a2.out" \
+  || fail "adv-case8a2-wrong-exit-1-path: $(cat "$WORK/adv8a2.out")"
+grep -Fxq '  ADVISORY  success  904  schedule  Nightly' "$WORK/adv8a2.out" \
+  || fail "adv-case8a2-advisory-block-missing-before-exit-1: $(cat "$WORK/adv8a2.out")"
+
+# Case 8b: supersession (a cancelled push run) beside an advisory run exits 4 and still
+# prints the ADVISORY block.
+adv_reset
+{ adv_run 911 completed '"cancelled"' CI '"push"'; adv_run 912 completed '"success"' Nightly '"schedule"'; } | adv_list "$FULL_SHA"
+adv_jobs 911 completed cancelled; adv_jobs 912 completed success
+adv_watch adv8b --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
+[ "$rc" -eq 4 ] || fail "adv-case8b-superseded-want-exit-4: rc=$rc: $(cat "$WORK/adv8b.out")"
+grep -Fxq '  ADVISORY  success  912  schedule  Nightly' "$WORK/adv8b.out" \
+  || fail "adv-case8b-advisory-block-missing-before-exit-4: $(cat "$WORK/adv8b.out")"
+
+# Case 8c: after an advisory-only tick, an empty listing prints the advisory-only waiting
+# line, never "no run yet".
+adv_reset
+adv_run 921 completed '"success"' Nightly '"schedule"' | adv_list "$FULL_SHA.1"
+adv_jobs 921 completed success
+adv_watch adv8c --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 3
+[ "$rc" -eq 3 ] || fail "adv-case8c-want-exit-3: rc=$rc: $(cat "$WORK/adv8c.out")"
+grep -Fxq "[tick 1] only advisory (schedule/workflow_dispatch) runs seen for sha=$SHORT_SHA; waiting for a gating run" "$WORK/adv8c.out" \
+  || fail "adv-case8c-empty-tick-lacks-advisory-only-line: $(cat "$WORK/adv8c.out")"
+if grep -Fq 'no run yet' "$WORK/adv8c.out"; then fail "adv-case8c-empty-tick-said-no-run-yet: $(cat "$WORK/adv8c.out")"; fi
+
+# Case 8d: a limit tick resets the consecutive gh run view failure count. Tick 0 and tick 2
+# list one gating run whose job view fails (no job fixture); tick 1 hits the 51-row limit.
+# Without the reset the second failure is "consecutive failure 2" and the watch exits 3.
+adv_reset
+adv_run 931 completed '"success"' CI '"push"' | adv_list "$FULL_SHA.1"
+{
+  n=941; while [ "$n" -le 991 ]; do adv_run "$n" completed '"success"' "Adv$n" '"schedule"'; n=$((n+1)); done
+} | adv_list "$FULL_SHA.2"
+adv_run 931 completed '"success"' CI '"push"' | adv_list "$FULL_SHA.3"
+adv_watch adv8d --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 3
+[ "$rc" -eq 2 ] || fail "adv-case8d-limit-tick-must-reset-gh-errs-want-exit-2: rc=$rc: $(cat "$WORK/adv8d.out")"
+if grep -Fq 'gh keeps failing' "$WORK/adv8d.out"; then fail "adv-case8d-gh-errs-not-reset-on-limit-tick: $(cat "$WORK/adv8d.out")"; fi
+[ "$(grep -c 'consecutive failure 1' "$WORK/adv8d.out" || true)" -eq 2 ] \
+  || fail "adv-case8d-want-two-first-failures: $(cat "$WORK/adv8d.out")"
 
 # Controls: a run whose event is absent, unknown, an object or malformed stays gating.
 for ev in 'null' '"repository_dispatch"' '{"x":1}' '"\u0000schedule"'; do

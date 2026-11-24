@@ -150,7 +150,8 @@ timeout, **3** when no gating run ever appeared (or gh failed). Runs triggered b
 or `workflow_dispatch` are **advisory**: they never decide the exit, and before each verdict
 exit the watcher prints an `ADVISORY` block listing them (`ADVISORY  <state>  <id>  <event>  <name>`;
 state is the run's status until it completes, then its conclusion). On the closing exits 2 and 3
-the block is cached from an earlier tick and its header names that tick. A run with a missing,
+the block is cached from the last complete listing and its header names that tick (`from tick K`);
+when no complete listing was seen it prints `ADVISORY: none observed in a complete listing`. A run with a missing,
 null or unrecognised event is gating. A manual dispatch that must gate is watched by run ID, not
 by `--sha`. A SHA with only advisory runs is never green: the watcher keeps polling for a
 gating run and ends in exit 3 if none appears.
@@ -158,8 +159,8 @@ gating run and ends in exit 3 if none appears.
 **The listing limit.** The watcher lists runs with `--limit 51`. A listing of at most 50 runs
 is complete; one that reaches 51 rows may be truncated, so that tick gives no verdict (no green,
 red, supersession or `--follow` switch) and the watcher polls again. If that persists to
-`--max-ticks`, it ends in exit 2 with a line naming the limit. That exit 2 is not cleared by
-re-arming: watch the gating `ci.yml` / `kind-smoke.yml` runs by run ID instead. On supersession, `--follow` resolves the current branch
+`--max-ticks`, it ends in exit 2; when the last tick reached the limit the closing line names it.
+That exit 2 is not cleared by re-arming: watch the gating `ci.yml` / `kind-smoke.yml` runs by run ID instead. On supersession, `--follow` resolves the current branch
 head, prints `FOLLOW sha=OLD -> NEW` for each switch and watches within the original
 `--max-ticks` budget. The final result covers the last watched SHA, a descendant that contains
 your merge. Main runs finish rather than cancel (#2561), so the followed head may wait for a
@@ -183,7 +184,7 @@ green `main` badge can be a subset. *(A future improvement: derive the EXPECTED 
 from the last known-good `main` commit's runs and fail closed until each expected workflow
 has a completed run for the target SHA.)*
 
-**merge.sh's release-guard read (4a77de820).** Before merging, `merge.sh` lists main's
+**merge.sh's release-guard read (#4670).** Before merging, `merge.sh` lists main's
 non-completed runs per status to look for a `chore(release):` commit's CI. A `total_count` that
 disagrees between pages, or with the records fetched, can be a listing that changed mid-read, so
 it is re-read up to 3 times (2, 4 and 6 s of added backoff); a mismatch that persists across all

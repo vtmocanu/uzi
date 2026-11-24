@@ -507,7 +507,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60 --max-ticks 200` in the background
    (main runs finish, so a followed head can wait a whole run; exit 2 is not red: re-arm, except a limit-reached one: merge-mechanics).
    Pass the exact SHA from `merge.sh`, never a prefix; an invalid or unknown SHA exits 3 before polling.
-   Exit 0 gating runs green (schedule/dispatch: ADVISORY; a partial dispatch counts; confirm a gate fix another way), 1 red (use its
+   Exit 0 gating runs green (schedule/dispatch: ADVISORY; a partial workflow set counts; confirm a gate fix another way), 1 red (use its
    per-job live-log commands, then follow the repair-ownership check below before fixing on a branch, never `main`; flake → file, and
    rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no gating run
    or lookup failed. `--follow` prints each
