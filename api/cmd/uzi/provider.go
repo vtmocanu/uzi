@@ -453,8 +453,10 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode provi
 			ids = append(ids, fmt.Sprintf("%s (%s)", cellText(d.ID), kind))
 		}
 		return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitUsage,
-			"%q names %d providers; pass an id: %s",
-			cellText(arg), len(named), strings.Join(ids, ", "))
+			// Ids first and the name capped: errors print through cellText (200-rune cap), so a
+			// long or quote-heavy name can only ever truncate itself, never an id.
+			"pass an id: %s (%d providers are named \"%s\")",
+			strings.Join(ids, ", "), len(named), capCell(cellText(arg), 40))
 	}
 	return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitNotFound,
 		"no provider named or with id %q; `uzi provider list` shows yours", cellText(arg))
@@ -463,14 +465,14 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode provi
 // sharedManagedRefusal is the refusal for an edit or retire aimed at an admin-shared definition:
 // only an admin changes it (in the web UI), so no request is sent.
 func sharedManagedRefusal(d apitypes.ProviderDTO) error {
-	// Errors print through cellText, which caps at 200 runes: keep this under that even with a
-	// 64-char name, so the fix step is never cut off.
+	// Errors print through cellText, which caps at 200 runes: the name is capped at 40 runes and
+	// quoted plainly (no %q escaping growth), so the fix step is never cut off.
 	hint := "; you can select it with `uzi provider use`"
 	if d.Retired {
 		hint = ""
 	}
 	return uzicli.Exitf(uzicli.ExitConflict,
-		"provider %q is managed by your admin; only an admin can change it%s", cellText(d.Name), hint)
+		"provider \"%s\" is managed by your admin; only an admin can change it%s", capCell(cellText(d.Name), 40), hint)
 }
 
 // providerUsableRefusal refuses, before any write, a provider the list already shows cannot be the

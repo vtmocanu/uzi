@@ -252,6 +252,39 @@ func TestProviderRefusalsSurviveTheErrorCapWithLongName(t *testing.T) {
 	}
 }
 
+// TestProviderRefusalsKeepEveryIDWithQuoteHeavyAndThreeWayNames: a 64-byte name of quotes (which a
+// %q verb would double) and a three-way case-fold collision (own "s…", own "ſ…" which EqualFold
+// matches but lower() keeps distinct, and a shared "s…") still print every id in full, untruncated.
+func TestProviderRefusalsKeepEveryIDWithQuoteHeavyAndThreeWayNames(t *testing.T) {
+	const thirdID = "22222222-2222-4222-8222-222222222222"
+	quotes := strings.Repeat(`"`, 40) + strings.Repeat("n", 24)
+	fc := &uzicli.FakeClient{ProviderList: enabledList(providerFixture(quotes), sharedProviderFixture(sharedTestID, quotes))}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", quotes)
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, providerTestID+" (yours)") || !strings.Contains(errOut, sharedTestID+" (admin)") {
+		t.Errorf("quote-heavy ambiguity: code %d, stderr %q", code, errOut)
+	}
+	fc = &uzicli.FakeClient{ProviderList: enabledList(sharedProviderFixture(sharedTestID, quotes))}
+	_, errOut, code = runCLI(t, fakeEnv(fc), "provider", "edit", quotes, "--name", "x")
+	if code != uzicli.ExitConflict || !strings.Contains(errOut, "only an admin can change it; you can select it with `uzi provider use`") {
+		t.Errorf("quote-heavy edit refusal: code %d, stderr %q", code, errOut)
+	}
+
+	base := strings.Repeat("x", 60)
+	ownS := providerFixture("s" + base)
+	ownLongS := providerFixture("\u017f" + base)
+	ownLongS.ID = thirdID
+	fc = &uzicli.FakeClient{ProviderList: enabledList(ownS, ownLongS, sharedProviderFixture(sharedTestID, "s"+base))}
+	_, errOut, code = runCLI(t, fakeEnv(fc), "provider", "use", "s"+base)
+	if code != uzicli.ExitUsage {
+		t.Fatalf("three-way: code %d, stderr %q", code, errOut)
+	}
+	for _, want := range []string{providerTestID + " (yours)", thirdID + " (yours)", sharedTestID + " (admin)", "3 providers are named"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("three-way stderr lacks %q: %q", want, errOut)
+		}
+	}
+}
+
 func TestProviderSharedRefusalRetiredOmitsUseAdvice(t *testing.T) {
 	shared := sharedProviderFixture(sharedTestID, "team")
 	shared.Retired = true
