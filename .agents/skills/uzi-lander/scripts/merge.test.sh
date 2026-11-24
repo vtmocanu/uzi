@@ -754,6 +754,12 @@ MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/codeql.yml 914)]"; export 
 relrefuse relcodeql
 MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 915),$(prun queued .github/workflows/kind-smoke.yml 916)]"; export MAIN_RUNS_JSON
 relrefuse relhalf
+# A tab inside the title must not shift the tab-joined row: the title below would, if split,
+# read as status=in_progress and path=ci.yml (the trailing @ is what running_run_finishes cuts
+# the rest of a split path at), which relrunning shows is allowed. It is a queued run: refuse.
+TABTITLE=$(printf 'chore(release): v0.86.0-rc.30\tin_progress\t.github/workflows/ci.yml@')
+MAIN_RUNS_JSON="[$(jq -nc --arg t "$TABTITLE" '{status:"queued",display_title:$t,head_sha:"5f9145cbaaaa0000",name:"CI",path:".github/workflows/other.yml",id:917}')]"; export MAIN_RUNS_JSON
+relrefuse reltabtitle
 unset WF_BODY_FILE
 unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
@@ -821,6 +827,9 @@ grep -qF "main's in_progress run listing changed while paging (total_count misma
 grep -qF "cannot parse main's in_progress workflow runs (total_count mismatch persisted across 4 reads); not merging" "$WORK/m.retrypersist" || fail "case retrypersist: persistence message missing: $(cat "$WORK/m.retrypersist")"
 # 5. empty stdout with rc 0 is a parse failure, not "no release run" (green-merge setup)
 unset MAIN_RUNS_SEQ_DIR
+# CONFIRM_AFTER_MERGE=1 makes a merge that reaches the merge command confirm as MERGED, so the
+# pre-fix behaviour (no release run found, merge proceeds) exits 0 here instead of 9.
+PRIOR_CAM="${CONFIRM_AFTER_MERGE-__unset__}"; export CONFIRM_AFTER_MERGE=1
 export MAIN_RUNS_EMPTY=1
 merge_run emptyout
 unset MAIN_RUNS_EMPTY
@@ -835,6 +844,7 @@ unset MAIN_RUNS_PAGE
 [ "$rc" -eq 2 ] || fail "case concatpages: concatenated page arrays rc=$rc: $(cat "$WORK/m.concatpages")"
 [ ! -e "$WORK/merge.log" ] || fail "case concatpages: merged on concatenated page arrays"
 [ "$(runs_total)" -eq 1 ] || fail "case concatpages: calls $(runs_total), want 1"
+if [ "$PRIOR_CAM" = __unset__ ]; then unset CONFIRM_AFTER_MERGE; else export CONFIRM_AFTER_MERGE="$PRIOR_CAM"; fi
 # Mutation controls: hard failures are never retried (1 call, exit 2, no merge).
 ctl() { # label status-1 raw: exit 2 after exactly one call
   seq_reset; seq_put queued 1 "$2"
@@ -845,6 +855,7 @@ ctl() { # label status-1 raw: exit 2 after exactly one call
 }
 ctl ctlnonarray '[7]'
 ctl ctlbadrec "[{\"total_count\":2,\"workflow_runs\":[{}]},{\"total_count\":3,\"workflow_runs\":[]}]"
+ctl ctlbadpath "[{\"total_count\":2,\"workflow_runs\":[{\"status\":\"queued\",\"display_title\":\"x\",\"head_sha\":\"a\",\"id\":1,\"path\":{}}]},{\"total_count\":3,\"workflow_runs\":[]}]"
 ctl ctlcap "$(cat "$WORK/capped-pages.json")"
 ctl ctlnegative '[{"total_count":-1,"workflow_runs":[]}]'
 ctl ctlfraction '[{"total_count":1.5,"workflow_runs":[]}]'

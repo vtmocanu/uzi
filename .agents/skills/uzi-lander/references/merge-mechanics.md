@@ -132,12 +132,13 @@ HTML-comment marker on the line. **Never push non-doc code to `main`.**
 
 ## Post-merge CI, and fixing failures
 
-Poll every run for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow`**,
+Poll the gating runs' jobs for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow`**,
 using the runtime-appropriate verified completion route in *Waiting, uniformly*.
 `MERGE_SHA` is the exact full SHA emitted by `merge.sh`;
 never type or hand-complete a prefix. The watcher resolves it through GitHub before polling
-and exits 3 when it is invalid or unknown. It exits on the first confirmed failing job rather
-than waiting for the whole run. Keep the owned callback/log receipt; do not re-author
+and exits 3 when it is invalid or unknown. It exits on the first confirmed failing gating job rather
+than waiting for the whole run; advisory (schedule/workflow_dispatch) runs are only reported
+from the listing. Keep the owned callback/log receipt; do not re-author
 a poll loop per merge:
 
 ```

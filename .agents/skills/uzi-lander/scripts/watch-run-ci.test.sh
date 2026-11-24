@@ -184,6 +184,30 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
 fi
 if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
   if [ "${MODE#adv-}" != "$MODE" ]; then
+    # A `--json` field list naming `event` gets run metadata: run 801 is a workflow_dispatch
+    # run. Each listed field is printed in order, tab-joined, so a script that read the event
+    # in run-ID mode would see workflow_dispatch in the position it asked for.
+    prev=""; fields=""
+    for a in "$@"; do
+      [ "$prev" = --json ] && fields="$a"
+      prev="$a"
+    done
+    case ",$fields," in
+      *,event,*)
+        row=""; sep=""
+        IFS=, read -r -a flds <<< "$fields"
+        for f in "${flds[@]}"; do
+          case "$f" in
+            event) v=workflow_dispatch ;;
+            status) v=completed ;;
+            conclusion) v=failure ;;
+            *) v="" ;;
+          esac
+          row="$row$sep$v"; sep=$'\t'
+        done
+        printf '%s\n' "$row"
+        exit 0 ;;
+    esac
     # Explicit per-run job rows; a run without a fixture is a test bug, not a green run.
     id=""
     for a in "$@"; do
@@ -293,9 +317,9 @@ for m in follow-green follow-chain follow-pending follow-red follow-no-run follo
   case "$m" in
     follow-chain)
       grep -Fxq "FOLLOW sha=$FOLLOW_SHA -> $FINAL_SHA" "$WORK/$m.out" || fail 'missing second switch'
-      grep -Fq "=== sha ${FINAL_SHA:0:8}: every run terminal" "$WORK/$m.out" || fail 'wrong final SHA verdict' ;;
+      grep -Fq "=== sha ${FINAL_SHA:0:8}: every gating run terminal" "$WORK/$m.out" || fail 'wrong final SHA verdict' ;;
     follow-green)
-      grep -Fq "=== sha ${FOLLOW_SHA:0:8}: every run terminal" "$WORK/$m.out" || fail 'old SHA verdict leaked' ;;
+      grep -Fq "=== sha ${FOLLOW_SHA:0:8}: every gating run terminal" "$WORK/$m.out" || fail 'old SHA verdict leaked' ;;
     follow-pending|follow-same|follow-no-run)
       [ "$(grep -c '^run list ' "$CALLS")" -eq 3 ] || fail "$m: reset the tick budget" ;;
   esac
@@ -621,7 +645,7 @@ adv_watch adv1 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
 [ "$rc" -eq 0 ] || fail "adv-case1-schedule-failure-not-gating: want exit 0, rc=$rc: $(cat "$WORK/adv1.out")"
 grep -Fxq '  ADVISORY  failure  402  schedule  Nightly' "$WORK/adv1.out" \
   || fail "adv-case1-advisory-line-missing: $(cat "$WORK/adv1.out")"
-grep -Fq 'every run terminal' "$WORK/adv1.out" || fail "adv-case1-green-summary-missing: $(cat "$WORK/adv1.out")"
+grep -Fq 'every gating run terminal' "$WORK/adv1.out" || fail "adv-case1-green-summary-missing: $(cat "$WORK/adv1.out")"
 # Case 4: the listing request carries the 51-row limit and the event field.
 grep -F 'run list' "$CALLS" | grep -Fq -- '--limit 51 --json databaseId,status,conclusion,workflowName,event' \
   || fail "adv-case4-limit-or-json-fields: $(cat "$CALLS")"
@@ -647,15 +671,18 @@ grep -Fq 'waiting for a gating run' "$WORK/adv3.out" || fail "adv-case3-waiting-
 grep -Fxq 'ADVISORY (schedule/workflow_dispatch: reported, never gating) from tick 1' "$WORK/adv3.out" \
   || fail "adv-case3-advisory-header-missing: $(cat "$WORK/adv3.out")"
 grep -Fxq '  ADVISORY  success  421  schedule  Nightly' "$WORK/adv3.out" || fail "adv-case3-advisory-line-missing: $(cat "$WORK/adv3.out")"
-if grep -Fq 'every run terminal' "$WORK/adv3.out"; then fail "adv-case3-advisory-only-went-green"; fi
+if grep -Fq 'none failed after' "$WORK/adv3.out"; then fail "adv-case3-advisory-only-went-green"; fi
 
 # Case 5: a listing that prints a row and then fails is unreadable, never a partial verdict.
 adv_reset
+# A green job row for run 501 exists, so a watcher that consumed the partial row as a run
+# would classify it and exit 0 (false green) instead of failing on a missing fixture.
+adv_jobs 501 completed success
 MODE=adv-partial; export MODE
 adv_watch adv5 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
 [ "$rc" -eq 3 ] || fail "adv-case5-partial-listing-want-exit-3: rc=$rc: $(cat "$WORK/adv5.out")"
 grep -Fq "run listing failed for sha=$SHORT_SHA; retrying" "$WORK/adv5.out" || fail "adv-case5-retry-line-missing: $(cat "$WORK/adv5.out")"
-if grep -Fq 'every run terminal' "$WORK/adv5.out"; then fail "adv-case5-partial-rows-gave-verdict"; fi
+if grep -Fq 'none failed after' "$WORK/adv5.out"; then fail "adv-case5-partial-rows-gave-verdict"; fi
 [ "$(adv_calls '^run view ')" -eq 0 ] || fail "adv-case5-partial-rows-were-classified: $(cat "$CALLS")"
 MODE=adv-json; export MODE
 
@@ -677,7 +704,7 @@ adv_watch adv6 --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
 [ "$(grep -c '^\[tick [0-9]*\] run listing for sha=.* reached --limit 51 (may be truncated); no verdict this tick$' "$WORK/adv6.out" || true)" -eq 2 ] \
   || fail "adv-case6-want-exactly-2-limit-lines: $(cat "$WORK/adv6.out")"
 [ "$(adv_calls '^run view ')" -eq 0 ] || fail "adv-case6-limit-tick-classified-runs: $(grep '^run view ' "$CALLS" | head -3)"
-if grep -Fq 'every run terminal' "$WORK/adv6.out"; then fail "adv-case6-limit-window-gave-green"; fi
+if grep -Fq 'none failed after' "$WORK/adv6.out"; then fail "adv-case6-limit-window-gave-green"; fi
 grep -Fq "=== sha $SHORT_SHA: run listing reached --limit 51 on the last tick (may be truncated): no verdict; re-arming will not clear this" "$WORK/adv6.out" \
   || fail "adv-case6-closing-limit-line-missing: $(tail -3 "$WORK/adv6.out")"
 grep -Fxq 'ADVISORY: none observed in a complete listing' "$WORK/adv6.out" || fail "adv-case6-advisory-cache-was-updated: $(tail -3 "$WORK/adv6.out")"
@@ -772,7 +799,9 @@ adv_reset
 n=800; while [ "$n" -lt 850 ]; do adv_run "$n" completed '"success"' CI '"push"'; adv_jobs "$n" completed success; n=$((n+1)); done | adv_list "$FULL_SHA"
 adv_watch adv-ctl-fifty --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2
 [ "$rc" -eq 0 ] || fail "adv-control-fifty-green-push-want-exit-0: rc=$rc: $(tail -3 "$WORK/adv-ctl-fifty.out")"
-# Run-ID mode is untouched: a failed workflow_dispatch run watched by ID is red.
+# Run-ID mode is untouched: a failed workflow_dispatch run watched by ID is red. The stub
+# reports run 801 as workflow_dispatch to any `run view --json ...event...`, so a regression
+# that read the event here and treated dispatch as advisory would not exit 1.
 adv_reset
 adv_jobs 801 completed failure
 adv_watch adv-ctl-runid 801 --repo test/repo --interval 0 --max-ticks 2

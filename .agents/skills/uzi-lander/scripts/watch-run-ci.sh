@@ -190,12 +190,12 @@ runs_for_sha() {
     2>/dev/null
 }
 
-# Print the cached advisory (schedule/workflow_dispatch) runs. $1 == 1 marks a closing exit:
-# the header names the tick the cache came from and an empty cache is stated explicitly.
-# Names and states are untrusted text.
+# Print the cached advisory (schedule/workflow_dispatch) runs before every verdict exit. $1 == 1
+# marks a closing exit: the header then names the tick the cache came from. An empty cache is
+# always stated explicitly. Names and states are untrusted text.
 print_advisory() {
   if [ -z "$adv_cache" ]; then
-    [ "${1:-0}" = 1 ] && echo "ADVISORY: none observed in a complete listing"
+    echo "ADVISORY: none observed in a complete listing"
     return 0
   fi
   adv_hdr='ADVISORY (schedule/workflow_dispatch: reported, never gating)'
@@ -419,7 +419,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
         print_advisory
         exit 4
       fi
-      echo "=== sha ${SHA:0:8}: every run terminal, none failed after $((tick*INTERVAL))s ==="
+      echo "=== sha ${SHA:0:8}: every gating run terminal, none failed after $((tick*INTERVAL))s ==="
       printf '%s\n' "$runs" | awk -F'\t' '{c=$3; if (c=="-") c=""; printf "  %-10s %-9s %s\n",c,$1,$4}'
       print_advisory
       exit 0

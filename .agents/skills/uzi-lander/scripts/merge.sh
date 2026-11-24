@@ -418,13 +418,17 @@ for st in queued in_progress waiting requested pending; do
         then . else error("count") end
       | [$pages[].workflow_runs[]] as $recs
       | if all($recs[]; type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
-            and (.head_sha|type) == "string" and (.id|type) == "number") then . else error("record") end
+            and (.head_sha|type) == "string" and (.id|type) == "number"
+            and (.path == null or (.path|type) == "string")) then . else error("record") end
       | if any($pages[]; .total_count > 1000) then error("incomplete") else . end
       | ($pages[0].total_count) as $total
       | if all($pages[]; .total_count == $total) and ($recs|length) == $total then
           "OK",
+          # Row fields are tab-joined and read back by field position, so a tab, newline or CR
+          # inside an attacker-chosen string (title, name, path) is flattened to a space first.
+          def flat: gsub("[\t\n\r]"; " ");
           ($recs[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
-            | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)\t\(.status)\t\(.path // "-")")
+            | "\(.head_sha|flat)\t\(.name // "?"|flat) #\(.id) \(.head_sha[0:8]|flat)\t\(.display_title|flat)\t\(.status|flat)\t\(.path // "-"|flat)")
         else "MISMATCH" end' 2>/dev/null) \
       || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
     first=${out%%$'\n'*}
