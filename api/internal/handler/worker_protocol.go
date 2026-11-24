@@ -1693,7 +1693,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				ack["registration_evidence"] = result.RegistrationEvidence
 			}
 			httpx.JSON(w, http.StatusConflict, ack)
-		case store.IsFreshResumeInProgress(err) && req.State != "running" && run.ID == runID && h.refuseFreshPreSeed(w, r, wkr, run):
+		case req.State != "running" && h.refuseFreshPreSeedOnGuard(w, r, wkr, runID, run, err):
 			// Issue #4628: a park or fail writer that reached the fresh resume guard instead of
 			// skipping the run; the reply is already written.
 		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence), errors.Is(err, workersvc.ErrInvalidCheckpointPublication):
@@ -2518,6 +2518,10 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 		// The hold's guard refused (wrong status, not interlocked, or no recorded completion
 		// attempt): 409 with the run's REAL status, which the worker reads off the body and
 		// retains the run on (it cleans up ONLY on a `paused` ack).
+		// Issue #4628: unless the run's transfer is claimed for this worker, the typed pre-seed refusal.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 		httpx.JSON(w, http.StatusConflict, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 		return
 	}

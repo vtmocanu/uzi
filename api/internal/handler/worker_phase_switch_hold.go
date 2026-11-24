@@ -85,6 +85,10 @@ func (h *Handler) WorkerRunPhaseSwitchHold(w http.ResponseWriter, r *http.Reques
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: a no-op hold on a run whose transfer is claimed for this worker is the typed pre-seed refusal.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	httpx.JSON(w, code, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }

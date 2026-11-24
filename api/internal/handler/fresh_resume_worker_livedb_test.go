@@ -420,6 +420,14 @@ func TestFreshResumePreSeedHooksLiveDB(t *testing.T) {
 	t.Run("base attestation hold", func(t *testing.T) {
 		preSeedBody(t, post("/base-attestation-hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen)))
 	})
+	// A claimed run matches no hold writer's status: the writers return zero rows, the handlers' !applied
+	// branches answer, and the typed refusal replaces the ordinary 409.
+	t.Run("claimed phase switch hold", func(t *testing.T) {
+		preSeedBody(t, post("/phase-switch-hold", fmt.Sprintf(`{"claim_generation":%d,"phase":"plan"}`, freshWorkerGen)))
+	})
+	t.Run("claimed completion hold", func(t *testing.T) {
+		preSeedBody(t, post("/completion/hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen)))
+	})
 
 	// The destination's run is `running` here (W2, claimed transfer): the hold writers match that status,
 	// set paused, and the fresh resume guard raises. The reply is the typed 409, never a 500, and neither
@@ -434,8 +442,11 @@ func TestFreshResumePreSeedHooksLiveDB(t *testing.T) {
 		}
 		return s
 	}
-	runningCase := func(name, tail, body string) {
+	runningCase := func(name, tail, body string, setup ...string) {
 		t.Run(name, func(t *testing.T) {
+			for _, s := range setup {
+				cliMustExec(t, f.pool, s, f.run)
+			}
 			before := snapshot()
 			preSeedBody(t, post(tail, body))
 			if after := snapshot(); after != before {
@@ -447,4 +458,13 @@ func TestFreshResumePreSeedHooksLiveDB(t *testing.T) {
 	runningCase("running policy hold", "/policy-hold", fmt.Sprintf(
 		`{"outcome_id":%q,"source_generation":%d,"claim_generation":%d,"detail":"refused","cause":"refused","continuation_mode":"same_conversation","tag":"cyberPolicy","phase":"implementation","correlation_id":"pr-00000000000000000000000000000000-1","published":false}`,
 		uuid.NewString(), freshWorkerGen, freshWorkerGen))
+	// The iteration park evidence passes Validate, and the run is eligible (issue lane, zero completion
+	// attempts, frozen allowance equal to the evidence), so SetRunIterationPark itself runs and raises.
+	runningCase("running iteration park", "/iteration-park",
+		fmt.Sprintf(`{"claim_generation":%d,"iteration_count":5,"max_iterations":5,"head":"","published":false}`, freshWorkerGen),
+		`UPDATE runs SET budget_max_iterations=5, completion_attempts=0 WHERE id=$1`)
+	runningCase("running repo agent source hold", "/repo-agent-source-hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen))
+	runningCase("running phase switch hold", "/phase-switch-hold", fmt.Sprintf(`{"claim_generation":%d,"phase":"plan"}`, freshWorkerGen))
+	runningCase("running completion hold", "/completion/hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen),
+		`UPDATE runs SET completion_contract_version=1, completion_attempts=1 WHERE id=$1`)
 }
