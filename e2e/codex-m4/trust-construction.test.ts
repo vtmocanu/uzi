@@ -33,8 +33,14 @@ import {
   EXEC_WORKSPACE,
   type ExecModules,
 } from "./harness-exec.js";
+import { CODEX_PROBE_EXPECTATION } from "../../agent/src/codex/codex-runtime-probe.js";
+import { assertNoTtlOverrides, assertNoTtlOverridesToml } from "../../agent/test/codex-no-ttl-overrides.js";
+import { loadProtocolModules, runProtocolTurn, P_SUITE_DEADLINE_MS } from "./harness-p.js";
+import { P_LAYER_SKIP } from "./p-platform.js";
+import { dummyCredential } from "./fake-provider.js";
+import { message } from "../codex-m0/harness.mjs";
 import { recordEvidence } from "./evidence.js";
-import { CODEX_U_TRUST_CONSTRUCTION_TITLE } from "./titles-c3.js";
+import { CODEX_U_TRUST_CONSTRUCTION_TITLE, CODEX_P_NO_TTL_TITLES } from "./titles-c3.js";
 
 let mods: UModules;
 let execMods: ExecModules;
@@ -148,3 +154,46 @@ describe("codex U repository trust construction (real config builders + real exe
     recordEvidence(CODEX_U_TRUST_CONSTRUCTION_TITLE, "pass");
   });
 });
+
+// Bounded API-key loopback observations through launchCodexRoot. These prove absence
+// on the exercised request path, not subscription routing or all upstream inheritance.
+for (const model of ["gpt-6.2-sol", "gpt-6.2-astra"] as const) {
+  it(CODEX_P_NO_TTL_TITLES[model],
+    { skip: P_LAYER_SKIP, timeout: P_SUITE_DEADLINE_MS }, async (t) => {
+      const protocol = await loadProtocolModules();
+      const obs = await runProtocolTurn(protocol, {
+        model, effort: "medium", credential: dummyCredential(),
+        grants: { role: "lead", phase: "implement", allowedTools: new Set(["Read"]), allowedSkills: new Set(), isRoot: true },
+        respond: () => [message("bounded cache construction control")],
+        spawnCommand: async () => { throw new Error("no command callback expected"); },
+        fileop: { op: async () => { throw new Error("no file callback expected"); } },
+      });
+      assert.equal(obs.binaryEvidence.version, `codex-cli ${CODEX_PROBE_EXPECTATION.version}`);
+      assert.equal(obs.binaryEvidence.integrity, true);
+      assert.equal(obs.turnStatus, "completed");
+      assert.deepEqual(obs.providerErrors, []);
+      assert.ok(obs.providerRequests.length > 0, "actual binary produced provider requests");
+      for (const body of obs.providerRequests) {
+        assert.equal(body.model, model, "selected model reached every actual provider request");
+        assert.ok(Array.isArray(body.input) && body.input.length > 0, "normal structured request input is present");
+        assertNoTtlOverrides(body, model + " actual provider request");
+      }
+      assert.ok(obs.emittedConfigTomls.length > 0, "production launcher emitted actual config.toml");
+      for (const toml of obs.emittedConfigTomls) {
+        const config = assertNoTtlOverridesToml(toml, model + " actual emitted config");
+        assert.equal(config.model, model);
+        assert.equal(config.model_provider, protocol.CODEX_M3B_LOOPBACK_PROVIDER_NAME);
+        assert.equal(config.project_doc_max_bytes, 0);
+      }
+      assert.equal(obs.threadParams.model, model);
+      assert.equal(obs.turnParams.model, model);
+      assert.deepEqual(obs.threadParams.environments, []);
+      assert.deepEqual(obs.turnParams.environments, []);
+      assert.ok(Array.isArray(obs.turnParams.input) && obs.turnParams.input.length > 0);
+      assertNoTtlOverrides(obs.threadParams, model + " exercised thread/start");
+      assertNoTtlOverrides(obs.turnParams, model + " exercised turn/start");
+      recordEvidence(CODEX_P_NO_TTL_TITLES[model], "pass");
+      t.diagnostic(JSON.stringify({ model, requests: obs.providerRequests.length, configs: obs.emittedConfigTomls.length,
+        version: obs.binaryEvidence.version, integrity: obs.binaryEvidence.integrity, elapsedMs: obs.elapsedMs }));
+    });
+}

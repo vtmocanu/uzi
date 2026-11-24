@@ -21,10 +21,10 @@ func TestPlanCrossCheckPersistentProvisioningMirrorsLiveDB(t *testing.T) {
 			protocols []string
 			placed    bool
 		}{
-			{"released without cross-check protocol", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false},
+			{"released without cross-check protocol", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}, false},
 			{"cross-check without Codex runtime", []string{capability.CodexHarnessV1, capability.CrossCheckV1}, true},
-			{"full protocols", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CrossCheckV1}, true},
-			{"round-aware protocols", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CrossCheckV1, capability.CrossCheckRoundsV1}, true},
+			{"full protocols", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CrossCheckV1}, true},
+			{"round-aware protocols", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CrossCheckV1, capability.CrossCheckRoundsV1}, true},
 		} {
 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
 				fx := newFleetFixture(t)
@@ -171,7 +171,7 @@ func TestPlanCrossCheckReleasedWorkerPlacementLiveDB(t *testing.T) {
       $4,'codex',now()+interval '5 minutes',$6,$7)`, uuid.New(), leadID, runID, []byte("test-digest"), round, limit, enabled)
 			}
 			// All existing Codex protocol requirements pass. Only the new capability is absent.
-			releasedCaps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+			releasedCaps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 			if kind == "round-2 cross_check child" {
 				releasedCaps = append(releasedCaps, capability.CrossCheckV1)
 			}

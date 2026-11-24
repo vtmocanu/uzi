@@ -35,7 +35,7 @@ func TestPlanCrossCheckEphemeralProvisioningMirrorsLiveDB(t *testing.T) {
 				}
 				w := seedEphemeralWorkerBound(fx, bound)
 				markOnline(fx, w, capOf(2))
-				protocols := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+				protocols := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 				if lane == "dedicated" {
 					protocols = append(protocols, "cross_check_lane_v1")
 					mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET max_cross_check_slots=1 WHERE id=$1`, w)

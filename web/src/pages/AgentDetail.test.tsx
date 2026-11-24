@@ -235,7 +235,7 @@ describe("AgentDetail read-only pin labels match the Agents list", () => {
   it.each([
     { name: "coder", model: null, codex_model: "gpt-6-luna", claude: ["Default · follows lead", "effort: Default · follows the run's effort"], codex: ["gpt-6-luna", "effort: Default · follows the run's effort"] },
     { name: "coder", model: "sonnet", codex_model: "gpt-6-sol", effort: "high", claude: ["sonnet", "effort: high"], codex: ["gpt-6-sol", "effort: Default · follows the run's effort"] },
-    { name: "lead", model: null, codex_model: null, claude: ["Default · SDK/account default (built-in)", "effort: Default · built-in (medium)"], codex: ["Default · built-in (gpt-6.1-sol)", "effort: Default · built-in (medium)"] },
+    { name: "lead", model: null, codex_model: null, claude: ["Default · SDK/account default (built-in)", "effort: Default · built-in (medium)"], codex: ["Default · built-in (gpt-6.2-sol)", "effort: Default · built-in (medium)"] },
   ])("renders $name Claude and Codex rows", async ({ claude, codex, ...pins }) => {
     mockUseAuth.mockReturnValue({ user: { ...ADMIN, is_admin: false } } as ReturnType<typeof useAuth>);
     mockApi.getAgentTemplate.mockResolvedValue({ template: row(pins) });

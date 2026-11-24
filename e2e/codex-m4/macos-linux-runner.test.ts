@@ -130,7 +130,7 @@ describe("buildMacosLinuxRunPlan argv invariants", () => {
 
   it("execute includes native-exception and phase-model characterizations in the strict P suite", () => {
     assert.ok(plan.execute.includes("/work/.uzi/scratch:uid=1000,gid=1000,mode=0700"));
-    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts", "native-exceptions.test.ts", "phase-model-switch.test.ts"]) {
+    for (const f of ["startup-smoke.test.ts", "policy-real.test.ts", "native-bypass.test.ts", "native-exceptions.test.ts", "phase-model-switch.test.ts", "trust-construction.test.ts"]) {
       assert.ok(
         plan.execute.includes(`../e2e/codex-m4/${f}`),
         `execute runs ${f}`,

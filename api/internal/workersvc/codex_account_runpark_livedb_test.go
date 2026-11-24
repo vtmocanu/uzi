@@ -68,7 +68,7 @@ func runningAccountParkFixture(t *testing.T, env codexTestEnv) (*codexClaimFix, 
   health_since=now(), recovery_wait_count=3, forge_park_count=2, disk_park_count=2
   WHERE id=$1`, fx.runID)
 	env.exec(`UPDATE workers SET last_heartbeat_at=now(), protocol_capabilities=$2 WHERE id=$1`,
-		fx.workerA, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1, capability.CodexAccountParkV1})
+		fx.workerA, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.RecoveryArchiveV1, capability.CodexAccountParkV1})
 	cap := env.mintCap(t, fx.runID, fx.workerA)
 	return fx, wkrRow(t, env, fx.workerA), cap
 }
@@ -288,7 +288,9 @@ func TestRunningCodexAccountParkReloginOverlapLiveDB(t *testing.T) {
 	defer func() {
 		cancel()
 		if !joined {
-			<-done
+			if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("join canceled account writer: %v", err)
+			}
 		}
 	}()
 	observed := false

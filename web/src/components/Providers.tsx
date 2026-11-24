@@ -29,7 +29,7 @@ const ROLES: { role: ProviderModelRole; label: string; required: boolean }[] = [
 
 const CODEX_ROLES: typeof ROLES = [
   { role: "default", label: "Default", required: true },
-  ...(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] as const).map(role => ({ role, label: role, required: false })),
+  ...(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"] as const).map(role => ({ role, label: role, required: false })),
 ];
 const rolesFor = (engine: ProviderDTO["engine"]) => engine === "codex" ? CODEX_ROLES : ROLES;
 const engineLabel = (engine: ProviderDTO["engine"]) => engine === "codex" ? "Codex" : "Claude";

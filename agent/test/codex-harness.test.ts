@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { rangeScanBytes } from "../src/codex/broker.js";
 import { m3ReduceAndPersist } from "./m3-projection-fixture.js";
@@ -2775,7 +2776,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     );
   });
 
-  it("thread/start carries worker dynamic tools, no native environment, explicit instructions/trust, and no hook bypass", async () => {
+  it("no TTL overrides: thread/start carries worker dynamic tools, no native environment, explicit instructions/trust, and no hook bypass", async () => {
     const { harness, transport } = makeHarness();
     transport.push(threadStarted()).end();
     const turn = harness.startTurn(makeRequest());
@@ -2784,8 +2785,11 @@ describe("CodexHarness: kind + thread configuration", () => {
 
     const start = transport.requests.find((r) => r.method === "thread/start");
     assert.ok(start, "thread/start was sent");
+    assert.equal(transport.requests.filter(r => r.method === "thread/start").length, 1);
     const params = rec(start.params);
     assert.equal(params.ephemeral, false, "run roots persist the rollout required by new-root resume");
+    assert.equal(params.model, "gpt-6-astra");
+    assertNoTtlOverrides(params, "root start/resume full params");
     const config = rec(params.config);
     assertNoNativeServers(config);
     assert.deepEqual(params.environments, [], "an empty environment list disables native shell and patch tools");
@@ -2796,7 +2800,10 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
     const startTurn = transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
     assert.ok(startTurn, "turn/start was sent after thread/start");
+    assertNoTtlOverrides(startTurn.params, "root fresh turn full params");
+    assert.equal(rec(startTurn.params).model, "gpt-6-astra");
     assert.deepEqual(rec(startTurn.params).environments, [], "every root turn disables native environments");
     assert.equal(config.project_doc_max_bytes, 0);
     const projects = rec(config.projects);
@@ -2807,7 +2814,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.doesNotMatch(JSON.stringify(params), /dangerously-bypass-hook-trust/);
   });
 
-  it("cold thread/resume on a fresh harness carries untrusted + doc_max 0 and disables turn environments", async () => {
+  it("no TTL overrides: cold thread/resume on a fresh harness carries untrusted + doc_max 0 and disables turn environments", async () => {
     const prior = makeHarness();
     prior.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     await collect(prior.harness.startTurn(makeRequest()).events);
@@ -2824,19 +2831,25 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(transport.requests.some((r) => r.method === "thread/start"), false, "resume does not start a fresh thread");
     const resume = transport.requests.find((r) => r.method === "thread/resume");
     assert.ok(resume, "thread/resume was sent");
+    assert.equal(transport.requests.filter(r => r.method === "thread/resume").length, 1);
     const params = rec(resume.params);
     assert.equal(params.threadId, "resumed-1");
     assert.equal(params.dynamicTools, undefined, "pinned thread/resume restores dynamic tools from persisted history");
     assert.equal(params.environments, undefined, "thread/resume has no environments field in the pinned protocol");
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined);
+    assert.equal(params.model, "gpt-6-astra");
+    assertNoTtlOverrides(params, "root start/resume full params");
     const config = rec(params.config);
     assertNoNativeServers(config);
     assert.equal(config.project_doc_max_bytes, 0);
     assert.deepEqual(rec(config.projects)[WORKSPACE], { trust_level: "untrusted" });
     assert.doesNotMatch(JSON.stringify(params), /bypass_hook_trust/);
     const startTurn = transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
     assert.ok(startTurn, "turn/start was sent after resume");
+    assertNoTtlOverrides(startTurn.params, "root resumed turn full params");
+    assert.equal(rec(startTurn.params).model, "gpt-6-astra");
     assert.deepEqual(
       rec(startTurn.params).environments,
       [],

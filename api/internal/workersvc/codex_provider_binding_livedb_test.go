@@ -62,7 +62,7 @@ func (f *codexBindingFix) wantOpen(t *testing.T, run store.Run, provider uuid.UU
 	t.Helper()
 	before := f.reads.cipherReads
 	worker := store.Worker{ProtocolCapabilities: []string{
-		capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+		capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3,
 	}}
 	pb, err := f.svc.assembleProviderBinding(f.env.ctx, worker, run)
 	if err != nil || pb == nil {
@@ -150,7 +150,7 @@ func TestCodexProviderBindingReadLiveDB(t *testing.T) {
 			}
 			before := f.reads.cipherReads
 			pb, err := f.svc.assembleProviderBinding(f.env.ctx, store.Worker{ProtocolCapabilities: []string{
-				capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+				capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3,
 			}}, f.run)
 			if pb != nil || !errors.Is(err, ErrProviderBindingStale) {
 				t.Fatalf("stale helper returned binding=%t, err=%v", pb != nil, err)

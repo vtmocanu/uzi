@@ -142,3 +142,60 @@ describe("worker-protected keys are all denied", () => {
     assert.deepEqual([], missing);
   });
 });
+
+// Independent expectations survive coordinated fixture and mirror removals.
+describe("Codex171EnvControls", () => {
+  it("reserves exact controls", () => {
+    for (const name of [
+      "SPIFFE_ENDPOINT_SOCKET",
+      "SSH2_CLIENT",
+      "COMSPEC",
+      "DENO_CERT",
+      "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+      "OTEL_RESOURCE_ATTRIBUTES",
+      "AWS_ENDPOINT_URL",
+    ]) {
+      assert.ok(runEnvNameViolation(name)?.includes("(denied name)"), name);
+    }
+  });
+  it("reserves control prefixes including future members", () => {
+    for (const [name, prefix] of [
+      ["OTEL_LOG_", "OTEL_LOG_"],
+      ["OTEL_LOG_LEVEL", "OTEL_LOG_"],
+      ["OTEL_LOG_FUTURE_CONTROL", "OTEL_LOG_"],
+      ["OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_"],
+      ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_"],
+      ["OTEL_EXPORTER_OTLP_METRICS_HEADERS", "OTEL_EXPORTER_OTLP_"],
+      ["OTEL_EXPORTER_OTLP_FUTURE_CONTROL", "OTEL_EXPORTER_OTLP_"],
+      ["AWS_ENDPOINT_URL_", "AWS_ENDPOINT_URL_"],
+      ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL_"],
+      ["AWS_ENDPOINT_URL_FUTURE_SERVICE", "AWS_ENDPOINT_URL_"],
+      ["OPENAI_IDENTITY_TOKEN_SOURCE", "OPENAI_"],
+      ["OPENAI_SPIFFE_AUDIENCE", "OPENAI_"],
+      ["OPENAI_SPIFFE_ID", "OPENAI_"],
+    ] as const) {
+      assert.ok(runEnvNameViolation(name)?.includes(`denied prefix ${prefix}:`), name);
+    }
+  });
+  it("allows application variables and prefix-boundary neighbors", () => {
+    for (const name of [
+      "OTEL_OTHER_APP",
+      "AWS_REGION",
+      "AWS_ACCESS_KEY_ID",
+      "OTEL_LOG",
+      "OTEL_LOGGER",
+      "OTEL_EXPORTER_OTLP",
+      "OTEL_EXPORTER_OTLPX_ENDPOINT",
+      "AWS_ENDPOINT_URLX",
+      "AWS_ENDPOINT_URLS",
+      "SPIFFE_ENDPOINT_SOCKET_APP",
+      "SSH2_CLIENT_APP",
+      "COMSPEC_APP",
+      "DENO_CERT_APP",
+      "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE_APP",
+      "OTEL_RESOURCE_ATTRIBUTES_APP",
+    ]) {
+      assert.equal(runEnvNameViolation(name), null, name);
+    }
+  });
+});

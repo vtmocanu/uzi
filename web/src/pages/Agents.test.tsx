@@ -123,7 +123,7 @@ describe("Agents page unset model label (#3255)", () => {
     expect(within(leadClaude).getByText("Claude: Default · SDK/account default (built-in)")).toBeTruthy();
     expect(within(leadClaude).getByText("effort: Default · built-in (medium)")).toBeTruthy();
     const leadCodex = within(leadRow).getByLabelText("Codex model and effort");
-    expect(within(leadCodex).getByText("Codex: Default · built-in (gpt-6.1-sol)")).toBeTruthy();
+    expect(within(leadCodex).getByText("Codex: Default · built-in (gpt-6.2-sol)")).toBeTruthy();
     expect(within(leadCodex).getByText("effort: Default · built-in (medium)")).toBeTruthy();
     expect(within(leadRow).queryByText("both harnesses")).toBeNull();
     const coderRow = screen.getByRole("link", { name: "coder" }).closest("tr")!;

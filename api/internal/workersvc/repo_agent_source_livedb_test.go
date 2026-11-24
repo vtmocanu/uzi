@@ -184,7 +184,7 @@ func TestRepoAgentSourceStampedUnpinnedClaimGateLiveDB(t *testing.T) {
 	}
 
 	old := f.protocolWorker(t, 0, capability.CompletionInterlockV1, capability.CIConfigGuardV1, capability.CodexHarnessV1,
-		capability.CodexRuntimeV2, capability.RecoveryArchiveV1, capability.CrossCheckV1, capability.JobRunnerV1)
+		capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.RecoveryArchiveV1, capability.CrossCheckV1, capability.JobRunnerV1)
 	eligibility, err := f.svc.WorkerEligibilityForHealth(f.env.ctx, time.Now(), run)
 	if err != nil {
 		t.Fatal(err)

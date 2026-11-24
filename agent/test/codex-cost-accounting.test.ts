@@ -97,6 +97,29 @@ describe("#2878 M2 priced cumulative monotonicity", () => {
 });
 
 describe("subscription API-equivalent pricing", () => {
+  for (const [model, expectedMicro] of [["gpt-6.2-sol", 1_064_554], ["gpt-6.2-astra", 4_258_216]] as const) {
+    it(`${model}: complete positive writes without TTL keep API-key/subscription parity and per-response tiers`, () => {
+      const acct = new CodexUsageAccountant();
+      acct.registerThread(ROOT, model, false);
+      const first = { inputTokens: 272_000, cachedInputTokens: 100_000, cacheWriteInputTokens: 1_000,
+        outputTokens: 42, reasoningOutputTokens: 10, totalTokens: 272_042 };
+      const second = { ...first, inputTokens: 272_001, totalTokens: 272_043 };
+      acct.record(ROOT, usage(first, first));
+      acct.record(ROOT, usage({ inputTokens: 544_001, cachedInputTokens: 200_000, cacheWriteInputTokens: 2_000,
+        outputTokens: 84, reasoningOutputTokens: 20, totalTokens: 544_085 }, second));
+      // Sol 354920 + 709634; Astra 1419680 + 2838536 microUSD. No TTL evidence or selector.
+      for (const pricing of [API_KEY_EARLY, SUBSCRIPTION]) {
+        const aggregate = acct.aggregateByModel(pricing);
+        const entry = get(aggregate, model);
+        assertTokens(entry, { input: 342_001, output: 84, cacheRead: 200_000, cacheCreation: 2_000, reasoning: 20 });
+        assert.equal(entry.costStatus, "metered");
+        assert.equal(micro(entry.costUSD), expectedMicro);
+        assert.deepEqual(deriveCodexRunCost(aggregate), { kind: "metered", usd: entry.costUSD!, source: "price_table" });
+      }
+      assert.deepEqual(acct.aggregateByModel(SUBSCRIPTION), acct.aggregateByModel(API_KEY_EARLY));
+    });
+  }
+
   it("gpt-6.1-sol identical responses have independent literal dollar parity with per-response tiers", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, "gpt-6.1-sol", false);

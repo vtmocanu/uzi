@@ -61,13 +61,13 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 	// A is the claimant now, so it is registered as a live Codex-capable worker (B's shape).
 	env.exec(`UPDATE workers SET protocol_capabilities = $2, last_heartbeat_at = now(),
 		snapshot_register_nonce = 'nonce-A', snapshot_epoch = 0 WHERE id = $1`, fx.workerA,
-		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.RecoveryArchiveV1})
 	fx.workerB = uuid.New()
 	env.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities,
 		last_heartbeat_at, snapshot_register_nonce, snapshot_epoch)
 		VALUES ($1, $2, $3, $4, 'online', $5, now(), 'nonce-B', 0)`,
 		fx.workerB, f.userID, "wb-"+fx.workerB.String(), fx.workerB[:],
-		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.RecoveryArchiveV1})
 	if olderHold {
 		fx.holdA = claimRecoveryHold(t, env, f.runID, fx.workerA, 1)
 		// The older open hold's live holder is the foreign worker B (A's original hold was
@@ -92,7 +92,7 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 func (fx *codexClaimFix) claimant(t *testing.T, capable bool) store.Worker {
 	t.Helper()
 	w := wkrRow(t, fx.env, fx.workerA)
-	w.ProtocolCapabilities = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	w.ProtocolCapabilities = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	if capable {
 		w.ProtocolCapabilities = append(w.ProtocolCapabilities, capability.RecoveryArchiveV1)
 	}

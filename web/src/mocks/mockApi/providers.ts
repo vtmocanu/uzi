@@ -62,7 +62,7 @@ function update(id: string, patch: Partial<ProviderDTO>): ProviderDTO {
 }
 
 function validate(engine: ProviderDTO["engine"], auth: ProviderDTO["auth_style"], map: ProviderDTO["model_map"]) {
-  const roles = engine === "codex" ? ["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] : ["haiku", "sonnet", "opus", "fable"];
+  const roles = engine === "codex" ? ["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"] : ["haiku", "sonnet", "opus", "fable"];
   if (engine === "codex" && auth !== "bearer") fail(400, "invalid_provider", "Codex requires Bearer auth");
   if (!map[engine === "codex" ? "default" : "haiku"]) fail(400, "invalid_provider", "required model missing");
   for (const [role, entry] of Object.entries(map)) {

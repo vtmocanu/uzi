@@ -1,3 +1,4 @@
+import { CODEX_CURATED_MODELS } from "./codexModels";
 import type { Harness } from "./apiTypes";
 import { modelFieldWarning } from "./agentTemplates";
 
@@ -14,7 +15,7 @@ export function checkerModelWarning(model: string, harness: Harness): string {
   if (syntax) return syntax;
   if (new TextEncoder().encode(value).length > 100) return "Invalid model ID.";
   const otherFamily = harness === "claude"
-    ? ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"]
+    ? CODEX_CURATED_MODELS
     : ["opus", "sonnet", "haiku", "fable"];
   return otherFamily.includes(value) ? "Choose a model from the checker's model family." : "";
 }

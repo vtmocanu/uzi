@@ -17,9 +17,10 @@ func TestProviderClaimEngineMatrixLiveDB(t *testing.T) {
 			{"legacy", nil, false, false},
 			{"claude", []string{"claude_provider_v1"}, true, false},
 			{"codex-native", []string{"codex_harness_v1", "codex_runtime_v2"}, false, false},
+			{"codex-provider-v2-only", []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"}, false, false},
 			{"codex-provider-only", []string{"codex_provider_v1"}, false, false},
-			{"codex", []string{"codex_harness_v1", "codex_runtime_v2", "codex_provider_v1"}, false, true},
-			{"both", []string{"codex_harness_v1", "codex_runtime_v2", "codex_provider_v1", "claude_provider_v1"}, true, true},
+			{"codex", []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_provider_v1"}, false, true},
+			{"both", []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_provider_v1", "claude_provider_v1"}, true, true},
 		} {
 			t.Run(engine+"/"+tc.name, func(t *testing.T) {
 				fx := newFleetFixture(t)

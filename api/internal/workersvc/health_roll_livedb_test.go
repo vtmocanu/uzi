@@ -32,7 +32,7 @@ func TestHealthRollSevenRungsLiveDB(t *testing.T) {
 			runID := e.seedQueuedRun(t, cv, req)
 			if lane == "harness" || lane == "runtime" || lane == "codex completion" || lane == "custom" {
 				e.exec(t, "UPDATE runs SET harness='codex' WHERE id=$1", runID)
-				protocols = append(protocols, capability.CodexHarnessV1, capability.CodexRuntimeV2)
+				protocols = append(protocols, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3)
 			}
 			if lane == "codex completion" {
 				protocols = append(protocols, capability.CodexCompletionInterlockV1)
@@ -135,7 +135,7 @@ func TestHealthRollWholeWorkerNegativesLiveDB(t *testing.T) {
 			v1 := int32(1)
 			runID := e.seedQueuedRun(t, &v1, []string{"gpu"})
 			e.exec(t, "UPDATE runs SET harness='codex',updated_at=now() - interval '3 hours' WHERE id=$1", runID)
-			caps := []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCompletionInterlockV1}
+			caps := []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCompletionInterlockV1}
 			w := e.seedHeartbeatWorker(t, caps)
 			e.exec(t, "UPDATE workers SET capabilities='{gpu}',draining_since=now()-interval '1 hour' WHERE id=$1", w)
 			wantRoll := false

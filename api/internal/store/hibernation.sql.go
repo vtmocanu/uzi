@@ -290,7 +290,7 @@ func (q *Queries) HibernationWakeProvenanceAdmits(ctx context.Context, arg Hiber
 const hibernationWakeSuppresses = `-- name: HibernationWakeSuppresses :one
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -553,7 +553,7 @@ func (q *Queries) ListHibernationRetirementCandidates(ctx context.Context, rowLi
 const listHibernationWakeDemand = `-- name: ListHibernationWakeDemand :many
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
-           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-6.2-astra') THEN t.codex_model END
             FROM agent_templates t
             LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
             LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
@@ -744,6 +744,7 @@ WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
        WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
+                        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
        ELSE false
    END)
 ORDER BY hw.worker_id, hw.run_id

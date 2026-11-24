@@ -42,7 +42,7 @@ func TestPlanCrossCheckClaimInputLiveDB(t *testing.T) {
 	svc.SetTxBeginner(env.pool)
 	child := mustRun(t, env, f.runID)
 	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{
-		capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+		capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 	payload, err := svc.assembleClaim(env.ctx, worker, child)
 	if err != nil {
 		t.Fatal(err)

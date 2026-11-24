@@ -22,7 +22,7 @@ func TestCodexProviderUnsupportedActualClaimBeforeReads(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			run := providerBoundRow(kind)
 			run.Harness = harnessCodex
-			worker := store.Worker{ProtocolCapabilities: []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}}
+			worker := store.Worker{ProtocolCapabilities: []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}}
 			payload, err := (&Service{}).assembleClaim(context.Background(), worker, run)
 			if payload != nil || !errors.Is(err, errProviderLaneClaimRefused) {
 				t.Fatalf("payload present=%v err=%v", payload != nil, err)
@@ -99,7 +99,7 @@ func TestProviderClaimEngineProfileAndLockedRecheck(t *testing.T) {
 				if engine == harnessCodex {
 					protocol = providers.ProtocolResponses
 					models = `{"default":{"model":"gateway"}}`
-					caps = []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+					caps = []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 				}
 				f := &providerClaimMatrixStore{fakeStore: &fakeStore{}, rev: store.GetModelProviderRevisionForOwnerRow{ProviderID: uuid.UUID(run.ModelProviderID.Bytes), Revision: 1, Engine: engine, Protocol: protocol, AuthStyle: "bearer", BaseUrl: pvBase, ModelMap: []byte(models)}, key: store.GetProviderBindingKeyByIDRow{Kind: providerKeyKind(engine), ProviderID: run.ModelProviderID, EnablementRev: 1}}
 				want := holdProviderBindingStale

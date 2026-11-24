@@ -20,7 +20,7 @@ import (
 // prove a refused claim leaves the run, its capability and its custody exactly as they were.
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; every name ends LiveDB.
 
-var provenanceCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1}
+var provenanceCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.RecoveryArchiveV1}
 
 const (
 	provHeldNamedA       = "held for worker %s: wait for it or cancel the run; only the worker that last ran this Codex run may resume it"

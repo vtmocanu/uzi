@@ -138,6 +138,35 @@ describe("probeCodexRuntime — valid receipt", () => {
   });
 });
 
+describe("probeCodexRuntime — required receipt contract", () => {
+  it("ties the required member set to CODEX_MEMBERS", async () => {
+    const lock = await readFile(new URL("../codex/codex-package.lock", import.meta.url), "utf8");
+    assert.deepEqual(DEFAULT_MEMBERS.map(m => m.member).sort(), lock.match(/^CODEX_MEMBERS=(.+)$/m)![1]!.split(" ").sort());
+  });
+  for (const fault of ["missing", "duplicate", "unexpected", "schema", "musl", "prefix", "versionRoot"] as const) {
+    it(`rejects ${fault} receipt contract`, async () => {
+      const { prefix } = await buildFixture({ mutateReceipt(r) {
+        const entries = r.members as ReceiptMemberObj[];
+        if (fault === "missing") entries.pop();
+        else if (fault === "duplicate") entries[4] = entries[0]!;
+        else if (fault === "unexpected") entries[4]!.member = "extra";
+        else if (fault === "schema") r.schemaVersion = 2;
+        else if (fault === "musl") r.muslTarget = "aarch64-unknown-linux-musl";
+        else r[fault] = "/wrong";
+      } });
+      assert.equal((await probe(prefix)).capable, false);
+    });
+  }
+  it("accepts an intact arm64 receipt with the matching musl target", async () => {
+    const { prefix } = await buildFixture({ mutateReceipt(r) {
+      r.targetArch = "arm64";
+      r.muslTarget = "aarch64-unknown-linux-musl";
+      r.lockDigest = CODEX_PROBE_EXPECTATION.lockDigest.arm64;
+    } });
+    assert.equal((await probeCodexRuntime({ prefix, arch: "arm64" })).capable, true);
+  });
+});
+
 describe("probeCodexRuntime — fails closed (never throws)", () => {
   it("absent receipt → not capable", async () => {
     const { prefix } = await buildFixture({ omitReceipt: true });

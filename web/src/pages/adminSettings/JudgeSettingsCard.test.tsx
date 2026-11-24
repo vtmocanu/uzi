@@ -13,12 +13,12 @@ const mockApi = vi.mocked(api);
 const settings = {
   judge_enabled: "true",
   judge_model: "opus",
-  codex_judge_model: "gpt-6.1-sol",
+  codex_judge_model: "gpt-6.2-sol",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
 } as AppSettings;
-const defaults = { judge_model: "opus", codex_judge_model: "gpt-6.1-sol" };
+const defaults = { judge_model: "opus", codex_judge_model: "gpt-6.2-sol" };
 const unpinned: Record<string, SettingSource> = { judge_model: "default", codex_judge_model: "default" };
 
 function renderCard(
@@ -81,7 +81,7 @@ describe("JudgeSettingsCard read-only instance default line (#3259)", () => {
   it("shows the built-in for unpinned lanes and links to Model defaults", () => {
     renderCard();
     expect(instanceLine()).toContain(
-      "Instance default: Claude opus (built-in) · Codex gpt-6.1-sol (built-in) · users may override.",
+      "Instance default: Claude opus (built-in) · Codex gpt-6.2-sol (built-in) · users may override.",
     );
     expect(screen.getAllByRole("link", { name: "Model defaults" }).every((a) => a.getAttribute("href") === "#model-defaults")).toBe(true);
   });

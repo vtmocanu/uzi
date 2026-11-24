@@ -287,7 +287,7 @@ func TestClaimPlanPhaseCodexClaimUnaffectedLiveDB(t *testing.T) {
 	env.exec(`UPDATE users SET planning_claude_model = 'opus', planning_claude_effort = 'high' WHERE id = $1`, cf.userID)
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
-	w := store.Worker{ID: cf.workerID, UserID: cf.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+	w := store.Worker{ID: cf.workerID, UserID: cf.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 	p, err := svc.assembleClaim(env.ctx, w, mustRun(t, env, cf.runID))
 	if err != nil {
 		t.Fatalf("Codex claim with Claude planning set: %v", err)
@@ -345,7 +345,7 @@ func TestCodexClaimPlanCapabilitiesLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
 	env.exec(`UPDATE users SET planning_codex_model='private-plan', planning_codex_effort='high' WHERE id=$1`, cf.userID)
-	base := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	base := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	for _, tc := range []struct {
 		name  string
 		extra []string

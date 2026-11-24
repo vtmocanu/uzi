@@ -9,6 +9,15 @@ import assert from "node:assert/strict";
 import { checkCompleteness, type RequiredCell } from "./completeness.js";
 import type { ClauseRow, OState } from "./clause.js";
 import type { EvidenceMap } from "./evidence.js";
+import { ALL_CLAUSES } from "./registry.js";
+import { ASYNC_MESSAGE_TITLES, EXCEPTIONS_TITLE } from "./native-exceptions.js";
+import {
+  CODEX_P_NATIVE_ABSENT_TITLES,
+  CODEX_P_SHELL_POLICY_TITLES,
+  CODEX_P_FILE_POLICY_TITLES,
+  NATIVE_PATCH_INERT_TITLES,
+  CODEX_P_NO_TTL_TITLES,
+} from "./titles-c3.js";
 
 /** A minimal well-formed U/P clause. */
 function uprow(overrides: Partial<ClauseRow> & Pick<ClauseRow, "id" | "adapter" | "layer">): ClauseRow {
@@ -156,4 +165,55 @@ describe("checkCompleteness pass case", () => {
     const evidence: EvidenceMap = { t: "pass", "dep-t": "pass" };
     assert.equal(checkCompleteness(clauses, evidence, REQ_CODEX_P).ok, true);
   });
+});
+
+
+// Synthetic reporter results against the real registry: these test the gate, not the binary.
+describe("M6 per-model evidence completeness", () => {
+  const required: readonly RequiredCell[] = [
+    { adapter: "claude", layer: "U" },
+    { adapter: "codex", layer: "U" },
+    { adapter: "codex", layer: "P" },
+  ];
+  const complete: EvidenceMap = Object.fromEntries(
+    ALL_CLAUSES.flatMap(row => row.tests.map(title => [title, "pass" as const])),
+  );
+
+  it("passes the complete U/P matrix", () => {
+    assert.deepEqual(checkCompleteness(ALL_CLAUSES, complete, required), { ok: true, failures: [] });
+  });
+
+  const maps = [
+    ["codex-p-no-ttl-overrides", CODEX_P_NO_TTL_TITLES],
+    ["codex-p-native-async-utc-exceptions", { legacy: EXCEPTIONS_TITLE, ...ASYNC_MESSAGE_TITLES }],
+    ["codex-p-native-bypass-forced-dispatch", CODEX_P_NATIVE_ABSENT_TITLES],
+    ["codex-p-shell-policy", CODEX_P_SHELL_POLICY_TITLES],
+    ["codex-p-file-policy", CODEX_P_FILE_POLICY_TITLES],
+    ["codex-p-native-patch-inert", NATIVE_PATCH_INERT_TITLES],
+  ] as const;
+  for (const [id, titles] of maps) {
+    it(`${id} requires every mapped title`, () => {
+      const row = ALL_CLAUSES.find(row => row.id === id);
+      assert.ok(row);
+      assert.equal(row.adapter, "codex");
+      assert.equal(row.layer, "P");
+      assert.deepEqual([...row.tests].sort(), Object.values(titles).sort());
+    });
+    for (const model of ["gpt-6.2-sol", "gpt-6.2-astra"]) {
+      const entries = Object.entries(titles).filter(([key]) => key === model || key.startsWith(`${model}/`));
+      it(`${id} includes ${model}`, () => { assert.ok(entries.length > 0); });
+      for (const [, title] of entries) {
+        for (const status of ["missing", "fail", "skip"] as const) {
+          it(`rejects independently ${status}: ${title}`, () => {
+            const evidence = { ...complete };
+            if (status === "missing") delete evidence[title];
+            else evidence[title] = status;
+            const report = checkCompleteness(ALL_CLAUSES, evidence, required);
+            assert.equal(report.ok, false);
+            assert.ok(report.failures.some(failure => failure.includes(title)), report.failures.join("\n"));
+          });
+        }
+      }
+    }
+  }
 });

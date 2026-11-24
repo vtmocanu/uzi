@@ -55,7 +55,7 @@ func TestCodexAdmissionClaimKindsLiveDB(t *testing.T) {
 				alias := e.seedLinkedSubscription(t, owner, uuid.NewString(), codexToken("access"), codexToken("refresh"))
 				run := e.seedQueuedCodexRun(t, owner, repo, alias, 1)
 				worker := e.seedCapableCodexWorker(t, owner)
-				caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1, capability.RecoveryArchiveV1}
+				caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1, capability.RecoveryArchiveV1}
 				e.exec("UPDATE workers SET protocol_capabilities=$2, last_heartbeat_at=now() WHERE id=$1", worker, caps)
 				var target any
 				if kind == "judge" || kind == "mr_rework" {
@@ -136,7 +136,7 @@ func TestCodexAdmissionSharedAliasesAndOtherAccountLiveDB(t *testing.T) {
 	runB := e.seedQueuedCodexRun(t, owner, repo, b, 2)
 	runOther := e.seedQueuedCodexRun(t, owner, repo, other, 3)
 	worker := e.seedCapableCodexWorker(t, owner)
-	caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
+	caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}
 	seedAdmissionCooldown(t, e, a)
 	// Refresh rotates credential authority without resetting account admission state.
 	e.exec("UPDATE codex_provider_account SET generation=generation+1, credential_revision=credential_revision+1 WHERE id=(SELECT provider_account_id FROM codex_credential_state WHERE user_secret_id=$1)", a)
@@ -207,7 +207,7 @@ func TestCodexAdmissionSubscriptionOnlyLiveDB(t *testing.T) {
 			}
 			worker := e.seedCapableCodexWorker(t, owner)
 			claimed, err := e.q.ClaimRun(e.ctx, e.codexClaimParams(owner, worker,
-				[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}))
+				[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}))
 			if err != nil || claimed.ID != run {
 				t.Fatalf("%s claim = %s, %v", mode, claimed.ID, err)
 			}
@@ -222,7 +222,7 @@ func TestCodexAdmissionClaimStatementSnapshotLiveDB(t *testing.T) {
 	owner, worker, repo := e.seedCodexInfra(t)
 	alias := e.seedLinkedSubscription(t, owner, uuid.NewString(), codexToken("a"), codexToken("r"))
 	run := e.seedQueuedCodexRun(t, owner, repo, alias, 1)
-	caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
+	caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}
 	e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", worker, caps)
 	ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
 	defer cancel()

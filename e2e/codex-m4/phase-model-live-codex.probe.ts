@@ -52,7 +52,7 @@ async function main(): Promise<void> {
     return;
   }
   const bin = resolveCodexBin().codexBin;
-  assertBinaryVersion(bin, "0.169.0");
+  assertBinaryVersion(bin, "0.171.0");
   const accounting = await import(pathToFileURL(path.resolve(process.env.CODEX_M4_SRC ?? "src", "codex/token-accounting.ts")).href) as typeof import("../../agent/src/codex/token-accounting.js");
   const accountant = new accounting.CodexUsageAccountant();
   const nonce = `nonce-${randomUUID()}`;
@@ -117,7 +117,7 @@ async function main(): Promise<void> {
     await cold?.close(); await warm?.close();
     clearTimeout(soft); clearTimeout(hard); process.off("SIGINT", stop); process.off("SIGTERM", stop);
     fs.rmSync(root, { recursive: true, force: true });
-    const summary = JSON.stringify({ kind: "phase-model-live", harness: "codex", pin: "0.169.0", scope: effortOnly ? "effort-only" : "full", failure,
+    const summary = JSON.stringify({ kind: "phase-model-live", harness: "codex", pin: "0.171.0", scope: effortOnly ? "effort-only" : "full", failure,
       groups: groups.map(({ name, turns, count }) => ({ name, turns, count })),
       usage: accountant.aggregateByModel(), authJsonMtimeChanged: mtime() !== before,
       modelOmission: "not applicable: buildRunRequest uses leadRequestFor/resolveLeadRequest provider fallback",
