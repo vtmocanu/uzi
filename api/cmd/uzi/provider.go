@@ -454,7 +454,8 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode provi
 		}
 		return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitUsage,
 			// Ids first and the name capped: errors print through cellText (200-rune cap), so a
-			// long or quote-heavy name can only ever truncate itself, never an id.
+			// long or quote-heavy name truncates itself before any id (all ids fit for up to 4 matches;
+			// 5+ EqualFold-equal names, e.g. s/U+017F variants, can still cut the last id).
 			"pass an id: %s (%d providers are named \"%s\")",
 			strings.Join(ids, ", "), len(named), capCell(cellText(arg), 40))
 	}
