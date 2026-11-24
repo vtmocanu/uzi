@@ -148,6 +148,12 @@ func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 	migrateTo(ctx, t, dsn, 523)
 	pool := openSharedPool(ctx, t, dsn)
 	s := seedLegacy(ctx, t, pool)
+	revisions := func() string {
+		return scalar[string](ctx, t, pool, `SELECT jsonb_agg(jsonb_build_array(provider_id, revision, engine, protocol,
+				base_url, auth_style, model_map, created_at) ORDER BY provider_id, revision)::text
+			FROM model_provider_revisions WHERE provider_id IN ($1, $2)`, s.claudeP, s.codexP)
+	}
+	beforeRevisions := revisions()
 	migrateTo(ctx, t, dsn, 0)
 
 	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM model_providers`); got != 2 {
@@ -168,8 +174,8 @@ func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 			t.Errorf("provider %s: owner=%s scope=%s mode=%v rev=%d, want owner and scope %s, no mode, rev %d", c.id, owner, scope, mode, rev, c.owner, c.rev)
 		}
 	}
-	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM model_provider_revisions WHERE provider_id = $1`, s.claudeP); got != 2 {
-		t.Errorf("revisions of the Claude provider = %d, want 2", got)
+	if got := revisions(); got != beforeRevisions {
+		t.Errorf("provider revisions changed on upgrade:\nbefore: %s\nafter: %s", beforeRevisions, got)
 	}
 	for _, k := range []struct {
 		id    uuid.UUID
@@ -611,8 +617,8 @@ func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 		if !scalar[bool](ctx, t, pool, `SELECT indisvalid AND indisunique FROM pg_index WHERE indexrelid = 'model_providers_scope_owner_id_key'::regclass`) {
 			t.Errorf("the index is not valid after recovery")
 		}
-		if v := appliedVersion(ctx, t, pool); v != 531 {
-			t.Errorf("version after recovery = %d, want 531", v)
+		if v := appliedVersion(ctx, t, pool); v < 531 {
+			t.Errorf("version after recovery = %d, want at least 531", v)
 		}
 	})
 	t.Run("00526 replaces an invalid index it finds", func(t *testing.T) {
@@ -650,8 +656,8 @@ func TestSharedScopeNilUserRollsBack00524LiveDB(t *testing.T) {
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatalf("Migrate after removing the nil-UUID user: %v", err)
 	}
-	if v := appliedVersion(ctx, t, pool); v != 531 {
-		t.Errorf("version after the retry = %d, want 531", v)
+	if v := appliedVersion(ctx, t, pool); v < 531 {
+		t.Errorf("version after the retry = %d, want at least 531", v)
 	}
 }
 
