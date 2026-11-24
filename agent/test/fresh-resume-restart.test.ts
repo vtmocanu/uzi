@@ -221,7 +221,14 @@ describe("the crash rig: a process kill at each step of a fresh seed, then a res
     assert.equal(freshStage(s), "ready");
     const journalsBefore = [recoveryJournal(s), cfg(s, `uzi-attempts.${s.branch}.entry`), cfg(s, freshJournalKey(s.branch))];
     const again = factoryFor();
-    await run(again.factory).execute(gitlabClaim(9105, { claim_generation: RESTART_GENERATION + 1, run_id: s.runId } as never));
+    const { logger, lines } = recordingLogger();
+    await run(again.factory, {}, logger).execute(gitlabClaim(9105, { claim_generation: RESTART_GENERATION + 1, run_id: s.runId } as never));
+    const msgs = lines.map(l => (l as { msg: string }).msg);
+    // The ready journal is decided locally: the claim goes on to the ordinary retained-recovery path of the live attempt (the first
+    // flight's failed model left its clone retained), which is that path's own stop, not a fresh one.
+    assert.ok(msgs.includes("retained recovery stopped; source and accounting kept"), "the ordinary retained-recovery path decided the second claim");
+    assert.equal(msgs.some(m => m.startsWith("fresh resume")), false, "no fresh resume stop, hold or discovery line was logged");
+    assert.equal(reported(s.runId).includes("failed"), false);
     assert.deepEqual([recoveryJournal(s), cfg(s, `uzi-attempts.${s.branch}.entry`).slice(0, journalsBefore[1]!.length), cfg(s, freshJournalKey(s.branch))],
       journalsBefore, "L0 to L4 are not rewritten by a later claim");
     assert.equal(stateCalls().length, 1, "only the first claim (journal seeding) asked the server; a ready journal is decided locally");
@@ -363,7 +370,44 @@ describe("the restart matrix", () => {
     assert.deepEqual(recoveryJournal(s), []);
   });
 
+  it("the journal changing under the lock of the unbind (after the runner's own recheck) stops, never unbinds or continues", async () => {
+    const s = await scene(9131, "L1");
+    script(terminalReply("refused"));
+    const real = git.markFreshUnbound.bind(git);
+    const patched = mock.method(git, "markFreshUnbound", async (...args: Parameters<typeof real>) => {
+      // After the runner's `again` read and before the locked recheck: another journal for the same attempt appears.
+      sh(s.bare, ["config", "--local", freshJournalKey(s.branch), freshJournalJson({ frid: randomUUID(), attemptId: s.attemptId, generation: SEED_GENERATION, sha: s.sha, stage: "seeding" })]);
+      return real(...args);
+    });
+    try {
+      const { factory, started } = factoryFor();
+      await run(factory).execute(s.claim);
+      assert.equal(patched.mock.callCount(), 1);
+      assert.equal(started(), 0, "the claim stopped instead of going on to start the model");
+      assert.equal(ledgerState(s), "fresh_pending", "A was not unbound");
+      assert.equal(reported(s.runId).includes("failed"), false);
+    } finally { patched.mock.restore(); }
+  });
+
   describe("the source's slot after a restart", () => {
+    it("a ready journal with a foreign-active slot takes the ordinary restore route, not the fresh hold", async () => {
+      const s = await scene(9144, "L2");
+      await git.commitFreshReceipt({ barePath: s.bare, branch: s.branch, runId: s.runId, clonePath: s.clonePath, attemptId: s.attemptId,
+        frid: s.frid, generation: SEED_GENERATION, sha: s.sha });
+      assert.equal(freshStage(s), "ready");
+      client.protocolFeatures = [PARK_FEATURE, "active_run_snapshot"];
+      ackParks(true);
+      const { logger, lines } = recordingLogger();
+      const { factory, started } = factoryFor();
+      await run(factory, { authority: stubAuthority(slotOf("old-incarnation", "active")) }, logger).execute(s.claim);
+      const msgs = lines.map(l => (l as { msg: string }).msg);
+      assert.ok(msgs.includes("retained predecessor is foreign-owned; taking the independent restore route"), "the #3644 restore route was taken");
+      assert.equal(msgs.some(m => /^fresh resume (source retained|owner hold)/.test(m)), false, "no fresh hold");
+      assert.equal(stateCalls().length, 0, "a ready journal asks the server nothing");
+      assert.equal(started(), 0);
+      assert.equal(freshStage(s), "ready");
+    });
+
     it("ended (the slot is ineligible): no hold, L4 commits", async () => {
       const s = await scene(9140, "L2");
       client.protocolFeatures = [PARK_FEATURE];
