@@ -1320,12 +1320,6 @@ export const runsApi = {
     const inputs = (mockRunInputs[id] ?? []).map((i) => ({ ...i }));
     return delay({ inputs }, 60);
   },
-  // PRD #1296 M5 (D6/D7): the owner-scoped recovery aggregate. Demo mode shows a
-  // realistic AVAILABLE archive for a failed run so the "Recovery archives" section
-  // renders its committed-history + secret-review copy and the enabled download; every
-  // other run reports the honest supported-but-empty aggregate (which renders nothing
-  // unless the run actually failed). A missing run 404s, which the section treats as
-  // "no recovery data".
   // Fresh resume (issue #4628) demo: a run held at recovery_wait previews as available, any other run
   // as ineligible; a start succeeds. No selection or request id is validated.
   getFreshResumePreview: async (id: string) => {
@@ -1347,6 +1341,12 @@ export const runsApi = {
       admission_deadline: new Date(Date.now() + 5 * 60_000).toISOString(),
     }, 60);
   },
+  // PRD #1296 M5 (D6/D7): the owner-scoped recovery aggregate. Demo mode shows a
+  // realistic AVAILABLE archive for a failed run so the "Recovery archives" section
+  // renders its committed-history + secret-review copy and the enabled download; every
+  // other run reports the honest supported-but-empty aggregate (which renders nothing
+  // unless the run actually failed). A missing run 404s, which the section treats as
+  // "no recovery data".
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");

@@ -1,5 +1,7 @@
 // The owner-facing text of a fresh resume (issue #4628), in one place for the web surface. The CLI
-// carries the same substance in api/cmd/uzi/fresh_resume.go; keep the two in step.
+// carries the same substance in api/cmd/uzi/fresh_resume.go (freshResumeCutoffText) and the server in
+// freshNotes (api/internal/workersvc/fresh_resume_select.go); keep the three in step. A Go test pins
+// the CLI and server copies equal; the web copy is pinned by freshResumeText.test.ts.
 
 /** The cutoff text the owner confirms against. */
 export const FRESH_RESUME_CUTOFF_TEXT: readonly string[] = [
@@ -35,4 +37,33 @@ const FRESH_RESUME_GENERIC_REFUSAL = "Fresh resume was refused for a reason this
 
 export function freshResumeStatusText(status: string | undefined): string {
   return (status !== undefined && Object.prototype.hasOwnProperty.call(FRESH_RESUME_STATUS_TEXT, status) && FRESH_RESUME_STATUS_TEXT[status]) || FRESH_RESUME_GENERIC_REFUSAL;
+}
+
+const FRESH_RESUME_CAUSES: readonly string[] = [
+  "worker_requeue_exhausted",
+  "retained_recovery_exhausted",
+  "retained_recovery_adoption_failed",
+  "retained_continuation_unwitnessed",
+];
+
+/**
+ * Mirrors the server's eligibility base (fn_fresh_resume_run_base in
+ * api/internal/store/migrations/00523_run_fresh_resumes.sql) on the fields the page has: a
+ * recovery_wait with one of four causes, no secret_remediation_active or source_end_declined detail,
+ * no retry stamp, and a run kind that can seed. The server stays the authority; this only keeps the
+ * offer off holds it always refuses.
+ */
+export function freshResumeEligible(run: {
+  status: string;
+  kind: string;
+  recovery_wait_cause?: string | null;
+  recovery_wait_detail?: string | null;
+  recovery_retry_not_before?: string | null;
+}): boolean {
+  return run.status === "recovery_wait"
+    && run.recovery_wait_cause != null && FRESH_RESUME_CAUSES.includes(run.recovery_wait_cause)
+    && run.recovery_wait_detail !== "secret_remediation_active"
+    && run.recovery_wait_detail !== "source_end_declined"
+    && run.recovery_retry_not_before === null
+    && ["issue", "mr_rework", "self_improve"].includes(run.kind);
 }

@@ -65,10 +65,18 @@ export function FreshResumeSection({ run, busy }: { run: Run; busy: boolean }) {
         setRetryable(false);
         setNotice(freshResumeStatusText(reason));
         setPhase({ kind: "idle" });
-      } else {
-        // Unknown outcome: the same confirm may be retried with the same id.
+      } else if (!(err instanceof ApiError) || err.status >= 500) {
+        // Unknown outcome (network failure or a server error): the same confirm may be retried with the
+        // same id.
         setRetryable(true);
         setNotice("The start may or may not have been recorded. Retry to confirm with the same request.");
+      } else {
+        // A definite client error (400, 401, 404 ...): the server did not accept it, so a retry of the
+        // same request cannot help; spend the id and review a fresh preview.
+        requestId.current = null;
+        setRetryable(false);
+        setNotice("The start was not accepted. Reload the run and review a new preview.");
+        setPhase({ kind: "idle" });
       }
     } finally {
       setSending(false);

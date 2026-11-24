@@ -397,8 +397,8 @@ func freshNotes(uncovered []int64) []string {
 		"Edits made after the saved evidence may be missing from the resumed run.",
 		"The original worker's source and custody are kept; starting a fresh resume does not delete them.",
 		"Unsaved edits may be lost if the original worker's volume is gone.",
-		"Each attempt keeps its own custody hold, and a healthy seeded run counts one extra admission unit until its claim-generation hold is released or the run ends.",
-		"While the original worker and the new worker both hold custody, only a third eligible hosted worker can take a repeat fresh resume. After seeding, the original worker never takes this run again, so an owner with two workers whose second worker is lost must add a worker or cancel the run.",
+		"Each attempt keeps its own custody hold, and a healthy seeded run counts one extra admission unit until its new hold is released or the run ends.",
+		"While the original worker and the new worker both hold custody, only a third eligible hosted worker can take a repeat fresh resume. After seeding, the original worker never takes this run again, so an owner with only two workers whose new worker is lost must add a worker or cancel the run.",
 	}
 	if len(uncovered) > 0 {
 		parts := make([]string, len(uncovered))

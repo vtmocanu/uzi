@@ -6,11 +6,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -20,7 +22,9 @@ import (
 )
 
 // freshResumeCutoffText is the cutoff text the owner confirms against. The web panel carries the same
-// substance (web/src/lib/freshResumeText.ts); the server's Notes carry it too for other consumers.
+// substance (web/src/lib/freshResumeText.ts); the server's Notes (freshNotes in
+// api/internal/workersvc/fresh_resume_select.go) carry it too for other consumers, and a test pins
+// the CLI and server copies equal.
 var freshResumeCutoffText = []string{
 	"Edits made after the saved evidence may be missing from the resumed run.",
 	"The original worker's source and custody are kept; starting a fresh resume does not delete them.",
@@ -61,6 +65,36 @@ func freshResumeHint(runID string) string {
 // freshResumeStartRetries bounds the same-request-id retries of a start whose transport failed.
 const freshResumeStartRetries = 2
 
+// freshResumeMaxBackoff bounds the wait before a start retry; freshResumeBaseBackoff is the wait when
+// the server gave no Retry-After.
+const (
+	freshResumeBaseBackoff = 500 * time.Millisecond
+	freshResumeMaxBackoff  = 5 * time.Second
+)
+
+// freshResumeSleep waits d or until ctx ends; tests replace it.
+var freshResumeSleep = func(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+// freshResumeBackoff is the bounded wait before retry number attempt (0-based): the server's
+// Retry-After when it sent one, else a short doubling base, never above freshResumeMaxBackoff.
+func freshResumeBackoff(ee *uzicli.ExitError, attempt int) time.Duration {
+	d := freshResumeBaseBackoff << uint(attempt)
+	if ee != nil && ee.RetryAfter > 0 {
+		d = ee.RetryAfter
+	}
+	if d > freshResumeMaxBackoff {
+		d = freshResumeMaxBackoff
+	}
+	return d
+}
+
 func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "fresh-resume <run-id> [--yes]",
@@ -70,16 +104,21 @@ func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"(generation, kind, commit, and any generations that saved nothing) and what a fresh resume " +
 			"may lose or cost, then asks you to confirm; pass --yes to skip the prompt. Without a " +
 			"terminal and without --yes it refuses and starts nothing.\n\n" +
-			"One confirm uses one request id. A retry after a lost reply reuses it automatically; to retry " +
-			"a separate invocation of the SAME confirm, pass the request id the first one printed with " +
-			"--request-id. Exit 5 on a refusal (stale selection, request already completed, in progress, " +
-			"or a status that says why a start is not possible).",
+			"One confirm uses one request id. A retry after a lost reply reuses it automatically. To retry " +
+			"a separate invocation of the SAME confirm, pass both values the first one printed: " +
+			"--request-id and --selection-token; the start is then sent directly, without a new preview. " +
+			"--request-id alone still goes through the preview. Exit 5 on a refusal (stale selection, " +
+			"request already completed, in progress, or a status that says why a start is not possible).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runID := args[0]
 			yes, _ := cmd.Flags().GetBool("yes")
 			requestID := strings.TrimSpace(mustFlagString(cmd, "request-id"))
+			token := strings.TrimSpace(mustFlagString(cmd, "selection-token"))
 			if requestID == "" {
+				if token != "" {
+					return uzicli.Exitf(uzicli.ExitUsage, "--selection-token is only used together with --request-id")
+				}
 				requestID = uuid.NewString()
 			} else if u, err := uuid.Parse(requestID); err != nil || u.String() != requestID {
 				return uzicli.Exitf(uzicli.ExitUsage, "--request-id must be a canonical lowercase UUID")
@@ -89,20 +128,32 @@ func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			p := env.printer(gf)
-			prev, err := c.FreshResumePreview(cmd.Context(), runID)
-			if err != nil {
-				return err
-			}
-			if prev.Status != apitypes.FreshResumeStatusAvailable || prev.SelectionToken == "" {
-				if p.Format == uzicli.FormatJSON {
-					if err := p.JSON(prev); err != nil {
-						return err
-					}
+			// The cutoff text is what the owner confirms against: print it whenever the prompt can be
+			// shown, whatever -q or -o json say; with --yes only for human, non-quiet output.
+			showText := !yes || (p.Format != uzicli.FormatJSON && !gf.quiet)
+			if token != "" {
+				// --request-id with its token: post directly. The preview reports in_progress while that
+				// transfer is active, so gating on it would keep the replay from reaching the server.
+				if showText {
+					_, _ = fmt.Fprint(env.Stderr, renderFreshResumeCutoff(apitypes.FreshResumePreviewDTO{}))
 				}
-				return uzicli.Exitf(uzicli.ExitConflict, "%s", freshResumeStatusMessage(prev.Status))
-			}
-			if p.Format != uzicli.FormatJSON && !gf.quiet {
-				_, _ = fmt.Fprint(env.Stderr, renderFreshResumePreview(runID, prev))
+			} else {
+				prev, err := c.FreshResumePreview(cmd.Context(), runID)
+				if err != nil {
+					return err
+				}
+				if prev.Status != apitypes.FreshResumeStatusAvailable || prev.SelectionToken == "" {
+					if p.Format == uzicli.FormatJSON {
+						if err := p.JSON(prev); err != nil {
+							return err
+						}
+					}
+					return uzicli.Exitf(uzicli.ExitConflict, "%s", freshResumeStatusMessage(prev.Status))
+				}
+				token = prev.SelectionToken
+				if showText {
+					_, _ = fmt.Fprint(env.Stderr, renderFreshResumePreview(runID, prev))
+				}
 			}
 			if !yes {
 				if !env.StdinTTY {
@@ -119,7 +170,7 @@ func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 					return nil
 				}
 			}
-			req := apitypes.FreshResumeStartRequest{SelectionToken: prev.SelectionToken, RequestID: requestID}
+			req := apitypes.FreshResumeStartRequest{SelectionToken: token, RequestID: requestID}
 			var out apitypes.FreshResumeStartDTO
 			for attempt := 0; ; attempt++ {
 				out, err = c.StartFreshResume(cmd.Context(), runID, req)
@@ -127,12 +178,14 @@ func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 					break
 				}
 				// A transport failure may have lost a reply that did start the transfer: retry the SAME
-				// request id (the server answers a replay with the existing row), bounded.
+				// request id (the server answers a replay with the existing row), bounded, after a short
+				// wait that honors the server's Retry-After.
 				var ee *uzicli.ExitError
 				if attempt < freshResumeStartRetries && errors.As(err, &ee) && ee.Code == uzicli.ExitUnreachable && ee.Reason == "" && cmd.Context().Err() == nil {
+					freshResumeSleep(cmd.Context(), freshResumeBackoff(ee, attempt))
 					continue
 				}
-				return freshResumeStartError(err, requestID)
+				return freshResumeStartError(err, requestID, token)
 			}
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(out)
@@ -150,6 +203,7 @@ func newRunFreshResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	cmd.Flags().BoolP("yes", "y", false, "skip the interactive confirmation (required for a non-interactive run)")
 	cmd.Flags().String("request-id", "", "reuse the request id of an earlier invocation of the same confirm (default: a new UUID)")
+	cmd.Flags().String("selection-token", "", "with --request-id: the selection token the earlier invocation printed; posts the start directly")
 	return cmd
 }
 
@@ -161,8 +215,8 @@ func freshResumeStatusMessage(status string) string {
 }
 
 // freshResumeStartError renders a start refusal: a typed 409 by its reason, anything else as is. A
-// transport error names the request id so the owner can retry the same confirm.
-func freshResumeStartError(err error, requestID string) error {
+// transport error names the request id and selection token so the owner can retry the same confirm.
+func freshResumeStartError(err error, requestID, token string) error {
 	var ee *uzicli.ExitError
 	if !errors.As(err, &ee) {
 		return err
@@ -171,7 +225,7 @@ func freshResumeStartError(err error, requestID string) error {
 		return uzicli.Exitf(uzicli.ExitConflict, "%s", freshResumeStatusMessage(ee.Reason))
 	}
 	if ee.Code == uzicli.ExitUnreachable {
-		return uzicli.Exitf(ee.Code, "%v; the start may or may not have been recorded: retry with --request-id %s", ee.Err, requestID)
+		return uzicli.Exitf(ee.Code, "%v; the start may or may not have been recorded: retry with --request-id %s --selection-token %s", ee.Err, requestID, token)
 	}
 	return err
 }
@@ -191,6 +245,13 @@ func renderFreshResumePreview(runID string, d apitypes.FreshResumePreviewDTO) st
 		fmt.Fprintf(&b, "  capture:                  %s\n", cellText(d.CaptureID))
 	}
 	b.WriteString("\n")
+	b.WriteString(renderFreshResumeCutoff(d))
+	return b.String()
+}
+
+// renderFreshResumeCutoff renders the cutoff text and any uncovered generations of d.
+func renderFreshResumeCutoff(d apitypes.FreshResumePreviewDTO) string {
+	var b strings.Builder
 	for _, t := range freshResumeCutoffText {
 		b.WriteString("  - " + t + "\n")
 	}

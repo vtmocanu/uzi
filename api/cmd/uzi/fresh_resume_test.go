@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -58,6 +62,9 @@ func TestFreshResumeNewConfirmNewRequestID(t *testing.T) {
 }
 
 func TestFreshResumeTransportRetryReusesRequestID(t *testing.T) {
+	old := freshResumeSleep
+	freshResumeSleep = func(context.Context, time.Duration) {}
+	defer func() { freshResumeSleep = old }()
 	fc := &uzicli.FakeClient{FreshResumePreviewResult: availableFreshPreview(),
 		FreshResumeStartErr: uzicli.Exitf(uzicli.ExitUnreachable, "connection reset")}
 	_, errb, code := runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes")
@@ -169,10 +176,147 @@ func TestFreshResumeUntrustedFieldsSanitized(t *testing.T) {
 	}
 }
 
+func TestFreshResumeUntrustedCheckpointRefAndCaptureSanitized(t *testing.T) {
+	p := availableFreshPreview()
+	p.CheckpointRef = "refs/x\x1b[31mred"
+	p.CaptureID = "cap\x1b[32mgreen"
+	fc := &uzicli.FakeClient{FreshResumePreviewResult: p}
+	_, errb, _ := runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes")
+	if strings.Contains(errb, "\x1b") || !strings.Contains(errb, "checkpoint ref:") {
+		t.Errorf("escape byte reached the terminal or ref missing: %q", errb)
+	}
+}
+
+func TestFreshResumeCutoffShownBeforePromptEvenWhenQuietOrJSON(t *testing.T) {
+	for _, args := range [][]string{{"--quiet"}, {"--json"}, {"--quiet", "--json"}} {
+		fc := &uzicli.FakeClient{FreshResumePreviewResult: availableFreshPreview()}
+		env := fakeEnv(fc)
+		env.StdinTTY = true
+		env.Stdin = strings.NewReader("n\n")
+		_, errb, _ := runCLI(t, env, append(append([]string{}, args...), "run", "fresh-resume", "run1")...)
+		if !strings.Contains(errb, "Edits made after the saved evidence may be missing") || !strings.Contains(errb, "[y/N]") {
+			t.Errorf("%v: cutoff text must precede the prompt: %q", args, errb)
+		}
+	}
+	// With --yes there is no prompt, so --quiet stays quiet.
+	fc := &uzicli.FakeClient{FreshResumePreviewResult: availableFreshPreview()}
+	_, errb, _ := runCLI(t, fakeEnv(fc), "--quiet", "run", "fresh-resume", "run1", "--yes")
+	if strings.Contains(errb, "Edits made after") {
+		t.Errorf("--quiet --yes printed the cutoff: %q", errb)
+	}
+}
+
+func TestFreshResumeRequestIDWithTokenPostsDirectly(t *testing.T) {
+	// The preview would say in_progress while the transfer is active; the direct post must not consult it.
+	fc := &uzicli.FakeClient{FreshResumePreviewResult: apitypes.FreshResumePreviewDTO{Status: apitypes.FreshResumeStatusInProgress}}
+	const id = "11111111-2222-4333-8444-555555555555"
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes", "--request-id", id, "--selection-token", "tokOld")
+	if code != uzicli.ExitOK || len(fc.FreshResumeStartCalls) != 1 {
+		t.Fatalf("exit=%d calls=%+v", code, fc.FreshResumeStartCalls)
+	}
+	c := fc.FreshResumeStartCalls[0]
+	if c.Request.RequestID != id || c.Request.SelectionToken != "tokOld" {
+		t.Errorf("call = %+v", c)
+	}
+	_, _, code = runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes", "--selection-token", "tokOld")
+	if code != uzicli.ExitUsage {
+		t.Errorf("token without request id exit = %d", code)
+	}
+}
+
+func TestFreshResumeTransportErrorNamesRequestIDAndToken(t *testing.T) {
+	old := freshResumeSleep
+	freshResumeSleep = func(context.Context, time.Duration) {}
+	defer func() { freshResumeSleep = old }()
+	fc := &uzicli.FakeClient{FreshResumePreviewResult: availableFreshPreview(),
+		FreshResumeStartErr: uzicli.Exitf(uzicli.ExitUnreachable, "connection reset")}
+	_, errb, _ := runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes")
+	id := fc.FreshResumeStartCalls[0].Request.RequestID
+	if !strings.Contains(errb, "--request-id "+id+" --selection-token tok1") {
+		t.Errorf("hint = %q", errb)
+	}
+}
+
+func TestFreshResumeRetryBacksOffHonoringRetryAfter(t *testing.T) {
+	var waits []time.Duration
+	old := freshResumeSleep
+	freshResumeSleep = func(_ context.Context, d time.Duration) { waits = append(waits, d) }
+	defer func() { freshResumeSleep = old }()
+	fc := &uzicli.FakeClient{FreshResumePreviewResult: availableFreshPreview(),
+		FreshResumeStartErr: &uzicli.ExitError{Code: uzicli.ExitUnreachable, Err: errors.New("shed"), RetryAfter: 2 * time.Second}}
+	runCLI(t, fakeEnv(fc), "run", "fresh-resume", "run1", "--yes")
+	if len(waits) != freshResumeStartRetries || waits[0] != 2*time.Second || waits[1] != 2*time.Second {
+		t.Errorf("waits = %v", waits)
+	}
+	if got := freshResumeBackoff(&uzicli.ExitError{RetryAfter: time.Hour}, 0); got != freshResumeMaxBackoff {
+		t.Errorf("unbounded Retry-After: %v", got)
+	}
+	if got := freshResumeBackoff(nil, 0); got <= 0 || got > freshResumeMaxBackoff {
+		t.Errorf("default backoff: %v", got)
+	}
+}
+
+func TestFreshResumeCutoffMatchesServerNotes(t *testing.T) {
+	src, err := os.ReadFile("../../internal/workersvc/fresh_resume_select.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range freshResumeCutoffText {
+		if !strings.Contains(string(src), strconv.Quote(line)) {
+			t.Errorf("server freshNotes lacks the CLI cutoff line %q", line)
+		}
+	}
+}
+
+func freshHeldRun(cause string) apitypes.RunDTO {
+	return apitypes.RunDTO{ID: "run9", Kind: "issue", Status: statusRecoveryWait, RecoveryWaitCause: &cause, RecoveryRetryNotBeforePresent: true}
+}
+
 func TestRecoveryDecisionLineHintsFreshResumeOnlyWhenHeld(t *testing.T) {
-	cause := retainedRecoveryExhaustedCause
-	held := apitypes.RunDTO{ID: "run9", Status: statusRecoveryWait, RecoveryWaitCause: &cause, RecoveryRetryNotBeforePresent: true}
+	held := freshHeldRun(retainedRecoveryExhaustedCause)
 	if got := recoveryDecisionLine(held); !strings.Contains(got, "uzi run fresh-resume run9") {
 		t.Errorf("held line lacks the hint: %q", got)
+	}
+}
+
+func TestFreshResumeHintFollowsServerEligibility(t *testing.T) {
+	const hint = "uzi run fresh-resume run9"
+	for _, cause := range []string{workerRequeueExhaustedCause, retainedRecoveryExhaustedCause, retainedRecoveryAdoptionFailedCause, retainedContinuationUnwitnessedCause} {
+		if got := workerExhaustionLine(freshHeldRun(cause)); !strings.Contains(got, hint) {
+			t.Errorf("%s: eligible hold lacks the hint: %q", cause, got)
+		}
+	}
+	str := func(s string) *string { return &s }
+	stamp := time.Now().Add(time.Hour)
+	for name, r := range map[string]apitypes.RunDTO{
+		"codex_idle_stall": freshHeldRun("codex_idle_stall"),
+		"secret_remediation_active": func() apitypes.RunDTO {
+			r := freshHeldRun(retainedRecoveryAdoptionFailedCause)
+			r.RecoveryWaitDetail = str(recoveryDetailSecretRemediationActive)
+			return r
+		}(),
+		"source_end_declined": func() apitypes.RunDTO {
+			r := freshHeldRun(retainedRecoveryAdoptionFailedCause)
+			r.RecoveryWaitDetail = str(recoveryDetailSourceEndDeclined)
+			return r
+		}(),
+		"retry stamp": func() apitypes.RunDTO {
+			r := freshHeldRun(retainedRecoveryExhaustedCause)
+			r.RecoveryRetryNotBefore = &stamp
+			return r
+		}(),
+		"requeue exhausted with retry stamp": func() apitypes.RunDTO {
+			r := freshHeldRun(workerRequeueExhaustedCause)
+			r.RecoveryRetryNotBefore = &stamp
+			return r
+		}(),
+		"task kind": func() apitypes.RunDTO { r := freshHeldRun(workerRequeueExhaustedCause); r.Kind = "task"; return r }(),
+	} {
+		if got := workerExhaustionLine(r); strings.Contains(got, hint) {
+			t.Errorf("%s: refused hold must not carry the hint: %q", name, got)
+		}
+		if freshResumeEligible(r) {
+			t.Errorf("%s: predicate must refuse", name)
+		}
 	}
 }

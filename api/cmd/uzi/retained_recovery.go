@@ -256,10 +256,35 @@ func idleStallResumeGuidance(r apitypes.RunDTO) string {
 	return "Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run"
 }
 
-// freshResumeHintSuffix points a held run at `uzi run fresh-resume` (issue #4628). Only an owner-held
-// recovery decision gets it; a timed retry will resume by itself.
+// freshResumeEligible mirrors the server's eligibility base (fn_fresh_resume_run_base in migration
+// 00523_run_fresh_resumes.sql) on the fields the CLI has: a recovery_wait with one of four causes, no
+// secret_remediation_active or source_end_declined detail, no retry stamp, and a run kind that can
+// seed. The server stays the authority; this only keeps the hint off holds it always refuses.
+func freshResumeEligible(r apitypes.RunDTO) bool {
+	if r.Status != statusRecoveryWait || r.RecoveryRetryNotBefore != nil {
+		return false
+	}
+	switch strOr(r.RecoveryWaitCause, "") {
+	case workerRequeueExhaustedCause, retainedRecoveryExhaustedCause,
+		retainedRecoveryAdoptionFailedCause, retainedContinuationUnwitnessedCause:
+	default:
+		return false
+	}
+	switch strOr(r.RecoveryWaitDetail, "") {
+	case recoveryDetailSecretRemediationActive, recoveryDetailSourceEndDeclined:
+		return false
+	}
+	switch r.Kind {
+	case "issue", "mr_rework", "self_improve":
+		return true
+	}
+	return false
+}
+
+// freshResumeHintSuffix points a held run at `uzi run fresh-resume` (issue #4628) when the run passes
+// freshResumeEligible.
 func freshResumeHintSuffix(r apitypes.RunDTO) string {
-	if !isRecoveryDecisionHold(r) {
+	if !freshResumeEligible(r) {
 		return ""
 	}
 	return " · " + freshResumeHint(r.ID)

@@ -70,6 +70,21 @@ describe("FreshResumeSection", () => {
     expect(a).toBe(b);
   });
 
+  it.each([400, 401, 404])("does not offer Retry after a %s and spends the request id", async (status) => {
+    await openPreview();
+    mockApi.startFreshResume.mockRejectedValue(new ApiError(status, "nope"));
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm fresh resume" }));
+    await screen.findByText(/start was not accepted/);
+    expect(screen.queryByRole("button", { name: "Retry fresh resume" })).toBeNull();
+  });
+
+  it("offers Retry after a network failure", async () => {
+    await openPreview();
+    mockApi.startFreshResume.mockRejectedValue(new TypeError("Failed to fetch"));
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm fresh resume" }));
+    await screen.findByRole("button", { name: "Retry fresh resume" });
+  });
+
   it("makes a new request id for a new confirm after a definite refusal and a fresh preview", async () => {
     await openPreview();
     mockApi.startFreshResume.mockRejectedValueOnce(new ApiError(409, "stale", { reason: "stale_selection" })).mockResolvedValue(started);
