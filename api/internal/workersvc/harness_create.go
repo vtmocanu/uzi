@@ -163,6 +163,16 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 			return store.Run{}, err
 		}
 	}
+	if len(origins) > 0 && origins[0].JudgeLane {
+		if explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex) {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		// The same decision as the atomic create, without its lock: a provider-bound judge needs the
+		// transaction and fails closed here.
+		if err := s.judgeLaneNonAtomic(ctx, userID, *explicit); err != nil {
+			return store.Run{}, err
+		}
+	}
 	// In-memory unit fakeStore: no live *store.Queries and no real transaction. Resolve to Claude
 	// (what these fakes assert) and run the insert directly. An explicit non-Claude request is
 	// still refused rather than silently downgraded, so a fake can never assert a wrong harness.

@@ -2297,6 +2297,10 @@ type Service struct {
 	// production.
 	judgeBeforeLockHook  func(ctx context.Context)
 	judgeAfterInsertHook func(ctx context.Context)
+	// judgeDecidedHook is the test seam of the judge lane decision (PRD #4322 M1a): it runs in the
+	// create transaction right after the lane decision, holding the shared secret-mutation lock,
+	// before the provider branch freezes its source. Nil in production.
+	judgeDecidedHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every

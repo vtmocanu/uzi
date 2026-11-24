@@ -77,12 +77,32 @@ func (s *Service) judgeCreateLacksTx() bool {
 // 23505 duplicate judge) maps to no reason, so nothing is recorded for it.
 func judgeSkipReasonFor(err error) (string, bool) {
 	switch {
+	case errors.Is(err, ErrNoAnthropicToken):
+		// The vendor Claude judge found no default Anthropic token row in its create transaction.
+		return JudgeSkipNoUsableCredential, true
 	case errors.Is(err, ErrHarnessCredentialDisabled):
 		return JudgeSkipCredentialDisabled, true
 	case errors.Is(err, ErrCodexPoolUnavailable):
 		return JudgeSkipCodexPoolUnavailable, true
 	case errors.Is(err, ErrNoCredentialForHarness):
 		return JudgeSkipNoUsableCredential, true
+	default:
+		return "", false
+	}
+}
+
+// judgeProviderSkipReasonFor maps a provider-lane refusal from the judge's create to its skip
+// reason: an unusable (cleared, invisible, retired, keyless) Claude source, a judge model the
+// source does not map, or no provider lane for the judge's harness (a Codex judge with a Codex
+// source). ErrJudgePolicyChanged maps to no reason on purpose.
+func judgeProviderSkipReasonFor(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrProviderSourceUnusable):
+		return JudgeSkipProviderSourceUnusable, true
+	case errors.Is(err, ErrProviderModelUnmapped):
+		return JudgeSkipProviderModelUnmapped, true
+	case errors.Is(err, ErrProviderLaneUnsupported):
+		return JudgeSkipProviderLaneUnsupported, true
 	default:
 		return "", false
 	}

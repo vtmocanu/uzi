@@ -271,28 +271,10 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		return store.Run{}, err
 	}
 	judgeHarness := judgeHarnessFor(owner.JudgeRunsOn, Harness(target.Harness))
-	rq, ok := s.q.(providerLaneSourceReader)
-	if !ok {
-		return store.Run{}, errHarnessStoreUnavailable
-	}
-	if err := s.refuseProviderLane(ctx, rq, target.UserID, judgeHarness); err != nil {
-		return store.Run{}, err
-	}
-	// PRD #1429 M3 (D4): a Claude judge keeps the existing Anthropic-token presence check
-	// (byte-identical to before this repair), keyed on the RESOLVED judge harness; a Codex
-	// judge's usability is enforced by the atomic create below, not a hardcoded Anthropic
-	// check.
-	if judgeHarness != HarnessCodex {
-		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-			UserID: target.UserID,
-			Kind:   store.KindAnthropicToken,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return store.Run{}, ErrNoAnthropicToken
-			}
-			return store.Run{}, err
-		}
-	}
+	// No lane or token presence read here: the judge's lane, and on the vendor Claude lane the
+	// default-token presence check (ErrNoAnthropicToken, as before), are decided inside the create
+	// transaction under the shared secret-mutation lock (createRunAtomic, JudgeLane). A Codex
+	// judge's usability is likewise enforced there, not by a hardcoded Anthropic check.
 	// PRD #1429 M3 (D4); PRD #3257: routed through the M2 createRunResolved funnel with the
 	// JUDGE's harness as an EXPLICIT selection, so D11 resolution + the INSERT + (for a Codex
 	// judge) the binding freeze commit atomically.
@@ -317,12 +299,18 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 			IssueDescription: "",
 			TriggerSource:    "judge_rerun",
 			Harness:          string(resolved.Harness),
+
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
 		if err == nil && s.judgeAfterInsertHook != nil {
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: target.RepoID}) // Enforce the engine-aware unsupported-lane selection policy.
+	}, harnessCreationOrigin{JudgeLane: true, ConsumerGateRepo: target.RepoID}) // The judge's own lane policy, decided in the create transaction.
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

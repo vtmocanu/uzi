@@ -13,9 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
-	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
@@ -1212,27 +1210,11 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	var judgeModel *string
 	if s.settings != nil {
 		harness := Harness(run.Harness)
-		instanceKey := settings.KeyJudgeModel
-		if harness == HarnessCodex {
-			instanceKey = settings.KeyCodexJudgeModel
-		}
-		var userModel string
-		if um, err := s.q.GetUserJudgeModels(ctx, run.UserID); err != nil {
-			slog.Warn("judge claim: read user judge models", "user", run.UserID.String(), "error", err)
-		} else if harness == HarnessCodex {
-			userModel = um.CodexJudgeModel.String
-		} else {
-			userModel = um.JudgeModel.String
-		}
-		instanceModel, err := s.settings.InstanceModel(ctx, instanceKey)
-		if err != nil {
-			slog.Warn("judge claim: read instance judge model", "key", instanceKey, "error", err)
-			instanceModel = ""
-		}
-		res := agenttmpl.ResolveJudgeModel(string(harness), userModel, instanceModel)
-		judgeModel = &res.Model
-		if len(res.Dropped) > 0 {
-			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, res.Dropped[0])
+		// strict=false: a read error is logged and that tier treated as unset, so this never errs.
+		model, dropped, _ := s.resolveJudgeModelFor(ctx, s.q, run.UserID, harness, false)
+		judgeModel = &model
+		if len(dropped) > 0 {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, dropped[0])
 		}
 	}
 

@@ -505,6 +505,11 @@ func writeRerunJudgeError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusUnprocessableEntity, "add an Anthropic token before running the judge")
 	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
 		httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
+	case errors.Is(err, workersvc.ErrJudgePolicyChanged):
+		// PRD #4322 M1a: the judge's policy moved while the create was deciding it (a lock-bypassing
+		// writer); nothing was created and nothing fell back to a vendor credential. Retry.
+		httpx.ErrorReason(w, http.StatusConflict,
+			"your judge settings changed while the judge was being created; try again", reasonJudgePolicyChanged)
 	case writeProviderCreateRefusal(w, err):
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		// PRD #1429 M3 (D4); PRD #3257: the judge is created on an explicit harness (the
