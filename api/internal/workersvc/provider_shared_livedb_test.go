@@ -603,7 +603,7 @@ func TestSharedClaudeDefinitionNeverServesACodexRunLiveDB(t *testing.T) {
 	            $5, 1, 'user_key', $6, $7)`, runID, pf.userID, pf.repoID, pf.workerID, pf.provider, pf.key, pf.keyRev(t))
 	run := mustRun(t, pf.env, runID)
 	wkr := pf.worker(t)
-	wkr.ProtocolCapabilities = append(wkr.ProtocolCapabilities, capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2)
+	wkr.ProtocolCapabilities = append(wkr.ProtocolCapabilities, capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3)
 
 	var refusal *providerClaimRefusal
 	if _, err := pf.svc.assembleProviderBinding(pf.env.ctx, wkr, run); !errors.As(err, &refusal) || refusal.Reason != holdProviderBindingStale {
