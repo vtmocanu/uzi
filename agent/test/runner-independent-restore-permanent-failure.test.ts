@@ -387,6 +387,19 @@ const WIRE_TOLERANCE_MS = 250;
 /** Outer watchdog for a drive whose hold is budgeted: the hold, the settled acknowledgement and the setup, each named. */
 const BUDGETED_DRIVE_MS = BUDGET_MS + HOLD_SLACK_MS + SETTLED_ACK_SLACK_MS + DRIVE_SETUP_SLACK_MS;
 
+/** Races a budgeted drive against BUDGETED_DRIVE_MS; the watchdog timer is cleared either way so it never outlives the test. */
+async function driveWithinBudget(run: Promise<unknown>): Promise<"done" | "timeout"> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      run.then(() => "done" as const),
+      new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), BUDGETED_DRIVE_MS); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 describe("an op-fenced credential switch after the restore transport stopped reaches the predecessor hold: claude", procfs, () => {
   const ledgerDirs: string[] = [];
   let restoreClient: (() => void) | undefined;
@@ -486,10 +499,7 @@ describe("an op-fenced credential switch after the restore transport stopped rea
       await until("the credential switch to trip", () => c.flight!.steering.pendingCredentialSwitch() === gen(c));
       api.failStateNext(100_000, 503);
     };
-    const outcome = await Promise.race([
-      drive(c.r).then(() => "done"),
-      new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGETED_DRIVE_MS)),
-    ]);
+    const outcome = await driveWithinBudget(drive(c.r));
     assert.equal(outcome, "done", "the Path A hold ended within its budget instead of retrying without end");
     await settle(c);
     assert.ok(api.stateWire.some(s => s.runId === c.r.runId && s.body.status === "credential_switch_held"), "the hold report was attempted");
@@ -560,10 +570,7 @@ describe("an op-fenced credential switch after the restore transport stopped rea
     switchAtStopClose(c, () => { armedAt = api.stateWire.length; api.failStateNext(100_000, 503); });
     let outcome: string;
     try {
-      outcome = await Promise.race([
-        drive(c.r).then(() => "done"),
-        new Promise<string>(resolve => setTimeout(() => resolve("timeout"), BUDGETED_DRIVE_MS)),
-      ]);
+      outcome = await driveWithinBudget(drive(c.r));
     } finally {
       heldClock.mock.restore();
     }
