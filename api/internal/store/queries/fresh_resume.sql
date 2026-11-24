@@ -471,7 +471,7 @@ SELECT set_config('uzi.fresh_resume_terminal', @run_id::text, true);
 -- cancel_deliverable predicate of GetFollowupFinalizeBlockers, extended to stop): unapplied, not
 -- superseded and not covered by a milestone-reconciliation stop_cutoff. No row (the run is gone) is
 -- false by the caller.
-SELECT (r.status IN ('claimed', 'running')
+SELECT COALESCE((r.status IN ('claimed', 'running')
         AND r.worker_id = @worker_id::uuid
         AND r.claim_generation = @live_generation::bigint
         AND r.claim_released_at IS NULL
@@ -480,14 +480,16 @@ SELECT (r.status IN ('claimed', 'running')
             WHERE i.run_id = r.id AND i.kind IN ('cancel', 'stop')
               AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
               AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
-                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)))::boolean AS current_authority
+                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff))), false)::boolean AS current_authority
 FROM runs r WHERE r.id = @run_id;
 
 -- name: ListFreshResumeSweepCandidates :many
 -- The sweep's selector: transfer rows with positive evidence that they must be refused, and the reason.
 -- Candidates only; the sweep re-runs this same query narrowed to one id (only_id) under the run and
 -- transfer locks and refuses only when the reason still holds. A snapshot that merely omits the run
--- inside the 60 second grace is NOT loss evidence.
+-- inside the grace (@omitted_grace_seconds: the worker heartbeat stale window plus its interval, as the
+-- missing cutoff) is NOT loss evidence. A departure stamp is cleared when the destination's snapshot lists
+-- the run at G' again (the stamp itself is never cleared).
 --   pending:  gate_off (the instance gate is off) or admission_deadline (the row expired).
 --   claimed (claimed_enabled): transfer_deadline; destination_deleted (the destination worker row is
 --     gone); destination_stale (its heartbeat is older than @stale_cutoff); destination_reregistered (the
@@ -510,10 +512,13 @@ FROM (
               WHEN r.snapshot_departed_generation = t.claim_generation
                    AND w.snapshot_register_nonce IS NOT NULL
                    AND r.snapshot_departed_nonce = w.snapshot_register_nonce
-                   AND r.snapshot_departed_epoch <= w.snapshot_epoch THEN 'snapshot_departed'
+                   AND r.snapshot_departed_epoch <= w.snapshot_epoch
+                   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                   WHERE a.worker_id = w.id AND a.run_id = r.id
+                                     AND a.claim_generation = t.claim_generation) THEN 'snapshot_departed'
               WHEN r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL
                    AND w.roll_heartbeat_at IS NOT NULL
-                   AND w.roll_heartbeat_at > r.status_since + interval '60 seconds'
+                   AND w.roll_heartbeat_at > r.status_since + make_interval(secs => @omitted_grace_seconds::double precision)
                    AND (w.pending_overflow_until IS NULL OR w.pending_overflow_until <= now())
                    AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                                    WHERE a.worker_id = w.id AND a.run_id = r.id

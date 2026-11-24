@@ -299,3 +299,124 @@ func TestFreshResumeWorkerAbandonLiveDB(t *testing.T) {
 	f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, freshWorkerAttempt, 3)), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
 	f.wantReason(f.route(http.MethodGet, "/bundle?claim_generation=3", f.w2Token, ""), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
 }
+
+// freshRoutes are the four destination routes with a body that passes validation, so a refusal is the
+// route's fence and never a 400.
+func (f *freshWorkerFix) freshRoutes(runID uuid.UUID, frid uuid.UUID) []func(token string) *httptest.ResponseRecorder {
+	base := fmt.Sprintf("/api/worker/runs/%s/fresh-resume/%s", runID, frid)
+	return []func(token string) *httptest.ResponseRecorder{
+		func(tok string) *httptest.ResponseRecorder {
+			return bearerReqBody(f.router, http.MethodGet, base+"/bundle?claim_generation=3", tok, "")
+		},
+		func(tok string) *httptest.ResponseRecorder {
+			return bearerReqBody(f.router, http.MethodPost, base+"/abandon", tok, freshGenBody(freshWorkerGen))
+		},
+		func(tok string) *httptest.ResponseRecorder {
+			return bearerReqBody(f.router, http.MethodPost, base+"/seeded", tok, freshSeededBody(3, freshWorkerAttempt, 3))
+		},
+		func(tok string) *httptest.ResponseRecorder {
+			return bearerReqBody(f.router, http.MethodGet, base+"/state?live_generation=3", tok, "")
+		},
+	}
+}
+
+func TestFreshResumeWorkerForeignCallersLiveDB(t *testing.T) {
+	f := newFreshWorkerFix(t)
+	f.claim(freshWorkerGen)
+	names := []string{"bundle", "abandon", "seeded", "state"}
+
+	// A worker of a different owner never reaches the transfer: 404 or 409, never 200, and the transfer
+	// stays claimed.
+	foreignOwner := cliSeedUser(t, f.pool, false)
+	tok, hash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fw := uuid.New()
+	cliMustExec(t, f.pool, `INSERT INTO workers (id, user_id, name, token_hash, status) VALUES ($1, $2, $3, $4, 'online')`, fw, foreignOwner, "foreign-"+fw.String(), hash)
+	for i, call := range f.freshRoutes(f.run, f.frid) {
+		if rec := call(tok); rec.Code != http.StatusNotFound && rec.Code != http.StatusConflict {
+			t.Errorf("foreign owner worker on %s = %d %s, want 404 or 409", names[i], rec.Code, rec.Body.String())
+		}
+	}
+	if got := f.transferStates(); len(got) != 1 || got[0] != "claimed" {
+		t.Fatalf("states after foreign calls = %v, want [claimed]", got)
+	}
+
+	// A transfer id of run X under run Y's path is not found: 404 on state, never 200 on any route.
+	var repo uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `SELECT repo_id FROM runs WHERE id=$1`, f.run).Scan(&repo); err != nil {
+		t.Fatal(err)
+	}
+	other := rmSeedRun(t, f.pool, f.owner, repo, "completed")
+	for i, call := range f.freshRoutes(other, f.frid) {
+		rec := call(f.w2Token)
+		want := http.StatusConflict
+		if names[i] == "state" {
+			want = http.StatusNotFound
+		}
+		if rec.Code != want {
+			t.Errorf("run Y path with run X's transfer on %s = %d %s, want %d", names[i], rec.Code, rec.Body.String(), want)
+		}
+	}
+	if got := f.transferStates(); len(got) != 1 || got[0] != "claimed" {
+		t.Fatalf("states after cross-run calls = %v, want [claimed]", got)
+	}
+}
+
+func TestFreshResumeWorkerLaneWorkerForbiddenLiveDB(t *testing.T) {
+	f := newFreshWorkerFix(t)
+	f.claim(freshWorkerGen)
+	tok, hash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	cliMustExec(t, f.pool, `INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at, kind, template_declared,
+	    hosted_size, docker_enabled, ephemeral, ephemeral_run_id, isolated_lane, protocol_capabilities)
+	    VALUES ($1, $2, $3, $4, 'online', now(), 'hosted', 'base', 'm', false, true, $5, true, '{isolated_fetch_v1}')`,
+		id, f.owner, "lane-"+id.String(), hash, f.run)
+	t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), `DELETE FROM workers WHERE id=$1`, id) })
+	for i, call := range f.freshRoutes(f.run, f.frid) {
+		if rec := call(tok); rec.Code != http.StatusForbidden {
+			t.Errorf("isolated-lane worker on route %d = %d %s, want 403", i, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestFreshResumeWorkerReceiptReplayLiveDB(t *testing.T) {
+	f := newFreshWorkerFix(t)
+	f.claim(freshWorkerGen)
+	if rec := f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, freshWorkerAttempt, 3)); rec.Code != http.StatusOK {
+		t.Fatalf("receipt = %d %s", rec.Code, rec.Body.String())
+	}
+	// Only a seeded row with the same attempt and generation is a replay success: a superseded or finished
+	// row answers not_claimed.
+	for _, state := range []string{"superseded", "finished"} {
+		cliMustExec(t, f.pool, `UPDATE run_fresh_resumes SET state=$2 WHERE id=$1`, f.frid, state)
+		f.wantReason(f.route(http.MethodPost, "/seeded", f.w2Token, freshSeededBody(3, freshWorkerAttempt, 3)), http.StatusConflict, apitypes.FreshResumeReasonNotClaimed)
+	}
+}
+
+// preSeedBody asserts the typed fresh_resume_pre_seed refusal with the run in the body.
+func preSeedBody(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	var body map[string]any
+	if rec.Code != http.StatusConflict || json.Unmarshal(rec.Body.Bytes(), &body) != nil || body["reason"] != apitypes.FreshResumeReasonPreSeed || body["run"] == nil {
+		t.Fatalf("got %d %s, want 409 fresh_resume_pre_seed with the run", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFreshResumePreSeedHooksLiveDB(t *testing.T) {
+	f := newFreshWorkerFix(t)
+	f.claim(freshWorkerGen)
+	post := func(tail, body string) *httptest.ResponseRecorder {
+		return bearerReqBody(f.router, http.MethodPost, fmt.Sprintf("/api/worker/runs/%s%s", f.run, tail), f.w2Token, body)
+	}
+	t.Run("run state fail report", func(t *testing.T) {
+		preSeedBody(t, post("/state", fmt.Sprintf(`{"status":"failed","claim_generation":%d}`, freshWorkerGen)))
+	})
+	t.Run("base attestation hold", func(t *testing.T) {
+		preSeedBody(t, post("/base-attestation-hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen)))
+	})
+}

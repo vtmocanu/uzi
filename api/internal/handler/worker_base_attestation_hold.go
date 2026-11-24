@@ -60,6 +60,10 @@ func (h *Handler) WorkerRunBaseAttestationHold(w http.ResponseWriter, r *http.Re
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: the excluded hold writer skipped a run whose transfer is claimed for this worker.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	httpx.JSON(w, code, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }

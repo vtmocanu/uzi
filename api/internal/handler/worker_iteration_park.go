@@ -84,6 +84,10 @@ func (h *Handler) WorkerRunIterationPark(w http.ResponseWriter, r *http.Request)
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: the excluded park writer skipped a run whose transfer is claimed for this worker.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	httpx.JSON(w, code, struct {
 		Applied         bool   `json:"applied"`

@@ -153,7 +153,7 @@ func (q *Queries) CountOpenHoldsForFreshRun(ctx context.Context, arg CountOpenHo
 }
 
 const freshResumeCurrentAuthority = `-- name: FreshResumeCurrentAuthority :one
-SELECT (r.status IN ('claimed', 'running')
+SELECT COALESCE((r.status IN ('claimed', 'running')
         AND r.worker_id = $1::uuid
         AND r.claim_generation = $2::bigint
         AND r.claim_released_at IS NULL
@@ -162,7 +162,7 @@ SELECT (r.status IN ('claimed', 'running')
             WHERE i.run_id = r.id AND i.kind IN ('cancel', 'stop')
               AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
               AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
-                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)))::boolean AS current_authority
+                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff))), false)::boolean AS current_authority
 FROM runs r WHERE r.id = $3
 `
 
@@ -582,10 +582,13 @@ FROM (
               WHEN r.snapshot_departed_generation = t.claim_generation
                    AND w.snapshot_register_nonce IS NOT NULL
                    AND r.snapshot_departed_nonce = w.snapshot_register_nonce
-                   AND r.snapshot_departed_epoch <= w.snapshot_epoch THEN 'snapshot_departed'
+                   AND r.snapshot_departed_epoch <= w.snapshot_epoch
+                   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                                   WHERE a.worker_id = w.id AND a.run_id = r.id
+                                     AND a.claim_generation = t.claim_generation) THEN 'snapshot_departed'
               WHEN r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL
                    AND w.roll_heartbeat_at IS NOT NULL
-                   AND w.roll_heartbeat_at > r.status_since + interval '60 seconds'
+                   AND w.roll_heartbeat_at > r.status_since + make_interval(secs => $4::double precision)
                    AND (w.pending_overflow_until IS NULL OR w.pending_overflow_until <= now())
                    AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
                                    WHERE a.worker_id = w.id AND a.run_id = r.id
@@ -595,7 +598,7 @@ FROM (
     JOIN runs r ON r.id = t.run_id
     LEFT JOIN workers w ON w.id = t.destination_worker_id
     WHERE t.state IN ('pending', 'claimed')
-      AND ($4::uuid IS NULL OR t.id = $4::uuid)
+      AND ($5::uuid IS NULL OR t.id = $5::uuid)
 ) c
 WHERE c.reason IS NOT NULL
 ORDER BY c.created_at, c.id
@@ -603,10 +606,11 @@ LIMIT 200
 `
 
 type ListFreshResumeSweepCandidatesParams struct {
-	GateOn         bool               `json:"gate_on"`
-	ClaimedEnabled bool               `json:"claimed_enabled"`
-	StaleCutoff    pgtype.Timestamptz `json:"stale_cutoff"`
-	OnlyID         pgtype.UUID        `json:"only_id"`
+	GateOn              bool               `json:"gate_on"`
+	ClaimedEnabled      bool               `json:"claimed_enabled"`
+	StaleCutoff         pgtype.Timestamptz `json:"stale_cutoff"`
+	OmittedGraceSeconds float64            `json:"omitted_grace_seconds"`
+	OnlyID              pgtype.UUID        `json:"only_id"`
 }
 
 type ListFreshResumeSweepCandidatesRow struct {
@@ -618,7 +622,9 @@ type ListFreshResumeSweepCandidatesRow struct {
 // The sweep's selector: transfer rows with positive evidence that they must be refused, and the reason.
 // Candidates only; the sweep re-runs this same query narrowed to one id (only_id) under the run and
 // transfer locks and refuses only when the reason still holds. A snapshot that merely omits the run
-// inside the 60 second grace is NOT loss evidence.
+// inside the grace (@omitted_grace_seconds: the worker heartbeat stale window plus its interval, as the
+// missing cutoff) is NOT loss evidence. A departure stamp is cleared when the destination's snapshot lists
+// the run at G' again (the stamp itself is never cleared).
 //
 //	pending:  gate_off (the instance gate is off) or admission_deadline (the row expired).
 //	claimed (claimed_enabled): transfer_deadline; destination_deleted (the destination worker row is
@@ -632,6 +638,7 @@ func (q *Queries) ListFreshResumeSweepCandidates(ctx context.Context, arg ListFr
 		arg.GateOn,
 		arg.ClaimedEnabled,
 		arg.StaleCutoff,
+		arg.OmittedGraceSeconds,
 		arg.OnlyID,
 	)
 	if err != nil {

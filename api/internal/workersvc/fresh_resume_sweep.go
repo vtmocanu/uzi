@@ -9,6 +9,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// freshSweepLockTimeout bounds each lock wait inside one row's refusal transaction.
+const freshSweepLockTimeout = "2s"
+
 // sweepFreshResumes is the sweep's fresh resume arm (issue #4628, plan section 5). A pending transfer is
 // refused when its admission deadline passed or the instance gate is off; a claimed one only on positive
 // loss evidence (ListFreshResumeSweepCandidates: the destination's heartbeat is stale, it re-registered,
@@ -27,6 +30,9 @@ func (s *Service) sweepFreshResumes(ctx context.Context, staleCutoff time.Time, 
 	}
 	base := store.ListFreshResumeSweepCandidatesParams{
 		GateOn: s.p.FreshResume, ClaimedEnabled: claimedEnabled, StaleCutoff: pgconv.Time(staleCutoff),
+		// The same window as the sweep's missing cutoff: how long a snapshot may omit a run it was just
+		// handed before the omission counts as evidence.
+		OmittedGraceSeconds: (s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval).Seconds(),
 	}
 	cands, err := s.listFreshResumeSweepCandidates(ctx, base)
 	if err != nil {
@@ -39,6 +45,11 @@ func (s *Service) sweepFreshResumes(ctx context.Context, staleCutoff time.Time, 
 			break
 		}
 		outcome, err := s.refuseFreshResumeForSweep(ctx, base, c)
+		if isLockNotAvailable(err) {
+			// A long holder (a W1 owner path) has the row's locks: skip it this tick, the next one retries.
+			slog.Info("sweeper: fresh resume refusal skipped, locks busy", "transfer", c.ID.String(), "run", c.RunID.String(), "reason", c.Reason)
+			continue
+		}
 		if err != nil {
 			slog.Warn("sweeper: fresh resume refusal", "transfer", c.ID.String(), "run", c.RunID.String(), "reason", c.Reason, "error", err)
 			continue
@@ -71,6 +82,10 @@ func (s *Service) refuseFreshResumeForSweep(ctx context.Context, base store.List
 		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Bound every lock wait of this row: a holder that outlasts it is SQLSTATE 55P03 and the row is skipped.
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+freshSweepLockTimeout+"'"); err != nil {
+		return "", err
+	}
 	holds := func(ctx context.Context, q *store.Queries) (bool, error) {
 		p := base
 		p.OnlyID = pgconv.UUID(c.ID)

@@ -1598,7 +1598,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/archives/{captureID}", h.WorkerRecoveryStatus)
 		// Issue #4628: the fresh resume destination's routes. They ignore the UZI_FRESH_RESUME gate;
 		// all but state are fenced on the calling worker, its claim generation and a claimed transfer.
-		r.Get("/runs/{id}/fresh-resume/{frid}/bundle", h.WorkerFreshResumeBundle)
+		r.With(proposalLimiter.PerWorkerMiddleware).Get("/runs/{id}/fresh-resume/{frid}/bundle", h.WorkerFreshResumeBundle)
 		r.Post("/runs/{id}/fresh-resume/{frid}/abandon", h.WorkerFreshResumeAbandon)
 		r.Post("/runs/{id}/fresh-resume/{frid}/seeded", h.WorkerFreshResumeSeeded)
 		r.Get("/runs/{id}/fresh-resume/{frid}/state", h.WorkerFreshResumeState)

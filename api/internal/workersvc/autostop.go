@@ -392,32 +392,17 @@ func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistF
 
 // failRunAutoStopRows runs FailRunAutoStop for one run. The fresh resume guard (a pending or claimed
 // transfer) refuses a status change to failed unless the same transaction set uzi.fresh_resume_terminal
-// to this run's id, so the write runs in one transaction that sets it first; the setting is
-// transaction-local and ends with the commit. The statement is id-scoped, so the setting names exactly
-// the one run it fails. Without a transaction beginner (unit wiring with a fake store) the write is the
-// plain autocommit one.
+// to this run's id. The caller (evaluateAutoStop) already holds the run's transaction and the run lock, and
+// s.q is that transaction's querier, so the allowance is set on the same querier immediately before the
+// write: a second transaction would try to update the row the first still holds. The setting is
+// transaction-local and ends with the commit; the statement is id-scoped, so it names exactly the one
+// run it fails.
 func (s *Service) failRunAutoStopRows(ctx context.Context, runID uuid.UUID) (int64, error) {
 	params := store.FailRunAutoStopParams{ID: runID, FailureReason: pgconv.TextOrNull(autoStopReason)}
-	if s.txBeginner == nil {
-		return s.q.FailRunAutoStop(ctx, params)
-	}
-	tx, err := s.txBeginner.Begin(ctx)
-	if err != nil {
+	if err := s.q.SetFreshResumeTerminal(ctx, runID.String()); err != nil {
 		return 0, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := store.New(tx)
-	if err := q.SetFreshResumeTerminal(ctx, runID.String()); err != nil {
-		return 0, err
-	}
-	rows, err := q.FailRunAutoStop(ctx, params)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return rows, nil
+	return s.q.FailRunAutoStop(ctx, params)
 }
 
 // logAutoStop is M7: ONE structured line per auto-stop decision, carrying every

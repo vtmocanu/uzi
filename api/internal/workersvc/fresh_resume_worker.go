@@ -95,6 +95,19 @@ func (s *Service) freshLocksOnce(ctx context.Context, wkr store.Worker, runID, f
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
+	// A plain unlocked read first: a transfer of another owner (or, on a fenced route, another destination)
+	// is refused before any lock is taken, so a foreign worker can never queue on the run or worker locks.
+	// The under-lock checks below stay the authority.
+	pre, err := q.GetFreshResume(ctx, frid)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (pre.RunID != runID || pre.UserID != wkr.UserID)) {
+		return ErrFreshTransferNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if workerLocks && pre.DestinationWorkerID != pgconv.UUID(wkr.ID) {
+		return ErrFreshNotClaimed
+	}
 	if workerLocks {
 		if _, err := q.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -211,7 +224,7 @@ func (s *Service) FreshResumeReceipt(ctx context.Context, wkr store.Worker, runI
 				return err
 			}
 			row = marked
-		case mine && row.SeededAt.Valid && (row.State == "seeded" || row.State == "superseded" || row.State == "finished"):
+		case mine && row.SeededAt.Valid && row.State == "seeded":
 			if row.DestinationAttemptID.String != attemptID || row.SeededGeneration.Int64 != gen {
 				return ErrFreshAttemptMismatch
 			}

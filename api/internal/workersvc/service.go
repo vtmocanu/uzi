@@ -1107,6 +1107,9 @@ type Store interface {
 	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
 	// request from a user whose ownership must be proven.
 	FailRunAutoStop(ctx context.Context, arg store.FailRunAutoStopParams) (int64, error)
+	// SetFreshResumeTerminal sets the transaction-local allowance for failing one run with a pending or
+	// claimed fresh resume transfer; it must run on the same querier (transaction) as FailRunAutoStop.
+	SetFreshResumeTerminal(ctx context.Context, runID string) error
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.

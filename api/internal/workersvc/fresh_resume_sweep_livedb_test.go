@@ -179,10 +179,21 @@ func TestFreshResumeSweepClaimedLiveDB(t *testing.T) {
 		f := newFreshFix(t, true, 2)
 		frid := f.pendingTransfer()
 		f.healthyClaim(frid)
+		// The destination's snapshot no longer lists the run, the stamp's meaning.
+		f.env.exec(`DELETE FROM worker_active_runs WHERE worker_id=$1`, f.w2)
 		f.env.exec(`UPDATE runs SET snapshot_departed_generation=3, snapshot_departed_nonce='n1', snapshot_departed_epoch=1 WHERE id=$1`, f.run)
 		f.sweep()
 		f.wantTransfer(frid, "refused", "snapshot_departed")
 		f.wantHeldRestored()
+	})
+	t.Run("a departure stamp is stale once the destination lists the run again", func(t *testing.T) {
+		f := newFreshFix(t, true, 2)
+		frid := f.pendingTransfer()
+		f.healthyClaim(frid)
+		// The stamp is never cleared; the run is listed at G' in the destination's snapshot (healthyClaim).
+		f.env.exec(`UPDATE runs SET snapshot_departed_generation=3, snapshot_departed_nonce='n1', snapshot_departed_epoch=1 WHERE id=$1`, f.run)
+		f.sweep()
+		f.wantTransfer(frid, "claimed", "")
 	})
 	t.Run("a candidate that stopped holding under the locks is left alone", func(t *testing.T) {
 		f := newFreshFix(t, true, 2)
@@ -190,7 +201,7 @@ func TestFreshResumeSweepClaimedLiveDB(t *testing.T) {
 		f.healthyClaim(frid)
 		// The unlocked read saw a stale heartbeat; by the time the locks are held the worker heartbeat again.
 		f.env.exec(`UPDATE workers SET last_heartbeat_at = now() - interval '10 minutes' WHERE id=$1`, f.w2)
-		base := store.ListFreshResumeSweepCandidatesParams{GateOn: true, ClaimedEnabled: true, StaleCutoff: pgconv.Time(time.Now().Add(-45 * time.Second))}
+		base := store.ListFreshResumeSweepCandidatesParams{GateOn: true, ClaimedEnabled: true, StaleCutoff: pgconv.Time(time.Now().Add(-45 * time.Second)), OmittedGraceSeconds: 60}
 		cands, err := f.env.q.ListFreshResumeSweepCandidates(f.env.ctx, base)
 		if err != nil {
 			t.Fatal(err)
@@ -216,27 +227,40 @@ func TestFreshResumeSweepClaimedLiveDB(t *testing.T) {
 func TestFreshResumeAutoStopLiveDB(t *testing.T) {
 	// Only a claimed transfer can meet auto-stop: a pending transfer's run is held at recovery_wait,
 	// which FailRunAutoStop never fails.
-	{
-		t.Run("claimed transfer", func(t *testing.T) {
-			f := newFreshFix(t, true, 2)
-			frid := f.pendingTransfer()
-			f.healthyClaim(frid)
-			// Without the terminal allowance the guard refuses the failure: this is what the wrapper fixes.
-			if _, err := f.env.q.FailRunAutoStop(f.env.ctx, store.FailRunAutoStopParams{ID: f.run}); !store.IsFreshResumeInProgress(err) {
-				t.Fatalf("autocommit FailRunAutoStop = %v, want the fresh resume guard", err)
-			}
-			rows, err := f.svc.failRunAutoStopRows(f.env.ctx, f.run)
-			if err != nil || rows != 1 {
-				t.Fatalf("failRunAutoStopRows = %d, %v, want 1 row", rows, err)
-			}
-			var status, stopKind string
-			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT status, COALESCE(stop_kind,'') FROM runs WHERE id=$1`, f.run).Scan(&status, &stopKind); err != nil {
-				t.Fatal(err)
-			}
-			if status != "failed" || stopKind != "auto_stopped" {
-				t.Fatalf("run = %s / %s, want failed / auto_stopped", status, stopKind)
-			}
-			f.wantTransfer(frid, "cancelled", "run_terminal")
-		})
-	}
+	t.Run("claimed transfer", func(t *testing.T) {
+		f := newFreshFix(t, true, 2)
+		frid := f.pendingTransfer()
+		f.healthyClaim(frid)
+		// Without the terminal allowance the guard refuses the failure.
+		if _, err := f.env.q.FailRunAutoStop(f.env.ctx, store.FailRunAutoStopParams{ID: f.run}); !store.IsFreshResumeInProgress(err) {
+			t.Fatalf("autocommit FailRunAutoStop = %v, want the fresh resume guard", err)
+		}
+		// The production path: evaluateAutoStop locks the run in a transaction and fails it through the
+		// bound service over that transaction's querier (boundClaimControlService, no transaction beginner).
+		tx, err := f.env.pool.Begin(f.env.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(f.env.ctx) }()
+		q := store.New(tx)
+		if _, err := q.GetRunByIDForUpdate(f.env.ctx, f.run); err != nil {
+			t.Fatal(err)
+		}
+		locked := f.svc.boundClaimControlService(q)
+		rows, err := locked.failRunAutoStopRows(f.env.ctx, f.run)
+		if err != nil || rows != 1 {
+			t.Fatalf("failRunAutoStopRows over the bound service = %d, %v, want 1 row", rows, err)
+		}
+		if err := tx.Commit(f.env.ctx); err != nil {
+			t.Fatal(err)
+		}
+		var status, stopKind string
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT status, COALESCE(stop_kind,'') FROM runs WHERE id=$1`, f.run).Scan(&status, &stopKind); err != nil {
+			t.Fatal(err)
+		}
+		if status != "failed" || stopKind != "auto_stopped" {
+			t.Fatalf("run = %s / %s, want failed / auto_stopped", status, stopKind)
+		}
+		f.wantTransfer(frid, "cancelled", "run_terminal")
+	})
 }

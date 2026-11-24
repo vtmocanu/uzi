@@ -89,6 +89,8 @@ func (f *autoStopFakeStore) FailRunAutoStop(_ context.Context, arg store.FailRun
 	return f.failRows, nil
 }
 
+func (f *autoStopFakeStore) SetFreshResumeTerminal(context.Context, string) error { return nil }
+
 func (f *autoStopFakeStore) CreateStopVerdictInput(_ context.Context, arg store.CreateStopVerdictInputParams) (store.RunUserInput, error) {
 	f.verdicts = append(f.verdicts, arg)
 	if f.verdictEr != nil {

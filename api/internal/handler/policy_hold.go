@@ -41,6 +41,11 @@ func (h *Handler) WorkerRunPolicyHold(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if result.Disposition == "pending" {
 		status = http.StatusConflict
+		// Issue #4628: a hold the excluded writer skipped on a run whose transfer is claimed for this
+		// worker and unseeded is the typed fresh_resume_pre_seed refusal, not a retryable pending.
+		if run, runErr := h.q.GetRunByID(r.Context(), id); runErr == nil && run.UserID == worker.UserID && h.refuseFreshPreSeed(w, r, worker, run) {
+			return
+		}
 	}
 	httpx.JSON(w, status, result)
 }
