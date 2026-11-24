@@ -167,7 +167,8 @@ export function ModelsCell({
         <button
           type="button"
           className="text-xs text-muted underline decoration-edge-strong underline-offset-2 hover:text-fg"
-          aria-label={`Reset ${field.family ? `${field.row} — ${family}` : field.row} to default`}
+          // The visible words come first, so a speech-input user can say what is on screen.
+          aria-label={`Reset to default (${field.family ? `${field.row} — ${family}` : field.row})`}
           onClick={() => {
             focusAfterReset.current = true;
             onReset();

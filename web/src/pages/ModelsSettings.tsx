@@ -200,8 +200,6 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // Bumped by Discard to remount the model pickers, so one left in "Other" with an empty box
   // (whose value never changed, so it would not re-derive) returns to its stored option.
   const [pickerGeneration, setPickerGeneration] = useState(0);
-  // Bumped per field by Reset to default, so a picker left in "Other" remounts on Default.
-  const [resetGeneration, setResetGeneration] = useState<Record<string, number>>({});
   // Save and Reload never overlap: while either is in flight, both are disabled, so neither
   // request can supersede the other's token.
   const busy = saving || reloading;
@@ -426,23 +424,20 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
     return {};
   };
 
-  const resetToDefault = (field: ModelsField) => {
-    setValue(field.key, "");
-    setResetGeneration((g) => ({ ...g, [field.key]: (g[field.key] ?? 0) + 1 }));
-  };
-
   const cellProps = (field: ModelsField) => {
     const notUsed = judgeNotUsedReason(field, judgeRunsOn);
     const saved = baseline[field.key] ?? "";
+    const dirty = dirtyKeys.has(field.key);
     return {
       field,
       idBase: idFor(field),
-      dirty: dirtyKeys.has(field.key),
+      dirty,
       // A cell showing its own Not used line drops the saved prediction's not_used note, so a
       // screen reader hears it once.
       prediction: predictionText(field, effective, { omitNotUsed: notUsed !== null }),
-      predictionVisible: !predictionRedundant(field, effective, saved, { ...rendered(field), omitNotUsed: notUsed !== null }),
-      onReset: saved !== "" ? () => resetToDefault(field) : undefined,
+      // A dirty cell always shows its saved line, so redundancy is checked only on a clean one.
+      predictionVisible: dirty || !predictionRedundant(field, effective, saved, { ...rendered(field), omitNotUsed: notUsed !== null }),
+      onReset: saved !== "" ? () => setValue(field.key, "") : undefined,
       reason: field.family ? harnessReason(field.family, effective) : null,
       notUsed,
       storedWarning: storedWarnings[field.key] ?? null,
@@ -487,7 +482,7 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
 
   const modelControl = (field: ModelsField, ids: ModelsCellIds) => (
     <ModelSelect
-      key={`${pickerGeneration}:${resetGeneration[field.key] ?? 0}`}
+      key={pickerGeneration}
       id={ids.control}
       value={draft[field.key] ?? ""}
       onChange={(v) => setValue(field.key, v)}

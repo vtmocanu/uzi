@@ -264,17 +264,17 @@ describe("Models page", () => {
     mount();
     await screen.findByLabelText("Worker model — Claude");
     // Only a saved override offers it: the Default Codex cell has none.
-    expect(screen.queryByRole("button", { name: "Reset Worker model — Codex to default" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Reset Worker model — Claude to default" }));
+    expect(screen.queryByRole("button", { name: "Reset to default (Worker model — Codex)" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" }));
     expect(control("Worker model — Claude").value).toBe("inherit");
     expect(document.activeElement).toBe(control("Worker model — Claude"));
-    expect(screen.queryByRole("button", { name: "Reset Worker model — Claude to default" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset to default (Worker model — Claude)" })).toBeNull();
     expect(visibleLine("Worker model — Claude")).toContain("Unsaved");
     expect(status()).toBe("1 unsaved change: Worker model — Claude");
     // Discard restores the override and its button.
     fireEvent.click(discardButton());
     expect(control("Worker model — Claude").value).toBe("sonnet");
-    fireEvent.click(screen.getByRole("button", { name: "Reset Worker model — Claude to default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" }));
     fireEvent.click(saveButton());
     await waitFor(() => expect(mockApi.putMyModelSettings).toHaveBeenCalledTimes(1));
     expect(mockApi.putMyModelSettings).toHaveBeenCalledWith({ default_claude_model: null });
@@ -284,7 +284,7 @@ describe("Models page", () => {
     mockApi.getMySettings.mockResolvedValue({ settings: makeSettings({ default_claude_model: "claude-x-1" }) });
     mount();
     await screen.findByLabelText("Worker model — Claude, custom model ID");
-    fireEvent.click(screen.getByRole("button", { name: "Reset Worker model — Claude to default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" }));
     expect(screen.queryByLabelText("Worker model — Claude, custom model ID")).toBeNull();
     expect(control("Worker model — Claude").value).toBe("inherit");
     expect(document.activeElement).toBe(control("Worker model — Claude"));

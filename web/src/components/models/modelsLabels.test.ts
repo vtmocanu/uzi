@@ -43,6 +43,8 @@ describe("predictionRedundant", () => {
     expect(predictionRedundant(worker, eff, "", { defaultLabel: "Default · lead template" })).toBe(false);
     expect(predictionRedundant(worker, eff, "", { defaultLabel: "Default · sonnet (lead template)" })).toBe(false);
     expect(predictionRedundant(worker, eff, "", { defaultLabel: "Default · opus (built-in)" })).toBe(false);
+    // A model ID that merely ends in the predicted one proves nothing.
+    expect(predictionRedundant(worker, eff, "", { defaultLabel: "Default · claude-custom-opus (lead template)" })).toBe(false);
   });
 
   it("hides an explicit value only when the server resolves it from the user's own choice", () => {
@@ -51,6 +53,10 @@ describe("predictionRedundant", () => {
     expect(predictionRedundant(worker, view({ models: [mcell("worker_model", { resolved_model: "sonnet", source: "template" })] }), "sonnet")).toBe(false);
     const planning = field("Planning model");
     expect(predictionRedundant(planning, view({ models: [mcell("planning_model", { resolved_model: "sonnet", source: "user_planning_default" })] }), "sonnet")).toBe(true);
+    // A source belonging to another setting never confirms this field's override.
+    expect(predictionRedundant(worker, view({ models: [mcell("worker_model", { resolved_model: "sonnet", source: "cross_check_pin" })] }), "sonnet")).toBe(false);
+    expect(predictionRedundant(worker, view({ models: [mcell("worker_model", { resolved_model: "sonnet", source: "user_planning_default" })] }), "sonnet")).toBe(false);
+    expect(predictionRedundant(planning, view({ models: [mcell("planning_model", { resolved_model: "sonnet", source: "user_default" })] }), "sonnet")).toBe(false);
   });
 
   it("shows the line for an ignored value, a note, a missing cell or no view", () => {

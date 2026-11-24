@@ -300,7 +300,7 @@ describe("Models grid layout", () => {
       }
       // A saved override the select already shows: no visible line, a Reset button instead.
       expect(cellOf("Worker model — Claude").querySelector("[data-prediction]")).toBeNull();
-      const reset = screen.getByRole("button", { name: "Reset Worker model — Claude to default" });
+      const reset = screen.getByRole("button", { name: "Reset to default (Worker model — Claude)" });
       expect(textContrast(reset), `${theme} reset`).toBeGreaterThanOrEqual(4.5);
     } finally {
       document.documentElement.removeAttribute("data-theme");
