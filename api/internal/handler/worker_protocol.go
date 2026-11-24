@@ -2496,6 +2496,10 @@ func (h *Handler) WorkerRunCompletionHold(w http.ResponseWriter, r *http.Request
 	}
 	run, applied, err := h.wsvc.SetRunCompletionHold(r.Context(), wkr, runID, body.Head, body.ClaimGeneration)
 	if err != nil {
+		// Issue #4628: the paused write hit the fresh resume guard on a claimed, unseeded transfer.
+		if h.refuseFreshPreSeedOnGuard(w, r, wkr, runID, run, err) {
+			return
+		}
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 			return

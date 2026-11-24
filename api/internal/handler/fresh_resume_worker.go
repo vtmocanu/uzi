@@ -194,6 +194,24 @@ func (h *Handler) WorkerFreshResumeState(w http.ResponseWriter, r *http.Request)
 	httpx.JSON(w, http.StatusOK, dto)
 }
 
+// refuseFreshPreSeedOnGuard handles a hold or park writer's error: when it is the fresh resume guard's
+// refusal (a pending or claimed transfer blocks the paused write) and the run's transfer is claimed for
+// this worker, it writes the typed pre-seed 409 and reports true. run is the row the service returned
+// with the error; when it is not the addressed run the row is read here. Any other error is "no".
+func (h *Handler) refuseFreshPreSeedOnGuard(w http.ResponseWriter, r *http.Request, wkr store.Worker, runID uuid.UUID, run store.Run, err error) bool {
+	if !store.IsFreshResumeInProgress(err) {
+		return false
+	}
+	if run.ID != runID {
+		var getErr error
+		run, getErr = h.q.GetRunByID(r.Context(), runID)
+		if getErr != nil {
+			return false
+		}
+	}
+	return h.refuseFreshPreSeed(w, r, wkr, run)
+}
+
 // refuseFreshPreSeed is the shared answer to a destination's park or fail report that an excluded writer
 // turned into zero rows (every park and fail writer skips a run with a pending or claimed transfer): when
 // the run's transfer is claimed for this worker, the ordinary no-op reply would be misread as "the run

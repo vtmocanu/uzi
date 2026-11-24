@@ -240,6 +240,14 @@ func TestFreshClaimExclusionsLiveDB(t *testing.T) {
 			f.env.exec(`UPDATE workers SET kind='hosted', hosted_size='m', template_declared='base', protocol_capabilities=$2, last_heartbeat_at=now() WHERE id=$1`, f.w1, freshBothCaps)
 			return f.w1
 		}, func(*fcFix) {}},
+		{"predecessor bound by worker_id only", func(f *fcFix) uuid.UUID {
+			// No released_worker_id, no claim_released_at and no open custody hold name W1: only the
+			// run's worker_id binds it, so only the worker_id exclusion refuses it.
+			f.env.exec(`UPDATE workers SET kind='hosted', hosted_size='m', template_declared='base', protocol_capabilities=$2, last_heartbeat_at=now() WHERE id=$1`, f.w1, freshBothCaps)
+			f.env.exec(`UPDATE runs SET released_worker_id=NULL, claim_released_at=NULL WHERE id=$1`, f.run)
+			f.env.exec(`UPDATE recovery_custody_holds SET state='released', live_worker_id=NULL, live_run_id=NULL, released_at=now() WHERE run_id=$1`, f.run)
+			return f.w1
+		}, func(*fcFix) {}},
 		{"the released worker", func(f *fcFix) uuid.UUID {
 			f.env.exec(`UPDATE runs SET released_worker_id=$2 WHERE id=$1`, f.run, f.w2)
 			return f.w2

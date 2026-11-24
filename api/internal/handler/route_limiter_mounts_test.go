@@ -1054,6 +1054,13 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pr-description/bind", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pr-description/lookup", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pr-description/ack", noLimiter},
+	// Issue #4628: the fresh resume destination routes. The bundle stream rides
+	// proposalLimiter.PerWorkerMiddleware (read as noLimiter by this per-USER probe); abandon, seeded
+	// and state are fenced local DB calls with no forge call or token spend, so unlimited.
+	{"GET", "/api/worker/runs/{id}/fresh-resume/{frid}/bundle", noLimiter},
+	{"POST", "/api/worker/runs/{id}/fresh-resume/{frid}/abandon", noLimiter},
+	{"POST", "/api/worker/runs/{id}/fresh-resume/{frid}/seeded", noLimiter},
+	{"GET", "/api/worker/runs/{id}/fresh-resume/{frid}/state", noLimiter},
 	{"POST", "/api/workers/", noLimiter},
 	{"POST", "/api/workers/hosted", limHosted},
 	// PRD #685 M1: admin upload of a branding logo — cookie-only admin write, raw body

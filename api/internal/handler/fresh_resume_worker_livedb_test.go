@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -419,4 +420,31 @@ func TestFreshResumePreSeedHooksLiveDB(t *testing.T) {
 	t.Run("base attestation hold", func(t *testing.T) {
 		preSeedBody(t, post("/base-attestation-hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen)))
 	})
+
+	// The destination's run is `running` here (W2, claimed transfer): the hold writers match that status,
+	// set paused, and the fresh resume guard raises. The reply is the typed 409, never a 500, and neither
+	// the run nor the transfer changes.
+	cliMustExec(t, f.pool, `UPDATE runs SET status='running', harness='codex', session_id='fresh-session', require_base_match=true, planned_base_commit=repeat('a',40) WHERE id=$1`, f.run)
+	cliMustExec(t, f.pool, `UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, f.w2,
+		[]string{capability.ProviderPolicyHoldV1, capability.CodexHarnessV1, capability.CodexRuntimeV2})
+	snapshot := func() string {
+		var s string
+		if err := f.pool.QueryRow(context.Background(), `SELECT (SELECT to_jsonb(r) FROM runs r WHERE r.id=$1)::text || (SELECT to_jsonb(x) FROM run_fresh_resumes x WHERE x.id=$2)::text`, f.run, f.frid).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	runningCase := func(name, tail, body string) {
+		t.Run(name, func(t *testing.T) {
+			before := snapshot()
+			preSeedBody(t, post(tail, body))
+			if after := snapshot(); after != before {
+				t.Fatalf("run or transfer changed:\n before %s\n after  %s", before, after)
+			}
+		})
+	}
+	runningCase("running base attestation hold", "/base-attestation-hold", fmt.Sprintf(`{"claim_generation":%d}`, freshWorkerGen))
+	runningCase("running policy hold", "/policy-hold", fmt.Sprintf(
+		`{"outcome_id":%q,"source_generation":%d,"claim_generation":%d,"detail":"refused","cause":"refused","continuation_mode":"same_conversation","tag":"cyberPolicy","phase":"implementation","correlation_id":"pr-00000000000000000000000000000000-1","published":false}`,
+		uuid.NewString(), freshWorkerGen, freshWorkerGen))
 }

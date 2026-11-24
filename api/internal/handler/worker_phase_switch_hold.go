@@ -57,6 +57,8 @@ func (h *Handler) WorkerRunPhaseSwitchHold(w http.ResponseWriter, r *http.Reques
 	run, applied, err := h.wsvc.SetRunPhaseSwitchHold(r.Context(), wkr, runID, body.Head, body.ClaimGeneration, body.Phase)
 	if err != nil {
 		switch {
+		case h.refuseFreshPreSeedOnGuard(w, r, wkr, runID, run, err):
+			// Issue #4628: the paused write hit the fresh resume guard; the reply is already written.
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrMissingClaimGeneration):

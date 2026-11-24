@@ -623,15 +623,15 @@ type ListFreshResumeSweepCandidatesRow struct {
 // Candidates only; the sweep re-runs this same query narrowed to one id (only_id) under the run and
 // transfer locks and refuses only when the reason still holds. A snapshot that merely omits the run
 // inside the grace (@omitted_grace_seconds: the worker heartbeat stale window plus its interval, as the
-// missing cutoff) is NOT loss evidence. A departure stamp is cleared when the destination's snapshot lists
-// the run at G' again (the stamp itself is never cleared).
+// missing cutoff) is NOT loss evidence. A departure stamp stops counting as evidence once the destination's
+// snapshot lists the run at G' again; the stamp column itself is never cleared.
 //
 //	pending:  gate_off (the instance gate is off) or admission_deadline (the row expired).
 //	claimed (claimed_enabled): transfer_deadline; destination_deleted (the destination worker row is
 //	  gone); destination_stale (its heartbeat is older than @stale_cutoff); destination_reregistered (the
 //	  nonce it reported its first running with is no longer its register nonce); snapshot_departed
 //	  (StampSnapshotDepartures' stamp is present at G' under the worker's current nonce); snapshot_omitted
-//	  (an accepted heartbeat snapshot newer than status_since + 60s does not list the run at G', and the
+//	  (an accepted heartbeat snapshot newer than status_since + @omitted_grace_seconds does not list the run at G', and the
 //	  worker is not under a pending-outcome overflow closure).
 func (q *Queries) ListFreshResumeSweepCandidates(ctx context.Context, arg ListFreshResumeSweepCandidatesParams) ([]ListFreshResumeSweepCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listFreshResumeSweepCandidates,
