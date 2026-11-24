@@ -44,8 +44,8 @@ Each recipient's key is the recipient's own sealed `anthropic_compatible_key` ro
 
 A NULL owner cannot be a foreign key parent, so each definition carries a derived `scope_owner_id`: the owner's id for a personal definition, the nil UUID (`00000000-0000-0000-0000-000000000000`) for a shared one. `UNIQUE (scope_owner_id, id)` is the parent key (`model_providers_scope_owner_id_key`). The references:
 
-- `user_secrets (provider_scope_id, provider_id)` -> `model_providers (scope_owner_id, id)`, `ON DELETE CASCADE` (00525).
-- `users (claude_provider_scope_id, claude_provider_id)` -> `model_providers (scope_owner_id, id)`, `ON DELETE RESTRICT` (00526).
+- `user_secrets (provider_scope_id, provider_id)` -> `model_providers (scope_owner_id, id)`, `ON DELETE CASCADE` (00527).
+- `users (claude_provider_scope_id, claude_provider_id)` -> `model_providers (scope_owner_id, id)`, `ON DELETE RESTRICT` (00528).
 
 CHECKs keep the pair honest and the scopes closed:
 
@@ -75,7 +75,7 @@ The accepted redirect residual of [ADR-4320](4320-custom-model-providers.md#know
 
 ### D6. Per-user Test evidence
 
-Test evidence belongs to the tested credential, so it moved to a new table, `model_provider_key_test_results`, one row per `(provider_id, user_id)` carrying the provider revision, the key secret id and the key's `enablement_rev`. Readers return it only while that exact tuple is current, so rotating a key, editing the map or replacing the key makes old evidence read as "not tested". B's success and C's failure never mix. Migration 00529 discards the provider-wide legacy rows (`DELETE FROM model_provider_probe_results`) so existing personal providers start as "not tested", and keeps that legacy table and its `(provider_id, revision)` conflict target for older API images.
+Test evidence belongs to the tested credential, so it moved to a new table, `model_provider_key_test_results`, one row per `(provider_id, user_id)` carrying the provider revision, the key secret id and the key's `enablement_rev`. Readers return it only while that exact tuple is current, so rotating a key, editing the map or replacing the key makes old evidence read as "not tested". B's success and C's failure never mix. Migration 00531 discards the provider-wide legacy rows (`DELETE FROM model_provider_probe_results`) so existing personal providers start as "not tested", and keeps that legacy table and its `(provider_id, revision)` conflict target for older API images.
 
 The write is fenced **after** the dial, in one short transaction that holds no lock across the network call: `LockVisibleProviderForEvidence` (provider row `FOR SHARE`, still visible, still at the probed revision, not retired), then `LockProviderKeyForEvidence` (the caller's key row `FOR SHARE`, same row id and enablement revision, enabled), then the upsert. If either row is gone or changed, zero rows come back, nothing is written, and the handler answers 409 ("the provider was edited or removed while it was being tested"). `FOR SHARE` on the provider row makes a revision bump (which takes `FOR NO KEY UPDATE`) wait instead of committing past the writer, so a late response cannot overwrite current evidence. Before the dial the handler still takes #4320's snapshot of revision, key identity and enablement revision and refuses (409) if it changed.
 
@@ -111,29 +111,29 @@ Reads (`GET /api/admin/providers`, `GET /api/admin/providers/{id}`) are `Require
 
 ## Migrations and failure model
 
-Eight migrations, 00522-00529, all additive and staged:
+Eight migrations, 00524-00531, all additive and staged:
 
 | File | Does |
 |---|---|
-| 00522 | refuses a nil-UUID user or owner; `owner_user_id` nullable; adds `credential_mode`, `scope_owner_id`; bounded backfill; the five CHECKs `NOT VALID` |
-| 00523 | validates those CHECKs; `scope_owner_id SET NOT NULL` |
-| 00524 | `NO TRANSACTION`: `model_providers_scope_owner_id_key (scope_owner_id, id)`, `model_providers_shared_name_lower_key (lower(name)) WHERE credential_mode IS NOT NULL`, partial `users_claude_provider_id_idx (claude_provider_id) WHERE claude_provider_id IS NOT NULL` |
-| 00525 | `user_secrets.provider_scope_id`, its CHECK, the composite key FK (`NOT VALID`) |
-| 00526 | `users.claude_provider_scope_id`, its CHECK, the composite source FK (`NOT VALID`) |
-| 00527, 00528 | validate the 00525 and 00526 constraints |
-| 00529 | `model_provider_key_test_results`; discards the legacy provider-wide cache rows |
+| 00524 | refuses a nil-UUID user or owner; `owner_user_id` nullable; adds `credential_mode`, `scope_owner_id`; bounded backfill; the five CHECKs `NOT VALID` |
+| 00525 | validates those CHECKs; `scope_owner_id SET NOT NULL` |
+| 00526 | `NO TRANSACTION`: `model_providers_scope_owner_id_key (scope_owner_id, id)`, `model_providers_shared_name_lower_key (lower(name)) WHERE credential_mode IS NOT NULL`, partial `users_claude_provider_id_idx (claude_provider_id) WHERE claude_provider_id IS NOT NULL` |
+| 00527 | `user_secrets.provider_scope_id`, its CHECK, the composite key FK (`NOT VALID`) |
+| 00528 | `users.claude_provider_scope_id`, its CHECK, the composite source FK (`NOT VALID`) |
+| 00529, 00530 | validate the 00527 and 00528 constraints |
+| 00531 | `model_provider_key_test_results`; discards the legacy provider-wide cache rows |
 
 Each FK is dropped and re-added under the same name in one `ALTER`, so no window exists without a provider foreign key. Every transactional file sets `lock_timeout = '5s'`.
 
-**Failure model.** Each transactional file is atomic: it either commits with its version row or leaves nothing, across a process crash, a killed connection or a restart, and the next boot re-runs the unrecorded file. This ADR claims no storage- or power-loss durability beyond PostgreSQL's own commit guarantee. 00524 is the exception, because `CREATE INDEX CONCURRENTLY` cannot run in a transaction. Each of its indexes is dropped first and rebuilt, so a re-run after an interrupted build replaces the invalid index instead of keeping it. **00524 must precede 00525 and 00526**: both foreign keys reference the scope key index, and each refuses to apply (`refusing to apply 00525` / `00526`) if it is missing or invalid, so a half-built index can never become a foreign key's parent. Recovery is to roll 00524 back and apply it again. 00522 refuses a nil-UUID user or provider owner and rolls back completely, leaving its version unrecorded. The API is a hard singleton that runs Goose at boot before serving, so no older writer races the migration. The upgrade preserves every personal provider, key, selection and ciphertext.
+**Failure model.** Each transactional file is atomic: it either commits with its version row or leaves nothing, across a process crash, a killed connection or a restart, and the next boot re-runs the unrecorded file. This ADR claims no storage- or power-loss durability beyond PostgreSQL's own commit guarantee. 00526 is the exception, because `CREATE INDEX CONCURRENTLY` cannot run in a transaction. Each of its indexes is dropped first and rebuilt, so a re-run after an interrupted build replaces the invalid index instead of keeping it. **00526 must precede 00527 and 00528**: both foreign keys reference the scope key index, and each refuses to apply (`refusing to apply 00527` / `00528`) if it is missing or invalid, so a half-built index can never become a foreign key's parent. Recovery is to roll 00526 back and apply it again. 00524 refuses a nil-UUID user or provider owner and rolls back completely, leaving its version unrecorded. The API is a hard singleton that runs Goose at boot before serving, so no older writer races the migration. The upgrade preserves every personal provider, key, selection and ciphertext.
 
 ### Rollback hazards
 
 Pinned by `TestSharedScopeImageOnlyRollbackLiveDB` and `TestSharedScopeDownGuardsAndFullDownLiveDB` (`api/internal/store/model_provider_shared_scope_livedb_test.go`) and by the guards in `model_provider_down_guard_livedb_test.go`.
 
-- **Migration Downs are out of band; shipped images run no Downs.** Each guarded Down locks its table `ACCESS EXCLUSIVE` before checking, and refuses rather than destroy or reassign data: 00526 while any user has a shared Claude source selected, 00525 while any key is attached to a shared definition, 00522 while any NULL-owner definition exists. 00527 and 00528 roll back freely; 00529 drops the evidence table (the data is a cache, and its Down loses it). Nothing clears a source for fallback, reassigns ownership or deletes key custody automatically. Once the references are gone, the full Down restores 00477's and 00479's owner-only FKs under their original names, and the schema matches a 00521 database. A re-upgrade then works.
+- **Migration Downs are out of band; shipped images run no Downs.** Each guarded Down locks its table `ACCESS EXCLUSIVE` before checking, and refuses rather than destroy or reassign data: 00528 while any user has a shared Claude source selected, 00527 while any key is attached to a shared definition, 00524 while any NULL-owner definition exists. 00529 and 00530 roll back freely; 00531 drops the evidence table (the data is a cache, and its Down loses it). Nothing clears a source for fallback, reassigns ownership or deletes key custody automatically. Once the references are gone, the full Down restores 00477's and 00479's owner-only FKs under their original names, and the schema matches a 00523 database. A re-upgrade then works.
 - **Image-only rollback.** The newer schema stays, and an older API image writes without the scope fields. Provider creation, key attachment and Claude source set and clear fail closed (a NOT NULL or CHECK violation), **including a user clearing a personal source back to vendor**. A user who already has a personal Claude source can still switch between their own personal providers, because the scope pair is unchanged; switching away from a shared selection is refused by the foreign key. On the older post-#4323 image, **Codex** source set and clear still work, since the Claude scope pair is untouched and the Codex FK is unchanged, but provider creation and key attachment fail for both engines. Key disable and delete, provider retirement and the older Test upsert (into the retained legacy table) keep working, as stop levers for rows the older API can address. Shared selections can read as `provider_missing` and shared bindings can go stale. The owner chose to document this rather than add a compatibility trigger. **Pause or cancel affected runs before rolling back.**
-- **Recovery is a re-upgrade.** Re-deploying the new image restores provider writes; there is nothing to repair by hand beyond the 00524 index recovery above.
+- **Recovery is a re-upgrade.** Re-deploying the new image restores provider writes; there is nothing to repair by hand beyond the 00526 index recovery above.
 
 ## Consequences
 

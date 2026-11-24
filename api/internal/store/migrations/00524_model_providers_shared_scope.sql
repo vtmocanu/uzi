@@ -14,10 +14,10 @@ SET LOCAL lock_timeout = '5s';
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM users WHERE id = '00000000-0000-0000-0000-000000000000'::uuid) THEN
-        RAISE EXCEPTION 'refusing to apply 00522: a user row carries the nil UUID, which is reserved as the shared provider scope';
+        RAISE EXCEPTION 'refusing to apply 00524: a user row carries the nil UUID, which is reserved as the shared provider scope';
     END IF;
     IF EXISTS (SELECT 1 FROM model_providers WHERE owner_user_id = '00000000-0000-0000-0000-000000000000'::uuid) THEN
-        RAISE EXCEPTION 'refusing to apply 00522: a model provider row is owned by the nil UUID, which is reserved as the shared provider scope';
+        RAISE EXCEPTION 'refusing to apply 00524: a model provider row is owned by the nil UUID, which is reserved as the shared provider scope';
     END IF;
 END
 $$;
@@ -31,7 +31,7 @@ ALTER TABLE model_providers ADD COLUMN scope_owner_id uuid;
 -- Bounded backfill: the table holds at most 20 definitions per owner.
 UPDATE model_providers SET scope_owner_id = owner_user_id;
 
--- All NOT VALID (no full scan under the lock), validated in 00523.
+-- All NOT VALID (no full scan under the lock), validated in 00525.
 ALTER TABLE model_providers ADD CONSTRAINT model_providers_credential_mode_check
     CHECK (credential_mode IN ('per_user_key')) NOT VALID;
 -- A NULL owner is exactly a shared definition, and a shared definition names its credential mode.
@@ -55,7 +55,7 @@ LOCK TABLE model_providers IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM model_providers WHERE owner_user_id IS NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back 00522: shared model provider definition(s) still exist; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00524: shared model provider definition(s) still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;
@@ -65,7 +65,7 @@ ALTER TABLE model_providers DROP CONSTRAINT model_providers_scope_owner_check;
 ALTER TABLE model_providers DROP CONSTRAINT model_providers_shared_engine_check;
 ALTER TABLE model_providers DROP CONSTRAINT model_providers_shared_mode_check;
 ALTER TABLE model_providers DROP CONSTRAINT model_providers_credential_mode_check;
--- Dropping the columns also drops the partial and composite indexes 00524 built on them.
+-- Dropping the columns also drops the partial and composite indexes 00526 built on them.
 ALTER TABLE model_providers DROP COLUMN scope_owner_id;
 ALTER TABLE model_providers DROP COLUMN credential_mode;
 ALTER TABLE model_providers ALTER COLUMN owner_user_id SET NOT NULL;
