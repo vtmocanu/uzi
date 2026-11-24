@@ -674,9 +674,9 @@ func (h *Handler) PutMyProviderKey(w http.ResponseWriter, r *http.Request) {
 	}
 	var row providerRow
 	err = h.withSecretLock(r.Context(), user.ID, &material, func(q *store.Queries) error {
-		// Lock order: the caller's secret-mutation lock (withSecretLock), the definition row FOR KEY
-		// SHARE, then the caller's key row. Admin edits of a shared definition take no per-user lock.
-		if _, err := q.LockVisibleProviderForKeyMutation(r.Context(), store.LockVisibleProviderForKeyMutationParams{ID: id, UserID: user.ID}); err != nil {
+		// Hold the definition FOR SHARE through the write: retirement and revision edits
+		// must wait. Take this after the caller's secret lock and before the key row.
+		if _, err := q.LockModelProviderForShare(r.Context(), store.LockModelProviderForShareParams{ID: id, OwnerUserID: user.ID}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return errProviderNotFound
 			}
@@ -750,12 +750,8 @@ func (h *Handler) DeleteMyProviderKey(w http.ResponseWriter, r *http.Request) {
 		if err := lockProviderForKeyMutation(r.Context(), q, id, user.ID); err != nil {
 			return err
 		}
-		if _, err := q.GetProviderKeyForUpdate(r.Context(), store.GetProviderKeyForUpdateParams{UserID: user.ID, ProviderID: pgtype.UUID{Bytes: id, Valid: true}}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return errProviderNoKey
-			}
-			return err
-		}
+		// DELETE itself locks the caller's key. Allow either compatible kind so an
+		// older mismatched row can be removed without rotating it under the wrong kind.
 		n, err := q.DeleteProviderKeySecret(r.Context(), store.DeleteProviderKeySecretParams{UserID: user.ID, ProviderID: pgtype.UUID{Bytes: id, Valid: true}})
 		if err != nil {
 			return err

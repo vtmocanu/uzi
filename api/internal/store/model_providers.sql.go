@@ -1312,10 +1312,9 @@ type LockVisibleProviderForKeyMutationRow struct {
 	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
 }
 
-// Takes the definition's row lock FOR KEY SHARE before the caller's key row is locked (key PUT, enable,
-// disable, delete), so the order is always provider then key. KEY SHARE blocks a provider delete but not
-// an edit, and it does not filter retired_at: a retired definition's key can still be disabled, deleted
-// or rotated out. The definition must be visible to the CALLER.
+// Enable, disable and delete take the visible definition's FOR KEY SHARE lock before the
+// caller's key row. It blocks a definition delete, and retired definitions remain eligible.
+// Key PUT instead takes LockModelProviderForShare to fence retirement and edits.
 func (q *Queries) LockVisibleProviderForKeyMutation(ctx context.Context, arg LockVisibleProviderForKeyMutationParams) (LockVisibleProviderForKeyMutationRow, error) {
 	row := q.db.QueryRow(ctx, lockVisibleProviderForKeyMutation, arg.ID, arg.UserID)
 	var i LockVisibleProviderForKeyMutationRow
