@@ -604,6 +604,9 @@ describe("an op-fenced credential switch after the restore transport stopped rea
           assert.equal(holds(c, "credential_switch_hold_settled").length, 0);
           const expectOutcome = order === "the control, then the switch" ? outcomes.control_first : outcomes.switch_first!;
           assert.equal(logged(c.r, STOPPED_LOG).length, expectOutcome.stopArm ?? 1, "the stop arm count");
+          // A decided exit never logs the late hold as held; only a switch pending at the hook (switch first) warns that it did not run.
+          assert.equal(logged(c.r, HOOK_LOG).length, 0, "no late hold logged as held");
+          assert.equal(logged(c.r, HOOK_FAILED_LOG).length, order === "the switch latched, then the control" ? 1 : 0, "late hold refusal warn");
           assert.equal(failed(c.r).length, expectOutcome.failed, "failed reports");
           assert.equal(c.terminalInstalls, expectOutcome.terminalInstalls, "terminal installs");
           assert.equal(c.counts.models, 0, "no model start");
