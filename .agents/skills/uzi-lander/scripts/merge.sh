@@ -45,6 +45,9 @@
 #      Also malformed repository syntax or unreadable changelog-policy checkout/origin,
 #      fetched main/PR head, merge-base or diff; no merge attempted.
 #      Also unreadable PR files or live-base migration listing.
+#      Also main's active workflow-run listing unreadable, empty or malformed, or a total_count
+#      mismatch that persists across 4 reads (a mismatch is re-read up to 3 times, adding at
+#      most 12 s of backoff per status).
 #   3  gh error, or the merge command was refused (classifier block, ruleset, conflict):
 #      the exact command is printed for the user to run via a `!` line. Also the PR
 #      conflicting with its base (mergeable=CONFLICTING), checked before the required
@@ -439,26 +442,59 @@ release_run_unneeded() {  # $1 = run head sha, $2 = run title
 # release to re-cut (exit 10). A run already in progress in ci.yml or kind-smoke.yml finishes.
 # Ordinary in-flight main CI does not block. Every non-completed run is enumerated (one
 # paginated Actions query per active status, no recency window). Refuses (exit 2) on a failed
-# or empty page set, a record missing the fields the decision reads, or an incomplete listing:
-# every page's total_count must agree and equal the records fetched, and GitHub caps filtered
-# run searches at 1,000 results, so a total_count above 1000 cannot be enumerated.
+# call, empty output, anything but exactly one top-level JSON value, an empty or malformed page
+# set, a record missing the fields the decision reads, a non-integer or negative total_count,
+# or a total_count above 1000 (GitHub caps filtered run searches at 1,000 results, so that
+# cannot be enumerated). None of those is retried.
+# A total_count disagreement between pages, or a total that differs from the records fetched,
+# can be a run listing that changed between page reads, so it is re-read per status: the first
+# read plus up to 3 re-queries, sleeping 2*N seconds before re-query N. That is at most 12 s per
+# status and 60 s across the five statuses of ADDED backoff, with the API call time on top. A
+# mismatch that persists across all 4 reads refuses (exit 2). jq prints OK (then the hit rows)
+# or the single line MISMATCH; any other first line is a parse failure.
 rel=""
 for st in queued in_progress waiting requested pending; do
-  pg=$(gh api --paginate --slurp "repos/$REPO/actions/runs?branch=main&status=$st&per_page=100" 2>/dev/null) \
-    || { echo "cannot read main's $st workflow runs; not merging"; exit 2; }
-  hit=$(printf '%s' "$pg" | jq -r '
-    if type != "array" or length == 0 then error("pages") else . end
-    | if all(.[]; type == "object" and (.workflow_runs|type) == "array" and (.total_count|type) == "number")
-      then . else error("page") end
-    | (.[0].total_count) as $total
-    | if all(.[]; .total_count == $total) and $total <= 1000 and ([.[].workflow_runs|length]|add) == $total
-      then . else error("incomplete") end
-    | [.[].workflow_runs[]]
-    | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
-            and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
-    | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
-        | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)\t\(.status)\t\(.path // "-")"] | join("\n")' 2>/dev/null) \
-    || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
+  retry=0
+  while :; do
+    pg=$(gh api --paginate --slurp "repos/$REPO/actions/runs?branch=main&status=$st&per_page=100" 2>/dev/null) \
+      || { echo "cannot read main's $st workflow runs; not merging"; exit 2; }
+    out=$(printf '%s' "$pg" | jq -rs '
+      if length != 1 then error("values") else .[0] end
+      | if type != "array" or length == 0 then error("pages") else . end
+      | . as $pages
+      | if all($pages[]; type == "object" and (.workflow_runs|type) == "array") then . else error("page") end
+      | if all($pages[]; (.total_count|type) == "number" and (.total_count == (.total_count|floor)) and .total_count >= 0)
+        then . else error("count") end
+      | [$pages[].workflow_runs[]] as $recs
+      | if all($recs[]; type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
+            and (.head_sha|type) == "string" and (.id|type) == "number"
+            and (.path == null or (.path|type) == "string")) then . else error("record") end
+      | if any($pages[]; .total_count > 1000) then error("incomplete") else . end
+      | ($pages[0].total_count) as $total
+      | if all($pages[]; .total_count == $total) and ($recs|length) == $total then
+          "OK",
+          # Row fields are tab-joined and read back by field position, so a tab, newline or CR
+          # inside an attacker-chosen string (title, name, path) is flattened to a space first.
+          def flat: gsub("[\t\n\r]"; " ");
+          ($recs[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
+            | "\(.head_sha|flat)\t\(.name // "?"|flat) #\(.id) \(.head_sha[0:8]|flat)\t\(.display_title|flat)\t\(.status|flat)\t\(.path // "-"|flat)")
+        else "MISMATCH" end' 2>/dev/null) \
+      || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
+    first=${out%%$'\n'*}
+    if [ "$first" = OK ]; then
+      hit=${out#OK}; hit=${hit#$'\n'}
+      break
+    elif [ "$out" = MISMATCH ]; then
+      if [ "$retry" -ge 3 ]; then
+        echo "cannot parse main's $st workflow runs (total_count mismatch persisted across 4 reads); not merging"; exit 2
+      fi
+      retry=$((retry + 1))
+      echo "main's $st run listing changed while paging (total_count mismatch); re-reading (retry $retry/3)"
+      sleep $((2 * retry))
+    else
+      echo "cannot parse main's $st workflow runs; not merging"; exit 2
+    fi
+  done
   [ -n "$hit" ] && rel="${rel:+$rel
 }$hit"
 done

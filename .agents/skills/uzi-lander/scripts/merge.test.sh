@@ -158,12 +158,21 @@ fi
 # main's workflow runs via the Actions API, one paginated query per status: MAIN_RUNS_JSON is
 # the full run list (Actions shape); the stub filters by status and splits it into pages of 2,
 # so a release run past any recency window is still reached. RUNS_FAIL=1 = an unreadable page.
-# MAIN_RUNS_PAGE overrides the raw slurped pages (malformed payloads).
+# MAIN_RUNS_PAGE overrides the raw slurped pages (malformed payloads). Every call, failed ones
+# included, appends its status to runs-calls.log. MAIN_RUNS_SEQ_DIR holds files <status>.<n>:
+# the raw stdout for the n-th call of that status (no file = the generation below).
+# MAIN_RUNS_EMPTY=1 prints nothing and exits 0.
 if [ "\${1:-}" = api ] && case "\$*" in *actions/runs*) true;; *) false;; esac; then
+  st=\$(printf '%s' "\$*" | sed -n 's/.*status=\\([a-z_]*\\).*/\\1/p')
+  echo "\$st" >> "$WORK/runs-calls.log"
   [ "\${RUNS_FAIL:-0}" = 1 ] && { echo 'HTTP 502' >&2; exit 1; }
+  [ "\${MAIN_RUNS_EMPTY:-0}" = 1 ] && exit 0
+  if [ -n "\${MAIN_RUNS_SEQ_DIR:-}" ]; then
+    n=\$(grep -cFx -- "\$st" "$WORK/runs-calls.log" || true)
+    [ -f "\$MAIN_RUNS_SEQ_DIR/\$st.\$n" ] && { cat "\$MAIN_RUNS_SEQ_DIR/\$st.\$n"; exit 0; }
+  fi
   [ -n "\${MAIN_RUNS_PAGE:-}" ] && { printf '%s\n' "\$MAIN_RUNS_PAGE"; exit 0; }
   [ -n "\${MAIN_RUNS_PAGE_FILE:-}" ] && { cat "\$MAIN_RUNS_PAGE_FILE"; exit 0; }
-  st=\$(printf '%s' "\$*" | sed -n 's/.*status=\\([a-z_]*\\).*/\\1/p')
   printf '%s' "\${MAIN_RUNS_JSON:-[]}" | jq -c --arg s "\$st" '[.[]|select(.status==\$s)] as \$r
     | (\$r|length) as \$n | if \$n==0 then [{total_count:0,workflow_runs:[]}] else [range(0; \$n; 2) as \$i | {total_count:\$n,workflow_runs: \$r[\$i:\$i+2]}] end'
   exit 0
@@ -311,7 +320,7 @@ grep -q 'not MERGED' "$WORK/open.out" || fail "--confirm-only OPEN did not repor
 #    skipping-only list refuse; pass+skipping and pass reach the merge.
 MERGE_STATE=OPEN; export MERGE_STATE
 merge_run() { # label -> rc, output in $WORK/m.<label>
-  rm -f "$WORK/merge.log"
+  rm -f "$WORK/merge.log" "$WORK/runs-calls.log"
   set +e
   bash "$SCRIPT" test/repo 42 --no-rework-check ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} > "$WORK/m.$1" 2>&1
   rc=$?
@@ -754,12 +763,19 @@ MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/codeql.yml 914)]"; export 
 relrefuse relcodeql
 MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 915),$(prun queued .github/workflows/kind-smoke.yml 916)]"; export MAIN_RUNS_JSON
 relrefuse relhalf
+# A tab inside the title must not shift the tab-joined row: the title below would, if split,
+# read as status=in_progress and path=ci.yml (the trailing @ is what running_run_finishes cuts
+# the rest of a split path at), which relrunning shows is allowed. It is a queued run: refuse.
+TABTITLE=$(printf 'chore(release): v0.86.0-rc.30\tin_progress\t.github/workflows/ci.yml@')
+MAIN_RUNS_JSON="[$(jq -nc --arg t "$TABTITLE" '{status:"queued",display_title:$t,head_sha:"5f9145cbaaaa0000",name:"CI",path:".github/workflows/other.yml",id:917}')]"; export MAIN_RUNS_JSON
+relrefuse reltabtitle
 unset WF_BODY_FILE
 unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
 merge_run runsfail
 [ "$rc" -eq 2 ] || fail "an unreadable main run page did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with an unreadable main run list"
+[ "$(wc -l < "$WORK/runs-calls.log")" -eq 1 ] || fail "runsfail: a failed gh call was retried: $(cat "$WORK/runs-calls.log")"
 unset RUNS_FAIL
 for bad in '{}' '[]' '[{}]' '[{"total_count":1,"workflow_runs":[{}]}]' '[{"total_count":1,"workflow_runs":[{"status":"queued","display_title":"x","head_sha":"a"}]}]' '[{"total_count":0,"workflow_runs":{}}]' \
     '[{"workflow_runs":[]}]' '[{"total_count":3,"workflow_runs":[]}]' '[{"total_count":1,"workflow_runs":[]},{"total_count":2,"workflow_runs":[]}]'; do
@@ -777,6 +793,82 @@ merge_run capped
 [ "$rc" -eq 2 ] || fail "1,000 of total_count 1001 did not refuse, rc=$rc: $(cat "$WORK/m.capped")"
 [ ! -e "$WORK/merge.log" ] || fail "merged on a capped run listing"
 unset MAIN_RUNS_PAGE_FILE
+# A total_count disagreement can be a listing that changed between page reads: re-read per
+# status (first read + up to 3 re-queries). Hard failures (unreadable, empty, several values,
+# malformed, non-integer or over-cap counts) are never retried. MAIN_RUNS_SEQ_DIR scripts the
+# n-th stdout per status; runs-calls.log records every call.
+runs_calls() { # status -> number of actions/runs calls for it
+  { grep -cFx -- "$1" "$WORK/runs-calls.log" 2>/dev/null || true; }
+}
+runs_total() { wc -l < "$WORK/runs-calls.log" | tr -d ' '; }
+seq_put() { mkdir -p "$WORK/seq"; printf '%s' "$3" > "$WORK/seq/$1.$2"; } # status n raw-stdout
+seq_reset() { rm -rf "$WORK/seq"; mkdir -p "$WORK/seq"; export MAIN_RUNS_SEQ_DIR="$WORK/seq"; }
+ordrun() { jq -nc --argjson id "$1" '{status:"in_progress",display_title:"ordinary",head_sha:"5f9145cbaaaa0000",name:"CI",id:$id}'; }
+EMPTYPG='[{"total_count":0,"workflow_runs":[]}]'
+MISPG="[{\"total_count\":2,\"workflow_runs\":[$(ordrun 1),$(ordrun 2)]},{\"total_count\":3,\"workflow_runs\":[$(ordrun 3)]}]"
+# 1. pages that disagree once, then agree: the guard passes after one re-read
+seq_reset; seq_put in_progress 1 "$MISPG"; seq_put in_progress 2 "$EMPTYPG"
+merge_run retrypages
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "case retrypages: merge stub not reached: $(cat "$WORK/m.retrypages")"
+[ "$(runs_calls in_progress)" -eq 2 ] || fail "case retrypages: in_progress calls $(runs_calls in_progress), want 2"
+grep -qF "main's in_progress run listing changed while paging (total_count mismatch); re-reading (retry 1/3)" "$WORK/m.retrypages" || fail "case retrypages: retry line missing: $(cat "$WORK/m.retrypages")"
+# 2. fewer records than the total, then consistent
+seq_reset; seq_put in_progress 1 "[{\"total_count\":3,\"workflow_runs\":[$(ordrun 1),$(ordrun 2)]},{\"total_count\":3,\"workflow_runs\":[]}]"; seq_put in_progress 2 "$EMPTYPG"
+merge_run retryshort
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "case retryshort: merge stub not reached: $(cat "$WORK/m.retryshort")"
+[ "$(runs_calls in_progress)" -eq 2 ] || fail "case retryshort: in_progress calls $(runs_calls in_progress), want 2"
+# 3. the retry finds a release run in a cancelling workflow
+seq_reset; seq_put in_progress 1 "$MISPG"
+seq_put in_progress 2 "[{\"total_count\":1,\"workflow_runs\":[$(prun in_progress .github/workflows/ci.yml 921)]}]"
+export WF_BODY_FILE="$WF_TRUE"
+merge_run retryrelease
+unset WF_BODY_FILE
+[ "$rc" -eq 10 ] || fail "case retryrelease: release run found on the re-read did not refuse, rc=$rc: $(cat "$WORK/m.retryrelease")"
+[ ! -e "$WORK/merge.log" ] || fail "case retryrelease: merged over a release run seen on the re-read"
+[ "$(runs_calls in_progress)" -eq 2 ] || fail "case retryrelease: in_progress calls $(runs_calls in_progress), want 2"
+# 4. a mismatch on every read refuses after exactly 4 reads
+seq_reset; for n in 1 2 3 4 5; do seq_put in_progress "$n" "$MISPG"; done
+merge_run retrypersist
+[ "$rc" -eq 2 ] || fail "case retrypersist: persistent mismatch rc=$rc: $(cat "$WORK/m.retrypersist")"
+[ ! -e "$WORK/merge.log" ] || fail "case retrypersist: merged on a persistent mismatch"
+[ "$(runs_calls in_progress)" -eq 4 ] || fail "case retrypersist: in_progress calls $(runs_calls in_progress), want 4"
+grep -qF "main's in_progress run listing changed while paging (total_count mismatch); re-reading (retry 3/3)" "$WORK/m.retrypersist" || fail "case retrypersist: retry 3/3 line missing: $(cat "$WORK/m.retrypersist")"
+grep -qF "cannot parse main's in_progress workflow runs (total_count mismatch persisted across 4 reads); not merging" "$WORK/m.retrypersist" || fail "case retrypersist: persistence message missing: $(cat "$WORK/m.retrypersist")"
+# 5. empty stdout with rc 0 is a parse failure, not "no release run" (green-merge setup)
+unset MAIN_RUNS_SEQ_DIR
+# CONFIRM_AFTER_MERGE=1 makes a merge that reaches the merge command confirm as MERGED, so the
+# pre-fix behaviour (no release run found, merge proceeds) exits 0 here instead of 9.
+PRIOR_CAM="${CONFIRM_AFTER_MERGE-__unset__}"; export CONFIRM_AFTER_MERGE=1
+export MAIN_RUNS_EMPTY=1
+merge_run emptyout
+unset MAIN_RUNS_EMPTY
+[ "$rc" -eq 2 ] || fail "case emptyout: empty run listing rc=$rc: $(cat "$WORK/m.emptyout")"
+[ ! -e "$WORK/merge.log" ] || fail "case emptyout: merged on an empty run listing"
+[ "$(runs_total)" -eq 1 ] || fail "case emptyout: calls $(runs_total), want 1"
+grep -qF "cannot parse main's queued workflow runs; not merging" "$WORK/m.emptyout" || fail "case emptyout: parse refusal missing: $(cat "$WORK/m.emptyout")"
+# 6. two concatenated, individually valid page arrays are not one page set
+export MAIN_RUNS_PAGE="${EMPTYPG}${EMPTYPG}"
+merge_run concatpages
+unset MAIN_RUNS_PAGE
+[ "$rc" -eq 2 ] || fail "case concatpages: concatenated page arrays rc=$rc: $(cat "$WORK/m.concatpages")"
+[ ! -e "$WORK/merge.log" ] || fail "case concatpages: merged on concatenated page arrays"
+[ "$(runs_total)" -eq 1 ] || fail "case concatpages: calls $(runs_total), want 1"
+if [ "$PRIOR_CAM" = __unset__ ]; then unset CONFIRM_AFTER_MERGE; else export CONFIRM_AFTER_MERGE="$PRIOR_CAM"; fi
+# Mutation controls: hard failures are never retried (1 call, exit 2, no merge).
+ctl() { # label status-1 raw: exit 2 after exactly one call
+  seq_reset; seq_put queued 1 "$2"
+  merge_run "$1"
+  [ "$rc" -eq 2 ] || fail "control $1: rc=$rc, want 2: $(cat "$WORK/m.$1")"
+  [ ! -e "$WORK/merge.log" ] || fail "control $1: merged"
+  [ "$(runs_total)" -eq 1 ] || fail "control $1: calls $(runs_total), want 1"
+}
+ctl ctlnonarray '[7]'
+ctl ctlbadrec "[{\"total_count\":2,\"workflow_runs\":[{}]},{\"total_count\":3,\"workflow_runs\":[]}]"
+ctl ctlbadpath "[{\"total_count\":2,\"workflow_runs\":[{\"status\":\"queued\",\"display_title\":\"x\",\"head_sha\":\"a\",\"id\":1,\"path\":{}}]},{\"total_count\":3,\"workflow_runs\":[]}]"
+ctl ctlcap "$(cat "$WORK/capped-pages.json")"
+ctl ctlnegative '[{"total_count":-1,"workflow_runs":[]}]'
+ctl ctlfraction '[{"total_count":1.5,"workflow_runs":[]}]'
+unset MAIN_RUNS_SEQ_DIR
 # --expect-closes: GitHub's closingIssuesReferences counts negated prose too (PR #2629's
 # "this PR does not close #1912" closed #1912 on merge). A mismatch refuses before the merge.
 export CLOSES_JSON='[{"number":1912}]'
@@ -1282,4 +1374,4 @@ pol_reset
 echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips; fragment guard refuses uncited multi-fragment PRs (15) and incomplete metadata (2), counting only added <uuid>.md fragments'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; a run-listing total_count mismatch is re-read up to 3 times while empty, malformed or unreadable listings refuse without retry; --expect-closes refuses a closing-reference mismatch"

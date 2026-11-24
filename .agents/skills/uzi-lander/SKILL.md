@@ -506,12 +506,11 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60 --max-ticks 200` in the background
-   (main runs finish, so a followed head can wait a whole run before starting; exit 2 is not red: re-arm).
-   Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
-   through GitHub and exits 3 before polling when it is invalid or unknown.
-   Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
-   per-job live-log commands it prints, then follow the repair-ownership check below before fixing on a branch, never `main`; flake → file, and
-   rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no run appeared
+   (main runs finish, so a followed head can wait a whole run; exit 2 is not red: re-arm, except a limit-reached one: merge-mechanics).
+   Pass the exact SHA from `merge.sh`, never a prefix; an invalid or unknown SHA exits 3 before polling.
+   Exit 0 gating runs green (schedule/dispatch: ADVISORY; a partial workflow set counts; confirm a gate fix another way), 1 red (use its
+   per-job live-log commands, then follow the repair-ownership check below before fixing on a branch, never `main`; flake → file, and
+   rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no gating run
    or lookup failed. `--follow` prints each
    `FOLLOW sha=OLD -> NEW` switch to the current branch head without resetting `--max-ticks`;
    the final verdict covers the last watched SHA. Without it, 4 superseded → re-watch the current `main` head
