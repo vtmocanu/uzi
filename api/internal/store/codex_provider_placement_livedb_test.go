@@ -170,7 +170,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&latest); err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range migrationDownStatements(t, "00522_codex_runtime_v3.sql") {
+	for _, stmt := range migrationDownStatements(t, "00523_codex_runtime_v3.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
 		}
@@ -232,7 +232,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if restored != current {
 		t.Fatal("00521 Down/Up roundtrip changed boundary definition")
 	}
-	for _, stmt := range migrationUpStatements(t, "00522_codex_runtime_v3.sql") {
+	for _, stmt := range migrationUpStatements(t, "00523_codex_runtime_v3.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
 		}
@@ -241,6 +241,6 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if restored != latest {
-		t.Fatal("00522 Up did not restore exact latest definition")
+		t.Fatal("00523 Up did not restore exact latest definition")
 	}
 }
