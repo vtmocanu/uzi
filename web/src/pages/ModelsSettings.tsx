@@ -54,6 +54,7 @@ import {
   judgeRunsOnHelp,
   planningEffortDefaultLabel,
   planningModelDefaultLabel,
+  predictionRedundant,
   predictionText,
   taskReviewEffortDefaultLabel,
   taskReviewModelDefaultLabel,
@@ -412,15 +413,31 @@ function ModelsEditor({ viewerId }: { viewerId: string }) {
   // The judge's routing as DRAFTED: dimming follows the select before it is saved.
   const judgeRunsOn = draft.judge_runs_on ?? "";
 
+  // What the select renders for its Default option and whether it offers Runtime default: the
+  // saved line hides only where these already show the prediction (predictionRedundant).
+  const rendered = (field: ModelsField): { defaultLabel?: string; runtimeOffered?: boolean } => {
+    if (field.kind === "model") return { defaultLabel: modelPicker(field).defaultLabel };
+    if (field.kind === "effort") {
+      const p = effortPicker(field);
+      return { defaultLabel: p.defaultLabel, runtimeOffered: p.runtimeLabel !== undefined };
+    }
+    return {};
+  };
+
   const cellProps = (field: ModelsField) => {
     const notUsed = judgeNotUsedReason(field, judgeRunsOn);
+    const saved = baseline[field.key] ?? "";
+    const dirty = dirtyKeys.has(field.key);
     return {
       field,
       idBase: idFor(field),
-      dirty: dirtyKeys.has(field.key),
+      dirty,
       // A cell showing its own Not used line drops the saved prediction's not_used note, so a
       // screen reader hears it once.
       prediction: predictionText(field, effective, { omitNotUsed: notUsed !== null }),
+      // A dirty cell always shows its saved line, so redundancy is checked only on a clean one.
+      predictionVisible: dirty || !predictionRedundant(field, effective, saved, { ...rendered(field), omitNotUsed: notUsed !== null }),
+      onReset: saved !== "" ? () => setValue(field.key, "") : undefined,
       reason: field.family ? harnessReason(field.family, effective) : null,
       notUsed,
       storedWarning: storedWarnings[field.key] ?? null,

@@ -44,15 +44,18 @@ on](./scheduling.md#which-harness-a-schedule-runs-on)).
 Switching the default harness never clears either model. Each lane is its
 own retained preference, so alternating between Claude and Codex keeps both
 choices intact. Click **Save changes** to save the harness, both lanes and
-every other change on the page together, in one request. Each cell also shows
-a small tag under its control with the **saved effective value**: the value a
-run would resolve today and where it comes from, such as `opus · lead template`
-(**Unavailable** if the server could not read it). An edit changes the tag only
-after you save; until then a changed cell labels it **Saved** and marks itself
-**Unsaved**. Leaving the page with unsaved changes
-asks you to **Stay** or **Discard**.
+every other change on the page together, in one request. A Default option
+names the value a run would resolve today and where it comes from, such as
+`Default · opus (lead template)`. Where the control does not already say it, a
+line under the control shows the **saved effective value** (for example
+`→ Claude · automatic` under **Default · automatic**, or **Unavailable** if the
+server could not read it); screen readers always hear it. An edit changes the
+saved value only after you save; until then a changed cell shows the **Saved**
+value and marks itself **Unsaved**. A value you changed from its default
+offers **Reset to default**, which you then save like any other edit. Leaving
+the page with unsaved changes asks you to **Stay** or **Discard**.
 
-![Settings, Models, showing the Worker runs rows: Worker model and Worker effort, each with a Claude and a Codex cell and a saved effective value tag](img/worker-model-settings.png)
+![Settings, Models, showing the Worker runs rows: Worker model and Worker effort, each with a Claude and a Codex cell, and Reset to default under a saved choice](img/worker-model-settings.png)
 
 ## Overflow to the other harness
 
