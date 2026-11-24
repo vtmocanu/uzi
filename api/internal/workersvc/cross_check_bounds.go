@@ -52,6 +52,9 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 	var guidanceDigest, instructionsDigest []byte
 	instructionsEnabled := false
 	if input.Stage == "code" {
+		if input.PlanRepoInstructionsEnabled != nil {
+			return ErrCrossCheckRefused
+		}
 		if input.RepoInstructionsEnabled != nil {
 			instructionsEnabled = *input.RepoInstructionsEnabled
 		}

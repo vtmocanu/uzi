@@ -929,6 +929,26 @@ func (q *Queries) GetLiveCodeCrossCheckDeadline(ctx context.Context, arg GetLive
 	return deadline_at, err
 }
 
+const getPlanCrossCheckRepoInstructionsConsent = `-- name: GetPlanCrossCheckRepoInstructionsConsent :one
+SELECT (repo.repo_claudemd_enabled AND repo.cross_check_repo_instructions_enabled)::boolean AS consent
+FROM repos repo JOIN forge_connections c ON c.id = repo.connection_id
+WHERE repo.id = $1 AND c.user_id = $2
+`
+
+type GetPlanCrossCheckRepoInstructionsConsentParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Plan-only consent to deliver the repo's root CLAUDE.md to the plan checker. Both flags are
+// read from one repos row version in one statement; no row lock is taken.
+func (q *Queries) GetPlanCrossCheckRepoInstructionsConsent(ctx context.Context, arg GetPlanCrossCheckRepoInstructionsConsentParams) (bool, error) {
+	row := q.db.QueryRow(ctx, getPlanCrossCheckRepoInstructionsConsent, arg.RepoID, arg.UserID)
+	var consent bool
+	err := row.Scan(&consent)
+	return consent, err
+}
+
 const insertCodeCrossCheck = `-- name: InsertCodeCrossCheck :one
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, head_commit,
  base_commit, candidate_digest, checker_run_id, checker_harness, deadline_at, verdict,

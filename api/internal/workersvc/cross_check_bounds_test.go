@@ -116,3 +116,20 @@ func TestCheckerEnvelopeBoundsWithoutMarker(t *testing.T) {
 		t.Fatal("incoherent checker accepted")
 	}
 }
+
+func TestPlanRepoInstructionsConsentFieldStageBounds(t *testing.T) {
+	yes := true
+	plan := boundedCheckerFixture(t)
+	plan.CrossCheck.PlanRepoInstructionsEnabled = &yes
+	if err := ValidateCrossCheckClaim(plan); err != nil {
+		t.Fatalf("plan claim with consent field refused: %v", err)
+	}
+	code := guidanceWireFixture(t)
+	if err := ValidateCrossCheckClaim(code); err != nil {
+		t.Fatalf("baseline code claim refused: %v", err)
+	}
+	code.CrossCheck.PlanRepoInstructionsEnabled = &yes
+	if err := ValidateCrossCheckClaim(code); !errors.Is(err, ErrCrossCheckRefused) {
+		t.Fatalf("code claim carrying the plan-only field accepted: %v", err)
+	}
+}
