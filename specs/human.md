@@ -680,6 +680,7 @@ Tracked as GitLab issue vtmocanu/uzi#64; PRD at `prds/done/64-uzi-cli.md`.
 Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
 
 - Automatic CI-fix is ON by default for every user (per-user tri-state opt-out, NULL=inherit=on), behind an admin instance-wide kill-switch (default on); admin can force-toggle any user. [user, PRD #914 — supersedes the earlier default-off from #71]
+- Per-run override (#4617): a run may carry its own CI-autofix on/off (null = follow the owner default). The branch's selected run (newest non-cancelled issue/ci_fix/prompt/self_improve run with an MR) decides; every CI fix copies that run's value, so a manual fix on an opted-out branch keeps it off; the automatic path re-checks it at creation; the admin kill-switch still wins; manual Fix CI is never blocked; no expiry. Set via `uzi run ci-autofix`, the run page, or `PUT /api/runs/{id}/ci-autofix`. (AI-synced 2026-11-23)
 - Fires only on agent-owned MR-branch pipelines (`agent/issue-N`); `main`/protected branches are never auto-touched — a fix still lands on the MR branch and a human still merges (primary directive). [user 2026-07-17]
 - Scope: this is the `ci_fix` lane only. Failures on the default branch are the `ci-repair` scheduled lane (Feature #2865), not auto-fixed here. (AI-synced 2026-10-14)
 - Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]

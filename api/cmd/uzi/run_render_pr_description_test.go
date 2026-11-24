@@ -251,7 +251,7 @@ func TestRenderRunDetailPrDescriptionHostile(t *testing.T) {
 	d := &apitypes.RunPrDescriptionDTO{Fields: apitypes.PrDescriptionFields{Summary: hostile}}
 	unknown := "x\x1b[2Jy"
 	out := renderDetail(t, prDescRun(d, &unknown))
-	for _, bad := range []string{"\x1b", "\u202e", "\nC", "&lt;"} {
+	for _, bad := range []string{"\x1b", "\u202e", "\nCloses", "&lt;"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("hostile description text reached the terminal carrying %q, got:\n%q", bad, out)
 		}

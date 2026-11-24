@@ -37,7 +37,9 @@ type ciAutofixStore interface {
 // automatic fix and a manual "Fix CI" click share one state machine and one set of
 // guards — the one-active-ci_fix-per-ref index and the cross-kind same-branch
 // exclusion — so the detector receives ErrActiveFixExists / ErrBranchInUse to
-// swallow on a race with the manual button.
+// swallow on a race with the manual button. It also returns
+// workersvc.ErrCIAutofixIneligible when the in-transaction recheck finds the branch's
+// selected run opted out (issue #4617); the detector treats that as a skip, not a failure.
 type CIAutoFixRunStarter interface {
 	CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot workersvc.FailureSnapshot, ciConfigPaths []string) (store.Run, error)
 }
@@ -321,6 +323,11 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 		// Transient (forge unreachable, locked PR, candidates moved): leave the pipeline
 		// unrecorded so the next tick retries.
 		slog.Warn("poller: ci-autofix PR binding not verifiable, will retry", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+	case errors.Is(err, workersvc.ErrCIAutofixIneligible):
+		// Issue #4617: the in-transaction recheck found the branch no longer eligible (opt-out,
+		// cancellation or owner change since detection). Nothing was created: no ledger write,
+		// no recorded pipeline, no comment. The next tick re-evaluates the ref from the listing.
+		slog.Debug("poller: ci-autofix no longer eligible", "repo", r.PathWithNamespace, "ref", ref, "reason", err)
 	default:
 		// ErrRepoNotFound / a transient DB error: leave unrecorded so the next tick retries.
 		slog.Error("poller: ci-autofix create run", "repo", r.PathWithNamespace, "ref", ref, "error", err)

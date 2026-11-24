@@ -382,10 +382,12 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// nullable column to *bool so null (inherit) survives to the wire distinct from
 		// an explicit true/false.
 		MrReworkEnabled: boolPtrValue(r.MrReworkEnabled),
-		LimitResetsAt:   timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
-		RetryNotBefore:  timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
-		LimitWaitCount:  r.LimitWaitCount,
-		RateLimitType:   textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		// Issue #4617: the per-run CI-autofix override, same tri-state mapping.
+		CiAutofixEnabled: boolPtrValue(r.CiAutofixEnabled),
+		LimitResetsAt:    timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
+		RetryNotBefore:   timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
+		LimitWaitCount:   r.LimitWaitCount,
+		RateLimitType:    textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
 		// PRD #1392 M1: the forge pre-clone park surface. RecoveryWaitCause is the typed cause
 		// (null = untyped/legacy park); RecoveryRetryNotBefore is the recovery-park promotion
 		// stamp (the recovery-park analog of RetryNotBefore, a distinct column); ForgeParkCount

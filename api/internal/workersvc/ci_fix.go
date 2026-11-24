@@ -67,6 +67,12 @@ var ErrActiveFixExists = errors.New("an active CI-fix run already exists for thi
 // ref's branch/worktree (the cross-kind same-branch exclusion). Mapped to 409.
 var ErrBranchInUse = errors.New("an active run already occupies this branch")
 
+// ErrCIAutofixIneligible is returned by the AUTOMATIC ci_fix create when the in-transaction
+// recheck (issue #4617) finds the branch no longer eligible: no selected run, a selected run
+// owned by another user, or the selected run's effective opt-in is off. The poller swallows
+// it and re-evaluates next tick. The manual path never returns it.
+var ErrCIAutofixIneligible = errors.New("ci-autofix is not eligible for this branch")
+
 // FailureSnapshot is the frozen record of the failed pipeline a ci_fix run works
 // from (PRD #6). It is captured at queue time — the pipeline_statuses cache row is
 // overwritten by later syncs, so the run must carry its own copy — stored as
@@ -158,9 +164,11 @@ func (s *Service) CreateCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 
 // CreateAutoCIFixRun is the AUTOMATIC sibling of CreateCIFixRun, called by the M6
 // poller detector when the ci-autofix loop guard proceeds on a failing agent MR
-// branch. It is identical to CreateCIFixRun except it passes autoApprove=true, so
+// branch. It differs from CreateCIFixRun in two ways: it passes autoApprove=true, so
 // the worker resolves the plan gate with an approve verdict instead of parking the
-// run at awaiting_approval (PRD #71 M4, mirroring autopilot's Decision 2). It runs
+// run at awaiting_approval (PRD #71 M4, mirroring autopilot's Decision 2), and it
+// rechecks per-run CI-autofix eligibility in the create transaction, returning
+// ErrCIAutofixIneligible when the branch's selected run opted out (issue #4617). It runs
 // the SAME guards — the one-active-ci_fix-per-ref index and the cross-kind
 // same-branch exclusion — so the detector gets ErrActiveFixExists / ErrBranchInUse
 // to swallow on a race with the manual Fix-CI button. The automatic path rebinds like the
@@ -171,10 +179,12 @@ func (s *Service) CreateAutoCIFixRun(ctx context.Context, userID, repoID uuid.UU
 }
 
 // createCIFixRun is the shared body of the manual and automatic ci_fix create
-// paths. autoApprove is the ONLY difference between them — it becomes
-// runs.auto_approve, which the worker reads to skip (true) or keep (false) the human
-// plan gate. Everything else — repo-ownership check, the guards, the snapshot
-// serialization and the queued notify — is identical, so the two paths cannot drift.
+// paths. autoApprove drives two differences: it becomes runs.auto_approve, which the
+// worker reads to skip (true) or keep (false) the human plan gate, and it gates the issue
+// #4617 eligibility recheck (only the automatic path can return ErrCIAutofixIneligible;
+// the manual path always proceeds and just copies the selected run's override). Everything
+// else — repo-ownership check, the guards, the snapshot serialization and the queued
+// notify — is shared, so the two paths cannot drift.
 func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, ref, title, description string, snapshot FailureSnapshot, ciConfigPaths []string, autoApprove bool) (store.Run, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
@@ -265,7 +275,43 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		if !sameCIFixCandidateSet(now, checked) {
 			return store.Run{}, ErrCIFixBindingChanged
 		}
+		// Issue #4617: re-resolve the per-run CI-autofix override in this transaction, after the
+		// run-branch lock and every guard above, so the fix copies the value of the run the
+		// candidate listing selects for this branch right now. Kept boundaries: (1) the per-run PUT
+		// (SetRunCIAutofixEnabled) takes the same LockRunBranch as this create, so it either
+		// commits before this read, or follows this insert and lists the new fix as in flight;
+		// a cancellation takes no branch lock and still behaves like one made after creation;
+		// (2) an override set on run A does not reach an in-flight ci_fix B,
+		// which keeps its copied value and governs once it completes with branch+mr_iid (the
+		// PUT response surfaces such fixes).
+		sel, selErr := q.GetCIAutofixSelectedRun(ctx, store.GetCIAutofixSelectedRunParams{
+			RepoID: repoID, Ref: pgtype.Text{String: ref, Valid: true},
+		})
+		var ciAutofixEnabled pgtype.Bool // NULL = inherit
+		switch {
+		case errors.Is(selErr, pgx.ErrNoRows):
+			if autoApprove {
+				return store.Run{}, fmt.Errorf("%w: no selected run on the branch", ErrCIAutofixIneligible)
+			}
+		case selErr != nil:
+			return store.Run{}, selErr
+		default:
+			if autoApprove {
+				if sel.UserID != userID {
+					return store.Run{}, fmt.Errorf("%w: selected run belongs to another owner", ErrCIAutofixIneligible)
+				}
+				eff := sel.RunCiAutofixEnabled
+				if !eff.Valid {
+					eff = sel.OwnerCiAutofixEnabled
+				}
+				if eff.Valid && !eff.Bool {
+					return store.Run{}, fmt.Errorf("%w: opted out", ErrCIAutofixIneligible)
+				}
+			}
+			ciAutofixEnabled = sel.RunCiAutofixEnabled
+		}
 		return q.CreateCIFixRun(ctx, store.CreateCIFixRunParams{
+			CiAutofixEnabled: ciAutofixEnabled,
 			CiFixMrIid:       bound,
 			UserID:           userID,
 			RepoID:           repoID,

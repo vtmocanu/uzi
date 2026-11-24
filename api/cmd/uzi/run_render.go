@@ -472,6 +472,8 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	// "inherit" (nil → follow the owner's account default), "on" or "off". An always-present
 	// row keeps "inherit" distinguishable from an old CLI that does not know the field.
 	rows = append(rows, []string{"MR_REWORK", triStateStr(r.MrReworkEnabled)})
+	// CI_AUTOFIX is the same tri-state for automatic CI fixes on this run's branch.
+	rows = append(rows, []string{"CI_AUTOFIX", triStateStr(r.CiAutofixEnabled)})
 	// MR_REWORK_CYCLES is the OWNER-ONLY automatic-rework ledger view (PRD #1202): cycles
 	// spent / the live admin cap, with " (stopped)" once the cap is reached (on-demand
 	// rework is how the owner reworks past it). Rendered ONLY when BOTH fields are present,

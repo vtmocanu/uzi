@@ -1333,6 +1333,52 @@ func TestSetRunMrReworkWire(t *testing.T) {
 	}
 }
 
+// TestSetRunCIAutofixWire asserts `SetRunCIAutofix` PUTs /api/runs/{id}/ci-autofix with the
+// tri-state `enabled` on the wire (nil is `null`, NOT omitted) and decodes the governing
+// run id and in-flight fix ids alongside the run.
+func TestSetRunCIAutofixWire(t *testing.T) {
+	tr := true
+	fa := false
+	for _, tc := range []struct {
+		name     string
+		in       *bool
+		wantBody string
+	}{
+		{"explicit true", &tr, `{"enabled":true}`},
+		{"explicit false", &fa, `{"enabled":false}`},
+		{"nil clears to inherit", nil, `{"enabled":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath, body string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod, gotPath = r.Method, r.URL.Path
+				b, _ := io.ReadAll(r.Body)
+				body = strings.TrimSpace(string(b))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"run":{"id":"r1","status":"completed"},"ci_autofix_governing_run_id":"g1","ci_autofix_inflight_fix_run_ids":["f1","f2"]}`))
+			}))
+			defer srv.Close()
+
+			res, err := newTestClient(srv).SetRunCIAutofix(context.Background(), "r1", tc.in)
+			if err != nil {
+				t.Fatalf("SetRunCIAutofix: %v", err)
+			}
+			if gotMethod != http.MethodPut || gotPath != "/api/runs/r1/ci-autofix" {
+				t.Errorf("request = %s %s, want PUT /api/runs/r1/ci-autofix", gotMethod, gotPath)
+			}
+			if body != tc.wantBody {
+				t.Errorf("body = %s, want %s", body, tc.wantBody)
+			}
+			if res.Run.ID != "r1" || res.GoverningRunID == nil || *res.GoverningRunID != "g1" {
+				t.Errorf("decoded run/governing = %q/%v", res.Run.ID, res.GoverningRunID)
+			}
+			if len(res.InflightFixRunIDs) != 2 || res.InflightFixRunIDs[0] != "f1" || res.InflightFixRunIDs[1] != "f2" {
+				t.Errorf("inflight = %v, want [f1 f2]", res.InflightFixRunIDs)
+			}
+		})
+	}
+}
+
 // TestRunReworkWire asserts `RunRework` POSTs to /api/runs/{id}/rework with a `guidance`
 // field carried verbatim (PRD #1202 M1), path-escapes the id, and unwraps the {run: <dto>}
 // envelope. An empty guidance is a valid trigger, so the field is ALWAYS sent (no

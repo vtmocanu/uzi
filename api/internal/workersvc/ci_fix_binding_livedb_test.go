@@ -132,12 +132,24 @@ func TestCIFixBindingUnboundCasesLiveDB(t *testing.T) {
 	const ref = "agent/issue-41004"
 	t.Run("no candidates needs no forge", func(t *testing.T) {
 		env, svc, userID, repoID := branchSerializeEnv(t) // no SetForges
-		run, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4100400), nil)
+		// Manual: this subtest is about binding. The automatic path additionally needs a selected
+		// run on the branch (issue #4617), asserted separately below.
+		run, err := svc.CreateCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4100400), nil)
 		if err != nil {
-			t.Fatalf("CreateAutoCIFixRun = %v, want success", err)
+			t.Fatalf("CreateCIFixRun = %v, want success", err)
 		}
 		if run.CiFixMrIid.Valid {
 			t.Fatalf("CiFixMrIid = %+v, want unbound", run.CiFixMrIid)
+		}
+	})
+	t.Run("no candidates is ineligible for the automatic path", func(t *testing.T) {
+		env, svc, userID, repoID := branchSerializeEnv(t)
+		_, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, ref, "Fix CI", "d", ciFixSnapshot(ref, 4100402), nil)
+		if !errors.Is(err, ErrCIAutofixIneligible) {
+			t.Fatalf("err = %v, want ErrCIAutofixIneligible", err)
+		}
+		if got := countCIFixRuns(t, env, repoID); got != 0 {
+			t.Fatalf("ci_fix runs after an ineligible auto create = %d, want 0", got)
 		}
 	})
 	t.Run("all merged or closed", func(t *testing.T) {
@@ -270,8 +282,12 @@ func TestCIFixBindingDoesNotChangePrDescriptionLiveDB(t *testing.T) {
 	const boundRef, unboundRef = "agent/issue-41008", "agent/issue-41009"
 	env, svc, _, userID, repoID := bindingEnv(t, map[int64]bindingAnswer{
 		410080: bindSum(410080, forge.MRStateOpened, boundRef),
+		// The unbound ref has a recorded PR (the automatic path needs a selected run, issue
+		// #4617) whose forge answer is merged, so the fix stays unbound via the all-merged path.
+		410090: bindSum(410090, forge.MRStateMerged, unboundRef),
 	})
 	seedRecordedPR(t, env, userID, repoID, boundRef, 410080, time.Now().Add(-time.Hour))
+	seedRecordedPR(t, env, userID, repoID, unboundRef, 410090, time.Now().Add(-time.Hour))
 	env.exec(`INSERT INTO pr_descriptions (repo_id, mr_iid) VALUES ($1, $2)`, repoID, 410080)
 
 	bound, err := svc.CreateAutoCIFixRun(env.ctx, userID, repoID, boundRef, "Fix CI", "d", ciFixSnapshot(boundRef, 4100800), nil)
