@@ -118,7 +118,7 @@ func TestClaimOfAnInaccessibleBindingIsStaleWithoutOpening(t *testing.T) {
 	for _, harness := range []string{"claude", "codex"} {
 		run := providerBoundRow(runkind.Issue)
 		run.Harness = harness
-		wkr := store.Worker{ProtocolCapabilities: []string{capability.ClaudeProviderV1, capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}}
+		wkr := store.Worker{ProtocolCapabilities: []string{capability.ClaudeProviderV1, capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}}
 		_, err := svc.assembleProviderBinding(context.Background(), wkr, run)
 		var refusal *providerClaimRefusal
 		if !errors.As(err, &refusal) || refusal.Reason != holdProviderBindingStale || !errors.Is(err, ErrProviderBindingStale) {
