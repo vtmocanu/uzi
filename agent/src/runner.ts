@@ -1,6 +1,6 @@
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { FreshConfigLockedError, FreshSeedError } from "./git.js";
-import { FreshAbandoned, FreshNoAuthority, FreshUnresolved, abandonFresh, classifyFreshState, commitFreshReceipt, decodeFreshResumeClaim, isFreshPreSeedAck, preemptFresh, produceFreshAttemptId, seedFresh, type FreshDeps, type FreshResumeClaim } from "./fresh-resume.js";
+import { FreshAbandoned, FreshNoAuthority, FreshUnresolved, abandonFresh, classifyFreshState, commitFreshReceipt, decodeFreshResumeClaim, isFreshPreSeedAck, preemptFresh, produceFreshAttemptId, seedFresh, type FreshAbandonOutcome, type FreshDeps, type FreshResumeClaim } from "./fresh-resume.js";
 import type { FreshResumeState } from "./client.js";
 import { freshJournalJson, type FreshJournal } from "./fresh-journal.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
@@ -15653,7 +15653,14 @@ export class RunRunner {
     // (or recovered attempt mode) is retried ONCE on a fresh attempt path when the re-read mode says
     // so: the mode can land between the read above and the seed under the bare lock.
     // issue #4628: a fresh resume seeds its own attempt (L0 to L3) instead of the ordinary seed loop below.
-    if (flight.freshResume !== undefined) await this.seedFreshResume(claim, flight, barePath, coordinates);
+    // The receipt commit (L4, journal ownership, only with current authority) follows the seed directly: nothing between them may throw
+    // into an ordinary failure report with the seed and a pending ledger entry on disk.
+    const peeledMarkerOf = (): string | undefined => flight.runnerClone?.wipRecovered === true && flight.runnerClone.wipCherryPicked !== true &&
+      /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
+    if (flight.freshResume !== undefined) {
+      await this.seedFreshResume(claim, flight, barePath, coordinates);
+      await this.commitFreshResume(claim, flight, barePath, peeledMarkerOf());
+    }
     for (let freshRetry = false; flight.freshResume === undefined; ) {
       try {
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed, flight.checkpointCoordinates ?? null, flight.checkpointClaimEvidence, flight));
@@ -15746,12 +15753,9 @@ export class RunRunner {
     // before this line, with no agent work in it.
     // issue #3239: a seed that peeled a `wip(park):` marker with `reset --soft` (not the diverged
     // cherry-pick leg, which has no single adopted marker) journals it as this attempt's lineage.
-    const peeledMarker = flight.runnerClone?.wipRecovered === true && flight.runnerClone.wipCherryPicked !== true &&
-      /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
-    // issue #4628: a fresh resume journals ownership with the receipt commit (L4), which runs only with current authority.
-    if (flight.freshResume !== undefined) await this.commitFreshResume(claim, flight, barePath, peeledMarker);
-    else await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
-      peeledMarker);
+    // A fresh resume committed its ownership (L4) right after the seed, above.
+    if (flight.freshResume === undefined) await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
+      peeledMarkerOf());
     await this.withLaunchLockRetry(flight, round => this.cloneRemediationRound(flight, round));
     batcher.emit({
       kind: "status",
@@ -31675,12 +31679,14 @@ export class RunRunner {
   /** The preemption: local state for the branch (or any restore composite) abandons the transfer. */
   private async freshPreempt(claim: ClaimResponse, flight: RunFlight, branch: string, cachePresent: boolean): Promise<void> {
     const fr = flight.freshResume!;
+    const outcome: FreshAbandonOutcome = { closed: false };
     try {
       await preemptFresh(this.freshDeps(flight), { runId: flight.runId, fr: fr.claim, generation: claim.claim_generation!,
-        barePath: this.git.barePathFor(claim.repo.clone_url), branch, cachePresent, signal: this.retainedLifecycleSignal(flight) });
+        barePath: this.git.barePathFor(claim.repo.clone_url), branch, cachePresent, outcome });
     } catch (error) {
+      // `abandoned` only after the server closed the transfer: otherwise it stays `pre_receipt` and dispatchFailure abandons again.
+      if (outcome.closed) fr.stage = "abandoned";
       this.retainedLifecycleGuard(flight);
-      fr.stage = "abandoned";
       throw this.freshStop(flight, error);
     }
   }
@@ -31699,18 +31705,20 @@ export class RunRunner {
     const attemptSeed = this.attemptSeedOptions(claim, flight)!;
     const lifecycle = this.retainedLifecycleSignal(flight);
     let result: Awaited<ReturnType<typeof seedFresh>>;
+    const outcome: FreshAbandonOutcome = { closed: false };
     try {
       result = await seedFresh(this.freshDeps(flight), {
         runId: flight.runId, fr: fr.claim, generation, attemptId, barePath, branch: coordinates.branch, key: coordinates.key,
         selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true ||
           claim.plan_cross_check_gated === true || claim.code_cross_check_required === true,
         isLive: attemptSeed.isLive, beforeSeed: attemptSeed.beforeSeed, ...(attemptSeed.onSeeded ? { onSeeded: attemptSeed.onSeeded } : {}),
-        guard: () => this.retainedLifecycleGuard(flight), signal: lifecycle, deadlineMs: RESTORE_SEED_DEADLINE_MS,
+        guard: () => this.retainedLifecycleGuard(flight), signal: lifecycle, deadlineMs: RESTORE_SEED_DEADLINE_MS, outcome,
         seedScope: fn => this.inFlightAuthority(flight, fn, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)),
       });
     } catch (error) {
+      // `abandoned` only after the server closed the transfer: otherwise it stays `pre_receipt` and dispatchFailure abandons again.
+      if (outcome.closed) fr.stage = "abandoned";
       this.retainedLifecycleGuard(flight);
-      fr.stage = "abandoned";
       throw this.freshStop(flight, error);
     }
     // The receipt is valid: from here the seed is the server's too, so nothing abandons. A failure stops with the seed kept.
@@ -31723,13 +31731,18 @@ export class RunRunner {
       await this.bindFlightSource(flight, runnerClone.path);
       if (!result.receipt.current_authority) throw new FreshNoAuthority(result.receipt);
     } catch (error) {
-      flight.preserveRecoveryClone = true;
-      flight.preserveSession = true;
-      flight.retainedLocalCustody = true;
-      flight.keepGuardedInventoryOpen = true;
+      this.keepFreshCustody(flight);
       this.retainedLifecycleGuard(flight);
       throw this.freshStop(flight, error);
     }
+  }
+
+  /** The four flags that keep the seeded source and its custody on this worker after a fresh failure past the receipt. */
+  private keepFreshCustody(flight: RunFlight): void {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.retainedLocalCustody = true;
+    flight.keepGuardedInventoryOpen = true;
   }
 
   /** L4 for a fresh resume flight, run only after a receipt with current authority: the recovery journal, the live ledger entry and
@@ -31744,10 +31757,7 @@ export class RunRunner {
       });
       flight.runLog.info("fresh resume committed", { transfer: fr.claim.id, attempt: fr.attemptId });
     } catch (error) {
-      flight.preserveRecoveryClone = true;
-      flight.preserveSession = true;
-      flight.retainedLocalCustody = true;
-      flight.keepGuardedInventoryOpen = true;
+      this.keepFreshCustody(flight);
       this.retainedLifecycleGuard(flight);
       throw this.freshStop(flight, error);
     }
@@ -31837,10 +31847,7 @@ export class RunRunner {
    * Always ends in {@link FreshReconcileStop}; a stale claim, a credential switch and a cancel propagate unchanged.
    */
   private async holdFreshResumeRetained(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<never> {
-    flight.preserveRecoveryClone = true;
-    flight.preserveSession = true;
-    flight.retainedLocalCustody = true;
-    flight.keepGuardedInventoryOpen = true;
+    this.keepFreshCustody(flight);
     let held = false;
     if (this.client.hasFeature(RETAINED_ADOPTION_FAILED_FEATURE) && Number.isSafeInteger(flight.claimGeneration) &&
         flight.claimGeneration > 0 && flight.runningAckStatus === "running") {
@@ -31879,8 +31886,9 @@ export class RunRunner {
   private async freshPreReceiptRefused(flight: RunFlight, reason: string): Promise<Error> {
     const fr = flight.freshResume;
     if (fr === undefined || fr.stage !== "pre_receipt") return new FreshReconcileStop();
-    fr.stage = "abandoned";
     const closed = await abandonFresh(this.freshDeps(flight), flight.runId, fr.claim, flight.claimGeneration, reason);
+    // Only a closed transfer is done with; a failed abandon keeps `pre_receipt` so the next terminal dispatch tries it again.
+    if (closed) fr.stage = "abandoned";
     if (closed && fr.attemptId !== undefined && fr.seed !== undefined)
       await this.git.markFreshUnbound({ ...fr.seed, runId: flight.runId, attemptId: fr.attemptId }).catch(() => undefined);
     return this.freshStop(flight, new FreshAbandoned(reason));

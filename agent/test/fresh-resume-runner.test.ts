@@ -1,4 +1,4 @@
-import { after, before, describe, it } from "node:test";
+import { after, before, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -155,6 +155,67 @@ describe("a fresh resume claim on the destination flight", () => {
     assert.deepEqual(api.freshResumeCalls.map(c => c.route), ["seeded", "abandon"]);
     assert.equal(parseAttemptLedgerEntry(config(`uzi-attempts.${branch}.entry`).at(-1)!)?.state, "fresh_unbound");
     assert.deepEqual(config(`uzi-recovery.${branch}.clone`), []);
+    assert.equal(reported(claim.run_id).includes("failed"), false);
+  });
+
+  it("a bare whose local state cannot be read abandons the transfer instead of stopping with it claimed", async () => {
+    const sha = publishCheckpoint();
+    const { frid, claim } = freshClaimFor(8106, sha);
+    await git.ensureClone(fx.originPath);
+    mock.method(git, "readFreshLocalState", async () => { throw new Error("config unreadable"); });
+    try {
+      const { factory, started } = factoryFor(() => {});
+      await run(factory).execute(claim);
+      assert.equal(started(), 0);
+      const abandons = api.freshResumeCalls.filter(c => c.route === "abandon");
+      assert.equal(abandons.length >= 1, true, "the transfer was given back");
+      assert.equal(abandons[0]!.frid, frid);
+      assert.equal(reported(claim.run_id).includes("failed"), false);
+    } finally { mock.restoreAll(); }
+  });
+
+  it("a non-fresh error before the receipt (the clone fails) still abandons the transfer and reports no failure", async () => {
+    const sha = publishCheckpoint();
+    const { frid, claim } = freshClaimFor(8107, sha);
+    mock.method(git, "ensureClone", async () => { throw new Error("disk exploded, not a fresh error"); });
+    try {
+      const { factory, started } = factoryFor(() => {});
+      await run(factory).execute(claim);
+      assert.equal(started(), 0);
+      const abandons = api.freshResumeCalls.filter(c => c.route === "abandon");
+      assert.equal(abandons.length >= 1, true, "the transfer was abandoned through dispatchFailure");
+      assert.equal(abandons[0]!.frid, frid);
+      assert.equal(reported(claim.run_id).includes("failed"), false);
+    } finally { mock.restoreAll(); }
+  });
+
+  it("a shutdown before the receipt still POSTs the abandon", async () => {
+    const sha = publishCheckpoint();
+    const { frid, claim } = freshClaimFor(8108, sha);
+    const runner = run(factoryFor(() => {}).factory);
+    mock.method(git, "seedFreshAttempt", async () => {
+      (runner as unknown as { shutdownSignal: AbortController }).shutdownSignal.abort();
+      throw new Error("interrupted by SIGTERM");
+    });
+    try {
+      await runner.execute(claim);
+      const abandons = api.freshResumeCalls.filter(c => c.route === "abandon");
+      assert.equal(abandons.length >= 1, true, "the shutdown did not abort the abandon");
+      assert.equal(abandons[0]!.frid, frid);
+      assert.equal(reported(claim.run_id).includes("failed"), false);
+    } finally { mock.restoreAll(); }
+  });
+
+  it("an abandon the server did not accept leaves the seeded attempt fresh_pending, never fresh_unbound", async () => {
+    const sha = publishCheckpoint();
+    api.freshResume = { seededRefusal: "fresh_resume_attempt_mismatch", abandonStatus: 500 };
+    const { claim } = freshClaimFor(8109, sha);
+    const branch = "agent/issue-8109";
+    const { factory, started } = factoryFor(() => {});
+    await run(factory).execute(claim);
+    assert.equal(started(), 0);
+    assert.equal(api.freshResumeCalls.some(c => c.route === "abandon"), true);
+    assert.equal(parseAttemptLedgerEntry(config(`uzi-attempts.${branch}.entry`).at(-1)!)?.state, "fresh_pending");
     assert.equal(reported(claim.run_id).includes("failed"), false);
   });
 });

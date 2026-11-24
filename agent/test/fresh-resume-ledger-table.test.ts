@@ -14,13 +14,16 @@ const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src")
 const DECL = /^(?:  (?:private |public |protected |static )*(?:async )?(?:function\s+)?([A-Za-z_]\w*)\s*(?:<[^>]*>)?\(|(?:export )?(?:async )?function\s+([A-Za-z_]\w*)\s*(?:<[^>]*>)?\()/;
 const NOT_A_DECLARATION = new Set(["if", "for", "while", "switch", "catch", "return", "await", "function", "constructor"]);
 
-/** `file#function` for each call of the parser: the nearest enclosing top-level function or class method declaration. */
+/** A call of the parser or of the shared ledger reads that wrap it (a definition has no leading dot). */
+const READ_CALL = /parseAttemptLedgerEntry\(|\.readAttemptLedger\(|\.readAllAttemptLedgers\(/;
+
+/** `file#function` for each call of the parser or a shared ledger read: the nearest enclosing top-level function or class method declaration. */
 function parserCallers(): Set<string> {
   const out = new Set<string>();
   for (const file of fs.readdirSync(SRC).filter(name => name.endsWith(".ts"))) {
     const lines = fs.readFileSync(path.join(SRC, file), "utf8").split("\n");
     lines.forEach((line, i) => {
-      if (!line.includes("parseAttemptLedgerEntry(") || /^\s*(\*|\/\/)/.test(line) || line.includes("export function parseAttemptLedgerEntry")) return;
+      if (!READ_CALL.test(line) || /^\s*(\*|\/\/)/.test(line) || line.includes("export function parseAttemptLedgerEntry")) return;
       for (let j = i; j >= 0; j--) {
         const m = DECL.exec(lines[j]!);
         const name = m?.[1] ?? m?.[2];
@@ -34,8 +37,8 @@ function parserCallers(): Set<string> {
 }
 
 describe("the attempt-ledger reader table", () => {
-  it("has a disposition for every function that calls parseAttemptLedgerEntry", () => {
-    const rows = new Set(LEDGER_READER_TABLE.filter(row => row.role === "parser").map(row => row.caller));
+  it("has a disposition for every function that calls parseAttemptLedgerEntry, readAttemptLedger or readAllAttemptLedgers", () => {
+    const rows = new Set(LEDGER_READER_TABLE.map(row => row.caller));
     const missing = [...parserCallers()].filter(caller => !rows.has(caller));
     assert.deepEqual(missing, [], "a new parser caller needs a row in ledger-reader-table.ts (and a decision about fresh states)");
   });
@@ -53,7 +56,8 @@ describe("the attempt-ledger reader table", () => {
   it("the registry scan itself finds the callers the issue names", () => {
     const callers = parserCallers();
     for (const expected of ["src/git.ts#compactAttemptLedger", "src/git.ts#scanRunBareConfig", "src/restore-route.ts#classifyRestoreRelationships",
-      "src/restore-boundary.ts#enumerateAttributedPaths"]) assert.ok(callers.has(expected), expected);
+      "src/restore-boundary.ts#enumerateAttributedPaths", "src/git.ts#remediationSourceUnderLock", "src/git.ts#seedIndependentAttempt",
+      "src/git.ts#retireRunnerCloneImpl"]) assert.ok(callers.has(expected), expected);
   });
 });
 

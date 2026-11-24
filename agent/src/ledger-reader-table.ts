@@ -26,8 +26,9 @@ export interface LedgerReaderRow {
   /** `src/<file>.ts#<enclosing function>` of a call to `parseAttemptLedgerEntry`, or the consumer's own symbol. */
   caller: string;
   disposition: LedgerDisposition;
-  /** The `parser` rows are enforced against the sources; `consumer` rows decide on a state a parser caller returned. */
-  role: "parser" | "consumer";
+  /** The `parser` and `reader` rows are enforced against the sources (a call of the parser, or of readAttemptLedger or
+   *  readAllAttemptLedgers); `consumer` rows decide on a state one of those returned. */
+  role: "parser" | "reader" | "consumer";
   note: string;
 }
 
@@ -58,13 +59,40 @@ export const LEDGER_READER_TABLE: readonly LedgerReaderRow[] = [
   { caller: "src/git.ts#readAcknowledgedReportSourcesUnderLock", role: "parser", disposition: "identity_only", note: "run id and identity checks only" },
   { caller: "src/git.ts#compactAttemptLedger", role: "parser", disposition: "kept", note: "a fresh entry is never dropped, even when its path is gone" },
   { caller: "src/git.ts#readAllAttemptLedgerValues", role: "parser", disposition: "identity_only",
-    note: "the shared ledger read behind readAttemptLedger and readAllAttemptLedgers; its callers are the consumer rows below" },
+    note: "the shared ledger read behind readAttemptLedger and readAllAttemptLedgers; the callers of those two are the reader rows below" },
   { caller: "src/restore-boundary.ts#enumerateAttributedPaths", role: "parser", disposition: "identity_only",
     note: "adds the entry's path to the attributed set; runAttributionCensus is unchanged and the fresh seed never runs it" },
   { caller: "src/restore-route.ts#classifyCanonicalShape", role: "parser", disposition: "blocks",
     note: "an own-run fresh entry makes the predecessor not plain: the restore route refuses" },
   { caller: "src/restore-route.ts#classifyRestoreRelationships", role: "parser", disposition: "blocks",
     note: "an own-run fresh entry is a conflicting attribution: the restore route refuses" },
+  // ---- callers of readAttemptLedger / readAllAttemptLedgers -------------------------------------------------------------------
+  { caller: "src/git.ts#attemptCloneForBranch", role: "reader", disposition: "occupies",
+    note: "hands the ledger to nonLiveKeyPaths for the seed-time process scan; a fresh entry occupies its path and is never adopted or freed" },
+  { caller: "src/git.ts#prepareRecoverySuccessor", role: "reader", disposition: "occupies",
+    note: "any entry, fresh included, makes a successor attempt id used (identity_used)" },
+  { caller: "src/git.ts#readRemediationUnderLock", role: "reader", disposition: "identity_only",
+    note: "matches a grant's origin source by attempt id and identity (sameRecoverySource); the state is not consulted, a fresh entry keeps its identity there" },
+  { caller: "src/git.ts#remediationSourceUnderLock", role: "reader", disposition: "blocks",
+    note: "the remediation source must be a live entry of the run at its path (state !== live refuses), so a fresh entry refuses" },
+  { caller: "src/git.ts#resolveBranchJournalUnderLock", role: "reader", disposition: "blocks",
+    note: "a restore stage is valid only with a live or retired ledger entry; a fresh entry throws a restore composite error" },
+  { caller: "src/git.ts#seedIndependentAttempt", role: "reader", disposition: "blocks",
+    note: "the predecessor must be live (state !== live refuses) and any newer non-retired entry, fresh included, refuses" },
+  { caller: "src/git.ts#completionSourceAlreadyRetired", role: "reader", disposition: "blocks",
+    note: "answers true only for a retired entry (state !== retired is false), so a fresh entry is never read as retired" },
+  { caller: "src/git.ts#clearRetiredCompletionJournal", role: "reader", disposition: "blocks",
+    note: "clears only a retired entry, or a live one while retiring; any other state, fresh included, returns false and clears nothing" },
+  { caller: "src/git.ts#retireRunnerCloneImpl", role: "reader", disposition: "identity_only",
+    note: "matches the owner by run id, path and the flight's own attempt id; one site refuses unless the entry is live, the completion site " +
+      "retires the matching entry. A fresh entry is never a live flight's attempt id before its receipt commit" },
+  { caller: "src/git.ts#seedFreshAttempt", role: "reader", disposition: "blocks",
+    note: "the fresh seed's own re-check: after L0 and L1 the ledger must hold exactly A as fresh_pending, or it refuses" },
+  { caller: "src/git.ts#readFreshAttemptEntry", role: "reader", disposition: "identity_only", note: "returns A's own last entry by attempt id for restart discovery" },
+  { caller: "src/git.ts#markFreshUnbound", role: "reader", disposition: "identity_only",
+    note: "moves only a fresh_pending entry of this run to fresh_unbound; any other state is left as it is" },
+  { caller: "src/git.ts#commitFreshReceipt", role: "reader", disposition: "identity_only",
+    note: "the receipt commit's own precondition: A's last value is this run's fresh_pending at this path (or already committed)" },
   // ---- consumers of a ledger state ------------------------------------------------------------------------------------------
   { caller: "src/git.ts#nonLiveKeyPaths", role: "consumer", disposition: "occupies",
     note: "the seed-time sweep names the path of a non-live entry for a process scan only; nothing is deleted or adopted" },

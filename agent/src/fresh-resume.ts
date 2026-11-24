@@ -102,11 +102,18 @@ export interface FreshDeps {
   log: Logger;
 }
 
+/** The abandon POST's own deadline. It is deliberately independent of the run's lifecycle signals: a shutdown or a cancel is a reason
+ *  to abandon, so it must never abort the abandon itself. */
+const FRESH_ABANDON_TIMEOUT_MS = 10_000;
+
+/** What an abandon attempt ended as, filled in by {@link preemptFresh} and {@link seedFresh} for the caller even when they throw a
+ *  guard error rather than {@link FreshAbandoned}. `closed` is true only when the server answered the abandon as closed. */
+export interface FreshAbandonOutcome { closed: boolean }
+
 /** POST abandon, best effort: never throws. True when the server closed the transfer. A 409 means it is no longer ours to abandon. */
-export async function abandonFresh(deps: FreshDeps, runId: string, fr: FreshResumeClaim, generation: number, reason: string,
-  signal?: AbortSignal): Promise<boolean> {
+export async function abandonFresh(deps: FreshDeps, runId: string, fr: FreshResumeClaim, generation: number, reason: string): Promise<boolean> {
   try {
-    await deps.client.abandonFreshResume(runId, fr.id, generation, signal);
+    await deps.client.abandonFreshResume(runId, fr.id, generation, AbortSignal.timeout(FRESH_ABANDON_TIMEOUT_MS));
     deps.log.warn("fresh resume transfer abandoned", { run_id: runId, transfer: fr.id, reason });
     return true;
   } catch (error) {
@@ -119,13 +126,23 @@ export async function abandonFresh(deps: FreshDeps, runId: string, fr: FreshResu
 /** Preemption: a fresh claim skips retained discovery, and abandons when the bare holds any attribution for the branch. A bare
  *  that does not exist yet holds none. Throws {@link FreshAbandoned}`("local_state_present")` after the abandon. */
 export async function preemptFresh(deps: FreshDeps, p: {
-  runId: string; fr: FreshResumeClaim; generation: number; barePath: string; branch: string; cachePresent: boolean; signal?: AbortSignal;
+  runId: string; fr: FreshResumeClaim; generation: number; barePath: string; branch: string; cachePresent: boolean; outcome?: FreshAbandonOutcome;
 }): Promise<void> {
   if (!p.cachePresent) return;
-  const state = await deps.git.readFreshLocalState(p.barePath, p.branch, p.runId);
+  // A bare that cannot be read cannot prove it is clear: that is a refusal to seed like any other, so it abandons too.
+  let state: string[];
+  try {
+    state = await deps.git.readFreshLocalState(p.barePath, p.branch, p.runId);
+  } catch (error) {
+    deps.log.warn("fresh resume: the bare's local state could not be read; abandoning", { run_id: p.runId, error: error instanceof Error ? error.message : String(error) });
+    const closed = await abandonFresh(deps, p.runId, p.fr, p.generation, "local_state_unreadable");
+    if (p.outcome) p.outcome.closed = closed;
+    throw new FreshAbandoned("local_state_unreadable", { cause: error });
+  }
   if (state.length === 0) return;
   deps.log.warn("fresh resume: the bare holds local state for this branch; abandoning", { run_id: p.runId, state });
-  await abandonFresh(deps, p.runId, p.fr, p.generation, "local_state_present", p.signal);
+  const closed = await abandonFresh(deps, p.runId, p.fr, p.generation, "local_state_present");
+  if (p.outcome) p.outcome.closed = closed;
   throw new FreshAbandoned("local_state_present");
 }
 
@@ -166,6 +183,8 @@ export interface FreshSeedParams {
   guard?: () => void;
   signal?: AbortSignal;
   deadlineMs?: number;
+  /** Receives whether the abandon was answered as closed (see {@link FreshAbandonOutcome}). */
+  outcome?: FreshAbandonOutcome;
 }
 
 export interface FreshSeedResult {
@@ -206,9 +225,11 @@ export async function seedFresh(deps: FreshDeps, p: FreshSeedParams): Promise<Fr
       { claim_generation: generation, attempt_id: attemptId, live_generation: generation }, p.signal);
     return { attemptId, seeded, receipt };
   } catch (error) {
-    const closed = await abandonFresh(deps, p.runId, fr, generation, errorReason(error), p.signal);
-    // The seed landed but never reached its receipt: A is unbound once the server has the transfer back.
-    if (seeded !== undefined && closed) {
+    const closed = await abandonFresh(deps, p.runId, fr, generation, errorReason(error));
+    if (p.outcome) p.outcome.closed = closed;
+    // The one rule for `fresh_unbound`: only after the server answered the abandon as closed. A failed abandon leaves A pending for
+    // discovery to reconcile. markFreshUnbound moves only a pending entry of this run, so it is a no-op when L1 was never written.
+    if (closed) {
       await deps.git.markFreshUnbound({ barePath: p.barePath, branch: p.branch, key: p.key, runId: p.runId, attemptId }).catch(() => undefined);
     }
     if (guardFailure !== undefined) throw guardFailure.error;

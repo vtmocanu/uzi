@@ -19100,6 +19100,10 @@ export class GitCache {
     const ref = `refs/uzi-fresh/${input.frid}`;
     const file = path.join(barePath, `.uzi-fresh-${input.frid}.bundle.tmp`);
     return this.withLock(barePath, async () => {
+      // A crash can leave this transfer's tmp behind, and the "wx" open below would then fail every retry. Under the lock nothing else
+      // writes it, so clear any leftover of the same prefix first (as rewriteConfigAtomically clears its own).
+      const tmpPrefix = `.uzi-fresh-${input.frid}.bundle.tmp`;
+      for (const name of await fs.readdir(barePath)) if (name.startsWith(tmpPrefix)) await fs.rm(path.join(barePath, name), { force: true });
       try {
         await this.assertBareClear(barePath, "fresh-bundle");
         let seen = 0;
@@ -19139,12 +19143,11 @@ export class GitCache {
    *   L2      refusal checks again (the bare now holds exactly L0 and L1 for this branch), then `assertBareClear` and
    *           admission of A's path, the seed-time sweep, and `seedRunnerClone` with the fresh normalization.
    * It never compacts the ledger, never runs the attribution census (the fresh seed sees no predecessor) and never writes the
-   * recovery journal key: that is the receipt commit ({@link commitFreshReceipt}). A failure after L1 appends `fresh_unbound` for A
-   * and keeps L0; every failure is a {@link FreshSeedError} naming the step (a {@link FreshConfigLockedError} passes through).
+   * recovery journal key: that is the receipt commit ({@link commitFreshReceipt}). A failure after L1 leaves A `fresh_pending` and keeps L0 (the caller marks it
+   * `fresh_unbound` only after the server closed the transfer); every failure is a {@link FreshSeedError} naming the step (a {@link FreshConfigLockedError} passes through).
    */
   async seedFreshAttempt(input: FreshSeedInput): Promise<RunnerClone> {
     let step = "checks";
-    let ledgerWritten = false;
     const refuse = (reason: string, cause?: unknown): never => { throw new FreshSeedError(reason, step, cause); };
     const locked = (): Promise<RunnerClone> => this.withLock(input.barePath, async () => {
       const { barePath, branch, key, runId, attemptId: aId, artifact } = input;
@@ -19161,12 +19164,14 @@ export class GitCache {
       const refSha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${artifact.artifactRef}^{commit}`])).trim();
       if (refSha !== artifact.artifactSha) return refuse("artifact_ref_mismatch");
 
+      // Read-only, for both artifact kinds: nothing is written while a deletion on this bare is still unresolved.
+      step = "bare_clear";
+      await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("authority_refused", err));
       step = "L0";
       const journal: FreshJournal = { frid: input.frid, attemptId: aId, generation: input.generation, sha: artifact.artifactSha, stage: "seeding" };
       await this.freshConfigWrite(barePath, [freshJournalKey(branch), freshJournalJson(journal)]);
       step = "L1";
       await this.freshConfigWrite(barePath, ["--add", attemptLedgerKey(branch), attemptLedgerValue({ attemptId: aId, runId, clonePath: aPath, state: "fresh_pending" })]);
-      ledgerWritten = true;
 
       step = "L2_checks";
       entries = await this.configEntries(barePath);
@@ -19193,8 +19198,8 @@ export class GitCache {
         ? this.withRecoveryOperation(input.signal ?? new AbortController().signal, Date.now() + (input.deadlineMs ?? Infinity), locked)
         : locked());
     } catch (err) {
-      // The seed did not reach its receipt: A is no longer pending, it is unbound (never adopted, kept for the guarded discard).
-      if (ledgerWritten) await this.markFreshUnbound(input).catch(() => undefined);
+      // A stays `fresh_pending` here: it becomes `fresh_unbound` only once the server has answered the caller's abandon as closed
+      // (see seedFresh), or discovery reads a refused or cancelled transfer that was never seeded.
       if (err instanceof FreshSeedError || err instanceof FreshConfigLockedError) throw err;
       const message = err instanceof Error ? err.message : "";
       throw new FreshSeedError(/deadline/i.test(message) ? "git_deadline" : "seed_failed", step, err);

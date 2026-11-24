@@ -434,6 +434,33 @@ describe("a park refused before the receipt", () => {
   });
 });
 
+describe("a park answered as not applied before the receipt", () => {
+  it("a 409 that only says the run moved on (applied false, no pre-seed reason) abandons the transfer through the report path itself", async () => {
+    simulateCommittedWork();
+    const sha = publishCheckpoint();
+    const frid = randomUUID();
+    const claim = gitlabClaim(9172, { claim_generation: SEED_GENERATION,
+      fresh_resume: { id: frid, kind: "checkpoint_ref", checkpoint_ref: CHECKPOINT_REF, sha, evidence_generation: 1 } });
+    api.stateAckWire = body => body.status === "recovery_wait"
+      ? { status: 409, body: { applied: false, run: { id: claim.run_id, status: "running", hold_reason: null } } } : undefined;
+    const { logger, lines } = recordingLogger();
+    const runner = run(factoryFor().factory, {}, logger);
+    const priv = runner as unknown as Record<string, (...a: unknown[]) => unknown>;
+    // A park is sent inside the pre-receipt window, where the server holds the transfer claimed.
+    mock.method(priv, "seedFreshResume", async (...args: unknown[]) => {
+      const flight = args[1] as { reportState(body: { status: string }): Promise<unknown> };
+      await flight.reportState({ status: "recovery_wait" });
+    });
+    await runner.execute(claim);
+    const abandons = api.freshResumeCalls.filter(c => c.route === "abandon");
+    assert.equal(abandons.length, 1, "abandoned once, by the unapplied answer");
+    assert.equal(abandons[0]!.frid, frid);
+    const logged = lines.find(l => (l as { msg?: string }).msg === "fresh resume transfer abandoned") as { reason?: string } | undefined;
+    assert.equal(logged?.reason, "report_not_applied");
+    assert.equal(api.states.filter(s => s.runId === claim.run_id && s.body.status === "failed").length, 0, "no failed report reached the api");
+  });
+});
+
 describe("a batcher breaker trip never reports failed from the fresh windows", () => {
   /** Arms a permanent 403 for the next message send, queues a feed line and flushes it: the breaker must trip (positive witness). */
   async function trip(flight: { batcher: { emit(msg: unknown): void; flushOwned(signal: AbortSignal): Promise<boolean>; awaitPermanentFailureSettled(): Promise<void> } }): Promise<void> {

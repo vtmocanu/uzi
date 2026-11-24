@@ -162,14 +162,17 @@ describe("fresh resume seed: L0 to L2 and the receipt commit (L4)", () => {
     assert.deepEqual(ledger(), []);
   });
 
-  it("a seed that fails after L1 leaves the attempt fresh_unbound and keeps the journal", async () => {
+  it("a seed that fails after L1 leaves the attempt fresh_pending (the caller marks it unbound only after a closed abandon) and keeps the journal", async () => {
     const sha = commitOn("work", mainTip(), { "a.txt": "a\n" }, "work a");
     await cache.ensureClone(fx.originPath);
     const { frid, artifact: art } = artifact("capture", sha);
     const input = seedInput(frid, art, { beforeSeed: async () => { throw new Error("sweep refused"); } });
     await assert.rejects(cache.seedFreshAttempt(input), (err: unknown) => err instanceof FreshSeedError && err.reason === "seed_failed");
-    assert.equal(parseAttemptLedgerEntry(ledger().at(-1)!)?.state, "fresh_unbound");
+    assert.equal(parseAttemptLedgerEntry(ledger().at(-1)!)?.state, "fresh_pending");
     assert.equal(parseFreshJournal(configValue(freshJournalKey(BRANCH))!).stage, "seeding");
+    // The caller's closed abandon is what moves it.
+    assert.equal(await cache.markFreshUnbound(input), true);
+    assert.equal(parseAttemptLedgerEntry(ledger().at(-1)!)?.state, "fresh_unbound");
   });
 });
 
@@ -297,6 +300,17 @@ describe("fresh resume bundle import", () => {
     assert.equal(ref, `refs/uzi-fresh/${frid}`);
     assert.equal(sh(bare, ["rev-parse", ref]), sha);
     assert.deepEqual(fs.readdirSync(bare).filter(n => n.startsWith(".uzi-fresh-")), [], "the temporary bundle file is gone");
+  });
+
+  it("a temporary file left by a crashed earlier attempt with the same transfer id does not block the fetch", async () => {
+    const sha = commitOn("work", mainTip(), { "a.txt": "a\n" }, "work a");
+    const bytes = bundleOf(sha);
+    const frid = randomUUID();
+    const stale = path.join(bare, `.uzi-fresh-${frid}.bundle.tmp`);
+    fs.writeFileSync(stale, "half a bundle from a crash");
+    const ref = await cache.fetchFreshBundle(bare, { frid, sha }, sink => pipeline(Readable.from([bytes]), sink));
+    assert.equal(sh(bare, ["rev-parse", ref]), sha);
+    assert.deepEqual(fs.readdirSync(bare).filter(n => n.startsWith(".uzi-fresh-")), []);
   });
 
   it("refuses a bundle whose tip is not the server sha, and leaves no ref", async () => {
