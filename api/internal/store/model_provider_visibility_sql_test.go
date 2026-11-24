@@ -2,6 +2,7 @@ package store
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -38,6 +39,10 @@ type visEntry struct {
 	// separately: it must contain every codexMust substring and never the shared-scope text.
 	codexFrom string
 	codexMust []string
+	// callers pins, for an identity-only query, the exact set of production files (relative to
+	// api/internal) that call it: an identity query has no ownership predicate of its own, so its
+	// authority is the caller's prior visibility check, and a new caller must be reviewed here.
+	callers []string
 }
 
 const (
@@ -98,14 +103,24 @@ var visibilityTable = map[string]visEntry{
 	"GetSharedModelProviderAdmin":       {class: classShared, caller: adminRead},
 
 	// identity-only: keyed by an id the caller already holds under a prior visibility check
-	"InsertModelProviderRevision":          {class: classIdentity, must: []string{"WHERE p.id = @provider_id"}},
-	"GetModelProviderRevision":             {class: classIdentity, must: []string{"WHERE provider_id = $1 AND revision = $2"}},
-	"GetProviderBindingKeyByID":            {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"}},
-	"LockProviderBindingKeyForShareNowait": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"}},
-	"LockProviderKeyForEvidence":           {class: classIdentity, must: []string{"k.provider_id ="}},
-	"UpsertProviderKeyTestResult":          {class: classIdentity, must: []string{"ON CONFLICT (provider_id, user_id)"}},
-	"DeleteProviderKeySecret":              {class: classIdentity, must: []string{"WHERE user_id = $1 AND provider_id = $2"}},
-	"GetUserProviderLaneSources":           {class: classIdentity, must: []string{"WHERE id = $1"}},
+	"InsertModelProviderRevision": {class: classIdentity, must: []string{"WHERE p.id = @provider_id"},
+		callers: []string{"handler/providers.go", "handler/providers_admin.go"}},
+	"GetModelProviderRevision": {class: classIdentity, must: []string{"WHERE provider_id = $1 AND revision = $2"},
+		callers: []string{"handler/providers.go", "handler/providers_admin.go"}},
+	"GetProviderBindingKeyByID": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"},
+		callers: []string{"workersvc/provider_claim.go", "workersvc/provider_source.go"}},
+	"LockProviderBindingKeyForShareNowait": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"},
+		callers: []string{"workersvc/provider_claim.go"}},
+	// The evidence key lock runs only after LockVisibleProviderForEvidence in the same transaction
+	// (TestIdentityQueryCallersArePinned checks that order in the caller).
+	"LockProviderKeyForEvidence": {class: classIdentity, must: []string{"k.provider_id =", "k.user_id =", "k.enablement_rev =", "k.disabled_at IS NULL"},
+		callers: []string{"handler/providers_probe.go"}},
+	"UpsertProviderKeyTestResult": {class: classIdentity, must: []string{"ON CONFLICT (provider_id, user_id)"},
+		callers: []string{"handler/providers_probe.go"}},
+	"DeleteProviderKeySecret": {class: classIdentity, must: []string{"WHERE user_id = $1 AND provider_id = $2"},
+		callers: []string{"handler/providers.go"}},
+	"GetUserProviderLaneSources": {class: classIdentity, must: []string{"WHERE id = $1"},
+		callers: []string{"workersvc/harness_resolver.go"}},
 }
 
 var (
@@ -212,6 +227,9 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 			if len(e.must) == 0 {
 				out = append(out, name+": identity-only query has no pinned key predicate")
 			}
+			if len(e.callers) == 0 {
+				out = append(out, name+": identity-only query has no authorized caller recorded")
+			}
 		}
 	}
 	for name := range table {
@@ -280,7 +298,9 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 			map[string]visEntry{"S": {class: classShared, caller: "x"}}, "S: shared-admin query lacks"},
 		{"shared-admin without caller", "-- name: S :one\nSELECT 1 FROM model_providers p WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key';",
 			map[string]visEntry{"S": {class: classShared}}, "S: shared-admin query has no authorized caller"},
-		{"stale entry", "-- name: A :one\nSELECT 1;", map[string]visEntry{"A": {class: classIdentity, must: []string{"1"}}, "Gone": {class: classOwner}}, "Gone: in visibilityTable but not in the query file"},
+		{"identity-only without caller", "-- name: I :one\nSELECT 1 FROM user_secrets WHERE id = $1;",
+			map[string]visEntry{"I": {class: classIdentity, must: []string{"WHERE id = $1"}}}, "I: identity-only query has no authorized caller recorded"},
+		{"stale entry", "-- name: A :one\nSELECT 1;", map[string]visEntry{"A": {class: classIdentity, must: []string{"1"}, callers: []string{"x.go"}}, "Gone": {class: classOwner}}, "Gone: in visibilityTable but not in the query file"},
 	}
 	for _, c := range cases {
 		got := strings.Join(visibilityViolations(c.sql, c.table), "\n")
@@ -293,5 +313,51 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 		if !strings.Contains(got, c.want) {
 			t.Errorf("%s: violations %q do not contain %q", c.name, got, c.want)
 		}
+	}
+}
+
+// TestIdentityQueryCallersArePinned: every identity-only query is called from exactly the
+// production files its entry records, and the evidence key lock is preceded by the provider
+// evidence fence and followed by the upsert in its one caller.
+func TestIdentityQueryCallersArePinned(t *testing.T) {
+	files := map[string]string{}
+	for _, dir := range []string{"handler", "workersvc"} {
+		entries, err := os.ReadDir(filepath.Join("..", dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, de := range entries {
+			n := de.Name()
+			if de.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join("..", dir, n)) //nolint:gosec // G304: a fixed sibling package dir listed by os.ReadDir, read-only.
+			if err != nil {
+				t.Fatal(err)
+			}
+			files[dir+"/"+n] = string(b)
+		}
+	}
+	for name, e := range visibilityTable {
+		if e.class != classIdentity {
+			continue
+		}
+		var got []string
+		for path, src := range files {
+			if strings.Contains(src, "."+name+"(") {
+				got = append(got, path)
+			}
+		}
+		sort.Strings(got)
+		want := append([]string(nil), e.callers...)
+		sort.Strings(want)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s: callers = %v, recorded %v (review the new caller's prior visibility check, then record it)", name, got, want)
+		}
+	}
+	src := files["handler/providers_probe.go"]
+	fence, key, upsert := strings.Index(src, ".LockVisibleProviderForEvidence("), strings.Index(src, ".LockProviderKeyForEvidence("), strings.Index(src, ".UpsertProviderKeyTestResult(")
+	if fence < 0 || key < 0 || upsert < 0 || fence >= key || key >= upsert {
+		t.Errorf("providers_probe.go evidence order: provider fence %d, key lock %d, upsert %d; want fence < key < upsert", fence, key, upsert)
 	}
 }
