@@ -193,7 +193,7 @@ async function openCrossCheckPanel(name: string): Promise<HTMLElement> {
   return screen.getByRole("group", { name: new RegExp(`Code cross-check for ${name}`) });
 }
 
-const CLAUDEMD_SWITCH = "Give the checker this repository's CLAUDE.md (read from the base commit)";
+const CLAUDEMD_SWITCH = "Give the cross-checkers this repository's CLAUDE.md";
 
 describe("Repos — Code cross-check panel (PRD #2170 M3)", () => {
   it("shows a Default badge + Manage on an enabled repo and nothing on a disabled one", async () => {
