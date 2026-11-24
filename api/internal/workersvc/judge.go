@@ -1120,14 +1120,25 @@ func judgeDefaultChoice(c secretChoice) secretChoice {
 // forks BEFORE GetRunClaimContext (a judge run has no repo) — that fork lives in
 // claim_assembly.go's assembleClaim, unchanged.
 func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
-	// PRD #4320 module 5: the judge lane has no provider support until PRD #4322. A provider-bound
-	// row (creation cannot produce one; defence in depth) is refused before any credential is opened.
-	if providerBoundRun(run) {
+	// PRD #4322 M1a: a provider-bound CLAUDE judge claims against its frozen binding (D-F): it never
+	// calls judgeChoice, reserveGateFrom, openWithAutoRetry or recordRunCredential, so no vendor
+	// credential is opened or recorded. A provider-bound judge of any other harness (Codex, until
+	// #4574) is refused before any credential is opened.
+	providerJudge := providerBoundRun(run)
+	if providerJudge && run.Harness != harnessClaude {
 		return nil, errProviderLaneClaimRefused
+	}
+	var providerBinding *ClaimProviderBinding
+	if providerJudge {
+		b, err := s.assembleProviderBinding(ctx, wkr, run)
+		if err != nil {
+			return nil, err
+		}
+		providerBinding = b
 	}
 	var anthropic []byte
 	recordedLastSeq := run.LastSeq
-	if run.Harness != harnessCodex {
+	if run.Harness != harnessCodex && !providerJudge {
 		// The run owner's JUDGE binding resolves the credential — and deliberately NOT the
 		// claiming worker's binding, even though a judge run is claimed by an ordinary
 		// worker through the same ClaimRun lane. Under PRD #104 D1 the judge lane is bound
@@ -1208,7 +1219,21 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	// error on either tier is logged and that tier is treated as unset: a claim never
 	// fails on it, and an empty model is never sent to the SDK.
 	var judgeModel *string
-	if s.settings != nil {
+	if providerJudge {
+		// Strict (PRD #4322 D-F): a read error is terminal (never a guessed model), and a model the
+		// frozen provider's map does not carry is refused as provider_model_unmapped, nothing delivered.
+		model, dropped, merr := s.resolveJudgeModelFor(ctx, s.q, run.UserID, HarnessClaude, true)
+		if merr != nil {
+			return nil, fmt.Errorf("%w: judge model: %w", errCredentialUnavailable, merr)
+		}
+		if !modelMapped(providerBinding.ModelMap, model) {
+			return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: (&ProviderModelUnmappedError{Model: model, Source: "judge"}).Error()}
+		}
+		judgeModel = &model
+		if len(dropped) > 0 {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, HarnessClaude, dropped[0])
+		}
+	} else if s.settings != nil {
 		harness := Harness(run.Harness)
 		// strict=false: a read error is logged and that tier treated as unset, so this never errs.
 		model, dropped, _ := s.resolveJudgeModelFor(ctx, s.q, run.UserID, harness, false)
@@ -1288,6 +1313,8 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 			// rides the ordinary ClaimPayload; the no-PAT guarantee is that assembly
 			// never decrypts one, asserted in judge_test.go.
 			AnthropicOAuthToken: string(anthropic),
+			// Set only for a provider-bound Claude judge (then AnthropicOAuthToken is empty).
+			Provider: providerBinding,
 		},
 		Agents:        []ClaimAgent{},
 		Skills:        []ClaimSkill{},

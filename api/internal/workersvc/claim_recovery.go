@@ -421,6 +421,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			payload, assemblyErr = nil, providerRefusal
 		}
 	}
+	// PRD #4322 D-G: a provider JUDGE never parks. Its refusal (from assembly, or found by the locked
+	// re-check above) settles terminally through the generic FailClaimAssemblyExact arm below, with
+	// fail_origin credential_unavailable and the refusal reason as the typed failure_reason.
+	if providerRefusal != nil && run.Kind == runkind.Judge {
+		assemblyErr = fmt.Errorf("%w: %w", errCredentialUnavailable, providerRefusal)
+		payload, providerRefusal = nil, nil
+	}
 	// PRD #3989 review rework: an account reset deletes the owner's secrets in the same
 	// transaction that stamps credentials_reset_at, under the run lock held here, and the FK
 	// clears runs.anthropic_secret_id. Every Anthropic lane records that id before it puts a

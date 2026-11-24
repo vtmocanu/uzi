@@ -6106,7 +6106,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				// compromised worker cannot smuggle a non-enum rate_limit_type past the
 				// server" would then be false on exactly the path a human reads. When the
 				// fields are absent this is nil and every other failure path is untouched.
-				FailureReason:  limitAwareFailureReason(owned.Harness, req),
+				FailureReason:  failedReportReason(owned, req),
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),

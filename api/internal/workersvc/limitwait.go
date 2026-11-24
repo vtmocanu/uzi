@@ -828,6 +828,23 @@ func limitAwareFailureReason(harness string, req StateRequest) pgtype.Text {
 	return pgconv.TextOrNull(limitFailureReason(harness, CoerceRateLimitType(req.RateLimitType), resetsAt, ""))
 }
 
+// providerJudgeGatewayLimitReason is the failure sentence of a provider-bound judge that reports a
+// limit: a judge never parks or waits, so it fails terminally with the limit recorded (PRD #4322 D-G).
+const providerJudgeGatewayLimitReason = "Provider gateway rate limit reached; a provider judge does not wait on rate limits"
+
+// failedReportReason is the `failed` arm's failure reason. A provider-bound JUDGE that reports any
+// limit fact has its report coerced to the provider gateway limit with no reset (whatever type or reset
+// the worker sent is ignored, as decideProviderLimitPark ignores them for a provider run), so the
+// recorded text never claims a vendor window. Every other run, an ordinary provider run and a vendor
+// judge included, takes limitAwareFailureReason unchanged; a provider judge report without limit facts
+// stays on that plain path too.
+func failedReportReason(owned store.Run, req StateRequest) pgtype.Text {
+	if providerBoundRun(owned) && owned.Kind == runkind.Judge && (req.RateLimitType != nil || req.LimitResetsAt != nil) {
+		return pgconv.TextOrNull(providerJudgeGatewayLimitReason)
+	}
+	return limitAwareFailureReason(owned.Harness, req)
+}
+
 // resolveWaitOnLimit answers "does THIS new run park on a usage limit" (PRD #35
 // Decision 7): the caller's explicit choice when it made one, else the owner's
 // users.wait_on_limit default.

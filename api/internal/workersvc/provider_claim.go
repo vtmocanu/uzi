@@ -30,10 +30,15 @@ import (
 const (
 	holdProviderDestinationNotAllowed = "provider_destination_not_allowed"
 	holdProviderBindingStale          = "provider_binding_stale"
+	// holdProviderModelUnmapped is the typed terminal reason of a provider JUDGE claim whose
+	// resolved judge model the frozen provider's map no longer carries (PRD #4322 D-F). It is never
+	// a park reason: finishRunClaimTx settles a judge's provider refusal as a failed run.
+	holdProviderModelUnmapped = "provider_model_unmapped"
 )
 
 // errProviderLaneClaimRefused is the claim-assembly refusal of a provider-bound run on a lane that
-// has no provider support yet (judge, job, cross-check, isolated; PRD #4322). It wraps
+// has no provider support yet (Codex judge until #4574, job, cross-check, isolated; a Claude judge is
+// supported since PRD #4322 M1a), or on a worker lacking the lane's capability. It wraps
 // errCredentialUnavailable, so finishRunClaim fails the claim terminally exactly as it does for the
 // other refused-lane shapes (errIsolatedClaimRefused), never delivering anything.
 var errProviderLaneClaimRefused = fmt.Errorf("%w: %w", errCredentialUnavailable, ErrProviderLaneUnsupported)
@@ -59,6 +64,8 @@ func (e *providerClaimRefusal) Is(target error) bool {
 		return e.Reason == holdProviderBindingStale
 	case ErrProviderDestinationNotAllowed:
 		return e.Reason == holdProviderDestinationNotAllowed
+	case ErrProviderModelUnmapped:
+		return e.Reason == holdProviderModelUnmapped
 	}
 	return false
 }
