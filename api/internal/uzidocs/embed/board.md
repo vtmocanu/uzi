@@ -219,11 +219,11 @@ retried in the background, without blocking the run, every 30 seconds for the
 first 30 minutes and then every 10 minutes (batch-limited, oldest first).
 Retries stop once the move has been pending for 24 hours, so a forge that
 recovers late in that window may not be reached before the give-up; move the
-card by hand then (admin health's `board.drift` counts such moves for 48
-hours). When an older run's pending move is next attempted and a newer run
-for the same issue already exists, the move is skipped and its marker cleared,
-so it does not move the newer run's card; a newer run created during that
-attempt is not seen.
+card by hand then (admin health's `board.drift` counts such moves until
+48 hours after the move first failed). Whenever an older run's move is
+attempted (immediately or on a retry) and a newer run for the same issue
+already exists, the move is skipped and its marker cleared, so it does not
+move the newer run's card; a newer run created during that attempt is not seen.
 
 Closing a completed run's merge request without merging it is treated as
 "rework needed": on the next poll its card moves from **Human Review** back

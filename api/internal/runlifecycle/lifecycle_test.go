@@ -622,7 +622,7 @@ func TestReconcileWindowCutoffs(t *testing.T) {
 		t.Fatalf("no fast-lane ListPendingColumnMoves call among %+v", fs.pendingArgs)
 	}
 	if !fast.GraceCutoff.Time.Equal(testNow.Add(-15 * time.Second)) {
-		t.Fatalf("grace cutoff = %v, want now-grace", fast.GraceCutoff.Time)
+		t.Fatalf("grace cutoff = %v, want now-15s", fast.GraceCutoff.Time)
 	}
 	if fast.MaxBatch != l.batch {
 		t.Fatalf("batch = %d, want %d", fast.MaxBatch, l.batch)
