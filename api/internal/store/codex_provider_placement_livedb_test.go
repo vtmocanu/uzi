@@ -240,7 +240,20 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
 		t.Fatal(err)
 	}
+	// 00523 Up is the immediate predecessor of 00534: the live head minus 00534's judge clause.
+	if want := strings.Replace(latest, " AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities))", "", 1); restored != want || want == latest {
+		t.Fatal("00523 Up did not restore the exact pre-00534 definition")
+	}
+	// Each later placement migration is replayed in order; the last one must land the live head.
+	for _, stmt := range migrationUpStatements(t, "00534_placement_provider_judge_capability.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
+		t.Fatal(err)
+	}
 	if restored != latest {
-		t.Fatal("00523 Up did not restore exact latest definition")
+		t.Fatal("00534 Up did not restore exact latest definition")
 	}
 }

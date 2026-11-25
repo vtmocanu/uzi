@@ -8,6 +8,11 @@ import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
+import { JudgeRunner } from "../src/judge-runner.js";
+import type { WorkerClient } from "../src/client.js";
+import type { SdkQueryFn } from "../src/sdk-executor.js";
+import type { ClaimResponse, ReviewRequest, StateRequest } from "../src/protocol.js";
+import { nullLogger } from "./helpers.js";
 
 // PRD #4320 module 7 (activation-blocking): does the REAL bundled CLI, run with the provider-mode
 // env uzi builds, send every request (main agent, Task subagent, haiku auxiliary calls) ONLY to the
@@ -296,6 +301,76 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
       }
     });
   }
+
+  // ── Provider judge settlement against the REAL pinned CLI (PRD #4322 M1a, D-H) ─────────────────
+  // The judge settles a gateway limit from the typed `api_error_status` of the raw result frame. This
+  // drives JudgeRunner.execute end to end through the real CLI against a gateway that answers every
+  // /v1/messages with 429, then 529 (the CLI's own retries bounded to 1 by the query wrapper, test-only),
+  // and a status-less control where the gateway drops the connection.
+  async function judgeAgainst(respond: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
+    const gw = new RecordingServer((req, res) => respond(req, res));
+    const { origin } = await gw.listen();
+    const states: StateRequest[] = [];
+    const reviews: ReviewRequest[] = [];
+    const client = {
+      getTrace: async () => ({ target: { id: "t", kind: "issue", status: "completed", issue_title: "x", issue_description: "", branch: null,
+        mr_iid: null, failure_reason: null, fix_verdict: null, plan_md: "", iteration_count: 1, repo_agents: null, stop_kind: null }, messages: [], inputs: [] }),
+      postReview: async (_id: string, review: ReviewRequest) => { reviews.push(review); },
+      reportState: async (_id: string, body: StateRequest) => { states.push(body); return { applied: true, status: body.status } as never; },
+      postMessages: async () => {},
+    } as unknown as WorkerClient;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-judge-it-"));
+    roots.push(root);
+    // The real CLI creates its socket and per-uid runtime directories under TMPDIR; point it inside
+    // root so they are removed with it (the shard's TMPDIR leak guard fails otherwise).
+    const tmp = path.join(root, "tmp");
+    fs.mkdirSync(tmp, { recursive: true });
+    const frames: unknown[] = [];
+    const queryFn = ((params: { prompt: AsyncIterable<unknown>; options: Options }) => {
+      const env = { ...params.options.env, CLAUDE_CODE_MAX_RETRIES: "1", TMPDIR: tmp };
+      return (async function* () {
+        for await (const m of query({ prompt: params.prompt as never, options: { ...params.options, env } })) { frames.push(m); yield m; }
+      })();
+    }) as unknown as SdkQueryFn;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn, homeRoot: root, modelTimeoutMs: 100_000 });
+    const claim = {
+      run_id: "judge-it", kind: "judge", target_run_id: "t", claim_generation: 2, issue_iid: null, issue_title: "j", issue_description: "",
+      repo: {} as never, last_seq: 0, agents: [], judge_model: "sonnet", secrets: { forge_pat: "", anthropic_oauth_token: "", provider: {
+        provider_id: "p", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: `${origin}${GATEWAY_PREFIX}`, auth_style: "bearer",
+        credential: KEY, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } } } },
+    } as unknown as ClaimResponse;
+    try { await runner.execute(claim); } finally { await gw.close(); }
+    const result = frames.find((f) => (f as { type?: string }).type === "result") as Record<string, unknown> | undefined;
+    return { states, reviews, result, seen: gw.seen };
+  }
+
+  for (const status of [429, 529]) {
+    it(`a provider judge against a gateway answering ${status}: failed/provider_gateway_limit, no review, never completed`, { timeout: 180_000 }, async () => {
+      const r = await judgeAgainst((_req, res) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: status === 429 ? "rate_limit_error" : "overloaded_error", message: "slow down" } }));
+      });
+      assert.ok(r.seen.some((s) => s.url.startsWith(`${GATEWAY_PREFIX}/v1/messages`)), "the judge's model call reached the gateway");
+      assert.equal(r.result?.api_error_status, status, `the real CLI surfaces api_error_status ${status} (result: ${JSON.stringify(r.result)?.slice(0, 400)})`);
+      assert.equal(r.reviews.length, 0);
+      assert.equal(r.states.some((s) => s.status === "completed"), false);
+      const last = r.states.at(-1)!;
+      assert.equal(last.status, "failed");
+      assert.equal(last.rate_limit_type, "provider_gateway_limit");
+      assert.equal(last.limit_resets_at, undefined);
+    });
+  }
+
+  it("status-less control: a gateway that drops the connection ends the provider judge failed, no review, never completed", { timeout: 180_000 }, async () => {
+    const r = await judgeAgainst((req) => { req.socket.destroy(); });
+    assert.ok(r.seen.length > 0, "the judge's model call reached the gateway");
+    assert.equal(r.reviews.length, 0);
+    assert.equal(r.states.some((s) => s.status === "completed"), false);
+    const last = r.states.at(-1)!;
+    assert.equal(last.status, "failed");
+    assert.equal(last.rate_limit_type, undefined);
+    assert.ok(!(last.failure_reason ?? "").includes(KEY));
+  });
 
   // ── Redirects ───────────────────────────────────────────────────────────────────────────────
   // ACCEPTED RISK (ADR-4320, 2026-11-19, #4505): the CLI, characterized at SDK 0.3.319 / CLI 2.1.319, FOLLOWS a

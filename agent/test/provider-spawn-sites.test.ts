@@ -397,26 +397,47 @@ function recordingClient(): { client: WorkerClient; states: { id: string; body: 
   return { client, states, calls };
 }
 
-describe("lanes the server refuses reject a provider claim with provider_lane_unsupported", () => {
-  const secrets = { forge_pat: "", anthropic_oauth_token: "", provider: binding() };
-
-  it("judge: reports failed, makes no model call, posts no review", async () => {
-    const { client, states, calls } = recordingClient();
-    let modelCalls = 0;
-    const queryFn = (() => { modelCalls++; return (async function* () { /* none */ })(); }) as unknown as SdkQueryFn;
+describe("JudgeRunner in provider mode (no longer a refused lane)", () => {
+  // Settlement, redaction and failure paths live in judge-runner-provider.test.ts; this pins only that
+  // the judge spawn site routes its model pass through the provider binding like the other sites.
+  it("judge: the model call carries the provider env and mapped model, the review is posted, the key is scrubbed", async () => {
+    const posted: { review?: unknown } = {};
+    const states: { status?: string }[] = [];
+    const client = new Proxy({}, {
+      get: (_t, name: string) => {
+        if (name === "reportState") return async (_id: string, body: { status?: string }) => { states.push(body); return { applied: true, status: body.status }; };
+        if (name === "postReview") return async (_id: string, review: unknown) => { posted.review = review; };
+        if (name === "getTrace") return async () => ({ target: { id: "t", kind: "issue", status: "completed", issue_title: "x", issue_description: "d", branch: null, mr_iid: 7, failure_reason: null, fix_verdict: null, plan_md: "", iteration_count: 1, repo_agents: null, stop_kind: null }, messages: [], inputs: [] });
+        return async () => undefined;
+      },
+    }) as unknown as WorkerClient;
+    const seen: { env?: Record<string, string | undefined>; model?: string }[] = [];
+    const queryFn = ((params: { options: SdkOptions }) => {
+      seen.push({ env: params.options.env, model: params.options.model });
+      return (async function* () {
+        yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ verdict: "ok", summary: `fine ${KEY}`, recommendations: [] }) }] } };
+        yield sessionResult();
+      })();
+    }) as unknown as SdkQueryFn;
     const { logger, added, removed } = secretRecordingLogger();
     await new JudgeRunner(client, logger, { homeRoot: testOwnedPassHomeRoot(), queryFn }).execute({
       run_id: "judge-1", kind: "judge", target_run_id: "t", issue_iid: null, issue_title: "J", issue_description: "", repo: {} as never,
-      secrets: secrets as never, last_seq: 0, agents: [], judge_model: "haiku", claim_generation: 3,
+      secrets: { forge_pat: "", anthropic_oauth_token: "", provider: binding() } as never, last_seq: 0, agents: [], judge_model: "haiku", claim_generation: 3,
     } as unknown as ClaimResponse);
-    assert.equal(modelCalls, 0);
-    assert.ok(!calls.includes("postReview"));
-    const failed = states.find((s) => s.body.status === "failed");
-    assert.ok(failed, "the judge is reported failed");
-    assert.match(failed.body.failure_reason ?? "", /provider_lane_unsupported/);
+    assert.equal(seen.length, 1, "one model call");
+    assertProviderEnv(seen[0]!.env, "judge pass");
+    assert.equal(seen[0]!.model, "haiku", "the alias is passed; the provider env maps it");
+    assert.equal(seen[0]!.env?.ANTHROPIC_DEFAULT_HAIKU_MODEL, "corp-haiku");
+    assert.ok(posted.review, "a review is posted");
+    assert.ok(!JSON.stringify(posted.review).includes(KEY), "the gateway key is scrubbed from the review");
+    assert.equal(states.at(-1)?.status, "completed");
     assert.ok(added.includes(KEY), "the gateway key was registered with the logger");
-    assert.ok(removed.includes(KEY), "and evicted again on the refusal path");
+    assert.ok(removed.includes(KEY), "and evicted again when the judge ended");
   });
+});
+
+describe("lanes the server refuses reject a provider claim with provider_lane_unsupported", () => {
+  const secrets = { forge_pat: "", anthropic_oauth_token: "", provider: binding() };
 
   it("job: fails terminally with the typed reason before any workspace or model work", async () => {
     const { client, states } = recordingClient();

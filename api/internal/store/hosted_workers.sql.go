@@ -551,7 +551,7 @@ WHERE w.id = ANY($1::uuid[])
           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
                       AND r.model_provider_key_mode IS NOT NULL
                       AND NOT (
-                          (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                          (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
                           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
@@ -1052,7 +1052,7 @@ WHERE w.ephemeral
           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
                       AND r.model_provider_key_mode IS NOT NULL
                       AND NOT (
-                          (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                          (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
                           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))

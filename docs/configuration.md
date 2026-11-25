@@ -268,6 +268,30 @@ provider run, which queues ("no worker that supports model providers is online")
 image overrides and Compose or separately run workers yourself, since only the chart's worker image
 pin is bumped by the release helper.
 
+**Provider judges (PRD #4322 M1a).** A Claude judge for an owner whose Claude source is a provider
+runs on that provider and needs a second worker capability, `claude_provider_judge_v1`, on top of
+`claude_provider_v1`. Roll the api first: until a worker advertising both is online, a provider
+judge stays queued and its health reads "no worker that supports provider judges
+(claude_provider_judge_v1) is online". The capability gates the judge's claim, placement, hibernation
+wake and the old-image reap of an ephemeral worker. Consequences to plan for:
+
+- **Bounded reprovision churn.** An ephemeral worker without the capability can be reaped and
+  replaced while its bound provider judge is queued, which repeats until the worker image pin
+  advertises it. Busy workers are never force-rolled.
+- **Queued without expiry.** Old persistent workers (and Compose or separately managed workers on an
+  old image) never claim a provider judge. It can wait indefinitely, still counting against the owner's
+  judge cooldown and daily budget. Update those workers yourself.
+- **Held locks after a lost connection.** The judge is created in a database transaction that holds the
+  owner's secret-mutation lock. If the api loses its connection mid-create, PostgreSQL keeps that
+  transaction's locks until it notices the dead client; no server-side `idle_in_transaction_session_timeout` or
+  PostgreSQL keepalive is configured for this transaction, so the owner's credential writes (token, provider and key changes) can stall in
+  the meantime. Codex pool credential creates already have the same exposure.
+- **Weekly reserve unchanged.** The claim-time weekly-reserve check does not exempt provider-bound runs,
+  so it can apply to a provider judge as it does to an ordinary provider run (tracked as #4658).
+
+A provider judge sends the judged trace to the gateway, including the trace of a vendor-run; see
+[A judge on a model provider](./judge.md#a-judge-on-a-model-provider).
+
 **Codex providers (PRD #4323).** The same allowlist also admits Responses-compatible gateways for
 the Codex engine (engine `codex`, Bearer auth only); put the exact base URL in the list like any
 other. Workers advertise `codex_provider_v1` together with the Codex harness capabilities, and the

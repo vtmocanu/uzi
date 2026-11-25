@@ -23,9 +23,15 @@ const (
 	JudgeSkipNoUsableCredential   = "no_usable_credential" //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCredentialDisabled   = "credential_disabled"  //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCodexPoolUnavailable = "codex_pool_unavailable"
-	// JudgeSkipProviderLaneUnsupported (PRD #4320): the owner's selected source is a model provider,
-	// which the judge lane does not serve yet (PRD #4322).
+	// JudgeSkipProviderLaneUnsupported (PRD #4320, #4322 M1a): recorded only for a Codex judge whose
+	// owner has a Codex model-provider source (not served until PRD #4322 #4574). Historical rows also
+	// exist for a Claude judge, from before a Claude source could bind a judge.
 	JudgeSkipProviderLaneUnsupported = "provider_lane_unsupported"
+	// JudgeSkipProviderSourceUnusable (PRD #4322 M1a): the owner's Claude source is cleared, unusable,
+	// invisible or retired at the judge's locked read.
+	JudgeSkipProviderSourceUnusable = "provider_source_unusable"
+	// JudgeSkipProviderModelUnmapped (PRD #4322 M1a): the judge model has no mapping on the source.
+	JudgeSkipProviderModelUnmapped = "provider_model_unmapped"
 )
 
 // JudgeSkipReasons lists every reason the judge_skips CHECK accepts.
@@ -34,6 +40,8 @@ var JudgeSkipReasons = []string{
 	JudgeSkipCredentialDisabled,
 	JudgeSkipCodexPoolUnavailable,
 	JudgeSkipProviderLaneUnsupported,
+	JudgeSkipProviderSourceUnusable,
+	JudgeSkipProviderModelUnmapped,
 }
 
 // JudgeSkip is the recorded reason the automatic judge of a run was skipped.
@@ -69,12 +77,32 @@ func (s *Service) judgeCreateLacksTx() bool {
 // 23505 duplicate judge) maps to no reason, so nothing is recorded for it.
 func judgeSkipReasonFor(err error) (string, bool) {
 	switch {
+	case errors.Is(err, ErrNoAnthropicToken):
+		// The vendor Claude judge found no default Anthropic token row in its create transaction.
+		return JudgeSkipNoUsableCredential, true
 	case errors.Is(err, ErrHarnessCredentialDisabled):
 		return JudgeSkipCredentialDisabled, true
 	case errors.Is(err, ErrCodexPoolUnavailable):
 		return JudgeSkipCodexPoolUnavailable, true
 	case errors.Is(err, ErrNoCredentialForHarness):
 		return JudgeSkipNoUsableCredential, true
+	default:
+		return "", false
+	}
+}
+
+// judgeProviderSkipReasonFor maps a provider-lane refusal from the judge's create to its skip
+// reason: an unusable (cleared, invisible, retired, keyless) Claude source, a judge model the
+// source does not map, or no provider lane for the judge's harness (a Codex judge with a Codex
+// source). ErrJudgePolicyChanged maps to no reason on purpose.
+func judgeProviderSkipReasonFor(err error) (string, bool) {
+	switch {
+	case errors.Is(err, ErrProviderSourceUnusable):
+		return JudgeSkipProviderSourceUnusable, true
+	case errors.Is(err, ErrProviderModelUnmapped):
+		return JudgeSkipProviderModelUnmapped, true
+	case errors.Is(err, ErrProviderLaneUnsupported):
+		return JudgeSkipProviderLaneUnsupported, true
 	default:
 		return "", false
 	}

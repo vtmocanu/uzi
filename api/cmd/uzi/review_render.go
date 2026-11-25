@@ -186,7 +186,18 @@ func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
 	case "codex_pool_unavailable":
 		why = "no pooled Codex account was available."
 	case "provider_lane_unsupported":
-		why = "the selected source is a model provider, which the judge does not support yet."
+		switch skip.Harness {
+		case "claude":
+			why = "the selected source was a model provider, which the judge did not support at the time."
+		case "codex":
+			why = "the selected Codex source is a model provider, which the Codex judge does not support yet."
+		default:
+			why = "the selected source is a model provider, which the judge does not support yet."
+		}
+	case "provider_source_unusable":
+		why = "the selected model provider could not serve the judge."
+	case "provider_model_unmapped":
+		why = "the model provider did not map the judge's model."
 	default:
 		why = "the judge could not run."
 	}

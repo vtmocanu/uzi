@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/codexselect"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -776,7 +777,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			// A provider binding's re-check and insert need one transaction: fail closed.
 			return store.Run{}, resolvedHarness{}, errProviderCreateRequiresTx
 		}
-		if origin.RefuseProviderOwner && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
+		if (origin.RefuseProviderOwner || origin.JudgeLane) && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
 			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
 		}
 		rq, ok := s.harnessStore()
@@ -788,7 +789,12 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
-		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner)
+		if origin.JudgeLane {
+			if err := s.judgeLaneNonAtomic(ctx, userID, *explicit); err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+		}
+		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
@@ -855,6 +861,32 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			return store.Run{}, resolvedHarness{}, err
 		}
 	}
+	// A judge decides its lane under the shared secret-mutation lock (PRD #4322 M1a): the lock is
+	// taken after the consumer gate and before the policy read, and held to commit, so every writer
+	// of the pin policy and the sources (all exclusive) is ordered before this read or after commit.
+	var judgeDec judgeLaneDecision
+	if origin.JudgeLane {
+		if explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex) {
+			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+		}
+		if err := store.LockSecretMutationShared(ctx, tx, userID); err != nil {
+			return store.Run{}, resolvedHarness{}, fmt.Errorf("judge lane: secret lock: %w", err)
+		}
+		dec, err := decideJudgeLaneFor(ctx, qtx, userID, *explicit)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		judgeDec = dec
+		if s.judgeDecidedHook != nil {
+			s.judgeDecidedHook(ctx)
+		}
+		if dec.Vendor && *explicit == HarnessClaude {
+			if err := requireJudgeAnthropicDefault(ctx, qtx, userID); err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+		}
+	}
+	providerJudge := origin.JudgeLane && !judgeDec.Vendor
 	if inheritedProvider {
 		// A successor of a provider-bound run uses the SOURCE RUN's binding and never consults the
 		// owner's current source (PRD #4320 inheritance).
@@ -872,19 +904,33 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
 	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
-	// A guarded lane (judge, job, cross-check) does the same: the guard above allowed its source snapshot,
-	// and a lane insert stamps no binding, so a second source read here could only see a source
-	// selected in between and then fail the binding assertion as an internal mismatch. The lane
-	// instead orders just before that selection (the source read above holds no secret lock).
-	vendorOnly := inherit != nil || origin.RefuseProviderOwner
+	// A guarded vendor lane (job, cross-check) does the same: the guard above allowed its source
+	// snapshot, and a vendor lane insert stamps no binding, so a second source read here could only
+	// see a source selected in between and then fail the binding assertion as an internal mismatch.
+	// A vendor judge needs vendorOnly for a different reason: its pin policy can choose vendor while
+	// a Claude source IS selected (pinned with a credential), so the resolver must not consult the
+	// source. A provider judge never reaches resolve(): it stamps all five binding columns from the
+	// source frozen under the shared lock (freezeProviderJudge).
+	vendorOnly := inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane
 	resolve := func() (resolvedHarness, error) {
 		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)
 	}
 
 	// Re-read the credential/default facts and resolve D11 INSIDE the transaction that commits.
-	res, err := resolve()
-	if err != nil {
-		return store.Run{}, resolvedHarness{}, err
+	// A provider judge never reaches the vendor resolver (its token checks would refuse an owner
+	// with no vendor credential): it freezes the Claude source directly, under the locks above.
+	var res resolvedHarness
+	if providerJudge {
+		frozen, ferr := s.freezeProviderJudge(ctx, tx, qtx, userID, judgeDec)
+		if ferr != nil {
+			return store.Run{}, resolvedHarness{}, ferr
+		}
+		res = resolvedHarness{Harness: HarnessClaude, ClaudeSourceSet: true, ProviderSource: &frozen}
+	} else {
+		res, err = resolve()
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
 	}
 
 	policy, err := qtx.GetHarnessCreationPolicy(ctx, userID)
@@ -946,7 +992,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		pick = *decisionPick
 	}
 
-	if res.ProviderSource != nil {
+	if res.ProviderSource != nil && !providerJudge {
 		// Freeze: secret-mutation lock (shared) THEN the provider row's share lock, then re-read and
 		// re-validate, so a rotation, edit, retire or URL change commits either before this read or
 		// after this transaction. Replaces the pre-lock source with what is committed now.
@@ -1096,6 +1142,10 @@ func (s *Service) verifyRunBinding(ctx context.Context, q *store.Queries, run st
 	if run.Harness != res.ProviderSource.Engine || run.AnthropicSecretID.Valid || run.CodexSecretID.Valid || run.CodexAuthMode.Valid || run.CredentialOverrideSecretID.Valid {
 		return errProviderBindingMismatch
 	}
+	if run.Kind == runkind.Judge {
+		// A judge runs one model, not a lead plus templates: validate it strictly (PRD #4322 M1a).
+		return s.checkProviderJudgeModel(ctx, q, run, *res.ProviderSource)
+	}
 	return s.checkProviderModels(ctx, q, run, *res.ProviderSource)
 }
 
@@ -1118,6 +1168,149 @@ func (s *Service) refuseProviderLane(ctx context.Context, q providerLaneSourceRe
 		return ErrProviderLaneUnsupported
 	}
 	return nil
+}
+
+// judgeLanePolicyReader reads the judge's creation policy in one owner snapshot.
+type judgeLanePolicyReader interface {
+	GetUserJudgeLanePolicy(context.Context, uuid.UUID) (store.GetUserJudgeLanePolicyRow, error)
+}
+
+// judgeLanePolicy is the one read of the judge's authoritative creation decision (PRD #4322 M1a):
+// the judge pin policy and both lane sources in a single statement. It is meant to run in the
+// create transaction under the shared secret-mutation lock, and every caller goes through it so the
+// store's caller pin for GetUserJudgeLanePolicy names exactly this file.
+func judgeLanePolicy(ctx context.Context, q judgeLanePolicyReader, userID uuid.UUID) (store.GetUserJudgeLanePolicyRow, error) {
+	return q.GetUserJudgeLanePolicy(ctx, userID)
+}
+
+// ErrJudgePolicyChanged: a provider judge's policy (its Claude source or its pin policy) read under
+// the shared secret-mutation lock differs from the one its decision used. Every writer of those
+// inputs holds the exclusive lock, so this is defence in depth against a lock-bypassing commit.
+// The create is refused with no vendor fallback; the automatic path logs and records no skip, the
+// manual path answers 409 judge_policy_changed.
+var ErrJudgePolicyChanged = errors.New("judge_policy_changed")
+
+// judgeLaneDecision is the judge's creation decision over one policy read (PRD #4322 M1a).
+type judgeLaneDecision struct {
+	// Vendor is true when the judge resolves vendor credentials only; false is the provider branch
+	// (a Claude judge bound to the owner's Claude source).
+	Vendor bool
+	// Policy is the read the decision was taken over, kept to compare against the locked re-read.
+	Policy store.GetUserJudgeLanePolicyRow
+}
+
+// decideJudgeLane is the pure judge lane decision:
+//   - Codex judge: a Codex source refuses (ErrProviderLaneUnsupported, until #4574); else vendor.
+//   - Claude judge: pinned to a credential (mode 'pinned' with a non-NULL secret, as judgeChoice
+//     reads it) is vendor despite any source; otherwise no Claude source is vendor, and a Claude
+//     source is the provider branch.
+//
+// A harness other than Claude or Codex is ErrProviderLaneUnsupported.
+func decideJudgeLane(h Harness, p store.GetUserJudgeLanePolicyRow) (judgeLaneDecision, error) {
+	switch h {
+	case HarnessCodex:
+		if p.CodexProviderID.Valid {
+			return judgeLaneDecision{}, ErrProviderLaneUnsupported
+		}
+		return judgeLaneDecision{Vendor: true, Policy: p}, nil
+	case HarnessClaude:
+		pinned := p.JudgeAnthropicBindMode == BindModePinned && p.JudgeAnthropicSecretID.Valid
+		return judgeLaneDecision{Vendor: pinned || !p.ClaudeProviderID.Valid, Policy: p}, nil
+	default:
+		return judgeLaneDecision{}, ErrProviderLaneUnsupported
+	}
+}
+
+// decideJudgeLaneFor reads the policy through judgeLanePolicy and decides. Callers in the create
+// transaction hold the shared secret-mutation lock; the no-transaction and fake-store branches
+// have none and refuse the provider branch (errProviderCreateRequiresTx) before it freezes anything.
+func decideJudgeLaneFor(ctx context.Context, q judgeLanePolicyReader, userID uuid.UUID, h Harness) (judgeLaneDecision, error) {
+	if h != HarnessClaude && h != HarnessCodex {
+		return judgeLaneDecision{}, ErrProviderLaneUnsupported
+	}
+	p, err := judgeLanePolicy(ctx, q, userID)
+	if err != nil {
+		return judgeLaneDecision{}, err
+	}
+	return decideJudgeLane(h, p)
+}
+
+// judgeTokenReader is the default-credential presence read of the vendor Claude judge branch.
+type judgeTokenReader interface {
+	GetUserSecretCiphertext(context.Context, store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error)
+}
+
+// requireJudgeAnthropicDefault is the vendor Claude judge's presence check: the owner has a default
+// Anthropic token row (an enabled or disabled one; the resolver classifies that). No row is
+// ErrNoAnthropicToken, which rolls the create back so the automatic path can record its
+// no_usable_credential skip afterwards and the manual path can answer 422.
+func requireJudgeAnthropicDefault(ctx context.Context, q judgeTokenReader, userID uuid.UUID) error {
+	if _, err := q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{UserID: userID, Kind: store.KindAnthropicToken}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNoAnthropicToken
+		}
+		return err
+	}
+	return nil
+}
+
+// judgePolicyDrift compares a provider judge's frozen source and a locked re-read of its pin policy
+// with its decision. Precedence: the frozen provider id first, then the pin policy.
+func judgePolicyDrift(dec judgeLaneDecision, frozen uuid.UUID, now store.GetUserJudgeLanePolicyRow) error {
+	if !dec.Policy.ClaudeProviderID.Valid || uuid.UUID(dec.Policy.ClaudeProviderID.Bytes) != frozen {
+		return ErrJudgePolicyChanged
+	}
+	if now.JudgeAnthropicBindMode != dec.Policy.JudgeAnthropicBindMode || now.JudgeAnthropicSecretID != dec.Policy.JudgeAnthropicSecretID {
+		return ErrJudgePolicyChanged
+	}
+	return nil
+}
+
+// judgeLaneNonAtomic is the judge decision for the creation paths that have no transaction (no
+// beginner wired, or the in-memory fake store), so no secret-mutation lock: a vendor decision
+// proceeds (with the vendor Claude judge's default-token presence check), and the provider branch
+// fails closed with errProviderCreateRequiresTx since it cannot freeze under the lock.
+func (s *Service) judgeLaneNonAtomic(ctx context.Context, userID uuid.UUID, h Harness) error {
+	pr, ok := s.q.(judgeLanePolicyReader)
+	if !ok {
+		return errHarnessStoreUnavailable
+	}
+	dec, err := decideJudgeLaneFor(ctx, pr, userID, h)
+	if err != nil {
+		return err
+	}
+	if !dec.Vendor {
+		return errProviderCreateRequiresTx
+	}
+	if h == HarnessClaude {
+		tr, ok := s.q.(judgeTokenReader)
+		if !ok {
+			return errHarnessStoreUnavailable
+		}
+		return requireJudgeAnthropicDefault(ctx, tr, userID)
+	}
+	return nil
+}
+
+// freezeProviderJudge freezes a provider judge's source under the shared secret-mutation lock the
+// caller already holds: freezeProviderSource takes the provider row's share lock and re-reads, so a
+// cleared, unusable, invisible or retired source is ErrProviderSourceUnusable (typed where the freeze
+// returns one). Only then is the frozen provider compared with the decision's, and the pin policy
+// re-read and compared (ErrJudgePolicyChanged), in that precedence. It never touches the vendor
+// credential resolver.
+func (s *Service) freezeProviderJudge(ctx context.Context, tx store.DBTX, qtx *store.Queries, userID uuid.UUID, dec judgeLaneDecision) (providerSource, error) {
+	frozen, err := s.freezeProviderSource(ctx, tx, qtx, userID, HarnessClaude)
+	if err != nil {
+		return providerSource{}, err
+	}
+	now, err := judgeLanePolicy(ctx, qtx, userID)
+	if err != nil {
+		return providerSource{}, err
+	}
+	if err := judgePolicyDrift(dec, frozen.ProviderID, now); err != nil {
+		return providerSource{}, err
+	}
+	return frozen, nil
 }
 
 // createInheritedProviderRun creates a successor of a provider-bound run (mr_rework, task child,

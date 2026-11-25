@@ -436,6 +436,31 @@ func (q *Queries) GetSharedModelProviderAdmin(ctx context.Context, id uuid.UUID)
 	return i, err
 }
 
+const getUserJudgeLanePolicy = `-- name: GetUserJudgeLanePolicy :one
+SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id, claude_provider_id, codex_provider_id FROM users WHERE id = $1
+`
+
+type GetUserJudgeLanePolicyRow struct {
+	JudgeAnthropicBindMode string      `json:"judge_anthropic_bind_mode"`
+	JudgeAnthropicSecretID pgtype.UUID `json:"judge_anthropic_secret_id"`
+	ClaudeProviderID       pgtype.UUID `json:"claude_provider_id"`
+	CodexProviderID        pgtype.UUID `json:"codex_provider_id"`
+}
+
+// The judge's authoritative creation decision (PRD #4322 M1a): the pin policy and both lane sources in
+// one statement, read under the shared secret-mutation lock so every writer of these four columns is excluded.
+func (q *Queries) GetUserJudgeLanePolicy(ctx context.Context, id uuid.UUID) (GetUserJudgeLanePolicyRow, error) {
+	row := q.db.QueryRow(ctx, getUserJudgeLanePolicy, id)
+	var i GetUserJudgeLanePolicyRow
+	err := row.Scan(
+		&i.JudgeAnthropicBindMode,
+		&i.JudgeAnthropicSecretID,
+		&i.ClaudeProviderID,
+		&i.CodexProviderID,
+	)
+	return i, err
+}
+
 const getUserProviderLaneSources = `-- name: GetUserProviderLaneSources :one
 SELECT claude_provider_id, codex_provider_id FROM users WHERE id = $1
 `

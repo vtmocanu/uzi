@@ -264,7 +264,12 @@ const (
 	// is pinned separately from the app tier. Maps to the SAME healthWaitingWorker enum
 	// (runs.health_reason is free text).
 	reasonNoProviderCapableWorker = "no worker that supports model providers is online"
-	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
+	// reasonNoProviderJudgeCapableWorker (PRD #4322 M1a) replaces it for a provider-bound Claude
+	// JUDGE: such a judge needs claude_provider_judge_v1 on top of claude_provider_v1 (the claim
+	// clause counted by CountOnlineWorkersSatisfyingProvider with Kind), so a fleet that only
+	// supports ordinary provider runs still leaves the judge queued, and this names why.
+	reasonNoProviderJudgeCapableWorker = "no worker that supports provider judges (claude_provider_judge_v1) is online"
+	reasonNoCurrentCodexRuntime        = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -1728,10 +1733,13 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// provider protocol intersection. Keep this ahead of the priority re-label.
 	// Read errors fall through, as with the other capability rungs.
 	if r.ModelProviderKeyMode.Valid {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: r.UserID, Engine: r.Harness})
+		c, cerr := s.q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: r.UserID, Engine: r.Harness, Kind: r.Kind})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying provider", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
+			if r.Kind == runkind.Judge && r.Harness == harnessClaude {
+				return reasonNoProviderJudgeCapableWorker
+			}
 			return reasonNoProviderCapableWorker
 		}
 	}

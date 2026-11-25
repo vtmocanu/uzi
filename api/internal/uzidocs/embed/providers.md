@@ -164,13 +164,27 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
 - **Automatic harness choice and overflow skip Claude** while a provider is your source: unknown
   usage is never compared with vendor readings, and your run never moves to another engine's
   credential.
-- **Lanes that cannot use a provider refuse.** The judge, jobs and cross-check lanes refuse an
+- **The judge runs on your provider.** A Claude judge for an owner whose Claude source is set runs
+  on that provider, frozen when the judge is created, with your provider key and no Anthropic token.
+  It never falls back to a vendor token. The one exception is a judge whose token you pinned to a
+  specific Anthropic token in Run defaults, which stays a vendor judge. It needs `opus` (the built-in
+  judge model) or your chosen judge model in the provider's map; otherwise the judge is skipped as
+  `provider_model_unmapped`, and a source that cannot serve it is skipped as `provider_source_unusable`
+  (**Run judge** refuses with the same typed 409). Details, failure behavior and data destinations:
+  [A judge on a model provider](./judge.md#a-judge-on-a-model-provider). Before PRD #4322 M1a, this
+  lane refused every owner whose Claude source was set with `provider_lane_unsupported`, so older
+  runs can still show that skip.
+- **Other lanes that cannot use a provider refuse.** The jobs and cross-check lanes refuse an
   owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
-  that use an Anthropic token. The refused judge is a visible skip on the run ("the selected
-  source is a model provider, which the judge does not support yet"). A plan cross-check whose
+  that use an Anthropic token. A plan cross-check whose
   checker would be refused sends the plan to the human plan gate instead; for a Codex lead that
   means a Codex lead with plan cross-check, owned by someone with a Claude source, waits for you
   to approve the plan. The isolated research lane refuses provider runs.
+- **Where judged traces go.** A provider judge sends the judged run's trace to your gateway, including
+  the trace of a run that used an Anthropic token. A pinned vendor judge sends a provider run's trace to
+  Anthropic. Because the Claude CLI follows gateway redirects (the warning above), judged trace bodies
+  can reach redirect destinations under either auth style, and the key can reach other paths on the
+  same host, or other hosts with `x_api_key`. Bearer is recommended.
 - **Models.** Every model the run uses (the lead, each agent template, summaries and advice
   passes) must be in the provider's model map. An unmapped alias or a full Anthropic model id is
   refused with `provider_model_unmapped`; uzi never swaps it for another model.
@@ -195,7 +209,8 @@ If the gateway keeps answering 429 or overloaded on an **issue run**, the run pa
 1 minute later, then 5, then 15, then waits for you to Resume (see
 [the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit)). A **chat** turn that
 hits a gateway limit ends with an error naming `provider_gateway_limit`; ask again in a moment.
-It does not park or retry.
+It does not park or retry. A provider **judge** that hits one ends failed with a fixed gateway-limit
+reason; it never parks or waits ([details](./judge.md#a-judge-on-a-model-provider)).
 
 ### Usage and cost
 
@@ -271,9 +286,11 @@ Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit
 
 ### What a Codex provider run does not do
 
-- **Judge.** A Codex judge is skipped for an owner with a provider source (a Claude or a Codex
-  source), with the visible skip "the selected source is a model provider, which the judge does
-  not support yet." A Claude judge follows your Claude source as described above.
+- **Judge.** A Codex judge is skipped for an owner whose **Codex** source is a provider, with the
+  visible skip "the selected Codex source is a model provider, which the Codex judge does not
+  support yet." An owner with only a Claude source gets a Codex judge on the vendor Codex
+  credential, ignoring the Claude source. A Claude judge follows your Claude source as described
+  above.
 - **Cross-check.** Plan and code cross-check refuse when either side would be bound to a Codex
   provider, with `provider_lane_unsupported`. For the plan stage this means a human plan gate: a
   Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker

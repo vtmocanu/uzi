@@ -1533,7 +1533,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- requires its engine's provider protocol capability: an older worker would ignore the
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
       AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(@worker_protocol_caps::text[])))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(@worker_protocol_caps::text[])))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
@@ -1837,7 +1837,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
                 -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
                 AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(p.protocol_capabilities)))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
@@ -12029,7 +12029,7 @@ WHERE run.id = @run_id
   AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL
-           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
            OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
@@ -12369,7 +12369,7 @@ WHERE w.user_id = @user_id
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND (
-    (@engine::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+    (@engine::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (@kind::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
     OR (@engine::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
@@ -12858,7 +12858,7 @@ WHERE r.status = 'queued'
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
@@ -12974,7 +12974,7 @@ WHERE r.status = 'queued'
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
