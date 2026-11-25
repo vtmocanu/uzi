@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,36 @@ func TestNetworkClassExcluded(t *testing.T) {
 				t.Fatalf("class = %q, want other", got)
 			}
 		})
+	}
+}
+
+// TestNetworkClassExclusionsBeatAllowlist pins each exclusion arm: every excluded
+// cause is joined with an allowlisted ECONNRESET, so removing (or reordering) an
+// exclusion turns that row into network and fails it.
+func TestNetworkClassExclusionsBeatAllowlist(t *testing.T) {
+	reset := syscall.ECONNRESET
+	for name, cause := range map[string]error{
+		"canceled":         context.Canceled,
+		"cert verify":      &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}},
+		"unknown ca":       x509.UnknownAuthorityError{},
+		"hostname":         x509.HostnameError{Certificate: &x509.Certificate{}, Host: "x"},
+		"invalid cert":     x509.CertificateInvalidError{Reason: x509.Expired},
+		"record header":    tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"},
+		"addr error":       &net.AddrError{Err: "missing port in address", Addr: "x"},
+		"parse error":      &net.ParseError{Type: "IP address", Text: "x"},
+		"dns nxdomain":     &net.DNSError{Err: "no such host", Name: "x", IsNotFound: true},
+		"dns without flag": &net.DNSError{Err: "odd", Name: "x"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := dialOpError(errors.Join(cause, reset))
+			if got := Class(newRedactor().error(err)); got != ErrorClassOther {
+				t.Fatalf("class = %q, want other (exclusion must win over ECONNRESET)", got)
+			}
+		})
+	}
+	// Control: the same join without an excluded cause is network.
+	if got := Class(newRedactor().error(dialOpError(errors.Join(errors.New("x"), reset)))); got != ErrorClassNetwork {
+		t.Fatalf("control class = %q, want network", got)
 	}
 }
 

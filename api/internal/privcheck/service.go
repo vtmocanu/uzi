@@ -287,7 +287,7 @@ func (r GuardResult) TransientForgeCause() (forge.ErrorClass, bool) {
 //
 // The result also carries ForgeRetryClass, the scrubbed class of a forge read
 // failure behind the block (VerifyToken or DefaultBranchProtection error, or a
-// GitHub ruleset read failure), cleared when ctx is done. It never changes the
+// GitHub ruleset read failure), cleared when ctx is done or the class is other. It never changes the
 // findings or the verdict; GuardResult.TransientForgeCause exposes it to callers
 // that may retry. A client-build failure carries no class.
 //
