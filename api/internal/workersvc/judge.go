@@ -248,9 +248,9 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 	return scanCommandNotFoundScrubbed(rows, nil)
 }
 
-// scanCommandNotFoundScrubbed is scanCommandNotFound with an optional evidence scrub (a
-// provider-bound judge, PRD #4322 M1a) applied to each candidate's command and evidence BEFORE
-// the judgeEvidenceMaxLen clip. nil keeps vendor-mode evidence byte-identical.
+// scanCommandNotFoundScrubbed is scanCommandNotFound with an optional row-text scrub (a
+// provider-bound judge, PRD #4322 M1a) applied to each whole tool_result payload BEFORE the
+// scan budget cut, the pattern match and the evidence clip. nil keeps vendor mode byte-identical.
 func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func(string) string) []missCandidate {
 	invoked := invokedExecutables(rows)
 	pinned := goRunPinnedTools(rows)
@@ -276,6 +276,12 @@ func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func
 			break
 		}
 		text := string(row.Payload)
+		if scrub != nil {
+			// Scrub the WHOLE row first: before the budget cut and the pattern match, either of
+			// which could split a key (the match stops at `/` or `%`) into pieces the scrub no
+			// longer recognises. Command identity stays raw-derived for the suppression lookups.
+			text = scrub(text)
+		}
 		if scanned+len(text) > judgeScanByteBudget {
 			text = text[:judgeScanByteBudget-scanned]
 		}
@@ -324,14 +330,10 @@ func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func
 			}
 			seen[cmd] = true
 			evidence = strings.TrimSpace(evidence)
-			command := cmd
-			if scrub != nil {
-				evidence, command = scrub(evidence), scrub(cmd)
-			}
 			if len(evidence) > judgeEvidenceMaxLen {
 				evidence = evidence[:judgeEvidenceMaxLen]
 			}
-			out = append(out, missCandidate{Command: command, Evidence: evidence, Seq: row.Seq})
+			out = append(out, missCandidate{Command: cmd, Evidence: evidence, Seq: row.Seq})
 		})
 	}
 	return out

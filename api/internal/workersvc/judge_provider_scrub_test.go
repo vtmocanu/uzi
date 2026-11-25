@@ -40,30 +40,52 @@ func TestProviderKeyFormsGoMatchesWorker(t *testing.T) {
 	}
 }
 
-// TestScanCommandNotFoundScrubsProviderKeyBeforeClip: a long provider key run as a command
-// makes the evidence match longer than judgeEvidenceMaxLen, so the clip cuts the key. The
-// provider scrub must run before the clip, so no partial prefix reaches the worker, whose
-// exact-form redactor could no longer match it (PRD #4322 M1a landing review). Without a
-// scrub the evidence is unchanged.
-func TestScanCommandNotFoundScrubsProviderKeyBeforeClip(t *testing.T) {
-	key := "gwk-" + strings.Repeat("A1b2", 60) // 244 chars, all command-token characters
-	rows := rawResultRows(`{"text":"bash: ` + key + `: command not found"}`)
-
-	plain := scanCommandNotFound(rows)
-	if len(plain) != 1 || !strings.Contains(plain[0].Evidence, key[:40]) || strings.Contains(plain[0].Evidence, key) {
-		t.Fatalf("fixture must leave a cut key in the unscrubbed evidence; got %+v", plain)
+// TestScanCommandNotFoundScrubsProviderKeyBeforeMatch: a provider judge's key must never reach a
+// miss candidate, even partially (PRD #4322 M1a landing review). Three transformations can cut a
+// key before an evidence-level scrub sees it whole: the 200-byte evidence clip, the pattern match
+// (its token class stops at `/` and `%`), and the 512 KiB scan-budget cut (the zsh form ends in
+// the token). The scrub therefore runs on each whole row first. A plain `jq` miss in the same
+// row is the control: the scan still finds real gaps. Without a scrub nothing changes.
+func TestScanCommandNotFoundScrubsProviderKeyBeforeMatch(t *testing.T) {
+	long := "gwk-" + strings.Repeat("A1b2", 60)    // 244 command-token chars: the clip cuts it
+	slashed := "gwp/" + strings.Repeat("C3d4", 10) // the exec form basenames it to a key suffix
+	zshAt := judgeScanByteBudget - 20              // the budget cut lands 20 bytes into the key
+	cases := []struct {
+		name, key, payload string
+	}{
+		{"evidence clip", long, `{"text":"bash: jq: command not found\nbash: ` + long + `: command not found"}`},
+		{"command token is a key suffix", slashed, `{"text":"bash: jq: command not found\nexec: \"` + slashed + `\": executable file not found in $PATH"}`},
+		{"scan budget cut", long, func() string {
+			head := `{"text":"bash: jq: command not found\n`
+			lead := " zsh: command not found: "
+			return head + strings.Repeat(" ", zshAt-len(head)-len(lead)) + lead + long + `"}`
+		}()},
 	}
-
-	got := scanCommandNotFoundScrubbed(rows, judgeProviderScrub(key))
-	if len(got) != 1 {
-		t.Fatalf("want one candidate, got %+v", got)
-	}
-	for _, s := range []string{got[0].Evidence, got[0].Command} {
-		if strings.Contains(s, key[:12]) {
-			t.Errorf("a key prefix survived: %q", s)
-		}
-	}
-	if got[0].Evidence != judgeProviderRedacted+": command not found" {
-		t.Errorf("the key must be replaced by the marker before the clip: %q", got[0].Evidence)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := rawResultRows(tc.payload)
+			leaked := func(ms []missCandidate) bool {
+				for _, m := range ms {
+					for _, s := range []string{m.Command, m.Evidence} {
+						for i := 0; i+12 <= len(tc.key); i++ {
+							if len(s) >= 12 && strings.Contains(s, tc.key[i:i+12]) {
+								return true
+							}
+						}
+					}
+				}
+				return false
+			}
+			if !leaked(scanCommandNotFound(rows)) {
+				t.Fatal("fixture must leak key material without a scrub")
+			}
+			got := scanCommandNotFoundScrubbed(rows, judgeProviderScrub(tc.key))
+			if leaked(got) {
+				t.Fatalf("key material reached a candidate: %+v", got)
+			}
+			if len(got) != 1 || got[0].Command != "jq" {
+				t.Fatalf("want only the jq control candidate, got %+v", got)
+			}
+		})
 	}
 }
