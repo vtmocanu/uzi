@@ -140,7 +140,15 @@ type Engine struct {
 
 	// warner receives each written reading for the weekly-limit warning (PRD #4123 M3); nil by default.
 	warner WeeklyWarner
+
+	// history receives each accepted reading for the raw usage-limit history (issue #4692);
+	// nil by default.
+	history HistoryRecorder
 }
+
+// SetHistory wires the usage-history recorder (issue #4692). Call once at startup, before
+// the engine runs. A nil recorder (the default) records nothing.
+func (e *Engine) SetHistory(h HistoryRecorder) { e.history = h }
 
 // SetWeeklyWarner wires the weekly-limit warning collaborator. Call once at startup, before the
 // engine runs.
@@ -403,8 +411,11 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 
 	reading, err := e.client.Usage(ctx, token)
 	if err == nil {
-		e.observe(ctx, userID, secretID, rev, notifyEarly, reading)
+		written, params := e.observe(ctx, userID, secretID, rev, notifyEarly, reading)
 		e.clearBackoff(secretID)
+		if written {
+			e.copyHistory(ctx, params)
+		}
 		return
 	}
 
@@ -429,8 +440,11 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 	}
 	preading, perr := e.client.ProbeHeaders(ctx, token)
 	if perr == nil {
-		e.observe(ctx, userID, secretID, rev, notifyEarly, preading)
+		written, params := e.observe(ctx, userID, secretID, rev, notifyEarly, preading)
 		e.clearBackoff(secretID)
+		if written {
+			e.copyHistory(ctx, params)
+		}
 		return
 	}
 	var probeErr *anthropic.Error
@@ -489,28 +503,28 @@ const earlyResetThreshold = 8 * time.Hour
 // poll started at (PRD #1732 D13): a prev from an earlier revision is no basis, and
 // a write the fence refused (the token was disabled, or disabled and re-enabled,
 // while the poll was in flight) notifies nothing.
-func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev int64, notifyEarly bool, next anthropic.Reading) {
-	if !notifyEarly {
-		// Opt-out (or the default): upsert as today, no read, no early-reset fire. Only the
-		// weekly-limit warning depends on the write result.
-		if written, syncedAt, err := e.upsert(ctx, userID, secretID, rev, next); err == nil && written {
-			e.observeWeekly(ctx, userID, secretID, rev, next, syncedAt)
+func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev int64, notifyEarly bool, next anthropic.Reading) (bool, store.UpsertRateLimitsParams) {
+	// Opt-out (or the default): upsert as today, no read, no early-reset fire. Only the
+	// weekly-limit warning depends on the write result.
+	var (
+		fire     bool
+		expected time.Time
+		now      time.Time
+	)
+	if notifyEarly {
+		// Read prev BEFORE the upsert overwrites it. A missing row (ErrNoRows) or a read
+		// failure means no comparison basis → no fire, but the write still proceeds.
+		prev, err := e.store.GetRateLimitsForToken(ctx, store.GetRateLimitsForTokenParams{
+			UserSecretID: secretID, EnablementRev: rev,
+		})
+		hasPrev := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			e.logger.Error("usage poller: read prior gauge for early-reset", "secret", secretID.String(), "error", err)
 		}
-		return
-	}
 
-	// Read prev BEFORE the upsert overwrites it. A missing row (ErrNoRows) or a read
-	// failure means no comparison basis → no fire, but the write still proceeds.
-	prev, err := e.store.GetRateLimitsForToken(ctx, store.GetRateLimitsForTokenParams{
-		UserSecretID: secretID, EnablementRev: rev,
-	})
-	hasPrev := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		e.logger.Error("usage poller: read prior gauge for early-reset", "secret", secretID.String(), "error", err)
+		now = e.now().UTC()
+		fire, expected = earlyResetFires(prev, hasPrev, next, now)
 	}
-
-	now := e.now().UTC()
-	fire, expected := earlyResetFires(prev, hasPrev, next, now)
 
 	// Upsert FIRST, always, then notify (D7: never notify before the write lands).
 	// SC5: a failed write leaves prev at the OLD epoch, so the moved-epoch edge is not
@@ -520,15 +534,21 @@ func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev in
 	// (0 rows) is silent for the stronger reason: the credential was disabled, or
 	// moved to a new revision, after this poll started, so the reading is not its
 	// owner's current state and must alert nothing.
-	written, syncedAt, err := e.upsert(ctx, userID, secretID, rev, next)
+	written, params, err := e.upsertParams(ctx, userID, secretID, rev, next)
 	if err != nil || !written {
-		return
+		return false, params
 	}
-	e.observeWeekly(ctx, userID, secretID, rev, next, syncedAt)
+	e.observeWeekly(ctx, userID, secretID, rev, next, params.SyncedAt.Time)
 
-	if !fire {
-		return
+	if notifyEarly && fire {
+		e.fireEarlyReset(ctx, userID, secretID, rev, expected, now)
 	}
+	return true, params
+}
+
+// fireEarlyReset delivers the early-reset alert for a written reading. Failure is logged,
+// never fatal.
+func (e *Engine) fireEarlyReset(ctx context.Context, userID, secretID uuid.UUID, rev int64, expected, now time.Time) {
 	if e.notifier == nil {
 		// Detection ran but delivery is disabled (the default; unit tests without a
 		// notifier). Log so the edge is not entirely invisible.
@@ -604,6 +624,17 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 // wrote as synced_at, truncated to microseconds (the column's precision), so a downstream
 // consumer (PRD #4123 M3) compares against the persisted value; zero when not written.
 func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, time.Time, error) {
+	written, params, err := e.upsertParams(ctx, userID, secretID, rev, r)
+	if err != nil || !written {
+		return false, time.Time{}, err
+	}
+	return true, params.SyncedAt.Time, nil
+}
+
+// upsertParams is upsert's body: it also returns the exact parameters it passed to
+// UpsertRateLimits, so the caller can copy the accepted reading into the usage history
+// (issue #4692) fenced against precisely what was written.
+func (e *Engine) upsertParams(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, store.UpsertRateLimitsParams, error) {
 	// An account without a 5-hour window (r.FiveHour nil) stores NULL pct + reset,
 	// never a fabricated 0%.
 	var fhPct pgtype.Int2
@@ -613,7 +644,7 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int
 		fhReset = r.FiveHour.ResetsAt
 	}
 	syncedAt := e.now().UTC().Truncate(time.Microsecond)
-	n, err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	params := store.UpsertRateLimitsParams{
 		UserSecretID:     secretID,
 		UserID:           userID,
 		FiveHourPct:      fhPct,
@@ -623,16 +654,17 @@ func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int
 		Source:           pgconv.Text(r.Source),
 		SyncedAt:         pgconv.Time(syncedAt),
 		EnablementRev:    rev,
-	})
+	}
+	n, err := e.store.UpsertRateLimits(ctx, params)
 	if err != nil {
 		// The token id is safe to log — it is a row identifier, never the credential.
 		e.logger.Error("usage poller: upsert", "user", userID.String(), "secret", secretID.String(), "error", err)
-		return false, time.Time{}, err
+		return false, params, err
 	}
 	if n == 0 {
-		return false, time.Time{}, nil
+		return false, params, nil
 	}
-	return true, syncedAt, nil
+	return true, params, nil
 }
 
 // The backoff map is keyed by SECRET id since M5 (it was user id under PRD #53's

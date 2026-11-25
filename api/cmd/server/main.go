@@ -124,6 +124,13 @@ var (
 	_ codexusagepoller.WeeklyWarner = (*weeklywarn.Warner)(nil)
 )
 
+// Both pollers copy each accepted reading into the raw usage-limit history (issue #4692); a
+// signature drift must be a build error, not a silently unwired history.
+var (
+	_ usagepoller.HistoryRecorder      = (*store.Queries)(nil)
+	_ codexusagepoller.HistoryRecorder = (*store.Queries)(nil)
+)
+
 // codexProviderRequestTimeout bounds nonrotating identity and usage reads in the
 // production codexauth.Client (PRD #1171 M1).
 const codexProviderRequestTimeout = 2500 * time.Millisecond
@@ -1473,6 +1480,7 @@ func run() error {
 		usageEngine = usagepoller.New(q, secretopen.NewOpener(vlt, box), anthropicClient, cfg.UsagePollInterval, cfg.UsageProbe, slog.Default())
 		usageEngine.SetNotifier(notifier) // PRD #1020 M2: deliver the loud early-reset DM
 		usageEngine.SetWeeklyWarner(weeklyWarner)
+		usageEngine.SetHistory(q)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
@@ -1503,6 +1511,7 @@ func run() error {
 		codexUsageEngine = codexusagepoller.New(q, wsvc, codexReconciler, cfg.CodexUsagePollInterval, slog.Default())
 		codexUsageEngine.SetNotifier(notifier)
 		codexUsageEngine.SetWeeklyWarner(weeklyWarner)
+		codexUsageEngine.SetHistory(q)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
