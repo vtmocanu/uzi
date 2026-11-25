@@ -16,10 +16,6 @@ import (
 // that is hijacked out of the pool for good, so a lock or a session setting can never leak into
 // pooled use. The pattern mirrors workersvc/checkpoint_retention.go's try-lock and proven unlock.
 
-// workerCapacitySampleCloseTimeout bounds the connection close on its own context: a caller's
-// context may already be expired when a session has to be abandoned.
-const workerCapacitySampleCloseTimeout = time.Second
-
 // Settings applied once per session. Server-side idle and connection-check timers end a session
 // whose client vanished, so its advisory lock cannot outlive a lost process for long.
 const (
@@ -38,8 +34,12 @@ type WorkerCapacitySampleSession struct {
 // applies the session settings (statement and lock timeouts in milliseconds) and tries the
 // session advisory lock. It returns (nil, false, nil) when another session holds the lock, and
 // an error when the setup or the try failed; in both non-acquired cases the connection is
-// closed, so an unknown lock result never survives.
+// closed, so an unknown lock result never survives. Either timeout under one millisecond is
+// refused before anything is acquired: it would render as "0", which disables the server timer.
 func OpenWorkerCapacitySampleSession(ctx context.Context, pool *pgxpool.Pool, statementTimeout, lockTimeout time.Duration) (*WorkerCapacitySampleSession, bool, error) {
+	if statementTimeout < time.Millisecond || lockTimeout < time.Millisecond {
+		return nil, false, fmt.Errorf("worker capacity samples: statement timeout %v and lock timeout %v must each be at least 1ms", statementTimeout, lockTimeout)
+	}
 	pc, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, false, fmt.Errorf("worker capacity samples: acquire connection: %w", err)
@@ -51,17 +51,17 @@ func OpenWorkerCapacitySampleSession(ctx context.Context, pool *pgxpool.Pool, st
 		     || set_config('idle_session_timeout', $3, false) || set_config('client_connection_check_interval', $4, false)`,
 		strconv.FormatInt(statementTimeout.Milliseconds(), 10), strconv.FormatInt(lockTimeout.Milliseconds(), 10),
 		workerCapacitySampleIdleSessionTimeoutMS, workerCapacitySampleConnCheckIntervalMS).Scan(&set); err != nil {
-		closeWorkerCapacitySampleConn(conn)
+		closeWorkerCapacitySampleConn(ctx, conn)
 		return nil, false, fmt.Errorf("worker capacity samples: session setup: %w", err)
 	}
 	var got bool
 	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1, 0)", WorkerCapacitySampleLockClass).Scan(&got); err != nil {
 		// Unknown whether the session now holds the lock: end the session.
-		closeWorkerCapacitySampleConn(conn)
+		closeWorkerCapacitySampleConn(ctx, conn)
 		return nil, false, fmt.Errorf("worker capacity samples: try lock: %w", err)
 	}
 	if !got {
-		closeWorkerCapacitySampleConn(conn)
+		closeWorkerCapacitySampleConn(ctx, conn)
 		return nil, false, nil
 	}
 	return &WorkerCapacitySampleSession{conn: conn, q: New(conn)}, true, nil
@@ -105,14 +105,14 @@ func (s *WorkerCapacitySampleSession) Close(ctx context.Context) (unlocked bool,
 			unlocked = true
 		}
 	}
-	closeWorkerCapacitySampleConn(conn)
+	closeWorkerCapacitySampleConn(ctx, conn)
 	return unlocked, err
 }
 
-// closeWorkerCapacitySampleConn closes a hijacked connection on its own bounded context, which
-// ends the session and releases any session advisory lock it holds.
-func closeWorkerCapacitySampleConn(conn *pgx.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), workerCapacitySampleCloseTimeout)
-	defer cancel()
+// closeWorkerCapacitySampleConn closes a hijacked connection under the caller's ctx, so the close
+// counts against the caller's deadline. pgconn.PgConn.Close closes the socket (a deferred
+// net.Conn.Close) even when ctx is already expired; the ctx only bounds the Terminate message
+// flush. Closing the socket ends the session and releases any session advisory lock it holds.
+func closeWorkerCapacitySampleConn(ctx context.Context, conn *pgx.Conn) {
 	_ = conn.Close(ctx)
 }

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -787,8 +789,8 @@ func TestWorkerCapacitySampleFailedInsertRetryLiveDB(t *testing.T) {
 	}
 }
 
-// A batch that committed but whose reply was lost (connection closed before the result was used)
-// is not repeated by the next session.
+// A batch that committed but whose session then vanished abruptly (the socket is closed with no
+// unlock round trip and the batch result is never used) is not repeated by the next session.
 func TestWorkerCapacitySampleLostReplyLiveDB(t *testing.T) {
 	f := newWcsFx(t)
 	owner := f.user()
@@ -797,21 +799,186 @@ func TestWorkerCapacitySampleLostReplyLiveDB(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		ws = append(ws, f.worker(owner, wcsWorkerOpts{heartbeat: &hb}))
 	}
-	s := f.session(10*time.Second, 5*time.Second)
-	if _, err := s.SampleBatch(f.ctx, wcsParams(wcsAt(0), 10)); err != nil {
+	p := f.probePool(t)
+	s, got, err := store.OpenWorkerCapacitySampleSession(f.ctx, p.pool, 10*time.Second, 5*time.Second)
+	if err != nil || !got {
+		t.Fatalf("open session: got=%v err=%v", got, err)
+	}
+	t.Cleanup(func() { _, _ = s.Close(context.Background()) })
+	if _, err := s.SampleBatch(f.ctx, wcsParams(wcsAt(0), 10)); err != nil { // the result is discarded unused
 		t.Fatal(err)
 	}
-	if _, err := s.Close(f.ctx); err != nil { // the result above is discarded unused
-		t.Fatal(err)
-	}
+	p.killClient(t) // no Close, no unlock
+	// a separate session sees the committed rows
 	for _, w := range ws {
 		if got := f.count(`SELECT count(*) FROM worker_capacity_samples WHERE worker_id=$1`, w); got != 1 {
 			t.Fatalf("committed batch left %d rows for %s", got, w)
 		}
 	}
+	f.waitLockFree(t)
 	if row := f.tick(0, 10); row.Inserted != 0 {
 		t.Errorf("the next session inserted %d rows for already-sampled workers", row.Inserted)
 	}
+	for _, w := range ws {
+		if got := f.count(`SELECT count(*) FROM worker_capacity_samples WHERE worker_id=$1`, w); got != 1 {
+			t.Errorf("worker %s has %d samples after the next session, want 1", w, got)
+		}
+	}
+}
+
+// wcsProbe is a pool of its own whose sessions carry a unique application_name and whose client
+// sockets the test can reach: it lets a test see a leaked session and end one abruptly. Only one
+// dial is allowed, so a client-side cancel request (a second dial) cannot reach the server.
+type wcsProbe struct {
+	pool       *pgxpool.Pool
+	tag        string
+	mu         sync.Mutex
+	conns      []net.Conn
+	lastSQL    string
+	afterSetup func() // runs when the session-settings statement has just completed
+}
+
+func (p *wcsProbe) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	p.mu.Lock()
+	p.lastSQL = d.SQL
+	p.mu.Unlock()
+	return ctx
+}
+
+func (p *wcsProbe) TraceQueryEnd(_ context.Context, _ *pgx.Conn, _ pgx.TraceQueryEndData) {
+	p.mu.Lock()
+	hook, isSetup := p.afterSetup, strings.Contains(p.lastSQL, "set_config")
+	p.mu.Unlock()
+	if hook != nil && isSetup {
+		hook()
+	}
+}
+
+func (f *wcsFx) probePool(t *testing.T) *wcsProbe {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(f.pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &wcsProbe{tag: "wcs-probe-" + uuid.NewString()}
+	cfg.MaxConns = 2
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["application_name"] = p.tag
+	cfg.ConnConfig.Tracer = p
+	d := &net.Dialer{}
+	cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if len(p.conns) > 0 {
+			return nil, errors.New("probe pool: only one dial is allowed")
+		}
+		c, err := d.DialContext(ctx, network, addr)
+		if err == nil {
+			p.conns = append(p.conns, c)
+		}
+		return c, err
+	}
+	pool, err := pgxpool.NewWithConfig(f.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	p.pool = pool
+	return p
+}
+
+// killClient closes the probe session's client socket with no Terminate and no cancel request.
+func (p *wcsProbe) killClient(t *testing.T) {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.conns) != 1 {
+		t.Fatalf("probe pool dialed %d connections, want 1", len(p.conns))
+	}
+	_ = p.conns[0].Close()
+}
+
+// waitNoSessions polls, within 1.5s, until no backend carries the probe's application_name.
+func (f *wcsFx) waitNoSessions(t *testing.T, tag string) {
+	t.Helper()
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for {
+		n := f.count(`SELECT count(*) FROM pg_stat_activity WHERE application_name = $1`, tag)
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d session(s) tagged %s still open 1.5s after they were abandoned", n, tag)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// The try-lock round trip fails with the connection still open (the context expires between the
+// setup statement and the try): the session must be closed, not leaked, even though the caller's
+// context is already expired. The idle-session backstop (5s) is longer than the bound here.
+func TestWorkerCapacitySampleTryLockErrorClosesConnLiveDB(t *testing.T) {
+	f := newWcsFx(t)
+	p := f.probePool(t)
+	ctx, cancel := context.WithCancel(f.ctx)
+	defer cancel()
+	p.mu.Lock()
+	p.afterSetup = cancel
+	p.mu.Unlock()
+	s, got, err := store.OpenWorkerCapacitySampleSession(ctx, p.pool, time.Second, time.Second)
+	if s != nil || got || err == nil || !strings.Contains(err.Error(), "try lock") {
+		t.Fatalf("open: session=%v got=%v err=%v, want nil/false and a try-lock error", s, got, err)
+	}
+	p.pool.Close()
+	f.waitNoSessions(t, p.tag)
+	f.waitLockFree(t)
+}
+
+// A client that vanishes while its statement is blocked on a row lock is noticed by the server's
+// connection check, which frees the advisory lock long before the 10s statement and lock timeouts.
+func TestWorkerCapacitySampleClientVanishedMidStatementLiveDB(t *testing.T) {
+	f := newWcsFx(t)
+	owner := f.user()
+	hb := wcsAt(0)
+	f.worker(owner, wcsWorkerOpts{heartbeat: &hb})
+	blocker, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(f.ctx) }()
+	if _, err := blocker.Exec(f.ctx, `SELECT 1 FROM users WHERE id=$1 FOR UPDATE`, owner); err != nil {
+		t.Fatal(err)
+	}
+	p := f.probePool(t)
+	s, got, err := store.OpenWorkerCapacitySampleSession(f.ctx, p.pool, 10*time.Second, 10*time.Second)
+	if err != nil || !got {
+		t.Fatalf("open session: got=%v err=%v", got, err)
+	}
+	t.Cleanup(func() { _, _ = s.Close(context.Background()) })
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.SampleBatch(f.ctx, wcsParams(wcsAt(0), 10))
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for f.count(`SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'`, p.tag) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the batch never blocked on the row lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.killClient(t)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a batch on a killed connection returned no error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the batch did not return after its connection was closed")
+	}
+	f.waitLockFree(t)
 }
 
 // The session lock: exclusion, proven unlock, an unknown try result closes the connection, and a
@@ -837,6 +1004,14 @@ func TestWorkerCapacitySampleSessionLockLiveDB(t *testing.T) {
 	if _, err := third.Close(f.ctx); err != nil {
 		t.Fatal(err)
 	}
+
+	// a timeout under 1ms would render as "0" and disable the server timer: refused before acquiring
+	for _, c := range [][2]time.Duration{{0, time.Second}, {time.Second, 0}, {999 * time.Microsecond, time.Second}, {time.Second, time.Microsecond}} {
+		if s, got, err := store.OpenWorkerCapacitySampleSession(f.ctx, f.pool, c[0], c[1]); err == nil || got || s != nil {
+			t.Fatalf("open with timeouts %v: session=%v got=%v err=%v, want a refusal", c, s, got, err)
+		}
+	}
+	f.waitLockFree(t)
 
 	// the context expires somewhere inside open: every outcome must leave the lock free
 	for _, d := range []time.Duration{time.Nanosecond, 20 * time.Microsecond, 100 * time.Microsecond, 400 * time.Microsecond, 2 * time.Millisecond} {
@@ -881,10 +1056,12 @@ func TestWorkerCapacitySampleSessionLockLiveDB(t *testing.T) {
 	f.waitLockFree(t)
 }
 
-// waitLockFree polls, boundedly, until a fresh session acquires and releases the lock.
+// waitLockFree polls, within 1.5s (well under the 5s idle-session and 10s statement backstops, so
+// only the client-side close or the connection check can have freed the lock), until a fresh
+// session acquires and releases the lock.
 func (f *wcsFx) waitLockFree(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(1500 * time.Millisecond)
 	for {
 		s, got, err := store.OpenWorkerCapacitySampleSession(f.ctx, f.pool, time.Second, time.Second)
 		if err == nil && got {
@@ -894,7 +1071,7 @@ func (f *wcsFx) waitLockFree(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("lock not reacquirable within 10s (got=%v err=%v)", got, err)
+			t.Fatalf("lock not reacquirable within 1.5s (got=%v err=%v)", got, err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -924,15 +1101,7 @@ func TestWorkerCapacitySampleRunsProbeUsesIndexLiveDB(t *testing.T) {
 	}
 	stmt := strings.TrimSpace(string(m[1]))
 	f.exec(`ANALYZE`)
-	tx, err := f.pool.Begin(f.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(f.ctx) }()
-	if _, err := tx.Exec(f.ctx, `SET LOCAL enable_seqscan = off`); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := tx.Query(f.ctx, "EXPLAIN (COSTS OFF) "+stmt, pgtype.Timestamptz{}, pgtype.Interval{Microseconds: 1, Valid: true}, int32(10))
+	rows, err := f.pool.Query(f.ctx, "EXPLAIN (COSTS OFF) "+stmt, pgtype.Timestamptz{}, pgtype.Interval{Microseconds: 1, Valid: true}, int32(10))
 	if err != nil {
 		t.Fatal(err)
 	}
