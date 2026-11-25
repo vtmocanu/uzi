@@ -1,9 +1,9 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
 
--- PRD #4416 M2: composes on 00523_codex_runtime_v3.sql: fn_placement_admitting_workers keeps every 00523 clause
--- (the engine-aware Codex provider clause and the codex_runtime_v3 requirement) and gains the run_env_v1 claim clause.
--- Down restores the 00523 Up definition.
+-- PRD #4416 M2: composes on 00534_placement_provider_judge_capability.sql: fn_placement_admitting_workers keeps
+-- 00534's judge-capability clause, the Codex provider clauses and every check, and gains the run_env_v1 claim clause.
+-- Down restores the 00534 Up definition.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -58,7 +58,7 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
                  -- Provider-bound placement requires the capability for the run's engine.
                  AND (r.model_provider_key_mode IS NULL
-                      OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                      OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
                       OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
                  -- requires its harness's phase-models capability. ClaimRun enforces the same clause;
@@ -120,7 +120,7 @@ $$;
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 
--- Restore the exact 00523 Up function.
+-- Restore the exact 00534 Up function (its judge-capability clause, the Codex provider clauses and every check).
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -171,7 +171,7 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
                  -- Provider-bound placement requires the capability for the run's engine.
                  AND (r.model_provider_key_mode IS NULL
-                      OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                      OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
                       OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  -- PRD #3252/#3253: a Claude or Codex lead-lane run with an owner planning value
                  -- requires its harness's phase-models capability. ClaimRun enforces the same clause;

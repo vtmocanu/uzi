@@ -149,7 +149,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
 	// The fixtures need the head schema (model_providers columns added after 00523), so the database
 	// is migrated to the head; the test then steps the placement function back to its
-	// 00523_codex_runtime_v3 definition by applying the later run-env placement Down.
+	// 00523_codex_runtime_v3 definition: the 00537 Down first (back to 00534), then the 00523 Down.
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
@@ -169,15 +169,27 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	const definition = `SELECT pg_get_functiondef('fn_placement_admitting_workers(runs,text,timestamptz,timestamptz,interval,boolean,text[])'::regprocedure)`
-	for _, stmt := range migrationDownStatements(t, "00533_run_env_placement.sql") {
+	// head is the live definition, read before any Down is applied.
+	var head string
+	if err := tx.QueryRow(ctx, definition).Scan(&head); err != nil {
+		t.Fatal(err)
+	}
+	// latest is the 00534 definition: the head definition minus the run-env block.
+	latest, changed := stripRunEnvBlock(head)
+	if !changed {
+		t.Fatal("head definition carries no run_env_v1 block")
+	}
+	for _, stmt := range migrationDownStatements(t, "00537_run_env_placement.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// latest is the 00523_codex_runtime_v3 definition: the head definition minus the run-env clause.
-	var latest string
-	if err := tx.QueryRow(ctx, definition).Scan(&latest); err != nil {
+	var afterRunEnvDown string
+	if err := tx.QueryRow(ctx, definition).Scan(&afterRunEnvDown); err != nil {
 		t.Fatal(err)
+	}
+	if afterRunEnvDown == head || afterRunEnvDown != latest {
+		t.Fatal("00537 Down did not restore exactly the 00534 definition")
 	}
 	for _, stmt := range migrationDownStatements(t, "00523_codex_runtime_v3.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
@@ -249,7 +261,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
 		t.Fatal(err)
 	}
-	// 00523 Up is the immediate predecessor of 00534: the live head minus 00534's judge clause.
+	// 00523 Up is the immediate predecessor of 00534: the 00534 definition minus its judge clause.
 	if want := strings.Replace(latest, " AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities))", "", 1); restored != want || want == latest {
 		t.Fatal("00523 Up did not restore the exact pre-00534 definition")
 	}
@@ -265,4 +277,33 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if restored != latest {
 		t.Fatal("00534 Up did not restore exact latest definition")
 	}
+	for _, stmt := range migrationUpStatements(t, "00537_run_env_placement.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored != head {
+		t.Fatal("00537 Up did not restore the exact live head definition")
+	}
+}
+
+// stripRunEnvBlock removes the run_env_v1 claim clause and the comment lines directly above it from a
+// function definition, and reports whether it removed anything.
+func stripRunEnvBlock(def string) (string, bool) {
+	var out []string
+	changed := false
+	for _, line := range strings.Split(def, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "AND ('run_env_v1' = ANY(") {
+			changed = true
+			for len(out) > 0 && strings.HasPrefix(strings.TrimSpace(out[len(out)-1]), "--") {
+				out = out[:len(out)-1]
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n"), changed
 }
