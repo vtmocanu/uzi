@@ -490,19 +490,21 @@ const earlyResetThreshold = 8 * time.Hour
 // (PctResetFloor 5 / PctResetCeil 1, PRD #1114 D5/D8) are single-sourced in usagereserve,
 // next to the arm predicate the weekly usage reserve shares.
 
-// observe writes the fresh reading and, when the owner opted in, fires the early
-// 7-day reset alert (PRD #1020 M2). It wraps EVERY upsert path — tick and poke —
-// on purpose: the upsert advances the stored prev to the new reset boundary, so an
-// upsert that skipped detection would silently consume the moved-epoch edge and
-// lose the alert forever.
+// observe writes the fresh reading with ONE fenced upsert and, when the owner opted in, fires
+// the early 7-day reset alert (PRD #1020 M2). It wraps EVERY upsert path (tick, poke and the
+// probe fallback) on purpose: the upsert advances the stored prev to the new reset boundary,
+// so an upsert that skipped detection would silently consume the moved-epoch edge and lose the
+// alert forever.
 //
-// Ordering is at-most-once (D7): read prev, decide, upsert next FIRST, then notify.
-// A notify error is logged, not fatal, and never before the write.
+// Ordering is at-most-once (D7): read prev (opt-in only), decide, upsert next FIRST, then
+// notify. A notify error is logged, not fatal, and never before the write.
 //
-// Both the prev read and the write are pinned to rev, the enablement revision the
-// poll started at (PRD #1732 D13): a prev from an earlier revision is no basis, and
-// a write the fence refused (the token was disabled, or disabled and re-enabled,
-// while the poll was in flight) notifies nothing.
+// Both the prev read and the write are pinned to rev, the enablement revision the poll
+// started at (PRD #1732 D13): a prev from an earlier revision is no basis. The returned
+// written is true only when the fenced upsert accepted the reading; a failed write or one the
+// fence refused (the token was disabled, or disabled and re-enabled, while the poll was in
+// flight) returns false. written gates the weekly warning, the early-reset notification and the
+// caller's usage-history copy (issue #4692), so an unwritten reading triggers none of them.
 func (e *Engine) observe(ctx context.Context, userID, secretID uuid.UUID, rev int64, notifyEarly bool, next anthropic.Reading) (bool, store.UpsertRateLimitsParams) {
 	// Opt-out (or the default): upsert as today, no read, no early-reset fire. Only the
 	// weekly-limit warning depends on the write result.

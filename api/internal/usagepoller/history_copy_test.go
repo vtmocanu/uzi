@@ -184,6 +184,56 @@ func TestHistoryCopyAfterProbeFallback(t *testing.T) {
 	}
 }
 
+// On the probe-fallback path the copy also runs after the backoff was cleared.
+func TestHistoryCopyAfterProbeFallbackOrdering(t *testing.T) {
+	u := uuid.New()
+	st := newFakeStore(u)
+	var e *Engine
+	cl := &fakeClient{
+		usage: func([]byte) (anthropic.Reading, error) { return anthropic.Reading{}, httpErr(429) },
+		probe: func([]byte) (anthropic.Reading, error) {
+			e.setBackoff(u) // armed during the poll; must be cleared before the copy
+			return reading(5, 6, anthropic.SourceHeaderProbe), nil
+		},
+	}
+	e, _ = newEngine(t, st, &fakeOpener{}, cl, true)
+	backoffAtCopy := true
+	h := &recordingHistory{n: 1, onCall: func(context.Context) { backoffAtCopy = e.inBackoff(u) }}
+	e.SetHistory(h)
+	e.tickAll(context.Background())
+	if h.calls() != 1 {
+		t.Fatalf("copies = %d, want 1", h.calls())
+	}
+	if backoffAtCopy {
+		t.Fatal("the probe-path copy ran before the backoff was cleared")
+	}
+}
+
+// On the probe-fallback path a write the fence refused never reaches the recorder.
+func TestHistoryCopyProbeFallbackFenceRefused(t *testing.T) {
+	u := uuid.New()
+	st := newFakeStore(u)
+	cl := &fakeClient{
+		usage: func([]byte) (anthropic.Reading, error) { return anthropic.Reading{}, httpErr(429) },
+		probe: func([]byte) (anthropic.Reading, error) {
+			st.mu.Lock()
+			st.rev[u] = 9 // the credential moved on during the probe
+			st.mu.Unlock()
+			return reading(5, 6, anthropic.SourceHeaderProbe), nil
+		},
+	}
+	e, _ := newEngine(t, st, &fakeOpener{}, cl, true)
+	h := &recordingHistory{n: 1}
+	e.SetHistory(h)
+	e.tickAll(context.Background())
+	if h.calls() != 0 {
+		t.Fatalf("recorder called %d times for a fence-refused probe write, want 0", h.calls())
+	}
+	if _, ok := st.got(u); ok {
+		t.Fatal("the gauge was written; the case did not exercise a refused write")
+	}
+}
+
 // The recorder receives the exact accepted write, field for field.
 func TestHistoryCopyParamsMatchTheAcceptedWrite(t *testing.T) {
 	fiveReset := time.Date(2026, 7, 15, 17, 0, 0, 0, time.UTC)

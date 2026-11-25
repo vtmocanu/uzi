@@ -234,15 +234,18 @@ func paramsEqual(a, b store.CopyCodexUsageSampleParams) bool {
 
 // A refused write (no row) never reaches the recorder; neither does a failed collection.
 func TestHistoryCopyOnlyWhenWritten(t *testing.T) {
-	for _, tc := range []string{"fence refused", "collection failed"} {
+	for _, tc := range []string{"fence refused", "collection failed", "store error"} {
 		t.Run(tc, func(t *testing.T) {
 			userID, acct := uuid.New(), uuid.New()
 			st := newFakeStore()
 			st.toPoll = []store.ListLinkedCodexAccountsToPollRow{linkedRow(userID, acct, 2, 5, "idle", false, false)}
 			res := collectResult{reading: sampleReading(2, 5)}
-			if tc == "fence refused" {
+			switch tc {
+			case "fence refused":
 				st.upsertRows = 0
-			} else {
+			case "store error":
+				st.upsertErr = errors.New("db down")
+			default:
 				res = collectResult{err: errors.New("provider down")}
 			}
 			col := &fakeCollector{results: map[uuid.UUID]collectResult{acct: res}}

@@ -288,8 +288,6 @@ func TestAnthropicUsageCopyFencesLiveDB(t *testing.T) {
 
 func TestAnthropicUsageCopyAdmissionWindowLiveDB(t *testing.T) {
 	ctx, pool, q, user := rateLimitEnablementDB(t)
-	sec := enablementToken(ctx, t, q, user, "window", true)
-	rev := tokenRev(ctx, t, q, user, sec)
 	// dbNow is the database clock, microsecond precision.
 	dbNow := func(offset string) time.Time {
 		var ts time.Time
@@ -309,6 +307,10 @@ func TestAnthropicUsageCopyAdmissionWindowLiveDB(t *testing.T) {
 		{"just inside now()+15min", "14 minutes 50 seconds", 1},
 		{"above now()+15min", "16 minutes", 0},
 	} {
+		// A fresh token per case: a shared token would let the same-bucket ON CONFLICT turn an
+		// expected-0 case green even with an admission guard removed.
+		sec := enablementToken(ctx, t, q, user, "window-"+uuid.NewString(), false)
+		rev := tokenRev(ctx, t, q, user, sec)
 		p := anthGauge(ctx, t, q, user, sec, rev, dbNow(tc.offset), nil)
 		if n := copyAnth(ctx, t, q, p); n != tc.want {
 			t.Errorf("%s: copy = %d rows, want %d", tc.name, n, tc.want)
@@ -699,6 +701,7 @@ func TestCodexUsagePayloadPolicyLiveDB(t *testing.T) {
 		{"reset_at huge", `[{"id":"a","primary":{"reset_at":1e30}}]`, 0},
 		{"reset_after negative", `[{"id":"a","secondary":{"reset_after_seconds":-5}}]`, 0},
 		{"reset_after a string", `[{"id":"a","secondary":{"reset_after_seconds":"5"}}]`, 0},
+		{"reset_after fractional", `[{"id":"a","secondary":{"reset_after_seconds":1.5}}]`, 0},
 		{"reset_after huge", `[{"id":"a","secondary":{"reset_after_seconds":1e30}}]`, 0},
 		// Rejected: the projection exceeds 4 KiB.
 		{"17 buckets with 99-byte ids and full windows (normalizer maximum)", many(17, 99, fullWindow), 0},

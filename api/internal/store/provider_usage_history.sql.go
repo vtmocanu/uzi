@@ -30,7 +30,7 @@ WHERE g.user_secret_id = $1::uuid
   AND g.enablement_rev = $3::bigint
   AND g.synced_at = $4::timestamptz
   AND g.source = $5::text
-  AND g.source <> 'limit_report'
+  AND g.source IN ('usage_endpoint', 'header_probe')
   AND g.five_hour_pct IS NOT DISTINCT FROM $6::smallint
   AND g.five_hour_resets_at IS NOT DISTINCT FROM $7::timestamptz
   AND g.seven_day_pct = $8::smallint

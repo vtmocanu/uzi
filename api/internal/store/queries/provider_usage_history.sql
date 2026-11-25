@@ -34,7 +34,7 @@ WHERE g.user_secret_id = @user_secret_id::uuid
   AND g.enablement_rev = @enablement_rev::bigint
   AND g.synced_at = sqlc.narg(synced_at)::timestamptz
   AND g.source = sqlc.narg(source)::text
-  AND g.source <> 'limit_report'
+  AND g.source IN ('usage_endpoint', 'header_probe')
   AND g.five_hour_pct IS NOT DISTINCT FROM sqlc.narg(five_hour_pct)::smallint
   AND g.five_hour_resets_at IS NOT DISTINCT FROM sqlc.narg(five_hour_resets_at)::timestamptz
   AND g.seven_day_pct = sqlc.narg(seven_day_pct)::smallint
