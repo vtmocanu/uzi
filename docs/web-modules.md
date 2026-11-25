@@ -8,7 +8,7 @@ audience: operator
 
 A **module** is a separately built and deployed web feature that appears inside uzi as a native page: it gets uzi's shell, router, theme and session, a sidebar entry, a command-menu entry and a route at `/m/<id>`. You enable modules in deployment configuration (the Helm chart or the compose generator); no web image rebuild is needed. This page is for operators. To build a module, see [web-modules-dev.md](./web-modules-dev.md). Design rationale: `prds/done/4686-runtime-web-modules.md`.
 
-With no modules configured, uzi looks and behaves as before. The only added request is one small, no-cache `GET /modules.json` (a `[]` file).
+With no modules configured, uzi looks and behaves as before. The host fetches one small, no-cache `GET /modules.json` (a `[]` file) and never loads the federation runtime. One local measurement of a cold `/dashboard` load counted about 37 KB more JavaScript and two more requests than before the feature; that was a single noisy run, not a guarantee.
 
 ## Trust model
 
@@ -38,9 +38,9 @@ Each entry has these fields.
 
 In the chart only, a dotless `HOST` (a Service name such as `example-module`) expands to `<host>.<release namespace>.svc.cluster.local`. The compose generator does not expand: Docker resolves a service name as it is.
 
-A bad list never deploys: the chart fails the render, and the generator exits 1 and writes nothing, with a message naming `modules[<index>]` and the field. Unknown input fields are ignored and never published.
+A bad list never deploys: the chart fails the render, and the generator exits non-zero and writes nothing; a per-entry error names `modules[<index>]` and the field. Unknown input fields are ignored and never published.
 
-The browser re-validates `/modules.json` because the file can be hand-edited: it skips an entry with an invalid id, a missing required field, a bad label, icon or `adminOnly`, or a duplicate id (the first valid entry wins), and maps an unknown `navGroup` to `modules`. Each skip logs one `console.error` naming the entry. A file that is not a JSON array means no modules.
+The browser re-validates `/modules.json` because the file can be hand-edited: it skips an entry with an invalid id, a missing required field, a bad label, icon or `adminOnly`, a `label`, `version` or `page` containing control or invisible characters, or a duplicate id (the first valid entry wins), and maps an unknown `navGroup` to `modules`. Each skip logs one `console.error` naming the entry. A file that is not a JSON array means no modules.
 
 ## Enable modules with the Helm chart
 
@@ -77,7 +77,7 @@ The compose stack takes the same list through a generator and an override file.
    scripts/web-modules-gen.py deploy/compose/web-modules.example.json .web-modules
    ```
 
-   The output directory gets `locations.conf` (one proxy location per module) and `modules.json` (the public list). `UZI_WEB_MODULES_DIR` picks another directory (default `./.web-modules`).
+   The output directory gets `locations.conf` (one proxy location per module) and `modules.json` (the public list). The override bind-mounts `${UZI_WEB_MODULES_DIR:-./.web-modules}`; if you set `UZI_WEB_MODULES_DIR`, pass that same directory to the generator. The directory must exist before `up` (the mount does not create it), and its files must be world-readable.
 3. Start the stack with the override and recreate `web`:
 
    ```sh
@@ -95,7 +95,7 @@ Generator rules. There is no lock and no crash-recovery protocol, and the genera
 
 **The bind-mounted window.** The directory is bind-mounted, so a running web container serves a new `modules.json` as soon as the generator renames it into place, while its nginx keeps the old locations until the container is recreated. A module you just added therefore shows its error card, and a removed module still proxies, until you recreate `web`. nginx reads the two files only at start, so a container that is never recreated never changes its routes.
 
-The generator exits 0 when written, 1 on invalid input (nothing written), 2 on a usage, input-read or output failure. `scripts/web-modules-gen.py --help` has the full text.
+The generator exits 0 when written, 1 on invalid input (nothing written), 2 on a usage, input-read (including malformed JSON) or output failure. `scripts/web-modules-gen.py --help` has the full text.
 
 ## What nginx does on module paths
 
@@ -118,7 +118,7 @@ Every module gets one `location ^~ /modules/<id>/` proxying to its upstream with
 
 ## What is not contained
 
-The host contains these failures to the module's own page: a load failure (network error, HTTP error, timeout, missing expose), an error thrown while rendering, and a refusal (contract or shared-version mismatch). It does not contain:
+The host contains these failures to the module's own page: a load failure (network error, HTTP error, timeout), an error thrown while rendering, and a refusal (contract or shared-version mismatch). It does not contain:
 
 - A module's JavaScript. It is not sandboxed and can call any API as the signed-in user.
 - Errors in a module's own async code outside React rendering. They surface as console errors and unhandled rejections.
@@ -131,7 +131,7 @@ Admins see the module id, its `version` and the reason in the error card; other 
 
 | What you see | Meaning and fix |
 |---|---|
-| "Module unavailable", "This module could not be loaded", **Retry** | A transient failure before the module ever loaded in this tab: its server is down or unreachable, or it did not answer within 15 seconds. Check the module's Deployment or container and the 502 below, then Retry. Retry reloads without a page reload. |
+| "Module unavailable", "This module could not be loaded", **Retry** | A transient failure before the module ever loaded in this tab: its server is down or unreachable, or it did not answer within 15 seconds. Check the module's Deployment or container and the 502 below, then Retry. Retry loads the module again without a page reload. |
 | "Module unavailable", "This module was updated while you had the page open", **Reload page** | After the module loaded, one of its files was replaced (a rollout) and the tab asked for an old file. Reload the page. During a mixed rollout a reload can still reach the old version; once the rollout completes it reaches the new one. Module authors can keep the previous build's hashed files to avoid this. |
 | "Module unavailable", "This module is not compatible with this version of uzi", no action | The module targets a different host contract major, was built against an incompatible React, react-dom or react-router-dom version, or does not expose the configured `page`. Retry cannot help: rebuild the module for this uzi version. Admins see which. |
 | "Module unavailable", "This module hit an error and stopped", **Retry** | The module threw while rendering. Retry remounts the page. |
@@ -141,5 +141,5 @@ Admins see the module id, its `version` and the reason in the error card; other 
 | A newly added module shows its error card on compose | You have not recreated `web` since the generator ran. |
 | A nav entry shows but the page fails | The entry stays visible when a module fails to load so uzi does not fetch every module up front; the page explains the failure. |
 | `helm template` / `helm upgrade` fails naming `web.modules[N]` | An invalid list or a missing resolver; see the chart render failures above. |
-| The generator exits 1 | An invalid list; the message names `modules[N]` and the field. Nothing was written. Fix the input and rerun. |
+| The generator exits 1 or 2 | 1: an invalid list (a per-entry error names `modules[N]` and the field). 2: a usage error, unreadable or malformed JSON input, or an output failure. Nothing was written on invalid input. Fix the cause and rerun. |
 | Nothing changes after editing the list | A list change takes effect on the next document load, and on compose only after `web` is recreated. |

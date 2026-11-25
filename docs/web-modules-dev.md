@@ -12,7 +12,7 @@ A module is a React app built as a Module Federation **remote**. It exposes one 
 
 ## The reference build
 
-`web/examples/ui-module/` is the reference module. It is a test and acceptance fixture only: it ships in no uzi image and no workflow publishes it. Copy its `vite.config.ts` (the file comments say what a module must do). It has no `package.json` of its own: it resolves dependencies from `web/node_modules`, so a real module repo adds its own.
+`web/examples/ui-module/` is the reference module. It is a test and acceptance fixture only: it ships in no uzi image and no workflow publishes it. Use its `vite.config.ts` as a guide (the file comments say what a module must do), not as a drop-in file: it builds several test variants, reads `web/package.json` by relative path and imports the plugin from `web/scripts/`. In your own repo, vendor `web/scripts/vite-mf-no-new-function.mjs` and `web/scripts/csp-build-scan.mjs` alongside `sdk.ts`, take `requiredVersion` from the uzi release you target, and drop the variant switches and test-only defines. It has no `package.json` of its own: it resolves dependencies from `web/node_modules`, so a real module repo adds its own.
 
 What a module build must set:
 
