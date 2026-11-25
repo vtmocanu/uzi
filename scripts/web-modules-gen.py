@@ -11,7 +11,7 @@ the SAME rules as the Helm chart (deploy/chart/templates/_web-modules.tpl) and s
 fixtures (scripts/fixtures/web-modules/); the one difference is that a dotless host is NOT
 expanded to a cluster-local name, because compose resolves a service name as it is.
 
-Every module is validated before anything is written. An invalid list exits 1 with a message
+Every module is validated before anything is written. An invalid list (including text that cannot be encoded as UTF-8) exits 1 with a message
 naming modules[<index>] and the field, and writes nothing (the output directory is not even
 created). On success <outdir> is created or chmod-ed 0755 and gets, in this order:
 
@@ -238,11 +238,11 @@ def render_json(mods):
     return json.dumps(pub, indent=2, ensure_ascii=False) + "\n"
 
 
-def write_atomic(outdir, name, text):
+def write_atomic(outdir, name, data):
     fd, tmp = tempfile.mkstemp(prefix="." + name + ".", suffix=".tmp", dir=outdir)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.chmod(tmp, 0o644)
         os.replace(tmp, os.path.join(outdir, name))
     except BaseException:
@@ -271,8 +271,14 @@ def main(argv):
     except Invalid as e:
         sys.stderr.write("web-modules-gen: %s\n" % e)
         return 1
-    locations = render_locations(mods)
-    public = render_json(mods)
+    # Encode both outputs strictly BEFORE the output directory is touched: a lone surrogate in a
+    # label passes validate() but cannot be encoded, and that is invalid input, not a crash.
+    try:
+        locations = render_locations(mods).encode("utf-8")
+        public = render_json(mods).encode("utf-8")
+    except UnicodeEncodeError as e:
+        sys.stderr.write("web-modules-gen: a field is not valid UTF-8 text (a lone surrogate?): %s\n" % e)
+        return 1
     outdir = argv[2]
     try:
         os.makedirs(outdir, exist_ok=True)

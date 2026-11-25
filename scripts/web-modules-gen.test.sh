@@ -46,6 +46,9 @@ fail=0
 ok() { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); echo "FAIL: $*" >&2; }
 
+# mode_of <path>: octal mode, GNU or BSD stat.
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
 # run_gen <input.json> <outdir>: sets RC and ERR (stderr text); stdout goes to the work dir.
 run_gen() {
   RC=0
@@ -100,8 +103,10 @@ n_valid=0
 n_invalid=0
 n_skipped=0
 # expect_valid <suffix> / expect_invalid <suffix> <message fragment, chart wording>
+NAMED=()
 fixture_json() { yq -o=json '.web.modules // []' "$FIX/values-$1.yaml" > "$W/fx.json" || broken "yq could not read values-$1.yaml"; }
 expect_valid() {
+  NAMED+=("$1")
   n_valid=$((n_valid + 1))
   fixture_json "$1"
   rm -rf "$W/fx-out"
@@ -109,6 +114,7 @@ expect_valid() {
   if [ "$RC" -eq 0 ] && [ -f "$W/fx-out/modules.json" ] && [ -f "$W/fx-out/locations.conf" ]; then ok; else bad "values-$1 should be accepted: exit $RC, $ERR"; fi
 }
 expect_invalid() {
+  NAMED+=("$1")
   n_invalid=$((n_invalid + 1))
   fixture_json "$1"
   want=${2//web.modules[/modules[}
@@ -144,10 +150,16 @@ expect_invalid unknown-navgroup 'unknown navGroup "sidebar"'
 expect_invalid adminonly-string 'adminOnly must be a boolean'
 expect_invalid module-not-map 'web.modules[0] must be a map'
 # Chart-only: web.nginx.resolver has no counterpart in compose.
-for f in no-resolver bad-resolver; do n_skipped=$((n_skipped + 1)); done
-# Every fixture must be named above or deliberately skipped, so a new one cannot go unread.
-n_files=$(find "$FIX" -maxdepth 1 -name 'values-*.yaml' | wc -l)
-[ "$n_files" -eq $((n_valid + n_invalid + n_skipped)) ] || broken "$n_files values fixtures but $((n_valid + n_invalid + n_skipped)) accounted for: add the new one to this test"
+SKIPPED="no-resolver bad-resolver"
+for f in $SKIPPED; do
+  [ -f "$FIX/values-$f.yaml" ] || broken "the skipped fixture values-$f.yaml does not exist"
+  n_skipped=$((n_skipped + 1))
+done
+# Every fixture must be named above or deliberately skipped: compare the NAMES, so a rename or a
+# new file cannot go unread.
+printf '%s\n' "${NAMED[@]}" $SKIPPED | sort > "$W/fx.want"
+find "$FIX" -maxdepth 1 -name 'values-*.yaml' | sed -e 's#.*/values-##' -e 's#\.yaml$##' | sort > "$W/fx.have"
+cmp -s "$W/fx.want" "$W/fx.have" || broken "values fixtures and the names in this test differ: $(diff "$W/fx.want" "$W/fx.have" | tr '\n' '|')"
 
 # --- input shape ------------------------------------------------------------------------------
 printf '{"id": "x"}' > "$W/obj.json"
@@ -163,6 +175,11 @@ python3 -I "$GEN" > /dev/null 2>&1 || RC=$?
 if [ "$RC" -eq 2 ]; then ok; else bad "no arguments: exit $RC, want 2"; fi
 python3 -I "$GEN" --help > "$W/help.txt" 2>&1 || bad "--help exited non-zero"
 if grep -q 'OPERATOR RULES' "$W/help.txt" && grep -q 'BIND-MOUNT WINDOW' "$W/help.txt"; then ok; else bad "--help does not state the operator rules and the bind-mount window"; fi
+
+# --- a lone surrogate is invalid input: no traceback, nothing written ----------------------------
+printf '[{"id":"s","version":"1","page":"P","label":"\\ud800","icon":"package","navGroup":"modules","upstream":"svc:80"}]' > "$W/sur.json"
+run_gen "$W/sur.json" "$W/sur-out"
+if [ "$RC" -eq 1 ] && [[ $ERR != *Traceback* ]] && [[ $ERR == *"web-modules-gen:"* ]] && [ ! -e "$W/sur-out" ]; then ok; else bad "a lone surrogate label: exit $RC, output dir present=$([ -e "$W/sur-out" ] && echo yes || echo no), $ERR"; fi
 
 # --- nothing is written on invalid input, into an existing directory too ---------------------
 mkdir "$W/keep"
@@ -187,15 +204,15 @@ mod_json example example-module:8080 > "$W/one.json"
   [ "$RC" -eq 0 ] || { echo "FAIL: first generation into a nested missing directory: exit $RC, $ERR" >&2; exit 1; }
 ) || fail=$((fail + 1))
 if [ -f "$W/deep/a/b/locations.conf" ] && [ -f "$W/deep/a/b/modules.json" ]; then ok; else bad "first generation into a missing directory wrote no files"; fi
-[ "$(stat -c %a "$W/deep/a/b")" = 755 ] && ok || bad "output directory mode is $(stat -c %a "$W/deep/a/b"), want 755"
+[ "$(mode_of "$W/deep/a/b")" = 755 ] && ok || bad "output directory mode is $(mode_of "$W/deep/a/b"), want 755"
 for f in locations.conf modules.json; do
-  [ "$(stat -c %a "$W/deep/a/b/$f")" = 644 ] && ok || bad "$f mode is $(stat -c %a "$W/deep/a/b/$f"), want 644"
+  [ "$(mode_of "$W/deep/a/b/$f")" = 644 ] && ok || bad "$f mode is $(mode_of "$W/deep/a/b/$f"), want 644"
 done
 [ "$(find "$W/deep/a/b" -mindepth 1 | wc -l)" -eq 2 ] && ok || bad "temporary files were left in the output directory: $(ls -A "$W/deep/a/b" | tr '\n' ' ')"
 # An existing 0700 directory is made readable for the web container's uid.
 mkdir -m 700 "$W/closed"
 run_gen "$W/one.json" "$W/closed"
-[ "$RC" -eq 0 ] && [ "$(stat -c %a "$W/closed")" = 755 ] && ok || bad "an existing 0700 directory was not made 0755 (exit $RC)"
+[ "$RC" -eq 0 ] && [ "$(mode_of "$W/closed")" = 755 ] && ok || bad "an existing 0700 directory was not made 0755 (exit $RC)"
 # Regenerating over existing files replaces them.
 mod_json other other-module:9090 > "$W/two.json"
 run_gen "$W/two.json" "$W/closed"

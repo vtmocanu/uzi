@@ -73,16 +73,24 @@ STACK_TOUCHED=0
 TORN_DOWN=0
 BCID=""
 FINAL_RC=0
+KEEP_RUN=0
 
 dc() { docker compose --env-file "$EMPTY" -p "$P" -f "$RENDERED" "$@"; }
+
+# remove_browser: the browser container goes BEFORE compose down, so the fallback path that
+# joined the project network does not leave that network in use.
+remove_browser() {
+  if [ -n "$BCID" ]; then docker rm -f "$BCID" >/dev/null 2>&1 || true; BCID=""; fi
+}
 
 teardown() {
   [ "$TORN_DOWN" = 0 ] || return 0
   TORN_DOWN=1
   [ "$STACK_TOUCHED" = 1 ] || return 0
-  local v bad=0 labelled rendered_vols
-  labelled=$(docker volume ls -q --filter "label=com.docker.compose.project=$P" 2>/dev/null) || labelled=""
-  rendered_vols=$(jq -r '.volumes[]?.name' "$CLEAN_JSON" 2>/dev/null) || rendered_vols=""
+  remove_browser
+  local v bad=0 labelled rendered_vols failed=""
+  labelled=$(docker volume ls -q --filter "label=com.docker.compose.project=$P" 2>/dev/null) || failed="$failed 'docker volume ls' (project label lookup);"
+  rendered_vols=$(jq -r '.volumes[]?.name' "$CLEAN_JSON" 2>/dev/null) || failed="$failed 'jq' over the rendered volumes;"
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     case "$v" in "${P}_"*) ;; *) echo "teardown: volume $v is not prefixed ${P}_" >&2; bad=1 ;; esac
@@ -90,17 +98,26 @@ teardown() {
 $labelled
 $rendered_vols
 EOF
-  if [ "$bad" = 1 ]; then
-    echo "teardown: REFUSING down -v: a volume outside project $P would be removed" >&2
+  if [ "$bad" = 1 ] || [ -n "$failed" ]; then
+    [ -z "$failed" ] || echo "teardown: the volume guard could not run, failed:$failed" >&2
+    [ "$bad" = 0 ] || echo "teardown: a volume outside project $P would be removed" >&2
+    echo "teardown: REFUSING down -v. Stopping the stack without removing volumes." >&2
+    dc down --timeout 20 >"$RUN/down.log" 2>&1 || echo "teardown: plain down also failed: $(tail -n 3 "$RUN/down.log")" >&2
+    echo "teardown: manual cleanup once the volumes are checked: docker compose -p $P -f $RENDERED down -v --rmi local" >&2
+    echo "teardown: the run directory $RUN is kept so that command can run" >&2
+    KEEP_RUN=1
     FINAL_RC=2
     return 0
   fi
+  # --rmi local removes only this project's locally built images (the api and web builds); the
+  # pulled db image is kept.
   if dc down -v --rmi local --timeout 20 >"$RUN/down.log" 2>&1; then
     if [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$P")" ] \
-      && [ -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$P")" ]; then
-      printf 'OK    teardown: down -v on project %s removed its containers and volumes (all prefixed %s_)\n' "$P" "$P"
+      && [ -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$P")" ] \
+      && [ -z "$(docker network ls -q --filter "label=com.docker.compose.project=$P")" ]; then
+      printf 'OK    teardown: down -v on project %s removed its containers, volumes and networks (all volumes prefixed %s_)\n' "$P" "$P"
     else
-      echo "FAIL  teardown: containers or volumes of $P remain after down -v" >&2
+      echo "FAIL  teardown: containers, volumes or networks of $P remain after down -v" >&2
       FINAL_RC=1
     fi
   else
@@ -111,9 +128,9 @@ EOF
 
 cleanup() {
   local rc=$?
+  remove_browser
   teardown
-  if [ -n "$BCID" ]; then docker rm -f "$BCID" >/dev/null 2>&1 || true; fi
-  case "$RUN" in "$ROOT"/.uzi/scratch/mh4686-[0-9]*) rm -rf "$RUN" ;; esac
+  if [ "$KEEP_RUN" = 0 ]; then case "$RUN" in "$ROOT"/.uzi/scratch/mh4686-[0-9]*) rm -rf "$RUN" ;; esac; fi
   [ "$rc" -ne 0 ] || rc=$FINAL_RC
   [ "$FINAL_RC" -le "$rc" ] || rc=$FINAL_RC
   exit "$rc"
@@ -308,7 +325,7 @@ browser_run() { # <baseline|enabled>
 # --- 6. baseline: no modules -----------------------------------------------------------------
 echo '[]' > "$RUN/baseline.json"
 python3 -I scripts/web-modules-gen.py "$RUN/baseline.json" "$GEN" > /dev/null || fail "baseline: the generator failed on []"
-[ "$(stat -c %a "$GEN")" = 755 ] || fail "baseline: the generated dir is not 0755"
+[ "$({ stat -c %a "$GEN" 2>/dev/null || stat -f %Lp "$GEN"; })" = 755 ] || fail "baseline: the generated dir is not 0755"
 dc up -d --no-build > "$RUN/up1.log" 2>&1 || { tail -n 20 "$RUN/up1.log" >&2; fail "baseline: up failed"; }
 wait_for 90 "$BASE/modules.json to answer" curl -fsS --max-time 5 "$BASE/modules.json"
 modules_json_is '. == []' || fail "baseline: $BASE/modules.json is not []"

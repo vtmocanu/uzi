@@ -17,7 +17,7 @@
 //             through the host router without a document reload; the remote entry was served
 //             200 by the web nginx.
 //   Both modes also assert zero CSP violations (a securitypolicyviolation listener is installed
-//   before any page script runs).
+//   before any page script runs, and a deliberate violation first proves it reports).
 //
 // Exit codes: 0 every check passed, 1 a check failed, 2 the instrument is broken (bad
 // arguments, the sign-in form never appeared, the browser could not start). A wait that
@@ -47,10 +47,14 @@ async function main() {
     throw new Broken(`the browser could not start: ${e.message}`);
   });
   const ctx = await browser.newContext();
+  // Violations are reported to this process, so they survive full document navigations.
+  const violations = [];
+  await ctx.exposeFunction("__cspReport", (v) => {
+    violations.push(v);
+  });
   await ctx.addInitScript(() => {
-    window.__violations = [];
     document.addEventListener("securitypolicyviolation", (e) => {
-      window.__violations.push(`${e.violatedDirective} ${e.blockedURI}`);
+      window.__cspReport?.(`${e.violatedDirective} ${e.blockedURI}`);
     });
   });
   const page = await ctx.newPage();
@@ -60,6 +64,17 @@ async function main() {
   page.on("response", (r) => responses.set(new URL(r.url()).pathname, r.status()));
 
   try {
+    // CSP control: a deliberate violation must be reported, or the zero-violation result below
+    // would prove nothing (the listener could be dead). connect-src 'self' blocks this fetch.
+    await page.goto(`${base}/login`);
+    await page.evaluate(() => {
+      fetch("http://127.0.0.2:1/x").catch(() => {});
+    });
+    for (let i = 0; i < 50 && violations.length === 0; i++) await page.waitForTimeout(100);
+    check(violations.length >= 1, "CSP control: a deliberate cross-origin fetch produced no securitypolicyviolation event, so the listener proves nothing");
+    console.log(`OK    CSP control: a deliberate violation was reported (${violations[0]})`);
+    violations.length = 0;
+
     // Sign in as the seeded admin.
     await page.goto(`${base}/login`);
     const emailInput = page.locator("input[type=email]").first();
@@ -90,7 +105,12 @@ async function main() {
       await entry.first().waitFor({ state: "visible", timeout: 15000 });
       console.log("OK    sidebar entry for the example module");
       await page.keyboard.press("Control+K");
-      await page.getByRole("option", { name: /Example/ }).first().waitFor({ state: "visible", timeout: 10000 });
+      // The option's name also carries its hint, so match the exact label span inside the option.
+      await page
+        .getByRole("option")
+        .filter({ has: page.locator("span.truncate", { hasText: /^Example$/ }) })
+        .first()
+        .waitFor({ state: "visible", timeout: 10000 });
       await page.keyboard.press("Escape");
       console.log("OK    command-menu entry for the example module");
 
@@ -154,7 +174,6 @@ async function main() {
       console.log("OK    /modules/example/remoteEntry.js served 200 through the web nginx");
     }
 
-    const violations = await page.evaluate(() => window.__violations ?? []);
     check(violations.length === 0, `CSP violations: ${JSON.stringify(violations.slice(0, 3))}`);
     console.log("OK    zero CSP violations");
   } finally {
