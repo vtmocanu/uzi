@@ -521,9 +521,10 @@ func TestStreamRunReplaysMissedMessagesOnReconnect(t *testing.T) {
 }
 
 // A reconcile tick during the no-socket wait must not restart the redial backoff.
-// When it did, every tick discarded the pending redial deadline, so once the backoff
-// grew past the reconcile interval (12s by default; the backoff only resets when a
-// frame arrives) the stream never redialled again while the run was live.
+// When it did, every selected tick discarded the pending redial deadline, so once the
+// backoff wait grew past the reconcile interval (12s by default; the backoff only
+// resets when a frame arrives) the redial was starved for as long as ticks kept
+// winning — normally until the run turned terminal and reconcile stopped the ticker.
 //
 // Deterministic by construction: streamAfter counts how often the deadline is armed
 // and only fires on cue. The pump is one goroutine and reconcile's GetRun is

@@ -471,10 +471,13 @@ func (s *RunStream) pump(ctx context.Context, c *HTTPClient, runID string, conn 
 			// re-read matters most, so it must not be starved by a 30s backoff.
 			//
 			// The redial deadline is armed ONCE per wait, outside the loop: a reconcile
-			// tick must not restart it. Re-arming it inside the select let every tick
-			// discard the pending redial, so once the backoff (which grows on every
-			// redial and resets only when the reader receives a raw frame, before
-			// decode) outgrew the reconcile interval, the stream never redialled again.
+			// tick must not restart it. Re-arming it inside the select let every
+			// selected tick discard the pending redial. The backoff grows on every
+			// redial (up to its 30s ceiling, jittered) and resets only when the reader
+			// receives a raw frame, before decode; once its wait outgrew the reconcile
+			// interval, ticks kept winning and the redial was starved for as long as
+			// they did — normally until reconcile saw a terminal status and stopped
+			// the ticker.
 			redial := c.after(c.backoff(attempt))
 			waiting := true
 			for waiting {
