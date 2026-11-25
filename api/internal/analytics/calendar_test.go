@@ -176,10 +176,16 @@ func TestAllTimeLongHistoryTerminates(t *testing.T) {
 
 func TestAllWindowEarliestAfterNowIsClamped(t *testing.T) {
 	loc := zone(t, "America/New_York")
-	now := utc(2026, 3, 10, 3, 30) // 2026-03-09 23:30 local
+	// Sunday 2026-03-15 23:30 local; earliest is Monday 2026-03-16 01:30 local, so the
+	// unclamped Monday-of-week would be 03-16, after now (review: a same-week pair could
+	// not detect a missing clamp).
+	now := utc(2026, 3, 16, 3, 30)
 	earliest := now.Add(2 * time.Hour)
 	if DateOf(earliest, loc) == DateOf(now, loc) {
 		t.Fatal("test setup: earliest must be on a later local date than now")
+	}
+	if DateOf(now, loc).Weekday() != time.Sunday || DateOf(earliest, loc).Weekday() != time.Monday {
+		t.Fatal("test setup: now must be a Sunday and earliest the following Monday, local")
 	}
 	b, err := ComputeBounds(now, loc, WindowAll, &earliest)
 	if err != nil {
