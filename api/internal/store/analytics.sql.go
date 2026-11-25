@@ -65,6 +65,528 @@ func (q *Queries) AnalyticsAllRepoOptions(ctx context.Context) ([]AnalyticsAllRe
 	return items, nil
 }
 
+const analyticsAllSpend = `-- name: AnalyticsAllSpend :one
+WITH
+prm AS (SELECT $5::timestamptz AS now_ts),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest($6::timestamptz[]), unnest($7::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+rp AS (
+    SELECT t.ord::int AS idx, t.s AS r_start, t.e AS r_end
+    FROM ROWS FROM (unnest($8::timestamptz[]), unnest($9::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+bnd AS (
+    SELECT COALESCE(array_agg(d.x ORDER BY d.x), '{}'::timestamptz[]) AS arr
+    FROM (SELECT r_start AS x FROM rp UNION SELECT r_end FROM rp) d
+),
+cohort AS MATERIALIZED (
+    SELECT r.id, r.user_id, u.email, r.repo_id, rpo.path_with_namespace AS repo_path,
+           true AS repo_shown,  -- all-only
+           r.kind, r.harness, r.status, r.created_at, r.finished_at, r.status_since, r.mr_iid
+    FROM runs r
+    JOIN users u ON u.id = r.user_id
+    LEFT JOIN repos rpo ON rpo.id = r.repo_id
+    WHERE r.created_at >= $10::timestamptz AND r.created_at < $5::timestamptz
+      AND ($11::uuid IS NULL OR r.repo_id = $11::uuid)
+      AND ($12::text IS NULL OR r.harness = $12::text)
+      AND r.kind = ANY($13::text[])
+),
+model_fold AS MATERIALIZED (
+    SELECT c.id AS run_id, m.model, m.input_tokens, m.cache_read_tokens, m.cache_creation_tokens,
+           m.output_tokens, m.cost_usd, m.cost_status
+    FROM cohort c
+    LEFT JOIN LATERAL (
+        SELECT t.model, t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens,
+               t.output_tokens, t.cost_usd, t.cost_status
+        FROM run_usage_model_totals t
+        WHERE t.run_id = c.id
+        OFFSET 0
+    ) m ON true
+    WHERE c.kind <> 'chat'
+),
+merged_witness AS MATERIALIZED (
+    SELECT DISTINCT w.repo_id, w.mr_iid
+    FROM runs w
+    WHERE w.mr_state = 'merged' AND w.mr_iid IS NOT NULL AND w.repo_id IS NOT NULL
+),
+run_fold AS MATERIALIZED (
+    SELECT c.id AS run_id, c.user_id, c.email, c.repo_id, c.kind, c.harness, c.status AS run_status,
+           c.created_at, c.finished_at, c.status_since, c.mr_iid,
+           CASE WHEN c.repo_id IS NULL THEN 'no_repo'
+                WHEN c.repo_shown THEN c.repo_id::text
+                ELSE 'inaccessible_repo' END AS repo_key,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_id END AS repo_id_out,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_path END AS repo_path_out,
+           (c.kind = ANY($14::text[])) AS is_delivery,
+           CASE WHEN c.created_at >= $1::timestamptz THEN 'cur'
+                WHEN $2::timestamptz IS NOT NULL AND c.created_at >= $2::timestamptz AND c.created_at < $1::timestamptz THEN 'prev'
+           END AS win,
+           f.input_tokens, f.cache_read_tokens, f.cache_creation_tokens, f.output_tokens, f.cost,
+           f.usage_status, f.primary_model,
+           o.outcome,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL AND EXISTS (
+               SELECT 1 FROM merged_witness mw WHERE mw.repo_id = c.repo_id AND mw.mr_iid = c.mr_iid)) AS witnessed,
+           width_bucket(c.created_at, $6::timestamptz[]) AS wb
+    FROM cohort c
+    JOIN (
+        SELECT mf.run_id,
+               COALESCE(sum(mf.input_tokens), 0) AS input_tokens,
+               COALESCE(sum(mf.cache_read_tokens), 0) AS cache_read_tokens,
+               COALESCE(sum(mf.cache_creation_tokens), 0) AS cache_creation_tokens,
+               COALESCE(sum(mf.output_tokens), 0) AS output_tokens,
+               COALESCE(sum(mf.cost_usd), 0) AS cost,
+               CASE WHEN count(mf.model) = 0 THEN 'missing'
+                    WHEN bool_or(mf.cost_status = 'unreported') THEN 'unreported'
+                    WHEN bool_or(mf.cost_status = 'metered') AND bool_or(mf.cost_status = 'subscription') THEN 'unreported'
+                    WHEN bool_or(mf.cost_status = 'subscription') THEN 'subscription'
+                    ELSE 'metered' END AS usage_status,
+               COALESCE((array_agg(mf.model ORDER BY mf.output_tokens DESC, mf.model COLLATE "C" ASC)
+                         FILTER (WHERE mf.model IS NOT NULL))[1], 'unknown') AS primary_model
+        FROM model_fold mf
+        GROUP BY mf.run_id
+    ) f ON f.run_id = c.id
+    LEFT JOIN LATERAL (
+        SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0
+    ) o ON true
+    WHERE c.kind <> 'chat'
+),
+rfb AS MATERIALIZED (
+    SELECT rf.run_id, rf.user_id, rf.email, rf.repo_id, rf.kind, rf.harness, rf.run_status, rf.created_at, rf.finished_at, rf.status_since, rf.mr_iid, rf.repo_key, rf.repo_id_out, rf.repo_path_out, rf.is_delivery, rf.win, rf.input_tokens, rf.cache_read_tokens, rf.cache_creation_tokens, rf.output_tokens, rf.cost, rf.usage_status, rf.primary_model, rf.outcome, rf.witnessed, rf.wb,
+           CASE WHEN rf.win = 'cur' AND rf.wb >= 1 AND rf.created_at < ($7::timestamptz[])[rf.wb] THEN rf.wb END AS bidx
+    FROM run_fold rf
+),
+tot_cur AS (SELECT jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM rfb x WHERE x.win = 'cur'),
+tot_prev AS (SELECT jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM rfb x WHERE x.win = 'prev'),
+tot_cost AS (SELECT COALESCE(sum(x.cost), 0) AS cost, count(*) AS runs FROM rfb x WHERE x.win = 'cur'),
+overall_cells AS (
+    SELECT bk.idx, jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j
+    FROM bk LEFT JOIN rfb x ON x.bidx = bk.idx
+    GROUP BY bk.idx
+),
+split_items AS MATERIALIZED (
+    SELECT x.run_id, x.usage_status, x.bidx, x.cost, x.input_tokens, x.cache_read_tokens,
+           x.cache_creation_tokens, x.output_tokens,
+           CASE $3::text
+                WHEN 'user' THEN x.user_id::text
+                WHEN 'harness' THEN x.harness
+                WHEN 'repo' THEN x.repo_key
+                WHEN 'kind' THEN x.kind
+                WHEN 'primary_model' THEN x.primary_model
+            END AS gkey,
+           CASE $3::text
+                WHEN 'user' THEN x.email
+                WHEN 'repo' THEN x.repo_path_out
+            END AS glabel,
+           CASE $3::text
+                WHEN 'user' THEN x.user_id
+                WHEN 'repo' THEN x.repo_id_out
+            END AS gid
+    FROM rfb x
+    WHERE x.win = 'cur' AND $3::text <> 'usage_model'
+    UNION ALL
+    SELECT mf.run_id, x.usage_status, x.bidx, COALESCE(mf.cost_usd, 0), COALESCE(mf.input_tokens, 0),
+           COALESCE(mf.cache_read_tokens, 0), COALESCE(mf.cache_creation_tokens, 0), COALESCE(mf.output_tokens, 0),
+           COALESCE(mf.model, 'unknown'), NULL::text, NULL::uuid
+    FROM model_fold mf
+    JOIN rfb x ON x.run_id = mf.run_id
+    WHERE x.win = 'cur' AND $3::text = 'usage_model'
+),
+split_groups AS (
+    SELECT i.gkey, i.glabel, i.gid,
+           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
+    FROM split_items i
+    GROUP BY i.gkey, i.glabel, i.gid
+),
+split_slotted AS MATERIALIZED (
+    SELECT i.run_id, i.usage_status, i.bidx, i.cost, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.gkey, i.glabel, i.gid, LEAST(g.rnk, 6) AS slot
+    FROM split_items i JOIN split_groups g ON g.gkey = i.gkey
+),
+split_tot AS (
+    SELECT x.slot, jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x GROUP BY x.slot
+),
+split_cells AS (
+    SELECT s.slot, bk.idx, jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j
+    FROM (SELECT DISTINCT slot FROM split_slotted) s
+    CROSS JOIN bk
+    LEFT JOIN split_slotted x ON x.slot = s.slot AND x.bidx = bk.idx
+    GROUP BY s.slot, bk.idx
+),
+cache_cur AS (
+    SELECT COALESCE(sum(x.cache_read_tokens), 0)::bigint AS read_tokens,
+           COALESCE(sum(x.input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(sum(x.cache_creation_tokens), 0)::bigint AS creation_tokens,
+           jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0) AS disclosure
+    FROM rfb x WHERE x.win = 'cur'
+),
+top_runs AS (
+    SELECT x.run_id, x.user_id, x.email, x.repo_id, x.kind, x.harness, x.run_status, x.created_at, x.finished_at, x.status_since, x.mr_iid, x.repo_key, x.repo_id_out, x.repo_path_out, x.is_delivery, x.win, x.input_tokens, x.cache_read_tokens, x.cache_creation_tokens, x.output_tokens, x.cost, x.usage_status, x.primary_model, x.outcome, x.witnessed, x.wb, x.bidx FROM rfb x WHERE x.win = 'cur'
+    ORDER BY x.cost DESC, x.created_at DESC, x.run_id
+    LIMIT 10
+),
+pr_agg AS (
+    SELECT rf.repo_id, rf.mr_iid, bool_or(rf.witnessed) AS wit,
+           min(rf.created_at) FILTER (WHERE rf.win = 'cur') AS t_cur,
+               COALESCE(sum(rf.cost) FILTER (WHERE rf.win = 'cur'), 0) AS num_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'metered'))::int AS m_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'subscription'))::int AS s_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'unreported'))::int AS u_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'missing'))::int AS x_cur,
+               min(rf.created_at) FILTER (WHERE rf.win = 'prev') AS t_prev,
+               COALESCE(sum(rf.cost) FILTER (WHERE rf.win = 'prev'), 0) AS num_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'metered'))::int AS m_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'subscription'))::int AS s_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'unreported'))::int AS u_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'missing'))::int AS x_prev,
+               min(rf.created_at) AS t_fold,
+               COALESCE(sum(rf.cost), 0) AS num_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'metered'))::int AS m_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'subscription'))::int AS s_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'unreported'))::int AS u_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'missing'))::int AS x_fold
+    FROM run_fold rf
+    WHERE rf.is_delivery AND rf.mr_iid IS NOT NULL AND rf.repo_id IS NOT NULL
+    GROUP BY rf.repo_id, rf.mr_iid
+),
+ev AS (
+    SELECT 'cpr' AS tag, rf.created_at AS t, rf.cost AS num,
+           (rf.is_delivery AND rf.outcome = 'completed')::int AS den,
+           (rf.usage_status = 'metered')::int AS m, (rf.usage_status = 'subscription')::int AS s,
+           (rf.usage_status = 'unreported')::int AS u, (rf.usage_status = 'missing')::int AS x
+    FROM run_fold rf
+    UNION ALL
+    SELECT 'pr_cur' AS tag, p.t_cur AS t, p.num_cur AS num, p.wit::int AS den,
+           p.m_cur AS m, p.s_cur AS s, p.u_cur AS u, p.x_cur AS x
+    FROM pr_agg p WHERE p.t_cur IS NOT NULL
+    UNION ALL
+    SELECT 'pr_prev' AS tag, p.t_prev AS t, p.num_prev AS num, p.wit::int AS den,
+           p.m_prev AS m, p.s_prev AS s, p.u_prev AS u, p.x_prev AS x
+    FROM pr_agg p WHERE p.t_prev IS NOT NULL
+    UNION ALL
+    SELECT 'pr_fold' AS tag, p.t_fold AS t, p.num_fold AS num, p.wit::int AS den,
+           p.m_fold AS m, p.s_fold AS s, p.u_fold AS u, p.x_fold AS x
+    FROM pr_agg p WHERE p.t_fold IS NOT NULL
+),
+ev_b AS (
+    SELECT e.tag, e.num, e.den, e.m, e.s, e.u, e.x,
+           CASE WHEN e.wb >= 1 AND e.t < ($7::timestamptz[])[e.wb] THEN e.wb END AS bidx
+    FROM (SELECT ev.tag, ev.t, ev.num, ev.den, ev.m, ev.s, ev.u, ev.x, width_bucket(ev.t, $6::timestamptz[]) AS wb FROM ev WHERE ev.tag IN ('cpr', 'pr_cur')) e
+),
+ev_seg AS (
+    SELECT e.tag, width_bucket(e.t, (SELECT arr FROM bnd)) AS seg,
+           sum(e.num) AS num, sum(e.den) AS den, sum(e.m) AS m, sum(e.s) AS s, sum(e.u) AS u, sum(e.x) AS x
+    FROM ev e
+    WHERE e.tag IN ('cpr', 'pr_fold')
+    GROUP BY e.tag, width_bucket(e.t, (SELECT arr FROM bnd))
+),
+cpr_cur AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'cpr' AND e.t >= $1::timestamptz),
+cpr_prev AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'cpr' AND $2::timestamptz IS NOT NULL AND e.t >= $2::timestamptz AND e.t < $1::timestamptz),
+cpr_cells AS (
+    SELECT bk.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j
+    FROM bk
+    LEFT JOIN ev_b e ON e.tag = 'cpr' AND e.bidx = bk.idx
+    GROUP BY bk.idx
+),
+cpr_roll AS (
+    SELECT rp.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(g.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(g.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN NULL ELSE round(sum(g.num) / sum(g.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(g.m), 0)::bigint, 'subscription', COALESCE(sum(g.s), 0)::bigint, 'unreported', COALESCE(sum(g.u), 0)::bigint, 'missing', COALESCE(sum(g.x), 0)::bigint, 'incomplete', COALESCE(sum(g.s + g.u + g.x), 0) > 0)) AS j
+    FROM rp
+    LEFT JOIN ev_seg g ON g.tag = 'cpr'
+        AND (SELECT arr[g.seg] FROM bnd) >= rp.r_start
+        AND (SELECT arr[g.seg] FROM bnd) < rp.r_end
+    GROUP BY rp.idx
+),
+pr_cur AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'pr_cur'),
+pr_prev AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'pr_prev'),
+pr_cells AS (
+    SELECT bk.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j
+    FROM bk
+    LEFT JOIN ev_b e ON e.tag = 'pr_cur' AND e.bidx = bk.idx
+    GROUP BY bk.idx
+),
+pr_roll AS (
+    SELECT rp.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(g.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(g.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN NULL ELSE round(sum(g.num) / sum(g.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(g.m), 0)::bigint, 'subscription', COALESCE(sum(g.s), 0)::bigint, 'unreported', COALESCE(sum(g.u), 0)::bigint, 'missing', COALESCE(sum(g.x), 0)::bigint, 'incomplete', COALESCE(sum(g.s + g.u + g.x), 0) > 0)) AS j
+    FROM rp
+    LEFT JOIN ev_seg g ON g.tag = 'pr_fold'
+        AND (SELECT arr[g.seg] FROM bnd) >= rp.r_start
+        AND (SELECT arr[g.seg] FROM bnd) < rp.r_end
+    GROUP BY rp.idx
+),
+bd_items AS MATERIALIZED (
+    SELECT x.run_id, x.user_id, x.email, x.repo_id, x.kind, x.harness, x.run_status, x.created_at, x.finished_at, x.status_since, x.mr_iid, x.repo_key, x.repo_id_out, x.repo_path_out, x.is_delivery, x.win, x.input_tokens, x.cache_read_tokens, x.cache_creation_tokens, x.output_tokens, x.cost, x.usage_status, x.primary_model, x.outcome, x.witnessed, x.wb, x.bidx,
+           CASE $4::text
+                WHEN 'user' THEN x.user_id::text
+                WHEN 'harness' THEN x.harness
+                WHEN 'repo' THEN x.repo_key
+                WHEN 'kind' THEN x.kind
+                WHEN 'primary_model' THEN x.primary_model
+            END AS gkey,
+           CASE $4::text
+                WHEN 'user' THEN x.email
+                WHEN 'repo' THEN x.repo_path_out
+            END AS glabel,
+           CASE $4::text
+                WHEN 'user' THEN x.user_id
+                WHEN 'repo' THEN x.repo_id_out
+            END AS gid
+    FROM rfb x
+    WHERE x.win = 'cur'
+),
+bd_groups AS (
+    SELECT i.gkey, i.glabel, i.gid,
+           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
+    FROM bd_items i
+    GROUP BY i.gkey, i.glabel, i.gid
+),
+bd_rows AS (
+    SELECT LEAST(g.rnk, 51) AS slot,
+           jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END))
+           || jsonb_build_object(
+               'finished', count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL),
+               'outcomes', jsonb_build_object(
+                   'completed', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'completed'),
+                   'cancelled', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'cancelled'),
+                   'plan_rejected', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'plan_rejected'),
+                   'base_diverged', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'base_diverged'),
+                   'failed', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'failed')),
+               'failure_rate', jsonb_build_object('value', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'failed')::numeric / count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL), 6) END, 'reason', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'completion_ratio', jsonb_build_object('value', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'completed')::numeric / count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL), 6) END, 'reason', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'cost_share', jsonb_build_object('value', CASE WHEN (SELECT tc.cost FROM tot_cost tc) = 0 THEN NULL ELSE round(COALESCE(sum(x.cost), 0) / (SELECT tc.cost FROM tot_cost tc), 6) END, 'reason', CASE WHEN (SELECT tc.cost FROM tot_cost tc) = 0 THEN 'not_applicable' END),
+               'elapsed_p50_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'elapsed_p90_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'merged_prs', count(DISTINCT (x.repo_id, x.mr_iid)) FILTER (WHERE x.is_delivery AND x.witnessed)) AS j
+    FROM bd_items x
+    JOIN bd_groups g ON g.gkey = x.gkey
+    GROUP BY LEAST(g.rnk, 51)
+)
+SELECT jsonb_build_object(
+    'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
+    'untracked_chat_runs', (SELECT count(*) FROM cohort c WHERE c.kind = 'chat' AND c.created_at >= $1::timestamptz),
+    'totals', jsonb_build_object('current', (SELECT j FROM tot_cur))
+        || CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT j FROM tot_prev)) END,
+    'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM overall_cells c), '[]'::jsonb),
+    'split', jsonb_build_object(
+        'dimension', $3::text,
+        'non_additive', $3::text = 'usage_model',
+        'groups', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'rank', st.slot,
+                    'is_other', st.slot = 6,
+                    'key', g.gkey, 'label', g.glabel, 'id', g.gid,
+                    'totals', st.j,
+                    'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', sc.idx - 1) || sc.j ORDER BY sc.idx)
+                                         FROM split_cells sc WHERE sc.slot = st.slot), '[]'::jsonb))
+                ORDER BY st.slot)
+            FROM split_tot st
+            LEFT JOIN split_groups g ON g.rnk = st.slot AND st.slot < 6), '[]'::jsonb)),
+    'cost_per_completed_run', jsonb_build_object(
+            'current', (SELECT j FROM cpr_cur),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM cpr_cells c), '[]'::jsonb),
+            'rolling', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM cpr_roll c), '[]'::jsonb))
+        || CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT j FROM cpr_prev)) END,
+    'cost_per_merged_pr', jsonb_build_object(
+            'current', (SELECT j FROM pr_cur),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM pr_cells c), '[]'::jsonb),
+            'rolling', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM pr_roll c), '[]'::jsonb))
+        || CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT j FROM pr_prev)) END,
+    'cache_read', (
+        SELECT jsonb_build_object(
+            'cache_read_tokens', cc.read_tokens,
+            'input_tokens', cc.input_tokens,
+            'cache_creation_tokens', cc.creation_tokens,
+            'denominator', cc.read_tokens + cc.input_tokens + cc.creation_tokens,
+            'value', CASE WHEN cc.read_tokens + cc.input_tokens + cc.creation_tokens = 0 THEN NULL
+                          ELSE round(cc.read_tokens::numeric / (cc.read_tokens + cc.input_tokens + cc.creation_tokens), 6) END,
+            'reason', CASE WHEN cc.read_tokens + cc.input_tokens + cc.creation_tokens = 0 THEN 'no_input_tokens' END,
+            'disclosure', cc.disclosure)
+        FROM cache_cur cc),
+    'top_runs', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'run_id', t.run_id, 'kind', t.kind, 'harness', t.harness, 'run_status', t.run_status,
+            'usage_status', t.usage_status, 'primary_model', t.primary_model,
+            'created_at', to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+            'cost', t.cost::numeric(24,6)::text,
+            'input_tokens', t.input_tokens::bigint, 'cache_read_tokens', t.cache_read_tokens::bigint,
+            'cache_creation_tokens', t.cache_creation_tokens::bigint, 'output_tokens', t.output_tokens::bigint,
+            'repo_key', t.repo_key, 'repo_id', t.repo_id_out, 'repo_path', t.repo_path_out,
+            'user_id', t.user_id, 'user_email', t.email)
+            ORDER BY t.cost DESC, t.created_at DESC, t.run_id)
+        FROM top_runs t), '[]'::jsonb),
+    'breakdown', jsonb_build_object(
+        'dimension', $4::text,
+        'rows', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'rank', r.slot,
+                    'is_other', r.slot = 51,
+                    'key', g.gkey, 'label', g.glabel, 'id', g.gid)
+                || r.j
+                ORDER BY r.slot)
+            FROM bd_rows r
+            LEFT JOIN bd_groups g ON g.rnk = r.slot AND r.slot < 51), '[]'::jsonb))
+)::jsonb AS doc
+`
+
+type AnalyticsAllSpendParams struct {
+	From          pgtype.Timestamptz   `json:"from"`
+	PreviousFrom  pgtype.Timestamptz   `json:"previous_from"`
+	Split         string               `json:"split"`
+	Breakdown     string               `json:"breakdown"`
+	Now           pgtype.Timestamptz   `json:"now"`
+	BucketStarts  []pgtype.Timestamptz `json:"bucket_starts"`
+	BucketEnds    []pgtype.Timestamptz `json:"bucket_ends"`
+	RollStarts    []pgtype.Timestamptz `json:"roll_starts"`
+	RollEnds      []pgtype.Timestamptz `json:"roll_ends"`
+	FoldFrom      pgtype.Timestamptz   `json:"fold_from"`
+	RepoID        pgtype.UUID          `json:"repo_id"`
+	Harness       pgtype.Text          `json:"harness"`
+	Kinds         []string             `json:"kinds"`
+	DeliveryKinds []string             `json:"delivery_kinds"`
+}
+
+// Issue #4684: the Spend document, one jsonb value built over ONE materialized cohort and fold.
+// The owner and all-scope statements are kept textually identical except the scope lines, each
+// tagged with a trailing marker comment (a Go test drops them and fails on any other drift).
+// Every range comes from the parameters (half-open: start <= created_at < end); there is no
+// calendar arithmetic here. Dollars are emitted as numeric strings, ratios as JSON numbers,
+// timestamps as UTC strings so the document does not depend on the session TimeZone.
+func (q *Queries) AnalyticsAllSpend(ctx context.Context, arg AnalyticsAllSpendParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, analyticsAllSpend,
+		arg.From,
+		arg.PreviousFrom,
+		arg.Split,
+		arg.Breakdown,
+		arg.Now,
+		arg.BucketStarts,
+		arg.BucketEnds,
+		arg.RollStarts,
+		arg.RollEnds,
+		arg.FoldFrom,
+		arg.RepoID,
+		arg.Harness,
+		arg.Kinds,
+		arg.DeliveryKinds,
+	)
+	var doc []byte
+	err := row.Scan(&doc)
+	return doc, err
+}
+
 const analyticsOwnerHistoryStart = `-- name: AnalyticsOwnerHistoryStart :one
 SELECT MIN(r.created_at)::timestamptz AS history_start
 FROM runs r
@@ -148,6 +670,535 @@ func (q *Queries) AnalyticsOwnerRepoOptions(ctx context.Context, userID uuid.UUI
 		return nil, err
 	}
 	return items, nil
+}
+
+const analyticsOwnerSpend = `-- name: AnalyticsOwnerSpend :one
+WITH
+prm AS (SELECT $5::timestamptz AS now_ts),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest($6::timestamptz[]), unnest($7::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+rp AS (
+    SELECT t.ord::int AS idx, t.s AS r_start, t.e AS r_end
+    FROM ROWS FROM (unnest($8::timestamptz[]), unnest($9::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+bnd AS (
+    SELECT COALESCE(array_agg(d.x ORDER BY d.x), '{}'::timestamptz[]) AS arr
+    FROM (SELECT r_start AS x FROM rp UNION SELECT r_end FROM rp) d
+),
+cohort AS MATERIALIZED (
+    SELECT r.id, r.user_id, u.email, r.repo_id, rpo.path_with_namespace AS repo_path,
+           ($10::boolean IS TRUE OR fc.id IS NOT NULL) AS repo_shown,  -- owner-only
+           r.kind, r.harness, r.status, r.created_at, r.finished_at, r.status_since, r.mr_iid
+    FROM runs r
+    JOIN users u ON u.id = r.user_id
+    LEFT JOIN repos rpo ON rpo.id = r.repo_id
+    LEFT JOIN forge_connections fc ON fc.id = rpo.connection_id AND fc.user_id = $11::uuid  -- owner-only
+    WHERE r.created_at >= $12::timestamptz AND r.created_at < $5::timestamptz
+      AND r.user_id = $11::uuid  -- owner-only
+      AND ($13::uuid IS NULL OR r.repo_id = $13::uuid)
+      AND ($14::text IS NULL OR r.harness = $14::text)
+      AND r.kind = ANY($15::text[])
+),
+model_fold AS MATERIALIZED (
+    SELECT c.id AS run_id, m.model, m.input_tokens, m.cache_read_tokens, m.cache_creation_tokens,
+           m.output_tokens, m.cost_usd, m.cost_status
+    FROM cohort c
+    LEFT JOIN LATERAL (
+        SELECT t.model, t.input_tokens, t.cache_read_tokens, t.cache_creation_tokens,
+               t.output_tokens, t.cost_usd, t.cost_status
+        FROM run_usage_model_totals t
+        WHERE t.run_id = c.id
+        OFFSET 0
+    ) m ON true
+    WHERE c.kind <> 'chat'
+),
+merged_witness AS MATERIALIZED (
+    SELECT DISTINCT w.repo_id, w.mr_iid
+    FROM runs w
+    WHERE w.mr_state = 'merged' AND w.mr_iid IS NOT NULL AND w.repo_id IS NOT NULL
+      AND w.user_id = $11::uuid  -- owner-only
+),
+run_fold AS MATERIALIZED (
+    SELECT c.id AS run_id, c.user_id, c.email, c.repo_id, c.kind, c.harness, c.status AS run_status,
+           c.created_at, c.finished_at, c.status_since, c.mr_iid,
+           CASE WHEN c.repo_id IS NULL THEN 'no_repo'
+                WHEN c.repo_shown THEN c.repo_id::text
+                ELSE 'inaccessible_repo' END AS repo_key,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_id END AS repo_id_out,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_path END AS repo_path_out,
+           (c.kind = ANY($16::text[])) AS is_delivery,
+           CASE WHEN c.created_at >= $1::timestamptz THEN 'cur'
+                WHEN $2::timestamptz IS NOT NULL AND c.created_at >= $2::timestamptz AND c.created_at < $1::timestamptz THEN 'prev'
+           END AS win,
+           f.input_tokens, f.cache_read_tokens, f.cache_creation_tokens, f.output_tokens, f.cost,
+           f.usage_status, f.primary_model,
+           o.outcome,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL AND EXISTS (
+               SELECT 1 FROM merged_witness mw WHERE mw.repo_id = c.repo_id AND mw.mr_iid = c.mr_iid)) AS witnessed,
+           width_bucket(c.created_at, $6::timestamptz[]) AS wb
+    FROM cohort c
+    JOIN (
+        SELECT mf.run_id,
+               COALESCE(sum(mf.input_tokens), 0) AS input_tokens,
+               COALESCE(sum(mf.cache_read_tokens), 0) AS cache_read_tokens,
+               COALESCE(sum(mf.cache_creation_tokens), 0) AS cache_creation_tokens,
+               COALESCE(sum(mf.output_tokens), 0) AS output_tokens,
+               COALESCE(sum(mf.cost_usd), 0) AS cost,
+               CASE WHEN count(mf.model) = 0 THEN 'missing'
+                    WHEN bool_or(mf.cost_status = 'unreported') THEN 'unreported'
+                    WHEN bool_or(mf.cost_status = 'metered') AND bool_or(mf.cost_status = 'subscription') THEN 'unreported'
+                    WHEN bool_or(mf.cost_status = 'subscription') THEN 'subscription'
+                    ELSE 'metered' END AS usage_status,
+               COALESCE((array_agg(mf.model ORDER BY mf.output_tokens DESC, mf.model COLLATE "C" ASC)
+                         FILTER (WHERE mf.model IS NOT NULL))[1], 'unknown') AS primary_model
+        FROM model_fold mf
+        GROUP BY mf.run_id
+    ) f ON f.run_id = c.id
+    LEFT JOIN LATERAL (
+        SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0
+    ) o ON true
+    WHERE c.kind <> 'chat'
+),
+rfb AS MATERIALIZED (
+    SELECT rf.run_id, rf.user_id, rf.email, rf.repo_id, rf.kind, rf.harness, rf.run_status, rf.created_at, rf.finished_at, rf.status_since, rf.mr_iid, rf.repo_key, rf.repo_id_out, rf.repo_path_out, rf.is_delivery, rf.win, rf.input_tokens, rf.cache_read_tokens, rf.cache_creation_tokens, rf.output_tokens, rf.cost, rf.usage_status, rf.primary_model, rf.outcome, rf.witnessed, rf.wb,
+           CASE WHEN rf.win = 'cur' AND rf.wb >= 1 AND rf.created_at < ($7::timestamptz[])[rf.wb] THEN rf.wb END AS bidx
+    FROM run_fold rf
+),
+tot_cur AS (SELECT jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM rfb x WHERE x.win = 'cur'),
+tot_prev AS (SELECT jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM rfb x WHERE x.win = 'prev'),
+tot_cost AS (SELECT COALESCE(sum(x.cost), 0) AS cost, count(*) AS runs FROM rfb x WHERE x.win = 'cur'),
+overall_cells AS (
+    SELECT bk.idx, jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j
+    FROM bk LEFT JOIN rfb x ON x.bidx = bk.idx
+    GROUP BY bk.idx
+),
+split_items AS MATERIALIZED (
+    SELECT x.run_id, x.usage_status, x.bidx, x.cost, x.input_tokens, x.cache_read_tokens,
+           x.cache_creation_tokens, x.output_tokens,
+           CASE $3::text
+                WHEN 'user' THEN x.user_id::text
+                WHEN 'harness' THEN x.harness
+                WHEN 'repo' THEN x.repo_key
+                WHEN 'kind' THEN x.kind
+                WHEN 'primary_model' THEN x.primary_model
+            END AS gkey,
+           CASE $3::text
+                WHEN 'user' THEN x.email
+                WHEN 'repo' THEN x.repo_path_out
+            END AS glabel,
+           CASE $3::text
+                WHEN 'user' THEN x.user_id
+                WHEN 'repo' THEN x.repo_id_out
+            END AS gid
+    FROM rfb x
+    WHERE x.win = 'cur' AND $3::text <> 'usage_model'
+    UNION ALL
+    SELECT mf.run_id, x.usage_status, x.bidx, COALESCE(mf.cost_usd, 0), COALESCE(mf.input_tokens, 0),
+           COALESCE(mf.cache_read_tokens, 0), COALESCE(mf.cache_creation_tokens, 0), COALESCE(mf.output_tokens, 0),
+           COALESCE(mf.model, 'unknown'), NULL::text, NULL::uuid
+    FROM model_fold mf
+    JOIN rfb x ON x.run_id = mf.run_id
+    WHERE x.win = 'cur' AND $3::text = 'usage_model'
+),
+split_groups AS (
+    SELECT i.gkey, i.glabel, i.gid,
+           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
+    FROM split_items i
+    GROUP BY i.gkey, i.glabel, i.gid
+),
+split_slotted AS MATERIALIZED (
+    SELECT i.run_id, i.usage_status, i.bidx, i.cost, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.gkey, i.glabel, i.gid, LEAST(g.rnk, 6) AS slot
+    FROM split_items i JOIN split_groups g ON g.gkey = i.gkey
+),
+split_tot AS (
+    SELECT x.slot, jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x GROUP BY x.slot
+),
+split_cells AS (
+    SELECT s.slot, bk.idx, jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j
+    FROM (SELECT DISTINCT slot FROM split_slotted) s
+    CROSS JOIN bk
+    LEFT JOIN split_slotted x ON x.slot = s.slot AND x.bidx = bk.idx
+    GROUP BY s.slot, bk.idx
+),
+cache_cur AS (
+    SELECT COALESCE(sum(x.cache_read_tokens), 0)::bigint AS read_tokens,
+           COALESCE(sum(x.input_tokens), 0)::bigint AS input_tokens,
+           COALESCE(sum(x.cache_creation_tokens), 0)::bigint AS creation_tokens,
+           jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0) AS disclosure
+    FROM rfb x WHERE x.win = 'cur'
+),
+top_runs AS (
+    SELECT x.run_id, x.user_id, x.email, x.repo_id, x.kind, x.harness, x.run_status, x.created_at, x.finished_at, x.status_since, x.mr_iid, x.repo_key, x.repo_id_out, x.repo_path_out, x.is_delivery, x.win, x.input_tokens, x.cache_read_tokens, x.cache_creation_tokens, x.output_tokens, x.cost, x.usage_status, x.primary_model, x.outcome, x.witnessed, x.wb, x.bidx FROM rfb x WHERE x.win = 'cur'
+    ORDER BY x.cost DESC, x.created_at DESC, x.run_id
+    LIMIT 10
+),
+pr_agg AS (
+    SELECT rf.repo_id, rf.mr_iid, bool_or(rf.witnessed) AS wit,
+           min(rf.created_at) FILTER (WHERE rf.win = 'cur') AS t_cur,
+               COALESCE(sum(rf.cost) FILTER (WHERE rf.win = 'cur'), 0) AS num_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'metered'))::int AS m_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'subscription'))::int AS s_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'unreported'))::int AS u_cur,
+               (count(*) FILTER (WHERE rf.win = 'cur' AND rf.usage_status = 'missing'))::int AS x_cur,
+               min(rf.created_at) FILTER (WHERE rf.win = 'prev') AS t_prev,
+               COALESCE(sum(rf.cost) FILTER (WHERE rf.win = 'prev'), 0) AS num_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'metered'))::int AS m_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'subscription'))::int AS s_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'unreported'))::int AS u_prev,
+               (count(*) FILTER (WHERE rf.win = 'prev' AND rf.usage_status = 'missing'))::int AS x_prev,
+               min(rf.created_at) AS t_fold,
+               COALESCE(sum(rf.cost), 0) AS num_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'metered'))::int AS m_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'subscription'))::int AS s_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'unreported'))::int AS u_fold,
+               (count(*) FILTER (WHERE rf.usage_status = 'missing'))::int AS x_fold
+    FROM run_fold rf
+    WHERE rf.is_delivery AND rf.mr_iid IS NOT NULL AND rf.repo_id IS NOT NULL
+    GROUP BY rf.repo_id, rf.mr_iid
+),
+ev AS (
+    SELECT 'cpr' AS tag, rf.created_at AS t, rf.cost AS num,
+           (rf.is_delivery AND rf.outcome = 'completed')::int AS den,
+           (rf.usage_status = 'metered')::int AS m, (rf.usage_status = 'subscription')::int AS s,
+           (rf.usage_status = 'unreported')::int AS u, (rf.usage_status = 'missing')::int AS x
+    FROM run_fold rf
+    UNION ALL
+    SELECT 'pr_cur' AS tag, p.t_cur AS t, p.num_cur AS num, p.wit::int AS den,
+           p.m_cur AS m, p.s_cur AS s, p.u_cur AS u, p.x_cur AS x
+    FROM pr_agg p WHERE p.t_cur IS NOT NULL
+    UNION ALL
+    SELECT 'pr_prev' AS tag, p.t_prev AS t, p.num_prev AS num, p.wit::int AS den,
+           p.m_prev AS m, p.s_prev AS s, p.u_prev AS u, p.x_prev AS x
+    FROM pr_agg p WHERE p.t_prev IS NOT NULL
+    UNION ALL
+    SELECT 'pr_fold' AS tag, p.t_fold AS t, p.num_fold AS num, p.wit::int AS den,
+           p.m_fold AS m, p.s_fold AS s, p.u_fold AS u, p.x_fold AS x
+    FROM pr_agg p WHERE p.t_fold IS NOT NULL
+),
+ev_b AS (
+    SELECT e.tag, e.num, e.den, e.m, e.s, e.u, e.x,
+           CASE WHEN e.wb >= 1 AND e.t < ($7::timestamptz[])[e.wb] THEN e.wb END AS bidx
+    FROM (SELECT ev.tag, ev.t, ev.num, ev.den, ev.m, ev.s, ev.u, ev.x, width_bucket(ev.t, $6::timestamptz[]) AS wb FROM ev WHERE ev.tag IN ('cpr', 'pr_cur')) e
+),
+ev_seg AS (
+    SELECT e.tag, width_bucket(e.t, (SELECT arr FROM bnd)) AS seg,
+           sum(e.num) AS num, sum(e.den) AS den, sum(e.m) AS m, sum(e.s) AS s, sum(e.u) AS u, sum(e.x) AS x
+    FROM ev e
+    WHERE e.tag IN ('cpr', 'pr_fold')
+    GROUP BY e.tag, width_bucket(e.t, (SELECT arr FROM bnd))
+),
+cpr_cur AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'cpr' AND e.t >= $1::timestamptz),
+cpr_prev AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'cpr' AND $2::timestamptz IS NOT NULL AND e.t >= $2::timestamptz AND e.t < $1::timestamptz),
+cpr_cells AS (
+    SELECT bk.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j
+    FROM bk
+    LEFT JOIN ev_b e ON e.tag = 'cpr' AND e.bidx = bk.idx
+    GROUP BY bk.idx
+),
+cpr_roll AS (
+    SELECT rp.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(g.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(g.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN NULL ELSE round(sum(g.num) / sum(g.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN 'no_completed_delivery_runs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(g.m), 0)::bigint, 'subscription', COALESCE(sum(g.s), 0)::bigint, 'unreported', COALESCE(sum(g.u), 0)::bigint, 'missing', COALESCE(sum(g.x), 0)::bigint, 'incomplete', COALESCE(sum(g.s + g.u + g.x), 0) > 0)) AS j
+    FROM rp
+    LEFT JOIN ev_seg g ON g.tag = 'cpr'
+        AND (SELECT arr[g.seg] FROM bnd) >= rp.r_start
+        AND (SELECT arr[g.seg] FROM bnd) < rp.r_end
+    GROUP BY rp.idx
+),
+pr_cur AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'pr_cur'),
+pr_prev AS (SELECT jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j FROM ev e WHERE e.tag = 'pr_prev'),
+pr_cells AS (
+    SELECT bk.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(e.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(e.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN NULL ELSE round(sum(e.num) / sum(e.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(e.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(e.m), 0)::bigint, 'subscription', COALESCE(sum(e.s), 0)::bigint, 'unreported', COALESCE(sum(e.u), 0)::bigint, 'missing', COALESCE(sum(e.x), 0)::bigint, 'incomplete', COALESCE(sum(e.s + e.u + e.x), 0) > 0)) AS j
+    FROM bk
+    LEFT JOIN ev_b e ON e.tag = 'pr_cur' AND e.bidx = bk.idx
+    GROUP BY bk.idx
+),
+pr_roll AS (
+    SELECT rp.idx, jsonb_build_object(
+            'numerator', COALESCE(sum(g.num), 0)::numeric(24,6)::text,
+            'denominator', COALESCE(sum(g.den), 0)::bigint,
+            'value', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN NULL ELSE round(sum(g.num) / sum(g.den), 6)::text END,
+            'reason', CASE WHEN COALESCE(sum(g.den), 0) = 0 THEN 'no_merged_prs' END,
+            'disclosure', jsonb_build_object('metered', COALESCE(sum(g.m), 0)::bigint, 'subscription', COALESCE(sum(g.s), 0)::bigint, 'unreported', COALESCE(sum(g.u), 0)::bigint, 'missing', COALESCE(sum(g.x), 0)::bigint, 'incomplete', COALESCE(sum(g.s + g.u + g.x), 0) > 0)) AS j
+    FROM rp
+    LEFT JOIN ev_seg g ON g.tag = 'pr_fold'
+        AND (SELECT arr[g.seg] FROM bnd) >= rp.r_start
+        AND (SELECT arr[g.seg] FROM bnd) < rp.r_end
+    GROUP BY rp.idx
+),
+bd_items AS MATERIALIZED (
+    SELECT x.run_id, x.user_id, x.email, x.repo_id, x.kind, x.harness, x.run_status, x.created_at, x.finished_at, x.status_since, x.mr_iid, x.repo_key, x.repo_id_out, x.repo_path_out, x.is_delivery, x.win, x.input_tokens, x.cache_read_tokens, x.cache_creation_tokens, x.output_tokens, x.cost, x.usage_status, x.primary_model, x.outcome, x.witnessed, x.wb, x.bidx,
+           CASE $4::text
+                WHEN 'user' THEN x.user_id::text
+                WHEN 'harness' THEN x.harness
+                WHEN 'repo' THEN x.repo_key
+                WHEN 'kind' THEN x.kind
+                WHEN 'primary_model' THEN x.primary_model
+            END AS gkey,
+           CASE $4::text
+                WHEN 'user' THEN x.email
+                WHEN 'repo' THEN x.repo_path_out
+            END AS glabel,
+           CASE $4::text
+                WHEN 'user' THEN x.user_id
+                WHEN 'repo' THEN x.repo_id_out
+            END AS gid
+    FROM rfb x
+    WHERE x.win = 'cur'
+),
+bd_groups AS (
+    SELECT i.gkey, i.glabel, i.gid,
+           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
+    FROM bd_items i
+    GROUP BY i.gkey, i.glabel, i.gid
+),
+bd_rows AS (
+    SELECT LEAST(g.rnk, 51) AS slot,
+           jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END))
+           || jsonb_build_object(
+               'finished', count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL),
+               'outcomes', jsonb_build_object(
+                   'completed', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'completed'),
+                   'cancelled', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'cancelled'),
+                   'plan_rejected', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'plan_rejected'),
+                   'base_diverged', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'base_diverged'),
+                   'failed', count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'failed')),
+               'failure_rate', jsonb_build_object('value', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'failed')::numeric / count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL), 6) END, 'reason', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'completion_ratio', jsonb_build_object('value', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.outcome = 'completed')::numeric / count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL), 6) END, 'reason', CASE WHEN count(DISTINCT x.run_id) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'cost_share', jsonb_build_object('value', CASE WHEN (SELECT tc.cost FROM tot_cost tc) = 0 THEN NULL ELSE round(COALESCE(sum(x.cost), 0) / (SELECT tc.cost FROM tot_cost tc), 6) END, 'reason', CASE WHEN (SELECT tc.cost FROM tot_cost tc) = 0 THEN 'not_applicable' END),
+               'elapsed_p50_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'elapsed_p90_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
+               'merged_prs', count(DISTINCT (x.repo_id, x.mr_iid)) FILTER (WHERE x.is_delivery AND x.witnessed)) AS j
+    FROM bd_items x
+    JOIN bd_groups g ON g.gkey = x.gkey
+    GROUP BY LEAST(g.rnk, 51)
+)
+SELECT jsonb_build_object(
+    'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
+    'untracked_chat_runs', (SELECT count(*) FROM cohort c WHERE c.kind = 'chat' AND c.created_at >= $1::timestamptz),
+    'totals', jsonb_build_object('current', (SELECT j FROM tot_cur))
+        || CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT j FROM tot_prev)) END,
+    'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM overall_cells c), '[]'::jsonb),
+    'split', jsonb_build_object(
+        'dimension', $3::text,
+        'non_additive', $3::text = 'usage_model',
+        'groups', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'rank', st.slot,
+                    'is_other', st.slot = 6,
+                    'key', g.gkey, 'label', g.glabel, 'id', g.gid,
+                    'totals', st.j,
+                    'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', sc.idx - 1) || sc.j ORDER BY sc.idx)
+                                         FROM split_cells sc WHERE sc.slot = st.slot), '[]'::jsonb))
+                ORDER BY st.slot)
+            FROM split_tot st
+            LEFT JOIN split_groups g ON g.rnk = st.slot AND st.slot < 6), '[]'::jsonb)),
+    'cost_per_completed_run', jsonb_build_object(
+            'current', (SELECT j FROM cpr_cur),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM cpr_cells c), '[]'::jsonb),
+            'rolling', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM cpr_roll c), '[]'::jsonb))
+        || CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT j FROM cpr_prev)) END,
+    'cost_per_merged_pr', jsonb_build_object(
+            'current', (SELECT j FROM pr_cur),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM pr_cells c), '[]'::jsonb),
+            'rolling', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1) || c.j ORDER BY c.idx) FROM pr_roll c), '[]'::jsonb))
+        || CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT j FROM pr_prev)) END,
+    'cache_read', (
+        SELECT jsonb_build_object(
+            'cache_read_tokens', cc.read_tokens,
+            'input_tokens', cc.input_tokens,
+            'cache_creation_tokens', cc.creation_tokens,
+            'denominator', cc.read_tokens + cc.input_tokens + cc.creation_tokens,
+            'value', CASE WHEN cc.read_tokens + cc.input_tokens + cc.creation_tokens = 0 THEN NULL
+                          ELSE round(cc.read_tokens::numeric / (cc.read_tokens + cc.input_tokens + cc.creation_tokens), 6) END,
+            'reason', CASE WHEN cc.read_tokens + cc.input_tokens + cc.creation_tokens = 0 THEN 'no_input_tokens' END,
+            'disclosure', cc.disclosure)
+        FROM cache_cur cc),
+    'top_runs', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'run_id', t.run_id, 'kind', t.kind, 'harness', t.harness, 'run_status', t.run_status,
+            'usage_status', t.usage_status, 'primary_model', t.primary_model,
+            'created_at', to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+            'cost', t.cost::numeric(24,6)::text,
+            'input_tokens', t.input_tokens::bigint, 'cache_read_tokens', t.cache_read_tokens::bigint,
+            'cache_creation_tokens', t.cache_creation_tokens::bigint, 'output_tokens', t.output_tokens::bigint,
+            'repo_key', t.repo_key, 'repo_id', t.repo_id_out, 'repo_path', t.repo_path_out,
+            'user_id', t.user_id, 'user_email', t.email)
+            ORDER BY t.cost DESC, t.created_at DESC, t.run_id)
+        FROM top_runs t), '[]'::jsonb),
+    'breakdown', jsonb_build_object(
+        'dimension', $4::text,
+        'rows', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'rank', r.slot,
+                    'is_other', r.slot = 51,
+                    'key', g.gkey, 'label', g.glabel, 'id', g.gid)
+                || r.j
+                ORDER BY r.slot)
+            FROM bd_rows r
+            LEFT JOIN bd_groups g ON g.rnk = r.slot AND r.slot < 51), '[]'::jsonb))
+)::jsonb AS doc
+`
+
+type AnalyticsOwnerSpendParams struct {
+	From          pgtype.Timestamptz   `json:"from"`
+	PreviousFrom  pgtype.Timestamptz   `json:"previous_from"`
+	Split         string               `json:"split"`
+	Breakdown     string               `json:"breakdown"`
+	Now           pgtype.Timestamptz   `json:"now"`
+	BucketStarts  []pgtype.Timestamptz `json:"bucket_starts"`
+	BucketEnds    []pgtype.Timestamptz `json:"bucket_ends"`
+	RollStarts    []pgtype.Timestamptz `json:"roll_starts"`
+	RollEnds      []pgtype.Timestamptz `json:"roll_ends"`
+	RevealRepos   bool                 `json:"reveal_repos"`
+	UserID        uuid.UUID            `json:"user_id"`
+	FoldFrom      pgtype.Timestamptz   `json:"fold_from"`
+	RepoID        pgtype.UUID          `json:"repo_id"`
+	Harness       pgtype.Text          `json:"harness"`
+	Kinds         []string             `json:"kinds"`
+	DeliveryKinds []string             `json:"delivery_kinds"`
+}
+
+// Issue #4684: the Spend document, one jsonb value built over ONE materialized cohort and fold.
+// The owner and all-scope statements are kept textually identical except the scope lines, each
+// tagged with a trailing marker comment (a Go test drops them and fails on any other drift).
+// Every range comes from the parameters (half-open: start <= created_at < end); there is no
+// calendar arithmetic here. Dollars are emitted as numeric strings, ratios as JSON numbers,
+// timestamps as UTC strings so the document does not depend on the session TimeZone.
+func (q *Queries) AnalyticsOwnerSpend(ctx context.Context, arg AnalyticsOwnerSpendParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, analyticsOwnerSpend,
+		arg.From,
+		arg.PreviousFrom,
+		arg.Split,
+		arg.Breakdown,
+		arg.Now,
+		arg.BucketStarts,
+		arg.BucketEnds,
+		arg.RollStarts,
+		arg.RollEnds,
+		arg.RevealRepos,
+		arg.UserID,
+		arg.FoldFrom,
+		arg.RepoID,
+		arg.Harness,
+		arg.Kinds,
+		arg.DeliveryKinds,
+	)
+	var doc []byte
+	err := row.Scan(&doc)
+	return doc, err
 }
 
 const analyticsRepoExists = `-- name: AnalyticsRepoExists :one

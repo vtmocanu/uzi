@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -11,8 +12,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/analytics"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -40,6 +45,98 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (the store IT runner
 // provides one), like TestUpsertRunUsageMergeLiveDB.
 func TestRunUsageGenericPlanLiveDB(t *testing.T) {
+	e := newGenericPlanEnv(t)
+	ctx, q := e.ctx, e.q
+	userID, targetID := e.userID, e.targetID
+
+	// The Runs page's own ids, exactly what the handler hands ListRunUsageTotalsForRuns.
+	page, err := q.ListRunsForUser(ctx, store.ListRunsForUserParams{UserID: userID})
+	if err != nil {
+		t.Fatalf("ListRunsForUser: %v", err)
+	}
+	if len(page) == 0 {
+		t.Fatal("ListRunsForUser returned no rows for the seeded user")
+	}
+	pageIDs := make([]string, 0, len(page))
+	for _, row := range page {
+		pageIDs = append(pageIDs, row.Run.ID.String())
+	}
+
+	u := func(id uuid.UUID) string { return "'" + id.String() + "'::uuid" }
+	cutoff := "'" + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano) + "'::timestamptz"
+	// scoped marks a read whose answer depends only on this user's legs: its run_usage
+	// SCAN nodes must emit at most the user's own leg count (scopedBound), which catches a
+	// plan that folds every user's usage once per call — linear in the whole table, the
+	// slow shape even without the per-row loop. GetJudgeRunUsageForTarget is not scoped:
+	// its LEFT JOIN onto the view has no pushable qual, so it folds the table once (inside
+	// the 4× bound) and is guarded here only against the per-row re-fold.
+	cases := []genericPlanCase{
+		// $1 background_grace_cutoff, $2 user_id, $3 repo_id (NULL = no filter), $4 issue_iid.
+		// Since #1620 M1 ListRunsForUser's plan does not touch run_usage at all: this case guards
+		// against the view join coming back into the run-list query.
+		{name: "ListRunsForUser", sql: store.ListRunsForUserSQL, args: []string{cutoff + ", " + u(userID) + ", NULL::uuid, NULL::bigint"}, scoped: true},
+		{name: "ListRunUsageTotalsForRuns", sql: store.ListRunUsageTotalsForRunsSQL, args: []string{"'{" + strings.Join(pageIDs, ",") + "}'::uuid[]"}, scoped: true},
+		{name: "SelfUsage", sql: store.SelfUsageSQL, args: []string{u(userID)}, scoped: true},
+		{name: "GetJudgeRunUsageForTarget", sql: store.GetJudgeRunUsageForTargetSQL, args: []string{u(targetID)}, scoped: false},
+		{name: "GetRunUsageTotal", sql: store.GetRunUsageTotalSQL, args: []string{u(targetID)}, scoped: true},
+	}
+	// Issue #4684: the Spend statements, in the same table. OwnerSpend is scoped to the
+	// Spend-only owner and is run with @reveal_repos false and true against one prepared
+	// statement (one cached generic plan serves both routes); AllSpend is unscoped.
+	cases = append(cases,
+		genericPlanCase{name: "AnalyticsOwnerSpend", sql: store.AnalyticsOwnerSpendSQL, args: e.spendArgs(t, e.spendOwnerID, false, true), scoped: true, spend: true, ownLegs: e.spendOwnLegs},
+		genericPlanCase{name: "AnalyticsAllSpend", sql: store.AnalyticsAllSpendSQL, args: e.spendArgs(t, uuid.Nil, false, false), scoped: false, spend: true},
+	)
+
+	for i, c := range cases {
+		stmt := fmt.Sprintf("usage_plan_%d", i)
+		e.exec(t, fmt.Sprintf("PREPARE %s AS %s", stmt, c.sql))
+		for v, args := range c.args {
+			name := c.name
+			if len(c.args) > 1 {
+				name = fmt.Sprintf("%s[variant %d]", c.name, v)
+			}
+			doc := e.explain(t, name, stmt, args)
+			e.checkPlan(t, name, c, doc)
+			t.Logf("%s generic plan (run_usage count %d):\n%s", name, e.denominator, renderPlan(doc, 0))
+		}
+		e.exec(t, "DEALLOCATE "+stmt)
+	}
+}
+
+// genericPlanCase is one statement under test: its SQL and one or more EXECUTE argument
+// lists (variants of one prepared statement). spend marks the #4684 Spend statements, which
+// get extra checks keyed to them; ownLegs overrides the scoped bound's own-leg count.
+type genericPlanCase struct {
+	name, sql string
+	args      []string
+	scoped    bool
+	spend     bool
+	ownLegs   int64
+}
+
+// genericPlanEnv is the seeded database, the repeatable-read connection with
+// plan_cache_mode = force_generic_plan, and the bounds the plan checks compare against.
+type genericPlanEnv struct {
+	ctx  context.Context
+	pool *pgxpool.Pool
+	q    *store.Queries
+	conn *pgxpool.Conn
+
+	userID, targetID uuid.UUID
+	// The Spend-only owner (and its runs), seeded after the five usage cases' data.
+	spendOwnerID uuid.UUID
+
+	denominator  int64
+	ownLegs      int64
+	spendOwnLegs int64
+	bound        float64
+	scopedBound  float64
+	runsTotal    int64
+}
+
+func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store integration runner for live-DB coverage")
@@ -52,7 +149,7 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 
 	// One fresh user with a repo, the shape of a real Runs page owner.
@@ -131,122 +228,367 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `ANALYZE runs`)
 	mustExec(ctx, t, pool, `ANALYZE run_usage`)
 
-	// The Runs page's own ids, exactly what the handler hands ListRunUsageTotalsForRuns.
-	page, err := q.ListRunsForUser(ctx, store.ListRunsForUserParams{UserID: userID})
-	if err != nil {
-		t.Fatalf("ListRunsForUser: %v", err)
-	}
-	if len(page) == 0 {
-		t.Fatal("ListRunsForUser returned no rows for the seeded user")
-	}
-	pageIDs := make([]string, 0, len(page))
-	for _, row := range page {
-		pageIDs = append(pageIDs, row.Run.ID.String())
-	}
-
-	u := func(id uuid.UUID) string { return "'" + id.String() + "'::uuid" }
-	cutoff := "'" + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano) + "'::timestamptz"
-	// scoped marks a read whose answer depends only on this user's legs: its run_usage
-	// SCAN nodes must emit at most the user's own leg count (scopedBound), which catches a
-	// plan that folds every user's usage once per call — linear in the whole table, the
-	// slow shape even without the per-row loop. GetJudgeRunUsageForTarget is not scoped:
-	// its LEFT JOIN onto the view has no pushable qual, so it folds the table once (inside
-	// the 4× bound) and is guarded here only against the per-row re-fold.
-	cases := []struct {
-		name, sql, args string
-		scoped          bool
-	}{
-		// $1 background_grace_cutoff, $2 user_id, $3 repo_id (NULL = no filter), $4 issue_iid.
-		// Since #1620 M1 ListRunsForUser's plan does not touch run_usage at all: this case guards
-		// against the view join coming back into the run-list query.
-		{"ListRunsForUser", store.ListRunsForUserSQL, cutoff + ", " + u(userID) + ", NULL::uuid, NULL::bigint", true},
-		{"ListRunUsageTotalsForRuns", store.ListRunUsageTotalsForRunsSQL, "'{" + strings.Join(pageIDs, ",") + "}'::uuid[]", true},
-		{"SelfUsage", store.SelfUsageSQL, u(userID), true},
-		{"GetJudgeRunUsageForTarget", store.GetJudgeRunUsageForTargetSQL, u(targetID), false},
-		{"GetRunUsageTotal", store.GetRunUsageTotalSQL, u(targetID), true},
-	}
+	// Issue #4684 Spend-only seed, appended after everything the five usage cases read. A
+	// dedicated owner keeps those cases' data untouched. Its runs spread over ~37 days (so
+	// both the current and the previous 30d window hold runs) and a fraction carry mr_iid
+	// (some shared by several runs) and mr_state merged, so the witness semi-join and the
+	// per-PR attribution actually execute. Two owners' worth of legs exist already (userID,
+	// otherUserID), so an unscoped fold of this owner's usage is visible against its own legs.
+	spendOwnerID, spendConnID, spendRepoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		spendOwnerID, fmt.Sprintf("genericplan-spend-%s@e2e", spendOwnerID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, spendConnID, spendOwnerID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/generic-plan-spend', 'https://forge.e2e/g/generic-plan-spend', 'main', true)`, spendRepoID, spendConnID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, created_at,
+		                   mr_iid, mr_state)
+		 SELECT gen_random_uuid(), $1, $2, g, 't', 'd', 'completed', 'issue', now() - make_interval(hours => g * 3),
+		        CASE WHEN g % 2 = 0 THEN (g % 60) + 1 END,
+		        CASE WHEN g % 4 = 0 THEN 'merged' WHEN g % 2 = 0 THEN 'opened' END
+		 FROM generate_series(1, $3::int) g`, spendOwnerID, spendRepoID, nRuns)
+	mustExec(ctx, t, pool,
+		`INSERT INTO run_usage (run_id, session_id, model, lineage_epoch, input_tokens, cache_read_tokens,
+		                        cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis)
+		 SELECT r.id, 'sess-' || e, m, e, 100 + e, 10, 5, 50, 0.001, 'claude', 'metered', 'per_leg'
+		 FROM runs r
+		 CROSS JOIN (VALUES ('model-a'), ('model-b')) AS models(m)
+		 CROSS JOIN generate_series(0, 1) AS e
+		 WHERE r.user_id = $1`, spendOwnerID)
+	mustExec(ctx, t, pool, `ANALYZE runs`)
+	mustExec(ctx, t, pool, `ANALYZE run_usage`)
 
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	defer conn.Release()
+	t.Cleanup(conn.Release)
+	e := &genericPlanEnv{ctx: ctx, pool: pool, q: q, conn: conn, userID: userID, targetID: targetID, spendOwnerID: spendOwnerID}
 	// Simple protocol throughout: these are session/utility statements, and the plan under
 	// test is the one the server-side PREPARE produces, not a pgx-cached one.
-	simple := pgx.QueryExecModeSimpleProtocol
-	exec := func(sql string) {
-		t.Helper()
-		if _, err := conn.Exec(ctx, sql, simple); err != nil {
-			t.Fatalf("exec %q: %v", sql, err)
-		}
-	}
-	exec(`BEGIN ISOLATION LEVEL REPEATABLE READ`)
-	defer func() { _, _ = conn.Exec(context.Background(), `ROLLBACK`, simple) }()
-	exec(`SET LOCAL plan_cache_mode = force_generic_plan`)
+	e.exec(t, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
+	t.Cleanup(func() { _, _ = conn.Exec(context.Background(), `ROLLBACK`, pgx.QueryExecModeSimpleProtocol) })
+	e.exec(t, `SET LOCAL plan_cache_mode = force_generic_plan`)
 
-	var denominator int64
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM run_usage`, simple).Scan(&denominator); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM run_usage`, pgx.QueryExecModeSimpleProtocol).Scan(&e.denominator); err != nil {
 		t.Fatalf("count run_usage: %v", err)
 	}
-	if denominator < 4*nRuns {
-		t.Fatalf("run_usage count %d < the %d legs this test seeded; the snapshot is wrong", denominator, 4*nRuns)
+	if e.denominator < 4*nRuns {
+		t.Fatalf("run_usage count %d < the %d legs this test seeded; the snapshot is wrong", e.denominator, 4*nRuns)
 	}
-	bound := 4 * float64(denominator)
-	var ownLegs int64
+	e.bound = 4 * float64(e.denominator)
 	if err := conn.QueryRow(ctx,
 		`SELECT count(*) FROM run_usage ru JOIN runs r ON r.id = ru.run_id WHERE r.user_id = $1`,
-		simple, userID).Scan(&ownLegs); err != nil {
+		pgx.QueryExecModeSimpleProtocol, userID).Scan(&e.ownLegs); err != nil {
 		t.Fatalf("count own run_usage: %v", err)
 	}
-	if ownLegs >= denominator {
-		t.Fatalf("own legs %d >= table %d: the other user's legs are missing, so scopedBound proves nothing", ownLegs, denominator)
+	if e.ownLegs >= e.denominator {
+		t.Fatalf("own legs %d >= table %d: the other user's legs are missing, so scopedBound proves nothing", e.ownLegs, e.denominator)
 	}
-	scopedBound := float64(ownLegs)
+	e.scopedBound = float64(e.ownLegs)
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM run_usage ru JOIN runs r ON r.id = ru.run_id WHERE r.user_id = $1`,
+		pgx.QueryExecModeSimpleProtocol, spendOwnerID).Scan(&e.spendOwnLegs); err != nil {
+		t.Fatalf("count spend owner run_usage: %v", err)
+	}
+	if e.spendOwnLegs >= e.denominator {
+		t.Fatalf("spend owner legs %d >= table %d: the other users' legs are missing", e.spendOwnLegs, e.denominator)
+	}
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM runs`, pgx.QueryExecModeSimpleProtocol).Scan(&e.runsTotal); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	return e
+}
 
-	for i, c := range cases {
-		stmt := fmt.Sprintf("usage_plan_%d", i)
-		exec(fmt.Sprintf("PREPARE %s AS %s", stmt, c.sql))
-		var raw []byte
-		if err := conn.QueryRow(ctx, fmt.Sprintf("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE %s(%s)", stmt, c.args), simple).Scan(&raw); err != nil {
-			t.Fatalf("%s: EXPLAIN EXECUTE: %v", c.name, err)
-		}
-		var generic int64
-		if err := conn.QueryRow(ctx, `SELECT generic_plans FROM pg_prepared_statements WHERE name = $1`, simple, stmt).Scan(&generic); err != nil {
-			t.Fatalf("%s: read pg_prepared_statements: %v", c.name, err)
-		}
-		if generic < 1 {
-			t.Fatalf("%s: generic_plans = %d; the EXPLAIN did not run the GENERIC plan this test exists to measure", c.name, generic)
-		}
-		exec("DEALLOCATE " + stmt)
+func (e *genericPlanEnv) exec(t *testing.T, sql string) {
+	t.Helper()
+	if _, err := e.conn.Exec(e.ctx, sql, pgx.QueryExecModeSimpleProtocol); err != nil {
+		t.Fatalf("exec %q: %v", sql, err)
+	}
+}
 
-		var doc []struct {
-			Plan planNode `json:"Plan"`
+// explain runs EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE on the prepared statement and returns
+// the plan, failing unless PostgreSQL ran the GENERIC plan.
+func (e *genericPlanEnv) explain(t *testing.T, name, stmt, args string) *planNode {
+	t.Helper()
+	var raw []byte
+	if err := e.conn.QueryRow(e.ctx, fmt.Sprintf("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE %s(%s)", stmt, args), pgx.QueryExecModeSimpleProtocol).Scan(&raw); err != nil {
+		t.Fatalf("%s: EXPLAIN EXECUTE: %v", name, err)
+	}
+	var generic int64
+	if err := e.conn.QueryRow(e.ctx, `SELECT generic_plans FROM pg_prepared_statements WHERE name = $1`, pgx.QueryExecModeSimpleProtocol, stmt).Scan(&generic); err != nil {
+		t.Fatalf("%s: read pg_prepared_statements: %v", name, err)
+	}
+	if generic < 1 {
+		t.Fatalf("%s: generic_plans = %d; the EXPLAIN did not run the GENERIC plan this test exists to measure", name, generic)
+	}
+	var doc []struct {
+		Plan planNode `json:"Plan"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil || len(doc) != 1 {
+		t.Fatalf("%s: decode EXPLAIN JSON (%d docs): %v", name, len(doc), err)
+	}
+	return &doc[0].Plan
+}
+
+// planOffenders is the issue #1620 check: every node whose subtree scans run_usage may do at
+// most 4 × count(run_usage) rows of work, and a scoped statement's run_usage scans may touch
+// no more legs than the scope's owner has.
+func (e *genericPlanEnv) planOffenders(c genericPlanCase, root *planNode) []string {
+	own := e.ownLegs
+	if c.ownLegs != 0 {
+		own = c.ownLegs
+	}
+	scopedBound := float64(own)
+	var offenders []string
+	walkUsagePlan(root, func(n *planNode) {
+		if total, _ := nodeWork(n); total > e.bound {
+			offenders = append(offenders, fmt.Sprintf("%s (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f)",
+				n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total))
 		}
-		if err := json.Unmarshal(raw, &doc); err != nil || len(doc) != 1 {
-			t.Fatalf("%s: decode EXPLAIN JSON (%d docs): %v", c.name, len(doc), err)
+		if c.scoped && n.RelationName == "run_usage" {
+			// EXPLAIN prints each per-loop count as an average ROUNDED to an integer, so
+			// count × loops can overshoot the true total by up to half a row per loop per
+			// rounded count (1201 legs over 301 loops prints as 4 × 301 = 1204); allow
+			// exactly that.
+			if total, rounded := nodeWork(n); total > scopedBound+rounded*n.ActualLoops/2 {
+				offenders = append(offenders, fmt.Sprintf("%s on run_usage (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f > the user's own %d legs: folds other users' usage)",
+					n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total, own))
+			}
 		}
-		var offenders []string
-		walkUsagePlan(&doc[0].Plan, func(n *planNode) {
-			if total, _ := nodeWork(n); total > bound {
-				offenders = append(offenders, fmt.Sprintf("%s (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f)",
-					n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total))
-			}
-			if c.scoped && n.RelationName == "run_usage" {
-				// EXPLAIN prints each per-loop count as an average ROUNDED to an integer, so
-				// count × loops can overshoot the true total by up to half a row per loop per
-				// rounded count (1201 legs over 301 loops prints as 4 × 301 = 1204); allow
-				// exactly that.
-				if total, rounded := nodeWork(n); total > scopedBound+rounded*n.ActualLoops/2 {
-					offenders = append(offenders, fmt.Sprintf("%s on run_usage (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f > the user's own %d legs: folds other users' usage)",
-						n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total, ownLegs))
-				}
-			}
+	})
+	return offenders
+}
+
+// checkPlan asserts the plan stays inside its bounds and, for the Spend statements, the
+// extra #4684 conditions.
+func (e *genericPlanEnv) checkPlan(t *testing.T, name string, c genericPlanCase, root *planNode) {
+	t.Helper()
+	own := e.ownLegs
+	if c.ownLegs != 0 {
+		own = c.ownLegs
+	}
+	if offenders := e.planOffenders(c, root); len(offenders) > 0 {
+		t.Errorf("%s: under a generic plan, run_usage work exceeds its bound (4 × count(run_usage) = %.0f, count %d, own legs %d), i.e. the view is re-folded per outer row or folded beyond this user (issue #1620):\n  %s",
+			name, e.bound, e.denominator, own, strings.Join(offenders, "\n  "))
+	}
+	if !c.spend {
+		return
+	}
+	var usageScans []*planNode
+	var runsScans []*planNode
+	var visit func(n *planNode)
+	visit = func(n *planNode) {
+		switch n.RelationName {
+		case "run_usage":
+			usageScans = append(usageScans, n)
+		case "runs":
+			runsScans = append(runsScans, n)
+		}
+		for i := range n.Plans {
+			visit(&n.Plans[i])
+		}
+	}
+	visit(root)
+
+	// Non-vacuity: the fold really read run_usage, so the bounds above compare something.
+	var nonEmpty bool
+	for _, n := range usageScans {
+		if n.ActualRows*n.ActualLoops > 0 {
+			nonEmpty = true
+		}
+	}
+	if !nonEmpty {
+		t.Errorf("%s: no run_usage scan node returned rows; the seed or the window is empty and the plan bounds prove nothing", name)
+	}
+	// Fold once (unscoped statement): the run_usage SCAN nodes together read each leg about
+	// once. Only scan nodes of run_usage count, never an ancestor aggregate, window or CTE.
+	if !c.scoped {
+		var sum, slack float64
+		for _, n := range usageScans {
+			total, rounded := nodeWork(n)
+			sum += total
+			slack += rounded * n.ActualLoops / 2
+		}
+		if sum > float64(e.denominator)+slack {
+			t.Errorf("%s: run_usage scan nodes did %.0f rows of work in total, more than one fold of the table (%d, rounding slack %.0f)",
+				name, sum, e.denominator, slack)
+		}
+	}
+	// No per-cohort-row re-scan of runs: a scan node that looped more than once may not do
+	// more than 4 × count(runs) work in total.
+	for _, n := range runsScans {
+		if total, _ := nodeWork(n); n.ActualLoops > 1 && total > 4*float64(e.runsTotal) {
+			t.Errorf("%s: %s on runs looped %.0f times for %.0f rows of work (> 4 × count(runs) = %d): a per-row re-scan of runs",
+				name, n.NodeType, n.ActualLoops, total, 4*e.runsTotal)
+		}
+	}
+}
+
+// spendArgs renders the EXECUTE arguments of a Spend statement for a 30d window ending at
+// the transaction's now(), with the bucket and rolling arrays from the real calendar code.
+// owner == uuid.Nil selects the all-scope statement. When bothReveal is true the owner
+// statement yields two variants, @reveal_repos false then true. The argument order is read
+// from what the generated Go method actually passes (a capturing DBTX), never assumed.
+func (e *genericPlanEnv) spendArgs(t *testing.T, owner uuid.UUID, reveal, bothReveal bool) []string {
+	t.Helper()
+	var now time.Time
+	// now() read inside the plan transaction (newGenericPlanEnv has already begun it), so
+	// DB/host clock skew cannot empty the cohort.
+	if err := e.conn.QueryRow(e.ctx, `SELECT now()`, pgx.QueryExecModeSimpleProtocol).Scan(&now); err != nil {
+		t.Fatalf("select now(): %v", err)
+	}
+	b, err := analytics.ComputeBounds(now, time.UTC, analytics.Window30d, nil)
+	if err != nil {
+		t.Fatalf("ComputeBounds: %v", err)
+	}
+	ts := func(v time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: v, Valid: true} }
+	tss := func(vs []time.Time) []pgtype.Timestamptz {
+		out := make([]pgtype.Timestamptz, len(vs))
+		for i, v := range vs {
+			out[i] = ts(v)
+		}
+		return out
+	}
+	var prev pgtype.Timestamptz
+	if b.PreviousFrom != nil {
+		prev = ts(*b.PreviousFrom)
+	}
+	common := func() (from, previous, fold, nowTS pgtype.Timestamptz) {
+		return ts(b.From), prev, ts(b.FoldFrom), ts(b.Now)
+	}
+	from, previous, fold, nowTS := common()
+	var variants [][]any
+	capture := &capturingDBTX{}
+	cq := store.New(capture)
+	if owner != uuid.Nil {
+		revs := []bool{reveal}
+		if bothReveal {
+			revs = []bool{false, true}
+		}
+		for _, r := range revs {
+			capture.args = nil
+			_, _ = cq.AnalyticsOwnerSpend(e.ctx, store.AnalyticsOwnerSpendParams{
+				UserID: owner, RevealRepos: r, Now: nowTS, From: from, PreviousFrom: previous, FoldFrom: fold,
+				BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds),
+				RollStarts: tss(b.RollStarts), RollEnds: tss(b.RollEnds),
+				Kinds: runkind.All(), DeliveryKinds: runkind.Delivery(), Split: "usage_model", Breakdown: "repo",
+			})
+			variants = append(variants, capture.args)
+		}
+	} else {
+		_, _ = cq.AnalyticsAllSpend(e.ctx, store.AnalyticsAllSpendParams{
+			Now: nowTS, From: from, PreviousFrom: previous, FoldFrom: fold,
+			BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds),
+			RollStarts: tss(b.RollStarts), RollEnds: tss(b.RollEnds),
+			Kinds: runkind.All(), DeliveryKinds: runkind.Delivery(), Split: "usage_model", Breakdown: "primary_model",
 		})
-		if len(offenders) > 0 {
-			t.Errorf("%s: under a generic plan, run_usage work exceeds its bound (4 × count(run_usage) = %.0f, count %d, own legs %d), i.e. the view is re-folded per outer row or folded beyond this user (issue #1620):\n  %s",
-				c.name, bound, denominator, ownLegs, strings.Join(offenders, "\n  "))
+		variants = append(variants, capture.args)
+	}
+	out := make([]string, 0, len(variants))
+	for _, args := range variants {
+		lits := make([]string, len(args))
+		for i, a := range args {
+			lits[i] = sqlLiteral(t, a)
 		}
-		t.Logf("%s generic plan (run_usage count %d):\n%s", c.name, denominator, renderPlan(&doc[0].Plan, 0))
+		out = append(out, strings.Join(lits, ", "))
+	}
+	return out
+}
+
+// capturingDBTX records the arguments of the last QueryRow so a test can read the argument
+// order of a generated sqlc method.
+type capturingDBTX struct{ args []any }
+
+func (c *capturingDBTX) Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+func (c *capturingDBTX) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
+	return nil, errors.New("capturingDBTX: Query unsupported")
+}
+
+func (c *capturingDBTX) QueryRow(_ context.Context, _ string, args ...interface{}) pgx.Row {
+	c.args = args
+	return capturedRow{}
+}
+
+type capturedRow struct{}
+
+func (capturedRow) Scan(...any) error { return nil }
+
+// sqlLiteral renders one generated-method argument as a typed SQL literal for EXECUTE.
+func sqlLiteral(t *testing.T, a any) string {
+	t.Helper()
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+	tsLit := func(v pgtype.Timestamptz) string {
+		if !v.Valid {
+			return "NULL::timestamptz"
+		}
+		return quote(v.Time.UTC().Format(time.RFC3339Nano)) + "::timestamptz"
+	}
+	switch v := a.(type) {
+	case pgtype.Timestamptz:
+		return tsLit(v)
+	case []pgtype.Timestamptz:
+		parts := make([]string, len(v))
+		for i, x := range v {
+			parts[i] = tsLit(x)
+		}
+		return "ARRAY[" + strings.Join(parts, ", ") + "]::timestamptz[]"
+	case string:
+		return quote(v) + "::text"
+	case []string:
+		parts := make([]string, len(v))
+		for i, x := range v {
+			parts[i] = quote(x)
+		}
+		return "ARRAY[" + strings.Join(parts, ", ") + "]::text[]"
+	case bool:
+		return fmt.Sprintf("%t::boolean", v)
+	case uuid.UUID:
+		return quote(v.String()) + "::uuid"
+	case pgtype.UUID:
+		if !v.Valid {
+			return "NULL::uuid"
+		}
+		return quote(uuid.UUID(v.Bytes).String()) + "::uuid"
+	case pgtype.Text:
+		if !v.Valid {
+			return "NULL::text"
+		}
+		return quote(v.String) + "::text"
+	}
+	t.Fatalf("sqlLiteral: unsupported argument type %T", a)
+	return ""
+}
+
+// TestAnalyticsSpendGenericPlanNegativeControlLiveDB proves the Spend plan check can fail:
+// an unscoped owner-shaped fold (a plain LEFT JOIN of run_usage_model_totals with no run-id
+// correlation, which is what the lateral fence in AnalyticsOwnerSpend exists to prevent)
+// must produce the scoped run_usage offender, i.e. a plan that folds other users' usage.
+func TestAnalyticsSpendGenericPlanNegativeControlLiveDB(t *testing.T) {
+	e := newGenericPlanEnv(t)
+	const unscoped = `SELECT r.id, m.model, m.cost_usd
+	FROM runs r
+	LEFT JOIN run_usage_model_totals m ON m.run_id = r.id
+	WHERE r.user_id = $1::uuid`
+	c := genericPlanCase{name: "UnscopedOwnerFold", sql: unscoped, scoped: true, spend: true, ownLegs: e.spendOwnLegs}
+	e.exec(t, "PREPARE usage_plan_control AS "+unscoped)
+	doc := e.explain(t, c.name, "usage_plan_control", "'"+e.spendOwnerID.String()+"'::uuid")
+	offenders := e.planOffenders(c, doc)
+	t.Logf("negative control plan:\n%s", renderPlan(doc, 0))
+	var found bool
+	for _, o := range offenders {
+		if strings.Contains(o, "on run_usage") && strings.Contains(o, "folds other users' usage") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the unscoped owner-shaped fold did not trip the scoped run_usage offender (offenders: %v); the Spend plan check cannot fail", offenders)
 	}
 }
 
