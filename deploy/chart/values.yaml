@@ -1784,7 +1784,8 @@ web:
     #    re-resolved at request time (survives a Service recreate). REQUIRES
     #    web.nginx.resolver set to the cluster's kube-dns/CoreDNS ClusterIP.
     dynamicResolution: false
-    # The cluster DNS resolver IP (only used when dynamicResolution: true). Find it
+    # The cluster DNS resolver IP (used when dynamicResolution: true, and always, in every module
+    # location, when web.modules is non-empty). Find it
     # with `kubectl -n kube-system get svc kube-dns -o jsonpath={.spec.clusterIP}`.
     resolver: ""
   # Runtime web modules (PRD #4686): UI modules served by their own Deployment and loaded
@@ -1797,8 +1798,8 @@ web:
   #   icon      (required) one of activity board book bot bug chat clock factory file-text gear git
   #             home key package scale search server shield skill terminal.
   #   navGroup  (required) work | factory | modules (the sidebar section).
-  #   adminOnly (optional) boolean, default false. A UI visibility rule only: a signed-in user
-  #             can still fetch /modules.json and the module files. Never put a secret in a module.
+  #   adminOnly (optional) boolean, default false. A UI visibility rule only: anyone can
+  #             fetch /modules.json and the module files (no authentication on those paths). Never put a secret in a module.
   #   upstream  (required) [http://]HOST:PORT of the module's static server; HOST is a lowercase
   #             DNS-1123 name or an IPv4 address, PORT 1-65535, nothing else (no path or query).
   #             A dotless HOST (a Service name) expands to <host>.<release namespace>.svc.cluster.local.

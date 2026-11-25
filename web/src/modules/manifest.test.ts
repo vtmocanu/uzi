@@ -55,8 +55,8 @@ describe("parseModuleList", () => {
     expect(errors).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["label", "version"])("skips a %s with control or invisible characters, one log each", (field) => {
-    for (const bad of ["a\u0000b", "a\tb", "a\u0085b", "a\u200bb", "a\u200fb", "a\u202eb", "a\u2066b", "a\u2069b", "a\u2028b", "a\u2029b"]) {
+  it.each(["label", "version", "page"])("skips a %s with control or invisible characters, one log each", (field) => {
+    for (const bad of ["a\u0000b", "a\tb", "a\u0085b", "a\u200bb", "a\u200fb", "a\u202eb", "a\u2066b", "a\u2069b", "a\u2028b", "a\u2029b", "a\u061cb", "a\ufeffb", "a\u2060b", "a\u2062b", "a\u2064b", "a\u00adb", "a\u180eb"]) {
       errors.mockClear();
       expect(parseModuleList([{ ...valid, [field]: bad }])).toEqual([]);
       expect(errors).toHaveBeenCalledTimes(1);

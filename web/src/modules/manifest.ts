@@ -23,8 +23,12 @@ const MODULE_ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const NAV_GROUPS: readonly string[] = ["work", "factory", "modules"];
 const LABEL_MAX = 40;
 // C0/C1 controls, zero-width and directional marks (U+200B-200F), bidi embeddings and
-// overrides (U+202A-202E), bidi isolates (U+2066-2069), and the line/paragraph separators.
-const UNSAFE_TEXT_RE = /[\p{Cc}\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/u;
+// overrides (U+202A-202E), bidi isolates (U+2066-2069), the line/paragraph separators, the Arabic
+// letter mark (U+061C), the BOM (U+FEFF), word joiner and invisible operators (U+2060-2064), the
+// soft hyphen (U+00AD) and the Mongolian vowel separator (U+180E). Keep equal to $unsafe in
+// deploy/chart/templates/_web-modules.tpl.
+const UNSAFE_TEXT_RE =
+  /[\p{Cc}\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\u061c\ufeff\u2060-\u2064\u00ad\u180e]/u;
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim() !== "";
@@ -61,7 +65,7 @@ export function parseModuleList(json: unknown): ModuleEntry[] {
       skip(id, `label is longer than ${LABEL_MAX} characters`);
       return;
     }
-    for (const field of ["label", "version"] as const) {
+    for (const field of ["label", "version", "page"] as const) {
       if (UNSAFE_TEXT_RE.test(e[field] as string)) {
         skip(id, `${field} contains control or invisible formatting characters`);
         return;

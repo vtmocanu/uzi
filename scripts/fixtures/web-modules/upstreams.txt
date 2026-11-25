@@ -11,6 +11,8 @@ accept <10.0.0.1:8080>
 accept <my-svc.my-ns.svc.cluster.local:65535>
 accept <http://10.255.255.255:1>
 accept <a1-b2.c3:443>
+# A 253-character host (the DNS maximum) of valid labels is accepted, 254 is not.
+accept <aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:80>
 reject <svc>
 reject <svc:>
 reject <:80>
@@ -53,3 +55,4 @@ reject <svc.:80>
 reject <svc_x:80>
 reject <svc:80:80>
 reject <http:svc:80>
+reject <aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:80>

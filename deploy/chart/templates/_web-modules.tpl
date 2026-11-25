@@ -45,7 +45,7 @@ render on the first invalid rule. Call with the root context.
 {{- $seen := dict -}}
 {{- $ipv4 := `^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$` -}}
 {{- $dns := `^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$` -}}
-{{- $unsafe := `[\p{Cc}\x{200B}-\x{200F}\x{2028}\x{2029}\x{202A}-\x{202E}\x{2066}-\x{2069}]` -}}
+{{- $unsafe := `[\p{Cc}\x{200B}-\x{200F}\x{2028}\x{2029}\x{202A}-\x{202E}\x{2066}-\x{2069}\x{061C}\x{FEFF}\x{2060}-\x{2064}\x{00AD}\x{180E}]` -}}
 {{- range $i, $m := $mods -}}
 {{- $where := printf "web.modules[%d]" $i -}}
 {{- if not (kindIs "map" $m) -}}
@@ -57,7 +57,10 @@ render on the first invalid rule. Call with the root context.
 {{- $idOK = regexMatch `^[a-z][a-z0-9-]{0,31}$` $id -}}
 {{- end -}}
 {{- if not $idOK -}}
+{{- if kindIs "string" $id -}}
 {{- fail (printf "%s: id %q is malformed: it must match ^[a-z][a-z0-9-]{0,31}$" $where $id) -}}
+{{- end -}}
+{{- fail (printf "%s: id must be a string matching ^[a-z][a-z0-9-]{0,31}$ (got %s)" $where (kindOf $id)) -}}
 {{- end -}}
 {{- if hasKey $seen $id -}}
 {{- fail (printf "%s: duplicate id %q (web.modules[%d] already uses it)" $where $id (index $seen $id)) -}}
@@ -74,7 +77,7 @@ render on the first invalid rule. Call with the root context.
 {{- fail (printf "%s: missing required field %q (it must be a non-empty string)" $where $f) -}}
 {{- end -}}
 {{- end -}}
-{{- range $f := list "label" "version" -}}
+{{- range $f := list "label" "version" "page" -}}
 {{- if regexMatch $unsafe (index $m $f) -}}
 {{- fail (printf "%s: %s contains control or invisible formatting characters" $where $f) -}}
 {{- end -}}
@@ -118,11 +121,6 @@ render on the first invalid rule. Call with the root context.
 {{- else -}}
 {{- if or (gt (len $host) 253) (not (regexMatch $dns $host)) -}}
 {{- fail $bad -}}
-{{- end -}}
-{{- range $label := splitList "." $host -}}
-{{- if gt (len $label) 63 -}}
-{{- fail $bad -}}
-{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if not (contains "." $host) -}}

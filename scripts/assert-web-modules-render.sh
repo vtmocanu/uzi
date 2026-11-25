@@ -275,7 +275,7 @@ invalid() { # <fixture-suffix> <message fragment>
 }
 invalid bad-id 'id "Bad" is malformed'
 invalid bad-id-long 'is malformed'
-invalid dup-id 'duplicate id "same"'
+invalid dup-id 'web.modules[1]: duplicate id "same" (web.modules[0] already uses it)'
 for f in version page label icon navGroup upstream; do
   invalid "missing-$f" "missing required field \"$f\""
 done
@@ -286,6 +286,9 @@ invalid label-control 'label contains control or invisible formatting characters
 invalid label-bidi 'label contains control or invisible formatting characters'
 invalid label-newline 'label contains control or invisible formatting characters'
 invalid version-invisible 'version contains control or invisible formatting characters'
+invalid page-invisible 'page contains control or invisible formatting characters'
+invalid label-bom 'label contains control or invisible formatting characters'
+invalid id-number 'id must be a string'
 invalid unknown-icon 'unknown icon "rocket"'
 invalid unknown-navgroup 'unknown navGroup "sidebar"'
 invalid adminonly-string 'adminOnly must be a boolean'
