@@ -267,8 +267,8 @@ func reserveRequestStillWanted(run store.Run, snap *reserveSnap) bool {
 	if !snap.on() || !snap.pauseRunning {
 		return false
 	}
-	// A provider-bound run is outside the vendor reserve (reserveEnforced): a request filed while it
-	// was filed before this exemption (an older build) is withdrawn.
+	// A provider-bound run is outside the vendor reserve (reserveEnforced): a request filed before
+	// this exemption existed (an older build) is withdrawn.
 	if providerBoundRun(run) {
 		return false
 	}
