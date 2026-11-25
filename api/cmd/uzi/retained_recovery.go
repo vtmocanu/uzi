@@ -257,7 +257,7 @@ func idleStallResumeGuidance(r apitypes.RunDTO) string {
 }
 
 // freshResumeEligible mirrors the server's eligibility base (fn_fresh_resume_run_base in migration
-// 00523_run_fresh_resumes.sql) on the fields the CLI has: a recovery_wait with one of four causes, no
+// 00532_run_fresh_resumes.sql) on the fields the CLI has: a recovery_wait with one of four causes, no
 // secret_remediation_active or source_end_declined detail, an explicit null retry stamp (the key must
 // be present), a run kind that can seed, not a claimed Codex run (harness codex and claim_generation
 // >= 1), no codex_policy_hold and no pending reserve pause. Clauses only the server can check, because

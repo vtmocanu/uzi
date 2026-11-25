@@ -2255,7 +2255,7 @@ RETURNING runs.*;
 -- Raw open holds bound the discounted admission count from above. This is only
 -- a health-pass prefilter, never claim or reconciliation authority. Owners at the
 -- bound still need the exact per-run admission and continuation-exemption read.
--- Outstanding fresh-resume transfer rows each reserve at most one unit (00523), so they bound the count too.
+-- Outstanding fresh-resume transfer rows each reserve at most one unit (00532), so they bound the count too.
 SELECT x.user_id
 FROM (SELECT h.user_id FROM recovery_custody_holds h
       WHERE h.user_id = ANY(@owner_ids::uuid[]) AND h.state = 'open'

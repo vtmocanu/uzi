@@ -100,7 +100,7 @@ Migration 00404 adds `retained_continuation_unwitnessed` to D2's cause-specific 
 
 ## Amendment 2026-11-25 — the fresh resume reservation (#4628)
 
-Migration 00523 (the number may be renumbered at merge) adds an owner reservation to the #4162 unit count for an owner [fresh resume](4628-fresh-resume-durable-evidence.md). Signatures are unchanged.
+Migration 00532 (the number may be renumbered at merge) adds an owner reservation to the #4162 unit count for an owner [fresh resume](4628-fresh-resume-durable-evidence.md). Signatures are unchanged.
 
 - **Reservation.** `fn_custody_admission_count` adds one unit for each `run_fresh_resumes` row in `pending`, `claimed`, `seeded` or `superseded` on a nonterminal run of the owner, while its hold is not already counted. A `pending` row always counts one. A later row counts only while the destination's open hold at the row's `claim_generation` exists and no non-excluded hold of the same (run, original worker = destination worker) is already counted. That anti-join targets the singleton-inclusive `counted` set of #4162, so a unit is never counted twice.
 - **Members.** `fn_custody_admission_members` emits one synthetic row per reserved unit: `hold_id` is the transfer id, `reason` is `fresh_reservation`, `counted` is true.

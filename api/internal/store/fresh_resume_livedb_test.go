@@ -762,7 +762,7 @@ func TestFreshResumeReservationOnlyFromOwnRowsLiveDB(t *testing.T) {
 // The Down guard's DO block refuses while an outstanding row exists and passes once it is closed.
 func TestFreshResumeDownGuardLiveDB(t *testing.T) {
 	f := newFreshFx(t)
-	src, err := os.ReadFile("migrations/00523_run_fresh_resumes.sql")
+	src, err := os.ReadFile("migrations/00532_run_fresh_resumes.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

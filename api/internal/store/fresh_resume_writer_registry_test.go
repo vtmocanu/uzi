@@ -10,7 +10,7 @@ import (
 )
 
 // Fresh resume writer registry (issue #4628). While a pending or claimed run_fresh_resumes row exists,
-// a0_guard_fresh_resume_trg (migration 00523) raises UZ416 on any runs status / worker_id /
+// a0_guard_fresh_resume_trg (migration 00532) raises UZ416 on any runs status / worker_id /
 // claim_generation write. That raise is only a backstop: a sweep that touches several runs in one
 // statement would abort wholesale on one transfer run and stall every other user's run behind it. So
 // every statement that assigns one of those columns (or checkpoint_tip) must be registered here with a

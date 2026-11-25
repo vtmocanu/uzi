@@ -1570,7 +1570,7 @@ type ListOwnersOverCustodyLimitParams struct {
 // the user_id. Callers pass the custody_hold_limit admin setting (#3150), always 1..1000, and skip
 // the query when it cannot be read; a non-positive limit here would match every owner.
 // Owners with an outstanding fresh-resume transfer row are candidates too: the count carries their
-// reserved units (00523) even when every open hold was discarded.
+// reserved units (00532) even when every open hold was discarded.
 func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, arg ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listOwnersOverCustodyLimit, arg.HeartbeatCutoff, arg.CustodyHoldLimit)
 	if err != nil {

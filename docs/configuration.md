@@ -606,7 +606,7 @@ Defaults and invalid-value handling are documented per row. Settings documented 
 
 ### Fresh resume rollback
 
-Fresh resume adds the `run_fresh_resumes` table and a trigger on `runs` (migration 00523; the number may be renumbered at merge). Turning `UZI_FRESH_RESUME` off is not a rollback of either.
+Fresh resume adds the `run_fresh_resumes` table and a trigger on `runs` (migration 00532; the number may be renumbered at merge). Turning `UZI_FRESH_RESUME` off is not a rollback of either.
 
 **Binary rollback precondition.** Before starting an API binary that predates fresh resume, this query must return no rows:
 

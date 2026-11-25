@@ -196,7 +196,7 @@ type FreshResumeRunBaseEligibleParams struct {
 	UserID               uuid.UUID `json:"user_id"`
 }
 
-// fn_fresh_resume_run_base (00523) over one owner run. No row: not the owner's run.
+// fn_fresh_resume_run_base (00532) over one owner run. No row: not the owner's run.
 func (q *Queries) FreshResumeRunBaseEligible(ctx context.Context, arg FreshResumeRunBaseEligibleParams) (bool, error) {
 	row := q.db.QueryRow(ctx, freshResumeRunBaseEligible, arg.GlobalTimeoutSeconds, arg.ID, arg.UserID)
 	var eligible bool
@@ -1128,7 +1128,7 @@ SELECT set_config('uzi.fresh_resume_id', $1::text, true)
 
 // Fresh resume (issue #4628): a run held at an owner-held worker-exhaustion recovery_wait is started on
 // a SEPARATE persistent hosted worker (W2) from durable evidence. run_fresh_resumes is the transfer
-// row; a0_guard_fresh_resume_trg (00523) refuses every runs status / worker_id / claim_generation
+// row; a0_guard_fresh_resume_trg (00532) refuses every runs status / worker_id / claim_generation
 // change while a pending or claimed row exists, except under the transaction-local opt-in below.
 // Callers lock the run (and the transfer row) before any of these writers; the sequence is
 // OptInFreshResume, the guarded writes, then ClearFreshResumeOptIn.
