@@ -9056,10 +9056,12 @@ export class RunRunner {
     // issue #4628: the fresh owner hold is nonterminal too (its park goes through reportState) and stays early here. The pre-seed
     // window (stage pre_receipt: the transfer is claimed and not yet seeded, so a `failed` report is refused by the server anyway)
     // sits below the #4645/#4655 confirmed-disposition return, so a confirmed hold or wall park wins over it. The policyHold
-    // check below is disjoint from a fresh claim: the fresh claim's run base excludes policy_pending_fresh and codex_policy_hold
-    // (api/internal/store/migrations/00532_run_fresh_resumes.sql) and its destination is never the run's own or released worker
-    // (api/internal/store/queries/fresh_resume.sql), while flight.policyHold comes only from this worker's own outbox
-    // (preparePolicyAdmission).
+    // check below is not expected to meet a pre_receipt flight: the fresh run base checked when the resume is requested excludes
+    // policy_pending_fresh and codex_policy_hold (api/internal/store/migrations/00532_run_fresh_resumes.sql), the claim never
+    // places it on the run's own or released worker (api/internal/store/queries/fresh_resume.sql), enterPolicyHold needs a
+    // running model, and preparePolicyAdmission reads only this worker's own outbox after resolving its pending terminals.
+    // Residual, not excluded by the server: a destination that ran the run before the predecessor and still holds an unsettled
+    // policy_hold outbox entry for it; that flight returns below without a failed report (nonterminal, but without this stop).
     if (flight.freshResumeHold) { flight.freshResumeTransportStopped = true; return; }
     if (flight.policyHold || flight.iterationParkState !== "none") return;
     if (flight.workerMemory?.hold) {
