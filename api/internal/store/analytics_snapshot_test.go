@@ -39,19 +39,15 @@ func (f *fakeAnalyticsTx) Rollback(ctx context.Context) error {
 type fakeAnalyticsBeginner struct {
 	tx       *fakeAnalyticsTx
 	beginErr error
-	delay    time.Duration
 	opts     pgx.TxOptions
+
+	beginDeadline    time.Time
+	beginHasDeadline bool
 }
 
 func (b *fakeAnalyticsBeginner) BeginTx(ctx context.Context, o pgx.TxOptions) (pgx.Tx, error) {
 	b.opts = o
-	if b.delay > 0 {
-		select {
-		case <-time.After(b.delay):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
+	b.beginDeadline, b.beginHasDeadline = ctx.Deadline()
 	if b.beginErr != nil {
 		return nil, b.beginErr
 	}
@@ -89,23 +85,27 @@ func TestRunAnalyticsSnapshotOptionsAndDeadline(t *testing.T) {
 }
 
 func TestRunAnalyticsSnapshotSharedDeadline(t *testing.T) {
-	old := analyticsSnapshotDeadline
-	analyticsSnapshotDeadline = 400 * time.Millisecond
-	t.Cleanup(func() { analyticsSnapshotDeadline = old })
-
-	b := &fakeAnalyticsBeginner{tx: &fakeAnalyticsTx{}, delay: 200 * time.Millisecond}
-	start := time.Now()
+	b := &fakeAnalyticsBeginner{tx: &fakeAnalyticsTx{}}
+	var fnDeadline time.Time
+	var fnHasDeadline, ran bool
 	err := RunAnalyticsSnapshot(context.Background(), b, func(ctx context.Context, _ *AnalyticsSnapshot) error {
-		<-ctx.Done()
-		return ctx.Err()
+		ran = true
+		fnDeadline, fnHasDeadline = ctx.Deadline()
+		return nil
 	})
-	elapsed := time.Since(start)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v", err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A fresh budget for fn would make this about 600ms.
-	if elapsed > 540*time.Millisecond {
-		t.Fatalf("begin and fn did not share one deadline: %v", elapsed)
+	if !ran {
+		t.Fatal("callback did not run")
+	}
+	if !b.beginHasDeadline || !fnHasDeadline {
+		t.Fatalf("deadline present: BeginTx %v, callback %v, want both", b.beginHasDeadline, fnHasDeadline)
+	}
+	// One budget covers BeginTx and the callback: a fresh timeout for the callback would
+	// give it a later deadline.
+	if !b.beginDeadline.Equal(fnDeadline) {
+		t.Fatalf("BeginTx deadline %v != callback deadline %v: not one shared budget", b.beginDeadline, fnDeadline)
 	}
 }
 
@@ -208,6 +208,8 @@ func TestClassifyAnalyticsErr(t *testing.T) {
 
 // TestAnalyticsSQLOptionsBlocksAvoidUsageTables reads queries/analytics.sql and asserts no
 // authority block (options, accessibility, existence, history start) mentions a usage table.
+// The named list is required so renaming or deleting a block cannot make the sweep vacuous;
+// the suffix sweep still covers any authority query added later.
 func TestAnalyticsSQLOptionsBlocksAvoidUsageTables(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("queries", "analytics.sql"))
 	if err != nil {
@@ -216,23 +218,33 @@ func TestAnalyticsSQLOptionsBlocksAvoidUsageTables(t *testing.T) {
 	src := string(raw)
 	nameRe := regexp.MustCompile(`(?m)^--\s*name:\s*(\S+)`)
 	locs := nameRe.FindAllStringSubmatchIndex(src, -1)
-	authority := regexp.MustCompile(`^Analytics\w*(Options|Accessible|Exists|HistoryStart)$`)
-	checked := 0
+	bodies := map[string]string{}
 	for i, loc := range locs {
-		name := src[loc[2]:loc[3]]
 		end := len(src)
 		if i+1 < len(locs) {
 			end = locs[i+1][0]
 		}
-		if !authority.MatchString(name) {
+		bodies[src[loc[2]:loc[3]]] = src[loc[0]:end]
+	}
+	required := []string{
+		"AnalyticsTimezoneNames", "AnalyticsOwnerRepoOptions", "AnalyticsAllRepoOptions",
+		"AnalyticsUserOptions", "AnalyticsOwnerRepoAccessible", "AnalyticsRepoExists",
+		"AnalyticsUserExists", "AnalyticsOwnerHistoryStart", "AnalyticsAllHistoryStart",
+	}
+	for _, name := range required {
+		body, ok := bodies[name]
+		if !ok {
+			t.Errorf("required authority block %s is missing from queries/analytics.sql", name)
 			continue
 		}
-		checked++
-		if strings.Contains(strings.ToLower(src[loc[0]:end]), "run_usage") {
+		if strings.Contains(strings.ToLower(body), "run_usage") {
 			t.Errorf("block %s references a run_usage relation", name)
 		}
 	}
-	if checked < 8 {
-		t.Fatalf("only %d authority blocks matched; did the file change shape?", checked)
+	authority := regexp.MustCompile(`^Analytics\w*(Options|Accessible|Exists|HistoryStart)$`)
+	for name, body := range bodies {
+		if authority.MatchString(name) && strings.Contains(strings.ToLower(body), "run_usage") {
+			t.Errorf("block %s references a run_usage relation", name)
+		}
 	}
 }

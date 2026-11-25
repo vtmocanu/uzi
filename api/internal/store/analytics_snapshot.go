@@ -23,9 +23,6 @@ const (
 	analyticsRollbackTimeout = 2 * time.Second
 )
 
-// analyticsSnapshotDeadline is the effective deadline; tests shrink it.
-var analyticsSnapshotDeadline = AnalyticsSnapshotDeadline
-
 // ErrAnalyticsTimeout is what ClassifyAnalyticsErr returns for any timeout-shaped failure.
 var ErrAnalyticsTimeout = errors.New("analytics: query timed out")
 
@@ -45,7 +42,7 @@ type AnalyticsSnapshot struct {
 // (AnalyticsSnapshotDeadline) covers begin, SET LOCAL and fn; fn receives that deadline's
 // context. The rollback always runs, on a context detached from ctx's cancellation.
 func RunAnalyticsSnapshot(ctx context.Context, beginner AnalyticsBeginner, fn func(ctx context.Context, s *AnalyticsSnapshot) error) error {
-	dctx, cancel := context.WithTimeout(ctx, analyticsSnapshotDeadline)
+	dctx, cancel := context.WithTimeout(ctx, AnalyticsSnapshotDeadline)
 	defer cancel()
 
 	tx, err := beginner.BeginTx(dctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})

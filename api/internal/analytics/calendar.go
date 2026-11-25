@@ -312,6 +312,7 @@ func ComputeBounds(now time.Time, loc *time.Location, window Window, earliest *t
 	if window == WindowAll {
 		if earliest == nil {
 			b.From, b.FoldFrom = now, now
+			b.WidthWeeks = 1 // weekly granularity, so the envelope reports 7 days, not the day-window 1
 			return b, nil
 		}
 		b.From, b.FoldFrom = *b.HistoryStart, *b.HistoryStart

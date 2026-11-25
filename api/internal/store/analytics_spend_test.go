@@ -138,21 +138,125 @@ func TestAnalyticsSpendStatementsDoNotDrift(t *testing.T) {
 			}
 		}
 	}
+	// The generated constants (what actually runs) carry the same scope predicates.
 	if store.AnalyticsOwnerSpendSQL == "" || store.AnalyticsAllSpendSQL == "" {
 		t.Error("generated statement constants are empty")
 	}
+	for _, want := range []string{`r\.user_id = \$\d+::uuid`, `w\.user_id = \$\d+::uuid`, `\$\d+::boolean IS TRUE OR`} {
+		if !regexp.MustCompile(want).MatchString(store.AnalyticsOwnerSpendSQL) {
+			t.Errorf("generated owner statement lacks %s", want)
+		}
+	}
+	if loc := regexp.MustCompile(`user_id = \$\d+`).FindString(store.AnalyticsAllSpendSQL); loc != "" {
+		t.Errorf("generated all-scope statement binds a user: %q", loc)
+	}
 }
 
+// analyticsSpendDocLiteral is a populated Spend document written by hand, so the decoder is
+// checked against the wire shape and not against the Go types it is also built from.
+const analyticsSpendDocLiteral = `{
+  "generated_at": "2026-11-25T12:00:00.000000Z",
+  "untracked_chat_runs": 3,
+  "totals": {
+    "current": {
+      "cost": "12.345678", "input_tokens": 100, "cache_read_tokens": 50, "cache_creation_tokens": 20,
+      "output_tokens": 70, "runs": 4,
+      "disclosure": {"metered": 3, "subscription": 1, "unreported": 0, "missing": 0, "incomplete": true},
+      "coverage": {"metered": 3, "applicable": 4, "value": 0.75, "reason": null}
+    }
+  },
+  "buckets": [
+    {"index": 0, "cost": "1.000000", "input_tokens": 1, "cache_read_tokens": 0, "cache_creation_tokens": 0,
+     "output_tokens": 2, "runs": 1,
+     "disclosure": {"metered": 1, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false},
+     "coverage": {"metered": 1, "applicable": 1, "value": 1, "reason": null}},
+    {"index": 1, "cost": "2.500000", "input_tokens": 5, "cache_read_tokens": 6, "cache_creation_tokens": 7,
+     "output_tokens": 8, "runs": 2,
+     "disclosure": {"metered": 2, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false},
+     "coverage": {"metered": 2, "applicable": 2, "value": 1, "reason": null}}
+  ],
+  "split": {
+    "dimension": "usage_model", "non_additive": true,
+    "groups": [
+      {"rank": 1, "is_other": false, "key": "claude-opus", "label": null, "id": null,
+       "totals": {"cost": "9.000000", "input_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0,
+         "output_tokens": 0, "runs": 2,
+         "disclosure": {"metered": 2, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false},
+         "coverage": {"metered": 2, "applicable": 2, "value": 1, "reason": null}},
+       "buckets": [{"index": 1, "cost": "4.250000", "input_tokens": 0, "cache_read_tokens": 0,
+         "cache_creation_tokens": 0, "output_tokens": 0, "runs": 1,
+         "disclosure": {"metered": 1, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false},
+         "coverage": {"metered": 1, "applicable": 1, "value": 1, "reason": null}}]}
+    ]
+  },
+  "cost_per_completed_run": {
+    "current": {"numerator": "10.000000", "denominator": 2, "value": "5.000000", "reason": null,
+      "disclosure": {"metered": 2, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false}},
+    "buckets": [], "rolling": []
+  },
+  "cost_per_merged_pr": {
+    "current": {"numerator": "0.000000", "denominator": 0, "value": null, "reason": "no_merged_prs",
+      "disclosure": {"metered": 0, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false}},
+    "buckets": [], "rolling": []
+  },
+  "cache_read": {"cache_read_tokens": 50, "input_tokens": 100, "cache_creation_tokens": 20, "denominator": 170,
+    "value": 0.294118, "reason": null,
+    "disclosure": {"metered": 3, "subscription": 1, "unreported": 0, "missing": 0, "incomplete": true}},
+  "top_runs": [
+    {"run_id": "11111111-1111-4111-8111-111111111111", "kind": "delivery", "harness": "claude",
+     "run_status": "completed", "usage_status": "metered", "primary_model": "claude-opus",
+     "created_at": "2026-11-24T10:00:00.000000Z", "cost": "7.654321", "input_tokens": 1, "cache_read_tokens": 2,
+     "cache_creation_tokens": 3, "output_tokens": 4, "repo_key": "no_repo", "repo_id": null, "repo_path": null,
+     "user_id": "22222222-2222-4222-8222-222222222222", "user_email": "a@example.test"}
+  ],
+  "breakdown": {"dimension": "repo", "rows": [
+    {"rank": 1, "is_other": false, "key": "k", "label": "org/repo", "id": "33333333-3333-4333-8333-333333333333",
+     "cost": "3.000000", "input_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "output_tokens": 0,
+     "runs": 2,
+     "disclosure": {"metered": 2, "subscription": 0, "unreported": 0, "missing": 0, "incomplete": false},
+     "coverage": {"metered": 2, "applicable": 2, "value": 1, "reason": null},
+     "finished": 2, "outcomes": {"completed": 1, "cancelled": 0, "plan_rejected": 0, "base_diverged": 0, "failed": 1},
+     "failure_rate": {"value": 0.5, "reason": null}, "completion_ratio": {"value": 0.5, "reason": null},
+     "cost_share": {"value": null, "reason": "not_applicable"},
+     "elapsed_p50_seconds": {"value": 60, "reason": null}, "elapsed_p90_seconds": {"value": 120, "reason": null},
+     "merged_prs": 1}
+  ]}
+}`
+
 func TestDecodeAnalyticsSpendDoc(t *testing.T) {
-	// A zero document survives a marshal/decode round trip, so the decoder accepts exactly
-	// the shape the types describe.
-	raw, err := json.Marshal(store.AnalyticsSpendDoc{})
+	raw := []byte(analyticsSpendDocLiteral)
+	doc, err := store.DecodeAnalyticsSpendDoc(raw)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("populated literal: %v", err)
 	}
-	if _, err := store.DecodeAnalyticsSpendDoc(raw); err != nil {
-		t.Fatalf("round trip: %v", err)
+	if doc.UntrackedChatRuns != 3 || doc.Totals.Current.Cost != "12.345678" || doc.Totals.Previous != nil {
+		t.Errorf("totals: chat %d cost %q previous %v", doc.UntrackedChatRuns, doc.Totals.Current.Cost, doc.Totals.Previous)
 	}
+	if len(doc.Buckets) != 2 || doc.Buckets[1].Index != 1 || doc.Buckets[1].Cost != "2.500000" || doc.Buckets[1].Runs != 2 {
+		t.Errorf("buckets[1] = %+v", doc.Buckets)
+	}
+	if len(doc.Split.Groups) != 1 || !doc.Split.NonAdditive {
+		t.Fatalf("split = %+v", doc.Split)
+	}
+	g := doc.Split.Groups[0]
+	if g.Key == nil || *g.Key != "claude-opus" || g.Label != nil || g.Totals.Cost != "9.000000" ||
+		len(g.Buckets) != 1 || g.Buckets[0].Index != 1 || g.Buckets[0].Cost != "4.250000" {
+		t.Errorf("split group = %+v", g)
+	}
+	if v := doc.CostPerCompletedRun.Current.Value; v == nil || *v != "5.000000" {
+		t.Errorf("cost_per_completed_run value = %v", v)
+	}
+	if r := doc.CostPerMergedPR.Current.Reason; r == nil || *r != store.AnalyticsReasonNoMergedPRs {
+		t.Errorf("cost_per_merged_pr reason = %v", r)
+	}
+	if len(doc.TopRuns) != 1 || doc.TopRuns[0].Cost != "7.654321" || doc.TopRuns[0].UserEmail != "a@example.test" {
+		t.Errorf("top_runs = %+v", doc.TopRuns)
+	}
+	if len(doc.Breakdown.Rows) != 1 || doc.Breakdown.Rows[0].Outcomes.Failed != 1 || doc.Breakdown.Rows[0].MergedPRs != 1 ||
+		doc.Breakdown.Rows[0].ElapsedP90Seconds.Value == nil || *doc.Breakdown.Rows[0].ElapsedP90Seconds.Value != 120 {
+		t.Errorf("breakdown = %+v", doc.Breakdown)
+	}
+
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatal(err)

@@ -224,7 +224,7 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	// per-run totals for finished runs. Options still accepts and ignores window, so the
 	// check is spend-only.
 	if section == analytics.SectionSpend && !slices.Contains(req.windowChoices(), string(req.window)) {
-		return req, "window all not available for all users"
+		return req, msgAnalyticsWindowAllAllUsers
 	}
 
 	splits, breakdowns := req.splitChoices(), req.breakdownChoices()
@@ -704,6 +704,9 @@ func (m *spendMapper) createdAt(s string) time.Time {
 	}
 	return t.UTC()
 }
+
+// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all spend request.
+const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
 // mapAnalyticsSpend builds the response from the calendar and the store document.
 func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {

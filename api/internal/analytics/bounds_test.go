@@ -78,6 +78,9 @@ func TestAllEmptyScope(t *testing.T) {
 	}
 	eq(t, "from", b.From, now)
 	eq(t, "fold", b.FoldFrom, now)
+	if b.WidthWeeks != 1 {
+		t.Errorf("empty all-time scope width %d weeks, want 1", b.WidthWeeks)
+	}
 }
 
 func TestAllWidthCoarsening(t *testing.T) {

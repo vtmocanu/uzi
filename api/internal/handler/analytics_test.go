@@ -100,8 +100,8 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"options breakdown", analyticsRoutes[2], "breakdown=kind", "invalid breakdown"},
 		{"unknown param", analyticsRoutes[1], "bogus=1", "unknown parameter"},
 		{"admin unknown param", analyticsRoutes[3], "bogus=1", "unknown parameter"},
-		{"admin all-users window=all", analyticsRoutes[3], "window=all", "window all not available for all users"},
-		{"admin user=all window=all", analyticsRoutes[3], "window=all&user=all", "window all not available for all users"},
+		{"admin all-users window=all", analyticsRoutes[3], "window=all", msgAnalyticsWindowAllAllUsers},
+		{"admin user=all window=all", analyticsRoutes[3], "window=all&user=all", msgAnalyticsWindowAllAllUsers},
 		{"bad window", analyticsRoutes[1], "window=1y", "invalid window"},
 		{"empty window", analyticsRoutes[1], "window=", "invalid window"},
 		{"repeated window", analyticsRoutes[1], "window=7d&window=30d", "invalid window"},
@@ -183,7 +183,7 @@ func TestAnalyticsAdminAllUsersWindowAllRefusalIsIdentical(t *testing.T) {
 		}
 		bodies = append(bodies, rec.Body.String())
 	}
-	if bodies[0] != bodies[1] || !strings.Contains(bodies[0], "window all not available for all users") {
+	if bodies[0] != bodies[1] || !strings.Contains(bodies[0], msgAnalyticsWindowAllAllUsers) {
 		t.Fatalf("bodies differ or lack the message: %q vs %q", bodies[0], bodies[1])
 	}
 }
@@ -204,6 +204,8 @@ func TestAnalyticsAcceptedQueriesReachTheSnapshot(t *testing.T) {
 		{analyticsRoutes[3], "user=" + someUUID + "&split=usage_model"},
 		{analyticsRoutes[2], "user=" + someUUID},
 		{analyticsRoutes[3], "window=all&user=" + someUUID},
+		{analyticsRoutes[2], "window=all"},
+		{analyticsRoutes[2], "window=all&user=all"},
 		{analyticsRoutes[3], "window=7d"},
 		{analyticsRoutes[3], "window=30d"},
 		{analyticsRoutes[3], "window=90d"},

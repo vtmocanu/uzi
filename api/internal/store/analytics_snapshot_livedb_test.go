@@ -111,7 +111,7 @@ func TestAnalyticsOptionsQueriesLiveDB(t *testing.T) {
 	otherRepo := uuid.New()
 	analyticsExec(ctx, t, pool,
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
-		 VALUES ($1, $2, 1, 'r'||$3||'foreign', 'https://forge.e2e/x', 'main', true)`, otherRepo, otherConn, tag)
+		 VALUES ($1, $2, 1, 'r'||$3||'0000foreign', 'https://forge.e2e/x', 'main', true)`, otherRepo, otherConn, tag)
 
 	q := New(pool)
 	rows, err := q.AnalyticsOwnerRepoOptions(ctx, owner)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -468,8 +469,8 @@ func TestAnalyticsAllTimeWindowSingleUserLiveDB(t *testing.T) {
 			if !dto.From.Equal(*dto.HistoryStart) {
 				t.Fatalf("from = %v, want history_start %v", dto.From, dto.HistoryStart)
 			}
-			if dto.BucketWidthDays <= 0 || dto.BucketWidthDays%7 != 0 {
-				t.Fatalf("bucket_width_days = %d, want a positive multiple of 7", dto.BucketWidthDays)
+			if dto.BucketWidthDays != 7 {
+				t.Fatalf("bucket_width_days = %d, want 7", dto.BucketWidthDays)
 			}
 			if dto.Totals.Current.Runs != 1 {
 				t.Fatalf("runs = %d, want 1", dto.Totals.Current.Runs)
@@ -625,6 +626,9 @@ func TestAnalyticsEmptyPopulationNullReasonsLiveDB(t *testing.T) {
 	if string(raw["history_start"]) != "null" {
 		t.Fatalf("history_start = %s, want null", raw["history_start"])
 	}
+	if all.BucketWidthDays != 7 {
+		t.Fatalf("bucket_width_days = %d for an empty all-time scope, want 7", all.BucketWidthDays)
+	}
 }
 
 func TestAnalyticsWireReconciliationLiveDB(t *testing.T) {
@@ -678,9 +682,17 @@ func TestAnalyticsAdmissionReleasedAfterCancelLiveDB(t *testing.T) {
 	defer cancel()
 	f.h.analyticsDeps.afterFirstRead = func(context.Context) { cancel() }
 	req := httptest.NewRequest(http.MethodGet, "/api/analytics/spend", nil).WithContext(mw.ContextWithUser(ctx, store.User{ID: owner}))
-	f.h.AnalyticsSpend(httptest.NewRecorder(), req)
+	first := httptest.NewRecorder()
+	f.h.AnalyticsSpend(first, req)
 	f.h.analyticsDeps.afterFirstRead = nil
 
+	// The cancellation really happened mid-request, and nobody was answered.
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("request context err = %v, want context.Canceled (the hook did not cancel)", ctx.Err())
+	}
+	if first.Body.Len() != 0 {
+		t.Fatalf("cancelled request wrote a body: %q", first.Body.String())
+	}
 	if n := f.pool.Stat().AcquiredConns(); n != 0 {
 		t.Fatalf("%d connections still acquired after a cancelled request", n)
 	}

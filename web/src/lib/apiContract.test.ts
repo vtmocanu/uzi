@@ -2352,3 +2352,205 @@ it("created issues are optional detail metadata and excluded from summaries", ()
   const excluded: never = null as unknown as Extract<keyof RunSummaryItem, "created_issues">;
   void excluded;
 });
+
+// ── Scoped usage analytics (issue #4684) ─────────────────────────────────────
+import type {
+  AnalyticsOptionsDTO,
+  AnalyticsSpendDTO,
+  AnalyticsSpendBlockDTO,
+  AnalyticsRatioPanelDTO,
+} from "./apiTypes";
+import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
+import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
+import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
+import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
+
+// The zero fixtures are json.Marshal of a zero DTO, so every slice is null there although the
+// handler emits [] on the real wire (the TS types say never-null arrays). NullSlices lets
+// every array slot accept that null; it leaves every other slot exactly as typed, so a
+// scalar or pointer whose nullability drifts still fails.
+type NullSlices<T> = T extends readonly (infer E)[]
+  ? NullSlices<E>[] | null
+  : T extends object
+    ? { [K in keyof T]: NullSlices<T[K]> }
+    : T;
+type AnalyticsKeyDiff<A, B> = Exclude<keyof A, keyof B> | Exclude<keyof B, keyof A>;
+type IsNullable<T> = null extends T ? true : false;
+
+describe("analytics options contract (issue #4684)", () => {
+  type Full = typeof analyticsOptionsFull;
+  const _topKeys: never = null as unknown as AnalyticsKeyDiff<AnalyticsOptionsDTO, Full>;
+  const _scopeKeys: never = null as unknown as AnalyticsKeyDiff<AnalyticsOptionsDTO["scope"], Full["scope"]>;
+  const _reposKeys: never = null as unknown as AnalyticsKeyDiff<AnalyticsOptionsDTO["repos"], Full["repos"]>;
+  const _repoKeys: never = null as unknown as AnalyticsKeyDiff<AnalyticsOptionsDTO["repos"]["items"][number], Full["repos"]["items"][number]>;
+  type Users = NonNullable<AnalyticsOptionsDTO["users"]>;
+  const _usersKeys: never = null as unknown as AnalyticsKeyDiff<Users, NonNullable<Full["users"]>>;
+  const _userKeys: never = null as unknown as AnalyticsKeyDiff<Users["items"][number], NonNullable<Full["users"]>["items"][number]>;
+  void [_topKeys, _scopeKeys, _reposKeys, _repoKeys, _usersKeys, _userKeys];
+
+  // Nullability is pinned on the exported type itself, not on the fixture.
+  const _usersNullable: IsNullable<AnalyticsOptionsDTO["users"]> extends true ? true : never = true;
+  const _reasonNullable: IsNullable<AnalyticsOptionsDTO["users_reason"]> extends true ? true : never = true;
+  const _reposNotNull: IsNullable<AnalyticsOptionsDTO["repos"]> extends false ? true : never = true;
+  const _windowsNotNull: IsNullable<AnalyticsOptionsDTO["windows"]> extends false ? true : never = true;
+  void [_usersNullable, _reasonNullable, _reposNotNull, _windowsNotNull];
+
+  it("accepts the full fixture", () => {
+    const full: AnalyticsOptionsDTO = analyticsOptionsFull;
+    expect(full.scope).toEqual({ route: "x", user: "x" });
+    expect(full.selected_user).toBe("x");
+    expect(full.repos.items[0]).toEqual({ id: "x", path: "x" });
+    expect(full.repos.truncated).toBe(true);
+    expect(full.users?.items[0]).toEqual({ id: "x", email: "x" });
+    expect(full.users_reason).toBe("x");
+    expect(full.windows).toEqual(["x"]);
+    expect(full.breakdowns).toEqual(["x"]);
+  });
+
+  it("accepts the zero fixture, where users and every slice are null", () => {
+    const zero: NullSlices<AnalyticsOptionsDTO> = analyticsOptionsZero;
+    expect(zero.users).toBeNull();
+    expect(zero.users_reason).toBeNull();
+    for (const k of ["windows", "kinds", "harnesses", "splits", "breakdowns"] as const) expect(zero[k]).toBeNull();
+    expect(zero.repos.items).toBeNull();
+    expect(zero.repos.truncated).toBe(false);
+    expect(zero.selected_user).toBe("");
+  });
+});
+
+describe("analytics spend contract (issue #4684)", () => {
+  type Full = typeof analyticsSpendFull;
+  type Block = AnalyticsSpendBlockDTO;
+  type FullBlock = Full["totals"]["current"];
+  type Panel = AnalyticsRatioPanelDTO;
+  type FullPanel = Full["cost_per_completed_run"];
+  type Group = AnalyticsSpendDTO["split"]["groups"][number];
+  type FullGroup = Full["split"]["groups"][number];
+  type Row = AnalyticsSpendDTO["breakdown"]["rows"][number];
+  type FullRow = Full["breakdown"]["rows"][number];
+  const _top: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO, Full>;
+  const _scope: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["scope"], Full["scope"]>;
+  const _bucket: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["buckets"][number], Full["buckets"][number]>;
+  const _rolling: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["rolling"][number], Full["rolling"][number]>;
+  const _totals: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["totals"], Full["totals"]>;
+  const _block: never = null as unknown as AnalyticsKeyDiff<Block, FullBlock>;
+  const _previous: never = null as unknown as AnalyticsKeyDiff<Block, Full["totals"]["previous"]>;
+  const _disclosure: never = null as unknown as AnalyticsKeyDiff<Block["disclosure"], FullBlock["disclosure"]>;
+  const _coverage: never = null as unknown as AnalyticsKeyDiff<Block["coverage"], FullBlock["coverage"]>;
+  const _series: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["series"][number], Full["series"][number]>;
+  const _split: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["split"], Full["split"]>;
+  const _group: never = null as unknown as AnalyticsKeyDiff<Group, FullGroup>;
+  const _groupTotals: never = null as unknown as AnalyticsKeyDiff<Group["totals"], FullGroup["totals"]>;
+  const _groupCell: never = null as unknown as AnalyticsKeyDiff<Group["buckets"][number], FullGroup["buckets"][number]>;
+  const _panel: never = null as unknown as AnalyticsKeyDiff<Panel, FullPanel>;
+  const _ratio: never = null as unknown as AnalyticsKeyDiff<Panel["current"], FullPanel["current"]>;
+  const _ratioPrevious: never = null as unknown as AnalyticsKeyDiff<NonNullable<Panel["previous"]>, FullPanel["current"]>;
+  const _ratioBucket: never = null as unknown as AnalyticsKeyDiff<Panel["buckets"][number], FullPanel["buckets"][number]>;
+  const _ratioRolling: never = null as unknown as AnalyticsKeyDiff<Panel["rolling"][number], FullPanel["rolling"][number]>;
+  const _mergedPanel: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["cost_per_merged_pr"], Full["cost_per_merged_pr"]>;
+  const _cache: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["cache_read"], Full["cache_read"]>;
+  const _topRun: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["top_runs"][number], Full["top_runs"][number]>;
+  const _breakdown: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendDTO["breakdown"], Full["breakdown"]>;
+  const _row: never = null as unknown as AnalyticsKeyDiff<Row, FullRow>;
+  const _outcomes: never = null as unknown as AnalyticsKeyDiff<Row["outcomes"], FullRow["outcomes"]>;
+  const _nullable: never = null as unknown as AnalyticsKeyDiff<Row["failure_rate"], FullRow["failure_rate"]>;
+  void [
+    _top, _scope, _bucket, _rolling, _totals, _block, _previous, _disclosure, _coverage, _series, _split, _group,
+    _groupTotals, _groupCell, _panel, _ratio, _ratioPrevious, _ratioBucket, _ratioRolling, _mergedPanel, _cache,
+    _topRun, _breakdown, _row, _outcomes, _nullable,
+  ];
+
+  // Nullability of the exported type itself: what the wire may carry as null...
+  const _historyNullable: IsNullable<AnalyticsSpendDTO["history_start"]> extends true ? true : never = true;
+  const _coverageValueNullable: IsNullable<Block["coverage"]["value"]> extends true ? true : never = true;
+  const _coverageReasonNullable: IsNullable<Block["coverage"]["reason"]> extends true ? true : never = true;
+  const _ratioValueNullable: IsNullable<Panel["current"]["value"]> extends true ? true : never = true;
+  const _ratioReasonNullable: IsNullable<Panel["current"]["reason"]> extends true ? true : never = true;
+  const _cacheValueNullable: IsNullable<AnalyticsSpendDTO["cache_read"]["value"]> extends true ? true : never = true;
+  const _groupKeyNullable: IsNullable<Group["key"]> extends true ? true : never = true;
+  const _groupLabelNullable: IsNullable<Group["label"]> extends true ? true : never = true;
+  const _groupIdNullable: IsNullable<Group["id"]> extends true ? true : never = true;
+  const _rowKeyNullable: IsNullable<Row["key"]> extends true ? true : never = true;
+  const _topRepoIdNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["repo_id"]> extends true ? true : never = true;
+  const _topRepoPathNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["repo_path"]> extends true ? true : never = true;
+  const _nnValueNullable: IsNullable<Row["cost_share"]["value"]> extends true ? true : never = true;
+  const _nnReasonNullable: IsNullable<Row["cost_share"]["reason"]> extends true ? true : never = true;
+  // ...and what it never carries as null: scalars, slices and the omitempty fields (absent, not null).
+  const _bucketsNotNull: IsNullable<AnalyticsSpendDTO["buckets"]> extends false ? true : never = true;
+  const _seriesNotNull: IsNullable<AnalyticsSpendDTO["series"]> extends false ? true : never = true;
+  const _topRunsNotNull: IsNullable<AnalyticsSpendDTO["top_runs"]> extends false ? true : never = true;
+  const _widthNotNull: IsNullable<AnalyticsSpendDTO["bucket_width_days"]> extends false ? true : never = true;
+  const _previousNotNull: IsNullable<AnalyticsSpendDTO["totals"]["previous"]> extends false ? true : never = true;
+  const _previousOptional: Record<never, never> extends Pick<AnalyticsSpendDTO["totals"], "previous"> ? true : never = true;
+  const _previousFromNotNull: IsNullable<AnalyticsSpendDTO["previous_from"]> extends false ? true : never = true;
+  const _previousFromOptional: Record<never, never> extends Pick<AnalyticsSpendDTO, "previous_from"> ? true : never = true;
+  const _previousToOptional: Record<never, never> extends Pick<AnalyticsSpendDTO, "previous_to"> ? true : never = true;
+  const _panelPreviousOptional: Record<never, never> extends Pick<Panel, "previous"> ? true : never = true;
+  const _panelPreviousNotNull: IsNullable<Panel["previous"]> extends false ? true : never = true;
+  void [
+    _historyNullable, _coverageValueNullable, _coverageReasonNullable, _ratioValueNullable, _ratioReasonNullable,
+    _cacheValueNullable, _groupKeyNullable, _groupLabelNullable, _groupIdNullable, _rowKeyNullable,
+    _topRepoIdNullable, _topRepoPathNullable, _nnValueNullable, _nnReasonNullable, _bucketsNotNull, _seriesNotNull,
+    _topRunsNotNull, _widthNotNull, _previousNotNull, _previousOptional, _previousFromNotNull, _previousFromOptional,
+    _previousToOptional, _panelPreviousOptional, _panelPreviousNotNull,
+  ];
+
+  it("accepts the full fixture", () => {
+    const full: AnalyticsSpendDTO = analyticsSpendFull;
+    expect(full.scope).toEqual({ route: "x", user: "x" });
+    expect(full.previous_from).toBe("2020-01-02T03:04:05Z");
+    expect(full.history_start).toBe("2020-01-02T03:04:05Z");
+    expect(full.bucket_width_days).toBe(1);
+    expect(full.buckets[0]).toEqual({ label: "x", start: "2020-01-02T03:04:05Z", end: "2020-01-02T03:04:05Z", partial: true });
+    expect(full.rolling).toHaveLength(1);
+    expect(full.untracked_chat_runs).toBe(1);
+    expect(full.totals.current.cost_usd).toBe(1.5);
+    expect(full.totals.previous?.runs).toBe(1);
+    expect(full.totals.current.disclosure.incomplete).toBe(true);
+    expect(full.totals.current.coverage).toEqual({ metered: 1, applicable: 1, value: 1.5, reason: "x" });
+    expect(full.series[0].index).toBe(1);
+    expect(full.series[0].cost_usd).toBe(1.5);
+    expect(full.split.non_additive).toBe(true);
+    expect(full.split.groups[0].is_other).toBe(true);
+    expect(full.split.groups[0].id).toBe("x");
+    expect(full.split.groups[0].buckets[0].index).toBe(1);
+    expect(full.cost_per_completed_run.current.numerator_usd).toBe(1.5);
+    expect(full.cost_per_completed_run.previous?.denominator).toBe(1);
+    expect(full.cost_per_completed_run.rolling[0].index).toBe(1);
+    expect(full.cost_per_merged_pr.buckets).toBeDefined();
+    expect(full.cache_read.value).toBe(1.5);
+    expect(full.top_runs[0]).toMatchObject({ run_id: "x", repo_id: "x", repo_path: "x", cost_usd: 1.5 });
+    expect(full.breakdown.rows[0].outcomes.plan_rejected).toBe(1);
+    expect(full.breakdown.rows[0].elapsed_p90_seconds).toEqual({ value: 1.5, reason: "x" });
+    expect(full.breakdown.rows[0].merged_prs).toBe(1);
+  });
+
+  it("accepts the zero fixture: omitted keys absent, nulls null", () => {
+    const zero: NullSlices<AnalyticsSpendDTO> = analyticsSpendZero;
+    // omitempty fields are absent, not null.
+    expect("previous_from" in zero).toBe(false);
+    expect("previous_to" in zero).toBe(false);
+    expect("previous" in zero.totals).toBe(false);
+    expect("previous" in zero.cost_per_completed_run).toBe(false);
+    expect("previous" in zero.cost_per_merged_pr).toBe(false);
+    // pointers and slices serialize as null.
+    expect(zero.history_start).toBeNull();
+    for (const k of ["buckets", "rolling", "series", "top_runs"] as const) expect(zero[k]).toBeNull();
+    expect(zero.split.groups).toBeNull();
+    expect(zero.breakdown.rows).toBeNull();
+    expect(zero.cost_per_completed_run.buckets).toBeNull();
+    expect(zero.cost_per_merged_pr.rolling).toBeNull();
+    expect(zero.totals.current.coverage.value).toBeNull();
+    expect(zero.totals.current.coverage.reason).toBeNull();
+    expect(zero.cost_per_completed_run.current.value).toBeNull();
+    expect(zero.cost_per_merged_pr.current.reason).toBeNull();
+    expect(zero.cache_read.value).toBeNull();
+    expect(zero.cache_read.reason).toBeNull();
+    // scalars are zero values, never null.
+    expect(zero.bucket_width_days).toBe(0);
+    expect(zero.untracked_chat_runs).toBe(0);
+    expect(zero.totals.current.cost_usd).toBe(0);
+    expect(zero.totals.current.disclosure.incomplete).toBe(false);
+    expect(zero.window).toBe("");
+  });
+});
