@@ -653,6 +653,19 @@ describe("Search partial results", () => {
         assert.equal(out.bytes, MIB + 10 + "needle c\n".length, "the short read refunds the unread part of its limit");
       });
 
+      it("a change with the carried partial line holding the 21st match reports matches and the skip", async () => {
+        const head = Buffer.from("needle\n".repeat(20));
+        const full = Buffer.concat([head, zeros(MIB - head.length - 6), Buffer.from("needle"), zeros(MIB)]);
+        const mem: Mem = flat({ "a.txt": full });
+        mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset! > 0
+          ? readBytesReply(full, req, { ident: "1:1:0:1" }) : undefined);
+        const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+        assert.equal(out.matches.length, 20);
+        assert.equal(out.truncated, true);
+        assert.equal(out.reason, "matches");
+        assert.equal(out.skippedFiles, 1);
+      });
+
       it("first chunk size differs from the stat size", async () => {
         const mem = mk();
         mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset === 0
@@ -672,6 +685,8 @@ describe("Search partial results", () => {
       };
       const cases: [string, (req: FileopRequest) => FileopResponse][] = [
         ["non-canonical base64", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: "bmVlZGxlCg" })],
+        // Right length, alphabet and padding, but the final character carries non-zero trailing bits.
+        ["padded base64 with non-zero trailing bits", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: "bmVlZGxlCh==" })],
         ["characters outside base64", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: "!!!!" })],
         ["data decoding to more than the limit", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: b64("needle\nX") })],
         ["encoded data longer than the limit allows", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: b64(zeros(4096)) })],

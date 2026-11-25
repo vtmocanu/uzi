@@ -133,9 +133,11 @@ describe("read-only Codex spike", () => {
     // Search needs read_bytes, which a packaged helper may predate: build the helper from this tree.
     const built = await buildFileopHelper("readonly-helper-");
     if (!built) return t.skip("Linux openat2 helper");
-    // The sandbox only lets the helper execute from inside its root, so the sandbox root is the
-    // build directory holding the binary, the checkout and the private tmp. The outside file
-    // lives in a separate directory the sandbox root does not contain.
+    // The built binary lives under scratch, outside the sandbox's executable system paths, so the
+    // sandbox root must contain it: the root is the build directory holding the binary, the
+    // checkout and the private tmp. That makes the Landlock root (build dir) wider than the
+    // helper root (checkout), unlike production. The outside file lives in a separate directory
+    // the sandbox root does not contain.
     const base = built.dir;
     const checkout = path.join(base, "checkout");
     const privateTmp = path.join(base, "private");

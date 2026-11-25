@@ -1232,7 +1232,7 @@ export class CodexCallbackBroker {
     } };
   }
 
-  /** Search only through fileop list/stat/read. Every traversal and returned byte has a
+  /** Search only through fileop list/stat/read_bytes.Every traversal and returned byte has a
    * fixed ceiling, and reaching one returns the matches found so far as an ok partial
    * result (`truncated: true`, a `reason`, `skippedFiles`, and a fixed `notice`) instead of
    * denying the search. A partial result is never complete coverage, and an empty one never
@@ -1371,10 +1371,10 @@ export class CodexCallbackBroker {
           ? reply.size !== fileSize
           : reply.size !== opening.size || reply.ident !== opening.ident;
         if (changed || (chunk.length < limit && reached < fileSize)) {
-          const scanned = scanCarry("file_size");
-          if (scanned) return scanned;
+          // Count the skip first: the walk goes on past it, so a match ceiling hit by the carry
+          // is the terminating cause and the partial must report this skip alongside it.
           skippedFiles++;
-          return undefined;
+          return scanCarry("matches");
         }
         opening ??= { size: reply.size, ident: reply.ident };
         offset = reached;
