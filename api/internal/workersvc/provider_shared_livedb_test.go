@@ -34,15 +34,6 @@ func seedSharedProvider(t *testing.T, env codexTestEnv, engine, modelMap string)
 	if err != nil {
 		t.Fatalf("insert shared provider: %v", err)
 	}
-	protocol := "anthropic_messages"
-	if engine == "codex" {
-		protocol = "openai_responses"
-	}
-	if err := env.q.InsertModelProviderRevision(env.ctx, store.InsertModelProviderRevisionParams{
-		ProviderID: p.ID, Revision: 1, Protocol: protocol, BaseUrl: pvBase, AuthStyle: "bearer", ModelMap: []byte(modelMap),
-	}); err != nil {
-		t.Fatalf("insert shared revision: %v", err)
-	}
 	t.Cleanup(func() {
 		ctx := context.Background()
 		if _, err := env.pool.Exec(ctx, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE claude_provider_id = $1`, p.ID); err != nil {
@@ -55,6 +46,15 @@ func seedSharedProvider(t *testing.T, env codexTestEnv, engine, modelMap string)
 			t.Errorf("delete shared provider in cleanup: %v", err)
 		}
 	})
+	protocol := "anthropic_messages"
+	if engine == "codex" {
+		protocol = "openai_responses"
+	}
+	if err := env.q.InsertModelProviderRevision(env.ctx, store.InsertModelProviderRevisionParams{
+		ProviderID: p.ID, Revision: 1, Protocol: protocol, BaseUrl: pvBase, AuthStyle: "bearer", ModelMap: []byte(modelMap),
+	}); err != nil {
+		t.Fatalf("insert shared revision: %v", err)
+	}
 	return p.ID, p.Name
 }
 

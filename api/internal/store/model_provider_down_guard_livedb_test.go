@@ -68,6 +68,7 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s has no Down block", file)
 		}
+		down = stripSQLLineComments(down)
 		if strings.Contains(file, "shared_codex") || strings.Contains(file, "codex_provider_scope") {
 			// The six shared Codex Downs lock all three tables, strictly in this order, before the first guard.
 			first := strings.Index(down, "IF EXISTS")
@@ -116,6 +117,7 @@ func TestUsersCodexScopeUpLocksBeforeAddColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	up, _, _ := strings.Cut(string(b), "-- +goose Down")
+	up = stripSQLLineComments(up)
 	lock := strings.Index(up, "LOCK TABLE model_providers, users IN ACCESS EXCLUSIVE MODE;")
 	add := strings.Index(up, "ALTER TABLE users ADD COLUMN")
 	if lock < 0 || add < 0 || lock >= add {
@@ -289,4 +291,16 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 	if err := run00("00481_runs_model_provider_binding.sql"); err != nil {
 		t.Fatalf("00481 Down with no bound run: %v", err)
 	}
+}
+
+// stripSQLLineComments drops every "--" line comment, so a commented-out statement cannot satisfy
+// a position check on the executable SQL. The migrations under test carry no "--" inside literals.
+func stripSQLLineComments(sql string) string {
+	lines := strings.Split(sql, "\n")
+	for i, l := range lines {
+		if c := strings.Index(l, "--"); c >= 0 {
+			lines[i] = l[:c]
+		}
+	}
+	return strings.Join(lines, "\n")
 }

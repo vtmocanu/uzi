@@ -539,10 +539,18 @@ func TestSharedProviderCodexTestEvidenceIsPerUserLiveDB(t *testing.T) {
 		if who == "C" {
 			want = "rejected"
 		}
+		found := false
 		for _, p := range list.Providers {
-			if p.ID == cx.ID && (p.Probe == nil || p.Probe.AuthResult != want) {
+			if p.ID != cx.ID {
+				continue
+			}
+			found = true
+			if p.Probe == nil || p.Probe.AuthResult != want {
 				t.Errorf("%s's list shows %+v for the shared Codex definition, want %s", who, p.Probe, want)
 			}
+		}
+		if !found {
+			t.Errorf("%s's list omits the shared Codex definition %s", who, cx.ID)
 		}
 	}
 	if n := countRows(t, s, `SELECT count(*) FROM model_provider_key_test_results WHERE provider_id = $1`, cx.ID); n != 2 {
@@ -586,10 +594,20 @@ func TestSharedProviderCodexTestEvidenceIsPerUserLiveDB(t *testing.T) {
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &all) != nil {
 		t.Fatalf("admin list = %d", rec.Code)
 	}
+	sawCx := false
 	for _, p := range all.Providers {
 		if !reflect.DeepEqual(keysOf(p), want) {
 			t.Errorf("admin list entry keys %v, want %v", keysOf(p), want)
 		}
+		var idOnly struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(p, &idOnly) == nil && idOnly.ID == cx.ID {
+			sawCx = true
+		}
+	}
+	if !sawCx {
+		t.Errorf("admin list omits the shared Codex definition %s", cx.ID)
 	}
 	for _, secret := range []string{testProviderKey, keyC, "auth_result", "ciphertext"} {
 		if strings.Contains(rec.Body.String(), secret) {
