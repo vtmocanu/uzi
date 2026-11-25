@@ -1,15 +1,15 @@
 # PRD #4691: Record pull request merge and close history
 
 **Issue:** #4691.
-**Status:** Ready.
+**Status:** Done.
 **Priority:** Normal.
 **Blocked by:** none.
-**Scope:** Neutral forge data, the three forge drivers and the shared test fake, additive history migrations, watcher persistence, one bounded retention pass, docs/specs/tests. No new API route, DTO, user interface or command. No changes under `.github/workflows/**`, including validation. Strict Goose with no allow-missing; migration numbers are assigned at merge time.
+**Scope:** Neutral forge data, the three forge drivers and the forgesvc watcher test fakes, additive history migrations, watcher persistence, docs/specs/tests. No new API route, DTO, user interface or command. No changes under `.github/workflows/**`, including validation. Strict Goose with no allow-missing; migration numbers are assigned at merge time.
 **Evidence baseline:** `591871c34b25348dd29becf57fa3928d83faf3ae`.
 
 ## Progress
 
-- [ ] M1 provider merge/close timestamps and durable per-PR history
+- [x] M1 provider merge/close timestamps and durable per-PR history
 
 ## 1. Problem
 
@@ -17,7 +17,7 @@
 
 ## 2. Outcome
 
-The existing watcher fetches already return provider merge and close timestamps. They are kept, and every state transition the watcher observes is written atomically into a per-PR head plus an append-only event table, with actual provider time and observation time kept apart. Nothing reads this history yet; it starts accumulating now so that later read APIs have real data. Bounded retention keeps storage finite.
+The existing watcher fetches already return provider merge and close timestamps. They are kept, and every state transition the watcher observes is written atomically into a per-PR head plus an append-only event table, with actual provider time and observation time kept apart. Nothing reads this history yet; it starts accumulating now so that later read APIs have real data.
 
 Acceptance examples:
 
@@ -46,7 +46,7 @@ Extend neutral `forge.MergeRequest` (`api/internal/forge/codehost.go`, today `II
 | GitLab | `gitlab.go`, `MergeRequests.GetMergeRequest` | client-go/v3 v3.40.0 `BasicMergeRequest.MergedAt`, `ClosedAt` (`*time.Time`) |
 | Forgejo | `forgejo_mr.go`, `GetPullRequest` | gitea SDK v0.25.1 `PullRequest.Merged` (`merged_at`), `Closed` (`closed_at`) (`*time.Time`) |
 
-No upstream lookup is left to the worker. Map all three drivers and update `forgetest.BaseFake` and timestamp-carrying test stubs; method signatures need not change. Preserve merged-before-closed state classification: a merged PR's close timestamp is not an unmerged close.
+No upstream lookup is left to the worker. Map all three drivers; `forgetest.BaseFake` keeps its loud not-stubbed default (it has nothing to map) and the forgesvc watcher fakes carry the timestamps; method signatures need not change. Preserve merged-before-closed state classification: a merged PR's close timestamp is not an unmerged close.
 
 Validate timestamps: absent or zero is unknown; a future or inverted timestamp is stored as unknown rather than producing a negative duration later. Keep provider time and observation time in separate columns with a fixed source marker (`provider` or `observation_fallback`). Never store observation time as if it were the provider's merge time.
 
@@ -58,7 +58,7 @@ Validate timestamps: absent or zero is unknown; a future or inverted timestamp i
 2. Upsert one per-PR head keyed by `(repo_id, mr_iid)`. On conflict, advance its observation watermark for any strictly newer observation (even when the state is unchanged) and change its state only when the known state differs; return the previous head state through an explicit previous-state column (PostgreSQL 16 and 17 both run in production and compose: do not use `RETURNING OLD/NEW` aliases).
 3. Insert the event from the returned head transition. For a new head, the previous state comes from the run's pre-update `mr_state`. Mark bootstrap provenance explicitly.
 
-The upsert serializes several referencing runs. A unique partial index permits at most one first-merge event per PR, and the head keeps first-merge knowledge after event retention, so a later observation cannot create a second first merge. Head and events cascade with the repo (`ON DELETE CASCADE`). `(repo_id, mr_iid)` means forge connection + repository + PR number; the same external PR connected by two owners is two identities.
+The upsert serializes several referencing runs. A unique partial index permits at most one first-merge event per PR, and the head keeps first-merge knowledge, so a later observation cannot create a second first merge. Head and events cascade with the repo (`ON DELETE CASCADE`). `(repo_id, mr_iid)` means forge connection + repository + PR number; the same external PR connected by two owners is two identities.
 
 **Observation ordering.** Two runs referencing one PR can commit forge observations out of order. Capture the observation time in Go when the forge fetch returns and pass it into the statement. The head keeps an observation watermark: the time of the newest observation that reached it. Every strictly newer observation that reaches `SetRunMRState` advances the watermark, including one that only confirms the head's current state; an event is inserted only when the state changes. An observation older than the watermark still updates its own run's `mr_state` exactly as today, but changes no head and writes no event. A first head insert for a run that already carried a pre-tracking `mr_state` is a bootstrap from that state. The watchers' existing same-state early return means a missing provider timestamp is never enriched by a later identical observation; document that coverage limit rather than changing watcher control flow.
 
@@ -66,24 +66,16 @@ The upsert serializes several referencing runs. A unique partial index permits a
 
 State, head and event commit together. A failure keeps the existing watcher log-and-retry behaviour. Do not advance the head if a prerequisite cancellation failed. Unknown states write nothing. Do not add a forge request to enrich history; board-free terminal self-eviction stays a documented coverage limit.
 
-### Bounded retention pass
-
-Use the existing `sweeper.Pass` (`api/internal/sweeper/sweeper.go`) on the existing sweep cadence (default 15 s, operator setting preserved), with a dedicated session advisory lock constant registered beside the existing ones in `store/migrate.go`, reusing `workersvc/checkpoint_retention.go`'s pinned-connection, nonblocking try-lock and proven-unlock/connection-destruction pattern. No new loop or scheduler.
-
-Retain events for 400 days by observation time. Delete in id-ordered batches of at most 1,000 rows, at most four batches and a two-second deadline per pass, one transaction per batch. Keep one fixed-size head per retained PR identity (O(distinct PRs), cascading with the repo).
-
-Measure drain at the effective sweep cadence against a stated peak event inflow, the added delay before the liveness sweep, WAL/row/index footprint and head/event cardinality. If drain cannot keep up within these bounds, stop for a design revision.
-
 ### Docs and specs
 
-Document the recorded history (fields, sources, bootstrap, coverage limits, retention) in an operator- or contributor-audience doc page with valid frontmatter and a unique order, run `task docs:sync`, and add a terse `specs/human.md` entry tagged `(AI-synced YYYY-MM-DD)`. Never edit frozen `specs/ai.md`.
+Document the recorded history (fields, sources, bootstrap, coverage limits, no expiry) in an operator- or contributor-audience doc page with valid frontmatter and a unique order, run `task docs:sync`, and add a terse `specs/human.md` entry tagged `(AI-synced YYYY-MM-DD)`. Never edit frozen `specs/ai.md`.
 
 ## 5. Testing decisions
 
 - Unit tests for each driver's timestamp mapping (nullable and real values) and for watcher behaviour through fakes: both lanes, cancellation and write failures with retry, unknown states, locked-to-terminal, supported reopen handling.
-- LiveDB tests only in `store`, executing the real statement on PostgreSQL 17: CTE pre-state correctness, concurrent duplicate observations of one PR from two runs, a delayed older `opened` observation arriving after `merged` (no head change, no event), a genuine `closed → opened → closed` cycle (three events), `opened` at T1 then an `opened` confirmation at T3 from another run then a delayed `closed` at T2 (watermark at T3, no close event), first-merge uniqueness, rollback, bootstrap from a pre-tracking `mr_state`, fallback source, stable observations, a run whose owner is not the connection owner (no history written, `mr_state` still updated), retention batches and deadline.
+- LiveDB tests only in `store`, executing the real statement on PostgreSQL 17: CTE pre-state correctness, concurrent duplicate observations of one PR from two runs, a delayed older `opened` observation arriving after `merged` (no head change, no event), a genuine `closed → opened → closed` cycle (three events), `opened` at T1 then an `opened` confirmation at T3 from another run then a delayed `closed` at T2 (watermark at T3, no close event), first-merge uniqueness, rollback, bootstrap from a pre-tracking `mr_state`, fallback source, stable observations, a run whose owner is not the connection owner (no history written, `mr_state` still updated).
 - Observe each regression-like mutation fail and the restored code pass (dedup, source selection, pre-update capture), per `.claude/rules/go.md`.
-- **In-run checks:** `task check:api`; `go test -race -count=1` on the affected packages, one package per command; the new LiveDB cases run by name against PostgreSQL 17 with positive RUN/PASS counts and no SKIP (Docker required); `task check:migration-numbering` and `task check:migration-additive`; `task docs:sync` plus `task check-docs:web`; `check:changelog-entry` with one lowercase UUID-v4 changelog fragment. The forge interface change touches `e2e/forge-fake/`: sweep changed identifiers with `git grep -F` across `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh`, `e2e/forge-fake/`, run `task test:e2e-lib` and `task test:forge-fake` when anything there changes, and name unrun phases.
+- **In-run checks:** `task check:api`; `go test -race -count=1` on the affected packages, one package per command; the new LiveDB cases run by name against PostgreSQL 17 with positive RUN/PASS counts and no SKIP (Docker required); `task check:migration-numbering` and `task check:migration-additive`; `task docs:sync` plus `task check-docs:web`; `check:changelog-entry` with one lowercase UUID-v4 changelog fragment. The e2e forge-fake is unchanged (e2e records `observation_fallback`); still sweep changed identifiers with `git grep -F` across `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh`, `e2e/forge-fake/`, run `task test:e2e-lib` and `task test:forge-fake` when anything there changes, and name unrun phases.
 
 ## 6. Milestones
 
@@ -91,9 +83,9 @@ Document the recorded history (fields, sources, bootstrap, coverage limits, rete
 
 **Blocked by:** none.
 
-Deliver the neutral fields and all three driver mappings, the fake updates, additive head/event migrations, the atomic `SetRunMRState` capture, first-merge uniqueness, the bounded retention pass, docs/specs/tests.
+Deliver the neutral fields and all three driver mappings, the forgesvc watcher fake updates, additive head/event migrations, the atomic `SetRunMRState` capture, first-merge uniqueness, docs/specs/tests.
 
-Acceptance: examples 1 to 4 hold; out-of-order observations never move the head backwards; only connection-owner observations enter history; actual, fallback and bootstrap sources are distinct; several referencing runs yield one merge; no extra forge call or watcher expansion; real PostgreSQL CTE and concurrency tests pass. Attach query plans for the extended statement, its measured latency change, WAL bytes per event and the retention-drain measurement.
+Acceptance: examples 1 to 4 hold; out-of-order observations never move the head backwards; only connection-owner observations enter history; actual, fallback and bootstrap sources are distinct; several referencing runs yield one merge; no extra forge call or watcher expansion; real PostgreSQL CTE and concurrency tests pass. Attach query plans for the extended statement, its measured latency change, WAL bytes per event and the storage growth measurement per event and head row.
 
 ### Landing obligations (not milestones)
 
@@ -110,6 +102,13 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Observation-time ordering on the head | Out-of-order commits from several runs must not rewind history; reject trusting commit order. |
 | Connection-owner observations only | One owner per head, no cross-owner influence; reject a shared head with later owner filtering, which cannot undo dedup. |
 | Preserve existing watcher coverage | Avoids unbounded terminal polling; disclose missing cycles rather than claim full history. |
-| Existing `sweeper.Pass` | No new scheduler or loop. |
+| Existing `sweeper.Pass` (superseded by the no-retention row below) | No new scheduler or loop. |
+| No retention for now | No retention for now: storage grows by a few rows per PR state change; a retention pass is a later additive change if growth ever matters. Rejected: a 400-day pass (adds a sweeper pass, lock class and deadline handling for negligible storage, and deletes the history the analytics work exists to keep). Supersedes the "Existing `sweeper.Pass`" row. |
+| Decline both fake changes | `forgetest.BaseFake` keeps its loud not-stubbed default because it has nothing to map, and the forgesvc watcher fakes carry the timestamps; the e2e forge-fake stays unchanged because e2e records `observation_fallback`. Rejected: stubbing timestamps in the shared fake and the e2e forge-fake, which adds surface for no coverage. |
+| `FOR NO KEY UPDATE OF r` on the run row | Serializes writers of the run without blocking FK `KEY SHARE` from referencing rows. Rejected: `FOR UPDATE`, which would block them. |
+| SQL-owned timestamp normalisation | A future or inverted provider time is nulled in SQL, where the observation time and head watermark are known; Go maps only nil, zero and out-of-range times. Rejected: duplicating the comparison in Go. |
+| Bootstrap provenance | A fresh head insert carries `from_state` = the run's prior known `mr_state`, even when equal to the new state, and the events CHECK is `bootstrap OR from_state IS DISTINCT FROM to_state`. Rejected: dropping the prior state or forbidding equal bootstrap events. |
+| Accept the cross_check-child delete deadlock | A repo or connection delete racing the watcher on a cross_check child run with an MR can deadlock; either side may get 40P01, pinned by `TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB`. Rejected: new locking in the delete queries for a rare, retryable race. |
+| Measurements (synthetic, PG17) | Synthetic data, local PG 17.12 container on tmpfs, single client, 10,000 PRs per phase (method and raw output kept with the run). Latency per call, old UPDATE vs new statement (mean): bootstrap 1102 vs 1278 µs (+16%), state change 1085 vs 1296 µs (+19%), first merge 1086 vs 1297 µs (+19%), no-change confirmation 1070 vs 1244 µs (+16%); absolute values include a lookup harness shared by both. Extra WAL per call: about +650 B bootstrap, +870 B state change, +1190 B first merge (extra partial-index entry), +485 B no-change (head watermark update). EXPLAIN (ANALYZE, BUFFERS, WAL): one runs_pkey index scan, a head upsert on pr_history_heads_pkey and an event insert (0 rows when unchanged). Storage after 10,000 PRs x 3 events: about 223 B per event row (117 heap + 104 index) and about 206 B per head row (157 heap + 44 index), i.e. a few hundred bytes per PR state change. Not measured: concurrency, fsync on real disk, production-size runs rows. |
 
-**UNVERIFIED before implementation:** mapping behaviour against every live forge deployment, write latency, WAL bytes and retention drain. SDK field availability is verified locally; no external lookup is left to the worker.
+**UNVERIFIED before implementation:** mapping behaviour against every live forge deployment, write latency, WAL bytes and storage growth per event and head row. SDK field availability is verified locally; no external lookup is left to the worker.
