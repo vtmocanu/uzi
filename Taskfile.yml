@@ -129,7 +129,9 @@
 # cache - 51.6s, the pipeline's cold long pole. So there is still a FETCH but no
 # compile (~1-2s to download+verify, not 51.6s), and it still writes nothing to
 # either go.mod. "Installs nothing" remains false as stated: it fetches a binary.
-# Everything else still holds: no `npm ci`, no `go mod download`.
+# Everything else still holds: no `npm ci`, no `go mod download`. The one other exception:
+# `test:web-browser:in-container*` may run `npm ci --ignore-scripts` INSIDE its throwaway
+# container, and only when the copied node_modules cannot load in that image (a musl host).
 # CI does that in .github/workflows/ci.yml's setup steps (`npm ci`); locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
 # host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
@@ -2911,9 +2913,13 @@ tasks:
       # cache is, and the same fixture mutation reddens it with no flag at all.
       # The two halves of this repo are NOT symmetric here.
       - npm test
+      # node --test over web/scripts/*.test.mjs (CSP scan, sdk transform pin, manifest
+      # traversal): pure node, so it belongs in the ordinary web test lane. It is not repeated
+      # in test:web-modules-browser; the in-container script runs it itself.
+      - npm run test:scripts
 
   test:web-browser:
-    desc: web layout tests in real Chromium (vitest browser mode, *.browser.test.tsx)
+    desc: web layout tests (vitest browser mode, *.browser.test.tsx) plus the runtime-modules built-mode harness, in real Chromium
     dir: web
     env:
       TZ: UTC
@@ -2937,11 +2943,9 @@ tasks:
     env:
       TZ: UTC
     cmds:
-      # test:scripts is node --test over web/scripts/*.test.mjs (the CSP scan, the sdk
-      # transform pin and the manifest traversal); test:modules-browser is the harness itself
-      # (scripts/modules-browser-test.mjs: in-process builds and servers, the scenarios, the
-      # process-group cleanup assertions and the SIGTERM self-test).
-      - npm run test:scripts
+      # test:modules-browser is the harness itself (scripts/modules-browser-test.mjs:
+      # in-process builds and servers, the scenarios, the process-group cleanup assertions and
+      # the SIGTERM self-test). The node script tests (test:scripts) run in test:web.
       - npm run test:modules-browser
 
   test:web-browser:in-container:
@@ -2951,6 +2955,14 @@ tasks:
     # inrun), copies it and web/node_modules into a `docker create --init` container, runs the
     # browser tests there and removes the container. Not wired into any gate. Exit 2 = the
     # instrument is broken; the details are in scripts/web-browser-in-container.sh.
+    cmds:
+      - ./scripts/web-browser-in-container.sh
+
+  test:web-browser:in-container-noinit:
+    desc: Same as test:web-browser:in-container but the container has no init (PID 1 does not reap, as in CI), to exercise the zombie-tolerant cleanup path
+    # A static env value (no variable is spliced into a command line).
+    env:
+      NO_INIT: "1"
     cmds:
       - ./scripts/web-browser-in-container.sh
 

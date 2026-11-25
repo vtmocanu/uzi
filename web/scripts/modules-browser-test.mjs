@@ -46,10 +46,32 @@ const WEB_DIR = fileURLToPath(new URL("..", import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
 const SCAN_SCRIPT = path.join(WEB_DIR, "scripts", "csp-build-scan.mjs");
 
-// The enforced CSP of the web nginx (scripts/assert-web-nginx.sh `CSP=`). Every response of the
-// harness front carries it, so a violation here is a violation under the real server.
-const CSP =
-  "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'";
+// The enforced CSP of the web nginx. It is read from web/nginx.conf (the server-level
+// `add_header Content-Security-Policy`) at harness start by loadCsp(), never copied here, and
+// cross-checked against scripts/assert-web-nginx.sh `CSP=` when that file is present. Every
+// response of the harness front carries it, so a violation here is a violation under the real
+// server.
+let CSP = "";
+
+function loadCsp() {
+  const conf = path.join(WEB_DIR, "nginx.conf");
+  let text;
+  try {
+    text = fs.readFileSync(conf, "utf8");
+  } catch (e) {
+    throw new InstrumentError(`cannot read ${conf}: ${e.message}`);
+  }
+  const m = /^ {4}add_header Content-Security-Policy "([^"]+)" always;/m.exec(text);
+  if (!m) throw new InstrumentError(`no server-level add_header Content-Security-Policy found in ${conf}`);
+  CSP = m[1];
+  SECURITY_HEADERS["Content-Security-Policy"] = CSP;
+  const assertScript = path.join(WEB_DIR, "..", "scripts", "assert-web-nginx.sh");
+  if (fs.existsSync(assertScript)) {
+    const a = /^CSP="(.*)"$/m.exec(fs.readFileSync(assertScript, "utf8"));
+    if (!a) throw new InstrumentError(`no CSP="..." line found in ${assertScript}`);
+    if (a[1] !== CSP) throw new InstrumentError(`CSP drift: web/nginx.conf has\n  ${CSP}\nbut scripts/assert-web-nginx.sh has\n  ${a[1]}`);
+  }
+}
 
 const argv = process.argv.slice(2);
 const MODE = argv.includes("--selftest-child") ? "selftest-child" : argv.includes("--selftest-interrupt") ? "selftest" : "full";
@@ -123,7 +145,10 @@ function groupMembers(pgid) {
     .map((c) => ({ pid: Number(c[0]), stat: c[2] }));
 }
 
-/** "Gone" is ESRCH for the group, or every remaining member being an unreaped zombie. */
+/**
+ * "Gone" is ESRCH for the group, or every remaining member being an unreaped zombie. Returns
+ * { problem: string|null, branch } where branch names which of those satisfied it.
+ */
 async function waitGroupGone(pgid, deadlineMs = 5000) {
   const end = Date.now() + deadlineMs;
   let last = "";
@@ -131,14 +156,46 @@ async function waitGroupGone(pgid, deadlineMs = 5000) {
     try {
       process.kill(-pgid, 0);
     } catch (e) {
-      if (e.code === "ESRCH") return null;
+      if (e.code === "ESRCH") return { problem: null, branch: "ESRCH (group fully reaped)" };
     }
-    const alive = groupMembers(pgid).filter((m) => !m.stat.startsWith("Z"));
-    if (alive.length === 0) return null;
+    const members = groupMembers(pgid);
+    const alive = members.filter((m) => !m.stat.startsWith("Z"));
+    if (alive.length === 0) {
+      return { problem: null, branch: members.length > 0 ? `zombies-only (${members.length} unreaped: ${members.map((m) => m.pid).join(",")})` : "no members listed" };
+    }
     last = alive.map((m) => `${m.pid}(${m.stat})`).join(",");
-    if (Date.now() > end) return `process group ${pgid} still has live members: ${last}`;
+    if (Date.now() > end) return { problem: `process group ${pgid} still has live members: ${last}`, branch: "none" };
     await sleep(100);
   }
+}
+
+// The interrupt self-test's child (see selftestInterrupt). Tracked here so shutdown and the
+// signal handlers can kill and await it: the child is the one process the harness spawns
+// besides the browser.
+let selfChild = null;
+let selfChildPgid = 0; // the browser group the child reported, killed too as a last resort
+let selfChildExited = null;
+let killChildPromise = null;
+
+function killSelfChild() {
+  killChildPromise ??= (async () => {
+    if (!selfChild || !selfChildExited) return;
+    if (selfChild.exitCode === null && selfChild.signalCode === null) {
+      selfChild.kill("SIGTERM");
+      if ((await withTimeout(selfChildExited, 5000)) === "timeout") {
+        selfChild.kill("SIGKILL");
+        await withTimeout(selfChildExited, 2000);
+      }
+    }
+    if (selfChildPgid) {
+      try {
+        process.kill(-selfChildPgid, "SIGKILL");
+      } catch (e) {
+        if (e.code !== "ESRCH") console.error(`killSelfChild: kill(-${selfChildPgid}) failed: ${e.message}`);
+      }
+    }
+  })();
+  return killChildPromise;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -198,7 +255,8 @@ async function cleanupProblems() {
   const problems = [];
   if (browserPgid) {
     const g = await waitGroupGone(browserPgid);
-    if (g) problems.push(g);
+    log(`cleanup: group ${browserPgid} gone via: ${g.branch}`);
+    if (g.problem) problems.push(g.problem);
   }
   for (const port of ports) {
     if (await acceptsConnection(port)) problems.push(`port ${port} still accepts connections`);
@@ -206,18 +264,20 @@ async function cleanupProblems() {
   return problems;
 }
 
+const shutdownAll = () => Promise.allSettled([shutdown(), killSelfChild()]);
+
 function installSignalHandlers() {
   for (const [sig, code] of [
     ["SIGINT", 130],
     ["SIGTERM", 143],
   ]) {
     process.on(sig, () => {
-      void shutdown().finally(() => process.exit(code));
+      void shutdownAll().finally(() => process.exit(code));
     });
   }
   const crash = (e) => {
     console.error("harness: unhandled error", e);
-    void shutdown().finally(() => process.exit(1));
+    void shutdownAll().finally(() => process.exit(1));
   };
   process.on("uncaughtException", crash);
   process.on("unhandledRejection", crash);
@@ -253,16 +313,21 @@ async function selftestChild() {
 
 async function selftestInterrupt() {
   const child = spawn(process.execPath, [SELF, "--selftest-child"], { stdio: ["ignore", "pipe", "inherit"] });
+  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+  selfChild = child;
+  selfChildExited = exited;
   let out = "";
   const ready = new Promise((resolve) => {
     child.stdout.on("data", (d) => {
       out += d;
       const m = /READY pgid=(\d+) ports=([\d,]+)/.exec(out);
-      if (m) resolve({ pgid: Number(m[1]), ports: m[2].split(",").map(Number) });
+      if (m) {
+        selfChildPgid = Number(m[1]);
+        resolve({ pgid: Number(m[1]), ports: m[2].split(",").map(Number) });
+      }
     });
     child.once("exit", () => resolve(null));
   });
-  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
   const info = await withTimeout(ready, 30000);
   if (info === "timeout" || info === null) {
     child.kill("SIGKILL");
@@ -276,12 +341,12 @@ async function selftestInterrupt() {
     problems.push("the child did not exit within 15 s of SIGTERM");
   }
   const g = await waitGroupGone(info.pgid);
-  if (g) problems.push(g);
+  if (g.problem) problems.push(g.problem);
   for (const p of info.ports) {
     if (await acceptsConnection(p)) problems.push(`port ${p} still accepts connections after SIGTERM`);
   }
   if (problems.length > 0) throw new Error(`interrupt self-test: ${problems.join("; ")}`);
-  return `child ${result.signal ?? `exit ${result.code}`}, group ${info.pgid} gone, ports ${info.ports.join(",")} closed`;
+  return `child ${result.signal ?? `exit ${result.code}`}, group ${info.pgid} gone via ${g.branch}, ports ${info.ports.join(",")} closed`;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -350,7 +415,7 @@ const MIME = {
 const COMPRESSIBLE = /\.(html|js|mjs|css|json|svg|txt)$/;
 
 const SECURITY_HEADERS = {
-  "Content-Security-Policy": CSP,
+  "Content-Security-Policy": "", // set by loadCsp() before the first server starts
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "same-origin",
@@ -663,12 +728,15 @@ async function newContext({ loadTimeoutMs } = {}) {
   ctx.setDefaultTimeout(10000);
   ctx.violations = [];
   ctx.consoleErrors = [];
+  ctx.requestUrls = [];
+  // Every request any page of the context makes, for the single-origin assertion in scenario().
+  ctx.on("request", (r) => ctx.requestUrls.push(r.url()));
   await ctx.exposeFunction("__uziHarnessCsp", (v) => ctx.violations.push(v));
   await ctx.addInitScript(
     ({ timeout }) => {
       document.addEventListener("securitypolicyviolation", (e) => {
         // @ts-ignore injected by exposeFunction
-        window.__uziHarnessCsp({ directive: e.violatedDirective, blocked: e.blockedURI, source: e.sourceFile });
+        window.__uziHarnessCsp({ directive: e.violatedDirective, blocked: e.blockedURI, source: e.sourceFile, page: location.pathname });
       });
       if (timeout) window.__UZI_MODULE_LOAD_TIMEOUT_MS__ = timeout;
     },
@@ -698,6 +766,19 @@ async function scenario(name, fn, { allowViolations = false, loadTimeoutMs } = {
   let error = null;
   try {
     await fn(ctxFactory);
+    // Single origin (PRD section 5): the host, the module files and the API all go through the
+    // front proxy, so any request to another origin (or a non-http URL) is a failure.
+    const frontOrigin = new URL(front).origin;
+    for (const c of ctxs) {
+      const stray = c.requestUrls.filter((u) => {
+        try {
+          return new URL(u).origin !== frontOrigin;
+        } catch {
+          return true;
+        }
+      });
+      assert(stray.length === 0, `requests outside the front origin ${frontOrigin}: ${stray.slice(0, 3).join(", ")}`);
+    }
     if (!allowViolations) {
       for (const c of ctxs) assert(c.violations.length === 0, `CSP violations: ${JSON.stringify(c.violations.slice(0, 3))}`);
     }
@@ -759,6 +840,8 @@ async function runScenarios(dirs) {
       const end = Date.now() + 5000;
       while (ctx.violations.length === 0 && Date.now() < end) await sleep(50);
       assert(ctx.violations.some((v) => /script-src/.test(v.directive)), `the deliberate violation was not reported: ${JSON.stringify(ctx.violations)}`);
+      const elsewhere = ctx.violations.filter((v) => v.page !== "/__csp-control");
+      assert(elsewhere.length === 0, `CSP violations from a page other than the control: ${JSON.stringify(elsewhere.slice(0, 3))}`);
       assert((await control.evaluate(() => window.__inlineRan)) !== true, "the inline script ran despite the CSP");
       await page.close();
     },
@@ -816,7 +899,6 @@ async function runScenarios(dirs) {
         const ctx = await ctxf({});
         world.upstream.get("example").mode = mode;
         const { page } = await openAs(ctx, "admin", [manifestEntry("example", { label: "Example" })], "/m/example");
-        world.upstream.get("example").mode = mode; // openAs reset nothing, but be explicit
         await page.getByRole("button", { name: "Retry" }).waitFor({ state: "visible", timeout: 8000 });
         observed[`firstLoadFailure.${mode}`] = await textOf(page, "[data-testid=module-error-reason]");
         await vis(page, navLink("example"));
@@ -893,6 +975,10 @@ async function runScenarios(dirs) {
     const { page } = await openAs(ctx, "admin", [manifestEntry("example", { label: "Example" }), manifestEntry("example2", { label: "Example Two" })], "/m/example");
     await vis(page, ".uzi-mod-example");
     await page.locator(navLink("example2")).click();
+    // example2 renders the same page source (same title text), so wait for the route AND for
+    // the host to have loaded the second remote before comparing refs.
+    await page.waitForURL(`${front}/m/example2`);
+    await page.waitForFunction(() => window.__uziModuleStats?.loadRemote >= 2);
     await page.waitForFunction(() => /Example module v1/.test(document.querySelector("[data-testid=example-title]")?.textContent ?? ""));
     const same = await page.evaluate(async () => {
       const host = window.__uziHostReactRefs;
@@ -946,8 +1032,11 @@ async function runScenarios(dirs) {
     const up = world.upstream.get("example");
     try {
       up.dir = dirs["example-v2"];
+      const mark = world.log.length;
       await page.getByRole("link", { name: "Sub view" }).click();
       await page.getByRole("button", { name: "Reload page" }).waitFor({ state: "visible" });
+      const stale = reqs(mark, (r) => r.path.startsWith("/modules/example/assets/") && r.status === 404);
+      assert(stale.length >= 1, `the proxy log shows no 404 for a v1 asset under /modules/example/assets/: ${JSON.stringify(modulePaths(mark))}`);
       assert((await page.getByRole("button", { name: "Retry" }).count()) === 0, "a stale module must not offer Retry");
       await page.getByRole("button", { name: "Reload page" }).click();
       await page.waitForFunction(() => /Sub view, build v2/.test(document.querySelector("[data-testid=example-subview]")?.textContent ?? ""));
@@ -965,11 +1054,26 @@ async function runScenarios(dirs) {
     assert((await page.getByRole("button", { name: "Retry" }).count()) === 1, "the error card disappeared on its own");
     const snap = () => page.evaluate(() => ({ origin: performance.timeOrigin, stats: { ...window.__uziModuleStats } }));
     const before = await snap();
+    assert(before.stats && typeof before.stats.loadRemote === "number" && before.stats.loadRemote >= 1, `the counters are missing or the remote was never loaded, so the comparison would be vacuous: ${JSON.stringify(before.stats)}`);
     await page.evaluate(() => {
       window.__uziFixtureArmSuccess = true;
     });
     await page.getByRole("button", { name: "Retry" }).click();
     await page.getByText("recovered", { exact: true }).waitFor({ state: "visible" });
+    // Quiescence: an async re-register or loadRemote regression may land after "recovered"
+    // shows, so wait until the counters stay unchanged for 500 ms (bounded at 5 s).
+    let last = JSON.stringify((await snap()).stats);
+    let stableSince = Date.now();
+    const quietEnd = Date.now() + 5000;
+    while (Date.now() - stableSince < 500) {
+      assert(Date.now() < quietEnd, `the module counters never settled within 5 s: ${last}`);
+      await sleep(100);
+      const cur = JSON.stringify((await snap()).stats);
+      if (cur !== last) {
+        last = cur;
+        stableSince = Date.now();
+      }
+    }
     const after = await snap();
     assert(after.origin === before.origin, "Retry reloaded the document");
     assert(JSON.stringify(after.stats) === JSON.stringify(before.stats), `Retry changed the module counters: ${JSON.stringify(before.stats)} -> ${JSON.stringify(after.stats)}`);
@@ -1098,6 +1202,7 @@ async function main() {
   if (MODE === "selftest-child") return selftestChild();
 
   if (MODE === "selftest") {
+    installSignalHandlers();
     const note = await selftestInterrupt();
     log(`PASS interrupt self-test: ${note}`);
     return 0;
@@ -1112,6 +1217,7 @@ async function main() {
   installSignalHandlers();
   let exitCode = 0;
   try {
+    loadCsp();
     const dirs = await buildAll(outRoot);
     const port = await startWorld(dirs);
     front = `http://127.0.0.1:${port}`;
@@ -1160,6 +1266,6 @@ main().then(
   },
   (e) => {
     console.error(e instanceof InstrumentError ? `BROKEN: ${e.message}` : e);
-    void shutdown().finally(() => process.exit(e instanceof InstrumentError ? 2 : 1));
+    void shutdownAll().finally(() => process.exit(e instanceof InstrumentError ? 2 : 1));
   },
 );

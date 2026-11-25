@@ -16,7 +16,9 @@
 # remove the container by the id `docker create` printed (EXIT trap, also on failure).
 #
 # Environment:
-#   SLOT   export slot, [A-Za-z0-9_-]+ (default: inrun)
+#   SLOT     export slot, [A-Za-z0-9_-]+ (default: inrun)
+#   NO_INIT  1 = create the container without --init (task test:web-browser:in-container-noinit)
+#            so the zombie-tolerant cleanup path is exercised; default keeps --init
 # Exit: the test command's status; 2 = the instrument is broken (docker missing, copy failed).
 set -euo pipefail
 
@@ -43,7 +45,9 @@ rm -rf "$SNAP" "$LOGS"
 mkdir -p "$SNAP" "$LOGS"
 git -C "$ROOT" archive HEAD | tar -x -C "$SNAP"
 # Overlay uncommitted work: modified and untracked files are copied, deleted ones removed.
-(cd "$ROOT" && git ls-files -d -z) | while IFS= read -r -d '' f; do rm -f -- "$SNAP/$f"; done
+# `git diff HEAD` (working tree vs HEAD, no rename detection) lists staged, unstaged and
+# rename-source deletions alike.
+(cd "$ROOT" && git diff --name-only --no-renames --diff-filter=D -z HEAD) | while IFS= read -r -d '' f; do rm -f -- "$SNAP/$f"; done
 changed="$SNAP.changed"
 (cd "$ROOT" && { git diff --name-only -z --diff-filter=d HEAD; git ls-files -o --exclude-standard -z; }) >"$changed"
 if [ -s "$changed" ]; then
@@ -52,7 +56,12 @@ fi
 rm -f "$changed"
 
 # 2. The container. `sleep infinity` as PID 1 under --init; --ipc=host for Chromium's shared memory.
-cid=$(docker create --init --ipc=host --name "cdr4686-browser-$$" "$IMAGE" sleep infinity) || broken "docker create failed"
+create_args=(--init --ipc=host)
+if [ "${NO_INIT:-}" = "1" ]; then
+  create_args=(--ipc=host)
+  echo "NO_INIT=1: container created without --init (PID 1 will not reap zombies, as in CI)"
+fi
+cid=$(docker create "${create_args[@]}" --name "cdr4686-browser-$$" "$IMAGE" sleep infinity) || broken "docker create failed"
 docker start "$cid" >/dev/null || broken "docker start failed"
 docker cp "$SNAP/." "$cid:/work" || broken "docker cp of the export failed"
 docker cp -L "$ROOT/web/node_modules" "$cid:/work/web/node_modules" || broken "docker cp of node_modules failed"
