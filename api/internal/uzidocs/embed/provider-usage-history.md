@@ -99,11 +99,12 @@ operator deletes that row by hand. Deleting or rotating a credential keeps its h
 the identity column has no foreign key.
 
 Deleting an owner removes all their history in one transaction. Measured on one identity with a
-year of rows (105,120) on a warm cache: 0.14 s (Anthropic), 0.27 s (typical Codex) and 0.80 s
+year of rows (105,120), right after a checkpoint with the data just loaded: 0.14 s (Anthropic), 0.27 s (typical Codex) and 0.80 s
 (max Codex), writing 21 to 213 MB of WAL. That is the realistic case, because pages of old
 history have been checkpointed since they last changed, so each one is written as a full page
 image. Only when the pages changed since the last checkpoint does it drop to about 6 MB of WAL.
-The cost grows linearly with identities and years, and leaves dead rows for autovacuum.
+The cost is expected to grow roughly in proportion to identities and years (only one
+identity-year was measured), and leaves dead rows for autovacuum.
 
 Rolling the migration back (the Down section of `00536_provider_usage_samples.sql`) drops both
 tables and their history. Take a database backup first; it is the only recovery. Each
@@ -113,7 +114,7 @@ of `users` and block every query on it meanwhile. Run it when the database is qu
 
 ## Growth
 
-Measured on PostgreSQL 17 (heap plus primary-key index, as grown; one or a few runs each on a
+Measured on PostgreSQL 17 (heap plus primary-key index, as grown; one to three runs each on a
 shared host, so indications). A full-cadence identity writes at most 105,120 rows a year, so these are
 upper bounds:
 
@@ -135,10 +136,11 @@ WAL per copy depends on checkpoints. In a burst of copies across thousands of id
 averaged 570 to 617 B (Anthropic), 873 to 902 B (typical Codex) and 2.3 to 2.4 KB (max Codex). At
 production cadence, though, each identity copies once per five minutes, the same as the default
 checkpoint interval, so most copies are the first change to their index page since the last
-checkpoint and carry a full page image. A dedicated experiment measured about 6.4 to 6.9 KB of
-WAL per copy that way (with `full_page_writes` on and `wal_compression` off), against about
-400 B without an intervening checkpoint. Size WAL archiving and backups for the higher figure:
-about 200 MB of WAL a day for 100 identities. A same-bucket no-op writes none.
+checkpoint and carry a full page image. A dedicated Anthropic experiment measured about 6.4 to
+6.9 KB of WAL per copy that way (with `full_page_writes` on and `wal_compression` off), against
+about 400 B without an intervening checkpoint; larger Codex rows add their own size on top. Size
+WAL archiving and backups for the higher figure: about 200 MB of WAL a day for 100 Anthropic
+identities, more for large Codex accounts. A same-bucket no-op writes none.
 
 ## Copy cost
 
