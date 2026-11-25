@@ -36,6 +36,12 @@
 **/.env
 **/.env.*
 
+# Run scratch (.uzi/scratch/) holds rendered compose files, logs and throwaway
+# credentials written by local checks such as scripts/web-modules-compose-acceptance.sh.
+# It must never enter a build context. Root-level patterns apply to the web image and
+# the example-module image (both build with context `.` and no per-Dockerfile ignore).
+.uzi/
+
 # Submodules and sibling services the web build does not need. inspiration/ is
 # large; api/ builds from its own context; e2e/ is test-only. `agent/` is excluded
 # for the WEB image only — the agent image shares this context root but is trimmed

@@ -132,7 +132,9 @@ describe("federation wiring", () => {
   // A fresh module graph per test: federation.ts initialises the runtime once per document.
   const fresh = async () => {
     vi.resetModules();
-    return import("./federation");
+    const federation = await import("./federation");
+    federation.setHostShared((await import("./hostShared")).HOST_SHARED);
+    return federation;
   };
 
   it("initialises the host as uzi_host with the four shared singletons, strict, from package.json ranges", async () => {

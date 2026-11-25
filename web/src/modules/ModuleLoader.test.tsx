@@ -12,6 +12,7 @@ const fed = vi.hoisted(() => ({
   loadModuleRemote: vi.fn(),
   reRegisterModule: vi.fn(),
   registerModuleRemotes: vi.fn(),
+  setHostShared: vi.fn(),
 }));
 vi.mock("./federation", () => fed);
 
@@ -191,5 +192,27 @@ describe("render errors and stale chunks inside the loaded page", () => {
     mount();
     await waitFor(() => expect(retry()).not.toBeNull());
     expect(reload()).toBeNull();
+  });
+});
+
+describe("values that cannot be stringified", () => {
+  it.each([
+    ["a null-prototype object", () => Object.create(null)],
+    ["an object whose toString throws", () => ({ toString: () => { throw new Error("no"); } })],
+  ])("%s thrown during render shows the module error card inside the shell", async (_n, make) => {
+    function Boom(): never {
+      throw make();
+    }
+    fed.loadModuleRemote.mockResolvedValue({ default: Boom, hostContract: 1 });
+    render(
+      <MemoryRouter>
+        <header>shell</header>
+        <ModuleLoader entry={entry} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(retry()).not.toBeNull());
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText("shell")).toBeTruthy();
+    expect(screen.getByTestId("module-error-reason").textContent).toBe("non-Error value thrown");
   });
 });

@@ -21,6 +21,7 @@
 #     change rolls the pods through checksum/nginx), and that checksum changes with the list;
 #   - every accept case of scripts/fixtures/web-modules/upstreams.txt renders and every reject
 #     case fails with the grammar message;
+#   - web.modules false, 0, "" and {} each fail with "web.modules must be a list" (absent and [] render);
 #   - every invalid values fixture fails with its specific message, a module without
 #     web.nginx.resolver fails.
 #
@@ -156,6 +157,14 @@ for name in default zero; do
     ok "(a) $name: modules-locations.conf is comment-only"
   fi
 done
+# web.modules removed from the values (null deletes the chart default): treated as no modules.
+render web-configmap.yaml "$WORK/cmnull.yaml" --set-json 'web.modules=null'
+cm_key "$WORK/cmnull.yaml" modules.json "$WORK/mnull.json"
+if [ "$(compact_json "$WORK/mnull.json")" = "[]" ]; then
+  ok "(a) absent web.modules: modules.json is []"
+else
+  bad "(a) absent web.modules: modules.json is '$(compact_json "$WORK/mnull.json")', want []"
+fi
 render web-deployment.yaml "$WORK/d0.yaml" -f "$FIX/values-zero.yaml"
 SUM0=$(checksum_of "$WORK/d0.yaml")
 
@@ -293,6 +302,11 @@ invalid unknown-icon 'unknown icon "rocket"'
 invalid unknown-navgroup 'unknown navGroup "sidebar"'
 invalid adminonly-string 'adminOnly must be a boolean'
 invalid module-not-map 'web.modules[0] must be a map'
+# A falsy non-list value must not be coerced into "no modules".
+invalid modules-false 'web.modules must be a list'
+invalid modules-zero 'web.modules must be a list'
+invalid modules-empty-string 'web.modules must be a list'
+invalid modules-empty-map 'web.modules must be a list'
 invalid no-resolver 'web.modules requires web.nginx.resolver'
 invalid bad-resolver 'not valid in an nginx resolver directive'
 # The failure is not specific to the ConfigMap template: the whole chart refuses too.

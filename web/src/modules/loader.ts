@@ -14,8 +14,10 @@
 //                re-registering can never swap v1 for v2 in place.
 
 import type { ComponentType } from "react";
-import { HOST_CONTRACT, type HostSdkV1 } from "./sdk";
+import { HOST_CONTRACT, type HostSdkV1 } from "./sdk-contract";
 import type { ModuleEntry } from "./manifest";
+import { loadModuleRemote, reRegisterModule } from "./federationEntry";
+import { describeThrown } from "./thrown";
 
 export type LoadFailureKind = "transient" | "incompatible" | "stale";
 
@@ -78,7 +80,7 @@ function timeoutMs(): number {
 function messageOf(err: unknown): string {
   const parts: string[] = [];
   for (let e: unknown = err, depth = 0; e != null && depth < 4; depth++) {
-    parts.push(e instanceof Error ? e.message : String(e));
+    parts.push(describeThrown(e));
     e = (e as { cause?: unknown } | null)?.cause;
   }
   return parts.join(" | ");
@@ -145,9 +147,8 @@ async function doLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePa
   const token = (attemptToken.get(id) ?? 0) + 1;
   attemptToken.set(id, token);
   try {
-    const federation = await import("./federation");
     const page = entry.page.replace(/^\.\//, "");
-    const mod = (await withTimeout(federation.loadModuleRemote(`${id}/${page}`), timeoutMs(), id)) as {
+    const mod = (await withTimeout(loadModuleRemote(`${id}/${page}`), timeoutMs(), id)) as {
       default?: unknown;
       hostContract?: unknown;
     } | null;
@@ -160,7 +161,7 @@ async function doLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePa
     if (mod.hostContract !== HOST_CONTRACT) {
       throw new ModuleLoadError(
         "incompatible",
-        `The module targets host contract ${String(mod.hostContract ?? "none")}; this uzi supports contract ${HOST_CONTRACT}`,
+        `The module targets host contract ${describeThrown(mod.hostContract ?? "none")}; this uzi supports contract ${HOST_CONTRACT}`,
       );
     }
     loadedOnce.add(id);
@@ -185,7 +186,6 @@ export function loadModulePage(entry: Pick<ModuleEntry, "id" | "page">): Promise
 // Retry for a transient first-load failure: re-register the remote with a fresh entry URL,
 // then load again. Not an update mechanism.
 export async function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
-  const federation = await import("./federation");
-  federation.reRegisterModule(entry.id, ++retryCounter);
+  await reRegisterModule(entry.id, ++retryCounter);
   return loadModulePage(entry);
 }

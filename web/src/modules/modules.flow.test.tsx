@@ -19,6 +19,7 @@ const fed = vi.hoisted(() => ({
   loadModuleRemote: vi.fn(),
   reRegisterModule: vi.fn(),
   registerModuleRemotes: vi.fn(),
+  setHostShared: vi.fn(),
 }));
 vi.mock("./federation", () => fed);
 
@@ -248,6 +249,77 @@ describe("navigation entries", () => {
     // and picking one navigates to it
     fireEvent.click(text("Own Mod")!);
     await screen.findByText("module page rendered");
+  }, 30000);
+
+  it("a mixed manifest shows exactly the valid entries in the sidebar and the command menu, one console error per bad entry", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const e = (id: string, over: Record<string, unknown> = {}) => ({
+      ...base,
+      id,
+      label: `L ${id}`,
+      navGroup: "work",
+      ...over,
+    });
+    const nopage = e("nopage");
+    delete (nopage as Record<string, unknown>).page;
+    serveList([
+      e("Bad_ID"), // 0 invalid id
+      nopage, // 1 missing field
+      e("longlabel", { label: "x".repeat(41) }), // 2 bad label
+      e("badicon", { icon: "no-such-icon" }), // 3 unknown icon
+      e("good-work", { label: "Good Work" }), // 4 valid work
+      e("good-work", { label: "Dup Work" }), // 5 later duplicate
+      e("nonbool", { adminOnly: "yes" }), // 6 non-boolean adminOnly
+      e("oddgroup", { label: "Odd Group", navGroup: "sideways" }), // 7 unknown group -> modules
+      e("good-fac", { label: "Good Factory", navGroup: "factory" }), // 8 valid factory
+    ]);
+    mount("/dashboard");
+    await screen.findAllByRole("link", { name: "Good Work" }, { timeout: 5000 });
+
+    const hrefs = Array.from(document.querySelector("nav")!.querySelectorAll('a[href^="/m/"]')).map((a) => a.getAttribute("href"));
+    expect(hrefs).toEqual(["/m/good-work", "/m/good-fac", "/m/oddgroup"]);
+    const labels = navLinkLabels();
+    const at = (l: string) => indexOfLabel(labels, l);
+    expect(at("Chat")).toBeLessThan(at("Good Work"));
+    expect(at("Good Work")).toBeLessThan(at("Agents"));
+    expect(at("Judge")).toBeLessThan(at("Good Factory"));
+    expect(at("Good Factory")).toBeLessThan(at("Odd Group"));
+    expect(at("Odd Group")).toBeLessThan(at("Settings"));
+    expect(Array.from(document.querySelectorAll("nav p")).map((p) => p.textContent)).toContain("Modules");
+    for (const gone of ["L Bad_ID", "L nopage", "L longlabel", "L badicon", "Dup Work", "L nonbool"]) {
+      expect(document.body.textContent).not.toContain(gone);
+    }
+
+    act(() => {
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "k", code: "KeyK", ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+    const dialog = await screen.findByRole("dialog", { name: "Command menu" });
+    const options = within(dialog).getAllByRole("option").map((o) => o.textContent ?? "");
+    const group = (label: string) => options.find((o) => o.includes(label)) ?? "";
+    expect(group("Good Work")).toContain("Work");
+    expect(group("Good Factory")).toContain("Factory");
+    expect(group("Odd Group")).toContain("Modules");
+    for (const gone of ["L Bad_ID", "L nopage", "L longlabel", "L badicon", "Dup Work", "L nonbool"]) {
+      expect(options.some((o) => o.includes(gone))).toBe(false);
+    }
+
+    // Seven problems, one line each, each naming its entry (once per document).
+    const lines = errors.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith("uzi modules: "));
+    expect(lines).toHaveLength(7);
+    const named = [
+      ['"Bad_ID"', "invalid id"],
+      ["(nopage)", 'missing required field "page"'],
+      ["(longlabel)", "label is longer"],
+      ["(badicon)", "unknown icon"],
+      ["(good-work)", "duplicate id"],
+      ["(nonbool)", "adminOnly is not a boolean"],
+      ["(oddgroup)", "unknown navGroup"],
+    ];
+    for (const [name, why] of named) {
+      expect(lines.filter((l) => l.includes(name) && l.includes(why))).toHaveLength(1);
+    }
   }, 30000);
 
   it("the command menu hides admin-only module entries from non-admins", async () => {

@@ -5,6 +5,7 @@ const fed = vi.hoisted(() => ({
   loadModuleRemote: vi.fn(),
   reRegisterModule: vi.fn(),
   registerModuleRemotes: vi.fn(),
+  setHostShared: vi.fn(),
 }));
 vi.mock("./federation", () => fed);
 
@@ -118,6 +119,13 @@ describe("stale classification after a first successful load", () => {
       "an MF script load error (observed text)",
       '[ Federation Runtime ]: Failed to load script resources. #RUNTIME-008 args: {"remoteName":"demo","resourceUrl":"http://localhost/modules/demo/remoteEntry.js"} Original Error Message: Failed to fetch dynamically imported module: http://localhost/modules/demo/remoteEntry.js',
     ],
+    // The federation shape alone: no browser dynamic-import wording and no module URL, so
+    // only the federation-specific branch of isStaleChunkError can classify these.
+    [
+      "an MF script load error with only the RUNTIME-008 code",
+      '[ Federation Runtime ]: Failed to load script resources. #RUNTIME-008 args: {"remoteName":"demo"} Original Error Message: Load failed',
+    ],
+    ["an MF script load error with only the message text", "[ Federation Runtime ]: Failed to load script resources."],
   ])("%s is stale", async (_n, message) => {
     fed.loadModuleRemote.mockRejectedValue(new TypeError(message));
     expect((await failure(loadModulePage(entry))).kind).toBe("stale");

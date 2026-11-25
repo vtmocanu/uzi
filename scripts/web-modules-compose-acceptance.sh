@@ -15,10 +15,13 @@
 #   reach the daemon. The residual (CLI config, proxies and build settings can still affect
 #   pulls and builds) is accepted for this check. No step re-execs around a guardrail.
 #   1. Project name: mh-4686-<pid>, passed with -p on every call. Never -p uzi, never a bare down.
+#      Before anything is built the daemon must hold NO container, volume or network of that
+#      name (label or name prefix); a failed lookup or an existing resource is BROKEN (exit 2).
 #   2. Ports: the published port is remapped with a `ports: !override` overlay to a free
 #      127.0.0.1 port and BASE names it explicitly.
 #   3. build, up and down run only from the rendered file (-f), with the same -p.
-#   4. After start, the containers' env and mounts match the render, and the web image id is
+#   4. After start, the env and mounts of web and api match the render EXACTLY (env: the render over
+#      the image's own defaults; mounts: the rendered volumes plus the image's declared VOLUMEs), and the web image id is
 #      identical between the no-modules and the example-enabled runs (the no-rebuild proof).
 #   5. Before any build or up, the rendered file is re-parsed (with an explicit EMPTY --env-file,
 #      so no .env is autoloaded) under the inherited environment and compared with the clean
@@ -56,6 +59,35 @@ NGINX_IMAGE=$(awk '/^FROM nginxinc\/nginx-unprivileged/ { print $2; exit }' web/
 # 1. The throwaway project. The prefix check is the guard every later call relies on.
 P="mh-4686-$$"
 case "$P" in mh-4686-[0-9]*) ;; *) broken "project name $P is not a mh-4686-<pid> name" ;; esac
+
+# 1b. Ownership precheck, before anything is created or taken. A PID can be reused and the
+# daemon can be shared, so resources of this project name may already exist and would then pass
+# the teardown prefix guard. Every lookup must succeed (a failed lookup is not "empty") and find
+# nothing; otherwise exit BROKEN here, before STACK_TOUCHED is set, so the teardown never runs down.
+lk=$(docker ps -aq --filter "label=com.docker.compose.project=$P" 2>&1) || broken "precheck: cannot list containers of project $P: $lk"
+[ -z "$lk" ] || broken "precheck: project $P already has containers ($lk); not taking ownership"
+lk=$(docker volume ls -q --filter "label=com.docker.compose.project=$P" 2>&1) || broken "precheck: cannot list volumes of project $P: $lk"
+[ -z "$lk" ] || broken "precheck: project $P already has labelled volumes ($lk); not taking ownership"
+lk=$(docker network ls -q --filter "label=com.docker.compose.project=$P" 2>&1) || broken "precheck: cannot list networks of project $P: $lk"
+[ -z "$lk" ] || broken "precheck: project $P already has labelled networks ($lk); not taking ownership"
+lk=$(docker ps -a --format '{{.Names}}' 2>&1) || broken "precheck: cannot list container names: $lk"
+while IFS= read -r nm; do
+  case "$nm" in "${P}-"*) broken "precheck: a container named $nm already exists; not taking ownership" ;; esac
+done <<EOF
+$lk
+EOF
+lk=$(docker volume ls -q 2>&1) || broken "precheck: cannot list volumes: $lk"
+while IFS= read -r nm; do
+  case "$nm" in "${P}_"*) broken "precheck: a volume named $nm already exists; not taking ownership" ;; esac
+done <<EOF
+$lk
+EOF
+lk=$(docker network ls --format '{{.Name}}' 2>&1) || broken "precheck: cannot list networks: $lk"
+while IFS= read -r nm; do
+  case "$nm" in "${P}_"*) broken "precheck: a network named $nm already exists; not taking ownership" ;; esac
+done <<EOF
+$lk
+EOF
 
 RUN="$ROOT/.uzi/scratch/mh4686-$$"
 GEN="$RUN/web-modules"
@@ -112,12 +144,18 @@ EOF
   # --rmi local removes only this project's locally built images (the api and web builds); the
   # pulled db image is kept.
   if dc down -v --rmi local --timeout 20 >"$RUN/down.log" 2>&1; then
-    if [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$P")" ] \
-      && [ -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$P")" ] \
-      && [ -z "$(docker network ls -q --filter "label=com.docker.compose.project=$P")" ]; then
-      printf 'OK    teardown: down -v on project %s removed its containers, volumes and networks (all volumes prefixed %s_)\n' "$P" "$P"
+    local left_c left_v left_n
+    if left_c=$(docker ps -aq --filter "label=com.docker.compose.project=$P") \
+      && left_v=$(docker volume ls -q --filter "label=com.docker.compose.project=$P") \
+      && left_n=$(docker network ls -q --filter "label=com.docker.compose.project=$P"); then
+      if [ -z "$left_c$left_v$left_n" ]; then
+        printf 'OK    teardown: down -v on project %s removed its containers, volumes and networks (all volumes prefixed %s_)\n' "$P" "$P"
+      else
+        echo "FAIL  teardown: containers, volumes or networks of $P remain after down -v" >&2
+        FINAL_RC=1
+      fi
     else
-      echo "FAIL  teardown: containers, volumes or networks of $P remain after down -v" >&2
+      echo "FAIL  teardown: a lookup after down -v failed, so the removal is unverified" >&2
       FINAL_RC=1
     fi
   else
@@ -240,9 +278,9 @@ ok "build (db is pulled, api builds from source): ${BUILD_SECS}s"
 # --- helpers over the running stack -----------------------------------------------------------
 cid_of() { dc ps -q "$1" 2>/dev/null | head -n 1; }
 
-# stack_matches_render <label>: ownership of web, and env and mounts of web and api against the render.
+# stack_matches_render <label>: ownership of web, and the EXACT env and mounts of web and api against the render.
 stack_matches_render() {
-  local label=$1 svc cid inspect have want
+  local label=$1 svc cid inspect img imginfo diffkeys mountdiff
   for svc in web api; do
     cid=$(cid_of "$svc")
     [ -n "$cid" ] || fail "$label: no $svc container in project $P"
@@ -250,17 +288,41 @@ stack_matches_render() {
     [ "$(jq -r '.Config.Labels["com.docker.compose.project"]' <<<"$inspect")" = "$P" ] \
       && [ "$(jq -r '.Config.Labels["com.docker.compose.service"]' <<<"$inspect")" = "$svc" ] \
       || fail "$label: $svc does not carry com.docker.compose.project=$P / service=$svc"
-    have=$(jq -c '.Config.Env' <<<"$inspect")
-    want=$(jq -c --arg s "$svc" '.services[$s].environment // {}' "$CLEAN_JSON")
-    jq -en --argjson have "$have" --argjson want "$want" \
-      '$want | to_entries | map(select(.value != null) | "\(.key)=\(.value)") | all(. as $e | $have | index($e) != null)' >/dev/null \
-      || fail "$label: the environment of $svc does not contain every value the render gives it"
-    jq -en --argjson have "$(jq -c '.Mounts' <<<"$inspect")" --argjson want "$(jq -c --arg s "$svc" '.services[$s].volumes // []' "$CLEAN_JSON")" \
-      --arg real "$GEN_REAL" '
-      ($want | all(. as $w | $have | any(.Destination == $w.target and ((.Type == $w.type) and
-          (if $w.type == "bind" then (.Source == $w.source or .Source == $real) and (.RW == (($w.read_only // false) | not)) else true end)))))
-      and ([$have[] | select(.Type == "bind") | .Destination] - [$want[] | select(.type == "bind") | .target] == [])' >/dev/null \
-      || fail "$label: the mounts of $svc do not match the render (or it has a bind mount the render lacks): $(jq -c '[.Mounts[] | {Type, Destination, Source, RW}]' <<<"$inspect")"
+    img=$(jq -r '.Image' <<<"$inspect")
+    imginfo=$(docker image inspect "$img" | jq '.[0]') || fail "$label: cannot inspect the image of $svc"
+    # Environment: exactly (the image's own defaults, overridden by the rendered environment).
+    # Only variable NAMES are printed; the values include the throwaway credentials.
+    diffkeys=$(jq -n -c --argjson have "$(jq -c '.Config.Env // []' <<<"$inspect")" \
+      --argjson img "$(jq -c '.Config.Env // []' <<<"$imginfo")" \
+      --argjson rend "$(jq -c --arg s "$svc" '.services[$s].environment // {}' "$CLEAN_JSON")" '
+      def kv: (index("=")) as $i | if $i == null then {key: ., value: ""} else {key: .[:$i], value: .[$i+1:]} end;
+      ($img | map(kv) | from_entries) as $d
+      | ($rend | with_entries(select(.value != null) | .value |= tostring)) as $r
+      | (($d + $r) | to_entries | map("\(.key)=\(.value)") | sort) as $w
+      | ($have | sort) as $h
+      | ((($w - $h) + ($h - $w)) | map(kv | .key) | unique) as $k
+      | if ($k | length) == 0 and ($w | length) != ($h | length) then ["<duplicate entries>"] else $k end') \
+      || fail "$label: the environment comparison of $svc could not run"
+    [ "$diffkeys" = "[]" ] || fail "$label: the environment of $svc differs from (render over image defaults) in: $diffkeys"
+    # Mounts: exactly the rendered volumes plus the image's declared VOLUMEs not rendered over
+    # (those are anonymous volumes), compared on type, source, destination and read-write.
+    mountdiff=$(jq -n -r --argjson mounts "$(jq -c '.Mounts // []' <<<"$inspect")" \
+      --argjson rvols "$(jq -c --arg s "$svc" '.services[$s].volumes // []' "$CLEAN_JSON")" \
+      --argjson named "$(jq -c '.volumes // {}' "$CLEAN_JSON")" \
+      --argjson imgvols "$(jq -c '(.Config.Volumes // {}) | keys' <<<"$imginfo")" \
+      --arg gen "$GEN" --arg real "$GEN_REAL" '
+      ($rvols | map({type, source: (if .type == "volume" then (if (.source // "") == "" then "anonymous" else ($named[.source].name // .source) end) elif .type == "bind" then .source else "" end),
+                     destination: .target, rw: ((.read_only // false) | not)})) as $r
+      | ($r | map(.destination)) as $rd
+      | ($r + ($imgvols | map(select(. as $d | $rd | index($d) == null)) | map({type: "volume", source: "anonymous", destination: ., rw: true}))
+         | sort_by(.destination)) as $want
+      | ($mounts | map({type: .Type,
+                        source: (if .Type == "volume" then (if (.Name | test("^[0-9a-f]{64}$")) then "anonymous" else .Name end)
+                                 elif .Type == "bind" then (if .Source == $real then $gen else .Source end) else "" end),
+                        destination: .Destination, rw: .RW}) | sort_by(.destination)) as $have
+      | if $want == $have then "" else "want \($want | tojson) have \($have | tojson)" end') \
+      || fail "$label: the mount comparison of $svc could not run"
+    [ -z "$mountdiff" ] || fail "$label: the mounts of $svc differ from the render plus the image's VOLUMEs: $mountdiff"
   done
   [ "$(dc port web 8080 2>/dev/null)" = "127.0.0.1:$PORT" ] || fail "$label: docker compose port web 8080 is not 127.0.0.1:$PORT"
   ok "$label: web owns 127.0.0.1:$PORT with the project labels; env and mounts of web and api match the render"

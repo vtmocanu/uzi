@@ -21,7 +21,17 @@ const JS_PATTERNS = [
   // `Function.prototype...`, `isFunction(`, `x.Function(` and `$Function(`.
   { name: "Function(", re: /(^|[^A-Za-z0-9_$.])Function\(/g },
 ];
-const INLINE_SCRIPT = /<script\b([^>]*)>/gi;
+// The tag body allows `>` inside a quoted attribute value.
+const INLINE_SCRIPT = /<script\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/gi;
+// One attribute: its name, then an optional quoted or unquoted value.
+const ATTRIBUTE = /([^\s"'<>/=]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g;
+
+// True when the tag body carries an attribute NAMED src. Text inside another attribute's
+// value (`title="src=x"`) and longer names (`data-src`) do not count.
+function hasSrcAttribute(tagBody) {
+  for (const m of tagBody.matchAll(ATTRIBUTE)) if (m[1].toLowerCase() === "src") return true;
+  return false;
+}
 
 function excerpt(text, index) {
   const start = Math.max(0, index - 30);
@@ -43,7 +53,7 @@ function scanText(file, text) {
   } else if (/\.html?$/.test(file)) {
     INLINE_SCRIPT.lastIndex = 0;
     for (let m = INLINE_SCRIPT.exec(text); m; m = INLINE_SCRIPT.exec(text)) {
-      if (!/\bsrc\s*=/i.test(m[1])) hits.push({ file, pattern: "inline <script>", excerpt: excerpt(text, m.index) });
+      if (!hasSrcAttribute(m[1])) hits.push({ file, pattern: "inline <script>", excerpt: excerpt(text, m.index) });
     }
   }
   return hits;

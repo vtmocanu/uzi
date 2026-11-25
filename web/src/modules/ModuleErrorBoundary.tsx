@@ -10,6 +10,7 @@ import { Component, Suspense, type ReactNode } from "react";
 import { Spinner } from "../components/ui";
 import { ModuleErrorCard } from "./ModuleErrorCard";
 import { isStaleChunkError } from "./loader";
+import { describeThrown } from "./thrown";
 import type { ModuleEntry } from "./manifest";
 
 type Props = { entry: Pick<ModuleEntry, "id" | "version">; children: ReactNode };
@@ -19,7 +20,7 @@ export class ModuleErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 
   static getDerivedStateFromError(error: unknown): State {
-    return { error: error instanceof Error ? error : new Error(String(error)) };
+    return { error: error instanceof Error ? error : new Error(describeThrown(error)) };
   }
 
   componentDidCatch(error: unknown) {

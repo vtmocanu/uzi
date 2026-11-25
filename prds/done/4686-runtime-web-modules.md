@@ -50,7 +50,7 @@ The web tier serves the list at `GET /modules.json` (no auth, `Cache-Control: no
 | `id` | Required. `^[a-z][a-z0-9-]{0,31}$`, unique. Names the route `/m/<id>`, the asset prefix `/modules/<id>/` and the federation remote name |
 | `version` | Required. Shown to admins in error details and diagnostics only; it is not part of any URL and does no cache busting (§ Same-origin delivery) |
 | `page` | Required expose name rendered at `/m/<id>/*` |
-| `label`, `icon`, `navGroup` | Required. `label` 1 to 40 characters; `icon` from a fixed host icon-name list; `navGroup` is `work`, `factory` or `modules` (mapping to the existing `"Work"` and `"Factory"` `NavGroupName`s, or a new `"Modules"` group rendered last and only when non-empty) |
+| `label`, `icon`, `navGroup` | Required. `label` 1 to 40 characters; `icon` from a fixed host icon-name list; `navGroup` is `work`, `factory` or `modules` (mapping to the existing `"Work"` and `"Factory"` `NavGroupName`s, or a new `"Modules"` group rendered only when non-empty; as built it sits after Factory and before the unlabelled Settings/Admin/Docs cluster, see the Decision Log) |
 | `adminOnly` | Optional boolean, default false. Nav and command-menu entries hidden from non-admins, route behind `AdminRoute`. Presentation only: the API still authorizes every call |
 
 The upstream address of a module is nginx configuration only and never appears in `/modules.json`. Ignore unknown fields, so a later contract can add one additively.
@@ -84,7 +84,7 @@ For each module the web nginx gets a `location /modules/<id>/` proxying to that 
 
 - All three configs (`web/nginx.conf`, `web/nginx.mock.conf`, the chart's `web-configmap.yaml`) gain an `include` of a modules directory inside the server block and a `location = /modules.json`.
 - Both images (`web/Dockerfile`, `web/Dockerfile.mock`) ship an empty `[]` and an empty include directory, so with no modules the only behaviour change is that file.
-- The chart renders the include and the file from `web.modules[]` (the fields above plus `upstream`) into the web ConfigMap. `web-deployment.yaml` today mounts only `default.conf` from that ConfigMap, so add explicit read-only mounts for the include directory and `/modules.json`, keeping the existing config-checksum rollout so a list change rolls the web pods.
+- The chart renders the include and the file from `web.modules[]` (the fields above plus `upstream`) into the web ConfigMap. `web-deployment.yaml` today mounts only `default.conf` from that ConfigMap, so add explicit read-only mounts for the include and `/modules.json`, keeping the existing config-checksum rollout so a list change rolls the web pods. As built these are two `subPath` file mounts, not directory mounts (see the Decision Log).
 - Compose takes the same list from a modules override file through a small generator script (`scripts/`), which validates as the chart does and writes the include and `modules.json` that an override compose file mounts.
 
 ### Loader
@@ -220,7 +220,11 @@ Acceptance (in-run): example 1 holds under compose with no web image rebuild bet
 | Modules nav group placement | A "Modules" group after Factory and before Settings/Admin/Docs; `work` and `factory` entries append in manifest order; sidebar sections are keyed by stable ids. Reject a group at the end. |
 | Manifest validation in the SPA | Invalid entries are skipped with one `console.error` each; a later duplicate id is skipped (first valid wins); an unknown `navGroup` falls back to `modules`. Reject failing the whole list. |
 | Stale vs transient errors | After a module's first successful load, dynamic-import and MF chunk failures under its prefix are stale and show "Reload page"; others remount with Retry and a forced re-registration. Reject Retry for stale chunks (the browser's module map keeps v1). |
-| Measurement (PRD M1) | One local environment, a single run of 5 cold `/dashboard` loads each, zero modules, hooks-off builds; noisy, report only: base transferred 2,160,102 B / JS 2,110,074 B / 36 requests / loadEventEnd 389 ms / LCP 560 ms; candidate 2,196,877 B / 2,146,321 B / 38 requests / 443 ms / 584 ms (about +36.8 KB, +2 requests). Built-mode browser harness 20/20 scenarios, 54.1 s wall time locally; hosted CI time is a landing obligation. |
+| Measurement (PRD M1) | One local environment, 5 cold `/dashboard` loads per subject, zero modules, hooks-off builds; noisy, report only. First run: base transferred 2,160,102 B / JS 2,110,074 B / 36 requests / loadEventEnd 389 ms / LCP 560 ms, gzip bundle JS 2,137,382 B, all 2,158,024 B; candidate then 2,196,877 B / 2,146,321 B / 38 requests / 443 ms / 584 ms, gzip bundle JS 2,195,972 B, all 2,216,654 B; `/m/example` cold load 2,248,988 B transferred, 35 requests, loadEventEnd 411 ms. The two extra requests were `/modules.json` and a bundler runtime chunk (`rolldown-runtime`) preloaded by the entry, split out because the lazy federation chunk imported React and the router from the entry; that broke example 4 and was fixed (shared libs handed to the federation chunk at call time), and the harness now refuses any preload or unexpected asset in a zero-module load. After the fix: candidate 2,204,654 B / 2,155,188 B / 36 requests / 348 ms / 476 ms, gzip bundle JS 2,203,786 B, all 2,224,435 B; `/m/example` 2,254,861 B, 33 requests, 338 ms (no base rerun in that run, so no like-for-like delta). Harness wall time 43 to 54 s locally; hosted CI time is a landing obligation. |
+| Example 4 by logical asset roles | The harness builds with a Vite manifest, takes S = static closure of `index.html` and F = static closure of `src/modules/federation.ts`, and with zero modules asserts one `/modules.json` request, no `/modules/` request, no request for or preload of an F \ S chunk, and no preload or unexpected asset at all. Reject hashed file names as the check (they change every build). |
+| Guard before load | `/m/:id/*` is a protected route; `adminOnly` entries render inside `AdminRoute`; `ModuleLoader` is the only caller of `loadRemote`, in a post-mount effect, so signed-out and non-admin visits fetch nothing under `/modules/`. Reject loading first and hiding after. |
+| Theme subscription | `sdk.theme.mode` is the polarity (`light` or `dark`) of the validated `data-theme` stamp; `subscribe` uses a `MutationObserver` on `<html data-theme>` and fires only when the polarity changes. Reject exposing theme names (palettes are host-internal). |
+| Vendorable contract file | `web/src/modules/sdk-contract.ts` imports only `react` types and carries `HostSdkV1` plus the nine `ui` prop types; the host assigns its real components to `HostSdkV1["ui"]` so prop drift fails the host type-check. Reject vendoring `sdk.ts` (it imports host runtime values). |
 
 ## 8. Spike evidence (local throwaway spike, built mode)
 
@@ -230,7 +234,7 @@ Not covered by the spike and required in §5: cache headers, a redeploy with an 
 
 **Measured during implementation** (replacing the earlier UNVERIFIED line):
 
-- Bundle and first-load delta with zero modules (PRD M1, one local environment, a single run of 5 cold `/dashboard` loads each, hooks-off builds; noisy, report only): base transferred 2,160,102 B, JS 2,110,074 B, 36 requests, loadEventEnd 389 ms, LCP 560 ms; candidate 2,196,877 B, 2,146,321 B, 38 requests, 443 ms, 584 ms (about +36.8 KB and +2 requests).
+- Bundle and first-load delta with zero modules, the gzip bundle size and the `/m/example` load cost: see the "Measurement (PRD M1)" Decision Log row (report only, one local environment).
 - Built-mode browser harness: 20/20 scenarios, 54.1 s wall time locally. The hosted CI time is a landing obligation, not measured here.
 - `strictVersion` on a React major mismatch: the module is refused, never double-loaded (#RUNTIME-015, verified).
 - `loadRemote` is raced against the 15 s timeout (the runtime is not relied on to honour an abort).

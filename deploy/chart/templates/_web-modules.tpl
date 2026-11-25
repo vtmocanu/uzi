@@ -24,8 +24,11 @@ The validated, normalised module list as JSON (internal: it carries the upstream
 render on the first invalid rule. Call with the root context.
 */ -}}
 {{- define "uzi.webModules.list" -}}
-{{- $mods := .Values.web.modules | default (list) -}}
-{{- if not (kindIs "slice" $mods) -}}
+{{- /* Absent or null is an empty list; any other non-list value (false, 0, "", {}) is refused, so no falsy value is coerced into "no modules". */ -}}
+{{- $mods := .Values.web.modules -}}
+{{- if kindIs "invalid" $mods -}}
+{{- $mods = list -}}
+{{- else if not (kindIs "slice" $mods) -}}
 {{- fail "web.modules must be a list" -}}
 {{- end -}}
 {{- $out := list -}}

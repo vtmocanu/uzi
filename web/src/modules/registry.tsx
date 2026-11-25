@@ -7,7 +7,9 @@
 // registered (no remote entry is fetched until a module route renders).
 
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { registerModuleRemotes } from "./federationEntry";
 import { parseModuleList, type ModuleEntry } from "./manifest";
+import { describeThrown } from "./thrown";
 
 export interface ModulesState {
   status: "loading" | "ready";
@@ -37,17 +39,16 @@ async function fetchModuleList(): Promise<ModuleEntry[]> {
       return [];
     }
   } catch (e) {
-    console.error(`uzi modules: GET /modules.json failed (${e instanceof Error ? e.message : String(e)}); no modules loaded`);
+    console.error(`uzi modules: GET /modules.json failed (${describeThrown(e)}); no modules loaded`);
     return [];
   }
   const list = parseModuleList(body);
   if (list.length > 0) {
     try {
-      const federation = await import("./federation");
-      federation.registerModuleRemotes(list);
+      await registerModuleRemotes(list);
     } catch (e) {
       // The list stays visible; opening a module then shows its load error card.
-      console.error(`uzi modules: registering modules failed (${e instanceof Error ? e.message : String(e)})`);
+      console.error(`uzi modules: registering modules failed (${describeThrown(e)})`);
     }
   }
   return list;

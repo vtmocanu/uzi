@@ -9,19 +9,30 @@
 // and the router context). `strictVersion` makes a module built against an incompatible
 // range fail loudly with a version-refusal error instead of loading a second copy.
 
-import * as React from "react";
-import * as ReactDOM from "react-dom";
-import * as JsxRuntime from "react/jsx-runtime";
-import * as ReactRouterDom from "react-router-dom";
 import { init, loadRemote, registerRemotes } from "@module-federation/runtime";
-import { version as reactVersion } from "react/package.json";
-import { version as reactDomVersion } from "react-dom/package.json";
-import { version as routerVersion } from "react-router-dom/package.json";
-import { dependencies } from "../../package.json";
 import type { ModuleEntry } from "./manifest";
 import { countModuleStat } from "./stats";
 
-function shareOf(version: string, lib: unknown, requiredVersion: string) {
+// The host's shared libraries, handed in by the entry chunk (hostShared.ts) through
+// importFederation (federationEntry.ts). This file must NOT import react, react-dom,
+// react-router-dom or the package.json files itself: a static import of any module that
+// lives in the entry chunk gives this lazy chunk an edge back to the entry, and rolldown
+// then moves its CommonJS interop helpers into a separate runtime chunk that the entry
+// preloads on every page load, an extra request even with zero modules configured.
+export interface HostSharedLib {
+  version: string;
+  lib: unknown;
+  requiredVersion: string;
+}
+export type HostShared = Record<"react" | "react-dom" | "react-router-dom" | "react/jsx-runtime", HostSharedLib>;
+
+let hostShared: HostShared | null = null;
+
+export function setHostShared(shared: HostShared): void {
+  hostShared = shared;
+}
+
+function shareOf({ version, lib, requiredVersion }: HostSharedLib) {
   return { version, lib: () => lib, shareConfig: { singleton: true, requiredVersion, strictVersion: true } };
 }
 
@@ -29,16 +40,18 @@ let initialised = false;
 
 function ensureInit(): void {
   if (initialised) return;
+  if (hostShared === null) throw new Error("uzi modules: the host shared libraries were not provided to the federation chunk");
+  const shared = hostShared;
   initialised = true;
   init({
     name: "uzi_host",
     remotes: [],
     shareStrategy: "loaded-first",
     shared: {
-      react: shareOf(reactVersion, React, dependencies.react),
-      "react-dom": shareOf(reactDomVersion, ReactDOM, dependencies["react-dom"]),
-      "react-router-dom": shareOf(routerVersion, ReactRouterDom, dependencies["react-router-dom"]),
-      "react/jsx-runtime": shareOf(reactVersion, JsxRuntime, dependencies.react),
+      react: shareOf(shared.react),
+      "react-dom": shareOf(shared["react-dom"]),
+      "react-router-dom": shareOf(shared["react-router-dom"]),
+      "react/jsx-runtime": shareOf(shared["react/jsx-runtime"]),
     },
   });
 }
@@ -70,27 +83,4 @@ export function loadModuleRemote(request: string): Promise<unknown> {
   ensureInit();
   countModuleStat("loadRemote");
   return loadRemote<unknown>(request);
-}
-
-// Harness-only (like __uziModuleStats): the host's own React and router references, so the
-// browser harness can prove a remote's `reactRefs` export is the SAME function object (one
-// React, one router across the host and every remote). Dead-code eliminated from shipped
-// builds, where __UZI_TEST_HOOKS__ is false.
-declare global {
-  interface Window {
-    __uziHostReactRefs?: {
-      useState: typeof React.useState;
-      createElement: typeof React.createElement;
-      jsx: typeof JsxRuntime.jsx;
-      useNavigate: typeof ReactRouterDom.useNavigate;
-    };
-  }
-}
-if (__UZI_TEST_HOOKS__) {
-  window.__uziHostReactRefs = {
-    useState: React.useState,
-    createElement: React.createElement,
-    jsx: JsxRuntime.jsx,
-    useNavigate: ReactRouterDom.useNavigate,
-  };
 }

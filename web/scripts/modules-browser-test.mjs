@@ -13,7 +13,9 @@
 // The only child is the browser: it is started with chromium.launchServer, which spawns it
 // detached in its own process group (Playwright 1.64: `detached` on Linux), and the harness
 // records that group id. shutdown() runs on normal exit, an uncaught error, SIGINT and
-// SIGTERM, is idempotent, and always: (1) asks the browser to close, bounded to 3 s, (2) then
+// SIGTERM, is idempotent, and always: (0) if the launch is still pending (a signal during
+// chromium.launchServer, before the group id is known), waits for it, bounded to 10 s, and a launch
+// that resolves later kills its own group; (1) asks the browser to close, bounded to 3 s, (2) then
 // SIGKILLs the whole group whether or not (1) worked, (3) destroys every tracked socket and
 // (4) closes every server. Afterwards it asserts the group is gone (ESRCH, or only zombie
 // members left: a container whose PID 1 does not reap leaves killed Chromium children as
@@ -40,7 +42,7 @@ import { chromium } from "playwright";
 import { build } from "vite";
 import { createModuleConfig } from "../examples/ui-module/vite.config.ts";
 import { chromiumLaunchOptions } from "./browser-launch.mjs";
-import { federationOnlyFiles, ManifestShapeError, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
+import { federationOnlyFiles, ManifestShapeError, zeroModuleRequestViolations, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
 
 const WEB_DIR = fileURLToPath(new URL("..", import.meta.url));
 const SELF = fileURLToPath(import.meta.url);
@@ -74,6 +76,7 @@ function loadCsp() {
 }
 
 const argv = process.argv.slice(2);
+const SELFTEST_LAUNCH = argv.includes("--selftest-launch"); // child mode: be signalled DURING the browser launch
 const MODE = argv.includes("--selftest-child") ? "selftest-child" : argv.includes("--selftest-interrupt") ? "selftest" : "full";
 
 class InstrumentError extends Error {}
@@ -145,6 +148,17 @@ function groupMembers(pgid) {
     .map((c) => ({ pid: Number(c[0]), stat: c[2] }));
 }
 
+/** Process groups of the DIRECT children of `ppid` (the browser is the harness's only child). */
+function childGroups(ppid) {
+  const r = spawnSync("ps", ["-o", "pid=,ppid=,pgid=", "-e"], { encoding: "utf8" });
+  if (r.status !== 0) throw new InstrumentError(`ps failed: ${r.stderr}`);
+  return r.stdout
+    .split("\n")
+    .map((l) => l.trim().split(/\s+/).map(Number))
+    .filter((c) => c.length >= 3 && c[1] === ppid)
+    .map((c) => c[2]);
+}
+
 /**
  * "Gone" is ESRCH for the group, or every remaining member being an unreaped zombie. Returns
  * { problem: string|null, branch } where branch names which of those satisfied it.
@@ -177,6 +191,13 @@ let selfChildPgid = 0; // the browser group the child reported, killed too as a 
 let selfChildExited = null;
 let killChildPromise = null;
 
+function resetSelfChild(child, exited) {
+  selfChild = child;
+  selfChildExited = exited;
+  selfChildPgid = 0;
+  killChildPromise = null;
+}
+
 function killSelfChild() {
   killChildPromise ??= (async () => {
     if (!selfChild || !selfChildExited) return;
@@ -205,18 +226,48 @@ function killSelfChild() {
 let browserServer = null;
 let browser = null;
 let browserPgid = 0;
+let launchPromise = null; // the pending (or settled) chromium.launchServer, kept so shutdown can await it
+let shuttingDown = false;
 let shutdownPromise = null;
+const LAUNCH_WAIT_MS = 10000;
+
+function killBrowserGroup() {
+  if (!browserPgid) return;
+  try {
+    process.kill(-browserPgid, "SIGKILL");
+  } catch (e) {
+    if (e.code !== "ESRCH") console.error(`shutdown: kill(-${browserPgid}) failed: ${e.message}`);
+  }
+}
 
 async function startBrowser() {
   try {
-    browserServer = await chromium.launchServer({
-      ...chromiumLaunchOptions(),
-      headless: true,
-      handleSIGINT: false,
-      handleSIGTERM: false,
-      handleSIGHUP: false,
-    });
-    browserPgid = browserServer.process().pid;
+    // Self-test hook (child only): hold the launch promise open after Chromium exists, so the
+    // wrapper's SIGTERM lands while launchServer has not resolved and the group id is unknown.
+    const hookDelay = MODE === "selftest-child" ? Number(process.env.MODULES_SELFTEST_LAUNCH_DELAY_MS ?? 0) : 0;
+    // The group id is recorded in the continuation attached HERE, so whoever awaits
+    // launchPromise (startBrowser, or shutdown during an interrupt) sees it already set.
+    launchPromise = chromium
+      .launchServer({
+        ...chromiumLaunchOptions(),
+        headless: true,
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        handleSIGHUP: false,
+      })
+      .then(async (server) => {
+        if (hookDelay > 0) await sleep(hookDelay);
+        browserServer = server;
+        browserPgid = server.process().pid;
+        if (MODE === "selftest-child") console.log(`BROWSER pgid=${browserPgid}`);
+        // A launch that resolved after shutdown gave up waiting for it: kill it now.
+        if (shuttingDown) killBrowserGroup();
+        return server;
+      });
+    await launchPromise;
+    // Shutdown began while launching: its signal handler (or the crash handler) ends the
+    // process after cleanup, so park here instead of reporting a spurious instrument error.
+    if (shuttingDown) await new Promise(() => {});
     // The browser must lead its own group (Playwright spawns it detached); a harness that
     // cannot prove that must not claim cleanup.
     const own = spawnSync("ps", ["-o", "pgid=", "-p", String(browserPgid)], { encoding: "utf8" }).stdout.trim();
@@ -229,17 +280,16 @@ async function startBrowser() {
 
 function shutdown() {
   shutdownPromise ??= (async () => {
+    shuttingDown = true;
+    // 0. A signal during chromium.launchServer: the group id is unknown until it resolves.
+    //    Wait for it (bounded); a launch that outlives the bound kills its own group when it
+    //    resolves (see startBrowser).
+    if (launchPromise && !browserPgid) await withTimeout(launchPromise.catch(() => {}), LAUNCH_WAIT_MS);
     // 1. graceful close, bounded. A connect()ed browser's close() only disconnects; the
     //    server's close() is what closes Chromium.
     await withTimeout(Promise.allSettled([browser?.close(), browserServer?.close()]), 3000);
     // 2. unconditionally, even if 1 failed or timed out.
-    if (browserPgid) {
-      try {
-        process.kill(-browserPgid, "SIGKILL");
-      } catch (e) {
-        if (e.code !== "ESRCH") console.error(`shutdown: kill(-${browserPgid}) failed: ${e.message}`);
-      }
-    }
+    killBrowserGroup();
     // 3. sockets, 4. servers.
     for (const s of sockets) s.destroy();
     await withTimeout(
@@ -301,6 +351,19 @@ async function selftestChild() {
     res.end(req.url === "/s.js" ? "fetch('/stall').catch(function(){})" : '<!doctype html><script src="/s.js"></script>');
   });
   const port = await listen(server);
+  if (SELFTEST_LAUNCH) {
+    // Phase "launch": start the launch, wait until Chromium exists (it is our child) but
+    // launchServer has not resolved, announce it, and keep waiting. The wrapper's SIGTERM
+    // arrives in this window.
+    const launching = startBrowser();
+    const end = Date.now() + 10000;
+    while (childGroups(process.pid).length === 0 && Date.now() < end) await sleep(10);
+    console.log(`LAUNCHING ports=${[...ports].join(",")}`);
+    await launching;
+    // Not signalled: the wrapper reports it; stay alive so it can.
+    setInterval(() => {}, 1 << 30);
+    return;
+  }
   await startBrowser();
   const page = await (await browser.newContext()).newPage();
   await page.goto(`http://127.0.0.1:${port}/`);
@@ -311,42 +374,79 @@ async function selftestChild() {
   setInterval(() => {}, 1 << 30);
 }
 
-async function selftestInterrupt() {
-  const child = spawn(process.execPath, [SELF, "--selftest-child"], { stdio: ["ignore", "pipe", "inherit"] });
+/**
+ * phase "ready": SIGTERM a child whose browser runs and holds a stalled request.
+ * phase "launch": SIGTERM a child while chromium.launchServer is still pending (the group id
+ * is not yet known to the child). The wrapper learns the group two independent ways, both
+ * collected until the child exits: the `BROWSER pgid=` line the child prints once it knows,
+ * and a `ps` poll for the child's own children (the browser). A child that dies without
+ * the harness ever recording the group would otherwise leave nothing to assert on, so
+ * "no group identified" is a failure of the self-test, not a pass.
+ */
+async function selftestInterrupt(phase) {
+  const env = { ...process.env, ...(phase === "launch" ? { MODULES_SELFTEST_LAUNCH_DELAY_MS: "1500" } : {}) };
+  const args = [SELF, "--selftest-child", ...(phase === "launch" ? ["--selftest-launch"] : [])];
+  const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "inherit"], env });
   const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
-  selfChild = child;
-  selfChildExited = exited;
+  resetSelfChild(child, exited);
   let out = "";
+  const marker = phase === "launch" ? /LAUNCHING ports=([\d,]*)/ : /READY pgid=(\d+) ports=([\d,]+)/;
   const ready = new Promise((resolve) => {
     child.stdout.on("data", (d) => {
       out += d;
-      const m = /READY pgid=(\d+) ports=([\d,]+)/.exec(out);
-      if (m) {
-        selfChildPgid = Number(m[1]);
-        resolve({ pgid: Number(m[1]), ports: m[2].split(",").map(Number) });
-      }
+      const b = /BROWSER pgid=(\d+)/.exec(out);
+      const r = /READY pgid=(\d+)/.exec(out);
+      // Recorded as soon as it is printed, so every cleanup path below can kill the group.
+      if (b || r) selfChildPgid = Number((b ?? r)[1]);
+      const m = marker.exec(out);
+      if (m) resolve({ ports: (phase === "launch" ? m[1] : m[2]).split(",").filter(Boolean).map(Number) });
     });
     child.once("exit", () => resolve(null));
   });
   const info = await withTimeout(ready, 30000);
   if (info === "timeout" || info === null) {
-    child.kill("SIGKILL");
-    throw new InstrumentError(`interrupt self-test child never became ready: ${out.trim()}`);
+    // Never SIGKILL the child here: it may own a browser group it has not told us about.
+    // SIGTERM runs its shutdown, which awaits the launch and kills the group; the helper
+    // escalates only after that, and kills the reported group as a last resort.
+    await killSelfChild();
+    throw new InstrumentError(`interrupt self-test (${phase}) child never became ready: ${out.trim()}`);
   }
+  const seen = new Set();
+  let polling = true;
+  const poll = (async () => {
+    while (polling) {
+      try {
+        for (const g of childGroups(child.pid)) seen.add(g);
+      } catch {
+        // ps unavailable: the BROWSER line is then the only source
+      }
+      await sleep(20);
+    }
+  })();
   child.kill("SIGTERM");
   const result = await withTimeout(exited, 15000);
+  polling = false;
+  await poll;
   const problems = [];
   if (result === "timeout") {
-    child.kill("SIGKILL");
+    await killSelfChild();
     problems.push("the child did not exit within 15 s of SIGTERM");
   }
-  const g = await waitGroupGone(info.pgid);
-  if (g.problem) problems.push(g.problem);
+  const groups = new Set(seen);
+  const reported = /(?:BROWSER|READY) pgid=(\d+)/.exec(out);
+  if (reported) groups.add(Number(reported[1]));
+  if (groups.size === 0) throw new InstrumentError(`interrupt self-test (${phase}): no browser group was identified, so cleanup cannot be asserted: ${out.trim()}`);
+  const via = [];
+  for (const pgid of groups) {
+    const g = await waitGroupGone(pgid);
+    if (g.problem) problems.push(g.problem);
+    via.push(`${pgid} via ${g.branch}`);
+  }
   for (const p of info.ports) {
     if (await acceptsConnection(p)) problems.push(`port ${p} still accepts connections after SIGTERM`);
   }
-  if (problems.length > 0) throw new Error(`interrupt self-test: ${problems.join("; ")}`);
-  return `child ${result.signal ?? `exit ${result.code}`}, group ${info.pgid} gone via ${g.branch}, ports ${info.ports.join(",")} closed`;
+  if (problems.length > 0) throw new Error(`interrupt self-test (${phase}): ${problems.join("; ")}`);
+  return `${phase}: child ${result.signal ?? `exit ${result.code}`}, group ${via.join("; ")}, ports ${info.ports.join(",")} closed`;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -685,20 +785,29 @@ async function startWorld(dirs) {
   return listen(createFront());
 }
 
-async function waitReady(base) {
+const READY_DEADLINE_MS = 15000;
+
+// Every URL must answer 2xx within ONE overall deadline. The remaining time bounds each fetch
+// and its body read (a stalled server cannot hold the harness past it), and a success that
+// completes after the deadline is not accepted. Expiry is an instrument error (exit 2) naming
+// the pending URL.
+async function waitReady(base, deadlineMs = READY_DEADLINE_MS) {
   const urls = [`${base}/`, ...[...world.upstream.keys()].map((id) => `${base}/modules/${id}/remoteEntry.js`)];
-  const end = Date.now() + 15000;
+  const end = Date.now() + deadlineMs;
   for (const url of urls) {
     for (;;) {
+      const remaining = end - Date.now();
+      if (remaining <= 0) throw new InstrumentError(`not ready within ${deadlineMs / 1000} s: ${url}`);
       try {
-        const r = await fetch(url);
-        await r.arrayBuffer();
-        if (r.ok) break;
+        const signal = AbortSignal.timeout(remaining);
+        const r = await fetch(url, { signal });
+        await r.arrayBuffer(); // under the same signal: an abort rejects this read too
+        if (r.ok && Date.now() <= end) break;
       } catch {
-        // not up yet
+        // not up yet, or aborted at the deadline (caught by the check at the top)
       }
-      if (Date.now() > end) throw new InstrumentError(`not ready within 15 s: ${url}`);
-      await sleep(100);
+      if (Date.now() >= end) throw new InstrumentError(`not ready within ${deadlineMs / 1000} s: ${url}`);
+      await sleep(Math.min(100, Math.max(0, end - Date.now())));
     }
   }
   world.log.length = 0;
@@ -1010,6 +1119,10 @@ async function runScenarios(dirs) {
     assert(modulePaths(mark).length === 0, `(b) /modules/ requested: ${modulePaths(mark).map((r) => r.path).join(", ")}`);
     const v = zeroModuleViolations({ manifest: hostManifest, requestedPaths: world.log.slice(mark).map((r) => r.path), indexHtml: hostIndexHtml });
     assert(v.length === 0, `(c/d) ${v.join("; ")}`);
+    // (e) The request budget: nothing beyond the entry chunk, its css and route chunks, and no
+    // modulepreload (a bundler runtime chunk split off by the lazy federation import is one).
+    const budget = zeroModuleRequestViolations({ manifest: hostManifest, requestedPaths: world.log.slice(mark).map((r) => r.path), indexHtml: hostIndexHtml });
+    assert(budget.length === 0, `(e) ${budget.join("; ")}`);
 
     // With modules configured: registration happens, the federation chunks load, but no remote entry yet.
     const ctx2 = await ctxf();
@@ -1203,8 +1316,7 @@ async function main() {
 
   if (MODE === "selftest") {
     installSignalHandlers();
-    const note = await selftestInterrupt();
-    log(`PASS interrupt self-test: ${note}`);
+    for (const phase of ["ready", "launch"]) log(`PASS interrupt self-test: ${await selftestInterrupt(phase)}`);
     return 0;
   }
 
@@ -1239,18 +1351,21 @@ async function main() {
   log(`${problems.length === 0 ? "PASS" : "FAIL"} cleanup: browser group gone, no tracked port accepts${problems.length ? `\n     ${problems.join("; ")}` : ""}`);
 
   if (exitCode === 0 && !argv.includes("--only")) {
-    const t0 = Date.now();
-    try {
-      const note = await selftestInterrupt();
-      results.push({ name: "interrupt self-test", ok: true, ms: Date.now() - t0 });
-      log(`PASS interrupt self-test (${Date.now() - t0} ms): ${note}`);
-    } catch (e) {
-      if (e instanceof InstrumentError) {
-        console.error(`BROKEN: ${e.message}`);
-        exitCode = 2;
+    for (const phase of ["ready", "launch"]) {
+      const t0 = Date.now();
+      const name = `interrupt self-test (${phase})`;
+      try {
+        const note = await selftestInterrupt(phase);
+        results.push({ name, ok: true, ms: Date.now() - t0 });
+        log(`PASS ${name} (${Date.now() - t0} ms): ${note}`);
+      } catch (e) {
+        if (e instanceof InstrumentError) {
+          console.error(`BROKEN: ${e.message}`);
+          exitCode = 2;
+        }
+        results.push({ name, ok: false, ms: Date.now() - t0, error: e.message });
+        log(`FAIL ${name}\n     ${e.message}`);
       }
-      results.push({ name: "interrupt self-test", ok: false, ms: Date.now() - t0, error: e.message });
-      log(`FAIL interrupt self-test\n     ${e.message}`);
     }
   }
   if (tempOut) fs.rmSync(outRoot, { recursive: true, force: true });

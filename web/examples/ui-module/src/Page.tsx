@@ -5,7 +5,7 @@
 import { createElement, lazy, Suspense, useEffect, useState } from "react";
 import { jsx } from "react/jsx-runtime";
 import { Link, Route, Routes, useNavigate } from "react-router-dom";
-import type { HostSdkV1 } from "../../../src/modules/sdk";
+import type { HostSdkV1 } from "../../../src/modules/sdk-contract";
 import "./module.css";
 
 const SubView = lazy(() => import("./SubView"));

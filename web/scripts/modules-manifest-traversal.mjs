@@ -82,3 +82,42 @@ export function zeroModuleViolations({ manifest, requestedPaths, indexHtml }) {
   }
   return out;
 }
+
+/**
+ * The stricter zero-module request budget (PRD #4686 example 4: the only added request is
+ * the small no-cache /modules.json fetch). With the base build the document loads exactly
+ * its entry chunk and stylesheet; route chunks load on demand. So for a zero-module load:
+ *
+ *   - the entry chunk is the file of the `index.html` manifest entry (plus its css);
+ *   - every OTHER file the entry reaches by static imports (a vendor split, a bundler
+ *     runtime chunk) is an extra request the base build did not make, whether or not the
+ *     federation chunk also uses it, and is refused, requested or preloaded;
+ *   - a requested .js/.css file must be the entry, or a route chunk (a dynamic import of
+ *     the entry other than federation.ts) with its own static closure.
+ *
+ * A deliberate future vendor split must update this expectation together with the PRD.
+ */
+export function zeroModuleRequestViolations({ manifest, requestedPaths, indexHtml }) {
+  const index = manifest[INDEX_KEY];
+  if (!index) throw new ManifestShapeError(`manifest has no ${INDEX_KEY} entry`);
+  const entry = new Set([index.file, ...(index.css ?? [])]);
+  const extraStatic = new Set([...closure(manifest, INDEX_KEY)].filter((f) => !entry.has(f)));
+  const allowed = new Set(entry);
+  for (const key of index.dynamicImports ?? []) {
+    if (key === FEDERATION_KEY) continue;
+    for (const f of closure(manifest, key)) allowed.add(f);
+  }
+  const out = [];
+  for (const p of requestedPaths) {
+    const f = fileOfUrl(p);
+    if (extraStatic.has(f)) out.push(`extra static chunk requested: ${f}`);
+    else if (/\.(m?js|css)$/.test(f) && f.startsWith("assets/") && !allowed.has(f)) {
+      out.push(`unexpected asset requested: ${f}`);
+    }
+  }
+  for (let m = PRELOAD_HREF.exec(indexHtml); m; m = PRELOAD_HREF.exec(indexHtml)) {
+    const href = HREF.exec(m[0]);
+    if (href) out.push(`index.html preloads a chunk the base build did not: ${fileOfUrl(href[1])}`);
+  }
+  return out;
+}

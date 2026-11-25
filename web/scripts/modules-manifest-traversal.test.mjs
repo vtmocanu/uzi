@@ -1,7 +1,7 @@
 // node --test web/scripts/modules-manifest-traversal.test.mjs
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { federationOnlyFiles, ManifestShapeError, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
+import { federationOnlyFiles, ManifestShapeError, zeroModuleRequestViolations, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
 
 // A synthetic manifest: index statically imports a shared vendor chunk; federation.ts is a
 // dynamic entry that imports the same vendor chunk plus a federation-only runtime chunk.
@@ -84,5 +84,56 @@ describe("zeroModuleViolations", () => {
     });
     assert.equal(v.length, 1);
     assert.match(v[0], /script tag/);
+  });
+});
+
+describe("zeroModuleRequestViolations", () => {
+  // The base shape: the entry chunk and its css only, plus one route chunk loaded on demand.
+  const base = () => ({
+    "index.html": {
+      file: "assets/index-a.js",
+      isEntry: true,
+      css: ["assets/index-a.css"],
+      dynamicImports: ["src/modules/federation.ts", "src/docs.ts"],
+    },
+    "src/docs.ts": { file: "assets/docs-e.js", isDynamicEntry: true },
+    "src/modules/federation.ts": { file: "assets/federation-c.js", isDynamicEntry: true },
+  });
+  const plainHtml = '<html><head><script type="module" src="/assets/index-a.js"></script></head></html>';
+
+  it("passes the base shape: entry, css and a route chunk", () => {
+    const v = zeroModuleRequestViolations({
+      manifest: base(),
+      requestedPaths: ["/", "/assets/index-a.js", "/assets/index-a.css", "/assets/docs-e.js", "/modules.json", "/assets/font-1.woff2"],
+      indexHtml: plainHtml,
+    });
+    assert.deepEqual(v, []);
+  });
+
+  it("fails an extra static chunk the entry imports (a bundler runtime chunk), requested", () => {
+    const m = base();
+    m["index.html"].imports = ["_rolldown-runtime.js"];
+    m["_rolldown-runtime.js"] = { file: "assets/rolldown-runtime-f.js" };
+    m["src/modules/federation.ts"].imports = ["_rolldown-runtime.js"];
+    const v = zeroModuleRequestViolations({ manifest: m, requestedPaths: ["/assets/index-a.js", "/assets/rolldown-runtime-f.js"], indexHtml: plainHtml });
+    assert.deepEqual(v, ["extra static chunk requested: assets/rolldown-runtime-f.js"]);
+  });
+
+  it("fails any modulepreload in index.html", () => {
+    const v = zeroModuleRequestViolations({
+      manifest: base(),
+      requestedPaths: [],
+      indexHtml: '<link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-f.js">',
+    });
+    assert.deepEqual(v, ["index.html preloads a chunk the base build did not: assets/rolldown-runtime-f.js"]);
+  });
+
+  it("fails an unexpected js asset, and the federation chunk", () => {
+    const v = zeroModuleRequestViolations({
+      manifest: base(),
+      requestedPaths: ["/assets/surprise-g.js", "/assets/federation-c.js"],
+      indexHtml: plainHtml,
+    });
+    assert.deepEqual(v, ["unexpected asset requested: assets/surprise-g.js", "unexpected asset requested: assets/federation-c.js"]);
   });
 });

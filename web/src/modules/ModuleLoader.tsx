@@ -12,6 +12,7 @@ import { ModuleErrorCard, type ModuleErrorKind } from "./ModuleErrorCard";
 import { hasModuleLoaded, loadModulePage, retryModuleLoad, ModuleLoadError, type ModulePageComponent } from "./loader";
 import type { ModuleEntry } from "./manifest";
 import { createHostSdk } from "./sdk";
+import { describeThrown } from "./thrown";
 
 type LoadState =
   | { phase: "loading" }
@@ -40,7 +41,7 @@ export function ModuleLoader({ entry }: { entry: ModuleEntry }) {
         },
         (e: unknown) => {
           if (attempt.n !== mine) return;
-          const err = e instanceof ModuleLoadError ? e : new ModuleLoadError("transient", String(e));
+          const err = e instanceof ModuleLoadError ? e : new ModuleLoadError("transient", describeThrown(e));
           setState({ phase: "error", kind: err.kind, reason: err.message });
         },
       );

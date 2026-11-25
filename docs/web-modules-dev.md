@@ -12,7 +12,7 @@ A module is a React app built as a Module Federation **remote**. It exposes one 
 
 ## The reference build
 
-`web/examples/ui-module/` is the reference module. It is a test and acceptance fixture only: it ships in no uzi image and no workflow publishes it. Use its `vite.config.ts` as a guide (the file comments say what a module must do), not as a drop-in file: it builds several test variants, reads `web/package.json` by relative path and imports the plugin from `web/scripts/`. In your own repo, vendor `web/scripts/vite-mf-no-new-function.mjs` and `web/scripts/csp-build-scan.mjs` alongside `sdk.ts`, take `requiredVersion` from the uzi release you target, and drop the variant switches and test-only defines. It has no `package.json` of its own: it resolves dependencies from `web/node_modules`, so a real module repo adds its own.
+`web/examples/ui-module/` is the reference module. It is a test and acceptance fixture only: it ships in no uzi image and no workflow publishes it. Use its `vite.config.ts` as a guide (the file comments say what a module must do), not as a drop-in file: it builds several test variants, reads `web/package.json` by relative path and imports the plugin from `web/scripts/`. In your own repo, vendor `web/scripts/vite-mf-no-new-function.mjs` and `web/scripts/csp-build-scan.mjs` alongside `sdk-contract.ts`, take `requiredVersion` from the uzi release you target, and drop the variant switches and test-only defines. It has no `package.json` of its own: it resolves dependencies from `web/node_modules`, so a real module repo adds its own.
 
 What a module build must set:
 
@@ -20,9 +20,9 @@ What a module build must set:
 - **`base: "/modules/<id>/"`.** The web nginx proxies that prefix to the module's server and keeps the path.
 - **Shared singletons** `react`, `react-dom`, `react-router-dom` and `react/jsx-runtime`, each `singleton: true`, `strictVersion: true`, with `requiredVersion` equal to the host's range (`web/package.json`), and `shareStrategy: "loaded-first"`.
 - **The same CSP-safe build as the host.** uzi's CSP has no `'unsafe-eval'`, so a module's output must carry no dynamic-code literal:
-  - `define: { FEDERATION_ALLOW_NEW_FUNCTION: "undefined", __system_context__: "undefined" }` removes the federation runtime's own `new Function` sites.
-  - The `mfNoNewFunction()` plugin (`web/scripts/vite-mf-no-new-function.mjs`) stubs the three unguarded `new Function` sites in `@module-federation/sdk`, so the stubbed code throws only if called. It is pinned to `@module-federation/sdk@2.9.3` and fails the build if the installed sdk version differs or a snippet is not found exactly once; an sdk bump needs the pin and snippets bumped together.
-  - `node web/scripts/csp-build-scan.mjs <dir>...` is a literal text scan of a build output for `eval(`, `new Function`, `Function(` and inline `<script>` tags (exit 0 clean, 1 hits, 2 missing or empty directory). It is a literal scan, not a proof: dynamically constructed code is also stopped at runtime by the CSP.
+  - `define: { FEDERATION_ALLOW_NEW_FUNCTION: "undefined", __system_context__: "undefined" }` removes the federation runtime's own uses of the Function constructor.
+  - The `mfNoNewFunction()` plugin (`web/scripts/vite-mf-no-new-function.mjs`) stubs the three unguarded Function-constructor sites in `@module-federation/sdk`, so the stubbed code throws only if called. It is pinned to `@module-federation/sdk@2.9.3` and fails the build if the installed sdk version differs or a snippet is not found exactly once; an sdk bump needs the pin and snippets bumped together.
+  - `node web/scripts/csp-build-scan.mjs <dir>...` is a literal text scan of a build output for eval calls, the Function constructor (with or without `new`) and inline `<script>` tags without a `src` attribute (exit 0 clean, 1 hits, 2 missing or empty directory). It is a literal scan, not a proof: dynamically constructed code is also stopped at runtime by the CSP.
 
 The example's `Dockerfile` and `nginx.conf` show a static server for a module image; they are also fixtures, not a supported base image.
 
@@ -30,7 +30,9 @@ The example's `Dockerfile` and `nginx.conf` show a static server for a module im
 
 The exposed component receives one prop, `sdk: HostSdkV1`, and its module file also exports `hostContract = 1`. The host supports exactly one contract major and refuses to render a module that exports a different one (or none).
 
-`web/src/modules/sdk.ts` is the single source of the types. **Vendor that file** at the uzi tag your module targets; its `import type` lines name host paths, which you replace with your own React types. There is no published npm package.
+`web/src/modules/sdk-contract.ts` is the single source of the contract types. **Vendor that one file** at the uzi tag your module targets: it imports only types from `react` and nothing from the host, so it compiles against your module's own React. It declares `HostSdkV1`, `HOST_CONTRACT` and the prop types of the nine `ui` components; the host type-checks its real components against those prop types, so a host-side prop change cannot drift silently. `sdk.ts` (the host's factory) and the other host files are not for vendoring. There is no published npm package.
+
+The example module imports its types from `sdk-contract.ts` the same way.
 
 | Field | What it gives you |
 |---|---|
