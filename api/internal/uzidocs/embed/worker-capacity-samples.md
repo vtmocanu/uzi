@@ -84,13 +84,16 @@ mechanism for analytics history is left to a later issue.
 ## Growth
 
 Measured on PostgreSQL 17.12 with a synthetic workload (5,000 workers, 3
-slot-holding runs each, about 10 million sample rows). An always-on worker
-writes 288 samples a day, 105,120 a year.
+slot-holding runs each, 100 workers per owner, about 10 million sample rows).
+Every registered worker row is sampled, online or offline, so each one writes
+288 samples a day, 105,120 a year, until the worker is deleted. The owner index
+compresses well with many workers per owner; with one worker per owner expect
+nearer 28 MiB per worker-year.
 
 | Quantity | Value |
 |---|---|
 | Bytes per row (table plus indexes) | about 218 (134 table, 84 indexes) |
-| One always-on worker, per year | about 22 MiB |
+| One worker, per year | about 22 MiB |
 | 50 workers, per year | about 1.1 GiB |
 | 500 workers, per year | about 10.7 GiB |
 | Write-ahead log per 1,000-sample batch | about 0.4 MB (steady state) |
@@ -106,4 +109,10 @@ The pass runs on the existing sweeper tick, once per tick, in up to 4 batches of
 overlapping API replicas from running it at once; a replica that does not get
 the lock does nothing that tick. Each batch is one statement with a server
 statement timeout of 1.75 s and a lock timeout of 300 ms. The pass ends at the
-first failed batch; remaining workers are sampled on a later tick.
+first failed batch; remaining workers are sampled on a later tick. The 1.75 s
+statement timeout is a second bound: the client-side work deadline usually ends
+a slow batch first by closing the connection, after which the lock is released
+when the database session ends.
+
+Rolling back the migration drops the table and all sample history; running it
+again does not bring the data back (only a backup restore does).

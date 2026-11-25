@@ -22,7 +22,9 @@ const (
 	capacitySampleBatchBudget    = 4
 	capacitySampleTotalDeadline  = 2 * time.Second
 	capacitySampleCleanupReserve = 250 * time.Millisecond
-	// Server-side bounds sit inside the client deadline so PostgreSQL gives up first.
+	// A second, server-side bound per statement. The client work deadline (total minus reserve,
+	// from pass start) normally fires first; pgx then breaks the connection, the unlock cannot be
+	// proven, and the lock ends with the backend (an accepted gap, see the PRD).
 	capacitySampleStatementTimeout = 1750 * time.Millisecond
 	capacitySampleLockTimeout      = 300 * time.Millisecond
 )

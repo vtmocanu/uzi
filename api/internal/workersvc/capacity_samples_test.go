@@ -115,7 +115,8 @@ func TestCapacitySamplerContextDeadlines(t *testing.T) {
 	if _, err := newTestSampler(t, f, true, time.Minute).Pass(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Context deadlines come from the real clock, so assert only the gap between them.
+	// Context deadlines are built from the injected clock (already past in real time; the fake
+	// session ignores ctx), so assert only the gap between them.
 	if len(f.batchCtxDL) != 1 {
 		t.Fatalf("batch deadlines = %d", len(f.batchCtxDL))
 	}
