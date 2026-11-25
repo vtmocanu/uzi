@@ -1655,34 +1655,93 @@ func (s *Service) checkMaintenanceActive(ctx context.Context) apitypes.HealthChe
 	return c
 }
 
-// checkBoardDrift warns when at least one column move was given up (pending past the give-up
-// boundary) within the last boardDriftWindow, on a run that HAS an issue (D12: issue_iid IS
-// NOT NULL, filtered in Go so the issue-less false positives of #1482 never count).
+// checkBoardDrift warns when an issue column move has been pending longer than
+// boardDriftAfter. It reads two bands with the same now: moves still retrying (pending
+// between boardDriftAfter and boardRetryWindow) and moves given up (between boardRetryWindow
+// and boardDriftWindow). Only runs that HAVE an issue count (D12: issue_iid IS NOT NULL,
+// filtered in Go so the issue-less false positives of #1482 never count). Each band is a
+// bounded sample (boardDriftSampleCap raw rows), so a capped band reports "at least". One
+// band failing degrades only that band; the check is unknown when nothing actionable was read.
 func (s *Service) checkBoardDrift(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("board.drift")
-	rows, err := s.cfg.Store.ListGaveUpColumnMoves(ctx, store.ListGaveUpColumnMovesParams{
-		GiveupCutoff: pgconv.Time(now.Add(-boardGiveUp)),
-		PriorCutoff:  pgconv.Time(now.Add(-boardDriftWindow)),
-	})
-	if err != nil {
-		return degradeUnknown(c, "board.drift", err)
+
+	type band struct {
+		count  int
+		capped bool
+		err    error
 	}
-	var count int
-	for _, r := range rows {
-		if r.IssueIid.Valid {
-			count++
+	read := func(giveup, prior time.Duration) band {
+		rows, err := s.cfg.Store.ListGaveUpColumnMoves(ctx, store.ListGaveUpColumnMovesParams{
+			GiveupCutoff: pgconv.Time(now.Add(-giveup)),
+			PriorCutoff:  pgconv.Time(now.Add(-prior)),
+		})
+		if err != nil {
+			return band{err: err}
+		}
+		b := band{capped: len(rows) >= boardDriftSampleCap}
+		for _, r := range rows {
+			if r.IssueIid.Valid {
+				b.count++
+			}
+		}
+		return b
+	}
+	retrying := read(boardDriftAfter, boardRetryWindow)
+	gaveUp := read(boardRetryWindow, boardDriftWindow)
+
+	value := func(b band) string {
+		switch {
+		case b.err != nil:
+			return "Unavailable (query failed)"
+		case b.capped:
+			return fmt.Sprintf("%d (sample capped at %d)", b.count, boardDriftSampleCap)
+		default:
+			return fmt.Sprintf("%d", b.count)
 		}
 	}
-	if count == 0 {
-		c.Severity = sevOK
-		c.Summary = "No column move has been given up in the last 24 hours."
+	evidence := []apitypes.HealthEvidenceDTO{
+		{Label: "Still retrying", Value: value(retrying)},
+		{Label: "Given up", Value: value(gaveUp)},
+	}
+	// prefix considers only the bands that were read.
+	prefix := ""
+	if (retrying.err == nil && retrying.capped) || (gaveUp.err == nil && gaveUp.capped) {
+		prefix = "at least "
+	}
+	const action = "An automation could not move an issue's card; move it by hand or investigate the board sync. " +
+		"A move still retrying can heal on a later eligible retry once the forge is reachable (batch limits and the existing guards still apply)."
+	warn := func(summary string) apitypes.HealthCheckDTO {
+		c.Severity = sevWarn
+		c.Summary = summary
+		c.Evidence = evidence
+		c.Action = strPtr(action)
 		return c
 	}
-	c.Severity = sevWarn
-	c.Summary = fmt.Sprintf("%d issue column move(s) were given up in the last 24 hours.", count)
-	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Given-up moves", Value: fmt.Sprintf("%d", count)}}
-	c.Action = strPtr("An automation could not move an issue's card; move it by hand or investigate the board sync.")
-	return c
+
+	switch {
+	case retrying.err == nil && gaveUp.err == nil:
+		r, g := retrying.count, gaveUp.count
+		if r+g > 0 {
+			return warn(prefix + fmt.Sprintf("%d issue column move(s) pending for over 30 minutes (%d still retrying, %d given up)", r+g, r, g))
+		}
+		c.Severity = sevOK
+		c.Summary = "No issue column move pending for over 30 minutes was found in the last 48 hours (bounded sample)."
+		if retrying.capped || gaveUp.capped {
+			c.Evidence = evidence
+		}
+		return c
+	case gaveUp.err != nil && retrying.err == nil && retrying.count > 0:
+		slog.Warn("health board.drift: band query failed", "band", "given_up", "error", gaveUp.err)
+		return warn(prefix + fmt.Sprintf("%d issue column move(s) still retrying for over 30 minutes; the given-up band could not be read", retrying.count))
+	case retrying.err != nil && gaveUp.err == nil && gaveUp.count > 0:
+		slog.Warn("health board.drift: band query failed", "band", "retrying", "error", retrying.err)
+		return warn(prefix + fmt.Sprintf("%d issue column move(s) given up after 24 hours; the still-retrying band could not be read", gaveUp.count))
+	}
+	err := retrying.err
+	if err == nil {
+		err = gaveUp.err
+	}
+	return degradeUnknown(c, "board.drift", err)
 }
 
 // checkCustodyHolds warns when at least one owner is at the custody-hold admission limit.
