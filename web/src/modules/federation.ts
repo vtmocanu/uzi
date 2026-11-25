@@ -72,7 +72,9 @@ export function registerModuleRemotes(list: ModuleEntry[]): void {
 }
 
 // Retry for a transient first-load failure: re-register the remote with a fresh entry URL
-// (the failed fetch may be cached by the browser's module map) and `force`.
+// and `force`. The fresh URL only clears a failed fetch of the entry itself. A child chunk
+// keeps its URL: Chromium re-fetches a failed chunk on Retry, but an engine that keeps the
+// failure for the document cannot recover by Retry, hence Reload page after a failed Retry.
 export function reRegisterModule(id: string, retry: number): void {
   ensureInit();
   registerRemotes([{ name: id, entry: entryUrl(id, retry), type: "module" as const }], { force: true });

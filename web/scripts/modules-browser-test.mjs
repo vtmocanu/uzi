@@ -478,6 +478,8 @@ const MODULE_BUILDS = [
   { dir: "noexpose", id: "noexpose", buildTag: "v1" },
 ];
 
+let pageChunkPath = ""; // set by buildAll: example-v1's Page chunk, as a request path
+
 async function buildAll(outRoot) {
   const t0 = Date.now();
   const dirs = { host: path.join(outRoot, "host"), hostOff: path.join(outRoot, "host-off") };
@@ -501,8 +503,24 @@ async function buildAll(outRoot) {
     });
     for (const m of MODULE_BUILDS) {
       dirs[m.dir] = path.join(outRoot, m.dir);
-      await build({ ...createModuleConfig({ id: m.id, buildTag: m.buildTag, outDir: dirs[m.dir] }), logLevel: "error" });
+      const cfg = createModuleConfig({ id: m.id, buildTag: m.buildTag, outDir: dirs[m.dir] });
+      // Only example-v1 gets a build manifest (set HERE; the example's vite.config.ts is
+      // untouched): the chunk-failure scenarios need the hashed file name of the Page chunk.
+      if (m.dir === "example-v1") cfg.build = { ...cfg.build, manifest: true };
+      await build({ ...cfg, logLevel: "error" });
     }
+    // The request path of example-v1's Page chunk, for the chunk-failure scenario.
+    const manifestFile = path.join(dirs["example-v1"], ".vite", "manifest.json");
+    let pageChunk;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      const found = manifest["src/Page.tsx"] ?? Object.values(manifest).find((e) => e && e.src === "src/Page.tsx");
+      if (!found || typeof found.file !== "string") throw new Error("no entry for src/Page.tsx");
+      pageChunk = `/modules/example/${found.file}`;
+    } catch (e) {
+      throw new InstrumentError(`example-v1 build manifest (${manifestFile}): ${e.message}`);
+    }
+    pageChunkPath = pageChunk;
   } catch (e) {
     throw new InstrumentError(`build failed: ${e.message}`);
   }
@@ -600,7 +618,12 @@ const world = {
 function resetWorld() {
   world.session = null;
   world.modules = [];
-  for (const u of world.upstream.values()) u.mode = "up";
+  for (const u of world.upstream.values()) {
+    u.mode = "up";
+    u.failPaths.clear();
+    u.holdRetryEntry = false;
+    for (const p of u.parked.splice(0)) p.res.destroy();
+  }
 }
 
 function sendJson(res, status, body, extra = {}) {
@@ -722,6 +745,30 @@ function proxyToModule(req, res, id) {
     return res.end("bad gateway");
   }
   if (up.mode === "stall") return; // hold the request open: the socket is tracked and destroyed at shutdown
+  const reqUrl = new URL(req.url ?? "/", "http://front");
+  if (up.failPaths.has(reqUrl.pathname)) {
+    res.writeHead(502, { "Content-Type": "text/plain", ...noStore });
+    return res.end("bad gateway");
+  }
+  if (up.holdRetryEntry && reqUrl.pathname === `/modules/${id}/remoteEntry.js` && reqUrl.search.startsWith("?retry=")) {
+    // Parked, not answered, until releaseParked(); the socket is tracked and destroyed at
+    // shutdown (and by resetWorld).
+    up.parked.push({ req, res });
+    return;
+  }
+  forwardToModule(up, req, res, noStore);
+}
+
+// Releases every parked retry-entry request: each is proxied normally.
+function releaseParked(up) {
+  for (const p of up.parked.splice(0))
+    forwardToModule(up, p.req, p.res, {
+      "Cache-Control": "no-store",
+      ...SECURITY_HEADERS,
+    });
+}
+
+function forwardToModule(up, req, res, noStore) {
   const out = http.request(
     { host: "127.0.0.1", port: up.port, method: req.method, path: req.url, headers: { host: "upstream", "accept-encoding": req.headers["accept-encoding"] ?? "" } },
     (r) => {
@@ -794,7 +841,14 @@ async function startWorld(dirs) {
     ["contract2", dirs.contract2],
     ["noexpose", dirs.noexpose],
   ]) {
-    const up = { dir, mode: "up", port: 0 };
+    const up = {
+      dir,
+      mode: "up",
+      port: 0,
+      failPaths: new Set(),
+      holdRetryEntry: false,
+      parked: [],
+    };
     up.port = await listen(createModuleServer(id, up));
     world.upstream.set(id, up);
   }
@@ -1045,6 +1099,219 @@ async function runScenarios(dirs) {
       { loadTimeoutMs: 1500 },
     );
   }
+
+  // A child chunk that fails on the first load. Retry only changes remoteEntry.js's URL; the
+  // chunk keeps its URL. Pinned Chromium re-fetches a failed chunk (S1: Retry recovers in the
+  // same document). Engines that keep a failed module file for the document are covered by the
+  // card path S2 pins: after a Retry that fails transient the card also offers Reload page.
+  const chunkFailure = () => {
+    assert(
+      pageChunkPath.startsWith("/modules/example/") && pageChunkPath.endsWith(".js"),
+      `instrument: unexpected chunk path ${JSON.stringify(pageChunkPath)}`,
+    );
+    const chunkFile = pageChunkPath.slice(pageChunkPath.lastIndexOf("/") + 1);
+    const up = world.upstream.get("example");
+    const retryBtn = (page) => page.getByRole("button", { name: "Retry" });
+    const reloadBtn = (page) => page.getByRole("button", { name: "Reload page" });
+    // The same-document round trip of ex.2: nav entry stays, dashboard works, back to the card.
+    const roundTrip = async (page) => {
+      await vis(page, navLink("example"));
+      await page.locator('nav a[href="/dashboard"]').first().click();
+      await page.waitForURL(`${front}/dashboard`);
+      await page.getByText("Module unavailable").waitFor({ state: "detached" });
+      await page.locator(navLink("example")).click();
+      await page.getByRole("button", { name: "Retry" }).waitFor({ state: "visible", timeout: 8000 });
+    };
+    // Steps 1-3 shared by both scenarios: entry 200, chunk 502, Retry only, same-document round trip.
+    const firstFailure = async (ctx, setStep) => {
+      setStep("1");
+      up.failPaths.add(pageChunkPath);
+      const m0 = world.log.length;
+      const { page } = await openAs(ctx, "admin", [manifestEntry("example", { label: "Example" })], "/m/example");
+      setStep("2");
+      await retryBtn(page).waitFor({ state: "visible", timeout: 8000 });
+      const firstEntry = reqs(m0, (r) => r.path === "/modules/example/remoteEntry.js" && r.search === "");
+      assert(
+        firstEntry.length >= 1 && firstEntry.every((r) => r.status === 200),
+        `remoteEntry.js should have answered 200: ${JSON.stringify(firstEntry)}`,
+      );
+      const firstChunk = reqs(m0, (r) => r.path === pageChunkPath);
+      assert(
+        firstChunk.some((r) => r.status === 502),
+        `the chunk should have answered 502: ${JSON.stringify(firstChunk)}`,
+      );
+      assert((await reloadBtn(page).count()) === 0, "Reload page must not be offered on the first failure");
+      setStep("3");
+      await page.evaluate(() => {
+        window.__noReload = performance.timeOrigin;
+      });
+      await roundTrip(page);
+      return { page, m0 };
+    };
+    const cleanup = () => {
+      up.failPaths.clear();
+      up.holdRetryEntry = false;
+      releaseParked(up);
+    };
+    const wrapFail = (e, step, scenarioMark) =>
+      new Error(
+        `step ${step}: /modules/ requests ${JSON.stringify(modulePaths(scenarioMark).map((r) => `${r.path}${r.search} ${r.status}`))}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    return {
+      chunkFile,
+      up,
+      retryBtn,
+      reloadBtn,
+      roundTrip,
+      firstFailure,
+      cleanup,
+      wrapFail,
+    };
+  };
+
+  await scenario(
+    "child-chunk failure on first load, chunk restored: Retry recovers in the same document (Chromium re-fetches the failed chunk)",
+    async (ctxf) => {
+      const { up, retryBtn, reloadBtn, firstFailure, cleanup, wrapFail } = chunkFailure();
+      const ctx = await ctxf();
+      let step = "setup";
+      const scenarioMark = world.log.length;
+      try {
+        const { page } = await firstFailure(ctx, (s) => {
+          step = s;
+        });
+        step = "4";
+        // 4. The chunk is healthy again.
+        up.failPaths.clear();
+        const probe = await page.evaluate(async (p) => (await fetch(p)).status, pageChunkPath);
+        assert(probe === 200, `the restored chunk should answer 200 to a plain fetch, got ${probe}`);
+        assert((await reloadBtn(page).count()) === 0, "Reload page must not be needed before the Retry");
+        step = "5";
+        const m1 = world.log.length;
+        await retryBtn(page).click();
+        await vis(page, ".uzi-mod-example");
+        step = "6";
+        const retryEntry = reqs(
+          m1,
+          (r) => r.path === "/modules/example/remoteEntry.js" && r.search.startsWith("?retry="),
+        );
+        assert(
+          retryEntry.length >= 1 && retryEntry.every((r) => r.status === 200),
+          `the Retry's remoteEntry.js should have answered 200: ${JSON.stringify(retryEntry)}`,
+        );
+        const refetched = reqs(m1, (r) => r.path === pageChunkPath);
+        assert(
+          refetched.some((r) => r.status === 200),
+          `Chromium should re-request the failed chunk on Retry and get 200: ${JSON.stringify(refetched)}`,
+        );
+        assert(
+          (await page.evaluate(() => window.__noReload === performance.timeOrigin)) === true,
+          "Retry reloaded the document",
+        );
+        assert((await reloadBtn(page).count()) === 0, "Reload page must not appear when Retry recovers");
+      } catch (e) {
+        throw wrapFail(e, step, scenarioMark);
+      } finally {
+        cleanup();
+      }
+    },
+  );
+
+  await scenario(
+    "child-chunk failure persists through Retry: Reload page next to Retry; the reload recovers once the chunk is back",
+    async (ctxf) => {
+      const { chunkFile, up, retryBtn, reloadBtn, roundTrip, firstFailure, cleanup, wrapFail } = chunkFailure();
+      const ctx = await ctxf();
+      let step = "setup";
+      const scenarioMark = world.log.length;
+      try {
+        const { page } = await firstFailure(ctx, (s) => {
+          step = s;
+        });
+
+        step = "5";
+        // 5. The chunk keeps failing. Retry, with the new remoteEntry.js request parked so the
+        // pending state is observable.
+        up.holdRetryEntry = true;
+        const m1 = world.log.length;
+        await retryBtn(page).click();
+        step = "5a (loading state after Retry)";
+        await page
+          .getByRole("status")
+          .filter({ hasText: "Loading module" })
+          .waitFor({ state: "visible", timeout: 8000 });
+        step = "5b (original card gone)";
+        await page.getByText("Module unavailable").waitFor({ state: "detached", timeout: 8000 });
+        step = "5c (retry entry parked)";
+        const parkDeadline = Date.now() + 8000;
+        while (up.parked.length === 0) {
+          assert(Date.now() < parkDeadline, "Retry never requested remoteEntry.js?retry=N");
+          await sleep(25);
+        }
+        up.holdRetryEntry = false;
+        releaseParked(up);
+        step = "5d (Retry settles after release)";
+        await page.locator("[role=alert], .uzi-mod-example").first().waitFor({ state: "visible", timeout: 8000 });
+        assert(
+          (await page.locator(".uzi-mod-example").count()) === 0,
+          "the module rendered although its chunk still answers 502",
+        );
+        await page.getByRole("alert").waitFor({ state: "visible", timeout: 8000 });
+
+        step = "6";
+        // 6. Before any Reload page check: what the Retry did on the wire, and what the card says.
+        const retryEntry = reqs(
+          m1,
+          (r) => r.path === "/modules/example/remoteEntry.js" && r.search.startsWith("?retry="),
+        );
+        assert(
+          retryEntry.length >= 1 && retryEntry.every((r) => r.status === 200),
+          `the Retry's remoteEntry.js should have answered 200: ${JSON.stringify(retryEntry)}`,
+        );
+        const chunkReqs = reqs(m1, (r) => r.path === pageChunkPath);
+        assert(
+          chunkReqs.length >= 1 && chunkReqs.every((r) => r.status === 502),
+          `the chunk should have been requested and answered 502: ${JSON.stringify(chunkReqs)}`,
+        );
+        const reason = await textOf(page, "[data-testid=module-error-reason]");
+        assert(
+          reason.includes(chunkFile) || reason.includes(pageChunkPath),
+          `the reason should name the failing chunk ${chunkFile}: ${reason}`,
+        );
+        assert(
+          (await page.evaluate(() => window.__noReload === performance.timeOrigin)) === true,
+          "Retry reloaded the document",
+        );
+
+        step = "7";
+        // 7. Only now: Reload page next to Retry.
+        await reloadBtn(page)
+          .waitFor({ state: "visible", timeout: 3000 })
+          .catch(() => {
+            throw new Error("after a Retry that failed transient the card offers no Reload page");
+          });
+        assert((await retryBtn(page).count()) === 1, "Retry should stay next to Reload page");
+
+        step = "8";
+        // 8. The per-document record keeps the offer across a client-side round trip.
+        await roundTrip(page);
+        await reloadBtn(page).waitFor({ state: "visible", timeout: 3000 });
+
+        step = "9";
+        // 9. The chunk is back; Reload page gets a fresh document, which loads the module.
+        up.failPaths.clear();
+        const probe = await page.evaluate(async (p) => (await fetch(p)).status, pageChunkPath);
+        assert(probe === 200, `the restored chunk should answer 200 to a plain fetch, got ${probe}`);
+        await reloadBtn(page).click();
+        await page.waitForFunction(() => window.__noReload === undefined);
+        await vis(page, ".uzi-mod-example");
+      } catch (e) {
+        throw wrapFail(e, step, scenarioMark);
+      } finally {
+        cleanup();
+      }
+    },
+  );
 
   const incompatReasons = {
     incompat: /does not satisfy the requirement of/,

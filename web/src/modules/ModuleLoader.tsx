@@ -9,7 +9,7 @@ import { useAuth } from "../auth/AuthContext";
 import { Spinner } from "../components/ui";
 import { ModuleErrorBoundary } from "./ModuleErrorBoundary";
 import { ModuleErrorCard, type ModuleErrorKind } from "./ModuleErrorCard";
-import { hasModuleLoaded, loadModulePage, retryModuleLoad, ModuleLoadError, type ModulePageComponent } from "./loader";
+import { hasModuleLoaded, hasRetryFailed, loadModulePage, retryModuleLoad, ModuleLoadError, type ModulePageComponent } from "./loader";
 import type { ModuleEntry } from "./manifest";
 import { createHostSdk } from "./sdk";
 import { describeThrown } from "./thrown";
@@ -66,6 +66,8 @@ export function ModuleLoader({ entry }: { entry: ModuleEntry }) {
         // After it loaded once there is nothing to re-register ("stale" has no Retry), so
         // any other late failure just loads again.
         onRetry={state.kind === "transient" ? () => run(!hasModuleLoaded(entry.id)) : undefined}
+        // A Retry that already failed in this document also offers Reload page.
+        offerReload={state.kind === "transient" && hasRetryFailed(entry.id)}
       />
     );
   }

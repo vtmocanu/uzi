@@ -5,7 +5,9 @@
 // arrival is discarded. Failures are classified so the error card can offer the right
 // action:
 //   transient    network/HTTP error or timeout before the module ever loaded in this
-//                document -> Retry (re-register with a fresh entry URL, load again)
+//                document -> Retry (re-register with a fresh entry URL, load again). A
+//                Retry that fails transient again also offers Reload page, because some
+//                engines keep a failed module file for the life of the document.
 //   incompatible shared-version refusal, missing expose, contract major mismatch ->
 //                no action (Retry cannot fix it)
 //   stale        a chunk load failing AFTER the module already loaded in this document
@@ -58,15 +60,22 @@ export type ModulePageComponent = ComponentType<{ sdk: HostSdkV1 }>;
 const loadedOnce = new Set<string>();
 const attemptToken = new Map<string, number>();
 const inflight = new Map<string, Promise<ModulePageComponent>>();
+// Modules whose Retry failed transient in THIS document (cleared by a successful load).
+const retryFailed = new Set<string>();
 let retryCounter = 0;
 
 export function hasModuleLoaded(id: string): boolean {
   return loadedOnce.has(id);
 }
 
+export function hasRetryFailed(id: string): boolean {
+  return retryFailed.has(id);
+}
+
 // Test helper.
 export function resetModuleLoaderForTests(): void {
   loadedOnce.clear();
+  retryFailed.clear();
   attemptToken.clear();
   inflight.clear();
   retryCounter = 0;
@@ -173,6 +182,7 @@ async function doLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePa
       );
     }
     loadedOnce.add(id);
+    retryFailed.delete(id);
     return mod.default as ModulePageComponent;
   } catch (e) {
     throw classifyLoadError(e, id);
@@ -192,8 +202,27 @@ export function loadModulePage(entry: Pick<ModuleEntry, "id" | "page">): Promise
 }
 
 // Retry for a transient first-load failure: re-register the remote with a fresh entry URL,
-// then load again. Not an update mechanism.
-export async function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
-  await reRegisterModule(entry.id, ++retryCounter);
-  return loadModulePage(entry);
+// then load again. Not an update mechanism. The whole of re-registration plus load is ONE
+// shared in-flight promise, registered synchronously, so a remount while a Retry is pending
+// joins it instead of starting an independent load. A Retry that fails transient is
+// recorded (retryFailed) so the error card offers Reload page next to Retry.
+export function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
+  const { id } = entry;
+  const running = inflight.get(id);
+  if (running) return running;
+  const n = ++retryCounter;
+  const p: Promise<ModulePageComponent> = (async () => {
+    try {
+      await reRegisterModule(id, n);
+      return await doLoad(entry);
+    } catch (e) {
+      const err = classifyLoadError(e, id); // never throws: guards a revoked Proxy
+      if (err.kind === "transient" && !loadedOnce.has(id)) retryFailed.add(id);
+      throw err;
+    }
+  })().finally(() => {
+    if (inflight.get(id) === p) inflight.delete(id);
+  });
+  inflight.set(id, p);
+  return p;
 }

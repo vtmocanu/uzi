@@ -102,6 +102,81 @@ describe("transient failure before the first load", () => {
   });
 });
 
+// A Retry only changes remoteEntry.js's URL; a child chunk that failed on the first load stays
+// cached as failed in the browser, so after a Retry that fails transient the card also offers
+// Reload page. The record is per document and per module id, and a success clears it.
+describe("transient failure after a Retry", () => {
+  const down = () => new TypeError("Failed to fetch");
+
+  it("offers Reload page next to Retry once Retry fails transient", async () => {
+    fed.loadModuleRemote.mockRejectedValue(down());
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    expect(reload()).toBeNull();
+    fireEvent.click(retry()!);
+    await waitFor(() => expect(reload()).not.toBeNull());
+    expect(retry()).not.toBeNull();
+    expect(fed.reRegisterModule).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps offering Reload page when the module is mounted again in the same document", async () => {
+    fed.loadModuleRemote.mockRejectedValue(down());
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    fireEvent.click(retry()!);
+    await waitFor(() => expect(reload()).not.toBeNull());
+    cleanup();
+
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    expect(reload()).not.toBeNull();
+  });
+
+  it("offers Reload page when the re-registration itself fails", async () => {
+    fed.loadModuleRemote.mockRejectedValue(down());
+    fed.reRegisterModule.mockImplementation(() => {
+      throw new Error("registerRemotes exploded");
+    });
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    fireEvent.click(retry()!);
+    await waitFor(() => expect(reload()).not.toBeNull());
+    expect(retry()).not.toBeNull();
+  });
+
+  it("clears the record on a successful load", async () => {
+    fed.loadModuleRemote
+      .mockRejectedValueOnce(down())
+      .mockRejectedValueOnce(down())
+      .mockResolvedValueOnce(good)
+      .mockRejectedValue(down());
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    fireEvent.click(retry()!);
+    await waitFor(() => expect(reload()).not.toBeNull());
+
+    fireEvent.click(retry()!);
+    expect(await screen.findByText("page contract 1")).toBeTruthy();
+    cleanup();
+
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    expect(reload()).toBeNull();
+  });
+
+  it("an incompatible outcome of the Retry has neither Retry nor Reload page", async () => {
+    fed.loadModuleRemote
+      .mockRejectedValueOnce(down())
+      .mockRejectedValue(new Error("does not satisfy the requirement of"));
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
+    fireEvent.click(retry()!);
+    await waitFor(() => expect(screen.getByText("This module is not compatible with this version of uzi.")).toBeTruthy());
+    expect(retry()).toBeNull();
+    expect(reload()).toBeNull();
+  });
+});
+
 describe("incompatible", () => {
   it.each([
     ["a shared-version refusal", () => fed.loadModuleRemote.mockRejectedValue(new Error("does not satisfy the requirement of"))],

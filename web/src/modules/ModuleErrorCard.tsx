@@ -1,7 +1,8 @@
 // The per-page error card for a module that failed to load or render (PRD #4686,
 // "Failure isolation"). Admins see the reason, the module id and its version; other users
 // see a generic message. The action depends on the failure class:
-//   transient (before the module ever loaded)  Retry: re-register and load again
+//   transient (before the module ever loaded)  Retry: re-register and load again; after a
+//                                              Retry that failed again, Reload page too
 //   render (error inside the loaded tree)       Retry: remount, no re-registration
 //   stale (chunk failed after a load)           Reload page
 //   incompatible                                none; Retry cannot fix it
@@ -24,12 +25,16 @@ export function ModuleErrorCard({
   reason,
   entry,
   onRetry,
+  offerReload,
 }: {
   kind: ModuleErrorKind;
   reason: string;
   entry: Pick<ModuleEntry, "id" | "version">;
   // Present for the two Retry classes.
   onRetry?: () => void;
+  // Transient only: a Retry already failed in this document, so Reload page is offered next
+  // to Retry (some engines keep a failed module file for the life of the document).
+  offerReload?: boolean;
 }) {
   const isAdmin = useAuth()?.user?.is_admin === true;
   return (
@@ -48,7 +53,8 @@ export function ModuleErrorCard({
             </p>
           </div>
         )}
-        {kind === "stale" && (
+        {kind === "transient" && offerReload && <p className="text-sm text-muted">If it keeps failing, reload the page.</p>}
+        {(kind === "stale" || (kind === "transient" && offerReload)) && (
           <Button variant="secondary" onClick={() => window.location.reload()}>
             Reload page
           </Button>
