@@ -1268,3 +1268,7 @@ Approval alone does not close P-2, P-5 or P-6.
 - No statement here is a runtime proof. The kernel, CSI and database behaviour
   described is a set of design assumptions, which the implementation's
   controls and M4 must prove.
+
+## Amendment 2026-11-25, #4628: the fresh resume seed's L2 under the bare lock
+
+Decision record (AI-synced 2026-11-25). The fresh resume destination ([ADR-4628](4628-fresh-resume-durable-evidence.md)) writes into a worker's bare repository outside the usual per-flight flow: its seed (step L2) runs under the bare lock, after the refusal checks and `assertBareClear` and admission. A destination whose bare already holds any local state for the branch abandons the transfer instead of seeding. That seed is a new writer of the kind this ADR classifies, and it is covered by the same lock and the same clear check, not by a coverage-based release: "Coverage-based release, evaluated and not adopted" still stands, which is why automatic fresh resume is deferred. Adapting the seed to the command-uid writer exclusion is pending under #4643; until it lands, the seed relies on the existing bare lock and the abandon on any foreign state.

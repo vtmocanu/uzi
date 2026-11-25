@@ -1378,6 +1378,14 @@ Decision record: [ADR-4365](../adr/4365-retained-source-end-hold.md).
 - On the new API, owner Resume refuses without writes for unchanged or missing registration/worker identity despite heartbeats. A different nonempty current registration permits an explicit owner guarded attempt, not proof of process death or usable sources. Cancel stays available and retains custody. An unavailable worker can mean permanent Resume refusal; separately authorized retained-storage recovery, archive export or verified restore remains available where eligible, without a latest-work guarantee. Discard is separate and follows backup verification. (AI-synced 2026-11-15)
 - Migration Down protects active and historical detail rows without erasure. Atomic server commit visibility does not include independent source fsync. Verification covers process crashes and injected faults, not power loss; exact-head CI including LiveDB and maintainer hosted two-source wall-park observation remain pending, so issue #4365 remains open. Generation-3 incident causation is UNPROVEN; later disposal warnings and branch tests are not historical receipt evidence. (AI-synced 2026-11-15)
 
+## Feature #4628 — Fresh resume on a separate hosted worker
+
+Decision record: [ADR-4628](../adr/4628-fresh-resume-durable-evidence.md). User docs: [docs/run-recovery.md](../docs/run-recovery.md#fresh-resume-on-a-separate-hosted-worker).
+
+- The owner of a run held at an owner-held worker-exhaustion `recovery_wait` (kind `issue`, `mr_rework` or `self_improve`, not a claimed Codex run) may Resume it on a separate persistent hosted worker from durable evidence (a recovery capture or the checkpoint ref), after seeing the evidence and the cutoff text. Owner-initiated only; never automatic. (AI-synced 2026-11-25)
+- The original worker's source and custody are kept. After seeding, the original worker never takes the run again; a healthy seeded run counts one extra custody admission unit until its new hold is released or the run ends. (AI-synced 2026-11-25)
+- The gate `UZI_FRESH_RESUME` defaults off and is set uniformly on every replica. Failure model: process or container crash, no power-loss durability claim. (AI-synced 2026-11-25)
+
 ## Feature #3859 — Bounded refusal loop for retained continuations
 
 - Repeated refusal of a retained continuation's unended predecessor reaches a bounded, truthful nonterminal outcome: charged requeues then an owner-held `worker_requeue_exhausted` park, or an owner-only `retained_continuation_unwitnessed` park. Never fabricate quiescence, memory parks or blockers; never discard custody. Agents predating registration evidence stay bounded only by the per-run custody limit. See [ADR-1751 amendment](../adr/1751-continuation-custody-admission.md#amendment-2026-11-04--witnessed-continuation-departures-are-charged-3859). (AI-synced 2026-11-04)

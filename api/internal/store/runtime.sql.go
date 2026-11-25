@@ -25950,7 +25950,9 @@ type ResumeWorkerRecoveryEpisodeRow struct {
 	Status string    `json:"status"`
 }
 
-// Explicit owner release of an exhaustion hold is the only episode-renewal writer.
+// Explicit owner release of an exhaustion hold is an episode-renewal writer; the other is
+// PrepareFreshResumeClaim (fresh_resume.sql), which applies this statement's paused credit and clears
+// for a fresh resume claim (issue #4628, ADR-1197 amendment). The grant itself is unchanged.
 // Keep the wall budget, custody and released incarnation; bank the hold only after execution started.
 func (q *Queries) ResumeWorkerRecoveryEpisode(ctx context.Context, arg ResumeWorkerRecoveryEpisodeParams) (ResumeWorkerRecoveryEpisodeRow, error) {
 	row := q.db.QueryRow(ctx, resumeWorkerRecoveryEpisode, arg.ID, arg.UserID, arg.GlobalTimeoutSeconds)

@@ -2242,3 +2242,7 @@ not decided here: #4494 Direction 1 and #4628.
 
 **Accounting.** As in #3644, the park holds the current generation's custody hold; an owner Resume adds a
 claim and a hold, each counting toward `custody_hold_limit`.
+
+## Amendment 2026-11-25, #4628: a second baseline-renewal writer (fresh resume claim)
+
+Decision record (AI-synced 2026-11-25). `ResumeWorkerRecoveryEpisode` is no longer the only writer that renews the episode baseline. `PrepareFreshResumeClaim` (`api/internal/store/queries/fresh_resume.sql`), the claim step of an owner [fresh resume](4628-fresh-resume-durable-evidence.md), applies the same paused-time credit (`budget_paused_seconds` banked from `status_since` once execution started), sets `requeue_episode_baseline = requeue_count`, and clears the same hold, cause, detail, retry and health fields. It leaves `worker_recovery_episode` untouched, so the grant and its high-water mark are unchanged. Like the owner Resume it is reached only from an explicit owner action; no timer, credential or ordinary input event renews a baseline. A refused transfer restores the saved pre-claim tuple, so a refusal does not keep the credit. Comments in `api/internal/store/queries/runtime.sql` that call `ResumeWorkerRecoveryEpisode` the "only episode-renewal writer" predate this amendment.

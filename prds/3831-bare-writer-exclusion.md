@@ -2,7 +2,7 @@
 
 **Status**: Draft, Gate A revision under the 2026-11-04 owner amendment (issue #3831 body, "Owner amendment (2026-11-04)"). The contract is PROPOSED, awaiting maintainer review. Design only: no implementation is authorized by this record. The whole record is revised to the amended contract; the superseded strict contract survives only as history (5.4, 9.2). Every `file:line` cite in the whole record is at base 3c37c55a, with the quoted line where one is quoted.
 
-**Gate B delivery (#3644, 2026-11-08).** The compose path of this contract is implemented by #3644 (the independent restore of a retained predecessor from its verified pin into a fresh attempt); hosted postures still refuse. What was built against each owner decision Q11 to Q17, and what is pending, is recorded at the end of 3.2 ("Gate B delivery") and in 6(h). Those blocks cite symbols at the #3644 branch head, not at 3c37c55a. Everything else in this record is still the Gate A text.
+**Gate B delivery (#3644, 2026-11-08).** The compose path of this contract is implemented by #3644 (the independent restore of a retained predecessor from its verified pin into a fresh attempt); hosted postures still refuse. What was built against each owner decision Q11 to Q17, and what is pending, is recorded at the end of 3.2 ("Gate B delivery") and in 6(h). Those blocks cite symbols at the #3644 branch head, not at 3c37c55a. Everything else in this record is still the Gate A text. The fresh resume seed ([ADR-4628](../adr/4628-fresh-resume-durable-evidence.md), #4628) is a further bare writer under the Gate B lock and clear checks; its adaptation to command-uid exclusion is pending under #4643.
 
 **Evidence classes** used throughout, kept apart:
 

@@ -2171,6 +2171,19 @@ chain in the diagram above, with no intervening `running`.
   the remaining residual, container-per-run, belongs to the k8s-operator path (see
   Not yet in scope, below).
 
+**Fresh resume (#4628).** A run held at a worker-exhaustion `recovery_wait` can be
+resumed by its owner on a *different* persistent hosted worker, seeded from durable
+evidence the server selects (a recovery capture or the checkpoint ref) rather than from
+the lost worker's source. The flow crosses the api, the destination worker and the
+database: an owner start writes a `run_fresh_resumes` row, the destination claims it in
+its ordinary claim transaction, seeds a new attempt in its own bare, and reports a
+receipt; a `runs` trigger (`UZ416`) keeps every other writer off the run's status,
+worker and claim generation while the transfer is pending or claimed, and excludes the
+original worker after seeding. Gated by `UZI_FRESH_RESUME` (default off). Design,
+authority chain and accepted limits:
+[adr/4628-fresh-resume-durable-evidence.md](adr/4628-fresh-resume-durable-evidence.md);
+operator and owner behaviour: [docs/run-recovery.md](docs/run-recovery.md#fresh-resume-on-a-separate-hosted-worker).
+
 ### Secrets: who holds what
 
 Three tiers, deliberately narrower at each step, are the primary directive's
