@@ -61,8 +61,8 @@ const (
 	defaultGiveup = 24 * time.Hour
 	// defaultSlowBatch caps runs reconciled per slow pass.
 	defaultSlowBatch = 25
-	// defaultSlowTimeout bounds one slow pass so a stalled forge cannot spend the
-	// fast lane's budget.
+	// defaultSlowTimeout bounds one slow pass so a stalled forge cannot spend more
+	// than this of the fast lane's pass budget.
 	defaultSlowTimeout = 10 * time.Second
 	// defaultWarnTimeout bounds the crossing-warning scans after the fast lane.
 	defaultWarnTimeout = 2 * time.Second
@@ -717,7 +717,7 @@ func (l *Lifecycle) RunReconciler(ctx context.Context) {
 // tick. The slow lane lists markers between the fast window and the give-up (24
 // hours), oldest first, at most every slowInterval and at most slowBatch per pass;
 // it runs first, under its own slowTimeout, so a stalled forge there cannot spend
-// the fast lane's budget. Markers older than the give-up are left set (visible
+// more than slowTimeout of the fast lane's pass budget. Markers older than the give-up are left set (visible
 // drift) and never retried. Each run's context and status are re-read immediately
 // before the write (narrowing the clobber window against a concurrent manual
 // drag) and the total-map target is applied. After the lanes, warnGivenUp logs the
@@ -725,7 +725,8 @@ func (l *Lifecycle) RunReconciler(ctx context.Context) {
 //
 // Known limits:
 //   - Both lanes list oldest first with a LIMIT, so rows that keep failing can
-//     leave later rows unattempted in that lane.
+//     leave later rows unattempted in that lane (in the slow lane, for up to 24
+//     hours: 25 stuck markers can hold every slow slot).
 //   - Cadence and caps are per reconciler process (per api replica).
 //   - A restart runs the slow pass early, and the first post-deploy tick retries
 //     markers up to 24 hours old, behind the existing guards and the superseded
@@ -739,6 +740,9 @@ func (l *Lifecycle) RunReconciler(ctx context.Context) {
 //     it unwritten. The stale board_column then makes the next retry or transition
 //     read the moved card as a manual drag, clear the marker and not move it. The
 //     same race exists at the 30s pass deadline and is likelier in the 10s slow lane.
+//   - The autopilot terminal comment (claim, then post) also runs under the lane
+//     context: a deadline between the claim and the post loses that comment, and a
+//     comment an earlier tick failed to claim can now post up to 24 hours late.
 func (l *Lifecycle) Reconcile(ctx context.Context) {
 	now := l.now()
 	for i := range l.warnFrom {

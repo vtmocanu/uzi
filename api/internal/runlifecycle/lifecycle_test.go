@@ -132,7 +132,7 @@ func (f *fakeStore) ListPendingColumnMoves(_ context.Context, arg store.ListPend
 			}
 		}
 		sort.Slice(ids, func(i, j int) bool { return f.markers[ids[i]].Before(f.markers[ids[j]]) })
-		if int32(len(ids)) > arg.MaxBatch {
+		if len(ids) > int(arg.MaxBatch) {
 			ids = ids[:arg.MaxBatch]
 		}
 		return ids, nil
@@ -875,7 +875,9 @@ func TestReconcileNoSlowTickGivesFastFullBudget(t *testing.T) {
 	x.l.Reconcile(context.Background()) // priming tick runs the slow lane
 	cur = cur.Add(30 * time.Second)
 	fast := x.add(time.Minute)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// A parent longer than slowTimeout, so a fast lane wrongly given any child
+	// deadline (slowTimeout, interval-slowTimeout, warnTimeout) is caught.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	x.l.Reconcile(ctx)
@@ -883,7 +885,7 @@ func TestReconcileNoSlowTickGivesFastFullBudget(t *testing.T) {
 	if len(x.fm.calls) != 1 || x.fm.calls[0].issueIID != fast {
 		t.Fatalf("calls = %+v", x.fm.calls)
 	}
-	if rem := x.fm.calls[0].deadlineRemaining; rem <= 1900*time.Millisecond {
+	if rem := x.fm.calls[0].deadlineRemaining; rem <= 25*time.Second {
 		t.Fatalf("a tick without a slow pass must leave the fast lane the full budget, remaining %v", rem)
 	}
 }
@@ -908,10 +910,15 @@ func TestReconcileStalledWarnScanDoesNotShortenFastPass(t *testing.T) {
 		return gaveUpResult{err: ctx.Err(), handled: true}
 	}
 	logs := captureSlog(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	start := time.Now()
 	x.l.Reconcile(ctx)
+	// The stalled scan is bounded by warnTimeout (50ms), not by the 30s parent.
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("a stalled warn scan must be cut off by warnTimeout, Reconcile took %v", el)
+	}
 
 	if len(x.fm.calls) != 1 || x.fm.calls[0].issueIID != fast {
 		t.Fatalf("calls = %+v", x.fm.calls)
@@ -923,7 +930,7 @@ func TestReconcileStalledWarnScanDoesNotShortenFastPass(t *testing.T) {
 		if c.order >= x.fs.gaveUpOrders[0] {
 			t.Fatalf("fast attempt order %d is not before the first warn scan %d", c.order, x.fs.gaveUpOrders[0])
 		}
-		if c.deadlineRemaining <= 1900*time.Millisecond {
+		if c.deadlineRemaining <= 25*time.Second {
 			t.Fatalf("the fast attempt must see the full parent budget, remaining %v", c.deadlineRemaining)
 		}
 	}
@@ -1010,7 +1017,9 @@ func TestWarnCrossingWindows(t *testing.T) {
 		x.tickAt(&cur)
 		var rows []store.ListGaveUpColumnMovesRow
 		for _, th := range []time.Duration{x.l.fastWindow, x.l.giveup} {
-			for _, off := range []time.Duration{0, 20 * time.Second, 45 * time.Second, 100 * time.Second, 105 * time.Second} {
+			// 10s and 60s sit in the gaps a fixed one-interval window would leave
+			// between the delayed ticks (now, +45s, +105s).
+			for _, off := range []time.Duration{0, 10 * time.Second, 20 * time.Second, 45 * time.Second, 60 * time.Second, 100 * time.Second, 105 * time.Second} {
 				rows = append(rows, crossingRow(testNow.Add(off-th)))
 			}
 		}
@@ -1028,11 +1037,11 @@ func TestWarnCrossingWindows(t *testing.T) {
 				t.Fatalf("row pending %v logged %d times, want exactly once", r.MovePendingSince.Time, n)
 			}
 		}
-		if n := logLinesWith(logs, fastCrossMsg); n != 5 {
-			t.Fatalf("fast-threshold lines = %d, want 5", n)
+		if n := logLinesWith(logs, fastCrossMsg); n != 7 {
+			t.Fatalf("fast-threshold lines = %d, want 7", n)
 		}
-		if n := logLinesWith(logs, giveUpMsg); n != 5 {
-			t.Fatalf("give-up lines = %d, want 5", n)
+		if n := logLinesWith(logs, giveUpMsg); n != 7 {
+			t.Fatalf("give-up lines = %d, want 7", n)
 		}
 	})
 
