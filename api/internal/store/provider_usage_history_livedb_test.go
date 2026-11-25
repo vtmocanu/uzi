@@ -258,9 +258,9 @@ func TestAnthropicUsageCopyFencesLiveDB(t *testing.T) {
 
 	// Disable, then re-enable: the revision moves, so the old reading's params no longer match.
 	g = fresh("toggle")
-	newRev := setEnabled(ctx, t, q, user, g.sec, false)
+	setEnabled(ctx, t, q, user, g.sec, false)
 	expectZero("disabled", g.p)
-	newRev = setEnabled(ctx, t, q, user, g.sec, true)
+	newRev := setEnabled(ctx, t, q, user, g.sec, true)
 	if newRev == g.rev {
 		t.Fatalf("re-enable did not move the revision (%d)", newRev)
 	}
