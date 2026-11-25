@@ -89,7 +89,7 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
     // Every span is found in the ORIGINAL string and the union is replaced once, so an
     // overlapping or self-overlapping occurrence never leaves part of a secret behind.
     const spans = verbatimSpans(s, list);
-    if (visible.length > 0 && INVISIBLE_TEST.test(s)) spans.push(...invisibleSpans(s, visible));
+    if (visible.length > 0 && INVISIBLE_TEST.test(s)) collectInvisibleSpans(spans, s, visible);
     return replaceSpans(s, spans);
   };
 }
@@ -135,12 +135,12 @@ function replaceSpans(text: string, spans: Array<[number, number]>): string {
 }
 
 /**
- * Spans of each secret wherever its characters appear in order with only invisible runs between
+ * Push the spans of each secret wherever its characters appear in order with only invisible runs between
  * them. The text is projected onto its visible characters (remembering where each came from),
  * matched there, and every match is mapped back to a span of the ORIGINAL, invisible separators
  * included, so nothing of the secret survives to be re-joined.
  */
-function invisibleSpans(text: string, secrets: string[]): Array<[number, number]> {
+function collectInvisibleSpans(spans: Array<[number, number]>, text: string, secrets: string[]): void {
   const chunks: string[] = [];
   const origin = new Int32Array(text.length); // visible UTF-16 unit i came from text[origin[i]]
   let n = 0;
@@ -156,11 +156,9 @@ function invisibleSpans(text: string, secrets: string[]): Array<[number, number]
   keep(last, text.length);
   const visible = chunks.join("");
 
-  const spans: Array<[number, number]> = [];
   for (const secret of secrets) {
     pushOccurrences(spans, visible, secret, (at, end) => [origin[at]!, origin[end - 1]! + 1]);
   }
-  return spans;
 }
 
 /** Scrub string values and member names without dropping colliding data. Finite numeric sums merge,

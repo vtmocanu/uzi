@@ -125,6 +125,14 @@ describe("overlapping occurrences redact as one union", () => {
   it("occurrences that only touch stay separate markers", () => {
     assert.equal(makeTextRedactor(["abcdefgh"])("abcdefghabcdefgh"), REDACTED + REDACTED);
   });
+
+  it("many disjoint invisible-pass matches do not overflow the argument limit", () => {
+    // Spans are collected into one array, never spread as call arguments (a spread of ~300k
+    // spans threw RangeError before any replacement ran).
+    const count = 300_000;
+    const stored = makeTextRedactor(["abcdefgh"])("\u200b" + "abcdefgh ".repeat(count));
+    assert.equal(stored, "\u200b" + `${REDACTED} `.repeat(count));
+  });
 });
 
 describe("redaction across invisible separators: the shared fixture", () => {
