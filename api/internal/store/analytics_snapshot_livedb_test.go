@@ -50,6 +50,7 @@ func TestAnalyticsSnapshotSettingsLiveDB(t *testing.T) {
 			{"transaction_isolation", "repeatable read"},
 			{"transaction_read_only", "on"},
 			{"statement_timeout", "8s"},
+			{"jit", "off"},
 		} {
 			var got string
 			if err := s.tx.QueryRow(dctx, "SHOW "+c.name).Scan(&got); err != nil {

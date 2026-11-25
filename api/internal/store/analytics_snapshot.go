@@ -63,6 +63,12 @@ func RunAnalyticsSnapshot(ctx context.Context, beginner AnalyticsBeginner, fn fu
 	if _, err := tx.Exec(dctx, "SET LOCAL statement_timeout = '8s'"); err != nil {
 		return err
 	}
+	// JIT off: the custom plans of the admin-all Spend statement are costed above jit_above_cost
+	// and PostgreSQL then JIT-compiles about 446 functions, 6.4-7.3s per call at 120k runs
+	// (admin 30d: 8.2-8.4s with JIT, 1.3s without). Issue #4684 m5 plan and runtime evidence.
+	if _, err := tx.Exec(dctx, "SET LOCAL jit = off"); err != nil {
+		return err
+	}
 	return fn(dctx, &AnalyticsSnapshot{Q: New(tx), tx: tx})
 }
 
