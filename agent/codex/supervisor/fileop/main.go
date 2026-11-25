@@ -19,6 +19,7 @@
 //	{"id":<int>,"op":"read","path":"rel"}
 //	{"id":<int>,"op":"read_range","path":"rel","offset":<integer>,"limit":<integer>}
 //	{"id":<int>,"op":"read_tail","path":"rel","tail":<integer>}
+//	{"id":<int>,"op":"read_bytes","path":"rel","offset":<integer>,"limit":<integer>}
 //	{"id":<int>,"op":"write","path":"rel","data":"<base64>"}
 //	{"id":<int>,"op":"apply","path":"rel","old":"<base64>","data":"<base64>"}
 //	{"id":<int>,"op":"mkdir","path":"rel"}
@@ -65,8 +66,18 @@
 // truncated means the excerpt omits opening bytes; empty files are not truncated.
 // Scan exhaustion discards any unfinished older line and sets incomplete.
 //
+// read_bytes is a positioned raw byte-window read: zero-based offset
+// (0..9007199254740991) and limit (1..1 MiB, the ordinary read cap), validated
+// before opening. Success fields are canonical base64 data (empty when offset is at
+// or past EOF), opening fstat size, the offset echo, and ident
+// "<dev>:<ino>:<mtime_ns>:<ctime_ns>" from the same opening fstat. The window is
+// min(limit, max(0, size-offset)) bytes; early EOF (shrinkage after open) returns the
+// short data, and a mutation between the fstat and the pread is not detected: size
+// and ident reflect the fstat sample. No text validation is applied.
+//
 // The descriptor and opening size pin each range/tail operation: later appends are
-// ignored and replacement cannot redirect it. read_range accepts early EOF as
+// ignored and replacement cannot redirect it. read_bytes follows the same pinning:
+// its reads are clamped to the opening size. read_range accepts early EOF as
 // shrinkage; read_tail requires full positioned reads or returns E_IO, including
 // short reads with EOF. Only zero-byte EINTR is retried, under the same context,
 // charging no scan bytes; nonzero reads charge their actual bytes.

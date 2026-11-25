@@ -15,6 +15,7 @@ import {
 } from "../src/codex/broker.js";
 import { wireFileopHelper } from "../src/codex/fileop-client.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
+import { buildFileopHelper, readBytesReply } from "./codex-search-fakes.js";
 
 const NOTICE = "Partial search: coverage is incomplete; a missing match does not mean the text is absent.";
 const MIB = 1024 * 1024;
@@ -57,6 +58,8 @@ interface Mem {
   files: Map<string, Buffer>;
   /** Overrides stat size for a path (to simulate an over-size file without allocating it). */
   sizes?: Map<string, number>;
+  /** Overrides the read_bytes ident for a path (default "1:1:0:0"). */
+  idents?: Map<string, string>;
   hook?: (req: FileopRequest) => FileopResponse | Promise<FileopResponse> | undefined;
 }
 function memFileop(mem: Mem): FileopClient & { ops: FileopRequest[] } {
@@ -78,11 +81,11 @@ function memFileop(mem: Mem): FileopClient & { ops: FileopRequest[] } {
         if (mem.dirs.has(req.path)) return { ok: true, exists: true, type: "dir", size: 0 };
         return { ok: true, exists: false };
       }
-      if (req.op === "read") {
+      // Search never issues the legacy whole-file `read`: it falls through to the throw below.
+      if (req.op === "read_bytes") {
         const body = mem.files.get(req.path);
         if (!body) return helperErr(mem.dirs.has(req.path) ? "E_IS_DIR" : "E_NOT_FOUND");
-        if (body.length > MIB) return helperErr("E_OVERSIZE");
-        return { ok: true, size: body.length, data: b64(body) };
+        return readBytesReply(body, req, { size: mem.sizes?.get(req.path), ident: mem.idents?.get(req.path) });
       }
       throw new Error(`unexpected op ${req.op}`);
     },
@@ -123,14 +126,22 @@ function fsFileop(root: string): FileopClient {
           const type = st.isFile() ? "file" : st.isDirectory() ? "dir" : st.isSymbolicLink() ? "symlink" : "other";
           return { ok: true, exists: true, type, size: st.size };
         }
-        if (req.op === "read") {
-          const st = await fsp.lstat(abs(req.path));
-          if (st.isSymbolicLink()) return helperErr("E_SYMLINK");
-          if (st.isDirectory()) return helperErr("E_IS_DIR");
-          if (!st.isFile()) return helperErr("E_NOT_FILE");
-          if (st.size > MIB) return helperErr("E_OVERSIZE");
-          const data = await fsp.readFile(abs(req.path));
-          return { ok: true, size: data.length, data: b64(data) };
+        if (req.op === "read_bytes") {
+          const lst = await fsp.lstat(abs(req.path));
+          if (lst.isSymbolicLink()) return helperErr("E_SYMLINK");
+          if (lst.isDirectory()) return helperErr("E_IS_DIR");
+          if (!lst.isFile()) return helperErr("E_NOT_FILE");
+          const handle = await fsp.open(abs(req.path), "r");
+          try {
+            const st = await handle.stat({ bigint: true });
+            const offset = req.offset ?? 0;
+            const buf = Buffer.alloc(Math.min(req.limit ?? 0, Math.max(0, Number(st.size) - offset)));
+            const { bytesRead } = await handle.read(buf, 0, buf.length, offset);
+            return {
+              ok: true, data: b64(buf.subarray(0, bytesRead)), size: Number(st.size), offset,
+              ident: `${st.dev}:${st.ino}:${st.mtimeNs}:${st.ctimeNs}`,
+            };
+          } finally { await handle.close(); }
         }
       } catch (e) {
         return codeOf(e);
@@ -238,14 +249,17 @@ describe("Search partial results", () => {
       let held = false;
       const mem = flat({ "a.txt": "needle\n", "b.txt": "x\n" });
       mem.hook = (req) => {
-        if (req.op === "read" && req.path === "b.txt") { held = true; return new Promise<FileopResponse>(() => {}); }
+        if (req.op === "read_bytes" && req.path === "b.txt") { held = true; return new Promise<FileopResponse>(() => {}); }
         return undefined;
       };
       const pending = call(brokerFor(memFileop(mem)), { query: "needle" });
       for (let i = 0; i < 1000 && !held; i++) await new Promise((r) => setImmediate(r));
       assert.equal(held, true);
       mock.timers.tick(10_000);
-      expectPartial(outputOf(await pending), "time");
+      const out = outputOf(await pending);
+      expectPartial(out, "time");
+      // a.txt is 7 bytes; the abandoned b.txt request (limit 2) stays charged at its full limit.
+      assert.equal(out.bytes, 7 + 2);
     });
 
     it("time, final recheck after a listing that settles normally past the deadline", async () => {
@@ -265,9 +279,9 @@ describe("Search partial results", () => {
       mock.timers.enable({ apis: ["setTimeout", "Date"] });
       const mem = flat({ "a.txt": "needle\n", "b.txt": "other\n" });
       mem.hook = (req) => {
-        if (req.op === "read" && req.path === "b.txt") {
+        if (req.op === "read_bytes" && req.path === "b.txt") {
           mock.timers.tick(10_001);
-          return { ok: true, size: 6, data: b64("other\n") };
+          return readBytesReply(Buffer.from("other\n"), req);
         }
         return undefined;
       };
@@ -279,9 +293,9 @@ describe("Search partial results", () => {
       mock.timers.enable({ apis: ["setTimeout", "Date"] });
       const mem = flat({ "a.txt": "needle\n", "b.txt": "needle b\n" });
       mem.hook = (req) => {
-        if (req.op === "read" && req.path === "b.txt") {
+        if (req.op === "read_bytes" && req.path === "b.txt") {
           mock.timers.tick(10_001);
-          return { ok: true, size: 9, data: b64("needle b\n") };
+          return readBytesReply(Buffer.from("needle b\n"), req);
         }
         return undefined;
       };
@@ -310,7 +324,7 @@ describe("Search partial results", () => {
       assert.equal(out.reason, "listing");
     });
 
-    it("file_size: an over-size file is skipped and a later file is still searched", async () => {
+    it("file_size: a file that reads short of its stat size is skipped and a later file is still searched", async () => {
       const mem = flat({ "a.txt": "needle\n", "b.bin": "huge", "c.txt": "needle again\n" });
       mem.sizes = new Map([["b.bin", MIB + 1]]);
       const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
@@ -364,12 +378,13 @@ describe("Search partial results", () => {
       });
     });
 
-    it("returns a partial file_size result for an over-size target", async () => {
+    it("returns a partial file_size result for a target that reads short of its stat size", async () => {
       const mem = flat({ "a.txt": "x" });
       mem.sizes = new Map([["a.txt", MIB + 1]]);
+      // The MiB-sized request is refunded down to the single byte actually read.
       assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "needle", path: "a.txt" }), {
         ok: true,
-        output: { matches: [], truncated: true, bytes: 0, reason: "file_size", skippedFiles: 1, notice: NOTICE },
+        output: { matches: [], truncated: true, bytes: 1, reason: "file_size", skippedFiles: 1, notice: NOTICE },
       });
     });
 
@@ -405,26 +420,366 @@ describe("Search partial results", () => {
     });
   });
 
-  it("does not treat a client-local E_OVERSIZE (no origin) on read as a skip", async () => {
+  it("does not treat a client-local E_OVERSIZE (no origin) on read_bytes as a skip", async () => {
     const mem = flat({ "a.txt": "needle\n" });
-    mem.hook = (req) => (req.op === "read" ? { ok: false, code: "E_OVERSIZE" } : undefined);
+    mem.hook = (req) => (req.op === "read_bytes" ? { ok: false, code: "E_OVERSIZE" } : undefined);
     assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "needle" }),
       { ok: false, code: "fileop_denied", message: "file operation denied (E_OVERSIZE)", fileopCode: "E_OVERSIZE" });
   });
 
-  it("skips helper E_OVERSIZE, truncated reads and bodies over the per-file cap", async () => {
-    const mem = flat({ "a.txt": "needle\n", "b.txt": "x", "c.txt": "x", "d.txt": "x" });
-    mem.hook = (req) => {
-      if (req.op !== "read") return undefined;
-      if (req.path === "b.txt") return helperErr("E_OVERSIZE");
-      if (req.path === "c.txt") return { ok: true, data: b64("x"), truncated: true };
-      if (req.path === "d.txt") return { ok: true, data: b64(Buffer.alloc(MIB + 1, "x")) };
-      return undefined;
-    };
-    const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
-    assert.equal(out.reason, "file_size");
-    assert.equal(out.skippedFiles, 3);
-    assert.deepEqual(out.matches.map((m) => m.path), ["a.txt"]);
+  describe("chunked reads", () => {
+    const denial = { ok: false, code: "fileop_denied", message: "Search file body unavailable" };
+    const reads = (fileop: { ops: FileopRequest[] }) => fileop.ops.filter((op) => op.op === "read_bytes");
+    const zeros = (n: number) => Buffer.alloc(n, "z");
+
+    it("scans a 2.5 MiB file with no size limit, in 1 MiB windows, and keeps line numbers across windows", async () => {
+      const body = Buffer.concat([Buffer.from("a\nneedle one\n"), zeros(2 * MIB), Buffer.from("\nb\nneedle two"), zeros(MIB / 2)]);
+      const fileop = memFileop(flat({ "big.txt": body }));
+      const out = outputOf(await call(brokerFor(fileop), { query: "needle" }));
+      assert.deepEqual(out.matches, [
+        { path: "big.txt", line: 2, text: "needle one" },
+        { path: "big.txt", line: 5, text: "needle two" + "z".repeat(MIB / 2) },
+      ].map((m) => ({ ...m, text: m.text.slice(0, 256) })));
+      assert.equal(out.truncated, false);
+      assert.equal(out.skippedFiles, undefined);
+      assert.equal(out.bytes, body.length);
+      assert.deepEqual(reads(fileop).map((r) => [r.offset, r.limit]), [[0, MIB], [MIB, MIB], [2 * MIB, body.length - 2 * MIB]]);
+    });
+
+    it("searches a walk from . that holds a file over 1 MiB without skipping it", async () => {
+      const out = outputOf(await call(brokerFor(memFileop(flat({ "big.ts": Buffer.concat([zeros(MIB + 10), Buffer.from("\nneedle")]) }))), { query: "needle", path: "." }));
+      assert.deepEqual(out.matches, [{ path: "big.ts", line: 2, text: "needle" }]);
+      assert.equal(out.truncated, false);
+      assert.equal("skippedFiles" in out, false);
+    });
+
+    it("reads a zero-size file with exactly one read_bytes request and refunds it", async () => {
+      const fileop = memFileop(flat({ "a.txt": "" }));
+      assert.deepEqual(outputOf(await call(brokerFor(fileop), { query: "needle" })), { matches: [], truncated: false, bytes: 0 });
+      assert.deepEqual(reads(fileop), [{ op: "read_bytes", path: "a.txt", offset: 0, limit: 1 }]);
+    });
+
+    it("denies a zero-size stat followed by a failed open instead of treating the file as empty", async () => {
+      for (const code of ["E_SYMLINK", "E_DENIED"]) {
+        const mem = flat({ "a.txt": "" });
+        mem.hook = (req) => (req.op === "read_bytes" ? helperErr(code) : undefined);
+        assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "needle" }),
+          { ok: false, code: "fileop_denied", message: `file operation denied (${code})`, fileopCode: code });
+      }
+    });
+
+    it("keeps recorded limits within the 16 MiB budget and each within what remained at dispatch", async () => {
+      // a.txt takes 15 MiB; b.txt's stat says 100 bytes but it grew before the read, so the helper's
+      // own fstat reports its real size (read only up to its limit, then skipped); c.txt is still
+      // searched and gets exactly the remaining MiB-100 before the walk stops on bytes.
+      const bBody = zeros(2 * MIB);
+      const mem = flat({
+        "a.txt": Buffer.concat([Buffer.from("needle\n"), zeros(15 * MIB - 7)]),
+        "b.txt": bBody, "c.txt": Buffer.concat([Buffer.from("needle c\n"), zeros(3 * MIB - 9)]),
+      });
+      mem.sizes = new Map([["b.txt", 100]]);
+      mem.hook = (req) => (req.op === "read_bytes" && req.path === "b.txt" ? readBytesReply(bBody, req, { size: bBody.length }) : undefined);
+      const fileop = memFileop(mem);
+      const out = outputOf(await call(brokerFor(fileop), { query: "needle" }));
+      assert.equal(out.reason, "bytes");
+      assert.equal(out.skippedFiles, 1, "the grown file is skipped after its first window");
+      assert.deepEqual(out.matches.map((m) => m.path), ["a.txt", "c.txt"], "the walk continues to the later file");
+      assert.equal(out.bytes, 16 * MIB);
+      let used = 0;
+      for (const r of reads(fileop)) {
+        assert.ok((r.limit ?? 0) >= 1 && (r.limit ?? 0) <= 16 * MIB - used, `limit ${r.limit} exceeds remaining ${16 * MIB - used}`);
+        used += r.limit ?? 0;
+      }
+      assert.equal(used, 16 * MIB);
+      assert.deepEqual(reads(fileop).filter((r) => r.path === "b.txt").map((r) => r.limit), [100]);
+      assert.deepEqual(reads(fileop).filter((r) => r.path === "c.txt").map((r) => r.limit), [MIB - 100]);
+    });
+
+    it("charges nothing for a request rejected by the operations ceiling", async () => {
+      const files: Record<string, string> = { "a.txt": "needle\n" };
+      for (let i = 0; i < 1100; i++) files[`f${String(i).padStart(4, "0")}`] = "tiny\n";
+      const fileop = memFileop(flat(files));
+      const out = outputOf(await call(brokerFor(fileop), { query: "needle" }));
+      assert.equal(out.reason, "operations");
+      assert.equal(fileop.ops.length, 2048, "the 2049th request is never dispatched");
+      // list, a.txt and f0000..f1021 (stat + read_bytes each), and the stat of f1022 are admitted; its read_bytes is the rejected 2049th.
+      assert.equal(out.bytes, 7 + 1022 * 5);
+    });
+
+    it("keeps the full limit charged after a helper E_TIMEOUT and returns the earlier matches as time", async () => {
+      const mem = flat({ "a.txt": Buffer.concat([Buffer.from("needle\n"), zeros(MIB + 3)]) });
+      mem.hook = (req) => (req.op === "read_bytes" && req.offset! > 0 ? helperErr("E_TIMEOUT") : undefined);
+      const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+      assert.deepEqual(out.matches, [{ path: "a.txt", line: 1, text: "needle" }]);
+      assert.equal(out.reason, "time");
+      assert.equal(out.bytes, MIB + 10);
+      assert.equal(out.skippedFiles, 0);
+    });
+
+    it("treats a client-local E_TIMEOUT (no origin) as a denial", async () => {
+      const mem = flat({ "a.txt": "needle\n" });
+      mem.hook = (req) => (req.op === "read_bytes" ? { ok: false, code: "E_TIMEOUT" } : undefined);
+      assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "needle" }),
+        { ok: false, code: "fileop_denied", message: "file operation denied (E_TIMEOUT)", fileopCode: "E_TIMEOUT" });
+    });
+
+    it("an abandoned mid-file request stops as time with its limit charged and earlier matches kept", async () => {
+      mock.timers.enable({ apis: ["setTimeout", "Date"] });
+      let held = false;
+      const mem = flat({ "a.txt": Buffer.concat([Buffer.from("needle\n"), zeros(MIB)]) });
+      mem.hook = (req) => {
+        if (req.op === "read_bytes" && req.offset! > 0) { held = true; return new Promise<FileopResponse>(() => {}); }
+        return undefined;
+      };
+      const pending = call(brokerFor(memFileop(mem)), { query: "needle" });
+      for (let i = 0; i < 1000 && !held; i++) await new Promise((r) => setImmediate(r));
+      assert.equal(held, true);
+      mock.timers.tick(10_000);
+      const out = outputOf(await pending);
+      assert.deepEqual(out.matches.map((m) => m.line), [1]);
+      assert.equal(out.reason, "time");
+      assert.equal(out.bytes, MIB + 7);
+    });
+
+    it("discards a chunk that settles past the deadline and keeps earlier matches", async () => {
+      mock.timers.enable({ apis: ["setTimeout", "Date"] });
+      const mem = flat({ "a.txt": Buffer.concat([Buffer.from("needle\n"), zeros(MIB)]) });
+      mem.hook = (req) => {
+        if (req.op !== "read_bytes" || req.offset === 0) return undefined;
+        mock.timers.tick(10_001);
+        // A valid short reply: 3 of the 7 bytes requested for the final window.
+        return readBytesReply(mem.files.get("a.txt")!.subarray(0, MIB + 3), req, { size: MIB + 7 });
+      };
+      const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+      assert.deepEqual(out.matches.map((m) => m.line), [1]);
+      assert.equal(out.reason, "time");
+      assert.equal(out.bytes, MIB + 7, "a late success keeps its full charge, with no refund for a short reply");
+    });
+
+    it("denies a failure that settles after the deadline instead of reporting time", async () => {
+      for (const code of ["E_SYMLINK", "E_DENIED", "E_IO"]) {
+        mock.timers.enable({ apis: ["setTimeout", "Date"] });
+        const mem = flat({ "a.txt": "needle\n" });
+        mem.hook = (req) => {
+          if (req.op !== "read_bytes") return undefined;
+          mock.timers.tick(10_001);
+          return helperErr(code);
+        };
+        assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "needle" }),
+          { ok: false, code: "fileop_denied", message: `file operation denied (${code})`, fileopCode: code });
+        mock.timers.reset();
+      }
+    });
+
+    it("bytes mid-file: scans the carried partial line before stopping", async () => {
+      const body = Buffer.concat([Buffer.from("a\n"), zeros(16 * MIB - 2 - 6), Buffer.from("needle"), zeros(4 * MIB)]);
+      const out = outputOf(await call(brokerFor(memFileop(flat({ "a.txt": body }))), { query: "needle" }));
+      assert.equal(out.reason, "bytes");
+      assert.equal(out.bytes, 16 * MIB);
+      assert.equal(out.matches.length, 1);
+      assert.equal(out.matches[0]!.line, 2);
+      assert.equal(out.matches[0]!.text, "z".repeat(125) + "needle");
+    });
+
+    it("operations mid-file: stops inside a large file with its earlier matches", async () => {
+      const files: Record<string, string | Buffer> = {};
+      for (let i = 0; i < 1020; i++) files[`a${String(i).padStart(4, "0")}`] = "tiny\n";
+      files["z.txt"] = Buffer.concat([Buffer.from("needle\n"), zeros(8 * MIB)]);
+      const fileop = memFileop(flat(files));
+      const out = outputOf(await call(brokerFor(fileop), { query: "needle" }));
+      assert.deepEqual(out.matches, [{ path: "z.txt", line: 1, text: "needle" }]);
+      assert.equal(out.reason, "operations");
+      assert.equal(out.bytes, 1020 * 5 + 6 * MIB, "the rejected seventh window of z.txt is not charged");
+    });
+
+    it("time mid-file via the helper deadline keeps the carried line scan", async () => {
+      const body = Buffer.concat([zeros(MIB - 6), Buffer.from("needle"), zeros(5)]);
+      const mem = flat({ "a.txt": body });
+      mem.hook = (req) => (req.op === "read_bytes" && req.offset! > 0 ? helperErr("E_TIMEOUT") : undefined);
+      const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+      assert.equal(out.reason, "time");
+      assert.deepEqual(out.matches.map((m) => m.line), [1]);
+    });
+
+    it("matches: 21 matches split across windows give 20, and exactly 20 are complete", async () => {
+      const needles = (n: number) => Buffer.from("needle\n".repeat(n));
+      const over = outputOf(await call(brokerFor(memFileop(flat({
+        "a.txt": Buffer.concat([needles(10), zeros(MIB), Buffer.from("\n"), needles(11)]),
+      }))), { query: "needle" }));
+      assert.equal(over.matches.length, 20);
+      assert.equal(over.reason, "matches");
+      assert.deepEqual(over.matches.map((m) => m.line), [...Array.from({ length: 10 }, (_, i) => i + 1), ...Array.from({ length: 10 }, (_, i) => i + 12)]);
+      const exact = outputOf(await call(brokerFor(memFileop(flat({
+        "a.txt": Buffer.concat([needles(10), zeros(MIB), Buffer.from("\n"), needles(10)]),
+      }))), { query: "needle" }));
+      assert.equal(exact.matches.length, 20);
+      assert.equal(exact.truncated, false);
+    });
+
+    describe("detected change skips the file, keeps earlier matches, and the walk continues", () => {
+      const run = async (mem: Mem) => {
+        mem.files.set("c.txt", Buffer.from("needle c\n"));
+        mem.dirs.get(".")!.entries.push({ name: "c.txt", type: "file" });
+        return outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+      };
+      const expectSkipped = (out: Output) => {
+        assert.deepEqual([...new Set(out.matches.map((m) => m.path))], ["a.txt", "c.txt"]);
+        assert.equal(out.matches.find((m) => m.path === "a.txt")!.line, 1, "the match before the change is kept");
+        assert.equal(out.truncated, true);
+        assert.equal(out.reason, "file_size");
+        assert.equal(out.skippedFiles, 1);
+      };
+      // a.txt holds a complete match then a partial line ending in the match "needle" at the MiB cut.
+      const body = Buffer.concat([Buffer.from("needle\n"), zeros(MIB - 7 - 6), Buffer.from("needle"), zeros(MIB)]);
+      const mk = (): Mem => ({ ...flat({ "a.txt": body }) });
+
+      it("later chunk size change", async () => {
+        const mem = mk();
+        mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset! > 0
+          ? readBytesReply(body, req, { size: body.length + 1 }) : undefined);
+        const out = await run(mem);
+        expectSkipped(out);
+        assert.deepEqual(out.matches.filter((m) => m.path === "a.txt").map((m) => m.line), [1, 2], "the carried partial line is scanned");
+      });
+
+      it("later chunk ident change", async () => {
+        const mem = mk();
+        mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset! > 0
+          ? readBytesReply(body, req, { ident: "1:1:0:1" }) : undefined);
+        expectSkipped(await run(mem));
+      });
+
+      it("short read before the stat size", async () => {
+        const mem = mk();
+        // The reply keeps the stat size and ident, so only the short read can reveal the change.
+        mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset! > 0
+          ? readBytesReply(body.subarray(0, MIB + 10), req, { size: body.length }) : undefined);
+        const out = await run(mem);
+        expectSkipped(out);
+        assert.equal(out.bytes, MIB + 10 + "needle c\n".length, "the short read refunds the unread part of its limit");
+      });
+
+      it("a change with the carried partial line holding the 21st match reports matches and the skip", async () => {
+        const head = Buffer.from("needle\n".repeat(20));
+        const full = Buffer.concat([head, zeros(MIB - head.length - 6), Buffer.from("needle"), zeros(MIB)]);
+        const mem: Mem = flat({ "a.txt": full });
+        mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset! > 0
+          ? readBytesReply(full, req, { ident: "1:1:0:1" }) : undefined);
+        const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
+        assert.equal(out.matches.length, 20);
+        assert.equal(out.truncated, true);
+        assert.equal(out.reason, "matches");
+        assert.equal(out.skippedFiles, 1);
+      });
+
+      it("first chunk size differs from the stat size", async () => {
+        const mem = mk();
+        mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" && req.offset === 0
+          ? readBytesReply(body, req, { size: body.length + 1 }) : undefined);
+        const out = await run(mem);
+        assert.deepEqual(out.matches.map((m) => m.path), ["c.txt"]);
+        assert.equal(out.reason, "file_size");
+        assert.equal(out.skippedFiles, 1);
+      });
+    });
+
+    it("denies data past the helper's reported EOF (zero-size file, one byte returned)", async () => {
+      const mem = flat({ "a.txt": "" });
+      mem.hook = (req) => (req.op === "read_bytes" ? { ok: true, data: b64("x"), size: 0, offset: 0, ident: "1:1:0:0" } : undefined);
+      assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "x" }), denial);
+    });
+
+    describe("bad replies deny the whole search", () => {
+      const reply = (make: (req: FileopRequest) => FileopResponse): Mem => {
+        const mem = flat({ "a.txt": "needle\n" });
+        mem.hook = (req) => (req.op === "read_bytes" ? make(req) : undefined);
+        return mem;
+      };
+      const cases: [string, (req: FileopRequest) => FileopResponse][] = [
+        ["non-canonical base64", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: "bmVlZGxlCg" })],
+        // Right length, alphabet and padding, but the final character carries non-zero trailing bits.
+        ["padded base64 with non-zero trailing bits", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: "bmVlZGxlCh==" })],
+        ["characters outside base64", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: "!!!!" })],
+        ["data decoding to more than the limit", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: b64("needle\nX") })],
+        ["encoded data longer than the limit allows", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: b64(zeros(4096)) })],
+        ["missing data", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), data: undefined })],
+        ["offset mismatch", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), offset: 1 })],
+        ["missing offset", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), offset: undefined })],
+        ["missing size", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), size: undefined })],
+        ["fractional size", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), size: 7.5 })],
+        ["negative size", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), size: -1 })],
+        ["missing ident", (req) => ({ ...readBytesReply(Buffer.from("needle\n"), req), ident: undefined })],
+      ];
+      for (const [name, make] of cases) {
+        it(name, async () => {
+          assert.deepEqual(await call(brokerFor(memFileop(reply(make))), { query: "needle" }), denial);
+        });
+      }
+    });
+
+    it("skips a file on a helper E_UNKNOWN_OP, never falls back to read, and keeps searching", async () => {
+      const mem = flat({ "a.txt": "needle\n", "b.txt": "needle b\n" });
+      mem.hook = (req) => (req.op === "read_bytes" && req.path === "a.txt" ? helperErr("E_UNKNOWN_OP") : undefined);
+      const fileop = memFileop(mem);
+      const out = outputOf(await call(brokerFor(fileop), { query: "needle" }));
+      assert.deepEqual(out.matches.map((m) => m.path), ["b.txt"]);
+      assert.equal(out.reason, "file_size");
+      assert.equal(out.skippedFiles, 1);
+      assert.equal(fileop.ops.some((op) => op.op === "read"), false);
+    });
+
+    it("denies a client-local E_UNKNOWN_OP (no origin) instead of skipping", async () => {
+      const mem = flat({ "a.txt": "needle\n" });
+      mem.hook = (req) => (req.op === "read_bytes" ? { ok: false, code: "E_UNKNOWN_OP" } : undefined);
+      const result = await call(brokerFor(memFileop(mem)), { query: "needle" });
+      assert.equal(result.ok, false);
+    });
+
+    it("never exposes ident or size metadata in the output", async () => {
+      const mem = flat({ "a.txt": "needle\n" });
+      mem.idents = new Map([["a.txt", "99:98:97:96"]]);
+      const result = await call(brokerFor(memFileop(mem)), { query: "needle" });
+      assert.deepEqual(outputOf(result), { matches: [{ path: "a.txt", line: 1, text: "needle" }], truncated: false, bytes: 7 });
+      assert.doesNotMatch(JSON.stringify(result), /99:98|ident/);
+    });
+
+    describe("UTF-8 across windows and at stops", () => {
+      it("matches a multibyte character split across a window boundary", async () => {
+        const body = Buffer.concat([zeros(MIB - 1), Buffer.from("é\n")]);
+        const out = outputOf(await call(brokerFor(memFileop(flat({ "a.txt": body }))), { query: "é" }));
+        assert.deepEqual(out.matches, [{ path: "a.txt", line: 1, text: "z".repeat(127) + "é" }]);
+      });
+
+      it("a byte ceiling cutting a valid scalar fabricates no U+FFFD match", async () => {
+        const body = Buffer.concat([zeros(16 * MIB - 1), Buffer.from("é"), zeros(10)]);
+        const out = outputOf(await call(brokerFor(memFileop(flat({ "a.txt": body }))), { query: "�" }));
+        assert.equal(out.reason, "bytes");
+        assert.deepEqual(out.matches, []);
+      });
+
+      it("malformed bytes at a byte ceiling still match U+FFFD", async () => {
+        const body = Buffer.concat([zeros(16 * MIB - 2), Buffer.from([0xe0, 0x80]), zeros(10)]);
+        const out = outputOf(await call(brokerFor(memFileop(flat({ "a.txt": body }))), { query: "�" }));
+        assert.equal(out.reason, "bytes");
+        assert.equal(out.matches.length, 1);
+        assert.equal(out.matches[0]!.line, 1);
+      });
+
+      it("keeps a leading BOM in the matched text", async () => {
+        const out = outputOf(await call(brokerFor(memFileop(flat({ "a.txt": "﻿needle\n" }))), { query: "needle" }));
+        assert.deepEqual(out.matches, [{ path: "a.txt", line: 1, text: "﻿needle" }]);
+      });
+    });
+
+    it("a custom child role with Read and Search gets the same large-file result as the root", async () => {
+      const mem = flat({ "big.txt": Buffer.concat([zeros(MIB + 5), Buffer.from("\nneedle\n")]) });
+      const child: RunGrants = { role: "custom-auditor", phase: "plan", isRoot: false, allowedTools: new Set(["Read", "Search"]), allowedSkills: new Set() };
+      const viaChild = await brokerFor(memFileop(mem), "/checkout", child)
+        .handleToolCall({ threadId: "t", turnId: "turn", callId: "child" }, "uzi_search", { query: "needle" }, "child");
+      const viaRoot = await call(brokerFor(memFileop(mem)), { query: "needle" });
+      assert.deepEqual(viaChild, viaRoot);
+      assert.deepEqual(outputOf(viaRoot).matches, [{ path: "big.txt", line: 2, text: "needle" }]);
+    });
   });
 
   describe("skips and denials", () => {
@@ -468,7 +823,7 @@ describe("Search partial results", () => {
         assert.deepEqual(result, { ok: false, code: "fileop_denied", message: `file operation denied (${code})`, fileopCode: code });
       }
       for (const code of ["E_IO", "E_DENIED"]) {
-        for (const op of ["stat", "read"]) {
+        for (const op of ["stat", "read_bytes"]) {
           const mem = flat({ "a.txt": "needle\n" });
           mem.hook = (req) => (req.op === op ? helperErr(code) : undefined);
           const result = await call(brokerFor(memFileop(mem)), { query: "needle" });
@@ -531,18 +886,33 @@ describe("Search partial results", () => {
   });
 
   describe("real fileop helper", () => {
-    it("searches a file target, skips a listed symlink and denies a symlink target", async (t) => {
-      const bin = "/usr/local/bin/uzi-codex-fileop";
-      try { await fsp.access(bin); } catch { return t.skip("packaged fileop binary unavailable"); }
-      const root = await fsp.mkdtemp(path.join(await fsp.realpath(os.tmpdir()), "search-helper-"));
-      await fsp.mkdir(path.join(root, "sub"));
-      await fsp.writeFile(path.join(root, "a.txt"), "x\nneedle\n");
-      await fsp.writeFile(path.join(root, "sub", "b.txt"), "needle too\n");
-      await fsp.symlink("a.txt", path.join(root, "link.txt"));
-      const child = spawn(bin, ["--root", root], { stdio: ["pipe", "pipe", "pipe"] });
+    // The helper is built from this tree (the packaged binary may predate read_bytes) into a
+    // directory under <repo>/.uzi/scratch, which also holds each test's checkout root.
+    const withHelper = async (t: { skip: (m?: string) => void }, fn: (broker: CodexCallbackBroker, root: string) => Promise<void>) => {
+      const built = await buildFileopHelper("search-helper-");
+      if (!built) return t.skip("Linux openat2 helper");
+      const root = path.join(built.dir, "root");
+      await fsp.mkdir(root);
+      const child = spawn(built.binary, ["--root", root], { stdio: ["pipe", "pipe", "pipe"] });
+      // Registered at spawn so an exit (or signal) before teardown is never missed; a launch
+      // error settles it too, so teardown cannot wait on an exit event that will never fire.
+      const exited = new Promise<void>((resolve) => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
       const handle = wireFileopHelper({ stdin: child.stdin, stdout: child.stdout });
       try {
-        const broker = brokerFor(handle.client, root);
+        await fn(brokerFor(handle.client, root), root);
+      } finally {
+        await handle.dispose();
+        await exited;
+        await fsp.rm(built.dir, { recursive: true, force: true });
+      }
+    };
+
+    it("searches a file target, skips a listed symlink and denies a symlink target", async (t) => {
+      await withHelper(t, async (broker, root) => {
+        await fsp.mkdir(path.join(root, "sub"));
+        await fsp.writeFile(path.join(root, "a.txt"), "x\nneedle\n");
+        await fsp.writeFile(path.join(root, "sub", "b.txt"), "needle too\n");
+        await fsp.symlink("a.txt", path.join(root, "link.txt"));
         assert.deepEqual(outputOf(await call(broker, { query: "needle", path: "a.txt" })),
           { matches: [{ path: "a.txt", line: 2, text: "needle" }], truncated: false, bytes: 9 });
         const dirOut = outputOf(await call(broker, { query: "needle" }));
@@ -550,11 +920,47 @@ describe("Search partial results", () => {
         assert.deepEqual(dirOut.matches.map((m) => m.path), ["a.txt", "sub/b.txt"]);
         assert.deepEqual(await call(broker, { query: "needle", path: "link.txt" }),
           { ok: false, code: "fileop_denied", message: "file operation denied (E_SYMLINK)", fileopCode: "E_SYMLINK" });
-      } finally {
-        await handle.dispose();
-        await new Promise<void>((resolve) => { if (child.exitCode !== null) resolve(); else child.once("exit", () => resolve()); });
-        await fsp.rm(root, { recursive: true, force: true });
-      }
+      });
+    });
+
+    it("searches a ~2 MiB source file past the first MiB, a literal straddling the MiB boundary once, and handles large symlinks", async (t) => {
+      await withHelper(t, async (broker, root) => {
+        const uniqueLiteral = "UNIQUE_BEYOND_FIRST_MIB_7f3a";
+        const straddleLiteral = "STRADDLE_LITERAL_9c1d";
+        const lines: string[] = [];
+        let size = 0;
+        const push = (line: string) => { lines.push(line); size += Buffer.byteLength(line) + 1; };
+        const sourceLine = (i: number) => `export const value_${i} = compute(${i}, "item-${i}", { enabled: ${i % 2 === 0} });`;
+        let i = 0;
+        // Pad so the straddling literal starts 8 bytes before byte 1048576 on its own line.
+        const straddleStart = MIB - 8 - "// ".length;
+        while (size + sourceLine(i).length + 1 < straddleStart - 4) push(sourceLine(i++));
+        push("//" + "x".repeat(straddleStart - size - 3));
+        assert.equal(size, straddleStart);
+        push(`// ${straddleLiteral}`);
+        const straddleLine = lines.length;
+        while (size < MIB + 4096) push(sourceLine(i++));
+        push(`// ${uniqueLiteral}`);
+        const uniqueLine = lines.length;
+        while (size < 2 * MIB) push(sourceLine(i++));
+        const text = lines.join("\n") + "\n";
+        const at = Buffer.from(text).indexOf(straddleLiteral);
+        assert.ok(at < MIB && at + straddleLiteral.length > MIB, "the literal straddles byte 1048576");
+        await fsp.mkdir(path.join(root, "src"));
+        await fsp.writeFile(path.join(root, "src", "big.ts"), text);
+        await fsp.symlink("big.ts", path.join(root, "src", "link.ts"));
+
+        for (const [literal, line] of [[uniqueLiteral, uniqueLine], [straddleLiteral, straddleLine]] as const) {
+          for (const scope of ["src/big.ts", "src", "."]) {
+            const out = outputOf(await call(broker, { query: literal, path: scope }));
+            assert.deepEqual(out.matches, [{ path: "src/big.ts", line, text: `// ${literal}` }], `${literal} in ${scope}`);
+            assert.equal(out.truncated, false);
+            assert.equal("skippedFiles" in out, false);
+          }
+        }
+        assert.deepEqual(await call(broker, { query: "needle", path: "src/link.ts" }),
+          { ok: false, code: "fileop_denied", message: "file operation denied (E_SYMLINK)", fileopCode: "E_SYMLINK" });
+      });
     });
   });
 });

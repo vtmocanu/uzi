@@ -89,6 +89,7 @@ function coerceResponse(value: unknown): FileopResponse {
     code: typeof o.code === "string" ? o.code : undefined,
     size: typeof o.size === "number" ? o.size : undefined,
     data: typeof o.data === "string" ? o.data : undefined,
+    ident: typeof o.ident === "string" ? o.ident : undefined,
     exists: typeof o.exists === "boolean" ? o.exists : undefined,
     type: typeof o.type === "string" ? o.type : undefined,
     entries,

@@ -14,6 +14,7 @@ import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { Logger } from "../src/log.js";
 import { recordingLogger } from "./helpers.js";
+import { readBytesReply } from "./codex-search-fakes.js";
 import { CheckActivityRecorder } from "../src/cross-check-activity.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 
@@ -125,7 +126,7 @@ function rig(options: {
  holdStat?: boolean;
  refresh?: boolean;
  activity?: CheckActivityRecorder;
- fileopReply?: (op: { op: string; path: string }) => Record<string, unknown> | undefined;
+ fileopReply?: (op: FileopRequest) => Record<string, unknown> | undefined;
  onFileopRequest?: (op: FileopRequest & { id: number }, emit: Emit) => boolean;
  wireFileop?: CrossCheckModelDeps["wireFileop"];
 } = {}) {
@@ -1465,7 +1466,7 @@ function activityRig(calls: { tool: string; arguments: Record<string, unknown> }
  return { r, events, recorder };
 }
 const bodyOf = (lines: number): string => Buffer.from(Array.from({ length: lines }, (_, i) => "line " + (i + 1)).join("\n") + "\n").toString("base64");
-const activityReply = (op: { op: string; path: string }): Record<string, unknown> | undefined => {
+const activityReply = (op: FileopRequest): Record<string, unknown> | undefined => {
  if (op.op === "stat" && op.path === ".") return undefined;
  if (op.path === "multi.ts" && op.op === "read") return { ok: true, data: bodyOf(50), size: Buffer.from(bodyOf(50), "base64").length };
  if (op.path === "big.ts") return { ok: false, code: "E_OVERSIZE" };
@@ -1473,6 +1474,7 @@ const activityReply = (op: { op: string; path: string }): Record<string, unknown
  if (op.op === "list" && op.path === "src") return { ok: true, entries: [{ name: "f.ts", type: "file" }] };
  if (op.path === "src/f.ts") {
   const body = Buffer.from("a\nneedle SECRET_QUERY_xyz\n");
+  if (op.op === "read_bytes") return { ...readBytesReply(body, op) };
   return { ok: true, data: body.toString("base64"), size: body.length };
  }
  return undefined;
@@ -1618,6 +1620,7 @@ it("activity: a ceiling-truncated Search with a match records ok with matches_tr
  const body = Buffer.from("needle\n");
  const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src" } }], (op) => {
   if (op.op === "list" && op.path === "src") return { ok: true, truncated: true, entries: [{ name: "f.ts", type: "file" }] };
+  if (op.op === "read_bytes" && op.path === "src/f.ts") return { ...readBytesReply(body, op) };
   if (op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
   return undefined;
  });
@@ -1630,7 +1633,7 @@ it("activity: a file-path Search (list E_NOT_DIR from the helper, then stat and 
  const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src/f.ts" } }], (op) => {
   if (op.op === "list" && op.path === "src/f.ts") return { ok: false, code: "E_NOT_DIR" };
   if (op.op === "stat" && op.path === "src/f.ts") return { ok: true, exists: true, type: "file", size: body.length };
-  if (op.op === "read" && op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
+  if (op.op === "read_bytes" && op.path === "src/f.ts") return { ...readBytesReply(body, op) };
   return undefined;
  });
  assert.equal(await r.run(), verdict);
@@ -1665,6 +1668,7 @@ it("activity: a Search with more than 20 matches records matches_truncated", asy
  const body = Buffer.from(Array.from({ length: 30 }, () => "needle").join("\n") + "\n");
  const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src" } }], (op) => {
   if (op.op === "list" && op.path === "src") return { ok: true, entries: [{ name: "f.ts", type: "file" }] };
+  if (op.op === "read_bytes" && op.path === "src/f.ts") return { ...readBytesReply(body, op) };
   if (op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
   return undefined;
  });

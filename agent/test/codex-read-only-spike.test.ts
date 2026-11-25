@@ -5,7 +5,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
-import { CodexCallbackBroker, type FileopClient, type RunGrants } from "../src/codex/broker.js";
+import { CodexCallbackBroker, type FileopClient, type FileopRequest, type RunGrants } from "../src/codex/broker.js";
+import { buildFileopHelper, readBytesReply } from "./codex-search-fakes.js";
 import { buildCodexDynamicTools } from "../src/codex/dynamic-tools.js";
 import { buildCodexProductionConfigToml } from "../src/codex/config.js";
 import { wireFileopHelper } from "../src/codex/fileop-client.js";
@@ -32,17 +33,34 @@ describe("read-only Codex spike", () => {
     assert.match(config, /trust_level = "untrusted"/);
   });
 
-  it("reports oversized and truncated files as partial file_size searches", async () => {
+  it("searches a file over 1 MiB in chunks and reports a file whose reads disagree with its size as a partial file_size search", async () => {
     const limit = 1024 * 1024;
-    for (const [size, truncated] of [
-      [limit + 1, false],
-      [1, true],
-      [1, false],
-    ] as const) {
+    const big = Buffer.concat([Buffer.alloc(limit + 1, "x"), Buffer.from("\nneedle")]);
+    const searched = await new CodexCallbackBroker({
+      registry: new ExecutionRegistry(newLocalExecutionEpoch(1)),
+      spawnCommand: async () => { throw new Error("shell must not run"); },
+      fileop: { op: async (request) => {
+        if (request.op === "list") return { ok: true, entries: [{ name: "sample.txt", type: "file" }] };
+        if (request.op === "stat") return { ok: true, size: big.length };
+        if (request.op === "read_bytes") return readBytesReply(big, request);
+        throw new Error(`unexpected operation: ${request.op}`);
+      } },
+      worktreePath: "/checkout",
+      grants,
+      delegate: async () => { throw new Error("delegation must not run"); },
+    }).handleToolCall({ threadId: "t", turnId: "turn", callId: "1" }, "uzi_search", { query: "needle" }, "root");
+    assert.deepEqual(searched, { ok: true, output: { matches: [{ path: "sample.txt", line: 2, text: "needle" }], truncated: false, bytes: big.length } });
+
+    for (const reply of [
+      // The first window reports a different size than the stat.
+      (request: FileopRequest) => readBytesReply(Buffer.from("x"), request, { size: 2 }),
+      // The window ends short of the stat size.
+      (request: FileopRequest) => readBytesReply(Buffer.from("x"), request, { size: 5 }),
+    ]) {
       const fileop: FileopClient = { op: async (request) => {
         if (request.op === "list") return { ok: true, entries: [{ name: "sample.txt", type: "file" }] };
-        if (request.op === "stat") return { ok: true, size };
-        if (request.op === "read") return { ok: true, data: Buffer.from(size === 1 && !truncated ? "x".repeat(limit + 1) : "x").toString("base64"), truncated };
+        if (request.op === "stat") return { ok: true, size: 5 };
+        if (request.op === "read_bytes") return reply(request);
         throw new Error(`unexpected operation: ${request.op}`);
       } };
       const broker = new CodexCallbackBroker({
@@ -56,7 +74,8 @@ describe("read-only Codex spike", () => {
       assert.deepEqual(await broker.handleToolCall(
         { threadId: "t", turnId: "turn", callId: "1" }, "uzi_search", { query: "absent" }, "root",
       ), { ok: true, output: {
-        matches: [], truncated: true, bytes: 0, reason: "file_size", skippedFiles: 1,
+        // The 5-byte request is refunded down to the single byte actually returned.
+        matches: [], truncated: true, bytes: 1, reason: "file_size", skippedFiles: 1,
         notice: "Partial search: coverage is incomplete; a missing match does not mean the text is absent.",
       } });
     }
@@ -72,7 +91,7 @@ describe("read-only Codex spike", () => {
       const fileop: FileopClient = { op: async (request) => {
         if (request.op === "list") return { ok: true, entries: [{ name: "sample.txt", type: "file" }] };
         if (request.op === "stat") return { ok: true, size: Buffer.byteLength(content) };
-        if (request.op === "read") return { ok: true, data: Buffer.from(content).toString("base64") };
+        if (request.op === "read_bytes") return readBytesReply(Buffer.from(content), request);
         throw new Error(`unexpected operation: ${request.op}`);
       } };
       const broker = new CodexCallbackBroker({
@@ -106,25 +125,32 @@ describe("read-only Codex spike", () => {
   it("executes broker reads through a required-Landlock fileop root without write authority", async (t) => {
     if (process.platform !== "linux") return t.skip("Landlock helper is Linux-only");
     const sandboxBin = "/usr/local/bin/uzi-codex-command-sandbox";
-    const fileopBin = "/usr/local/bin/uzi-codex-fileop";
     try {
       await fs.access(sandboxBin);
-      await fs.access(fileopBin);
     } catch {
-      return t.skip("packaged fileop and sandbox binaries unavailable");
+      return t.skip("packaged sandbox binary unavailable");
     }
-    const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "readonly-"));
+    // Search needs read_bytes, which a packaged helper may predate: build the helper from this tree.
+    const built = await buildFileopHelper("readonly-helper-");
+    if (!built) return t.skip("Linux openat2 helper");
+    // The built binary lives under scratch, outside the sandbox's executable system paths, so the
+    // sandbox root must contain it: the root is the build directory holding the binary, the
+    // checkout and the private tmp. That makes the Landlock root (build dir) wider than the
+    // helper root (checkout), unlike production. The outside file lives in a separate directory
+    // the sandbox root does not contain.
+    const base = built.dir;
     const checkout = path.join(base, "checkout");
     const privateTmp = path.join(base, "private");
-    const outside = path.join(base, "outside.txt");
+    const outsideDir = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "readonly-outside-"));
+    const outside = path.join(outsideDir, "outside.txt");
     await fs.mkdir(checkout);
     await fs.mkdir(privateTmp, { mode: 0o700 });
     await fs.chmod(privateTmp, 0o700);
     await fs.writeFile(path.join(checkout, "sample.txt"), "needle\nsecond line\n");
     await fs.writeFile(outside, "outside secret");
     const child = spawn(sandboxBin, [
-      "--root", checkout, "--tmp", privateTmp, "--cwd", checkout,
-      "--mode", "required", "--", fileopBin, "--root", checkout,
+      "--root", base, "--tmp", privateTmp, "--cwd", checkout,
+      "--mode", "required", "--", built.binary, "--root", checkout,
     ], { cwd: checkout, env: { PATH: "/usr/bin:/bin", HOME: privateTmp, TMPDIR: privateTmp, LANG: "C" }, stdio: ["pipe", "pipe", "pipe"] });
     const handle = wireFileopHelper({ stdin: child.stdin, stdout: child.stdout });
     let stderr = "";
@@ -178,7 +204,8 @@ describe("read-only Codex spike", () => {
     } finally {
       await handle.dispose();
       await new Promise<void>((resolve) => { if (child.exitCode !== null) resolve(); else child.once("exit", () => resolve()); });
-      await fs.rm(base, { recursive: true, force: true });
+      await fs.rm(outsideDir, { recursive: true, force: true });
+      await fs.rm(built.dir, { recursive: true, force: true });
     }
   });
 });
