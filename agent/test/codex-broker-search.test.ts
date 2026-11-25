@@ -469,16 +469,21 @@ describe("Search partial results", () => {
     });
 
     it("keeps recorded limits within the 16 MiB budget and each within what remained at dispatch", async () => {
-      // a.txt takes 15 MiB; b.txt's stat says 100 bytes though its body is longer (read only up to its
-      // limit); c.txt then gets exactly the remaining MiB-100 and the walk stops on bytes.
+      // a.txt takes 15 MiB; b.txt's stat says 100 bytes but it grew before the read, so the helper's
+      // own fstat reports its real size (read only up to its limit, then skipped); c.txt is still
+      // searched and gets exactly the remaining MiB-100 before the walk stops on bytes.
+      const bBody = zeros(2 * MIB);
       const mem = flat({
         "a.txt": Buffer.concat([Buffer.from("needle\n"), zeros(15 * MIB - 7)]),
-        "b.txt": zeros(2 * MIB), "c.txt": zeros(3 * MIB),
+        "b.txt": bBody, "c.txt": Buffer.concat([Buffer.from("needle c\n"), zeros(3 * MIB - 9)]),
       });
       mem.sizes = new Map([["b.txt", 100]]);
+      mem.hook = (req) => (req.op === "read_bytes" && req.path === "b.txt" ? readBytesReply(bBody, req, { size: bBody.length }) : undefined);
       const fileop = memFileop(mem);
       const out = outputOf(await call(brokerFor(fileop), { query: "needle" }));
       assert.equal(out.reason, "bytes");
+      assert.equal(out.skippedFiles, 1, "the grown file is skipped after its first window");
+      assert.deepEqual(out.matches.map((m) => m.path), ["a.txt", "c.txt"], "the walk continues to the later file");
       assert.equal(out.bytes, 16 * MIB);
       let used = 0;
       for (const r of reads(fileop)) {
@@ -542,12 +547,13 @@ describe("Search partial results", () => {
       mem.hook = (req) => {
         if (req.op !== "read_bytes" || req.offset === 0) return undefined;
         mock.timers.tick(10_001);
-        return readBytesReply(mem.files.get("a.txt")!, req);
+        // A valid short reply: 3 of the 7 bytes requested for the final window.
+        return readBytesReply(mem.files.get("a.txt")!.subarray(0, MIB + 3), req, { size: MIB + 7 });
       };
       const out = outputOf(await call(brokerFor(memFileop(mem)), { query: "needle" }));
       assert.deepEqual(out.matches.map((m) => m.line), [1]);
       assert.equal(out.reason, "time");
-      assert.equal(out.bytes, MIB + 7, "a late success keeps its full charge");
+      assert.equal(out.bytes, MIB + 7, "a late success keeps its full charge, with no refund for a short reply");
     });
 
     it("denies a failure that settles after the deadline instead of reporting time", async () => {
@@ -675,6 +681,12 @@ describe("Search partial results", () => {
         assert.equal(out.reason, "file_size");
         assert.equal(out.skippedFiles, 1);
       });
+    });
+
+    it("denies data past the helper's reported EOF (zero-size file, one byte returned)", async () => {
+      const mem = flat({ "a.txt": "" });
+      mem.hook = (req) => (req.op === "read_bytes" ? { ok: true, data: b64("x"), size: 0, offset: 0, ident: "1:1:0:0" } : undefined);
+      assert.deepEqual(await call(brokerFor(memFileop(mem)), { query: "x" }), denial);
     });
 
     describe("bad replies deny the whole search", () => {

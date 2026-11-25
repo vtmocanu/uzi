@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -213,6 +214,42 @@ func TestReadBytesIdentChanges(t *testing.T) {
 	}
 	if third := ident(); third == second {
 		t.Fatal("ident unchanged after replacement")
+	}
+}
+
+// A same-size, same-inode in-place rewrite changes only the time parts of ident.
+func TestReadBytesIdentChangesOnSameSizeInPlaceRewrite(t *testing.T) {
+	s, root, _ := bytesFixture(t, []byte("0123456789"))
+	identOf := func() []string {
+		got := s.handle(bytesReq("f", "0", "1"))
+		wantOK(t, got)
+		if got["size"] != int64(10) {
+			t.Fatalf("size %v", got["size"])
+		}
+		parts := strings.Split(got["ident"].(string), ":")
+		if len(parts) != 4 {
+			t.Fatalf("ident %q", got["ident"])
+		}
+		return parts
+	}
+	before := identOf()
+	time.Sleep(20 * time.Millisecond) // let mtime/ctime advance
+	f, err := os.OpenFile(filepath.Join(root, "f"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("abcdefghij"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after := identOf()
+	if before[0] != after[0] || before[1] != after[1] {
+		t.Fatalf("dev:ino changed: %v -> %v", before, after)
+	}
+	if before[2] == after[2] || before[3] == after[3] {
+		t.Fatalf("mtime/ctime parts must both differ: %v -> %v", before, after)
 	}
 }
 

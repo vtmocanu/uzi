@@ -1362,6 +1362,8 @@ export class CodexCallbackBroker {
         if (chunk.toString("base64") !== encoded || chunk.length > limit) return bodyUnavailable();
         if (reply.offset !== offset || typeof reply.size !== "number" || !Number.isSafeInteger(reply.size) ||
           reply.size < 0 || typeof reply.ident !== "string") return bodyUnavailable();
+        // The helper never returns bytes past the EOF it reports for the same open file.
+        if (chunk.length > Math.max(0, reply.size - offset)) return bodyUnavailable();
         // A chunk settling past the deadline is discarded and keeps its full charge.
         if (expired()) return stopMid("time");
         bytes -= limit - chunk.length;
