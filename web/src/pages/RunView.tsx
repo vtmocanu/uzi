@@ -2,6 +2,8 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
+import { FreshResumeSection } from "../components/FreshResumeSection";
+import { freshResumeEligible } from "../lib/freshResumeText";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
@@ -1711,6 +1713,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
           <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
         </div>
       ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
+      {ownerProof && freshResumeEligible(run) && <FreshResumeSection run={run} busy={busy} />}
     </div>
   );
 }

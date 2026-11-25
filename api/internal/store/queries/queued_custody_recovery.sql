@@ -180,7 +180,8 @@ UPDATE runs r SET status = 'recovery_wait', status_since = now(),
         THEN sqlc.narg(released_worker_nonce)::text ELSE r.released_worker_nonce END,
     codex_cap_hash = NULL,
     updated_at = now()
-WHERE r.worker_id = @worker_id AND r.id = ANY(@locked_parent_ids::uuid[])
+WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = r.id AND frt.state IN ('pending', 'claimed'))
+  AND r.worker_id = @worker_id AND r.id = ANY(@locked_parent_ids::uuid[])
   AND r.status = 'queued' AND r.claim_generation > 0
   AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
   AND r.pause_requested_at IS NULL AND r.credential_switch_requested_at IS NULL

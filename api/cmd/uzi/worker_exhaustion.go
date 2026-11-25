@@ -35,7 +35,8 @@ func workerExhaustionLine(r apitypes.RunDTO) string {
 	id := cellText(r.ID)
 	return "worker recovery exhausted · " + workerRecoveryAllowance(r) +
 		" · owner Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id +
-		" · no automatic resume; only owner Resume starts a fresh allowance"
+		" · no automatic resume; only owner Resume starts a fresh allowance" +
+		freshResumeHintSuffix(r)
 }
 
 // workerExhaustionEvidence describes the server's historical observation, never

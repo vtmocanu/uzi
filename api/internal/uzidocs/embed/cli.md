@@ -4921,6 +4921,40 @@ inputs view and the TUI show an owner hold. Read `uzi run recovery <id>`, then
 follow stop for this decision; explicit `--until` keeps its status set. See
 [Unwitnessed continuation hold](run-recovery-wait.md#unwitnessed-continuation-hold).
 
+### Fresh resume: `uzi run fresh-resume`
+
+```
+uzi run fresh-resume <run-id> [--yes] [--request-id <uuid> [--selection-token <token>]]
+```
+
+Resumes a run held at a worker-exhaustion `recovery_wait` on a **separate persistent hosted worker**, seeded from the run's saved evidence (a recovery capture or the checkpoint ref). The feature is off unless the operator sets `UZI_FRESH_RESUME` ([Configuration](configuration.md)). Eligibility, how the evidence is chosen and what happens after the start are in [Fresh resume on a separate hosted worker](run-recovery.md#fresh-resume-on-a-separate-hosted-worker).
+
+The command is **preview, then confirm, then start**:
+
+1. **Preview.** It reads the server's preview and prints the evidence generation (`Ge`) and the run's latest claim generation, the evidence kind, the commit, the checkpoint ref or capture id, and any generations that saved no evidence.
+2. **Cutoff text.** It prints what a fresh resume may lose or cost (edits after the evidence may be missing; the original worker's source and custody are kept; unsaved edits may be lost if that worker's volume is gone; a healthy seeded run counts one extra custody admission unit; a repeat fresh resume while two workers hold custody needs a third eligible worker). The text is printed on stderr before the prompt whatever `-q` or `-o json` say. With `--yes` it is printed only for human, non-quiet output.
+3. **Confirm.** An interactive terminal is asked `Start a fresh resume on a separate hosted worker? [y/N]`; anything but `y` or `yes` aborts and starts nothing. Without a terminal and without `--yes` the command refuses with exit 2 and starts nothing.
+4. **Start.** It posts the selection token from the preview with a request id and prints the transfer (`started`, or `already started by this request` for a replay). With `--json` it prints the transfer object (`id`, `run_id`, `request_id`, `state`, `replay`, `evidence_generation`, `kind`, `sha`, `capture_id` or `checkpoint_ref`, `admission_deadline`).
+
+**One request id per confirm.** Each confirm action uses one UUID request id, generated for you unless you pass `--request-id`. If the start's reply is lost to a transport failure, the command retries the **same** request id up to twice, waiting the server's `Retry-After` or a short bounded backoff, and the server answers a replay with the existing transfer rather than creating a second. If the retries are used up, the error prints the retry hint: `retry with --request-id <uuid> --selection-token <token>`. Passing both flags starts directly with that token, without a new preview, so a replay still reaches the server while the transfer is active. `--request-id` alone still goes through the preview and cutoff text, and a `--selection-token` without `--request-id` is a usage error (exit 2). The request id must be a canonical lowercase UUID.
+
+**Exit 5 on a refusal.** A run that is not eligible, or a start the server refuses, exits 5 with nothing started and a one-line explanation. The preview statuses and the 409 reasons are:
+
+| Reason | Meaning |
+| --- | --- |
+| `disabled` | Fresh resume is not enabled on this instance. |
+| `ineligible` | The run is not held in a state a fresh resume can start from. |
+| `no_destination` | No other persistent hosted worker is online with fresh resume support. |
+| `custody_limit` | Starting would take you past your custody hold limit. |
+| `no_evidence`, `expired`, `unbound`, `prereq_unproven`, `ambiguous` | No usable evidence; see [how the evidence is chosen](run-recovery.md#how-the-evidence-is-chosen). |
+| `in_progress`, `fresh_resume_in_progress` | A fresh resume of this run is already pending or claimed. |
+| `stale_selection` | The selection changed since the preview; run the command again to review the new preview. |
+| `request_completed` | That request id already finished; run the command again for a new preview. |
+
+An unknown reason prints a generic refusal line and never the raw server text. With `--json`, a refused preview prints the preview object before exiting 5.
+
+**The hold-line hint.** The hold line the CLI prints for a worker-recovery-exhausted hold and for a retained-recovery hold appends `Fresh resume on a separate hosted worker: uzi run fresh-resume <run-id>` when the run looks eligible (one of the four owner-held `recovery_wait` causes with an explicit null retry stamp, an `issue`, `mr_rework` or `self_improve` run, no `codex_policy_hold` or reserve pause, and not a claimed Codex run). The CLI can only check the fields it has, so the hint merely keeps the line off holds the server always refuses; the server stays the authority and may still refuse with `ineligible`.
+
 ### Waiting for a state: `uzi run wait`
 
 `uzi run wait <id>` blocks until the run reaches a state you can act on — the

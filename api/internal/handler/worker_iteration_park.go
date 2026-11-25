@@ -73,6 +73,10 @@ func (h *Handler) WorkerRunIterationPark(w http.ResponseWriter, r *http.Request)
 	}
 	run, applied, reason, err := h.wsvc.ReportIterationPark(r.Context(), wkr, id, evidence)
 	if err != nil {
+		// Issue #4628: the paused write hit the fresh resume guard on a claimed, unseeded transfer.
+		if h.refuseFreshPreSeedOnGuard(w, r, wkr, id, run, err) {
+			return
+		}
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 			return
@@ -84,6 +88,10 @@ func (h *Handler) WorkerRunIterationPark(w http.ResponseWriter, r *http.Request)
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: a no-op park on a run whose transfer is claimed for this worker is the typed pre-seed refusal.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	httpx.JSON(w, code, struct {
 		Applied         bool   `json:"applied"`

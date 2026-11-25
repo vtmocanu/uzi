@@ -127,6 +127,9 @@ import type {
   ProjectSyncStatus,
   HeldPublications,
   RecoveryArchiveSummary,
+  FreshResumePreview,
+  FreshResumeStart,
+  FreshResumeStartRequest,
   RecoveryCustodyHolds,
   ReleaseCheckStatus,
   Repo,
@@ -1483,6 +1486,12 @@ const realApi = {
   // attachment link, see runArchiveDownloadUrl.
   getRunArchives: (id: string) =>
     request<RecoveryArchiveSummary>("GET", `/runs/${id}/archives`),
+  // Fresh resume (issue #4628): the owner's preview and confirm. The preview answers 200 for every
+  // status; a start refusal is a 409 whose body `reason` names it.
+  getFreshResumePreview: (id: string) =>
+    request<FreshResumePreview>("GET", `/runs/${id}/fresh-resume`),
+  startFreshResume: (id: string, body: FreshResumeStartRequest) =>
+    request<FreshResumeStart>("POST", `/runs/${id}/fresh-resume`, body),
   // A failed run's held-work publications (issue #2545): RequireUser owner route. A server
   // without it answers 404; the run-page panel treats any failure as "nothing to show".
   getRunHeldPublications: (id: string) =>

@@ -1198,6 +1198,45 @@ func TestLoadHeldPublication(t *testing.T) {
 	}
 }
 
+// TestLoadFreshResume pins UZI_FRESH_RESUME (issue #4628): default OFF (unlike the held-publication
+// switch), on/off spellings parse, and an unrecognised value refuses to start.
+func TestLoadFreshResume(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.FreshResume {
+		t.Fatal("FreshResume default = true, want off")
+	}
+	for raw, want := range map[string]bool{
+		"": false, "off": false, "false": false, "0": false,
+		"on": true, "ON": true, " true ": true, "1": true, "yes": true,
+	} {
+		t.Setenv("UZI_FRESH_RESUME", raw)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_FRESH_RESUME=%q: %v", raw, err)
+		}
+		if cfg.FreshResume != want {
+			t.Errorf("UZI_FRESH_RESUME=%q -> %v, want %v", raw, cfg.FreshResume, want)
+		}
+	}
+	for _, raw := range []string{"enabled", "of", "2", "tru"} {
+		t.Setenv("UZI_FRESH_RESUME", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_FRESH_RESUME") {
+			t.Errorf("UZI_FRESH_RESUME=%q: Load() err = %v, want a UZI_FRESH_RESUME error", raw, err)
+		}
+	}
+}
+
 // TestNormalizeTrustedBotBaseURLMatchesConfig pins settings.NormalizeTrustedBotBaseURL (a copy,
 // because this package imports settings) to NormalizeForgeBaseURL: the trusted review-bot
 // allowlist is matched against the connection's normalized base URL, so the two must agree.

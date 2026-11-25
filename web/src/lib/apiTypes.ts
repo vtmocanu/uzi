@@ -6684,6 +6684,9 @@ export interface RecoveryCustodyAggregate {
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;
+  // #4628: how many admission units are fresh-resume reservations rather than holds; the
+  // per-hold counted flags plus this sum to admission_counted_holds. Optional for older servers.
+  fresh_reserved_units?: number;
 }
 
 // HeldPublication is one held-work publication of a failed run (issue #2545), mirroring
@@ -6752,4 +6755,47 @@ export interface PolicyHoldResumeRequest {
 export interface PolicyHoldResumeResponse {
   run: Run;
   replay?: true;
+}
+
+// ── Fresh resume (issue #4628) ────────────────────────────────────────────────
+// The Go source is api/internal/apitypes/fresh_resume.go. GET /api/runs/{id}/fresh-resume answers
+// 200 for every status; only "available" carries a selection token.
+export type FreshResumeStatus =
+  | "available" | "disabled" | "no_destination" | "custody_limit" | "no_evidence" | "expired"
+  | "unbound" | "prereq_unproven" | "ambiguous" | "in_progress" | "ineligible";
+
+export interface FreshResumePreview {
+  status: FreshResumeStatus;
+  selection_token?: string;
+  /** The claim generation the evidence was saved under (Ge). */
+  evidence_generation?: number;
+  /** The run's latest claim generation. */
+  claim_generation?: number;
+  kind?: "capture" | "checkpoint_ref";
+  capture_id?: string;
+  checkpoint_ref?: string;
+  sha?: string;
+  /** Generations after the evidence's that saved nothing; never null on the wire. */
+  uncovered_generations: number[];
+  notes: string[];
+}
+
+export interface FreshResumeStartRequest {
+  selection_token: string;
+  /** Client-generated UUID, one per confirm action. */
+  request_id: string;
+}
+
+export interface FreshResumeStart {
+  id: string;
+  run_id: string;
+  request_id: string;
+  state: string;
+  replay: boolean;
+  evidence_generation: number;
+  kind: string;
+  capture_id?: string;
+  checkpoint_ref?: string;
+  sha: string;
+  admission_deadline: string;
 }

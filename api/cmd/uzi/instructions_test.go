@@ -393,6 +393,15 @@ var knownInstructions = []knownInstruction{
 			"candidate; the path-resolution check is the complete bar.",
 	},
 	{
+		command:  "uzi run fresh-resume",
+		evidence: evidenceGoTest,
+		where:    "TestFreshResumeEach409ReasonRendered",
+		note: "RUNTIME: the stale_selection and request_completed refusals tell the owner to run " +
+			"`uzi run fresh-resume` again for a new preview (fresh_resume.go). " +
+			"TestFreshResumeEach409ReasonRendered executes the real cobra command against a fake " +
+			"client returning each typed 409 and asserts the rendered line and the exit code.",
+	},
+	{
 		command:  "uzi run resume-now",
 		evidence: evidenceHelpOnly,
 		// ARRIVED WITH PRD #1190 M4. The span sits inside `uzi run resume`'s Long help

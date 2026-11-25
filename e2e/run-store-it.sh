@@ -301,19 +301,50 @@ fi
 
 # This opt-in leg shares the live throwaway DSN but is outside the LiveDB name
 # filter. Existing Go-only CI lanes neither require Node nor prove this composition.
+# It composes the real worker client (and, for the fresh resume proof, the real run runner)
+# with the real handler and Postgres. The explicit -timeout bounds the whole leg (the fresh
+# resume proof alone measured about 131s of test time (about 137s wall) under -race on one worker; every Node child is bounded
+# separately by the test), where Go's default 10m would otherwise be the only fence.
 if [ -n "${UZI_CODEX_REFRESH_LOSTREPLY_E2E:-}" ]; then
   E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/codex-recovery-log.XXXXXX")"
-  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
-    -run '^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 -timeout 30m \
+    -run '^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall|FreshResumeSeparateWorker)E2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
   # A named RUN and PASS are mandatory; inspect all indentation levels for skips.
   if grep -q -- '--- SKIP:' "$E2E_LOG"; then
-    echo "combined Codex proof skipped: $E2E_LOG" >&2
+    echo "combined recovery proof skipped: $E2E_LOG" >&2
     exit 1
   fi
-  for proof in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E TestRecoveryRestoreWorkerClientSmallE2E; do
+  for proof in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E TestRecoveryRestoreWorkerClientSmallE2E TestFreshResumeSeparateWorkerE2E; do
     if ! grep -Fxq "=== RUN   $proof" "$E2E_LOG" ||
       ! grep -q "^--- PASS: $proof " "$E2E_LOG"; then
-      echo "combined Codex proof did not run and pass: $proof ($E2E_LOG)" >&2
+      echo "combined recovery proof did not run and pass: $proof ($E2E_LOG)" >&2
+      exit 1
+    fi
+  done
+  # The fresh resume proof's subtests are each pinned by name: a renamed or dropped subtest must
+  # fail here, not shrink the proof. Their PASS lines are indented (nested t.Run).
+  fresh_resume_name=TestFreshResumeSeparateWorkerE2E
+  fresh_resume_cases=(
+    capture
+    checkpoint_ref
+    lost_seeded_reply_graceful_restart
+    lost_seeded_reply_sigkill_restart
+    changed_attempt_id
+    unverifiable_bundle_abandon
+    evidence_refused
+    evidence_refused/expired
+    evidence_refused/ambiguous
+    evidence_refused/unbound
+    stale_claim_refused
+    w1_unchanged
+    receipt_replay_current_authority
+    receipt_replay_current_authority/cancel
+    receipt_replay_current_authority/requeue_and_reclaim
+  )
+  for fresh_resume_case in "${fresh_resume_cases[@]}"; do
+    if ! grep -Fxq "=== RUN   $fresh_resume_name/$fresh_resume_case" "$E2E_LOG" ||
+      ! grep -Eq "^[[:space:]]*--- PASS: $fresh_resume_name/$fresh_resume_case \\(" "$E2E_LOG"; then
+      echo "combined recovery proof did not run and pass: $fresh_resume_name/$fresh_resume_case ($E2E_LOG)" >&2
       exit 1
     fi
   done

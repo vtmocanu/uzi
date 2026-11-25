@@ -905,6 +905,10 @@ var wantRouteMounts = []routeMount{
 	// On-demand MR rework (PRD #1202): reads the MR's review comments off the forge on
 	// every call, so it carries the per-user forge limiter, like ci-fix-runs.
 	{"POST", "/api/runs/{id}/rework", limForge},
+	// Issue #4628: fresh resume preview and start prove the evidence's prerequisite commits on the
+	// forge, so both carry the per-user forge limiter, like rework above.
+	{"GET", "/api/runs/{id}/fresh-resume", limForge},
+	{"POST", "/api/runs/{id}/fresh-resume", limForge},
 	{"POST", "/api/skills/", noLimiter},
 	{"POST", "/api/skills/{id}/reset", noLimiter},
 	{"POST", "/api/tool-allowlist/", noLimiter},
@@ -1057,6 +1061,13 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/pr-description/bind", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pr-description/lookup", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pr-description/ack", noLimiter},
+	// Issue #4628: the fresh resume destination routes. The bundle stream rides
+	// proposalLimiter.PerWorkerMiddleware (read as noLimiter by this per-USER probe); abandon, seeded
+	// and state are fenced local DB calls with no forge call or token spend, so unlimited.
+	{"GET", "/api/worker/runs/{id}/fresh-resume/{frid}/bundle", noLimiter},
+	{"POST", "/api/worker/runs/{id}/fresh-resume/{frid}/abandon", noLimiter},
+	{"POST", "/api/worker/runs/{id}/fresh-resume/{frid}/seeded", noLimiter},
+	{"GET", "/api/worker/runs/{id}/fresh-resume/{frid}/state", noLimiter},
 	{"POST", "/api/workers/", noLimiter},
 	{"POST", "/api/workers/hosted", limHosted},
 	// PRD #685 M1: admin upload of a branding logo — cookie-only admin write, raw body

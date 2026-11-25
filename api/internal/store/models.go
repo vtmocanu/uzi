@@ -152,6 +152,7 @@ type CheckpointPublishAttempt struct {
 	LastError        pgtype.Text        `json:"last_error"`
 	ReconcileReadyAt pgtype.Timestamptz `json:"reconcile_ready_at"`
 	AttestedSource   pgtype.Text        `json:"attested_source"`
+	ClaimGeneration  pgtype.Int8        `json:"claim_generation"`
 }
 
 type CheckpointRetention struct {
@@ -1451,6 +1452,9 @@ type Run struct {
 	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
 	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
 	CiAutofixEnabled                  pgtype.Bool        `json:"ci_autofix_enabled"`
+	FreshHoldVersion                  int64              `json:"fresh_hold_version"`
+	CheckpointTipGeneration           pgtype.Int8        `json:"checkpoint_tip_generation"`
+	CheckpointTipGenerationTip        pgtype.Text        `json:"checkpoint_tip_generation_tip"`
 }
 
 type RunCompletionAttempt struct {
@@ -1591,6 +1595,34 @@ type RunForgeOrigin struct {
 	ApiOrigin                 pgtype.Text `json:"api_origin"`
 	ApiReservationIncarnation pgtype.UUID `json:"api_reservation_incarnation"`
 	ApiReservationVersion     pgtype.Int8 `json:"api_reservation_version"`
+}
+
+type RunFreshResume struct {
+	ID                   uuid.UUID          `json:"id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	RequestID            uuid.UUID          `json:"request_id"`
+	EvidenceGeneration   int64              `json:"evidence_generation"`
+	EvidenceKind         string             `json:"evidence_kind"`
+	CaptureID            pgtype.UUID        `json:"capture_id"`
+	CheckpointRef        pgtype.Text        `json:"checkpoint_ref"`
+	Sha                  string             `json:"sha"`
+	CandidateToken       string             `json:"candidate_token"`
+	PredecessorWorkerID  pgtype.UUID        `json:"predecessor_worker_id"`
+	DestinationWorkerID  pgtype.UUID        `json:"destination_worker_id"`
+	SavedWorkerID        pgtype.UUID        `json:"saved_worker_id"`
+	SavedTuple           []byte             `json:"saved_tuple"`
+	ClaimGeneration      pgtype.Int8        `json:"claim_generation"`
+	DestinationAttemptID pgtype.Text        `json:"destination_attempt_id"`
+	SeededGeneration     pgtype.Int8        `json:"seeded_generation"`
+	State                string             `json:"state"`
+	RefusalReason        pgtype.Text        `json:"refusal_reason"`
+	AdmissionDeadline    pgtype.Timestamptz `json:"admission_deadline"`
+	TransferDeadline     pgtype.Timestamptz `json:"transfer_deadline"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ClaimedAt            pgtype.Timestamptz `json:"claimed_at"`
+	SeededAt             pgtype.Timestamptz `json:"seeded_at"`
+	ClosedAt             pgtype.Timestamptz `json:"closed_at"`
 }
 
 type RunGatePresentation struct {

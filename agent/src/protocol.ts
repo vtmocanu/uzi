@@ -1824,6 +1824,10 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Issue #1324 D9: the half-open API-origin reservation of this claim, sent only to a worker that
    *  advertised forge_api_success_v1. Echoed on a successful direct forge API call; grants no authority. */
   forge_api_origin_reservation?: ForgeOriginReservation;
+  /** Issue #4628: the fresh resume transfer this claim took (api `FreshResumePayload`), sent only to a
+   *  worker that advertised fresh_resume_v1. `capture_id` is set for kind `capture`, `checkpoint_ref` for
+   *  kind `checkpoint_ref`. Decode it with decodeFreshResumeClaim (fresh-resume.ts). */
+  fresh_resume?: unknown;
   /** Issue #1324: the active publication intent, sent only to a publication_resume_v1 worker while an
    *  enrollment is active (api `PublicationResumePayload`). `intent` and `handoff` are opaque here; parse
    *  them with parseClaimPublicationResume (publication-intent.ts), which throws a typed mismatch. */
@@ -3769,6 +3773,10 @@ export interface StateAck {
    *  StaleClaimError on it (BLOCKING-4), which the executeClaim catch chain turns into a clean
    *  stop — no terminal report, no preserve flag. */
   staleClaim?: boolean;
+  /** Issue #4628: true when a park or fail report was refused with a 409 `{run, reason: "fresh_resume_pre_seed"}`: the run's
+   *  fresh resume transfer is claimed for this worker and not yet seeded, so the report was a zero-row no-op. The flight abandons
+   *  the transfer instead of reading the refusal as "the run moved on". Absent otherwise. */
+  freshResumePreSeed?: true;
   /** PRD #1247 M5b (BLOCKING-2 rework): true when the /state ack carried `disposition: "released"`
    *  on a 200 — the held-state credential-switch RELEASE applied. The server sets it for BOTH a
    *  fresh requeue (status 'queued') and an idempotent release after a reclaim (status 'running'),

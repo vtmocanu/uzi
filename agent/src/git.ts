@@ -68,6 +68,7 @@ import {
 import { GitIndexError, indexUnchanged, readBoundedIndex, readSmallRegularFile, statSignature, withClosingHandle, type BoundedIndex } from "./git-index.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
+import { freshJournalJson, freshJournalKey, freshJournalKeyBranch, parseFreshJournal, type FreshJournal } from "./fresh-journal.js";
 import {
   RestoreCompositeBlockedError, RestoreCompositeError, RestoreSeedError, attemptIdStartMs, holdingNamePrefix, isHoldingName, parseRestoreValue,
   restoreDigest, restoreEnvelopeJson, restoreJournalKey, restoreKeyBranch, restoreProtects, restoreRefProtection, restoreTombstoneJson, type RestoreBasis, type RestoreRefProtection, type RestoreStage,
@@ -2243,7 +2244,14 @@ function attemptLedgerKey(branch: string): string {
 }
 
 /** One attempt ledger state (see {@link attemptLedgerKey}). */
-export type AttemptLedgerState = "live" | "abandoned" | "retired" | "reclaimed";
+export type AttemptLedgerState = "live" | "abandoned" | "retired" | "reclaimed" | "fresh_pending" | "fresh_unbound";
+
+/** issue #4628: a fresh-resume destination attempt that is not (yet) bound to the run's recovery journal. `fresh_pending` is
+ *  written before the seed (L1); `fresh_unbound` marks a seed that did not reach its receipt commit. Neither is ever adopted by an
+ *  ordinary claim; both are kept until the guarded discard (see ledger-reader-table.ts for every parser caller's disposition). */
+export function isFreshLedgerState(state: AttemptLedgerState | "none" | undefined): state is "fresh_pending" | "fresh_unbound" {
+  return state === "fresh_pending" || state === "fresh_unbound";
+}
 
 /** One attempt ledger value. */
 export interface AttemptLedgerEntry {
@@ -2616,6 +2624,92 @@ export interface IndependentSeedInput {
   deadlineMs?: number;
 }
 
+/** issue #4628: the artifact a fresh resume seeds from. `ref` is the bare ref that must resolve to `sha` (the fetched capture ref,
+ *  or the broker-owned checkpoint ref); `sha` is the server-named evidence sha. */
+export interface FreshSeedArtifact {
+  kind: "capture" | "checkpoint_ref";
+  artifactRef: string;
+  artifactSha: string;
+}
+
+/** issue #4628: a git config write met an existing `config.lock`. It is never removed and never retried: whoever holds it (a live
+ *  git, or a crash that left it stale) owns it, and the fresh resume stops nonterminally. */
+export class FreshConfigLockedError extends Error {
+  constructor(options?: ErrorOptions) { super("bare config.lock exists; not removed, not retried", options); this.name = "FreshConfigLockedError"; }
+}
+
+/** issue #4628: a fresh seed refusal before or during L2. `step` names where it stopped. */
+export class FreshSeedError extends Error {
+  constructor(readonly reason: string, readonly step: string, cause?: unknown) {
+    super(`fresh resume seed refused (${reason}) at ${step}`, cause === undefined ? undefined : { cause });
+    this.name = "FreshSeedError";
+  }
+}
+
+/** issue #4628: everything {@link GitCache.seedFreshAttempt} needs. The callbacks run under the bare lock. */
+export interface FreshSeedInput {
+  barePath: string;
+  branch: string;
+  key: string;
+  runId: string;
+  /** The destination attempt A, minted by the caller from the claim generation (never a `gx` id). */
+  attemptId: string;
+  /** The transfer id. */
+  frid: string;
+  /** G', the claim generation the transfer was claimed at; it must be the one A's id carries. */
+  generation: number;
+  artifact: FreshSeedArtifact;
+  selfContained?: boolean;
+  isLive(clonePath: string): boolean;
+  /** The seed-time sweep over the key's non-live paths (the same sweep an attempt seed runs). */
+  beforeSeed(nonLivePaths: string[], canonicalPath: string): Promise<void>;
+  onSeeded?(clonePath: string): void;
+  signal?: AbortSignal;
+  /** Bounds the whole seed, queued lock waits included. */
+  deadlineMs?: number;
+}
+
+/** issue #4628: the inputs of {@link GitCache.commitFreshReceipt}. */
+export interface FreshCommitInput {
+  barePath: string;
+  branch: string;
+  runId: string;
+  clonePath: string;
+  attemptId: string;
+  frid: string;
+  generation: number;
+  sha: string;
+  /** The `wip(park)` marker a seed peeled with `reset --soft`, journaled as lineage like markRecoveryCapture does. */
+  peeledMarker?: string;
+}
+
+/**
+ * issue #4628: why the bare already holds local state for `branch` that a fresh resume must not seed on top of, as stable tokens
+ * (empty means none). Pure over one `config --null --list` output. A non-empty (not cleared) recovery journal, attempt-ledger
+ * entry, restore entry or fresh journal on the branch counts; so does any attempt-ledger entry of `runId` on another branch, a
+ * stopped marker of `runId` and a retained descriptor of `runId`. A cleared (empty) value is no state.
+ */
+export function freshLocalState(entries: readonly string[], branch: string, runId: string): string[] {
+  const out = new Set<string>();
+  for (const item of entries) {
+    if (!item) continue;
+    const nl = item.indexOf("\n");
+    const key = nl < 0 ? item : item.slice(0, nl);
+    const value = nl < 0 ? "" : item.slice(nl + 1);
+    if (!key.startsWith("uzi-")) continue;
+    const valueless = nl < 0;
+    if (!valueless && value === "") continue;
+    if (key === recoveryCaptureKey(branch)) out.add("recovery_journal");
+    else if (key === attemptLedgerKey(branch)) out.add("attempt_ledger");
+    else if (freshJournalKeyBranch(key) === branch) out.add("fresh_journal");
+    else if (restoreKeyBranch(key) === branch) out.add("restore_entry");
+    else if (/^uzi-attempts\..+\.entry$/.test(key) && parseAttemptLedgerEntry(value)?.runId === runId) out.add("attempt_ledger_other_branch");
+    else if (key === stoppedMarkerKey(runId)) out.add("stopped_marker");
+    else if (key === `uzi-retained.${runId}.journal`) out.add("retained_descriptor");
+  }
+  return [...out].sort();
+}
+
 /** issue #3644: a restore composite's predecessor, as the inventory readers report it. Its path is never read. */
 export interface RetainedPredecessor { clonePath: string; branch: string; runId: string; attemptId: string; generation: number }
 
@@ -2648,7 +2742,8 @@ export function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | und
   const o = parsed as Record<string, unknown>;
   if (typeof o.attemptId !== "string" || !ATTEMPT_ID_RE.test(o.attemptId)) return undefined;
   if (typeof o.runId !== "string" || typeof o.clonePath !== "string") return undefined;
-  if (o.state !== "live" && o.state !== "abandoned" && o.state !== "retired" && o.state !== "reclaimed") return undefined;
+  if (o.state !== "live" && o.state !== "abandoned" && o.state !== "retired" && o.state !== "reclaimed" &&
+      o.state !== "fresh_pending" && o.state !== "fresh_unbound") return undefined;
   return { attemptId: o.attemptId, runId: o.runId, clonePath: o.clonePath, state: o.state };
 }
 
@@ -3650,6 +3745,9 @@ export interface RetainedDiscardOptions {
   signal?: AbortSignal;
   /** The single operation deadline (default {@link RETAINED_OP_DEADLINE_MS}). */
   deadlineMs?: number;
+  /** issue #4628: attempt ids whose fresh resume transfer the server reports `refused` or `cancelled` before any seed. The guarded
+   *  discard retires a `fresh_pending` attempt only when it is named here; a `fresh_unbound` one needs no such proof. */
+  freshTransferNegative?: ReadonlySet<string>;
 }
 
 export type RetainedSourceOutcome = "removed" | "retained" | "missing" | "unknown";
@@ -4215,7 +4313,11 @@ export interface RunnerClone {
    *  issue #3644 adds `"restore_pin"`: an independent restore seeded the clone from a verified pin SHA in the
    *  bare alone ({@link GitCache.seedIndependentAttempt}). It is NOT a continuation of the predecessor's work
    *  (the predecessor's later bytes are absent), and it carries no verified capture. */
-  seededFrom: "origin" | "tracking" | "default" | "checkpoint" | "restore_pin";
+  seededFrom: "origin" | "tracking" | "default" | "checkpoint" | "restore_pin" | "fresh_resume";
+  /** issue #4628: set only for `seededFrom: "fresh_resume"`. `artifactSha` is the server-named evidence sha; `executionBase` is the
+   *  commit the clone actually sits on after the structural overlay peel and the `wip(park)` reset (the two differ whenever either
+   *  normalization ran, so the artifact sha is never mistaken for the execution base). */
+  freshResume?: { artifactSha: string; executionBase: string; peeledOverlay: boolean; wipRecovered: boolean };
   /** PRD #122 M8 — true when a mirrored checkpoint ref existed but LOST to origin/default
    *  because it had diverged (not a strict descendant of the floor). Origin/default wins on
    *  divergence — never a silent merge or discard — and the runner emits a LOUD worker
@@ -8163,7 +8265,7 @@ export class GitCache {
           await fs.lstat(p);
           try { await fs.lstat(attemptPath); continue; }
           catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
-          if (!identitiesComplete || entry?.state === "reclaimed" || entry?.state === "live" ||
+          if (!identitiesComplete || entry?.state === "reclaimed" || entry?.state === "live" || isFreshLedgerState(entry?.state) ||
               named(attemptPath) || named(p) || predicates.isLive(attemptPath) || predicates.isLive(p)) continue;
           orphanedSkills.count++;
         } else {
@@ -8462,7 +8564,9 @@ export class GitCache {
     runId: string | undefined,
     resume: boolean,
     expectedCheckpointTip: string | undefined,
-    opts?: { selfContained?: boolean; recoveryTip?: string; restoreTip?: string; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
+    opts?: { selfContained?: boolean; recoveryTip?: string; restoreTip?: string; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean;
+      /** issue #4628: a fresh resume seeds from the server-named artifact. `artifactSha` stays separate from the execution base. */
+      freshResume?: FreshSeedArtifact },
   ): Promise<RunnerClone> {
     // (A bare block: the body below kept its original indentation when issue #1783 M2 lifted it
     // out of runnerCloneForBranch's lock callback, so its diff stays reviewable.)
@@ -8541,6 +8645,8 @@ export class GitCache {
       const verifiedCapture = !!opts?.recoveryTip;
       // issue #3644: a restore pin never sets verifiedCapture (it is not a captured episode) and is never a task seed.
       if (opts?.restoreTip !== undefined && (opts.recoveryTip !== undefined || taskCheckpoint)) throw new Error("restore pin cannot seed a task or a captured episode");
+      if (opts?.freshResume !== undefined && (opts.recoveryTip !== undefined || opts.restoreTip !== undefined || taskCheckpoint))
+        throw new Error("fresh resume cannot seed a task, a captured episode or a restore pin");
       if (taskCheckpoint && !verifiedCapture && opts?.checkpointWriteUnresolved !== false)
         throw new Error("task checkpoint write unresolved or unknown; recovery retained");
       if (taskCheckpoint && !verifiedCapture && !ownedHere) {
@@ -8696,6 +8802,19 @@ export class GitCache {
         seededFrom = "restore_pin";
         checkpointSetAside = false;
       }
+      // issue #4628: a fresh resume seeds from the server-named artifact SHA, resolved in the bare and nowhere else: the tracking
+      // ref, the origin branch and the mirrored checkpoint are not consulted for the base. The artifact ref (the unsealed capture's
+      // fetched ref, or the broker-owned checkpoint ref) must still resolve to exactly that SHA now, under the caller's bare lock.
+      if (opts?.freshResume !== undefined) {
+        const artifact = opts.freshResume;
+        if (!SHA40_RE.test(artifact.artifactSha) || !defaultRef ||
+            !await this.sharesHistory(barePath, artifact.artifactSha, defaultRef)) throw new Error("fresh resume history cannot be verified");
+        const refSha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${artifact.artifactRef}^{commit}`])).trim();
+        if (refSha !== artifact.artifactSha) throw new Error("fresh resume artifact ref does not equal the server sha");
+        baseRef = artifact.artifactSha;
+        seededFrom = "fresh_resume";
+        checkpointSetAside = false;
+      }
       let baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
       // PRD #1062 M2 (#1036) — peel a `.github/workflows` overlay transport wrapper. When the
       // adopted base is a `ckpt(overlay):` commit (built by checkpointPack for a branch behind
@@ -8715,7 +8834,12 @@ export class GitCache {
       // DISCARD the agent's real commit (this peel throws the tip's tree away — unlike the
       // wip-park soft-reset, which keeps it). A subject prefix is not provenance across the agent
       // trust boundary; seededFrom is.
-      if (seededFrom === "checkpoint" && (await this.isOverlayMarker(barePath, baseSha))) {
+      // issue #4628: a fresh resume from a checkpoint ref is the same broker-owned ref the agent cannot push to, so it gets the peel
+      // (with the part-2 structural checks below); a captured bundle is agent-writable content, so an overlay subject there is a
+      // forgery and is never peeled.
+      let overlayPeeled = false;
+      if ((seededFrom === "checkpoint" || (seededFrom === "fresh_resume" && opts?.freshResume?.kind === "checkpoint_ref")) &&
+          (await this.isOverlayMarker(barePath, baseSha))) {
         const overlaySha = baseSha;
         // The real tip is the LAST parent. Count parents (`rev-list --parents -n 1` prints
         // "<commit> <p1> [<p2> …]"), then read `<sha>^<n>` where n = parent count.
@@ -8763,6 +8887,7 @@ export class GitCache {
           (changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/")));
         if (/^[0-9a-f]{40}$/.test(realTip) && isOverlayStructure) {
           baseSha = realTip;
+          overlayPeeled = true;
           this.log.info("runner clone: peeled .github/workflows overlay wrapper to its realTip", {
             branch,
             overlay_sha: overlaySha,
@@ -8799,7 +8924,7 @@ export class GitCache {
       // the marker HERE, before those counts are computed, and `reset --soft` the checkout
       // back to the parent after `checkout -b` below, so the marker's tree lands as
       // uncommitted changes and the marker never enters the history the agent builds on.
-      const adoptedMarker = (seededFrom === "tracking" || seededFrom === "checkpoint")
+      const adoptedMarker = (seededFrom === "tracking" || seededFrom === "checkpoint" || seededFrom === "fresh_resume")
         && await this.isWipParkMarker(barePath, baseSha);
       const markerParent = adoptedMarker
         ? (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${baseSha}^^{commit}`])).trim()
@@ -9093,7 +9218,9 @@ export class GitCache {
       const recoveredMarkerSha = willRecoverMarker ? baseSha : recoveredCheckpointMarkerSha;
       return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
         adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}),
-        ...(wipRecovered && recoveredMarkerSha !== "" ? { recoveredMarkerSha } : {}) };
+        ...(wipRecovered && recoveredMarkerSha !== "" ? { recoveredMarkerSha } : {}),
+        ...(opts?.freshResume !== undefined ? { freshResume: { artifactSha: opts.freshResume.artifactSha, executionBase: effectiveBase,
+          peeledOverlay: overlayPeeled, wipRecovered } } : {}) };
     }
   }
 
@@ -16633,7 +16760,8 @@ export class GitCache {
    */
   private async evaluateRetained(
     g: GatheredBare, rec: GatheredRecord,
-    ctx: { holds: RetainedHoldsSnapshot | undefined; lifecycle?: RetainedLifecycleSnapshot; isLivePath: (p: string) => boolean },
+    ctx: { holds: RetainedHoldsSnapshot | undefined; lifecycle?: RetainedLifecycleSnapshot; isLivePath: (p: string) => boolean;
+      freshTransferNegative?: ReadonlySet<string> },
   ): Promise<{
     blockers: string[]; consumers: string[]; localRecords: RetainedLocalRecord[]; live: Map<string, boolean>;
     holdsView: RetainedSourceEvidence["holds"]; disposition: RetainedDisposition | undefined;
@@ -16675,6 +16803,11 @@ export class GitCache {
       const p = rec.parts[0]!;
       consumers.push(`ledger:${p.ledgerState}`);
       if (p.ledgerState === "live") { blockers.push("ledger_live"); ownLedgerLive = "ledger_live"; }
+      // issue #4628: a fresh-resume attempt is discarded only through the guarded fresh discard. `fresh_unbound` is already proven
+      // negative (the server took the transfer back or refused it before any seed); `fresh_pending` is retired only when the caller
+      // names its attempt in `freshTransferNegative`. Anything else keeps the blocker.
+      if (isFreshLedgerState(p.ledgerState) && p.ledgerState !== "fresh_unbound" &&
+          !(p.attemptId !== undefined && ctx.freshTransferNegative?.has(p.attemptId) === true)) blockers.push("ledger_fresh");
       if (p.ledgerState === "none") blockers.push("attribution_unknown");
       try {
         if (rec.key === "" || (await this.classifyOwnerClonePath(g.barePath, rec.branch, rec.key, rec.runId, p.clonePath)) !== "attempt") {
@@ -17380,6 +17513,7 @@ export class GitCache {
               } else {
                 const ev = await this.evaluateRetained(g, rec, {
                   holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
+                  ...(opts.freshTransferNegative ? { freshTransferNegative: opts.freshTransferNegative } : {}),
                 });
                 const want = mode === "protected" ? "local_protected_discard" : "local_discard";
                 const disposition = epoch ? ev.epochSettlement?.disposition : ev.disposition;
@@ -17568,6 +17702,10 @@ export class GitCache {
                   await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
                     { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
                 }
+              }
+              if (!restoreExit && rec.kind === "attempt") {
+                const only = rec.parts[0]!;
+                if (only.attemptId !== undefined && isFreshLedgerState(only.ledgerState)) await this.retireFreshTransfer(bare, rec.branch, only.attemptId);
               }
               if (rec.kind === "canonical" && rec.markerState !== "none") {
                 const target = rec.parts[0]!.clonePath;
@@ -19246,6 +19384,231 @@ export class GitCache {
     }
   }
 
+  /** issue #4628: one fresh-resume config write (`git config --local`, one atomic config replacement). A write that meets an existing
+   *  `config.lock` is a {@link FreshConfigLockedError}: the lock is never removed and the write is never retried. */
+  private async freshConfigWrite(barePath: string, args: string[]): Promise<void> {
+    try {
+      await this.runGit(barePath, ["config", "--local", ...args]);
+    } catch (err) {
+      if (/could not lock config file|config\.lock/i.test(gitErrorMessage(err))) throw new FreshConfigLockedError({ cause: err });
+      throw err;
+    }
+  }
+
+  /** issue #4628: the bare's local state for `branch` that a fresh resume must not seed on top of ({@link freshLocalState}), read
+   *  under the bare lock. Config only: it opens no path under the runner root and writes nothing. */
+  readFreshLocalState(barePath: string, branch: string, runId: string): Promise<string[]> {
+    return this.withLock(barePath, async () => freshLocalState(await this.configEntries(barePath), branch, runId));
+  }
+
+  /** issue #4628: the branch's fresh-resume journal (L0/L4), or undefined when none. A malformed value throws. Under the bare lock. */
+  readFreshJournal(barePath: string, branch: string): Promise<FreshJournal | undefined> {
+    return this.withLock(barePath, async () => this.readFreshJournalUnderLock(await this.configEntries(barePath), branch));
+  }
+
+  private readFreshJournalUnderLock(entries: readonly string[], branch: string): FreshJournal | undefined {
+    const prefix = `${freshJournalKey(branch)}\n`;
+    const values = entries.filter(item => item.startsWith(prefix) || item === freshJournalKey(branch));
+    if (values.length === 0) return undefined;
+    if (values.length > 1 || !values[0]!.startsWith(prefix)) throw new Error("fresh journal is ambiguous or valueless");
+    const raw = values[0]!.slice(prefix.length);
+    return raw === "" ? undefined : parseFreshJournal(raw);
+  }
+
+  /**
+   * issue #4628: stream a capture bundle to a file inside the bare, verify it and fetch it into `refs/uzi-fresh/<frid>`. `download`
+   * writes the bytes (at most {@link RECOVERY_MAX_BUNDLE_BYTES}); the bundle must then pass `git bundle verify` against this bare
+   * (its prerequisites must already be here), carry exactly one ref naming `sha`, and the fetched ref must equal `sha`. Any failure
+   * removes the ref and the file and throws. Returns the ref.
+   */
+  async fetchFreshBundle(barePath: string, input: { frid: string; sha: string },
+    download: (sink: Writable) => Promise<void>): Promise<string> {
+    if (!SHA40_RE.test(input.sha) || !/^[0-9a-f-]{36}$/.test(input.frid)) throw new Error("malformed fresh bundle identity");
+    const ref = `refs/uzi-fresh/${input.frid}`;
+    const file = path.join(barePath, `.uzi-fresh-${input.frid}.bundle.tmp`);
+    return this.withLock(barePath, async () => {
+      // A crash can leave this transfer's tmp behind, and the "wx" open below would then fail every retry. Under the lock nothing else
+      // writes it, so clear any leftover of the same prefix first (as rewriteConfigAtomically clears its own).
+      const tmpPrefix = `.uzi-fresh-${input.frid}.bundle.tmp`;
+      for (const name of await fs.readdir(barePath)) if (name.startsWith(tmpPrefix)) await fs.rm(path.join(barePath, name), { force: true });
+      try {
+        await this.assertBareClear(barePath, "fresh-bundle");
+        let seen = 0;
+        const cap = new Transform({ transform(chunk: Buffer, _enc, cb) {
+          seen += chunk.length;
+          if (seen > RECOVERY_MAX_BUNDLE_BYTES) cb(new RecoveryBundleTooLargeError(seen, RECOVERY_MAX_BUNDLE_BYTES));
+          else cb(null, chunk);
+        } });
+        const out = createWriteStream(file, { flags: "wx", mode: 0o600 });
+        const written = finished(out);
+        cap.pipe(out);
+        cap.on("error", err => out.destroy(err));
+        await download(cap);
+        cap.end();
+        await written;
+        await readRecoveryBundleHeader(file, input.sha);
+        await this.runGit(barePath, ["bundle", "verify", file]);
+        await this.runGit(barePath, ["fetch", "--no-tags", "--quiet", file, `+${RECOVERY_BUNDLE_REF}:${ref}`]);
+        const got = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+        if (got !== input.sha) throw new Error("fresh bundle tip does not equal the server sha");
+        return ref;
+      } catch (err) {
+        await this.runGit(barePath, ["update-ref", "-d", ref]).catch(() => undefined);
+        throw err;
+      } finally {
+        await fs.rm(file, { force: true });
+      }
+    });
+  }
+
+  /**
+   * issue #4628: seed the destination attempt A of a fresh resume. One bare lock; the steps, each leaving a durable fail-closed trace:
+   *   checks  no local state of this run or branch (no recovery journal, ledger entry, restore entry, fresh journal, stopped marker
+   *           or retained descriptor), A's id carries G', A's own leaf is absent, the artifact ref equals the server sha.   [none]
+   *   L0      the fresh journal `{frid, A, G', sha, stage: seeding}`, one `git config --local` write.                       [journal]
+   *   L1      A's ledger entry `fresh_pending`, one write.                                                                  [ledger]
+   *   L2      refusal checks again (the bare now holds exactly L0 and L1 for this branch), then `assertBareClear` and
+   *           admission of A's path, the seed-time sweep, and `seedRunnerClone` with the fresh normalization.
+   * It never compacts the ledger, never runs the attribution census (the fresh seed sees no predecessor) and never writes the
+   * recovery journal key: that is the receipt commit ({@link commitFreshReceipt}). A failure after L1 leaves A `fresh_pending` and keeps L0 (the caller marks it
+   * `fresh_unbound` only after the server closed the transfer); every failure is a {@link FreshSeedError} naming the step (a {@link FreshConfigLockedError} passes through).
+   */
+  async seedFreshAttempt(input: FreshSeedInput): Promise<RunnerClone> {
+    let step = "checks";
+    const refuse = (reason: string, cause?: unknown): never => { throw new FreshSeedError(reason, step, cause); };
+    const locked = (): Promise<RunnerClone> => this.withLock(input.barePath, async () => {
+      const { barePath, branch, key, runId, attemptId: aId, artifact } = input;
+      if (key === "" || key.startsWith(".") || key.includes(path.sep) || isRetainedArtifactName(key)) return refuse("unsafe_key");
+      if (!ATTEMPT_ID_RE.test(aId) || attemptGeneration(aId) !== input.generation) return refuse("attempt_id");
+      if (!SHA40_RE.test(artifact.artifactSha) || !/^[0-9a-f-]{36}$/.test(input.frid)) return refuse("malformed");
+      const canonical = this.runnerClonePath(barePath, key);
+      const aPath = attemptClonePath(canonical, aId);
+      let entries = await this.configEntries(barePath);
+      this.assertRecoveryConfigKeys(entries.map(item => { const nl = item.indexOf("\n"); return nl < 0 ? item : item.slice(0, nl); }));
+      const present = freshLocalState(entries, branch, runId);
+      if (present.length > 0) return refuse("local_state_present", present.join("+"));
+      if (await this.pathPresent(aPath)) return refuse("attempt_path_exists");
+      const refSha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${artifact.artifactRef}^{commit}`])).trim();
+      if (refSha !== artifact.artifactSha) return refuse("artifact_ref_mismatch");
+
+      step = "exclusion";
+      // issue #4643: a retained inventory proof's work may still be in scope of this key; refuse before any write (L0/L1).
+      await this.refuseExcludedKey(barePath, branch, canonical, input.isLive, "full");
+      // Read-only, for both artifact kinds: nothing is written while a deletion on this bare is still unresolved.
+      step = "bare_clear";
+      await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("bare_not_clear", err));
+      step = "L0";
+      const journal: FreshJournal = { frid: input.frid, attemptId: aId, generation: input.generation, sha: artifact.artifactSha, stage: "seeding" };
+      await this.freshConfigWrite(barePath, [freshJournalKey(branch), freshJournalJson(journal)]);
+      step = "L1";
+      await this.freshConfigWrite(barePath, ["--add", attemptLedgerKey(branch), attemptLedgerValue({ attemptId: aId, runId, clonePath: aPath, state: "fresh_pending" })]);
+
+      step = "L2_checks";
+      entries = await this.configEntries(barePath);
+      const own = freshLocalState(entries, branch, runId).filter(t => t !== "fresh_journal" && t !== "attempt_ledger");
+      const ledger = await this.readAttemptLedger(barePath, branch, entries);
+      if (own.length > 0 || ledger.size !== 1 || ledger.get(aId)?.state !== "fresh_pending") return refuse("local_state_present");
+      if (this.readFreshJournalUnderLock(entries, branch)?.attemptId !== aId) return refuse("journal_changed");
+      step = "admit";
+      await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("authority_refused", err));
+      await this.admitSource(aPath, "seed-attempt").catch((err: unknown) => refuse("authority_refused", err));
+      step = "before_seed";
+      await input.beforeSeed(await this.nonLiveKeyPaths(canonical, ledger, input.isLive), canonical);
+      step = "seed";
+      const seeded = await this.seedRunnerClone(barePath, branch, aPath, runId, true, undefined, {
+        ...(input.selfContained === undefined ? {} : { selfContained: input.selfContained }), freshResume: artifact,
+      });
+      input.onSeeded?.(aPath);
+      this.log.info("fresh resume: seeded the destination attempt", { branch, attempt: aId, generation: input.generation, sha: artifact.artifactSha });
+      return { ...seeded, attemptId: aId };
+    });
+    const operation = input.signal !== undefined || input.deadlineMs !== undefined;
+    try {
+      return await (operation
+        ? this.withRecoveryOperation(input.signal ?? new AbortController().signal, Date.now() + (input.deadlineMs ?? Infinity), locked)
+        : locked());
+    } catch (err) {
+      // A stays `fresh_pending` here: it becomes `fresh_unbound` only once the server has answered the caller's abandon as closed
+      // (see seedFresh), or discovery reads a refused or cancelled transfer that was never seeded.
+      if (err instanceof FreshSeedError || err instanceof FreshConfigLockedError || err instanceof InventorySourceExclusionRefusal) throw err;
+      const message = err instanceof Error ? err.message : "";
+      throw new FreshSeedError(/deadline/i.test(message) ? "git_deadline" : "seed_failed", step, err);
+    }
+  }
+
+  /** issue #4628: A's own ledger entry (the last value for the attempt), or undefined. Under the bare lock; writes nothing. */
+  readFreshAttemptEntry(barePath: string, branch: string, attemptId: string): Promise<AttemptLedgerEntry | undefined> {
+    return this.withLock(barePath, async () => (await this.readAttemptLedger(barePath, branch)).get(attemptId));
+  }
+
+  /** issue #4628: the last step of the guarded fresh discard, under the caller's bare lock: when the branch's fresh journal still
+   *  names `attemptId`, delete its `refs/uzi-fresh/<frid>` ref and clear the journal, so the branch is free for a later transfer. A
+   *  journal that names another attempt is left alone. A ref that cannot be deleted keeps the journal (fail closed). */
+  private async retireFreshTransfer(barePath: string, branch: string, attemptId: string): Promise<void> {
+    const journal = this.readFreshJournalUnderLock(await this.configEntries(barePath), branch);
+    if (journal === undefined || journal.attemptId !== attemptId) return;
+    await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-fresh/${journal.frid}`]);
+    await this.freshConfigWrite(barePath, [freshJournalKey(branch), ""]);
+  }
+
+  /** issue #4628: A's ledger entry `fresh_pending` to `fresh_unbound`: its seed did not reach the receipt commit. Only a pending
+   *  entry of this run moves; anything else (including an already live attempt) is left as it is. One write under the bare lock. */
+  markFreshUnbound(input: { barePath: string; branch: string; key: string; runId: string; attemptId: string; expectedJournal?: FreshJournal }): Promise<boolean> {
+    return this.withLock(input.barePath, async () => {
+      // The journal must still name this attempt (and be exactly `expectedJournal` when the caller read one), checked in this section.
+      const journal = this.readFreshJournalUnderLock(await this.configEntries(input.barePath), input.branch);
+      if (journal?.attemptId !== input.attemptId) return false;
+      if (input.expectedJournal !== undefined && freshJournalJson(journal) !== freshJournalJson(input.expectedJournal)) return false;
+      const entry = (await this.readAttemptLedger(input.barePath, input.branch)).get(input.attemptId);
+      if (entry?.state !== "fresh_pending" || entry.runId !== input.runId) return false;
+      await this.freshConfigWrite(input.barePath, ["--add", attemptLedgerKey(input.branch), attemptLedgerValue({ ...entry, state: "fresh_unbound" })]);
+      return true;
+    });
+  }
+
+  /**
+   * issue #4628 (L4): the receipt commit. ONE rename of the bare's config under the bare lock ({@link rewriteConfigAtomically}):
+   * the recovery journal `uzi-recovery.<branch>.clone` names A (exactly what markRecoveryCapture writes), A's ledger entry goes
+   * `fresh_pending` to `live`, and the fresh journal goes `seeding` to `ready`. Preconditions, all under the lock: the fresh journal
+   * is exactly `{frid, A, G', sha, seeding}`, A's last ledger value is this run's `fresh_pending` at this path, no restore entry, and
+   * the branch's recovery journal is absent. Idempotent when the commit already landed. A `config.lock` that already exists is a
+   * {@link FreshConfigLockedError}: never removed, never retried. Returns whether this call wrote.
+   */
+  commitFreshReceipt(input: FreshCommitInput): Promise<"committed" | "already"> {
+    return this.withLock(input.barePath, async () => {
+      const { barePath, branch, runId, clonePath, attemptId, frid } = input;
+      if (input.peeledMarker !== undefined && !SHA40_RE.test(input.peeledMarker)) throw new Error("invalid peeled marker");
+      await this.assertRecoveryBare(barePath);
+      const entries = await this.configEntries(barePath);
+      if (this.restoreValueIn(entries, branch) !== undefined) throw new FreshSeedError("restore_entry_exists", "L4");
+      const journal = this.readFreshJournalUnderLock(entries, branch);
+      if (journal === undefined || journal.frid !== frid || journal.attemptId !== attemptId || journal.generation !== input.generation ||
+          journal.sha !== input.sha) throw new FreshSeedError("journal_mismatch", "L4");
+      const source = recoverySource({ runId, clonePath, attemptId });
+      const ledger = await this.readAttemptLedger(barePath, branch, entries);
+      const last = ledger.get(attemptId);
+      if (last === undefined || last.runId !== runId || last.clonePath !== clonePath) throw new FreshSeedError("ledger_mismatch", "L4");
+      const pending = await this.readRecoveryCapture(barePath, branch, entries);
+      if (journal.stage === "ready" && last.state === "live" && pending !== undefined && sameRecoverySource(pending, source)) return "already" as const;
+      if (journal.stage !== "seeding" || last.state !== "fresh_pending") throw new FreshSeedError("not_pending", "L4");
+      if (pending !== undefined) throw new FreshSeedError("recovery_journal_present", "L4");
+      const value = recoveryJournalJson({ ...source, ...(input.peeledMarker === undefined ? {} : { peeledMarkers: [input.peeledMarker] }) });
+      parseRecoveryJournal(value);
+      try {
+        await this.rewriteConfigAtomically(barePath, "the fresh receipt commit", async tmp => {
+          await this.runGit(barePath, ["config", "--file", tmp, "--replace-all", recoveryCaptureKey(branch), value]);
+          await this.runGit(barePath, ["config", "--file", tmp, "--add", attemptLedgerKey(branch),
+            attemptLedgerValue({ attemptId, runId, clonePath, state: "live" })]);
+          await this.runGit(barePath, ["config", "--file", tmp, "--replace-all", freshJournalKey(branch), freshJournalJson({ ...journal, stage: "ready" })]);
+        });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new FreshConfigLockedError({ cause: err });
+        throw err;
+      }
+      return "committed" as const;
+    });
+  }
+
   /** The stored spelling of `journal` in the key that `found` was read from. */
   private journalValueFor(found: { restore?: { basis: RestoreBasis; stage: RestoreStage } }, journal: RecoveryJournalEntry): string {
     return found.restore ? restoreJournalJson(found.restore.basis, found.restore.stage, journal) : recoveryJournalJson(journal);
@@ -19328,6 +19691,42 @@ export class GitCache {
    *  every caller already holds the bare lock. The field order is the documented contract. */
   private async appendAttemptLedger(barePath: string, branch: string, entry: AttemptLedgerEntry): Promise<void> {
     await this.runGit(barePath, ["config", "--local", "--add", attemptLedgerKey(branch), attemptLedgerValue(entry)]);
+    // issue #4628: an attempt that leaves `live` ends the transfer its ready fresh journal records.
+    if (entry.state === "retired" || entry.state === "reclaimed") await this.clearReadyFreshJournal(barePath, branch, entry.attemptId);
+  }
+
+  /** issue #4628: under the caller's bare lock, clear the branch's fresh journal and its `refs/uzi-fresh/<frid>` ref when it is
+   *  `ready` and `shouldClear` accepts it. Best effort: a failure is logged and leaves the journal (it is cleared by a later call). */
+  private async clearReadyFreshJournalIf(barePath: string, branch: string, shouldClear: (journal: FreshJournal) => boolean): Promise<void> {
+    try {
+      const journal = this.readFreshJournalUnderLock(await this.configEntries(barePath), branch);
+      if (journal === undefined || journal.stage !== "ready" || !shouldClear(journal)) return;
+      await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-fresh/${journal.frid}`]);
+      await this.freshConfigWrite(barePath, [freshJournalKey(branch), ""]);
+    } catch (err) {
+      this.log.warn("a ready fresh journal could not be cleared; it stays", { branch, error: gitErrorMessage(err) });
+    }
+  }
+
+  private clearReadyFreshJournal(barePath: string, branch: string, attemptId: string): Promise<void> {
+    return this.clearReadyFreshJournalIf(barePath, branch, journal => journal.attemptId === attemptId);
+  }
+
+  private clearGoneReadyFreshJournal(barePath: string, branch: string, keptLedgerValues: readonly string[]): Promise<void> {
+    return this.clearReadyFreshJournalIf(barePath, branch, journal => !keptLedgerValues.some(v => v.includes(journal.attemptId)));
+  }
+
+  /** issue #4628: clear the branch's fresh journal and its artifact ref under one bare lock, only while the journal is still exactly
+   *  `expected` (compared by its canonical JSON). Returns whether it cleared. Used when the server proved a never-seeded transfer
+   *  that left no ledger entry (a crash between L0 and L1). */
+  clearFreshJournal(barePath: string, branch: string, expected: FreshJournal): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      const journal = this.readFreshJournalUnderLock(await this.configEntries(barePath), branch);
+      if (journal === undefined || freshJournalJson(journal) !== freshJournalJson(expected)) return false;
+      await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-fresh/${journal.frid}`]);
+      await this.freshConfigWrite(barePath, [freshJournalKey(branch), ""]);
+      return true;
+    });
   }
 
   /**
@@ -19464,11 +19863,12 @@ export class GitCache {
         if (lastIndex.get(e.attemptId) !== i) continue;
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
         const droppable = gone && !namedByJournal(e.clonePath) && !namedByBinding(e) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
-          (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
+          (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId))) && !isFreshLedgerState(e.state);
         if (!droppable) kept.push(attemptLedgerValue(e));
       }
-      if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
-      await this.rewriteLedgerAtomically(barePath, key, kept);
+      if (!(kept.length === raw.length && kept.every((v, i) => v === raw[i]))) await this.rewriteLedgerAtomically(barePath, key, kept);
+      // issue #4628: a ready fresh journal whose attempt is no longer in the ledger names nothing: clear it with its artifact ref.
+      await this.clearGoneReadyFreshJournal(barePath, branch, kept);
     } catch (err) {
       this.checkRecoveryInterruption();
       this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });

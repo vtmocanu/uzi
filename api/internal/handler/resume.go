@@ -146,11 +146,23 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				resumeErr = h.wsvc.ResumeSourceEndHold(r.Context(), user.ID, run, int32(h.cfg.RunTimeout.Seconds()))
 				break
 			}
-			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
-				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
-			})
+			// Issue #4628: with fresh resume on, or an outstanding transfer for the owner, the Resume takes the
+			// owner lock first and refuses a pending transfer before it writes the run. Otherwise
+			// (handled=false) the autocommit write below is unchanged.
+			handled := false
+			if h.wsvc != nil {
+				handled, resumeErr = h.wsvc.ResumeWorkerRecoveryFresh(r.Context(), user.ID, run, int32(h.cfg.RunTimeout.Seconds()))
+			}
+			if !handled {
+				_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
+					ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+				})
+			}
 		}
 		if resumeErr != nil {
+			if writeFreshResumeInProgress(w, resumeErr) {
+				return
+			}
 			if errors.Is(resumeErr, pgx.ErrNoRows) {
 				// The write is fenced on the same predicate; a park that classified itself active
 				// between the read and the write is the refusal, not a generic changed hold.
@@ -176,6 +188,9 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		// run out of pool_wait between the read and this write yields 0 rows → 409 below.
 		rows, err := h.q.PromotePoolWaitRun(r.Context(), store.PromotePoolWaitRunParams{ID: runID, UserID: user.ID})
 		if err != nil {
+			if writeFreshResumeInProgress(w, err) {
+				return
+			}
 			slog.Error("resume run now (pool_wait)", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -296,6 +311,9 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, http.StatusConflict, "run is no longer paused")
 				return
 			}
+			if writeFreshResumeInProgress(w, err) {
+				return
+			}
 			slog.Error("resume run now (paused)", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -311,6 +329,9 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		}
 		rows, err := h.q.ResumeProviderGatewayLimitWait(r.Context(), store.ResumeProviderGatewayLimitWaitParams{ID: runID, UserID: user.ID})
 		if err != nil {
+			if writeFreshResumeInProgress(w, err) {
+				return
+			}
 			slog.Error("resume run now (provider gateway limit_wait)", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -382,6 +403,9 @@ type policyResumeBody struct {
 // resumePolicyHold resolves one exact applied policy episode. Every refusal is zero-mutation: the
 // service transaction repeats owner, status, hold reason, episode id and lane predicates.
 func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID, raw []byte) {
+	if h.refuseIfFreshResumeActive(w, r, userID, runID) {
+		return
+	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	var body policyResumeBody
 	if err := httpx.DecodeJSONStrictBounded(r, &body, policyResumeBodyLimit); err != nil {
@@ -411,6 +435,8 @@ func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userI
 		httpx.ErrorReason(w, http.StatusConflict, "run is finishing; your guidance was not delivered", "follow_up_finalizing")
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
+	case writeFreshResumeInProgress(w, err):
+		// Issue #4628: a fresh resume transfer owns the run's status; the guard refused the resume write.
 	default:
 		slog.Error("resume policy hold", "run", runID, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

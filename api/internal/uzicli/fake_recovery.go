@@ -90,3 +90,33 @@ func (f *FakeClient) DiscardRecoveryHold(_ context.Context, runID, holdID string
 	}
 	return f.Err
 }
+
+// FreshResumeStartCall is one recorded StartFreshResume attempt (issue #4628).
+type FreshResumeStartCall struct {
+	RunID   string
+	Request apitypes.FreshResumeStartRequest
+}
+
+// FreshResumePreview returns the canned preview (FreshResumePreviewErr, then the blanket Err, win).
+func (f *FakeClient) FreshResumePreview(_ context.Context, _ string) (apitypes.FreshResumePreviewDTO, error) {
+	if f.FreshResumePreviewErr != nil {
+		return apitypes.FreshResumePreviewDTO{}, f.FreshResumePreviewErr
+	}
+	if f.Err != nil {
+		return apitypes.FreshResumePreviewDTO{}, f.Err
+	}
+	return f.FreshResumePreviewResult, nil
+}
+
+// StartFreshResume records the request FIRST, then returns FreshResumeStartErr (or the blanket Err),
+// else the canned result.
+func (f *FakeClient) StartFreshResume(_ context.Context, runID string, req apitypes.FreshResumeStartRequest) (apitypes.FreshResumeStartDTO, error) {
+	f.FreshResumeStartCalls = append(f.FreshResumeStartCalls, FreshResumeStartCall{RunID: runID, Request: req})
+	if f.FreshResumeStartErr != nil {
+		return apitypes.FreshResumeStartDTO{}, f.FreshResumeStartErr
+	}
+	if f.Err != nil {
+		return apitypes.FreshResumeStartDTO{}, f.Err
+	}
+	return f.FreshResumeStartResult, nil
+}

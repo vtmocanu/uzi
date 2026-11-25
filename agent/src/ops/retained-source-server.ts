@@ -30,9 +30,11 @@ import { ATTEMPT_ID_RE } from "../attempt-path.js";
 import type { AuthorityRuntime, AuthorityScope } from "../authority-runtime.js";
 import type { DindPruneGate } from "../dind-prune.js";
 import type {
-  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedHomeBinding, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
+  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedHomeBinding, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceEvidence, RetainedSourceSelector,
 } from "../git.js";
 import type { Logger } from "../log.js";
+import type { FreshResumeState } from "../client.js";
+import { classifyFreshState } from "../fresh-resume.js";
 import { hasRetainedHomeMarker, removeRetainedHomeMarker } from "../retained-homes.js";
 import type { DescribeLocalRecordsResult, OperatorRequestSignals, ResolveLocalRecordResult } from "../recovery.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "../protocol.js";
@@ -88,10 +90,13 @@ export interface RetainedSourceRunnerPort {
 
 export interface RetainedSourceServerDeps {
   dataDir: string;
-  git: Pick<GitCache, "inspectRetainedSources" | "discardStoppedSource" | "discardProtectedSource">;
+  /** `readFreshJournal` (with the client's `getFreshResumeState`) is how the guarded discard of a `fresh_pending` attempt learns that
+   *  the server refused or cancelled its transfer before any seed. Absent: such an attempt stays blocked. */
+  git: Pick<GitCache, "inspectRetainedSources" | "discardStoppedSource" | "discardProtectedSource"> & Partial<Pick<GitCache, "readFreshJournal">>;
   client: {
     listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
     getRunOwnership(runId: string): Promise<RunOwnershipResponse>;
+    getFreshResumeState?(runId: string, frid: string, liveGeneration: number, signal?: AbortSignal): Promise<FreshResumeState | null>;
   };
   /** Undefined ⇒ every destructive request refuses. */
   gate: DindPruneGate | undefined;
@@ -649,7 +654,9 @@ export class RetainedSourceServer {
           const [holds, lifecycle] = await Promise.all([this.readHolds(sel.runId), this.readLifecycle(sel.runId)]);
           if (holds.state === "unknown") return this.refusal("holds_unknown");
           if (clientGone()) return this.refusal("client_disconnected");
+          const freshNegative = await this.readFreshNegative(ev);
           const opts = {
+            ...(freshNegative ? { freshTransferNegative: freshNegative } : {}),
             selector: sel, confirm: req.confirm, holds, lifecycle, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
             barePath: ev.barePath, signal: this.shutdown.signal,
             // issue #3644: the retained-home marker of an independent restore lives under the worker's data dir. The guarded discard of
@@ -684,6 +691,21 @@ export class RetainedSourceServer {
       gate.open("retained_ops");
       writer();
     }
+  }
+
+  /** issue #4628: the attempt id of a `fresh_pending` source whose transfer the server reports `refused` or `cancelled` with no seed,
+   *  asked outside the bare lock. Any failure or other answer is undefined (the attempt stays blocked). */
+  private async readFreshNegative(ev: RetainedSourceEvidence): Promise<ReadonlySet<string> | undefined> {
+    const readJournal = this.deps.git.readFreshJournal;
+    const readState = this.deps.client.getFreshResumeState;
+    if (ev.kind !== "attempt" || ev.ledgerState !== "fresh_pending" || !readJournal || !readState) return undefined;
+    try {
+      const journal = await readJournal.call(this.deps.git, ev.barePath, ev.branch);
+      if (journal === undefined || journal.attemptId !== ev.attempt) return undefined;
+      const generation = typeof ev.generation === "number" && ev.generation > 0 ? ev.generation : journal.generation;
+      const state = await readState.call(this.deps.client, ev.runId, journal.frid, generation, this.shutdown.signal);
+      return classifyFreshState(journal, state).kind === "negative" ? new Set([ev.attempt]) : undefined;
+    } catch { return undefined; }
   }
 
   // ─── diagnostics ────────────────────────────────────────────────────────────────────────

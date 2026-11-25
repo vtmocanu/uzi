@@ -951,12 +951,17 @@ for (const stage of ["reservation", "discovery"] as const) {
       git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
       // issue #3644: the opaque pre-discovery reads the bare under the same lock; discovery is stubbed here, so it is too.
       git.discoverOpaque = async () => ({ kind: "other" });
+      // issue #4628: the fresh journal read comes before the opaque read under the same lock; it is stubbed for the same reason.
+      git.readFreshJournal = async () => undefined;
       const reserve = git.reserveRecoveryIteration.bind(git);
       git.reserveRecoveryIteration = async (...args) => { entered(); return reserve(...args); };
     } else {
       const discover = git.discoverRetainedRecovery.bind(git);
       git.discoverRetainedRecovery = async (...args) => { entered(); return discover(...args); };
       // issue #3644: discovery now starts with the opaque config read, which is the first step to queue behind the held lock.
+      // issue #4628: the fresh journal read now comes first under the same lock, so it is the step that queues behind the holder.
+      const freshRead = git.readFreshJournal.bind(git);
+      git.readFreshJournal = async (...args) => { entered(); return freshRead(...args); };
       const opaque = git.discoverOpaque.bind(git);
       git.discoverOpaque = async (...args) => { entered(); return opaque(...args); };
     }
@@ -1159,6 +1164,8 @@ for (const setupDelay of [0, 5_000]) {
     git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
     // issue #3644: the opaque pre-discovery would queue behind the held lock; discovery is stubbed, so it is too.
     git.discoverOpaque = async () => ({ kind: "other" });
+    // issue #4628: so would the fresh journal read that precedes it.
+    git.readFreshJournal = async () => undefined;
     let release!: () => void, acquired!: () => void, entered!: () => void;
     const held = new Promise<void>(resolve => { acquired = resolve; });
     const entry = new Promise<void>(resolve => { entered = resolve; });

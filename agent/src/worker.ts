@@ -1,4 +1,5 @@
 import { policyOwnershipGeneration } from "./policy-resolve.js";
+import { freshResumeCapabilities } from "./fresh-resume.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
@@ -1145,6 +1146,9 @@ export class Worker {
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
         protocolCapabilities.push("pending_outcome_scoped_claim_v1");
+        // Issue #4628: fresh resume destination. Only a hosted slot (a UUID UZI_POD_UID) is a destination, and the api also
+        // requires recovery_inventory_v1 (advertised unconditionally above), so the pair is what makes a worker eligible.
+        protocolCapabilities.push(...freshResumeCapabilities());
         // The compact policy hold promises a durable local outcome journal and the active-run snapshot
         // registry. Advertise only while both are usable; these are the same preconditions
         // RunRunner.executeClaimInAttempt checks before it reserves a policy flight, so a claim the

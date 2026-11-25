@@ -140,9 +140,9 @@ func TestNoOpPublishOfOwnPersistedTipSucceedsLiveDB(t *testing.T) {
 func TestNoOpPublishAfterUnlandedAttemptSkipsLiveDB(t *testing.T) {
 	f := newSupersedeFix(t)
 	f.settlingOld(t)
-	earlier, err := f.svc1.recordPublishAttempt(f.e.ctx, f.newRun, f.branch, f.branchRef, retentionTestTip, pgtype.Text{})
+	earlier, err := f.svc1.recordPublishAttemptAt(f.e.ctx, f.newRun, f.branch, f.branchRef, retentionTestTip, pgtype.Text{}, pgtype.Int8{})
 	if err != nil || earlier == uuid.Nil {
-		t.Fatalf("recordPublishAttempt: id %v err %v", earlier, err)
+		t.Fatalf("recordPublishAttemptAt: id %v err %v", earlier, err)
 	}
 
 	f.assertSkippedUnclaimed(t, f.publishNewTip(t, f.svc1, retentionTestTip))

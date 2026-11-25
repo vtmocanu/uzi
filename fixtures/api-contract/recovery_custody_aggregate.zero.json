@@ -3,5 +3,6 @@
   "admission_counted_holds": 0,
   "custody_hold_limit": 0,
   "decision_needed": 0,
-  "blocked_runs": 0
+  "blocked_runs": 0,
+  "fresh_reserved_units": 0
 }

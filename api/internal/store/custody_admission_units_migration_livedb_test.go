@@ -164,8 +164,11 @@ func TestCustodyAdmissionUnitsRollbackScriptLiveDB(t *testing.T) {
 		if err := store.Migrate(ctx, dsn); err != nil {
 			t.Fatalf("re-migrate: %v", err)
 		}
-		if got := custodyUnitsFunctionDefs(ctx, t, pool); got != up {
-			t.Fatal("re-applied migration did not reinstall the Up bodies")
+		// Later migrations may redefine these functions (00535 adds the fresh-resume reservation), so the
+		// re-migrated head bodies are not byte-equal to this migration's Up bodies; they must still be
+		// the grouped-unit bodies, not the restored pre-migration ones.
+		if got := custodyUnitsFunctionDefs(ctx, t, pool); got == old || !strings.Contains(got.members, "same_run_group") {
+			t.Fatal("re-applied migration did not reinstall the grouped-unit bodies")
 		}
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version WHERE version_id=$1 AND is_applied`, ver).Scan(&rows); err != nil || rows != 1 {
 			t.Fatalf("goose rows for version %d after re-migrate: %d err=%v", ver, rows, err)

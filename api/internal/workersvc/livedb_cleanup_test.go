@@ -97,6 +97,10 @@ var liveDBCleanupSteps = []struct {
 	name, sql string
 	set       liveDBSet
 }{
+	// A fresh resume transfer RESTRICTs the capture it names (issue #4628), so the transfers go before
+	// the captures. Deleting a row fires no guard: both fresh resume triggers are on runs updates.
+	{"run_fresh_resumes", `DELETE FROM run_fresh_resumes
+		WHERE user_id = ANY($1) OR run_id IN (SELECT id FROM runs WHERE user_id = ANY($1))`, liveDBUsers},
 	// Captures RESTRICT their hold, so they go first. A closure pins its capture and
 	// cannot be deleted, so a pinned capture is left. The shared DB does hold closures
 	// (harness_overflow_lifecycle_livedb_test.go creates them and deletes them in its own

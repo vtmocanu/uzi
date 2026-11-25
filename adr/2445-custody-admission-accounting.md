@@ -97,3 +97,13 @@ Migration 00404 adds `retained_continuation_unwitnessed` to D2's cause-specific 
 - **A-D6 (revises D6: wording).** Admission is evaluated over the claim statement's snapshot. It is an admission gate, not a transactional ceiling, and this amendment states no numerical overshoot bound.
 
 **Rollout and rollback.** The chart runs the api as a hard singleton (replicas plus `Recreate`, `deploy/chart/templates/api-deployment.yaml`) and `store.Migrate` runs before serving (`api/cmd/server/main.go`), so old claim code stops before grouped accounting is active. An old api image's `ClaimRun` against grouped accounting would admit a run at its own limit. Before starting an old image, stop the upgraded api and run `scripts/custody-admission-units-rollback.sql`: it restores the previous function bodies and removes goose row 427. It is non-destructive (it raises admission pressure and changes no hold). Do not assume an image rollback runs the migration Down.
+
+## Amendment 2026-11-25 — the fresh resume reservation (#4628)
+
+Migration 00535 (the number may be renumbered at merge) adds an owner reservation to the #4162 unit count for an owner [fresh resume](4628-fresh-resume-durable-evidence.md). Signatures are unchanged.
+
+- **Reservation.** `fn_custody_admission_count` adds one unit for each `run_fresh_resumes` row in `pending`, `claimed`, `seeded` or `superseded` on a nonterminal run of the owner, while its hold is not already counted. A `pending` row always counts one. A later row counts only while the destination's open hold at the row's `claim_generation` exists and no non-excluded hold of the same (run, original worker = destination worker) is already counted. That anti-join targets the singleton-inclusive `counted` set of #4162, so a unit is never counted twice.
+- **Members.** `fn_custody_admission_members` emits one synthetic row per reserved unit: `hold_id` is the transfer id, `reason` is `fresh_reservation`, `counted` is true.
+- **DTO.** `RecoveryCustodyAggregateDTO.fresh_reserved_units` reports how many of `admission_counted_holds` are reservations rather than holds; the per-hold counted flags plus that field sum to `admission_counted_holds`.
+- **R1 disclosure.** A healthy seeded run counts one extra unit until its new hold is released or the run ends. Start refuses with `custody_limit` when the reservation or the new hold would pass `custody_hold_limit` (the run's own open holds must leave room for two more), and the claim rechecks headroom (R1).
+- **Rollback.** Schema Down restores the #4162 function bodies first, and refuses while an outstanding transfer exists ([Configuration](../docs/configuration.md#fresh-resume-rollback)).

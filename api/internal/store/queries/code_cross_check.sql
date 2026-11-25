@@ -127,7 +127,7 @@ WITH expired AS (
  RETURNING cc.*
 ), cancelled AS (
  UPDATE runs child SET status = 'cancelled', status_since = now(), finished_at = now(), updated_at = now(),
- claim_released_at = now() FROM expired cc WHERE child.id = cc.checker_run_id
+ claim_released_at = now() FROM expired cc WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = child.id AND frt.state IN ('pending', 'claimed')) AND child.id = cc.checker_run_id
  AND child.status NOT IN ('completed','failed','cancelled')
 )
 SELECT * FROM expired;

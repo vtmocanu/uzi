@@ -1099,6 +1099,14 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Issue #4628: pause, pause_cancel, extend, scope and a milestone stop (a scope-ceiling write) can
+	// write runs columns the fresh resume guard does not watch, so an active transfer is read here and
+	// refused before the write. Cancel stays allowed (the guard admits it).
+	if (req.Kind == "pause" || req.Kind == "pause_cancel" || req.Kind == "extend" || req.Kind == "scope" || req.Kind == "stop") &&
+		h.refuseIfFreshResumeActive(w, r, user.ID, id) {
+		return
+	}
+
 	// PRD #84 M4 4c: the "run without the capability" user override (Decision 12). When the
 	// owner approves WITH override_capabilities, the override entry point BYPASSES the
 	// capability approval gate and clears the run's inferred/hinted required_capabilities —
@@ -1218,6 +1226,9 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			// built the run-specific sentence (cap-exceeded names the per-extension maximum,
 			// limit-reached the room left), so surface it verbatim.
 			httpx.Error(w, http.StatusConflict, err.Error())
+		case writeFreshResumeInProgress(w, err):
+			// Issue #4628: a fresh resume transfer owns the run's status, worker and generation, so a
+			// pause, extend, answer or other guarded owner write is a 409, never a 500.
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")
 		case errors.Is(err, workersvc.ErrChatInputNotAllowed):

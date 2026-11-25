@@ -288,7 +288,7 @@ func idleStallPublicationChanges(t *testing.T, before, after map[string]json.Raw
 	for _, key := range keys {
 		equal := bytes.Equal(before[key], after[key])
 		switch key {
-		case "checkpoint_tip", "checkpoint_tip_at", "checkpoint_attested_source":
+		case "checkpoint_tip", "checkpoint_tip_at", "checkpoint_attested_source", "checkpoint_tip_generation_tip":
 			if equal {
 				t.Fatalf("publication did not change %s", key)
 			}

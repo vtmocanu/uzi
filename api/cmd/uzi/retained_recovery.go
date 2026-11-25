@@ -98,7 +98,8 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 	}
 	return state + guidance + " · owner Resume now: uzi run resume " + cellText(r.ID) +
 		"; Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)" +
-		" · Resume requests an attempt; success is not assured · source/archive availability and latest edits unverified"
+		" · Resume requests an attempt; success is not assured · source/archive availability and latest edits unverified" +
+		freshResumeHintSuffix(r)
 }
 
 // secretRemediationActiveDetail reports an adoption-failed park classified secret_remediation_active,
@@ -253,4 +254,48 @@ func idleStallResumeGuidance(r apitypes.RunDTO) string {
 		return ""
 	}
 	return "Resume starts a fresh wall and resets the idle-stall count; Cancel ends the run"
+}
+
+// freshResumeEligible mirrors the server's eligibility base (fn_fresh_resume_run_base in migration
+// 00535_run_fresh_resumes.sql) on the fields the CLI has: a recovery_wait with one of four causes, no
+// secret_remediation_active or source_end_declined detail, an explicit null retry stamp (the key must
+// be present), a run kind that can seed, not a claimed Codex run (harness codex and claim_generation
+// >= 1), no codex_policy_hold and no pending reserve pause. Clauses only the server can check, because
+// the DTO lacks the field or the data: codex_material_revision and codex_secret_id in the Codex
+// provenance test, an active publication-resume row, policy_pending_fresh, and the wall budget. The
+// server stays the authority; this only keeps the hint off holds it always refuses.
+func freshResumeEligible(r apitypes.RunDTO) bool {
+	if r.Status != statusRecoveryWait || !r.RecoveryRetryNotBeforePresent || r.RecoveryRetryNotBefore != nil {
+		return false
+	}
+	if r.Harness == "codex" && r.ClaimGeneration != nil && *r.ClaimGeneration >= 1 {
+		return false
+	}
+	if strOr(r.HoldReason, "") == "codex_policy_hold" || strOr(r.PauseMode, "") == "reserve" {
+		return false
+	}
+	switch strOr(r.RecoveryWaitCause, "") {
+	case workerRequeueExhaustedCause, retainedRecoveryExhaustedCause,
+		retainedRecoveryAdoptionFailedCause, retainedContinuationUnwitnessedCause:
+	default:
+		return false
+	}
+	switch strOr(r.RecoveryWaitDetail, "") {
+	case recoveryDetailSecretRemediationActive, recoveryDetailSourceEndDeclined:
+		return false
+	}
+	switch r.Kind {
+	case "issue", "mr_rework", "self_improve":
+		return true
+	}
+	return false
+}
+
+// freshResumeHintSuffix points a held run at `uzi run fresh-resume` (issue #4628) when the run passes
+// freshResumeEligible.
+func freshResumeHintSuffix(r apitypes.RunDTO) string {
+	if !freshResumeEligible(r) {
+		return ""
+	}
+	return " · " + freshResumeHint(r.ID)
 }

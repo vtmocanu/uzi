@@ -922,6 +922,13 @@ type Config struct {
 	// Off stops advertising publication_resume_v1 and refuses NEW enrollment only: existing
 	// intents keep their meaning and stay guarded.
 	PublicationResume bool
+
+	// FreshResume (issue #4628, UZI_FRESH_RESUME, default OFF) is the fresh resume activation gate:
+	// an owner may start a held run on a separate persistent hosted worker from durable evidence.
+	// Parsed like UZI_HELD_PUBLICATION (on/off or true/false, case-insensitive; anything else fails
+	// startup). While off the preview reports status disabled and start is refused; the worker
+	// routes of a transfer already in flight ignore it so a live claimant still finishes.
+	FreshResume bool
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1631,6 +1638,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.PublicationResume = publicationResume
+
+	freshResume, err := parseOnOff("UZI_FRESH_RESUME", false)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.FreshResume = freshResume
 
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {

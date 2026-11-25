@@ -326,6 +326,11 @@ export class FakeApi {
   // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
   // test). No override for an owner => 404 (fail closed), matching the server's not-found.
   private readonly orphanByRun = new Map<string, { httpStatus: number; identity?: RunOrphanClassificationResponse }>();
+  /** issue #4628: scripted answers of the fresh resume routes, and every call made to them. */
+  freshResume: { authority?: boolean; seededRefusal?: string; abandonStatus?: number; bundle?: Buffer;
+    /** The state route's answer; absent is the 404 of an unknown transfer. */
+    state?: (frid: string, query: Record<string, string>) => { status: number; body: unknown } } = {};
+  readonly freshResumeCalls: Array<{ route: string; runId: string; frid: string; body: Record<string, unknown>; query: Record<string, string> }> = [];
   private codexDelayMs = 0;
   private codexResponseOverride: unknown | undefined;
 
@@ -1988,6 +1993,30 @@ export class FakeApi {
       if (!o || o.httpStatus === 404) return send(res, 404, { error: "run not found for this worker" });
       if (o.httpStatus !== 200 || !o.identity) return send(res, o.httpStatus, { error: "injected orphan failure" });
       return send(res, 200, o.identity);
+    }
+
+    // issue #4628: the destination worker's fresh resume routes. Every call is recorded; `freshResume` scripts the answers.
+    const freshMatch = /^\/api\/worker\/runs\/([^/]+)\/fresh-resume\/([^/]+)\/(bundle|abandon|seeded|state)$/.exec(p);
+    if (freshMatch) {
+      const route = freshMatch[3] as "bundle" | "abandon" | "seeded" | "state";
+      const record = { route, runId: freshMatch[1]!, frid: freshMatch[2]!, body: json, query: Object.fromEntries(url.searchParams) };
+      this.freshResumeCalls.push(record);
+      const scripted = this.freshResume;
+      if (route === "abandon") return send(res, scripted.abandonStatus ?? 200, scripted.abandonStatus && scripted.abandonStatus >= 400
+        ? { error: "refused", reason: "fresh_resume_not_claimed" } : { id: record.frid, state: "refused" });
+      if (route === "seeded") {
+        if (scripted.seededRefusal) return send(res, 409, { error: "refused", reason: scripted.seededRefusal });
+        return send(res, 200, { state: "seeded", seeded_at: "2026-01-01T00:00:00Z", destination_attempt_id: record.body.attempt_id ?? null,
+          seeded_generation: record.body.claim_generation ?? null, current_authority: scripted.authority !== false });
+      }
+      if (route === "state") {
+        const answer = scripted.state?.(record.frid, record.query);
+        if (answer) return send(res, answer.status, answer.body);
+        return send(res, 404, { error: "fresh resume transfer not found", reason: "fresh_resume_not_found" });
+      }
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      res.end(scripted.bundle ?? Buffer.alloc(0));
+      return;
     }
 
     const publicationIntentMatch = /^\/api\/worker\/runs\/([^/]+)\/publication-intent$/.exec(p);

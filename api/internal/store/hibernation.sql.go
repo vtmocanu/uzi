@@ -1370,6 +1370,11 @@ SELECT EXISTS (
     SELECT 1 FROM hibernation_wakes hw
     JOIN runs r ON r.id = hw.run_id
     WHERE hw.worker_id = $1 AND r.status = 'queued'
+      -- #4628: a wake naming a worker that ClaimRun now refuses (post-seed predecessor exclusion) is no demand.
+      AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes t WHERE t.run_id = r.id AND t.state IN ('seeded', 'superseded')
+            AND (t.predecessor_worker_id = $1
+                 OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = t.run_id AND h.state = 'open'
+                            AND h.generation < t.seeded_generation AND $1 IN (h.live_worker_id, h.original_worker_id))))
 )::boolean AS pending
 `
 

@@ -57,6 +57,10 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 		secretID = &id
 	}
 
+	// Issue #4628: a held run's token switch can change no guarded column, so read the transfer first.
+	if h.refuseIfFreshResumeActive(w, r, user.ID, runID) {
+		return
+	}
 	res, err := h.wsvc.SetRunCredential(r.Context(), user.ID, runID, req.Mode, secretID)
 	if err != nil {
 		// For either Codex refusal, an unresolved policy episode still names the
@@ -94,6 +98,8 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
 	var ownerHeld *workersvc.RunOwnerHeldError
 	switch {
+	case writeFreshResumeInProgress(w, err):
+		// Issue #4628: a fresh resume transfer owns the run; the guard refused the switch write.
 	case errors.Is(err, workersvc.ErrCodexSwitchIneligible):
 		httpx.Error(w, http.StatusUnprocessableEntity, workersvc.ErrCodexSwitchIneligible.Error())
 	case errors.Is(err, workersvc.ErrRunNotFound):
