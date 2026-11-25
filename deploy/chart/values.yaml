@@ -535,12 +535,15 @@ workers:
   # it. Without workers.uidSplit, turning it on also adds UZI_CLI_CA_FILE to the worker pod
   # template, which can start paced worker rolls; those rolls never add UZI_CODEX_CA_FILE
   # for a Secret that lacks the key, and a roll does not rewrite an existing Secret.
-  # Removing it withdraws only the Codex-specific setting; existing Secrets and
-  # NODE_EXTRA_CA_CERTS keep the original bundle. A Secret recreated by hand is not tracked.
-  # UPGRADE: workers created with the extra CA under earlier controllers have the key but no
-  # recorded evidence, so they roll once on upgrade and lose the Codex CA until reprovisioned;
-  # a controller restart between a worker's Secret create and its /data claim create, or
-  # during a /data recycle, can do the same.
+  # Removing it withdraws UZI_CODEX_CA_FILE (and, without workers.uidSplit, UZI_CLI_CA_FILE);
+  # existing Secrets and NODE_EXTRA_CA_CERTS keep the original bundle. A Secret recreated by
+  # hand is not tracked.
+  # UPGRADE: earlier controllers rendered UZI_CODEX_CA_FILE on every non-isolated worker while
+  # this was set, and no worker has recorded evidence yet, so each such worker rolls once on
+  # upgrade and drops it; those created with the extra CA lose the Codex CA until
+  # reprovisioned. A controller restart between a new worker's Secret create and its /data
+  # claim create leaves that worker without the Codex CA (its first Deployment never gets
+  # it), and a restart during a /data recycle rolls it once and drops it.
   # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
   # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
   # no other api client; the api refuses to boot if the file is unreadable or holds no
