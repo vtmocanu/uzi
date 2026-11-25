@@ -148,8 +148,9 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
 	// The fixtures need the head schema (model_providers columns added after 00523), so the database
-	// is migrated to the head; the test then steps the placement function back to its
-	// 00523_codex_runtime_v3 definition: the 00537 Down first (back to 00534), then the 00523 Down.
+	// is migrated to the head; the test then steps the placement function back: the 00537 Down
+	// lands on 00534's definition, then the 00523 Down lands on 00521's definition (00534's own Down
+	// is not exercised here).
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}

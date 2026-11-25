@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { PER_SECRET_MAX, SecretSet } from "../src/redact.js";
+import { PER_SECRET_MAX, SecretSet, makeTextRedactor } from "../src/redact.js";
 import { runEnvClaimForms } from "../src/run-env-forms.js";
 
 const REDACTED = "***REDACTED***";
@@ -60,6 +60,85 @@ describe("SecretSet", () => {
       assert.equal(out, `a ${REDACTED} b`);
       assert.ok(!out.includes(SECOND.slice(0, half)));
     }
+  });
+});
+
+// Mirrors api/internal/termsafe SanitizeTTY: drop Cc (except \t, \n) and Cf.
+const displayAsTTY = (s: string) => s.replace(/[\p{Cc}\p{Cf}]/gu, (c) => (c === "\t" || c === "\n" ? c : ""));
+// True when any window of `min` characters of the secret is still readable in the displayed output.
+const leaksFragment = (out: string, secret: string, min = 8): boolean => {
+  const shown = displayAsTTY(out);
+  for (let i = 0; i + min <= secret.length; i++) if (shown.includes(secret.slice(i, i + min))) return true;
+  return false;
+};
+
+// The live run redactor gathers every span (verbatim and across invisible characters) in the original
+// string and replaces the union once (#4688). Each case below left half the secret visible when the
+// verbatim span was replaced first and the invisible pass ran on the redacted output.
+describe("SecretSet redacts overlapping occurrences as one union", () => {
+  const block = ["run", "owned", "Secret", "9f3k2"].join("-");
+  const secret = block + block;
+  const zwsp = "​";
+  const fillers = Array.from({ length: PER_SECRET_MAX + 1 }, (_, i) => `filler-secret-${String(i).padStart(3, "0")}-dummy`);
+  const cases: Array<[string, string, string]> = [
+    ["a verbatim occurrence overlapping an invisible-separated one", `before ${secret}${zwsp}${block} after`, `before ${REDACTED} after`],
+    ["self-overlapping invisible-separated occurrences", `before ${block}${zwsp}${block}${zwsp}${block} after`, `before ${REDACTED} after`],
+  ];
+  const variants: Array<[string, string[]]> = [
+    ["per-secret path", [secret]],
+    ["indexed path (more than PER_SECRET_MAX secrets)", [...fillers, secret]],
+  ];
+
+  for (const [path, secrets] of variants) {
+    for (const [name, input, expected] of cases) {
+      it(`${path}, text: ${name}`, () => {
+        const out = new SecretSet(secrets).text(input);
+        assert.equal(out, expected);
+        assert.ok(!leaksFragment(out, secret), JSON.stringify(out));
+      });
+      it(`${path}, payload: ${name}`, () => {
+        const out = new SecretSet(secrets).payload({ k: [input] }) as { k: string[] };
+        assert.deepEqual(out, { k: [expected] });
+        assert.ok(!leaksFragment(out.k[0]!, secret), JSON.stringify(out));
+      });
+    }
+
+    it(`${path}: a self-overlapping verbatim run is redacted whole`, () => {
+      const set = new SecretSet(path.startsWith("per") ? ["abababab"] : [...fillers, "abababab"]);
+      const out = set.text("xx ababababab yy");
+      assert.equal(out, `xx ${REDACTED} yy`);
+      assert.ok(!leaksFragment(out, "abababab"), JSON.stringify(out));
+      assert.deepEqual(set.payload({ k: "ababababab" }), { k: REDACTED });
+    });
+  }
+
+  it("occurrences that only touch stay separate markers", () => {
+    assert.equal(new SecretSet(["abcdefgh"]).text("abcdefghabcdefgh"), REDACTED + REDACTED);
+  });
+});
+
+describe("makeTextRedactor over more than PER_SECRET_MAX secrets redacts overlapping occurrences as one union", () => {
+  const block = ["run", "owned", "Secret", "9f3k2"].join("-");
+  const secret = block + block;
+  const zwsp = "​";
+  const fillers = Array.from({ length: PER_SECRET_MAX + 1 }, (_, i) => `filler-secret-${String(i).padStart(3, "0")}-dummy`);
+  const scrub = makeTextRedactor([...fillers, secret]);
+
+  it("a verbatim occurrence overlapping an invisible-separated one leaves no fragment", () => {
+    const out = scrub(`before ${secret}${zwsp}${block} after`);
+    assert.equal(out, `before ${REDACTED} after`);
+    assert.ok(!leaksFragment(out, secret), JSON.stringify(out));
+  });
+
+  it("self-overlapping invisible-separated occurrences leave no fragment", () => {
+    const out = scrub(`before ${block}${zwsp}${block}${zwsp}${block} after`);
+    assert.equal(out, `before ${REDACTED} after`);
+    assert.ok(!leaksFragment(out, secret), JSON.stringify(out));
+  });
+
+  it("a self-overlapping verbatim run is redacted whole", () => {
+    const out = makeTextRedactor([...fillers, "abababab"])("xx ababababab yy");
+    assert.equal(out, `xx ${REDACTED} yy`);
   });
 });
 
