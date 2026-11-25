@@ -135,7 +135,9 @@ later rule denies can still be removed.
   repo has an enabled live variable or that holds a secret receipt, as a standalone clause in
   `api/internal/store/queries/runtime.sql`. The same condition is mirrored in fleet-aware placement
   (migration `00533_run_env_placement.sql`) and in run health, which reports "no online worker supports
-  repo variables (run_env_v1); upgrade a worker" while no capable worker is connected. The claim
+  repo variables (run_env_v1); upgrade a worker" while no capable worker is connected. A worker
+  advertises `run_env_v1` only under the uid split, so a single-uid worker never counts as capable
+  (see "Single-uid posture" below). The claim
   response is `Cache-Control: no-store`, and the snapshot is unexported so no outbox, journal or
   hibernation record can serialise it.
 - **A receipted version that is missing, swapped or cannot be opened parks the run** with hold
@@ -414,12 +416,14 @@ every Claude CLI start in every lane, the worker:
    path through a symlink and never deletes anything in it;
 3. creates the `HOME/.claude/projects` and `HOME/.claude/tasks` targets as the runner uid with a
    fixed `/bin/mkdir -p -m 700` argv, so they are runner-owned and private, as when the CLI made
-   them. The worker never writes or renames anything inside `.claude`. Only a mkdir that
-   completes with exit status 1 (a planted non-directory, an unsearchable `.claude`) renames
-   `.claude` aside once and retries (transcripts stay in the aside copy, so a resume of that
-   session finds none); a second exit 1 refuses the start. Any other failure (spawn error, signal,
-   timeout, another non-zero exit such as a `setpriv` failure) refuses that start only and leaves
-   `.claude`, and the shared chat root's transcripts, in place;
+   them. The worker never writes or renames anything inside `.claude`. When that mkdir exits
+   non-zero, a second runner-uid helper (`/bin/stat -c '%u|%a|%F|%n'`) looks for a positive
+   obstruction: a matched non-directory, a `.claude` with a wrong owner, or one whose owner mode
+   lacks rwx. Only then is `.claude` renamed aside once and retried (transcripts stay in the aside
+   copy, so a resume of that session finds none); a second obstruction refuses the start. Any
+   other failure (spawn error, signal, timeout, an exit status other than 0 and 1, or exit 1
+   with a lookup failure, a capacity failure, no stat output or a killed helper) refuses that
+   start only and leaves `.claude`, and the shared chat root's transcripts, in place;
 4. refuses the start, with no spawn, when it cannot do the above. When `HOME` is set,
    `spawnDetached` also refuses unless `env.CLAUDE_CONFIG_DIR` equals that exact path; a start that
    carries a provider credential but no `HOME` is refused (the CLI would fall back to the runner's
@@ -453,15 +457,29 @@ module relies on and does not create (`agent/templates/entrypoint.sh`):
 - The data root on a hosted volume is 2775 with group 10001, restored by `align_pvc_root` when the
   epoch lock is not in use. It is group-writable and not sticky, and the chat HOME is `agent-home`
   itself, so the worker does not refuse that parent: refusing it would stop every chat start.
-- The worker refuses a HOME whose parent is world-writable and not sticky, and one whose parent is
-  group-writable and not sticky with a runner, runner-cmd or codex-session gid (10002, 10003,
-  10004), since the runner could then rename HOME's entry. The hosted 2775 data root (group 10001)
-  is not in that set.
+- `guardHome` (`agent/src/claude-global-config.ts`) checks HOME itself (a real directory, not a
+  symlink, its own real path, owned by the worker) and then HOME's parent and every ancestor up to
+  `/`, each by `lstat` (no symlinks): a real directory, owned by uid 0 or the worker, not
+  world-writable unless sticky, and not group-writable with a runner, runner-cmd or codex-session
+  gid (10002, 10003, 10004) unless sticky, since the runner could then rename the entry below.
+  Any other layout refuses the start. The hosted 2775 data root (group 10001) is not in that set.
+
+**Single-uid posture.** Claude run-variable delivery requires the protected two-uid worker
+(`UZI_UID_SPLIT=1`, set by the root-started entrypoint; on k8s the opt-in is
+`UZI_WORKER_UID_SPLIT`, and compose workers are uid-split by default). A single-uid worker does not advertise
+`run_env_v1` (`agent/src/worker.ts`, `uidSplitActive()`), so the api does not place a run that
+carries variables (or secret receipts) on it; such a run waits for a two-uid worker. If one is
+claimed anyway, the worker refuses it before starting anything (`assertRunEnvDeliverable`,
+`REASON_RUN_ENV_NEEDS_SPLIT`, in `agent/src/sdk-env.ts` and the executor's setup phase). Ordinary
+single-uid launches without variables still start, with the config directory prepared as 0555 and
+owned by the same uid. That gives no protection against the owner's own uid and is not an
+integrity boundary.
 
 **Single-uid limit.** With one uid (a k8s single-uid start, or the unit tests) the CLI and the
 agent are the same uid as the worker, so the directory gives no protection: the agent can alter it
 between the worker's last check and the CLI's read. The checks then only repair what an earlier
-turn left. This is the PRD's accepted shared-uid residual. Kernel enforcement of the sticky and
+turn left, and no ownership or ancestor check is made. This is the PRD's accepted shared-uid
+residual, and it is why variables are not delivered there. Kernel enforcement of the sticky and
 ownership boundary cannot be shown with one uid and is not unit-tested; the two-uid e2e below is
 the evidence for the split.
 
@@ -484,11 +502,12 @@ allowance. See [ADR-2332](2332-sdk-spill-read-allowance.md).
   good directory (same inode, no stale copy), rebuild of a tampered one-uid 0555 directory (extra
   entry, retargeted link, other bytes, other mode), symlinked `.claude` and `projects` moved aside
   and never followed, a regular file at `.claude/projects` or `.claude/tasks` recovered, the
-  runner mkdir exiting 1 once (retry after rename aside) and twice (refusal), a transient or other
-  mkdir failure (refusal, `.claude` kept), the `spawnDetached`
-  refusals (mismatched `CLAUDE_CONFIG_DIR`, credential without `HOME`), the HOME parent cases
-  (world-writable non-sticky, runner-gid group-writable non-sticky refused; hosted 2775 and
-  sticky accepted), per-step hostile-process scenarios, concurrent prepares, and `rmHomeTree`
+  runner mkdir failing with a positive obstruction once (rename aside and retry) and twice
+  (refusal), a mkdir failure with no positive obstruction (refusal, `.claude` kept), the
+  preparation deadline and the bounded helper, the `spawnDetached`
+  refusals (mismatched `CLAUDE_CONFIG_DIR`, credential without `HOME`), the HOME and ancestor
+  cases (a non-directory, a foreign owner, world-writable non-sticky or runner-gid group-writable
+  non-sticky refused at any level up to `/`; hosted 2775 and sticky accepted), per-step hostile-process scenarios, concurrent prepares, and `rmHomeTree`
   removing the HOME with the directory and its aside copies.
 - `agent/test/sdk-executor-global-config.test.ts`, through the real executor and spawn path: the CLI
   process is pointed at the prepared directory and sees the fixed bytes (its fake CLI reads only that
@@ -536,7 +555,7 @@ fake server that answers with a `tool_use` and then ends the turn. Results:
   the config directory, in `HOME/.claude`, in both, and with `CLAUDE_CONFIG_DIR` pointed at
   `HOME/.claude`. An empty read-only file and `{}` also
   start cleanly. **Scope: this was a no-account session with a fake key only.** A real OAuth
-  subscription login was not tested; see "Pending owner acceptance" below.
+  subscription login was not tested; see "Acceptance decision" below.
 - **Tools.** With a 0555 directory holding `.claude.json` and `projects`: Bash, Read, Write and
   Edit work. TaskCreate fails with ENOENT without a `tasks` directory (the CLI cannot create it)
   and works with `tasks -> ../.claude/tasks`. `TodoWrite` is unavailable in `-p` mode in both
@@ -578,22 +597,26 @@ recovery described under R3.
   longer refuses every later start of a HOME, the shared chat HOME included. What still fails
   closed (the start is refused, nothing is spawned):
   - the rename aside itself failing (for example a read-only data volume);
-  - a second mkdir exit 1 after the one retry;
-  - a transient or other mkdir failure (spawn error, signal, timeout, a non-zero exit other than
+  - a second positive obstruction after `.claude` was moved aside once;
+  - a mkdir failure with no positive obstruction (exit 1 with a lookup failure, a capacity failure,
+    no stat output or a killed helper; a spawn error, signal, timeout, or a status other than 0 and
     1): that start only, `.claude` kept;
   - a non-zero mkdir of `.claude` itself;
-  - a HOME that fails the boundary checks (not worker-owned under the split, a world-writable
-    non-sticky parent, or a runner-gid group-writable non-sticky parent);
+  - the preparation passing its 10 s deadline (checked before each helper spawn);
+  - a HOME that fails the boundary checks (see Boundary: not worker-owned under the split, or an
+    ancestor that is not a real directory, is owned by neither root nor the worker, is
+    world-writable and not sticky, or is group-writable by a runner group and not sticky);
   - the directory changing past the bounded number of attempts ("kept changing"), and the same
     bound on the `.claude` targets;
   - a HOME that is not a canonical absolute path or not a real directory, and a
     `CLAUDE_CONFIG_DIR` that is not exactly `<HOME>/.uzi-claude-config`.
 
-  Residual (accepted as documented): exit 1 is not proof of a planted entry. mkdir also exits 1 on
-  ENOSPC, EDQUOT or EIO, and `setpriv` exits 1 when it cannot resolve the runner user (for example
-  under descriptor or memory exhaustion). Such a failure moves `.claude` aside once. The start is
-  then refused if the retry fails too, and otherwise proceeds with a fresh `.claude`; nothing is
-  deleted, and earlier sessions' resume history stays in the aside copy.
+  A non-zero mkdir exit alone moves nothing, because exit 1 is not proof of a planted entry (mkdir
+  also exits 1 on ENOSPC, EDQUOT or EIO, and `setpriv` exits 1 when it cannot resolve the runner
+  user). `.claude` is moved aside only on a positive obstruction reported by the runner stat probe
+  (a matched non-directory, a wrong owner, or an owner mode without rwx); a lookup failure, a
+  capacity failure, no output or a killed helper refuses that start and keeps `.claude` in place.
+  There is no exit-1 residual.
 
   Asides (`.claude.stale-*`, `.uzi-claude-config.stale-*`) are not
   reclaimed automatically in a HOME that is never torn down, such as the shared chat root; each
@@ -610,14 +633,32 @@ recovery described under R3.
   control), including with the file in `HOME/.claude` while `CLAUDE_CONFIG_DIR` is set. Managed settings
   (`/etc/claude-code`) are root-owned and absent from the image.
 
-**Pending owner acceptance (not verified).** Whether a real OAuth subscription session applies an
-unsigned stored remote-settings file was not tested and stays an owner acceptance item. The CLI's
-behaviour in the sticky shared root under the real uid split with the real CLI binary (rather than
-the fixture) is also not shown; the two-uid e2e exercises the worker's own steps, not a CLI save.
+**Acceptance decision (verification moved after the release).** The maintainer accepts landing on
+the current direct-CLI evidence within its stated limits (the probes above: pinned CLI, `-p` mode,
+fake key, loopback servers, no real account; the two-uid e2e exercises the worker's own steps, not
+a CLI save). Verification through the pinned SDK launch path moves to a post-release acceptance
+check: after the release rolls, a real Claude run confirms authentication, completion and resume.
+It is a compatibility check only. It does not establish that agent-writable settings are ignored
+and does not resolve the remaining R2 and R4 uncertainty (a real OAuth subscription session
+against an unsigned stored remote-settings file, and a write during a running CLI in SDK mode,
+stay untested). R3 stays a follow-up that the maintainer files.
 
-**Known limit.** Every error in the preparation, a full disk included, is reported as this
-refusal, not as a disk park. The `mkdir` timeout is not an enforceable bound on a runner-uid child
-(the worker cannot signal it under the split), and no stronger bound is claimed.
+**Known limit: the preparation is synchronous and bounded, not unbounded.** Every error in the
+preparation, a full disk included, is reported as this refusal, not as a disk park. The bound is:
+
+- each runner helper runs behind a worker-uid `/bin/sh` that `spawnSync` kills with SIGKILL after
+  4 s (the worker uid can always deliver it);
+- the runner helper itself runs under `timeout -s KILL 2`;
+- the whole preparation has a 10 s deadline, checked before each helper spawn.
+
+The preparation is synchronous, so the worker's event loop is blocked for its duration: the worst
+case is about 14 s per preparation (the 10 s deadline is checked before a spawn, so a last helper
+can still run up to 4 s past it). The worker heartbeats every 15 s and the server marks a worker
+stale after 45 s (`WORKER_HEARTBEAT_INTERVAL`, `WORKER_HEARTBEAT_STALE`), so one preparation
+cannot reach the stale threshold, but several back-to-back worst-case preparations on one worker
+could. A helper blocked in uninterruptible I/O (or a synchronous fs call on a hung volume) is not
+bounded. An async spawn was not adopted: the enforced bound keeps the worker-uid kill and the
+output file handling simple, at the price of the blocked loop above (PRD Decision Log).
 
 ## Residuals
 

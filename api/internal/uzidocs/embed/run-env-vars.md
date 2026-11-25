@@ -31,10 +31,15 @@ job receives CI variables. Tools that read the environment work unchanged.
 - **Precedence**: user variables have the lowest precedence. A name the worker
   sets itself is never replaced or removed by a variable, and the worker drops
   a variable whose name breaks the rules below, with a run event naming it.
-- **Worker support**: delivery needs a worker that reports `run_env_v1`. A run
-  whose repo has variables is never claimed by an older worker, and run health
-  says "no online worker supports repo variables (run_env_v1); upgrade a worker"
-  while none is online. Cross-check children get no variables, but one claimed
+- **Worker support**: delivery needs a worker that reports `run_env_v1`, and a
+  worker reports it only when the worker and the agent run as separate users
+  (the protected two-uid worker: compose workers by default, k8s with
+  `UZI_WORKER_UID_SPLIT`; see [Configuration](configuration.md)). A run whose
+  repo has variables is never claimed by an older or single-user worker, and
+  run health says "no online worker supports repo variables (run_env_v1);
+  upgrade a worker" while none is online. Such a run waits for a two-user
+  worker; if a single-user worker is somehow handed one, it refuses the run
+  before starting anything. Cross-check children get no variables, but one claimed
   by a worker without `run_env_v1` ends as checker unavailable, which asks for a
   human decision; upgrade the worker to avoid it.
 
@@ -245,16 +250,29 @@ Every Claude CLI start runs with its global config taken from a directory the
 worker prepares under the run's home (`.uzi-claude-config`) and the agent cannot
 write when the worker and the agent run as separate users. An `env` block the
 agent writes to the usual config files in the home is not read, so it does not
-apply at the next start. With a single user (some small installs) there is no
-such protection, because the agent has the worker's own permissions. If something
-unexpected sits at that path, the worker moves it aside (`.uzi-claude-config.stale-*`,
-`.claude.stale-*`) and rebuilds. It fails the run instead of starting the CLI when
-it cannot do that or cannot trust the layout: the rename fails (for example a
-read-only data volume), the home directory fails the worker's ownership and parent
-mode checks, preparing the transcript directories fails again after the one retry
-or fails for another reason (a transient spawn failure refuses that start only), or
-the directory keeps changing while the worker prepares it. ADR-4416 has the
-details and the limits.
+apply at the next start. Variables are delivered to Claude runs only on that
+protected two-user worker. A single-user worker (some small installs) does not
+report `run_env_v1`, so a run that carries variables is not placed on it and
+waits for a two-user worker. Ordinary launches without variables still start
+there, with the directory prepared read-only and owned by the same user; that
+gives no protection against the agent's own user and is not an integrity
+boundary.
+
+If something unexpected sits at that path, the worker moves it aside
+(`.uzi-claude-config.stale-*`, `.claude.stale-*`) and rebuilds. It fails the run
+instead of starting the CLI when it cannot do that or cannot trust the layout:
+the rename fails (for example a read-only data volume), the home directory or
+one of its parent directories fails the worker's ownership and mode checks (a
+symlink, an owner other than root or the worker, world-writable without the
+sticky bit, or group-writable by a runner group without it), preparing the
+transcript directories fails (the worker moves `.claude` aside only when a
+check shows a planted file, a wrong owner or an unusable mode, and only once;
+any other failure, a full disk included, refuses that start and keeps
+`.claude`), the preparation passes its 10 second limit, or the directory keeps
+changing while the worker prepares it. Every preparation error is reported as
+this refusal, not as a disk park. The preparation blocks the worker for up to
+about 14 seconds in the worst case; a helper stuck in uninterruptible I/O is not
+bounded. ADR-4416 has the details and the limits.
 
 ## Name and value rules
 
