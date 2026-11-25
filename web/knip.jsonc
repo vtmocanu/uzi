@@ -64,8 +64,12 @@
   // `scripts/modules-browser-test.mjs` is the runtime-modules harness (`npm run
   // test:modules-browser`); knip reaches it through that package.json script, and it imports
   // browser-launch.mjs and modules-manifest-traversal.mjs, so those need no line.
+  // `nginx-modules.js` (PRD #4686) is the njs module the web nginx loads (`js_import` in
+  // nginx-main.conf, COPY'd into both web images). Nothing in the JS graph imports it; its
+  // `default` export is read by nginx, so `exports` is ignored for it below.
   "entry": [
     "public/theme-preinit.js",
+    "nginx-modules.js",
     "scripts/gen-favicon-png.mjs",
     "scripts/csp-build-scan.mjs",
     "examples/ui-module/vite.config.ts",
@@ -78,6 +82,7 @@
   // `default` is read by the vite CLI. No import statement names them, so `exports` would
   // flag all of them. Scoped to exactly those two files and that one issue type.
   "ignoreIssues": {
+    "nginx-modules.js": ["exports"],
     "examples/ui-module/src/Page.tsx": ["exports"],
     "examples/ui-module/vite.config.ts": ["exports"]
   },

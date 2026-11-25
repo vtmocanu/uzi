@@ -28,6 +28,21 @@
 # --dns-option ndots:0 so the chart's static proxy_pass host "api" resolves to the stub
 # alias and not to a search-domain lookalike.
 #
+# RUNTIME WEB MODULES (PRD #4686). Each web container also gets the module delivery files the
+# images ship (web/nginx-main.conf as /etc/nginx/nginx.conf, web/nginx-modules.js, and a fixture
+# /etc/nginx/uzi-modules/ naming one module `example`), and the stub upstream answers as that
+# module's origin (alias `modup`) with deliberately hostile headers. The per-module location is
+# scripts/fixtures/web-modules/location.example.conf, the block the chart and the compose
+# generator emit. Asserted in all three configs: the host security headers and CSP exactly
+# once, every upstream cache/cookie/security header and every X-Accel-* header stripped,
+# X-Accel-Redirect not followed, Cookie and Authorization not forwarded, GET and HEAD only,
+# the Cache-Control split per path and final status, /modules.json, an unknown id, an absent
+# upstream (nginx still starts), and that web/nginx-main.conf is the pinned image's own
+# nginx.conf plus exactly the two njs lines. The module resolver is Docker's embedded DNS
+# (127.0.0.11) in every variant: the throwaway network has no other DNS a name could be
+# resolved by, so it stands in for the cluster DNS IP the chart's web.nginx.resolver names.
+# Module resolution is independent of the chart's dynamicResolution (false here).
+#
 # Everything is read from <repo-root> (default: this script's parent directory), so it can
 # be pointed at a git archive export of an older commit to prove it goes red there.
 #
@@ -53,7 +68,8 @@ for tool in docker helm yq curl gzip cmp; do
   command -v "$tool" >/dev/null 2>&1 || broken "$tool not on PATH"
 done
 docker info >/dev/null 2>&1 || broken "docker daemon not reachable"
-for f in web/Dockerfile web/nginx.conf web/nginx.mock.conf deploy/chart/Chart.yaml; do
+for f in web/Dockerfile web/nginx.conf web/nginx.mock.conf web/nginx-main.conf web/nginx-modules.js \
+  scripts/fixtures/web-modules/location.example.conf deploy/chart/Chart.yaml; do
   [ -f "$ROOT/$f" ] || broken "missing $ROOT/$f"
 done
 
@@ -189,6 +205,7 @@ server {
         return 200 '{"input":"STUB-SEMANTIC-INPUT"}';
     }
     include /usr/share/nginx/stub/cookie-proof.conf;
+    include /usr/share/nginx/stub/mod-locations.conf;
     location = /api/identity {
         default_type application/json;
         alias /usr/share/nginx/stub/identity.json;
@@ -215,6 +232,81 @@ location = /api/cookie-proof {
 }
 STUBCOOKIE
 printf 'COOKIE-UPSTREAM-REACHED' > "$STUB/cookie-proof.body"
+
+# --- runtime web modules fixtures --------------------------------------------------------
+# The module origin. Every response carries upstream headers that must NOT survive the web
+# nginx: all values contain the marker wnginx-upstream (except Expires), so a leak is found
+# by name or by value.
+mkdir -p "$STUB/mod/assets" "$STUB/mod/sub/assets"
+for f in remoteEntry.js assets/app-0123abcd.js sub/assets/a.js; do
+  i=0
+  while [ "$i" -lt 100 ]; do
+    printf 'module line %s of %s, padded so that it compresses well and exceeds one KB\n' "$i" "$f"
+    i=$((i + 1))
+  done > "$STUB/mod/$f"
+done
+cat > "$STUB/mod-poison.conf" <<'STUBPOISON'
+add_header Set-Cookie "wnginx-upstream-cookie=1; Path=/" always;
+add_header Expires "Thu, 01 Jan 2099 00:00:00 GMT" always;
+add_header Cache-Control "public, max-age=31536000, immutable, wnginx-upstream" always;
+add_header Content-Security-Policy "default-src * 'unsafe-eval'; report-uri wnginx-upstream" always;
+add_header X-Frame-Options "ALLOW-FROM wnginx-upstream" always;
+add_header X-Content-Type-Options "wnginx-upstream" always;
+add_header Referrer-Policy "unsafe-url wnginx-upstream" always;
+add_header X-Accel-Redirect "/internal/wnginx-upstream-target" always;
+add_header X-Accel-Expires "999" always;
+add_header X-Accel-Limit-Rate "1" always;
+add_header X-Accel-Buffering "no" always;
+add_header X-Accel-Charset "wnginx-upstream" always;
+add_header X-Accel-Uzi-Probe "wnginx-upstream" always;
+STUBPOISON
+# Static files (Range gives 206, If-Modified-Since gives 304), a missing file (404), an echo
+# of the request headers the module origin received, and two relative redirects.
+cat > "$STUB/mod-locations.conf" <<'STUBMOD'
+location = /modules/example/echo {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    default_type text/plain;
+    return 200 "echo cookie=[$http_cookie] authorization=[$http_authorization] method=[$request_method]";
+}
+location = /modules/example/go {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    return 302 /modules/example/remoteEntry.js;
+}
+location = /modules/example/assets/moved-0123abcd.js {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    return 302 /modules/example/assets/app-0123abcd.js;
+}
+location ^~ /modules/example/assets/ {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    if_modified_since before;
+    alias /usr/share/nginx/stub/mod/assets/;
+}
+location ^~ /modules/example/ {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    if_modified_since before;
+    alias /usr/share/nginx/stub/mod/;
+}
+STUBMOD
+# The module config of each web container: `example` is served by the stub (alias modup);
+# the ghosts exist only to prove an absent upstream does not stop nginx (one name never
+# resolves, one resolves to a port nothing listens on).
+MOD_RESOLVER=127.0.0.11
+MODULES_JSON='[{"id":"example","version":"1.0.0","page":"Page","label":"Example","icon":"package","navGroup":"modules","adminOnly":false}]'
+LOC_TEMPLATE="$ROOT/scripts/fixtures/web-modules/location.example.conf"
+render_loc() { # <resolver> <upstream> [<id> <var-suffix>]
+  sed -e "s/@UZI_RESOLVER@/$1/g" -e "s/@UZI_UPSTREAM@/$2/g" \
+    -e "s#/modules/example/#/modules/${3:-example}/#" -e "s/uzi_module_example/uzi_module_${4:-example}/g" "$LOC_TEMPLATE"
+}
+for v in $VARIANTS; do
+  mkdir -p "$W/uzi-modules.$v"
+  printf '%s\n' "$MODULES_JSON" > "$W/uzi-modules.$v/modules.json"
+  {
+    render_loc "$MOD_RESOLVER" modup:8080
+    render_loc "$MOD_RESOLVER" "ghost.invalid:8080" ghost-dns ghost_dns
+    render_loc "$MOD_RESOLVER" modup:9 ghost-conn ghost_conn
+  } > "$W/uzi-modules.$v/locations.conf"
+done
+! grep -q '@UZI_' "$W/uzi-modules.compose/locations.conf" || broken "location template placeholders not fully substituted"
 # nginx runs as uid 101 inside the image: everything copied in must be world-readable.
 # Exercise the exact owner-input proxy ceiling and its first rejected byte.
 dd if=/dev/zero of="$W/approval-exact.bin" bs=1048576 count=17 2>/dev/null
@@ -245,7 +337,7 @@ start_ctr() {
   fi
 }
 
-start_ctr "wnginx-$$-up" "$W/stub.conf" "" --network-alias api --dns-option ndots:0
+start_ctr "wnginx-$$-up" "$W/stub.conf" "" --network-alias api --network-alias modup --dns-option ndots:0
 # docker cp creates a missing destination directory when the source is a directory.
 docker cp "$STUB/." "wnginx-$$-up:/usr/share/nginx/stub" || broken "docker cp stub fixtures failed"
 docker start "wnginx-$$-up" >/dev/null || { container_logs "wnginx-$$-up"; broken "stub upstream did not start"; }
@@ -258,6 +350,10 @@ done
 
 for v in $VARIANTS; do
   start_ctr "wnginx-$$-$v" "$W/$v.conf" "$DOC" --dns-option ndots:0 -p 127.0.0.1::8080
+  # The image's main nginx.conf (njs), the njs file and the module dir, as the images ship them.
+  docker cp "$ROOT/web/nginx-main.conf" "wnginx-$$-$v:/etc/nginx/nginx.conf" || broken "docker cp main conf to $v failed"
+  docker cp "$ROOT/web/nginx-modules.js" "wnginx-$$-$v:/etc/nginx/uzi-modules.js" || broken "docker cp njs file to $v failed"
+  docker cp "$W/uzi-modules.$v/." "wnginx-$$-$v:/etc/nginx/uzi-modules" || broken "docker cp uzi-modules to $v failed"
   docker start "wnginx-$$-$v" >/dev/null || { container_logs "wnginx-$$-$v"; broken "$v web container did not start"; }
 done
 
@@ -324,6 +420,26 @@ no_ce() { [ "$(hcount "$1" content-encoding)" = 0 ]; }
 not_index() { ! grep -q INDEX-MARKER "$W/$1.b"; }
 cc_not_immutable() { ! hhas "$1" cache-control immutable; }
 
+# Runtime web modules helpers. cc_is: exactly one Cache-Control header, with exactly this value.
+cc_is() { [ "$(hcount "$1" cache-control)" = 1 ] && [ "$(hvals "$1" cache-control)" = "$2" ]; }
+no_upstream_marks() { ! grep -qi 'wnginx-upstream' "$W/$1.h"; }
+no_accel() { ! grep -qi '^x-accel-' "$W/$1.h"; }
+no_cookie_expires() { [ "$(hcount "$1" set-cookie)" = 0 ] && [ "$(hcount "$1" expires)" = 0 ]; }
+body_has() { grep -qF -- "$2" "$W/$1.b"; }
+body_lacks() { ! grep -qF -- "$2" "$W/$1.b"; }
+# mod_cell <label> <tag> <port> <path> <status> <cache-control> [curl args...]: one request,
+# checked on the raw status and headers.
+mod_cell() {
+  local label="$1" tag="$2" port="$3" path="$4" st="$5" cc="$6"; shift 6
+  fetch "$tag" "$port" "$path" "$@"
+  check "$label: status $st (got $STATUS)" has_status "$st"
+  check "$label: exactly one Cache-Control '$cc'" cc_is "$tag" "$cc"
+  check "$label: no upstream header value leaked" no_upstream_marks "$tag"
+  check "$label: no X-Accel-* header" no_accel "$tag"
+  check "$label: no Set-Cookie or Expires" no_cookie_expires "$tag"
+  sec_headers "$tag" "$label"
+}
+
 cookie_response() {
   [ "$(hcount "$1" set-cookie)" = 1 ] &&
     [ "$(hvals "$1" set-cookie)" = "__Host-uzi_vault_slot=$SET_COOKIE_SENTINEL; Path=/; HttpOnly; SameSite=Strict" ]
@@ -363,6 +479,40 @@ cookie_logs_absent() {
 # Never print the collected logs or headers: assertion names alone are sufficient.
 
 # --- assertions --------------------------------------------------------------------------
+# Drift guard: web/nginx-main.conf must be the pinned image's own nginx.conf plus exactly two
+# added lines, load_module first (main context) and js_import directly before the conf.d
+# include (http context). The stub container runs the same image, so its stock file is the base.
+V="drift"
+docker cp "wnginx-$$-up:/etc/nginx/nginx.conf" "$W/image-nginx.conf" || broken "docker cp of the image's nginx.conf failed"
+LOAD_LINE='load_module modules/ngx_http_js_module.so;'
+IMPORT_LINE='    js_import uzi_modules from /etc/nginx/uzi-modules.js;'
+INCLUDE_LINE='    include /etc/nginx/conf.d/*.conf;'
+main_without_added() { grep -vxF -e "$LOAD_LINE" -e "$IMPORT_LINE" "$ROOT/web/nginx-main.conf" | cmp -s - "$W/image-nginx.conf"; }
+main_line_counts() {
+  [ "$(grep -cxF -e "$LOAD_LINE" "$ROOT/web/nginx-main.conf")" = 1 ] &&
+    [ "$(grep -cxF -e "$IMPORT_LINE" "$ROOT/web/nginx-main.conf")" = 1 ] &&
+    [ "$(wc -l < "$ROOT/web/nginx-main.conf")" = "$(($(wc -l < "$W/image-nginx.conf") + 2))" ]
+}
+main_line_places() {
+  [ "$(head -n 1 "$ROOT/web/nginx-main.conf")" = "$LOAD_LINE" ] &&
+    [ "$(grep -xF -B1 -e "$INCLUDE_LINE" "$ROOT/web/nginx-main.conf" | head -n 1)" = "$IMPORT_LINE" ]
+}
+check "web/nginx-main.conf minus the two added lines equals the pinned image's nginx.conf" main_without_added
+check "web/nginx-main.conf adds exactly one load_module and one js_import line" main_line_counts
+check "load_module is the first line and js_import sits directly before the conf.d include" main_line_places
+
+# Controls on the module origin itself: it really does send the hostile headers and echo the
+# request headers it receives, so the absences below are not vacuous.
+V="module-origin"
+docker exec "wnginx-$$-up" wget -S -q -O /dev/null http://127.0.0.1:8080/modules/example/remoteEntry.js >"$W/origin.h" 2>&1 || true
+for hn in Set-Cookie Expires Cache-Control Content-Security-Policy X-Frame-Options X-Content-Type-Options Referrer-Policy \
+  X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset X-Accel-Uzi-Probe; do
+  check "control: the module origin sends $hn" grep -qi "^ *$hn:" "$W/origin.h"
+done
+docker exec "wnginx-$$-up" wget -q -O - --header 'Cookie: ctl-cookie' --header 'Authorization: ctl-auth' \
+  http://127.0.0.1:8080/modules/example/echo >"$W/origin.echo" 2>/dev/null || true
+check "control: the module origin echoes Cookie and Authorization when sent" grep -qF 'cookie=[ctl-cookie] authorization=[ctl-auth]' "$W/origin.echo"
+
 for v in $VARIANTS; do
   V=$v
   port=$(port_of "$v")
@@ -442,6 +592,69 @@ for v in $VARIANTS; do
     check "ordinary API: 1 MiB plus one byte rejected (got $STATUS)" has_status 413
     fetch "$v-worker-over" "$port" "/api/worker/runs/12345678-1234-4123-8123-123456789012/inputs" -X POST --data-binary "@$W/ordinary-over.bin"
     check "worker inputs: larger owner limit is not inherited (got $STATUS)" has_status 413
+  fi
+
+  # --- runtime web modules ---------------------------------------------------------------
+  IMM="public, max-age=31536000, immutable"
+  A=/modules/example/assets/app-0123abcd.js
+  R=/modules/example/remoteEntry.js
+  IMS='If-Modified-Since: Fri, 01 Jan 2100 00:00:00 GMT'
+  # Cache-Control table: one request per path and final status, exactly one header each.
+  mod_cell "asset 200" "$v-m-a200" "$port" "$A" 200 "$IMM"
+  mod_cell "asset 206" "$v-m-a206" "$port" "$A" 206 "$IMM" -H 'Range: bytes=0-9'
+  mod_cell "asset 304" "$v-m-a304" "$port" "$A" 304 "$IMM" -H "$IMS"
+  mod_cell "asset 302" "$v-m-a302" "$port" /modules/example/assets/moved-0123abcd.js 302 no-store
+  mod_cell "asset 404" "$v-m-a404" "$port" /modules/example/assets/missing-0123abcd.js 404 no-store
+  check "asset 404: Cache-Control not immutable" cc_not_immutable "$v-m-a404"
+  mod_cell "module path 200" "$v-m-r200" "$port" "$R" 200 no-cache
+  mod_cell "module path 206" "$v-m-r206" "$port" "$R" 206 no-cache -H 'Range: bytes=0-9'
+  mod_cell "module path 304" "$v-m-r304" "$port" "$R" 304 no-cache -H "$IMS"
+  mod_cell "module path 302" "$v-m-r302" "$port" /modules/example/go 302 no-store
+  mod_cell "module path 404" "$v-m-r404" "$port" /modules/example/missing.js 404 no-store
+  mod_cell "nested assets dir is not a hashed asset" "$v-m-nested" "$port" /modules/example/sub/assets/a.js 200 no-cache
+  mod_cell "asset HEAD" "$v-m-ahead" "$port" "$A" 200 "$IMM" -I
+  mod_cell "module path HEAD" "$v-m-rhead" "$port" "$R" 200 no-cache -I
+  # Bodies are the module origin's, X-Accel-Redirect is not followed, ranges pass through.
+  fetch "$v-m-body" "$port" "$R"
+  check "module body is the origin's file" raw_eq "$v-m-body" "$STUB/mod/remoteEntry.js"
+  check "X-Accel-Redirect not followed (body is not the SPA index)" not_index "$v-m-body"
+  fetch "$v-m-gz" "$port" "$R" -H 'Accept-Encoding: gzip'
+  check "module path gzip: Content-Encoding gzip" hhas "$v-m-gz" content-encoding gzip
+  check "module path gzip: decoded body equals the file" decoded_eq "$v-m-gz" "$STUB/mod/remoteEntry.js"
+  check "module path gzip: still exactly one Cache-Control no-cache" cc_is "$v-m-gz" no-cache
+  fetch "$v-m-range" "$port" "$R" -H 'Range: bytes=0-9'
+  check "module range body is the first 10 bytes" [ "$(cat "$W/$v-m-range.b")" = "$(head -c 10 "$STUB/mod/remoteEntry.js")" ]
+  # Request headers: Cookie and Authorization are cleared before the module origin.
+  fetch "$v-m-echo" "$port" /modules/example/echo -H "Cookie: wnginx-modcookie-$$" -H "Authorization: Bearer wnginx-modauth-$$"
+  check "echo: status 200 (got $STATUS)" has_status 200
+  check "echo: Cookie not forwarded" body_has "$v-m-echo" 'cookie=[]'
+  check "echo: Authorization not forwarded" body_has "$v-m-echo" 'authorization=[]'
+  check "echo: no sentinel reached the module origin" body_lacks "$v-m-echo" "wnginx-mod"
+  # Methods: GET and HEAD only.
+  for m in POST PUT DELETE; do
+    mod_cell "$m is refused" "$v-m-$m" "$port" /modules/example/echo 403 no-store -X "$m" --data x
+    check "$m: the module origin was not reached" body_lacks "$v-m-$m" "echo cookie="
+  done
+  # Unknown id and absent upstream.
+  mod_cell "unknown module id" "$v-m-nope" "$port" /modules/nope/x 404 no-store
+  check "unknown module id: body is not the SPA index" not_index "$v-m-nope"
+  mod_cell "unresolvable upstream" "$v-m-dns" "$port" /modules/ghost-dns/x 502 no-store
+  mod_cell "refused upstream" "$v-m-conn" "$port" /modules/ghost-conn/x 502 no-store
+  mod_cell "refused upstream, asset path" "$v-m-connasset" "$port" /modules/ghost-conn/assets/a-0123abcd.js 502 no-store
+  fetch "$v-m-spa" "$port" /
+  check "/ is still served with absent module upstreams (got $STATUS)" has_status 200
+  check "/ is the SPA index" raw_eq "$v-m-spa" "$DOC/index.html"
+  # The manifest.
+  fetch "$v-m-json" "$port" /modules.json
+  check "/modules.json: status 200 (got $STATUS)" has_status 200
+  check "/modules.json: body is the fixture" [ "$(cat "$W/$v-m-json.b")" = "$MODULES_JSON" ]
+  check "/modules.json: exactly one Cache-Control no-cache" cc_is "$v-m-json" no-cache
+  check "/modules.json: Content-Type application/json" hhas "$v-m-json" content-type application/json
+  sec_headers "$v-m-json" "/modules.json"
+
+  # Last, because it stops the container to flush its logs: the sentinels must also be absent
+  # from the logs after the module requests above (which carried their own Cookie sentinels).
+  if [ "$v" != mock ]; then
     check "cookie proof: sentinels absent from web logs" cookie_logs_absent "$v"
   fi
 done
