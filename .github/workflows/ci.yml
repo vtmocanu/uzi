@@ -1185,6 +1185,8 @@ jobs:
               - 'deploy/chart/**'
               - 'Taskfile.yml'
               - 'scripts/assert-web-nginx.sh'
+              - 'scripts/web-modules-gen.py'
+              - 'scripts/fixtures/web-modules/**'
               - '.github/workflows/ci.yml'
 
       - name: Classify component-independent changes
