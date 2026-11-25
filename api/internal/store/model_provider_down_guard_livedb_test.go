@@ -24,6 +24,9 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 		"00479_users_claude_provider_source.sql":     {"users", "ACCESS EXCLUSIVE"},
 		"00481_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
 		"00488_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
+		"00524_model_providers_shared_scope.sql":     {"model_providers", "ACCESS EXCLUSIVE"},
+		"00527_user_secrets_provider_scope.sql":      {"user_secrets", "ACCESS EXCLUSIVE"},
+		"00528_users_claude_provider_scope.sql":      {"users", "ACCESS EXCLUSIVE"},
 	} {
 		table := spec.table
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
@@ -63,7 +66,7 @@ func TestModelProviderDownLockSerializesWithAWriterLiveDB(t *testing.T) {
 
 	user, provider, conn, repo, worker := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	mustExec(ctx, t, pool, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", user, user.String()+"@example.com")
-	mustExec(ctx, t, pool, "INSERT INTO model_providers(id,owner_user_id,name,engine,current_revision) VALUES($1,$2,'p','claude',1)", provider, user)
+	mustExec(ctx, t, pool, "INSERT INTO model_providers(id,owner_user_id,scope_owner_id,name,engine,current_revision) VALUES($1,$2,$2,'p','claude',1)", provider, user)
 	mustExec(ctx, t, pool, `INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext)
  VALUES($1,$2,'github','https://example.com','bot',1,'x')`, conn, user)
 	mustExec(ctx, t, pool, `INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch)
@@ -134,7 +137,7 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 
 	user, provider, conn, repo, worker, run := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	mustExec(ctx, t, pool, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", user, user.String()+"@example.com")
-	mustExec(ctx, t, pool, "INSERT INTO model_providers(id,owner_user_id,name,engine,current_revision) VALUES($1,$2,'p','claude',1)", provider, user)
+	mustExec(ctx, t, pool, "INSERT INTO model_providers(id,owner_user_id,scope_owner_id,name,engine,current_revision) VALUES($1,$2,$2,'p','claude',1)", provider, user)
 	mustExec(ctx, t, pool, `INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext)
  VALUES($1,$2,'github','https://example.com','bot',1,'x')`, conn, user)
 	mustExec(ctx, t, pool, `INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch)
@@ -164,11 +167,11 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 	}
 
 	// 00479: a selected source blocks the Down.
-	mustExec(ctx, t, pool, "UPDATE users SET claude_provider_id = $2 WHERE id = $1", user, provider)
+	mustExec(ctx, t, pool, "UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1", user, provider)
 	if err := run00("00479_users_claude_provider_source.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00479") {
 		t.Fatalf("00479 Down with a selected source: %v, want a refusal", err)
 	}
-	mustExec(ctx, t, pool, "UPDATE users SET claude_provider_id = NULL WHERE id = $1", user)
+	mustExec(ctx, t, pool, "UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1", user)
 	if err := run00("00479_users_claude_provider_source.sql"); err != nil {
 		t.Fatalf("00479 Down with no selected source: %v", err)
 	}

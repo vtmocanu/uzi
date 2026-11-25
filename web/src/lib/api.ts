@@ -135,6 +135,7 @@ import type {
   RunListItem,
   RunMessage,
   RunStartBody,
+  SetRunCiAutofixResponse,
   RunSummaryItem,
   RunNowResponse,
   RunReview,
@@ -176,6 +177,9 @@ import type {
   Worker,
   CodexAccountMode,
   HibernationResult,
+  AdminSharedProvider,
+  AdminSharedProviderList,
+  AdminSharedProviderCreateInput,
   CreateProviderInput,
   ProviderAuthStyle,
   ProviderDTO,
@@ -1612,6 +1616,16 @@ const realApi = {
     request<{ run: Run }>("PUT", `/runs/${id}/mr-rework`, { enabled }),
 
   /**
+   * Issue #4617: set (or clear) THIS run's per-run CI-autofix override. `true`/`false` is an
+   * explicit override; `null` clears back to inherit the owner's Settings default. Owner-scoped.
+   * The response carries the updated run plus, when another run on the branch governs the
+   * setting (ci_autofix_governing_run_id) or CI fixes are already in flight
+   * (ci_autofix_inflight_fix_run_ids, which keep their own setting), the ids to tell the owner.
+   */
+  setRunCiAutofix: (id: string, enabled: boolean | null) =>
+    request<SetRunCiAutofixResponse>("PUT", `/runs/${id}/ci-autofix`, { enabled }),
+
+  /**
    * PRD #1202: start an ON-DEMAND MR-review-rework run for THIS run's open MR, right now.
    * Owner-scoped, and it deliberately BYPASSES the automatic loop's cap / debounce /
    * staleness / green-pipeline gates — the owner asked explicitly — while KEEPING the
@@ -2144,6 +2158,24 @@ const realApi = {
     ),
   adminDeleteEgressProfile: (name: string) =>
     request<null>("DELETE", `/admin/egress-profiles/${encodeURIComponent(name)}`),
+  // Admin-shared provider definitions (PRD #4324). Reads sit in the admin read group; every
+  // write is a cookie-only admin route. Create is keyless (each user attaches their own key);
+  // PATCH changes the name and/or model map only (base_url/auth_style are a 400); DELETE is a
+  // 409 provider_in_use_as_source while any user has the definition selected.
+  adminListSharedProviders: () =>
+    request<AdminSharedProviderList>("GET", "/admin/providers"),
+  adminCreateSharedProvider: (input: AdminSharedProviderCreateInput) =>
+    request<{ provider: AdminSharedProvider }>("POST", "/admin/providers", {
+      ...input,
+      engine: "claude",
+      protocol: "anthropic_messages",
+    }),
+  adminPatchSharedProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
+    request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}`, body),
+  adminRetireSharedProvider: (id: string) =>
+    request<{ provider: AdminSharedProvider }>("POST", `/admin/providers/${encodeURIComponent(id)}/retire`),
+  adminDeleteSharedProvider: (id: string) =>
+    request<{ deleted: boolean; deleted_key_count: number }>("DELETE", `/admin/providers/${encodeURIComponent(id)}`),
 
   // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
   // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')

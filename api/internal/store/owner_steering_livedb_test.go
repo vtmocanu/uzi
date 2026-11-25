@@ -492,7 +492,7 @@ func TestInsertOwnerSteeringLiveDB(t *testing.T) {
 func TestOwnerSteeringCodeChildUnaffectedLiveDB(t *testing.T) {
 	fx := steeringFixture(t)
 	w := fx.worker("code-host", capOf(1), false)
-	caps := []string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2"}
+	caps := []string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}
 	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2, max_cross_check_slots=1 WHERE id=$1`, w, caps)
 	lead := fx.queuedRun()
 	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='task',interactive=true,status='awaiting_followup',issue_iid=NULL,

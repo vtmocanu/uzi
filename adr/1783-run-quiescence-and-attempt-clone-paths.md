@@ -5,6 +5,132 @@
 **Date**: 2026-09-27
 **Related**: GitHub issue vtmocanu/uzi#1783
 
+## Amendment 2026-11-23 — #4632: inventory source proof serialized against same-key seeds
+
+The retained-recovery inventory proof runs unmarked runner-uid git in a failed
+predecessor's clone. A same-key attempt seed sweeps every non-live path of the
+clone key and read that git as unattributed residue, failing the successor.
+
+- **Bare-lock section.** Each clone's proof (before-scan, runner git, after-scan)
+  runs as one section under the repository's bare lock `B`
+  (`GitCache.withInventorySourceLock`). Lock wait is 30 s; the section budget is
+  12 s; every scan in it, the before-scan included, has 3 s, and the status read
+  3 s. A nested call, a boundary
+  scope that releases `B` itself, an expired lock wait or an active reclaim
+  admission refuses `source_lock_unavailable`. A queued seed waits for the
+  flight-boundary `A` wait of 30 s (`codexBoundaryDeadlineMs`); each section ahead
+  of it adds at most 15 s (12 s plus the seed probe), `B` is FIFO, and there is no
+  end-to-end bound.
+- **Stage latch.** Work runs as tracked stages. At the deadline, an abort or the
+  section's end a latch closes: no new stage or git call starts (the content
+  proof polls it before each git call). The stage gate also checks the clock
+  (`Date.now() >= deadlineAt`) before each stage, so a continuation running after
+  `D` but before the deadline timer fires cannot start another stage. A late
+  callback never changes the verdict, and abandoned work stays tracked until it
+  settles. A section that cannot show
+  its work settled refuses `source_settlement_unproven`.
+- **Forced-helper scans.** The section's scans always run through the helper
+  (`forceHelper`), because the in-process scan exempts the scanner's own
+  descendants and would not see the proof's git.
+- **In-memory exclusion.** Before spawning, the section installs an entry keyed by
+  (bare, clone key); a leftover entry is first cleared lazily (2 s). An entry
+  clears only when the body ran to its end, git started, everything settled, the
+  after-scan was quiescent and at least 1 s remains, and a fresh observe-only
+  probe reads clear. The probe never signals a process. Verdict
+  (`inventoryClearVerdict`): unmarked in-scope residue blocks; processes marked
+  to another live, protected or terminal attempt do not. Any unverified result,
+  an undefined result or an unknown reason is not clear. Inventory descendants
+  are not necessarily readable by the scanner: a clone-configured hook could
+  leave a non-dumpable, unmarked descendant, which reads
+  `unreadable_unattributed`. Revised 2026-11-23 on the owner's review of MR
+  !4643: the worker cannot establish that an unreadable process is unrelated to
+  the inventory operation, and the admitted seed's sweep can still meet it and
+  take the terminal residue path, so an unreadable-only result is not clear (this
+  replaces the earlier accepted boundary that treated it as clear). Consequence:
+  a non-dumpable runner-uid process that persists keeps probes unverified only
+  while nothing positively attributes it (see Helper bounds). An attributed peer,
+  such as the Codex supervisor (`uzi-codex-super`, measured on the uzi worker),
+  no longer blocks. While an unattributed one persists the exclusion stands:
+  same-key seeds wait once, retry once and stop for retry nonterminally with
+  custody kept, and persistent stranding can exhaust requeues. The production
+  probe carries a deadline, and with it a per-PID access denial reaches
+  attribution instead of failing the table, so the verdict rule above is what
+  decides it.
+- **Helper bounds.** Before- and after-scan helpers also get their bound from the
+  parent-side group kill at the gate deadline (`run-quiescence.ts`) and the
+  section race. The inventory before- and after-scans (opt-in
+  `QuiesceRunRequest.helperDeadline`, set only by the runner's inventory quiesce
+  wrapper) and observe-only probes carry `deadlineAt` into the helper's
+  `ScanRequest`, so the helper's own scan and kill gates stop no later than `D`. Other helper
+  scans (the #3980 gate checkpoints, terminal preservation) do not carry it,
+  deliberately: forwarding it would let an attributed non-dumpable peer (the Codex
+  supervisor) block them.
+  In a scan whose serialized request carries `deadlineAt`, a per-PID EACCES or
+  EPERM on a process's `environ` or `cwd` is not a table failure. It reaches the
+  existing attribution (`attributedToOtherLive`): the pid, its pgid, sid or an
+  ancestor must be a recorded root, of another live attempt or a worker-launched
+  root, with matching pid and start time. Only such a positively attributed
+  process is exempt; there is no exemption by ancestry alone or by start-time
+  cutoff. An unattributed or ambiguous one (a start-time mismatch, say) reads
+  `unreadable_unattributed`: the scan is unverified, the clear verdict is not
+  clear and the exclusion stays. Still fail closed: any other errno, listPids,
+  status or stat read failures, the byte, PID and work budgets, and the deadline
+  itself. For the opted-in signalling inventory scans the
+  `mayKillUnreadableUnattributed` reap (uid split, no other live attempt or
+  claim) and the #3915 late-root re-proof are reachable again, as before the
+  deadline was forwarded. The #3980 checkpoints and terminal preservation do not
+  carry the serialized deadline and are unchanged. An expired helper result of a
+  deadline-forwarded scan is withdrawn as unverified in every result state, so a
+  late `survivors` result can never read clear.
+  Revised 2026-11-23 on the owner's review of MR !4643: the earlier accepted
+  liveness cost (any unreadable runner-uid process, including an attributed peer,
+  blocked inventory proofs) is withdrawn.
+- **Ambient scopes.** The section is bound by the ambient boundary, recovery
+  operation, report and maintenance-budget scopes `withLock` honours: their
+  signals abort it and their remaining time caps `D`. The predecessor path also
+  gates every stage start on its grant staying live. A section that observed an
+  abort reports `aborted` and is `source_settlement_unproven`, like a timeout. The
+  final clear removes an entry only if no abort or deadline latched while its
+  probe was pending. Every read, scope discovery and probe of a clear is tracked
+  on the key's entries, so a timed-out one keeps the key unsettled until it ends.
+  The result reports `heldMs`, the time `B` was held.
+- **Scope-classed clears.** A full clear sweeps the same scope as a seed
+  (`nonLiveKeyPaths`) and removes the settled entries. A restore clear uses the
+  narrower restore seed scope and only admits that seed; the entry stays. A full
+  clear is deferred (`full_probe_deferred_restore`) while a restore entry holds
+  the branch.
+- **Refusals.** Same-key canonical and attempt seeds, restore seeds and orphan
+  reclaims refuse nonterminally while the key is excluded
+  (`InventorySourceExclusionRefusal`, not an authority refusal). The runner waits
+  once (30 s), retries once, then stops the claim for retry with custody kept. A
+  restore seed refused twice is refused `inventory_source_exclusion`. Reclaims
+  take a per-target-key admission under `B`, held for the whole proof, which
+  makes a section refuse `source_lock_unavailable` meanwhile.
+- **Restart boundary.** The registry is process memory. A worker restart is
+  safe only where the PID namespace ends with the worker (tini as PID 1, or
+  docker-init over tini); other postures are logged once as not namespace-scoped
+  and fall back to the unchanged seed sweep after a restart. A census stat read
+  that fails other than by vanishing (ENOENT, ESRCH), for example EACCES, also
+  makes the posture not scoped.
+- **Timing changes.** The inventory status read has a 3 s timeout instead of the
+  10 min git default. The predecessor content proof is bounded by the section and
+  fails closed on large trees; that path is disabled in production
+  (`predecessorFinalForTests`).
+- **Accepted boundaries.** Operator discards do not consult the registry. The
+  `PendingRecoveryCaptureError` recovery capture is ungated (pre-existing).
+  Containers are not covered by the probe. A descendant that forges a marker
+  escapes the clear. A canonical reseed is over-excluded. While unmarked residue
+  persists, a same-key claim waits once, retries once and stops, so repeated
+  claims can exhaust requeues; base would instead have failed the seed
+  terminally (`worker_residue_blocked`), since seed mode kills attempt-marked (own or
+  terminal) residue, and, under the uid split with no other claim, unreadable
+  unattributed processes, but a readable unmarked in-scope process survives as
+  `unattributed_in_scope`. The clear's bare-config reads and observe-only probe
+  can outlive the section's budget on expiry, but stay tracked until they settle;
+  none of them runs in the clone.
+- **Rollout.** The checks `source_lock_unavailable` and
+  `source_settlement_unproven` are new; older workers do not emit or retry them.
+
 ## Amendment 2026-11-15 — #4365: definitive declined source end
 
 A retired source-owner sink whose admission barrier has joined can record a
@@ -1952,7 +2078,9 @@ the admission rules of the [ADR-1197 #3644 amendment](1197-transient-recovery-pa
 - **No effect on P.** The park changes none of P's bytes (journal, slot, clone, HOME,
   provision) and reaps nothing. Resume claims again, holds again unchanged on this
   release, and adds a claim and an open custody hold, except that a run already at its own `custody_hold_limit` bound is requeued with no claim and no hold (#4162). The parked run holds P's hold
-  and the current generation's.
+  and the current generation's. A permanent message failure (the batcher breaker) in this hold or
+  anywhere from route selection until the seed hands off reports no `failed` and reaps nothing (#4644; see the
+  [ADR-1197 #3644 amendment](1197-transient-recovery-park.md#amendment-2026-11-09-3644-an-unsupported-predecessor-holds-for-its-owner)).
 - **Hosted.** An owner-held hosted run blocks its worker's ordinary image roll (the run is
   non-terminal) until the owner cancels or discards it.
 - **Unchanged.** A stale claim, a credential switch, lost ownership and an owner Cancel

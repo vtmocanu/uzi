@@ -148,7 +148,7 @@ func TestUserSettingsJudgeModelsCells(t *testing.T) {
 			db:   &fakeSettingsDB{},
 			want: []apitypes.ModelSettingCellDTO{
 				{Harness: "claude", DefaultModel: "opus", DefaultSource: "builtin", ResolvedModel: "opus", Source: "builtin"},
-				{Harness: "codex", DefaultModel: "gpt-6.1-sol", DefaultSource: "builtin", ResolvedModel: "gpt-6.1-sol", Source: "builtin"},
+				{Harness: "codex", DefaultModel: "gpt-6.2-sol", DefaultSource: "builtin", ResolvedModel: "gpt-6.2-sol", Source: "builtin"},
 			},
 		},
 		{
@@ -176,7 +176,7 @@ func TestUserSettingsJudgeModelsCells(t *testing.T) {
 			rows: inst("sonnet", ""),
 			want: []apitypes.ModelSettingCellDTO{
 				{Harness: "claude", Model: str("gpt-6-sol"), DefaultModel: "sonnet", DefaultSource: "instance_default", ResolvedModel: "sonnet", Source: "instance_default"},
-				{Harness: "codex", DefaultModel: "gpt-6.1-sol", DefaultSource: "builtin", ResolvedModel: "gpt-6.1-sol", Source: "builtin"},
+				{Harness: "codex", DefaultModel: "gpt-6.2-sol", DefaultSource: "builtin", ResolvedModel: "gpt-6.2-sol", Source: "builtin"},
 			},
 		},
 		{
@@ -184,7 +184,7 @@ func TestUserSettingsJudgeModelsCells(t *testing.T) {
 			db:   &fakeSettingsDB{judge: txt("gpt-6-luna")},
 			want: []apitypes.ModelSettingCellDTO{
 				{Harness: "claude", Model: str("gpt-6-luna"), DefaultModel: "opus", DefaultSource: "builtin", ResolvedModel: "opus", Source: "builtin"},
-				{Harness: "codex", DefaultModel: "gpt-6.1-sol", DefaultSource: "builtin", ResolvedModel: "gpt-6.1-sol", Source: "builtin"},
+				{Harness: "codex", DefaultModel: "gpt-6.2-sol", DefaultSource: "builtin", ResolvedModel: "gpt-6.2-sol", Source: "builtin"},
 			},
 		},
 	}

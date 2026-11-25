@@ -93,7 +93,7 @@ describe("mock checker pins", () => {
     let cells = (await api.getMySettings()).settings.cross_check_pins!;
     expect(cells).toHaveLength(4);
     expect(cells.find(p => p.harness === "codex")).toMatchObject({
-      model: null, effort: null, resolved_model: "gpt-6.1-sol", resolved_effort: "high", model_source: "worker default", effort_source: "cross-check default", active: true,
+      model: null, effort: null, resolved_model: "gpt-6.2-sol", resolved_effort: "high", model_source: "worker default", effort_source: "cross-check default", active: true,
     });
     await api.putMySettings({ cross_check_pins: [
       { stage: "plan", harness: "claude", model: " custom-claude ", effort: "max" },

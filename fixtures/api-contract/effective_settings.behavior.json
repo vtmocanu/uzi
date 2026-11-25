@@ -134,9 +134,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "judge_model",
             "fixed_at": "claim",
@@ -1870,9 +1870,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "worker_model",
             "fixed_at": "claim",
@@ -1896,9 +1896,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "planning_model",
             "fixed_at": "claim",
@@ -1920,9 +1920,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "judge_model",
             "fixed_at": "claim",
@@ -2087,9 +2087,9 @@
             {
               "harness": "codex",
               "model": null,
-              "default_model": "gpt-6.1-sol",
+              "default_model": "gpt-6.2-sol",
               "default_source": "cross_check_worker_default",
-              "resolved_model": "gpt-6.1-sol",
+              "resolved_model": "gpt-6.2-sol",
               "source": "cross_check_worker_default",
               "setting": "cross_check_plan",
               "fixed_at": "claim",
@@ -2113,9 +2113,9 @@
             {
               "harness": "codex",
               "model": null,
-              "default_model": "gpt-6.1-sol",
+              "default_model": "gpt-6.2-sol",
               "default_source": "cross_check_worker_default",
-              "resolved_model": "gpt-6.1-sol",
+              "resolved_model": "gpt-6.2-sol",
               "source": "cross_check_worker_default",
               "setting": "cross_check_code",
               "fixed_at": "claim",
@@ -2270,7 +2270,7 @@
             "worker_model": {
               "harness": "codex",
               "model": "gpt-6-sol",
-              "default_model": "gpt-6.1-sol",
+              "default_model": "gpt-6.2-sol",
               "default_source": "builtin",
               "resolved_model": "gpt-6-sol",
               "source": "run_override"
@@ -2356,9 +2356,9 @@
             "worker_model": {
               "harness": "codex",
               "model": null,
-              "default_model": "gpt-6.1-sol",
+              "default_model": "gpt-6.2-sol",
               "default_source": "builtin",
-              "resolved_model": "gpt-6.1-sol",
+              "resolved_model": "gpt-6.2-sol",
               "source": "builtin",
               "setting": "worker_model",
               "fixed_at": "claim",
@@ -2392,7 +2392,7 @@
             },
             "subagents": {
               "mode": "own_pins",
-              "lead_value": "gpt-6.1-sol",
+              "lead_value": "gpt-6.2-sol",
               "pinned": [],
               "pinned_truncated": false,
               "notes": [
@@ -2424,9 +2424,9 @@
             "worker_model": {
               "harness": "codex",
               "model": null,
-              "default_model": "gpt-6.1-sol",
+              "default_model": "gpt-6.2-sol",
               "default_source": "builtin",
-              "resolved_model": "gpt-6.1-sol",
+              "resolved_model": "gpt-6.2-sol",
               "source": "builtin",
               "setting": "worker_model",
               "fixed_at": "claim",
@@ -2465,7 +2465,7 @@
             },
             "subagents": {
               "mode": "follow_lead",
-              "lead_value": "gpt-6.1-sol",
+              "lead_value": "gpt-6.2-sol",
               "pinned": [],
               "pinned_truncated": false,
               "notes": [
@@ -2655,9 +2655,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "judge_model",
             "fixed_at": "claim",
@@ -3281,9 +3281,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "judge_model",
             "fixed_at": "claim",
@@ -4039,9 +4039,9 @@
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "judge_model",
             "fixed_at": "claim",

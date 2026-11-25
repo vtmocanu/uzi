@@ -519,3 +519,30 @@ func TestSweepCompletesIdleChats(t *testing.T) {
 		t.Fatalf("ChatIdleCompleted = %d, want 1", res.ChatIdleCompleted)
 	}
 }
+
+// chatNoSourceReaderStore is a Store that cannot read the engine provider source (it does not
+// implement GetUserProviderSource) and counts CreateChatRun inserts.
+type chatNoSourceReaderStore struct {
+	Store
+	creates int
+}
+
+func (s *chatNoSourceReaderStore) CreateChatRun(context.Context, store.CreateChatRunParams) (store.Run, error) {
+	s.creates++
+	return store.Run{ID: uuid.New()}, nil
+}
+
+// TestCreateChatRunFailsClosedWithoutProviderSourceReader: a store that cannot read the owner's
+// provider source must error and insert no chat run, never fall through to an unchecked vendor chat.
+func TestCreateChatRunFailsClosedWithoutProviderSourceReader(t *testing.T) {
+	st := &chatNoSourceReaderStore{}
+	svc := New(st, newBox(t), testParams())
+
+	_, err := svc.CreateChatRun(context.Background(), uuid.New(), "hello")
+	if err == nil {
+		t.Fatal("CreateChatRun with a store lacking GetUserProviderSource succeeded, want an error")
+	}
+	if st.creates != 0 {
+		t.Fatalf("CreateChatRun store calls = %d, want 0 (no chat run inserted)", st.creates)
+	}
+}

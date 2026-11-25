@@ -337,6 +337,15 @@ func (c *HTTPClient) reconcileInterval() time.Duration {
 	return defaultStreamReconcile
 }
 
+// after arms the reconnect backoff deadline: time.After, unless a test installed
+// streamAfter.
+func (c *HTTPClient) after(d time.Duration) <-chan time.Time {
+	if c.streamAfter != nil {
+		return c.streamAfter(d)
+	}
+	return time.After(d)
+}
+
 func (c *HTTPClient) backoff(attempt int) time.Duration {
 	base := c.streamBackoffBase
 	if base <= 0 {
@@ -460,6 +469,16 @@ func (s *RunStream) pump(ctx context.Context, c *HTTPClient, runID string, conn 
 			// No socket: wait out the backoff and try again. The reconcile ticker is
 			// in this select on purpose — an outage is exactly when the periodic state
 			// re-read matters most, so it must not be starved by a 30s backoff.
+			//
+			// The redial deadline is armed ONCE per wait, outside the loop: a reconcile
+			// tick must not restart it. Re-arming it inside the select let every
+			// selected tick discard the pending redial. The backoff grows on every
+			// redial (up to its 30s ceiling, jittered) and resets only when the reader
+			// receives a raw frame, before decode; once its wait outgrew the reconcile
+			// interval, ticks kept winning and the redial was starved for as long as
+			// they did — normally until reconcile saw a terminal status and stopped
+			// the ticker.
+			redial := c.after(c.backoff(attempt))
 			waiting := true
 			for waiting {
 				select {
@@ -472,7 +491,7 @@ func (s *RunStream) pump(ctx context.Context, c *HTTPClient, runID string, conn 
 						reconcile.Stop()
 						reconcileStopped = true
 					}
-				case <-time.After(c.backoff(attempt)):
+				case <-redial:
 					waiting = false
 				}
 			}

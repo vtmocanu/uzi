@@ -50,8 +50,8 @@
       }
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
-      "last_modified": "2026-11-14T08:26:23Z",
-      "resolved": "github:NixOS/nixpkgs/5d2b81a7a3be3e2f832879028e4d60abbf58e9a0?lastModified=1794644783"
+      "last_modified": "2026-11-22T18:15:35Z",
+      "resolved": "github:NixOS/nixpkgs/619c39f6eac5d1ed6b8f073a9414baf7034b2356?lastModified=1795371335"
     }
   }
 }

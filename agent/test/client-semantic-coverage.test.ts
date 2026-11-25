@@ -288,3 +288,14 @@ it("M2 HTTP client bounds a response body that never completes and preserves own
   await assert.rejects(client.semanticCoverageStatus("run", 1, owner.signal));
   assert.equal(cancelled, 1);
 });
+
+it("issue #4519 semantic plan claim renders with worker evidence, which the server may not send", async () => {
+  const f = await fixture();
+  const checker = { ...f.structural, candidate_identity_version: "semantic_v1" as const,
+    semantic_candidate: f.compiled.candidate, stage: "plan" as const, lead_run_id: "lead", round: 1,
+    candidate_digest: f.compiled.candidate.digest, deadline_at: "2030-01-01T00:00:00Z" };
+  const withEvidence = { ...checker, milestones: [{ id: "m1", title: "A" }], repo_instructions_evidence: { status: "supplied" as const, text: "RULES" } };
+  const prompt = crossCheckPrompt(makeClaim({ kind: "cross_check", cross_check: withEvidence }));
+  assert.ok(prompt.includes("RULES"));
+  assert.throws(() => decodeCrossCheckClaim(withEvidence), /invalid cross-check claim/);
+});

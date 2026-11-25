@@ -132,31 +132,46 @@ HTML-comment marker on the line. **Never push non-doc code to `main`.**
 
 ## Post-merge CI, and fixing failures
 
-Poll every run for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow`**,
+Poll the gating runs' jobs for the merge SHA with **`scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow`**,
 using the runtime-appropriate verified completion route in *Waiting, uniformly*.
 `MERGE_SHA` is the exact full SHA emitted by `merge.sh`;
 never type or hand-complete a prefix. The watcher resolves it through GitHub before polling
-and exits 3 when it is invalid or unknown. It exits on the first confirmed failing job rather
-than waiting for the whole run. Keep the owned callback/log receipt; do not re-author
+and exits 3 when it is invalid or unknown. It exits on the first confirmed failing gating job rather
+than waiting for the whole run; advisory (schedule/workflow_dispatch) runs are only reported
+from the listing. Keep the owned callback/log receipt; do not re-author
 a poll loop per merge:
 
 ```
 <this skill's directory>/scripts/watch-run-ci.sh --sha "$MERGE_SHA" --follow --interval 60 --max-ticks 200
 ```
 
-It exits **0** when every run that exists for the SHA is green, **1** on a real red
-(`failure`/`timed_out`/`startup_failure`/`action_required`), **2** on timeout, **3** when
-no run ever appeared (or gh failed). On supersession, `--follow` resolves the current branch
+It exits **0** when at least one gating run exists for the SHA and every gating run is green,
+**1** on a real red (`failure`/`timed_out`/`startup_failure`/`action_required`), **2** on
+timeout, **3** when no gating run ever appeared (or gh failed). Runs triggered by `schedule`
+or `workflow_dispatch` are **advisory**: they never decide the exit, and before each verdict
+exit the watcher prints an `ADVISORY` block listing them (`ADVISORY  <state>  <id>  <event>  <name>`;
+state is the run's status until it completes, then its conclusion). On the closing exits 2 and 3
+the block is cached from the last complete listing and its header names that tick (`from tick K`);
+whenever no advisory run is on record (on any verdict exit) it prints `ADVISORY: none observed in a complete listing`. A run with a missing,
+null or unrecognised event is gating. A manual dispatch that must gate is watched by run ID, not
+by `--sha`. A SHA with only advisory runs is never green: the watcher keeps polling for a
+gating run and ends in exit 3 if none appears.
+
+**The listing limit.** The watcher lists runs with `--limit 51`. A listing of at most 50 runs
+is complete; one that reaches 51 rows may be truncated, so that tick gives no verdict (no green,
+red, supersession or `--follow` switch) and the watcher polls again. If that persists to
+`--max-ticks`, it ends in exit 2; when the last tick reached the limit the closing line names it.
+That exit 2 is not cleared by re-arming: watch the gating `ci.yml` / `kind-smoke.yml` runs by run ID instead. On supersession, `--follow` resolves the current branch
 head, prints `FOLLOW sha=OLD -> NEW` for each switch and watches within the original
 `--max-ticks` budget. The final result covers the last watched SHA, a descendant that contains
 your merge. Main runs finish rather than cancel (#2561), so the followed head may wait for a
 whole running run before its own starts: pass `--max-ticks 200`, and treat exit 2 as still
-pending, never as red; re-arm it. A finished run for an older (ancestor) SHA does not cover
+pending, never as red; re-arm it, unless it names the listing limit (above). A finished run for an older (ancestor) SHA does not cover
 your merge. Without `--follow`,
 supersession exits **4** (see below).
 
-**Exit 0 means "every run that EXISTS for the SHA is green" — NOT "the full expected
-workflow set ran."** Measured 2026-09-02 (a docs-only fix commit to `main`, `f015f1f`): only
+**Exit 0 means "every gating run that EXISTS for the SHA is green" (at least one) — NOT "the
+full expected workflow set ran."** Measured 2026-09-02 (a docs-only fix commit to `main`, `f015f1f`): only
 the `CodeQL` run existed for the SHA, and `ci.yml`/`kind-smoke.yml` never dispatched, so
 the watcher saw one green run and exited 0 — a *partial* dispatch read as a full green. A
 `[skip ci]` commit landing on top can also leave the current HEAD with no full CI run at all.
@@ -169,6 +184,13 @@ stays the PR's OWN checks (`watch-pr.sh`), which run `pull_request`-triggered fu
 green `main` badge can be a subset. *(A future improvement: derive the EXPECTED workflow set
 from the last known-good `main` commit's runs and fail closed until each expected workflow
 has a completed run for the target SHA.)*
+
+**merge.sh's release-guard read (#4670).** Before merging, `merge.sh` lists main's
+non-completed runs per status to look for a `chore(release):` commit's CI. A `total_count` that
+disagrees between pages, or with the records fetched, can be a listing that changed mid-read, so
+it is re-read up to 3 times (2, 4 and 6 s of added backoff); a mismatch that persists across all
+4 reads refuses with exit 2. A failed call, empty output, more than one JSON value, a malformed
+page, record or count, or a `total_count` above 1000 refuses at once, with no retry.
 
 Before local repair, follow SKILL.md's **Main-CI repair ownership** check: inspect ci_watch schedules and episode run IDs, agree one fixer, and settle any existing repair. A scheduled repair is a prompt run on its own branch, not a ci_fix or a direct main push.
 

@@ -34,6 +34,15 @@ check contract '.jobs.propose.steps[-1].env.GH_TOKEN == "${{ secrets.DEVBOX_UPDA
 check contract '.jobs.propose.steps[-1].env.ARTIFACT_TOKEN == "${{ github.token }}"'
 check contract '.on.workflow_dispatch.inputs.dry_run.default == false and (.jobs.propose.if | contains("inputs.dry_run != true"))'
 
+# #3311: the worker relock is the staged, manifest-preserving refresh, never a full
+# `devbox update` (which migrates raw package keys to @latest on Devbox 0.17.5).
+check contract '[.jobs.validate.steps[] | select(.id == "refresh_worker_lock") | .run | (contains("python3 scripts/refresh-worker-lock.py") and (test("(^|\\n)\\s*devbox +update"; "") | not))] == [true]'
+# A failed scheduled refresh surfaces as one tracking issue, from its own job whose
+# token can only write issues and never sees validation or proposal credentials.
+check contract '.jobs.report_failure.permissions == {"issues":"write"} and .jobs.report_failure.needs == ["validate","validate_tools","propose"]'
+check contract '(.jobs.report_failure.if | contains("github.event_name == '\''schedule'\''")) and (.jobs.report_failure.if | startswith("always() &&"))'
+check contract '((.jobs.report_failure | tostring | contains("secrets.")) | not) and ([.jobs.report_failure.steps[] | has("uses")] | any | not) and (.jobs.report_failure.steps | length) == 1'
+
 # If the security split is absent, the structural regression above must fail;
 # never read an absent proposal step as a vacuous behavioral success.
 if ! jq -e '.jobs.propose.steps[-1].run | type == "string"' "$TMP/workflow.json" >/dev/null; then
@@ -158,5 +167,31 @@ check proposal_case dry none
 check proposal_case uxlab-lease lease
 check proposal_case uxlab-bad-sha invalid
 check proposal_case both-bad-uxlab invalid
+report_case() {
+  local mode="$1" dir="$TMP/report-$1" rc=0
+  mkdir -p "$dir/bin"; : > "$dir/calls"
+  jq -r '.jobs.report_failure.steps[-1].run' "$TMP/workflow.json" > "$dir/report.sh"
+  cat > "$dir/bin/gh" <<'STUB'
+#!/bin/bash
+set -eu
+printf 'gh %s\n' "$*" >> "$CALLS"
+case "$1 $2" in
+  'issue list') if [ "$MODE" = existing ]; then echo '[{"number":7,"title":"Weekly devbox toolchain refresh failing"},{"number":9,"title":"Other devbox toolchain issue"}]'; else echo '[{"number":9,"title":"Weekly devbox toolchain refresh failing (old)"}]'; fi ;;
+  'issue comment'|'issue create') ;;
+  *) echo "unexpected gh command: $*" >&2; exit 2 ;;
+esac
+STUB
+  chmod +x "$dir/bin/gh"
+  env -i PATH="$dir/bin:$PATH" MODE="$mode" CALLS="$dir/calls" GH_TOKEN=fixture GH_REPO=example/repo \
+    RUN_URL=https://github.com/example/repo/actions/runs/42 RESULTS='validate=failure validate_tools=success propose=skipped' \
+    bash "$dir/report.sh" > "$dir/out" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  case "$mode" in
+    existing) grep -F 'gh issue comment 7 --body' "$dir/calls" && ! grep -F 'gh issue create' "$dir/calls" ;;
+    fresh) grep -F 'gh issue create --title Weekly devbox toolchain refresh failing --label area::runtime' "$dir/calls" && ! grep -F 'gh issue comment' "$dir/calls" ;;
+  esac
+}
+check report_case existing
+check report_case fresh
 printf 'cases=%s passed=%s\n'  "$cases" "$passed"
-[ "$cases" -eq 39 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -eq 45 ] && [ "$cases" -eq "$passed" ]

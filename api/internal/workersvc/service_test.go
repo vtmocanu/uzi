@@ -54,6 +54,11 @@ type fakeStore struct {
 	reviseErr error
 	// ciFixCandidatesFn overrides ListCIFixBindingCandidates (issue #4079).
 	ciFixCandidatesFn func() ([]int64, error)
+	// selectedRun / selectedRunErr override GetCIAutofixSelectedRun (issue #4617). Unset, the
+	// fake reports a selected run owned by the user GetRepoForUser last saw, with NULL bools.
+	selectedRun    *store.GetCIAutofixSelectedRunRow
+	selectedRunErr error
+	repoUserID     uuid.UUID // captured from GetRepoForUser params
 	Store
 
 	// Claim path.
@@ -1016,12 +1021,6 @@ func (f *fakeStore) SetRunAnthropicSecret(_ context.Context, arg store.SetRunAnt
 	return 1, nil
 }
 
-// GetUserClaudeProviderSource answers "no provider source" (PRD #4320): the override validator
-// reads the owner's source and fails closed on a surface that cannot.
-func (f *fakeStore) GetUserClaudeProviderSource(context.Context, uuid.UUID) (store.GetUserClaudeProviderSourceRow, error) {
-	return store.GetUserClaudeProviderSourceRow{}, nil
-}
-
 // GetUserSecretMetaByIDOfKind mirrors the real kind-SCOPED by-id lookup (PRD #1247 M1):
 // owner-scoped AND kind-scoped, so a foreign id, a missing id, or a wrong-kind id all
 // yield pgx.ErrNoRows (never another tenant's or another kind's row). It reuses the
@@ -1816,8 +1815,19 @@ func (f *fakeStore) RejectRunServerSide(_ context.Context, arg store.RejectRunSe
 	}
 	return 1, nil
 }
-func (f *fakeStore) GetRepoForUser(context.Context, store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {
+func (f *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {
+	f.repoUserID = a.UserID
 	return f.repoRow, f.repoErr
+}
+
+func (f *fakeStore) GetCIAutofixSelectedRun(context.Context, store.GetCIAutofixSelectedRunParams) (store.GetCIAutofixSelectedRunRow, error) {
+	if f.selectedRunErr != nil {
+		return store.GetCIAutofixSelectedRunRow{}, f.selectedRunErr
+	}
+	if f.selectedRun != nil {
+		return *f.selectedRun, nil
+	}
+	return store.GetCIAutofixSelectedRunRow{ID: uuid.New(), UserID: f.repoUserID}, nil
 }
 func (f *fakeStore) RevertProposalToPending(_ context.Context, id uuid.UUID) (int64, error) {
 	f.revertedProposals = append(f.revertedProposals, id)

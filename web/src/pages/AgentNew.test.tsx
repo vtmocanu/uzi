@@ -72,7 +72,7 @@ describe("AgentNew real editor model pins", () => {
     expect((claude as HTMLSelectElement).value).toBe("inherit");
     expect((codex as HTMLSelectElement).value).toBe("inherit");
     expect(within(codex).getAllByRole("option").map((option) => option.textContent)).toEqual([
-      "Default · follows lead", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
+      "Default · follows lead", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna",
     ]);
     expect(within(claude).getByRole("option", { name: "Default · follows lead" })).toBeTruthy();
     const help = screen.getByText("Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.");
@@ -81,7 +81,7 @@ describe("AgentNew real editor model pins", () => {
 
     fireEvent.change(screen.getByPlaceholderText("my-helper"), { target: { value: "lead" } });
     expect(within(claude).getByRole("option", { name: "Default · SDK/account default (built-in)" })).toBeTruthy();
-    expect(within(codex).getByRole("option", { name: "Default · built-in (gpt-6.1-sol)" })).toBeTruthy();
+    expect(within(codex).getByRole("option", { name: "Default · built-in (gpt-6.2-sol)" })).toBeTruthy();
   });
 
   it.each([

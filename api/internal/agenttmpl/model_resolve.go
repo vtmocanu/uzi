@@ -14,7 +14,7 @@ const (
 const (
 	DefaultClaudeJudgeModel = "opus"
 	// Literal, not DefaultCodexModel: a later worker-default change must not move judges (PRD #3245 D1).
-	DefaultCodexJudgeModel = "gpt-6.1-sol"
+	DefaultCodexJudgeModel = "gpt-6.2-sol"
 )
 
 // Built-in run-summary models per harness. fixtures/model-settings/summary.json

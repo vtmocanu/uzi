@@ -326,6 +326,13 @@ type FakeClient struct {
 	MrReworkRun         apitypes.RunDTO
 	SetRunMrReworkErr   error
 
+	// SetRunCIAutofix capture, mirroring the MR-rework fields above: the run id, the
+	// tri-state pointer, the canned result, and a write-specific error.
+	LastCIAutofixRunID   string
+	LastCIAutofixEnabled *bool
+	CIAutofixResult      SetRunCIAutofixResult
+	SetRunCIAutofixErr   error
+
 	// RunRework capture (PRD #1202 M1): LastReworkRunID is the run id `uzi run rework`
 	// targeted; LastReworkGuidance is the guidance it sent (from -m or stdin, "" when
 	// none). ReworkRun is the canned success reply; RunReworkErr wins over the blanket Err
@@ -424,6 +431,11 @@ type FakeClient struct {
 	// SetWeeklyWarningMargin capture (PRD #4123): call count and the margin the command sent.
 	MarginCalls   int
 	LastMarginPts int
+
+	// SharedProviders drives AdminListSharedProviders and AdminGetSharedProvider (PRD #4324); an id
+	// not in the list is an ExitNotFound error, like the server's 404. SharedProviderGets counts gets.
+	SharedProviders    []apitypes.AdminSharedProviderDTO
+	SharedProviderGets int
 
 	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
 	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record

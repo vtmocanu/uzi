@@ -45,7 +45,7 @@ const checkedRounds: PlanCrossCheckRound[] = [
 ];
 
 const checker = {
-  checker_run_id: null, checker_model: "gpt-6.1-sol", checker_effort: "high",
+  checker_run_id: null, checker_model: "gpt-6.2-sol", checker_effort: "high",
   checker_model_source: "worker default", checker_effort_source: "cross-check default",
 } as const;
 

@@ -494,6 +494,7 @@
       },
       "wait_on_limit": true,
       "mr_rework_enabled": true,
+      "ci_autofix_enabled": true,
       "mr_rework_auto_cycles": 1,
       "mr_rework_auto_cap": 1,
       "limit_resets_at": "2020-01-02T03:04:05Z",

@@ -84,7 +84,14 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
   case "\$*" in
     *closingIssuesReferences*)
       [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
-      printf '{"closingIssuesReferences":%s,"title":%s}\n' "\${CLOSES_JSON:-[]}" "\$(jq -n --arg t "\${PR_TITLE:-fix(x): y}" '\$t')"; exit 0 ;;
+      cj_now=\${CLOSES_JSON:-[]}
+      # CLOSES_SEQ_FILE counts metadata reads; from the second read on CLOSES_JSON_LATER is returned.
+      if [ -n "\${CLOSES_SEQ_FILE:-}" ]; then
+        sq=0; [ -f "\$CLOSES_SEQ_FILE" ] && sq=\$(cat "\$CLOSES_SEQ_FILE"); sq=\$((sq+1)); echo "\$sq" > "\$CLOSES_SEQ_FILE"
+        [ "\$sq" -lt 2 ] || cj_now=\${CLOSES_JSON_LATER:-[]}
+      fi
+      [ -z "\${PR_META_JSON:-}" ] || { printf '%s\n' "\$PR_META_JSON"; exit 0; }
+      printf '{"closingIssuesReferences":%s,"title":%s}\n' "\$cj_now" "\$(jq -n --arg t "\${PR_TITLE:-fix(x): y}" '\$t')"; exit 0 ;;
   esac
   case "\$*" in
     *'-q .state'*) printf '%s\n' "\$st" ;;
@@ -118,7 +125,9 @@ if [ "\${1:-}" = api ]; then
       [ "\${BASE_MIG_FAIL:-0}" = 1 ] && exit 1
       printf '%s\n' "\${BASE_MIG_JSON:-[]}"
       exit 0 ;;
-    *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1; printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
+    *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
+      [ -z "\${COMMIT_PAGES_JSON:-}" ] || { printf '%s\n' "\$COMMIT_PAGES_JSON"; exit 0; }
+      printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
     *'/pulls/42 --jq .commits'*) printf '%s\n' "\${COMMIT_COUNT:-\$(printf '%s' "\${COMMITS_JSON:-[]}" | jq length)}"; exit 0 ;;
     *'/protection/required_status_checks'*)
       printf 'HTTP/2.0 %s Test\r\n\r\n' "\${CLASSIC_HTTP:-404}"
@@ -149,12 +158,21 @@ fi
 # main's workflow runs via the Actions API, one paginated query per status: MAIN_RUNS_JSON is
 # the full run list (Actions shape); the stub filters by status and splits it into pages of 2,
 # so a release run past any recency window is still reached. RUNS_FAIL=1 = an unreadable page.
-# MAIN_RUNS_PAGE overrides the raw slurped pages (malformed payloads).
+# MAIN_RUNS_PAGE overrides the raw slurped pages (malformed payloads). Every call, failed ones
+# included, appends its status to runs-calls.log. MAIN_RUNS_SEQ_DIR holds files <status>.<n>:
+# the raw stdout for the n-th call of that status (no file = the generation below).
+# MAIN_RUNS_EMPTY=1 prints nothing and exits 0.
 if [ "\${1:-}" = api ] && case "\$*" in *actions/runs*) true;; *) false;; esac; then
+  st=\$(printf '%s' "\$*" | sed -n 's/.*status=\\([a-z_]*\\).*/\\1/p')
+  echo "\$st" >> "$WORK/runs-calls.log"
   [ "\${RUNS_FAIL:-0}" = 1 ] && { echo 'HTTP 502' >&2; exit 1; }
+  [ "\${MAIN_RUNS_EMPTY:-0}" = 1 ] && exit 0
+  if [ -n "\${MAIN_RUNS_SEQ_DIR:-}" ]; then
+    n=\$(grep -cFx -- "\$st" "$WORK/runs-calls.log" || true)
+    [ -f "\$MAIN_RUNS_SEQ_DIR/\$st.\$n" ] && { cat "\$MAIN_RUNS_SEQ_DIR/\$st.\$n"; exit 0; }
+  fi
   [ -n "\${MAIN_RUNS_PAGE:-}" ] && { printf '%s\n' "\$MAIN_RUNS_PAGE"; exit 0; }
   [ -n "\${MAIN_RUNS_PAGE_FILE:-}" ] && { cat "\$MAIN_RUNS_PAGE_FILE"; exit 0; }
-  st=\$(printf '%s' "\$*" | sed -n 's/.*status=\\([a-z_]*\\).*/\\1/p')
   printf '%s' "\${MAIN_RUNS_JSON:-[]}" | jq -c --arg s "\$st" '[.[]|select(.status==\$s)] as \$r
     | (\$r|length) as \$n | if \$n==0 then [{total_count:0,workflow_runs:[]}] else [range(0; \$n; 2) as \$i | {total_count:\$n,workflow_runs: \$r[\$i:\$i+2]}] end'
   exit 0
@@ -302,7 +320,7 @@ grep -q 'not MERGED' "$WORK/open.out" || fail "--confirm-only OPEN did not repor
 #    skipping-only list refuse; pass+skipping and pass reach the merge.
 MERGE_STATE=OPEN; export MERGE_STATE
 merge_run() { # label -> rc, output in $WORK/m.<label>
-  rm -f "$WORK/merge.log"
+  rm -f "$WORK/merge.log" "$WORK/runs-calls.log"
   set +e
   bash "$SCRIPT" test/repo 42 --no-rework-check ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"} > "$WORK/m.$1" 2>&1
   rc=$?
@@ -745,12 +763,19 @@ MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/codeql.yml 914)]"; export 
 relrefuse relcodeql
 MAIN_RUNS_JSON="[$(prun in_progress .github/workflows/ci.yml 915),$(prun queued .github/workflows/kind-smoke.yml 916)]"; export MAIN_RUNS_JSON
 relrefuse relhalf
+# A tab inside the title must not shift the tab-joined row: the title below would, if split,
+# read as status=in_progress and path=ci.yml (the trailing @ is what running_run_finishes cuts
+# the rest of a split path at), which relrunning shows is allowed. It is a queued run: refuse.
+TABTITLE=$(printf 'chore(release): v0.86.0-rc.30\tin_progress\t.github/workflows/ci.yml@')
+MAIN_RUNS_JSON="[$(jq -nc --arg t "$TABTITLE" '{status:"queued",display_title:$t,head_sha:"5f9145cbaaaa0000",name:"CI",path:".github/workflows/other.yml",id:917}')]"; export MAIN_RUNS_JSON
+relrefuse reltabtitle
 unset WF_BODY_FILE
 unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
 merge_run runsfail
 [ "$rc" -eq 2 ] || fail "an unreadable main run page did not refuse, rc=$rc: $(cat "$WORK/m.runsfail")"
 [ ! -e "$WORK/merge.log" ] || fail "merged with an unreadable main run list"
+[ "$(wc -l < "$WORK/runs-calls.log")" -eq 1 ] || fail "runsfail: a failed gh call was retried: $(cat "$WORK/runs-calls.log")"
 unset RUNS_FAIL
 for bad in '{}' '[]' '[{}]' '[{"total_count":1,"workflow_runs":[{}]}]' '[{"total_count":1,"workflow_runs":[{"status":"queued","display_title":"x","head_sha":"a"}]}]' '[{"total_count":0,"workflow_runs":{}}]' \
     '[{"workflow_runs":[]}]' '[{"total_count":3,"workflow_runs":[]}]' '[{"total_count":1,"workflow_runs":[]},{"total_count":2,"workflow_runs":[]}]'; do
@@ -768,6 +793,82 @@ merge_run capped
 [ "$rc" -eq 2 ] || fail "1,000 of total_count 1001 did not refuse, rc=$rc: $(cat "$WORK/m.capped")"
 [ ! -e "$WORK/merge.log" ] || fail "merged on a capped run listing"
 unset MAIN_RUNS_PAGE_FILE
+# A total_count disagreement can be a listing that changed between page reads: re-read per
+# status (first read + up to 3 re-queries). Hard failures (unreadable, empty, several values,
+# malformed, non-integer or over-cap counts) are never retried. MAIN_RUNS_SEQ_DIR scripts the
+# n-th stdout per status; runs-calls.log records every call.
+runs_calls() { # status -> number of actions/runs calls for it
+  { grep -cFx -- "$1" "$WORK/runs-calls.log" 2>/dev/null || true; }
+}
+runs_total() { wc -l < "$WORK/runs-calls.log" | tr -d ' '; }
+seq_put() { mkdir -p "$WORK/seq"; printf '%s' "$3" > "$WORK/seq/$1.$2"; } # status n raw-stdout
+seq_reset() { rm -rf "$WORK/seq"; mkdir -p "$WORK/seq"; export MAIN_RUNS_SEQ_DIR="$WORK/seq"; }
+ordrun() { jq -nc --argjson id "$1" '{status:"in_progress",display_title:"ordinary",head_sha:"5f9145cbaaaa0000",name:"CI",id:$id}'; }
+EMPTYPG='[{"total_count":0,"workflow_runs":[]}]'
+MISPG="[{\"total_count\":2,\"workflow_runs\":[$(ordrun 1),$(ordrun 2)]},{\"total_count\":3,\"workflow_runs\":[$(ordrun 3)]}]"
+# 1. pages that disagree once, then agree: the guard passes after one re-read
+seq_reset; seq_put in_progress 1 "$MISPG"; seq_put in_progress 2 "$EMPTYPG"
+merge_run retrypages
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "case retrypages: merge stub not reached: $(cat "$WORK/m.retrypages")"
+[ "$(runs_calls in_progress)" -eq 2 ] || fail "case retrypages: in_progress calls $(runs_calls in_progress), want 2"
+grep -qF "main's in_progress run listing changed while paging (total_count mismatch); re-reading (retry 1/3)" "$WORK/m.retrypages" || fail "case retrypages: retry line missing: $(cat "$WORK/m.retrypages")"
+# 2. fewer records than the total, then consistent
+seq_reset; seq_put in_progress 1 "[{\"total_count\":3,\"workflow_runs\":[$(ordrun 1),$(ordrun 2)]},{\"total_count\":3,\"workflow_runs\":[]}]"; seq_put in_progress 2 "$EMPTYPG"
+merge_run retryshort
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "case retryshort: merge stub not reached: $(cat "$WORK/m.retryshort")"
+[ "$(runs_calls in_progress)" -eq 2 ] || fail "case retryshort: in_progress calls $(runs_calls in_progress), want 2"
+# 3. the retry finds a release run in a cancelling workflow
+seq_reset; seq_put in_progress 1 "$MISPG"
+seq_put in_progress 2 "[{\"total_count\":1,\"workflow_runs\":[$(prun in_progress .github/workflows/ci.yml 921)]}]"
+export WF_BODY_FILE="$WF_TRUE"
+merge_run retryrelease
+unset WF_BODY_FILE
+[ "$rc" -eq 10 ] || fail "case retryrelease: release run found on the re-read did not refuse, rc=$rc: $(cat "$WORK/m.retryrelease")"
+[ ! -e "$WORK/merge.log" ] || fail "case retryrelease: merged over a release run seen on the re-read"
+[ "$(runs_calls in_progress)" -eq 2 ] || fail "case retryrelease: in_progress calls $(runs_calls in_progress), want 2"
+# 4. a mismatch on every read refuses after exactly 4 reads
+seq_reset; for n in 1 2 3 4 5; do seq_put in_progress "$n" "$MISPG"; done
+merge_run retrypersist
+[ "$rc" -eq 2 ] || fail "case retrypersist: persistent mismatch rc=$rc: $(cat "$WORK/m.retrypersist")"
+[ ! -e "$WORK/merge.log" ] || fail "case retrypersist: merged on a persistent mismatch"
+[ "$(runs_calls in_progress)" -eq 4 ] || fail "case retrypersist: in_progress calls $(runs_calls in_progress), want 4"
+grep -qF "main's in_progress run listing changed while paging (total_count mismatch); re-reading (retry 3/3)" "$WORK/m.retrypersist" || fail "case retrypersist: retry 3/3 line missing: $(cat "$WORK/m.retrypersist")"
+grep -qF "cannot parse main's in_progress workflow runs (total_count mismatch persisted across 4 reads); not merging" "$WORK/m.retrypersist" || fail "case retrypersist: persistence message missing: $(cat "$WORK/m.retrypersist")"
+# 5. empty stdout with rc 0 is a parse failure, not "no release run" (green-merge setup)
+unset MAIN_RUNS_SEQ_DIR
+# CONFIRM_AFTER_MERGE=1 makes a merge that reaches the merge command confirm as MERGED, so the
+# pre-fix behaviour (no release run found, merge proceeds) exits 0 here instead of 9.
+PRIOR_CAM="${CONFIRM_AFTER_MERGE-__unset__}"; export CONFIRM_AFTER_MERGE=1
+export MAIN_RUNS_EMPTY=1
+merge_run emptyout
+unset MAIN_RUNS_EMPTY
+[ "$rc" -eq 2 ] || fail "case emptyout: empty run listing rc=$rc: $(cat "$WORK/m.emptyout")"
+[ ! -e "$WORK/merge.log" ] || fail "case emptyout: merged on an empty run listing"
+[ "$(runs_total)" -eq 1 ] || fail "case emptyout: calls $(runs_total), want 1"
+grep -qF "cannot parse main's queued workflow runs; not merging" "$WORK/m.emptyout" || fail "case emptyout: parse refusal missing: $(cat "$WORK/m.emptyout")"
+# 6. two concatenated, individually valid page arrays are not one page set
+export MAIN_RUNS_PAGE="${EMPTYPG}${EMPTYPG}"
+merge_run concatpages
+unset MAIN_RUNS_PAGE
+[ "$rc" -eq 2 ] || fail "case concatpages: concatenated page arrays rc=$rc: $(cat "$WORK/m.concatpages")"
+[ ! -e "$WORK/merge.log" ] || fail "case concatpages: merged on concatenated page arrays"
+[ "$(runs_total)" -eq 1 ] || fail "case concatpages: calls $(runs_total), want 1"
+if [ "$PRIOR_CAM" = __unset__ ]; then unset CONFIRM_AFTER_MERGE; else export CONFIRM_AFTER_MERGE="$PRIOR_CAM"; fi
+# Mutation controls: hard failures are never retried (1 call, exit 2, no merge).
+ctl() { # label status-1 raw: exit 2 after exactly one call
+  seq_reset; seq_put queued 1 "$2"
+  merge_run "$1"
+  [ "$rc" -eq 2 ] || fail "control $1: rc=$rc, want 2: $(cat "$WORK/m.$1")"
+  [ ! -e "$WORK/merge.log" ] || fail "control $1: merged"
+  [ "$(runs_total)" -eq 1 ] || fail "control $1: calls $(runs_total), want 1"
+}
+ctl ctlnonarray '[7]'
+ctl ctlbadrec "[{\"total_count\":2,\"workflow_runs\":[{}]},{\"total_count\":3,\"workflow_runs\":[]}]"
+ctl ctlbadpath "[{\"total_count\":2,\"workflow_runs\":[{\"status\":\"queued\",\"display_title\":\"x\",\"head_sha\":\"a\",\"id\":1,\"path\":{}}]},{\"total_count\":3,\"workflow_runs\":[]}]"
+ctl ctlcap "$(cat "$WORK/capped-pages.json")"
+ctl ctlnegative '[{"total_count":-1,"workflow_runs":[]}]'
+ctl ctlfraction '[{"total_count":1.5,"workflow_runs":[]}]'
+unset MAIN_RUNS_SEQ_DIR
 # --expect-closes: GitHub's closingIssuesReferences counts negated prose too (PR #2629's
 # "this PR does not close #1912" closed #1912 on merge). A mismatch refuses before the merge.
 export CLOSES_JSON='[{"number":1912}]'
@@ -941,7 +1042,11 @@ case " $* " in
     fi
     printf '%s\n' "$*" >> "$POLICY_GIT_LOG"
     [ "${POLICY_FETCH_FAIL:-0}" != 1 ] || exit 88 ;;
-  *' diff '*) [ "${POLICY_DIFF_FAIL:-0}" != 1 ] || exit 89 ;;
+  *' diff '*)
+    [ "${POLICY_DIFF_FAIL:-0}" != 1 ] || exit 89
+    # Fails only the fragment listing (its pathspec is changelog.d), not the policy diff.
+    if [ "${POLICY_FRAGMENT_DIFF_FAIL:-0}" = 1 ] && [[ " $* " == *' -- changelog.d '* ]]; then exit 90; fi ;;
+  *' cat-file blob '*) [ "${POLICY_FRAGMENT_BLOB_FAIL:-0}" != 1 ] || exit 91 ;;
 esac
 exec "$REAL_GIT" -c core.fsmonitor=false -c "url.${POLICY_REMOTE}.insteadOf=https://github.com/vtmocanu/uzi.git" "$@"
 STUB
@@ -949,13 +1054,30 @@ cat > "$WORK/policy-bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$POLICY_GH_LOG"
+# POLICY_BASE_REF serves another base branch (its rules answer as main's); POLICY_BASE_JSON
+# sets a raw baseRefName value (a non-string).
+args=()
+for a in "$@"; do
+  if [ -n "${POLICY_BASE_REF:-}" ] && [[ "$a" == */rules/branches/"$POLICY_BASE_REF" ]]; then a=${a%/*}/main; fi
+  args+=("$a")
+done
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ] && [[ "$*" == *headRefOid* ]]; then
-  "$POLICY_BASE_GH" "$@" | jq --arg h "$POLICY_HEAD" '.headRefOid=$h'
+  "$POLICY_BASE_GH" "${args[@]}" | jq --arg h "$POLICY_HEAD" --argjson b "${POLICY_BASE_JSON:-null}" --arg r "${POLICY_BASE_REF:-}" \
+    '.headRefOid=$h | if $b != null then .baseRefName=$b elif $r != "" then .baseRefName=$r else . end'
 else
-  exec "$POLICY_BASE_GH" "$@"
+  exec "$POLICY_BASE_GH" "${args[@]}"
 fi
 STUB
-chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh"
+REAL_GREP=$(command -v grep); export REAL_GREP
+cat > "$WORK/policy-bin/grep" <<'STUB'
+#!/usr/bin/env bash
+# POLICY_FRAGMENT_GREP_FAIL fails only the fragment path filter (its uuid pattern), as a grep error.
+if [ "${POLICY_FRAGMENT_GREP_FAIL:-0}" = 1 ]; then
+  for a in "$@"; do case "$a" in *'changelog\.d/[0-9a-f]{8}'*) exit 2 ;; esac; done
+fi
+exec "$REAL_GREP" "$@"
+STUB
+chmod +x "$WORK/policy-bin/git" "$WORK/policy-bin/gh" "$WORK/policy-bin/grep"
 export PATH="$WORK/policy-bin:$PATH" CONFIRM_AFTER_MERGE=1 MERGE_STATE=OPEN
 export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]' CHECKS_RC=0
 export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
@@ -1089,7 +1211,167 @@ set -e
 [ "$(wc -l < "$POLICY_GIT_LOG")" = "$fetches_before" ] || fail 'confirm-only fetched policy after an out-of-band merge'
 unset POLICY_FETCH_FAIL
 [ -s "$POLICY_GIT_LOG" ] || fail 'policy freshness never fetched under the merge lock'
-echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips'
+
+# Changelog fragment citation guard (#4669): two or more fragments added by the PR need one
+# headline citing the PR number or a same-repo issue the merge closes. PR is #42.
+export MERGE_STATE=OPEN
+pol_reset() {
+  unset CLOSES_JSON CLOSES_JSON_LATER CLOSES_SEQ_FILE CLOSES_FAIL COMMITS_JSON COMMIT_COUNT COMMIT_PAGES_JSON PR_META_JSON \
+    PR_TITLE FRAG_DESC POLICY_BASE_REF POLICY_BASE_JSON POLICY_FRAGMENT_DIFF_FAIL POLICY_FRAGMENT_BLOB_FAIL POLICY_FRAGMENT_GREP_FAIL
+  MERGE_ARGS=()
+}
+pol_commits() { # [message of the first commit]: a stub commit list matching the topic branch
+  local n; n=$(git -C "$POLICY_ROOT" rev-list --count main..HEAD)
+  COMMITS_JSON=$(jq -cn --argjson n "$n" --arg m "${1:-docs: fixture}" '[range(0;$n) | {commit:{message:(if . == 0 then $m else "docs: fixture" end)}}]')
+  COMMIT_COUNT=$n; export COMMITS_JSON COMMIT_COUNT
+}
+pol_pr() { # branch, then N=headline per fragment (one commit each); none = a docs-only commit
+  local name=$1 spec n; shift
+  git -C "$POLICY_ROOT" checkout -q -B "$name" main
+  mkdir -p "$POLICY_ROOT/changelog.d"
+  for spec in "$@"; do
+    n=${spec%%=*}
+    printf '### Fixed\n\n- **%s**\n  %s\n' "${spec#*=}" "${FRAG_DESC:-Description line.}" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+    git -C "$POLICY_ROOT" add changelog.d
+    git -C "$POLICY_ROOT" commit -qm "docs: fragment $n"
+  done
+  if [ "$#" -eq 0 ]; then printf '%s\n' "$name" > "$POLICY_ROOT/api/doc.md"; git -C "$POLICY_ROOT" commit -qam 'docs: no fragment'; fi
+  POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD
+  pol_commits
+}
+pol_want() { # label, rc, 1 = merged | 0 = not merged
+  [ "$rc" -eq "$2" ] || fail "fragment guard $1: want rc $2, got $rc: $(cat "$WORK/policy.out")"
+  if [ "$3" = 1 ]; then
+    [ -s "$WORK/merge.log" ] || fail "fragment guard $1: did not merge: $(cat "$WORK/policy.out")"
+  else
+    [ ! -e "$WORK/merge.log" ] || fail "fragment guard $1: reached the forge merge"
+  fi
+}
+pol_same_repo() { printf '[{"number":%s,"repository":{"owner":{"login":"vtmocanu"},"name":"uzi"}}]' "$1"; }
+F1=$(printf 'changelog.d/%08x-1111-4111-8111-%012x.md' 1 1); F2=$(printf 'changelog.d/%08x-1111-4111-8111-%012x.md' 2 2)
+
+# 1. Regression: two fragments citing only the issue, nothing closed, no PR number.
+pol_reset; pol_pr frag-1 '1=Fix a (#4626).' '2=Fix b (#4626).'
+policy_run; pol_want uncited 15 0
+grep -qF "$F1" "$WORK/policy.out" && grep -qF "$F2" "$WORK/policy.out" || fail "uncited refusal omitted a fragment path: $(cat "$WORK/policy.out")"
+grep -qF 'CHANGELOG_FRAGMENTS_UNCITED' "$WORK/policy.out" || fail 'uncited refusal lacks its marker'
+grep -qF 'add the PR number to one headline' "$WORK/policy.out" || grep -qF 'Add the PR number to one headline' "$WORK/policy.out" || fail 'uncited refusal lacks the fix'
+grep -qF '(#<issue>, #42)' "$WORK/policy.out" || fail 'uncited refusal lacks the example'
+# 2./3. The PR number, bare or as this repository's owner/repo#N, in any one headline.
+for cite in '(#4626, #42)' 'vtmocanu/uzi#42' 'Vtmocanu/Uzi#42' '(#042)' '#42.' '[#42]'; do
+  pol_reset; pol_pr frag-2 "1=Fix a $cite" '2=Fix b (#4626).'
+  policy_run; pol_want "cite $cite" 0 1
+done
+# 4. A same-repo issue the merge closes (body reference or commit-message keyword) counts.
+pol_reset; pol_pr frag-4 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_JSON; CLOSES_JSON=$(pol_same_repo 4626)
+policy_run vtmocanu/uzi --expect-closes 4626; pol_want 'closed same-repo issue' 0 1
+pol_reset; pol_pr frag-4b '1=Fix a (#4626).' '2=Fix b (#4626).'; pol_commits 'fix(x): y
+
+Closes #4626'
+policy_run vtmocanu/uzi --expect-closes 4626; pol_want 'closed by a commit keyword' 0 1
+# 5. Another repository's reference never counts, as a citation or as a closing reference.
+pol_reset; pol_pr frag-5 '1=Fix a (other/repo#42).' '2=Fix b (#4626).'
+policy_run; pol_want 'foreign cite' 15 0
+pol_reset; pol_pr frag-5b '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_JSON; CLOSES_JSON=$(pol_same_repo 4626 | sed 's/"vtmocanu"/"other"/; s/"uzi"/"repo"/')
+policy_run; pol_want 'foreign closing reference' 15 0
+# 6. Whole references only.
+for cite in '#420' '#42suffix' '#42_name' '#42é' 'café#42' 'abc#42' 'a/b/vtmocanu/uzi#42' '#46260'; do
+  pol_reset; pol_pr frag-6 "1=Fix a ($cite)." '2=Fix b (#9999).'
+  if [ "$cite" = '#46260' ]; then export CLOSES_JSON; CLOSES_JSON=$(pol_same_repo 4626); fi
+  policy_run; pol_want "partial cite $cite" 15 0
+done
+# 7. Only the headline counts, not the description.
+pol_reset; FRAG_DESC='Related to #42.' pol_pr frag-7 '1=Fix a (#4626).' '2=Fix b (#4626).'
+policy_run; pol_want 'description-only cite' 15 0
+# 8. Zero or one fragment is never checked.
+pol_reset; pol_pr frag-8 '1=Fix a (#4626).'
+policy_run; pol_want 'one fragment' 0 1
+pol_reset; pol_pr frag-8b
+policy_run; pol_want 'no fragment' 0 1
+# 9. Fragments that main gained after the branch point are not the PR's.
+pol_reset; pol_pr frag-9
+git -C "$POLICY_ROOT" checkout -q main
+for n in 3 4; do
+  printf '### Fixed\n\n- **Main fix %s (#4626).**\n  Description line.\n' "$n" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+done
+git -C "$POLICY_ROOT" add changelog.d; git -C "$POLICY_ROOT" commit -qm 'docs: main fragments'; git -C "$POLICY_ROOT" push -q origin main
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse frag-9); export POLICY_HEAD
+policy_run; pol_want 'fragments added on main' 0 1
+# 10. Other repositories and other base branches are out of scope.
+pol_reset; pol_pr frag-10 '1=Fix a (#4626).' '2=Fix b (#4626).'
+policy_run vtmocanu/other; pol_want 'another repository' 0 1
+export POLICY_BASE_REF=release
+policy_run; pol_want 'non-main base' 0 1
+# 11. An unreadable fragment list or blob refuses.
+pol_reset; pol_pr frag-11 '1=Fix a (#42).' '2=Fix b (#4626).'
+export POLICY_FRAGMENT_DIFF_FAIL=1; policy_run; pol_want 'fragment list unreadable' 2 0
+unset POLICY_FRAGMENT_DIFF_FAIL
+export POLICY_FRAGMENT_BLOB_FAIL=1; policy_run; pol_want 'fragment blob unreadable' 2 0
+unset POLICY_FRAGMENT_BLOB_FAIL
+export POLICY_FRAGMENT_GREP_FAIL=1; policy_run; pol_want 'fragment filter failed' 2 0
+grep -qF 'cannot filter the changelog fragments' "$WORK/policy.out" || fail "fragment filter failure: wrong refusal: $(cat "$WORK/policy.out")"
+unset POLICY_FRAGMENT_GREP_FAIL
+# 12. Unreadable closing metadata refuses, cited or not.
+export CLOSES_FAIL=1
+policy_run; pol_want 'closes unreadable, cited' 2 0
+pol_reset; pol_pr frag-12 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_FAIL=1
+policy_run; pol_want 'closes unreadable, uncited' 2 0
+# 13./14. Metadata the lenient CLOSES= read tolerates is incomplete for the guard (even when
+# the PR is cited), while a one-fragment PR keeps the lenient behaviour.
+pol_fixture() { # name -> exports that fixture's environment (after pol_reset)
+  case "$1" in
+    a) export COMMITS_JSON='[{}]' COMMIT_COUNT=1 ;;
+    b) export COMMITS_JSON='[{"commit":{"message":null}}]' COMMIT_COUNT=1 ;;
+    c) export PR_META_JSON='{"closingIssuesReferences":[],"title":null}' ;;
+    d) export COMMIT_PAGES_JSON='[null,[{"commit":{"message":"x"}}]]' COMMIT_COUNT=1 ;;
+    e) export CLOSES_JSON='[{"number":4626}]' ;;
+    f) export COMMIT_PAGES_JSON='[[]]' COMMIT_COUNT=0 ;;
+    g) export COMMIT_PAGES_JSON='[[{"commit":{"message":"x"}}]] {"extra":1}' COMMIT_COUNT=1 ;;
+  esac
+}
+for fx in a b c d e f g; do
+  cite='(#42)'; [ "$fx" = e ] && cite='(#4626)'
+  pol_reset; pol_pr "frag-13$fx" "1=Fix a $cite." "2=Fix b $cite."; pol_fixture "$fx"
+  policy_run; pol_want "incomplete metadata $fx" 2 0
+  grep -qF 'closing metadata incomplete for the changelog fragment check' "$WORK/policy.out" || fail "incomplete metadata $fx: wrong refusal: $(cat "$WORK/policy.out")"
+  want=none; [ "$fx" = e ] && want=4626
+  pol_reset; pol_pr "frag-14$fx" "1=Fix a $cite."; pol_fixture "$fx"
+  policy_run vtmocanu/uzi --expect-closes "$want"; pol_want "one fragment $fx with flag" 0 1
+  grep -qxF "CLOSES=$want" "$WORK/policy.out" || fail "one fragment $fx: CLOSES= line changed: $(cat "$WORK/policy.out")"
+  policy_run; pol_want "one fragment $fx without flag" 0 1
+  grep -qxF "CLOSES=$want" "$WORK/policy.out" || fail "one fragment $fx without flag: CLOSES= line changed: $(cat "$WORK/policy.out")"
+done
+# 15. A non-string base is no base: refused before any merge.
+pol_reset; pol_pr frag-15 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export POLICY_BASE_JSON=true; policy_run; pol_want 'non-string base' 2 0
+# The old `jq -r` read stringified it ("of true"); the new read has no base at all.
+grep -qF 'cannot read the required checks of the base branch' "$WORK/policy.out" \
+  || fail "non-string base was read as a branch name: $(cat "$WORK/policy.out")"
+# 15b. Only added changelog.d/<uuid>.md paths count: a new README.md beside one fragment is one.
+pol_reset; pol_pr frag-17 '1=Fix a (#4626).'
+printf 'notes\n' > "$POLICY_ROOT/changelog.d/README.md"
+git -C "$POLICY_ROOT" add changelog.d; git -C "$POLICY_ROOT" commit -qm 'docs: changelog readme'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
+policy_run; pol_want 'non-uuid added path' 0 1
+# 15c. Editing two inherited fragments (main's 3 and 4 from case 9) adds none.
+pol_reset; git -C "$POLICY_ROOT" checkout -q -B frag-18 main
+for n in 3 4; do
+  printf '### Fixed\n\n- **Main fix %s reworded (#4626).**\n  Description line.\n' "$n" > "$POLICY_ROOT/changelog.d/$(printf '%08x-1111-4111-8111-%012x' "$n" "$n").md"
+done
+git -C "$POLICY_ROOT" commit -qam 'docs: reword inherited fragments'
+POLICY_HEAD=$(git -C "$POLICY_ROOT" rev-parse HEAD); export POLICY_HEAD; pol_commits
+policy_run; pol_want 'modified inherited fragments' 0 1
+# 16. One captured read: a later forge answer cannot change the guard's closing set.
+pol_reset; pol_pr frag-16 '1=Fix a (#4626).' '2=Fix b (#4626).'
+export CLOSES_SEQ_FILE="$WORK/closes-seq" CLOSES_JSON='[]' CLOSES_JSON_LATER; CLOSES_JSON_LATER=$(pol_same_repo 4626)
+rm -f "$CLOSES_SEQ_FILE"
+policy_run vtmocanu/uzi --expect-closes none; pol_want 'single closing read' 15 0
+[ "$(cat "$CLOSES_SEQ_FILE")" = 1 ] || fail "closing metadata read $(cat "$CLOSES_SEQ_FILE") times, want 1"
+pol_reset
+echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips; fragment guard refuses uncited multi-fragment PRs (15) and incomplete metadata (2), counting only added <uuid>.md fragments'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless it is already running in a no-cancel workflow (#4107) or its tag is on origin and coverage holds without it; a run-listing total_count mismatch is re-read up to 3 times while empty, malformed or unreadable listings refuse without retry; --expect-closes refuses a closing-reference mismatch"

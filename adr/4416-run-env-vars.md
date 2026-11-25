@@ -85,8 +85,11 @@ caught beyond the PRD list:
   `AWS_ENDPOINT_URL_SSO_OIDC` (`network_wiring`), by exact name: the global AWS endpoint override
   also routes Bedrock traffic. The STS, SSO and SSO OIDC names override the endpoints of the AWS
   credential exchange that the Bedrock harness's AWS SDK credential chain can use; they are denied
-  for consistency with `AWS_ENDPOINT_URL`. The other per-service names
-  (for example `AWS_ENDPOINT_URL_S3`) stay allowed. Names are checked on write only, so a stored
+  for consistency with `AWS_ENDPOINT_URL`. Merging main (#4649, Codex 0.171.0) added the
+  broader `AWS_ENDPOINT_URL_` prefix, so every per-service name, including `AWS_ENDPOINT_URL_S3`,
+  is now denied; the narrower BEDROCK prefix and the STS and SSO names stay as redundant,
+  documented entries. It also added the names `SPIFFE_ENDPOINT_SOCKET` (`provider_auth`),
+  `SSH2_CLIENT` (`git_authority`) and `OTEL_RESOURCE_ATTRIBUTES` (`harness_control`). Names are checked on write only, so a stored
   variable whose name a later rule denies is dropped at injection by a worker that has the rule,
   with a run event naming the rule.
 

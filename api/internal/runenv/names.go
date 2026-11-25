@@ -209,6 +209,9 @@ var deniedNames = []deniedRule{
 	{"VSCODE_INSPECTOR_OPTIONS", "harness_control", "TypeScript debug-mode selector read by the bundled Claude CLI"},
 	{"SYSTEMDRIVE", "managed_dirs", "system directory selection (uppercase spelling of the Windows SystemDrive)"},
 	{"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "provider_auth", "makes the Claude CLI treat the worker-set gateway as the first-party Anthropic API"},
+	{"SPIFFE_ENDPOINT_SOCKET", "provider_auth", "workload identity endpoint Codex reads to obtain provider credentials"},
+	{"SSH2_CLIENT", "git_authority", "its presence changes Codex network proxy credential brokerage"},
+	{"OTEL_RESOURCE_ATTRIBUTES", "harness_control", "telemetry resource attributes and statusline collector eligibility in Codex"},
 }
 
 // deniedPrefixes are name prefixes reserved for the worker and the agent harnesses.
@@ -248,6 +251,7 @@ var deniedPrefixes = []deniedRule{
 	{"OTEL_EXPORTER_OTLP_", "network_wiring", "telemetry exporter endpoints and headers the harness reads"},
 	{"GCE_METADATA_", "network_wiring", "metadata server address the harness's Google auth reads"},
 	{"AWS_ENDPOINT_URL_BEDROCK", "network_wiring", "Bedrock endpoint the harness reads; covers AWS_ENDPOINT_URL_BEDROCK_RUNTIME"},
+	{"AWS_ENDPOINT_URL_", "network_wiring", "AWS per-service endpoint overrides (Codex 0.171.0 reserves the whole family); also covers the more specific AWS_ENDPOINT_URL_BEDROCK prefix and the STS and SSO names above, which stay for their documented rationale"},
 }
 
 // deniedSuffixes are name suffixes that change network routing.

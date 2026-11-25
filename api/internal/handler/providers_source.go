@@ -83,7 +83,7 @@ func quoteModel(m string) string { return "\"" + m + "\"" }
 
 // SetMyClaudeProviderSource is PUT /api/me/providers/claude-source: it selects (or, with null,
 // clears) the caller's Claude model-provider source. The selection is refused unless the provider
-// is the caller's, not retired, its current base URL is on the operator allowlist and it has an
+// is visible to the caller (their own, or an admin-shared definition), not retired, its current base URL is on the operator allowlist and it has an
 // enabled key (409 provider_source_unusable); a foreign or unknown provider is a 404. It runs under
 // the per-user secret-mutation lock and applies the SAME usability rules run creation does
 // (workersvc.ResolveProviderSource), by writing the selection and reading it back in the one
@@ -131,13 +131,23 @@ func (h *Handler) setMyProviderSource(w http.ResponseWriter, r *http.Request, en
 			_, err := q.SetUserProviderSource(r.Context(), store.SetUserProviderSourceParams{Engine: engine, ID: user.ID})
 			return err
 		}
-		// An unknown or foreign provider violates the composite (owner, provider) foreign key.
-		if profile, err := q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: *want, OwnerUserID: user.ID}); err != nil {
+		// Freeze fence: the definition's row FOR SHARE (visible to the caller: their own, or a shared
+		// one) is taken after the per-user secret lock and before the usability recheck, the same
+		// order run creation uses, so an admin retire or model-map edit waits for this transaction
+		// and a retire that committed first reads as unusable below.
+		if _, err := q.LockModelProviderForShare(r.Context(), store.LockModelProviderForShareParams{ID: *want, OwnerUserID: user.ID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return errProviderNotFound
+			}
+			return err
+		}
+		if profile, err := q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: *want, UserID: user.ID}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return errProviderNotFound
 			}
 			return err
 		} else if profile.Engine != engine {
+			// Includes a shared definition on /codex-source: a shared definition is Claude only.
 			return errProviderNotFound
 		}
 		if _, err := q.SetUserProviderSource(r.Context(), store.SetUserProviderSourceParams{
@@ -157,6 +167,10 @@ func (h *Handler) setMyProviderSource(w http.ResponseWriter, r *http.Request, en
 		case errors.As(err, &unusable):
 			httpx.ErrorReason(w, http.StatusConflict,
 				providerSourceUnusableMessagePrefix+providerSourceReasonText(unusable.Reason), reasonProviderSourceUnusable)
+		case isPGForeignKeyViolation(err, "users_claude_provider_fkey"), isPGForeignKeyViolation(err, "users_codex_provider_fkey"):
+			// Defensive backstop: the share lock blocks a delete, and a delete that committed first
+			// yields no row (404 above), so this only fires if the provider is unusable by the caller.
+			writeProviderError(w, errProviderNotFound)
 		case writeProviderError(w, err):
 		default:
 			internalProviderError(w, "set provider source", err)

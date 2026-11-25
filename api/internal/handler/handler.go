@@ -1149,6 +1149,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Owner-scoped in SQL (foreign run → 404); no status guard (D2). Guarded
 				// against a cookie-only mis-mount by a router-level auth test.
 				r.Put("/{id}/mr-rework", h.SetRunMrReworkEnabled)
+				// Issue #4617: the per-run CI-autofix override (tri-state). RequireUser so a uzc_
+				// Bearer reaches it; owner-scoped in SQL, no limiter (no forge read).
+				r.Put("/{id}/ci-autofix", h.SetRunCIAutofixEnabled)
 				// On-demand MR rework past the automatic cap (PRD #1202). RequireUser (NOT the
 				// cookie-only RequireAuth group) so the `uzi run rework` CLI verb reaches it
 				// from a uzc_ Bearer, mirroring the mr-rework toggle above; behind the per-user

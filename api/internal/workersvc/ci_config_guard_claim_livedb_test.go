@@ -127,7 +127,7 @@ func TestCIConfigGuardClaimGateLiveDB(t *testing.T) {
 				tc.setup(f, run)
 				old = f.guardWorker(t, 0)
 			} else {
-				old = f.guardWorker(t, 0, capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+				old = f.guardWorker(t, 0, capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3,
 					capability.RecoveryArchiveV1, capability.CrossCheckV1, capability.JobRunnerV1)
 			}
 			f.refuseClaim(t, old, run, "worker without ci_config_guard_v1")

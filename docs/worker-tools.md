@@ -128,13 +128,39 @@ Go currently uses an immutable nixpkgs channel ref because the Devbox index
 lags its required patch release. Updating that pin is deliberate: evaluate
 `go_1_27.version` and its Linux output at the new ref, record their exact
 version/output metadata in the lock, and verify the output is cached. The
-weekly refresh rejects manifest rewrites and reuses metadata only when the
-complete resolved Go ref is unchanged. Renovate proposes monthly channel digest updates
+weekly refresh preserves this explicit pin and its evaluated metadata. Renovate proposes monthly channel digest updates
 to the manifest and guard map together; those PRs remain red until a maintainer
 regenerates the lock key and its evaluated version/output metadata.
-Devbox 0.17.5 currently rewrites the key-less gcc entry, so the weekly refresh
-knowingly fails at this guard until a separate refresh redesign lands. It must
-not publish a mismatched lock while that work is pending.
+
+Weekly maintenance runs `scripts/refresh-worker-lock.py` with the pinned Devbox
+version. It copies the manifest and lock to an isolated project and updates only
+Devbox's stdenv input (`devbox update nixpkgs --no-install`). Two selected-raw-package
+updates with `--no-install` resolve the refreshed output paths. Each pass preserves
+one existing `source: nixpkg` entry while invalidating the other raw entries; the
+second pass refreshes the original preserved entry. This avoids the legacy-key
+migration without updating explicit pins or implementing a separate Nix resolver.
+A normal full `devbox update` can migrate raw keys to devbox-search `@latest` entries
+(observed on Devbox 0.17.5) and is intentionally avoided. This two-pass method is the
+path proven on Devbox 0.17.5 on Linux; rerun that proof when Devbox is bumped. A failed
+scheduled refresh opens or comments on one `Weekly devbox toolchain refresh failing`
+tracking issue.
+
+The helper requires the manifest to remain byte-identical and validates the
+complete lock and module Go requirements. It then checks every selected output
+and its dependency closure against the remote `https://cache.nixos.org` store,
+even if an output already exists locally. Uncached outputs or an unavailable cache
+fail closed with a retry-next-week result before package installation. Only a
+cache-covered closure proceeds to `devbox install --tidy-lockfile`; the output
+paths must remain unchanged afterward. Realization can require substantial cache
+downloads, so the complete refresh is not offline.
+
+Only then does it atomically replace the original lock. A failed or partial
+attempt leaves both original inputs intact. The read-only
+workflow then builds the image; only its hash-bound, validated lock artifact can
+reach the separate write-capable proposal job. Review all package version changes
+before landing. The monthly Go revision and weekly stdenv revision can differ,
+adding a second nixpkgs closure; compare closure counts and both image sizes when
+upgrading, rather than assuming a size reduction will persist.
 
 Both images bake the sha-verified sqlc archive at `/usr/local/share/uzi-sqlc`.
 Linux amd64 and arm64 use separate upstream archive hashes at the same version.

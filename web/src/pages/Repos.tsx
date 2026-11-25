@@ -1556,7 +1556,7 @@ export function Repos() {
                         </p>
                         <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
                           <span className="rounded border border-edge px-1.5 py-0.5">root CLAUDE.md</span>
-                          <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">lead only</span>
+                          <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">lead (+ plan checker with its consent)</span>
                           <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">@-imports stripped</span>
                           <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">cannot override guardrails</span>
                           <span className="rounded border border-edge px-1.5 py-0.5">64 KB cap</span>
@@ -1678,24 +1678,27 @@ export function Repos() {
                 <div className="flex items-start gap-3 rounded-md border border-edge bg-raised p-3">
                   <div className="min-w-0 flex-1 space-y-2">
                     <p id="cross-check-claudemd" className="text-sm font-semibold text-fg">
-                      Give the checker this repository&rsquo;s CLAUDE.md (read from the base commit)
+                      Give the cross-checkers this repository&rsquo;s CLAUDE.md
                     </p>
                     <p className="text-sm text-muted">
-                      The checker reads the root{" "}
-                      <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> as it was
-                      at the run&rsquo;s merge base with the default branch, so a run cannot write the instructions it is
-                      checked against. This is separate from the lead&rsquo;s
-                      Repo instructions setting.
+                      Code checks read the root{" "}
+                      <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> at a freshly
+                      fetched default-branch tip, so a run cannot write the instructions it is checked against; their
+                      consent is frozen when the check is created. Plan checks read it at the plan&rsquo;s frozen base
+                      commit, and only when the lead&rsquo;s Repo instructions setting is also on. Plan-check consent is
+                      read when the checker starts, so a change here also affects a plan check still waiting to start.
+                      On a resumed branch that commit can include the run&rsquo;s own earlier changes.
                     </p>
                     <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
                       <span className="rounded border border-edge px-1.5 py-0.5">root CLAUDE.md</span>
-                      <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">base commit, not the run&rsquo;s head</span>
+                      <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">code: default-branch tip</span>
+                      <span className="rounded border border-edge px-1.5 py-0.5">plan: frozen base commit</span>
                       <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">@-imports stripped</span>
                       <span className="rounded border border-edge px-1.5 py-0.5">64 KB cap</span>
                     </div>
                   </div>
                   <Toggle
-                    label="Give the checker this repository's CLAUDE.md (read from the base commit)"
+                    label="Give the cross-checkers this repository's CLAUDE.md"
                     checked={checkerClaudemdDraft}
                     disabled={crossCheckBusy}
                     onChange={(next) => {
@@ -1719,7 +1722,7 @@ export function Repos() {
                     Close
                   </Button>
                   <span role="status" className="text-xs text-ok">
-                    {crossCheckSaved ? "Saved. New code cross-checks use these settings." : ""}
+                    {crossCheckSaved ? "Saved. New code cross-checks use these settings; plan cross-checks read the CLAUDE.md setting when their checker starts." : ""}
                   </span>
                 </div>
               </div>

@@ -19,7 +19,7 @@ func (fx *reserveFix) leadParkRun(tok uuid.UUID) (uuid.UUID, store.Worker) {
 	run := fx.pauseRun(pauseRun{cred: &tok, completed: 1})
 	fx.env.exec(`UPDATE runs SET claim_generation = 1, milestones_completed = '["m1"]'::jsonb, auto_approve = true, plan_md = 'plan', budget_wall_seconds = 86400 WHERE id = $1`, run)
 	fx.env.exec(`UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, fx.workerID,
-		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.ParkRunV1})
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.ParkRunV1})
 	if n := fx.pass(); n < 1 {
 		fx.t.Fatal("the sweeper filed no reserve request")
 	}

@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { parse } from "smol-toml";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { after, before, describe, it } from "node:test";
@@ -334,6 +335,9 @@ describe("no native MCP servers are configured", () => {
           const config = parse(builder === "production" ? buildCodexProductionConfigToml(opts)
             : buildCodexLoopbackTestConfigToml(opts, "http://127.0.0.1:43123/v1"));
           assertNoNativeServers(config);
+          assert.equal(config.model, opts.model);
+          assertNoTtlOverrides(opts, "production/loopback options");
+          assertNoTtlOverrides(config, `${builder}/${authMode}/host=${codeModeHost} emitted TOML`);
           assert.equal((config.features as Record<string, unknown>).goals, false);
         });
       }
@@ -341,6 +345,9 @@ describe("no native MCP servers are configured", () => {
   }
   it("custom provider semantic no-server config", () => {
     const config = parse(buildCodexConfigToml(OPTS));
+    assert.equal(config.model, OPTS.model);
+    assertNoTtlOverrides(OPTS, "generic options");
+    assertNoTtlOverrides(config, "generic emitted TOML");
     assertNoNativeServers(config);
     assert.equal((config.features as Record<string, unknown>).goals, false);
   });
@@ -357,5 +364,45 @@ describe("no native MCP servers are configured", () => {
       { "'mcp_servers'.fixture": {} },
     ]) assert.throws(() => assertNoNativeServers(config), /no native MCP servers/);
     assertNoNativeServers({ model: "mcp_servers", projects: { "/work/repo": { trust_level: "untrusted" } } });
+  });
+});
+
+
+describe("no TTL overrides: structured construction invariant", () => {
+  it("rejects direct, nested, dotted and quoted TTL fields regardless of value", () => {
+    for (const field of [
+      { prompt_cache_ttl: null }, { prompt_cache_retention: "12h" },
+      { config: { prompt_cache_options: { ttl: "12h" } } },
+      { config: { prompt_cache_breakpoint: { ttl: false } } },
+      { "config.prompt_cache_options.ttl": "12h" },
+      { config: { '"prompt_cache_breakpoint"."ttl"': "12h" } },
+      { "'prompt_cache_ttl'": undefined },
+      { config: [{ "prompt_cache_retention": 0 }] },
+      parse('[config.prompt_cache_options]\nttl = "12h"'),
+      parse('"prompt_cache_breakpoint.ttl" = "12h"'),
+    ]) assert.throws(() => assertNoTtlOverrides(field, "helper control"), /helper control: no TTL overrides/);
+  });
+
+  it("ignores prompt string values and permits cache identity without a TTL", () => {
+    assertNoTtlOverrides({
+      model: "gpt-6-astra", prompt_cache_key: "identity",
+      input: [{ type: "text", text: 'prompt_cache_ttl = "12h"; prompt_cache_options.ttl; prompt_cache_retention' }],
+      developerInstructions: "prompt_cache_breakpoint.ttl",
+      config: { projects: { "/work/repo": { trust_level: "untrusted" } }, prompt_cache_options: {} },
+    }, "harmless prompt strings");
+    for (const value of [undefined, null, "prompt_cache_ttl", []]) {
+      assert.throws(() => assertNoTtlOverrides(value, "invalid root"), /structured construction/);
+    }
+  });
+
+  it("production options reject unsupported TTL injection without widening the whitelist", () => {
+    for (const injection of [
+      { prompt_cache_ttl: "12h" }, { prompt_cache_retention: "12h" },
+      { prompt_cache_options: { ttl: "12h" } }, { prompt_cache_breakpoint: { ttl: "12h" } },
+    ]) {
+      assert.throws(() => buildCodexProductionConfigToml({
+        model: "gpt-6-astra", projectPath: "/work/repo", authMode: "api_key", ...injection,
+      } as never), /unsupported option/);
+    }
   });
 });

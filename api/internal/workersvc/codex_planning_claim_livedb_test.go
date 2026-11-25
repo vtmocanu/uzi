@@ -27,7 +27,7 @@ func codexPlanningFixture(t *testing.T) (*isoFix, codexRunFixture) {
 }
 
 func codexPlanningCaps(extra ...string) []string {
-	return append([]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CompletionInterlockV1}, extra...)
+	return append([]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CompletionInterlockV1}, extra...)
 }
 
 func insertCodexPlanningRun(t *testing.T, f *isoFix, cf codexRunFixture, kind string) uuid.UUID {

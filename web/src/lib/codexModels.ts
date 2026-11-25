@@ -5,7 +5,7 @@
 
 // The curated Codex models: the worker, picker, run and judge vocabulary. Order is
 // the picker's display order (the fixture is sorted; the test compares sorted).
-export const CODEX_CURATED_MODELS: readonly string[] = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"];
+export const CODEX_CURATED_MODELS: readonly string[] = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"];
 
 // The Codex role models: the curated set plus uzi's private advice model gpt-6-luna.
 // No Claude lane accepts any of these (the server's Claude-lane guard).

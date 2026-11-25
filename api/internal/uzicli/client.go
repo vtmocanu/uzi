@@ -173,6 +173,11 @@ type Client interface {
 	// null`). No status guard: editable on a completed run for as long as its MR is open. A
 	// foreign/absent run is 404 → 4.
 	SetRunMrRework(ctx context.Context, id string, enabled *bool) (apitypes.RunDTO, error)
+	// SetRunCIAutofix sets the per-run CI-autofix override: PUT /api/runs/{id}/ci-autofix
+	// {enabled: bool|null}, RequireUser. Tri-state like SetRunMrRework (nil sends null =
+	// inherit). The reply also names the run that governs automatic CI fixes on the branch
+	// and the caller's in-flight ci_fix runs there. A foreign/unknown run is 404 → 4.
+	SetRunCIAutofix(ctx context.Context, id string, enabled *bool) (SetRunCIAutofixResult, error)
 	// RunRework starts ONE on-demand MR-rework cycle on a completed run whose MR is open,
 	// past the automatic cap (PRD #1202 M1): POST /api/runs/{id}/rework {guidance},
 	// RequireUser so a `uzc_` token reaches it. guidance is the optional operator note
@@ -380,6 +385,11 @@ type Client interface {
 	// unknown name is a 404 (exit 4).
 	AdminListEgressProfiles(ctx context.Context) ([]apitypes.EgressProfileDTO, error)
 	AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error)
+	// AdminListSharedProviders / AdminGetSharedProvider read the admin-shared provider definitions
+	// (PRD #4324): GET /api/admin/providers[/{id}], in the admin READ group (a uza_ token reads
+	// them). READ-ONLY: admin writes are cookie-only. A personal provider id is a 404 (exit 4).
+	AdminListSharedProviders(ctx context.Context) ([]apitypes.AdminSharedProviderDTO, error)
+	AdminGetSharedProvider(ctx context.Context, id string) (apitypes.AdminSharedProviderDTO, error)
 	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
 	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
 	// (category, target), attribution hidden — the reply is an unenveloped
@@ -949,6 +959,9 @@ type HTTPClient struct {
 	streamReconcile   time.Duration
 	streamBackoffBase time.Duration
 	streamBackoffMax  time.Duration
+	// streamAfter, when set, replaces time.After for the reconnect backoff wait so
+	// a test can observe how often the redial deadline is armed and fire it on cue.
+	streamAfter func(time.Duration) <-chan time.Time
 }
 
 // NewHTTPClient builds the live client from resolved settings.

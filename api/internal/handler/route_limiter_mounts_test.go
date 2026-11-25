@@ -312,6 +312,13 @@ var wantRouteMounts = []routeMount{
 	// writes cookie-only; every one a local DB statement with no forge call → noLimiter.
 	{"GET", "/api/admin/egress-profiles", noLimiter},
 	{"GET", "/api/admin/egress-profiles/{name}", noLimiter},
+	// Admin-shared provider definitions (PRD #4324): local DB reads and writes, no egress.
+	{"GET", "/api/admin/providers", noLimiter},
+	{"GET", "/api/admin/providers/{id}", noLimiter},
+	{"POST", "/api/admin/providers", noLimiter},
+	{"PATCH", "/api/admin/providers/{id}", noLimiter},
+	{"POST", "/api/admin/providers/{id}/retire", noLimiter},
+	{"DELETE", "/api/admin/providers/{id}", noLimiter},
 	// PRD #3989: admin-issued reset link, a cookie-only admin DB write with no per-user limiter.
 	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
@@ -1166,6 +1173,7 @@ var wantRouteMounts = []routeMount{
 	// write, and no status change. Unlike wait-on-limit it is mounted on RequireUser (D3),
 	// but the limiter dimension is the same.
 	{"PUT", "/api/runs/{id}/mr-rework", noLimiter},
+	{"PUT", "/api/runs/{id}/ci-autofix", noLimiter},
 	{"PUT", "/api/runs/{id}/wait-on-limit", noLimiter},
 	{"PUT", "/api/runs/{id}/review/recommendations/{recID}/disposition", noLimiter},
 	{"PUT", "/api/skills/{id}", noLimiter},

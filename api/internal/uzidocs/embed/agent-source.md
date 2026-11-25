@@ -176,7 +176,7 @@ human reads the diff before it can run anywhere.
 A source role has one `model:` value, which selects a pin for one harness:
 
 - A recognized Codex role model — `gpt-5.6-sol`, `gpt-6-astra`,
-  `gpt-6-luna`, `gpt-6-sol`, or `gpt-6.1-sol` — sets the Codex pin and
+  `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, or `gpt-6.2-astra` — sets the Codex pin and
   leaves the Claude pin on **Default**.
 - Any other valid, nonempty model sets the Claude pin and leaves the Codex
   pin on **Default**.

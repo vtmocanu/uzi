@@ -40,8 +40,8 @@
   //   * `chromium` — the headless browser agent-browser drives (mainProgram `chromium`,
   //     so it resolves at /opt/uzi-toolchain/bin/chromium; AGENT_BROWSER_EXECUTABLE_PATH
   //     in both Dockerfiles points there). Prebuilt in cache.nixos.org on x86_64-linux at
-  //     the pinned rev (chromium-150.0.7871.128, narinfo HTTP 200), so CI's amd64-only
-  //     kaniko build substitutes it rather than compiling Chromium from source.
+  //     the pinned rev (chromium-150.0.7871.128, narinfo HTTP 200), so CI's Linux
+  //     Buildx build substitutes it rather than compiling Chromium from source.
   //   * `fontconfig` + `dejavu_fonts` — a nix Chromium closure ships NO fonts, so without
   //     a font package + a fontconfig that can find it every screenshot (the role's whole
   //     evidence artifact) renders tofu. Both prebuilt at the pinned rev. The Dockerfiles
@@ -121,7 +121,7 @@
   //     bin/file, bin/perl, bin/fmt, bin/helm and bin/kubeconform IN THE PROFILE.
   //   * exercised from that profile: `file --version` → file-5.48, `perl -e` runs,
   //     `fmt -w 20` rewraps, `helm version --short` → v4.2.3, `kubeconform -v` → v0.7.0.
-  //   * all narinfos are HTTP 200 on cache.nixos.org, so CI's amd64-only kaniko build
+  //   * all narinfos are HTTP 200 on cache.nixos.org, so CI's Linux Buildx build
   //     substitutes them rather than compiling.
   //
   // NOTE (as load-bearing as the openssl one): write them BARE, never `file@latest`. A
@@ -157,7 +157,7 @@
   // Verified at the pinned rev (2026-07-27): both are single-output (meta.outputsToInstall
   // == ["out"]), so neither hits the openssl split-output trap above; mainPrograms `helm`
   // and `kubeconform`; both narinfos are HTTP 200 on cache.nixos.org for x86_64-linux
-  // (79 MiB and 9.1 MiB), so the amd64 kaniko build substitutes rather than compiles.
+  // (79 MiB and 9.1 MiB), so the Linux Buildx build substitutes rather than compiles.
   //
   // `go-task` + `jq` (2026-08-07) close two more open `install_worker_tool` judge recs,
   // both surfaced by the deterministic pre-scan on run 5bf8edb3 reporting them not-found
@@ -222,7 +222,7 @@
   // `shellcheck.bin` lands bin/shellcheck in the profile via live
   // `devbox install`, `shellcheck --version` → 0.11.0; its bin-output narinfo
   // (ixvpvkr2s92pbi6si1ki8yk3fs1gvlf2) is HTTP 200 on cache.nixos.org for x86_64-linux (1.5 MiB
-  // download / 7.5 MiB unpacked), so CI's amd64-only kaniko build SUBSTITUTES it rather than
+  // download / 7.5 MiB unpacked), so CI's Linux Buildx build SUBSTITUTES it rather than
   // compiling shellcheck (a Haskell binary) from source — the non-negotiable condition for baking it.
   //
   // `fd` + `yq-go` (2026-08-10) close two more open `install_worker_tool` judge recs
@@ -247,7 +247,7 @@
   // `fd --version` → fd 10.4.2, `yq --version` → v4.53.3, and `yq '.a.c[1]'` over a small YAML
   // doc evaluates. Both narinfos are HTTP 200 on cache.nixos.org for x86_64-linux (fd 10.4.2
   // 0qakfy0pyvma5sv880fvhyl7n34hfhln, yq-go 4.53.3 cgad2c1jkcm04mrgf7djy5c4dyylr60v), so CI's
-  // amd64-only kaniko build SUBSTITUTES them rather than compiling from source — the
+  // Linux Buildx build SUBSTITUTES them rather than compiling from source — the
   // non-negotiable condition for baking a tool in.
   // Written BARE of any version/`@latest` suffix and added by hand-editing this file +
   // `devbox install` (never `devbox add`, which pins each package to its own nixpkgs rev and
@@ -273,7 +273,7 @@
   // because the full manifest cannot `devbox install` on darwin (chromium is linux-only).
   // This rev carries make 4.4.1; its out-output narinfo (9m4gd15rxxz4xfafqysi5q7jaczxv65c)
   // is HTTP 200 on cache.nixos.org for x86_64-linux (406.8 KiB download / 1.5 MiB unpacked),
-  // so CI's amd64-only kaniko build SUBSTITUTES it rather than compiling — the
+  // so CI's Linux Buildx build SUBSTITUTES it rather than compiling — the
   // non-negotiable condition for baking a tool in. Written BARE of any version/`@latest`
   // suffix and added by hand-editing this file + the sibling devbox.lock entry (never
   // `devbox add`, which pins to its own nixpkgs rev and writes a fat `systems:` block) for
@@ -324,7 +324,7 @@
   // assumed): both are SINGLE-output (`outputs` == ["out"], so the bare attr carries the CLI and
   // no `.bin`/`.out` selector is needed or correct). ripgrep-15.2.0 (binary `rg`) and
   // opentofu-1.12.4 (binary `tofu`); both narinfos are HTTP 200 on cache.nixos.org for
-  // x86_64-linux at the pinned rev, so CI's amd64-only kaniko build SUBSTITUTES them rather than
+  // x86_64-linux at the pinned rev, so CI's Linux Buildx build SUBSTITUTES them rather than
   // compiling from source — the non-negotiable condition for baking a tool in. Verify against the
   // PROFILE (readlink -f .devbox/nix/profile/default then `ls bin/`), never `command -v` inside
   // `devbox run` — the check that would have caught the `file` regression.
@@ -350,7 +350,7 @@
   // shellcheck.bin, whose CLI-bearing output is not `out`). mainProgram `yamllint`, so it lands
   // bin/yamllint (the guard row is `yamllint  yamllint  yamllint --version`). This rev carries
   // yamllint 1.37.1; its out-output narinfo (7indfvjgpj47yrjbn3zgnczgr4f5h8yz) is HTTP 200 on
-  // cache.nixos.org for x86_64-linux, so CI's amd64-only kaniko build SUBSTITUTES it rather than
+  // cache.nixos.org for x86_64-linux, so CI's Linux Buildx build SUBSTITUTES it rather than
   // compiling from source — the non-negotiable condition for baking a tool in. Verified against
   // the realized PROFILE (`ls bin/` of the out output → bin/yamllint present, `yamllint --version`
   // → 1.37.1), never `command -v` inside `devbox run` — the check that would have caught the

@@ -153,3 +153,36 @@ func TestCheckerClaimResponseOwnerSteeringHeader(t *testing.T) {
 		t.Fatal("tampered steering delivered")
 	}
 }
+
+// The plan-only repo-instructions consent rides the outer claim struct. A legacy plan claim
+// without it keeps its exact envelope bound; adding only the field tips the largest accepted
+// claim over the bound, and a normal-size claim carries the key.
+func TestPlanCheckerClaimResponseRepoInstructionsConsentField(t *testing.T) {
+	p := checkerResponseFixture(t)
+	branch := ""
+	p.Branch = &branch
+	base, err := workersvc.MarshalCrossCheckClaim(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch = strings.Repeat("x", (2<<20)-len(base))
+	rec := httptest.NewRecorder()
+	writeWorkerRunClaim(rec, p)
+	if rec.Code != http.StatusOK || rec.Body.Len() != 2<<20 || strings.Contains(rec.Body.String(), "plan_repo_instructions_enabled") {
+		t.Fatalf("largest accepted legacy plan claim: status=%d bytes=%d", rec.Code, rec.Body.Len())
+	}
+	yes := true
+	p.CrossCheck.PlanRepoInstructionsEnabled = &yes
+	rec = httptest.NewRecorder()
+	writeWorkerRunClaim(rec, p)
+	if rec.Code != http.StatusInternalServerError || rec.Header().Get("X-Uzi-Claim-Kind") != "" {
+		t.Fatalf("field-only growth past the bound: status=%d marker=%q", rec.Code, rec.Header().Get("X-Uzi-Claim-Kind"))
+	}
+	small := checkerResponseFixture(t)
+	small.CrossCheck.PlanRepoInstructionsEnabled = &yes
+	rec = httptest.NewRecorder()
+	writeWorkerRunClaim(rec, small)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"plan_repo_instructions_enabled":true`) {
+		t.Fatalf("normal plan claim body: status=%d %s", rec.Code, rec.Body.String())
+	}
+}

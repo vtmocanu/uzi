@@ -279,7 +279,8 @@ denied:
   `BUN_`, `CCR_`, `SELF_HOSTED_RUNNER_`, `BUGHUNTER_`, `_CLAUDE_`, `ANT_OTEL_`,
   `ANT_CLAUDE_`, `OTEL_LOG_`, `LC_`, `GCM_`, `OTEL_EXPORTER_OTLP_`,
   `GCE_METADATA_`, `AWS_ENDPOINT_URL_BEDROCK` (which also covers
-  `AWS_ENDPOINT_URL_BEDROCK_AGENT*`).
+  `AWS_ENDPOINT_URL_BEDROCK_AGENT*`), `AWS_ENDPOINT_URL_` (every per-service
+  AWS endpoint override, such as `AWS_ENDPOINT_URL_S3`).
   The `BUN_` prefix also refuses Bun application settings such as `BUN_INSTALL`
   and `BUN_CONFIG_REGISTRY` as repo variables: the bundled Claude CLI is a Bun
   executable whose runtime reads `BUN_*` controls.
@@ -295,8 +296,10 @@ denied:
   endpoints of the AWS credential exchange, STS, IAM Identity Center and SSO
   OIDC, that the Bedrock harness's AWS SDK credential chain can use; denied for
   consistency with `AWS_ENDPOINT_URL`), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
-  `AWS_ENDPOINT_URL_BEDROCK*` name. The other per-service names, such as
-  `AWS_ENDPOINT_URL_S3`, stay allowed.
+  `AWS_ENDPOINT_URL_*` name, including `AWS_ENDPOINT_URL_S3`. Other AWS
+  settings such as `AWS_REGION` stay allowed. Codex 0.171.0 adds the names
+  `SPIFFE_ENDPOINT_SOCKET`, `SSH2_CLIENT` and `OTEL_RESOURCE_ATTRIBUTES` to
+  the denied set.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`,
   `NODE_INSPECTOR_IPC`, `VSCODE_INSPECTOR_OPTIONS`, `API_FORCE_IDLE_TIMEOUT`,
@@ -306,7 +309,7 @@ denied:
 - Telemetry switches the Claude CLI reads outside the denied prefixes:
   `ENABLE_BETA_TRACING_DETAILED`, `ENABLE_ENHANCED_TELEMETRY_BETA`,
   `BETA_TRACING_ENDPOINT`. `OTEL_*` names outside the denied `OTEL_LOG_` and
-  `OTEL_EXPORTER_OTLP_` prefixes are allowed for your own application: the CLI
+  `OTEL_EXPORTER_OTLP_` prefixes and `OTEL_RESOURCE_ATTRIBUTES` are allowed for your own application: the CLI
   starts no third-party OpenTelemetry exporter unless
   `CLAUDE_CODE_ENABLE_TELEMETRY` (denied by the `CLAUDE_` prefix) or the beta
   tracing pair above is set, and the worker never sets them. `OTEL_LOG_` is

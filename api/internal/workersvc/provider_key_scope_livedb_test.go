@@ -14,7 +14,7 @@ import (
 func seedProviderKey(t *testing.T, fx *cdFix, plaintext string) uuid.UUID {
 	t.Helper()
 	provider, key := uuid.New(), uuid.New()
-	fx.env.exec(`INSERT INTO model_providers (id, owner_user_id, name, engine, current_revision) VALUES ($1, $2, $3, 'claude', 1)`,
+	fx.env.exec(`INSERT INTO model_providers (id, owner_user_id, scope_owner_id, name, engine, current_revision) VALUES ($1, $2, $2, $3, 'claude', 1)`,
 		provider, fx.userID, "gw-"+provider.String())
 	fx.env.exec(`INSERT INTO model_provider_revisions (provider_id, revision, protocol, base_url, auth_style, model_map)
 	    VALUES ($1, 1, 'anthropic_messages', 'https://gw.example.com/anthropic', 'bearer', '{}')`, provider)
@@ -22,8 +22,8 @@ func seedProviderKey(t *testing.T, fx *cdFix, plaintext string) uuid.UUID {
 	if err != nil {
 		t.Fatalf("seal provider key: %v", err)
 	}
-	fx.env.exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id)
-	    VALUES ($1, $2, 'anthropic_compatible_key', $3, false, false, $4, 'master', $5)`,
+	fx.env.exec(`INSERT INTO user_secrets (id, user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id, provider_scope_id)
+	    VALUES ($1, $2, 'anthropic_compatible_key', $3, false, false, $4, 'master', $5, $2)`,
 		key, fx.userID, provider.String(), sealed, provider)
 	return key
 }

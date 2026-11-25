@@ -143,7 +143,7 @@ export interface SecretDependents {
 }
 
 // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
-export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable" | "default" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna";
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable" | "default" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.2-sol" | "gpt-6.2-astra" | "gpt-6-luna";
 
 export interface ProviderModelEntry {
   model: string;
@@ -171,9 +171,42 @@ export interface ProviderDTO {
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
+  /** null for a personal provider; "per_user_key" for an admin-shared definition (PRD #4324),
+   *  whose has_key, key_enabled and probe then describe the caller's own key only. */
+  credential_mode: "per_user_key" | null;
   has_key: boolean;
   key_enabled: boolean;
   probe: ProviderProbe | null;
+}
+
+// ── Admin-shared providers (PRD #4324) ───────────────────────────────────────
+/** GET /api/admin/providers row: a shared definition plus two counts. It never carries a key
+ *  or any user's Test evidence. Endpoint and auth style are fixed at creation. */
+export interface AdminSharedProvider {
+  id: string;
+  name: string;
+  engine: "claude";
+  retired: boolean;
+  current_revision: number;
+  protocol: "anthropic_messages";
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+  credential_mode: "per_user_key";
+  selected_user_count: number;
+  attached_key_count: number;
+}
+
+export interface AdminSharedProviderList {
+  providers: AdminSharedProvider[];
+}
+
+/** POST /api/admin/providers body: keyless, Claude only. */
+export interface AdminSharedProviderCreateInput {
+  name: string;
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
 }
 
 export interface ProvidersList {
@@ -542,7 +575,7 @@ export interface UserSettings {
    *  default_model, and a curated Codex id is rejected here (D3 cross-vocabulary 400). */
   default_claude_model?: string | null;
   /** Per-user Codex worker-model default (PRD #1551 M1/D2); null = inherit the Codex
-   *  fallback (gpt-6.1-sol). Optional for the same back-compat reason. Unlike the other
+   *  fallback (gpt-6.2-sol). Optional for the same back-compat reason. Unlike the other
    *  lanes it accepts a custom id (D5), but a known Claude alias is rejected here (D3). */
   default_codex_model?: string | null;
   /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
@@ -4279,6 +4312,9 @@ export interface Run {
    *  per-run override. Kept `boolean | null` (never `any`) to preserve the
    *  omitted-vs-null-vs-value distinction, exactly like mr_state's nullability. */
   mr_rework_enabled?: boolean | null;
+  /** Issue #4617: this run's per-run CI-autofix override. null/absent = inherit the owner's
+   *  Settings default; an explicit true/false overrides it for this run's branch. */
+  ci_autofix_enabled?: boolean | null;
   /** PRD #1202 D11: the OWNER-ONLY view of the automatic rework loop guard, so the owner
    *  can see why the watcher stopped. `mr_rework_auto_cycles` is the automatic cycles spent
    *  (0 when none), `mr_rework_auto_cap` the live admin cap. Both are populated only on the
@@ -5203,6 +5239,16 @@ export interface UsageTail {
   coverage: "complete" | "partial";
   coverage_reasons: string[];
   models: UsageTailModel[];
+}
+
+/** Issue #4617: PUT /runs/{id}/ci-autofix response. The two optional-looking hints name
+ *  OTHER runs on the same branch so the UI can tell the owner where the setting is read. */
+export interface SetRunCiAutofixResponse {
+  run: Run;
+  /** The run whose override currently governs automatic CI fixes on this branch, or null. */
+  ci_autofix_governing_run_id: string | null;
+  /** CI-fix runs already in flight on this branch; they keep their own setting. */
+  ci_autofix_inflight_fix_run_ids: string[];
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display

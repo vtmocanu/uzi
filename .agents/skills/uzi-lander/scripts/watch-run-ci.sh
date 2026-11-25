@@ -6,10 +6,14 @@
 #   <run-id>        one specific run (a release commit's ci.yml, a rerun).
 #   --branch NAME   the LATEST run of --workflow on a branch, re-resolved each tick so a
 #                   run minted by a concurrent push is picked up (release flow).
-#   --sha SHA       EVERY workflow run for one commit on --branch (default main): the
+#   --sha SHA       the GATING workflow runs for one commit on --branch (default main): the
 #                   post-merge watch, pinned to the merge SHA so a supersession by a newer
 #                   push is reported as such (exit 4), not as red. SHA is 7-40 hex digits;
 #                   it is resolved through GitHub before polling, so a typo fails fast.
+#                   Runs whose event is `schedule` or `workflow_dispatch` are ADVISORY: they
+#                   are reported in an ADVISORY block but never gate the verdict. Every other
+#                   event (and a missing or malformed one) is gating. Watch a manual dispatch
+#                   that must gate by its run ID instead.
 #
 # Usage:
 #   watch-run-ci.sh <run-id> [--interval SECS] [--max-ticks N] [--repo OWNER/REPO]
@@ -31,16 +35,21 @@
 # one `[tick N] pending after Ns: ...` line, so an empty output means no tick finished yet.
 #
 # Exit codes (callers branch on these; keep them stable):
-#   0  every job terminal and none failed (green). In --sha mode: every run that EXISTS
-#      for the SHA. A docs-only or skip-ci-adjacent push can dispatch a PARTIAL workflow
-#      set (measured 2026-09-02, f015f1f: only CodeQL ran), so a green here does not prove
-#      validate-* ran; confirm a gate fix another way (run the gate locally, or wait for
-#      the next real code-change dispatch).
+#   0  every job terminal and none failed (green). In --sha mode: at least one GATING run
+#      exists and every gating run in a listing of at most 50 runs (fetched with
+#      --limit 51) is green; schedule/workflow_dispatch runs are printed as ADVISORY and
+#      never decide. A listing that reaches 51 rows never yields a verdict. A docs-only or
+#      skip-ci-adjacent push can dispatch a PARTIAL workflow set (measured 2026-09-02,
+#      f015f1f: only CodeQL ran), so a green here does not prove validate-* ran; confirm a
+#      gate fix another way (run the gate locally, or wait for the next real code-change
+#      dispatch).
 #   1  a job completed with a failing conclusion (name + url printed) — react now
-#   2  timed out: still pending after --max-ticks
-#   3  usage / gh error; in --sha mode also an invalid/unresolvable SHA or "no run ever
-#      appeared for the SHA" (a push to main sometimes spawns none: re-point at a descendant
-#      commit rather than waiting)
+#   2  timed out: still pending after --max-ticks. In --sha mode, if the last tick's
+#      listing reached --limit 51 the closing line says so: that exit is NOT cleared by
+#      re-arming; watch the gating ci.yml/kind-smoke.yml runs by run ID instead.
+#   3  usage / gh error; in --sha mode also an invalid/unresolvable SHA or "no GATING run
+#      appeared for the SHA" (a push to main sometimes spawns none, or only schedule/
+#      workflow_dispatch runs: re-point at a descendant commit rather than waiting)
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
 #      superseded it) and no non-superseded run failed (a superseded run may still show
 #      a failed aggregator job). A run not yet concluded whose jobs are all
@@ -70,6 +79,13 @@
 #    NON-TERMINAL: any job whose status != completed.
 #  - Early-exit on the first failure is the whole point: one red job means the run
 #    cannot go green, so there is nothing to gain by waiting for the rest.
+#  - --sha classification happens inside jq (event -> advisory:schedule |
+#    advisory:workflow_dispatch | gating), so only fixed tokens cross the shell boundary.
+#    The listing is fetched with --limit 51; 51 rows means the listing may be truncated,
+#    so that tick makes no verdict and no advisory-cache update. A non-zero listing
+#    status is an unreadable tick, never a partial verdict. The ADVISORY block is printed
+#    before exits 0, 1, 2, 3 (no gating run) and 4; on the closing exits it names the
+#    tick it was cached from. It is not printed before the other exit 3 paths or exit 12.
 # GitHub quota handback (all modes): exit 12, RESULT=gh_rate_limited,
 # GH_RATE_LIMIT_RESOURCE/RESET/RESET_AT and GH_RETRY_AT (reset + 5s).
 # Re-arm after GH_RETRY_AT; this is never readiness or unknown-streak exhaustion.
@@ -85,7 +101,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="${2:?}"; shift 2;;
     --max-ticks) MAX_TICKS="${2:?}"; shift 2;;
     --repo) REPO="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,49p' "$0"; exit 3;;
+    -h|--help) sed -n '2,62p' "$0"; exit 3;;
     *)
       if [ -z "$RUN" ]; then RUN="$1"; shift
       else echo "unexpected arg: $1" >&2; exit 3
@@ -161,13 +177,39 @@ resolve_run() {
 }
 
 # --sha mode: every run whose head matches the canonical 40-hex SHA, one line per run:
-# databaseId<TAB>status<TAB>conclusion<TAB>workflowName. GitHub's server-side --commit
-# filter means a busy main cannot push it out of a capped branch-list window.
+# databaseId<TAB>status<TAB>conclusion<TAB>workflowName<TAB>class. GitHub's server-side
+# --commit filter means a busy main cannot push it out of a capped branch-list window.
+# No field is ever empty (`-` stands in), so a tab-IFS read splits exactly. The event is
+# classified inside jq against the original JSON value: only the fixed class tokens
+# advisory:schedule, advisory:workflow_dispatch and gating reach the shell. A null,
+# non-string or malformed event is gating. The caller reads this function's exit status.
 runs_for_sha() {
-  gh run list "${GHR[@]}" --branch "$BRANCH" --commit "$SHA" --limit 50 \
-    --json databaseId,status,conclusion,workflowName \
-    --jq '.[] | [.databaseId, .status, (.conclusion // ""), .workflowName] | @tsv' \
+  gh run list "${GHR[@]}" --branch "$BRANCH" --commit "$SHA" --limit 51 \
+    --json databaseId,status,conclusion,workflowName,event \
+    --jq 'def f: if type=="string" and .!="" then . else "-" end; .[] | [(.databaseId|tostring), (.status|f), (.conclusion|f), (.workflowName|f), (if .event=="schedule" then "advisory:schedule" elif .event=="workflow_dispatch" then "advisory:workflow_dispatch" else "gating" end)] | @tsv' \
     2>/dev/null
+}
+
+# Print the cached advisory (schedule/workflow_dispatch) runs before every verdict exit. $1 == 1
+# marks a closing exit: the header then names the tick the cache came from. An empty cache is
+# always stated explicitly. Names and states are untrusted text.
+print_advisory() {
+  if [ -z "$adv_cache" ]; then
+    echo "ADVISORY: none observed in a complete listing"
+    return 0
+  fi
+  adv_hdr='ADVISORY (schedule/workflow_dispatch: reported, never gating)'
+  [ "${1:-0}" = 1 ] && adv_hdr="$adv_hdr from tick $adv_cache_tick"
+  echo "$adv_hdr"
+  while IFS=$'\t' read -r a_id a_status a_concl a_name a_class; do
+    [ -z "$a_id" ] && continue
+    [ "$a_concl" = "-" ] && a_concl=""
+    a_state="$a_status"
+    [ "$a_status" = "completed" ] && a_state="${a_concl:-completed}"
+    printf '  ADVISORY  %s  %s  %s  %s\n' \
+      "$(printf '%s' "$a_state" | sanitize_untrusted 40)" "$(printf '%s' "$a_id" | sanitize_untrusted 20)" \
+      "$(printf '%s' "${a_class#advisory:}" | sanitize_untrusted 40)" "$(printf '%s' "$a_name" | sanitize_untrusted 200)"
+  done <<< "$adv_cache"
 }
 
 # Classify one run's jobs (jq TSV on stdin:
@@ -238,24 +280,65 @@ print_fails() {  # $1 = run id, $2 = workflow name (optional), $3 = verdict text
 }
 
 tick=0; gh_errs=0; seen_any=0
+# --sha mode state: advisory_only_seen (an earlier complete listing held only advisory
+# runs), limit_hit (the LAST tick's listing reached --limit 51), adv_cache/adv_cache_tick
+# (advisory rows of the last complete non-empty listing and the tick they came from).
+advisory_only_seen=0; limit_hit=0; adv_cache=""; adv_cache_tick=""
 while [ "$tick" -lt "$MAX_TICKS" ]; do
 
   if [ "$SHA_MODE" -eq 1 ]; then
-    # ---- --sha mode: aggregate over every run for the commit -------------------------
-    runs="$(runs_for_sha)"
+    # ---- --sha mode: aggregate over every GATING run for the commit ------------------
+    limit_hit=0
+    runs_rc=0
+    runs="$(runs_for_sha)" || runs_rc=$?
+    if [ "$runs_rc" -ne 0 ]; then
+      # A non-zero listing status may carry partial rows: discard them, no verdict.
+      gh_rate_limit_stop
+      echo "[tick $tick] run listing failed for sha=${SHA:0:8}; retrying"
+      sleep "$INTERVAL"; tick=$((tick+1)); continue
+    fi
     if [ -z "$runs" ]; then
       gh_rate_limit_stop
       if [ "$seen_any" -eq 1 ]; then
         echo "[tick $tick] workflow listing temporarily empty after runs were seen for sha=${SHA:0:8}; retrying"
+      elif [ "$advisory_only_seen" -eq 1 ]; then
+        echo "[tick $tick] only advisory (schedule/workflow_dispatch) runs seen for sha=${SHA:0:8}; waiting for a gating run"
       else
         echo "[tick $tick] no run yet for sha=${SHA:0:8} on $BRANCH; retrying"
       fi
       sleep "$INTERVAL"; tick=$((tick+1)); continue
     fi
-    seen_any=1
-    pending=0; superseded=0; failed=0
-    while IFS=$'\t' read -r rid rstatus rconcl wname; do
+    # awk, not grep: every row has a non-empty id field, so this is the run count.
+    nrows="$(printf '%s\n' "$runs" | awk 'NF{n++} END{print n+0}')"
+    if [ "$nrows" -ge 51 ]; then
+      # The listing may be truncated: a failed run could sit beyond the window. No
+      # verdict and no advisory-cache update; runs do exist for the SHA.
+      echo "[tick $tick] run listing for sha=${SHA:0:8} reached --limit 51 (may be truncated); no verdict this tick"
+      seen_any=1; gh_errs=0; limit_hit=1
+      sleep "$INTERVAL"; tick=$((tick+1)); continue
+    fi
+    # One pre-pass splits the complete listing into gating and advisory rows.
+    gating_rows=""; adv_rows=""
+    while IFS=$'\t' read -r rid rstatus rconcl wname rclass; do
       [ -z "$rid" ] && continue
+      row="$(printf '%s\t%s\t%s\t%s\t%s' "$rid" "$rstatus" "$rconcl" "$wname" "${rclass:-gating}")"
+      case "${rclass:-gating}" in
+        advisory:schedule|advisory:workflow_dispatch) adv_rows="${adv_rows}${row}"$'\n' ;;
+        *) gating_rows="${gating_rows}${row}"$'\n' ;;
+      esac
+    done <<< "$runs"
+    adv_cache="$adv_rows"; adv_cache_tick="$tick"
+    if [ -z "$gating_rows" ]; then
+      advisory_only_seen=1
+      echo "[tick $tick] only advisory (schedule/workflow_dispatch) runs for sha=${SHA:0:8}; waiting for a gating run"
+      sleep "$INTERVAL"; tick=$((tick+1)); continue
+    fi
+    seen_any=1
+    runs="${gating_rows%$'\n'}"
+    pending=0; superseded=0; failed=0
+    while IFS=$'\t' read -r rid rstatus rconcl wname rclass; do
+      [ -z "$rid" ] && continue
+      [ "$rconcl" = "-" ] && rconcl=""
       if [ "$rstatus" = "completed" ] && [ "$rconcl" = "cancelled" ]; then
         superseded=$((superseded+1)); echo "[tick $tick] $wname run $rid cancelled (superseded)"; continue
       fi
@@ -312,7 +395,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
         GREEN) : ;;
       esac
     done <<< "$runs"
-    [ "$failed" -eq 1 ] && exit 1
+    if [ "$failed" -eq 1 ]; then print_advisory; exit 1; fi
     if [ "$pending" -eq 0 ]; then
       if [ "$superseded" -gt 0 ]; then
         if [ "$FOLLOW" -eq 1 ]; then
@@ -326,16 +409,19 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           if [ "$next_sha" != "$SHA" ]; then
             printf 'FOLLOW sha=%s -> %s\n' "$SHA" "$next_sha"
             SHA="$next_sha"; seen_any=0; gh_errs=0
+            adv_cache=""; adv_cache_tick=""; advisory_only_seen=0
           else
             printf '[tick %s] superseded sha=%s is still the branch head; retrying\n' "$tick" "$SHA"
           fi
           sleep "$INTERVAL"; tick=$((tick+1)); continue
         fi
         echo "=== sha ${SHA:0:8}: $superseded run(s) cancelled by concurrency, none failed — superseded; re-watch the current $BRANCH head (exit 4) ==="
+        print_advisory
         exit 4
       fi
-      echo "=== sha ${SHA:0:8}: every run terminal, none failed after $((tick*INTERVAL))s ==="
-      printf '%s\n' "$runs" | awk -F'\t' '{printf "  %-10s %-9s %s\n",$3,$1,$4}'
+      echo "=== sha ${SHA:0:8}: every gating run terminal, none failed after $((tick*INTERVAL))s ==="
+      printf '%s\n' "$runs" | awk -F'\t' '{c=$3; if (c=="-") c=""; printf "  %-10s %-9s %s\n",c,$1,$4}'
+      print_advisory
       exit 0
     fi
     # Heartbeat: workflow names are untrusted (anyone who can push a workflow names one).
@@ -440,8 +526,18 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
 done
 
 if [ "$SHA_MODE" -eq 1 ] && [ "$seen_any" -eq 0 ]; then
-  echo "=== sha ${SHA:0:8}: NO RUN APPEARED on $BRANCH within $((MAX_TICKS*INTERVAL))s (the push may have spawned no workflow run; re-point at a descendant commit) ==="
+  echo "=== sha ${SHA:0:8}: NO GATING RUN APPEARED on $BRANCH within $((MAX_TICKS*INTERVAL))s (the push may have spawned no workflow run, or only schedule/workflow_dispatch runs; re-point at a descendant commit) ==="
+  print_advisory 1
   exit 3
+fi
+if [ "$SHA_MODE" -eq 1 ]; then
+  if [ "$limit_hit" -eq 1 ]; then
+    echo "=== sha ${SHA:0:8}: run listing reached --limit 51 on the last tick (may be truncated): no verdict; re-arming will not clear this, watch the gating ci.yml/kind-smoke.yml runs by run ID (exit 2) ==="
+  else
+    echo "=== sha ${SHA:0:8}: still pending after $((MAX_TICKS*INTERVAL))s (max-ticks reached) ==="
+  fi
+  print_advisory 1
+  exit 2
 fi
 echo "=== ${RUN:-${SHA:+sha:${SHA:0:8}}}${RUN:-${SHA:-branch:$BRANCH}}: still pending after $((MAX_TICKS*INTERVAL))s (max-ticks reached) ==="
 exit 2

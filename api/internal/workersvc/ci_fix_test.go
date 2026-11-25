@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -71,6 +72,60 @@ func TestCreateAutoCIFixRunApproves(t *testing.T) {
 	}
 	if fs.ciFixRunParams == nil || !fs.ciFixRunParams.AutoApprove {
 		t.Fatalf("automatic CreateAutoCIFixRun must pass auto_approve=true, got %+v", fs.ciFixRunParams)
+	}
+}
+
+func TestCreateAutoCIFixRunRefusesOptedOutSelectedRun(t *testing.T) {
+	// Issue #4617: the in-transaction recheck refuses an automatic fix when the branch's
+	// selected run has CI-autofix explicitly off, and nothing is inserted.
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{selectedRun: &store.GetCIAutofixSelectedRunRow{
+		ID: uuid.New(), UserID: user, RunCiAutofixEnabled: pgtype.Bool{Bool: false, Valid: true},
+	}}
+	svc := New(fs, newBox(t), testParams())
+	_, err := svc.CreateAutoCIFixRun(context.Background(), user, repo, "agent/issue-7", "t", "d", sampleSnapshot(), nil)
+	if !errors.Is(err, ErrCIAutofixIneligible) {
+		t.Fatalf("err = %v, want ErrCIAutofixIneligible", err)
+	}
+	if fs.ciFixRunParams != nil {
+		t.Fatal("an ineligible automatic fix must not insert a run")
+	}
+}
+
+func TestCreateAutoCIFixRunRefusesForeignSelectedRun(t *testing.T) {
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{selectedRun: &store.GetCIAutofixSelectedRunRow{
+		ID: uuid.New(), UserID: uuid.New(), RunCiAutofixEnabled: pgtype.Bool{Bool: true, Valid: true},
+	}}
+	svc := New(fs, newBox(t), testParams())
+	_, err := svc.CreateAutoCIFixRun(context.Background(), user, repo, "agent/issue-7", "t", "d", sampleSnapshot(), nil)
+	if !errors.Is(err, ErrCIAutofixIneligible) {
+		t.Fatalf("err = %v, want ErrCIAutofixIneligible", err)
+	}
+	if fs.ciFixRunParams != nil {
+		t.Fatal("an ineligible automatic fix must not insert a run")
+	}
+}
+
+func TestCreateCIFixRunManualIgnoresOptOut(t *testing.T) {
+	// The manual Fix-CI path never refuses on the override; it copies the selected run's
+	// value (false here) onto the new run.
+	user, repo := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		ciFixRunResult: store.Run{ID: uuid.New(), Kind: runkind.CIFix},
+		selectedRun: &store.GetCIAutofixSelectedRunRow{
+			ID: uuid.New(), UserID: user, RunCiAutofixEnabled: pgtype.Bool{Bool: false, Valid: true},
+		},
+	}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.CreateCIFixRun(context.Background(), user, repo, "agent/issue-7", "t", "d", sampleSnapshot(), nil); err != nil {
+		t.Fatalf("CreateCIFixRun: %v", err)
+	}
+	if fs.ciFixRunParams == nil {
+		t.Fatal("manual fix must insert a run")
+	}
+	if got := fs.ciFixRunParams.CiAutofixEnabled; !got.Valid || got.Bool {
+		t.Fatalf("CiAutofixEnabled = %+v, want explicit false", got)
 	}
 }
 

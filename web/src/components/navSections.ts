@@ -25,12 +25,12 @@ const SEP = " › ";
 // /workers is canonical; /settings/workers only redirects to it.
 const SETTINGS_TABS: SectionDef[] = [
   { label: "Account & tokens", to: "/settings", keywords: ["account", "token", "profile", "password", "api"] },
-  { label: "Appearance", to: "/settings/appearance", keywords: ["theme", "dark", "light", "typeface", "mode"] },
   { label: "Models", to: "/settings/models", keywords: ["model", "models", "effort", "harness", "planning", "cross-check", "judge", "summary"] },
   { label: "Run defaults", to: "/settings/run-defaults", keywords: ["run", "defaults", "harness", "overflow"] },
   { label: "Forge", to: "/settings/forge", keywords: ["github", "gitlab", "connection", "repo"] },
   { label: "Access", to: "/settings/access", keywords: ["tokens", "permissions", "sharing", "oauth"] },
   { label: "Memory", to: "/settings/memory", keywords: ["notes", "context", "remember"] },
+  { label: "Appearance", to: "/settings/appearance", keywords: ["theme", "dark", "light", "typeface", "mode"] },
   { label: "Workers", to: "/workers", keywords: ["fleet", "hosted", "docker", "runner"] },
 ];
 
@@ -44,6 +44,7 @@ const ADMIN_TABS: SectionDef[] = [
   { label: "Workers", to: "/admin/workers", keywords: ["fleet", "hosted", "docker", "ephemeral", "hibernation", "capability", "scheduling"] },
   { label: "Branding", to: "/admin/branding", keywords: ["logo", "company", "brand"] },
   { label: "Site lists", to: "/admin/egress-profiles", keywords: ["egress", "profiles", "domains", "network"] },
+  { label: "Shared providers", to: "/admin/shared-providers", keywords: ["provider", "gateway", "claude", "shared", "keys"] },
   { label: "Products", to: "/admin/products", keywords: ["external", "jobs"] },
   { label: "Health", to: "/admin/health", keywords: ["status", "checks", "diagnostics"] },
 ];

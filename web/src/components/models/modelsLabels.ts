@@ -124,6 +124,68 @@ export function predictionText(
   return `${effortValue(cell)} · ${modelSettingSourceLabel(sourceField(field), cell.source)}`;
 }
 
+// The server's source token for a value the user stored in THIS field: a checker pin, a
+// planning choice, or any other user default. A source from another setting never confirms it.
+function ownSource(field: ModelsField): string {
+  if ("pin" in field.target) return "cross_check_pin";
+  return field.row.startsWith("Planning") ? "user_planning_default" : "user_default";
+}
+
+// predictionRedundant is true only when the control ALREADY shows everything the saved
+// prediction would (#4671), so the cell may hide its visible line (the accessible description
+// keeps it). It is proven against what is rendered, never re-resolved:
+// - an explicit saved value: the server resolves exactly that value from the user's own stored
+//   choice in this very field (an explicit Runtime default only where the control offers one);
+// - Default: the rendered Default label ends with the prediction's own " · <value> (<source>)";
+// - Judge runs on "Same as the run": the select reads exactly what the prediction would.
+// No view, no cell, a shown note, an ignored value, a source the label lacks, or a hidden value
+// (Default harness "automatic") returns false, so the cell shows its line. `saved` is the
+// field's normalized SAVED value ("" = Default); `defaultLabel` is the select's Default option.
+export function predictionRedundant(
+  field: ModelsField,
+  effective: EffectiveSettings | null,
+  saved: string,
+  { defaultLabel = "", runtimeOffered = false, omitNotUsed = false }: { defaultLabel?: string; runtimeOffered?: boolean; omitNotUsed?: boolean } = {},
+): boolean {
+  if (!effective) return false;
+  if (field.kind === "routing") {
+    const jh = effective.judge_harness;
+    if (!jh) return false;
+    if ((jh.notes ?? []).length > 0) return false;
+    return saved === "" ? jh.value == null && jh.source === "same_as_run" : jh.value === saved && jh.source === "user_default";
+  }
+  if (field.kind === "harness") {
+    const value = effective.start?.find((c) => c.choice === "default")?.harness;
+    return saved !== "" && !!value && value.value === saved && value.source === "user_default" && (value.notes ?? []).length === 0;
+  }
+  const pin = "pin" in field.target ? field.target.pin : null;
+  const setting = pin ? (pin.stage === "plan" ? "cross_check_plan" : "cross_check_code") : null;
+  const isModel = pin ? pin.member === "model" : field.kind === "model";
+  const srcField = pin ? (isModel ? "model" : "effort") : sourceField(field);
+  if (isModel) {
+    const cell = pin
+      ? effective.cross_check?.models?.find((c) => c.setting === setting && c.harness === pin.harness)
+      : effective.models?.find((c) => c.setting === MODEL_SETTING[field.row] && c.harness === field.family);
+    if (!cell || cell.ignored) return false;
+    if ((cell.notes ?? []).some((n) => !(omitNotUsed && n === "not_used"))) return false;
+    if (saved !== "") return cell.resolved_model === saved && cell.source === ownSource(field);
+    return labelShows(defaultLabel, modelValue(cell.resolved_model), modelSettingSourceLabel(srcField, cell.source));
+  }
+  const cell = pin
+    ? effective.cross_check?.efforts?.find((c) => c.setting === setting && c.harness === pin.harness)
+    : effective.efforts?.find((c) => c.setting === EFFORT_SETTING[field.row] && c.harness === field.family);
+  if (!cell || (cell.notes ?? []).length > 0) return false;
+  if (saved === "runtime") return runtimeOffered && cell.mode === "runtime_default" && cell.source === ownSource(field);
+  if (saved !== "") return cell.mode === "explicit" && cell.resolved_effort === saved && cell.source === ownSource(field);
+  return labelShows(defaultLabel, effortValue(cell), modelSettingSourceLabel(srcField, cell.source));
+}
+
+// A Default label shows a prediction only when its whole value-and-provenance part is the same
+// " · <value> (<source>)" the line would show ("claude-custom-opus" never proves "opus").
+function labelShows(label: string, value: string, source: string): boolean {
+  return source !== "unknown" && label.endsWith(` · ${value} (${source})`);
+}
+
 // Worker model Default: what the cleared override resolves to, from the saved prediction's
 // default_model / default_source; an older server or a missing prediction keeps Run defaults' copy.
 export function workerModelDefaultLabel(harness: Harness, cell: ModelSettingCell | undefined): string {

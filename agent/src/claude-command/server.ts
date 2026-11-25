@@ -21,6 +21,7 @@ const DECIMAL_DIGITS = /^\s*[0-9]+\s*$/;
 
 export const GUARDED_COMMAND_DESCRIPTION = [
   "Run a shell command in the foreground and return its exit code and output.",
+  "The exit code is the exit status of the supervised shell invocation: for a simple sequence that ran to completion it is normally the last command's status, so a trailing command that fails, such as a `grep` with no match, makes the result an error; a code above 128 can also mean the shell or its last command was stopped by a signal, which the number alone does not establish.",
   "Foreground only: run_in_background is refused and there is no long-running mode or extension.",
   `The default deadline is 2 minutes (${String(DEFAULT_COMMAND_TIMEOUT_MS)} ms) and the maximum is 60 minutes (${String(MAX_COMMAND_TIMEOUT_MS)} ms); pass an explicit timeout in milliseconds for a long required check.`,
   "At the deadline the command and every descendant process are stopped and drained. A required check that cannot finish within 60 minutes is a blocker to report, not something to skip.",

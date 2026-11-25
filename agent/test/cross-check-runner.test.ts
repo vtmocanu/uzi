@@ -706,6 +706,32 @@ function assertClosedThenFenced(r: Awaited<ReturnType<typeof scenario>>, status:
  assert.deepEqual(r.landed.map((m) => m.seq), r.landed.map((_m, i) => i + 1), "stream is contiguous");
 }
 
+// Issue #4676: the model timer can abort before a fake checker reaches its wait, and an
+// "abort" listener added after the abort never fires, so a bare listener wait hangs.
+const untilAborted = (signal: AbortSignal) => new Promise<void>((resolve) => {
+ if (signal.aborted) resolve();
+ else signal.addEventListener("abort", () => resolve(), { once: true });
+});
+const settlesWithin = async (p: Promise<void>, ms: number) => {
+ let t: ReturnType<typeof setTimeout> | undefined;
+ try {
+  return await Promise.race([p.then(() => true), new Promise<boolean>((r) => { t = setTimeout(() => r(false), ms); })]);
+ } finally { clearTimeout(t); }
+};
+
+it("untilAborted settles for a signal aborted before the call, and waits for a later abort", async () => {
+ const early = new AbortController();
+ early.abort();
+ assert.equal(await settlesWithin(untilAborted(early.signal), 2000), true, "already-aborted signal settled (not the watchdog)");
+ const late = new AbortController();
+ let settled = false;
+ const pending = untilAborted(late.signal).then(() => { settled = true; });
+ await new Promise<void>((r) => setTimeout(r, 0));
+ assert.equal(settled, false, "live signal stays pending until abort()");
+ late.abort();
+ assert.equal(await settlesWithin(pending, 2000), true, "live signal settled after abort() (not the watchdog)");
+});
+
 it("checker delivery: marker, activity, usage and summary go through the batcher with redaction before verdict and terminal", async () => {
  const pat = "forge-pat-secret-0123456789";
  const r = await scenario({ forgePat: pat, checker: async ({ usage, activity }) => {
@@ -743,7 +769,7 @@ it("checker delivery: a model timeout closes the batcher before its terminal rep
  const r = await scenario({ modelTimeoutMs: 30, checker: async ({ signal, usage, activity }) => {
   await usage(initFrame);
   activity!.begin("pending", "read", "a.ts");
-  await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  await untilAborted(signal);
   signal.throwIfAborted();
   return verdict;
  } });
@@ -1443,3 +1469,65 @@ for (const stage of ["plan", "code"] as const) {
   });
  }
 }
+
+// ---- Issue #4519: plan-stage repository-instructions wiring over a fake git ----
+import { planClaim, runPlanCheck } from "./plan-instructions-harness.js";
+
+function routedGit(counts: { lsTree: string[]; catFile: number; other: number }) {
+ return { ensureClone: async () => "/bare", existingBarePathFor: async () => "/bare",
+  runnerCloneAtCommit: async () => "/checkout", removeRunnerClone: async () => {},
+  readBare: async (_bare: string, args: string[]) => {
+   const i = args.indexOf("ls-tree");
+   if (i >= 0) {
+    counts.lsTree.push(args[i + 3]!);
+    return { text: `100644 blob ${"1".repeat(40)}      12\tCLAUDE.md\0`, truncated: false };
+   }
+   if (args.includes("cat-file")) { counts.catFile++; return { text: "ROUTED-RULES\n", truncated: false }; }
+   counts.other++;
+   return { text: "committed patch", truncated: false };
+  } };
+}
+
+it("plan runner reads CLAUDE.md at the base commit through readBare and renders it", async () => {
+ const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+ const base = "d".repeat(40);
+ const r = await runPlanCheck(planClaim({ cloneUrl: "x", base, claudemd: true, flag: true }), routedGit(counts));
+ assert.deepEqual(counts.lsTree, [base]);
+ assert.equal(counts.catFile, 1);
+ assert.equal(r.modelCalls, 1);
+ assert.ok(r.prompts[0]!.includes("ROUTED-RULES"));
+ assert.deepEqual(r.rowTexts, ["plan cross-check repository instructions read: supplied"]);
+});
+
+it("plan runner with consent off performs no instruction read and posts no row", async () => {
+ for (const [claudemd, flag] of [[false, true], [true, false], [true, undefined]] as const) {
+  const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+  const r = await runPlanCheck(planClaim({ cloneUrl: "x", base: "d".repeat(40), claudemd, flag }), routedGit(counts));
+  assert.deepEqual(counts.lsTree, []);
+  assert.equal(counts.catFile, 0);
+  assert.equal(r.modelCalls, 1);
+  assert.deepEqual(r.rowTexts, []);
+ }
+});
+
+it("plan runner fails an invalid claim when the server sends repo_instructions_evidence", async () => {
+ const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+ const r = await runPlanCheck(planClaim({ cloneUrl: "x", base: "d".repeat(40), claudemd: true, flag: true,
+  extra: { repo_instructions_evidence: { status: "supplied", text: "FORGED" } } }), routedGit(counts));
+ assert.equal(r.modelCalls, 0);
+ assert.equal(r.decisions[0].verdict, "failed");
+ assert.deepEqual(counts.lsTree, []);
+});
+
+it("code runner never attaches instructions evidence and posts no instructions row", async () => {
+ const counts = { lsTree: [] as string[], catFile: 0, other: 0 };
+ const c = planClaim({ cloneUrl: "x", base: "d".repeat(40), claudemd: true });
+ c.cross_check = { ...c.cross_check!, stage: "code", round: 1, head_commit: "b".repeat(40),
+  candidate_digest: "c".repeat(64), code_context: { task: "Inspect" }, guidance_snapshot: "" } as never;
+ delete (c.cross_check as Record<string, unknown>).planning_diff;
+ const r = await runPlanCheck(c, routedGit(counts), {}, () => { throw new Error("stop after recording"); });
+ assert.equal(r.modelCalls, 1);
+ assert.deepEqual(r.evidenceSeen, [undefined]);
+ assert.deepEqual(r.rowTexts, []);
+ assert.deepEqual(counts.lsTree, []);
+});

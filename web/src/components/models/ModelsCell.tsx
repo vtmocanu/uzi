@@ -1,8 +1,11 @@
 // One cell of the Models grid (PRD #3263): a family's control for one row, its saved
 // prediction, an optional note, reason, Not used reason and field error, each wired to the
-// control through aria-describedby. The prediction line is the grid's signature: it always says
-// what is SAVED ("Saved effective value: …"), and a draft that differs from it marks the cell
-// Unsaved with a brand rail and border rather than pretending to predict the unsaved edit.
+// control through aria-describedby. The prediction always says what is SAVED ("Saved effective
+// value: …") to assistive tech; on screen it is a muted line shown only where it adds something
+// the control does not already show (#4671): an Unsaved cell, Unavailable, or a value the select
+// hides. A draft that differs from the saved value marks the cell Unsaved with a brand rail and
+// border rather than pretending to predict the unsaved edit. A clean cell holding a saved
+// override offers Reset to default, which edits the draft only.
 //
 // A cell the draft routing leaves unused (the Codex judge model while the judge runs on Claude)
 // is DIMMED, never disabled: its control drops its fill and takes a dashed border (the value
@@ -30,6 +33,8 @@ export function ModelsCell({
   storedWarning,
   error,
   wide = false,
+  predictionVisible = true,
+  onReset,
   children,
 }: {
   field: ModelsField;
@@ -37,6 +42,11 @@ export function ModelsCell({
   dirty: boolean;
   /** The saved prediction, or null when it is unavailable. */
   prediction: string | null;
+  /** False when the control already shows everything the saved prediction says (a clean cell
+   *  only; a dirty or Unavailable cell always shows its line). */
+  predictionVisible?: boolean;
+  /** Present on a clean cell whose saved value is not Default: resets the draft to Default. */
+  onReset?: () => void;
   reason?: string | null;
   /** Neutral context for the control (what a routing choice does, where a toggle lives). */
   note?: ReactNode;
@@ -62,6 +72,8 @@ export function ModelsCell({
     .join(" ");
   const family = field.family ? harnessName(field.family) : null;
   const root = useRef<HTMLDivElement>(null);
+  // Reset removes its own button, so focus moves to the cell's control once the draft re-renders.
+  const focusAfterReset = useRef(false);
   // An errored cell marks its controls aria-invalid. ModelSelect and EffortSelect are shared
   // pickers with no aria-invalid prop, so the cell sets it on its own select/input; it runs
   // after every render because the custom model ID box mounts and unmounts.
@@ -70,7 +82,12 @@ export function ModelsCell({
       if (error) el.setAttribute("aria-invalid", "true");
       else el.removeAttribute("aria-invalid");
     });
+    if (focusAfterReset.current) {
+      focusAfterReset.current = false;
+      document.getElementById(control)?.focus();
+    }
   });
+  const lineShown = dirty || prediction === null || predictionVisible;
   return (
     <div
       ref={root}
@@ -123,17 +140,43 @@ export function ModelsCell({
       ) : (
         children({ control, describedBy })
       )}
-      <p id={predictionId} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-faint">
-        <span>
-          Saved effective value:{" "}
-          <span className={prediction ? "text-muted" : "italic"}>{prediction ?? "Unavailable"}</span>
+      {/* Assistive tech always gets ONE text run, "Saved effective value: <prediction>[, Unsaved]":
+          computed descriptions trim each text node, so a sentence split across spans reads
+          "Savedeffective value:…". The visible line (when shown) and markers are aria-hidden
+          duplicates. */}
+      <p id={predictionId} className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 text-xs text-faint">
+        <span className="sr-only">
+          {`Saved effective value: ${prediction ?? "Unavailable"}${dirty ? ", Unsaved" : ""}`}
         </span>
-        {dirty && (
-          <span className="rounded border border-brand/40 bg-brand/10 px-1 text-[11px] font-medium text-brand">
-            <span className="sr-only">, </span>Unsaved
-          </span>
+        {lineShown && (
+          <>
+            {dirty && <span aria-hidden="true">Saved</span>}
+            <span aria-hidden="true">{"\u2192"}</span>
+            <span aria-hidden="true" data-prediction="" className={cx("min-w-0 max-w-full [overflow-wrap:anywhere]", prediction ? "text-muted" : "italic")}>
+              {prediction ?? "Unavailable"}
+            </span>
+            {dirty && (
+              <span aria-hidden="true" className="rounded border border-brand/40 bg-brand/10 px-1 text-[11px] font-medium text-brand">
+                Unsaved
+              </span>
+            )}
+          </>
         )}
       </p>
+      {onReset && !dirty && (
+        <button
+          type="button"
+          className="text-xs text-muted underline decoration-edge-strong underline-offset-2 hover:text-fg"
+          // The visible words come first, so a speech-input user can say what is on screen.
+          aria-label={`Reset to default (${field.family ? `${field.row} — ${family}` : field.row})`}
+          onClick={() => {
+            focusAfterReset.current = true;
+            onReset();
+          }}
+        >
+          Reset to default
+        </button>
+      )}
       {notUsed && (
         <p id={notUsedId} className="text-xs text-muted">
           {notUsed}

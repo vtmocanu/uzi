@@ -173,6 +173,7 @@ uzi run inputs <id> [--json]
 uzi run lead-config <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
+uzi run ci-autofix <id> [--enabled[=false]] [--clear]
 uzi run export <id> --output <path> [--capture <id>]
 uzi run fetches <id> [--json]
 uzi run recovery [<id> | --user <uuid>] [--json]
@@ -236,6 +237,7 @@ uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
 uzi admin egress-profile list | show <name>
+uzi admin provider list | get <id|name>
 uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
@@ -1039,6 +1041,29 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
+- **`run ci-autofix <id>`** sets the per-run override for **automatic** CI fixes
+  on the run's branch. It is tri-state: `--enabled` (the default for a bare
+  call) turns them on, `--enabled=false` turns them off, and `--clear` returns
+  the run to inherit (your account default). `--clear` with `--enabled` is a
+  usage error (exit 2) and sends nothing; a foreign or unknown run is not found
+  (exit 4). It is editable on a completed run. The override that counts is the
+  one on the branch's **selected run**: the newest non-cancelled issue,
+  `ci_fix`, prompt or self-improve run that has an MR. A `ci_fix` repair run
+  that ends (completed or failed) with a branch and MR becomes the selected
+  run, as the newest qualifying run, and carries the value it inherited, so
+  re-enabling after a repair means editing that repair run; the command prints
+  the governing run when it is another of your runs. A new issue run taking over the
+  same `agent/issue-N` branch starts from its own default, and `mr_rework`
+  runs, and prompt or self-improve runs on their own run-ID branches, do not
+  displace the selection. CI fixes already in flight keep the value they copied
+  at creation: the command lists your own in-flight fixes so you can cancel
+  them or set the value on them too. The admin gate always wins, and manual
+  Fix CI (`uzi ci fix`) is never blocked by this setting. The override does not
+  expire, so re-enable it when you are done. It prints the updated run
+  (`uzi run get` shows the same state in its `CI_AUTOFIX` row) followed by the
+  governing-run and in-flight notes when they apply; `--json` emits the full
+  `{"run": ..., "ci_autofix_governing_run_id": ..., "ci_autofix_inflight_fix_run_ids": [...]}`
+  envelope. See [Automatic CI fixes](./ci-autofix.md#per-run-override).
 - **`run plan <run-id>` prints the latest plan Markdown verbatim.** Use
   `uzi run plan <run-id> [--version N] [--diff] [--json]` regardless of run
   status, including after approval or once the run has finished. For reading
@@ -1327,6 +1352,16 @@ A few worth knowing:
   triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
   need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
   the cross-user Mark done and Undo stay cookie-only in the web UI.
+- **`admin provider list` and `admin provider get <id|name>` read the
+  [admin-shared providers](providers.md#admin-shared-providers)** (PRD #4324),
+  model provider definitions an admin shares with every user. `list` prints `NAME`,
+  `ENGINE`, `URL`, `AUTH`, `RETIRED`, `REVISION`, `SELECTED` (users who selected it)
+  and `KEYS` (users with a key attached). `get` takes the id, or the name matched
+  without regard to case, and prints the fields plus the model map; an unknown
+  id or name exits 4 (a personal provider is never shown). `--json` carries the
+  same fields. Read-only and need an `admin_ro` (`uza_`) token; there is no write
+  verb, because creating, editing, retiring and deleting a shared definition are
+  cookie-only admin writes in the web app (Admin → Shared providers).
 - **`admin egress-profile list` and `admin egress-profile show <name>` read the
   [egress profiles](egress-profiles.md)** (PRD #1906), the named site lists for
   official-sources research. `list` prints `NAME`, `HOSTS` (entry count),
@@ -2993,7 +3028,7 @@ Anthropic-compatible one for the Claude engine, or a Responses-compatible one fo
 engine. The CLI manages the parts that never handle a credential:
 
 ```sh
-uzi provider list                              # NAME, ENGINE, URL, AUTH, MODELS, KEY, TEST, RETIRED
+uzi provider list                              # NAME, ENGINE, URL, AUTH, MODELS, KEY, TEST, RETIRED, MANAGED BY
 uzi provider create --name corp-gw --base-url https://gw.example.com/anthropic \
   --model haiku=corp-haiku:200000 --model sonnet=corp-sonnet:200000
 uzi provider create --engine codex --name code-gw --base-url https://gw.example.com/openai \
@@ -3015,7 +3050,7 @@ after the last colon is read as the context window.
 
 The `--model` vocabulary is per engine. Claude: `haiku` (required), `sonnet`, `opus`, `fable`.
 Codex: `default` (required) plus the optional Codex model ids `gpt-6-astra`, `gpt-5.6-sol`,
-`gpt-6-sol`, `gpt-6.1-sol` and `gpt-6-luna`. A Codex model the map does not name resolves through
+`gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra` and `gpt-6-luna`. A Codex model the map does not name resolves through
 `default` when uzi picks it, but an explicit `--model` on a run or a schedule pin needs its own key
 (`provider_model_unmapped` otherwise); see [Use a provider as your Codex
 source](./providers.md#use-a-provider-as-your-codex-source).
@@ -3050,6 +3085,16 @@ provider)". Claude provider runs start on workers that advertise `claude_provide
 ones on workers that advertise `codex_provider_v1` together with the Codex harness capabilities; an
 older worker leaves them queued ("no worker that supports model providers is online"). See [Model
 providers](./providers.md).
+
+**Admin-shared providers.** `list` also shows definitions your admin shares ([Admin-shared
+providers](./providers.md#admin-shared-providers)); the `MANAGED BY` column says `you` for your own
+and `admin` for a shared one (`--json` carries `credential_mode: "per_user_key"` on shared rows).
+`use` and `test` accept either kind and `use` prints "(shared by your admin)" for a shared one. When an
+owned and a shared definition have the same name, `use` and `test` exit 2 and list the matching ids
+(each marked `yours` or `admin`): pass an id. `edit` and `retire` resolve only your own definitions; a
+name or id that identifies a shared one exits 5 with "managed by your admin; only an admin can change
+it", before any write request. The key is still attached in Settings, and your own key and Test result are
+the only ones the CLI shows.
 
 ## Anthropic tokens
 
@@ -3538,6 +3583,13 @@ instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Cha
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
 
 ### Changing model and effort settings
+
+The current Codex built-in worker fallback is `gpt-6.2-sol`; the independent
+Codex judge built-in is also `gpt-6.2-sol`. Explicit user, instance, run, schedule
+and template choices are not migrated. Task review and PR descriptions retain
+`gpt-6-sol`; summaries retain `gpt-6-luna`. See the
+[current worker baseline](./worker-model.md#current-codex-worker-baseline).
+
 
 ```sh
 uzi settings set worker-model --harness codex gpt-5.5

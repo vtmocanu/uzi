@@ -556,6 +556,13 @@ WHERE w.id = ANY($1::uuid[])
                               AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                       AND r.status NOT IN ('completed', 'failed', 'cancelled')))
+      OR (w.online_since IS NOT NULL
+          AND NOT ('codex_runtime_v3' = ANY(w.protocol_capabilities))
+          AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
+                      AND r.model_provider_key_mode IS NOT NULL
+                      AND r.harness = 'codex'
+                      AND r.status = 'queued'
+                      AND r.claim_generation = 0))
   )
 `
 
@@ -1050,6 +1057,13 @@ WHERE w.ephemeral
                               AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                       AND r.status NOT IN ('completed', 'failed', 'cancelled')))
+      OR (w.online_since IS NOT NULL
+          AND NOT ('codex_runtime_v3' = ANY(w.protocol_capabilities))
+          AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
+                      AND r.model_provider_key_mode IS NOT NULL
+                      AND r.harness = 'codex'
+                      AND r.status = 'queued'
+                      AND r.claim_generation = 0))
   )
 FOR UPDATE OF w SKIP LOCKED
 `
@@ -1099,6 +1113,12 @@ type LockReapableEphemeralWorkersParams struct {
 //	    ephemeral cap) and in rate (the provision and reap ticks), but the total number of
 //	    cycles is NOT bounded while an image without the required provider capability is provisioned; that is
 //	    accepted, as for arm (e), until the worker image pin advertises it (ADR-4320, 2026-11-19).
+//	(h) registered Codex provider workers missing runtime v3, only while their bound run
+//	    is queued and never admitted (claim_generation = 0). Previously claimed runs retain
+//	    their uniqueness slot for this incompatibility; native runs are excluded.
+//	    The register-before-heartbeat caveat in (e) applies here too. Existing cap and
+//	    tick limits bound concurrency and rate, but total reprovision cycles remain
+//	    unbounded while the provisioned image lacks v3. Busy and custody guards apply.
 //	(f) PRD #2006: arm (a) is spared while the worker's ephemeral lease is live at
 //	    clock_timestamp(); the lease ending (expiry, drain, re-register) makes (a) true again.
 //
