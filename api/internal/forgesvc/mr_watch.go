@@ -346,7 +346,6 @@ func historyProviderTime(mr forge.MergeRequest) *time.Time {
 var (
 	providerTimeMin = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 	providerTimeEnd = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) // exclusive
-
 )
 
 // providerTimeParam maps a provider time to the statement's nullable parameter: nil,

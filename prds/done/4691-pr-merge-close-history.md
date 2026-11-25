@@ -17,7 +17,7 @@
 
 ## 2. Outcome
 
-The existing watcher fetches already return provider merge and close timestamps. They are kept, and every state transition the watcher persists is written atomically into a per-PR head plus an append-only event table, with actual provider time and observation time kept apart. Nothing reads this history yet; it starts accumulating now so that later read APIs have real data.
+The existing watcher fetches already return provider merge and close timestamps. They are kept, and every connection-owner state transition the watcher persists is written atomically into a per-PR head plus an append-only event table, with actual provider time and observation time kept apart. Nothing reads this history yet; it starts accumulating now so that later read APIs have real data.
 
 Acceptance examples:
 

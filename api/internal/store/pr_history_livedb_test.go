@@ -671,15 +671,14 @@ func TestPRHistoryAtomicityLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer connW.Release() // also on every early t.Fatal; a second Release is a no-op
 		writerPID := prhPID(fx.ctx, t, connW)
 		n, err := prhObserve(fx.ctx, store.New(connW.Conn()), run, "closed", prhAt(2), nil)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "P0001" || pgErr.Message != "pr_history_test_forced_failure" {
-			connW.Release()
 			t.Fatalf("SetRunMRState = (%d, %v), want P0001 pr_history_test_forced_failure", n, err)
 		}
 		if checkerPID := prhPID(fx.ctx, t, fx.pool); checkerPID == writerPID {
-			connW.Release()
 			t.Fatalf("checker session pid %d equals writer pid", checkerPID)
 		}
 		func() {
@@ -787,9 +786,10 @@ func prhRollback(tx pgx.Tx) {
 	_ = tx.Rollback(ctx)
 }
 
-// prhJoin returns a deferred func that cancels the session context and waits (bounded)
-// for the goroutine to finish, so a test that fails early never releases or rolls back
-// a connection the goroutine is still using.
+// prhJoin returns a deferred func that cancels the session context and waits up to 15s
+// for the goroutine to finish, so a test that fails early does not release or roll back
+// a connection the goroutine is still using. After that bound it gives up and the test
+// may race its own teardown; the 90s session contexts make that practically unreachable.
 func prhJoin(cancel context.CancelFunc, finished <-chan struct{}) func() {
 	return func() {
 		cancel()
