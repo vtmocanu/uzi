@@ -1409,8 +1409,9 @@ WITH checker_template_pins AS MATERIALIZED (
       -- readings. A held run matches no row and stays queued. The exemption arms mirror Go's
       -- reserveEnforced (chat is already excluded above): an active manual-resume override
       -- (@reserve_override_ended lists run ids whose override ended early; empty until the reset
-      -- observation lands) and a previously started run while the pause toggle is off
-      -- (@reserve_pause_on). The credential arm mirrors Go's reserveHeld, in claimSecretID order:
+      -- observation lands), a previously started run while the pause toggle is off
+      -- (@reserve_pause_on), and a run frozen to a custom model provider (model_provider_key_mode IS NOT
+      -- NULL: it spends its own gateway key, never a vendor credential). The credential arm mirrors Go's reserveHeld, in claimSecretID order:
       --   Codex run        -> its frozen alias is blocked (api_key aliases are never in the list);
       --   judge/self_improve -> the owner's judge-lane binding;
       --   per-run override -> pinned id / default / auto pool (a pinned override with a NULL id
@@ -1425,6 +1426,7 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (NOT $16::boolean
            OR (COALESCE(r.reserve_exempt_until > $17::timestamptz, false) AND NOT (r.id = ANY($18::uuid[])))
            OR (r.first_started_at IS NOT NULL AND NOT $19::boolean)
+           OR r.model_provider_key_mode IS NOT NULL
            OR NOT (
                CASE
                    WHEN r.harness = 'codex'
@@ -1945,8 +1947,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- mode resolves to a blocked token or an all-blocked auto pool): that peer's
                 -- ClaimRun would hold the run, and deferring to it would leave the run unclaimed
                 -- until @spread_cutoff. Only a run whose credential is chosen by the claiming
-                -- WORKER is affected: Codex, judge/self_improve and per-run override runs resolve
-                -- their credential independently of the peer, and an exempt run is not gated. The
+                -- WORKER is affected: Codex, judge/self_improve, per-run override and provider-bound
+                -- runs resolve their credential independently of the peer, and an exempt run is not gated. The
                 -- list is computed without the run's dead-credential exclusion; the spread is advisory
                 -- and fails open at @spread_cutoff, so that approximation can delay a deferral but
                 -- never strand a run.
@@ -1955,6 +1957,7 @@ WITH checker_template_pins AS MATERIALIZED (
                     AND NOT (COALESCE(r.reserve_exempt_until > $17::timestamptz, false) AND NOT (r.id = ANY($18::uuid[])))
                     AND NOT (r.first_started_at IS NOT NULL AND NOT $19::boolean)
                     AND r.harness IS DISTINCT FROM 'codex'
+                    AND r.model_provider_key_mode IS NULL
                     AND r.kind NOT IN ('judge', 'self_improve')
                     AND NOT (r.credential_override_mode = 'pinned' AND r.credential_override_secret_id IS NOT NULL)
                     AND COALESCE(r.credential_override_mode, '') NOT IN ('default', 'auto')
