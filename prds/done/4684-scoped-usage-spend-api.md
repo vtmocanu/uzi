@@ -50,7 +50,7 @@ Register every literal route as `noLimiter` in `route_limiter_mounts_test.go`, a
 
 Validated parameters:
 
-- `window=7d|30d|90d|all`, default `30d`. The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists `7d`, `30d`, `90d` there and Spend answers 400 `window all not available for all users` before any database work (owner decision at landing, 2026-11-25).
+- `window=7d|30d|90d|all`, default `30d`. The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists `7d`, `30d`, `90d` there and Spend answers 400 `window all not available for all users` before any analytics database work (authentication runs first) (owner decision at landing, 2026-11-25).
 - `tz`, default `UTC` when omitted. Explicit empty and `Local` are invalid. Validate against a new cached lookup of `pg_timezone_names` (there is no existing Postgres-side precedent; `handler/schedules_catalog.go` validates with Go's `time.LoadLocation` and rejects `Local`). A name accepted by the database must also load in Go, because Go derives the bounds; test that pairing.
 - `repo=<uuid>`, `harness=claude|codex`, `kind=<registry kind>|delivery|supporting`.
 - Spend `split=user|usage_model|harness|repo|kind` (default `usage_model`) and `breakdown=user|primary_model|harness|repo|kind` (default `repo`).
@@ -163,7 +163,7 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Repo masking on the owner route only | Owners must not learn foreign repo ids; an admin route has no such boundary, and an admin selecting a user may see that user's foreign repo (but cannot filter by it). Which applies comes from the mounted route, never a parameter; reject masking on admin routes. |
 | Snapshot helper in the `store` package (`RunAnalyticsSnapshot`) | One place owns the REPEATABLE READ READ ONLY transaction, the 8 s deadline, `SET LOCAL` settings and rollback; reject per-handler transaction code. |
 | `SET LOCAL jit = off` in the snapshot | Admin all-users Spend was JIT-compiling about 446 functions: 8.2 s with JIT, 1.3 s without (30d); reject a server-wide `jit` change. |
-| Admin all-users `window=all` not offered (owner decision at landing, 2026-11-25) | Measured 9.6-10.2 s against the 8 s budget, a 503. Options omits `all` for that scope and Spend answers 400 `window all not available for all users` before any database work; owner and admin `user=<uuid>` all-time and every bounded window are unchanged, and Options still accepts and ignores `window`. Admin all-users all-time deferred to a follow-up that adds per-run totals for finished runs; owner decision at landing. |
+| Admin all-users `window=all` not offered (owner decision at landing, 2026-11-25) | Measured 9.6-10.2 s against the 8 s budget, a 503. Options omits `all` for that scope and Spend answers 400 `window all not available for all users` before any analytics database work (authentication runs first); owner and admin `user=<uuid>` all-time and every bounded window are unchanged, and Options still accepts and ignores `window`. Admin all-users all-time deferred to a follow-up that adds per-run totals for finished runs; owner decision at landing. |
 | Keep the lateral `OFFSET 0` fold over shape (b) `run_id = ANY(ARRAY(SELECT ...))` | Shape (b) is 5-10% faster on custom plans but 30x to 170x slower on generic plans (owner 30d 9.2 s, admin 30d 215 s); the lateral stays bounded under both. See ADR-1620's #4684 addendum. |
 | No index added | Four candidates (`runs (created_at)` and three `runs (repo_id, mr_iid)` variants) gave at most 7.8% p95 gain (owner) and 4.9% (admin 30d), under the 20% bar, at 0.45-2.7 MB each; reject carrying write cost for noise. Numbers below. |
 
@@ -183,11 +183,11 @@ Method: throwaway PostgreSQL 17.12 with default settings (shared_buffers 128MB, 
 | Owner 90d | 908 / 935 | 425 / 435 |
 | Admin all-users `window=all` | 15678 / 15818 | 9599 / 9749 (10017 / 10090 on a second pass) |
 
-Generic plans get no JIT: admin 30d 1295 / 1312, owner 30d 289 / 291. Admin options 24 ms.
+Generic plans get no JIT: admin 30d 1295 / 1312, owner 30d 289 / 291. The admin options workload (repo options, user options and the all-users history start, timed together) takes 24 ms; the Options endpoint itself does not read history start, which is most of that time.
 
-**Indexes** (JIT off, custom, median / p95 ms; baseline owner 30d 250 / 254, admin 30d 1283 / 1302, admin `all` 9599 / 9749, admin options 24.1 / 25.9):
+**Indexes** (JIT off, custom, median / p95 ms; baseline owner 30d 250 / 254, admin 30d 1283 / 1302, admin `all` 9599 / 9749, admin options workload 24.1 / 25.9):
 
-| Candidate | Bytes | Owner 30d | Admin 30d | Admin `all` | Admin options |
+| Candidate | Bytes | Owner 30d | Admin 30d | Admin `all` | Admin options workload |
 |---|---|---|---|---|---|
 | `runs (created_at)` | 2,719,744 | 246 / 251 | 1253 / 1266 | 9748 / 9833 | 1.5 / 1.7 |
 | `runs (repo_id, mr_iid) WHERE mr_iid IS NOT NULL` | 1,081,344 | 235 / 241 | 1265 / 1272 | 9972 / 10037 | 24.2 / 25.9 |
@@ -206,6 +206,6 @@ None was kept, so there is no index migration. Side effects noted: `created_at` 
 | Owner 30d, `harness=claude`, `kind=issue` | 98 | 104 |
 | Admin `user=<uuid>` 30d, same filters | 97 | 107 |
 
-Owner all-time cost is the per-run `model_fold` lateral (about 1.0 s over 23,672 runs) plus its spilled `run_fold` sort, so it grows with the owner's run count. The candidate-index table above reproduces for indexes 1, 3 and 4; index 2 (`(repo_id, mr_iid) WHERE mr_iid IS NOT NULL`) measured about twice as slow on admin all-users `window=all` in this pass (1.6x with `split=user`, unchanged with `split=repo`, and +21% on admin 30d `split=user`), undiagnosed and possibly host noise; no index ships.
+The two filtered workloads (EXPLAIN, custom / generic): owner 30d filtered 101.0 / 116.0 ms exec and admin `user=<uuid>` filtered 97.1 / 121.9 ms, no temp blocks, no disk sorts, zero JIT; the cohort is a bitmap scan on `runs_user_created_idx` (1,080 runs) and the per-run `model_fold` lateral is the largest node (about 44 ms over 1,080 loops). Owner all-time cost is the per-run `model_fold` lateral (about 1.0 s over 23,672 runs) plus its spilled `run_fold` sort, so it grows with the owner's run count. The candidate-index table above reproduces for indexes 1, 3 and 4; index 2 (`(repo_id, mr_iid) WHERE mr_iid IS NOT NULL`) measured about twice as slow on admin all-users `window=all` in this pass (1.6x with `split=user`, unchanged with `split=repo`, and +21% on admin 30d `split=user`), undiagnosed and possibly host noise; no index ships.
 
 **Not measured:** `mr_rework` and `cross_check` runs (the seed has none); end-to-end request time; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).

@@ -408,7 +408,9 @@ asserts the bound under a forced generic plan.
 
 **2. Shape (b), `run_id = ANY(ARRAY(SELECT ...))`, was measured and rejected.** One fold
 filtered by the cohort's ids is 5-10% faster under a custom plan, but under a generic plan,
-which pgx reaches after 5 executions and so the steady state, the planner no longer pushes
+which PostgreSQL may choose from the sixth execution of a prepared statement (it compares the
+generic plan against the earlier custom plans, so a forced generic plan measures the case where
+it is chosen, not which plan production will settle on), the planner no longer pushes
 the ids into the view and folds all of `run_usage`. On the 120,000-run seed (845,988 legs),
 medians:
 
@@ -447,6 +449,6 @@ Spend statement is costed above `jit_above_cost`, so PostgreSQL compiled about 4
 The measured generic plans were not JIT-compiled (costed below `jit_above_cost`) and are unchanged. The setting is transaction-local, so
 the pool and every other statement keep the server default. `window=all` for the admin
 all-users scope still exceeds the 8 s budget with JIT off, so the API does not offer it: Spend
-answers 400 `window all not available for all users` before any database work (owner decision at
+answers 400 `window all not available for all users` before any analytics database work (authentication runs first) (owner decision at
 landing, 2026-11-25), and all-time for that scope is deferred to a follow-up that adds per-run
 totals for finished runs. This addendum does not fix the latency.

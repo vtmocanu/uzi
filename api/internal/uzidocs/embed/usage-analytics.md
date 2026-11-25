@@ -48,7 +48,7 @@ bill.
   sensitive text.
 - Spend on the admin all-users scope with `window=all` is a 400,
   `window all not available for all users`. It is answered before any
-  database work and is not a 503.
+  analytics database work (authentication runs first) and is not a 503.
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
@@ -242,8 +242,9 @@ about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 
 **Decision:** admin all-users `window=all` is not offered. Options does not
 list `all` for that scope and Spend answers 400 `window all not available for
-all users` before any database work. The measured 10 s is over the 8 second
+all users` before any analytics database work (authentication runs first). The measured 10 s is over the 8 second
 budget, so the request would otherwise have been a 503. All-time stays
-available for the owner route and for admin `user=<uuid>`; owner `all` was not
-measured. Admin all-users all-time is deferred to a follow-up that adds per-run
+available for the owner route and for admin `user=<uuid>`; owner `all` Spend
+measured about 1.8 s (statement-level median, custom plan) on the same seed, and
+end-to-end request latency was not measured. Admin all-users all-time is deferred to a follow-up that adds per-run
 totals for finished runs (owner decision at landing).
