@@ -170,7 +170,7 @@ Anthropic token.
   default-model judge: set a judge model the map does include, or add `opus` to the map.
 - **No wait on rate limits.** A gateway 429 or overloaded answer ends the judge as failed with the fixed reason
   "Provider gateway rate limit reached; a provider judge does not wait on rate limits". The Claude CLI may
-  retry the request itself before it reports the limit; once it does, uzi never parks, requeues or re-runs
+  retry the request itself before it reports the limit; once it does, uzi never parks, requeues or automatically re-runs
   the judge, never falls back to a vendor credential, and records no vendor reset time or cooldown for it.
 - **A revoked provider fails the judge.** If the provider's key or revision was revoked or went stale before the
   judge was delivered, or the judge model was changed to one the frozen map does not map while the judge was
