@@ -285,7 +285,7 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 	wantViolation(t, "owned provider with a credential mode", err, "23514", "model_providers_shared_mode_check")
 	_, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "bad-mode", "claude", "operator_key", nilScope)
 	wantViolation(t, "unknown credential mode", err, "23514", "model_providers_credential_mode_check")
-	// A shared Codex definition is accepted since 00532 (issue #4633); a third engine is still refused
+	// A shared Codex definition is accepted since 00536 (issue #4633); a third engine is still refused
 	// by the engine check, covered in TestSharedCodexScopeConstraintNegativesLiveDB.
 	if _, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "shared-codex", "codex", "per_user_key", nilScope); err != nil {
 		t.Errorf("NULL-owner Codex insert: %v, want accepted", err)
@@ -313,7 +313,7 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 		_, err = pool.Exec(ctx, insKey, b, "openai_compatible_key", fmt.Sprintf("c%d", i), cx.ID, c.scope)
 		wantViolation(t, "B's Codex key planted on A's Codex provider with scope "+c.scope, err, c.code, c.name)
 	}
-	// Since 00533 the database accepts a Codex-kind key with the shared scope (the handler and the
+	// Since 00537 the database accepts a Codex-kind key with the shared scope (the handler and the
 	// queries decide which definitions may carry one). Rolled back so it does not collide with the
 	// valid key below under the one-key-per-provider unique index.
 	func() {
@@ -582,7 +582,7 @@ func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 			t.Fatalf("Down to %d = %v, want a refusal containing %q", to, err, snippet)
 		}
 	}
-	// 00537-00529 roll back freely (no shared Codex state exists here); 00528 refuses while B's source is the shared definition.
+	// 00541-00529 roll back freely (no shared Codex state exists here); 00528 refuses while B's source is the shared definition.
 	refuses(527, "refusing to roll back 00528")
 	if v := appliedVersion(ctx, t, pool); v != 528 {
 		t.Fatalf("version after the refused 00528 Down = %d, want 528", v)
@@ -753,7 +753,7 @@ SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, prob
 
 // TestSharedScopeImageOnlyRollbackLiveDB: with the new schema and the previous API image, the writes that
 // cannot fill the scope columns fail (provider insert, key insert, Claude source set and clear, and since
-// 00534 a Codex source set from a cleared state and a Codex clear), while the stop levers keep working:
+// 00538 a Codex source set from a cleared state and a Codex clear), while the stop levers keep working:
 // a personal-to-personal Codex switch (the scope is already the user's own), key disable and delete,
 // retire, and the old probe upsert against the retained legacy table.
 func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {

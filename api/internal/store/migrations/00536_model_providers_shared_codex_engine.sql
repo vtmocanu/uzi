@@ -3,7 +3,7 @@ SET LOCAL lock_timeout = '5s';
 
 -- Admin-shared Codex provider definitions (issue #4633): a shared definition (owner_user_id NULL) may
 -- now be a Codex one as well as a Claude one. The same-named check is replaced in one statement so
--- no window exists without it. NOT VALID (no full scan under the lock), validated in 00535.
+-- no window exists without it. NOT VALID (no full scan under the lock), validated in 00539.
 ALTER TABLE model_providers
     DROP CONSTRAINT model_providers_shared_engine_check,
     ADD CONSTRAINT model_providers_shared_engine_check

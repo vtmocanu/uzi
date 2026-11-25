@@ -95,7 +95,7 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 	}
 }
 
-// TestUsersCodexScopeUpLocksBeforeAddColumn: the 00534 Up (resolved by name, so a renumber needs no
+// TestUsersCodexScopeUpLocksBeforeAddColumn: the 00538 Up (resolved by name, so a renumber needs no
 // edit) takes ACCESS EXCLUSIVE on model_providers and users before it adds the users column.
 func TestUsersCodexScopeUpLocksBeforeAddColumn(t *testing.T) {
 	entries, err := os.ReadDir("migrations")

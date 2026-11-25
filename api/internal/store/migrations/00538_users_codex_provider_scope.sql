@@ -42,7 +42,7 @@ ALTER TABLE users ADD CONSTRAINT users_codex_provider_scope_check
             AND codex_provider_scope_id IN (id, '00000000-0000-0000-0000-000000000000'::uuid))) NOT VALID;
 
 -- ON DELETE RESTRICT is kept: deleting a selected definition is refused, never silently nulled.
--- One statement so no window exists without a foreign key. Validated in 00537.
+-- One statement so no window exists without a foreign key. Validated in 00541.
 ALTER TABLE users
     DROP CONSTRAINT users_codex_provider_fkey,
     ADD CONSTRAINT users_codex_provider_fkey

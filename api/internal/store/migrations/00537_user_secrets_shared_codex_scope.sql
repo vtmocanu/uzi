@@ -5,7 +5,7 @@ SET LOCAL lock_timeout = '5s';
 -- (openai_compatible_key) as well as a Claude one (anthropic_compatible_key). The personal scope
 -- (provider_scope_id = user_id) is unchanged. The composite foreign key to model_providers
 -- (scope_owner_id, id) is untouched, so a key still binds only to a definition that exists. Replaced
--- in one statement so no window exists without the check. NOT VALID, validated in 00536.
+-- in one statement so no window exists without the check. NOT VALID, validated in 00540.
 ALTER TABLE user_secrets
     DROP CONSTRAINT user_secrets_provider_scope_check,
     ADD CONSTRAINT user_secrets_provider_scope_check
