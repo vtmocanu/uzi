@@ -102,9 +102,9 @@ describe("transient failure before the first load", () => {
   });
 });
 
-// A Retry only changes remoteEntry.js's URL; a child chunk that failed on the first load stays
-// cached as failed in the browser, so after a Retry that fails transient the card also offers
-// Reload page. The record is per document and per module id, and a success clears it.
+// A Retry only changes remoteEntry.js's URL; a child chunk keeps its URL. The pinned Chromium
+// re-fetches it (browser harness), but an engine that keeps the failure cannot recover by
+// Retry, so after a Retry that fails transient the card also offers Reload page. The record is per document and per module id, and a success clears it.
 describe("transient failure after a Retry", () => {
   const down = () => new TypeError("Failed to fetch");
 
@@ -173,6 +173,13 @@ describe("transient failure after a Retry", () => {
     fireEvent.click(retry()!);
     await waitFor(() => expect(screen.getByText("This module is not compatible with this version of uzi.")).toBeTruthy());
     expect(retry()).toBeNull();
+    expect(reload()).toBeNull();
+    // An incompatible outcome is not recorded: a later transient failure gets Retry alone.
+    cleanup();
+    fed.loadModuleRemote.mockReset();
+    fed.loadModuleRemote.mockRejectedValue(down());
+    mount();
+    await waitFor(() => expect(retry()).not.toBeNull());
     expect(reload()).toBeNull();
   });
 });

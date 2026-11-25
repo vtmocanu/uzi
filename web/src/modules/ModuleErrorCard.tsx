@@ -33,7 +33,7 @@ export function ModuleErrorCard({
   // Present for the two Retry classes.
   onRetry?: () => void;
   // Transient only: a Retry already failed in this document, so Reload page is offered next
-  // to Retry (some engines keep a failed module file for the life of the document).
+  // to Retry (the module may still be down, or an engine may keep a failed module file).
   offerReload?: boolean;
 }) {
   const isAdmin = useAuth()?.user?.is_admin === true;

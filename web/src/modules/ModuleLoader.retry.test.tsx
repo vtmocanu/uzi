@@ -135,3 +135,22 @@ describe("navigating away and back while a Retry is pending", () => {
     expect(ent.loadModuleRemote).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("a Retry whose re-registration never settles", () => {
+  afterEach(() => {
+    delete (globalThis as { __UZI_MODULE_LOAD_TIMEOUT_MS__?: number }).__UZI_MODULE_LOAD_TIMEOUT_MS__;
+  });
+
+  it("is bounded by the load timeout, so a joined remount ends in the card, not a spinner", async () => {
+    await firstFailure();
+    (globalThis as { __UZI_MODULE_LOAD_TIMEOUT_MS__?: number }).__UZI_MODULE_LOAD_TIMEOUT_MS__ = 30;
+    ent.reRegisterModule.mockReturnValue(new Promise(() => {}));
+    fireEvent.click(retry()!);
+    cleanup();
+    mount();
+    await waitFor(() => expect(reload()).not.toBeNull());
+    expect(retry()).not.toBeNull();
+    expect(screen.getByTestId("module-error-reason").textContent).toContain("Timed out after 30 ms");
+    expect(ent.loadModuleRemote).toHaveBeenCalledTimes(1);
+  });
+});

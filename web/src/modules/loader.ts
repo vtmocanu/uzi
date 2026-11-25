@@ -6,8 +6,8 @@
 // action:
 //   transient    network/HTTP error or timeout before the module ever loaded in this
 //                document -> Retry (re-register with a fresh entry URL, load again). A
-//                Retry that fails transient again also offers Reload page, because some
-//                engines keep a failed module file for the life of the document.
+//                Retry that fails transient again also offers Reload page: the module may still be down,
+//                or an engine may keep a failed module file for the life of the document.
 //   incompatible shared-version refusal, missing expose, contract major mismatch ->
 //                no action (Retry cannot fix it)
 //   stale        a chunk load failing AFTER the module already loaded in this document
@@ -213,7 +213,8 @@ export function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promis
   const n = ++retryCounter;
   const p: Promise<ModulePageComponent> = (async () => {
     try {
-      await reRegisterModule(id, n);
+      // Bounded like the load: a remount joins this promise, so a hang here must not spin forever.
+      await withTimeout(reRegisterModule(id, n), timeoutMs(), id);
       return await doLoad(entry);
     } catch (e) {
       const err = classifyLoadError(e, id); // never throws: guards a revoked Proxy
