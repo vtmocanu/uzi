@@ -838,6 +838,11 @@ func TestCodexCAStampedCreateResponseWithoutTheStampKeepsTheCarry(t *testing.T) 
 	if !m.codexCACarried("w1", ns) {
 		t.Error("a create response without the stamp cleared the carry")
 	}
+	// The confirmed Secret write alone (secretWritten) must still defer the Deployment:
+	// the tick was frozen without evidence, and an env-less create would drift-roll next tick.
+	if d := caDep(t, c, ns, "w1"); d != nil {
+		t.Errorf("deployment created on the tick the Secret key was first confirmed (env=%v)", caHasEnv(d))
+	}
 }
 
 // Control: the direct reconcileWorker fallback (no tick context) decides like the tick.
