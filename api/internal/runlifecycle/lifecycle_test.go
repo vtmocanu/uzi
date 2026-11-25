@@ -25,6 +25,7 @@ const testOrigin = "https://uzi.test"
 type fakeStore struct {
 	moveCtx    store.GetRunMoveContextRow
 	moveCtxErr error
+	issueReads int // GetIssueByIID calls (the superseded fence must make none)
 	issue      store.Issue
 	issueErr   error
 	columns    []store.BoardColumn
@@ -48,6 +49,7 @@ func (f *fakeStore) GetRunMoveContext(context.Context, uuid.UUID) (store.GetRunM
 	return f.moveCtx, f.moveCtxErr
 }
 func (f *fakeStore) GetIssueByIID(context.Context, store.GetIssueByIIDParams) (store.Issue, error) {
+	f.issueReads++
 	return f.issue, f.issueErr
 }
 func (f *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardColumn, error) {
@@ -416,6 +418,10 @@ func TestReconcileSupersededRunMovesNothing(t *testing.T) {
 	}
 	if len(fs.cleared) != 1 || fs.cleared[0] != runID {
 		t.Fatalf("the pending marker must be cleared, got %v", fs.cleared)
+	}
+	// The fence is apply's first statement: no issue read precedes it.
+	if fs.issueReads != 0 {
+		t.Fatalf("a superseded run must not read the issue, GetIssueByIID calls=%d", fs.issueReads)
 	}
 	// The fence covers the move only: the terminal-comment hook still runs.
 	if fs.claimCalls < 1 {

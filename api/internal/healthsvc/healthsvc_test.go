@@ -962,6 +962,24 @@ func TestBoardDrift(t *testing.T) {
 			wantEvidence: map[string]string{"Still retrying": "3", "Given up": "100 (sample capped at 100)"},
 		},
 		{
+			name:     "capped retrying band reads at least",
+			retrying: band{rows: repeat(withIssue, 100)}, gaveUp: band{rows: repeat(withIssue, 1)},
+			wantSev: sevWarn, wantSummary: "at least 101 issue column move(s) pending for over 30 minutes (100 still retrying, 1 given up)",
+			wantEvidence: map[string]string{"Still retrying": "100 (sample capped at 100)", "Given up": "1"},
+		},
+		{
+			name:     "given-up band fails, capped retrying band reads at least",
+			retrying: band{rows: repeat(withIssue, 100)}, gaveUp: band{err: boom},
+			wantSev: sevWarn, wantSummary: "at least 100 issue column move(s) still retrying for over 30 minutes; the given-up band could not be read",
+			wantEvidence: map[string]string{"Still retrying": "100 (sample capped at 100)", "Given up": unavailable},
+		},
+		{
+			name:     "retrying band fails, capped given-up band reads at least",
+			retrying: band{err: boom}, gaveUp: band{rows: repeat(withIssue, 100)},
+			wantSev: sevWarn, wantSummary: "at least 100 issue column move(s) given up after 24 hours; the still-retrying band could not be read",
+			wantEvidence: map[string]string{"Still retrying": unavailable, "Given up": "100 (sample capped at 100)"},
+		},
+		{
 			name:     "capped issue-less band stays ok but shows the cap",
 			retrying: band{rows: repeat(noIssue, 100)},
 			wantSev:  sevOK, wantSummary: "No issue column move pending for over 30 minutes was found in the last 48 hours (bounded sample).",

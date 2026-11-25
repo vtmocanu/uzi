@@ -3,7 +3,6 @@ package runlifecycle
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
 	"os"
 	"testing"
 	"time"
@@ -47,7 +46,7 @@ func TestGetRunMoveContextSupersededLiveDB(t *testing.T) {
 		repo := uuid.New()
 		exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		      VALUES ($1, $2, $3, $4, 'https://forge.test/g/s', 'main', true)`,
-			repo, conn, 1_000_000_000+rand.Int64N(1_000_000_000), "g/superseded-"+repo.String())
+			repo, conn, 1_000_000_000+int64(uuid.New().ID()), "g/superseded-"+repo.String())
 		return repo
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)

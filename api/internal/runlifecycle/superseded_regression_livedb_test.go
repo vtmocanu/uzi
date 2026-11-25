@@ -3,7 +3,6 @@ package runlifecycle
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
 	"os"
 	"testing"
 	"time"
@@ -70,7 +69,7 @@ func TestSupersededRunRetryDoesNotMoveNewerRunsCardLiveDB(t *testing.T) {
 		}
 	}
 	const issueN = 41
-	projectID := 2_000_000_000 + rand.Int64N(1_000_000_000)
+	projectID := 5_000_000_000 + int64(uuid.New().ID())
 	user, conn, repo := uuid.New(), uuid.New(), uuid.New()
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, user, fmt.Sprintf("suprg-%s@e2e", user))
 	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
