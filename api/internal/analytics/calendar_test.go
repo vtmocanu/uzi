@@ -78,73 +78,124 @@ func withGuard(t *testing.T, f func()) {
 	}
 }
 
-func forwardProgress(t *testing.T, zoneName string, probe time.Time, d1, d2 Date, want1, want2 time.Time) {
+// fpCase is one dayStart call in a forward-progress test. fallback is true when
+// the call must take fallback steps and false when it must take none.
+type fpCase struct {
+	date     Date
+	want     time.Time
+	fallback bool
+}
+
+func forwardProgress(t *testing.T, zoneName string, cases []fpCase) {
 	t.Helper()
 	loc := zone(t, zoneName)
-	_, end := probe.In(loc).ZoneBounds()
-	affected := !end.After(probe) && !end.IsZero()
-	if !affected {
-		t.Logf("%s: ZoneBounds end %s is after %s; precondition does not hold, fallback not asserted", zoneName, end.UTC(), probe)
-	}
-	var steps1, steps2 int
-	var got1, got2 time.Time
-	var err1, err2 error
-	withGuard(t, func() {
-		got1, err1 = dayStart(d1, loc, &steps1)
-		got2, err2 = dayStart(d2, loc, &steps2)
-	})
-	if err1 != nil || err2 != nil {
-		t.Fatalf("errors: %v, %v", err1, err2)
-	}
-	eq(t, zoneName+" "+d1.String(), got1, want1)
-	eq(t, zoneName+" "+d2.String(), got2, want2)
-	t.Logf("%s fallback steps: %d and %d", zoneName, steps1, steps2)
-	if affected && steps1+steps2 == 0 {
-		t.Errorf("%s: precondition holds but fallback counter is zero", zoneName)
-	}
-	if steps1 > 273600+1000 || steps2 > 273600+1000 {
-		t.Errorf("%s: fallback steps %d/%d exceed bound", zoneName, steps1, steps2)
+	for _, c := range cases {
+		var steps int
+		var got time.Time
+		var err error
+		withGuard(t, func() { got, err = dayStart(c.date, loc, &steps) })
+		if err != nil {
+			t.Fatalf("%s %s: %v", zoneName, c.date, err)
+		}
+		eq(t, zoneName+" "+c.date.String(), got, c.want)
+		t.Logf("%s %s fallback steps: %d", zoneName, c.date, steps)
+		if c.fallback && steps == 0 {
+			t.Errorf("%s %s: expected fallback steps, got 0", zoneName, c.date)
+		}
+		if !c.fallback && steps != 0 {
+			t.Errorf("%s %s: expected no fallback steps, got %d", zoneName, c.date, steps)
+		}
+		if steps > 273600+1000 {
+			t.Errorf("%s %s: fallback steps %d exceed bound", zoneName, c.date, steps)
+		}
 	}
 }
 
 func TestDayStartForwardProgressNewYork2040(t *testing.T) {
-	loc := zone(t, "America/New_York")
-	_, end := time.Date(2040, 12, 31, 12, 0, 0, 0, time.UTC).In(loc).ZoneBounds()
-	if !end.Equal(utc(2040, 12, 31, 0, 0)) {
-		t.Logf("precondition: ZoneBounds end is %s, not 2040-12-31T00:00Z", end.UTC())
-	}
-	forwardProgress(t, "America/New_York", utc(2040, 12, 31, 12, 0),
-		Date{2040, 12, 31}, Date{2041, 1, 1},
-		utc(2040, 12, 31, 5, 0), utc(2041, 1, 1, 5, 0))
+	forwardProgress(t, "America/New_York", []fpCase{
+		{Date{2040, 12, 31}, utc(2040, 12, 31, 5, 0), true},
+		{Date{2041, 1, 1}, utc(2041, 1, 1, 5, 0), true},
+	})
 }
 
 func TestDayStartForwardProgressBucharest2044(t *testing.T) {
-	forwardProgress(t, "Europe/Bucharest", utc(2044, 12, 31, 12, 0),
-		Date{2044, 12, 31}, Date{2045, 1, 1},
-		utc(2044, 12, 30, 22, 0), utc(2044, 12, 31, 22, 0))
+	forwardProgress(t, "Europe/Bucharest", []fpCase{
+		// East of UTC the search segment for 2044-12-31 (starting at
+		// 2044-12-29T22:00Z) is still valid, so no fallback is needed.
+		{Date{2044, 12, 31}, utc(2044, 12, 30, 22, 0), false},
+		{Date{2045, 1, 1}, utc(2044, 12, 31, 22, 0), true},
+	})
 }
 
 func TestAllTimeLongHistoryTerminates(t *testing.T) {
-	for _, name := range []string{"America/New_York", "Europe/Bucharest"} {
-		t.Run(name, func(t *testing.T) {
-			loc := zone(t, name)
-			earliest := utc(2030, 1, 7, 12, 0)
-			now := utc(2041, 6, 15, 12, 0)
+	earliest := utc(2030, 1, 7, 12, 0)
+	type lhCase struct {
+		zone   string
+		now    time.Time
+		dates  []Date // dates whose dayStart must take fallback steps (7d, 90d)
+		window Window
+	}
+	var cases []lhCase
+	for _, w := range []Window{WindowAll, Window7d, Window90d} {
+		cases = append(cases,
+			lhCase{"America/New_York", utc(2041, 1, 3, 12, 0), []Date{{2040, 12, 31}, {2041, 1, 1}}, w},
+			lhCase{"Europe/Bucharest", utc(2045, 1, 3, 12, 0), []Date{{2045, 1, 1}}, w},
+		)
+	}
+	for _, c := range cases {
+		t.Run(c.zone+"/"+string(c.window), func(t *testing.T) {
+			loc := zone(t, c.zone)
+			steps := map[Date]int{}
+			dayStartObserver = func(d Date, n int) { steps[d] += n }
+			defer func() { dayStartObserver = nil }()
 			var b Bounds
 			var err error
-			withGuard(t, func() { b, err = ComputeBounds(now, loc, WindowAll, &earliest) })
+			withGuard(t, func() { b, err = ComputeBounds(c.now, loc, c.window, &earliest) })
 			if err != nil {
 				t.Fatal(err)
 			}
-			if b.WidthWeeks == 0 || len(b.Buckets) == 0 || len(b.Buckets) > 104 {
-				t.Fatalf("width %d, %d buckets", b.WidthWeeks, len(b.Buckets))
+			if len(b.Buckets) == 0 || len(b.Buckets) > 104 {
+				t.Fatalf("%d buckets", len(b.Buckets))
 			}
-			if len(b.Rolling) != len(b.Buckets) {
-				t.Fatalf("rolling %d vs buckets %d", len(b.Rolling), len(b.Buckets))
+			if c.window == WindowAll && b.WidthWeeks == 0 {
+				t.Fatal("all window has no bucket width")
 			}
 			checkTiling(t, b, loc)
+			// The all window only evaluates week starts, so the defect dates
+			// need not be hit there; the day windows must hit them.
+			if c.window != WindowAll {
+				for _, d := range c.dates {
+					if steps[d] == 0 {
+						t.Errorf("dayStart(%s) took no fallback steps: fallback path not exercised", d)
+					}
+				}
+			}
 		})
 	}
+}
+
+func TestAllWindowEarliestAfterNowIsClamped(t *testing.T) {
+	loc := zone(t, "America/New_York")
+	now := utc(2026, 3, 10, 3, 30) // 2026-03-09 23:30 local
+	earliest := now.Add(2 * time.Hour)
+	if DateOf(earliest, loc) == DateOf(now, loc) {
+		t.Fatal("test setup: earliest must be on a later local date than now")
+	}
+	b, err := ComputeBounds(now, loc, WindowAll, &earliest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.HistoryStart == nil || b.HistoryStart.After(now) {
+		t.Fatalf("HistoryStart %v after now", b.HistoryStart)
+	}
+	if len(b.Buckets) != 1 {
+		t.Fatalf("got %d buckets, want 1", len(b.Buckets))
+	}
+	bk := b.Buckets[0]
+	if bk.Start.After(bk.End) || !bk.End.Equal(now) || !bk.Partial {
+		t.Errorf("malformed bucket %+v", bk)
+	}
+	checkTiling(t, b, loc)
 }
 
 // checkTiling asserts the structural calendar invariants for one Bounds.

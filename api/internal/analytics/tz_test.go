@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 	"time"
-	_ "time/tzdata" // hermetic zone data for every test in the package
+	_ "time/tzdata" // embedded zone database: a fallback used only when the host has no zoneinfo
 )
 
 func TestValidateTZ(t *testing.T) {

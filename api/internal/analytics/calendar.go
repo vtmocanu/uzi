@@ -223,6 +223,10 @@ type Bounds struct {
 // dayStarter memoises DayStart per date for one ComputeBounds call: the
 // traversal is the expensive part and the same dates recur across buckets,
 // rolling ranges and the today search.
+// dayStartObserver, when non-nil, is called by dayStarter.at with each computed
+// date and its fallback step count. Tests only; not safe for parallel tests.
+var dayStartObserver func(d Date, steps int)
+
 type dayStarter struct {
 	loc  *time.Location
 	memo map[Date]time.Time
@@ -232,7 +236,11 @@ func (s *dayStarter) at(d Date) (time.Time, error) {
 	if t, ok := s.memo[d]; ok {
 		return t, nil
 	}
-	t, err := DayStart(d, s.loc)
+	var steps int
+	t, err := dayStart(d, s.loc, &steps)
+	if dayStartObserver != nil {
+		dayStartObserver(d, steps)
+	}
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -264,7 +272,13 @@ func ComputeBounds(now time.Time, loc *time.Location, window Window, earliest *t
 
 	var histDate Date
 	if earliest != nil {
-		histDate = mondayOf(DateOf(*earliest, loc))
+		// Clock skew: an earliest run after Today is clamped to Today so no
+		// bucket starts after now.
+		ed := DateOf(*earliest, loc)
+		if b.Today.Before(ed) {
+			ed = b.Today
+		}
+		histDate = mondayOf(ed)
 		hs, err := ds.at(histDate)
 		if err != nil {
 			return Bounds{}, err
