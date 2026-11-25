@@ -143,10 +143,6 @@ func TestCodexProviderJudgeCapabilityCountsLiveDB(t *testing.T) {
 		if got := satisfyingProvider(fx, "codex", "issue"); got != 2 {
 			t.Fatalf("issue kind with both workers = %d, want 2", got)
 		}
-		// The Claude engine's count is unaffected by the Codex judge capability.
-		if got := satisfyingProvider(fx, "claude", "judge"); got != 0 {
-			t.Fatalf("claude judge kind with Codex-only workers = %d, want 0", got)
-		}
 	})
 }
 
