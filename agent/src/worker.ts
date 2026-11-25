@@ -3,7 +3,7 @@ import { freshResumeCapabilities } from "./fresh-resume.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -1090,6 +1090,11 @@ export class Worker {
           // worker advertising it, and client.ts requireProviderCapability still refuses a provider
           // claim on a registration that did not advertise it.
           CLAUDE_PROVIDER_CAPABILITY,
+          // PRD #4322 M1a: this image runs a Claude provider-bound JUDGE (judge-runner.ts provider path).
+          // Advertised UNCONDITIONALLY: the api places a provider judge only on a worker advertising it
+          // (placement 00534), and client.ts requireProviderCapability refuses a provider judge claim on
+          // a registration that did not advertise it.
+          CLAUDE_PROVIDER_JUDGE_CAPABILITY,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

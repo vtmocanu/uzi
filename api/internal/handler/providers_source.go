@@ -21,6 +21,7 @@ const (
 	reasonProviderSourceUnusable        = "provider_source_unusable"
 	reasonProviderLaneUnsupported       = "provider_lane_unsupported"
 	reasonProviderModelUnmapped         = "provider_model_unmapped"
+	reasonJudgePolicyChanged            = "judge_policy_changed"
 	reasonProviderBindingStale          = "provider_binding_stale"
 	reasonProviderDestinationNotAllowed = "provider_destination_not_allowed"
 

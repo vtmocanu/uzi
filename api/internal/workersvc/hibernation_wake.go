@@ -146,7 +146,7 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 		return DemandWakeNone, nil
 	}
 
-	if providerBoundRun(run) && !workerSupportsProvider(w, run.Harness) {
+	if providerBoundRun(run) && !workerSupportsProvider(w, run.Harness, run.Kind) {
 		return DemandWakeNone, nil
 	}
 
@@ -236,7 +236,7 @@ func (s *Service) ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, 
 		if rerr != nil {
 			return false, rerr
 		}
-		stale = providerBoundRun(run) && !workerSupportsProvider(w, run.Harness)
+		stale = providerBoundRun(run) && !workerSupportsProvider(w, run.Harness, run.Kind)
 	}
 	if !stale {
 		return false, nil

@@ -1520,7 +1520,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- requires its engine's provider protocol capability: an older worker would ignore the
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
       AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY($29::text[]))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY($29::text[])))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[])))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY($29::text[]))
@@ -1829,7 +1829,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
                 -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
                 AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(p.protocol_capabilities)))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
@@ -3237,7 +3237,7 @@ WHERE run.id = $1
   AND fn_codex_claim_provenance_admits(run, w.id)
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL
-           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
            OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
@@ -3815,7 +3815,7 @@ WHERE w.user_id = $1
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND (
-    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
     OR ($2::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
@@ -3827,13 +3827,14 @@ WHERE w.user_id = $1
 type CountOnlineWorkersSatisfyingProviderParams struct {
 	UserID uuid.UUID `json:"user_id"`
 	Engine string    `json:"engine"`
+	Kind   string    `json:"kind"`
 }
 
 // Provider-bound queued health uses the frozen engine. Codex needs its provider,
 // harness and current runtime on the same worker; Claude retains its legacy rule.
 // Unknown engines fail closed. Keep the Codex-harness count's intake/lane filters.
 func (q *Queries) CountOnlineWorkersSatisfyingProvider(ctx context.Context, arg CountOnlineWorkersSatisfyingProviderParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProvider, arg.UserID, arg.Engine)
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingProvider, arg.UserID, arg.Engine, arg.Kind)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -16329,7 +16330,7 @@ WHERE r.status = 'queued'
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (
@@ -16445,7 +16446,7 @@ WHERE r.status = 'queued'
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
-           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+           OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
            OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
                  AND (
                      NOT (

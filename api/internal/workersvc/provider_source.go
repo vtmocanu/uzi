@@ -29,8 +29,10 @@ var (
 	// (retired, URL no longer allowlisted, key missing or disabled). Never falls back to a vendor
 	// credential or to the other engine. 409 provider_source_unusable.
 	ErrProviderSourceUnusable = errors.New("provider_source_unusable")
-	// ErrProviderLaneUnsupported: judge, job, cross-check and isolated (egress-profile) runs do not
-	// support a provider-sourced owner until PRD #4322. 409 provider_lane_unsupported.
+	// ErrProviderLaneUnsupported: job, cross-check and isolated (egress-profile) runs do not
+	// support a provider-sourced owner until PRD #4322, and neither does a Codex judge for an owner
+	// with a Codex source (until #4574); a Claude judge is provider-bound (PRD #4322 M1a).
+	// 409 provider_lane_unsupported.
 	ErrProviderLaneUnsupported = errors.New("provider_lane_unsupported")
 	// ErrProviderModelUnmapped: a model the run would use is neither a mapped alias nor a mapped
 	// target of the bound provider's model map. 409 provider_model_unmapped.

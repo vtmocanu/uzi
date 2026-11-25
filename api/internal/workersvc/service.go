@@ -2304,6 +2304,10 @@ type Service struct {
 	// production.
 	judgeBeforeLockHook  func(ctx context.Context)
 	judgeAfterInsertHook func(ctx context.Context)
+	// judgeDecidedHook is the test seam of the judge lane decision (PRD #4322 M1a): it runs in the
+	// create transaction right after the lane decision, holding the shared secret-mutation lock,
+	// before the provider branch freezes its source. Nil in production.
+	judgeDecidedHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -6109,7 +6113,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				// compromised worker cannot smuggle a non-enum rate_limit_type past the
 				// server" would then be false on exactly the path a human reads. When the
 				// fields are absent this is nil and every other failure path is untouched.
-				FailureReason:  limitAwareFailureReason(owned.Harness, req),
+				FailureReason:  failedReportReason(owned, req),
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),

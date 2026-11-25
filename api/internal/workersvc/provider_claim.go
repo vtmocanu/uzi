@@ -13,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/providers"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -29,10 +30,15 @@ import (
 const (
 	holdProviderDestinationNotAllowed = "provider_destination_not_allowed"
 	holdProviderBindingStale          = "provider_binding_stale"
+	// holdProviderModelUnmapped is the typed terminal reason of a provider JUDGE claim whose
+	// resolved judge model the frozen provider's map no longer carries (PRD #4322 D-F). It is never
+	// a park reason: finishRunClaimTx settles a judge's provider refusal as a failed run.
+	holdProviderModelUnmapped = "provider_model_unmapped"
 )
 
 // errProviderLaneClaimRefused is the claim-assembly refusal of a provider-bound run on a lane that
-// has no provider support yet (judge, job, cross-check, isolated; PRD #4322). It wraps
+// has no provider support yet (Codex judge until #4574, job, cross-check, isolated; a Claude judge is
+// supported since PRD #4322 M1a), or on a worker lacking the lane's capability. It wraps
 // errCredentialUnavailable, so finishRunClaim fails the claim terminally exactly as it does for the
 // other refused-lane shapes (errIsolatedClaimRefused), never delivering anything.
 var errProviderLaneClaimRefused = fmt.Errorf("%w: %w", errCredentialUnavailable, ErrProviderLaneUnsupported)
@@ -58,6 +64,8 @@ func (e *providerClaimRefusal) Is(target error) bool {
 		return e.Reason == holdProviderBindingStale
 	case ErrProviderDestinationNotAllowed:
 		return e.Reason == holdProviderDestinationNotAllowed
+	case ErrProviderModelUnmapped:
+		return e.Reason == holdProviderModelUnmapped
 	}
 	return false
 }
@@ -225,7 +233,7 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 // and the possibly re-keyed payload is never delivered.
 func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimProviderBinding, error) {
 	// Require the complete engine protocol before any binding read or vault open.
-	if !workerSupportsProvider(wkr, run.Harness) {
+	if !workerSupportsProvider(wkr, run.Harness, run.Kind) {
 		return nil, errProviderLaneClaimRefused
 	}
 	keyID, ok := frozenProviderKeyID(run)
@@ -288,11 +296,13 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 }
 
 // workerSupportsProvider checks only the advertised protocol for the frozen engine.
-// Wake admission and claim assembly share this conjunction without reading credentials.
-func workerSupportsProvider(w store.Worker, engine string) bool {
+// Wake admission and claim assembly share this conjunction without reading credentials. A Claude
+// judge additionally needs claude_provider_judge_v1 (PRD #4322 M1a), mirroring the SQL claim clause.
+func workerSupportsProvider(w store.Worker, engine, kind string) bool {
 	switch engine {
 	case harnessClaude:
-		return slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderV1)
+		return slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderV1) &&
+			(kind != runkind.Judge || slices.Contains(w.ProtocolCapabilities, capability.ClaudeProviderJudgeV1))
 	case harnessCodex:
 		return slices.Contains(w.ProtocolCapabilities, capability.CodexProviderV1) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&

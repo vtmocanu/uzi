@@ -604,7 +604,7 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     });
     // The never-judged control fixture stays skip-free.
     expect((await api.getRunReview("run-unjudged")).skip).toBeNull();
-    for (const r of mockRuns.filter((x) => x.id !== "run-judge-skipped")) {
+    for (const r of mockRuns.filter((x) => !x.id.startsWith("run-judge-skipped"))) {
       if (r.kind !== "issue" && r.kind !== "ci_fix") continue;
       expect((await api.getRunReview(r.id)).skip, r.id).toBeNull();
     }
@@ -616,6 +616,32 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     });
     // No judge was created on the other harness: still skipped, nothing pending.
     expect((await api.getRunReview("run-judge-skipped")).pending_judge).toBeNull();
+  });
+
+  it("provider_* judge skips are seeded and Run judge refuses them with a reason-aware 409 (#4322)", async () => {
+    installStorage();
+    const api = await reload();
+    const cases = [
+      ["codex", "codex", "provider_lane_unsupported", "this run type does not support a model-provider source yet"],
+      ["unusable", "claude", "provider_source_unusable", "your source is a model provider that cannot serve a run"],
+      ["unmapped", "claude", "provider_model_unmapped", "the provider's model map does not map a model this run uses"],
+    ] as const;
+    for (const [suffix, harness, reason, message] of cases) {
+      const id = `run-judge-skipped-provider-${suffix}`;
+      expect(await api.getRunReview(id)).toEqual({
+        review: null,
+        pending_judge: null,
+        skip: { harness, reason, at: expect.any(String) },
+      });
+      await expect(api.rerunJudge(id)).rejects.toMatchObject({ status: 409, message, body: { reason } });
+      expect((await api.getRunReview(id)).pending_judge).toBeNull();
+    }
+    // A historical Claude lane row no longer refuses: a Claude judge runs on the provider source.
+    const claude = "run-judge-skipped-provider-claude";
+    expect((await api.getRunReview(claude)).skip).toMatchObject({ harness: "claude", reason: "provider_lane_unsupported" });
+    const { run } = await api.rerunJudge(claude);
+    expect(run.kind).toBe("judge");
+    expect((await api.getRunReview(claude)).pending_judge).not.toBeNull();
   });
 
   it("rerunJudge enqueues a judge run for a terminal issue run and rejects a non-terminal one", async () => {

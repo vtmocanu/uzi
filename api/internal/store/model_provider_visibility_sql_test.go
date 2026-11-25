@@ -125,6 +125,8 @@ var visibilityTable = map[string]visEntry{
 		callers: []string{"handler/providers.go"}},
 	"GetUserProviderLaneSources": {class: classIdentity, must: []string{"WHERE id = $1"},
 		callers: []string{"workersvc/harness_resolver.go"}},
+	"GetUserJudgeLanePolicy": {class: classIdentity, must: []string{"WHERE id = $1"},
+		callers: []string{"workersvc/harness_resolver.go"}},
 }
 
 var (

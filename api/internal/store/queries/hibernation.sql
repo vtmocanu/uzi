@@ -161,6 +161,7 @@ WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
    OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
    OR (r.model_provider_key_mode IS NOT NULL AND NOT CASE r.harness
        WHEN 'claude' THEN 'claude_provider_v1' = ANY(w.protocol_capabilities)
+                        AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities))
        WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)

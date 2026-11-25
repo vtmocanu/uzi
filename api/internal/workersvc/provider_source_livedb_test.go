@@ -1001,9 +1001,10 @@ func TestProviderBoundRunNeverAppliesAnInPlaceSwitchLiveDB(t *testing.T) {
 	})
 }
 
-// TestProviderOwnerGetsNoJudgeLiveDB: a completed provider-bound run is not judged (the judge lane
-// refuses a provider-sourced owner), while the same user's vendor run still is.
-func TestProviderOwnerGetsNoJudgeLiveDB(t *testing.T) {
+// TestProviderOwnerGetsProviderBoundJudgeLiveDB: with a Claude source selected (and no judge pin) the
+// judge of a completed run, bound or vendor, is itself bound to the owner's source (PRD #4322 M1a),
+// never a vendor judge; with the source cleared the vendor judge is created as before.
+func TestProviderOwnerGetsProviderBoundJudgeLiveDB(t *testing.T) {
 	fx := newProvFix(t)
 	seedDefaultAnthropicToken(t, fx.env, fx.userID)
 	fx.addProvider(pvDefaultMap, false)
@@ -1018,39 +1019,46 @@ func TestProviderOwnerGetsNoJudgeLiveDB(t *testing.T) {
 	for _, id := range []uuid.UUID{vendor.ID, bound.ID} {
 		fx.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, id)
 		judge.maybeEnqueueJudge(fx.env.ctx, mustRun(t, fx.env, id))
-	}
-	if _, _, ok := judgeForTarget(t, fx.env, bound.ID); ok {
-		t.Fatal("a provider-bound run was judged")
-	}
-	if _, _, ok := judgeForTarget(t, fx.env, vendor.ID); ok {
-		t.Fatal("the owner has a provider source, so even the vendor run's Claude judge is refused (lane unsupported)")
+		jid, _, ok := judgeForTarget(t, fx.env, id)
+		if !ok {
+			t.Fatalf("run %s: the owner's source is usable, so a provider-bound judge must be created", id)
+		}
+		fx.wantBound(mustRun(t, fx.env, jid), 1, fx.keyRev())
 	}
 	fx.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID)
-	judge.maybeEnqueueJudge(fx.env.ctx, mustRun(t, fx.env, vendor.ID))
-	if _, _, ok := judgeForTarget(t, fx.env, vendor.ID); !ok {
+	control := mustRun(t, fx.env, mustCreate(t, fx).ID)
+	fx.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, control.ID)
+	judge.maybeEnqueueJudge(fx.env.ctx, mustRun(t, fx.env, control.ID))
+	jid, _, ok := judgeForTarget(t, fx.env, control.ID)
+	if !ok {
 		t.Fatal("control: with no provider source the vendor run is judged as before")
 	}
+	fx.wantVendor(mustRun(t, fx.env, jid))
 }
 
 // TestProviderOwnerJudgeSkipIsVisibleLiveDB (PRD #1429 D4: a derived run that is not created needs a
-// visible reason): the automatic judge refused for a provider-sourced owner records the
-// provider_lane_unsupported skip, for a usable and an unusable source, and for an owner with no
-// Anthropic token at all (which must not read as a missing vendor credential).
+// visible reason): a provider-only owner (no Anthropic token) gets a provider-bound judge while the
+// source is usable and no vendor-credential skip, and the automatic judge refused for an unusable
+// source records the provider_source_unusable skip.
 func TestProviderOwnerJudgeSkipIsVisibleLiveDB(t *testing.T) {
 	fx := newProvFix(t)
 	fx.addProvider(pvDefaultMap, true) // a provider-only owner: no Anthropic token
 	judge := judgeEnqueueSvc(fx.env, fx.userID)
 	judge.p.ProviderAllowedBaseURLs = fx.svc.p.ProviderAllowedBaseURLs
 
-	for i, retire := range []bool{false, true} {
-		if retire {
-			fx.env.exec(`UPDATE model_providers SET retired_at = now() WHERE id = $1`, fx.provider)
-		}
-		target := seedJudgeTarget(t, fx.env, fx.userID, fx.repoID, "claude", int64(9701+i))
-		judge.maybeEnqueueJudge(fx.env.ctx, target)
-		noJudgeAnywhere(t, fx.env, target.ID, "provider-sourced owner")
-		wantSkip(t, fx.env, target.ID, "claude", JudgeSkipProviderLaneUnsupported)
+	usable := seedJudgeTarget(t, fx.env, fx.userID, fx.repoID, "claude", 9701)
+	judge.maybeEnqueueJudge(fx.env.ctx, usable)
+	jid, _, ok := judgeForTarget(t, fx.env, usable.ID)
+	if !ok {
+		t.Fatal("a provider-only owner with a usable source must get a provider-bound judge, not a missing-token skip")
 	}
+	fx.wantBound(mustRun(t, fx.env, jid), 1, fx.keyRev())
+
+	fx.env.exec(`UPDATE model_providers SET retired_at = now() WHERE id = $1`, fx.provider)
+	unusable := seedJudgeTarget(t, fx.env, fx.userID, fx.repoID, "claude", 9702)
+	judge.maybeEnqueueJudge(fx.env.ctx, unusable)
+	noJudgeAnywhere(t, fx.env, unusable.ID, "provider-sourced owner with a retired source")
+	wantSkip(t, fx.env, unusable.ID, "claude", JudgeSkipProviderSourceUnusable)
 }
 
 // TestProviderOwnerGetsNoJobLiveDB: a job is refused for a provider-sourced owner (usable or not)

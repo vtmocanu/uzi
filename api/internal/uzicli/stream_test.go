@@ -52,13 +52,31 @@ type streamServer struct {
 
 	// conns hands each accepted socket to the test so it can push frames or kill it.
 	conns chan *websocket.Conn
+
+	// closeConns is fixed before the server starts serving and never written again.
+	closeConns bool
+}
+
+// streamServerOpts configures newStreamServerWith; the zero value is newStreamServer.
+type streamServerOpts struct {
+	// closeConns answers GetRun and RunLogs with `Connection: close`, so no request
+	// reuses a pooled connection. net/http only transparently retries a request on a
+	// REUSED connection, so this makes the server's getRuns count exactly one per
+	// client call — a test counting reconcile passes needs that.
+	closeConns bool
 }
 
 func newStreamServer(t *testing.T) *streamServer {
 	t.Helper()
+	return newStreamServerWith(t, streamServerOpts{})
+}
+
+func newStreamServerWith(t *testing.T, opts streamServerOpts) *streamServer {
+	t.Helper()
 	s := &streamServer{
-		status: "running",
-		conns:  make(chan *websocket.Conn, 8),
+		status:     "running",
+		conns:      make(chan *websocket.Conn, 8),
+		closeConns: opts.closeConns,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +107,9 @@ func newStreamServer(t *testing.T) *streamServer {
 			}
 		}
 		s.mu.Unlock()
+		if s.closeConns {
+			w.Header().Set("Connection", "close")
+		}
 		writeJSON(w, map[string]any{"messages": out})
 	})
 	mux.HandleFunc("/api/runs/"+testRunID, func(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +117,9 @@ func newStreamServer(t *testing.T) *streamServer {
 		s.getRuns++
 		st := s.status
 		s.mu.Unlock()
+		if s.closeConns {
+			w.Header().Set("Connection", "close")
+		}
 		writeJSON(w, map[string]any{"run": apitypes.RunDTO{ID: testRunID, Status: st}})
 	})
 	s.Server = httptest.NewServer(mux)
@@ -494,6 +518,92 @@ func TestStreamRunReplaysMissedMessagesOnReconnect(t *testing.T) {
 	if logs[0] != 1 {
 		t.Errorf("reconnect replayed from after=%d, want after=1 (the last seq seen) — replaying from 0 duplicates the whole run", logs[0])
 	}
+}
+
+// A reconcile tick during the no-socket wait must not restart the redial backoff.
+// When it did, every selected tick discarded the pending redial deadline, so once the
+// backoff wait grew past the reconcile interval (12s by default; the backoff only
+// resets when a frame arrives) the redial was starved for as long as ticks kept
+// winning — normally until the run turned terminal and reconcile stopped the ticker.
+//
+// Deterministic by construction: streamAfter counts how often the deadline is armed
+// and only fires on cue. The pump is one goroutine and reconcile's GetRun is
+// synchronous, so by the time the server has seen two GetRuns after the wait began,
+// a variant that re-arms per select entry has armed at least twice. closeConns rules
+// out a transparent net/http retry counting one reconcile twice.
+func TestStreamRunReconcileTicksDoNotRestartRedialBackoff(t *testing.T) {
+	srv := newStreamServerWith(t, streamServerOpts{closeConns: true})
+	c := srv.client("uzc_test")
+	c.streamReconcile = time.Millisecond
+
+	var (
+		afterMu    sync.Mutex
+		afterCalls int
+		enterOnce  sync.Once
+	)
+	entered := make(chan struct{})
+	fire := make(chan time.Time, 1)
+	c.streamAfter = func(time.Duration) <-chan time.Time {
+		afterMu.Lock()
+		afterCalls++
+		afterMu.Unlock()
+		enterOnce.Do(func() { close(entered) })
+		return fire
+	}
+	calls := func() int {
+		afterMu.Lock()
+		defer afterMu.Unlock()
+		return afterCalls
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := c.StreamRun(ctx, testRunID)
+	if err != nil {
+		t.Fatalf("StreamRun: %v", err)
+	}
+	defer func() {
+		stream.Close()
+		if !stream.waitStopped(5 * time.Second) {
+			t.Error("stream did not stop")
+		}
+	}()
+	// Reconcile's first pass emits a state frame on the unbuffered events channel;
+	// drain so it never blocks the pump.
+	go func() {
+		for range stream.Events() {
+		}
+	}()
+
+	conn := srv.nextConn(t)
+	_ = conn.CloseNow()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never entered its reconnect backoff wait after the socket died")
+	}
+	_, g, _, _, _ := srv.snapshot()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	deadline := time.After(5 * time.Second)
+	for {
+		if _, n, _, _, _ := srv.snapshot(); n >= g+2 {
+			break
+		}
+		select {
+		case <-poll.C:
+		case <-deadline:
+			t.Fatal("reconcile never ticked during the reconnect wait")
+		}
+	}
+	if n := calls(); n != 1 {
+		t.Fatalf("streamAfter calls = %d, want 1 (reconcile ticks restarted the redial backoff)", n)
+	}
+
+	// The original deadline still drives the redial.
+	fire <- time.Now()
+	_ = srv.nextConn(t)
 }
 
 // A reconnect also re-reads GetRun, because the message replay cannot reveal a state

@@ -6520,6 +6520,11 @@ func (f *fakeStore) GetUserProviderLaneSources(context.Context, uuid.UUID) (stor
 	return store.GetUserProviderLaneSourcesRow{}, nil
 }
 
+// GetUserJudgeLanePolicy preserves the fixture's vendor judge policy: default pin policy, no source.
+func (f *fakeStore) GetUserJudgeLanePolicy(context.Context, uuid.UUID) (store.GetUserJudgeLanePolicyRow, error) {
+	return store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModeDefault}, nil
+}
+
 func TestAgentsFromTemplatesEffortProjection(t *testing.T) {
 	rows := []store.AgentTemplate{
 		{Name: "claude-only", Effort: pgconv.TextOrNull("high")},

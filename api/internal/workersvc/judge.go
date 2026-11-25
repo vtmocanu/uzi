@@ -13,9 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
-	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
@@ -247,6 +245,13 @@ func normalizeCommandToken(cmd string) string {
 // ABSENT from the window is deliberately still scanned — the high-confidence forms must
 // report even with no invocation to corroborate against.
 func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
+	return scanCommandNotFoundScrubbed(rows, nil)
+}
+
+// scanCommandNotFoundScrubbed is scanCommandNotFound with an optional row-text scrub (a
+// provider-bound judge, PRD #4322 M1a) applied to each whole tool_result payload BEFORE the
+// scan budget cut, the pattern match and the evidence clip. nil keeps vendor mode byte-identical.
+func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func(string) string) []missCandidate {
 	invoked := invokedExecutables(rows)
 	pinned := goRunPinnedTools(rows)
 	funcs := shellFunctionNames(rows)
@@ -270,60 +275,84 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 		if scanned >= judgeScanByteBudget || len(out) >= judgeMissCandidateCap {
 			break
 		}
-		text := string(row.Payload)
-		if scanned+len(text) > judgeScanByteBudget {
-			text = text[:judgeScanByteBudget-scanned]
+		var texts []string
+		if scrub != nil {
+			// Provider judge: inspect only WHOLE rows, decoded. The budget cut, the pattern match
+			// (it stops at `/` or `%`) and a JSON-escaped invisible separator (`\u001b`) can each
+			// split a key into pieces the scrub no longer recognises, so a row that does not fit
+			// the remaining budget, or does not decode, is omitted rather than cut. Each decoded
+			// string value is scrubbed (key forms replaced, also across invisible runs, with
+			// separators outside a key kept) and matched on its own, so fields never combine.
+			// Command identity stays as extracted for the suppression lookups.
+			if scanned+len(row.Payload) > judgeScanByteBudget {
+				continue
+			}
+			decoded, ok := decodedPayloadStrings(row.Payload)
+			if !ok {
+				continue
+			}
+			scanned += len(row.Payload)
+			for _, d := range decoded {
+				texts = append(texts, scrub(d))
+			}
+		} else {
+			text := string(row.Payload)
+			if scanned+len(text) > judgeScanByteBudget {
+				text = text[:judgeScanByteBudget-scanned]
+			}
+			scanned += len(text)
+			texts = []string{payloadText([]byte(text))}
 		}
-		scanned += len(text)
-		text = payloadText([]byte(text))
 
-		forEachNotFound(text, func(cmd, evidence string, lowConfidence bool) {
-			cmd = normalizeCommandToken(cmd)
-			// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
-			// barred by Decision 6 and rejected when an admin allowlists it
-			// (toolprofile.Denied). Recommending its installation can never be actioned,
-			// so observing it absent is the policy working rather than a finding.
-			//
-			// FILTERED HERE, at collection, and that placement is load-bearing rather than
-			// incidental: judgeMissCandidateCap short-circuits this loop, so a denied CLI
-			// caught later (in suppressResolved, or downstream at recommendation time)
-			// would still consume a candidate slot and crowd out a genuine miss — the
-			// precise failure the cap's own comment above documents at length.
-			//
-			// SCOPE: this covers the DETERMINISTIC path only. The judge MODEL also reads
-			// the sampled trace and can emit the same recommendation on its own; both
-			// observed `glab` recommendations (runs b64b98f3, 1dfc65b4) came from a
-			// `complete` model review, not from fallbackReview. JUDGE_SYSTEM_PROMPT names
-			// the barred class so the model reclassifies to adjust_template/improve_agent,
-			// which is the actionable category — that prompt line, not this filter, is
-			// what addresses those two.
-			//
-			// pinned[cmd] is the same shape of not-a-gap: a tool the run invokes via
-			// `go run <module>@<version>` is reached THROUGH that pinned ref and needs no
-			// bare executable, so its `command not found` is by-design, not a missing
-			// worker tool to install (judge rec run eaa26abe: golangci-lint reached via
-			// `go run …/golangci-lint@v2.12.2`, then flagged missing). Filtered HERE for
-			// the same candidate-slot reason as the denylist above. Presence-based, not
-			// green/seq-gated like suppressResolved: the ref's mere presence proves the
-			// canonical invocation does not need PATH, and the bare-name probe often comes
-			// AFTER the successful `go run`.
-			//
-			// funcs[cmd] is the same shape of not-a-gap: a name the run DEFINES as a shell
-			// function anywhere in the trace (shellFunctionNames) is not a missing worker
-			// tool — a subshell that could not see the function reports `db_psql: command
-			// not found`, but installing anything would be wrong. Presence-based, like
-			// pinned above.
-			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] || funcs[cmd] ||
-				(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
-				return
-			}
-			seen[cmd] = true
-			evidence = strings.TrimSpace(evidence)
-			if len(evidence) > judgeEvidenceMaxLen {
-				evidence = evidence[:judgeEvidenceMaxLen]
-			}
-			out = append(out, missCandidate{Command: cmd, Evidence: evidence, Seq: row.Seq})
-		})
+		for _, text := range texts {
+			forEachNotFound(text, func(cmd, evidence string, lowConfidence bool) {
+				cmd = normalizeCommandToken(cmd)
+				// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
+				// barred by Decision 6 and rejected when an admin allowlists it
+				// (toolprofile.Denied). Recommending its installation can never be actioned,
+				// so observing it absent is the policy working rather than a finding.
+				//
+				// FILTERED HERE, at collection, and that placement is load-bearing rather than
+				// incidental: judgeMissCandidateCap short-circuits this loop, so a denied CLI
+				// caught later (in suppressResolved, or downstream at recommendation time)
+				// would still consume a candidate slot and crowd out a genuine miss — the
+				// precise failure the cap's own comment above documents at length.
+				//
+				// SCOPE: this covers the DETERMINISTIC path only. The judge MODEL also reads
+				// the sampled trace and can emit the same recommendation on its own; both
+				// observed `glab` recommendations (runs b64b98f3, 1dfc65b4) came from a
+				// `complete` model review, not from fallbackReview. JUDGE_SYSTEM_PROMPT names
+				// the barred class so the model reclassifies to adjust_template/improve_agent,
+				// which is the actionable category — that prompt line, not this filter, is
+				// what addresses those two.
+				//
+				// pinned[cmd] is the same shape of not-a-gap: a tool the run invokes via
+				// `go run <module>@<version>` is reached THROUGH that pinned ref and needs no
+				// bare executable, so its `command not found` is by-design, not a missing
+				// worker tool to install (judge rec run eaa26abe: golangci-lint reached via
+				// `go run …/golangci-lint@v2.12.2`, then flagged missing). Filtered HERE for
+				// the same candidate-slot reason as the denylist above. Presence-based, not
+				// green/seq-gated like suppressResolved: the ref's mere presence proves the
+				// canonical invocation does not need PATH, and the bare-name probe often comes
+				// AFTER the successful `go run`.
+				//
+				// funcs[cmd] is the same shape of not-a-gap: a name the run DEFINES as a shell
+				// function anywhere in the trace (shellFunctionNames) is not a missing worker
+				// tool — a subshell that could not see the function reports `db_psql: command
+				// not found`, but installing anything would be wrong. Presence-based, like
+				// pinned above.
+				if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] || funcs[cmd] ||
+					(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
+					return
+				}
+				seen[cmd] = true
+				evidence = strings.TrimSpace(evidence)
+				if len(evidence) > judgeEvidenceMaxLen {
+					evidence = evidence[:judgeEvidenceMaxLen]
+				}
+				out = append(out, missCandidate{Command: cmd, Evidence: evidence, Seq: row.Seq})
+			})
+		}
 	}
 	return out
 }
@@ -1122,14 +1151,25 @@ func judgeDefaultChoice(c secretChoice) secretChoice {
 // forks BEFORE GetRunClaimContext (a judge run has no repo) — that fork lives in
 // claim_assembly.go's assembleClaim, unchanged.
 func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
-	// PRD #4320 module 5: the judge lane has no provider support until PRD #4322. A provider-bound
-	// row (creation cannot produce one; defence in depth) is refused before any credential is opened.
-	if providerBoundRun(run) {
+	// PRD #4322 M1a: a provider-bound CLAUDE judge claims against its frozen binding (D-F): it never
+	// calls judgeChoice, reserveGateFrom, openWithAutoRetry or recordRunCredential, so no vendor
+	// credential is opened or recorded. A provider-bound judge of any other harness (Codex, until
+	// #4574) is refused before any credential is opened.
+	providerJudge := providerBoundRun(run)
+	if providerJudge && run.Harness != harnessClaude {
 		return nil, errProviderLaneClaimRefused
+	}
+	var providerBinding *ClaimProviderBinding
+	if providerJudge {
+		b, err := s.assembleProviderBinding(ctx, wkr, run)
+		if err != nil {
+			return nil, err
+		}
+		providerBinding = b
 	}
 	var anthropic []byte
 	recordedLastSeq := run.LastSeq
-	if run.Harness != harnessCodex {
+	if run.Harness != harnessCodex && !providerJudge {
 		// The run owner's JUDGE binding resolves the credential — and deliberately NOT the
 		// claiming worker's binding, even though a judge run is claimed by an ordinary
 		// worker through the same ClaimRun lane. Under PRD #104 D1 the judge lane is bound
@@ -1180,7 +1220,13 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	if run.TargetRunID.Valid {
 		id := uuid.UUID(run.TargetRunID.Bytes).String()
 		targetRunID = &id
-		signal = s.judgeSignal(ctx, uuid.UUID(run.TargetRunID.Bytes))
+		// PRD #4322 M1a: a provider-bound judge scrubs its key forms from the evidence before the
+		// pre-scan clips it (a cut key would reach the worker as an unmatchable partial prefix).
+		var scrub func(string) string
+		if providerBinding != nil {
+			scrub = judgeProviderScrub(providerBinding.Credential)
+		}
+		signal = s.judgeSignal(ctx, uuid.UUID(run.TargetRunID.Bytes), scrub)
 		// PRD #69 M7a Pass B: surface the reviewed run's TRUSTED failure ORIGIN
 		// (runs.fail_origin, the closed enum stamped at each failed write) so the judge
 		// can weigh the failure CLASS — e.g. no retry/backoff advice for a policy/config
@@ -1210,29 +1256,27 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	// error on either tier is logged and that tier is treated as unset: a claim never
 	// fails on it, and an empty model is never sent to the SDK.
 	var judgeModel *string
-	if s.settings != nil {
+	if providerJudge {
+		// Strict (PRD #4322 D-F): a read error is terminal (never a guessed model), and a model the
+		// frozen provider's map does not carry is refused as provider_model_unmapped, nothing delivered.
+		model, dropped, merr := s.resolveJudgeModelFor(ctx, s.q, run.UserID, HarnessClaude, true)
+		if merr != nil {
+			return nil, fmt.Errorf("%w: judge model: %w", errCredentialUnavailable, merr)
+		}
+		if !modelMapped(providerBinding.ModelMap, model) {
+			return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: fmt.Sprintf("model %q (judge) is not mapped by the provider", model)}
+		}
+		judgeModel = &model
+		if len(dropped) > 0 {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, HarnessClaude, dropped[0])
+		}
+	} else if s.settings != nil {
 		harness := Harness(run.Harness)
-		instanceKey := settings.KeyJudgeModel
-		if harness == HarnessCodex {
-			instanceKey = settings.KeyCodexJudgeModel
-		}
-		var userModel string
-		if um, err := s.q.GetUserJudgeModels(ctx, run.UserID); err != nil {
-			slog.Warn("judge claim: read user judge models", "user", run.UserID.String(), "error", err)
-		} else if harness == HarnessCodex {
-			userModel = um.CodexJudgeModel.String
-		} else {
-			userModel = um.JudgeModel.String
-		}
-		instanceModel, err := s.settings.InstanceModel(ctx, instanceKey)
-		if err != nil {
-			slog.Warn("judge claim: read instance judge model", "key", instanceKey, "error", err)
-			instanceModel = ""
-		}
-		res := agenttmpl.ResolveJudgeModel(string(harness), userModel, instanceModel)
-		judgeModel = &res.Model
-		if len(res.Dropped) > 0 {
-			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, res.Dropped[0])
+		// strict=false: a read error is logged and that tier treated as unset, so this never errs.
+		model, dropped, _ := s.resolveJudgeModelFor(ctx, s.q, run.UserID, harness, false)
+		judgeModel = &model
+		if len(dropped) > 0 {
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, dropped[0])
 		}
 	}
 
@@ -1306,6 +1350,8 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 			// rides the ordinary ClaimPayload; the no-PAT guarantee is that assembly
 			// never decrypts one, asserted in judge_test.go.
 			AnthropicOAuthToken: string(anthropic),
+			// Set only for a provider-bound Claude judge (then AnthropicOAuthToken is empty).
+			Provider: providerBinding,
 		},
 		Agents:        []ClaimAgent{},
 		Skills:        []ClaimSkill{},
@@ -1386,7 +1432,7 @@ func (s *Service) targetCostContext(ctx context.Context, targetID uuid.UUID) (*s
 // only, while the green index reads both kinds and joins them by tool_use_id. The
 // order is scan → index → suppress, and the wire contract is unchanged — a suppressed
 // miss is simply absent from MissingTools.
-func (s *Service) judgeSignal(ctx context.Context, targetID uuid.UUID) *JudgeSignal {
+func (s *Service) judgeSignal(ctx context.Context, targetID uuid.UUID, scrub func(string) string) *JudgeSignal {
 	rows, err := s.q.ListToolTraceForRun(ctx, store.ListToolTraceForRunParams{
 		RunID: targetID,
 		Lim:   judgeToolTraceRowCap,
@@ -1395,7 +1441,7 @@ func (s *Service) judgeSignal(ctx context.Context, targetID uuid.UUID) *JudgeSig
 		slog.Warn("judge signal: list tool trace", "target", targetID, "error", err)
 		return nil
 	}
-	misses := suppressResolved(scanCommandNotFound(rows), observedGreenTools(rows))
+	misses := suppressResolved(scanCommandNotFoundScrubbed(rows, scrub), observedGreenTools(rows))
 	if len(misses) == 0 {
 		return nil
 	}

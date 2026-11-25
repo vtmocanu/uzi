@@ -56,7 +56,9 @@ const pendingJudges: Record<string, PendingJudge> = Object.fromEntries(
 
 // The recorded automatic-judge skips (PRD #3257), the same mutable-copy pattern. getRunReview
 // reads it; rerunJudge refuses a skipped target (the demo owner still has no usable credential
-// for the judge's harness), so no mock judge is ever created over a skip row.
+// for the judge's harness, or a provider refusal still applies), so no mock judge is created
+// over a skip row, except a historical Claude provider_lane_unsupported row (#4322 M1a), which
+// the real server now judges on the owner's provider source.
 const judgeSkips: Record<string, JudgeSkip> = Object.fromEntries(
   Object.entries(mockJudgeSkips).map(([id, s]) => [id, { ...s }]),
 );
@@ -999,11 +1001,24 @@ export const judgeApi = {
     if (pendingJudges[id]) {
       throw new ApiError(409, "a judge run is already in progress for this run");
     }
-    // PRD #3257: a skipped target's owner still has no usable credential for the judge's
-    // harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
+    // PRD #3257: a skipped target's owner (other than the historical Claude lane row below)
+    // still has no usable credential for the judge's harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
     // no_credential_for_harness body) and the panel shows it inline. No judge is created on
     // the other harness.
-    const skip = judgeSkips[id];
+    // A historical Claude provider_lane_unsupported row (#4322 M1a): a Claude judge now runs on
+    // the owner's provider source, so the real server would create the judge; so does the mock.
+    const historicalClaudeLane = judgeSkips[id]?.reason === "provider_lane_unsupported" && judgeSkips[id]?.harness === "claude";
+    const skip = historicalClaudeLane ? undefined : judgeSkips[id];
+    // A provider_* skip mirrors writeRerunJudgeError's 409 reason codes and messages.
+    const providerRefusal: Record<string, string> = {
+      provider_source_unusable: "your source is a model provider that cannot serve a run",
+      provider_model_unmapped: "the provider's model map does not map a model this run uses",
+      provider_lane_unsupported: "this run type does not support a model-provider source yet",
+    };
+    if (skip && providerRefusal[skip.reason] !== undefined) {
+      const message = providerRefusal[skip.reason];
+      throw new ApiError(409, message, { error: message, reason: skip.reason });
+    }
     if (skip) {
       const message = `the judge's harness (${skip.harness}) has no usable credential`;
       throw new ApiError(422, message, { error: message, code: "no_credential_for_harness" });
