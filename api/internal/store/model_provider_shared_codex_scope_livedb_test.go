@@ -153,6 +153,18 @@ func TestSharedCodexScopeConstraintNegativesLiveDB(t *testing.T) {
 	} else {
 		wantViolation(t, "deleting a selected shared Codex definition", err, "23503", "users_codex_provider_fkey")
 	}
+	// The database does NOT enforce the engine of a shared source: it accepts a Codex source on a shared
+	// Claude definition and a Claude source on a shared Codex definition (nil scope both ways). The
+	// engine is enforced by the queries; TestSharedCodexSourceWriterRefusesCrossEngineLiveDB proves the
+	// writer refuses both and the reader resolves neither.
+	d, _ := newProductUser(ctx, t, pool)
+	sharedClaude := newSharedProvider(ctx, t, q, "shared-claude-crossed")
+	if _, err := pool.Exec(ctx, setSrc, d, sharedClaude.ID, nilScope); err != nil {
+		t.Errorf("the database refused a Codex source on a shared Claude definition: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = $3 WHERE id = $1`, d, sc, nilScope); err != nil {
+		t.Errorf("the database refused a Claude source on a shared Codex definition: %v", err)
+	}
 	insKey := `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id, provider_scope_id) VALUES ($1, 'openai_compatible_key', 'k', 'ct', 'master', $2, $3)`
 	if _, err := pool.Exec(ctx, insKey, b, sc, nilScope); err != nil {
 		t.Errorf("B's Codex key on the shared Codex definition with the shared scope: %v", err)

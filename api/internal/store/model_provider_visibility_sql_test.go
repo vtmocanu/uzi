@@ -39,10 +39,13 @@ type visEntry struct {
 	// id is the one caller-id expression a recipient-read (classVIS) query may compare the owner
 	// column to; any other expression (a self-comparison included) is a violation.
 	id string
-	// codexFrom, when set, marks where the statement's Codex part begins; that part is checked
-	// separately: it must contain every codexMust substring and never the shared-scope text.
-	codexFrom string
-	codexMust []string
+	// codexFrom, when set, marks where the statement's Codex part begins. Each engine part (before and
+	// from the marker) is checked separately: it must carry the exact owner-or-shared predicate with
+	// the caller's id, every claudeMust / codexMust substring (its engine guard), and no OR attached
+	// to the owner arm beyond that predicate.
+	codexFrom  string
+	claudeMust []string
+	codexMust  []string
 	// callers pins, for an identity-only query, the exact set of production files (relative to
 	// api/internal) that call it: an identity query has no ownership predicate of its own, so its
 	// authority is the caller's prior visibility check, and a new caller must be reviewed here.
@@ -56,6 +59,16 @@ const (
 	adminDelete = "admin delete (cookie + CSRF)"
 	adminRead   = "admin list/get (cookie, or the admin-read token)"
 )
+
+// bothSelectionArms pins that a shared definition's selection count covers both engines' nil-scope
+// selections; dropping either arm would let a delete pass over a selected definition's users.
+var bothSelectionArms = []string{
+	"claude_provider_scope_id = " + nilScopeSQL,
+	"codex_provider_scope_id = " + nilScopeSQL,
+}
+
+// adminCountMust is bothSelectionArms plus the shared scope the admin reads select on.
+var adminCountMust = append([]string{"p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'"}, bothSelectionArms...)
 
 // visibilityTable is the classification. Keep it sorted by class, then name.
 var visibilityTable = map[string]visEntry{
@@ -77,9 +90,11 @@ var visibilityTable = map[string]visEntry{
 	"GetProviderKeyForUpdate": {class: classVIS, id: "k.user_id"},
 	"InsertProviderKeySecret": {class: classVIS, id: "@user_id::uuid"},
 	"GetUserProviderSource": {class: classVIS, id: "u.id", codexFrom: " UNION ALL ",
-		codexMust: []string{"p.owner_user_id = u.id", "@engine::text = 'codex'"}},
+		claudeMust: []string{"p.engine = @engine", "@engine::text = 'claude'"},
+		codexMust:  []string{"p.engine = @engine", "@engine::text = 'codex'"}},
 	"SetUserProviderSource": {class: classVIS, id: "u.id", codexFrom: "(@engine::text = 'codex' AND EXISTS",
-		codexMust: []string{"p.owner_user_id = u.id", "p.engine = 'codex'"}},
+		claudeMust: []string{"p.engine = 'claude'"},
+		codexMust:  []string{"p.engine = 'codex'"}},
 	"LockModelProviderForShare":                    {class: classVIS, id: "@owner_user_id::uuid"},
 	"GetModelProviderRevisionForOwner":             {class: classVIS, id: "@owner_user_id::uuid"},
 	"LockProviderBindingRevisionForKeyShareNowait": {class: classVIS, id: "@owner_user_id::uuid"},
@@ -93,7 +108,7 @@ var visibilityTable = map[string]visEntry{
 	"LockSharedModelProviderCatalogue": {class: classShared, caller: adminCreate, must: []string{"hashtext('00000000-0000-0000-0000-000000000000')"}},
 	"CountSharedModelProviders":        {class: classShared, caller: adminCreate},
 	"InsertSharedModelProvider": {class: classShared, caller: adminCreate, must: []string{
-		"VALUES (NULL, @name, 'claude', 1, 'per_user_key', " + nilScopeSQL + ")"}},
+		"VALUES (NULL, @name, @engine, 1, 'per_user_key', " + nilScopeSQL + ")"}},
 	"LockSharedModelProviderForEdit":    {class: classShared, caller: adminEdit},
 	"BumpSharedModelProviderRevision":   {class: classShared, caller: adminEdit},
 	"RenameSharedModelProvider":         {class: classShared, caller: adminEdit},
@@ -102,9 +117,9 @@ var visibilityTable = map[string]visEntry{
 	"LockSharedModelProviderForDelete":  {class: classShared, caller: adminDelete},
 	"DeleteSharedModelProvider":         {class: classShared, caller: adminDelete},
 	"DeleteSharedProviderKeys":          {class: classShared, caller: adminDelete, must: []string{"provider_scope_id = " + nilScopeSQL}},
-	"CountSharedProviderSelections":     {class: classShared, caller: adminDelete, must: []string{"claude_provider_scope_id = " + nilScopeSQL}},
-	"ListSharedModelProvidersAdmin":     {class: classShared, caller: adminRead},
-	"GetSharedModelProviderAdmin":       {class: classShared, caller: adminRead},
+	"CountSharedProviderSelections":     {class: classShared, caller: adminDelete, must: bothSelectionArms},
+	"ListSharedModelProvidersAdmin":     {class: classShared, caller: adminRead, must: adminCountMust},
+	"GetSharedModelProviderAdmin":       {class: classShared, caller: adminRead, must: adminCountMust},
 
 	// identity-only: keyed by an id the caller already holds under a prior visibility check
 	"InsertModelProviderRevision": {class: classIdentity, must: []string{"WHERE p.id = @provider_id"},
@@ -200,20 +215,30 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 			if e.codexFrom != "" {
 				i := strings.Index(stmt, e.codexFrom)
 				if i < 0 {
-					out = append(out, name+": codex part marker "+e.codexFrom+" not found")
+					out = append(out, name+": engine part marker "+e.codexFrom+" not found")
 					break
 				}
-				part := stmt[i:]
-				for _, m := range e.codexMust {
-					if !strings.Contains(part, m) {
-						out = append(out, name+": codex part lacks "+m)
+				for _, arm := range []struct {
+					label, part string
+					must        []string
+				}{{"claude", stmt[:i], e.claudeMust}, {"codex", stmt[i:], e.codexMust}} {
+					ams := visRE.FindAllStringSubmatch(arm.part, -1)
+					if len(ams) == 0 {
+						out = append(out, name+": "+arm.label+" part lacks the exact owner-or-shared predicate")
 					}
-				}
-				if ownerOrRE.MatchString(part) {
-					out = append(out, name+": codex part attaches an OR to the owner arm")
-				}
-				if strings.Contains(part, "credential_mode") || strings.Contains(part, "owner_user_id IS NULL") {
-					out = append(out, name+": codex part must stay owner-only (no credential_mode, no owner_user_id IS NULL)")
+					for _, m := range ams {
+						if m[1] != e.id {
+							out = append(out, name+": "+arm.label+" part compares the owner to "+m[1]+", want "+e.id)
+						}
+					}
+					for _, m := range arm.must {
+						if !strings.Contains(arm.part, m) {
+							out = append(out, name+": "+arm.label+" part lacks "+m)
+						}
+					}
+					if ownerOrRE.MatchString(visRE.ReplaceAllString(arm.part, "")) {
+						out = append(out, name+": "+arm.label+" part attaches an OR to the owner arm")
+					}
 				}
 			}
 		case classShared:
@@ -269,6 +294,11 @@ func TestModelProviderQueriesAreVisibilityClassified(t *testing.T) {
 // widened, a shared-admin query that lost its scope and a stale table entry each fail.
 func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 	vis := "(p.owner_user_id = @u::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))"
+	vis2 := "(p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))"
+	getEntry := map[string]visEntry{"G": {class: classVIS, id: "u.id", codexFrom: " UNION ALL ",
+		claudeMust: []string{"p.engine = @engine", "@engine::text = 'claude'"}, codexMust: []string{"p.engine = @engine", "@engine::text = 'codex'"}}}
+	setEntry := map[string]visEntry{"S": {class: classVIS, id: "u.id", codexFrom: "(@engine::text = 'codex' AND EXISTS",
+		claudeMust: []string{"p.engine = 'claude'"}, codexMust: []string{"p.engine = 'codex'"}}}
 	cases := []struct {
 		name  string
 		sql   string
@@ -288,18 +318,45 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 			map[string]visEntry{"RenameModelProvider": {class: classOwner}}, "RenameModelProvider: owner-only query attaches an OR to the owner arm"},
 		{"recipient self-comparison", "-- name: R :one\nSELECT 1 FROM model_providers p WHERE (p.owner_user_id = p.owner_user_id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'));",
 			map[string]visEntry{"R": {class: classVIS, id: "@u::uuid"}}, "R: recipient predicate compares the owner to p.owner_user_id"},
-		{"GetUserProviderSource codex arm widened",
-			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON p.owner_user_id = u.id OR p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key' WHERE @engine::text = 'codex';",
-			map[string]visEntry{"G": {class: classVIS, id: "u.id", codexFrom: " UNION ALL ", codexMust: []string{"p.owner_user_id = u.id", "@engine::text = 'codex'"}}}, "G: codex part must stay owner-only"},
-		{"SetUserProviderSource codex arm shared",
-			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE p.credential_mode = 'per_user_key' AND p.engine = 'codex'));",
-			map[string]visEntry{"S": {class: classVIS, id: "u.id", codexFrom: "(@engine::text = 'codex' AND EXISTS", codexMust: []string{"p.owner_user_id = u.id", "p.engine = 'codex'"}}}, "S: codex part lacks p.owner_user_id = u.id"},
-		{"GetUserProviderSource codex arm ORs the engine",
-			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON (p.owner_user_id = u.id OR p.engine = @engine) WHERE @engine::text = 'codex';",
-			map[string]visEntry{"G": {class: classVIS, id: "u.id", codexFrom: " UNION ALL ", codexMust: []string{"p.owner_user_id = u.id", "@engine::text = 'codex'"}}}, "G: codex part attaches an OR to the owner arm"},
+		{"GetUserProviderSource codex arm missing the shared arm",
+			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON " + vis2 + " AND p.engine = @engine WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON p.owner_user_id = u.id AND p.engine = @engine WHERE @engine::text = 'codex';",
+			getEntry, "G: codex part lacks the exact owner-or-shared predicate"},
+		{"GetUserProviderSource codex arm missing the engine guard",
+			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON " + vis2 + " AND p.engine = @engine WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON " + vis2 + " WHERE @engine::text = 'codex';",
+			getEntry, "G: codex part lacks p.engine = @engine"},
+		{"GetUserProviderSource codex arm with an OR attached to the owner arm",
+			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON " + vis2 + " AND p.engine = @engine WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON (p.owner_user_id = u.id OR TRUE) AND p.engine = @engine WHERE @engine::text = 'codex';",
+			getEntry, "G: codex part attaches an OR to the owner arm"},
+		{"GetUserProviderSource passes with both arms and guards",
+			"-- name: G :one\nSELECT 1 FROM users u LEFT JOIN model_providers p ON " + vis2 + " AND p.engine = @engine WHERE @engine::text = 'claude' UNION ALL SELECT 1 FROM users u LEFT JOIN model_providers p ON " + vis2 + " AND p.engine = @engine WHERE @engine::text = 'codex';",
+			getEntry, ""},
+		{"SetUserProviderSource codex arm missing the shared arm",
+			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + " AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE p.owner_user_id = u.id AND p.engine = 'codex'));",
+			setEntry, "S: codex part lacks the exact owner-or-shared predicate"},
+		{"SetUserProviderSource codex arm missing the engine guard",
+			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + " AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + "));",
+			setEntry, "S: codex part lacks p.engine = 'codex'"},
 		{"SetUserProviderSource codex arm ORs TRUE",
-			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR TRUE) AND p.engine = 'codex'));",
-			map[string]visEntry{"S": {class: classVIS, id: "u.id", codexFrom: "(@engine::text = 'codex' AND EXISTS", codexMust: []string{"p.owner_user_id = u.id", "p.engine = 'codex'"}}}, "S: codex part attaches an OR to the owner arm"},
+			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + " AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE (p.owner_user_id = u.id OR TRUE) AND p.engine = 'codex'));",
+			setEntry, "S: codex part attaches an OR to the owner arm"},
+		{"SetUserProviderSource claude arm missing the engine guard",
+			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + ")) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + " AND p.engine = 'codex'));",
+			setEntry, "S: claude part lacks p.engine = 'claude'"},
+		{"SetUserProviderSource passes with both arms and guards",
+			"-- name: S :one\nUPDATE users u SET x = 1 WHERE (@engine::text = 'claude' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + " AND p.engine = 'claude')) OR (@engine::text = 'codex' AND EXISTS (SELECT 1 FROM model_providers p WHERE " + vis2 + " AND p.engine = 'codex'));",
+			setEntry, ""},
+		{"selection count missing the codex arm",
+			"-- name: C :one\nSELECT count(*) FROM users WHERE claude_provider_id = @id AND claude_provider_scope_id = " + nilScopeSQL + ";",
+			map[string]visEntry{"C": {class: classShared, caller: "x", must: bothSelectionArms}}, "C: lacks required text codex_provider_scope_id"},
+		{"selection count missing the claude arm",
+			"-- name: C :one\nSELECT count(*) FROM users WHERE codex_provider_id = @id AND codex_provider_scope_id = " + nilScopeSQL + ";",
+			map[string]visEntry{"C": {class: classShared, caller: "x", must: bothSelectionArms}}, "C: lacks required text claude_provider_scope_id"},
+		{"admin count missing the codex arm",
+			"-- name: C :one\nSELECT 1 FROM model_providers p WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key' AND claude_provider_scope_id = " + nilScopeSQL + ";",
+			map[string]visEntry{"C": {class: classShared, caller: "x", must: adminCountMust}}, "C: lacks required text codex_provider_scope_id"},
+		{"InsertSharedModelProvider hardcoding the engine",
+			"-- name: I :one\nINSERT INTO model_providers VALUES (NULL, @name, 'claude', 1, 'per_user_key', " + nilScopeSQL + ");",
+			map[string]visEntry{"I": {class: classShared, caller: "x", must: []string{"VALUES (NULL, @name, @engine, 1, 'per_user_key', " + nilScopeSQL + ")"}}}, "I: lacks required text VALUES (NULL, @name, @engine"},
 		{"shared-admin lost scope", "-- name: S :one\nSELECT 1 FROM model_providers p WHERE p.id = @id;",
 			map[string]visEntry{"S": {class: classShared, caller: "x"}}, "S: shared-admin query lacks"},
 		{"shared-admin without caller", "-- name: S :one\nSELECT 1 FROM model_providers p WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key';",

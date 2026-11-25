@@ -40,6 +40,9 @@ type sharedFx struct {
 	gw     *fakeProviderGateway
 	base   string
 	shared apitypes.AdminSharedProviderDTO
+	// cgw and codexBase are the Responses fixture gateway of the Codex tests (useCodexGateway).
+	cgw       *codexGateway
+	codexBase string
 }
 
 func newSharedFx(t *testing.T, createShared bool) *sharedFx {
@@ -78,11 +81,19 @@ func (s *sharedFx) createShared(t *testing.T, name, auth string) apitypes.AdminS
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatal(err)
 	}
-	id := env.Provider.ID
+	s.cleanupShared(t, env.Provider.ID)
+	return env.Provider
+}
+
+// cleanupShared registers cleanup that removes every trace of a shared definition: both engines'
+// selections, its keys and the row itself.
+func (s *sharedFx) cleanupShared(t *testing.T, id string) {
+	t.Helper()
 	t.Cleanup(func() {
 		ctx := context.Background()
 		for _, q := range []string{
 			`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE claude_provider_id = $1`,
+			`UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE codex_provider_id = $1`,
 			`DELETE FROM user_secrets WHERE provider_id = $1`,
 			`DELETE FROM model_providers WHERE id = $1`,
 		} {
@@ -91,14 +102,18 @@ func (s *sharedFx) createShared(t *testing.T, name, auth string) apitypes.AdminS
 			}
 		}
 	})
-	return env.Provider
 }
 
 func (s *sharedFx) sharedPath() string { return "/api/me/providers/" + s.shared.ID }
 
 func (s *sharedFx) adminGet(t *testing.T) apitypes.AdminSharedProviderDTO {
 	t.Helper()
-	rec := cookieReq(t, s.f.router, http.MethodGet, adminProvidersPath+"/"+s.shared.ID, s.admin.jwt, "")
+	return s.adminGetID(t, s.shared.ID)
+}
+
+func (s *sharedFx) adminGetID(t *testing.T, id string) apitypes.AdminSharedProviderDTO {
+	t.Helper()
+	rec := cookieReq(t, s.f.router, http.MethodGet, adminProvidersPath+"/"+id, s.admin.jwt, "")
 	var env struct {
 		Provider apitypes.AdminSharedProviderDTO `json:"provider"`
 	}
@@ -266,20 +281,22 @@ func TestSharedProviderAdminAuthMatrixLiveDB(t *testing.T) {
 
 func TestSharedProviderOwnerRoutesRefuseSharedLiveDB(t *testing.T) {
 	s := newSharedFx(t, true)
-	id := s.sharedPath()
-	for who, cred := range map[string]providerFixture{"recipient": s.b, "admin": s.admin} {
-		cookie := func(method, path, body string) *httptest.ResponseRecorder {
-			return cookieReq(t, s.f.router, method, path, cred.jwt, body)
-		}
-		for _, c := range []struct{ name, method, path, body string }{
-			{"rename-only patch", http.MethodPatch, id, `{"name":"renamed"}`},
-			{"model-map patch", http.MethodPatch, id, `{"model_map":{"haiku":{"model":"h2"}}}`},
-			{"endpoint", http.MethodPatch, id + "/endpoint", `{"auth_style":"x_api_key"}`},
-			{"retire", http.MethodPost, id + "/retire", ""},
-			{"delete", http.MethodDelete, id, ""},
-		} {
-			if rec := cookie(c.method, c.path, c.body); rec.Code != http.StatusNotFound {
-				t.Errorf("%s: owner route %s on a shared definition = %d %s, want 404", who, c.name, rec.Code, rec.Body.String())
+	sharedCodex := s.createSharedCodex(t, "owner-codex-"+uuid.NewString()[:8])
+	for _, id := range []string{s.sharedPath(), "/api/me/providers/" + sharedCodex.ID} {
+		for who, cred := range map[string]providerFixture{"recipient": s.b, "admin": s.admin} {
+			cookie := func(method, path, body string) *httptest.ResponseRecorder {
+				return cookieReq(t, s.f.router, method, path, cred.jwt, body)
+			}
+			for _, c := range []struct{ name, method, path, body string }{
+				{"rename-only patch", http.MethodPatch, id, `{"name":"renamed"}`},
+				{"model-map patch", http.MethodPatch, id, `{"model_map":{"haiku":{"model":"h2"}}}`},
+				{"endpoint", http.MethodPatch, id + "/endpoint", `{"auth_style":"x_api_key"}`},
+				{"retire", http.MethodPost, id + "/retire", ""},
+				{"delete", http.MethodDelete, id, ""},
+			} {
+				if rec := cookie(c.method, c.path, c.body); rec.Code != http.StatusNotFound {
+					t.Errorf("%s: owner route %s on %s = %d %s, want 404", who, c.name, id, rec.Code, rec.Body.String())
+				}
 			}
 		}
 	}
@@ -287,9 +304,12 @@ func TestSharedProviderOwnerRoutesRefuseSharedLiveDB(t *testing.T) {
 	if got.Name != s.shared.Name || got.Retired || got.CurrentRevision != 1 || got.AuthStyle != "bearer" {
 		t.Errorf("an owner route changed the shared definition: %+v", got)
 	}
-	// A shared definition is not a Codex source either.
+	if cur := s.adminGetID(t, sharedCodex.ID); cur.Name != sharedCodex.Name || cur.Retired || cur.CurrentRevision != 1 {
+		t.Errorf("an owner route changed the shared Codex definition: %+v", cur)
+	}
+	// A shared Claude definition is not a Codex source (the cross-engine guard).
 	if rec := cookieReq(t, s.f.router, http.MethodPut, "/api/me/providers/codex-source", s.b.jwt, `{"provider_id":"`+s.shared.ID+`"}`); rec.Code != http.StatusNotFound {
-		t.Errorf("codex-source with a shared id = %d %s, want 404", rec.Code, rec.Body.String())
+		t.Errorf("codex-source with a shared Claude id = %d %s, want 404", rec.Code, rec.Body.String())
 	}
 	if n := countRows(t, s, `SELECT count(*) FROM users WHERE codex_provider_id IS NOT NULL AND id = $1`, s.b.user); n != 0 {
 		t.Errorf("a refused codex select left a selection")
@@ -305,10 +325,10 @@ func TestSharedProviderAdminCreateRefusalsLiveDB(t *testing.T) {
 	name := "refusal-" + uuid.NewString()[:8]
 	good := s.sharedBody(name, "bearer")
 
-	// Codex is refused with no row.
-	codex := strings.Replace(good, `"name"`, `"engine":"codex","name"`, 1)
-	if rec := post(codex); rec.Code != http.StatusBadRequest {
-		t.Errorf("codex create = %d %s, want 400", rec.Code, rec.Body.String())
+	// An engine that is neither claude nor codex is refused with no row.
+	gemini := strings.Replace(good, `"name"`, `"engine":"gemini","name"`, 1)
+	if rec := post(gemini); rec.Code != http.StatusBadRequest {
+		t.Errorf("gemini create = %d %s, want 400", rec.Code, rec.Body.String())
 	}
 	// Bidi and ANSI names, an unallowlisted URL, and a key field are refused.
 	for label, body := range map[string]string{

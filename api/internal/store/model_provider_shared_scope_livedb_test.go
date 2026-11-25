@@ -81,7 +81,7 @@ func wantViolation(t *testing.T, what string, err error, code string, names ...s
 
 func newSharedProvider(ctx context.Context, t *testing.T, q *store.Queries, name string) store.ModelProvider {
 	t.Helper()
-	p, err := q.InsertSharedModelProvider(ctx, name)
+	p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
 	if err != nil {
 		t.Fatalf("insert shared provider %q: %v", name, err)
 	}
@@ -438,9 +438,9 @@ func TestSharedScopeRecipientQueriesLiveDB(t *testing.T) {
 	if src, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: b, Engine: "codex"}); err != nil || src.ProviderID.Valid {
 		t.Errorf("B's Codex source = %+v (%v), want none", src, err)
 	}
-	// A Codex source never accepts a shared definition, and selecting Codex leaves the Claude scope alone.
+	// A Codex source never accepts a shared CLAUDE definition (the cross-engine guard), and selecting Codex leaves the Claude scope alone.
 	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: b, Engine: "codex", ProviderID: pgUUID(shared.ID)}); !errors.Is(err, pgx.ErrNoRows) {
-		t.Errorf("B's Codex source on a shared definition = %v, want no rows", err)
+		t.Errorf("B's Codex source on a shared Claude definition = %v, want no rows", err)
 	}
 	bc, err := q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: b, Name: "b-codex", Engine: "codex"})
 	if err != nil {
@@ -759,7 +759,7 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	if tag, err := pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(pk.ID), a); err != nil || tag.RowsAffected() != 1 {
 		t.Errorf("the old image switching between personal Claude providers: rows=%d err=%v, want one row", tag.RowsAffected(), err)
 	}
-	sh, err := q.InsertSharedModelProvider(ctx, "rollback-shared")
+	sh, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: "rollback-shared", Engine: "claude"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,7 +851,7 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 		if n >= cap {
 			return false, nil
 		}
-		p, err := q.InsertSharedModelProvider(ctx, name)
+		p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
 		if err != nil {
 			return false, err
 		}
