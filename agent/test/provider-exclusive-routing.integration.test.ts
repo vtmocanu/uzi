@@ -319,15 +319,19 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
       reportState: async (_id: string, body: StateRequest) => { states.push(body); return { applied: true, status: body.status } as never; },
       postMessages: async () => {},
     } as unknown as WorkerClient;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-judge-it-"));
+    roots.push(root);
+    // The real CLI creates its socket and per-uid runtime directories under TMPDIR; point it inside
+    // root so they are removed with it (the shard's TMPDIR leak guard fails otherwise).
+    const tmp = path.join(root, "tmp");
+    fs.mkdirSync(tmp, { recursive: true });
     const frames: unknown[] = [];
     const queryFn = ((params: { prompt: AsyncIterable<unknown>; options: Options }) => {
-      const env = { ...params.options.env, CLAUDE_CODE_MAX_RETRIES: "1" };
+      const env = { ...params.options.env, CLAUDE_CODE_MAX_RETRIES: "1", TMPDIR: tmp };
       return (async function* () {
         for await (const m of query({ prompt: params.prompt as never, options: { ...params.options, env } })) { frames.push(m); yield m; }
       })();
     }) as unknown as SdkQueryFn;
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-judge-it-"));
-    roots.push(root);
     const runner = new JudgeRunner(client, nullLogger(), { queryFn, homeRoot: root, modelTimeoutMs: 100_000 });
     const claim = {
       run_id: "judge-it", kind: "judge", target_run_id: "t", claim_generation: 2, issue_iid: null, issue_title: "j", issue_description: "",
