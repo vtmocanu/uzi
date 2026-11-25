@@ -86,20 +86,61 @@ export function makeTextRedactor(secrets: Array<string | undefined | null>): Tex
   if (list.length === 0) return (s) => s;
   const visible = list.map((secret) => secret.replace(INVISIBLE, "")).filter((v) => v.length >= MIN_SECRET_LEN);
   return (s) => {
-    let out = s;
-    for (const secret of list) out = out.split(secret).join(REDACTED);
-    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, visible);
-    return out;
+    // Every span is found in the ORIGINAL string and the union is replaced once, so an
+    // overlapping or self-overlapping occurrence never leaves part of a secret behind.
+    const spans = verbatimSpans(s, list);
+    if (visible.length > 0 && INVISIBLE_TEST.test(s)) collectInvisibleSpans(spans, s, visible);
+    return replaceSpans(s, spans);
   };
 }
 
+/** Push [start, end) for each occurrence of `needle` in `haystack`, resuming one code unit past
+ *  each match start so overlaps are found; an occurrence overlapping the previous span extends it.
+ *  `map` turns a haystack range into an original-text span. */
+function pushOccurrences(spans: Array<[number, number]>, haystack: string, needle: string,
+  map: (at: number, end: number) => [number, number]): void {
+  let open: [number, number] | undefined;
+  let openEnd = -1; // haystack end of the open span
+  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+    const span = map(at, at + needle.length);
+    if (open !== undefined && at < openEnd) {
+      open[1] = span[1];
+    } else {
+      open = span;
+      spans.push(open);
+    }
+    openEnd = at + needle.length;
+  }
+}
+
+/** Every verbatim occurrence of each secret, overlaps included. */
+function verbatimSpans(text: string, secrets: string[]): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  for (const secret of secrets) pushOccurrences(spans, text, secret, (at, end) => [at, end]);
+  return spans;
+}
+
+/** Replace the union of `spans` in `text`: overlapping spans merge into one marker (spans that only
+ *  touch stay separate markers); text outside every span is kept byte-for-byte. */
+function replaceSpans(text: string, spans: Array<[number, number]>): string {
+  if (spans.length === 0) return text;
+  spans.sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let cursor = 0;
+  for (const [start, end] of spans) {
+    if (start >= cursor) out += text.slice(cursor, start) + REDACTED;
+    cursor = Math.max(cursor, end);
+  }
+  return out + text.slice(cursor);
+}
+
 /**
- * Redact each secret wherever its characters appear in order with only invisible runs between
+ * Push the spans of each secret wherever its characters appear in order with only invisible runs between
  * them. The text is projected onto its visible characters (remembering where each came from),
- * matched there, and every matched span is replaced in the ORIGINAL, invisible separators
+ * matched there, and every match is mapped back to a span of the ORIGINAL, invisible separators
  * included, so nothing of the secret survives to be re-joined.
  */
-function redactAcrossInvisible(text: string, secrets: string[]): string {
+function collectInvisibleSpans(spans: Array<[number, number]>, text: string, secrets: string[]): void {
   const chunks: string[] = [];
   const origin = new Int32Array(text.length); // visible UTF-16 unit i came from text[origin[i]]
   let n = 0;
@@ -115,21 +156,9 @@ function redactAcrossInvisible(text: string, secrets: string[]): string {
   keep(last, text.length);
   const visible = chunks.join("");
 
-  const spans: Array<[number, number]> = [];
   for (const secret of secrets) {
-    for (let at = visible.indexOf(secret); at !== -1; at = visible.indexOf(secret, at + secret.length)) {
-      spans.push([origin[at]!, origin[at + secret.length - 1]! + 1]);
-    }
+    pushOccurrences(spans, visible, secret, (at, end) => [origin[at]!, origin[end - 1]! + 1]);
   }
-  if (spans.length === 0) return text;
-  spans.sort((a, b) => a[0] - b[0]);
-  let out = "";
-  let cursor = 0;
-  for (const [start, end] of spans) {
-    if (start >= cursor) out += text.slice(cursor, start) + REDACTED;
-    cursor = Math.max(cursor, end);
-  }
-  return out + text.slice(cursor);
 }
 
 /** Scrub string values and member names without dropping colliding data. Finite numeric sums merge,
