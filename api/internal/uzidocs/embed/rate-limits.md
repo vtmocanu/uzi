@@ -659,6 +659,15 @@ credential that reads held or unknown:
 - **Not gated, by structure:** a Codex API-key alias and an OpenAI API key have
   no subscription meter, so they are never held. A missing reading is never
   used to decide this.
+- **Provider-bound runs are not gated.** A run frozen to your [custom model
+  provider](providers.md) (created while a provider source was selected,
+  including provider judges and self-improve runs) spends its own gateway key,
+  never a vendor token or account, so the vendor reserve never holds it, puts
+  no hold marker on it and files no pause request for it. Fleet spreading does
+  not refuse to defer it to a peer because of that peer's vendor reserve. A run
+  explicitly bound to a vendor credential stays subject to the reserve, even
+  with a provider source selected. The gateway's own limits, budgets and
+  capability checks are unchanged.
 - **The auto pool skips held tokens.** A run on [auto
   credential selection](anthropic-token.md) can start on another pooled token
   that reads below the threshold; it never leaves the pool or its pinning
@@ -701,7 +710,7 @@ The reserve is not a strict cap, and usage can exceed the threshold:
 - kinds that cannot pause mid-run (CI-fix, MR-rework, job, judge, cross-check,
   interactive tasks) are held at admission only, and one already running
   finishes;
-- chat is exempt;
+- chat and provider-bound runs are exempt;
 - a pause whose checkpoint fails lets the run continue and is re-requested at
   the next boundary.
 

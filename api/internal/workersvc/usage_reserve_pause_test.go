@@ -205,6 +205,9 @@ func TestReserveSpentVerdictAndRequestWanted(t *testing.T) {
 	if reserveRequestStillWanted(store.Run{AnthropicSecretID: pgconv.UUID(tokPinOK)}, snap) {
 		t.Error("a fresh OK reading must withdraw the request")
 	}
+	if reserveRequestStillWanted(store.Run{ModelProviderID: pgconv.UUID(uuid.New())}, snap) {
+		t.Error("a provider-bound run is exempt from the reserve: its pending request must be withdrawn")
+	}
 	snap.pauseRunning = false
 	if reserveRequestStillWanted(run, snap) {
 		t.Error("the toggle off must withdraw the request")

@@ -207,6 +207,15 @@ not one you or the run's lead asked for: the pending request has
   an owner resume does. The same three conditions withdraw a request that has
   not parked yet. The sweeper never releases an owner pause, a wall park, a
   usage-limit wait or any other hold.
+- **Provider-bound runs are exempt.** A run frozen to a custom model provider
+  spends its own gateway key, so the reserve files no new pause request on it.
+  A request already pending is withdrawn best-effort, by the sweeper or at the
+  next claim; a worker park can win first, so the run may still enter a
+  `weekly_reserve` pause. Such a pause becomes release-eligible on the next
+  sweeper pass and is released through the same guarded resume as an owner
+  resume: it keeps the remaining budget and can still be refused by those
+  guards. A run explicitly bound to a vendor credential stays subject to the
+  reserve. See [weekly usage reserve](rate-limits.md#what-it-holds).
 - **Resuming by hand overrides the reserve.** `uzi run resume <id>` (or
   **Resume** on the run page) on a `weekly_reserve` pause queues the run
   immediately and records an override for the credential it spent, so it is not
