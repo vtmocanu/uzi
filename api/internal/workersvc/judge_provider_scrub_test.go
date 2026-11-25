@@ -123,7 +123,7 @@ func TestScanCommandNotFoundProviderKeepsSeparators(t *testing.T) {
 func TestJudgeProviderScrubOverlappingMatches(t *testing.T) {
 	block := "gwk-A1b2C3d4E5f6G7h8"
 	scrub := judgeProviderScrub(block + block)
-	const zw = "​"
+	const zw = "\u200b"
 	for name, in := range map[string]string{
 		"verbatim overlaps invisible":  block + block + zw + block + ": command not found",
 		"invisible overlaps invisible": block + zw + block + zw + block + ": command not found",
