@@ -4,6 +4,7 @@
 **Priority**: High
 **Umbrella**: [#4319](https://github.com/vtmocanu/uzi/issues/4319)
 **Blocked by**: [#4323](https://github.com/vtmocanu/uzi/issues/4323) (landed in #4638), and merged [#4322](https://github.com/vtmocanu/uzi/issues/4322) M1a before #4574 M1. The remaining #4322 slices are not prerequisites.
+**Status**: M1 delivered (this PR); M2 pending its own gated run; no on-deck enrollment.
 **Disposition**: M1 has the owner's go (2026-11-25) for one gated run after the v2 fold; M2 needs its own grant. One slice per gated run; no on-deck sweep enrollment.
 
 ## Problem and outcome
@@ -79,3 +80,9 @@ Landing obligations, outside milestones: **full agent suite: exact-head PR CI** 
 - **2026-11-25: Codex judge model rule is key-or-`default` (D3).** Reason: it matches the shipped Codex advice resolver, which stays the only implementation (no second server resolver); the Claude-style `modelMapped` check wrongly refused `default`-only maps and differing targets for Codex. Rejected: strict explicit-key matching, which would need a worker change and a new skip.
 - **2026-11-25: Redirect risk covers Codex gateways (D4, owner).** The owner confirmed that #4322 D5 (2026-11-20) covers both engines: judged traces, including vendor-run traces judged by provider policy, may reach a Codex gateway. Documented in `docs/judge.md`.
 - **2026-11-25: Dual architecture review folded (v2).** Engine-aware change sites, capability census command, typed limit seam scoped to the judge, fuller acceptance tests, copy sweep, M1/#4322 M1b and M2/#4322 M2 serialization.
+- **2026-11-25: Conditional capability advertisement (M1).** `codex_provider_judge_v1` is advertised only under the Codex harness advertise gate, and the server gates claim, placement, demand, reap and wake on it for Codex provider judges (placement migration 00536, draft number). Reason: a worker that cannot run the Codex harness must never be handed a Codex provider judge; the capability follows the same gate as `codex_provider_v1`.
+- **2026-11-25: Typed settlement seam (M1).** A judge-only `settlement` on the read-only Codex model pass carries the terminal classification, with escaped-rejection provenance and presence flags; first match wins, and anything unmatched is terminal (failed, no review). Reason: parity with the Claude judge seam without changing shared advice behavior.
+- **2026-11-25: `FakeProvider` error-status mode (M1).** The fake provider gained an opt-in error-status mode so the P test can drive 429 and 529 through the real app-server. Reason: the riskiest assumption (which classification a gateway limit produces) had to be proved against the real runtime.
+- **2026-11-25: Rerun fake-store handler test rows expect the fake store's 500.** Reason: whether Run judge is allowed for a Codex provider is proved in LiveDB, not in the fake store, so the handler rows now assert the fake store's 500.
+- **2026-11-25: Routing by engine (M1).** Only a binding whose engine is `codex` goes through `selectCodexExecutionAuthority`; Claude bindings keep the pre-existing discriminator. Reason: avoids changing the shipped Claude provider judge path.
+- **2026-11-25: Accepted limit, journaled terminal log re-send.** A worker's later re-send of a journaled terminal log through its logger is not scrubbed again; the body is key-free because the key is redacted before it is journaled. Reason: re-scrubbing would need a worker-side change outside M1.

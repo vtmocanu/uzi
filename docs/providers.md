@@ -284,13 +284,20 @@ Rotating or disabling the key, or a revision or allowlist change, takes effect a
 `provider_gateway_limit`, retried after 1, 5 and then 15 minutes, then it waits for you to
 Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit)).
 
+### The Codex judge on a provider
+
+A Codex judge for an owner whose **Codex** source is a provider (their own, or an admin-shared definition
+with their own enabled key) runs on that provider, frozen when the judge is created, with no vendor
+fallback. A selected Codex source always wins; there is no judge pin that keeps it a vendor judge. An
+owner with only a Claude source gets a Codex judge on the vendor Codex credential, ignoring the Claude
+source. The judge model resolves through the provider's model map: an exact key, else the required
+`default` slot. A map without `default` is an unusable source, skipped as `provider_source_unusable`,
+never `provider_model_unmapped`. Failure behavior, the `codex_provider_judge_v1` worker capability and the
+trace destination: [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider). Older
+`provider_lane_unsupported` skip rows for a Codex judge are historical.
+
 ### What a Codex provider run does not do
 
-- **Judge.** A Codex judge is skipped for an owner whose **Codex** source is a provider, with the
-  visible skip "the selected Codex source is a model provider, which the Codex judge does not
-  support yet." An owner with only a Claude source gets a Codex judge on the vendor Codex
-  credential, ignoring the Claude source. A Claude judge follows your Claude source as described
-  above.
 - **Cross-check.** Plan and code cross-check refuse when either side would be bound to a Codex
   provider, with `provider_lane_unsupported`. For the plan stage this means a human plan gate: a
   Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker
@@ -300,7 +307,7 @@ Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit
   `provider_lane_unsupported` while your **Claude** source is set; a Codex source does not
   affect them.
 
-Codex providers on the judge and cross-check lanes are tracked in #4574.
+Codex providers on the cross-check lane are tracked in #4574.
 
 ### Operators: rollout and keys
 
