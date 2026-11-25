@@ -234,17 +234,41 @@ func TestSharedProviderCodexSelectAndClearLiveDB(t *testing.T) {
 	}
 
 	code, _, body := s.b.putCodexSource(t, `{"provider_id":"`+cx.ID+`"}`)
-	if code != http.StatusOK || !strings.Contains(body, cx.ID) {
-		t.Fatalf("codex select = %d %s", code, body)
+	selected := code == http.StatusOK && strings.Contains(body, cx.ID)
+	if !selected {
+		t.Errorf("codex select = %d %s", code, body)
 	}
-	if l := s.lanes(t, s.b.user); !l.codexSelected(cx.ID) || !ptrIs(l.claude, s.shared.ID) || !ptrIs(l.claudeScope, sharedNilScope) {
-		t.Fatalf("lanes after the Codex select = %+v", l)
+	// Always read the columns back: a failed select must have left the Codex lane cleared.
+	l := s.lanes(t, s.b.user)
+	if !ptrIs(l.claude, s.shared.ID) || !ptrIs(l.claudeScope, sharedNilScope) {
+		t.Errorf("the Codex select changed the Claude lane: %+v", l)
 	}
-	if code, _, body := s.b.putCodexSource(t, `{"provider_id":null}`); code != http.StatusOK {
-		t.Fatalf("codex clear = %d %s", code, body)
+	if selected && !l.codexSelected(cx.ID) {
+		t.Errorf("lanes after the Codex select = %+v, want the Codex source set", l)
 	}
-	if l := s.lanes(t, s.b.user); !l.codexClear() || !ptrIs(l.claude, s.shared.ID) || !ptrIs(l.claudeScope, sharedNilScope) {
-		t.Fatalf("lanes after the Codex clear = %+v, want a cleared Codex lane and an unchanged Claude lane", l)
+	if !selected {
+		if !l.codexClear() {
+			t.Errorf("a failed Codex select left the Codex lane %+v, want it cleared", l)
+		}
+		return
+	}
+	code, _, body = s.b.putCodexSource(t, `{"provider_id":null}`)
+	cleared := code == http.StatusOK
+	if !cleared {
+		t.Errorf("codex clear = %d %s", code, body)
+	}
+	l = s.lanes(t, s.b.user)
+	if !ptrIs(l.claude, s.shared.ID) || !ptrIs(l.claudeScope, sharedNilScope) {
+		t.Errorf("the Codex clear changed the Claude lane: %+v", l)
+	}
+	if cleared && !l.codexClear() {
+		t.Errorf("lanes after the Codex clear = %+v, want a cleared Codex lane", l)
+	}
+	if !cleared {
+		if !l.codexSelected(cx.ID) {
+			t.Errorf("a failed Codex clear changed the Codex lane: %+v, want it still selected", l)
+		}
+		return
 	}
 	// With nothing selecting it, the admin can delete the Codex definition and B's key goes with it.
 	rec := cookieReq(t, s.f.router, http.MethodDelete, adminProvidersPath+"/"+cx.ID, s.admin.jwt, "")
@@ -263,10 +287,11 @@ func TestSharedProviderCodexSelectionRefusalsLiveDB(t *testing.T) {
 		t.Helper()
 		code, reason, body := who.putCodexSource(t, `{"provider_id":"`+id+`"}`)
 		if code != http.StatusConflict || reason != "provider_source_unusable" {
-			t.Fatalf("%s: select = %d %s, want 409 provider_source_unusable", why, code, body)
+			t.Errorf("%s: select = %d %s, want 409 provider_source_unusable", why, code, body)
 		}
+		// Always read the columns back, so an unexpected status still shows whether anything was written.
 		if l := s.lanes(t, who.user); !l.codexClear() {
-			t.Fatalf("%s: a refused select left the Codex lane %+v", why, l)
+			t.Errorf("%s: a refused select left the Codex lane %+v", why, l)
 		}
 	}
 	// No key.

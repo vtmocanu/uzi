@@ -30,10 +30,10 @@ LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM user_secrets WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid AND kind = 'openai_compatible_key') THEN
-        RAISE EXCEPTION 'refusing to roll back 00533: shared Codex provider key(s) still exist; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back user_secrets_shared_codex_scope: shared Codex provider key(s) still exist; delete them explicitly before downgrading';
     END IF;
     IF EXISTS (SELECT 1 FROM model_providers WHERE owner_user_id IS NULL AND engine = 'codex') THEN
-        RAISE EXCEPTION 'refusing to roll back 00533: shared Codex provider definition(s) still exist; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back user_secrets_shared_codex_scope: shared Codex provider definition(s) still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;

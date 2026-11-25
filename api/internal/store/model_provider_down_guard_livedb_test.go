@@ -19,26 +19,47 @@ import (
 func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 	// ALTER Downs take their final ACCESS EXCLUSIVE lock up front (no lock upgrade).
 	type guardSpec struct{ table, mode string }
-	// The shared Codex Downs (00532-00537) lock three tables and read each guarded one in turn.
-	// 00532 and 00533 predate users.codex_provider_scope_id, so they read no selection, though they still lock users.
+	// The shared Codex Downs lock three tables and read each guarded one in turn. The engine and
+	// key-scope migrations predate users.codex_provider_scope_id, so they read no selection, though they still lock users.
 	sharedCodexDownNoSelection := []guardSpec{{"model_providers", "ACCESS EXCLUSIVE"}, {"user_secrets", "ACCESS EXCLUSIVE"}}
 	sharedCodexDown := append(append([]guardSpec{}, sharedCodexDownNoSelection...), guardSpec{"users", "ACCESS EXCLUSIVE"})
-	for file, specs := range map[string][]guardSpec{
-		"00476_model_providers.sql":                              {{"model_providers", "SHARE ROW EXCLUSIVE"}},
-		"00477_user_secrets_provider_key.sql":                    {{"user_secrets", "ACCESS EXCLUSIVE"}},
-		"00479_users_claude_provider_source.sql":                 {{"users", "ACCESS EXCLUSIVE"}},
-		"00481_runs_model_provider_binding.sql":                  {{"runs", "ACCESS EXCLUSIVE"}},
-		"00488_runs_provider_gateway_limit_type.sql":             {{"runs", "ACCESS EXCLUSIVE"}},
-		"00524_model_providers_shared_scope.sql":                 {{"model_providers", "ACCESS EXCLUSIVE"}},
-		"00527_user_secrets_provider_scope.sql":                  {{"user_secrets", "ACCESS EXCLUSIVE"}},
-		"00528_users_claude_provider_scope.sql":                  {{"users", "ACCESS EXCLUSIVE"}},
-		"00532_model_providers_shared_codex_engine.sql":          sharedCodexDownNoSelection,
-		"00533_user_secrets_shared_codex_scope.sql":              sharedCodexDownNoSelection,
-		"00534_users_codex_provider_scope.sql":                   sharedCodexDown,
-		"00535_validate_model_providers_shared_codex_engine.sql": sharedCodexDown,
-		"00536_validate_user_secrets_shared_codex_scope.sql":     sharedCodexDown,
-		"00537_validate_users_codex_provider_scope.sql":          sharedCodexDown,
+	specsByFile := map[string][]guardSpec{
+		"00476_model_providers.sql":                  {{"model_providers", "SHARE ROW EXCLUSIVE"}},
+		"00477_user_secrets_provider_key.sql":        {{"user_secrets", "ACCESS EXCLUSIVE"}},
+		"00479_users_claude_provider_source.sql":     {{"users", "ACCESS EXCLUSIVE"}},
+		"00481_runs_model_provider_binding.sql":      {{"runs", "ACCESS EXCLUSIVE"}},
+		"00488_runs_provider_gateway_limit_type.sql": {{"runs", "ACCESS EXCLUSIVE"}},
+		"00524_model_providers_shared_scope.sql":     {{"model_providers", "ACCESS EXCLUSIVE"}},
+		"00527_user_secrets_provider_scope.sql":      {{"user_secrets", "ACCESS EXCLUSIVE"}},
+		"00528_users_claude_provider_scope.sql":      {{"users", "ACCESS EXCLUSIVE"}},
+	}
+	// The six shared Codex migrations are draft-numbered and renumbered at merge, so each is resolved
+	// by its stable name suffix (exactly one file) rather than by a literal number.
+	for name, specs := range map[string][]guardSpec{
+		"model_providers_shared_codex_engine":          sharedCodexDownNoSelection,
+		"user_secrets_shared_codex_scope":              sharedCodexDownNoSelection,
+		"users_codex_provider_scope":                   sharedCodexDown,
+		"validate_model_providers_shared_codex_engine": sharedCodexDown,
+		"validate_user_secrets_shared_codex_scope":     sharedCodexDown,
+		"validate_users_codex_provider_scope":          sharedCodexDown,
 	} {
+		matches, err := filepath.Glob(filepath.Join("migrations", "*_"+name+".sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// "*_<name>.sql" also matches a longer name ending in it (validate_<name>); keep the exact one.
+		var exact []string
+		for _, m := range matches {
+			if _, rest, ok := strings.Cut(filepath.Base(m), "_"); ok && rest == name+".sql" {
+				exact = append(exact, filepath.Base(m))
+			}
+		}
+		if len(exact) != 1 {
+			t.Fatalf("migration %s resolves to %v, want exactly one file", name, exact)
+		}
+		specsByFile[exact[0]] = specs
+	}
+	for file, specs := range specsByFile {
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
 		if err != nil {
 			t.Fatal(err)

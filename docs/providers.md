@@ -334,8 +334,9 @@ instance. You see it in Settings, **Custom providers**, next to your own, marked
 admin**, and in `uzi provider list` with `admin` in the MANAGED BY column. The admin fixes its
 engine, name, base URL, auth style and model map. **You supply and control your own key**: you attach
 it, test it and select the definition as your Claude or Codex source (matching its engine) exactly as
-for your own provider. The admin never sees your key, and
-you never see anyone else's key or Test results.
+for your own provider. The admin UI and API never show your key (the key is still sent to the gateway
+endpoint, so whoever operates that gateway receives it), and you never see anyone else's key or Test
+results.
 
 - **Before you attach a key or select it**, Settings shows a disclosure. It says what the admin
   decides (the endpoint and auth style, fixed when the definition was created, so your admin cannot
@@ -344,8 +345,9 @@ you never see anyone else's key or Test results.
   you) and what you hold (your own key, stored encrypted for your account only, which you can rotate,
   disable or delete at any time). It also repeats the redirect warning above: your key is sent to that
   endpoint on every request, a redirecting gateway can resend your prompts and code to another host
-  and your key to another path on the same host, and with `x_api_key` auth it can forward the key
-  itself to another host.
+  and your key to another path on the same host. For a Claude definition with `x_api_key` auth it can
+  also forward the key itself to another host. A shared Codex definition always uses Bearer, and the
+  Codex runtime can forward the Bearer header to another host.
 - **The key and Test are yours.** **Test** uses your key and shows only your own result ("Latest test
   of your key"). Replacing, rotating or disabling your key, or an admin model-map edit, makes your old
   result read as not tested again. Another user's pass or failure never shows on your row.

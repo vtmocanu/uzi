@@ -258,6 +258,14 @@ func TestSharedCodexDownGuardsLiveDB(t *testing.T) {
 	if len(cases) != 15 {
 		t.Fatalf("case table has %d cases, want 15 (six row-only, five key+row, four selection+key+row)", len(cases))
 	}
+	migrationNames := map[int64]string{
+		vs.engine:     "model_providers_shared_codex_engine",
+		vs.keyScope:   "user_secrets_shared_codex_scope",
+		vs.userScope:  "users_codex_provider_scope",
+		vs.vEngine:    "validate_model_providers_shared_codex_engine",
+		vs.vKeyScope:  "validate_user_secrets_shared_codex_scope",
+		vs.vUserScope: "validate_users_codex_provider_scope",
+	}
 	names := map[sharedCodexLevel]string{sharedCodexRowOnly: "row", sharedCodexKeyAndRow: "key+row", sharedCodexSelectionKeyRow: "selection+key+row"}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%05d/%s", c.version, names[c.level]), func(t *testing.T) {
@@ -273,7 +281,8 @@ func TestSharedCodexDownGuardsLiveDB(t *testing.T) {
 			}
 
 			err := store.MigrateDownTo(ctx, dsn, sharedCodexPredecessor(t, c.version))
-			want := fmt.Sprintf("refusing to roll back %05d: %s", c.version, c.level.refusal())
+			// The RAISE messages name the migration, not its draft number, so a renumber changes nothing here.
+			want := fmt.Sprintf("refusing to roll back %s: %s", migrationNames[c.version], c.level.refusal())
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("Down of %d = %v, want a refusal containing %q", c.version, err, want)
 			}

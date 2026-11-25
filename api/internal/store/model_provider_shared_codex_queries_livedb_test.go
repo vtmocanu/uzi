@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -47,29 +48,51 @@ func TestSharedCodexSourceWriterLiveDB(t *testing.T) {
 		t.Fatalf("fresh user codex selection = (%v, %v), want both NULL", p, s)
 	}
 	row, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: b, Engine: "codex", ProviderID: pgUUID(def)})
+	wrote := err == nil
 	if err != nil {
-		t.Fatalf("selecting the shared Codex definition: %v", err)
-	}
-	if !row.CodexProviderID.Valid || uuid.UUID(row.CodexProviderID.Bytes) != def || row.ClaudeProviderID.Valid {
+		t.Errorf("selecting the shared Codex definition failed (%s): %v", writerErrorClass(err), err)
+	} else if !row.CodexProviderID.Valid || uuid.UUID(row.CodexProviderID.Bytes) != def || row.ClaudeProviderID.Valid {
 		t.Errorf("returned lanes = %+v, want codex = %s and no claude", row, def)
 	}
-	lanes, err := q.GetUserProviderLaneSources(ctx, b)
-	if err != nil || !lanes.CodexProviderID.Valid || uuid.UUID(lanes.CodexProviderID.Bytes) != def || lanes.ClaudeProviderID.Valid {
-		t.Errorf("lane sources = %+v (%v), want codex = %s only", lanes, err, def)
+	// Always re-read, so a refused write also proves the selection stayed unchanged.
+	lanes, lerr := q.GetUserProviderLaneSources(ctx, b)
+	if lerr != nil {
+		t.Fatalf("read lane sources: %v", lerr)
 	}
 	p, s := codexSelection(ctx, t, pool, b)
-	if p == nil || *p != def || s == nil || s.String() != nilScope {
-		t.Errorf("stored codex selection = (%v, %v), want (%s, %s)", p, s, def, nilScope)
+	if wrote {
+		if !lanes.CodexProviderID.Valid || uuid.UUID(lanes.CodexProviderID.Bytes) != def || lanes.ClaudeProviderID.Valid {
+			t.Errorf("lane sources = %+v, want codex = %s only", lanes, def)
+		}
+		if p == nil || *p != def || s == nil || s.String() != nilScope {
+			t.Errorf("stored codex selection = (%v, %v), want (%s, %s)", p, s, def, nilScope)
+		}
+	} else if lanes.CodexProviderID.Valid || lanes.ClaudeProviderID.Valid || p != nil || s != nil {
+		t.Errorf("after the failed write the selection changed: lanes = %+v, codex = (%v, %v), want both NULL", lanes, p, s)
 	}
 	if cp, cs := claudeSelection(ctx, t, pool, b); cp != nil || cs != nil {
 		t.Errorf("selecting a Codex source touched the Claude lane: (%v, %v)", cp, cs)
 	}
 
 	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: b, Engine: "codex"}); err != nil {
-		t.Fatalf("clearing the Codex source: %v", err)
+		t.Errorf("clearing the Codex source failed (%s): %v", writerErrorClass(err), err)
 	}
 	if p, s := codexSelection(ctx, t, pool, b); p != nil || s != nil {
 		t.Errorf("after a clear the codex selection = (%v, %v), want both NULL", p, s)
+	}
+}
+
+// writerErrorClass names which way a source write failed: the query matched no row (its engine or
+// visibility guard refused), or the database refused the scope pairing.
+func writerErrorClass(err error) string {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return "no rows: the writer's guard matched nothing"
+	case errors.As(err, &pgErr) && pgErr.Code == "23514" && pgErr.ConstraintName == "users_codex_provider_scope_check":
+		return "check violation users_codex_provider_scope_check"
+	default:
+		return "unclassified"
 	}
 }
 
@@ -118,10 +141,12 @@ func TestSharedCodexSelectionCountsLiveDB(t *testing.T) {
 	u2, _ := newProductUser(ctx, t, pool)
 	u3, _ := newProductUser(ctx, t, pool)
 	u4, _ := newProductUser(ctx, t, pool)
+	u5, _ := newProductUser(ctx, t, pool)
 
 	claudeDef := newSharedProvider(ctx, t, q, "count-claude").ID
 	codexDef := insertSharedCodexRow(ctx, t, pool, "count-codex")
 	idleCodex := insertSharedCodexRow(ctx, t, pool, "count-idle-codex")
+	bothLanes := insertSharedCodexRow(ctx, t, pool, "count-both-lanes")
 	personal := newProvider(ctx, t, q, u3, "u3-claude")
 
 	selectClaude := func(u, def uuid.UUID, scope string) {
@@ -137,8 +162,12 @@ func TestSharedCodexSelectionCountsLiveDB(t *testing.T) {
 	// Codex-only definition: u2 (who also selects the Claude one: a mixed user) and u4.
 	selectCodex(u2, codexDef, nilScope)
 	selectCodex(u4, codexDef, nilScope)
+	// One user selecting the SAME shared definition in both lanes (reachable only through raw SQL: the
+	// foreign keys do not check the engine) is one user, not two.
+	selectClaude(u5, bothLanes, nilScope)
+	selectCodex(u5, bothLanes, nilScope)
 
-	want := map[uuid.UUID]int64{claudeDef: 2, codexDef: 2, idleCodex: 0}
+	want := map[uuid.UUID]int64{claudeDef: 2, codexDef: 2, idleCodex: 0, bothLanes: 1}
 	for id, n := range want {
 		got, err := q.CountSharedProviderSelections(ctx, id)
 		if err != nil || got != n {

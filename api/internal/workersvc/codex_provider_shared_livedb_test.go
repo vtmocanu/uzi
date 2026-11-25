@@ -314,7 +314,32 @@ func TestCodexProviderSharedNoVendorFallbackLiveDB(t *testing.T) {
 		selectSharedCodexBySQL(pf, pf.provider)
 
 		before := snapshotProviderRuns(t, pf.env, pf.userID)
-		_, err := createSharedCodexTask(pf, "Shared Codex without a key")
+		created, err := createSharedCodexTask(pf, "Shared Codex without a key")
+		if err == nil {
+			// A fallback mutant creates the run. Record the failure, then run it exactly as the vendor
+			// control does so the red output shows which credential the fallback reached.
+			t.Errorf("create succeeded, want provider_source_unusable (key_missing)")
+			var vendor uuid.UUID
+			if err := pf.env.pool.QueryRow(ctx, `SELECT id FROM user_secrets WHERE user_id=$1 AND kind='openai_api_key'`, pf.userID).Scan(&vendor); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pf.svc.DispatchTaskRun(ctx, pf.userID, created.ID); err != nil {
+				t.Fatal(err)
+			}
+			restartCodexActualClaimService(pf)
+			p, err := pf.svc.Claim(ctx, pf.worker(t), nil)
+			if err != nil || p == nil || p.RunID != created.ID.String() {
+				t.Fatalf("fallback Claim payload=%+v err=%v", p, err)
+			}
+			r := mustRun(t, pf.env, created.ID)
+			if r.CodexSecretID.Valid && uuid.UUID(r.CodexSecretID.Bytes) == vendor {
+				t.Errorf("the run fell back to the vendor credential %s", vendor)
+			}
+			if b := bindingOfRun(r); b == (bindingParams{}) {
+				t.Errorf("the fallback run carries no provider binding, so it ran on the vendor path")
+			}
+			return
+		}
 		if !errors.Is(err, ErrProviderSourceUnusable) || !isUnusable(err, SourceUnusableKeyMissing) {
 			t.Fatalf("create err = %v, want provider_source_unusable (key_missing)", err)
 		}

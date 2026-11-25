@@ -213,6 +213,18 @@ func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 	if err != nil || !resolved.ProviderID.Valid || uuid.UUID(resolved.ProviderID.Bytes) != s.codexP {
 		t.Errorf("upgraded Codex selection resolves to %+v (%v), want provider %s", resolved, err, s.codexP)
 	}
+	// ProviderID alone comes straight from users.codex_provider_id even when the revision and key joins
+	// miss, so also require the whole source to judge usable with the original revision and key.
+	allowAll := func(string) (string, bool) { return "", true }
+	if got := workersvc.EvaluateProviderSource("codex", resolved, allowAll); got.State != workersvc.ProviderSourceUsable {
+		t.Errorf("upgraded Codex selection judged %+v, want usable", got)
+	}
+	if !resolved.CurrentRevision.Valid || resolved.CurrentRevision.Int32 != 1 {
+		t.Errorf("upgraded Codex selection revision = %+v, want the original revision 1", resolved.CurrentRevision)
+	}
+	if !resolved.KeySecretID.Valid || uuid.UUID(resolved.KeySecretID.Bytes) != s.codexKy {
+		t.Errorf("upgraded Codex selection key = %+v, want the original key %s", resolved.KeySecretID, s.codexKy)
+	}
 	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM users WHERE id = $1 AND claude_provider_scope_id IS NULL`, s.userB); got != 1 {
 		t.Errorf("a user with no Claude source must keep a NULL scope")
 	}

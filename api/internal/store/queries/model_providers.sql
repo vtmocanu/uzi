@@ -498,10 +498,10 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
-              SELECT claude_provider_id AS pid FROM users
+              SELECT id AS uid, claude_provider_id AS pid FROM users
                WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
-              UNION ALL
-              SELECT codex_provider_id AS pid FROM users
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
                WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
             GROUP BY sel.pid) su ON su.pid = p.id
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
@@ -519,10 +519,10 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
-              SELECT claude_provider_id AS pid FROM users
+              SELECT id AS uid, claude_provider_id AS pid FROM users
                WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
-              UNION ALL
-              SELECT codex_provider_id AS pid FROM users
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
                WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
             GROUP BY sel.pid) su ON su.pid = p.id
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
