@@ -262,9 +262,10 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	}
 	// Usability of the JUDGE's harness (PRD #1429 M3, D4; PRD #3257) is not pre-checked here. The
 	// judge harness is passed to createRunResolved below as an EXPLICIT selection, keyed on the
-	// RESOLVED judge harness, not the target's. A Codex judge's usability is the resolver's own
+	// RESOLVED judge harness, not the target's. A vendor Codex judge's usability is the resolver's own
 	// per-harness usability (workersvc.resolveUsableCodexCredential), enforced by the atomic create
-	// (ErrNoCredentialForHarness for an unusable Codex harness).
+	// (ErrNoCredentialForHarness for an unusable Codex harness); a Codex judge bound to the owner's
+	// Codex source is validated by its frozen source instead (PRD #4574 M1).
 	// No lane or token presence read happens here: the judge's lane (vendor or provider-bound), and
 	// on the vendor Claude lane the default-token presence check, are decided inside the create
 	// transaction under the shared secret-mutation lock (createRunAtomic, JudgeLane). A refusal
@@ -319,9 +320,8 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			return
 		}
 		if reason, ok := judgeProviderSkipReasonFor(err); ok {
-			// PRD #4322 M1a: a provider-bound judge was refused (source unusable, model unmapped) or
-			// the judge's harness has no provider lane (a Codex judge with a Codex source); not a
-			// failure, and (PRD #1429 D4) the refusal needs a visible reason. The create rolled back;
+			// PRD #4322 M1a, #4574 M1: a provider-bound judge (Claude or Codex) was refused (source
+			// unusable, Claude model unmapped); not a failure, and (PRD #1429 D4) the refusal needs a visible reason. The create rolled back;
 			// the reason is recorded in its own transaction.
 			slog.Info("judge enqueue: provider judge refused, no judge created", "run", run.ID, "reason", reason, "error", err)
 			s.recordJudgeSkip(ctx, run.ID, judgeHarness, reason)

@@ -47,8 +47,9 @@ func TestDecideJudgeLane(t *testing.T) {
 		{"codex/no source", HarnessCodex, pol(BindModeDefault, none, none, none), true, nil},
 		{"codex/claude source only is vendor", HarnessCodex, pol(BindModeDefault, none, claudeSrc, none), true, nil},
 		{"codex/pinned claude judge policy is irrelevant", HarnessCodex, pol(BindModePinned, secret, claudeSrc, none), true, nil},
-		{"codex/codex source refuses", HarnessCodex, pol(BindModeDefault, none, none, codexSrc), false, ErrProviderLaneUnsupported},
-		{"codex/both sources refuses", HarnessCodex, pol(BindModeDefault, none, claudeSrc, codexSrc), false, ErrProviderLaneUnsupported},
+		{"codex/codex source is the provider branch", HarnessCodex, pol(BindModeDefault, none, none, codexSrc), false, nil},
+		{"codex/both sources is the provider branch", HarnessCodex, pol(BindModeDefault, none, claudeSrc, codexSrc), false, nil},
+		{"codex/codex source beats a pinned claude judge policy", HarnessCodex, pol(BindModePinned, secret, claudeSrc, codexSrc), false, nil},
 		{"unknown harness", Harness("unknown"), pol(BindModeDefault, none, none, none), false, ErrProviderLaneUnsupported},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -59,8 +60,8 @@ func TestDecideJudgeLane(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || got.Vendor != tc.wantVendor || got.Policy != tc.p {
-				t.Fatalf("decision = %+v, %v; want vendor=%t over the same policy", got, err, tc.wantVendor)
+			if err != nil || got.Vendor != tc.wantVendor || got.Harness != tc.h || got.Policy != tc.p {
+				t.Fatalf("decision = %+v, %v; want vendor=%t harness=%s over the same policy", got, err, tc.wantVendor, tc.h)
 			}
 		})
 	}
@@ -94,6 +95,41 @@ func TestJudgePolicyDriftPrecedence(t *testing.T) {
 		{"pinned", frozenA, withPin, dec, ErrJudgePolicyChanged},
 		{"both changed", frozenB, withPin, dec, ErrJudgePolicyChanged},
 		{"decision had no source", frozenA, base, judgeLaneDecision{Policy: store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModeDefault}}, ErrJudgePolicyChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := judgePolicyDrift(tc.dec, tc.frozen, tc.now); !errors.Is(err, tc.want) {
+				t.Fatalf("drift = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestJudgePolicyDriftCodex pins the Codex judge's drift rule: only the selected Codex source
+// (decision, frozen and the locked re-read) is compared; the Anthropic pin is ignored.
+func TestJudgePolicyDriftCodex(t *testing.T) {
+	a, b, secret := uuidOf(1), uuidOf(2), uuidOf(3)
+	base := store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModeDefault, CodexProviderID: a}
+	dec := judgeLaneDecision{Harness: HarnessCodex, Policy: base}
+	pinChanged := base
+	pinChanged.JudgeAnthropicBindMode, pinChanged.JudgeAnthropicSecretID = BindModePinned, secret
+	nowOther := base
+	nowOther.CodexProviderID = b
+	nowCleared := base
+	nowCleared.CodexProviderID = pgtype.UUID{}
+	frozenA, frozenB := uuid.UUID(a.Bytes), uuid.UUID(b.Bytes)
+	for _, tc := range []struct {
+		name   string
+		dec    judgeLaneDecision
+		frozen uuid.UUID
+		now    store.GetUserJudgeLanePolicyRow
+		want   error
+	}{
+		{"unchanged", dec, frozenA, base, nil},
+		{"anthropic pin changed is ignored", dec, frozenA, pinChanged, nil},
+		{"frozen differs from the decision", dec, frozenB, base, ErrJudgePolicyChanged},
+		{"locked re-read selects another source", dec, frozenA, nowOther, ErrJudgePolicyChanged},
+		{"locked re-read cleared the source", dec, frozenA, nowCleared, ErrJudgePolicyChanged},
+		{"decision had no codex source", judgeLaneDecision{Harness: HarnessCodex}, frozenA, base, ErrJudgePolicyChanged},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := judgePolicyDrift(tc.dec, tc.frozen, tc.now); !errors.Is(err, tc.want) {
@@ -199,7 +235,7 @@ func TestJudgeLaneFakeCreationAdmission(t *testing.T) {
 		{name: "claude provider branch fails closed before any token read", explicit: laneHarness(HarnessClaude), f: judgeLaneCfg{policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: src}}, want: errProviderCreateRequiresTx, policy: 1},
 		{name: "claude pinned with a credential is vendor despite a source", explicit: laneHarness(HarnessClaude), f: judgeLaneCfg{policy: store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModePinned, JudgeAnthropicSecretID: secret, ClaudeProviderID: src}}, policy: 1, token: 1, inserts: 1},
 		{name: "claude with a codex source only is vendor", explicit: laneHarness(HarnessClaude), f: judgeLaneCfg{policy: store.GetUserJudgeLanePolicyRow{CodexProviderID: src}}, policy: 1, token: 1, inserts: 1},
-		{name: "codex source refuses a codex judge", explicit: laneHarness(HarnessCodex), f: judgeLaneCfg{policy: store.GetUserJudgeLanePolicyRow{CodexProviderID: src}}, want: ErrProviderLaneUnsupported, policy: 1},
+		{name: "codex provider branch fails closed without a transaction", explicit: laneHarness(HarnessCodex), f: judgeLaneCfg{policy: store.GetUserJudgeLanePolicyRow{CodexProviderID: src}}, want: errProviderCreateRequiresTx, policy: 1},
 		{name: "claude source does not refuse a codex judge (fake credential refusal)", explicit: laneHarness(HarnessCodex), f: judgeLaneCfg{policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: src}}, want: errNoCredentialForHarness, policy: 1},
 		{name: "policy read error", explicit: laneHarness(HarnessClaude), f: judgeLaneCfg{policyErr: boom}, want: boom, policy: 1},
 	} {

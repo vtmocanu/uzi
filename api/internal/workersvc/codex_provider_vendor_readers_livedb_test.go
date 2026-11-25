@@ -245,15 +245,16 @@ func (e codexTestEnv) mustSecretKind(t *testing.T, id uuid.UUID) string {
 	return k
 }
 
-// TestCodexJudgeSkipsProviderSourceOwnerLiveDB: an owner whose Codex source is a model provider
-// (users.codex_provider_id set) and who also holds a usable vendor Codex credential gets no Codex
-// judge for a finished run. The enqueue records the provider_lane_unsupported skip and creates no
-// judge run on either harness, through the production createRunAtomic path. The same owner without the provider
-// source gets the Codex judge (control), so the refusal is the source's doing.
-func TestCodexJudgeSkipsProviderSourceOwnerLiveDB(t *testing.T) {
+// TestCodexJudgeBindsProviderSourceOwnerLiveDB: an owner whose Codex source is a model provider
+// (users.codex_provider_id set) and who also holds a usable vendor Codex credential gets a Codex
+// judge bound to that source (PRD #4574 M1), not a vendor judge and not a skip, through the
+// production createRunAtomic path. The same owner without the provider source gets the vendor Codex
+// judge (control), so the binding is the source's doing.
+func TestCodexJudgeBindsProviderSourceOwnerLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, repoID := seedCodexOnlyOriginUser(t, env) // usable vendor Codex default
 	svc := judgeEnqueueSvc(env, userID)
+	svc.p.ProviderAllowedBaseURLs = []string{pvBase}
 
 	control := seedJudgeTarget(t, env, userID, repoID, "codex", 9801)
 	svc.maybeEnqueueJudge(env.ctx, control)
@@ -261,24 +262,38 @@ func TestCodexJudgeSkipsProviderSourceOwnerLiveDB(t *testing.T) {
 		t.Fatalf("control: want a Codex judge for the owner without a provider source, got ok=%v harness=%q", ok, h)
 	}
 
-	provider, _ := seedCodexProviderKeyFor(t, env, userID)
-	env.exec(`UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1 WHERE id = $1`, userID, provider)
+	provider, providerKey := seedCodexProviderKeyFor(t, env, userID)
+	env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = id WHERE id = $1`, userID, provider)
 	t.Cleanup(func() {
 		_, _ = env.pool.Exec(env.ctx, `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id = $1`, userID)
 	})
 
+	wantBound := func(t *testing.T, target store.Run) {
+		t.Helper()
+		id, h, ok := judgeForTarget(t, env, target.ID)
+		if !ok || h != string(HarnessCodex) {
+			t.Fatalf("want a Codex judge bound to the Codex source, got ok=%v harness=%q", ok, h)
+		}
+		r := mustRun(t, env, id)
+		b := bindingOfRun(r)
+		if !b.ProviderID.Valid || uuid.UUID(b.ProviderID.Bytes) != provider || !b.KeySecret.Valid || uuid.UUID(b.KeySecret.Bytes) != providerKey || r.CodexSecretID.Valid {
+			t.Fatalf("judge binding = %+v codex secret %v, want provider %s key %s and no vendor credential", b, r.CodexSecretID, provider, providerKey)
+		}
+		if n := judgeSkipCount(t, env, target.ID); n != 0 {
+			t.Fatalf("%d judge skip(s) recorded, want none", n)
+		}
+	}
+
 	t.Run("codex target", func(t *testing.T) {
 		target := seedJudgeTarget(t, env, userID, repoID, "codex", 9802)
 		svc.maybeEnqueueJudge(env.ctx, target)
-		noJudgeAnywhere(t, env, target.ID, "provider-sourced Codex owner")
-		wantSkip(t, env, target.ID, "codex", JudgeSkipProviderLaneUnsupported)
+		wantBound(t, target)
 	})
 
 	t.Run("claude target judged on codex", func(t *testing.T) {
 		setJudgeRunsOn(env, userID, "codex")
 		target := seedJudgeTarget(t, env, userID, repoID, "claude", 9803)
 		svc.maybeEnqueueJudge(env.ctx, target)
-		noJudgeAnywhere(t, env, target.ID, "provider-sourced Codex owner, Codex judge lane")
-		wantSkip(t, env, target.ID, "codex", JudgeSkipProviderLaneUnsupported)
+		wantBound(t, target)
 	})
 }

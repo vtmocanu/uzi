@@ -190,7 +190,7 @@ func judgeSkipPhrase(skip *apitypes.JudgeSkipDTO) string {
 		case "claude":
 			why = "the selected source was a model provider, which the judge did not support at the time."
 		case "codex":
-			why = "the selected Codex source is a model provider, which the Codex judge does not support yet."
+			why = "the selected Codex source is a model provider, which the Codex judge did not support at the time."
 		default:
 			why = "the selected source is a model provider, which the judge does not support yet."
 		}
