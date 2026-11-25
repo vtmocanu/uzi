@@ -95,8 +95,9 @@ by anything on the PR itself.
    cannot help (owner opted out, the admin kill-switch is on, or a `.github/workflows` finding
    — the "when this session still fixes locally" list below). **Its other exits do NOT
    authorize a local fix:** exit 3 means a run is STILL reworking (re-run to keep waiting),
-   exit 5 means the polls were unreliable so "never fired" is unproven, and exit 4 means the
-   repo did not resolve — treating any of these as "budget spent, fix locally" re-opens the
+   exit 5 means the polls were unreliable so "never fired" is unproven, exit 6 means the run is
+   parked for the owner (a plan gate, a question or a pause: steer it with `uzi-watcher`, then re-run),
+   and exit 4 means the repo did not resolve — treating any of these as "budget spent, fix locally" re-opens the
    double-push collision. **Either way**, the
    pre-push guard (re-list `kind=mr_rework` for this MR AND re-fetch the branch head, step 1)
    stays mandatory right before any local push, because the run can fire during your edit.
@@ -150,3 +151,13 @@ This is the **first** fork of the findings step in `SKILL.md` and of `coderabbit
 (this dir): read those for how to verify and label a finding, but decide **who fixes** it
 here first.
 
+## Watching a rework run directly
+
+When you wait on a rework run by id (one that predates your `$SINCE`, so `wait-mrrework.sh`
+cannot see it), use `.agents/skills/uzi-watcher/scripts/watch-run.sh REWORK_RUN
+completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX` with no plan
+watermark, and `WATCH_ATTENTION_IGNORE_HEALTH=slow,waiting_worker,stalled` so plan cross-check
+rounds (health `waiting_worker`, "waiting for plan cross-check") do not stop it. A rework
+whose plan cross-check ends non-pass stops at a forced plan gate even when it auto-approves;
+a terminal-only stop set polls that gate until its budget runs out. Steer the gate with
+`uzi-watcher` (buddy co-sign), then re-arm with the approved plan seq as the 5th argument.

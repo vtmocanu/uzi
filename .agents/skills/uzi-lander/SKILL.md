@@ -370,7 +370,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      succeed on this branch, so never send it back to uzi: fix locally. Then `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
-     Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
+     Exit 3: still running, re-run with the same `$SINCE`; exit 6: parked for the owner, steer it.
      GUIDANCE asks only for steps the agent can do in-run. It has no network git, so never
      require fetching or merging live `main` (or any worker-, forge- or lander-only step):
      an impossible precondition spins the run into its iteration budget. Integrate `main`
@@ -383,9 +383,8 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      push its tip onto the PR branch with a lease once it fast-forwards from the PR head.
      **A rework already running** (uzi starts one on new bot comments; a second `uzi run
      rework` then fails "already working this branch"): steer it with `uzi run follow-up
-     REWORK_RUN -m 'GUIDANCE'` instead, and wait on that run itself
-      (`.agents/skills/uzi-watcher/scripts/watch-run.sh REWORK_RUN completed,failed,cancelled 60`):
-      it predates any `$SINCE` you capture now, so `wait-mrrework.sh` would not see it.
+     REWORK_RUN -m 'GUIDANCE'` instead and wait on that run itself with `watch-run.sh`, step
+      1's stop set: it predates any `$SINCE` you capture now, so `wait-mrrework.sh` misses it.
       Its exit 3 / `RESULT=elapsed` ends coverage, not rework: re-snapshot and re-arm.
      A finding an earlier cycle declined that resurfaces
      with no new evidence: ask for a reasoned reply on the thread and no code change.

@@ -22,12 +22,17 @@
 #   5  budget elapsed but the polls were UNRELIABLE (every poll, or the final one,
 #      failed — `uzi run list` errored or returned non-JSON), so "never fired" is NOT
 #      established: do NOT fall back to a local fix on this; re-run or investigate.
+#   6  a CURRENT-cycle mr_rework run is parked for the owner: awaiting_approval (a plan
+#      gate; a non-pass plan cross-check forces one even on an auto-approve rework),
+#      awaiting_input (a question) or paused. It never moves on its own: steer it with
+#      uzi-watcher (review the plan, answer, or extend/resume), then re-run me. Prints
+#      MRREWORK_ID / MRREWORK_STATUS. Not a terminal state: do NOT fix locally.
 #
 # The exit-2-vs-5 split is load-bearing: a failed listing must never masquerade as a
 # confirmed-empty "no run", or a transient `uzi`/network blip would greenlight a local
 # fix while mr_rework is in fact mid-flight — recreating the double-push collision this
 # poller exists to prevent. Callers must treat ONLY exit 2 as "no rework, fix locally";
-# 3/4/5 all mean "do NOT fix locally yet".
+# 3/4/5/6 all mean "do NOT fix locally yet".
 set -uo pipefail
 
 REPO_SLUG=${1:?usage: wait-mrrework.sh OWNER/REPO PR [max_ticks] [interval_s] [since_utc]}
@@ -84,6 +89,11 @@ for i in $(seq 1 "$MAX"); do
         echo "MRREWORK_ID=$id"
         echo "MRREWORK_STATUS=$st"
         exit 0 ;;
+      awaiting_approval|awaiting_input|paused)
+        echo "MRREWORK_ID=$id"
+        echo "MRREWORK_STATUS=$st"
+        echo "PARKED: mr_rework $id is $st and waits for the owner (steer it, then re-run me)"
+        exit 6 ;;
     esac
   fi
   sleep "$INT"
