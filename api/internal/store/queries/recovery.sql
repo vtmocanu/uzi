@@ -875,7 +875,7 @@ DELETE FROM custody_episode_notices WHERE user_id = @user_id;
 -- the user_id. Callers pass the custody_hold_limit admin setting (#3150), always 1..1000, and skip
 -- the query when it cannot be read; a non-positive limit here would match every owner.
 -- Owners with an outstanding fresh-resume transfer row are candidates too: the count carries their
--- reserved units (00532) even when every open hold was discarded.
+-- reserved units (00535) even when every open hold was discarded.
 SELECT o.user_id
 FROM (SELECT h.user_id FROM recovery_custody_holds h WHERE h.state = 'open'
       UNION

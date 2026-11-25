@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// freshResumeSQLState is the SQLSTATE a0_guard_fresh_resume_trg (migration 00532) raises for both
+// freshResumeSQLState is the SQLSTATE a0_guard_fresh_resume_trg (migration 00535) raises for both
 // of its rules. Class UZ is not a PostgreSQL class; UZ416 follows UZ413 to UZ415.
 const freshResumeSQLState = "UZ416"
 

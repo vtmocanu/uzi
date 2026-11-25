@@ -48,7 +48,7 @@ const FRESH_RESUME_CAUSES: readonly string[] = [
 
 /**
  * Mirrors the server's eligibility base (fn_fresh_resume_run_base in
- * api/internal/store/migrations/00532_run_fresh_resumes.sql) on the fields the page has: a
+ * api/internal/store/migrations/00535_run_fresh_resumes.sql) on the fields the page has: a
  * recovery_wait with one of four causes, no secret_remediation_active or source_end_declined detail,
  * no retry stamp, a run kind that can seed, not a claimed Codex run (harness codex and
  * claim_generation >= 1), no codex_policy_hold, and no pending reserve pause. Clauses only the

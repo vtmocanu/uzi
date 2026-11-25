@@ -40,7 +40,7 @@ var ErrAmbiguous = errors.New("recovery: ambiguous open custody generation")
 var ErrCaptureInFreshResume = errors.New("recovery: capture is referenced by a fresh resume transfer")
 
 // freshReservationReason is the admission-member reason fn_custody_admission_members (migration
-// 00532) gives each synthetic fresh-resume reservation row.
+// 00535) gives each synthetic fresh-resume reservation row.
 const freshReservationReason = "fresh_reservation"
 
 // ── Worker-facing operations (D2/D6/D7). Each enforces the ORIGINAL worker identity and

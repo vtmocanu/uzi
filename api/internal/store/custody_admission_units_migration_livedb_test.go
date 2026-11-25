@@ -164,7 +164,7 @@ func TestCustodyAdmissionUnitsRollbackScriptLiveDB(t *testing.T) {
 		if err := store.Migrate(ctx, dsn); err != nil {
 			t.Fatalf("re-migrate: %v", err)
 		}
-		// Later migrations may redefine these functions (00532 adds the fresh-resume reservation), so the
+		// Later migrations may redefine these functions (00535 adds the fresh-resume reservation), so the
 		// re-migrated head bodies are not byte-equal to this migration's Up bodies; they must still be
 		// the grouped-unit bodies, not the restored pre-migration ones.
 		if got := custodyUnitsFunctionDefs(ctx, t, pool); got == old || !strings.Contains(got.members, "same_run_group") {

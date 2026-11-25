@@ -1,6 +1,6 @@
 -- Fresh resume (issue #4628): a run held at an owner-held worker-exhaustion recovery_wait is started on
 -- a SEPARATE persistent hosted worker (W2) from durable evidence. run_fresh_resumes is the transfer
--- row; a0_guard_fresh_resume_trg (00532) refuses every runs status / worker_id / claim_generation
+-- row; a0_guard_fresh_resume_trg (00535) refuses every runs status / worker_id / claim_generation
 -- change while a pending or claimed row exists, except under the transaction-local opt-in below.
 -- Callers lock the run (and the transfer row) before any of these writers; the sequence is
 -- OptInFreshResume, the guarded writes, then ClearFreshResumeOptIn.
@@ -401,7 +401,7 @@ SELECT EXISTS (SELECT 1 FROM run_fresh_resumes t
                  AND r.status NOT IN ('completed', 'failed', 'cancelled'))::boolean AS outstanding;
 
 -- name: FreshResumeRunBaseEligible :one
--- fn_fresh_resume_run_base (00532) over one owner run. No row: not the owner's run.
+-- fn_fresh_resume_run_base (00535) over one owner run. No row: not the owner's run.
 SELECT fn_fresh_resume_run_base(r, @global_timeout_seconds::int)::boolean AS eligible
 FROM runs r WHERE r.id = @id AND r.user_id = @user_id;
 

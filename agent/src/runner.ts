@@ -9058,7 +9058,7 @@ export class RunRunner {
     // sits below the #4645/#4655 confirmed-disposition return, so a confirmed hold or wall park wins over it. The policyHold
     // check below is not expected to meet a pre_receipt flight: only a Codex flight writes a policy_hold outbox entry
     // (policyHoldEligible requires initiallyCodex), and the fresh run base checked when the resume is requested refuses a claimed
-    // Codex-provenance run and excludes policy_pending_fresh and codex_policy_hold (api/internal/store/migrations/00532_run_fresh_resumes.sql);
+    // Codex-provenance run and excludes policy_pending_fresh and codex_policy_hold (api/internal/store/migrations/00535_run_fresh_resumes.sql);
     // the claim never places it on the run's own or released worker (api/internal/store/queries/fresh_resume.sql);
     // preparePolicyAdmission reads only this worker's own outbox after resolving its pending terminals; and enterPolicyHold runs only
     // after clone setup (post-receipt for a fresh flight). This rests on a run's harness and Codex provenance never being cleared; if

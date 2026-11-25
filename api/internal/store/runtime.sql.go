@@ -13850,7 +13850,7 @@ type ListHealthCustodyCandidateOwnersParams struct {
 // Raw open holds bound the discounted admission count from above. This is only
 // a health-pass prefilter, never claim or reconciliation authority. Owners at the
 // bound still need the exact per-run admission and continuation-exemption read.
-// Outstanding fresh-resume transfer rows each reserve at most one unit (00532), so they bound the count too.
+// Outstanding fresh-resume transfer rows each reserve at most one unit (00535), so they bound the count too.
 func (q *Queries) ListHealthCustodyCandidateOwners(ctx context.Context, arg ListHealthCustodyCandidateOwnersParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listHealthCustodyCandidateOwners, arg.OwnerIds, arg.CustodyHoldLimit)
 	if err != nil {
