@@ -395,7 +395,7 @@ symptom in general.
 ## Addendum (#4684, 2026-11-25): the per-model consumer, the reveal flag and JIT
 
 Issue #4684 adds the scoped Spend API. Four decisions belong with this rule; the PRD is
-[prds/4684-scoped-usage-spend-api.md](../prds/4684-scoped-usage-spend-api.md).
+[prds/done/4684-scoped-usage-spend-api.md](../prds/done/4684-scoped-usage-spend-api.md).
 
 **1. A multi-row consumer of `run_usage_model_totals`, kept bounded by a lateral with
 `OFFSET 0`.** The Spend statements read the new view `run_usage_model_totals`, which yields

@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [ ] M1 owner/admin filter options and Spend
+- [x] M1 owner/admin filter options and Spend
 
 ## 1. Problem
 
@@ -196,6 +196,6 @@ Generic plans get no JIT: admin 30d 1295 / 1312, owner 30d 289 / 291. Admin opti
 
 None was kept, so there is no index migration. Side effects noted: `created_at` takes the admin history-start `MIN` from 24 ms to 1.5 ms, and the merged-witness indexes turn a 30 ms sequential scan into a 1.5 ms index-only scan.
 
-**Finding, not fixed here:** admin all-users `window=all` takes 9.6-10.2 s with JIT off (15.7 s with it), over the 8 s `statement_timeout`, so it returns 503. In its plan the per-run `model_fold` lateral is the largest node (about 5.2 s of 117,550 per-run scans); the next is the breakdown and split ranking family (external-merge sorts and window passes over 117,550 rows, about 4 s inclusive), so removing the fold alone would still leave it near 5 s. Closing it needs a design decision: cap `all` for the admin all-users scope, precompute per-run totals, or a larger budget. No redesign was attempted. The owner decided at landing (2026-11-25) not to offer admin all-users `window=all`: it answers 400 `window all not available for all users`, and the all-time follow-up with per-run totals is deferred (see the Decision Log).
+**Finding, not fixed here:** admin all-users `window=all` takes 9.6-10.2 s with JIT off (15.7 s with it), over the 8 s `statement_timeout`, so it would return 503. In its plan the per-run `model_fold` lateral is the largest node (about 5.2 s of 117,550 per-run scans); the next is the breakdown and split ranking family (external-merge sorts and window passes over 117,550 rows, about 4 s inclusive), so removing the fold alone would still leave it near 5 s. Closing it needs a design decision: cap `all` for the admin all-users scope, precompute per-run totals, or a larger budget. No redesign was attempted. The owner decided at landing (2026-11-25) not to offer admin all-users `window=all`: it answers 400 `window all not available for all users`, and the all-time follow-up with per-run totals is deferred (see the Decision Log).
 
 **Not measured:** owner `window=all`; `mr_rework` and `cross_check` runs; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
