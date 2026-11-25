@@ -44,4 +44,32 @@ describe("retryModuleLoad deadline", () => {
       vi.useRealTimers();
     }
   });
+
+  it("a backward wall-clock step during re-registration does not stretch the budget", async () => {
+    vi.useFakeTimers();
+    try {
+      ent.loadModuleRemote.mockRejectedValueOnce(new Error("down"));
+      await loadModulePage(entry).catch(() => undefined);
+      ent.reRegisterModule.mockImplementation(
+        () =>
+          new Promise<void>((r) =>
+            setTimeout(() => {
+              vi.setSystemTime(Date.now() - 60 * 60 * 1000); // the wall clock jumps back 1 h
+              r();
+            }, 10000),
+          ),
+      );
+      ent.loadModuleRemote.mockReturnValue(new Promise(() => {}));
+      let settled: unknown = null;
+      void retryModuleLoad(entry).catch((e: unknown) => {
+        settled = e;
+      });
+      await vi.advanceTimersByTimeAsync(14999);
+      expect(settled).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBeInstanceOf(ModuleLoadError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

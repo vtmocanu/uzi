@@ -217,10 +217,15 @@ export function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promis
     try {
       // One deadline for the whole Retry (re-registration plus load), the same budget as a
       // single load: a remount joins this promise, so a hang here must not spin forever.
+      // Elapsed time on the monotonic clock: a wall-clock step must not stretch the budget.
       const budget = timeoutMs();
-      const start = Date.now();
+      const start = performance.now();
       await withTimeout(reRegisterModule(id, n), budget, id);
-      return await doLoad(entry, Math.max(1, budget - (Date.now() - start)));
+      const remaining = budget - (performance.now() - start);
+      if (!(remaining > 0)) {
+        throw new ModuleLoadError("transient", `Timed out after ${budget} ms loading module "${id}"`);
+      }
+      return await doLoad(entry, remaining);
     } catch (e) {
       const err = classifyLoadError(e, id); // never throws: guards a revoked Proxy
       if (err.kind === "transient" && !loadedOnce.has(id)) retryFailed.add(id);
