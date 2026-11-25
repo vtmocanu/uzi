@@ -5807,9 +5807,9 @@ export interface PendingJudge {
 
 // JudgeSkip is the recorded reason the AUTOMATIC judge of a run was skipped (issue #3257,
 // apitypes.JudgeSkipDTO): the judge could not start. The reasons are no_usable_credential,
-// credential_disabled, codex_pool_unavailable, provider_lane_unsupported (now recorded only for
-// a Codex judge whose owner has a Codex model-provider source; older Claude rows are historical,
-// since Claude judges now run on providers), provider_source_unusable and
+// credential_disabled, codex_pool_unavailable, provider_lane_unsupported (no longer recorded:
+// older Claude and Codex rows are historical, since both judges now run on providers),
+// provider_source_unusable and
 // provider_model_unmapped. A third sibling key on
 // the review envelope, always present and null when nothing was skipped; the server sets it
 // only when `review` and `pending_judge` are both null (read precedence review > pending >
