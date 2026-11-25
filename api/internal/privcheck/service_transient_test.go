@@ -15,8 +15,10 @@ type classedErr struct{ class forge.ErrorClass }
 func (e classedErr) Error() string           { return "forge failure" }
 func (e classedErr) Class() forge.ErrorClass { return e.class }
 
-// classedWrapErr is a classed error that wraps a cause, the shape a driver gives a
-// forge call that ran into its caller's deadline.
+// classedWrapErr is a classed timeout that also wraps its cause (e.g. DeadlineExceeded).
+// Drivers do not wrap the cause (forge's redactor keeps only a message and a class), and
+// the guard reads only forge.Class, so these rows behave like the plain classed-timeout
+// rows today; they guard against a future errors.Is check on the cause.
 type classedWrapErr struct {
 	class forge.ErrorClass
 	cause error
