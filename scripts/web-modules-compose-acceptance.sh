@@ -14,7 +14,9 @@
 #   port, down) run from the rendered file under the inherited environment, which they need to
 #   reach the daemon. The residual (CLI config, proxies and build settings can still affect
 #   pulls and builds) is accepted for this check. No step re-execs around a guardrail.
-#   1. Project name: mh-4686-<pid>, passed with -p on every call. Never -p uzi, never a bare down.
+#   1. Project name: mh-4686-<pid>-<nonce> (8 random hex chars per invocation, so two runs that
+#      share a daemon and a PID still get distinct projects), passed with -p on every call. Never
+#      -p uzi, never a bare down.
 #      Before anything is built the daemon must hold NO container, volume or network of that
 #      name (label or name prefix); a failed lookup or an existing resource is BROKEN (exit 2).
 #   2. Ports: the published port is remapped with a `ports: !override` overlay to a free
@@ -27,7 +29,9 @@
 #      so no .env is autoloaded) under the inherited environment and compared with the clean
 #      render; any mismatch stops the run. The Compose version is recorded.
 #   6. Teardown: `down -v` by exact project name, only after every volume it would remove (by
-#      project label and by rendered name) is confirmed prefixed mh-4686-<pid>_.
+#      project label and by rendered name) is confirmed prefixed mh-4686-<pid>-<nonce>_. Unnamed
+#      (anonymous) volumes attached to this invocation's own containers may also be removed: with a
+#      per-invocation project name they can belong to no other stack (owner-approved).
 #
 # Steps (each prints OK or FAIL): clean render; render assertions; round-trip; nonce through a
 # throwaway container; build once (timed); baseline start and ownership, env and mount
@@ -57,8 +61,9 @@ NGINX_IMAGE=$(awk '/^FROM nginxinc\/nginx-unprivileged/ { print $2; exit }' web/
 [ -n "$PLAY_IMAGE" ] && [ -n "$NGINX_IMAGE" ] || broken "could not read the pinned Playwright or nginx image"
 
 # 1. The throwaway project. The prefix check is the guard every later call relies on.
-P="mh-4686-$$"
-case "$P" in mh-4686-[0-9]*) ;; *) broken "project name $P is not a mh-4686-<pid> name" ;; esac
+NONCE=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n') || broken "cannot read /dev/urandom for the project nonce"
+P="mh-4686-$$-$NONCE"
+case "$P" in mh-4686-[0-9]*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) broken "project name $P is not a mh-4686-<pid>-<nonce> name" ;; esac
 
 # 1b. Ownership precheck, before anything is created or taken. A PID can be reused and the
 # daemon can be shared, so resources of this project name may already exist and would then pass

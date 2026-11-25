@@ -1,7 +1,7 @@
 # PRD #4686: Runtime web modules
 
 **Issue:** #4686.
-**Status:** Done (2026-11-25). Kubernetes owner acceptance pending (landing obligation).
+**Status:** Implementation complete (2026-11-25); Kubernetes owner acceptance pending.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** web SPA, web nginx configs and images, Helm chart, compose, docs, specs and tests. No api, store, worker or CLI behaviour change (the generated `api/internal/uzidocs/embed` changes from `task docs:sync` are expected). No changes under `.github/workflows/**`, including validation.
@@ -215,7 +215,7 @@ Acceptance (in-run): example 1 holds under compose with no web image rebuild bet
 | Shared upstream grammar and fixtures | Chart and generator validate against the same fixtures so they cannot drift; dotless-host expansion is in the chart only (compose resolves a service name as is). Reject separate grammars. |
 | Chart `subPath` mounts, rollout via `checksum/nginx` | Each pod stays consistent with its own nginx; mid-rollout generation skew is accepted and documented. Reject directory mounts (kubelet updates files under a running nginx). |
 | Simple compose generator | Validate, encode before write, temp file + rename, `locations.conf` first; no lock or crash-recovery protocol and no crash-safety claim; operator rules are documented. Reject a locking/recovery protocol (owner simplification). |
-| Compose acceptance deviates from `stack.md`'s literal `env -i` start (owner-approved) | Render with `env -i` into a literal file, then build/up/down from that file under a unique `-p mh-4686-<pid>` project with a ports override, a pre-start round-trip comparison, env and mount checks, image-id equality as the no-rebuild proof, and `down -v` only after verifying volume prefixes. Accepted residual: CLI config, proxies and build settings can affect pulls and builds. |
+| Compose acceptance deviates from `stack.md`'s literal `env -i` start (owner-approved) | Render with `env -i` into a literal file, then build/up/down from that file under a unique per-invocation `-p mh-4686-<pid>-<nonce>` project with a ports override, a pre-start round-trip comparison, env and mount checks, image-id equality as the no-rebuild proof, and `down -v` only after verifying volume prefixes (unnamed volumes of the invocation's own containers are allowed, owner-approved at landing). Accepted residual: CLI config, proxies and build settings can affect pulls and builds. |
 | Example module image is a fixture only | `web/examples/ui-module/Dockerfile` is a test and acceptance fixture, shipped in no uzi image and published by no workflow. Reject shipping it as a sample image. |
 | Modules nav group placement | A "Modules" group after Factory and before Settings/Admin/Docs; `work` and `factory` entries append in manifest order; sidebar sections are keyed by stable ids. Reject a group at the end. |
 | Manifest validation in the SPA | Invalid entries are skipped with one `console.error` each; a later duplicate id is skipped (first valid wins); an unknown `navGroup` falls back to `modules`. Reject failing the whole list. |

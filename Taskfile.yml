@@ -3480,7 +3480,7 @@ tasks:
 
   test:web-modules-compose:
     desc: Opt-in live compose acceptance of runtime web modules (PRD 4686, m5); builds the stack from source
-    # Runs scripts/web-modules-compose-acceptance.sh: a throwaway project mh-4686-<pid> rendered
+    # Runs scripts/web-modules-compose-acceptance.sh: a throwaway project mh-4686-<pid>-<nonce> rendered
     # to a literal file with `env -i`, built once, started with no modules and then with the
     # example module, driven by a Playwright container. Needs a docker daemon with compose,
     # jq, yq and python3; the api image builds from source, so it takes many minutes. NOT wired
