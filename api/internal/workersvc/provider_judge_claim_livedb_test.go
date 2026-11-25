@@ -363,18 +363,26 @@ func TestProviderJudgeCodexBoundRefusedLiveDB(t *testing.T) {
 }
 
 // TestProviderJudgeWorkerCapabilityBackstopLiveDB: the Go backstop of the SQL claim clause. A worker
-// with claude_provider_v1 but not claude_provider_judge_v1 is never handed a provider Claude judge
-// (and nothing is opened); the same judge claims on a worker with both (the positive control).
+// holding every other capability but not claude_provider_judge_v1 is never handed a provider Claude
+// judge and opens nothing; the same judge claims on a worker with all of them (the positive control).
 func TestProviderJudgeWorkerCapabilityBackstopLiveDB(t *testing.T) {
 	p := newPJFix(t)
 	judge := p.createdJudge()
 	p.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, judge.ID, p.workerID)
 	w := p.worker()
 
-	w.ProtocolCapabilities = []string{capability.ClaudeProviderV1}
+	// Only the judge capability is missing, so the refusal is pinned to it and not to another flag.
+	w.ProtocolCapabilities = []string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.ClaudeProviderV1}
+	spy := &keyOpenSpy{Store: p.svc.q, rd: p.svc.q.(providerClaimReader)}
+	orig := p.svc.q
+	p.svc.q = spy
 	if _, err := p.svc.assembleClaim(p.env.ctx, w, mustRun(t, p.env, judge.ID)); !errors.Is(err, errProviderLaneClaimRefused) {
 		t.Fatalf("assembleClaim without judge capability = %v, want errProviderLaneClaimRefused", err)
 	}
+	if b, c := spy.bindingReads.Load(), spy.ciphertextReads.Load(); b != 0 || c != 0 {
+		t.Fatalf("the refusal reached the key: %d binding read(s), %d ciphertext read(s)", b, c)
+	}
+	p.svc.q = orig
 	w.ProtocolCapabilities = pjFullCaps
 	payload, err := p.svc.assembleClaim(p.env.ctx, w, mustRun(t, p.env, judge.ID))
 	if err != nil || payload == nil || payload.Secrets.Provider == nil {

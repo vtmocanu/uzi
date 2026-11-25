@@ -85,10 +85,11 @@ const success = (extra: Record<string, unknown> = {}) => ({ type: "result", subt
 
 /** A scripted queryFn that counts its calls; `frames` may also throw. */
 function scripted(frames: unknown[] | (() => AsyncGenerator<unknown>)) {
-  const seen = { calls: 0, model: undefined as string | undefined };
-  const queryFn = ((params: { options: { model?: string } }) => {
+  const seen = { calls: 0, model: undefined as string | undefined, prompt: undefined as unknown };
+  const queryFn = ((params: { prompt?: unknown; options: { model?: string } }) => {
     seen.calls++;
     seen.model = params.options.model;
+    seen.prompt = params.prompt;
     return typeof frames === "function" ? frames() : (async function* () { for (const f of frames) yield f; })();
   }) as unknown as SdkQueryFn;
   return { queryFn, seen };
@@ -346,5 +347,25 @@ describe("provider judge: reported reasons and fallbacks are scrubbed of the key
     const rationale = calls.review?.recommendations?.[0]?.rationale ?? "";
     assert.ok(rationale.includes(REDACTED), "the key is replaced before the clip");
     assert.ok(!rationale.includes(KEY.slice(0, 12)), "no partial key prefix survives the clip");
+  });
+
+  it("a key straddling a trace clip (plan, failure reason, message evidence) is scrubbed before the prompt clips it", async () => {
+    // plan_md clips at 6000, failure_reason at 800 and each message summary at 600: each key starts
+    // just inside its cap, so clipping first would leave a key prefix in the prompt.
+    const keyed: JudgeTraceResponse = {
+      ...trace,
+      target: { ...trace.target, plan_md: `${"p".repeat(5990)}${KEY}`, failure_reason: `${"f".repeat(790)}${KEY}` },
+      messages: [{ seq: 1, kind: "assistant", agent: "lead", agent_instance: null, created_at: "2026-11-25T10:00:00Z",
+        payload: { text: `${"m".repeat(500)}${KEY}` } } as never],
+    };
+    const api = fakeClient({ getTrace: async () => keyed });
+    const { seen } = await run([assistant(verdict()), success()], providerClaim(), { client: api });
+    assert.equal(seen.calls, 1, "the model pass ran");
+    // The pass hands the SDK an async stream of user messages; the scripted queryFn never drains it.
+    const parts: unknown[] = [];
+    for await (const m of seen.prompt as AsyncIterable<unknown>) parts.push(m);
+    const prompt = JSON.stringify(parts);
+    assert.ok(prompt.includes("p".repeat(100)) && prompt.includes("f".repeat(100)), "the clipped fields reached the prompt");
+    assert.ok(!prompt.includes(KEY.slice(0, 8)), "no key prefix survives a trace clip");
   });
 });

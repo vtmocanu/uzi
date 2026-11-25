@@ -18,7 +18,7 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { Logger } from "./log.js";
-import { makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
+import { makeTextRedactor, providerKeyForms, redactStrings, type TextRedactor } from "./redact.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, isErrorResult, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
@@ -354,7 +354,7 @@ export class JudgeRunner {
         this.activeRuns?.remove(judgeRunId);
         return;
       }
-      const trace = await this.fetchTrace(targetId);
+      const trace = await this.fetchTrace(targetId, providerCredential ? providerScrub : undefined);
       // PRD #1429 M3 (D4): the claim SHAPE decides the advice lane, not a hardcoded
       // Anthropic-token check. selectCodexBinding is the SAME pure, fail-closed
       // discriminator the run lane uses (agent/src/main.ts's makeExecutor); a malformed
@@ -524,8 +524,11 @@ export class JudgeRunner {
     }
   }
 
-  /** Fetch and reduce the reviewed trace, bounded to 200 pages with no cap probe. */
-  private async fetchTrace(targetId: string): Promise<ReducedJudgeTrace> {
+  /** Fetch and reduce the reviewed trace, bounded to 200 pages with no cap probe. In provider mode
+   *  `scrub` removes the key's forms from every message, the target and the inputs BEFORE the reducer
+   *  or the prompt clips anything, so a clip can never leave a key prefix the output redactors miss
+   *  (PRD #4322 M1a landing review). Vendor mode passes none and stays byte-identical. */
+  private async fetchTrace(targetId: string, scrub?: TextRedactor): Promise<ReducedJudgeTrace> {
     let after = 0;
     const reducer = new JudgeEvidenceReducer();
     for (let page = 1; page <= MAX_TRACE_PAGES; page++) {
@@ -547,11 +550,12 @@ export class JudgeRunner {
           || !("payload" in message)) throw new Error("malformed or nonadvancing judge trace message");
         cursor = message.seq;
       }
-      for (const message of res.messages) reducer.accept(message);
+      for (const message of res.messages) reducer.accept(scrub ? redactStrings(message, scrub) : message);
       after = cursor;
       const complete = res.messages.length < TRACE_PAGE;
       if (complete || page === MAX_TRACE_PAGES) {
-        return { target: res.target, inputs: res.inputs, evidence: reducer.render({
+        return { target: scrub ? redactStrings(res.target, scrub) : res.target,
+          inputs: scrub ? redactStrings(res.inputs, scrub) : res.inputs, evidence: reducer.render({
           pages: page, complete, reason: complete ? "short page" : "message cap reached; end unknown",
           cap: MAX_TRACE_MESSAGES,
         }) };
