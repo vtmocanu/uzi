@@ -124,7 +124,7 @@ func TestReadBytesMalformedBeforeOpen(t *testing.T) {
 	for _, tc := range []struct{ offset, limit string }{
 		{"0", "0"}, {"0", fmt.Sprint(maxReadBytes + 1)}, {"0", ""}, {"0", "-1"}, {"0", "1.5"},
 		{"0", "null"}, {"0", `"3"`},
-		{"-1", "1"}, {"1.5", "1"}, {`"x"`, "1"}, {"null", "1"}, {"", "1"}, {"9007199254740992", "1"},
+		{"-1", "1"}, {"1.5", "1"}, {"0.5", "1"}, {`"x"`, "1"}, {"null", "1"}, {"", "1"}, {"9007199254740992", "1"},
 		{"-0", "1"}, {"00", "1"}, {"0x0", "1"},
 	} {
 		s, _, _ := bytesFixture(t, []byte("abc"))
@@ -233,6 +233,68 @@ func TestReadBytesMutationBetweenFstatAndPreadUndetected(t *testing.T) {
 	}
 	if got["size"] != int64(10) || got["ident"] != before["ident"] {
 		t.Fatalf("response must reflect the fstat sample: %v", withoutData(got))
+	}
+}
+
+func TestReadBytesGrowthAfterFstatClampedToOpeningSize(t *testing.T) {
+	s, root, _ := bytesFixture(t, []byte("0123456789"))
+	s.fstat = func(fd int, st *unix.Stat_t) error {
+		if err := unix.Fstat(fd, st); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(filepath.Join(root, "f"), os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.Write([]byte("abcdefghij"))
+		return err
+	}
+	got := s.handle(bytesReq("f", "0", "100"))
+	wantOK(t, got)
+	if string(respData(t, got)) != "0123456789" || got["size"] != int64(10) {
+		t.Fatalf("%q %v", respData(t, got), withoutData(got))
+	}
+}
+
+func TestReadBytesOffsetAtOrPastSizeIssuesNoPread(t *testing.T) {
+	for _, offset := range []string{"10", "11", "1000"} {
+		s, _, _ := bytesFixture(t, []byte("0123456789"))
+		reads := 0
+		s.fileReadAt = func(*os.File, []byte, int64) (int, error) { reads++; return 0, nil }
+		got := s.handle(bytesReq("f", offset, "5"))
+		wantOK(t, got)
+		if reads != 0 || len(respData(t, got)) != 0 || got["size"] != int64(10) {
+			t.Fatalf("offset %s: reads=%d %v", offset, reads, withoutData(got))
+		}
+	}
+}
+
+func TestReadBytesZeroProgressWithoutErrorIsIO(t *testing.T) {
+	s, _, closes := bytesFixture(t, []byte("abc"))
+	s.fileReadAt = func(*os.File, []byte, int64) (int, error) { return 0, nil }
+	wantErr(t, s.handle(bytesReq("f", "0", "2")), codeIO)
+	if *closes != 1 {
+		t.Fatalf("closes=%d", *closes)
+	}
+}
+
+// Expiry landing at the post-fstat check must win over the file-type rejection.
+func TestReadBytesExpiryBeatsFileTypeRejection(t *testing.T) {
+	s, root, closes := bytesFixture(t, []byte("abc"))
+	if err := os.Mkdir(filepath.Join(root, "d"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(filepath.Join(root, "p"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"d", "p"} {
+		*closes = 0
+		expireAt(s, 3)
+		wantErr(t, s.handle(bytesReq(path, "0", "1")), codeTimeout)
+		if *closes != 1 {
+			t.Fatalf("%s closes=%d", path, *closes)
+		}
 	}
 }
 

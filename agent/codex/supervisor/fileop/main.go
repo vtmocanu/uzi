@@ -76,7 +76,8 @@
 // and ident reflect the fstat sample. No text validation is applied.
 //
 // The descriptor and opening size pin each range/tail operation: later appends are
-// ignored and replacement cannot redirect it. read_range accepts early EOF as
+// ignored and replacement cannot redirect it. read_bytes follows the same pinning:
+// its reads are clamped to the opening size. read_range accepts early EOF as
 // shrinkage; read_tail requires full positioned reads or returns E_IO, including
 // short reads with EOF. Only zero-byte EINTR is retried, under the same context,
 // charging no scan bytes; nonzero reads charge their actual bytes.
