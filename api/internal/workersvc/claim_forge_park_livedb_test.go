@@ -601,22 +601,64 @@ func TestClaimForgeTransientExpiredContextStaysClaimedLiveDB(t *testing.T) {
 	wantHolds(t, x.env, x.run, "open", "open")
 }
 
+// cfpDeadlineCtx is a request context whose deadline passes on demand: expire closes Done and from then
+// on Err is context.DeadlineExceeded and Deadline is in the past. It stands in for a WithTimeout whose
+// timer fires at a chosen instant, without waiting on a real one.
+type cfpDeadlineCtx struct {
+	context.Context
+	mu   sync.Mutex
+	done chan struct{}
+	at   time.Time
+}
+
+func newCFPDeadlineCtx(parent context.Context) *cfpDeadlineCtx {
+	return &cfpDeadlineCtx{Context: parent, done: make(chan struct{})}
+}
+
+func (c *cfpDeadlineCtx) expire() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.done:
+	default:
+		c.at = time.Now().Add(-time.Second)
+		close(c.done)
+	}
+}
+
+func (c *cfpDeadlineCtx) Done() <-chan struct{} { return c.done }
+
+func (c *cfpDeadlineCtx) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return c.Context.Err()
+	}
+}
+
+func (c *cfpDeadlineCtx) Deadline() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.at.IsZero() {
+		return c.Context.Deadline()
+	}
+	return c.at, true
+}
+
 // The same fence for a request deadline that expires (context.DeadlineExceeded, not Canceled) between
 // the assembly and the finisher: the run stays claimed, nothing is written, nothing is published.
 func TestClaimForgeTransientExpiredDeadlineStaysClaimedLiveDB(t *testing.T) {
 	x := newCFPFix(t)
-	ctx, cancel := context.WithTimeout(x.env.ctx, 8*time.Second)
-	defer cancel()
-	x.hooks(func(ctx context.Context, _ store.Run) {
-		select {
-		case <-ctx.Done():
-		case <-time.After(30 * time.Second):
-			t.Error("the request deadline never expired")
-		}
-	}, nil)
+	ctx := newCFPDeadlineCtx(x.env.ctx)
+	// The deadline "expires" deterministically inside the hook: no real timer is waited on.
+	x.hooks(func(context.Context, store.Run) { ctx.expire() }, nil)
 	payload, err := x.f.svc.Claim(ctx, x.f.wkr, nil)
 	if err == nil || payload != nil {
 		t.Fatalf("Claim = (%v, %v), want an error", payload != nil, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Claim error = %v, want it to wrap DeadlineExceeded", err)
 	}
 	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("request context error = %v, want DeadlineExceeded", ctx.Err())
@@ -714,8 +756,13 @@ func cfpReadCooldown(t *testing.T, env codexTestEnv, workerID uuid.UUID, origin 
 // is a matching reservation.
 type cfpFence struct {
 	gitVersionDelta int64 // added to the Git row's reservation_version (the run's own stamp stays 7)
+	apiVersionDelta int64 // added to the API row's reservation_version (the run's own stamp stays 11)
+	gitGenDelta     int64 // added to the Git row's reservation_generation
 	apiGenDelta     int64 // added to the API row's reservation_generation
+	gitOtherRun     bool  // the Git row is reserved by a different run at this claim's generation
 	apiOtherRun     bool  // the API row is reserved by a different run at this claim's generation
+	gitOtherInc     bool  // the run stamps a Git reservation incarnation other than its row's
+	apiOtherInc     bool  // the run stamps an API reservation incarnation other than its row's
 }
 
 // cfpSeedBothReservations reserves BOTH of this claim's origins (the Git origin and the distinct GitHub
@@ -732,20 +779,33 @@ func cfpSeedBothReservations(t *testing.T, env codexTestEnv, userID, workerID, r
 		t.Fatalf("claim stamped no distinct git/api origin pair: %v (origin=%v api=%v)", err, origin, api)
 	}
 	gitInc, apiInc, foreignInc := uuid.New(), uuid.New(), uuid.New()
-	apiRun := runID
+	gitRun, apiRun := runID, runID
+	if fence.gitOtherRun {
+		gitRun = uuid.New()
+	}
 	if fence.apiOtherRun {
 		apiRun = uuid.New()
+	}
+	// forge_origin_cooldowns_check ties a row's reservation_incarnation to its own incarnation, so the
+	// incarnation fence is varied on the run's side: the run stamps a different incarnation than the
+	// one its row carries.
+	gitStamp, apiStamp := gitInc, apiInc
+	if fence.gitOtherInc {
+		gitStamp = uuid.New()
+	}
+	if fence.apiOtherInc {
+		apiStamp = uuid.New()
 	}
 	env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, incarnation, cooled_until, last_reason, observed_at,
 	    failure_step, observation_version, reservation_run_id, reservation_generation, reservation_incarnation, reservation_version, reservation_observation_version)
 	    VALUES ($1,$2,$3,$4,now()+interval '1 hour','transient_clone_fetch_exhausted',now(),3,5,$5,$6,$4,$7,5)`,
-		userID, workerID, *origin, gitInc, runID, gen, 7+fence.gitVersionDelta)
+		userID, workerID, *origin, gitInc, gitRun, gen+fence.gitGenDelta, 7+fence.gitVersionDelta)
 	env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, incarnation, cooled_until, last_reason, observed_at,
 	    failure_step, observation_version, reservation_run_id, reservation_generation, reservation_incarnation, reservation_version, reservation_observation_version)
-	    VALUES ($1,$2,$3,$4,now()+interval '2 hour','transient_clone_fetch_exhausted',now(),4,6,$5,$6,$4,11,6)`,
-		userID, workerID, *api, apiInc, apiRun, gen+fence.apiGenDelta)
+	    VALUES ($1,$2,$3,$4,now()+interval '2 hour','transient_clone_fetch_exhausted',now(),4,6,$5,$6,$4,$7,6)`,
+		userID, workerID, *api, apiInc, apiRun, gen+fence.apiGenDelta, 11+fence.apiVersionDelta)
 	env.exec(`UPDATE run_forge_origins SET reservation_incarnation=$2, reservation_version=7, api_reservation_incarnation=$3, api_reservation_version=11 WHERE run_id=$1`,
-		runID, gitInc, apiInc)
+		runID, gitStamp, apiStamp)
 	foreignOrigin = "https://newer.forge.e2e"
 	env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, incarnation, cooled_until, last_reason, observed_at,
 	    failure_step, observation_version, reservation_run_id, reservation_generation, reservation_incarnation, reservation_version, reservation_observation_version)
@@ -788,6 +848,11 @@ func TestClaimForgeTransientClearsOnlyThisClaimsReservationLiveDB(t *testing.T) 
 		{"git row at a newer reservation version", cfpFence{gitVersionDelta: 1}, false, true},
 		{"api row at a newer generation", cfpFence{apiGenDelta: 1}, true, false},
 		{"api row reserved by another run", cfpFence{apiOtherRun: true}, true, false},
+		{"api row at a newer reservation version", cfpFence{apiVersionDelta: 1}, true, false},
+		{"git row at another generation", cfpFence{gitGenDelta: 1}, false, true},
+		{"git row reserved by another run", cfpFence{gitOtherRun: true}, false, true},
+		{"git row at another reservation incarnation", cfpFence{gitOtherInc: true}, false, true},
+		{"api row at another reservation incarnation", cfpFence{apiOtherInc: true}, true, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			x := newCFPFix(t)

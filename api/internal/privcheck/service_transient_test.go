@@ -15,6 +15,17 @@ type classedErr struct{ class forge.ErrorClass }
 func (e classedErr) Error() string           { return "forge failure" }
 func (e classedErr) Class() forge.ErrorClass { return e.class }
 
+// classedWrapErr is a classed error that wraps a cause, the shape a driver gives a
+// forge call that ran into its caller's deadline.
+type classedWrapErr struct {
+	class forge.ErrorClass
+	cause error
+}
+
+func (e classedWrapErr) Error() string           { return "forge failure: " + e.cause.Error() }
+func (e classedWrapErr) Unwrap() error           { return e.cause }
+func (e classedWrapErr) Class() forge.ErrorClass { return e.class }
+
 var retryableClasses = []forge.ErrorClass{
 	forge.ErrorClassTimeout, forge.ErrorClassServerError,
 	forge.ErrorClassRateLimited, forge.ErrorClassNetwork,
@@ -117,8 +128,10 @@ func TestGuardRepoTransientCauseContextDone(t *testing.T) {
 			}
 			wantNoCause(t, res)
 		})
+		// A timeout-classed error that wraps the real context.DeadlineExceeded: only the done
+		// caller context can suppress it, since the class alone would make it transient.
 		t.Run(name+"_verify_deadline_exceeded", func(t *testing.T) {
-			res := guardWith(&fakeForge{verifyErr: context.DeadlineExceeded}, ctx)
+			res := guardWith(&fakeForge{verifyErr: classedWrapErr{forge.ErrorClassTimeout, context.DeadlineExceeded}}, ctx)
 			if !res.Blocked {
 				t.Fatalf("must still block: %+v", res)
 			}
@@ -131,6 +144,9 @@ func TestGuardRepoTransientCauseContextDone(t *testing.T) {
 	// Control: the same timeout-class errors under a live context are transient.
 	t.Run("live_verify_timeout", func(t *testing.T) {
 		wantCause(t, guardWith(&fakeForge{verifyErr: classedErr{forge.ErrorClassTimeout}}, context.Background()), forge.ErrorClassTimeout)
+	})
+	t.Run("live_verify_deadline_exceeded", func(t *testing.T) {
+		wantCause(t, guardWith(&fakeForge{verifyErr: classedWrapErr{forge.ErrorClassTimeout, context.DeadlineExceeded}}, context.Background()), forge.ErrorClassTimeout)
 	})
 	t.Run("live_protection_timeout", func(t *testing.T) {
 		wantCause(t, guardWith(protForge(protResult{err: classedErr{forge.ErrorClassTimeout}}), context.Background()), forge.ErrorClassTimeout)
