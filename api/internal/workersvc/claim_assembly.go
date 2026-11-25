@@ -347,6 +347,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			Overridden: rc.GuardrailOverrideReason.Valid,
 		})
 		if res.Blocked {
+			if class, ok := res.TransientForgeCause(); ok {
+				// The only blocker is an unreadable forge that may recover: finishRunClaimTx parks a
+				// started run on it instead of failing it terminally.
+				return nil, guardrailForgeTransientError{
+					class: class,
+					msg:   errGuardrailBlockedClaim.Error() + ": " + strings.Join(res.BlockMessages(), "; "),
+				}
+			}
 			return nil, fmt.Errorf("%w: %s", errGuardrailBlockedClaim, strings.Join(res.BlockMessages(), "; "))
 		}
 	}
@@ -1492,6 +1500,19 @@ func (e legacyReviewClaimError) Error() string {
 }
 
 func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim }
+
+// guardrailForgeTransientError is the claim-time guardrail block whose only cause is an unreadable
+// forge that may recover (privcheck.GuardResult.TransientForgeCause). It reads exactly like the
+// terminal block and unwraps to errGuardrailBlockedClaim, so a never-started run, a kind that cannot
+// park, or any caller that does not look for it fails the run as before; finishRunClaimTx parks a
+// started run instead. It carries no transport error, only the scrubbed class.
+type guardrailForgeTransientError struct {
+	class forge.ErrorClass
+	msg   string
+}
+
+func (e guardrailForgeTransientError) Error() string { return e.msg }
+func (e guardrailForgeTransientError) Unwrap() error { return errGuardrailBlockedClaim }
 
 // planCrossCheckCodexLeadSupported reports whether the claim should carry
 // plan_cross_check_codex_lead: this api accepts a Codex lead's checked-plan submission,
