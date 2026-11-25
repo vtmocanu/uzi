@@ -776,6 +776,41 @@ is not treated as proof that the run ended. The same applies to the
 data-volume park and to a claim already enrolled for publication whose clone
 fails; the later publishing park below is a separate path.
 
+### Refused by the guardrail at claim
+
+The default-branch guardrail also runs when uzi assigns a run to a worker.
+If the **api** could not read the forge at that moment (verifying the bot
+token, or reading the default branch's protection, including a GitHub
+ruleset) because of a timeout, a 5xx, a rate limit, or a network failure
+(connection refused, reset or unreachable, or a temporary DNS failure), the
+guardrail still refuses fail-closed: no payload and no credential reach the
+worker.
+
+What happens next depends on the run:
+
+- **A run that has already started once parks** in `recovery_wait` with
+  cause `forge_unreachable`, but only when that unreadable protection is the
+  only blocking finding. A run that never started fails with
+  `guardrail_blocked`, as before.
+- **An ordinary started run** counts against `forge_park_count` and
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS` (`0` = unlimited) with the usual backoff.
+  At the cap it holds for owner **Resume** with a NULL retry time.
+- **A publication-enrolled run** keeps its publication phase, intent,
+  custodian worker, handoff and episode clock, and leaves `forge_park_count`
+  unchanged. It is bounded by `RUN_PROVIDER_PARK_MAX_DURATION` instead: at
+  that bound it holds for owner Resume with `publication_retry_exhausted`.
+  After Resume the next park starts a new episode clock.
+- **No worker cooldown and no worker health evidence is recorded**, because
+  the failed read happened on the api, not on the worker. The claim's own
+  half-open reservations are released by the existing lifecycle cleanup.
+
+Everything else still fails immediately as `guardrail_blocked`: an auth
+failure (401/403, a revoked or expired token), an unprotected branch or any
+other blocking finding, a client-build failure, an unknown error class,
+NXDOMAIN, certificate/TLS and address errors, caller cancellation, and a stop
+or cancel requested during the claim. See
+[ADR-1392](../adr/1392-forge-unreachable-preclone-park.md) for the design.
+
 ## Forge unreachable while publishing
 
 A run whose work is finished can meet the same kind of forge outage at
