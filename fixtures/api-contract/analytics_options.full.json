@@ -1,0 +1,42 @@
+{
+  "scope": {
+    "route": "x",
+    "user": "x"
+  },
+  "generated_at": "2020-01-02T03:04:05Z",
+  "selected_user": "x",
+  "repos": {
+    "items": [
+      {
+        "id": "x",
+        "path": "x"
+      }
+    ],
+    "truncated": true
+  },
+  "users": {
+    "items": [
+      {
+        "id": "x",
+        "email": "x"
+      }
+    ],
+    "truncated": true
+  },
+  "users_reason": "x",
+  "windows": [
+    "x"
+  ],
+  "kinds": [
+    "x"
+  ],
+  "harnesses": [
+    "x"
+  ],
+  "splits": [
+    "x"
+  ],
+  "breakdowns": [
+    "x"
+  ]
+}

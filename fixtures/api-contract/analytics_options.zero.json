@@ -1,0 +1,19 @@
+{
+  "scope": {
+    "route": "",
+    "user": ""
+  },
+  "generated_at": "0001-01-01T00:00:00Z",
+  "selected_user": "",
+  "repos": {
+    "items": null,
+    "truncated": false
+  },
+  "users": null,
+  "users_reason": null,
+  "windows": null,
+  "kinds": null,
+  "harnesses": null,
+  "splits": null,
+  "breakdowns": null
+}
