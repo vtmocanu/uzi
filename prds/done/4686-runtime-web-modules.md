@@ -1,7 +1,7 @@
 # PRD #4686: Runtime web modules
 
 **Issue:** #4686.
-**Status:** Ready.
+**Status:** Done (2026-11-25). Kubernetes owner acceptance pending (landing obligation).
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** web SPA, web nginx configs and images, Helm chart, compose, docs, specs and tests. No api, store, worker or CLI behaviour change (the generated `api/internal/uzidocs/embed` changes from `task docs:sync` are expected). No changes under `.github/workflows/**`, including validation.
@@ -9,8 +9,8 @@
 
 ## Progress
 
-- [ ] M1 host runtime
-- [ ] M2 delivery (nginx, chart, compose)
+- [x] M1 host runtime
+- [x] M2 delivery (nginx, chart, compose)
 
 ## 1. Problem
 
@@ -207,6 +207,20 @@ Acceptance (in-run): example 1 holds under compose with no web image rebuild bet
 | Pages only, no slots | Smallest useful contract; slots inside existing pages can be added additively later. |
 | Example module inside `web/` with no own `package.json` | CI's existing `npm ci` covers it; no network install in a gate. |
 | No browser SRI | Dynamic ES module imports cannot carry integrity without an inline import map, which needs a CSP hash or nonce. Provenance comes from pinning module images by digest. |
+| Runtime-only host | `@module-federation/runtime@2.9.3` (`init`, `registerRemotes`, `loadRemote`), lazy-imported only when the list is non-empty; the plugin is used only for remotes. Reject the host plugin (eager runtime, build-time remote config). |
+| CSP amendment: literal artifact scan plus runtime enforcement | "No eval/new Function" is verified by a literal artifact scan (`web/scripts/csp-build-scan.mjs`) with hit and no-hit controls, plus runtime enforcement: the exact CSP header asserted on the host document, a deliberate-violation control page that the listener must report, and zero violations in every other scenario. Literal hits in the pinned MF sdk are removed at build time by a `define` plus a version-pinned transform that fails the build on drift. Reject an AST scanner (owner simplification) and adding `'unsafe-eval'`. |
+| nginx layout | `/etc/nginx/uzi-modules/{modules.json,locations.conf}` outside `conf.d`; one flat `location ^~ /modules/<id>/` per module, identical text from chart and generator; a `/modules/` catch-all 404 `no-store` with full security headers; one `map "$status:$uri" $uzi_modcc`, named to avoid colliding with a module id `cc`. Reject per-config copies and a shared `$cc` variable. |
+| Strip every X-Accel-* by njs | An njs header filter deletes every `x-accel-*` response header (image main `nginx.conf` = the pinned image's file + `load_module` + `js_import`, with a drift guard). Reject a fixed list (cannot cover unknown names). |
+| Expanded hidden-header and cleared-request-header lists | From the m3 security review: `Service-Worker-Allowed`, HSTS, `Clear-Site-Data` and others hidden; `Proxy-Authorization` and `X-CSRF-Token` cleared. Reject the narrower list in the first draft. |
+| Shared upstream grammar and fixtures | Chart and generator validate against the same fixtures so they cannot drift; dotless-host expansion is in the chart only (compose resolves a service name as is). Reject separate grammars. |
+| Chart `subPath` mounts, rollout via `checksum/nginx` | Each pod stays consistent with its own nginx; mid-rollout generation skew is accepted and documented. Reject directory mounts (kubelet updates files under a running nginx). |
+| Simple compose generator | Validate, encode before write, temp file + rename, `locations.conf` first; no lock or crash-recovery protocol and no crash-safety claim; operator rules are documented. Reject a locking/recovery protocol (owner simplification). |
+| Compose acceptance deviates from `stack.md`'s literal `env -i` start (owner-approved) | Render with `env -i` into a literal file, then build/up/down from that file under a unique `-p mh-4686-<pid>` project with a ports override, a pre-start round-trip comparison, env and mount checks, image-id equality as the no-rebuild proof, and `down -v` only after verifying volume prefixes. Accepted residual: CLI config, proxies and build settings can affect pulls and builds. |
+| Example module image is a fixture only | `web/examples/ui-module/Dockerfile` is a test and acceptance fixture, shipped in no uzi image and published by no workflow. Reject shipping it as a sample image. |
+| Modules nav group placement | A "Modules" group after Factory and before Settings/Admin/Docs; `work` and `factory` entries append in manifest order; sidebar sections are keyed by stable ids. Reject a group at the end. |
+| Manifest validation in the SPA | Invalid entries are skipped with one `console.error` each; a later duplicate id is skipped (first valid wins); an unknown `navGroup` falls back to `modules`. Reject failing the whole list. |
+| Stale vs transient errors | After a module's first successful load, dynamic-import and MF chunk failures under its prefix are stale and show "Reload page"; others remount with Retry and a forced re-registration. Reject Retry for stale chunks (the browser's module map keeps v1). |
+| Measurement (m2) | One local environment, a single run of 5 cold `/dashboard` loads each, zero modules, hooks-off builds; noisy, report only: base transferred 2,160,102 B / JS 2,110,074 B / 36 requests / loadEventEnd 389 ms / LCP 560 ms; candidate 2,196,877 B / 2,146,321 B / 38 requests / 443 ms / 584 ms (about +36.8 KB, +2 requests). Built-mode browser harness 20/20 scenarios, 54.1 s wall time locally; hosted CI time is a landing obligation. |
 
 ## 8. Spike evidence (local throwaway spike, built mode)
 
@@ -214,4 +228,9 @@ Acceptance (in-run): example 1 holds under compose with no web image rebuild bet
 
 Not covered by the spike and required in §5: cache headers, a redeploy with an open tab, a separately deployed second remote, incompatible shared versions, a stalled upstream, and the host build's own `eval` scan. Live list refresh is out of scope (§3).
 
-**UNVERIFIED before implementation:** the bundle-size and first-load delta of the federation runtime with zero modules; the CI time of the built-mode browser test; `strictVersion` behaviour on a React major mismatch; whether the federation runtime's `loadRemote` honours an abort or must be raced against the timeout.
+**Measured during implementation** (replacing the earlier UNVERIFIED line):
+
+- Bundle and first-load delta with zero modules (m2, one local environment, a single run of 5 cold `/dashboard` loads each, hooks-off builds; noisy, report only): base transferred 2,160,102 B, JS 2,110,074 B, 36 requests, loadEventEnd 389 ms, LCP 560 ms; candidate 2,196,877 B, 2,146,321 B, 38 requests, 443 ms, 584 ms (about +36.8 KB and +2 requests).
+- Built-mode browser harness: 20/20 scenarios, 54.1 s wall time locally. The hosted CI time is a landing obligation, not measured here.
+- `strictVersion` on a React major mismatch: the module is refused, never double-loaded (#RUNTIME-015, verified).
+- `loadRemote` is raced against the 15 s timeout (the runtime is not relied on to honour an abort).

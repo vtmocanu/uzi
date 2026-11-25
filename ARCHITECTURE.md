@@ -2753,6 +2753,10 @@ under PRD #58: there is now a published worker image too
 (`.../uzi/agent-{base,jvm}:<tag>`, built on every `v*` tag), and an optional
 in-cluster alternative — see the next section.
 
+### Runtime web modules (PRD #4686)
+
+Operators can add trusted UI modules to the web app without rebuilding the web image. The list is deployment configuration (chart `web.modules[]`, or the compose generator `scripts/web-modules-gen.py`), rendered into files the `web` nginx reads at start: `/modules.json` (the public list the SPA fetches) and one `location ^~ /modules/<id>/` proxy per module, resolved at request time. The SPA registers each module with the Module Federation runtime and loads its page on first visit; failures stay on that page. The `api` is not involved: there is no new endpoint, privilege or credential, and no trust boundary beyond the module itself, which runs with full page authority as the signed-in user and is the operator's trust decision (`/modules.json` and module files are unauthenticated). Module locations drop session headers and the upstream's cache, cookie and security headers, and the CSP stays `script-src 'self'`. Operator reference: [docs/web-modules.md](docs/web-modules.md); module authors: [docs/web-modules-dev.md](docs/web-modules-dev.md); rationale: [prds/done/4686-runtime-web-modules.md](prds/done/4686-runtime-web-modules.md).
+
 ### Worker controller (k8s only)
 
 **PRD #58** adds one new, deliberately small component: `uzi-controller`, the
