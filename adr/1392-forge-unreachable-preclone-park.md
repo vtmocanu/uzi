@@ -296,6 +296,11 @@ protection is the only blocking finding; and the run has already started once
 - **Not recorded:** no worker-origin cooldown and no worker health evidence, because
   the read happened on the api, not the worker. The claim's own half-open
   reservations are released by the existing lifecycle cleanup.
+- **Late reports:** the payload was never delivered. The park revokes the Codex claim
+  capability (`codex_cap_hash` cleared, epoch + 1) and keeps `claim_released_at` NULL
+  like the worker-path park, so reports at an older generation are refused while a
+  report at the parked generation, or one with no generation, is admitted exactly as
+  for today's worker-path park. This boundary is accepted.
 - **Still terminal `guardrail_blocked`:** a never-started run; auth (401/403, a revoked
   or expired token); a client-build failure; an unknown error class; NXDOMAIN,
   certificate/TLS and address errors; a cancelled forge call (a cancelled claim request

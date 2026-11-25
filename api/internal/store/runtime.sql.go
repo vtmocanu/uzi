@@ -19374,8 +19374,10 @@ type ParkClaimForgeUnreachableParams struct {
 // restore (#3607 Mf), because the payload was never delivered. Differences: the park is
 // recovery_wait / forge_unreachable, a pending completion_blocked annotation is cleared (the owner's
 // decision is already recorded; the forge is now the actionable reason), and a run with a claimed
-// or pending fresh transfer, a stamped stop, or no first start never matches (0 rows: the caller
-// returns errClaimRecoveryStale and the transaction rolls back).
+// or pending fresh transfer, a stamped stop, or no first start never matches. The caller sends a
+// stamped stop, a missing first start and a fresh claim to their own arms before this statement;
+// an active transfer on a non-fresh claim, which the caller does not check, matches 0 rows and
+// the caller returns errClaimRecoveryStale, rolling back.
 //
 // @count_park is true for an ordinary pre-clone continuation (the cap counter advances) and false
 // for the cap hold and for a publication-enrolled run, which never counts against the pre-clone
