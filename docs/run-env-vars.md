@@ -36,8 +36,9 @@ job receives CI variables. Tools that read the environment work unchanged.
   (the protected two-uid worker: compose workers by default, k8s with
   `UZI_WORKER_UID_SPLIT`; see [Configuration](configuration.md)). A run whose
   repo has variables is never claimed by an older or single-user worker, and
-  run health says "no online worker supports repo variables (run_env_v1);
-  upgrade a worker" while none is online. Such a run waits for a two-user
+  run health says "no online worker supports repo variables (run_env_v1); repo
+  variables need a current two-uid worker (UZI_UID_SPLIT, or UZI_WORKER_UID_SPLIT
+  on hosted workers)" while none is online. Such a run waits for a two-user
   worker; if a single-user worker is somehow handed one, it refuses the run
   before starting anything. Cross-check children get no variables, but one claimed
   by a worker without `run_env_v1` ends as checker unavailable, which asks for a

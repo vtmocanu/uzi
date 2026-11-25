@@ -239,7 +239,7 @@ const (
 	// receives repo variables (an enabled live variable, or a secret delivery receipt) whose
 	// owner has no online worker self-reporting 'run_env_v1': ClaimRun's standalone run_env
 	// clause can never be satisfied until a worker that injects the variables comes online.
-	reasonNoRunEnvCapableWorker             = "no online worker supports repo variables (run_env_v1); upgrade a worker"
+	reasonNoRunEnvCapableWorker             = "no online worker supports repo variables (run_env_v1); repo variables need a current two-uid worker (UZI_UID_SPLIT, or UZI_WORKER_UID_SPLIT on hosted workers)"
 	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"

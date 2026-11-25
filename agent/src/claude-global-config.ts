@@ -57,7 +57,8 @@
 //
 // Targets. `<HOME>/.claude/projects` and `<HOME>/.claude/tasks` must exist and be writable by the
 // CLI. Missing ones are created AS THE RUNNER UID (a fixed worker-authored `/bin/mkdir -p -m 700`
-// argv, workerSpawnEnv on a minimal PATH env, no shell), so they are runner-owned and private
+// argv, workerSpawnEnv on a minimal PATH env, started through a constant worker-uid /bin/sh
+// intermediary script that takes its arguments by position, with no interpolation; see Bound), so they are runner-owned and private
 // (0700), and neither runner-cmd (the Codex command uid, which shares group runner) nor the worker
 // ever holds a write path into a Claude transcript directory. The worker never writes or renames
 // anything under `.claude`; the only thing it ever moves is the `.claude` entry itself in HOME. The
@@ -168,6 +169,8 @@ export interface PrepareDeps {
   runAsRunner?: (bin: string, args: readonly string[]) => HelperResult;
   /** lstat of HOME's parent and each ancestor (default `fs.lstatSync`). */
   lstatAncestor?: (p: string) => fs.Stats;
+  /** lstat of HOME itself (default `fs.lstatSync`). */
+  lstatHome?: (p: string) => fs.Stats;
   /** The final rename of the built temp directory into place (default `fs.renameSync`). */
   rename?: (from: string, to: string) => void;
   /** The clock for the preparation deadline, in milliseconds (default `Date.now`). */
@@ -207,7 +210,7 @@ export function prepareClaudeConfigDir(
   const prep: Prep = { run: deps.runAsRunner ?? defaultRunAsRunner, now, deadline: now() + PREPARE_DEADLINE_MS };
   try {
     step("home");
-    guardHome(home, deps.lstatAncestor ?? ((p) => fs.lstatSync(p)));
+    guardHome(home, deps.lstatAncestor ?? ((p) => fs.lstatSync(p)), deps.lstatHome ?? ((p) => fs.lstatSync(p)));
     step("targets");
     ensureTargets(home, prep, step);
     ensureConfigDir(home, dir, step, deps.rename ?? ((from, to) => fs.renameSync(from, to)));
@@ -219,8 +222,8 @@ export function prepareClaudeConfigDir(
 
 /** HOME must be a real directory; under the split it must be the worker's and sticky, and sit under
  *  ancestors that are all trusted (see the header's Boundary). */
-function guardHome(home: string, lstatAncestor: (p: string) => fs.Stats): void {
-  const st = fs.lstatSync(home);
+function guardHome(home: string, lstatAncestor: (p: string) => fs.Stats, lstatHome: (p: string) => fs.Stats): void {
+  const st = lstatHome(home);
   if (!st.isDirectory()) throw refuse("HOME is not a real directory");
   if (!uidSplitActive()) return;
   const uid = process.getuid?.();

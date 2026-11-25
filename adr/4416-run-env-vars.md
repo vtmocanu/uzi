@@ -135,7 +135,8 @@ later rule denies can still be removed.
   repo has an enabled live variable or that holds a secret receipt, as a standalone clause in
   `api/internal/store/queries/runtime.sql`. The same condition is mirrored in fleet-aware placement
   (migration `00533_run_env_placement.sql`) and in run health, which reports "no online worker supports
-  repo variables (run_env_v1); upgrade a worker" while no capable worker is connected. A worker
+  repo variables (run_env_v1); repo variables need a current two-uid worker (UZI_UID_SPLIT, or
+  UZI_WORKER_UID_SPLIT on hosted workers)" while no capable worker is connected. A worker
   advertises `run_env_v1` only under the uid split, so a single-uid worker never counts as capable
   (see "Single-uid posture" below). The claim
   response is `Cache-Control: no-store`, and the snapshot is unexported so no outbox, journal or

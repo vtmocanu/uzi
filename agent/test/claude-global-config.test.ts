@@ -701,6 +701,13 @@ describe("prepareClaudeConfigDir: the uid-split checks", () => {
     assertFixedDir(dirOf());
   });
 
+  it("refuses a HOME owned by another uid and builds nothing; a HOME owned by the worker is accepted", () => {
+    const asOwnedBy = (uid: number) => (p: string): fs.Stats => Object.assign(Object.create(Object.getPrototypeOf(fs.lstatSync(p))), fs.lstatSync(p), { uid });
+    refusedNothingBuilt({ lstatHome: asOwnedBy(self() + 1) }, /HOME is not owned by the worker/);
+    prep(envOf(), { lstatHome: asOwnedBy(self()) });
+    assertFixedDir(dirOf());
+  });
+
   it("refuses an ancestor that is a symlink, at any depth", () => {
     for (const p of [parentOf(), grandparentOf(), "/"]) {
       refusedNothingBuilt(withAncestors({ [p]: { mode: 0o120777 } }), /not a real directory/);

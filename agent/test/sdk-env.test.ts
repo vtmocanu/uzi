@@ -334,7 +334,7 @@ describe("run variables are delivered only under the uid split (PRD #4416)", () 
     );
   });
 
-  it("without the split no injection and an empty injection build the same env as before", () => {
+  it("without the split no injection and an empty injection build the same env as a run without variables", () => {
     delete process.env.UZI_UID_SPLIT;
     const plain = buildSdkEnv(cred, HOME_DIR);
     assert.deepStrictEqual(buildSdkEnv(cred, HOME_DIR, {}, undefined, undefined, undefined, undefined, { vars: [] }), plain);
