@@ -107,6 +107,25 @@ describe("FileopHelperClient: range protocol provenance", () => {
     } finally { h.client.close(); }
   });
 
+  it("forwards a read_bytes request and keeps a string ident, dropping any other ident type", async () => {
+    const h = makeClient();
+    try {
+      const pending = h.client.op({ op: "read_bytes", path: "x", offset: 4, limit: 8 });
+      const req = await h.requests.next();
+      assert.deepEqual(req, { id: req.id, op: "read_bytes", path: "x", offset: 4, limit: 8 });
+      h.respond({ id: req.id, ok: true, data: "", size: 12, offset: 4, ident: "1:2:3:4" });
+      const res = await pending;
+      assert.equal(res.ident, "1:2:3:4");
+      assert.equal(res.offset, 4);
+      for (const ident of [7, null, true, {}, ["1:2:3:4"]]) {
+        const next = h.client.op({ op: "read_bytes", path: "x", offset: 0, limit: 1 });
+        const frame = await h.requests.next();
+        h.respond({ id: frame.id, ok: true, data: "", size: 0, offset: 0, ident });
+        assert.equal((await next).ident, undefined);
+      }
+    } finally { h.client.close(); }
+  });
+
   it("derives invalid truncated metadata only from the wire field type", async () => {
     const h = makeClient();
     try {

@@ -517,4 +517,9 @@ export const mockPendingJudges: Record<string, PendingJudge> = {
 // run with no review and no active judge; do not seed one beside either.
 export const mockJudgeSkips: Record<string, JudgeSkip> = {
   "run-judge-skipped": { harness: "codex", reason: "no_usable_credential", at: minsAgo(56) },
+  // Provider skips: the first is a historical Claude row (Claude judges now run on providers).
+  "run-judge-skipped-provider-claude": { harness: "claude", reason: "provider_lane_unsupported", at: minsAgo(57) },
+  "run-judge-skipped-provider-codex": { harness: "codex", reason: "provider_lane_unsupported", at: minsAgo(58) },
+  "run-judge-skipped-provider-unusable": { harness: "claude", reason: "provider_source_unusable", at: minsAgo(59) },
+  "run-judge-skipped-provider-unmapped": { harness: "claude", reason: "provider_model_unmapped", at: minsAgo(60) },
 };

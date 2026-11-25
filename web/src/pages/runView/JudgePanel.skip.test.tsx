@@ -75,7 +75,11 @@ describe("JudgePanel skip state (#3257 M2)", () => {
     [skip({ harness: "codex", reason: "credential_disabled" }), ": the Codex credential was disabled."],
     [skip({ harness: "claude", reason: "credential_disabled" }), ": the Claude credential was disabled."],
     [skip({ harness: "codex", reason: "codex_pool_unavailable" }), ": no pooled Codex account was available."],
-    [skip({ harness: "claude", reason: "provider_lane_unsupported" }), ": the selected source is a model provider, which the judge does not support yet."],
+    [skip({ harness: "claude", reason: "provider_lane_unsupported" }), ": the selected source was a model provider, which the judge did not support at the time."],
+    [skip({ harness: "codex", reason: "provider_lane_unsupported" }), ": the selected Codex source is a model provider, which the Codex judge does not support yet."],
+    [skip({ harness: "gemini", reason: "provider_lane_unsupported" }), ": the selected source is a model provider, which the judge does not support yet."],
+    [skip({ harness: "claude", reason: "provider_source_unusable" }), ": the selected model provider could not serve the judge."],
+    [skip({ harness: "codex", reason: "provider_model_unmapped" }), ": the model provider did not map the judge's model."],
   ])("renders fixed copy for %o", async (s, cause) => {
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null, skip: s });
     renderPanel();

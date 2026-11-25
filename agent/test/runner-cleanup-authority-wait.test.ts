@@ -430,6 +430,11 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     // multi-line form of the same spread.
     const seamWait = statement(source.indexOf("wait: {\n        ...this.authorityWait(flight),"));
     assert.ok(seamWait.includes("this.retainedLifecycleSignal(flight)"), seamWait);
-    assert.equal(starts("this.authorityWait(").length, 18, "live source, remediation, existing admission, the two restore-seed waits and the mid-run seam wait remain enumerated");
+    // issue #4628: the fresh resume seed runs its normalization and journal writes under the flight's clone-bound wait, the same
+    // class as the attempt seed above.
+    const freshSeed = starts("seedScope: fn => this.inFlightAuthority(").map(statement);
+    assert.equal(freshSeed.length, 1);
+    assert.ok(freshSeed[0]!.includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"), freshSeed.join("\n"));
+    assert.equal(starts("this.authorityWait(").length, 19, "live source, remediation, existing admission, the two restore-seed waits, the mid-run seam wait and the fresh seed scope remain enumerated");
   });
 });

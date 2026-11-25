@@ -168,6 +168,9 @@ type checkpointPush struct {
 	// attestedSource is the request's source attestation frozen at admission (issue #3194;
 	// invalid: none). Every attempt row and the tip persist of this publish carry exactly it.
 	attestedSource pgtype.Text
+	// tipGeneration is the fenced claim generation Publish was admitted at (invalid: unfenced). It is
+	// recorded on the attempt row and stamped onto runs.checkpoint_tip_generation with the tip (#4628).
+	tipGeneration pgtype.Int8
 }
 
 // publishBase is the run's tracking state a push observed immediately before its forge call
@@ -287,11 +290,12 @@ func pushDefinitelyRefused(err error) bool {
 // p.run is the authorization snapshot and is never refreshed to a newer claim.
 func (p *checkpointPush) recordAttempt(ctx context.Context) (uuid.UUID, error) {
 	if terminalStatuses[p.run.Status] {
-		return p.s.recordPublishAttempt(ctx, p.runID, p.checkpointKey, p.ref, p.opts.DeclaredTip, p.attestedSource)
+		return p.s.recordPublishAttemptAt(ctx, p.runID, p.checkpointKey, p.ref, p.opts.DeclaredTip, p.attestedSource, p.tipGeneration)
 	}
 	return p.s.q.RecordLiveCheckpointPublishAttempt(ctx, store.RecordLiveCheckpointPublishAttemptParams{
 		RecordCheckpointPublishAttemptParams: store.RecordCheckpointPublishAttemptParams{
 			RunID: p.runID, Branch: p.checkpointKey, Ref: p.ref, Tip: p.opts.DeclaredTip, AttestedSource: p.attestedSource,
+			ClaimGeneration: p.tipGeneration,
 		},
 		ExpectedWorkerID: p.run.WorkerID, ExpectedClaimGeneration: p.run.ClaimGeneration,
 		AttemptID: p.preparedID,
@@ -319,14 +323,16 @@ func (p *checkpointPush) clearPreparedAttempt(ctx context.Context) {
 	p.s.clearPublishAttempt(ctx, id)
 }
 
-// recordPublishAttempt writes the attempt row a push needs before it is sent. Inert (uuid.Nil, no
-// error) when supersession is not wired: then no supersession, and no reconciliation, ever runs.
-func (s *Service) recordPublishAttempt(ctx context.Context, runID uuid.UUID, branch, ref, tip string, attestedSource pgtype.Text) (uuid.UUID, error) {
+// recordPublishAttemptAt writes the attempt row a push needs before it is sent, carrying the push's
+// fenced claim generation (invalid: unfenced), which the reconcilers stamp onto
+// runs.checkpoint_tip_generation with the tip. Inert (uuid.Nil, no error) when supersession is not
+// wired: then no supersession, and no reconciliation, ever runs.
+func (s *Service) recordPublishAttemptAt(ctx context.Context, runID uuid.UUID, branch, ref, tip string, attestedSource pgtype.Text, claimGeneration pgtype.Int8) (uuid.UUID, error) {
 	if !s.supersessionWired() {
 		return uuid.Nil, nil
 	}
 	return s.q.RecordCheckpointPublishAttempt(ctx, store.RecordCheckpointPublishAttemptParams{
-		RunID: runID, Branch: branch, Ref: ref, Tip: tip, AttestedSource: attestedSource,
+		RunID: runID, Branch: branch, Ref: ref, Tip: tip, AttestedSource: attestedSource, ClaimGeneration: claimGeneration,
 	})
 }
 
@@ -632,6 +638,7 @@ func (s *Service) reRecordPublishedTip(ctx context.Context, a store.CheckpointPu
 	// Issue #3194: the attestation is this attempt row's own frozen value, never the run's.
 	n, perr := q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
 		CheckpointTip: a.Tip, ID: a.RunID, ExpectedTip: expectedRunTip, AttestedSource: a.AttestedSource,
+		TipGeneration: a.ClaimGeneration,
 	})
 	if perr != nil {
 		return "", false, fmt.Errorf("persist reconciled tip: %w", perr)

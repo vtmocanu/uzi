@@ -459,6 +459,10 @@ func (h *Handler) DiscardRecoveryArchive(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	discarded, err := h.recovery().Discard(r.Context(), user.ID, runID, captureID)
+	if errors.Is(err, recovery.ErrCaptureInFreshResume) {
+		httpx.Error(w, http.StatusConflict, "fresh_resume_in_progress")
+		return
+	}
 	if err != nil {
 		slog.Error("recovery discard", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

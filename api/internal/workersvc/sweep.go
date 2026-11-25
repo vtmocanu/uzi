@@ -281,6 +281,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 	}
 
+	// Issue #4628: the fresh resume transfers the sweep must refuse (expired or gate-off pending rows, and
+	// claimed rows with positive loss evidence). The loss evidence reads worker liveness, so the claimed
+	// arms stand down inside the boot grace like the stale-worker passes above.
+	res.FreshResumeRefused = s.sweepFreshResumes(ctx, now.Add(-s.p.WorkerHeartbeatStale), !graceActive)
+
 	// Settle plan cross-check children whose lead left its claim or generation.
 	// The query locks lead rows first and is idempotent across sweep ticks.
 	if q, ok := s.q.(*store.Queries); ok {

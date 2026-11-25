@@ -148,7 +148,8 @@ RETURNING *;
 WITH candidates AS MATERIALIZED (
     SELECT r.id FROM runs r
     JOIN run_publication_resume p ON p.run_id = r.id AND p.state = 'active' AND p.handoff IS NULL
-    WHERE r.status = 'queued'
+    WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = r.id AND frt.state IN ('pending', 'claimed'))
+      AND r.status = 'queued'
       AND (
           -- The custodian is the side row's worker_id (runs.worker_id is cleared by the resume
           -- writers); a NULL one is held.
@@ -188,7 +189,8 @@ WITH candidates AS MATERIALIZED (
         health = 'ok', health_reason = NULL, health_since = NULL,
         updated_at = now()
     FROM candidates c
-    WHERE runs.id = c.id AND runs.status = 'queued'
+    WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+      AND runs.id = c.id AND runs.status = 'queued'
     RETURNING runs.id, runs.user_id
 ), marked AS (
     UPDATE run_publication_resume p SET hold_reason = 'publication_custodian_unavailable'

@@ -286,7 +286,7 @@ describe("controls: the guarded matcher still redacts exactly", () => {
     const naive = (secrets: string[], text: string): Array<[number, number]> => {
       const spans: Array<[number, number]> = [];
       for (const secret of secrets) {
-        for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + secret.length)) spans.push([at, at + secret.length]);
+        for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) spans.push([at, at + secret.length]);
       }
       return spans.sort((a, b) => a[0] - b[0]);
     };

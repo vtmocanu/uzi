@@ -6,6 +6,8 @@ import { makeRedactor, makeTextRedactor, providerKeyForms } from "../src/redact.
 const TOKEN = "dummy-oauth-token-do-not-scan-0000";
 const PAT = "dummy-forge-pat-do-not-scan-1111";
 const REDACTED = "***REDACTED***";
+// Mirrors api/internal/termsafe SanitizeTTY: drop Cc (except \t, \n) and Cf.
+const displayAsTTY = (s: string) => s.replace(/[\p{Cc}\p{Cf}]/gu, (c) => (c === "\t" || c === "\n" ? c : ""));
 
 describe("makeRedactor", () => {
   it("scrubs secret substrings from strings, arrays, and nested objects", () => {
@@ -64,8 +66,6 @@ describe("makeTextRedactor", () => {
 describe("redaction across invisible separators", () => {
   // An arbitrary synthetic run-owned secret (not provider-shaped), built at runtime.
   const secret = ["run", "owned", "Secret", "9f3k2"].join("-");
-  // Mirrors api/internal/termsafe SanitizeTTY: drop Cc (except \t, \n) and Cf.
-  const displayAsTTY = (s: string) => s.replace(/[\p{Cc}\p{Cf}]/gu, (c) => (c === "\t" || c === "\n" ? c : ""));
   const split = (sep: string) => secret.slice(0, 5) + sep + secret.slice(5, 11) + sep + secret.slice(11);
   const separators: Array<[string, string]> = [
     ["zero-width space", "​"],
@@ -137,6 +137,43 @@ describe("makeTextRedactor over more than 64 secrets", () => {
     const ms = Date.now() - started;
     assert.ok(out.endsWith(REDACTED));
     assert.ok(ms < 5000, `took ${ms}ms`);
+  });
+});
+
+// A secret built from a repeating block X (S = XX) overlaps itself, and a verbatim occurrence can
+// overlap an invisible-separated one. Every span is found in the original text and the union is
+// replaced once, so no block of the secret survives (#4688).
+describe("overlapping occurrences redact as one union", () => {
+  const block = ["run", "owned", "Secret", "9f3k2"].join("-");
+  const secret = block + block;
+  const zwsp = "\u200b";
+
+  it("a verbatim occurrence overlapping an invisible-separated one leaves no block", () => {
+    const stored = makeTextRedactor([secret])(`before ${secret}${zwsp}${block} after`);
+    assert.equal(stored, `before ${REDACTED} after`);
+    assert.ok(!displayAsTTY(stored).includes(block), JSON.stringify(stored));
+  });
+
+  it("self-overlapping invisible-separated occurrences leave no block", () => {
+    const stored = makeTextRedactor([secret])(`before ${block}${zwsp}${block}${zwsp}${block} after`);
+    assert.equal(stored, `before ${REDACTED} after`);
+    assert.ok(!displayAsTTY(stored).includes(block), JSON.stringify(stored));
+  });
+
+  it("a self-overlapping verbatim run is redacted whole", () => {
+    assert.equal(makeTextRedactor(["aaaaaaaa"])("a".repeat(20)), REDACTED);
+  });
+
+  it("occurrences that only touch stay separate markers", () => {
+    assert.equal(makeTextRedactor(["abcdefgh"])("abcdefghabcdefgh"), REDACTED + REDACTED);
+  });
+
+  it("many disjoint invisible-pass matches do not overflow the argument limit", () => {
+    // Spans are collected into one array, never spread as call arguments (a spread of ~300k
+    // spans threw RangeError before any replacement ran).
+    const count = 300_000;
+    const stored = makeTextRedactor(["abcdefgh"])("\u200b" + "abcdefgh ".repeat(count));
+    assert.equal(stored, "\u200b" + `${REDACTED} `.repeat(count));
   });
 });
 

@@ -169,19 +169,21 @@ function textRedactorWithin(secrets: Array<string | undefined | null>): ((s: str
   if (list.length > PER_SECRET_MAX) {
     const find = literalSpanFinder(list);
     const findVisible = !stripped ? find : visible.length > 0 ? literalSpanFinder(visible) : undefined;
-    return (s, work) => {
-      let out = replaceSpans(s, find(s, work));
-      if (findVisible && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisible, work);
-      return out;
-    };
+    return (s, work) => redactUnion(s, work, find, findVisible);
   }
   const findEach = spansOfEach(list);
-  const findVisibleEach = !stripped ? findEach : spansOfEach(visible);
-  return (s, work) => {
-    let out = replaceSpans(s, findEach(s, work));
-    if (visible.length > 0 && INVISIBLE_TEST.test(out)) out = redactAcrossInvisible(out, findVisibleEach, work);
-    return out;
-  };
+  const findVisibleEach = visible.length === 0 ? undefined : !stripped ? findEach : spansOfEach(visible);
+  return (s, work) => redactUnion(s, work, findEach, findVisibleEach);
+}
+
+/** Every span is found in the ORIGINAL string (verbatim, and across invisible separators) and the union is
+ *  replaced once, so an overlapping or self-overlapping occurrence, or a verbatim one overlapping an
+ *  invisible-separated one, never leaves part of a secret behind (#4688). */
+function redactUnion(s: string, work: RedactionWork, find: SpanFinder, findVisible: SpanFinder | undefined): string {
+  const spans = find(s, work);
+  if (findVisible !== undefined && INVISIBLE_TEST.test(s)) collectInvisibleSpans(spans, s, findVisible, work);
+  spans.sort((a, b) => a[0] - b[0]);
+  return replaceSpans(s, spans);
 }
 
 /** The most secrets redacted one pass each; a longer list is matched in a single indexed pass. */
@@ -382,23 +384,42 @@ export function replaceSpans(text: string, spans: Array<[number, number]>): stri
   return out + text.slice(cursor);
 }
 
+/** True when a proper prefix of `s` is also its suffix: only then can two occurrences of `s` overlap. */
+function hasBorder(s: string): boolean {
+  const fail = new Int32Array(s.length);
+  let k = 0;
+  for (let i = 1; i < s.length; i++) {
+    while (k > 0 && s.charCodeAt(i) !== s.charCodeAt(k)) k = fail[k - 1]!;
+    if (s.charCodeAt(i) === s.charCodeAt(k)) k++;
+    fail[i] = k;
+  }
+  return k > 0;
+}
+
 /** The finder that looks for each secret (at least MIN_SECRET_LEN long): `indexOf` of its first MIN_SECRET_LEN units
  *  finds a candidate, and the full comparison is charged, so a long secret against periodic text cannot spend more
- *  than the budget. Matches are non-overlapping per secret; a hit resumes after it, a miss one unit later. */
+ *  than the budget. Overlapping occurrences of one secret are reported too (replaceSpans merges them): after a hit a
+ *  secret with a border (a self-overlapping one) resumes one unit past the hit, any other secret after it, since only
+ *  a border lets two of its occurrences overlap. A miss resumes one unit later. */
 export function spansOfEach(secrets: readonly string[]): SpanFinder {
   return (text, work) => {
     const spans: Array<[number, number]> = [];
     for (const secret of secrets) {
       const prefix = secret.slice(0, MIN_SECRET_LEN);
+      let overlaps: boolean | undefined;
       let at = text.indexOf(prefix);
       while (at !== -1) {
         charge(work, 1 + secret.length);
+        let next = at + 1;
         if (text.startsWith(secret, at)) {
           spans.push([at, at + secret.length]);
-          at = text.indexOf(prefix, at + secret.length);
-        } else {
-          at = text.indexOf(prefix, at + 1);
+          if (overlaps === undefined) {
+            charge(work, secret.length);
+            overlaps = hasBorder(secret);
+          }
+          if (!overlaps) next = at + secret.length;
         }
+        at = text.indexOf(prefix, next);
       }
     }
     return spans.sort((a, b) => a[0] - b[0]);
@@ -406,12 +427,12 @@ export function spansOfEach(secrets: readonly string[]): SpanFinder {
 }
 
 /**
- * Redact each secret wherever its characters appear in order with only invisible runs between
+ * Push the spans of each secret wherever its characters appear in order with only invisible runs between
  * them. The text is projected onto its visible characters (remembering where each came from),
- * matched there, and every matched span is replaced in the ORIGINAL, invisible separators
+ * matched there, and every match is mapped back to a span of the ORIGINAL, invisible separators
  * included, so nothing of the secret survives to be re-joined.
  */
-function redactAcrossInvisible(text: string, find: SpanFinder, work: RedactionWork): string {
+function collectInvisibleSpans(spans: Array<[number, number]>, text: string, find: SpanFinder, work: RedactionWork): void {
   const chunks: string[] = [];
   const origin = new Int32Array(text.length); // visible UTF-16 unit i came from text[origin[i]]
   let n = 0;
@@ -427,9 +448,8 @@ function redactAcrossInvisible(text: string, find: SpanFinder, work: RedactionWo
   keep(last, text.length);
   const visible = chunks.join("");
 
-  const spans = find(visible, work).map(([from, to]): [number, number] => [origin[from]!, origin[to - 1]! + 1]);
-  spans.sort((a, b) => a[0] - b[0]);
-  return replaceSpans(text, spans);
+  // Pushed one by one: a spread of a very large span list overflows the call-argument limit.
+  for (const [from, to] of find(visible, work)) spans.push([origin[from]!, origin[to - 1]! + 1]);
 }
 
 /** Scrub string values and member names without dropping colliding data. Finite numeric sums merge,
@@ -556,17 +576,18 @@ export class SecretSet {
     const indexed = list.length > PER_SECRET_MAX;
     const plain = indexed ? (this.plain ??= indexOf(list)) : undefined;
     const find: SpanFinder = plain ? (t, w) => plain.find(t, w) : spansOfEach(list);
-    let out = replaceSpans(s, find(s, work));
-    if (!INVISIBLE_TEST.test(out)) return out;
     const visible = this.visible;
-    if (visible === undefined) return redactAcrossInvisible(out, find, work);
-    if (visible.list.length === 0) return out;
-    if (indexed) {
+    let findVisible: SpanFinder | undefined;
+    if (visible === undefined) {
+      findVisible = find;
+    } else if (visible.list.length === 0) {
+      findVisible = undefined;
+    } else if (indexed) {
       const index = (visible.index ??= indexOf(visible.list));
-      out = redactAcrossInvisible(out, (t, w) => index.find(t, w), work);
+      findVisible = (t, w) => index.find(t, w);
     } else {
-      out = redactAcrossInvisible(out, spansOfEach(visible.list), work);
+      findVisible = spansOfEach(visible.list);
     }
-    return out;
+    return redactUnion(s, work, find, findVisible);
   }
 }

@@ -104,7 +104,8 @@ export interface ReadOnlyModelPassOpts {
    *  (review/summary), the helper's default applies: throw a generic
    *  `${label} model call returned an error result` on an error frame, return the
    *  accumulated text on success. It receives the raw SDK message OUTSIDE the provider redaction
-   *  seam, so it must not be used on a provider pass (the judge refuses providers today). */
+   *  seam, so a provider-pass caller must scrub frames upstream, before onResult sees them (as
+   *  judgeProvider's wrapped queryFn does). */
   onResult?(msg: unknown, ctx: { isError: boolean; latest: RateLimitObservation | undefined }): void;
   /** PRD #1429 M3: when set, this pass runs the ISOLATED CODEX advice harness (built via
    *  the injected `buildHarness` factory — never constructed in this file, per

@@ -3895,6 +3895,99 @@ Notes:
 - If a resume with earlier follow-ups cannot deliver its pending input, the run fails when the failure is definitive and parks when it is transient.
 - A Codex run whose resume attempt is rejected mid-claim and falls back to a fresh thread is not covered by this carry-over.
 
+## Fresh resume on a separate hosted worker
+
+A run held at a worker-exhaustion `recovery_wait` normally waits for the worker that held its source. **Fresh resume** (issue #4628) lets you, the owner, Resume that run on a *different* persistent hosted worker, seeded from durable evidence uzi already holds: a recovery capture or the run's published checkpoint ref. It is owner-initiated only. Nothing starts one automatically, and the original worker's source and custody are never deleted by it. Design record: [ADR-4628](../adr/4628-fresh-resume-durable-evidence.md). CLI: [`uzi run fresh-resume`](cli.md#fresh-resume-uzi-run-fresh-resume). The web run page shows the same preview and confirmation in the worker decision panel of an eligible held run.
+
+The feature is off by default. An operator turns it on with `UZI_FRESH_RESUME` (see [Configuration](configuration.md)); while it is off the preview reports `disabled` and a start is refused.
+
+### When it applies
+
+A fresh resume can start only when all of these hold:
+
+- The run is at `recovery_wait` with cause `worker_requeue_exhausted`, `retained_recovery_exhausted`, `retained_recovery_adoption_failed` or `retained_continuation_unwitnessed`, and no automatic retry is stamped (the hold is waiting for you).
+- The park is not a secret remediation (`secret_remediation_active`) or a declined source end (`source_end_declined`).
+- The run kind is `issue`, `mr_rework` or `self_improve`.
+- The run is not a Codex run that has already been claimed once (a Codex run stays with the worker that last ran it, [ADR-4476](../adr/4476-codex-claim-provenance.md)).
+- It has no active publication resume, no pending policy change, no `codex_policy_hold` and no pending weekly-reserve pause, and its wall budget is not already spent.
+- No other fresh resume of the run is pending or claimed.
+- A destination exists: an online, persistent (not run-bound) hosted worker of yours that advertises `fresh_resume_v1` and `recovery_inventory_v1`, is accepting new work (not draining or maintenance-fenced), is not the worker the run is or was bound to, and holds no open custody hold on the run.
+- You have custody headroom for the extra hold ([Custody and admission](#custody-and-admission-the-extra-unit)).
+
+The preview names the first failing condition as its status (`disabled`, `in_progress`, `ineligible`, `no_destination`, `custody_limit`, then the evidence statuses below). It never writes.
+
+### How the evidence is chosen
+
+Each claim of the run has a **generation**, and each generation keeps its own custody hold. The **evidence generation** `Ge` is the highest generation, up to the run's latest, that saved anything: a recovery capture under that generation's hold, or a checkpoint tip stamped with that generation. A generation that saved nothing is **uncovered**; a later uncovered generation never falls back to older evidence silently, and the preview lists the uncovered generations (up to 64) so you can see which edits are not included.
+
+At `Ge` the candidates are:
+
+- **A capture** that is available, bound to its manifest, not expired and with more than 30 minutes of retention left at the start, under that generation's hold and the run's repo. Each commit it depends on must be proven by the forge to be an ancestor of the default branch head (or be the run's stamped checkpoint tip).
+- **The checkpoint ref**, only when the run's tip is stamped with `Ge`, the run still has an open hold, and the ref on the forge still points at that tip.
+
+A candidate is chosen only if it **dominates** every other: it is the same commit as, or contains (by its prerequisites and forge ancestry), each of the others, so nothing another candidate saved is lost. If several dominate, a checkpoint ref beats a capture, then the lowest capture id wins. If none dominates, the selection is `ambiguous`.
+
+When nothing can be chosen, the status says why:
+
+| Status | Meaning |
+| --- | --- |
+| `no_evidence` | No generation saved a capture or a stamped checkpoint tip. |
+| `expired` | The only candidates have expired, are about to, or the checkpoint ref moved or is gone. |
+| `unbound` | The run's checkpoint tip is not tied to a generation, so it might hold newer work than any candidate, and the chosen candidate cannot be proven to contain it. |
+| `prereq_unproven` | The forge could not prove a capture's base commits (unreachable, over the bounded number of forge calls or 20 second budget, or not an ancestor). Unproven is never assumed. |
+| `ambiguous` | Several candidates exist and none contains the others. |
+
+The preview returns a **selection token** that binds your confirmation to the exact run state, claim generation, hold version, `Ge` and chosen evidence. If any of them changes before you confirm, the start is refused as `stale_selection` and you review a new preview.
+
+### What you see before confirming
+
+The CLI and the web panel show the evidence (generation, kind, commit, ref or capture) and this cutoff text before every confirmation:
+
+- Edits made after the saved evidence may be missing from the resumed run.
+- The original worker's source and custody are kept; starting a fresh resume does not delete them.
+- Unsaved edits may be lost if the original worker's volume is gone.
+- Each attempt keeps its own custody hold, and a healthy seeded run counts one extra admission unit until its new hold is released or the run ends.
+- While the original worker and the new worker both hold custody, only a third eligible hosted worker can take a repeat fresh resume. After seeding, the original worker never takes this run again, so an owner with only two workers whose new worker is lost must add a worker or cancel the run.
+- If generations saved no evidence: "No saved evidence exists for generation N; any edits made in it are not included."
+
+### What happens after you confirm
+
+1. **Start.** uzi records a *pending* transfer. The run itself is untouched and stays at `recovery_wait`. Each confirm uses one request id; a retry with the same id returns the same transfer instead of creating another. A pending transfer that is not claimed within 24 hours is refused.
+2. **Claim.** An eligible destination, on its next claim poll, takes the transfer. The run is queued for that worker and the transfer is *claimed*. The destination has 2 hours to seed.
+3. **Seed.** The destination fetches the evidence, verifies it (a capture's bundle is verified by git; the checkpoint ref must equal the commit uzi named), refuses if its repository already holds any local state for that branch, seeds a new attempt, and reports a *seeded* receipt. The run continues on the new worker only when the receipt confirms that worker still holds the run's live claim.
+4. **Refusal.** If anything fails before the receipt (the destination gives the transfer back, loses contact, has no room, the credential is disabled, or the deadline passes), the transfer is closed and the run returns to its held `recovery_wait` exactly as it was. The destination never reports the run `failed` from this window.
+
+While a transfer is pending or claimed, owner writes such as pause, extend and set-token are refused with `fresh_resume_in_progress`, and so is a Resume of a *claimed* transfer. Cancel always works. An owner Resume of a run with a *pending* transfer refuses that transfer first and then takes the ordinary Resume path. Turning the feature off drains pending transfers on the next sweep tick; a claimed transfer still finishes or is refused on loss evidence (stale or re-registered destination, missing from its worker's snapshot, or past its deadline).
+
+After seeding, the original worker and any worker holding an older open hold of the run are excluded from taking the run again. This holds even if the new worker is later lost.
+
+### Custody and admission: the extra unit
+
+A fresh resume reserves one admission unit for you while its transfer is pending, claimed, seeded or superseded and its new hold is not already counted. A healthy seeded run therefore counts one **extra** unit against `custody_hold_limit` until the new hold is released or the run ends. The preview refuses with `custody_limit` when the reservation or the extra hold would take you past the limit. The recovery admission summary reports how many counted units are fresh reservations as `fresh_reserved_units`, and the per-hold membership list shows each as a counted `fresh_reservation` member. See [Admin settings](admin-settings.md#custody-hold-limit).
+
+### Backups
+
+Fresh resume does not move or delete the original worker's source. `.agents/skills/uzi-watcher/scripts/backup-runs.sh` (the watcher skill's backup procedure) still snapshots the original worker's PVC: it searches every running hosted worker pod for the run's attributed sources by journal and ledger identity, so it reaches the original worker's source and the new worker's. It has no fresh-resume-specific handling; read its output as usual.
+
+### Recovering from a stale `config.lock`
+
+The destination changes the worker's repository configuration under git's own `config.lock`. The agent never removes or retries past an existing lock; what happens next depends on whether the receipt was already seeded.
+
+- **Before the seeded receipt** (while the destination is still seeding the branch): the destination stops without touching the lock, abandons the transfer (the run returns to its hold) and does not retry.
+- **After the seeded receipt** (the final step that commits the receipt into the configuration finds the lock): the transfer is not abandoned. The first flight stops nonterminally and keeps the seeded work and its custody on the new worker. After a worker restart, the reconciler repeats that step; if the lock is still there it requests an owner hold (`recovery_wait`, cause `retained_recovery_adoption_failed`) on the new worker, with the work and custody preserved.
+
+**The agent never removes a stale `config.lock`.** An operator removes it only after confirming no git process is running against that repository (a live git owns the lock); then Resume again.
+
+### Failure model
+
+The design survives a **process or container crash**. It claims no power-loss durability: the configuration rewrite is not fsynced beyond what the existing rewrite already does.
+
+### Not covered
+
+- No automatic fresh resume: no record proves a lossless cutoff, so a human decides ([ADR-4628](../adr/4628-fresh-resume-durable-evidence.md)).
+- Compose and non-hosted workers are never destinations, and a Codex hand-off is not provided (follow-up #4651).
+- Rolling the API back needs a precondition; see [Configuration](configuration.md#fresh-resume-rollback).
+
 ## Salvage copies
 
 Separate from the archive above, a **salvage copy** is a bounded, run-scoped

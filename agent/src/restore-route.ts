@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import { attemptClonePath, attemptGeneration, cloneKeyOf } from "./attempt-path.js";
 import {
-  parseAttemptLedgerEntry, recoveryCaptureKey, stoppedMarkerKey,
+  isFreshLedgerState, parseAttemptLedgerEntry, recoveryCaptureKey, stoppedMarkerKey,
   type BareAttributionEntry, type RestorePinSpec, type RestorePinVerdict,
 } from "./git.js";
 import type { SlotSnapshot } from "./completion-authority.js";
@@ -91,7 +91,7 @@ function classifyCanonicalShape(input: RelationshipInput, j: Record<string, unkn
     if (/^uzi-attempts\..+\.entry$/.test(key)) {
       const decoded = valueless ? undefined : parseAttemptLedgerEntry(value);
       if (decoded === undefined) { if (names(value)) return conflicting; continue; }
-      if (decoded.runId === input.runId ? decoded.state === "live" || decoded.state === "reclaimed" : decoded.clonePath === clonePath) return conflicting;
+      if (decoded.runId === input.runId ? decoded.state === "live" || decoded.state === "reclaimed" || isFreshLedgerState(decoded.state) : decoded.clonePath === clonePath) return conflicting;
       continue;
     }
     if (names(value)) return conflicting;
@@ -160,7 +160,7 @@ function classifyRestoreRelationships(input: RelationshipInput): RelationshipRes
   if (own === undefined || own.state !== "live" || own.clonePath !== clonePath) return refuse("predecessor_ledger");
   for (const other of ledger.values()) {
     if (other.attemptId === attemptId) continue;
-    if (other.state === "live" || other.state === "reclaimed") return refuse("conflicting_attribution");
+    if (other.state === "live" || other.state === "reclaimed" || isFreshLedgerState(other.state)) return refuse("conflicting_attribution");
     const g = attemptGeneration(other.attemptId);
     if ((g === undefined || g >= generation) && other.state !== "retired") return refuse("conflicting_attribution");
   }

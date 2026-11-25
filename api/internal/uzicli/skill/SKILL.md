@@ -226,6 +226,7 @@ uzi run inputs <run-id>
 uzi run expedite <run-id> [--clear]
 uzi run resume-now <run-id>
 uzi run resume <run-id>
+uzi run fresh-resume <run-id> [--yes] [--request-id <uuid> [--selection-token <token>]]
 uzi run set-token <run-id> (<label> | --auto | --default | --inherit)
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi run ci-autofix <run-id> [--enabled[=false]] [--clear]

@@ -208,7 +208,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and returns no rows for a repo-less judge run, which
 	// the no-rows branch below would then fail as an owner mismatch, #1691)
-	// and before the bot-PAT open. Its claim carries only the Anthropic token.
+	// and before the bot-PAT open. A vendor judge's claim carries only the Anthropic token; a
+	// provider-bound Claude judge carries only its frozen provider binding, and a provider refusal
+	// fails it terminally (credential_unavailable) rather than parking it (PRD #4322 D-G).
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
 	// the shapes that cannot be isolated: the judge lane below has no isolation, and a Codex
@@ -219,13 +221,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, errIsolatedClaimRefused
 	}
 	// Provider claims support ordinary engine-aware lanes only; refuse unsupported
-	// shapes before context or credential reads, without entering a vendor ladder.
-	if providerBoundRun(run) && (run.Kind == runkind.Judge || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
+	// shapes before context or credential reads, without entering a vendor ladder. A Claude judge
+	// is supported (PRD #4322 M1a); a provider-bound Codex judge stays refused here until #4574.
+	if providerBoundRun(run) && ((run.Kind == runkind.Judge && run.Harness != harnessClaude) || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
 		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
 		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
 		return nil, errProviderLaneClaimRefused
 	}
-	if providerBoundRun(run) && !workerSupportsProvider(wkr, run.Harness) {
+	if providerBoundRun(run) && !workerSupportsProvider(wkr, run.Harness, run.Kind) {
 		return nil, errProviderLaneClaimRefused
 	}
 	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A

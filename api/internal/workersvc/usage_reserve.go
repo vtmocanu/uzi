@@ -24,8 +24,8 @@ import (
 //   - reserveSnapshot reads the owner's threshold and, only when one is set, their fresh 7-day
 //     readings (usagereserve.EvaluateClaude / EvaluateCodex), and derives the verdict of every
 //     enabled Anthropic token and every enabled Codex alias.
-//   - reserveEnforced is the single exemption rule (no threshold, chat, an active manual-resume
-//     override, a started run while the pause toggle is off).
+//   - reserveEnforced is the single exemption rule (no threshold, chat, a run frozen to a custom model
+//     provider, an active manual-resume override, a started run while the pause toggle is off).
 //   - reserveHeld resolves the credential a run would spend in claimSecretID's order and reports
 //     whether its verdict blocks it.
 //
@@ -415,12 +415,17 @@ func sortedBlocked(m map[uuid.UUID]usagereserve.Verdict) []uuid.UUID {
 // --- exemptions and the held decision ----------------------------------------------------------
 
 // reserveEnforced is the single exemption rule: the reserve applies to a run only when the owner has a
-// threshold, the run is not chat (the interactive use the reserve protects), no manual-resume
-// override is active, and the run is either never-started or the owner's pause toggle is on (a
-// previously started run's resume claim is gated only while pausing is enabled). ClaimRun's reserve
-// clause mirrors these arms in SQL.
+// threshold, the run is not chat (the interactive use the reserve protects), the run is not frozen to
+// a custom model provider (it spends its own gateway key, never a vendor credential, so the VENDOR
+// weekly reserve has nothing to protect), no manual-resume override is active, and the run is either
+// never-started or the owner's pause toggle is on (a previously started run's resume claim is gated
+// only while pausing is enabled). ClaimRun's reserve clause mirrors these arms in SQL.
 func reserveEnforced(run store.Run, snap *reserveSnap, now time.Time) bool {
 	if !snap.on() || run.Kind == runkind.Chat {
+		return false
+	}
+	// The same discriminator claim assembly uses to send a run down the provider path (providerBoundRun).
+	if providerBoundRun(run) {
 		return false
 	}
 	if overrideActive(run, snap, now) {

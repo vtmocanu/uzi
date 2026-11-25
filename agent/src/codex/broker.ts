@@ -254,7 +254,7 @@ const SEARCH_DEADLINE_MS = 10_000;
 const SEARCH_MAX_OPERATIONS = 2048;
 const SEARCH_MAX_DIRECTORIES = 1024;
 const SEARCH_MAX_ENTRIES = 16384;
-const SEARCH_MAX_FILE_BYTES = 1024 * 1024;
+const SEARCH_CHUNK_BYTES = 1024 * 1024;
 const SEARCH_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 const SEARCH_MAX_MATCHES = 20;
 const SEARCH_PARTIAL_NOTICE = "Partial search: coverage is incomplete; a missing match does not mean the text is absent.";
@@ -271,7 +271,7 @@ type SearchStopReason = SearchCeiling | "matches" | "directories" | "entries" | 
  *  within the pinned parent directory.
  *  The `id` correlation is the production client's job, not the broker's. */
 export interface FileopRequest {
-  readonly op: "stat" | "read" | "read_range" | "read_tail" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
+  readonly op: "stat" | "read" | "read_range" | "read_tail" | "read_bytes" | "write" | "apply" | "mkdir" | "rename" | "unlink" | "rmdir" | "list";
   readonly path: string;
   readonly offset?: number;
   readonly limit?: number;
@@ -301,6 +301,8 @@ export interface FileopResponse {
   readonly code?: string;
   readonly size?: number;
   readonly data?: string;
+  /** read_bytes opening-fstat identity (dev:ino:mtime_ns:ctime_ns); never model-visible. */
+  readonly ident?: string;
   readonly exists?: boolean;
   readonly type?: string;
   readonly entries?: ReadonlyArray<{ readonly name: string; readonly type: string }>;
@@ -1230,7 +1232,7 @@ export class CodexCallbackBroker {
     } };
   }
 
-  /** Search only through fileop list/stat/read. Every traversal and returned byte has a
+  /** Search only through fileop list/stat/read_bytes. Every traversal and returned byte has a
    * fixed ceiling, and reaching one returns the matches found so far as an ok partial
    * result (`truncated: true`, a `reason`, `skippedFiles`, and a fixed `notice`) instead of
    * denying the search. A partial result is never complete coverage, and an empty one never
@@ -1239,7 +1241,21 @@ export class CodexCallbackBroker {
    * breadth-first with each listing sorted by name, so results are deterministic. The first
    * stop reason wins: a truncated listing records "listing" and the walk continues, so a later
    * ceiling does not replace it. `path` may name one regular file, searched through the same
-   * stat, size, read, and scan routine as the walk.
+   * stat, chunked read, and scan routine as the walk.
+   *
+   * Every regular file is read through positioned `read_bytes` windows of at most 1 MiB, so
+   * there is no per-file size limit; the 16 MiB total bounds the walk. Each window's limit is
+   * charged to the byte total when it is dispatched (after the operation-count and deadline
+   * admission checks, so a rejected request costs nothing) and a validated short reply refunds
+   * the unread part; a failed, timed-out, abandoned, or late reply keeps the full charge.
+   * Matching carries the raw bytes after the last LF across windows, so lines and multibyte
+   * characters that straddle a window boundary match once with continuous line numbers.
+   * A change is DETECTED (the file is skipped, earlier matches kept, the walk continues) when
+   * the first window's size differs from the stat size, a later window's size or identity
+   * differs from the first window's, or a short read ends before the stat size. Changes after
+   * a window's own fstat (between that fstat and its pread, within a pread) and changes that
+   * leave size and identity unchanged are NOT detected. A helper too old for `read_bytes`
+   * skips the file. The identity is used only for this comparison and is never model-visible.
    *
    * The deadline bounds broker waiting and admission of new operations, not settlement of an
    * already-dispatched helper op: the client op is never cancelled and owns its own settlement. */
@@ -1263,9 +1279,12 @@ export class CodexCallbackBroker {
       ok: true,
       output: { matches, truncated: true, bytes, reason, skippedFiles, notice: SEARCH_PARTIAL_NOTICE },
     });
-    const searchOp = async (request: FileopRequest): Promise<FileopResponse | SearchCeiling> => {
+    // `charge` bytes are added to the running total only after the admission checks pass,
+    // right before dispatch: a request rejected here costs nothing.
+    const searchOp = async (request: FileopRequest, charge = 0): Promise<FileopResponse | SearchCeiling> => {
       if (++operations > SEARCH_MAX_OPERATIONS) return "operations";
       if (expired()) return "time";
+      bytes += charge;
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         // The race only stops this broker waiting; the client op is not cancelled.
@@ -1279,46 +1298,101 @@ export class CodexCallbackBroker {
         if (timer) clearTimeout(timer);
       }
     };
-    // Stat, size-check, read, and scan one file. Undefined means the file was searched or
-    // skipped; otherwise the walk stops with a ceiling or ends with a final result.
+    // Scan `text` (split on LF) with its first line numbered `startLine`. Returns the line
+    // number of the last segment (where a following chunk continues) or, when the match
+    // ceiling is hit before a further match, the final partial result.
+    const scanLines = (rel: string, text: string, startLine: number, fallback: SearchStopReason): { result: CallbackResult } | { next: number } => {
+      let lineStart = 0;
+      for (let index = startLine; ; index++) {
+        const newline = text.indexOf("\n", lineStart);
+        const lineEnd = newline < 0 ? text.length : newline;
+        const line = text.slice(lineStart, lineEnd);
+        const matchAt = line.indexOf(query);
+        if (matchAt >= 0) {
+          if (matches.length === SEARCH_MAX_MATCHES) return { result: partial(stopReason ?? fallback) };
+          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
+          matches.push({ path: rel, line: index, text: line.slice(excerptStart, excerptStart + 256) });
+        }
+        if (newline < 0) return { next: index };
+        lineStart = newline + 1;
+      }
+    };
+    // Stat, then read one file in bounded chunks and scan it. Undefined means the file was
+    // searched or skipped; otherwise the walk stops with a ceiling or ends with a final result.
     const searchFile = async (rel: string, direct: boolean): Promise<{ stop: SearchStopReason } | { result: CallbackResult } | undefined> => {
       const stat = await searchOp({ op: "stat", path: rel });
       if (typeof stat === "string") return { stop: stat };
       if (!stat.ok) return { result: this.mapFileopError(stat) };
       if (typeof stat.size !== "number" || !Number.isSafeInteger(stat.size) || stat.size < 0) return { result: deny("fileop_denied", "Search file size unavailable") };
       if (direct && stat.type !== "file") return { result: deny("fileop_denied", "Search target is not a regular file") };
-      if (stat.size > SEARCH_MAX_FILE_BYTES) { skippedFiles++; return undefined; }
-      if (bytes + stat.size > SEARCH_MAX_TOTAL_BYTES) return { stop: "bytes" };
-      const read = await searchOp({ op: "read", path: rel });
-      if (typeof read === "string") return { stop: read };
-      if (!read.ok) {
-        if (read.code === "E_OVERSIZE" && read.origin === "helper") { skippedFiles++; return undefined; }
-        return { result: this.mapFileopError(read) };
-      }
-      if (read.truncated) { skippedFiles++; return undefined; }
-      if (typeof read.data !== "string") return { result: deny("fileop_denied", "Search file body unavailable") };
-      const body = Buffer.from(read.data, "base64");
-      if (body.length > SEARCH_MAX_FILE_BYTES) { skippedFiles++; return undefined; }
-      if (bytes + body.length > SEARCH_MAX_TOTAL_BYTES) return { stop: "bytes" };
-      if (expired()) return { stop: "time" };
-      bytes += body.length;
-      const text = body.toString("utf8");
-      let lineStart = 0;
-      for (let index = 1; lineStart <= text.length; index++) {
-        const newline = text.indexOf("\n", lineStart);
-        const lineEnd = newline < 0 ? text.length : newline;
-        const line = text.slice(lineStart, lineEnd);
-        const matchAt = line.indexOf(query);
-        if (matchAt >= 0) {
-          if (matches.length === SEARCH_MAX_MATCHES) return { result: partial(stopReason ?? "matches") };
-          const excerptStart = Math.max(0, matchAt - Math.floor((256 - query.length) / 2));
-          matches.push({ path: rel, line: index, text: line.slice(excerptStart, excerptStart + 256) });
+      const fileSize = stat.size;
+      const bodyUnavailable = (): { result: CallbackResult } => ({ result: deny("fileop_denied", "Search file body unavailable") });
+      let offset = 0;
+      let opening: { size: number; ident: string } | undefined;
+      let lineNo = 1; // line number at which the carried (LF-free) tail starts
+      let carry: Buffer[] = [];
+      // Scan the carried partial line before a mid-file stop. A streaming decode holds back
+      // only a still-valid incomplete scalar, so a ceiling cutting a character in half never
+      // fabricates U+FFFD, while genuinely malformed bytes still decode to it.
+      const scanCarry = (fallback: SearchStopReason): { result: CallbackResult } | undefined => {
+        if (carry.length === 0) return undefined;
+        const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(Buffer.concat(carry), { stream: true });
+        const scanned = scanLines(rel, text, lineNo, fallback);
+        return "result" in scanned ? scanned : undefined;
+      };
+      const stopMid = (reason: SearchStopReason): { stop: SearchStopReason } | { result: CallbackResult } =>
+        scanCarry(reason) ?? { stop: reason };
+      for (;;) {
+        if (expired()) return stopMid("time");
+        const remaining = SEARCH_MAX_TOTAL_BYTES - bytes;
+        if (remaining <= 0) return stopMid("bytes");
+        const limit = Math.max(1, Math.min(SEARCH_CHUNK_BYTES, remaining, fileSize - offset));
+        const reply = await searchOp({ op: "read_bytes", path: rel, offset, limit }, limit);
+        if (typeof reply === "string") return stopMid(reply);
+        if (!reply.ok) {
+          if (reply.origin === "helper" && reply.code === "E_TIMEOUT") return stopMid("time");
+          if (reply.origin === "helper" && reply.code === "E_UNKNOWN_OP") { skippedFiles++; return undefined; }
+          return { result: this.mapFileopError(reply) };
         }
-        if (newline < 0) break;
-        lineStart = newline + 1;
+        // Validate in this order: encoded bounds precede decoding; decoded bounds precede metadata.
+        const encoded = reply.data;
+        if (typeof encoded !== "string" || encoded.length > 4 * Math.ceil(limit / 3) ||
+          encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) return bodyUnavailable();
+        const chunk = Buffer.from(encoded, "base64");
+        if (chunk.toString("base64") !== encoded || chunk.length > limit) return bodyUnavailable();
+        if (reply.offset !== offset || typeof reply.size !== "number" || !Number.isSafeInteger(reply.size) ||
+          reply.size < 0 || typeof reply.ident !== "string") return bodyUnavailable();
+        // The helper never returns bytes past the EOF it reports for the same open file.
+        if (chunk.length > Math.max(0, reply.size - offset)) return bodyUnavailable();
+        // A chunk settling past the deadline is discarded and keeps its full charge.
+        if (expired()) return stopMid("time");
+        bytes -= limit - chunk.length;
+        // A change seen between chunks skips the file; earlier matches stay.
+        const reached = offset + chunk.length;
+        const changed = opening === undefined
+          ? reply.size !== fileSize
+          : reply.size !== opening.size || reply.ident !== opening.ident;
+        if (changed || (chunk.length < limit && reached < fileSize)) {
+          // Count the skip first: the walk goes on past it, so a match ceiling hit by the carry
+          // is the terminating cause and the partial must report this skip alongside it.
+          skippedFiles++;
+          return scanCarry("matches");
+        }
+        opening ??= { size: reply.size, ident: reply.ident };
+        offset = reached;
+        if (offset >= fileSize) {
+          const scanned = scanLines(rel, Buffer.concat([...carry, chunk]).toString("utf8"), lineNo, "matches");
+          if ("result" in scanned) return scanned;
+          if (expired()) return { stop: "time" };
+          return undefined;
+        }
+        const lastLf = chunk.lastIndexOf(10);
+        if (lastLf < 0) { carry.push(chunk); continue; }
+        const scanned = scanLines(rel, Buffer.concat([...carry, chunk.subarray(0, lastLf + 1)]).toString("utf8"), lineNo, "matches");
+        if ("result" in scanned) return scanned;
+        lineNo = scanned.next;
+        carry = lastLf + 1 < chunk.length ? [chunk.subarray(lastLf + 1)] : [];
       }
-      if (expired()) return { stop: "time" };
-      return undefined;
     };
     let first = true;
     walk: while (pending.length > 0) {

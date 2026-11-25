@@ -1,8 +1,9 @@
 import { policyOwnershipGeneration } from "./policy-resolve.js";
+import { freshResumeCapabilities } from "./fresh-resume.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { RUN_ENV_CAPABILITY } from "./run-env-claim.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
@@ -1096,6 +1097,11 @@ export class Worker {
           // placement clause keeps runs that carry variables (or secret receipts) off it.
           // sdk-executor's phaseSetup refusal (assertRunEnvDeliverable) is the second check.
           ...(uidSplitActive() ? [RUN_ENV_CAPABILITY] : []),
+          // PRD #4322 M1a: this image runs a Claude provider-bound JUDGE (judge-runner.ts provider path).
+          // Advertised UNCONDITIONALLY: the api places a provider judge only on a worker advertising it
+          // (placement 00534), and client.ts requireProviderCapability refuses a provider judge claim on
+          // a registration that did not advertise it.
+          CLAUDE_PROVIDER_JUDGE_CAPABILITY,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];
@@ -1147,6 +1153,9 @@ export class Worker {
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
         protocolCapabilities.push("pending_outcome_scoped_claim_v1");
+        // Issue #4628: fresh resume destination. Only a hosted slot (a UUID UZI_POD_UID) is a destination, and the api also
+        // requires recovery_inventory_v1 (advertised unconditionally above), so the pair is what makes a worker eligible.
+        protocolCapabilities.push(...freshResumeCapabilities());
         // The compact policy hold promises a durable local outcome journal and the active-run snapshot
         // registry. Advertise only while both are usable; these are the same preconditions
         // RunRunner.executeClaimInAttempt checks before it reserves a policy flight, so a claim the

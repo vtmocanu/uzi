@@ -34,6 +34,8 @@ func (h *Handler) WorkerRunRepoAgentSourceHold(w http.ResponseWriter, r *http.Re
 	run, applied, err := h.wsvc.SetRunRepoAgentSourceHold(r.Context(), wkr, runID, body.ClaimGeneration, body.Commit)
 	if err != nil {
 		switch {
+		case h.refuseFreshPreSeedOnGuard(w, r, wkr, runID, run, err):
+			// Issue #4628: the paused write hit the fresh resume guard; the reply is already written.
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
@@ -55,6 +57,10 @@ func (h *Handler) WorkerRunRepoAgentSourceHold(w http.ResponseWriter, r *http.Re
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: a no-op hold on a run whose transfer is claimed for this worker is the typed pre-seed refusal.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	httpx.JSON(w, code, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }

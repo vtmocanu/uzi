@@ -57,6 +57,8 @@ func (h *Handler) WorkerRunPhaseSwitchHold(w http.ResponseWriter, r *http.Reques
 	run, applied, err := h.wsvc.SetRunPhaseSwitchHold(r.Context(), wkr, runID, body.Head, body.ClaimGeneration, body.Phase)
 	if err != nil {
 		switch {
+		case h.refuseFreshPreSeedOnGuard(w, r, wkr, runID, run, err):
+			// Issue #4628: the paused write hit the fresh resume guard; the reply is already written.
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
@@ -83,6 +85,10 @@ func (h *Handler) WorkerRunPhaseSwitchHold(w http.ResponseWriter, r *http.Reques
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: a no-op hold on a run whose transfer is claimed for this worker is the typed pre-seed refusal.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	httpx.JSON(w, code, map[string]any{"run": h.workerRunDTO(r.Context(), run)})
 }

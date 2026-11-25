@@ -300,8 +300,8 @@ func (n *NextClaimSnapshot) effectiveLimit() float64 {
 }
 
 // ReserveEnforced reports whether the weekly usage reserve applies to the run (the claim path's own
-// exemption rule: a threshold, not chat, no active manual-resume override, a started run only while
-// pausing is on).
+// exemption rule: a threshold, not chat, not frozen to a custom model provider, no active manual-resume
+// override, a started run only while pausing is on).
 func (n *NextClaimSnapshot) ReserveEnforced(run store.Run) bool {
 	return reserveEnforced(run, n.reserve, n.now)
 }

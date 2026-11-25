@@ -52,6 +52,10 @@ func (h *Handler) WorkerRunPause(w http.ResponseWriter, r *http.Request) {
 	code := http.StatusOK
 	if !applied {
 		code = http.StatusConflict
+		// Issue #4628: the excluded pause writer skipped a run whose transfer is claimed for this worker.
+		if h.refuseFreshPreSeed(w, r, wkr, run) {
+			return
+		}
 	}
 	ack, ackErr := h.workerStateAck(w, r, run)
 	if ackErr != nil {

@@ -408,3 +408,11 @@ it("announces Codex idle stall omitted, timed and held transitions", async () =>
   rerender(view(idleStall(null), true));
   await waitFor(() => expect(notice.textContent).toMatch(/There is no scheduled retry/));
 });
+
+it("offers the fresh resume entry to the owner of a held run and not to a non-owner", () => {
+  const { unmount } = render(view(held(), true));
+  expect(screen.getByRole("button", { name: /Fresh resume on another worker/ })).toBeTruthy();
+  unmount();
+  render(view(held(), false));
+  expect(screen.queryByRole("button", { name: /Fresh resume on another worker/ })).toBeNull();
+});

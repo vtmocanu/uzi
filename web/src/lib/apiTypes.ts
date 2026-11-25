@@ -5812,7 +5812,11 @@ export interface PendingJudge {
 }
 
 // JudgeSkip is the recorded reason the AUTOMATIC judge of a run was skipped (issue #3257,
-// apitypes.JudgeSkipDTO): the judge's harness had no usable credential. A third sibling key on
+// apitypes.JudgeSkipDTO): the judge could not start. The reasons are no_usable_credential,
+// credential_disabled, codex_pool_unavailable, provider_lane_unsupported (now recorded only for
+// a Codex judge whose owner has a Codex model-provider source; older Claude rows are historical,
+// since Claude judges now run on providers), provider_source_unusable and
+// provider_model_unmapped. A third sibling key on
 // the review envelope, always present and null when nothing was skipped; the server sets it
 // only when `review` and `pending_judge` are both null (read precedence review > pending >
 // skip). `harness` and `reason` are fixed server codes, typed as strings on purpose: the panel
@@ -6689,6 +6693,9 @@ export interface RecoveryCustodyAggregate {
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;
+  // #4628: how many admission units are fresh-resume reservations rather than holds; the
+  // per-hold counted flags plus this sum to admission_counted_holds. Optional for older servers.
+  fresh_reserved_units?: number;
 }
 
 // HeldPublication is one held-work publication of a failed run (issue #2545), mirroring
@@ -6757,4 +6764,47 @@ export interface PolicyHoldResumeRequest {
 export interface PolicyHoldResumeResponse {
   run: Run;
   replay?: true;
+}
+
+// ── Fresh resume (issue #4628) ────────────────────────────────────────────────
+// The Go source is api/internal/apitypes/fresh_resume.go. GET /api/runs/{id}/fresh-resume answers
+// 200 for every status; only "available" carries a selection token.
+export type FreshResumeStatus =
+  | "available" | "disabled" | "no_destination" | "custody_limit" | "no_evidence" | "expired"
+  | "unbound" | "prereq_unproven" | "ambiguous" | "in_progress" | "ineligible";
+
+export interface FreshResumePreview {
+  status: FreshResumeStatus;
+  selection_token?: string;
+  /** The claim generation the evidence was saved under (Ge). */
+  evidence_generation?: number;
+  /** The run's latest claim generation. */
+  claim_generation?: number;
+  kind?: "capture" | "checkpoint_ref";
+  capture_id?: string;
+  checkpoint_ref?: string;
+  sha?: string;
+  /** Generations after the evidence's that saved nothing; never null on the wire. */
+  uncovered_generations: number[];
+  notes: string[];
+}
+
+export interface FreshResumeStartRequest {
+  selection_token: string;
+  /** Client-generated UUID, one per confirm action. */
+  request_id: string;
+}
+
+export interface FreshResumeStart {
+  id: string;
+  run_id: string;
+  request_id: string;
+  state: string;
+  replay: boolean;
+  evidence_generation: number;
+  kind: string;
+  capture_id?: string;
+  checkpoint_ref?: string;
+  sha: string;
+  admission_deadline: string;
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -37,18 +38,26 @@ type rerunStore struct {
 	// resolve the judge harness; the zero value is "same as the run".
 	judgeRunsOn pgtype.Text
 
-	providerSources      store.GetUserProviderLaneSourcesRow
-	providerSourceErr    error
-	providerSourceOwners []uuid.UUID
-	ciphertextReads      int
+	// judgePolicy is the owner's judge lane policy (PRD #4322 M1a) that the create decision reads;
+	// the zero value is the default pin policy with no source.
+	judgePolicy       store.GetUserJudgeLanePolicyRow
+	judgePolicyErr    error
+	judgePolicyOwners []uuid.UUID
+	ciphertextReads   int
+	// noToken makes the default Anthropic token row absent (the 422 for a missing token).
+	noToken bool
 }
 
-func (s *rerunStore) GetUserProviderLaneSources(_ context.Context, owner uuid.UUID) (store.GetUserProviderLaneSourcesRow, error) {
-	s.providerSourceOwners = append(s.providerSourceOwners, owner)
+func (s *rerunStore) GetUserJudgeLanePolicy(_ context.Context, owner uuid.UUID) (store.GetUserJudgeLanePolicyRow, error) {
+	s.judgePolicyOwners = append(s.judgePolicyOwners, owner)
 	if owner != s.ownerID {
-		return store.GetUserProviderLaneSourcesRow{}, errors.New("unexpected provider source owner")
+		return store.GetUserJudgeLanePolicyRow{}, errors.New("unexpected judge policy owner")
 	}
-	return s.providerSources, s.providerSourceErr
+	p := s.judgePolicy
+	if p.JudgeAnthropicBindMode == "" {
+		p.JudgeAnthropicBindMode = workersvc.BindModeDefault
+	}
+	return p, s.judgePolicyErr
 }
 
 func (s *rerunStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, error) {
@@ -57,6 +66,9 @@ func (s *rerunStore) GetUserByID(_ context.Context, id uuid.UUID) (store.User, e
 
 func (s *rerunStore) GetUserSecretCiphertext(_ context.Context, _ store.GetUserSecretCiphertextParams) (store.GetUserSecretCiphertextRow, error) {
 	s.ciphertextReads++
+	if s.noToken {
+		return store.GetUserSecretCiphertextRow{}, pgx.ErrNoRows
+	}
 	// The owner has a token to spend, so the gate above the enqueue passes and the 409
 	// under test is reached rather than the 422 for a missing token.
 	return store.GetUserSecretCiphertextRow{Ciphertext: []byte{0x1}}, nil
@@ -239,99 +251,6 @@ func TestRerunJudgeNoCredentialNamesJudgeHarness(t *testing.T) {
 	}
 	if st.created != 0 {
 		t.Fatalf("CreateJudgeRun ran %d times; a refused explicit choice must create nothing", st.created)
-	}
-}
-
-// TestRerunJudgeProviderSourcePolicy exercises the public handler, including its
-// error mapping. The target stays Claude; JudgeRunsOn selects the authoritative lane.
-// Each case is one synchronous request with no retries, model calls, or database.
-func TestRerunJudgeProviderSourcePolicy(t *testing.T) {
-	providerID := pgtype.UUID{Bytes: uuid.MustParse("65070921-4487-44f4-8630-378c76e42098"), Valid: true}
-	for _, tc := range []struct {
-		name    string
-		sources store.GetUserProviderLaneSourcesRow
-		lane    string
-		refused bool
-	}{
-		{"neither/claude", store.GetUserProviderLaneSourcesRow{}, "claude", false},
-		{"neither/codex", store.GetUserProviderLaneSourcesRow{}, "codex", false},
-		{"claude-only/claude", store.GetUserProviderLaneSourcesRow{ClaudeProviderID: providerID}, "claude", true},
-		{"claude-only/codex", store.GetUserProviderLaneSourcesRow{ClaudeProviderID: providerID}, "codex", true},
-		{"codex-only/claude", store.GetUserProviderLaneSourcesRow{CodexProviderID: providerID}, "claude", false},
-		{"codex-only/codex", store.GetUserProviderLaneSourcesRow{CodexProviderID: providerID}, "codex", true},
-		{"both/claude", store.GetUserProviderLaneSourcesRow{ClaudeProviderID: providerID, CodexProviderID: providerID}, "claude", true},
-		{"both/codex", store.GetUserProviderLaneSourcesRow{ClaudeProviderID: providerID, CodexProviderID: providerID}, "codex", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ds, runID, _ := oneRecStore()
-			ds.run.Harness = string(workersvc.HarnessClaude)
-			st := &rerunStore{
-				dispStore:       ds,
-				judgeRunsOn:     pgtype.Text{String: tc.lane, Valid: true},
-				providerSources: tc.sources,
-				createJudgeErr:  &pgconn.PgError{Code: "23505", ConstraintName: "uq_runs_one_active_judge_per_target"},
-			}
-			h := newRunsHandler(t, st)
-			h.wsvc.SetSettings(judgeSwitch{enabled: true})
-			rec := httptest.NewRecorder()
-			h.RerunJudge(rec, rerunReq(store.User{ID: st.ownerID}, runID))
-
-			wantStatus, wantQueries, wantPresence, wantCreated := http.StatusConflict, 2, 0, 0
-			var body map[string]string
-			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-				t.Fatalf("decode %s: %v", rec.Body.String(), err)
-			}
-			switch {
-			case tc.refused:
-				wantQueries = 1
-				if body["reason"] != "provider_lane_unsupported" {
-					t.Fatalf("reason = %q, want provider_lane_unsupported; body=%s", body["reason"], rec.Body.String())
-				}
-			case tc.lane == "codex":
-				wantStatus = http.StatusUnprocessableEntity
-				if body["code"] != "no_credential_for_harness" || body["error"] != "the judge's harness (codex) has no usable credential" {
-					t.Fatalf("allowed Codex lane must reach credential refusal; body=%s", rec.Body.String())
-				}
-			default:
-				wantPresence, wantCreated = 1, 1
-				if body["error"] != "a judge run is already in progress for this run" {
-					t.Fatalf("allowed Claude lane must reach the index conflict; body=%s", rec.Body.String())
-				}
-			}
-			if rec.Code != wantStatus {
-				t.Fatalf("status = %d, want %d; body=%s", rec.Code, wantStatus, rec.Body.String())
-			}
-			if len(st.providerSourceOwners) != wantQueries || st.ciphertextReads != wantPresence || st.created != wantCreated {
-				t.Fatalf("source queries/presence reads/inserts = %d/%d/%d, want %d/%d/%d", len(st.providerSourceOwners), st.ciphertextReads, st.created, wantQueries, wantPresence, wantCreated)
-			}
-			for _, owner := range st.providerSourceOwners {
-				if owner != st.ownerID {
-					t.Fatalf("source query owner = %s, want %s", owner, st.ownerID)
-				}
-			}
-		})
-	}
-
-	for _, lane := range []string{"claude", "codex"} {
-		t.Run("source query error/"+lane, func(t *testing.T) {
-			ds, runID, _ := oneRecStore()
-			ds.run.Harness = string(workersvc.HarnessClaude)
-			st := &rerunStore{
-				dispStore:         ds,
-				judgeRunsOn:       pgtype.Text{String: lane, Valid: true},
-				providerSourceErr: errors.New("source query failed"),
-			}
-			h := newRunsHandler(t, st)
-			h.wsvc.SetSettings(judgeSwitch{enabled: true})
-			rec := httptest.NewRecorder()
-			h.RerunJudge(rec, rerunReq(store.User{ID: st.ownerID}, runID))
-			if rec.Code != http.StatusInternalServerError || errorMessage(t, rec) != "internal error" {
-				t.Fatalf("source query failure = %d %s, want 500 internal error", rec.Code, rec.Body.String())
-			}
-			if len(st.providerSourceOwners) != 1 || st.providerSourceOwners[0] != st.ownerID || st.ciphertextReads != 0 || st.created != 0 {
-				t.Fatalf("source failure must stop before presence/create: owners=%v, presence=%d, inserts=%d", st.providerSourceOwners, st.ciphertextReads, st.created)
-			}
-		})
 	}
 }
 

@@ -537,8 +537,17 @@ vendor fallback. A provider run's claim carries one `provider` object and no
 `anthropic_oauth_token`; the worker maps it onto the SDK env in `buildSdkEnv`. Issue runs wait out
 a gateway 429 or overload as `limit_wait` (`provider_gateway_limit`) on a 1, 5, 15 minute
 schedule and then for the owner; chat ends the turn instead. Usage is recorded with
-`cost_status='unreported'`. The judge, job, cross-check and isolated lanes refuse provider-sourced
-owners (`provider_lane_unsupported`).
+`cost_status='unreported'`. The job, cross-check and isolated lanes refuse provider-sourced
+owners (`provider_lane_unsupported`). The judge no longer does for Claude (PRD #4322 M1a): its
+lane decision (`decideJudgeLane`, taken under the shared secret-mutation lock in `createRunAtomic`)
+freezes the owner's Claude source onto the judge in the creation transaction, unless the owner pinned
+a vendor Anthropic token (`judgeLaneDecision.Vendor` from `decideJudgeLane`, which sends the provider run's trace to Anthropic). A provider
+judge's claim carries only the provider binding and needs `claude_provider_judge_v1` in addition to
+`claude_provider_v1` (claim, placement, hibernation wake, both ephemeral reap predicates, health);
+revocation or an unmapped model at assembly or the final locked re-check fails it terminally
+(`credential_unavailable`), never parked, and a gateway limit fails it with fixed text. It sends the
+judged trace, a vendor run's included, to the gateway. Design: [PRD #4322](prds/4322-custom-providers-server-lanes.md);
+user docs: [docs/judge.md](docs/judge.md#a-judge-on-a-model-provider).
 
 The Test probe is dialed from the api, ignores proxy variables, never follows a redirect and
 admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
@@ -570,7 +579,8 @@ The issue/task/prompt/self_improve lane, its in-run advice, summary and task-rev
 retries, resume and cold resume use the frozen binding (provider, revision, key `enablement_rev`);
 `mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
 Interim refusals (`provider_lane_unsupported`, follow-up #4574): the Codex judge is skipped for an
-owner with a provider source, plan and code cross-check refuse when either side is Codex-provider
+owner with a Codex source (an owner with only a Claude source gets a vendor Codex judge since PRD
+#4322 M1a; earlier rows for a Claude judge with a Claude source are historical), plan and code cross-check refuse when either side is Codex-provider
 bound (a Claude lead with plan cross-check owned by someone with a Codex source gets a human plan
 gate), and jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
 model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);
@@ -2183,6 +2193,19 @@ chain in the diagram above, with no intervening `running`.
   [docs/worker-setup.md](docs/worker-setup.md#concurrent-runs); the real fix for
   the remaining residual, container-per-run, belongs to the k8s-operator path (see
   Not yet in scope, below).
+
+**Fresh resume (#4628).** A run held at a worker-exhaustion `recovery_wait` can be
+resumed by its owner on a *different* persistent hosted worker, seeded from durable
+evidence the server selects (a recovery capture or the checkpoint ref) rather than from
+the lost worker's source. The flow crosses the api, the destination worker and the
+database: an owner start writes a `run_fresh_resumes` row, the destination claims it in
+its ordinary claim transaction, seeds a new attempt in its own bare, and reports a
+receipt; a `runs` trigger (`UZ416`) keeps every other writer off the run's status,
+worker and claim generation while the transfer is pending or claimed, and excludes the
+original worker after seeding. Gated by `UZI_FRESH_RESUME` (default off). Design,
+authority chain and accepted limits:
+[adr/4628-fresh-resume-durable-evidence.md](adr/4628-fresh-resume-durable-evidence.md);
+operator and owner behaviour: [docs/run-recovery.md](docs/run-recovery.md#fresh-resume-on-a-separate-hosted-worker).
 
 ### Secrets: who holds what
 

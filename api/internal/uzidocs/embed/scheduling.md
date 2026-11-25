@@ -867,8 +867,9 @@ exceed `max_issues` once backfill walks past a skip), which ones
   any benign skip.
   `provider_source_unusable`: the provider is retired, its URL is off the
   operator allowlist, or its key is missing or disabled.
-  `provider_lane_unsupported`: judge, job, cross-check and isolated runs do not
-  support a provider yet. `provider_model_unmapped`: a model the run would use
+  `provider_lane_unsupported`: job, cross-check and isolated runs do not
+  support a provider yet (the run judge does since PRD #4322 M1a, except a Codex
+  judge for a Codex source). `provider_model_unmapped`: a model the run would use
   is not in the provider's model map (for a Codex provider, a model pinned on the
   schedule needs its own key; models uzi picks fall back to `default`). `provider_binding_stale`: an inherited
   provider key was rotated, disabled or deleted since the source run.

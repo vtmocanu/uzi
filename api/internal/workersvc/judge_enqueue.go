@@ -260,45 +260,15 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	if !s.judgeSpendGuardsAllow(ctx, run) {
 		return
 	}
-	// Gate 4 (PRD #1429 M3, D4; PRD #3257): usability of the JUDGE's harness. It sits after
-	// the spend guards so a credential refusal is only ever reported for a run the judge
-	// would otherwise review. The judge harness is passed to createRunResolved below as an
-	// EXPLICIT selection, so a Claude judge keeps the Anthropic-token presence check
-	// (byte-identical to before) while a Codex judge's usability is the resolver's own
-	// per-harness usability (workersvc.resolveUsableCodexCredential), enforced
-	// authoritatively by the atomic create (ErrNoCredentialForHarness for an unusable Codex
-	// harness) — presence-only here would be the same wrong shape this repair replaces, so
-	// Codex gets no separate presence pre-check. Keyed on the RESOLVED judge harness, not
-	// the target's: a Claude target judged on Codex needs no Anthropic token, a Codex target
-	// judged on Claude does.
-	// Selection policy precedes vendor credential checks and is repeated by atomic creation.
-	rq, ok := s.q.(providerLaneSourceReader)
-	if !ok {
-		slog.Warn("judge enqueue: lane query surface unavailable", "run", run.ID)
-		return
-	}
-	if lerr := s.refuseProviderLane(ctx, rq, run.UserID, judgeHarness); lerr != nil {
-		if errors.Is(lerr, ErrProviderLaneUnsupported) {
-			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
-		} else {
-			slog.Warn("judge enqueue: lane source check", "run", run.ID, "error", lerr)
-		}
-		return
-	}
-	if judgeHarness != HarnessCodex {
-		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
-			UserID: run.UserID,
-			Kind:   store.KindAnthropicToken,
-		}); err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Warn("judge enqueue: token presence check", "run", run.ID, "error", err)
-				return
-			}
-			// No token ⇒ nothing to spend ⇒ no judge run, with a visible reason.
-			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipNoUsableCredential)
-			return
-		}
-	}
+	// Usability of the JUDGE's harness (PRD #1429 M3, D4; PRD #3257) is not pre-checked here. The
+	// judge harness is passed to createRunResolved below as an EXPLICIT selection, keyed on the
+	// RESOLVED judge harness, not the target's. A Codex judge's usability is the resolver's own
+	// per-harness usability (workersvc.resolveUsableCodexCredential), enforced by the atomic create
+	// (ErrNoCredentialForHarness for an unusable Codex harness).
+	// No lane or token presence read happens here: the judge's lane (vendor or provider-bound), and
+	// on the vendor Claude lane the default-token presence check, are decided inside the create
+	// transaction under the shared secret-mutation lock (createRunAtomic, JudgeLane). A refusal
+	// rolls that transaction back and is recorded below, after it, in the skip's own transaction.
 	// Enqueue. The judge run is owned by the SAME user (never cross-user) and targets
 	// this run. A concurrent duplicate trips the one-active-judge-per-target index.
 	//
@@ -327,12 +297,18 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			IssueDescription: "",
 			TriggerSource:    "judge",
 			Harness:          string(resolved.Harness),
+
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
 		if err == nil && s.judgeAfterInsertHook != nil {
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: run.RepoID}) // Enforce the engine-aware unsupported-lane selection policy.
+	}, harnessCreationOrigin{JudgeLane: true, ConsumerGateRepo: run.RepoID}) // The judge's own lane policy, decided in the create transaction.
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -342,11 +318,19 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			slog.Warn("judge enqueue: judge creation is not READ COMMITTED, no judge created and no skip recorded", "run", run.ID)
 			return
 		}
-		if errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
-			// PRD #4320: a provider-sourced owner has no judge until PRD #4322; not a failure, and
-			// (PRD #1429 D4) the refusal needs a visible reason.
-			slog.Info("judge enqueue: owner's provider source is a model provider, no judge created", "run", run.ID, "error", err)
-			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
+		if reason, ok := judgeProviderSkipReasonFor(err); ok {
+			// PRD #4322 M1a: a provider-bound judge was refused (source unusable, model unmapped) or
+			// the judge's harness has no provider lane (a Codex judge with a Codex source); not a
+			// failure, and (PRD #1429 D4) the refusal needs a visible reason. The create rolled back;
+			// the reason is recorded in its own transaction.
+			slog.Info("judge enqueue: provider judge refused, no judge created", "run", run.ID, "reason", reason, "error", err)
+			s.recordJudgeSkip(ctx, run.ID, judgeHarness, reason)
+			return
+		}
+		if errors.Is(err, ErrJudgePolicyChanged) {
+			// The policy moved under the create (a lock-bypassing writer): refused with no vendor
+			// fallback, and no skip is recorded since nothing about the owner's setup is unusable.
+			slog.Warn("judge enqueue: judge policy changed during creation, no judge created and no skip recorded", "run", run.ID, "error", err)
 			return
 		}
 		if reason, ok := judgeSkipReasonFor(err); ok {

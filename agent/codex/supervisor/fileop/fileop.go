@@ -44,6 +44,7 @@ const (
 	opRead      = "read"
 	opReadRange = "read_range"
 	opReadTail  = "read_tail"
+	opReadBytes = "read_bytes"
 	opWrite     = "write"
 	opApply     = "apply"
 	opMkdir     = "mkdir"
@@ -90,7 +91,8 @@ var (
 // request is one parsed, validated operation frame. NewPath is meaningful only for
 // rename; Data is base64-encoded bytes for write (and the REPLACEMENT text for apply);
 // Old is base64-encoded bytes of the text apply must find-and-replace.
-// Offset and Limit are validated by read_range and rejected by read_tail.
+// Offset and Limit are validated by read_range and read_bytes (read_bytes allows
+// a zero offset) and rejected by read_tail.
 // Tail is independently validated only by read_tail.
 type request struct {
 	ID      int             `json:"id"`
@@ -246,6 +248,8 @@ func (s *server) handle(req request) map[string]any {
 		return s.doReadRange(req)
 	case opReadTail:
 		return s.doReadTail(req)
+	case opReadBytes:
+		return s.doReadBytes(req)
 	case opWrite:
 		return s.doWrite(req)
 	case opApply:

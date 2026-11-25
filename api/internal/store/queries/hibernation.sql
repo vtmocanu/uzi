@@ -127,6 +127,11 @@ SELECT EXISTS (
     SELECT 1 FROM hibernation_wakes hw
     JOIN runs r ON r.id = hw.run_id
     WHERE hw.worker_id = @worker_id AND r.status = 'queued'
+      -- #4628: a wake naming a worker that ClaimRun now refuses (post-seed predecessor exclusion) is no demand.
+      AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes t WHERE t.run_id = r.id AND t.state IN ('seeded', 'superseded')
+            AND (t.predecessor_worker_id = @worker_id
+                 OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = t.run_id AND h.state = 'open'
+                            AND h.generation < t.seeded_generation AND @worker_id IN (h.live_worker_id, h.original_worker_id))))
 )::boolean AS pending;
 
 -- name: LockRunForShare :one
@@ -156,6 +161,7 @@ WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
    OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
    OR (r.model_provider_key_mode IS NOT NULL AND NOT CASE r.harness
        WHEN 'claude' THEN 'claude_provider_v1' = ANY(w.protocol_capabilities)
+                        AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities))
        WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)

@@ -144,3 +144,26 @@ func (c *HTTPClient) DiscardRecoveryHold(ctx context.Context, runID, holdID stri
 	path := "/api/runs/" + url.PathEscape(runID) + "/recovery-holds/" + url.PathEscape(holdID) + "?confirm=discard"
 	return c.del(ctx, path)
 }
+
+// FreshResumePreview reads GET /api/runs/{id}/fresh-resume (issue #4628): the evidence a fresh
+// resume would seed from and a selection token, or the status that says why it cannot start. The
+// server answers 200 for every status; the status is the answer.
+func (c *HTTPClient) FreshResumePreview(ctx context.Context, runID string) (apitypes.FreshResumePreviewDTO, error) {
+	var out apitypes.FreshResumePreviewDTO
+	if err := c.get(ctx, "/api/runs/"+url.PathEscape(runID)+"/fresh-resume", &out); err != nil {
+		return apitypes.FreshResumePreviewDTO{}, err
+	}
+	return out, nil
+}
+
+// StartFreshResume posts POST /api/runs/{id}/fresh-resume (issue #4628). requestID is the caller's
+// one-per-confirm UUID: a retry of the same confirm must pass the same value. A 409 carries its
+// reason on the returned *ExitError (stale_selection, request_completed, fresh_resume_in_progress,
+// or a preview status).
+func (c *HTTPClient) StartFreshResume(ctx context.Context, runID string, req apitypes.FreshResumeStartRequest) (apitypes.FreshResumeStartDTO, error) {
+	var out apitypes.FreshResumeStartDTO
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/fresh-resume", req, &out); err != nil {
+		return apitypes.FreshResumeStartDTO{}, err
+	}
+	return out, nil
+}

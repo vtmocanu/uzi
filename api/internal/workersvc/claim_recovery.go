@@ -57,6 +57,9 @@ func (e *codexMintedClaimError) Unwrap() error { return e.cause }
 type claimRecoveryIdentity struct {
 	workerID        uuid.UUID
 	recoveryCapable bool
+	// freshID is the claimed fresh resume transfer this claim took (issue #4628); uuid.Nil for every
+	// other claim. While it is set, no assembly arm may write the run: each refuses the transfer.
+	freshID uuid.UUID
 }
 
 // claimFinishQueries is the statement surface of finishRunClaim's exact-claim transaction.
@@ -162,24 +165,31 @@ func runClaimOpenedCustody(run store.Run, recoveryCapable bool) bool {
 // assembleAndFinishRunClaim is the run lane's single post-ClaimRun tail, shared by both
 // Claim return paths so each outcome goes through the same exact-claim transaction.
 func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool) (*ClaimPayload, error) {
-	return s.assembleAndFinishRunClaimRef(ctx, wkr, run, recoveryCapable, nil)
+	return s.assembleAndFinishRunClaimRef(ctx, wkr, run, recoveryCapable, nil, nil)
 }
 
 // assembleAndFinishRunClaimRef is assembleAndFinishRunClaim carrying the memory-park reference
-// claimRunInTx built inside the claim transaction (issue #3639); nil attaches nothing.
-func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool, ref *MemoryParkReference) (*ClaimPayload, error) {
+// claimRunInTx built inside the claim transaction (issue #3639); nil attaches nothing. fresh is the
+// claimed transfer row of a fresh claim (issue #4628), nil for every other claim: it adds the claim
+// payload's fresh_resume object and turns every assembly refusal in finishRunClaimTx into a refusal of
+// that transfer.
+func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool, ref *MemoryParkReference, fresh *store.RunFreshResume) (*ClaimPayload, error) {
 	if h := s.claimHooks; h != nil && h.beforeAssembly != nil {
 		h.beforeAssembly(ctx, run)
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
 	if payload != nil {
 		payload.MemoryParkReference = ref
+		payload.FreshResume = freshResumePayload(fresh)
 	}
 	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
 		h.afterAssembly(ctx, run, payload, err)
 	}
-	return s.finishRunClaim(ctx, run, payload, err,
-		claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable})
+	identity := claimRecoveryIdentity{workerID: wkr.ID, recoveryCapable: recoveryCapable}
+	if fresh != nil {
+		identity.freshID = fresh.ID
+	}
+	return s.finishRunClaim(ctx, run, payload, err, identity)
 }
 
 // finishRunClaim checks even successful payloads against the exact mint and current
@@ -204,7 +214,8 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// transient nor terminal, so it must pass this early return to reach the fenced park. So is
 	// errRunOverrideUnavailable (PRD #3250), which parks on its own hold.
 	// PRD #4320 module 5: a provider claim refusal (revoked binding) is its own non-terminal
-	// classification, like errCredentialDisabled: it parks the run for the owner.
+	// classification, like errCredentialDisabled: it parks the run for the owner
+	// (except a provider judge, which finishRunClaimTx fails terminally, PRD #4322 D-G).
 	_, providerRefused := isProviderClaimRefusal(assemblyErr)
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
 		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !providerRefused &&
@@ -222,6 +233,11 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 				// transition (clients render the hold reason), published like the promoter's
 				// paused -> queued.
 				s.publishSwept(run.ID, "paused")
+			case freshRefusedSettle:
+				// Issue #4628: an assembly arm refused the fresh transfer and the run is back at its
+				// held recovery_wait. That restored state is the only transition to publish; the run
+				// neither failed nor paused, so neither of those goes out.
+				s.publishSwept(run.ID, "recovery_wait")
 			}
 			return out, nil
 		}
@@ -237,8 +253,11 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 			if settleErr != nil {
 				return nil, errors.Join(err, settleErr)
 			}
-			if status == "failed" {
+			switch status {
+			case "failed":
 				s.notify(run.ID, "failed")
+			case freshRefusedSettle:
+				s.publishSwept(run.ID, "recovery_wait")
 			}
 			return nil, err
 		}
@@ -356,6 +375,20 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			return nil, "", nil
 		}
 	}
+	if identity.freshID != uuid.Nil {
+		// Issue #4628: a fresh claim's refusal restores the run's pre-claim tuple, which needs the
+		// predecessor worker (W1) locked before the run row. NOWAIT, because this transaction may already
+		// hold W2's worker row FOR UPDATE (optInRunFences takes it only for a checkpoint-coordinate or
+		// publication-enrolled run; any other run holds no worker lock here): a held conflicting lock is
+		// 55P03, which finishRunClaim's bounded retry handles like the alias and account locks.
+		live, ok := q.(pgxClaimFinishTx)
+		if !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		if err := lockFreshSavedWorkerNoWait(ctx, live.Queries, identity.freshID); err != nil {
+			return nil, "", err
+		}
+	}
 	locked, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
 		ID: run.ID, WorkerID: pgconv.UUID(identity.workerID),
 	})
@@ -425,7 +458,8 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// above, against the frozen binding: the key row is locked FOR SHARE NOWAIT (55P03 rolls back for
 	// finishRunClaim's bounded retry, a missing row is stale) and the frozen URL must still be on the
 	// operator allowlist. A refusal (from assembly, or found now) delivers nothing and parks the run
-	// `paused` with hold_reason = the literal; it never falls back to a vendor credential. Revocation
+	// `paused` with hold_reason = the literal (a provider JUDGE is the exception: PRD #4322 D-G fails it
+	// terminally, credential_unavailable, below); it never falls back to a vendor credential. Revocation
 	// applies at this claim only: a claim already delivered is never re-checked.
 	providerRefusal, _ := isProviderClaimRefusal(assemblyErr)
 	if providerRefusal == nil && assemblyErr == nil && payload != nil && providerBoundRun(locked) {
@@ -437,6 +471,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			providerRefusal = &providerClaimRefusal{Reason: reason}
 			payload, assemblyErr = nil, providerRefusal
 		}
+	}
+	// PRD #4322 D-G: a provider JUDGE never parks. Its refusal (from assembly, or found by the locked
+	// re-check above) settles terminally through the generic FailClaimAssemblyExact arm below, with
+	// fail_origin credential_unavailable and the refusal reason as the typed failure_reason.
+	if providerRefusal != nil && run.Kind == runkind.Judge {
+		assemblyErr = fmt.Errorf("%w: %w", errCredentialUnavailable, providerRefusal)
+		payload, providerRefusal = nil, nil
 	}
 	// PRD #3989 review rework: an account reset deletes the owner's secrets in the same
 	// transaction that stamps credentials_reset_at, under the run lock held here, and the FK
@@ -690,6 +731,13 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 				return nil, "", err
 			}
 		}
+	}
+	if identity.freshID != uuid.Nil {
+		// Issue #4628, V1: every assembly arm below would write the run (a park, a requeue, a failure),
+		// which would strand a claimed transfer or fail a run the owner can still resume from its
+		// original worker. A fresh claim refuses the transfer instead, restoring the held run. The
+		// custody release above already freed W2's generation hold, so no hold of the attempt is left.
+		return s.refuseFreshAtAssembly(ctx, q, run, identity, freshAssemblyReason(overrideUnavailable, credDisabled, holdClass, transient, decision), expected)
 	}
 	var n int64
 	var overrideMsg []byte

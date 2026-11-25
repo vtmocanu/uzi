@@ -1114,6 +1114,9 @@ type Store interface {
 	// its two neighbours it takes no user_id: it is driven by the sweeper, not by a
 	// request from a user whose ownership must be proven.
 	FailRunAutoStop(ctx context.Context, arg store.FailRunAutoStopParams) (int64, error)
+	// SetFreshResumeTerminal sets the transaction-local allowance for failing one run with a pending or
+	// claimed fresh resume transfer; it must run on the same querier (transaction) as FailRunAutoStop.
+	SetFreshResumeTerminal(ctx context.Context, runID string) error
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
@@ -1813,6 +1816,10 @@ type Params struct {
 	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) carries
 	// config.Config.PublicationResume. It gates NEW enrollment only; the zero value refuses it.
 	PublicationResume bool
+
+	// FreshResume (issue #4628, UZI_FRESH_RESUME) carries config.Config.FreshResume. It gates the
+	// owner preview and start and the sweep's gate_off drain; the zero value is off.
+	FreshResume bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2306,6 +2313,10 @@ type Service struct {
 	// production.
 	judgeBeforeLockHook  func(ctx context.Context)
 	judgeAfterInsertHook func(ctx context.Context)
+	// judgeDecidedHook is the test seam of the judge lane decision (PRD #4322 M1a): it runs in the
+	// create transaction right after the lane decision, holding the shared secret-mutation lock,
+	// before the provider branch freezes its source. Nil in production.
+	judgeDecidedHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -3917,7 +3928,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
 	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, memRef, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
+	run, memRef, fresh, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -3932,7 +3943,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, err
 	}
 	committed = true
-	return s.assembleAndFinishRunClaimRef(ctx, reread, run, params.RecoveryCapable, memRef)
+	return s.assembleAndFinishRunClaimRef(ctx, reread, run, params.RecoveryCapable, memRef, fresh)
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request
@@ -6128,7 +6139,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				// compromised worker cannot smuggle a non-enum rate_limit_type past the
 				// server" would then be false on exactly the path a human reads. When the
 				// fields are absent this is nil and every other failure path is untouched.
-				FailureReason:  limitAwareFailureReason(owned.Harness, req),
+				FailureReason:  failedReportReason(owned, req),
 				FailOrigin:     pgconv.TextOrNull(failOrigin),
 				PreservedPatch: clampWirePreservedPatch(req.PreservedPatch),
 				SessionID:      sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -7536,6 +7547,9 @@ func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID u
 	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
 	push := &checkpointPush{s: s, runID: runID, run: owned, checkpointKey: branch, ref: ref, opts: opts, routedAt: routedAt,
 		attestedSource: pgconv.TextPtr(attestedSource)}
+	if generation != nil {
+		push.tipGeneration = pgtype.Int8{Int64: *generation, Valid: true}
+	}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
@@ -7755,6 +7769,7 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 			CheckpointTip:  pgtype.Text{String: tipOid, Valid: true},
 			ID:             runID,
 			AttestedSource: push.attestedSource,
+			TipGeneration:  push.tipGeneration,
 		}); err != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
 			return false
@@ -7763,6 +7778,7 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 	}
 	n, err := s.q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
 		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip, AttestedSource: push.attestedSource,
+		TipGeneration: push.tipGeneration,
 	})
 	if err != nil {
 		slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
@@ -9311,6 +9327,9 @@ type SweepResult struct {
 	WallParked    int64
 	StaleFailed   int64
 	StaleRequeued int64
+	// FreshResumeRefused is the number of fresh resume transfers (issue #4628) this pass refused: an
+	// expired or gate-off pending row, or a claimed one with positive loss evidence.
+	FreshResumeRefused int64
 	// PublicationHeld is the number of queued runs moved to an owner hold because their
 	// publication custodian worker cannot serve them (issue #1324 D5).
 	PublicationHeld    int64

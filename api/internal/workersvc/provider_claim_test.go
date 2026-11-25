@@ -60,9 +60,11 @@ func providerBoundRow(kind string) store.Run {
 	}
 }
 
-// Judge, job and cross-check claims (and an isolated profile-bound one) refuse a provider-bound row
-// with provider_lane_unsupported before anything is opened: the store is a nil-embedding fake, so any
-// credential read would panic.
+// Job and cross-check claims (and an isolated profile-bound one) refuse a provider-bound row with
+// provider_lane_unsupported before anything is opened: the store is a nil-embedding fake, so any
+// credential read would panic. The judge row is refused here too, but only because the zero Worker
+// lacks claude_provider_v1 / claude_provider_judge_v1 (a Claude judge is provider-bound since PRD
+// #4322 M1a); a Codex-bound judge is the one refused as an unsupported lane.
 func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 	svc := New(&fakeStore{}, newBox(t), testParams())
 	for _, kind := range []string{runkind.Judge, runkind.Job, runkind.CrossCheck} {

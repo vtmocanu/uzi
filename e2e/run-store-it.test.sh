@@ -217,15 +217,28 @@ case " $* " in
     esac
     printf 'ok\t%s\t0.01s\n' "$root"
     exit 0 ;;
-  *" ^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$ "*)
+  *" ^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall|FreshResumeSeparateWorker)E2E$ "*)
     if [ "$SCENARIO" = retained-go-fail ]; then echo "retained process failed"; exit 9; fi
-    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E TestRecoveryRestoreWorkerClientSmallE2E; do
+    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E TestRecoveryRestoreWorkerClientSmallE2E TestFreshResumeSeparateWorkerE2E; do
       if { [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-run ]; } &&
         { [ "$name" != TestPrerequisiteClosureReleaseE2E ] || [ "$SCENARIO" != retained-missing-closure-run ]; }; then
         echo "=== RUN   $name"
       fi
       if [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-pass ]; then
         echo "--- PASS: $name (0.01s)"
+      fi
+    done
+    # The fresh resume proof's pinned subtests; a scenario drops one subtest's RUN or PASS line.
+    fresh=TestFreshResumeSeparateWorkerE2E
+    for sub in capture checkpoint_ref lost_seeded_reply_graceful_restart lost_seeded_reply_sigkill_restart changed_attempt_id \
+      unverifiable_bundle_abandon evidence_refused evidence_refused/expired evidence_refused/ambiguous evidence_refused/unbound \
+      stale_claim_refused w1_unchanged receipt_replay_current_authority receipt_replay_current_authority/cancel \
+      receipt_replay_current_authority/requeue_and_reclaim; do
+      if [ "$SCENARIO" != retained-missing-fresh-subtest-run ] || [ "$sub" != changed_attempt_id ]; then
+        echo "=== RUN   $fresh/$sub"
+      fi
+      if [ "$SCENARIO" != retained-missing-fresh-subtest-pass ] || [ "$sub" != evidence_refused/unbound ]; then
+        echo "    --- PASS: $fresh/$sub (0.01s)"
       fi
     done
     case "$SCENARIO" in
@@ -266,7 +279,7 @@ assert_case() {
 
 # Explicit expected order, independent of the runner's PKGS array.
 expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller hostedsvc issuetrackersvc runlifecycle weeklywarn)
-for scenario in success optional retained-missing-run retained-missing-closure-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
+for scenario in success optional retained-missing-run retained-missing-closure-run retained-missing-pass retained-missing-fresh-subtest-run retained-missing-fresh-subtest-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
   case_dir="$TMP/$scenario"
   mkdir -p "$case_dir"
   optional=""
@@ -293,8 +306,8 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
     if [ "$scenario" = go-fail ] && [ "$pkg" = forgesvc ]; then break; fi
   done
   if [ "$scenario" = optional ] || [[ "$scenario" = retained-* ]]; then
-    # The optional leg retains its own selector and Go's default timeout policy.
-    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$\t./internal/handler/...\n' \
+    # The optional leg retains its own selector and an explicit 30m timeout.
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t30m\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall|FreshResumeSeparateWorker)E2E$\t./internal/handler/...\n' \
       "$dsn" >> "$case_dir/expected"
   fi
   assert_case "ordered calls, exact flags, timeout reset and shared DSN" \
@@ -325,9 +338,9 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
         retained-go-fail)
           assert_case "optional Go failure survives tee" test "$rc" -eq 9
           ;;
-        retained-missing-run|retained-missing-closure-run|retained-missing-pass|retained-top-skip|retained-sub-skip)
+        retained-missing-run|retained-missing-closure-run|retained-missing-pass|retained-missing-fresh-subtest-run|retained-missing-fresh-subtest-pass|retained-top-skip|retained-sub-skip)
           assert_case "retained proof guard reports missing evidence or skip" \
-            grep -qE 'combined Codex proof (skipped|did not run and pass)' "$case_dir/output"
+            grep -qE 'combined recovery proof (skipped|did not run and pass)' "$case_dir/output"
           ;;
         go-fail)
           assert_case "Go's nonzero exit survives tee" test "$rc" -eq 7
@@ -489,7 +502,7 @@ for scenario in group-unset group-workersvc group-rest group-rest-proof group-em
   esac
   for entry in "${want[@]}"; do group_line "$dsn" "${entry%%:*}" "${entry#*:}" >> "$case_dir/expected"; done
   if [ "$scenario" = group-rest-proof ]; then
-    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$\t./internal/handler/...\n' \
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t30m\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall|FreshResumeSeparateWorker)E2E$\t./internal/handler/...\n' \
       "$dsn" >> "$case_dir/expected"
   fi
   assert_case "group runs exactly its packages in order, then any proof, on one DSN" \

@@ -2306,3 +2306,12 @@ Cost scales with paths. This is one measured point, not a worst case.
 - Inherited gap, unchanged by this change by design ("keep today's admitted shapes"): the inner
   directories of a non-group-writable bare are still not mode-checked, as before. It is filed
   separately as an incidental finding.
+
+## Amendment 2026-11-25, #4628: `fresh_pending` and `fresh_unbound` ledger states
+
+Decision record (AI-synced 2026-11-25). A fresh resume seeds a new attempt on a different worker from server-held evidence ([ADR-4628](4628-fresh-resume-durable-evidence.md)). Two attempt-ledger states are added for that seed, and `agent/src/ledger-reader-table.ts` (the table of every ledger consumer and how it reads each state) is extended with them:
+
+- **`fresh_pending`** is written before the seed (step L1, after the fresh journal `uzi-freshresume.<branch>.journal` is written at L0). A consumer that reads the ledger treats it as an attempt that may hold a seed in progress, so an ordinary discard adds the `ledger_fresh` blocker unless the transfer is named in `freshTransferNegative` (the guarded fresh discard).
+- **`fresh_unbound`** is a seed that never reached its receipt commit. It is already proven negative, adds no blocker, and is the one fresh state an ordinary discard may retire.
+
+A `ready` fresh journal is decided locally and sets the ledger aside; a `seeding` journal reads the attempt's entry. An agent build that predates these states reads either value as unknown evidence for the **whole bare**, and fails closed (an accepted limit recorded in ADR-4628).

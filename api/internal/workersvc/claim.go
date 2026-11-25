@@ -40,7 +40,10 @@ type ClaimPayload struct {
 	SemanticPlanning          *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
 	// MemoryParkReference (issue #3639) names the settled memory-pressure park an owner Resume lifted
 	// for exactly this worker incarnation; nil (omitted) for every other claim.
-	MemoryParkReference     *MemoryParkReference `json:"memory_park_reference,omitempty"`
+	MemoryParkReference *MemoryParkReference `json:"memory_park_reference,omitempty"`
+	// FreshResume (issue #4628) names the transfer a fresh claim carries: the evidence the destination
+	// seeds from. Present only on the claim that took a pending fresh resume; omitted for every other.
+	FreshResume             *FreshResumePayload  `json:"fresh_resume,omitempty"`
 	MemoryEpisode           int64                `json:"memory_episode"`
 	MemoryInterventionCount int32                `json:"memory_intervention_count"`
 	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`

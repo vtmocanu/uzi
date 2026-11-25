@@ -1064,6 +1064,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "issue_key_v1",
     "claude_phase_models_v1",
     "claude_provider_v1",
+    "claude_provider_judge_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // #4007 slice B is production-dark: its capability is never advertised in any permutation below.

@@ -96,9 +96,11 @@ UPDATE runs SET
     worker_recovery_evidence = NULL,
     checkpoint_contains_latest = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL
-WHERE id = (
+WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+  AND id = (
     SELECT r.id FROM runs r
-    WHERE r.user_id = @user_id
+    WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = r.id AND frt.state IN ('pending', 'claimed'))
+      AND r.user_id = @user_id
       AND EXISTS (SELECT 1 FROM claimant c WHERE NOT c.maintenance_fenced
         -- Hibernation (PRD #4205) fences every claim, resume-pinned runs included.
         AND c.hibernation_state = 'none'
@@ -172,12 +174,14 @@ WHERE run_id = @run_id AND kind = 'follow_up';
 -- the other sweeps.
 UPDATE runs SET plan_cross_check_gate_reason = NULL,
     status = 'completed', status_since = now(), finished_at = now(), updated_at = now()
-WHERE kind = 'chat'
+WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+  AND kind = 'chat'
   AND status IN ('claimed', 'running')
   AND id IN (
       SELECT r.id FROM runs r
       JOIN run_messages m ON m.run_id = r.id
-      WHERE r.kind = 'chat' AND r.status IN ('claimed', 'running')
+      WHERE NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = r.id AND frt.state IN ('pending', 'claimed'))
+        AND r.kind = 'chat' AND r.status IN ('claimed', 'running')
       GROUP BY r.id
       HAVING max(m.created_at) < @cutoff
   )

@@ -574,6 +574,16 @@ func TestRecoveryOwnerHoldsAdmissionMembershipLiveDB(t *testing.T) {
 
 	_, hClosed := custodySeedTerminalHold(t, pool, owner, conn, fresh, 4308, "released", 1)
 
+	// Issue #4628: a pending fresh resume transfer reserves one admission unit that matches no hold row,
+	// so the per-hold flags plus FreshReservedUnits, not the flags alone, sum to the aggregate.
+	cliMustExec(t, pool, `INSERT INTO run_fresh_resumes (run_id,user_id,request_id,evidence_generation,evidence_kind,checkpoint_ref,sha,candidate_token)
+	    VALUES ($1,$2,$3,1,'checkpoint_ref','refs/uzi-checkpoints/x','abababababababababababababababababababab','tok')`, runB, owner, uuid.New())
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `DELETE FROM run_fresh_resumes WHERE run_id = $1`, runB); err != nil {
+			t.Errorf("cleanup run_fresh_resumes: %v", err)
+		}
+	})
+
 	for _, path := range []string{"/api/recovery/holds", "/api/recovery/holds?state=open"} {
 		rec := bearerReq(router, http.MethodGet, path, uzc)
 		if rec.Code != http.StatusOK {
@@ -620,8 +630,12 @@ func TestRecoveryOwnerHoldsAdmissionMembershipLiveDB(t *testing.T) {
 		if seenOpen != len(wants) {
 			t.Errorf("%s: saw %d open holds, want %d", path, seenOpen, len(wants))
 		}
-		if counted != got.Aggregate.AdmissionCountedHolds {
-			t.Errorf("%s: counted flags = %d, aggregate.admission_counted_holds = %d", path, counted, got.Aggregate.AdmissionCountedHolds)
+		if got.Aggregate.FreshReservedUnits != 1 {
+			t.Errorf("%s: fresh_reserved_units = %d, want the one pending transfer", path, got.Aggregate.FreshReservedUnits)
+		}
+		if counted+got.Aggregate.FreshReservedUnits != got.Aggregate.AdmissionCountedHolds {
+			t.Errorf("%s: counted flags = %d + fresh_reserved_units = %d, aggregate.admission_counted_holds = %d",
+				path, counted, got.Aggregate.FreshReservedUnits, got.Aggregate.AdmissionCountedHolds)
 		}
 	}
 }

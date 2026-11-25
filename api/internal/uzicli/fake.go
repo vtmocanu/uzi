@@ -813,6 +813,16 @@ type FakeClient struct {
 	DiscardHoldCalls    []DiscardHoldCall
 	DiscardHoldErr      error
 
+	// Fresh resume (issue #4628). FreshResumePreviewResult/Err back FreshResumePreview;
+	// FreshResumeStartResult/Err back StartFreshResume and FreshResumeStartCalls records each
+	// request in order so a test can assert the request_id reuse rule and that a declined
+	// confirm sent nothing.
+	FreshResumePreviewResult apitypes.FreshResumePreviewDTO
+	FreshResumePreviewErr    error
+	FreshResumeStartResult   apitypes.FreshResumeStartDTO
+	FreshResumeStartErr      error
+	FreshResumeStartCalls    []FreshResumeStartCall
+
 	// Admin run debug (issue #4198). RecoveryHoldsScopedResult/Err back RecoveryHoldsScoped and
 	// RecoveryHoldsScopedCalls records each selector; AdminRunsDebugResult/Err back
 	// AdminListRunsDebug and AdminListRunsDebugCalls records each filter pair;
