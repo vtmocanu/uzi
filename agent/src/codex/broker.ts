@@ -1232,7 +1232,7 @@ export class CodexCallbackBroker {
     } };
   }
 
-  /** Search only through fileop list/stat/read_bytes.Every traversal and returned byte has a
+  /** Search only through fileop list/stat/read_bytes. Every traversal and returned byte has a
    * fixed ceiling, and reaching one returns the matches found so far as an ok partial
    * result (`truncated: true`, a `reason`, `skippedFiles`, and a fixed `notice`) instead of
    * denying the search. A partial result is never complete coverage, and an empty one never
