@@ -2,7 +2,10 @@ package store_test
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 	"math/big"
+	"reflect"
 	"testing"
 	"time"
 
@@ -791,23 +794,63 @@ func TestAnalyticsSpendBreakdownCapLiveDB(t *testing.T) {
 	f := newSpendFixture(t)
 	o := f.owner("cap")
 	repo, _ := f.repo(o, "cap")
-	// 52 distinct primary models, cheapest last: 50 rows plus Other holding two runs.
-	for i := 0; i < 52; i++ {
-		r := f.run(spendRun{Owner: o.User, Repo: repo, At: spendDay(3, 9).Add(time.Duration(i) * time.Minute),
-			Finished: spendDay(3, 10)})
-		f.metered(r, "pm-"+string(rune('A'+i/26))+string(rune('a'+i%26)), decimalCost(100-i))
+	at := spendDay(3, 9)
+	add := func(i int, model string, cost int, elapsed time.Duration) {
+		start := at.Add(time.Duration(i) * time.Minute)
+		r := f.run(spendRun{Owner: o.User, Repo: repo, At: start, Finished: start.Add(elapsed)})
+		f.metered(r, model, decimalCost(cost))
 	}
+	// 48 groups of distinct cost (200 - i), then three groups TIED at cost 100 (t1, t2, t3):
+	// the key breaks the tie ascending, so t1 and t2 take ranks 49 and 50 and t3 falls into
+	// Other. Three cheaper groups follow, so Other holds four runs. Their elapsed times are
+	// skewed (1, 2, 10 and 100 minutes) so the direct population percentiles (6 minutes at
+	// p50, 73 minutes at p90) differ from the mean of the per-group values (28.25 minutes).
+	var want []string
+	for i := 0; i < 48; i++ {
+		key := fmt.Sprintf("pm-%02d", i)
+		want = append(want, key)
+		add(i, key, 200-i, time.Hour)
+	}
+	add(48, "pm-t3", 100, 60*time.Second)
+	add(49, "pm-t1", 100, time.Hour)
+	add(50, "pm-t2", 100, time.Hour)
+	want = append(want, "pm-t1", "pm-t2")
+	add(51, "pm-u1", 10, 2*time.Minute)
+	add(52, "pm-u2", 9, 10*time.Minute)
+	add(53, "pm-u3", 8, 100*time.Minute)
+
 	res := f.call(spendCall{Owner: o.User, Now: spendNow, Breakdown: "primary_model"})
 	rows := res.Doc.Breakdown.Rows
 	if len(rows) != 51 {
 		t.Fatalf("breakdown rows = %d, want 50 plus Other", len(rows))
 	}
+	var keys []string
+	for _, r := range rows[:50] {
+		if r.IsOther || r.Key == nil {
+			t.Fatalf("a kept row is Other or keyless: %+v", r)
+		}
+		keys = append(keys, *r.Key)
+	}
+	if !reflect.DeepEqual(keys, want) {
+		t.Errorf("kept rows are not the 50 highest-cost groups in cost order with the key tie-break:\n got %v\nwant %v", keys, want)
+	}
 	other := rows[50]
-	if !other.IsOther || other.Key != nil || other.Rank != 51 || other.Runs != 2 || other.Finished != 2 {
+	if !other.IsOther || other.Key != nil || other.Rank != 51 || other.Runs != 4 || other.Finished != 4 {
 		t.Errorf("Other row = %+v", other)
 	}
-	if other.ElapsedP50Seconds.Value == nil {
-		t.Error("Other's percentile is not computed directly")
+	for _, c := range []struct {
+		what string
+		got  *float64
+		want float64
+	}{
+		{"Other p50 seconds", other.ElapsedP50Seconds.Value, 360},
+		{"Other p90 seconds", other.ElapsedP90Seconds.Value, 4380},
+	} {
+		if c.got == nil {
+			t.Errorf("%s is NULL, want %v", c.what, c.want)
+		} else if math.Abs(*c.got-c.want) > 1e-6 {
+			t.Errorf("%s = %v, want %v (a direct percentile over the four Other runs)", c.what, *c.got, c.want)
+		}
 	}
 	var costs []string
 	for _, r := range rows {

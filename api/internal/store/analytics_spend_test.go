@@ -3,6 +3,7 @@ package store_test
 import (
 	"encoding/json"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -80,6 +81,35 @@ func TestAnalyticsSpendStatementsDoNotDrift(t *testing.T) {
 			}
 		}
 		t.Fatalf("Spend statements drifted in length: %d vs %d lines", len(ol), len(al))
+	}
+	// The tagged lines are exactly these, by content: a new owner-only or all-only predicate
+	// changes the statement's meaning and must be added here on purpose.
+	tagged := func(block string) (ownerOnly, allOnly []string) {
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "-- owner-only") {
+				ownerOnly = append(ownerOnly, line)
+			}
+			if strings.Contains(line, "-- all-only") {
+				allOnly = append(allOnly, line)
+			}
+		}
+		return ownerOnly, allOnly
+	}
+	wantOwnerOnly := []string{
+		"(@reveal_repos::boolean IS TRUE OR fc.id IS NOT NULL) AS repo_shown,  -- owner-only",
+		"LEFT JOIN forge_connections fc ON fc.id = rpo.connection_id AND fc.user_id = @user_id::uuid  -- owner-only",
+		"AND r.user_id = @user_id::uuid  -- owner-only",
+		"AND w.user_id = @user_id::uuid  -- owner-only",
+	}
+	wantAllOnly := []string{"true AS repo_shown,  -- all-only"}
+	gotOO, gotAO := tagged(owner)
+	if !reflect.DeepEqual(gotOO, wantOwnerOnly) || len(gotAO) != 0 {
+		t.Errorf("owner statement tagged lines:\n owner-only %q\n all-only %q\nwant owner-only %q and no all-only", gotOO, gotAO, wantOwnerOnly)
+	}
+	gotOO, gotAO = tagged(all)
+	if !reflect.DeepEqual(gotAO, wantAllOnly) || len(gotOO) != 0 {
+		t.Errorf("all statement tagged lines:\n all-only %q\n owner-only %q\nwant all-only %q and no owner-only", gotAO, gotOO, wantAllOnly)
 	}
 	// The marked lines are exactly the scope predicates.
 	for _, want := range []string{"r.user_id = @user_id::uuid", "w.user_id = @user_id::uuid"} {

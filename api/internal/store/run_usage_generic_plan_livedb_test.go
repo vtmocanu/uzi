@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -127,12 +128,16 @@ type genericPlanEnv struct {
 	// The Spend-only owner (and its runs), seeded after the five usage cases' data.
 	spendOwnerID uuid.UUID
 
-	denominator  int64
-	ownLegs      int64
-	spendOwnLegs int64
-	bound        float64
-	scopedBound  float64
-	runsTotal    int64
+	// denominator, ownLegs, bound and scopedBound serve the five original cases and exclude
+	// the Spend owner's legs; the spend* fields serve the Spend cases.
+	denominator      int64
+	ownLegs          int64
+	spendOwnLegs     int64
+	spendDenominator int64
+	bound            float64
+	spendBound       float64
+	scopedBound      float64
+	runsTotal        int64
 }
 
 func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
@@ -232,7 +237,9 @@ func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
 	// dedicated owner keeps those cases' data untouched. Its runs spread over ~37 days (so
 	// both the current and the previous 30d window hold runs) and a fraction carry mr_iid
 	// (some shared by several runs) and mr_state merged, so the witness semi-join and the
-	// per-PR attribution actually execute. Two owners' worth of legs exist already (userID,
+	// per-PR attribution actually execute. Each run's legs spread over 25 distinct models, so
+	// the usage_model split and the primary_model breakdown have many groups and a
+	// runs × groups join is visible against 4 × count(runs). Two owners' worth of legs exist already (userID,
 	// otherUserID), so an unscoped fold of this owner's usage is visible against its own legs.
 	spendOwnerID, spendConnID, spendRepoID := uuid.New(), uuid.New(), uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
@@ -253,9 +260,10 @@ func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
 	mustExec(ctx, t, pool,
 		`INSERT INTO run_usage (run_id, session_id, model, lineage_epoch, input_tokens, cache_read_tokens,
 		                        cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis)
-		 SELECT r.id, 'sess-' || e, m, e, 100 + e, 10, 5, 50, 0.001, 'claude', 'metered', 'per_leg'
+		 SELECT r.id, 'sess-' || e, 'spend-model-' || lpad(((r.issue_iid + k * 7) % 25)::text, 2, '0'), e,
+		        100 + e, 10, 5, 50, 0.001, 'claude', 'metered', 'per_leg'
 		 FROM runs r
-		 CROSS JOIN (VALUES ('model-a'), ('model-b')) AS models(m)
+		 CROSS JOIN generate_series(0, 1) AS k
 		 CROSS JOIN generate_series(0, 1) AS e
 		 WHERE r.user_id = $1`, spendOwnerID)
 	mustExec(ctx, t, pool, `ANALYZE runs`)
@@ -273,9 +281,19 @@ func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
 	t.Cleanup(func() { _, _ = conn.Exec(context.Background(), `ROLLBACK`, pgx.QueryExecModeSimpleProtocol) })
 	e.exec(t, `SET LOCAL plan_cache_mode = force_generic_plan`)
 
-	if err := conn.QueryRow(ctx, `SELECT count(*) FROM run_usage`, pgx.QueryExecModeSimpleProtocol).Scan(&e.denominator); err != nil {
+	// The five original cases' counts are the table WITHOUT the Spend owner's legs, read in
+	// this same snapshot, so their sanity checks and bounds are exactly what they were
+	// before the Spend seed existed (a missing seed for them still fails here).
+	var fullCount int64
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM run_usage`, pgx.QueryExecModeSimpleProtocol).Scan(&fullCount); err != nil {
 		t.Fatalf("count run_usage: %v", err)
 	}
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM run_usage ru JOIN runs r ON r.id = ru.run_id WHERE r.user_id = $1`,
+		pgx.QueryExecModeSimpleProtocol, spendOwnerID).Scan(&e.spendOwnLegs); err != nil {
+		t.Fatalf("count spend owner run_usage: %v", err)
+	}
+	e.denominator = fullCount - e.spendOwnLegs
 	if e.denominator < 4*nRuns {
 		t.Fatalf("run_usage count %d < the %d legs this test seeded; the snapshot is wrong", e.denominator, 4*nRuns)
 	}
@@ -289,14 +307,12 @@ func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
 		t.Fatalf("own legs %d >= table %d: the other user's legs are missing, so scopedBound proves nothing", e.ownLegs, e.denominator)
 	}
 	e.scopedBound = float64(e.ownLegs)
-	if err := conn.QueryRow(ctx,
-		`SELECT count(*) FROM run_usage ru JOIN runs r ON r.id = ru.run_id WHERE r.user_id = $1`,
-		pgx.QueryExecModeSimpleProtocol, spendOwnerID).Scan(&e.spendOwnLegs); err != nil {
-		t.Fatalf("count spend owner run_usage: %v", err)
+	// The Spend cases compare against the whole table, Spend seed included.
+	if e.spendOwnLegs < 4*nRuns || e.spendOwnLegs >= fullCount {
+		t.Fatalf("spend owner legs %d (table %d, need at least %d): the Spend seed or the other users' legs are missing", e.spendOwnLegs, fullCount, 4*nRuns)
 	}
-	if e.spendOwnLegs >= e.denominator {
-		t.Fatalf("spend owner legs %d >= table %d: the other users' legs are missing", e.spendOwnLegs, e.denominator)
-	}
+	e.spendDenominator = fullCount
+	e.spendBound = 4 * float64(fullCount)
 	if err := conn.QueryRow(ctx, `SELECT count(*) FROM runs`, pgx.QueryExecModeSimpleProtocol).Scan(&e.runsTotal); err != nil {
 		t.Fatalf("count runs: %v", err)
 	}
@@ -310,12 +326,12 @@ func (e *genericPlanEnv) exec(t *testing.T, sql string) {
 	}
 }
 
-// explain runs EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE on the prepared statement and returns
+// explain runs EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) EXECUTE on the prepared statement and returns
 // the plan, failing unless PostgreSQL ran the GENERIC plan.
 func (e *genericPlanEnv) explain(t *testing.T, name, stmt, args string) *planNode {
 	t.Helper()
 	var raw []byte
-	if err := e.conn.QueryRow(e.ctx, fmt.Sprintf("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE %s(%s)", stmt, args), pgx.QueryExecModeSimpleProtocol).Scan(&raw); err != nil {
+	if err := e.conn.QueryRow(e.ctx, fmt.Sprintf("EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) EXECUTE %s(%s)", stmt, args), pgx.QueryExecModeSimpleProtocol).Scan(&raw); err != nil {
 		t.Fatalf("%s: EXPLAIN EXECUTE: %v", name, err)
 	}
 	var generic int64
@@ -343,9 +359,13 @@ func (e *genericPlanEnv) planOffenders(c genericPlanCase, root *planNode) []stri
 		own = c.ownLegs
 	}
 	scopedBound := float64(own)
+	bound := e.bound
+	if c.spend {
+		bound = e.spendBound
+	}
 	var offenders []string
 	walkUsagePlan(root, func(n *planNode) {
-		if total, _ := nodeWork(n); total > e.bound {
+		if total, _ := nodeWork(n); total > bound {
 			offenders = append(offenders, fmt.Sprintf("%s (rows %.0f + removed by filter %.0f, × loops %.0f = %.0f)",
 				n.NodeType, n.ActualRows, n.RowsRemovedByFilter, n.ActualLoops, total))
 		}
@@ -372,11 +392,18 @@ func (e *genericPlanEnv) checkPlan(t *testing.T, name string, c genericPlanCase,
 		own = c.ownLegs
 	}
 	if offenders := e.planOffenders(c, root); len(offenders) > 0 {
+		bound, denominator := e.bound, e.denominator
+		if c.spend {
+			bound, denominator = e.spendBound, e.spendDenominator
+		}
 		t.Errorf("%s: under a generic plan, run_usage work exceeds its bound (4 × count(run_usage) = %.0f, count %d, own legs %d), i.e. the view is re-folded per outer row or folded beyond this user (issue #1620):\n  %s",
-			name, e.bound, e.denominator, own, strings.Join(offenders, "\n  "))
+			name, bound, denominator, own, strings.Join(offenders, "\n  "))
 	}
 	if !c.spend {
 		return
+	}
+	for _, o := range e.spendOffenders(root) {
+		t.Errorf("%s: %s", name, o)
 	}
 	var usageScans []*planNode
 	var runsScans []*planNode
@@ -413,9 +440,9 @@ func (e *genericPlanEnv) checkPlan(t *testing.T, name string, c genericPlanCase,
 			sum += total
 			slack += rounded * n.ActualLoops / 2
 		}
-		if sum > float64(e.denominator)+slack {
+		if sum > float64(e.spendDenominator)+slack {
 			t.Errorf("%s: run_usage scan nodes did %.0f rows of work in total, more than one fold of the table (%d, rounding slack %.0f)",
-				name, sum, e.denominator, slack)
+				name, sum, e.spendDenominator, slack)
 		}
 	}
 	// No per-cohort-row re-scan of runs: a scan node that looped more than once may not do
@@ -592,6 +619,34 @@ func TestAnalyticsSpendGenericPlanNegativeControlLiveDB(t *testing.T) {
 	}
 }
 
+// TestAnalyticsSpendWitnessNegativeControlLiveDB proves the witness guard can fail: the
+// previous EXISTS form of the merged-PR witness, put back into the real owner statement (the
+// generated text with only that one expression swapped), must be reported by witnessProblems
+// as an un-hashed read of merged_witness.
+func TestAnalyticsSpendWitnessNegativeControlLiveDB(t *testing.T) {
+	e := newGenericPlanEnv(t)
+	const inForm = "(c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)"
+	const existsForm = "EXISTS (SELECT 1 FROM merged_witness mw WHERE mw.repo_id = c.repo_id AND mw.mr_iid = c.mr_iid)"
+	if strings.Count(store.AnalyticsOwnerSpendSQL, inForm) != 1 {
+		t.Fatalf("the owner statement no longer carries the witness IN form exactly once; update this control")
+	}
+	control := strings.Replace(store.AnalyticsOwnerSpendSQL, inForm, existsForm, 1)
+	args := e.spendArgs(t, e.spendOwnerID, false, false)
+	e.exec(t, "PREPARE usage_plan_witness_control AS "+control)
+	doc := e.explain(t, "ExistsWitness", "usage_plan_witness_control", args[0])
+	t.Logf("witness negative control plan:\n%s", renderPlan(doc, 0))
+	problems, _ := witnessProblems(doc)
+	var found bool
+	for _, p := range problems {
+		if strings.Contains(p, "un-hashed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the correlated EXISTS witness did not trip the un-hashed offender (problems: %v); the witness guard cannot fail", problems)
+	}
+}
+
 // planNode is the subset of EXPLAIN (ANALYZE, FORMAT JSON) this test reads. InitPlans and
 // SubPlans appear as ordinary children in "Plans", so walking Plans covers them.
 type planNode struct {
@@ -601,7 +656,100 @@ type planNode struct {
 	ActualRows          float64    `json:"Actual Rows"`
 	ActualLoops         float64    `json:"Actual Loops"`
 	RowsRemovedByFilter float64    `json:"Rows Removed by Filter"`
+	RowsRemovedByJoin   float64    `json:"Rows Removed by Join Filter"`
+	SubplanName         string     `json:"Subplan Name"`
+	ParentRelationship  string     `json:"Parent Relationship"`
+	CTEName             string     `json:"CTE Name"`
+	Filter              string     `json:"Filter"`
+	JoinFilter          string     `json:"Join Filter"`
+	Output              []string   `json:"Output"`
 	Plans               []planNode `json:"Plans"`
+}
+
+// spendOffenders holds the Spend-only plan conditions (issue #4684) that work on every node,
+// whether or not it scans run_usage:
+//   - a node that looped more than once may not do more than 4 × count(runs) work in total,
+//     counting the rows it emitted plus the rows its Filter and Join Filter discarded, CTE
+//     Scans included (a materialized CTE re-scanned once per outer row shows up as a CTE
+//     Scan with loops > 1, which a runs-relation-only check cannot see); a join that
+//     discarded more than that by its Join Filter is an offender whatever its loops;
+//   - every scan of the merged_witness CTE is a hashed SubPlan or the build side of a hash
+//     join, never a correlated SubPlan that re-scans the CTE per cohort row; and at least
+//     one such hashed read exists, so the check is not vacuous.
+func (e *genericPlanEnv) spendOffenders(root *planNode) []string {
+	limit := 4 * float64(e.runsTotal)
+	var out []string
+	var loops func(n *planNode)
+	loops = func(n *planNode) {
+		if work := (n.ActualRows + n.RowsRemovedByFilter + n.RowsRemovedByJoin) * n.ActualLoops; n.ActualLoops > 1 && work > limit {
+			out = append(out, fmt.Sprintf("%s %s%s looped %.0f times for %.0f rows of work (> 4 × count(runs) = %.0f): a per-row re-scan or a runs × groups join",
+				n.NodeType, n.CTEName, n.RelationName, n.ActualLoops, work, limit))
+		}
+		if n.RowsRemovedByJoin > limit {
+			out = append(out, fmt.Sprintf("%s discarded %.0f rows by its Join Filter (> 4 × count(runs) = %.0f): a cross product filtered after the join",
+				n.NodeType, n.RowsRemovedByJoin, limit))
+		}
+		for i := range n.Plans {
+			loops(&n.Plans[i])
+		}
+	}
+	loops(root)
+	problems, hashed := witnessProblems(root)
+	out = append(out, problems...)
+	if hashed == 0 {
+		out = append(out, "no hashed read of merged_witness found in the plan: the witness check is vacuous or the plan shape changed")
+	}
+	return out
+}
+
+// hashedSubPlanRef matches how EXPLAIN VERBOSE prints a hashed SubPlan where an expression
+// uses it. The node's own "Subplan Name" is just "SubPlan N" whether or not it is hashed;
+// only the expression that references it says "hashed".
+var hashedSubPlanRef = regexp.MustCompile(`hashed (SubPlan \d+)`)
+
+// witnessProblems reports each scan of the merged_witness CTE that is neither inside a
+// hashed SubPlan nor under a Hash node, and counts the hashed ones. A SubPlan is hashed when
+// some expression in the plan (Output, Filter or Join Filter) references it as
+// "hashed SubPlan N".
+func witnessProblems(root *planNode) (problems []string, hashed int) {
+	hashedSubPlans := map[string]bool{}
+	var collect func(n *planNode)
+	collect = func(n *planNode) {
+		texts := append([]string{n.Filter, n.JoinFilter}, n.Output...)
+		for _, txt := range texts {
+			for _, m := range hashedSubPlanRef.FindAllStringSubmatch(txt, -1) {
+				hashedSubPlans[m[1]] = true
+			}
+		}
+		for i := range n.Plans {
+			collect(&n.Plans[i])
+		}
+	}
+	collect(root)
+	var visit func(n *planNode, sub *planNode, underHash bool)
+	visit = func(n *planNode, sub *planNode, underHash bool) {
+		if n.ParentRelationship == "SubPlan" {
+			sub = n
+		}
+		if n.NodeType == "Hash" {
+			underHash = true
+		}
+		if n.NodeType == "CTE Scan" && n.CTEName == "merged_witness" {
+			switch {
+			case sub != nil && !hashedSubPlans[sub.SubplanName]:
+				problems = append(problems, fmt.Sprintf("merged_witness is read by the un-hashed %q (CTE Scan loops %.0f): a correlated per-row re-scan", sub.SubplanName, n.ActualLoops))
+			case sub != nil || underHash:
+				hashed++
+			default:
+				problems = append(problems, "merged_witness is scanned outside a hashed SubPlan or a Hash build side")
+			}
+		}
+		for i := range n.Plans {
+			visit(&n.Plans[i], sub, underHash)
+		}
+	}
+	visit(root, nil, false)
+	return problems, hashed
 }
 
 // nodeWork is a node's total row work across all its loops: the rows it emitted, plus,
@@ -641,6 +789,12 @@ func renderPlan(n *planNode, depth int) string {
 	fmt.Fprintf(&b, "%s%s", strings.Repeat("  ", depth), n.NodeType)
 	if n.RelationName != "" {
 		fmt.Fprintf(&b, " on %s", n.RelationName)
+	}
+	if n.CTEName != "" {
+		fmt.Fprintf(&b, " on CTE %s", n.CTEName)
+	}
+	if n.SubplanName != "" {
+		fmt.Fprintf(&b, " [%s %s]", n.ParentRelationship, n.SubplanName)
 	}
 	if n.IndexName != "" {
 		fmt.Fprintf(&b, " using %s", n.IndexName)

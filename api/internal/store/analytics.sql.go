@@ -36,7 +36,7 @@ func (q *Queries) AnalyticsAllHistoryStart(ctx context.Context, arg AnalyticsAll
 const analyticsAllRepoOptions = `-- name: AnalyticsAllRepoOptions :many
 SELECT r.id, r.path_with_namespace
 FROM repos r
-ORDER BY r.path_with_namespace, r.id
+ORDER BY r.path_with_namespace COLLATE "C", r.id
 LIMIT 201
 `
 
@@ -125,8 +125,8 @@ run_fold AS MATERIALIZED (
            f.input_tokens, f.cache_read_tokens, f.cache_creation_tokens, f.output_tokens, f.cost,
            f.usage_status, f.primary_model,
            o.outcome,
-           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL AND EXISTS (
-               SELECT 1 FROM merged_witness mw WHERE mw.repo_id = c.repo_id AND mw.mr_iid = c.mr_iid)) AS witnessed,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL
+                AND (c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)) AS witnessed,
            width_bucket(c.created_at, $6::timestamptz[]) AS wb
     FROM cohort c
     JOIN (
@@ -228,15 +228,18 @@ split_items AS MATERIALIZED (
     JOIN rfb x ON x.run_id = mf.run_id
     WHERE x.win = 'cur' AND $3::text = 'usage_model'
 ),
-split_groups AS (
-    SELECT i.gkey, i.glabel, i.gid,
-           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
-    FROM split_items i
-    GROUP BY i.gkey, i.glabel, i.gid
+split_ranked AS (
+    SELECT y.run_id, y.usage_status, y.bidx, y.cost, y.input_tokens, y.cache_read_tokens, y.cache_creation_tokens, y.output_tokens, y.gkey, y.glabel, y.gid, y.gsum, dense_rank() OVER (ORDER BY y.gsum DESC, y.gkey COLLATE "C")::int AS rnk
+    FROM (SELECT i.run_id, i.usage_status, i.bidx, i.cost, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.gkey, i.glabel, i.gid, sum(i.cost) OVER (PARTITION BY i.gkey) AS gsum FROM split_items i) y
+),
+split_groups AS MATERIALIZED (
+    SELECT r.gkey, min(r.glabel COLLATE "C") AS glabel, (array_agg(r.gid ORDER BY r.gid))[1] AS gid, min(r.rnk) AS rnk
+    FROM split_ranked r
+    GROUP BY r.gkey
 ),
 split_slotted AS MATERIALIZED (
-    SELECT i.run_id, i.usage_status, i.bidx, i.cost, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.gkey, i.glabel, i.gid, LEAST(g.rnk, 6) AS slot
-    FROM split_items i JOIN split_groups g ON g.gkey = i.gkey
+    SELECT r.run_id, r.usage_status, r.bidx, r.cost, r.input_tokens, r.cache_read_tokens, r.cache_creation_tokens, r.output_tokens, r.gkey, r.glabel, r.gid, r.gsum, r.rnk, LEAST(r.rnk, 6) AS slot
+    FROM split_ranked r
 ),
 split_tot AS (
     SELECT x.slot, jsonb_build_object(
@@ -253,8 +256,8 @@ split_tot AS (
                 'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
                 'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x GROUP BY x.slot
 ),
-split_cells AS (
-    SELECT s.slot, bk.idx, jsonb_build_object(
+split_cell_agg AS (
+    SELECT x.slot, x.bidx, jsonb_build_object(
             'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
             'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
             'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
@@ -266,11 +269,28 @@ split_cells AS (
                 'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
                 'applicable', count(DISTINCT x.run_id),
                 'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
-                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x GROUP BY x.slot, x.bidx
+),
+split_cell_empty AS (
+    SELECT jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x WHERE false
+),
+split_cells AS MATERIALIZED (
+    SELECT s.slot, bk.idx, COALESCE(a.j, (SELECT e.j FROM split_cell_empty e)) AS j
     FROM (SELECT DISTINCT slot FROM split_slotted) s
     CROSS JOIN bk
-    LEFT JOIN split_slotted x ON x.slot = s.slot AND x.bidx = bk.idx
-    GROUP BY s.slot, bk.idx
+    LEFT JOIN split_cell_agg a ON a.slot = s.slot AND a.bidx = bk.idx
 ),
 cache_cur AS (
     SELECT COALESCE(sum(x.cache_read_tokens), 0)::bigint AS read_tokens,
@@ -431,14 +451,17 @@ bd_items AS MATERIALIZED (
     FROM rfb x
     WHERE x.win = 'cur'
 ),
-bd_groups AS (
-    SELECT i.gkey, i.glabel, i.gid,
-           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
-    FROM bd_items i
-    GROUP BY i.gkey, i.glabel, i.gid
+bd_ranked AS (
+    SELECT y.run_id, y.user_id, y.email, y.repo_id, y.kind, y.harness, y.run_status, y.created_at, y.finished_at, y.status_since, y.mr_iid, y.repo_key, y.repo_id_out, y.repo_path_out, y.is_delivery, y.win, y.input_tokens, y.cache_read_tokens, y.cache_creation_tokens, y.output_tokens, y.cost, y.usage_status, y.primary_model, y.outcome, y.witnessed, y.wb, y.bidx, y.gkey, y.glabel, y.gid, y.gsum, dense_rank() OVER (ORDER BY y.gsum DESC, y.gkey COLLATE "C")::int AS rnk
+    FROM (SELECT i.run_id, i.user_id, i.email, i.repo_id, i.kind, i.harness, i.run_status, i.created_at, i.finished_at, i.status_since, i.mr_iid, i.repo_key, i.repo_id_out, i.repo_path_out, i.is_delivery, i.win, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.cost, i.usage_status, i.primary_model, i.outcome, i.witnessed, i.wb, i.bidx, i.gkey, i.glabel, i.gid, sum(i.cost) OVER (PARTITION BY i.gkey) AS gsum FROM bd_items i) y
+),
+bd_groups AS MATERIALIZED (
+    SELECT r.gkey, min(r.glabel COLLATE "C") AS glabel, (array_agg(r.gid ORDER BY r.gid))[1] AS gid, min(r.rnk) AS rnk
+    FROM bd_ranked r
+    GROUP BY r.gkey
 ),
 bd_rows AS (
-    SELECT LEAST(g.rnk, 51) AS slot,
+    SELECT LEAST(x.rnk, 51) AS slot,
            jsonb_build_object(
             'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
             'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
@@ -466,9 +489,8 @@ bd_rows AS (
                'elapsed_p50_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
                'elapsed_p90_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
                'merged_prs', count(DISTINCT (x.repo_id, x.mr_iid)) FILTER (WHERE x.is_delivery AND x.witnessed)) AS j
-    FROM bd_items x
-    JOIN bd_groups g ON g.gkey = x.gkey
-    GROUP BY LEAST(g.rnk, 51)
+    FROM bd_ranked x
+    GROUP BY LEAST(x.rnk, 51)
 )
 SELECT jsonb_build_object(
     'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
@@ -642,7 +664,7 @@ SELECT r.id, r.path_with_namespace
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1::uuid
-ORDER BY r.path_with_namespace, r.id
+ORDER BY r.path_with_namespace COLLATE "C", r.id
 LIMIT 201
 `
 
@@ -735,8 +757,8 @@ run_fold AS MATERIALIZED (
            f.input_tokens, f.cache_read_tokens, f.cache_creation_tokens, f.output_tokens, f.cost,
            f.usage_status, f.primary_model,
            o.outcome,
-           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL AND EXISTS (
-               SELECT 1 FROM merged_witness mw WHERE mw.repo_id = c.repo_id AND mw.mr_iid = c.mr_iid)) AS witnessed,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL
+                AND (c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)) AS witnessed,
            width_bucket(c.created_at, $6::timestamptz[]) AS wb
     FROM cohort c
     JOIN (
@@ -838,15 +860,18 @@ split_items AS MATERIALIZED (
     JOIN rfb x ON x.run_id = mf.run_id
     WHERE x.win = 'cur' AND $3::text = 'usage_model'
 ),
-split_groups AS (
-    SELECT i.gkey, i.glabel, i.gid,
-           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
-    FROM split_items i
-    GROUP BY i.gkey, i.glabel, i.gid
+split_ranked AS (
+    SELECT y.run_id, y.usage_status, y.bidx, y.cost, y.input_tokens, y.cache_read_tokens, y.cache_creation_tokens, y.output_tokens, y.gkey, y.glabel, y.gid, y.gsum, dense_rank() OVER (ORDER BY y.gsum DESC, y.gkey COLLATE "C")::int AS rnk
+    FROM (SELECT i.run_id, i.usage_status, i.bidx, i.cost, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.gkey, i.glabel, i.gid, sum(i.cost) OVER (PARTITION BY i.gkey) AS gsum FROM split_items i) y
+),
+split_groups AS MATERIALIZED (
+    SELECT r.gkey, min(r.glabel COLLATE "C") AS glabel, (array_agg(r.gid ORDER BY r.gid))[1] AS gid, min(r.rnk) AS rnk
+    FROM split_ranked r
+    GROUP BY r.gkey
 ),
 split_slotted AS MATERIALIZED (
-    SELECT i.run_id, i.usage_status, i.bidx, i.cost, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.gkey, i.glabel, i.gid, LEAST(g.rnk, 6) AS slot
-    FROM split_items i JOIN split_groups g ON g.gkey = i.gkey
+    SELECT r.run_id, r.usage_status, r.bidx, r.cost, r.input_tokens, r.cache_read_tokens, r.cache_creation_tokens, r.output_tokens, r.gkey, r.glabel, r.gid, r.gsum, r.rnk, LEAST(r.rnk, 6) AS slot
+    FROM split_ranked r
 ),
 split_tot AS (
     SELECT x.slot, jsonb_build_object(
@@ -863,8 +888,8 @@ split_tot AS (
                 'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
                 'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x GROUP BY x.slot
 ),
-split_cells AS (
-    SELECT s.slot, bk.idx, jsonb_build_object(
+split_cell_agg AS (
+    SELECT x.slot, x.bidx, jsonb_build_object(
             'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
             'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
             'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
@@ -876,11 +901,28 @@ split_cells AS (
                 'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
                 'applicable', count(DISTINCT x.run_id),
                 'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
-                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x GROUP BY x.slot, x.bidx
+),
+split_cell_empty AS (
+    SELECT jsonb_build_object(
+            'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
+            'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
+            'cache_read_tokens', COALESCE(sum(x.cache_read_tokens), 0)::bigint,
+            'cache_creation_tokens', COALESCE(sum(x.cache_creation_tokens), 0)::bigint,
+            'output_tokens', COALESCE(sum(x.output_tokens), 0)::bigint,
+            'runs', count(DISTINCT x.run_id),
+            'disclosure', jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0),
+            'coverage', jsonb_build_object(
+                'metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'),
+                'applicable', count(DISTINCT x.run_id),
+                'value', CASE WHEN count(DISTINCT x.run_id) = 0 THEN NULL ELSE round(count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered')::numeric / count(DISTINCT x.run_id), 6) END,
+                'reason', CASE WHEN count(DISTINCT x.run_id) = 0 THEN 'no_applicable_runs' END)) AS j FROM split_slotted x WHERE false
+),
+split_cells AS MATERIALIZED (
+    SELECT s.slot, bk.idx, COALESCE(a.j, (SELECT e.j FROM split_cell_empty e)) AS j
     FROM (SELECT DISTINCT slot FROM split_slotted) s
     CROSS JOIN bk
-    LEFT JOIN split_slotted x ON x.slot = s.slot AND x.bidx = bk.idx
-    GROUP BY s.slot, bk.idx
+    LEFT JOIN split_cell_agg a ON a.slot = s.slot AND a.bidx = bk.idx
 ),
 cache_cur AS (
     SELECT COALESCE(sum(x.cache_read_tokens), 0)::bigint AS read_tokens,
@@ -1041,14 +1083,17 @@ bd_items AS MATERIALIZED (
     FROM rfb x
     WHERE x.win = 'cur'
 ),
-bd_groups AS (
-    SELECT i.gkey, i.glabel, i.gid,
-           row_number() OVER (ORDER BY sum(i.cost) DESC, i.gkey COLLATE "C")::int AS rnk
-    FROM bd_items i
-    GROUP BY i.gkey, i.glabel, i.gid
+bd_ranked AS (
+    SELECT y.run_id, y.user_id, y.email, y.repo_id, y.kind, y.harness, y.run_status, y.created_at, y.finished_at, y.status_since, y.mr_iid, y.repo_key, y.repo_id_out, y.repo_path_out, y.is_delivery, y.win, y.input_tokens, y.cache_read_tokens, y.cache_creation_tokens, y.output_tokens, y.cost, y.usage_status, y.primary_model, y.outcome, y.witnessed, y.wb, y.bidx, y.gkey, y.glabel, y.gid, y.gsum, dense_rank() OVER (ORDER BY y.gsum DESC, y.gkey COLLATE "C")::int AS rnk
+    FROM (SELECT i.run_id, i.user_id, i.email, i.repo_id, i.kind, i.harness, i.run_status, i.created_at, i.finished_at, i.status_since, i.mr_iid, i.repo_key, i.repo_id_out, i.repo_path_out, i.is_delivery, i.win, i.input_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.output_tokens, i.cost, i.usage_status, i.primary_model, i.outcome, i.witnessed, i.wb, i.bidx, i.gkey, i.glabel, i.gid, sum(i.cost) OVER (PARTITION BY i.gkey) AS gsum FROM bd_items i) y
+),
+bd_groups AS MATERIALIZED (
+    SELECT r.gkey, min(r.glabel COLLATE "C") AS glabel, (array_agg(r.gid ORDER BY r.gid))[1] AS gid, min(r.rnk) AS rnk
+    FROM bd_ranked r
+    GROUP BY r.gkey
 ),
 bd_rows AS (
-    SELECT LEAST(g.rnk, 51) AS slot,
+    SELECT LEAST(x.rnk, 51) AS slot,
            jsonb_build_object(
             'cost', COALESCE(sum(x.cost), 0)::numeric(24,6)::text,
             'input_tokens', COALESCE(sum(x.input_tokens), 0)::bigint,
@@ -1076,9 +1121,8 @@ bd_rows AS (
                'elapsed_p50_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
                'elapsed_p90_seconds', jsonb_build_object('value', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN NULL ELSE percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (COALESCE(x.finished_at, x.status_since) - x.created_at))) FILTER (WHERE x.outcome IS NOT NULL) END, 'reason', CASE WHEN count(*) FILTER (WHERE x.outcome IS NOT NULL) = 0 THEN 'no_finished_runs' END),
                'merged_prs', count(DISTINCT (x.repo_id, x.mr_iid)) FILTER (WHERE x.is_delivery AND x.witnessed)) AS j
-    FROM bd_items x
-    JOIN bd_groups g ON g.gkey = x.gkey
-    GROUP BY LEAST(g.rnk, 51)
+    FROM bd_ranked x
+    GROUP BY LEAST(x.rnk, 51)
 )
 SELECT jsonb_build_object(
     'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
@@ -1214,7 +1258,7 @@ func (q *Queries) AnalyticsRepoExists(ctx context.Context, repoID uuid.UUID) (bo
 
 const analyticsTimezoneNames = `-- name: AnalyticsTimezoneNames :many
 
-SELECT name::text AS name FROM pg_catalog.pg_timezone_names ORDER BY name
+SELECT name::text AS name FROM pg_catalog.pg_timezone_names ORDER BY name COLLATE "C"
 `
 
 // Issue #4684: scoped run usage (Spend) API, options and authority statements.
@@ -1261,7 +1305,7 @@ func (q *Queries) AnalyticsUserExists(ctx context.Context, userID uuid.UUID) (bo
 const analyticsUserOptions = `-- name: AnalyticsUserOptions :many
 SELECT u.id, u.email
 FROM users u
-ORDER BY u.email, u.id
+ORDER BY u.email COLLATE "C", u.id
 LIMIT 201
 `
 
