@@ -198,4 +198,14 @@ None was kept, so there is no index migration. Side effects noted: `created_at` 
 
 **Finding, not fixed here:** admin all-users `window=all` takes 9.6-10.2 s with JIT off (15.7 s with it), over the 8 s `statement_timeout`, so it would return 503. In its plan the per-run `model_fold` lateral is the largest node (about 5.2 s of 117,550 per-run scans); the next is the breakdown and split ranking family (external-merge sorts and window passes over 117,550 rows, about 4 s inclusive), so removing the fold alone would still leave it near 5 s. Closing it needs a design decision: cap `all` for the admin all-users scope, precompute per-run totals, or a larger budget. No redesign was attempted. The owner decided at landing (2026-11-25) not to offer admin all-users `window=all`: it answers 400 `window all not available for all users`, and the all-time follow-up with per-run totals is deferred (see the Decision Log).
 
-**Not measured:** owner `window=all`; `mr_rework` and `cross_check` runs; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
+**Re-measured at landing (2026-11-25, rework head `cc6a03719`).** Same harness and setup on a throwaway PostgreSQL 17 container started with `jit=off` (every baseline EXPLAIN reports zero JIT). Seed: 120,000 runs, 847,208 `run_usage` legs, 200 owners (largest 20.1%, top 10 59.8%), 1,250 repos, 10.2% of runs in the last 30 days, ANALYZEd. These are statement-level timings: the harness lifts `statement_timeout` and times the prepared sqlc statements on one connection (20 runs after warm-up; 8 for statements over 8 s), in custom and generic `plan_cache_mode`. End-to-end request time (HTTP, JSON encoding, pool wait, the 8 s request budget) was not measured. The existing workloads reproduce the JIT-off figures above within about 2.5% (custom median / p95: admin all-users 30d 1287 / 1304 ms, owner 30d 248 / 250, owner 90d 435 / 450, admin all-users `window=all` 9690 / 9767 at the store level, a statement the route no longer issues). New workloads, custom / generic median:
+
+| Workload | custom | generic |
+|---|---|---|
+| Owner `window=all` | 1801 | 2190 |
+| Owner 30d, `harness=claude`, `kind=issue` | 98 | 104 |
+| Admin `user=<uuid>` 30d, same filters | 97 | 107 |
+
+Owner all-time cost is the per-run `model_fold` lateral (about 1.0 s over 23,672 runs) plus its spilled `run_fold` sort, so it grows with the owner's run count. The candidate-index table above reproduces for indexes 1, 3 and 4; index 2 (`(repo_id, mr_iid) WHERE mr_iid IS NOT NULL`) measured about twice as slow on the admin all-time workloads in this pass, undiagnosed and possibly host noise; no index ships.
+
+**Not measured:** `mr_rework` and `cross_check` runs (the seed has none); end-to-end request time; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
