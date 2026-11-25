@@ -282,6 +282,13 @@ export class JudgeRunner {
   private async executeClaim(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
     const judgeRunId = claim.run_id;
     const targetId = claim.target_run_id;
+    // Provider mode only: scrub every reported failure reason / fallback of the claim's key forms (a
+    // RequestError body can echo the key; logger redaction does not cover reported reasons). Vendor
+    // mode keeps the identity function, so its reasons stay byte-identical.
+    const providerCredential = claim.secrets?.provider?.credential;
+    const providerScrub: (s: string) => string = providerCredential
+      ? makeTextRedactor(providerKeyForms(providerCredential))
+      : (s) => s;
     if (!targetId) {
       this.log.warn("judge claim missing target_run_id; failing", { run_id: judgeRunId });
       await safeReportFailed(
@@ -401,7 +408,7 @@ export class JudgeRunner {
           this.log,
           "judge",
           judgeRunId,
-          errMessage(err),
+          providerScrub(errMessage(err)),
           hasFacts ? err : undefined,
           claim.claim_generation,
           this.terminalDeps,
@@ -417,6 +424,11 @@ export class JudgeRunner {
         error: errMessage(err),
       });
       review = fallbackReview(claim.judge_signal);
+      if (providerCredential) {
+        // The signal derives from the target's tool trace and may carry the key.
+        review = redactStrings(review, providerScrub);
+        review.model = providerScrub(review.model);
+      }
     }
 
     try {
@@ -500,7 +512,7 @@ export class JudgeRunner {
         this.log,
         "judge",
         judgeRunId,
-        errMessage(err),
+        providerScrub(errMessage(err)),
         err,
         claim.claim_generation,
         this.terminalDeps,

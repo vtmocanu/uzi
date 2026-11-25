@@ -313,3 +313,27 @@ describe("provider judge: whole-claim log redaction (real logger)", () => {
     });
   }
 });
+
+describe("provider judge: reported reasons and fallbacks are scrubbed of the key", () => {
+  const noKey = (s: string) => { for (const form of providerKeyForms(KEY)) assert.ok(!s.includes(form), `a key form leaked: ${form.slice(0, 8)}`); };
+
+  it("a review POST failure whose body echoes the key reports a scrubbed failed reason", async () => {
+    const api = fakeClient();
+    (api.client as unknown as { postReview: () => Promise<void> }).postReview = async () => { throw new RequestError("POST", "/review", 500, `upstream said ${KEY}`); };
+    const { calls } = await run([assistant(verdict()), success()], providerClaim(), { client: api });
+    const last = calls.states.at(-1)!;
+    assert.equal(last.status, "failed");
+    assert.ok((last.failure_reason ?? "").includes(REDACTED));
+    noKey(last.failure_reason ?? "");
+  });
+
+  it("a prep failure posts a fallback review built from a key-bearing signal with the key scrubbed", async () => {
+    const api = fakeClient({ getTrace: async () => { throw new Error("trace down"); } });
+    const claim = providerClaim({ judge_signal: { missing_tools: [{ command: `curl -H ${KEY}`, evidence: `${KEY}: command not found` }] } });
+    const { calls } = await run([], claim, { client: api });
+    assert.ok(calls.review, "a fallback review is posted");
+    noKey(JSON.stringify(calls.review));
+    assert.ok(JSON.stringify(calls.review).includes(REDACTED));
+    assert.equal(calls.states.at(-1)?.status, "completed");
+  });
+});
