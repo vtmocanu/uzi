@@ -159,13 +159,15 @@ function withTimeout<T>(p: Promise<T>, ms: number, id: string): Promise<T> {
   });
 }
 
-async function doLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
+// budgetMs: the remaining load deadline (a Retry shares one deadline across re-registration
+// and load, so the whole Retry stays within the per-load timeout).
+async function doLoad(entry: Pick<ModuleEntry, "id" | "page">, budgetMs: number = timeoutMs()): Promise<ModulePageComponent> {
   const { id } = entry;
   const token = (attemptToken.get(id) ?? 0) + 1;
   attemptToken.set(id, token);
   try {
     const page = entry.page.replace(/^\.\//, "");
-    const mod = (await withTimeout(loadModuleRemote(`${id}/${page}`), timeoutMs(), id)) as {
+    const mod = (await withTimeout(loadModuleRemote(`${id}/${page}`), budgetMs, id)) as {
       default?: unknown;
       hostContract?: unknown;
     } | null;
@@ -213,9 +215,12 @@ export function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promis
   const n = ++retryCounter;
   const p: Promise<ModulePageComponent> = (async () => {
     try {
-      // Bounded like the load: a remount joins this promise, so a hang here must not spin forever.
-      await withTimeout(reRegisterModule(id, n), timeoutMs(), id);
-      return await doLoad(entry);
+      // One deadline for the whole Retry (re-registration plus load), the same budget as a
+      // single load: a remount joins this promise, so a hang here must not spin forever.
+      const budget = timeoutMs();
+      const start = Date.now();
+      await withTimeout(reRegisterModule(id, n), budget, id);
+      return await doLoad(entry, Math.max(1, budget - (Date.now() - start)));
     } catch (e) {
       const err = classifyLoadError(e, id); // never throws: guards a revoked Proxy
       if (err.kind === "transient" && !loadedOnce.has(id)) retryFailed.add(id);
