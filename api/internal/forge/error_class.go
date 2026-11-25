@@ -107,6 +107,12 @@ func classifyTransport(err error) (class ErrorClass, ok bool) {
 // classifyError inspects raw typed errors before the redactor severs their chain.
 // status is supplied where an SDK returns HTTP metadata separately.
 func classifyError(err error, status int) ErrorClass {
+	// A supplied 401/403 is a definitive answer from the forge: an error that also
+	// carries a timeout (e.g. the body read timed out after the response arrived)
+	// must not turn a refused credential into a retryable class.
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return ErrorClassAuth
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ErrorClassTimeout
 	}

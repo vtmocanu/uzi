@@ -108,7 +108,33 @@ func TestGuardRepoTransientCauseContextDone(t *testing.T) {
 		t.Run(name+"_protection", func(t *testing.T) {
 			wantNoCause(t, guardWith(protForge(protResult{err: classedErr{forge.ErrorClassNetwork}}), ctx))
 		})
+		// A timeout-class error is the shape a done caller context actually
+		// produces; it must be suppressed the same way as a network one.
+		t.Run(name+"_verify_timeout", func(t *testing.T) {
+			res := guardWith(&fakeForge{verifyErr: classedErr{forge.ErrorClassTimeout}}, ctx)
+			if !res.Blocked {
+				t.Fatalf("must still block: %+v", res)
+			}
+			wantNoCause(t, res)
+		})
+		t.Run(name+"_verify_deadline_exceeded", func(t *testing.T) {
+			res := guardWith(&fakeForge{verifyErr: context.DeadlineExceeded}, ctx)
+			if !res.Blocked {
+				t.Fatalf("must still block: %+v", res)
+			}
+			wantNoCause(t, res)
+		})
+		t.Run(name+"_protection_timeout", func(t *testing.T) {
+			wantNoCause(t, guardWith(protForge(protResult{err: classedErr{forge.ErrorClassTimeout}}), ctx))
+		})
 	}
+	// Control: the same timeout-class errors under a live context are transient.
+	t.Run("live_verify_timeout", func(t *testing.T) {
+		wantCause(t, guardWith(&fakeForge{verifyErr: classedErr{forge.ErrorClassTimeout}}, context.Background()), forge.ErrorClassTimeout)
+	})
+	t.Run("live_protection_timeout", func(t *testing.T) {
+		wantCause(t, guardWith(protForge(protResult{err: classedErr{forge.ErrorClassTimeout}}), context.Background()), forge.ErrorClassTimeout)
+	})
 }
 
 func TestGuardRepoTransientCauseProtectionUnverified(t *testing.T) {

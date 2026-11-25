@@ -169,6 +169,9 @@ func TestClaimForgeTransientParksEnrolledPublicationLiveDB(t *testing.T) {
 	}
 	promote()
 	sideBefore, runBefore := f.side(t), f.run(t)
+	if len(sideBefore.Intent) == 0 {
+		t.Fatalf("fixture side row carries no intent bytes: %+v", sideBefore)
+	}
 	if !sideBefore.WaitStartedAt.Valid || sideBefore.ParkTotal != 1 || !sideBefore.WorkerID.Valid || uuid.UUID(sideBefore.WorkerID.Bytes) != f.workerID {
 		t.Fatalf("fixture side row = %+v", sideBefore)
 	}
@@ -201,6 +204,7 @@ func TestClaimForgeTransientParksEnrolledPublicationLiveDB(t *testing.T) {
 	side := f.side(t)
 	if side.State != "active" || side.EnrollmentSeq != sideBefore.EnrollmentSeq || side.WorkerID != sideBefore.WorkerID ||
 		string(side.Handoff) != string(sideBefore.Handoff) || side.Episode != sideBefore.Episode ||
+		string(side.Intent) != string(sideBefore.Intent) || side.CandidateSeq != sideBefore.CandidateSeq ||
 		!side.WaitStartedAt.Time.Equal(sideBefore.WaitStartedAt.Time) || side.ParkTotal != sideBefore.ParkTotal+1 {
 		t.Fatalf("side row moved beyond one park:\nbefore %+v\nafter  %+v", sideBefore, side)
 	}

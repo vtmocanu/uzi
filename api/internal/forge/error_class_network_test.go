@@ -129,6 +129,43 @@ func TestNetworkClassFallThrough(t *testing.T) {
 	}
 }
 
+// timeoutNetErr is a net.Error whose Timeout() is true and that carries no
+// context.DeadlineExceeded in its chain.
+type timeoutNetErr struct{}
+
+func (timeoutNetErr) Error() string   { return "i/o timeout" }
+func (timeoutNetErr) Timeout() bool   { return true }
+func (timeoutNetErr) Temporary() bool { return false }
+
+// TestClassAuthStatusBeatsTimeout pins that a supplied 401/403 wins over a
+// timeout-carrying error (a refused credential is definitive), while 0 and 503
+// leave the timeout class unchanged: only auth outranks it.
+func TestClassAuthStatusBeatsTimeout(t *testing.T) {
+	errs := map[string]error{
+		"net.Error timeout": fmt.Errorf("read body: %w", timeoutNetErr{}),
+		"deadline exceeded": fmt.Errorf("read body: %w", context.DeadlineExceeded),
+		"op error timeout":  &net.OpError{Op: "read", Net: "tcp", Err: timeoutNetErr{}},
+		"joined deadline":   errors.Join(errors.New("x"), context.DeadlineExceeded),
+	}
+	for name, err := range errs {
+		for _, tc := range []struct {
+			status int
+			want   ErrorClass
+		}{
+			{401, ErrorClassAuth},
+			{403, ErrorClassAuth},
+			{0, ErrorClassTimeout},
+			{503, ErrorClassTimeout},
+		} {
+			t.Run(fmt.Sprintf("%s status %d", name, tc.status), func(t *testing.T) {
+				if got := Class(newRedactor().errorStatus(err, tc.status)); got != tc.want {
+					t.Fatalf("class = %q, want %q", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
 func TestNetworkClassKeepsRedaction(t *testing.T) {
 	token := "glpat-" + "abcdefghijklmnopqrst"
 	err := fmt.Errorf("PRIVATE-TOKEN %s rejected: %w", token, dialOpError(os.NewSyscallError("read", syscall.ECONNRESET)))

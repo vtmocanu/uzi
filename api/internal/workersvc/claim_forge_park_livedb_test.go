@@ -309,6 +309,10 @@ func TestClaimForgeTransientParksHandoffPeerLiveDB(t *testing.T) {
 	peer := f.peerWorker(t)
 	f.svc.SetRepoGuard(&fakeGuard{res: transientGuardBlock()})
 	sideBefore := cfpSide(t, f.env, f.runID)
+	handoffBefore := string(f.side(t).Handoff)
+	if handoffBefore == "" || !strings.Contains(handoffBefore, pubHeadC) {
+		t.Fatalf("fixture handoff = %q, want one carrying the checkpoint tip %s", handoffBefore, pubHeadC)
+	}
 
 	if p, err := f.svc.Claim(f.env.ctx, peer, nil); err != nil || p != nil {
 		t.Fatalf("peer Claim = (%v, %v), want an idle park", p != nil, err)
@@ -318,7 +322,7 @@ func TestClaimForgeTransientParksHandoffPeerLiveDB(t *testing.T) {
 		t.Fatalf("status=%s phase=%v worker=%v, want recovery_wait/publication parked on the peer %s", r.Status, r.RecoveryWaitPhase, r.WorkerID, peer.ID)
 	}
 	side := f.side(t)
-	if side.WorkerID.Bytes != f.workerID || string(side.Handoff) == "" || side.ParkTotal != 2 {
+	if side.WorkerID.Bytes != f.workerID || string(side.Handoff) != handoffBefore || side.ParkTotal != 2 {
 		t.Fatalf("side row custodian/handoff/park_total = %v/%s/%d, want the custodian and handoff kept and one more park", side.WorkerID, side.Handoff, side.ParkTotal)
 	}
 	if cfpSide(t, f.env, f.runID) == sideBefore {
@@ -597,6 +601,33 @@ func TestClaimForgeTransientExpiredContextStaysClaimedLiveDB(t *testing.T) {
 	wantHolds(t, x.env, x.run, "open", "open")
 }
 
+// The same fence for a request deadline that expires (context.DeadlineExceeded, not Canceled) between
+// the assembly and the finisher: the run stays claimed, nothing is written, nothing is published.
+func TestClaimForgeTransientExpiredDeadlineStaysClaimedLiveDB(t *testing.T) {
+	x := newCFPFix(t)
+	ctx, cancel := context.WithTimeout(x.env.ctx, 8*time.Second)
+	defer cancel()
+	x.hooks(func(ctx context.Context, _ store.Run) {
+		select {
+		case <-ctx.Done():
+		case <-time.After(30 * time.Second):
+			t.Error("the request deadline never expired")
+		}
+	}, nil)
+	payload, err := x.f.svc.Claim(ctx, x.f.wkr, nil)
+	if err == nil || payload != nil {
+		t.Fatalf("Claim = (%v, %v), want an error", payload != nil, err)
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("request context error = %v, want DeadlineExceeded", ctx.Err())
+	}
+	if r := mustRun(t, x.env, x.run); r.Status != "claimed" {
+		t.Fatalf("status = %s, want claimed", r.Status)
+	}
+	x.wantUnwritten("an expired deadline")
+	wantHolds(t, x.env, x.run, "open", "open")
+}
+
 func TestClaimForgeTransientRollbackFencesLiveDB(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -679,30 +710,123 @@ func cfpReadCooldown(t *testing.T, env codexTestEnv, workerID uuid.UUID, origin 
 	return c
 }
 
-// The park clears this claim's reservation through the existing trigger, leaves a newer reservation
-// and every observation field alone, and writes no observation of its own.
+// cfpFence says how a reservation of this claim is made to differ in one fence column; the zero value
+// is a matching reservation.
+type cfpFence struct {
+	gitVersionDelta int64 // added to the Git row's reservation_version (the run's own stamp stays 7)
+	apiGenDelta     int64 // added to the API row's reservation_generation
+	apiOtherRun     bool  // the API row is reserved by a different run at this claim's generation
+}
+
+// cfpSeedBothReservations reserves BOTH of this claim's origins (the Git origin and the distinct GitHub
+// API origin), stamps the run's own reservation identity for each, and adds a reservation of another
+// run on a third origin. forge_origin_cooldowns has one row per (user, worker, origin), so a "newer"
+// reservation of the same origin cannot sit beside this claim's; a row at the same key whose fence
+// column differs (fence) stands in for it.
+func cfpSeedBothReservations(t *testing.T, env codexTestEnv, userID, workerID, runID uuid.UUID, fence cfpFence) (gitOrigin, apiOrigin, foreignOrigin string) {
+	t.Helper()
+	var gen int64
+	var origin, api *string
+	if err := env.pool.QueryRow(env.ctx, `SELECT generation, origin, api_origin FROM run_forge_origins WHERE run_id=$1`, runID).Scan(&gen, &origin, &api); err != nil ||
+		origin == nil || api == nil || *api == *origin {
+		t.Fatalf("claim stamped no distinct git/api origin pair: %v (origin=%v api=%v)", err, origin, api)
+	}
+	gitInc, apiInc, foreignInc := uuid.New(), uuid.New(), uuid.New()
+	apiRun := runID
+	if fence.apiOtherRun {
+		apiRun = uuid.New()
+	}
+	env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, incarnation, cooled_until, last_reason, observed_at,
+	    failure_step, observation_version, reservation_run_id, reservation_generation, reservation_incarnation, reservation_version, reservation_observation_version)
+	    VALUES ($1,$2,$3,$4,now()+interval '1 hour','transient_clone_fetch_exhausted',now(),3,5,$5,$6,$4,$7,5)`,
+		userID, workerID, *origin, gitInc, runID, gen, 7+fence.gitVersionDelta)
+	env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, incarnation, cooled_until, last_reason, observed_at,
+	    failure_step, observation_version, reservation_run_id, reservation_generation, reservation_incarnation, reservation_version, reservation_observation_version)
+	    VALUES ($1,$2,$3,$4,now()+interval '2 hour','transient_clone_fetch_exhausted',now(),4,6,$5,$6,$4,11,6)`,
+		userID, workerID, *api, apiInc, apiRun, gen+fence.apiGenDelta)
+	env.exec(`UPDATE run_forge_origins SET reservation_incarnation=$2, reservation_version=7, api_reservation_incarnation=$3, api_reservation_version=11 WHERE run_id=$1`,
+		runID, gitInc, apiInc)
+	foreignOrigin = "https://newer.forge.e2e"
+	env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, incarnation, cooled_until, last_reason, observed_at,
+	    failure_step, observation_version, reservation_run_id, reservation_generation, reservation_incarnation, reservation_version, reservation_observation_version)
+	    VALUES ($1,$2,$3,$4,now()+interval '1 hour','transient_clone_fetch_exhausted',now(),2,4,$5,$6,$4,3,4)`,
+		userID, workerID, foreignOrigin, foreignInc, uuid.New(), gen+9)
+	return *origin, *api, foreignOrigin
+}
+
+// cfpCooldownText renders the whole cooldown row, reservation columns included.
+func cfpCooldownText(t *testing.T, env codexTestEnv, workerID uuid.UUID, origin string) string {
+	t.Helper()
+	var s string
+	if err := env.pool.QueryRow(env.ctx, `SELECT c::text FROM forge_origin_cooldowns c WHERE worker_id=$1 AND origin=$2`, workerID, origin).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// cfpObservationText renders every observation column (everything but the reservation binding).
+func cfpObservationText(t *testing.T, env codexTestEnv, workerID uuid.UUID, origin string) string {
+	t.Helper()
+	var s string
+	if err := env.pool.QueryRow(env.ctx, `SELECT concat_ws('|', user_id, worker_id, origin, incarnation, observation_version, failure_step,
+	    cooled_until, last_reason, observed_at, git_unverified, api_unverified) FROM forge_origin_cooldowns WHERE worker_id=$1 AND origin=$2`, workerID, origin).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// The park clears this claim's reservations through the existing trigger (the Git row and the API row,
+// each only while its own fence matches), leaves every other reservation alone, and writes no
+// observation of its own.
 func TestClaimForgeTransientClearsOnlyThisClaimsReservationLiveDB(t *testing.T) {
-	x := newCFPFix(t)
-	x.env.exec(`UPDATE repos SET web_url='https://github.com/group/repo' WHERE id=$1`, x.f.repoID)
-	x.env.exec(`UPDATE forge_connections SET forge_type='github' WHERE user_id=$1`, x.f.userID)
-	var own, foreign string
-	var ownBefore, foreignBefore cfpCooldown
-	x.hooks(func(_ context.Context, run store.Run) {
-		own, foreign = cfpSeedReservation(t, x.env, x.f.userID, x.f.workerID, run.ID)
-		ownBefore, foreignBefore = cfpReadCooldown(t, x.env, x.f.workerID, own), cfpReadCooldown(t, x.env, x.f.workerID, foreign)
-	}, nil)
-	x.mustPark()
-	ownAfter, foreignAfter := cfpReadCooldown(t, x.env, x.f.workerID, own), cfpReadCooldown(t, x.env, x.f.workerID, foreign)
-	if !ownBefore.ReservationRunID.Valid || ownAfter.ReservationRunID.Valid || ownAfter.ReservationVersion != nil || ownAfter.ResvGeneration != nil {
-		t.Fatalf("this claim's reservation: before %+v after %+v, want cleared", ownBefore, ownAfter)
-	}
-	if ownAfter.Step != ownBefore.Step || ownAfter.ObsVersion != ownBefore.ObsVersion || ownAfter.Reason != ownBefore.Reason ||
-		!ownAfter.CooledUntil.Equal(ownBefore.CooledUntil) || !ownAfter.ObservedAt.Equal(ownBefore.ObservedAt) {
-		t.Fatalf("the park changed the observation fields: before %+v after %+v", ownBefore, ownAfter)
-	}
-	if foreignAfter.ReservationRunID != foreignBefore.ReservationRunID || !foreignAfter.ReservationRunID.Valid ||
-		foreignAfter.Step != foreignBefore.Step || foreignAfter.ObsVersion != foreignBefore.ObsVersion || !foreignAfter.CooledUntil.Equal(foreignBefore.CooledUntil) {
-		t.Fatalf("a newer reservation moved: before %+v after %+v", foreignBefore, foreignAfter)
+	for _, c := range []struct {
+		name                 string
+		fence                cfpFence
+		gitCleared, apiClear bool
+	}{
+		{"both reservations match", cfpFence{}, true, true},
+		{"git row at a newer reservation version", cfpFence{gitVersionDelta: 1}, false, true},
+		{"api row at a newer generation", cfpFence{apiGenDelta: 1}, true, false},
+		{"api row reserved by another run", cfpFence{apiOtherRun: true}, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newCFPFix(t)
+			x.env.exec(`UPDATE repos SET web_url='https://github.com/group/repo' WHERE id=$1`, x.f.repoID)
+			x.env.exec(`UPDATE forge_connections SET forge_type='github' WHERE user_id=$1`, x.f.userID)
+			var gitO, apiO, foreign string
+			var gitRow, apiRow, foreignRow, gitObs, apiObs, foreignObs string
+			x.hooks(func(_ context.Context, run store.Run) {
+				gitO, apiO, foreign = cfpSeedBothReservations(t, x.env, x.f.userID, x.f.workerID, run.ID, c.fence)
+				gitRow, apiRow, foreignRow = cfpCooldownText(t, x.env, x.f.workerID, gitO), cfpCooldownText(t, x.env, x.f.workerID, apiO), cfpCooldownText(t, x.env, x.f.workerID, foreign)
+				gitObs, apiObs, foreignObs = cfpObservationText(t, x.env, x.f.workerID, gitO), cfpObservationText(t, x.env, x.f.workerID, apiO), cfpObservationText(t, x.env, x.f.workerID, foreign)
+			}, nil)
+			x.mustPark()
+
+			for _, o := range []struct {
+				what        string
+				origin      string
+				row, obs    string
+				wantCleared bool
+			}{
+				{"git", gitO, gitRow, gitObs, c.gitCleared},
+				{"api", apiO, apiRow, apiObs, c.apiClear},
+				{"foreign", foreign, foreignRow, foreignObs, false},
+			} {
+				after := cfpReadCooldown(t, x.env, x.f.workerID, o.origin)
+				if got := cfpObservationText(t, x.env, x.f.workerID, o.origin); got != o.obs {
+					t.Fatalf("%s: the park changed the observation fields:\nbefore %s\nafter  %s", o.what, o.obs, got)
+				}
+				if o.wantCleared {
+					if after.ReservationRunID.Valid || after.ReservationVersion != nil || after.ResvGeneration != nil {
+						t.Fatalf("%s: this claim's reservation not cleared: %s", o.what, cfpCooldownText(t, x.env, x.f.workerID, o.origin))
+					}
+					continue
+				}
+				if got := cfpCooldownText(t, x.env, x.f.workerID, o.origin); got != o.row || !after.ReservationRunID.Valid {
+					t.Fatalf("%s: a reservation that is not this claim's moved:\nbefore %s\nafter  %s", o.what, o.row, got)
+				}
+			}
+		})
 	}
 }
 
@@ -820,12 +944,18 @@ func TestClaimForgeTransientEnrolledSideRowFailureRollsBackLiveDB(t *testing.T) 
 func TestClaimForgeTransientParkIsAtomicToOtherReadersLiveDB(t *testing.T) {
 	f, x := cfpEnrolledFresh(t)
 	reached, release := make(chan struct{}), make(chan struct{})
-	x.hooks(nil, &claimTestHooks{beforeClaimParkCommit: func(context.Context) error {
+	var claimEpoch int64
+	x.hooks(func(ctx context.Context, run store.Run) {
+		if err := f.env.pool.QueryRow(ctx, `SELECT codex_claim_epoch FROM runs WHERE id=$1`, run.ID).Scan(&claimEpoch); err != nil {
+			t.Error(err)
+		}
+	}, &claimTestHooks{beforeClaimParkCommit: func(context.Context) error {
 		close(reached)
 		<-release
 		return nil
 	}})
 	side := cfpSide(t, f.env, f.runID)
+	runBefore, sideBefore := f.run(t), f.side(t)
 	type result struct {
 		p   *ClaimPayload
 		err error
@@ -886,6 +1016,61 @@ func TestClaimForgeTransientParkIsAtomicToOtherReadersLiveDB(t *testing.T) {
 		t.Fatalf("after the commit: status=%s holds=%v", r.Status, cfpHolds(t, f.env, f.runID))
 	}
 	x.wantPublished("recovery_wait")
+
+	// A fresh repeatable-read transaction opened after the commit sees every write of the park in one
+	// snapshot: the run, the custody holds and the publication side row together.
+	post, err := f.env.pool.BeginTx(f.env.ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = post.Rollback(f.env.ctx) }()
+	var (
+		pStatus, pCause, pPhase, pHealth string
+		pWait, pPark, pEpoch             int64
+		pRetry                           bool
+	)
+	if err := post.QueryRow(f.env.ctx, `SELECT status, COALESCE(recovery_wait_cause,''), COALESCE(recovery_wait_phase,''), recovery_wait_count,
+	    forge_park_count, codex_claim_epoch, health, recovery_retry_not_before IS NOT NULL FROM runs WHERE id=$1`, f.runID).
+		Scan(&pStatus, &pCause, &pPhase, &pWait, &pPark, &pEpoch, &pHealth, &pRetry); err != nil {
+		t.Fatal(err)
+	}
+	if pStatus != "recovery_wait" || pCause != "forge_unreachable" || pPhase != "publication" || pWait != int64(runBefore.RecoveryWaitCount)+1 ||
+		pPark != int64(runBefore.ForgeParkCount) || pEpoch != claimEpoch+1 || pHealth != "ok" || !pRetry {
+		t.Fatalf("post-commit run = %s/%s/%s wait_count=%d forge_park_count=%d epoch=%d health=%s retry=%v; want recovery_wait/forge_unreachable/publication %d/%d/%d/ok/true",
+			pStatus, pCause, pPhase, pWait, pPark, pEpoch, pHealth, pRetry, runBefore.RecoveryWaitCount+1, runBefore.ForgeParkCount, claimEpoch+1)
+	}
+	pHolds := map[int64]string{}
+	rows, err := post.Query(f.env.ctx, `SELECT generation, state FROM recovery_custody_holds WHERE run_id=$1`, f.runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var g int64
+		var st string
+		if err := rows.Scan(&g, &st); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		pHolds[g] = st
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(pHolds) != 2 || pHolds[1] != "open" || pHolds[2] != "released" {
+		t.Fatalf("post-commit custody pHolds = %v, want generation 1 open and generation 2 released", pHolds)
+	}
+	ps, err := f.env.q.WithTx(post).GetActivePublicationResume(f.env.ctx, f.runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ps.State != "active" || ps.WorkerID != sideBefore.WorkerID || string(ps.Handoff) != string(sideBefore.Handoff) || ps.Episode != sideBefore.Episode ||
+		string(ps.Intent) != string(sideBefore.Intent) || ps.CandidateSeq != sideBefore.CandidateSeq || ps.EnrollmentSeq != sideBefore.EnrollmentSeq ||
+		!ps.WaitStartedAt.Time.Equal(sideBefore.WaitStartedAt.Time) || ps.WaitStartedAt.Valid != sideBefore.WaitStartedAt.Valid ||
+		!ps.FirstWaitAt.Time.Equal(sideBefore.FirstWaitAt.Time) || ps.FirstWaitAt.Valid != sideBefore.FirstWaitAt.Valid ||
+		ps.ParkTotal != sideBefore.ParkTotal+1 || ps.HoldReason.Valid {
+		t.Fatalf("post-commit side row:\nbefore %+v\nafter  %+v\nwant only park_total+1 and no hold", sideBefore, ps)
+	}
 }
 
 // ---- lost acknowledgement and unapplied rediscovery ----
