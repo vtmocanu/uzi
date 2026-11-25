@@ -2,6 +2,10 @@
 //
 // The module list provider and the federation wiring (PRD #4686, "Loader"), with only the
 // federation RUNTIME package mocked: ./federation and ./registry are real.
+import * as React from "react";
+import * as ReactDOM from "react-dom";
+import * as JsxRuntime from "react/jsx-runtime";
+import * as ReactRouterDom from "react-router-dom";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -15,6 +19,7 @@ vi.mock("@module-federation/runtime", () => rt);
 
 import { loadModuleList, ModulesProvider, resetModuleListForTests, useModules } from "./registry";
 import { dependencies } from "../../package.json";
+import { HOST_SHARED } from "./hostShared";
 
 const entry = { id: "demo", version: "1", page: "Page", label: "Demo", icon: "package", navGroup: "work" };
 
@@ -149,6 +154,29 @@ describe("federation wiring", () => {
       const range = name === "react/jsx-runtime" ? dependencies.react : dependencies[name as "react"];
       expect(cfg.shareConfig).toEqual({ singleton: true, requiredVersion: range, strictVersion: true });
     }
+  });
+
+  it("hands the runtime the host's real React, ReactDOM, router and jsx-runtime namespaces", async () => {
+    // HOST_SHARED comes from this file's own (non-reset) module graph, so the namespaces are the
+    // ones imported above; a graph reset can re-evaluate an inlined dependency into a new object.
+    vi.resetModules();
+    const federation = await import("./federation");
+    federation.setHostShared(HOST_SHARED);
+    federation.registerModuleRemotes(list);
+    const shared = rt.init.mock.calls[0][0].shared as Record<string, { lib: () => unknown }>;
+    expect(shared.react.lib()).toBe(React);
+    expect(shared["react-dom"].lib()).toBe(ReactDOM);
+    expect(shared["react-router-dom"].lib()).toBe(ReactRouterDom);
+    expect(shared["react/jsx-runtime"].lib()).toBe(JsxRuntime);
+  });
+
+  it("refuses to initialise when setHostShared was never called", async () => {
+    vi.resetModules();
+    const federation = await import("./federation");
+    expect(() => federation.registerModuleRemotes(list)).toThrow(/shared libraries were not provided/);
+    expect(() => federation.reRegisterModule("demo", 1)).toThrow(/shared libraries were not provided/);
+    expect(() => federation.loadModuleRemote("demo/Page")).toThrow(/shared libraries were not provided/);
+    expect(rt.init).not.toHaveBeenCalled();
   });
 
   it("initialises exactly once across register, re-register and load", async () => {

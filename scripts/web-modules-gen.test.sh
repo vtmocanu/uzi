@@ -126,6 +126,20 @@ expect_invalid() {
     bad "values-$1 should be rejected with <$want>: exit $RC, output dir present=$([ -e "$W/fx-out" ] && echo yes || echo no), $ERR"
   fi
 }
+# expect_not_list <suffix>: the chart refuses a non-list web.modules; the generator is given the
+# same value untouched (no `// []`, which would turn false into "no modules") and must refuse it.
+expect_not_list() {
+  NAMED+=("$1")
+  n_invalid=$((n_invalid + 1))
+  yq -o=json '.web.modules' "$FIX/values-$1.yaml" > "$W/fx.json" || broken "yq could not read values-$1.yaml"
+  rm -rf "$W/fx-out"
+  run_gen "$W/fx.json" "$W/fx-out"
+  if [ "$RC" -eq 1 ] && [[ $ERR == *"must be a JSON array"* ]] && [ ! -e "$W/fx-out" ]; then
+    ok
+  else
+    bad "values-$1 (web.modules not a list) should be rejected: exit $RC, $ERR"
+  fi
+}
 expect_valid zero
 expect_valid one
 expect_valid two
@@ -149,6 +163,9 @@ expect_invalid unknown-icon 'unknown icon "rocket"'
 expect_invalid unknown-navgroup 'unknown navGroup "sidebar"'
 expect_invalid adminonly-string 'adminOnly must be a boolean'
 expect_invalid module-not-map 'web.modules[0] must be a map'
+for f in empty-map empty-string false zero; do
+  expect_not_list "modules-$f"
+done
 # Chart-only: web.nginx.resolver has no counterpart in compose.
 SKIPPED="no-resolver bad-resolver"
 for f in $SKIPPED; do

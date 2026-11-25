@@ -64,29 +64,41 @@ case "$P" in mh-4686-[0-9]*) ;; *) broken "project name $P is not a mh-4686-<pid
 # daemon can be shared, so resources of this project name may already exist and would then pass
 # the teardown prefix guard. Every lookup must succeed (a failed lookup is not "empty") and find
 # nothing; otherwise exit BROKEN here, before STACK_TOUCHED is set, so the teardown never runs down.
-lk=$(docker ps -aq --filter "label=com.docker.compose.project=$P" 2>&1) || broken "precheck: cannot list containers of project $P: $lk"
-[ -z "$lk" ] || broken "precheck: project $P already has containers ($lk); not taking ownership"
-lk=$(docker volume ls -q --filter "label=com.docker.compose.project=$P" 2>&1) || broken "precheck: cannot list volumes of project $P: $lk"
-[ -z "$lk" ] || broken "precheck: project $P already has labelled volumes ($lk); not taking ownership"
-lk=$(docker network ls -q --filter "label=com.docker.compose.project=$P" 2>&1) || broken "precheck: cannot list networks of project $P: $lk"
-[ -z "$lk" ] || broken "precheck: project $P already has labelled networks ($lk); not taking ownership"
-lk=$(docker ps -a --format '{{.Names}}' 2>&1) || broken "precheck: cannot list container names: $lk"
+# lookup <docker command...>: stdout lands in LK, stderr in LKERR, status is the command's. A CLI
+# warning on stderr of a successful call must not read as an existing resource, so the two are
+# never merged; a non-zero status is still a failed lookup (broken), not an empty result.
+lookup() {
+  local ef rc
+  ef=$(mktemp) || broken "precheck: cannot create a temporary file"
+  LK=$("$@" 2>"$ef")
+  rc=$?
+  LKERR=$(cat "$ef")
+  rm -f "$ef"
+  return "$rc"
+}
+lookup docker ps -aq --filter "label=com.docker.compose.project=$P" || broken "precheck: cannot list containers of project $P: $LKERR"
+[ -z "$LK" ] || broken "precheck: project $P already has containers ($LK); not taking ownership"
+lookup docker volume ls -q --filter "label=com.docker.compose.project=$P" || broken "precheck: cannot list volumes of project $P: $LKERR"
+[ -z "$LK" ] || broken "precheck: project $P already has labelled volumes ($LK); not taking ownership"
+lookup docker network ls -q --filter "label=com.docker.compose.project=$P" || broken "precheck: cannot list networks of project $P: $LKERR"
+[ -z "$LK" ] || broken "precheck: project $P already has labelled networks ($LK); not taking ownership"
+lookup docker ps -a --format '{{.Names}}' || broken "precheck: cannot list container names: $LKERR"
 while IFS= read -r nm; do
   case "$nm" in "${P}-"*) broken "precheck: a container named $nm already exists; not taking ownership" ;; esac
 done <<EOF
-$lk
+$LK
 EOF
-lk=$(docker volume ls -q 2>&1) || broken "precheck: cannot list volumes: $lk"
+lookup docker volume ls -q || broken "precheck: cannot list volumes: $LKERR"
 while IFS= read -r nm; do
   case "$nm" in "${P}_"*) broken "precheck: a volume named $nm already exists; not taking ownership" ;; esac
 done <<EOF
-$lk
+$LK
 EOF
-lk=$(docker network ls --format '{{.Name}}' 2>&1) || broken "precheck: cannot list networks: $lk"
+lookup docker network ls --format '{{.Name}}' || broken "precheck: cannot list networks: $LKERR"
 while IFS= read -r nm; do
   case "$nm" in "${P}_"*) broken "precheck: a network named $nm already exists; not taking ownership" ;; esac
 done <<EOF
-$lk
+$LK
 EOF
 
 RUN="$ROOT/.uzi/scratch/mh4686-$$"

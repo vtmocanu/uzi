@@ -235,6 +235,6 @@ Not covered by the spike and required in §5: cache headers, a redeploy with an 
 **Measured during implementation** (replacing the earlier UNVERIFIED line):
 
 - Bundle and first-load delta with zero modules, the gzip bundle size and the `/m/example` load cost: see the "Measurement (PRD M1)" Decision Log row (report only, one local environment).
-- Built-mode browser harness: 20/20 scenarios, 54.1 s wall time locally. The hosted CI time is a landing obligation, not measured here.
+- Built-mode browser harness: 21/21 scenarios (two interrupt self-test phases, ready and launch), 43 to 54 s wall time locally across runs. The hosted CI time is a landing obligation, not measured here.
 - `strictVersion` on a React major mismatch: the module is refused, never double-loaded (#RUNTIME-015, verified).
 - `loadRemote` is raced against the 15 s timeout (the runtime is not relied on to honour an abort).

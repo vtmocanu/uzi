@@ -81,7 +81,11 @@ function messageOf(err: unknown): string {
   const parts: string[] = [];
   for (let e: unknown = err, depth = 0; e != null && depth < 4; depth++) {
     parts.push(describeThrown(e));
-    e = (e as { cause?: unknown } | null)?.cause;
+    try {
+      e = (e as { cause?: unknown }).cause;
+    } catch {
+      break; // a throwing `cause` getter or a revoked Proxy ends the chain
+    }
   }
   return parts.join(" | ");
 }
@@ -104,7 +108,11 @@ export function isStaleChunkError(err: unknown, id: string): boolean {
 }
 
 export function classifyLoadError(err: unknown, id: string): ModuleLoadError {
-  if (err instanceof ModuleLoadError) return err;
+  try {
+    if (err instanceof ModuleLoadError) return err; // throws for a revoked Proxy
+  } catch {
+    // classified below from its safe text
+  }
   const msg = messageOf(err);
   if (msg.includes(SHARE_REFUSAL)) {
     return new ModuleLoadError("incompatible", `This module needs a shared library version this uzi does not provide: ${msg}`, { cause: err });

@@ -20,7 +20,13 @@ export class ModuleErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 
   static getDerivedStateFromError(error: unknown): State {
-    return { error: error instanceof Error ? error : new Error(describeThrown(error)) };
+    // `instanceof` throws for a revoked Proxy, and this runs while React unwinds a render.
+    try {
+      if (error instanceof Error) return { error };
+    } catch {
+      // fall through to a safe wrapper
+    }
+    return { error: new Error(describeThrown(error)) };
   }
 
   componentDidCatch(error: unknown) {
@@ -36,7 +42,7 @@ export class ModuleErrorBoundary extends Component<Props, State> {
       return (
         <ModuleErrorCard
           kind={stale ? "stale" : "render"}
-          reason={error.message}
+          reason={describeThrown(error)}
           entry={this.props.entry}
           onRetry={stale ? undefined : this.retry}
         />

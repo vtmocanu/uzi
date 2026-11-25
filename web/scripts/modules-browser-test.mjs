@@ -290,6 +290,15 @@ function shutdown() {
     await withTimeout(Promise.allSettled([browser?.close(), browserServer?.close()]), 3000);
     // 2. unconditionally, even if 1 failed or timed out.
     killBrowserGroup();
+    // 2b. Prove it, then say so BEFORE the caller's process.exit: Playwright's own exit
+    //     handler also SIGKILLs launched browsers' groups, so the interrupt self-test cannot
+    //     tell the harness's cleanup from Playwright's by looking at the group alone. It
+    //     requires this line, with the pgid it learned, instead. Only printed for a known
+    //     group (a shutdown that never learned the pgid prints nothing).
+    if (browserPgid) {
+      const g = await waitGroupGone(browserPgid);
+      if (!g.problem) console.log(`SHUTDOWN group ${browserPgid} gone`);
+    }
     // 3. sockets, 4. servers.
     for (const s of sockets) s.destroy();
     await withTimeout(
@@ -427,6 +436,8 @@ async function selftestInterrupt(phase) {
   const result = await withTimeout(exited, 15000);
   polling = false;
   await poll;
+  // The exit event can precede the last stdout data: let the pipe drain before reading `out`.
+  if (!child.stdout.readableEnded) await withTimeout(new Promise((r) => child.stdout.once("end", r)), 2000);
   const problems = [];
   if (result === "timeout") {
     await killSelfChild();
@@ -436,6 +447,11 @@ async function selftestInterrupt(phase) {
   const reported = /(?:BROWSER|READY) pgid=(\d+)/.exec(out);
   if (reported) groups.add(Number(reported[1]));
   if (groups.size === 0) throw new InstrumentError(`interrupt self-test (${phase}): no browser group was identified, so cleanup cannot be asserted: ${out.trim()}`);
+  // The harness's own shutdown must have killed and verified the group (see shutdown, 2b):
+  // Playwright's exit handler would otherwise make this pass without it.
+  for (const pgid of groups) {
+    if (!out.includes(`SHUTDOWN group ${pgid} gone`)) problems.push(`the harness's shutdown never reported group ${pgid} gone (cleanup relied on something else)`);
+  }
   const via = [];
   for (const pgid of groups) {
     const g = await waitGroupGone(pgid);
@@ -1106,7 +1122,7 @@ async function runScenarios(dirs) {
     }
   });
 
-  await scenario("ex.4: zero modules fetch no federation code (manifest traversal a-d); with modules, no remoteEntry before a module route", async (ctxf) => {
+  await scenario("ex.4: zero modules fetch no federation code (manifest traversal a-e); with modules, no remoteEntry before a module route", async (ctxf) => {
     assert(fed.only.size > 0, "the host build has no federation-only files; the check would be vacuous");
     const ctx = await ctxf();
     const mark = world.log.length;

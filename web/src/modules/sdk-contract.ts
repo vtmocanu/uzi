@@ -8,8 +8,10 @@
 // sdk.ts and are NOT part of what a module vendors.
 //
 // Within a major version changes are additive only. The host supports exactly one major.
-// sdk.ts assigns the host's real components to `HostSdkV1["ui"]`, so a host component whose
-// props drift away from the prop types below fails the host's type-check.
+// sdk.ts assigns the host's real components to `HostSdkV1["ui"]` and checks that every prop key
+// named below still exists on the host component, so a host component that drops a prop, narrows
+// a prop's type or adds a required prop fails the host's type-check. (Host-only extra optional
+// props are allowed.)
 
 import type { ButtonHTMLAttributes, ReactNode, Ref, SelectHTMLAttributes } from "react";
 

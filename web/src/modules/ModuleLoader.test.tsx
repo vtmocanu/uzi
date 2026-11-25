@@ -215,4 +215,22 @@ describe("values that cannot be stringified", () => {
     expect(screen.getByText("shell")).toBeTruthy();
     expect(screen.getByTestId("module-error-reason").textContent).toBe("non-Error value thrown");
   });
+
+  // A revoked Proxy cannot be thrown from render: React itself reads `.then` on a thrown object
+  // before any boundary runs, and that read throws. The seam this host owns is a failed load.
+  it("a revoked Proxy as the load failure shows the module error card inside the shell", async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    fed.loadModuleRemote.mockRejectedValue(proxy);
+    render(
+      <MemoryRouter>
+        <header>shell</header>
+        <ModuleLoader entry={entry} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(retry()).not.toBeNull());
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(screen.getByText("shell")).toBeTruthy();
+    expect(screen.getByTestId("module-error-reason").textContent).toBe("non-Error value thrown");
+  });
 });

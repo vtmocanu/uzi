@@ -14,7 +14,7 @@ import type { ModuleEntry } from "./manifest";
 import { countModuleStat } from "./stats";
 
 // The host's shared libraries, handed in by the entry chunk (hostShared.ts) through
-// importFederation (federationEntry.ts). This file must NOT import react, react-dom,
+// the wrappers in federationEntry.ts (registerModuleRemotes, reRegisterModule, loadModuleRemote). This file must NOT import react, react-dom,
 // react-router-dom or the package.json files itself: a static import of any module that
 // lives in the entry chunk gives this lazy chunk an edge back to the entry, and rolldown
 // then moves its CommonJS interop helpers into a separate runtime chunk that the entry
