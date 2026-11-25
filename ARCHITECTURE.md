@@ -638,7 +638,12 @@ per-token readings — and the SPA renders them as meters in three places: a
 Settings card, a sidebar micro-meter, and an Admin → Rate limits table. See
 [prds/done/53-rate-limits.md](prds/done/53-rate-limits.md) (especially its Design
 Decisions) for the full rationale, including the vault-locked staleness
-rule and the failure/backoff semantics; user-facing behavior is in
+rule and the failure/backoff semantics; the gauges keep no history themselves,
+but every accepted reading is also copied best effort, after the gauge write,
+into raw five-minute `anthropic_usage_samples` / `codex_usage_samples` rows with
+no default deletion (PRD #4692,
+[prds/done/4692-provider-usage-limit-history.md](prds/done/4692-provider-usage-limit-history.md),
+[docs/provider-usage-history.md](docs/provider-usage-history.md)); user-facing behavior is in
 [docs/rate-limits.md](docs/rate-limits.md).
 
 ## Codex account rate-limit visibility (PRD #1209)
