@@ -514,6 +514,59 @@ func TestAnalyticsSpendMergeWitnessInvarianceLiveDB(t *testing.T) {
 	wantRatio(t, "A's own pre-fold witness", withOwn.Doc.CostPerMergedPR.Current, "2.000000", 1, "2.000000", "")
 }
 
+// witnessScopes runs fn once per statement: the owner statement and the all-users
+// statement (no owner, isolated by the repo filter).
+func witnessScopes(t *testing.T, o spendOwner, repo uuid.UUID, fn func(t *testing.T, c spendCall)) {
+	t.Helper()
+	t.Run("owner", func(t *testing.T) { fn(t, spendCall{Owner: o.User, Now: spendNow, Repo: repo}) })
+	t.Run("all", func(t *testing.T) { fn(t, spendCall{Now: spendNow, Repo: repo}) })
+}
+
+// The merge witness decides only whether a selected PR merged; it ignores the harness filter.
+func TestAnalyticsSpendWitnessIgnoresHarnessFilterLiveDB(t *testing.T) {
+	f := newSpendFixture(t)
+	o := f.owner("witharn")
+	repo, _ := f.repo(o, "witharn")
+
+	issue := f.run(spendRun{Owner: o.User, Repo: repo, Harness: "claude", At: spendDay(3, 9), MR: 61, MRState: "opened"})
+	f.metered(issue, "model-a", "2.000000")
+	other := f.run(spendRun{Owner: o.User, Repo: repo, Harness: "codex", At: spendDay(4, 9), MR: 61, MRState: "merged"})
+	f.metered(other, "model-a", "7.000000")
+
+	witnessScopes(t, o, repo, func(t *testing.T, c spendCall) {
+		c.Harness = "claude"
+		res := f.call(c)
+		wantRatio(t, "cost_per_merged_pr", res.Doc.CostPerMergedPR.Current, "2.000000", 1, "2.000000", "")
+		wantDollars(t, "totals.current.cost", res.Doc.Totals.Current.Cost, "2.000000")
+		if res.Doc.Totals.Current.Runs != 1 {
+			t.Errorf("totals.current.runs = %d, want 1", res.Doc.Totals.Current.Runs)
+		}
+	})
+}
+
+// The merge witness also ignores the kind filter: a rework's merged state counts for the
+// issue run's PR while the rework's own cost stays out of the selection.
+func TestAnalyticsSpendWitnessIgnoresKindFilterLiveDB(t *testing.T) {
+	f := newSpendFixture(t)
+	o := f.owner("witkind")
+	repo, _ := f.repo(o, "witkind")
+
+	issue := f.run(spendRun{Owner: o.User, Repo: repo, At: spendDay(3, 9), MR: 62, MRState: "opened"})
+	f.metered(issue, "model-a", "2.000000")
+	rw := f.run(spendRun{Owner: o.User, Repo: repo, Kind: runkind.MRRework, Target: issue, At: spendDay(4, 9), MR: 62, MRState: "merged"})
+	f.metered(rw, "model-a", "5.000000")
+
+	witnessScopes(t, o, repo, func(t *testing.T, c spendCall) {
+		c.Kinds = []string{runkind.Issue}
+		res := f.call(c)
+		wantRatio(t, "cost_per_merged_pr", res.Doc.CostPerMergedPR.Current, "2.000000", 1, "2.000000", "")
+		wantDollars(t, "totals.current.cost", res.Doc.Totals.Current.Cost, "2.000000")
+		if res.Doc.Totals.Current.Runs != 1 {
+			t.Errorf("totals.current.runs = %d, want 1", res.Doc.Totals.Current.Runs)
+		}
+	})
+}
+
 func TestAnalyticsSpendPRAttributionWithinWindowLiveDB(t *testing.T) {
 	f := newSpendFixture(t)
 	o := f.owner("prattr")
