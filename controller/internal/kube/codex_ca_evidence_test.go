@@ -540,11 +540,13 @@ func TestCodexCAPressureRecycleRestartDropsTheEnv(t *testing.T) {
 	}
 }
 
-// AC8c (default admission): the same restart without the operator's force-roll. A lone
-// worker has no roll coverage, so the drift between the retained Deployment (rendered with
-// the env) and the now-keyless render is NOT admitted: the retained Deployment gets no
-// template write, so it is neither given nor stripped of anything, while the replacement
-// claim is minted unstamped. Only ForceRoll (the test above) admits the replacement.
+// AC8c (default admission): the same restart without the operator's force-roll. Losing the
+// carry changes the target while the retained reservation is pinned to the env-bearing
+// render, and the existing roll machinery holds any target change made during a retained
+// reservation ("participant reservation without canary; explicit recovery required"): the
+// retained Deployment gets no template write, so it is neither given nor stripped of
+// anything, while the replacement claim is minted unstamped. Only explicit recovery or
+// ForceRoll (the test above) admits the replacement. Accepted, documented boundary.
 func TestCodexCAPressureRecycleRestartDefaultAdmissionWritesNoTemplate(t *testing.T) {
 	m, c, w, cfg := recycleFixture(t, true)
 	before := depHash(caDep(t, c, cfg.Namespace, "w1"))

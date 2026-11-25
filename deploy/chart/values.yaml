@@ -542,9 +542,11 @@ workers:
   # carries UZI_CODEX_CA_FILE (earlier controllers added it whenever this was set) now drifts
   # and, once the ordinary roll admits it, rolls without it; those created with the extra CA
   # lose the Codex CA until reprovisioned. A worker still on its pre-CA template does not
-  # drift. A controller restart between a new worker's Secret create and its /data claim
-  # create leaves that worker without the Codex CA (its first Deployment never gets it), and
-  # a restart during a /data recycle leaves the replacement without it.
+  # drift on this account. A controller restart between a new worker's Secret create and its
+  # /data claim create leaves that worker without the Codex CA (its first Deployment never
+  # gets it). A restart during a /data recycle leaves the replacement without it; if the
+  # recycle retained the Deployment at zero replicas, that worker stays scaled to zero
+  # (reported as a roll hold) until explicit recovery or a force roll.
   # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
   # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
   # no other api client; the api refuses to boot if the file is unreadable or holds no
