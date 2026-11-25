@@ -8,7 +8,7 @@ audience: operator
 
 A **module** is a separately built and deployed web feature that appears inside uzi as a native page: it gets uzi's shell, router, theme and session, a sidebar entry, a command-menu entry and a route at `/m/<id>`. You enable modules in deployment configuration (the Helm chart or the compose generator); no web image rebuild is needed. This page is for operators. To build a module, see [web-modules-dev.md](./web-modules-dev.md). Design rationale: `prds/done/4686-runtime-web-modules.md`.
 
-With no modules configured, uzi looks and behaves as before. The host fetches one small, no-cache `GET /modules.json` (a `[]` file) and never loads the federation runtime. One local measurement of a cold `/dashboard` load counted about 37 KB more JavaScript and two more requests than before the feature; that was a single noisy run, not a guarantee.
+With no modules configured, uzi looks and behaves as before. The host fetches one small, no-cache `GET /modules.json` (a `[]` file) and never loads the federation runtime. One local measurement of a cold `/dashboard` load counted about 36 KB more JavaScript (about 37 KB more transferred) and two more requests than before the feature; that was a single noisy run, not a guarantee.
 
 ## Trust model
 
@@ -77,7 +77,7 @@ The compose stack takes the same list through a generator and an override file.
    scripts/web-modules-gen.py deploy/compose/web-modules.example.json .web-modules
    ```
 
-   The output directory gets `locations.conf` (one proxy location per module) and `modules.json` (the public list). The override bind-mounts `${UZI_WEB_MODULES_DIR:-./.web-modules}`; if you set `UZI_WEB_MODULES_DIR`, pass that same directory to the generator. The directory must exist before `up` (the mount does not create it), and its files must be world-readable.
+   The output directory gets `locations.conf` (one proxy location per module) and `modules.json` (the public list). The override bind-mounts `${UZI_WEB_MODULES_DIR:-./.web-modules}`; if you set `UZI_WEB_MODULES_DIR`, pass that same directory to the generator (use an absolute path, or run both from the repo root: compose resolves a relative path against the project directory, the generator against the current directory). The directory must exist before `up` (the mount does not create it), and its files must be world-readable.
 3. Start the stack with the override and recreate `web`:
 
    ```sh
@@ -118,7 +118,7 @@ Every module gets one `location ^~ /modules/<id>/` proxying to its upstream with
 
 ## What is not contained
 
-The host contains these failures to the module's own page: a load failure (network error, HTTP error, timeout), an error thrown while rendering, and a refusal (contract or shared-version mismatch). It does not contain:
+The host contains these failures to the module's own page: a load failure (network error, HTTP error, timeout), an error thrown while rendering, and a refusal (contract, shared-version or missing-expose mismatch). It does not contain:
 
 - A module's JavaScript. It is not sandboxed and can call any API as the signed-in user.
 - Errors in a module's own async code outside React rendering. They surface as console errors and unhandled rejections.

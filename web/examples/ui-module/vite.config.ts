@@ -1,5 +1,6 @@
-// Build config for the example runtime web module (PRD #4686). A real module repo copies
-// this file: it is the reference for what a federated module must set.
+// Build config for the example runtime web module (PRD #4686). A real module repo uses
+// this file as a guide (not a drop-in copy): it is the reference for what a federated
+// module must set; docs/web-modules-dev.md says what to vendor and what to drop.
 //
 // NOT SHIPPED. Nothing in a uzi image, chart or workflow builds or publishes this module; it
 // is the acceptance fixture for the host (the browser harness web/scripts/modules-browser-test.mjs
