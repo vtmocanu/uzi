@@ -959,6 +959,9 @@ type HTTPClient struct {
 	streamReconcile   time.Duration
 	streamBackoffBase time.Duration
 	streamBackoffMax  time.Duration
+	// streamAfter, when set, replaces time.After for the reconnect backoff wait so
+	// a test can observe how often the redial deadline is armed and fire it on cue.
+	streamAfter func(time.Duration) <-chan time.Time
 }
 
 // NewHTTPClient builds the live client from resolved settings.
