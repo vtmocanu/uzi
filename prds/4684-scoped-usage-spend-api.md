@@ -1,7 +1,7 @@
 # PRD #4684: Scoped run usage API: filter options and Spend
 
 **Issue:** #4684.
-**Status:** Ready.
+**Status:** Implemented; owner decision pending on the admin all-users `window=all` latency limit.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** API, DTO contracts, docs and specs. Additive view/index migrations only. No user-interface or command implementation. No changes under `.github/workflows/**`, including validation.
@@ -69,6 +69,8 @@ For an admitted request, create one approximately eight-second request deadline 
 
 Capture the injectable Go clock once and pass `@now`, `@from`, `@to` and previous-period bounds. This SQL never calls `now()`. Preserve session TimeZone independence: use three-argument `date_trunc` and the timezone-aware four-argument `generate_series` (PostgreSQL 17). Apply sargable half-open timestamp predicates before folding.
 
+**Amendment D-A: Go-authoritative calendar (owner-accepted, rev 6 plan review).** This supersedes the `date_trunc` / `generate_series` sentence above and the rolling-bound wording below. Go computes every boundary (`analytics.DayStart`: the earliest instant whose local date is at least D). SQL does only half-open membership against Go-supplied arrays (`bucket_starts[]`, `bucket_ends[]`, `roll_starts[]`, `roll_ends[]`): no `date_trunc`, no `generate_series`, no `now()`, and `@now = @to`. Buckets are contiguous first-midnight intervals `[dayStart(D), dayStart(D+1))`, so a wholly skipped date yields one bucket fewer and a rollback across midnight puts the repeated instants in the later bucket. The last bucket ends at `@now` and is empty (still emitted) when `@now` is a local midnight. A rolling point covers the seven local dates ending at the last date its bucket covers, whatever the bucket width, clipped at `history_start`; it is partial when that unclipped range starts before `history_start` or belongs to today's bucket. The rolling ratio series attributes per local day over the fold range (`previous_from`, or `history_start` for `all`); the displayed bucket panel and the headline attribute over `[from, now)`.
+
 `7d` is today plus six preceding local calendar days; 30d/90d are analogous, with the last bucket ending at captured now and marked partial. The previous comparison is the immediately preceding equal number of whole calendar days; report those actual bounds, so the partial/current-versus-full comparison is explicit. All time covers the scope's complete creation history, starting at its aligned week; use 1, 2, 4, 8... week buckets until at most 104 are needed. Report the width; do not truncate history. Empty scopes return bounded empty data without inventing an earliest run.
 
 For `window=all` there is no previous period: the previous bounds are absent and every fold below that is written over `[previous_from, to)` uses `[history_start, to)`, where `history_start` is the aligned start of the scope's creation history. Seven-day rolling series (Spend's rolling ratios here, and any later section's) have one point per displayed bucket (so at most the bucket count, ≤ 104 points). Each point covers the seven local calendar days ending at that bucket's end (captured now for the last bucket), using real data from before the window where it exists: the fold's lower bound for these series extends six days before the window start (before `history_start` for `window=all` it has nothing to extend into). A point is marked partial when its seven days are not fully covered, that is when they reach before `history_start` or end at captured now. Pin both rules in fixtures, including week-wide all-time buckets and the point ending today.
@@ -95,6 +97,8 @@ Return run-level metered, subscription, unreported and missing-usage counts. Cov
 Canonical PR identity is `(repo_id, mr_iid)`: `repos` is unique on `(connection_id, forge_project_id)`, and a connection has one owner. This concretely means forge connection + repository + PR number. Instance totals can count the same external PR twice when two owners connected it; disclose that boundary.
 
 A PR is currently considered merged if any retained run with that identity has `mr_state='merged'`. Do not inspect only a helper run's stale state. Existing issue watchers update the relevant latest completed run; board-free watchers stop on terminal states. Disclose current-state coverage limitations.
+
+**Amendment D-B: scoped merge witnesses (owner-accepted, rev 6 plan review).** "Any retained run" above means any run in the response's own scope. A PR is merged when a run in that scope with the same `(repo_id, mr_iid)` has `mr_state = 'merged'`, whatever its creation time. Owner-shaped statements add `w.user_id = @user_id` to the witness; only the admin all-users statement has no owner predicate. An owner's figure therefore never depends on another owner's runs.
 
 Select PR identities through filtered creation-cohort Delivery runs. Assign each selected PR to exactly one bucket, the earliest matching cohort run referencing it. Cost-per-merged-PR numerator includes every filtered cohort Delivery run carrying a selected PR, including prompt, failed attempts and rework; runs without a PR are outside this ratio. The denominator is distinct selected currently merged PRs. It is a cohort ratio, not a ledger or actual merge-day activity. Rolling ratios divide summed numerators by summed denominators, never average daily ratios. This attribution differs from the existing usage endpoints' PR counts; say so in the docs.
 
@@ -152,5 +156,43 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Reuse the existing outcome classification, incl. `base_diverged` | One definition across endpoints; reject a second failure taxonomy. |
 | API only | Consumers share one bounded statistical contract without presentation coupling. |
 | Spend first, outcome analysis as its own issue | Each is useful alone; one PRD is one run and one PR. This issue builds the shared boundary; the next reuses it. |
+| D-A: Go-authoritative calendar (owner-accepted, rev 6 plan review) | Go owns every boundary and SQL only tests membership against arrays, so DST, skipped dates and the all-time week anchor have one definition (Go's `ZoneBounds` can report an end before the queried instant in far-future years, and `ParseInLocation` can run backwards, so `DayStart` is a bounded search pinned by tests); reject SQL calendar arithmetic, which would put a second definition in the query. |
+| D-B: merge witnesses scoped to the response (owner-accepted, rev 6 plan review) | An owner's cost per merged PR must not depend on other owners' runs; reject an instance-wide witness behind an owner filter. |
+| Repo masking on the owner route only | Owners must not learn foreign repo ids; an admin route has no such boundary, and an admin selecting a user may see that user's foreign repo (but cannot filter by it). Which applies comes from the mounted route, never a parameter; reject masking on admin routes. |
+| Snapshot helper in the `store` package (`RunAnalyticsSnapshot`) | One place owns the REPEATABLE READ READ ONLY transaction, the 8 s deadline, `SET LOCAL` settings and rollback; reject per-handler transaction code. |
+| `SET LOCAL jit = off` in the snapshot | Admin all-users Spend was JIT-compiling about 446 functions: 8.2 s with JIT, 1.3 s without (30d); reject a server-wide `jit` change. |
+| Keep the lateral `OFFSET 0` fold over shape (b) `run_id = ANY(ARRAY(SELECT ...))` | Shape (b) is 5-10% faster on custom plans but 30x to 170x slower on generic plans (owner 30d 9.2 s, admin 30d 215 s); the lateral stays bounded under both. See ADR-1620's #4684 addendum. |
+| No index added | Four candidates (`runs (created_at)` and three `runs (repo_id, mr_iid)` variants) gave at most 7.8% p95 gain (owner) and 4.9% (admin 30d), under the 20% bar, at 0.45-2.7 MB each; reject carrying write cost for noise. Numbers below. |
 
-**UNVERIFIED before implementation:** latency, disk bytes, query plans and suite-runtime impact. These require the stated offline measurements; no external lookup is left to the implementation worker.
+## 8. Measurement evidence
+
+Method: throwaway PostgreSQL 17.12 with default settings (shared_buffers 128MB, work_mem 4MB, jit_above_cost 100000), the exact sqlc statement text prepared, `now` fixed, a single host (a few percent noise). Harness: `analytics_evidence_livedb_test.go` under the `analyticsevidence` build tag and `UZI_ANALYTICS_PLAN_EVIDENCE=1`, not a gate and not committed. Raw logs were not kept in the repository.
+
+**Seed:** 120,000 runs, 845,988 `run_usage` legs (8 per run), 200 owners (largest 20.1% of runs, top 10 59.8%), 1,250 repos, three years of history (10.2% of runs in 30d, 15.2% in 90d), 80.9% Delivery and 19.1% Supporting kinds (judge 17%, chat 2%), 23.4% carry an MR. `mr_rework` and `cross_check` were not seeded. `ANALYZE` run. Disk: `runs` 97.6 MB (indexes 43.4 MB), `run_usage` 201.4 MB (indexes 64.4 MB).
+
+**Timings** (custom plan, median / p95 ms):
+
+| Workload | JIT on | JIT off (shipped) |
+|---|---|---|
+| Admin all-users 30d | 8193 / 8338 | 1283 / 1302 |
+| Admin all-users 30d, `split=user`, `breakdown=user` | 8294 / 8446 | 1310 / 1320 |
+| Owner 30d | 710 / 722 | 250 / 254 |
+| Owner 90d | 908 / 935 | 425 / 435 |
+| Admin all-users `window=all` | 15678 / 15818 | 9599 / 9749 (10017 / 10090 on a second pass) |
+
+Generic plans get no JIT: admin 30d 1295 / 1312, owner 30d 289 / 291. Admin options 24 ms.
+
+**Indexes** (JIT off, custom, median / p95 ms; baseline owner 30d 250 / 254, admin 30d 1283 / 1302, admin `all` 9599 / 9749, admin options 24.1 / 25.9):
+
+| Candidate | Bytes | Owner 30d | Admin 30d | Admin `all` | Admin options |
+|---|---|---|---|---|---|
+| `runs (created_at)` | 2,719,744 | 246 / 251 | 1253 / 1266 | 9748 / 9833 | 1.5 / 1.7 |
+| `runs (repo_id, mr_iid) WHERE mr_iid IS NOT NULL` | 1,081,344 | 235 / 241 | 1265 / 1272 | 9972 / 10037 | 24.2 / 25.9 |
+| `runs (repo_id, mr_iid) WHERE mr_state = 'merged'` | 450,560 | 245 / 246 | 1254 / 1259 | 9635 / 9773 | 24.1 / 26.0 |
+| `runs (user_id, repo_id, mr_iid) WHERE mr_state = 'merged'` | 630,784 | 227 / 234 | 1188 / 1238 | 9665 / 9805 | 23.7 / 26.1 |
+
+None was kept, so there is no index migration. Side effects noted: `created_at` takes the admin history-start `MIN` from 24 ms to 1.5 ms, and the merged-witness indexes turn a 30 ms sequential scan into a 1.5 ms index-only scan.
+
+**Finding, not fixed here:** admin all-users `window=all` takes 9.6-10.2 s with JIT off (15.7 s with it), over the 8 s `statement_timeout`, so it returns 503. In its plan the per-run `model_fold` lateral is the largest node (about 5.2 s of 117,550 per-run scans); the next is the breakdown and split ranking family (external-merge sorts and window passes over 117,550 rows, about 4 s inclusive), so removing the fold alone would still leave it near 5 s. Closing it needs a design decision: cap `all` for the admin all-users scope, precompute per-run totals, or a larger budget. No redesign was attempted. This is the open owner decision in the status line, and M1 stays unticked until it is made.
+
+**Not measured:** owner `window=all`; `mr_rework` and `cross_check` runs; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).

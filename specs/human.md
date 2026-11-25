@@ -453,6 +453,9 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-report
 - Chat runs are out of scope (not counted). [user]
 - Shipped surfaces validated against the approved mock (+ addendum). [user 2026-07-12]
 - A Claude run's usage not covered by any SDK result (an interrupted session's tail) is recorded and shown apart from the metered total, labelled estimated with its price provenance, as unknown cost when unpriced (never $0), with a coverage indicator. (AI-synced 2026-10-03)
+- A scoped analytics API (API only, no UI or command yet; `docs/usage-analytics.md`) gives filter options and Spend at `/api/analytics/{options,spend}` (the caller's own runs) and `/api/admin/analytics/{options,spend}` (admin read group; an ordinary Bearer token never reaches it). Calendar windows (`7d`/`30d`/`90d`/`all`, any timezone) are computed in Go with contiguous first-midnight buckets, so SQL only tests half-open membership and a skipped local date yields one bucket fewer. Repo masking (`inaccessible_repo`) applies on the owner route only. Every block discloses metered, subscription, unreported and missing runs; chat is only `untracked_chat_runs`. (AI-synced 2026-11-25, #4684)
+- Cost per merged PR counts a PR as merged when any run in the response's own scope with that (repo, PR number) is merged, so an owner's figure never depends on another owner's runs, and instance totals can count one external PR twice when two owners connected it. Each PR's cost goes to its earliest run's bucket (the rolling series: its earliest run's day over the fold range), which differs from the `/api/usage` PR counts. (AI-synced 2026-11-25, #4684)
+- Known limit, pending an owner decision: on a 120,000-run seed an admin all-users `window=all` request takes about 10 s and returns 503 at the 8 s budget; 30d takes about 1.3 s for an admin and 0.25 s for an owner. (AI-synced 2026-11-25, #4684)
 
 ## Feature — Run retrospective (LLM judge) & self-improvement job
 
