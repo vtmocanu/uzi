@@ -336,4 +336,15 @@ describe("provider judge: reported reasons and fallbacks are scrubbed of the key
     assert.ok(JSON.stringify(calls.review).includes(REDACTED));
     assert.equal(calls.states.at(-1)?.status, "completed");
   });
+
+  it("a key straddling the fallback's 200-char evidence clip is scrubbed before clipping, leaving no partial prefix", async () => {
+    const api = fakeClient({ getTrace: async () => { throw new Error("trace down"); } });
+    // The clip keeps the first 188 chars, so the key (starting at 160) would be cut mid-key.
+    const evidence = `${"x".repeat(160)}${KEY}: command not found`;
+    const claim = providerClaim({ judge_signal: { missing_tools: [{ command: "jq", evidence }] } });
+    const { calls } = await run([], claim, { client: api });
+    const rationale = calls.review?.recommendations?.[0]?.rationale ?? "";
+    assert.ok(rationale.includes(REDACTED), "the key is replaced before the clip");
+    assert.ok(!rationale.includes(KEY.slice(0, 12)), "no partial key prefix survives the clip");
+  });
 });

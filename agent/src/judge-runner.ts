@@ -423,7 +423,7 @@ export class JudgeRunner {
         run_id: judgeRunId,
         error: errMessage(err),
       });
-      review = fallbackReview(claim.judge_signal);
+      review = fallbackReview(claim.judge_signal, providerScrub);
       if (providerCredential) {
         // The signal derives from the target's tool trace and may carry the key.
         review = redactStrings(review, providerScrub);
@@ -663,7 +663,7 @@ export class JudgeRunner {
       );
     } catch (err) {
       this.log.warn("judge prompt build failed; using deterministic fallback", { run_id: claim.run_id, error: scrub(errMessage(err)) });
-      const fb = redactStrings(fallbackReview(claim.judge_signal), scrub);
+      const fb = redactStrings(fallbackReview(claim.judge_signal, scrub), scrub);
       fb.model = scrub(model);
       return { review: fb };
     }
@@ -695,7 +695,7 @@ export class JudgeRunner {
       if (err instanceof LimitReachedError || err instanceof ProviderJudgeTerminalError) throw err;
       if (err instanceof ProviderJudgeStatusError) {
         this.log.warn("provider judge model returned a non-limit error status; using deterministic fallback", { run_id: claim.run_id });
-        const fb = redactStrings(fallbackReview(claim.judge_signal), scrub);
+        const fb = redactStrings(fallbackReview(claim.judge_signal, scrub), scrub);
         fb.model = scrub(model);
         return { review: fb };
       }
@@ -708,7 +708,7 @@ export class JudgeRunner {
       return { review: redactStrings(review, scrub), usageMessage };
     } catch (err) {
       this.log.warn("judge model output unusable; using deterministic fallback", { run_id: claim.run_id, error: scrub(errMessage(err)) });
-      const fb = redactStrings(fallbackReview(claim.judge_signal), scrub);
+      const fb = redactStrings(fallbackReview(claim.judge_signal, scrub), scrub);
       fb.model = scrub(model);
       return { review: fb, usageMessage };
     }
@@ -1168,11 +1168,16 @@ function sliceFirstObject(text: string, from = 0): { start: number; slice: strin
 
 /** The deterministic fallback review (Decision 4): a run whose model call failed still
  *  yields the command-not-found findings the API pre-scanned. status="failed" marks it. */
-export function fallbackReview(signal: JudgeSignal | null | undefined): ReviewRequest {
+export function fallbackReview(
+  signal: JudgeSignal | null | undefined,
+  // Provider mode: scrub each signal string BEFORE clipping, so a key straddling the clip
+  // boundary cannot survive as a partial prefix the exact-form redactor no longer matches.
+  scrub: (s: string) => string = (s) => s,
+): ReviewRequest {
   const recommendations: ReviewRecommendation[] = (signal?.missing_tools ?? []).map((m) => ({
     category: "install_worker_tool",
-    target: m.command,
-    rationale: `A shell reported this command missing during the run: ${clip(m.evidence, 200)}`,
+    target: scrub(m.command),
+    rationale: `A shell reported this command missing during the run: ${clip(scrub(m.evidence), 200)}`,
     confidence: "high",
   }));
   return {
