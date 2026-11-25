@@ -53,13 +53,13 @@ CHECKs keep the pair honest and the scopes closed:
 |---|---|
 | `model_providers_shared_mode_check` | `(owner_user_id IS NULL) = (credential_mode IS NOT NULL)` |
 | `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key')` |
-| `model_providers_shared_engine_check` | `owner_user_id IS NOT NULL OR engine IN ('claude', 'codex')` (Claude only until #4633 widened it, migration 00532) |
+| `model_providers_shared_engine_check` | `owner_user_id IS NOT NULL OR engine IN ('claude', 'codex')` (Claude only until #4633 widened it, migration 00532 model_providers_shared_codex_engine) |
 | `model_providers_scope_owner_check` | `scope_owner_id = COALESCE(owner_user_id, nil)`, never NULL |
 | `model_providers_owner_not_nil_check` | no personal owner is the nil UUID |
-| `user_secrets_provider_scope_check` | id and scope both NULL, or both set with scope = the user, or the nil scope for kind `anthropic_compatible_key` only (also `openai_compatible_key` since #4633, migration 00533) |
+| `user_secrets_provider_scope_check` | id and scope both NULL, or both set with scope = the user, or the nil scope for kind `anthropic_compatible_key` only (also `openai_compatible_key` since #4633, migration 00533 user_secrets_shared_codex_scope) |
 | `users_claude_provider_scope_check` | id and scope both NULL, or both set with scope = the user or the nil scope |
 
-Explicit NULL checks mean SQL's UNKNOWN cannot admit a half-set pair. A private provider owned by A therefore cannot be referenced by B's key or source even by a direct write, a Codex key could never carry the shared scope, and `users.codex_provider_id` kept its owner-bound composite FK (00517), so a shared definition could never be a Codex source. **Both statements were true for the original delivery only**: #4633 relaxed them (migrations 00533 and 00534, see the amendment). The database constraints, the SQL predicates and the handler checks are independent layers: each rejects the cross-owner reference on its own. The parent key `model_providers_owner_id_key` (00476) is untouched: it stays as the owner-keyed parent even though `users_codex_provider_fkey` moved to the scope key in #4633.
+Explicit NULL checks mean SQL's UNKNOWN cannot admit a half-set pair. A private provider owned by A therefore cannot be referenced by B's key or source even by a direct write, a Codex key could never carry the shared scope, and `users.codex_provider_id` kept its owner-bound composite FK (00517), so a shared definition could never be a Codex source. **Both statements were true for the original delivery only**: #4633 relaxed them (migrations 00533 user_secrets_shared_codex_scope and 00534 users_codex_provider_scope, see the amendment). The database constraints, the SQL predicates and the handler checks are independent layers: each rejects the cross-owner reference on its own. The parent key `model_providers_owner_id_key` (00476) is untouched: it stays as the owner-keyed parent even though `users_codex_provider_fkey` moved to the scope key in #4633.
 
 ### D4. Engine: Claude, or Codex since #4633
 
@@ -71,7 +71,7 @@ An admin sets engine, base URL, protocol and auth style once. The **engine never
 
 An edit of the model map creates a new immutable revision. A fresh run freezes the current revision, so the map decides which model and context window a user's own key pays for on the next fresh run. This is an accepted trust decision for the admin and is stated in the user-facing disclosure. Frozen runs keep their revision.
 
-The accepted redirect residual of [ADR-4320](4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay) applies to a shared definition under either auth style (owner decision, 2026-11-20), and to a shared Codex definition under its Bearer auth as ADR-4320 records for Codex providers: a redirecting gateway can re-send a selecting user's prompts to the `Location` host and the key to a same-host sibling path, and cross-host under `x_api_key`. Exact-key redaction and the push scan are unchanged. The attach and select panels say so.
+The accepted redirect residual of [ADR-4320](4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-activated-without-the-relay) applies to a shared definition under either auth style (owner decision, 2026-11-20). For a shared Claude definition, a redirecting gateway can re-send a selecting user's prompts to the `Location` host and the key to a same-host sibling path under Bearer, or cross-host under `x_api_key`. A shared Codex definition has no same-host limit: the runtime can forward the Bearer header beyond the approved URL (see "Redirect exposure" in [the amendment](#amended-for-4633-2026-11-25) and ADR-4320). Exact-key redaction and the push scan are unchanged. The attach and select panels say so.
 
 ### D6. Per-user Test evidence
 
@@ -98,7 +98,7 @@ Every path takes locks in one order, so no cycle exists:
 ### D8. Deletion, retirement and chat
 
 - **Retire** stops fresh selections and runs. A user who selected it keeps the selection, which reads as `provider_source_unusable`; nothing falls back to vendor spend. Frozen runs keep their binding (#4320's retire versus revoke). A retired definition still counts toward the 50-definition shared cap, enforced across all admins under the catalogue lock. A user can still disable or delete their own key on a retired definition.
-- **Delete is refused while any user has it selected**: 409 `provider_in_use_as_source`, from the selection count under the definition lock, with the `users_claude_provider_fkey` `RESTRICT` as the structural backstop. When allowed, it deletes every user's attached key (their Test evidence cascades), preserves run history, makes non-terminal bound runs `provider_binding_stale` at their next claim, and answers 200 with `deleted_key_count`, the exact number of keys removed, which is also logged.
+- **Delete is refused while any user has it selected**: 409 `provider_in_use_as_source`, from the selection count under the definition lock, with the `users_claude_provider_fkey` `RESTRICT` (and, since #4633, `users_codex_provider_fkey`, migration 00534 `users_codex_provider_scope`) as the structural backstop. When allowed, it deletes every user's attached key (their Test evidence cascades), preserves run history, makes non-terminal bound runs `provider_binding_stale` at their next claim, and answers 200 with `deleted_key_count`, the exact number of keys removed, which is also logged.
 - **Chat fails closed.** `CreateChatRun` resolves the Claude source through the engine source reader. A store that cannot read the provider source returns an error; it never creates an unchecked vendor chat.
 
 ### D9. Audit
@@ -153,22 +153,24 @@ Admin-shared **Codex** definitions (issue #4633). The Claude decisions above sta
 - With no usable key, run creation is refused as `provider_source_unusable`. There is never a fallback to the vendor Codex credential.
 - Frozen bindings work as for Claude. A run binds the revision and the recipient's key; an admin edit makes a new revision for fresh runs only; retirement refuses fresh runs while inherited and reclaimed runs keep their binding; rotating, disabling or deleting the key makes the next claim `provider_binding_stale`.
 - Delete is refused with 409 `provider_in_use_as_source` while any user selects the definition for either engine. The admin selected-user count covers both.
-- **Redirect exposure.** The admin chooses the base URL, and that URL receives every recipient's Codex key as a Bearer token. The pinned Codex runtime follows redirects and can forward request bodies and the Bearer header beyond the approved URL; the allowlist is admission control, not confinement ([ADR-4320](4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23), owner decision 2026-11-19). The web create form and the recipient disclosure carry the same advice: share only a gateway you trust not to redirect. A wrong choice exposes every recipient who attached a key, not one user.
+- **Redirect exposure.** The admin chooses the base URL, and that URL receives every recipient's Codex key as a Bearer token. The pinned Codex runtime follows redirects and can forward request bodies and the Bearer header beyond the approved URL; the allowlist is admission control, not confinement ([ADR-4320](4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23), owner decision 2026-11-19). The web create form and the recipient disclosure both warn of this exposure; only the admin create form carries the advice to share only a gateway you trust not to redirect, while the recipient disclosure warns that redirects can resend prompts, code and the key. A wrong choice exposes every recipient who attached a key, not one user.
 
 ### Migrations 00532-00537
 
-Draft numbers; they are renumbered at merge, so match by name.
+Draft numbers; they are renumbered at merge, so match by name: 00532 model_providers_shared_codex_engine through 00537 validate_users_codex_provider_scope.
 
 | File | Does |
 |---|---|
 | 00532 (`model_providers_shared_codex_engine`) | widens `model_providers_shared_engine_check` to `claude` or `codex` |
 | 00533 (`user_secrets_shared_codex_scope`) | widens `user_secrets_provider_scope_check` so the nil scope admits `openai_compatible_key` |
 | 00534 (`users_codex_provider_scope`) | adds `users.codex_provider_scope_id`, `users_codex_provider_scope_check` and the partial index `users_codex_provider_id_idx`; moves `users_codex_provider_fkey` to `(codex_provider_scope_id, codex_provider_id)` -> `model_providers (scope_owner_id, id)` `ON DELETE RESTRICT` |
-| 00535-00537 | validate the three constraints, one per table |
+| 00535 (`validate_model_providers_shared_codex_engine`) | validates `model_providers_shared_engine_check` |
+| 00536 (`validate_user_secrets_shared_codex_scope`) | validates `user_secrets_provider_scope_check` |
+| 00537 (`validate_users_codex_provider_scope`) | validates `users_codex_provider_scope_check` and `users_codex_provider_fkey`; four constraints are validated across the three files |
 
 00534 first takes an explicit `LOCK TABLE model_providers, users IN ACCESS EXCLUSIVE MODE`. The database reviewer reproduced a deadlock without it, and taking both tables up front in one statement avoids that case. The partial index is built inside the migration transaction, on the stated assumption that `users` is small. That size is unmeasured and the risk is accepted: on a very large `users` table the build would hold the lock for its duration.
 
-**Down guard G.** Every Down of these files locks `model_providers`, `user_secrets` and `users` `ACCESS EXCLUSIVE`, in that order, then refuses with a distinct message while a shared Codex selection, a shared Codex key or a shared Codex definition exists. Nothing clears a selection, reassigns ownership or deletes key custody automatically.
+**Down guard G.** Every Down of these files locks `model_providers`, `user_secrets` and `users` `ACCESS EXCLUSIVE`, in that order, then refuses with a distinct message. 00534-00537 refuse while a shared Codex selection exists (they postdate the `users.codex_provider_scope_id` column); 00532 and 00533 predate that column, so they check only for shared Codex keys and definitions, not selections. Nothing clears a selection, reassigns ownership or deletes key custody automatically.
 
 **Lock-order caveat.** The guard's order is not exactly the order every application path uses: some paths touch `users` or `user_secrets` before `model_providers`. A Down running against live traffic can therefore deadlock with such a path in a narrow window; PostgreSQL aborts one side and no data is lost. Run Downs with the API stopped. This ADR does not claim the guard's order matches the application's.
 
