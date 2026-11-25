@@ -30,26 +30,35 @@ func createSharedCodexTask(pf *pcFix, title string) (store.Run, error) {
 	return pf.svc.CreateTaskRun(pf.env.ctx, pf.userID, pf.repoID, title, "main", false, false, false, false, nil)
 }
 
-// newSharedCodexPCFix is newCodexActualClaimFix over a SHARED Codex definition: default_harness is codex,
-// a usable static openai_api_key default exists, the recipient holds their own sealed key on the shared
-// definition (unique label), and the run is created, dispatched and frozen through CreateTaskRun.
-func newSharedCodexPCFix(t *testing.T) (*pcFix, uuid.UUID) {
+// seedSharedCodexSelection seeds a shared Codex definition, the recipient's own sealed key on it (unique
+// label) and the direct-SQL selection, and creates no run. Tests that must reach a reader without any
+// run-creation path in front of it (the freezeProviderSource pin) use this directly.
+func seedSharedCodexSelection(t *testing.T) *pcFix {
 	t.Helper()
 	pf := newPCFix(t)
 	provider, _ := seedSharedProvider(t, pf.env, "codex", `{"default":{"model":"gateway"}}`)
 	key := seedSealedKey(t, pf.env, pf.userID, provider, pf.plain)
 	pf.env.exec(`UPDATE user_secrets SET label=$2 WHERE id=$1`, key, "shared-codex-key-"+uuid.NewString())
 	pf.provider, pf.key = provider, key
+	selectSharedCodexBySQL(pf, provider)
+	t.Cleanup(func() {
+		_, _ = pf.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, pf.userID)
+	})
+	return pf
+}
+
+// newSharedCodexPCFix is newCodexActualClaimFix over a SHARED Codex definition: default_harness is codex,
+// a usable static openai_api_key default exists, the recipient holds their own sealed key on the shared
+// definition (unique label), and the run is created, dispatched and frozen through CreateTaskRun.
+func newSharedCodexPCFix(t *testing.T) (*pcFix, uuid.UUID) {
+	t.Helper()
+	pf := seedSharedCodexSelection(t)
 	pf.env.exec(`UPDATE users SET default_harness='codex' WHERE id=$1`, pf.userID)
 	pf.env.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, pf.workerID,
 		[]string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexProviderV1, capability.RepoAgentSourceV1})
 	// A usable native credential stays available throughout every provider refusal.
 	vendor := pf.env.seedStaticAPIKey(t, pf.userID, "available-native-"+uuid.NewString(), "inert-available-native-key")
 	pf.env.exec(`UPDATE user_secrets SET is_default=true WHERE id=$1`, vendor)
-	selectSharedCodexBySQL(pf, provider)
-	t.Cleanup(func() {
-		_, _ = pf.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, pf.userID)
-	})
 
 	created, err := createSharedCodexTask(pf, "Shared Codex provider claim")
 	if err != nil {
@@ -88,7 +97,7 @@ func TestCodexProviderActualClaimSharedLiveDB(t *testing.T) {
 	// The pinned site for the owner-only reader mutation: freezeProviderSource itself, on the shared
 	// selection, must bind revision N and the recipient's key.
 	t.Run("freezeProviderSource binds the shared selection", func(t *testing.T) {
-		pf, _ := newSharedCodexPCFix(t)
+		pf := seedSharedCodexSelection(t) // no run is created: the reader is the first thing exercised
 		tx, err := pf.env.pool.Begin(pf.env.ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -169,6 +178,9 @@ func TestCodexProviderActualClaimSharedLiveDB(t *testing.T) {
 	t.Run("retirement", func(t *testing.T) {
 		pf, id := newSharedCodexPCFix(t)
 		ctx := pf.env.ctx
+		// First claim happens BEFORE retirement so the later claim is a genuine reclaim.
+		restartCodexActualClaimService(pf)
+		first := wantCodexActualProviderClaim(t, pf, id)
 		src := mustRun(t, pf.env, id)
 		if n, err := pf.env.q.RetireSharedModelProvider(ctx, pf.provider); err != nil || n != 1 {
 			t.Fatalf("retire shared = (%d, %v)", n, err)
@@ -196,9 +208,17 @@ func TestCodexProviderActualClaimSharedLiveDB(t *testing.T) {
 			t.Fatalf("inherited source = %+v", got)
 		}
 
-		// A reclaim keeps it too.
+		// A real reclaim keeps it too: requeue the claimed run (no worker process runs in this fixture),
+		// then claim again after retirement.
+		_ = tx.Rollback(ctx)
+		pf.env.exec(`UPDATE runs SET status='queued',claim_released_at=now()
+    WHERE id=$1 AND worker_id=$2 AND claim_generation=$3 AND status='claimed'`, id, pf.workerID, first.ClaimGeneration)
 		restartCodexActualClaimService(pf)
-		wantCodexActualProviderClaim(t, pf, id)
+		again := wantCodexActualProviderClaim(t, pf, id)
+		if again.ClaimGeneration <= first.ClaimGeneration {
+			t.Fatalf("claim generation %d did not advance past %d", again.ClaimGeneration, first.ClaimGeneration)
+		}
+		wantSharedCodexBinding(t, pf, again, 1, pf.keyRev(t))
 	})
 
 	for _, mutation := range []string{"rotated", "disabled", "deleted"} {
