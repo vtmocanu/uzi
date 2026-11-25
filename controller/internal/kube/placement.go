@@ -71,7 +71,7 @@ func (m *Materializer) placementStampedFor(ctx context.Context, w protocol.Desir
 }
 
 // renderCfgFor is the config every render of w's Deployment uses, so all hash consumers
-// agree on the placement.
+// agree on the placement and on whether the worker's Secret carries the Codex CA key.
 func (m *Materializer) renderCfgFor(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) RenderConfig {
-	return m.cfg.withPlacement(m.placementStampedFor(ctx, w, obs))
+	return m.cfg.withPlacement(m.placementStampedFor(ctx, w, obs)).withCodexCA(m.codexCAInSecretFor(ctx, w, obs))
 }

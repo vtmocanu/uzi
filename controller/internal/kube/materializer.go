@@ -143,6 +143,10 @@ type Materializer struct {
 	// recordRefusal.
 	refusalMu sync.Mutex
 	refusals  map[string]reconcile.Refusal
+	// codexCACarry is the process-local half of the Codex CA evidence (codex_ca.go),
+	// lazily initialised so a zero Materializer works.
+	codexCAMu    sync.Mutex
+	codexCACarry map[codexCAKey]struct{}
 }
 
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
@@ -775,6 +779,9 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	// Freeze each worker's placement decision from THIS tick's observation, before any
 	// PVC is created or deleted below, so every render in the tick agrees.
 	ctx = context.WithValue(ctx, placementTickKey{}, m.placementDecisions(desired, observedByID))
+	// Likewise freeze whether each worker's Secret is known to carry the Codex CA key.
+	m.pruneCodexCACarry(desiredIDs)
+	ctx = context.WithValue(ctx, codexCATickKey{}, m.codexCADecisions(desired, observedByID))
 
 	var errs []error
 	tick, order := m.planRoll(ctx, desired, observedByID)
@@ -1031,10 +1038,18 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 		}
 	}
 	for _, name := range names {
-		if err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("delete pvc %s for recycle: %w", name, err))
 		} else {
 			m.log.Info("recycling hosted worker volumes: deleted pvc", "worker_id", w.ID, "pvc", name, "namespace", ns)
+		}
+		// A stamped /data claim is the only durable proof the Secret has the Codex CA
+		// key; carry it across the delete so the replacement claim is stamped too.
+		if err == nil && name == dataPVCName(w.ID) {
+			if c := ownDataClaim(w, obs, ns); c != nil && c.CodexExtraCA {
+				m.setCodexCACarry(w.ID, ns)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -1052,7 +1067,12 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 // Inconsistent presence evidence also defers: never mint claims using a placement
 // decision that counted a claim now marked absent. A fresh tick must decide from
 // the current claim set.
-func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) (deferred bool, err error) {
+//
+// stampCodexCA stamps the /data claim this call creates with AnnotationCodexExtraCA.
+// codexStamped reports that THAT create returned success with the stamp, name and
+// namespace intact (a failed or unconfirmed create is not evidence; the carry survives
+// it). A confirmed stamp retires the carry.
+func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec, stampCodexCA bool) (deferred, codexStamped bool, err error) {
 	placementSet := m.cfg.NewPlacementSet()
 	stamp := false
 	if placementSet {
@@ -1065,20 +1085,22 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 			{obs.HasDinDDataPVC, obs.DinDClaim},
 		} {
 			if !c.has && c.claim != nil {
-				return true, nil
+				return true, false, nil
 			}
 			if c.has && c.claim != nil && c.claim.Terminating {
-				return false, nil
+				return false, false, nil
 			}
 		}
 		stamp = m.placementStampedFor(ctx, w, obs)
 	}
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
+		isData := false
 		switch pvc.Name {
 		case dataPVCName(w.ID):
 			if obs.HasDataPVC {
 				continue
 			}
+			isData = true
 		case nixPVCName(w.ID):
 			if obs.HasNixPVC {
 				continue
@@ -1094,10 +1116,16 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 			}
 			pvc.Annotations[AnnotationPlacement] = placementNew
 		}
+		if isData && stampCodexCA {
+			if pvc.Annotations == nil {
+				pvc.Annotations = map[string]string{}
+			}
+			pvc.Annotations[AnnotationCodexExtraCA] = codexExtraCAWritten
+		}
 		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			m.recordPVCRejection(w.ID, pvc.Name, err)
-			return false, fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+			return false, codexStamped, fmt.Errorf("create pvc %s: %w", pvc.Name, err)
 		}
 		if err != nil && placementSet {
 			// AlreadyExists does not prove the existing claim carries the stamp we
@@ -1105,13 +1133,18 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 			// provisioning (no more claims or Deployment render) until the next
 			// observation decides placement.
 			m.log.Info("pvc already exists but is not attributed to the worker; deferring", "worker_id", w.ID, "pvc", pvc.Name)
-			return true, nil
+			return true, codexStamped, nil
+		}
+		if err == nil && isData && stampCodexCA && created != nil && created.Name == pvc.Name &&
+			created.Namespace == ns && created.Annotations[AnnotationCodexExtraCA] == codexExtraCAWritten {
+			codexStamped = true
+			m.clearCodexCACarry(w.ID, ns)
 		}
 		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
 			m.recordEpochMint(ctx, w.ID, created)
 		}
 	}
-	return false, nil
+	return false, codexStamped, nil
 }
 
 // withinRecycleCooldown reports whether the worker's disk volumes were minted too
@@ -1202,11 +1235,18 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 			}
 			remaining -= len(value)
 		}
-		_, err := m.client.CoreV1().Secrets(ns).Create(ctx, secret, metav1.CreateOptions{})
+		created, err := m.client.CoreV1().Secrets(ns).Create(ctx, secret, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			// The error is from the apiserver about an object it rejected; it does not carry
 			// the Secret's data. Still, nothing here interpolates the token.
 			return fmt.Errorf("create token secret: %w", err)
+		}
+		// Only the apiserver's own response to THIS create proves the Codex CA key was
+		// written (AlreadyExists proves nothing about the existing Secret's contents).
+		// Carry that fact until the /data claim is created with the durable stamp.
+		if err == nil && created != nil && created.Name == secretName(w.ID) && created.Namespace == ns &&
+			len(created.Data[codexExtraCACertKey]) > 0 {
+			m.setCodexCACarry(w.ID, ns)
 		}
 	}
 
@@ -1215,9 +1255,14 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// may scale a parked worker or delete its volumes. The claims are still created if
 	// missing, and the Secret above is never touched.
 	if w.Hibernation != nil {
-		deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec)
+		deferred, codexStamped, err := m.ensurePVCs(ctx, w, obs, ns, spec, m.codexCACarried(w.ID, ns))
 		if err != nil {
 			return err
+		}
+		if m.codexCAWriteDeferred(ctx, w, obs, ns, codexStamped) {
+			// The Codex CA evidence was written this pass; the Deployment (create or wake)
+			// waits for the next observation to see it, so it renders the env once.
+			return nil
 		}
 		if deferred {
 			// Claim attribution blocks provisioning and wake, not the guarded stop
@@ -1303,8 +1348,14 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// The dind data root (issue #224 M-a) is a THIRD claim, and only for a docker worker:
 	// RenderPVCs emits it only when w.Docker, so this loop never sees it for a plain one
 	// and its gate cannot mis-fire there.
-	if deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec); deferred || err != nil {
+	deferred, codexStamped, err := m.ensurePVCs(ctx, w, obs, ns, spec, m.codexCACarried(w.ID, ns))
+	if deferred || err != nil {
 		return err
+	}
+	if m.codexCAWriteDeferred(ctx, w, obs, ns, codexStamped) {
+		// See the hibernation branch: no Deployment create or patch until the next tick
+		// observes the Codex CA stamp.
+		return nil
 	}
 
 	// Size-only PVC expansion (issue #3890): never touches the Deployment, the pod
@@ -1333,7 +1384,10 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// Suppress the (re)create while a nix PVC EXISTS but is not LIVE-at-desired-size
 		// (Terminating, or mid-recycle). Never place the Deployment over a doomed/undersized
 		// volume. When the nix PVC is ABSENT (HasNixPVC==false: first-create or post-reap
-		// re-mint tick) this is false, so first-provision and re-mint still create in one tick.
+		// re-mint tick) this is false, so first-provision and re-mint still create in one
+		// tick, except that a pass which writes the Codex CA evidence (a Secret with the
+		// key, or the stamped /data claim) stops after ensurePVCs (codexCAWriteDeferred),
+		// so the Deployment is created on the following tick.
 		//
 		// M4: a Terminating /data PVC (present but not live) mid disk-pressure recycle also
 		// suppresses the recreate — /data has no size, so its liveness is the gate. dataBlocking
@@ -1588,6 +1642,7 @@ func templateForMergePatch(tmpl corev1.PodTemplateSpec, live map[string]string) 
 // one, and the delete NotFounds — which this loop already tolerates.
 func (m *Materializer) teardown(ctx context.Context, id, ns string) error {
 	m.log.Info("tearing down a hosted worker the api no longer wants", "worker_id", id, "namespace", ns)
+	m.clearCodexCACarryFor(id)
 	var errs []error
 
 	if err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(id), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {

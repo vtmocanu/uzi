@@ -58,6 +58,9 @@ type ClaimObservation struct {
 	RollAnnotationPresent bool
 	// PlacementNew is true when the claim carries uzi.dev/placement: new.
 	PlacementNew bool
+	// CodexExtraCA is true when the claim carries uzi.dev/codex-extra-ca: written, the
+	// create-time proof that the worker's Secret was written with the Codex CA key.
+	CodexExtraCA bool
 }
 
 // ObservedWorker is one hosted worker's state as it currently exists in the

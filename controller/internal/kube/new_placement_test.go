@@ -596,7 +596,7 @@ func TestNewPlacementTickDecisionIsFrozen(t *testing.T) {
 				t.Errorf("render placement = %s, want %s (the map)", got, want)
 			}
 
-			deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec)
+			deferred, _, err := m.ensurePVCs(ctx, w, obs, ns, spec, false)
 			if err != nil || deferred {
 				t.Fatalf("ensurePVCs deferred=%v err=%v", deferred, err)
 			}
@@ -815,7 +815,7 @@ func TestNewPlacementTerminatingGateDefersStaleClaimPointer(t *testing.T) {
 		DataClaim: claim(dataPVCName("w1"), false), NixClaim: claim(nixPVCName("w1"), false),
 		DinDClaim: claim(dindDataPVCName("w1"), true), // stale: gone in the refreshed flags
 	}
-	deferred, err := m.ensurePVCs(context.Background(), w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size))
+	deferred, _, err := m.ensurePVCs(context.Background(), w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size), false)
 	if err != nil || !deferred {
 		t.Fatalf("ensurePVCs = %v, %v", deferred, err)
 	}

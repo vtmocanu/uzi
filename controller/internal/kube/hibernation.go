@@ -205,8 +205,9 @@ func allTerminated(specNames []string, statuses []corev1.ContainerStatus) bool {
 // deploymentPlacementBlocked reports that a Deployment must not be created yet: a nix
 // PVC EXISTS but is not LIVE at the desired size (Terminating, or mid-recycle), or a
 // /data or DinD claim is Terminating. Never place a Deployment over a doomed or
-// undersized volume. False when a claim is absent (first provision and re-mint still
-// create in one tick) or live (steady state).
+// undersized volume. False when a claim is absent or live (steady state); first provision
+// and re-mint reach the create in one tick unless that pass wrote the Codex CA evidence,
+// when reconcileWorker defers the Deployment one tick (codexCAWriteDeferred).
 func deploymentPlacementBlocked(w protocol.DesiredWorker, obs reconcile.ObservedWorker, spec preset.Spec) bool {
 	nixLiveAtSize := obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) >= 0
 	dataBlocking := obs.HasDataPVC && !obs.DataPVCLive // present but Terminating

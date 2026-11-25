@@ -94,6 +94,16 @@ const (
 	// placementNew is the AnnotationPlacement value that opts a worker into the new
 	// placement.
 	placementNew = "new"
+
+	// AnnotationCodexExtraCA is set ONLY at create time on a worker's /data PVC, and only
+	// when the worker's Secret was just written with the codexExtraCACertKey entry. The
+	// Secret is write-once and the controller cannot read it back, so this claim stamp is
+	// the durable evidence that the key exists; the pod template renders UZI_CODEX_CA_FILE
+	// only on that evidence (RenderConfig.withCodexCA).
+	AnnotationCodexExtraCA = "uzi.dev/codex-extra-ca"
+
+	// codexExtraCAWritten is the AnnotationCodexExtraCA value.
+	codexExtraCAWritten = "written"
 )
 
 // Secret keys, and the paths they mount at.
@@ -687,6 +697,23 @@ type RenderConfig struct {
 	// per-worker Secret under fetcherCACertKey and pointed at by UZI_FETCHER_CA_FILE.
 	// Only isolated workers get either.
 	FetcherCAPEM []byte
+
+	// codexCAInSecret is set per worker by Materializer.renderCfgFor (withCodexCA): true
+	// only when durable evidence says the worker's Secret carries codexExtraCACertKey.
+	// Unexported and unhashed itself; it gates UZI_CODEX_CA_FILE, which is.
+	codexCAInSecret bool
+}
+
+// withCodexCA returns the config to render a worker with, recording whether its Secret
+// is known to carry the Codex CA key.
+func (c RenderConfig) withCodexCA(inSecret bool) RenderConfig {
+	c.codexCAInSecret = inSecret
+	return c
+}
+
+// secretCarriesCodexCA reports whether RenderSecret writes the Codex CA key for w.
+func secretCarriesCodexCA(cfg RenderConfig, w protocol.DesiredWorker) bool {
+	return !w.Isolated && len(cfg.ExtraCAPEM) > 0
 }
 
 // secretMountPath is the effective join-token Secret mount directory.
@@ -765,14 +792,18 @@ func IsOurs(labels map[string]string) (string, bool) {
 // destroy the join token — which after delivery is the only copy in existence). So
 // a CA ROOT rotation strands existing workers, and the remedy is v1's answer to
 // everything: delete + reprovision. The operator's extra CA (ExtraCAPEM) shares the
-// entry and the limit: adding or changing it reaches workers created afterwards. The chart's caDuration is 5 years precisely
+// entry and the limit: adding or changing it reaches workers created afterwards. The
+// Codex key is written here whenever secretCarriesCodexCA, but the pod only references
+// it (UZI_CODEX_CA_FILE) on durable evidence it exists: the create-time
+// AnnotationCodexExtraCA stamp on the /data claim, or the in-process carry covering the
+// window until that claim is created (see codex_ca.go). The chart's caDuration is 5 years precisely
 // because re-trusting a new root means touching every worker at once.
 func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *corev1.Secret {
 	data := map[string][]byte{tokenKey: []byte(token)}
 	if ca := cfg.workerCABundle(); len(ca) > 0 {
 		data[caCertKey] = ca
 	}
-	if !w.Isolated && len(cfg.ExtraCAPEM) > 0 {
+	if secretCarriesCodexCA(cfg, w) {
 		// Codex gets only the operator CA, without the API trust in workerCABundle.
 		data[codexExtraCACertKey] = cfg.ExtraCAPEM
 	}
@@ -1213,7 +1244,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// pure pod spec. Codex provider trust uses the separate extra-only bundle below.
 		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
 	}
-	if !w.Isolated && len(cfg.ExtraCAPEM) > 0 {
+	if secretCarriesCodexCA(cfg, w) && cfg.codexCAInSecret {
+		// Only with evidence the key exists in THIS worker's write-once Secret: a pod whose
+		// Secret predates the extra CA would crash on the missing file.
 		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_CA_FILE", Value: cfg.secretMountPath() + "/" + codexExtraCACertKey})
 	}
 	if len(cfg.ExtraCAPEM) > 0 && (!cfg.UIDSplit || w.Isolated) {
