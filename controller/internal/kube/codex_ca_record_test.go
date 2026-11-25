@@ -196,7 +196,20 @@ func TestCodexCALateDataDeleteCannotHitTheReplacement(t *testing.T) {
 	ns := cfg.Namespace
 	caEnforcePVCUID(c)
 	oldUID := caClaim(t, c, ns, dataPVCName("w1")).UID
+	// Record the DeleteOptions the recycle actually issues for the /data claim.
+	var issued *metav1.DeleteOptions
+	c.PrependReactor("delete", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		d := a.(k8stesting.DeleteAction)
+		if d.GetName() == dataPVCName("w1") && issued == nil {
+			o := d.GetDeleteOptions()
+			issued = &o
+		}
+		return false, nil, nil
+	})
 	caRecycleTick1(t, m, c, w)
+	if issued == nil {
+		t.Fatal("fixture: no /data delete was recorded")
+	}
 	w.DiskPressure = false
 	for i := 0; i < 3; i++ {
 		caMustTick(t, m, w)
@@ -205,8 +218,8 @@ func TestCodexCALateDataDeleteCannotHitTheReplacement(t *testing.T) {
 	if !caStamped(repl) || string(repl.UID) == string(oldUID) {
 		t.Fatalf("fixture: replacement stamped=%v uid=%s (old %s)", caStamped(repl), repl.UID, oldUID)
 	}
-	uid := oldUID
-	err := c.CoreV1().PersistentVolumeClaims(ns).Delete(context.Background(), dataPVCName("w1"), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+	// Replay the issued options late, after the stamped replacement exists.
+	err := c.CoreV1().PersistentVolumeClaims(ns).Delete(context.Background(), dataPVCName("w1"), *issued)
 	if !apierrors.IsConflict(err) {
 		t.Fatalf("late delete err = %v, want Conflict", err)
 	}
@@ -568,6 +581,29 @@ func TestCodexCARecordSurvivesALaterScannedForeignDeployment(t *testing.T) {
 	}
 }
 
+// Namespace fold, end to end: with a same-ID unmarked Deployment in the docker namespace, a
+// retained recycle that deletes the claim and a restart still stamp the replacement and
+// bring the retained worker back at one replica with the env and an unchanged hash.
+func TestCodexCARetainedRecycleRestartWithAForeignDeployment(t *testing.T) {
+	foreign := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: deploymentName("w1"), Namespace: caDockerNS, Labels: objectLabels("w1")}}
+	m, c, w, cfg := caRetained(t, true, "", true, foreign)
+	ns := cfg.Namespace
+	before := depHash(caDep(t, c, ns, "w1"))
+	caRecycleTick1(t, m, c, w)
+	m = matrixRestart(m)
+	w.DiskPressure = false
+	for i := 0; i < 6; i++ {
+		caMustTick(t, m, w)
+	}
+	if p := caClaim(t, c, ns, dataPVCName("w1")); !caStamped(p) {
+		t.Fatalf("replacement data claim = %+v, want stamped", p)
+	}
+	d := caDep(t, c, ns, "w1")
+	if d == nil || caReplicas(d) != 1 || !caHasEnv(d) || depHash(d) != before {
+		t.Fatalf("deployment = %v, want replicas 1, env kept, hash %s", d, before)
+	}
+}
+
 // Namespace fold (PVC a): a stamped live claim in the own namespace keeps its stamp and its
 // UID although a same-ID /data claim scanned later in another namespace overwrote the scalar
 // DataClaim; the record is written and the delete fences the OWN claim.
@@ -635,12 +671,13 @@ func TestCodexCAForeignClaimAloneCannotAuthorizeADataDelete(t *testing.T) {
 	}
 }
 
-// /nix goes first and the controller restarts before the /data delete: the record written
-// before the loop carries the evidence.
-func TestCodexCAPartialDeletionRestartKeepsTheEnv(t *testing.T) {
+// caPartialDelete runs a retained recycle whose /data delete fails after /nix was deleted,
+// then restarts the controller at that boundary.
+func caPartialDelete(t *testing.T) (*Materializer, *fake.Clientset, protocol.DesiredWorker, RenderConfig, types.UID) {
+	t.Helper()
 	m, c, w, cfg := recycleFixture(t, true)
 	ns := cfg.Namespace
-	before := depHash(caDep(t, c, ns, "w1"))
+	origUID := caClaim(t, c, ns, dataPVCName("w1")).UID
 	failed := false
 	c.PrependReactor("delete", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		if a.(k8stesting.DeleteAction).GetName() != dataPVCName("w1") || failed {
@@ -655,7 +692,35 @@ func TestCodexCAPartialDeletionRestartKeepsTheEnv(t *testing.T) {
 	if caClaim(t, c, ns, nixPVCName("w1")) != nil || caClaim(t, c, ns, dataPVCName("w1")) == nil {
 		t.Fatal("fixture: want /nix deleted and /data kept")
 	}
-	m = matrixRestart(m)
+	return matrixRestart(m), c, w, cfg, origUID
+}
+
+// /nix goes first and the controller restarts before the /data delete; the pressure then
+// clears. The worker recovers on the ORIGINAL stamped /data claim with the env kept.
+func TestCodexCAPartialDeletionRestartRecoversOnTheOriginalClaim(t *testing.T) {
+	m, c, w, cfg, origUID := caPartialDelete(t)
+	ns := cfg.Namespace
+	before := depHash(caDep(t, c, ns, "w1"))
+	w.DiskPressure = false
+	for i := 0; i < 6; i++ {
+		caMustTick(t, m, w)
+	}
+	p := caClaim(t, c, ns, dataPVCName("w1"))
+	if p == nil || p.UID != origUID || !caStamped(p) {
+		t.Fatalf("data claim = %+v, want the original stamped claim %s", p, origUID)
+	}
+	d := caDep(t, c, ns, "w1")
+	if d == nil || caReplicas(d) != 1 || !caHasEnv(d) || depHash(d) != before {
+		t.Fatalf("deployment = %v, want replicas 1, env kept, hash %s", d, before)
+	}
+}
+
+// Same boundary, but the pressure stays on: the data claim is recycled once /nix is back
+// and the record written before the loop carries the evidence to the replacement.
+func TestCodexCAPartialDeletionRestartThenRerecycleKeepsTheEnv(t *testing.T) {
+	m, c, w, cfg, _ := caPartialDelete(t)
+	ns := cfg.Namespace
+	before := depHash(caDep(t, c, ns, "w1"))
 	for i := 0; i < 3 && caClaim(t, c, ns, dataPVCName("w1")) != nil; i++ {
 		caMustTick(t, m, w) // pressure still on: the data claim is recycled once /nix is back
 	}
@@ -675,11 +740,9 @@ func TestCodexCAPartialDeletionRestartKeepsTheEnv(t *testing.T) {
 	}
 }
 
-// The data claim stays Terminating across a restart: the Deployment stays at zero until the
-// claim is gone, then the replacement is stamped and the env kept.
-func TestCodexCATerminatingDataClaimAcrossARestartKeepsTheEnv(t *testing.T) {
-	m, c, w, cfg := recycleFixture(t, true)
-	ns := cfg.Namespace
+// caTerminateDataDeletes makes a delete of the /data claim leave it Terminating (a finalizer
+// holds it) instead of removing it.
+func caTerminateDataDeletes(c *fake.Clientset) {
 	c.PrependReactor("delete", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		name := a.(k8stesting.DeleteAction).GetName()
 		if name != dataPVCName("w1") {
@@ -694,6 +757,83 @@ func TestCodexCATerminatingDataClaimAcrossARestartKeepsTheEnv(t *testing.T) {
 		keep.DeletionTimestamp = &now
 		return true, nil, c.Tracker().Update(a.GetResource(), keep, a.GetNamespace())
 	})
+}
+
+// The new-placement twin of the retained recycle fixture: every claim carries the placement
+// stamp and the data claim the Codex stamp, and the Deployment renders the new placement.
+func caRetainedNewPlacement(t *testing.T) (*Materializer, *fake.Clientset, protocol.DesiredWorker, RenderConfig) {
+	t.Helper()
+	cfg := caCfg()
+	cfg.NodeSelector = map[string]string{"kubernetes.io/arch": "amd64"}
+	cfg.Tolerations = uziTaint
+	cfg.NewPlacementNodeSelector = map[string]string{"pool": "new"}
+	cfg.NewPlacementTolerations = newPlacementTaint
+	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", DiskPressure: true}, m5Now)
+	dep := markedDeployment(t, cfg.withPlacement(true).withCodexCA(true), w, false)
+	zero := int32(0)
+	dep.Spec.Replicas = &zero
+	objs := []runtime.Object{dep}
+	for _, o := range caClaims("w1", true) {
+		p := o.(*corev1.PersistentVolumeClaim)
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[AnnotationPlacement] = placementNew
+		objs = append(objs, p)
+	}
+	m, c := caMat(t, cfg, objs...)
+	return m, c, w, cfg
+}
+
+// New placement: the data claim stays Terminating across a restart. Nothing is created and
+// the Deployment stays at zero; once the claim is gone the replacement carries both stamps,
+// and the worker returns to one replica on the new placement with the env kept.
+func TestCodexCATerminatingDataClaimAcrossARestartNewPlacement(t *testing.T) {
+	m, c, w, cfg := caRetainedNewPlacement(t)
+	ns := cfg.Namespace
+	if got := podPlacement(caDep(t, c, ns, "w1")); got != "new" {
+		t.Fatalf("fixture: placement = %s, want new", got)
+	}
+	caTerminateDataDeletes(c)
+	before := depHash(caDep(t, c, ns, "w1"))
+	caMustTick(t, m, w)
+	if p := caClaim(t, c, ns, dataPVCName("w1")); p == nil || p.DeletionTimestamp == nil {
+		t.Fatal("fixture: the data claim is not Terminating")
+	}
+	m = matrixRestart(m)
+	w.DiskPressure = false
+	c.ClearActions()
+	for i := 0; i < 3; i++ {
+		caMustTick(t, m, w)
+		if d := caDep(t, c, ns, "w1"); d == nil || caReplicas(d) != 0 {
+			t.Fatalf("deployment = %v while the data claim is Terminating, want replicas 0", d)
+		}
+	}
+	if created := createdPVCs(c); created[dataPVCName("w1")] != nil {
+		t.Fatal("a data claim was created while the old one is Terminating")
+	}
+	if err := c.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), ns, dataPVCName("w1")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		caMustTick(t, m, w)
+	}
+	p := caClaim(t, c, ns, dataPVCName("w1"))
+	if p == nil || !caStamped(p) || !isStamped(p) {
+		t.Fatalf("replacement data claim = %+v, want both stamps", p)
+	}
+	d := caDep(t, c, ns, "w1")
+	if d == nil || caReplicas(d) != 1 || !caHasEnv(d) || depHash(d) != before || podPlacement(d) != "new" {
+		t.Fatalf("deployment = %v, want replicas 1, env, hash %s, new placement", d, before)
+	}
+}
+
+// The data claim stays Terminating across a restart: the Deployment stays at zero until the
+// claim is gone, then the replacement is stamped and the env kept.
+func TestCodexCATerminatingDataClaimAcrossARestartKeepsTheEnv(t *testing.T) {
+	m, c, w, cfg := recycleFixture(t, true)
+	ns := cfg.Namespace
+	caTerminateDataDeletes(c)
 	before := depHash(caDep(t, c, ns, "w1"))
 	caMustTick(t, m, w)
 	if p := caClaim(t, c, ns, dataPVCName("w1")); p == nil || p.DeletionTimestamp == nil {
@@ -760,10 +900,18 @@ func TestCodexCANonRetainedRecycleRestartStaysCarryOnly(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		caMustTick(t, m, w)
 	}
-	if caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
+	repl := caClaim(t, c, ns, dataPVCName("w1"))
+	if repl == nil {
+		t.Fatal("fixture: no replacement data claim after the restart")
+	}
+	if caStamped(repl) {
 		t.Error("replacement claim stamped after a restart")
 	}
-	if d := caDep(t, c, ns, "w1"); d != nil && caHasEnv(d) {
+	d := caDep(t, c, ns, "w1")
+	if d == nil {
+		t.Fatal("fixture: the Deployment was not rebuilt after the restart")
+	}
+	if caHasEnv(d) {
 		t.Error("recreated deployment kept the env without evidence")
 	}
 }
