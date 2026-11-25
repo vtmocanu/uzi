@@ -970,12 +970,38 @@ func TestReserveProviderBoundExemptLiveDB(t *testing.T) {
 		if reserveEnforced(mustRun(t, p.env, provJudge.ID), snap, time.Now()) {
 			t.Errorf("Go: the provider judge is subject to the vendor reserve")
 		}
+		// directClaim is ClaimRun's verdict with the reserve parameters claimLane derives for the worker.
+		directClaim := func() (store.Run, error) {
+			w := p.worker()
+			now := time.Now()
+			s, err := p.svc.reserveSnapshot(p.env.ctx, p.userID, now)
+			if err != nil {
+				t.Fatalf("reserveSnapshot: %v", err)
+			}
+			peers, err := p.svc.reserveBlockedWorkers(p.env.ctx, s)
+			if err != nil {
+				t.Fatalf("reserveBlockedWorkers: %v", err)
+			}
+			cp := claimRunParamsFor(w)
+			reserveClaimParams(&cp, s, w, peers, now)
+			return p.env.q.ClaimRun(p.env.ctx, cp)
+		}
+		got, err := directClaim()
+		switch {
+		case err != nil:
+			t.Errorf("SQL: ClaimRun refused the provider judge on the blocked vendor token: %v", err)
+		case got.ID != provJudge.ID:
+			t.Errorf("SQL: ClaimRun claimed %s, want the provider judge %s", got.ID, provJudge.ID)
+		default:
+			// Back to queued, as reserveFix.admits does, so Service.Claim can claim it.
+			p.env.exec(`UPDATE runs SET status = 'queued', worker_id = NULL, claim_generation = 0 WHERE id = $1`, provJudge.ID)
+		}
 		payload, err := p.svc.Claim(p.env.ctx, p.worker(), nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
 		if payload == nil || payload.RunID != provJudge.ID.String() {
-			t.Errorf("SQL: the provider judge was not claimed despite the blocked vendor token: %+v", payload)
+			t.Errorf("Claim: the provider judge was not claimed despite the blocked vendor token: %+v", payload)
 		}
 
 		// A judge pinned to the held vendor token is vendor-frozen and stays queued.
@@ -990,15 +1016,26 @@ func TestReserveProviderBoundExemptLiveDB(t *testing.T) {
 		if !reserveEnforced(mustRun(t, p.env, vendorJudge.ID), snap, time.Now()) {
 			t.Errorf("Go: the vendor-frozen judge is not subject to the reserve")
 		}
+		genBefore := mustRun(t, p.env, vendorJudge.ID).ClaimGeneration
+		if direct, err := directClaim(); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("SQL: ClaimRun on the vendor-frozen judge = (%v, %v), want pgx.ErrNoRows", direct.ID, err)
+			if err == nil {
+				p.env.exec(`UPDATE runs SET status = 'queued', worker_id = NULL, claim_generation = $2 WHERE id = $1`, vendorJudge.ID, genBefore)
+			}
+		}
 		again, err := p.svc.Claim(p.env.ctx, p.worker(), nil)
 		if err != nil {
 			t.Fatalf("Claim: %v", err)
 		}
 		if again != nil {
-			t.Errorf("SQL: the vendor-frozen judge on the held token was claimed: %s", again.RunID)
+			t.Errorf("Claim: the vendor-frozen judge on the held token was claimed: %s", again.RunID)
 		}
-		if r := mustRun(t, p.env, vendorJudge.ID); r.Status != "queued" {
-			t.Errorf("vendor judge status = %s, want queued", r.Status)
+		after := mustRun(t, p.env, vendorJudge.ID)
+		if after.Status != "queued" {
+			t.Errorf("vendor judge status = %s, want queued", after.Status)
+		}
+		if after.ClaimGeneration != genBefore {
+			t.Errorf("vendor judge claim_generation advanced %d -> %d", genBefore, after.ClaimGeneration)
 		}
 	})
 
@@ -1061,10 +1098,14 @@ func TestReserveProviderBoundExemptLiveDB(t *testing.T) {
 		fx.bindWorker(BindModeDefault, nil)
 		vendor := fx.queueRun(reserveRun{})
 		prov := fx.queueRun(reserveRun{provider: true})
+		provFresh := fx.queueRun(reserveRun{provider: true}) // starts unmarked
 		fx.env.exec(`UPDATE runs SET reserve_hold_reason = $2 WHERE id = $1`, prov, usagereserve.HeldReason(72, 70))
 		fx.mark()
 		if got, ok := fx.reasonOf(prov); ok {
-			t.Errorf("the provider-bound run carries a reserve hold reason %q", got)
+			t.Errorf("the pre-marked provider-bound run kept a reserve hold reason %q", got)
+		}
+		if got, ok := fx.reasonOf(provFresh); ok {
+			t.Errorf("the unmarked provider-bound run gained a reserve hold reason %q", got)
 		}
 		if got, ok := fx.reasonOf(vendor); !ok || got != usagereserve.HeldReason(72, 70) {
 			t.Errorf("vendor control reason = (%q, %v), want %q", got, ok, usagereserve.HeldReason(72, 70))

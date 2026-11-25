@@ -132,6 +132,9 @@ func TestReserveHeldResolution(t *testing.T) {
 		return r
 	}
 	issue := store.Run{Kind: runkind.Issue}
+	provider := func(kind string) store.Run {
+		return store.Run{Kind: kind, ModelProviderID: uuidp(uuid.New())}
+	}
 	cases := []struct {
 		name string
 		run  store.Run
@@ -198,6 +201,10 @@ func TestReserveHeldResolution(t *testing.T) {
 		{name: "cross_check checker uses the worker lane", run: store.Run{Kind: runkind.CrossCheck, Harness: harnessClaude}, lane: pinLane(tokPinHi), want: true},
 		{name: "exempt run is never held", run: store.Run{Kind: runkind.Issue, ReserveExemptUntil: pgconv.Time(now.Add(time.Hour))}, lane: defLane, want: false},
 		{name: "chat is never held", run: store.Run{Kind: runkind.Chat}, lane: defLane, want: false},
+		{name: "provider-bound issue run on a held default lane is not held", run: provider(runkind.Issue), lane: defLane, want: false},
+		{name: "provider-bound issue run on a held pinned lane is not held", run: provider(runkind.Issue), lane: pinLane(tokPinHi), want: false},
+		{name: "provider-bound judge on a held default judge lane is not held", run: provider(runkind.Judge), lane: pinLane(tokPinOK), want: false},
+		{name: "provider-bound self_improve on a held default judge lane is not held", run: provider(runkind.SelfImprove), lane: pinLane(tokPinOK), want: false},
 		{name: "off snapshot", run: issue, lane: defLane, snap: func(s *reserveSnap) { s.threshold = nil }, want: false},
 	}
 	for _, c := range cases {
