@@ -32,6 +32,11 @@ export interface FakeProviderOptions {
   readonly usage?: (responseIndex: number) => Record<string, unknown>;
   /** Produce the Responses output items for one request (mirrors M0's `respond`). */
   readonly respond: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>;
+  /** Opt-in error mode (issue #4574): when it returns an HTTP status for the Nth authenticated request
+   *  (1-based, the request is still recorded in `requests`), the fake answers that status with a small
+   *  JSON error body instead of an SSE stream, and `respond` is not called for it. Absent or returning
+   *  undefined keeps the normal streaming behavior, so existing callers are unchanged. */
+  readonly errorStatus?: (requestIndex: number) => number | undefined;
 }
 
 /** A runtime-assembled dummy bearer token — secret-SHAPED, never a real/baked value, and
@@ -69,6 +74,9 @@ function sse(id: string, items: ResponseItem[], usage?: Record<string, unknown>)
 export class FakeProvider {
   readonly requests: ResponsesBody[] = [];
   readonly errors: string[] = [];
+  /** One entry per authenticated request answered by a 200 stream or an opt-in error status: the exact
+   *  Authorization header the request carried and the status the fake answered. */
+  readonly receipts: { authorization: string | undefined; status: number }[] = [];
   private closing = false;
 
   private constructor(
@@ -78,6 +86,7 @@ export class FakeProvider {
     private readonly maxRequestBytes: number,
     private readonly usage: FakeProviderOptions["usage"],
     private readonly responder: (body: ResponsesBody, provider: FakeProvider) => ResponseItem[] | Promise<ResponseItem[]>,
+    private readonly errorStatus: FakeProviderOptions["errorStatus"],
   ) {}
 
   /** The base URL the loopback config's `base_url` points Codex at. Satisfies
@@ -103,7 +112,7 @@ export class FakeProvider {
     if (address === null || typeof address === "string" || address.address !== "127.0.0.1") {
       throw new Error("fake provider must bind 127.0.0.1");
     }
-    const provider = new FakeProvider(server, address.port, options.credential, maxRequestBytes, options.usage, options.respond);
+    const provider = new FakeProvider(server, address.port, options.credential, maxRequestBytes, options.usage, options.respond, options.errorStatus);
     holder.provider = provider;
     return provider;
   }
@@ -133,9 +142,19 @@ export class FakeProvider {
           }
           const body = JSON.parse(raw) as ResponsesBody;
           this.requests.push(body);
+          const status = this.errorStatus?.(this.requests.length);
+          if (status !== undefined) {
+            const payload = JSON.stringify({ error: { message: "m4 fixture gateway error" } });
+            this.receipts.push({ authorization: auth, status });
+            if (response.destroyed) return;
+            response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+            response.end(payload);
+            return;
+          }
           const items = await this.responder(body, this);
           if (response.destroyed) return;
           const data = sse(`m4-response-${this.requests.length}`, items, this.usage?.(this.requests.length));
+          this.receipts.push({ authorization: auth, status: 200 });
           response.writeHead(200, { "content-type": "text/event-stream", "content-length": Buffer.byteLength(data) });
           response.end(data);
         } catch (error) {

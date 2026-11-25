@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { WorkerClient } from "../src/client.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
 import { makeClaim, recordingLogger } from "./helpers.js";
 
 // PRD #4320 module 5: the claim decoder is fail-closed on a provider binding, on the run lane
@@ -133,6 +133,28 @@ describe("loopback is accepted only with the worker's own UZI_PROVIDER_ALLOW_LOO
 const codexProvider = (): Record<string, unknown> => provider({ engine: "codex", protocol: "openai_responses",
   model_map: { default: { model: "gateway-default" } } });
 const CODEX_CAPS = ["codex_provider_v1", "codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"];
+
+// Issue #4574: a Codex provider-bound JUDGE claim also needs codex_provider_judge_v1; the same
+// binding on an issue claim needs only the Codex provider trio.
+describe("a Codex provider judge claim requires codex_provider_judge_v1", () => {
+  it("refuses a Codex provider judge on the trio alone, accepts it with the judge capability", async () => {
+    await client.register("provider-worker", undefined, undefined, undefined, CODEX_CAPS);
+    setBody("judge", { forge_pat: "", anthropic_oauth_token: "", provider: codexProvider() });
+    await assert.rejects(client.claimRun(), (e: Error) => /malformed provider binding on claim: judge capability not advertised/.test(e.message) && !e.message.includes(KEY));
+    setBody("issue", { provider: codexProvider() });
+    assert.ok(await client.claimRun(), "the same binding on an issue claim needs only the Codex provider trio");
+    await client.register("provider-worker", undefined, undefined, undefined, [...CODEX_CAPS, CODEX_PROVIDER_JUDGE_CAPABILITY]);
+    setBody("judge", { forge_pat: "", anthropic_oauth_token: "", provider: codexProvider() });
+    const decoded = await client.claimRun();
+    assert.equal((decoded!.secrets as { provider?: { engine: string } }).provider?.engine, "codex");
+  });
+
+  it("does not let the Claude judge capability stand in for the Codex one", async () => {
+    await client.register("provider-worker", undefined, undefined, undefined, [...CODEX_CAPS, CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY]);
+    setBody("judge", { forge_pat: "", anthropic_oauth_token: "", provider: codexProvider() });
+    await assert.rejects(client.claimRun(), /judge capability not advertised/);
+  });
+});
 
 describe("a failed re-register fails closed", () => {
   it("refuses a Codex provider claim after a re-register that throws following a successful one", async () => {

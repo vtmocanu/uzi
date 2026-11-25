@@ -63,7 +63,7 @@ import { CATALOG_PROBE_LIMIT, parseCatalogEntry, type CodexCatalogEntry } from "
 export type { CodexCatalogEntry } from "./catalog-probe.js";
 import { CodexRateLimitObserver } from "./rate-limits.js";
 import { LimitReachedError } from "../limit.js";
-import { isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT } from "../provider-binding.js";
+import { PROVIDER_GATEWAY_LIMIT } from "../provider-binding.js";
 import { PhaseSwitchUnverifiedError } from "../phase-switch-unverified.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { DRAFT_PLAN_ACK } from "../draft-plan.js";
@@ -72,6 +72,7 @@ import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName, de
 import {
   CodexTurnFailedError,
   formatCodexClassification,
+  isCodexProviderGatewayLimit,
   normalizeCodexErrorInfo,
   normalizeCodexStatus,
   normalizeCodexTerminalErrors,
@@ -2789,11 +2790,7 @@ export class CodexHarness implements RunHarness {
     const usageLimit = outcome === "failed" && classification?.classification === "usageLimitExceeded";
     // Only the selected closed classification can identify a provider gateway limit.
     // Normalized HTTP status exists only on accepted structured transport variants.
-    const gatewayLimit = outcome === "failed" && this.authMode === "provider" && (
-      classification?.classification === "rateLimitExceeded" ||
-      classification?.classification === "serverOverloaded" ||
-      (classification?.category === "transport" && isGatewayLimitStatus(classification.httpStatus))
-    );
+    const gatewayLimit = isCodexProviderGatewayLimit(outcome, this.authMode, classification);
     const limitEvidence = usageLimit && this.authMode !== "provider" ? this.rateLimits.classify(this.authMode) : undefined;
     const durationMs = Math.max(0, Math.floor(this.nowMs() - (this.dispatchStartedAt ?? this.nowMs())));
     return {

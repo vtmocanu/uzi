@@ -11,7 +11,7 @@ import { PRIVATE_CA_TITLE } from "./private-ca-title.js";
 //      the receipts gate (`check:codex-m4-receipts`, the LEAD merge gate) exits non-zero until the
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
-import { PROVIDER_ADVICE_SUMMARY_TITLE, PROVIDER_ROOT_TITLES } from "./titles-provider.js";
+import { PROVIDER_ADVICE_JUDGE_TITLE, PROVIDER_ADVICE_SUMMARY_TITLE, PROVIDER_ROOT_TITLES } from "./titles-provider.js";
 import type { ClauseRow } from "./clause.js";
 import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
@@ -88,6 +88,14 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     negativeOracle: "a clean control pass returns its text unchanged while the pass that echoes the raw, JSON-escaped and percent-encoded key is redacted; zero release/refresh/admission client calls; no other credential header or log line carries the key",
     intendedOutcome: "provider-bound advice and summary passes run on the frozen binding with the key over the app-server login only; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
     tests: [PROVIDER_ADVICE_SUMMARY_TITLE],
+  },
+  {
+    id: "codex-p-bound-provider-advice-judge", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "JudgeRunner.execute/runReadOnlyModelPass settlement/makeProductionCodexAdviceHarnessFactory/CodexAdviceHarness with launchCodexRoot, app-server auth and pinned app-server HTTP",
+    positiveControl: "a provider-bound judge reaches the authenticated Responses fake with the bound key as the only bearer, and the parsed request body carries the mapped gateway model for a default-only map, a key whose target differs and an absent key",
+    negativeOracle: "a gateway 429 and 529 each settle as a provider gateway limit failure with no review, no completion and no reset time, the pass settlement records a classification that satisfies the shared gateway-limit predicate, and no vendor release/refresh/admission client call or log line carries the key",
+    intendedOutcome: "the Codex provider judge runs on the frozen binding with the key over the app-server login only and reports a gateway limit as a limit, never a review; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ADVICE_JUDGE_TITLE],
   },
   {
     id: "codex-p-phase-model-switch", adapter: "codex", layer: "P", family: "Persisted context and usage replay",
