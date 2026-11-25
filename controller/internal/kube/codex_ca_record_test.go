@@ -673,10 +673,12 @@ func TestCodexCAForeignClaimAloneCannotAuthorizeADataDelete(t *testing.T) {
 
 // caPartialDelete runs a retained recycle whose /data delete fails after /nix was deleted,
 // then restarts the controller at that boundary.
-func caPartialDelete(t *testing.T) (*Materializer, *fake.Clientset, protocol.DesiredWorker, RenderConfig, types.UID) {
+// It also returns the Deployment's hash taken before the first recycle tick.
+func caPartialDelete(t *testing.T) (*Materializer, *fake.Clientset, protocol.DesiredWorker, RenderConfig, types.UID, string) {
 	t.Helper()
 	m, c, w, cfg := recycleFixture(t, true)
 	ns := cfg.Namespace
+	before := depHash(caDep(t, c, ns, "w1"))
 	origUID := caClaim(t, c, ns, dataPVCName("w1")).UID
 	failed := false
 	c.PrependReactor("delete", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -692,15 +694,14 @@ func caPartialDelete(t *testing.T) (*Materializer, *fake.Clientset, protocol.Des
 	if caClaim(t, c, ns, nixPVCName("w1")) != nil || caClaim(t, c, ns, dataPVCName("w1")) == nil {
 		t.Fatal("fixture: want /nix deleted and /data kept")
 	}
-	return matrixRestart(m), c, w, cfg, origUID
+	return matrixRestart(m), c, w, cfg, origUID, before
 }
 
 // /nix goes first and the controller restarts before the /data delete; the pressure then
 // clears. The worker recovers on the ORIGINAL stamped /data claim with the env kept.
 func TestCodexCAPartialDeletionRestartRecoversOnTheOriginalClaim(t *testing.T) {
-	m, c, w, cfg, origUID := caPartialDelete(t)
+	m, c, w, cfg, origUID, before := caPartialDelete(t)
 	ns := cfg.Namespace
-	before := depHash(caDep(t, c, ns, "w1"))
 	w.DiskPressure = false
 	for i := 0; i < 6; i++ {
 		caMustTick(t, m, w)
@@ -716,11 +717,12 @@ func TestCodexCAPartialDeletionRestartRecoversOnTheOriginalClaim(t *testing.T) {
 }
 
 // Same boundary, but the pressure stays on: the data claim is recycled once /nix is back
-// and the record written before the loop carries the evidence to the replacement.
+// by the restarted process. Its live stamped /data claim is the evidence here (that
+// recycle sets the carry and the record again before its delete), so this test does not
+// on its own guard the record; the restart-after-delete tests do.
 func TestCodexCAPartialDeletionRestartThenRerecycleKeepsTheEnv(t *testing.T) {
-	m, c, w, cfg, _ := caPartialDelete(t)
+	m, c, w, cfg, _, before := caPartialDelete(t)
 	ns := cfg.Namespace
-	before := depHash(caDep(t, c, ns, "w1"))
 	for i := 0; i < 3 && caClaim(t, c, ns, dataPVCName("w1")) != nil; i++ {
 		caMustTick(t, m, w) // pressure still on: the data claim is recycled once /nix is back
 	}
