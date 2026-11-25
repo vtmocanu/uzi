@@ -61,23 +61,81 @@ func providerKeyFormsGo(key string) []string {
 	return out
 }
 
-// judgeProviderScrub returns the evidence scrub for a provider-bound judge claim: strip
-// invisible runs (so a key split by them is contiguous again), then replace every key form.
-// It runs BEFORE the pre-scan clips evidence, so a key straddling the clip cannot reach the
-// worker as a partial prefix its exact-form redactor no longer matches. A nil result (no
-// credential) leaves vendor-mode evidence byte-identical.
+// judgeProviderScrub returns the pre-scan scrub for a provider-bound judge claim. It replaces every
+// key form, then (mirroring agent/src/redact.ts redactAcrossInvisible) every key form that appears
+// with only invisible runs between its characters: the match runs on the visible projection and the
+// whole original span, separators included, is replaced. Text outside a matched span is kept
+// byte-for-byte, so newlines and other separators still divide commands. It runs BEFORE the
+// pre-scan matches or clips anything, so no partial key can reach the worker. A nil result (no
+// credential) leaves vendor-mode scanning byte-identical.
 func judgeProviderScrub(credential string) func(string) string {
 	forms := providerKeyFormsGo(credential)
 	if len(forms) == 0 {
 		return nil
 	}
 	return func(s string) string {
-		s = judgeInvisible.ReplaceAllString(s, "")
 		for _, f := range forms {
 			s = strings.ReplaceAll(s, f, judgeProviderRedacted)
 		}
+		return redactAcrossInvisibleGo(s, forms)
+	}
+}
+
+// redactAcrossInvisibleGo replaces each original span whose visible characters (invisible runs
+// removed) spell one of forms. Overlapping spans merge into one marker.
+func redactAcrossInvisibleGo(s string, forms []string) string {
+	locs := judgeInvisible.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
 		return s
 	}
+	vis := make([]byte, 0, len(s))
+	origin := make([]int, 0, len(s)) // vis[i] came from s[origin[i]]
+	keep := func(from, to int) {
+		for i := from; i < to; i++ {
+			vis = append(vis, s[i])
+			origin = append(origin, i)
+		}
+	}
+	prev := 0
+	for _, l := range locs {
+		keep(prev, l[0])
+		prev = l[1]
+	}
+	keep(prev, len(s))
+	v := string(vis)
+	var spans [][2]int
+	for _, f := range forms {
+		for off := 0; ; {
+			i := strings.Index(v[off:], f)
+			if i < 0 {
+				break
+			}
+			st, en := off+i, off+i+len(f)
+			spans = append(spans, [2]int{origin[st], origin[en-1] + 1})
+			off = en
+		}
+	}
+	if len(spans) == 0 {
+		return s
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	var b strings.Builder
+	cursor := 0
+	for i := 0; i < len(spans); {
+		st, en := spans[i][0], spans[i][1]
+		for i++; i < len(spans) && spans[i][0] < en; i++ {
+			if spans[i][1] > en {
+				en = spans[i][1]
+			}
+		}
+		if st >= cursor {
+			b.WriteString(s[cursor:st])
+			b.WriteString(judgeProviderRedacted)
+			cursor = en
+		}
+	}
+	b.WriteString(s[cursor:])
+	return b.String()
 }
 
 // jsStringifyBody is JSON.stringify(s) without its surrounding quotes: `"` and `\` escaped,
@@ -132,14 +190,15 @@ func lowerPercentHex(s string) string {
 	return percentHex.ReplaceAllStringFunc(s, strings.ToLower)
 }
 
-// decodedPayloadStrings decodes a tool_result payload and joins every string value it holds
-// (object keys in sorted order, so the text is deterministic) with newlines. The provider pre-scan
-// matches this decoded text, so a JSON escape (`\u001b`, `\/`, `\"`) can no longer hide a key from
+// decodedPayloadStrings decodes a tool_result payload and returns every string value it holds
+// (object keys in sorted order, so the order is deterministic). The provider pre-scan scrubs and
+// matches each value on its own, so fields never combine into a synthetic command and a JSON escape
+// (`\u001b`, `\/`, `\"`) can no longer hide a key from
 // the scrub. A payload that does not decode reports false and is omitted, never matched raw.
-func decodedPayloadStrings(payload []byte) (string, bool) {
+func decodedPayloadStrings(payload []byte) ([]string, bool) {
 	var v any
 	if err := json.Unmarshal(payload, &v); err != nil {
-		return "", false
+		return nil, false
 	}
 	var parts []string
 	var walk func(any)
@@ -163,5 +222,5 @@ func decodedPayloadStrings(payload []byte) (string, bool) {
 		}
 	}
 	walk(v)
-	return strings.Join(parts, "\n"), true
+	return parts, true
 }

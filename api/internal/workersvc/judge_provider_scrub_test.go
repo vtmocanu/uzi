@@ -96,3 +96,22 @@ func TestScanCommandNotFoundScrubsProviderKeyBeforeMatch(t *testing.T) {
 		})
 	}
 }
+
+// TestScanCommandNotFoundProviderKeepsSeparators: the provider scrub keeps every separator outside
+// a key, and each decoded string value is matched on its own, so ordinary multiline output and
+// adjacent fields never merge into a synthetic command (PRD #4322 M1a landing review).
+func TestScanCommandNotFoundProviderKeepsSeparators(t *testing.T) {
+	scrub := judgeProviderScrub("gwk-" + strings.Repeat("A1b2", 10))
+	for name, payload := range map[string]string{
+		"newline before the miss": `{"text":"server ready\njq: command not found"}`,
+		"ANSI before the miss":    `{"text":"server ready\u001b[0m\njq: command not found"}`,
+		"adjacent fields":         `{"a":"server ready","b":"jq: command not found"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := scanCommandNotFoundScrubbed(rawResultRows(payload), scrub)
+			if len(got) != 1 || got[0].Command != "jq" {
+				t.Fatalf("want exactly jq, got %+v", got)
+			}
+		})
+	}
+}

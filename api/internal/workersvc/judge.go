@@ -275,13 +275,14 @@ func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func
 		if scanned >= judgeScanByteBudget || len(out) >= judgeMissCandidateCap {
 			break
 		}
-		var text string
+		var texts []string
 		if scrub != nil {
 			// Provider judge: inspect only WHOLE rows, decoded. The budget cut, the pattern match
 			// (it stops at `/` or `%`) and a JSON-escaped invisible separator (`\u001b`) can each
 			// split a key into pieces the scrub no longer recognises, so a row that does not fit
-			// the remaining budget, or does not decode, is omitted rather than cut; the decoded
-			// text is scrubbed (invisible runs stripped, every key form replaced) before matching.
+			// the remaining budget, or does not decode, is omitted rather than cut. Each decoded
+			// string value is scrubbed (key forms replaced, also across invisible runs, with
+			// separators outside a key kept) and matched on its own, so fields never combine.
 			// Command identity stays as extracted for the suppression lookups.
 			if scanned+len(row.Payload) > judgeScanByteBudget {
 				continue
@@ -291,63 +292,67 @@ func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func
 				continue
 			}
 			scanned += len(row.Payload)
-			text = scrub(decoded)
+			for _, d := range decoded {
+				texts = append(texts, scrub(d))
+			}
 		} else {
-			text = string(row.Payload)
+			text := string(row.Payload)
 			if scanned+len(text) > judgeScanByteBudget {
 				text = text[:judgeScanByteBudget-scanned]
 			}
 			scanned += len(text)
-			text = payloadText([]byte(text))
+			texts = []string{payloadText([]byte(text))}
 		}
 
-		forEachNotFound(text, func(cmd, evidence string, lowConfidence bool) {
-			cmd = normalizeCommandToken(cmd)
-			// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
-			// barred by Decision 6 and rejected when an admin allowlists it
-			// (toolprofile.Denied). Recommending its installation can never be actioned,
-			// so observing it absent is the policy working rather than a finding.
-			//
-			// FILTERED HERE, at collection, and that placement is load-bearing rather than
-			// incidental: judgeMissCandidateCap short-circuits this loop, so a denied CLI
-			// caught later (in suppressResolved, or downstream at recommendation time)
-			// would still consume a candidate slot and crowd out a genuine miss — the
-			// precise failure the cap's own comment above documents at length.
-			//
-			// SCOPE: this covers the DETERMINISTIC path only. The judge MODEL also reads
-			// the sampled trace and can emit the same recommendation on its own; both
-			// observed `glab` recommendations (runs b64b98f3, 1dfc65b4) came from a
-			// `complete` model review, not from fallbackReview. JUDGE_SYSTEM_PROMPT names
-			// the barred class so the model reclassifies to adjust_template/improve_agent,
-			// which is the actionable category — that prompt line, not this filter, is
-			// what addresses those two.
-			//
-			// pinned[cmd] is the same shape of not-a-gap: a tool the run invokes via
-			// `go run <module>@<version>` is reached THROUGH that pinned ref and needs no
-			// bare executable, so its `command not found` is by-design, not a missing
-			// worker tool to install (judge rec run eaa26abe: golangci-lint reached via
-			// `go run …/golangci-lint@v2.12.2`, then flagged missing). Filtered HERE for
-			// the same candidate-slot reason as the denylist above. Presence-based, not
-			// green/seq-gated like suppressResolved: the ref's mere presence proves the
-			// canonical invocation does not need PATH, and the bare-name probe often comes
-			// AFTER the successful `go run`.
-			//
-			// funcs[cmd] is the same shape of not-a-gap: a name the run DEFINES as a shell
-			// function anywhere in the trace (shellFunctionNames) is not a missing worker
-			// tool — a subshell that could not see the function reports `db_psql: command
-			// not found`, but installing anything would be wrong. Presence-based, like
-			// pinned above.
-			if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] || funcs[cmd] ||
-				(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
-				return
-			}
-			seen[cmd] = true
-			evidence = strings.TrimSpace(evidence)
-			if len(evidence) > judgeEvidenceMaxLen {
-				evidence = evidence[:judgeEvidenceMaxLen]
-			}
-			out = append(out, missCandidate{Command: cmd, Evidence: evidence, Seq: row.Seq})
-		})
+		for _, text := range texts {
+			forEachNotFound(text, func(cmd, evidence string, lowConfidence bool) {
+				cmd = normalizeCommandToken(cmd)
+				// A denylisted credential-bearing CLI (glab/gh/aws/az/…) is not a gap: it is
+				// barred by Decision 6 and rejected when an admin allowlists it
+				// (toolprofile.Denied). Recommending its installation can never be actioned,
+				// so observing it absent is the policy working rather than a finding.
+				//
+				// FILTERED HERE, at collection, and that placement is load-bearing rather than
+				// incidental: judgeMissCandidateCap short-circuits this loop, so a denied CLI
+				// caught later (in suppressResolved, or downstream at recommendation time)
+				// would still consume a candidate slot and crowd out a genuine miss — the
+				// precise failure the cap's own comment above documents at length.
+				//
+				// SCOPE: this covers the DETERMINISTIC path only. The judge MODEL also reads
+				// the sampled trace and can emit the same recommendation on its own; both
+				// observed `glab` recommendations (runs b64b98f3, 1dfc65b4) came from a
+				// `complete` model review, not from fallbackReview. JUDGE_SYSTEM_PROMPT names
+				// the barred class so the model reclassifies to adjust_template/improve_agent,
+				// which is the actionable category — that prompt line, not this filter, is
+				// what addresses those two.
+				//
+				// pinned[cmd] is the same shape of not-a-gap: a tool the run invokes via
+				// `go run <module>@<version>` is reached THROUGH that pinned ref and needs no
+				// bare executable, so its `command not found` is by-design, not a missing
+				// worker tool to install (judge rec run eaa26abe: golangci-lint reached via
+				// `go run …/golangci-lint@v2.12.2`, then flagged missing). Filtered HERE for
+				// the same candidate-slot reason as the denylist above. Presence-based, not
+				// green/seq-gated like suppressResolved: the ref's mere presence proves the
+				// canonical invocation does not need PATH, and the bare-name probe often comes
+				// AFTER the successful `go run`.
+				//
+				// funcs[cmd] is the same shape of not-a-gap: a name the run DEFINES as a shell
+				// function anywhere in the trace (shellFunctionNames) is not a missing worker
+				// tool — a subshell that could not see the function reports `db_psql: command
+				// not found`, but installing anything would be wrong. Presence-based, like
+				// pinned above.
+				if cmd == "" || shellNames[cmd] || toolprofile.DeniedExecutable(cmd) || pinned[cmd] || funcs[cmd] ||
+					(lowConfidence && !invoked[cmd]) || seen[cmd] || len(out) >= judgeMissCandidateCap {
+					return
+				}
+				seen[cmd] = true
+				evidence = strings.TrimSpace(evidence)
+				if len(evidence) > judgeEvidenceMaxLen {
+					evidence = evidence[:judgeEvidenceMaxLen]
+				}
+				out = append(out, missCandidate{Command: cmd, Evidence: evidence, Seq: row.Seq})
+			})
+		}
 	}
 	return out
 }
