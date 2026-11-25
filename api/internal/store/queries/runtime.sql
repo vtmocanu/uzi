@@ -4117,16 +4117,17 @@ RETURNING *;
 -- failed transiently (finishRunClaimTx, guardrailForgeTransientError). The claim payload was never
 -- delivered, so no flight ran: worker_id, started_at and session_id are kept as resume affinity, the
 -- run's published handoff (if any) stays valid, and claim_released_at is deliberately NOT set, which
--- matches the worker-path forge parks (ParkRunForgeUnreachable). The claim capability is revoked
--- (codex_cap_hash NULL, epoch + 1) so a delivered-nowhere claim cannot be reported against.
+-- matches the worker-path forge parks (ParkRunForgeUnreachable). The Codex claim capability is revoked
+-- (codex_cap_hash NULL, epoch + 1); other reports at this generation are not fenced by this park, the
+-- same accepted boundary as the worker-path park.
 --
 -- It is ParkCredentialDisabledRun's twin for the undelivered-claim shape: the same exact-claim fence
 -- (status 'claimed' at this worker and generation, claim unreleased) and the same one-claim Fresh
 -- restore (#3607 Mf), because the payload was never delivered. Differences: the park is
 -- recovery_wait / forge_unreachable, a pending completion_blocked annotation is cleared (the owner's
 -- decision is already recorded; the forge is now the actionable reason), and a run with a claimed
--- or pending fresh transfer, a stamped stop, or no first start never matches (the caller refuses
--- those through their own arms).
+-- or pending fresh transfer, a stamped stop, or no first start never matches (0 rows: the caller
+-- returns errClaimRecoveryStale and the transaction rolls back).
 --
 -- @count_park is true for an ordinary pre-clone continuation (the cap counter advances) and false
 -- for the cap hold and for a publication-enrolled run, which never counts against the pre-clone

@@ -298,7 +298,8 @@ protection is the only blocking finding; and the run has already started once
   reservations are released by the existing lifecycle cleanup.
 - **Still terminal `guardrail_blocked`:** a never-started run; auth (401/403, a revoked
   or expired token); a client-build failure; an unknown error class; NXDOMAIN,
-  certificate/TLS and address errors; caller cancellation; any mix with another
+  certificate/TLS and address errors; a cancelled forge call (a cancelled claim request
+  writes nothing and leaves the run claimed for the sweeper); any mix with another
   blocking finding; a stop or cancel requested during the claim; and the legacy
   mr_rework and cross-check refusals.
 

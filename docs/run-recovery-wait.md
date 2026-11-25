@@ -807,8 +807,9 @@ What happens next depends on the run:
 Everything else still fails immediately as `guardrail_blocked`: an auth
 failure (401/403, a revoked or expired token), an unprotected branch or any
 other blocking finding, a client-build failure, an unknown error class,
-NXDOMAIN, certificate/TLS and address errors, caller cancellation, and a stop
-or cancel requested during the claim. See
+NXDOMAIN, certificate/TLS and address errors, a cancelled forge call, and a stop
+or cancel requested during the claim. If the claim request itself is
+cancelled, nothing is written and the run stays claimed for the sweeper. See
 [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md) for the design.
 
 ## Forge unreachable while publishing
