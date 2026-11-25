@@ -3873,7 +3873,7 @@ A fresh resume can start only when all of these hold:
 - The run is at `recovery_wait` with cause `worker_requeue_exhausted`, `retained_recovery_exhausted`, `retained_recovery_adoption_failed` or `retained_continuation_unwitnessed`, and no automatic retry is stamped (the hold is waiting for you).
 - The park is not a secret remediation (`secret_remediation_active`) or a declined source end (`source_end_declined`).
 - The run kind is `issue`, `mr_rework` or `self_improve`.
-- The run is not a Codex run that has already been claimed once (a Codex run stays with the worker that last ran it, [ADR-4476](https://github.com/vtmocanu/uzi/blob/main/adr/4476-codex-claim-provenance.md)).
+- The run is not a Codex run that has already been claimed once (a Codex run stays with the worker that last ran it, [ADR-4476](../adr/4476-codex-claim-provenance.md)).
 - It has no active publication resume, no pending policy change, no `codex_policy_hold` and no pending weekly-reserve pause, and its wall budget is not already spent.
 - No other fresh resume of the run is pending or claimed.
 - A destination exists: an online, persistent (not run-bound) hosted worker of yours that advertises `fresh_resume_v1` and `recovery_inventory_v1`, is accepting new work (not draining or maintenance-fenced), is not the worker the run is or was bound to, and holds no open custody hold on the run.
@@ -3936,7 +3936,12 @@ Fresh resume does not move or delete the original worker's source. `.agents/skil
 
 ### Recovering from a stale `config.lock`
 
-The destination changes the worker's repository configuration under git's own `config.lock`. If a `config.lock` already exists in the worker's bare repository, the destination stops without touching it, abandons the transfer (the run returns to its hold) and never retries. **The agent never removes a stale `config.lock`.** An operator removes it only after confirming no git process is running against that repository (a live git owns the lock); then Resume again.
+The destination changes the worker's repository configuration under git's own `config.lock`. The agent never removes or retries past an existing lock; what happens next depends on whether the receipt was already seeded.
+
+- **Before the seeded receipt** (while the destination is still seeding the branch): the destination stops without touching the lock, abandons the transfer (the run returns to its hold) and does not retry.
+- **After the seeded receipt** (the final step that commits the receipt into the configuration finds the lock): the transfer is not abandoned. The first flight stops nonterminally and keeps the seeded work and its custody on the new worker. After a worker restart, the reconciler repeats that step; if the lock is still there it requests an owner hold (`recovery_wait`, cause `retained_recovery_adoption_failed`) on the new worker, with the work and custody preserved.
+
+**The agent never removes a stale `config.lock`.** An operator removes it only after confirming no git process is running against that repository (a live git owns the lock); then Resume again.
 
 ### Failure model
 
