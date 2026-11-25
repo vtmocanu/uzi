@@ -254,8 +254,8 @@ picks the source from the provider's engine; clearing needs the engine named
   - **An explicit model you pick** (`--model` on a run, or a model pinned on a schedule) resolves
     only through its own key. If the map has no such key the run is refused with
     `provider_model_unmapped` before any credential is sent.
-  - **A model uzi picks** (the default model, the planning default and the task-review model)
-    resolves through its own key when the map has one, otherwise through `default`.
+  - **A model uzi picks** (the default model, the planning default, the task-review model and the
+    Codex judge model) resolves through its own key when the map has one, otherwise through `default`.
   - **Effort** values pass through to the gateway unchanged.
   - **Context window.** A map entry's `context_window` sets the runtime's
     `model_context_window` for that model. Without one, the runtime's own fallback applies, which

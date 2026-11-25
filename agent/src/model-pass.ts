@@ -718,10 +718,11 @@ async function runCodexAdviceModelPass(
       throw err;
     }
   };
-  const runPromise = (async (): Promise<string> => {
-    if (!settlement) return runBody();
-    // Issue #4574: record the exact rejection of the WHOLE body (factory build, harness.run, its cleanup,
-    // its policy error). A timeout shaped rejection is a stop, however it arrived.
+  // Issue #4574: only the judge (a settlement) wraps the body; every other advice caller races runBody()
+  // itself, so its promise-job ordering against the timer and an external abort is unchanged.
+  const runPromise: Promise<string> = !settlement ? runBody() : (async (): Promise<string> => {
+    // Record the exact rejection of the WHOLE body (factory build, harness.run, its cleanup, its policy
+    // error). A timeout shaped rejection is a stop, however it arrived.
     try {
       return await runBody();
     } catch (err) {

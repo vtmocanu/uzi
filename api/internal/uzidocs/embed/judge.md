@@ -191,9 +191,10 @@ back to an Anthropic token.
 
 A Codex judge for an owner whose **Codex source** is a model provider runs on that provider, with your
 provider key and no vendor Codex credential. The provider and its revision are frozen onto the judge when it
-is created; a later change to your source affects new judges only. A judge whose source changes between
-the decision and the freeze (both inside creation) fails creation with `judge_policy_changed` (retry-safe, nothing is
-created). It never falls back to a vendor Codex credential.
+is created; a later change to your source affects new judges only. If your source changes between the
+decision and the freeze (both inside creation), nothing is created: a source that was cleared or became
+unusable fails with `provider_source_unusable`, and a source switched to another usable provider fails
+with `judge_policy_changed` (retry-safe). It never falls back to a vendor Codex credential.
 
 - **No pin keeps it a vendor judge.** Unlike Claude, there is no judge pin that keeps a Codex judge on the
   vendor: a selected Codex source always wins. The Anthropic token pin does not apply to the Codex lane. An
@@ -208,8 +209,10 @@ created). It never falls back to a vendor Codex credential.
   `rate_limit_type` `provider_gateway_limit`, no review and no vendor cooldown. It never parks.
 - **A revoked binding fails the judge.** If the key was revoked, rotated or disabled by the time the judge is
   claimed, it ends failed with `credential_unavailable`, never parked.
-- **Other failures.** A timeout, an abort, a cleanup failure or an error the worker cannot classify fails
-  the judge with no review. Any other classified model error (a bad request, an unauthorized answer, a
+- **Other failures.** A timeout, an abort, a failure while the advice harness shuts down its session
+  (closing the app-server transport or its auth admission), or an error the worker cannot classify fails
+  the judge with no review. A failed disposal of the judge's temporary home is only logged and does not
+  change the outcome. Any other classified model error (a bad request, an unauthorized answer, a
   server error that carries a status) produces the deterministic fallback review, scrubbed of the key,
   as do a prompt that cannot be built (the model is never called) and model output that cannot be parsed.
 - **The provider key is redacted** in its raw, escaped and invisible-separated forms from the review, model

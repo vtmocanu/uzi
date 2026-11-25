@@ -10,8 +10,10 @@ import { JudgeRunner } from "../src/judge-runner.js";
 import { RequestError, type WorkerClient } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import type { Logger } from "../src/log.js";
-import { runReadOnlyModelPass } from "../src/model-pass.js";
+import { runReadOnlyModelPass, type ModelPassSettlement } from "../src/model-pass.js";
 import { providerKeyForms } from "../src/redact.js";
+import { PROVIDER_LANE_UNSUPPORTED } from "../src/provider-binding.js";
+import { resolvePendingTerminal } from "../src/terminal-resolve.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type {
   ClaimCodexProviderBinding,
@@ -264,6 +266,7 @@ async function exec(
 function assertTerminalFailure(calls: Calls, reason?: RegExp | string): StateRequest {
   const last = calls.states.at(-1)!;
   assert.equal(last.status, "failed");
+  assert.notEqual(last.failure_reason, PROVIDER_LANE_UNSUPPORTED, "not the pre-#4574 Claude-only refusal");
   assert.equal(last.rate_limit_type, undefined, "a terminal failure carries no limit facts");
   assert.equal(calls.review, undefined, "no review is posted");
   assert.equal(calls.states.some(s => s.status === "completed"), false, "never completed");
@@ -295,7 +298,11 @@ function assertNoKey(text: string, what = "output"): void {
 }
 
 /** Every encoding a gateway echo might use: raw, JSON-escaped, and split by zero-width spaces. */
-const ECHO = (): string => [KEY, JSON.stringify(KEY).slice(1, -1), KEY.split("").join("​")].join(" | ");
+const SLASH_ESCAPED = KEY.replaceAll("/", "\\/");
+const HTML_SAFE = KEY.replace(/[<>&]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+const INVISIBLE = KEY.split("").join("\u200b");
+for (const form of [SLASH_ESCAPED, HTML_SAFE, INVISIBLE]) assert.notEqual(form, KEY, "each echoed form is a distinct encoding of the key");
+const ECHO = (): string => [KEY, SLASH_ESCAPED, HTML_SAFE, INVISIBLE].join(" | ");
 
 function capturingLog(lines: string[]): Logger {
   const base = nullLogger();
@@ -407,7 +414,10 @@ describe("codex provider judge: settlement of a classified terminal (real advice
   ];
   for (const [name, info, expected] of rows) {
     it(`${name} settles as ${expected}`, async () => {
-      const calls = await exec(realFactory({ notes: [failedWith(info)] }));
+      const rec = newRec();
+      const calls = await exec(realFactory({ notes: [failedWith(info)] }, rec));
+      assert.equal(rec.builds.length, 1, "the provider factory was invoked");
+      assert.equal(rec.builds[0]!.binding.authMode, "provider");
       if (expected === "limit") assertLimit(calls);
       else if (expected === "terminal") assertTerminalFailure(calls);
       else assertFallbackReview(calls);
@@ -467,7 +477,9 @@ describe("codex provider judge: a recorded stop outranks everything", () => {
       policy.onTerminal(term("failed", RATE), { isError: true, latest: undefined });
       throw new Error("unreachable");
     };
-    const calls = await exec(scriptedFactory(late), codexClaim(), { modelTimeoutMs: 40 });
+    const rec = newRec();
+    const calls = await exec(scriptedFactory(late, rec), codexClaim(), { modelTimeoutMs: 40 });
+    assert.equal(rec.requests.length, 1, "harness.run was entered");
     assertTerminalFailure(calls, /judge model call exceeded 40ms/);
   });
 
@@ -534,9 +546,11 @@ describe("codex provider judge: a throw from the pass finally is never the class
 
   it("a finally that throws undefined after success is a terminal failure (the presence flag, not the value)", async () => {
     const sentinel: unknown = undefined;
-    const calls = await exec(scriptedFactory(withUsage(okScript, hostileUsage)), codexClaim(), {
+    const rec = newRec();
+    const calls = await exec(scriptedFactory(withUsage(okScript, hostileUsage), rec), codexClaim(), {
       log: warnThrows(/usage callback failed/, () => sentinel),
     });
+    assert.equal(rec.requests.length, 1, "harness.run was entered and a success terminal scripted");
     assertTerminalFailure(calls);
   });
 });
@@ -649,6 +663,18 @@ describe("codex provider judge: key redaction", () => {
     assert.ok(journal, "the terminal outcome is journaled");
     assert.equal(journal.body.status, "failed");
     assertNoKey(JSON.stringify(journal.body), "journaled body");
+
+    // A later resolve by the worker (sweep, drain or boot) after JudgeRunner exited: plain worker logger,
+    // no per-run redactor. A key-echoing failure response must still never reach that log.
+    const replayLines: string[] = [];
+    await resolvePendingTerminal({ outbox, client: api.client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: capturingLog(replayLines) }, {
+      runId: "judge-1", claimGeneration: 5,
+      send: async () => { throw new RequestError("POST", "/state", 502, `replay said ${ECHO()}`); },
+    });
+    assert.ok(replayLines.some(l => /outbox: terminal report send failed/.test(l)), "the replay logged the failed send");
+    assertNoKey(replayLines.join("\n"), "replay log");
+    assert.ok(replayLines.some(l => l.includes("POST /state returned 502")), "the bounded diagnostic names the request and status");
+    assert.ok(await outbox.readTerminalJournal("judge-1", 5), "the journal stays for a later resolve");
   });
 
   it("a key echoed in the model text, summary, model name and usage never reaches the wire", async () => {
@@ -729,6 +755,72 @@ describe("shared gateway-limit predicate", () => {
     assert.equal(e.name, "Error");
     assert.equal(String(e), "Error: judge model call exceeded 5ms");
     assert.ok(e instanceof Error);
+  });
+});
+
+describe("the pass records settlement provenance (direct pass, judge-only settlement)", () => {
+  const binding = codexBinding() as ClaimCodexProviderBinding;
+  const fresh = (): ModelPassSettlement => ({ terminalSeen: false, policyErrorSet: false, rejectionSet: false, escapedSet: false });
+  const pass = (script: Script, settlement: ModelPassSettlement, rec: Rec, extra: { timeoutMs?: number; signal?: AbortSignal } = {}) => {
+    const authority = createCodexProviderExecutionAuthority(binding);
+    return runReadOnlyModelPass({
+      provider: authority.providerBinding as ClaimProviderBinding, model: JUDGE_MODEL, systemPrompt: "s", prompt: "p",
+      homeRoot: PASS_HOME_ROOT, homePrefix: "uzi-judge-", label: "judge", timeoutMs: extra.timeoutMs ?? 5000, queryFn: forbiddenQuery,
+      denyReason: "read-only", log: nullLogger(), ...(extra.signal ? { signal: extra.signal } : {}),
+      codex: { runId: "r1", binding: authority, buildHarness: scriptedFactory(script, rec), settlement },
+    });
+  };
+  const waitAbort = (request: AdviceRequest): Promise<void> => new Promise<void>(resolve => {
+    if (request.signal.aborted) resolve(); else request.signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+
+  it("a recorded limit terminal: terminal, policy error, rejection identity and the escaped value are all recorded", async () => {
+    const settlement = fresh(); const rec = newRec();
+    let caught: unknown;
+    await pass(failScript(RATE), settlement, rec).catch((e: unknown) => { caught = e; });
+    assert.equal(rec.builds.length, 1); assert.equal(rec.requests.length, 1);
+    assert.equal(settlement.terminalSeen, true);
+    assert.deepEqual(settlement.terminal, { isError: true, classification: RATE });
+    assert.equal(settlement.policyErrorSet, true); assert.equal(settlement.rejectionSet, true);
+    assert.equal(settlement.rejection, settlement.policyError, "the run promise rejected with the policy error itself");
+    assert.equal(settlement.escapedSet, true); assert.equal(caught, settlement.escaped, "the caller sees the recorded escaped value");
+    assert.equal(settlement.stop, undefined);
+  });
+
+  it("a terminal arriving after the pass timer is never recorded (stop = timeout)", async () => {
+    const settlement = fresh(); const rec = newRec();
+    const late: Script = async (request, policy) => {
+      await waitAbort(request);
+      try { policy.onTerminal(term("failed", RATE), { isError: true, latest: undefined }); } catch { /* stopped */ }
+      throw new Error("late");
+    };
+    await assert.rejects(pass(late, settlement, rec, { timeoutMs: 30 }));
+    assert.equal(rec.requests.length, 1);
+    assert.equal(settlement.stop, "timeout");
+    assert.equal(settlement.terminalSeen, false, "a stopped pass records no terminal");
+    assert.equal(settlement.policyErrorSet, false, "a stopped pass records no policy error");
+  });
+
+  it("a terminal arriving after an external abort is never recorded (stop = aborted)", async () => {
+    const settlement = fresh(); const rec = newRec();
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 20);
+    const late: Script = async (request, policy) => {
+      await waitAbort(request);
+      try { policy.onTerminal(term("failed", RATE), { isError: true, latest: undefined }); } catch { /* stopped */ }
+      throw new Error("late");
+    };
+    await assert.rejects(pass(late, settlement, rec, { signal: controller.signal }));
+    assert.equal(settlement.stop, "aborted");
+    assert.equal(settlement.terminalSeen, false);
+    assert.equal(settlement.policyErrorSet, false);
+  });
+
+  it("a harness rejection that is not the policy error is recorded as a rejection without a policy error", async () => {
+    const settlement = fresh(); const rec = newRec();
+    await assert.rejects(pass(async () => { throw new Error("exploded"); }, settlement, rec));
+    assert.equal(settlement.rejectionSet, true); assert.equal(settlement.policyErrorSet, false);
+    assert.equal(settlement.escapedSet, true);
   });
 });
 

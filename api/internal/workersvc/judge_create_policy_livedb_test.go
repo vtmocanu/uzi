@@ -935,6 +935,37 @@ func TestCodexProviderJudgeCreateLiveDB(t *testing.T) {
 		}
 		c.wantBoundCodex(mustRun(t, c.env, created.ID), c.provider, c.key)
 	})
+	// The pin DRIFTS inside creation: it is written between the lane decision and the locked re-read,
+	// so the decision and the re-read disagree on the Anthropic pin. The Codex lane ignores it and
+	// still freezes the Codex source.
+	for _, path := range []string{"manual", "automatic"} {
+		t.Run("an anthropic judge pin drifting during creation does not affect the codex judge/"+path, func(t *testing.T) {
+			c := newCjFix(t)
+			pin := c.env.seedAnthropicSecret(t, c.userID, "pin-"+uuid.NewString(), false)
+			ran := false
+			c.svc.judgeDecidedHook = func(context.Context) {
+				ran = true
+				c.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'pinned', judge_anthropic_secret_id = $2 WHERE id = $1`, c.userID, pin)
+			}
+			target := c.newTarget("codex")
+			var judge store.Run
+			if path == "manual" {
+				created, err := c.manual(target)
+				if err != nil {
+					t.Fatalf("manual with a drifting Anthropic pin: %v", err)
+				}
+				judge = mustRun(t, c.env, created.ID)
+			} else {
+				c.auto(target)
+				c.wantNoSkip(target)
+				judge = c.mustJudge(target)
+			}
+			if !ran {
+				t.Fatal("the decision hook never ran")
+			}
+			c.wantBoundCodex(judge, c.provider, c.key)
+		})
+	}
 }
 
 // TestCodexProviderJudgeFrozenAcrossSourceChangeLiveDB: the owner re-selects another Codex source
