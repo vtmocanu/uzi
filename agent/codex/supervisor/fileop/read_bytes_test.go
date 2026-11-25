@@ -155,6 +155,9 @@ func TestReadBytesPreadNeverExceedsWindow(t *testing.T) {
 		if off < 10 || off+int64(len(p)) > 30 {
 			t.Fatalf("read outside window: off=%d len=%d", off, len(p))
 		}
+		if off != 10+int64(total) { // retries continue where the short read stopped: 10, 17, 24
+			t.Fatalf("retry offset=%d, want %d", off, 10+int64(total))
+		}
 		n := min(len(p), 7) // force short reads
 		total += n
 		return n, nil

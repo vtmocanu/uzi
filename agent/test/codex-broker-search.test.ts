@@ -739,6 +739,7 @@ describe("Search partial results", () => {
       const mem = flat({ "a.txt": "needle\n" });
       mem.idents = new Map([["a.txt", "99:98:97:96"]]);
       const result = await call(brokerFor(memFileop(mem)), { query: "needle" });
+      assert.deepEqual(outputOf(result), { matches: [{ path: "a.txt", line: 1, text: "needle" }], truncated: false, bytes: 7 });
       assert.doesNotMatch(JSON.stringify(result), /99:98|ident/);
     });
 
@@ -893,12 +894,15 @@ describe("Search partial results", () => {
       const root = path.join(built.dir, "root");
       await fsp.mkdir(root);
       const child = spawn(built.binary, ["--root", root], { stdio: ["pipe", "pipe", "pipe"] });
+      // Registered at spawn so an exit (or signal) before teardown is never missed; a launch
+      // error settles it too, so teardown cannot wait on an exit event that will never fire.
+      const exited = new Promise<void>((resolve) => { child.once("exit", () => resolve()); child.once("error", () => resolve()); });
       const handle = wireFileopHelper({ stdin: child.stdin, stdout: child.stdout });
       try {
         await fn(brokerFor(handle.client, root), root);
       } finally {
         await handle.dispose();
-        await new Promise<void>((resolve) => { if (child.exitCode !== null) resolve(); else child.once("exit", () => resolve()); });
+        await exited;
         await fsp.rm(built.dir, { recursive: true, force: true });
       }
     };
