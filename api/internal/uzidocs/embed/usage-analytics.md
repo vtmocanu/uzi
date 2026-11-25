@@ -72,8 +72,8 @@ bill.
 - An admitted request has an 8 second budget, enforced by a request deadline
   and `SET LOCAL statement_timeout = '8s'`. Hitting it also answers 503 with
   `Retry-After: 1`. Other database failures are a plain 500 with no detail.
-- All reads of one request (timezone check, user and repo checks, history
-  start, the statement) run in a single `REPEATABLE READ` read-only
+- All reads of one request (user and repo checks, history start, the
+  statement, and the timezone list on its first, cached load) run in a single `REPEATABLE READ` read-only
   transaction, so they agree with each other. JIT is off inside it.
 
 ## Calendar
@@ -214,7 +214,8 @@ On the owner route `users` is null with reason `not_applicable`.
 
 Measured on a synthetic 120,000-run seed (845,988 usage legs, 200 owners with
 skew, 1,250 repos, three years of history), PostgreSQL 17, default settings,
-JIT off. Medians:
+JIT off. Custom-plan medians (generic plans, the steady state, are within
+about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 
 | Request | Time |
 |---|---|

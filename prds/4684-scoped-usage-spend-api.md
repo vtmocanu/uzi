@@ -166,7 +166,7 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 
 ## 8. Measurement evidence
 
-Method: throwaway PostgreSQL 17.12 with default settings (shared_buffers 128MB, work_mem 4MB, jit_above_cost 100000), the exact sqlc statement text prepared, `now` fixed, a single host (a few percent noise). Harness: `analytics_evidence_livedb_test.go` under the `analyticsevidence` build tag and `UZI_ANALYTICS_PLAN_EVIDENCE=1`, not a gate and not committed. Raw logs were not kept in the repository.
+Method: throwaway PostgreSQL 17.12 with default settings (shared_buffers 128MB, work_mem 4MB, jit_above_cost 100000), the exact sqlc statement text prepared, `now` fixed, a single host (a few percent noise). Harness: `analytics_evidence_livedb_test.go` under the `analyticsevidence` build tag and `UZI_ANALYTICS_PLAN_EVIDENCE=1`, committed as an opt-in harness (build tag plus env var), not a gate. Raw logs were not kept in the repository.
 
 **Seed:** 120,000 runs, 845,988 `run_usage` legs (8 per run), 200 owners (largest 20.1% of runs, top 10 59.8%), 1,250 repos, three years of history (10.2% of runs in 30d, 15.2% in 90d), 80.9% Delivery and 19.1% Supporting kinds (judge 17%, chat 2%), 23.4% carry an MR. `mr_rework` and `cross_check` were not seeded. `ANALYZE` run. Disk: `runs` 97.6 MB (indexes 43.4 MB), `run_usage` 201.4 MB (indexes 64.4 MB).
 

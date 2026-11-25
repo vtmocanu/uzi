@@ -394,7 +394,7 @@ symptom in general.
 
 ## Addendum (#4684, 2026-11-25): the per-model consumer, the reveal flag and JIT
 
-Issue #4684 adds the scoped Spend API. Three decisions belong with this rule; the PRD is
+Issue #4684 adds the scoped Spend API. Four decisions belong with this rule; the PRD is
 [prds/4684-scoped-usage-spend-api.md](../prds/4684-scoped-usage-spend-api.md).
 
 **1. A multi-row consumer of `run_usage_model_totals`, kept bounded by a lateral with
@@ -427,9 +427,9 @@ visible even for repos outside the user's connections. D1's letter holds: the
 `r.user_id = @user_id` predicate stays unconditional, so the flag can never widen the cohort.
 It only reveals identifiers of repos already inside it, which the admin routes need when
 `user=<uuid>` selects a user whose run references a foreign repo. The route sets it and a
-query parameter never can (the owner handler passes false, a test pins that), and every gated
-projection is written `(@reveal_repos::boolean IS TRUE OR repo_visible)`, so false or NULL
-masks (fails closed). The alternative was a second, duplicated, very large jsonb statement for
+query parameter never can (the owner handler passes false, a test pins that), and a single
+projection, `(@reveal_repos::boolean IS TRUE OR fc.id IS NOT NULL) AS repo_shown`, gates every
+repo identifier, so false or NULL masks (fails closed). The alternative was a second, duplicated, very large jsonb statement for
 the selected-user case, which invites the two copies to drift. The admin all-users statement
 stays separate and has no gate at all.
 
@@ -444,7 +444,7 @@ Spend statement is costed above `jit_above_cost`, so PostgreSQL compiled about 4
 | owner 90d | 908 ms | 425 ms |
 | admin all-users `all` | 15678 ms | 9599 ms |
 
-Generic plans are never JIT-compiled and are unchanged. The setting is transaction-local, so
+The measured generic plans were not JIT-compiled (costed below `jit_above_cost`) and are unchanged. The setting is transaction-local, so
 the pool and every other statement keep the server default. `window=all` for the admin
 all-users scope still exceeds the 8 s budget with JIT off; that is a recorded limit pending an
 owner decision, not something this addendum fixes.
