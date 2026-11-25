@@ -167,6 +167,9 @@ const freshResumeInProgressReason = "fresh_resume_in_progress"
 // credential; scope_ceiling is outside the saved tuple, so a refusal never overwrites it; a policy-hold
 // Resume changes status and meets the guard. A run that is not the caller's is left to the service's own 404.
 func (h *Handler) refuseIfFreshResumeActive(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID) bool {
+	if h.q == nil { // handlers wired without a store (unit tests) have no transfer to read
+		return false
+	}
 	if _, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: userID}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false
