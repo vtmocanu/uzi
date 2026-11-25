@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PRD #4324 M1 against real Postgres: the ownership/reference migrations 00524-00531, the shared
@@ -707,6 +708,29 @@ WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
       SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
         AND p.owner_user_id = u.id AND p.engine = $1::text))
 RETURNING claude_provider_id, codex_provider_id`
+	// The source reader of the image before #4633 (base 591871c34): its Codex arm is owner-only.
+	baseGetUserProviderSource = `SELECT u.claude_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id
+ AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = $1
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = $2 AND $1::text = 'claude'
+UNION ALL
+SELECT u.codex_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.codex_provider_id AND p.owner_user_id = u.id AND p.engine = $1
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = $2 AND $1::text = 'codex'`
 	baseUpsertModelProviderProbeResult = `INSERT INTO model_provider_probe_results (provider_id, revision, auth_result, tool_result, probed_at)
 SELECT p.id, p.current_revision, $1, $2, now()
 FROM model_providers p
@@ -810,6 +834,41 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 		t.Errorf("clearing the Codex source through the current statement: %v", err)
 	}
 	checkSources(pgtype.UUID{})
+	// A shared Codex selection made by the new image (with a usable key) reads, through the old image's
+	// owner-only reader, as a selected source whose definition is invisible: provider_missing, so the
+	// old image fails closed and never falls back to a vendor credential.
+	shCx, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: "rollback-shared-codex", Engine: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.InsertModelProviderRevision(ctx, store.InsertModelProviderRevisionParams{ProviderID: shCx.ID, Revision: 1, Protocol: "openai_responses", BaseUrl: "https://resp.example.com/v1", AuthStyle: "bearer", ModelMap: []byte(`{"default":{"model":"m"}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	cxSel, _ := newProductUser(ctx, t, pool)
+	if _, err := insertProviderKey(ctx, q, cxSel, shCx.ID); err != nil {
+		t.Fatalf("attaching the recipient's key to the shared Codex definition: %v", err)
+	}
+	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: cxSel, Engine: "codex", ProviderID: pgUUID(shCx.ID)}); err != nil {
+		t.Fatalf("selecting the shared Codex definition through the current statement: %v", err)
+	}
+	allowAll := func(string) (string, bool) { return "", true }
+	cur, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{Engine: "codex", ID: cxSel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := workersvc.EvaluateProviderSource("codex", cur, allowAll); got.State != workersvc.ProviderSourceUsable {
+		t.Fatalf("control: the current reader judges the shared Codex selection %+v, want usable", got)
+	}
+	var old store.GetUserProviderSourceRow
+	if err := pool.QueryRow(ctx, baseGetUserProviderSource, "codex", cxSel).Scan(&old.ProviderID, &old.Engine, &old.Protocol,
+		&old.CurrentRevision, &old.RetiredAt, &old.BaseUrl, &old.AuthStyle, &old.ModelMap, &old.KeySecretID, &old.KeyKind,
+		&old.KeyProviderID, &old.KeyDisabledAt, &old.KeyEnablementRev); err != nil {
+		t.Fatalf("the old image reading the Codex source: %v", err)
+	}
+	if got := workersvc.EvaluateProviderSource("codex", old, allowAll); got.State != workersvc.ProviderSourceUnusable ||
+		got.Reason != workersvc.SourceUnusableProviderMissing || got.ProviderID != shCx.ID {
+		t.Errorf("the old image reading a shared Codex selection = %+v, want unusable %s for %s", got, workersvc.SourceUnusableProviderMissing, shCx.ID)
+	}
 	// Key disable, then delete, then retire: the application's own statements for those.
 	if _, err := pool.Exec(ctx, `UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, key.ID); err != nil {
 		t.Errorf("disabling the key: %v", err)
