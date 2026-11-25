@@ -134,8 +134,18 @@ type ObservedWorker struct {
 	// gate. The legacy scalar claim fields above merge same-ID objects across
 	// namespaces and cannot prove which lane's claim is being deleted.
 	TerminatingClaims map[string]bool `json:"-"`
-	PodsKnown         bool
-	WorkerPodCount    int
+	// DataClaimsByNamespace is the observed /data claim per namespace (any state,
+	// Terminating included). DataClaim above folds same-ID claims across namespaces
+	// (last scanned wins), so a decision about the worker's OWN namespace reads this map.
+	// Nil when no /data claim was observed. Not on the wire.
+	DataClaimsByNamespace map[string]ClaimObservation `json:"-"`
+	// DeploymentCodexExtraCA is the set of namespaces whose non-terminating worker
+	// Deployment carries the uzi.dev/codex-extra-ca "written" record. Keyed by namespace
+	// because workers fold by ID across namespaces and a per-Deployment scalar would be
+	// overwritten by a later-scanned one. Not on the wire.
+	DeploymentCodexExtraCA map[string]bool `json:"-"`
+	PodsKnown              bool
+	WorkerPodCount         int
 	// TerminalPodCount is how many of the WorkerPodCount pods are in phase Succeeded or
 	// Failed (an evicted pod, say). A terminal phase is not proof that containers have
 	// exited: kubelet eviction publishes Failed before it kills them. Informational for

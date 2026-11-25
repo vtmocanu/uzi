@@ -514,58 +514,24 @@ func TestCodexCAPressureRecycleRetainedDeploymentKeepsTheEnv(t *testing.T) {
 	}
 }
 
-// AC8c: the controller restarts between the delete and the re-mint. The carry is lost, so
-// the replacement claim is unstamped and the resumed Deployment drops the env.
-func TestCodexCAPressureRecycleRestartDropsTheEnv(t *testing.T) {
-	m, c, w, cfg := recycleFixture(t, true)
-	caRecycleTick1(t, m, c, w)
-	m = matrixRestart(m)
-	// The retained Deployment now drifts from the keyless render; a lone worker has no
-	// roll coverage, so the operator's force-roll admits the template replacement.
-	m.drain.ForceRoll = true
-	w.DiskPressure = false
-	for i := 0; i < 4; i++ {
-		caMustTick(t, m, w)
-	}
-	if caStamped(caClaim(t, c, cfg.Namespace, dataPVCName("w1"))) {
-		t.Error("replacement claim stamped after a restart")
-	}
-	d := caDep(t, c, cfg.Namespace, "w1")
-	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 || caHasEnv(d) {
-		var replicas int32 = -1
-		if d.Spec.Replicas != nil {
-			replicas = *d.Spec.Replicas
-		}
-		t.Fatalf("resumed deployment replicas=%d env=%v, want 1 and no env", replicas, caHasEnv(d))
-	}
-}
-
-// AC8c (default admission): the same restart without the operator's force-roll. Losing the
-// carry changes the target while the retained reservation is pinned to the env-bearing
-// render, and the existing roll machinery holds any target change made during a retained
-// reservation ("participant reservation without canary; explicit recovery required"): the
-// retained Deployment gets no template write, so it is neither given nor stripped of
-// anything, while the replacement claim is minted unstamped. Only explicit recovery or
-// ForceRoll (the test above) admits the replacement. Accepted, documented boundary.
-func TestCodexCAPressureRecycleRestartDefaultAdmissionWritesNoTemplate(t *testing.T) {
+// AC8c: the controller restarts between the delete and the re-mint. The retained
+// Deployment's durable record survives the restart, so the replacement claim is stamped
+// again, the spec hash is unchanged and the resumed Deployment keeps the env.
+func TestCodexCAPressureRecycleRestartKeepsTheEnv(t *testing.T) {
 	m, c, w, cfg := recycleFixture(t, true)
 	before := depHash(caDep(t, c, cfg.Namespace, "w1"))
 	caRecycleTick1(t, m, c, w)
 	m = matrixRestart(m)
 	w.DiskPressure = false
-	c.ClearActions()
 	for i := 0; i < 4; i++ {
 		caMustTick(t, m, w)
 	}
-	if got := templatePatches(c); len(got) != 0 {
-		t.Fatalf("default admission patched the template of %v", got)
-	}
-	if caStamped(caClaim(t, c, cfg.Namespace, dataPVCName("w1"))) {
-		t.Error("replacement claim stamped after a restart")
+	if !caStamped(caClaim(t, c, cfg.Namespace, dataPVCName("w1"))) {
+		t.Error("replacement claim is not stamped after a restart")
 	}
 	d := caDep(t, c, cfg.Namespace, "w1")
-	if got := depHash(d); got != before {
-		t.Errorf("retained deployment hash moved %s -> %s without admission", before, got)
+	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 || !caHasEnv(d) || depHash(d) != before {
+		t.Fatalf("resumed deployment replicas=%v env=%v hash %s -> %s", d.Spec.Replicas, caHasEnv(d), before, depHash(d))
 	}
 }
 

@@ -49,7 +49,11 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 	o.MaintenanceRollAnnotation = ""
 	o.SpecHash, o.Generation = "", 0
 	o.DeploymentNodeSelector = nil
+	o.DeploymentCodexExtraCA = nil
 	if o.HasDeployment {
+		if codexExtraCARecord(d) {
+			o.DeploymentCodexExtraCA = map[string]bool{ns: true}
+		}
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil

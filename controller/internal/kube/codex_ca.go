@@ -2,6 +2,12 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
@@ -12,11 +18,21 @@ import (
 //
 //   - durable: AnnotationCodexExtraCA on the worker's /data claim, stamped at claim create
 //     (ensurePVCs) in the same pass that wrote the Secret;
+//   - durable, retained recycle only: the same annotation on the retained worker Deployment
+//     (held at zero replicas under a reservation). recycleWorkerVolumes syncs it to the
+//     own claim's stamp (set when stamped, cleared when not) with a confirmed patch
+//     immediately before the claim delete, so it covers the window between that delete and
+//     the replacement claim's create across a controller restart. With no own claim the
+//     record counts only on a non-terminating Deployment in the worker's own namespace
+//     carrying exactly "written"; with an own claim, the claim alone decides. The /data
+//     delete in that case carries a UID precondition so a delayed delete cannot hit the
+//     replacement;
 //   - in-process carry: bridges the window between a confirmed Secret write (or a /data
 //     recycle delete of a stamped claim) and the stamped claim's create. It is lost on a
 //     controller restart, which only ever costs the env (fail closed), never a crash.
+//     Non-retained recycles (the Deployment is deleted, not held) remain carry-only.
 //
-// Without either, the pod template omits UZI_CODEX_CA_FILE.
+// Without any of them, the pod template omits UZI_CODEX_CA_FILE.
 //
 // A carry for a namespace the worker has left (a Docker/Isolated flip) persists until
 // teardown or until the worker leaves the desired set. It is bounded and stays truthful:
@@ -73,8 +89,71 @@ func (m *Materializer) pruneCodexCACarry(desired map[string]bool) {
 	}
 }
 
-// ownDataClaim returns obs's /data claim when it is w's own claim in ns.
+// codexExtraCARecord reports whether d carries a valid, live Codex CA record: the exact
+// "written" value on a Deployment that is not being deleted. Anything else (absent,
+// malformed, terminating) is no evidence.
+func codexExtraCARecord(d *appsv1.Deployment) bool {
+	return d != nil && d.DeletionTimestamp == nil && d.Annotations[AnnotationCodexExtraCA] == codexExtraCAWritten
+}
+
+// codexCANoClaimEvidence is the evidence used when w has no own-namespace /data claim:
+// the in-process carry, or the durable record on the worker's Deployment in ns.
+func (m *Materializer) codexCANoClaimEvidence(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) bool {
+	return m.codexCACarried(w.ID, ns) || obs.DeploymentCodexExtraCA[ns]
+}
+
+// syncRetainedCodexCARecord makes the retained Deployment's AnnotationCodexExtraCA record
+// match the claim's stamp (written: present with the exact value; otherwise absent). It
+// is a no-op when it already matches. Otherwise it patches under UID and resourceVersion
+// preconditions and requires a confirmed response before returning nil: the caller
+// deletes the claim only on nil.
+func (m *Materializer) syncRetainedCodexCARecord(ctx context.Context, ns string, e *rollEntry, written bool) error {
+	if e == nil || e.dep == nil {
+		return fmt.Errorf("codex CA evidence write unavailable; re-poll required")
+	}
+	dep := e.dep
+	cur, has := dep.Annotations[AnnotationCodexExtraCA]
+	if written && has && cur == codexExtraCAWritten || !written && !has {
+		return nil
+	}
+	if dep.UID == "" || dep.ResourceVersion == "" || dep.DeletionTimestamp != nil {
+		return fmt.Errorf("codex CA evidence write unavailable; re-poll required")
+	}
+	var value any // nil clears the key under a merge patch
+	if written {
+		value = codexExtraCAWritten
+	}
+	body, err := json.Marshal(map[string]any{"metadata": m.withOperatorMetadata(map[string]any{
+		"uid":             dep.UID,
+		"resourceVersion": dep.ResourceVersion,
+		"annotations":     map[string]any{AnnotationCodexExtraCA: value},
+	})})
+	if err != nil {
+		return err
+	}
+	got, err := m.client.AppsV1().Deployments(ns).Patch(ctx, dep.Name, types.MergePatchType, body, metav1.PatchOptions{})
+	if err != nil || got == nil || got.UID != dep.UID || got.ResourceVersion == "" || got.ResourceVersion == dep.ResourceVersion || got.DeletionTimestamp != nil ||
+		got.Annotations[annotationRoll] != dep.Annotations[annotationRoll] || got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+		return fmt.Errorf("codex CA evidence write unconfirmed; re-poll required")
+	}
+	gotVal, gotHas := got.Annotations[AnnotationCodexExtraCA]
+	if written && (!gotHas || gotVal != codexExtraCAWritten) || !written && gotHas {
+		return fmt.Errorf("codex CA evidence write unconfirmed; re-poll required")
+	}
+	return nil
+}
+
+// ownDataClaim returns obs's /data claim when it is w's own claim in ns. When the
+// namespace-keyed observation is present it alone decides, so a same-ID claim scanned
+// later in another namespace cannot shadow or masquerade as the own claim.
 func ownDataClaim(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) *reconcile.ClaimObservation {
+	if obs.DataClaimsByNamespace != nil {
+		if c, ok := obs.DataClaimsByNamespace[ns]; ok && c.Name == dataPVCName(w.ID) {
+			cp := c
+			return &cp
+		}
+		return nil
+	}
 	c := obs.DataClaim
 	if obs.HasDataPVC && c != nil && c.Namespace == ns && c.Name == dataPVCName(w.ID) {
 		return c
@@ -94,7 +173,7 @@ func (m *Materializer) deriveCodexCA(w protocol.DesiredWorker, obs reconcile.Obs
 	if c := ownDataClaim(w, obs, ns); c != nil {
 		return c.CodexExtraCA, !c.Terminating, ns, true
 	}
-	return m.codexCACarried(w.ID, ns), false, ns, true
+	return m.codexCANoClaimEvidence(w, obs, ns), false, ns, true
 }
 
 // codexCADecisions computes the Codex CA decision for every DESIRED worker once per tick,

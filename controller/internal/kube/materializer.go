@@ -387,6 +387,12 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
+		if codexExtraCARecord(d) {
+			if o.DeploymentCodexExtraCA == nil {
+				o.DeploymentCodexExtraCA = map[string]bool{}
+			}
+			o.DeploymentCodexExtraCA[ns] = true
+		}
 		applyDeploymentHibernationEvidence(o, d)
 		for _, c := range d.Status.Conditions {
 			if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
@@ -458,7 +464,11 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
 			dataClaim := claimObservationOf(ns, id, p)
 			o.DataClaim = &dataClaim // any state, Terminating included (issue #3890)
-			if !terminating {        // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
+			if o.DataClaimsByNamespace == nil {
+				o.DataClaimsByNamespace = map[string]reconcile.ClaimObservation{}
+			}
+			o.DataClaimsByNamespace[ns] = dataClaim // namespace-keyed: DataClaim above is last-scanned-wins
+			if !terminating {                       // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
 				o.DataPVCLive = true
 				t := p.CreationTimestamp.Time
 				o.DataPVCCreatedAt = &t
@@ -1037,6 +1047,24 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 			}
 		}
 	}
+	// Retained /data recycle: record the claim's Codex CA stamp on the retained Deployment
+	// BEFORE the claim goes, so a controller restart between the delete and the
+	// replacement create does not lose the evidence (the carry is in-process only). The
+	// record mirrors the claim exactly: set when stamped, cleared when not, so a stale
+	// record can never promote an unstamped replacement. Nothing is deleted unless the
+	// sync is confirmed or already matches.
+	var dataUID *types.UID
+	if retained && slices.Contains(names, dataPVCName(w.ID)) {
+		claim := ownDataClaim(w, obs, ns)
+		if claim == nil || claim.Terminating || claim.UID == "" {
+			return fmt.Errorf("recycle data claim evidence unavailable; re-poll required")
+		}
+		uid := types.UID(claim.UID)
+		dataUID = &uid
+		if err := m.syncRetainedCodexCARecord(ctx, ns, rollFrom(ctx, w.ID), claim.CodexExtraCA); err != nil {
+			return err
+		}
+	}
 	for _, name := range names {
 		// A stamped /data claim is the only durable proof the Secret has the Codex CA
 		// key; carry it across the delete so the replacement claim is stamped too. The
@@ -1049,8 +1077,14 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 				m.setCodexCACarry(w.ID, ns)
 			}
 		}
-		err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
+		opts := metav1.DeleteOptions{}
+		if name == dataPVCName(w.ID) && dataUID != nil {
+			// Fence a delayed delete: it must never hit a replacement claim that already
+			// carries a new UID. A Conflict means the claim we meant to delete is gone.
+			opts.Preconditions = &metav1.Preconditions{UID: dataUID}
+		}
+		err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, opts)
+		if err != nil && !apierrors.IsNotFound(err) && !(opts.Preconditions != nil && apierrors.IsConflict(err)) {
 			errs = append(errs, fmt.Errorf("delete pvc %s for recycle: %w", name, err))
 		} else {
 			m.log.Info("recycling hosted worker volumes: deleted pvc", "worker_id", w.ID, "pvc", name, "namespace", ns)
@@ -1261,7 +1295,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// may scale a parked worker or delete its volumes. The claims are still created if
 	// missing, and the Secret above is never touched.
 	if w.Hibernation != nil {
-		deferred, codexStamped, err := m.ensurePVCs(ctx, w, obs, ns, spec, m.codexCACarried(w.ID, ns))
+		deferred, codexStamped, err := m.ensurePVCs(ctx, w, obs, ns, spec, m.codexCANoClaimEvidence(w, obs, ns))
 		if err != nil {
 			return err
 		}
@@ -1354,7 +1388,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// The dind data root (issue #224 M-a) is a THIRD claim, and only for a docker worker:
 	// RenderPVCs emits it only when w.Docker, so this loop never sees it for a plain one
 	// and its gate cannot mis-fire there.
-	deferred, codexStamped, err := m.ensurePVCs(ctx, w, obs, ns, spec, m.codexCACarried(w.ID, ns))
+	deferred, codexStamped, err := m.ensurePVCs(ctx, w, obs, ns, spec, m.codexCANoClaimEvidence(w, obs, ns))
 	if deferred || err != nil {
 		return err
 	}

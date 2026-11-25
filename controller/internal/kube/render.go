@@ -95,11 +95,16 @@ const (
 	// placement.
 	placementNew = "new"
 
-	// AnnotationCodexExtraCA is set ONLY at create time on a worker's /data PVC, and only
+	// AnnotationCodexExtraCA is set at create time on a worker's /data PVC, and only
 	// when the worker's Secret was just written with the codexExtraCACertKey entry. The
 	// Secret is write-once and the controller cannot read it back, so this claim stamp is
 	// the durable evidence that the key exists; the pod template renders UZI_CODEX_CA_FILE
 	// only on that evidence (RenderConfig.withCodexCA).
+	//
+	// It is also written on a retained worker Deployment (never rendered by RenderDeployment)
+	// during a retained /data recycle: recycleWorkerVolumes syncs it to the claim's stamp
+	// immediately before the claim delete, so the evidence survives a controller restart
+	// between the delete and the replacement claim's create. See codex_ca.go.
 	AnnotationCodexExtraCA = "uzi.dev/codex-extra-ca"
 
 	// codexExtraCAWritten is the AnnotationCodexExtraCA value.
