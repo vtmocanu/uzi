@@ -1084,8 +1084,11 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 			opts.Preconditions = &metav1.Preconditions{UID: dataUID}
 		}
 		err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, opts)
-		if err != nil && !apierrors.IsNotFound(err) && !(opts.Preconditions != nil && apierrors.IsConflict(err)) {
+		gone := apierrors.IsNotFound(err) || (opts.Preconditions != nil && apierrors.IsConflict(err))
+		if err != nil && !gone {
 			errs = append(errs, fmt.Errorf("delete pvc %s for recycle: %w", name, err))
+		} else if err != nil {
+			m.log.Info("recycling hosted worker volumes: pvc already gone or replaced (uid precondition)", "worker_id", w.ID, "pvc", name, "namespace", ns)
 		} else {
 			m.log.Info("recycling hosted worker volumes: deleted pvc", "worker_id", w.ID, "pvc", name, "namespace", ns)
 		}

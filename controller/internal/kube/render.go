@@ -800,8 +800,9 @@ func IsOurs(labels map[string]string) (string, bool) {
 // entry and the limit: adding or changing it reaches workers created afterwards. The
 // Codex key is written here whenever secretCarriesCodexCA, but the pod only references
 // it (UZI_CODEX_CA_FILE) on durable evidence it exists: the create-time
-// AnnotationCodexExtraCA stamp on the /data claim, or the in-process carry covering the
-// window until that claim is created (see codex_ca.go). The chart's caDuration is 5 years precisely
+// AnnotationCodexExtraCA stamp on the /data claim, or, while no claim exists, the in-process
+// carry or the retained Deployment's record covering the window until that claim is
+// created (see codex_ca.go). The chart's caDuration is 5 years precisely
 // because re-trusting a new root means touching every worker at once.
 func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *corev1.Secret {
 	data := map[string][]byte{tokenKey: []byte(token)}

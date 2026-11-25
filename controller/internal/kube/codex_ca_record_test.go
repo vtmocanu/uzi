@@ -354,9 +354,38 @@ func TestCodexCAUnconfirmedRecordWriteDeletesNothing(t *testing.T) {
 			return d, nil
 		},
 	}
+	// Each response below is otherwise valid (fresh resourceVersion, same UID, record
+	// written) and breaks exactly one confirmation clause.
+	one := func(mutate func(d *appsv1.Deployment)) func(next func() (runtime.Object, error)) (runtime.Object, error) {
+		return func(next func() (runtime.Object, error)) (runtime.Object, error) {
+			o, err := next()
+			if err != nil {
+				return nil, err
+			}
+			d := o.(*appsv1.Deployment).DeepCopy()
+			d.ResourceVersion = "rv-fresh-from-test"
+			mutate(d)
+			return d, nil
+		}
+	}
+	cases["same resourceVersion"] = one(func(d *appsv1.Deployment) { d.ResourceVersion = "rv-orig" })
+	cases["deletion timestamp set"] = one(func(d *appsv1.Deployment) {
+		now := metav1.NewTime(m5Now)
+		d.DeletionTimestamp = &now
+	})
+	cases["annotationRoll changed"] = one(func(d *appsv1.Deployment) { d.Annotations[annotationRoll] += "-changed" })
+	cases["replicas one"] = one(func(d *appsv1.Deployment) { one := int32(1); d.Spec.Replicas = &one })
 	for name, f := range cases {
 		t.Run(name, func(t *testing.T) {
-			m, c, w, _ := recycleFixture(t, true)
+			m, c, w, cfg := recycleFixture(t, true)
+			if name == "same resourceVersion" {
+				// Pin the stored resourceVersion so the response can repeat it exactly.
+				d := caDep(t, c, cfg.Namespace, "w1").DeepCopy()
+				d.ResourceVersion = "rv-orig"
+				if err := c.Tracker().Update(appsv1.SchemeGroupVersion.WithResource("deployments"), d, cfg.Namespace); err != nil {
+					t.Fatal(err)
+				}
+			}
 			caInterceptRecordPatch(c, 1, f)
 			if err := caTick(t, m, w); err == nil {
 				t.Fatal("tick succeeded despite an unconfirmed record write")
@@ -365,6 +394,85 @@ func TestCodexCAUnconfirmedRecordWriteDeletesNothing(t *testing.T) {
 				t.Fatalf("claims deleted: %v", got)
 			}
 		})
+	}
+}
+
+// The own /data claim is Terminating while a same-ID live claim in the other worker
+// namespace folds the scalar DataPVCLive to true: no /data delete, an error.
+func TestCodexCATerminatingOwnClaimWithLiveForeignClaimDeletesNothing(t *testing.T) {
+	foreign := pvcForNS("w1", "data", caDockerNS)
+	m, c, w, cfg := caRetained(t, true, "", true, foreign)
+	own := caClaim(t, c, cfg.Namespace, dataPVCName("w1")).DeepCopy()
+	now := metav1.NewTime(m5Now)
+	own.DeletionTimestamp = &now
+	if err := c.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), own, cfg.Namespace); err != nil {
+		t.Fatal(err)
+	}
+	if obs := caObserve(t, m, "w1"); !obs.DataPVCLive {
+		t.Fatal("fixture: the foreign live claim should fold DataPVCLive to true")
+	}
+	err := caTick(t, m, w)
+	if err == nil || !strings.Contains(err.Error(), "recycle data claim evidence unavailable") {
+		t.Fatalf("tick err = %v, want the evidence-unavailable error", err)
+	}
+	if got := caPVCDeletes(c); len(got) != 0 {
+		t.Fatalf("claims deleted: %v", got)
+	}
+}
+
+// An own /data claim without a UID cannot be fenced: nothing is deleted.
+func TestCodexCAOwnClaimWithoutUIDDeletesNothing(t *testing.T) {
+	m, c, w, cfg := caRetained(t, true, "", false)
+	own := caClaim(t, c, cfg.Namespace, dataPVCName("w1")).DeepCopy()
+	own.UID = ""
+	if err := c.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), own, cfg.Namespace); err != nil {
+		t.Fatal(err)
+	}
+	err := caTick(t, m, w)
+	if err == nil || !strings.Contains(err.Error(), "recycle data claim evidence unavailable") {
+		t.Fatalf("tick err = %v, want the evidence-unavailable error", err)
+	}
+	if got := caPVCDeletes(c); len(got) != 0 {
+		t.Fatalf("claims deleted: %v", got)
+	}
+}
+
+// The sync refuses to patch from a Deployment snapshot that cannot be preconditioned.
+func TestCodexCASyncRefusesAnUnpreconditionableDeployment(t *testing.T) {
+	now := metav1.NewTime(m5Now)
+	cases := map[string]func(d *appsv1.Deployment){
+		"no uid":             func(d *appsv1.Deployment) { d.UID = "" },
+		"no resourceVersion": func(d *appsv1.Deployment) { d.ResourceVersion = "" },
+		"deletion timestamp": func(d *appsv1.Deployment) { d.DeletionTimestamp = &now },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, c, _, cfg := caRetained(t, true, "", false)
+			dep := caDep(t, c, cfg.Namespace, "w1").DeepCopy()
+			dep.UID, dep.ResourceVersion = "uid-1", "rv-1"
+			mutate(dep)
+			c.ClearActions()
+			if err := m.syncRetainedCodexCARecord(context.Background(), cfg.Namespace, &rollEntry{dep: dep}, true); err == nil {
+				t.Fatal("sync succeeded without a usable UID, resourceVersion or live Deployment")
+			}
+			if n := caRecordPatches(c); n != 0 {
+				t.Fatalf("record patched %d times", n)
+			}
+		})
+	}
+}
+
+// After a confirmed write the roll entry carries the patched Deployment, not the stale one.
+func TestCodexCASyncRefreshesTheRollEntry(t *testing.T) {
+	m, c, _, cfg := caRetained(t, true, "", false)
+	dep := caDep(t, c, cfg.Namespace, "w1").DeepCopy()
+	e := &rollEntry{dep: dep}
+	if err := m.syncRetainedCodexCARecord(context.Background(), cfg.Namespace, e, true); err != nil {
+		t.Fatal(err)
+	}
+	got := caDep(t, c, cfg.Namespace, "w1")
+	if e.dep == dep || e.o.DeploymentResourceVersion != e.dep.ResourceVersion || e.dep.ResourceVersion != got.ResourceVersion || e.dep.Annotations[AnnotationCodexExtraCA] != codexExtraCAWritten {
+		t.Fatalf("roll entry not refreshed: dep rv=%s o.rv=%s stored rv=%s", e.dep.ResourceVersion, e.o.DeploymentResourceVersion, got.ResourceVersion)
 	}
 }
 

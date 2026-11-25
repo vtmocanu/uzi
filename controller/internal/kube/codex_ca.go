@@ -140,6 +140,10 @@ func (m *Materializer) syncRetainedCodexCARecord(ctx context.Context, ns string,
 	if written && (!gotHas || gotVal != codexExtraCAWritten) || !written && gotHas {
 		return fmt.Errorf("codex CA evidence write unconfirmed; re-poll required")
 	}
+	// Confirmed: refresh the tick state so no stale resourceVersion remains. annotationRoll
+	// is confirmed unchanged, so the marker stays.
+	e.dep = got
+	e.o.DeploymentUID, e.o.DeploymentResourceVersion = string(got.UID), got.ResourceVersion
 	return nil
 }
 
@@ -162,7 +166,8 @@ func ownDataClaim(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns str
 }
 
 // deriveCodexCA applies the evidence rules with no side effects: the own-namespace /data
-// claim's stamp decides when one is observed; otherwise the carry does. A present but
+// claim's stamp decides when one is observed; otherwise the in-process carry or the
+// retained Deployment's durable record does. A present but
 // unreadable claim, a claim in another namespace and a brand-new worker with no carry
 // all read false.
 func (m *Materializer) deriveCodexCA(w protocol.DesiredWorker, obs reconcile.ObservedWorker) (decision bool, liveOwnClaim bool, ns string, ok bool) {
