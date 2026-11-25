@@ -17,6 +17,10 @@ import (
 //     controller restart, which only ever costs the env (fail closed), never a crash.
 //
 // Without either, the pod template omits UZI_CODEX_CA_FILE.
+//
+// A carry for a namespace the worker has left (a Docker/Isolated flip) persists until
+// teardown or until the worker leaves the desired set. It is bounded and stays truthful:
+// it names the namespace whose Secret was written.
 
 // codexCATickKey carries the per-tick Codex CA decision (worker id -> Secret carries the
 // key) in the Reconcile context, frozen like placementTickKey.
@@ -122,13 +126,19 @@ func (m *Materializer) codexCAInSecretFor(ctx context.Context, w protocol.Desire
 	return decision
 }
 
-// codexCAWriteDeferred reports that this pass wrote the Codex CA evidence (a carry is
-// set, or the stamped claim was just created) while the tick's frozen decision still
-// says no. Rendering a Deployment now would omit the env that the next observation will
-// require, so the pass stops after ensurePVCs and the next tick creates it.
-func (m *Materializer) codexCAWriteDeferred(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, codexStamped bool) bool {
+// codexCAWriteDeferred reports that this pass wrote Codex CA evidence (secretWritten:
+// this tick's own Secret create response carried the key; codexStamped: this pass's
+// stamped claim create was confirmed) while the tick's frozen decision still says no.
+// Rendering a Deployment now would omit the env that the next observation will require,
+// so the pass stops after ensurePVCs and the next tick creates it.
+//
+// Only evidence from THIS pass counts. A carry left by an earlier tick must not fire the
+// guard: a Terminating own unstamped claim never clears it, and a guard keyed on it would
+// return on every tick (skipping, in the hibernation branch, the Preparing stop of a live
+// Deployment).
+func (m *Materializer) codexCAWriteDeferred(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, secretWritten, codexStamped bool) bool {
 	if m.codexCAInSecretFor(ctx, w, obs) {
 		return false
 	}
-	return codexStamped || m.codexCACarried(w.ID, ns)
+	return secretWritten || codexStamped
 }

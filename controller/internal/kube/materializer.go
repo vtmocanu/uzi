@@ -1221,6 +1221,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// would strand a working worker), or the api's buffer expired unread and recovery
 	// is a rotation. Never invent one, never clear the existing Secret on account of
 	// it, and never log the field.
+	secretWritten := false
 	if w.JoinToken != nil {
 		// There is no get on Secrets, so "create if absent" is not available to us — and
 		// does not need to be. Issue the create and treat AlreadyExists as success. That
@@ -1247,6 +1248,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		if err == nil && created != nil && created.Name == secretName(w.ID) && created.Namespace == ns &&
 			len(created.Data[codexExtraCACertKey]) > 0 {
 			m.setCodexCACarry(w.ID, ns)
+			secretWritten = true
 		}
 	}
 
@@ -1259,7 +1261,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		if err != nil {
 			return err
 		}
-		if m.codexCAWriteDeferred(ctx, w, obs, ns, codexStamped) {
+		if m.codexCAWriteDeferred(ctx, w, obs, secretWritten, codexStamped) {
 			// The Codex CA evidence was written this pass; the Deployment (create or wake)
 			// waits for the next observation to see it, so it renders the env once.
 			return nil
@@ -1352,7 +1354,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	if deferred || err != nil {
 		return err
 	}
-	if m.codexCAWriteDeferred(ctx, w, obs, ns, codexStamped) {
+	if m.codexCAWriteDeferred(ctx, w, obs, secretWritten, codexStamped) {
 		// See the hibernation branch: no Deployment create or patch until the next tick
 		// observes the Codex CA stamp.
 		return nil

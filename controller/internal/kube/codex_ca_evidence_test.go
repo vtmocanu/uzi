@@ -176,6 +176,9 @@ func TestCodexCAFreshWorkerTakesThreeTicks(t *testing.T) {
 	if d := caDep(t, c, ns, "w1"); d != nil {
 		t.Fatalf("tick 1 created the Deployment (env=%v); it must wait for the stamp to be observed", caHasEnv(d))
 	}
+	if m.codexCACarried("w1", ns) {
+		t.Error("tick 1: the confirmed stamped create left the carry in place")
+	}
 
 	caMustTick(t, m, w)
 	d := caDep(t, c, ns, "w1")
@@ -630,7 +633,8 @@ func TestCodexCARemovalDropsTheEnvOnly(t *testing.T) {
 	w := evidence(desired("w1"), m5Now)
 	w.Ephemeral = true // outside the roll pools: the template is patched directly
 	live := RenderDeployment(cfg.withCodexCA(true), w, testSpec(t, "base", "m"))
-	objs := append(caClaims("w1", true), live)
+	liveSecret := RenderSecret(cfg, w, "uzw_w1") // written while the bundle was configured
+	objs := append(caClaims("w1", true), live, liveSecret)
 	m, c := caMat(t, cfg, objs...)
 	m.cfg.ExtraCAPEM = nil
 	caMustTick(t, m, w)
@@ -640,6 +644,9 @@ func TestCodexCARemovalDropsTheEnvOnly(t *testing.T) {
 	}
 	if n := caSecretActions(c); n != 0 {
 		t.Errorf("secret actions = %d", n)
+	}
+	if s, err := c.CoreV1().Secrets(ns).Get(context.Background(), secretName("w1"), metav1.GetOptions{}); err != nil || string(s.Data[codexExtraCACertKey]) != "extra-ca-A" {
+		t.Errorf("live secret = %v, %v; want it to keep %s", s, err, codexExtraCACertKey)
 	}
 	was, now := codexCABaseEnv(live), codexCABaseEnv(d)
 	if was["UZI_WORKER_TOKEN_FILE"] == "" || now["UZI_WORKER_TOKEN_FILE"] != was["UZI_WORKER_TOKEN_FILE"] {
@@ -749,6 +756,87 @@ func TestCodexCALiveUnstampedClaimClearsTheCarry(t *testing.T) {
 	}
 	if d := caDep(t, c, ns, "w1"); d == nil || caHasEnv(d) {
 		t.Fatalf("deployment = %v, want created without the env", d)
+	}
+}
+
+// The hibernation branch honours the same guard: a Waking worker with nothing provisioned
+// gets its Secret and stamped claim on tick 1 and no Deployment; tick 2 creates it with the env.
+func TestCodexCAHibernationWakeDefersTheDeploymentOneTick(t *testing.T) {
+	cfg := caCfg()
+	ns := cfg.Namespace
+	m, c := caMat(t, cfg)
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	w.JoinToken = token("uzw_w1")
+
+	caMustTick(t, m, w)
+	s, err := c.CoreV1().Secrets(ns).Get(context.Background(), secretName("w1"), metav1.GetOptions{})
+	if err != nil || len(s.Data[codexExtraCACertKey]) == 0 {
+		t.Fatalf("tick 1 secret = %v, %v; want the codex key", s, err)
+	}
+	if !caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
+		t.Error("tick 1: data claim is not stamped")
+	}
+	if d := caDep(t, c, ns, "w1"); d != nil {
+		t.Fatalf("tick 1 created the Deployment (env=%v); it must wait for the stamp to be observed", caHasEnv(d))
+	}
+
+	caMustTick(t, m, w)
+	if d := caDep(t, c, ns, "w1"); d == nil || !caHasEnv(d) {
+		t.Fatalf("tick 2: deployment = %v, want created with %s", d, caEnvName)
+	}
+}
+
+// A carry left by an earlier tick must not hold the guard: the worker's own unstamped claim
+// is Terminating (it never clears the carry), and the Preparing stop of its live Deployment
+// still has to proceed.
+func TestCodexCALeftoverCarryDoesNotStickTheGuard(t *testing.T) {
+	cfg := caCfg()
+	ns := cfg.Namespace
+	data := pvcFor("w1", "data")
+	gone := metav1.NewTime(m5Now)
+	data.DeletionTimestamp = &gone
+	data.Finalizers = []string{"kubernetes.io/pvc-protection"}
+	m, c, _ := hibEnv(t, hibDeployment(1, "op-1"))
+	if err := c.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), data, ns); err != nil {
+		t.Fatal(err)
+	}
+	m.setCodexCACarry("w1", ns) // left by an earlier tick's Secret create
+	if err := hibTick(t, m, hibW(protocol.HibernationPreparing, "op-1")); err != nil {
+		t.Fatal(err)
+	}
+	if n := replicaPatches(c); n != 1 {
+		t.Fatalf("replica patches = %d, want the Preparing stop to proceed once", n)
+	}
+	if r := hibGet(t, c).Spec.Replicas; r == nil || *r != 0 {
+		t.Fatalf("replicas = %v, want 0", r)
+	}
+}
+
+// A stamped create whose response lacks the stamp is not evidence: the carry stays.
+func TestCodexCAStampedCreateResponseWithoutTheStampKeepsTheCarry(t *testing.T) {
+	cfg := caCfg()
+	ns := cfg.Namespace
+	m, c := caMat(t, cfg)
+	c.PrependReactor("create", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		pvc := a.(k8stesting.CreateAction).GetObject().(*corev1.PersistentVolumeClaim)
+		if pvc.Name != dataPVCName("w1") {
+			return false, nil, nil
+		}
+		stored := pvc.DeepCopy()
+		stored.UID, stored.ResourceVersion = "uid-data", "1"
+		if err := c.Tracker().Create(a.GetResource(), stored, a.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		echo := stored.DeepCopy()
+		delete(echo.Annotations, AnnotationCodexExtraCA)
+		return true, echo, nil
+	})
+	caMustTick(t, m, caWorker("w1"))
+	if !caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
+		t.Fatal("fixture: the stored claim is not stamped")
+	}
+	if !m.codexCACarried("w1", ns) {
+		t.Error("a create response without the stamp cleared the carry")
 	}
 }
 
