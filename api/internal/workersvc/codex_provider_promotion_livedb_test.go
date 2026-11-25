@@ -65,7 +65,7 @@ func TestCodexProviderFrozenHoldPromotionLiveDB(t *testing.T) {
 
 			switch name {
 			case "reallow_after_source_cleared":
-				f.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, f.userID)
+				f.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, f.userID)
 			case "reallow_after_source_changed_to_unusable_b":
 				seedCodexSource(t, f.provFix)
 				if f.provider == a || f.key == keyA {

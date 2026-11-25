@@ -28,9 +28,9 @@ func seedCodexSource(t *testing.T, fx *provFix) {
 	}
 	fx.provider, fx.key = p.ID, key.ID
 	t.Cleanup(func() {
-		_, _ = fx.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL WHERE id=$1`, fx.userID)
+		_, _ = fx.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, fx.userID)
 	})
-	fx.env.exec(`UPDATE users SET codex_provider_id=$2, default_harness='codex' WHERE id=$1`, fx.userID, p.ID)
+	fx.env.exec(`UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1, default_harness='codex' WHERE id=$1`, fx.userID, p.ID)
 }
 
 func wantCodexBinding(t *testing.T, fx *provFix, run store.Run, revision int32, keyRev int64) {
@@ -179,7 +179,7 @@ func TestCodexProviderSuccessorLifecycleLiveDB(t *testing.T) {
 			oldProvider, oldKey := fx.provider, fx.key
 			switch change {
 			case "cleared":
-				fx.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, fx.userID)
+				fx.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, fx.userID)
 			case "changed":
 				seedCodexSource(t, fx)
 			case "retired":
@@ -244,9 +244,9 @@ func TestCodexProviderFrozenSuccessorLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = fx.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL WHERE id=$1`, fx.userID)
+		_, _ = fx.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, fx.userID)
 	})
-	fx.env.exec(`UPDATE users SET codex_provider_id=$2,default_harness='codex' WHERE id=$1`, fx.userID, p.ID)
+	fx.env.exec(`UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1,default_harness='codex' WHERE id=$1`, fx.userID, p.ID)
 	run, res, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, nil, fx.insertAt(nil))
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +254,7 @@ func TestCodexProviderFrozenSuccessorLiveDB(t *testing.T) {
 	if res.Codex != nil || run.Harness != "codex" || !run.ModelProviderKeyRev.Valid || uuid.UUID(run.ModelProviderKeySecretID.Bytes) != key.ID || run.CodexSecretID.Valid || run.CodexAuthMode.Valid {
 		t.Fatalf("wrong binding: %+v", run)
 	}
-	fx.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, fx.userID)
+	fx.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, fx.userID)
 	child, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, nil, fx.insertAt(nil), harnessCreationOrigin{InheritFrom: &run})
 	if err != nil {
 		t.Fatal(err)

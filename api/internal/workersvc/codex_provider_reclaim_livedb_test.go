@@ -58,7 +58,7 @@ func TestCodexProviderCreationCrashBeforeClaimPersistenceAssemblyLiveDB(t *testi
 
 	// Both vendor sources are available to creation on the restarted service.
 	// Clearing the selection affects this new run only, not the committed A run.
-	f.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, f.userID)
+	f.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, f.userID)
 	for _, harness := range []Harness{HarnessClaude, HarnessCodex} {
 		_, resolved, err := f.svc.createRunAtomic(f.env.ctx, f.userID, &harness, f.insertAt(nil))
 		if err != nil || resolved.ProviderSource != nil {

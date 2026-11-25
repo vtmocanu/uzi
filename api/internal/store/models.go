@@ -2125,6 +2125,7 @@ type User struct {
 	WeeklyWarningMarginPts    int16              `json:"weekly_warning_margin_pts"`
 	CodexProviderID           pgtype.UUID        `json:"codex_provider_id"`
 	ClaudeProviderScopeID     pgtype.UUID        `json:"claude_provider_scope_id"`
+	CodexProviderScopeID      pgtype.UUID        `json:"codex_provider_scope_id"`
 }
 
 type UserCrossCheckPin struct {

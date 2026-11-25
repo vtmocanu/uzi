@@ -1483,7 +1483,10 @@ SET claude_provider_id = CASE WHEN $1::text = 'claude' THEN $2::uuid ELSE claude
     claude_provider_scope_id = CASE WHEN $1::text = 'claude'
         THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $2::uuid)
         ELSE claude_provider_scope_id END,
-    codex_provider_id = CASE WHEN $1::text = 'codex' THEN $2::uuid ELSE codex_provider_id END
+    codex_provider_id = CASE WHEN $1::text = 'codex' THEN $2::uuid ELSE codex_provider_id END,
+    codex_provider_scope_id = CASE WHEN $1::text = 'codex'
+        THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $2::uuid)
+        ELSE codex_provider_scope_id END
 WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
   AND ($2::uuid IS NULL
        OR ($1::text = 'claude' AND EXISTS (
@@ -1510,8 +1513,9 @@ type SetUserProviderSourceRow struct {
 // Sets or clears (NULL) the caller's source for one engine; a NULL provider_id CLEARS the setting and
 // the engine must be named. The Claude branch accepts a definition visible to the caller (their own
 // or a shared per-user-key one) and writes claude_provider_scope_id from that definition in the same
-// statement (NULL when clearing); the Codex branch accepts only the caller's own Codex definition and
-// never touches the Claude scope. The composite foreign keys (users_claude_provider_fkey,
+// statement (NULL when clearing); the Codex branch likewise writes codex_provider_scope_id from the
+// definition and never touches the Claude scope. In this statement the Codex branch still accepts only
+// the caller's own Codex definition. The composite foreign keys (users_claude_provider_fkey,
 // users_codex_provider_fkey) independently reject a definition the caller may not use. Usability is
 // checked by the caller, which holds the user's secret-mutation lock.
 func (q *Queries) SetUserProviderSource(ctx context.Context, arg SetUserProviderSourceParams) (SetUserProviderSourceRow, error) {

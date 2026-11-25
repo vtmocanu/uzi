@@ -18,17 +18,27 @@ import (
 // TestModelProviderDownLockSerializesWithAWriterLiveDB).
 func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 	// ALTER Downs take their final ACCESS EXCLUSIVE lock up front (no lock upgrade).
-	for file, spec := range map[string]struct{ table, mode string }{
-		"00476_model_providers.sql":                  {"model_providers", "SHARE ROW EXCLUSIVE"},
-		"00477_user_secrets_provider_key.sql":        {"user_secrets", "ACCESS EXCLUSIVE"},
-		"00479_users_claude_provider_source.sql":     {"users", "ACCESS EXCLUSIVE"},
-		"00481_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
-		"00488_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
-		"00524_model_providers_shared_scope.sql":     {"model_providers", "ACCESS EXCLUSIVE"},
-		"00527_user_secrets_provider_scope.sql":      {"user_secrets", "ACCESS EXCLUSIVE"},
-		"00528_users_claude_provider_scope.sql":      {"users", "ACCESS EXCLUSIVE"},
+	type guardSpec struct{ table, mode string }
+	// The shared Codex Downs (00532-00537) lock three tables and read each guarded one in turn.
+	// 00532 and 00533 predate users.codex_provider_scope_id, so they read no selection, though they still lock users.
+	sharedCodexDownNoSelection := []guardSpec{{"model_providers", "ACCESS EXCLUSIVE"}, {"user_secrets", "ACCESS EXCLUSIVE"}}
+	sharedCodexDown := append(append([]guardSpec{}, sharedCodexDownNoSelection...), guardSpec{"users", "ACCESS EXCLUSIVE"})
+	for file, specs := range map[string][]guardSpec{
+		"00476_model_providers.sql":                              {{"model_providers", "SHARE ROW EXCLUSIVE"}},
+		"00477_user_secrets_provider_key.sql":                    {{"user_secrets", "ACCESS EXCLUSIVE"}},
+		"00479_users_claude_provider_source.sql":                 {{"users", "ACCESS EXCLUSIVE"}},
+		"00481_runs_model_provider_binding.sql":                  {{"runs", "ACCESS EXCLUSIVE"}},
+		"00488_runs_provider_gateway_limit_type.sql":             {{"runs", "ACCESS EXCLUSIVE"}},
+		"00524_model_providers_shared_scope.sql":                 {{"model_providers", "ACCESS EXCLUSIVE"}},
+		"00527_user_secrets_provider_scope.sql":                  {{"user_secrets", "ACCESS EXCLUSIVE"}},
+		"00528_users_claude_provider_scope.sql":                  {{"users", "ACCESS EXCLUSIVE"}},
+		"00532_model_providers_shared_codex_engine.sql":          sharedCodexDownNoSelection,
+		"00533_user_secrets_shared_codex_scope.sql":              sharedCodexDownNoSelection,
+		"00534_users_codex_provider_scope.sql":                   sharedCodexDown,
+		"00535_validate_model_providers_shared_codex_engine.sql": sharedCodexDown,
+		"00536_validate_user_secrets_shared_codex_scope.sql":     sharedCodexDown,
+		"00537_validate_users_codex_provider_scope.sql":          sharedCodexDown,
 	} {
-		table := spec.table
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
 		if err != nil {
 			t.Fatal(err)
@@ -37,11 +47,14 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s has no Down block", file)
 		}
-		timeout := strings.Index(down, "SET LOCAL lock_timeout = '5s';")
-		lock := strings.Index(down, "LOCK TABLE "+table+" IN "+spec.mode+" MODE;")
-		guard := strings.Index(down, "IF EXISTS (SELECT 1 FROM "+table)
-		if timeout < 0 || lock < 0 || guard < 0 || timeout >= lock || lock >= guard {
-			t.Errorf("%s Down: lock_timeout@%d, LOCK TABLE %s@%d, IF EXISTS guard@%d; want all present in that order", file, timeout, table, lock, guard)
+		for _, spec := range specs {
+			table := spec.table
+			timeout := strings.Index(down, "SET LOCAL lock_timeout = '5s';")
+			lock := strings.Index(down, "LOCK TABLE "+table+" IN "+spec.mode+" MODE;")
+			guard := strings.Index(down, "IF EXISTS (SELECT 1 FROM "+table)
+			if timeout < 0 || lock < 0 || guard < 0 || timeout >= lock || lock >= guard {
+				t.Errorf("%s Down: lock_timeout@%d, LOCK TABLE %s@%d, IF EXISTS guard@%d; want all present in that order", file, timeout, table, lock, guard)
+			}
 		}
 		if strings.Contains(down, "count(*)") {
 			t.Errorf("%s Down still counts rows instead of IF EXISTS", file)
