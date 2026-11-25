@@ -43,6 +43,9 @@ const launchOptions = executablePath
 // imports src/index.css itself: Tailwind classes only mean something with the real stylesheet.
 export default defineConfig({
   plugins: [react(), docHeadingsPlugin()],
+  // Same flag vite.config.ts defines: the module loader reads it, and a bare identifier
+  // would otherwise be a ReferenceError in the browser.
+  define: { __UZI_TEST_HOOKS__: "false" },
   test: {
     include: ["src/**/*.browser.test.{ts,tsx}"],
     testTimeout: 20000,

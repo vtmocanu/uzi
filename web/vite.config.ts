@@ -5,6 +5,7 @@ import { defineConfig } from "vite";
 import { configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { docHeadingsPlugin } from "./vite-doc-headings";
+import { mfNoNewFunction } from "./scripts/vite-mf-no-new-function.mjs";
 
 // In production the SPA is served by nginx, which also proxies /api to the API
 // service (same origin, no CORS). The dev proxy below mirrors that so `npm run
@@ -12,7 +13,23 @@ import { docHeadingsPlugin } from "./vite-doc-headings";
 // /api/ws WebSocket too (nginx does this via its dedicated /api/ws location), so
 // the live run view streams under `npm run dev` and not just behind nginx.
 export default defineConfig({
-  plugins: [react(), docHeadingsPlugin()],
+  plugins: [react(), docHeadingsPlugin(), mfNoNewFunction()],
+  // Runtime web modules (PRD #4686). The host uses ONLY the Module Federation runtime
+  // (no federation build plugin), and its CSP is `script-src 'self'` with no
+  // 'unsafe-eval', so the dynamic-code literals the runtime would otherwise ship are
+  // removed at build time:
+  //   - FEDERATION_ALLOW_NEW_FUNCTION and __system_context__ -> undefined removes
+  //     runtime-core's guarded `new Function` sites;
+  //   - the mfNoNewFunction plugin above stubs the sdk's unguarded sites (pinned to
+  //     one sdk version; it fails the build on any drift);
+  //   - __UZI_TEST_HOOKS__ is false in every shipped build, so the browser harness's
+  //     window.__uziModuleStats counters are dead-code-eliminated. The harness build
+  //     overrides it to true.
+  define: {
+    FEDERATION_ALLOW_NEW_FUNCTION: "undefined",
+    __system_context__: "undefined",
+    __UZI_TEST_HOOKS__: "false",
+  },
   // Vitest's default testTimeout is 5s, and this project had no `test` block at all — so
   // every one of the 862 tests ran on that default. Measured during PRD #98: under full-suite
   // CPU contention, THREE unrelated tests each timed out once across ~20 runs —

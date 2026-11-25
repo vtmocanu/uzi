@@ -48,7 +48,19 @@
   // their own (`index.html` -> `src/main.tsx`, `vite.config.ts`, the test files), and
   // those are additive to this. Verified by measurement, not by assumption: with this
   // key present the report is unchanged except for the one file it removes.
-  "entry": ["public/theme-preinit.js", "scripts/gen-favicon-png.mjs"],
+  //
+  // `scripts/csp-build-scan.mjs` (PRD #4686) is a CLI run as `node scripts/csp-build-scan.mjs
+  // <build dir>...` by the module build checks, and its test spawns it as a child process
+  // rather than importing it, so nothing in the module graph reaches it. An entry, not an
+  // ignore, for the same reason as the favicon generator.
+  "entry": ["public/theme-preinit.js", "scripts/gen-favicon-png.mjs", "scripts/csp-build-scan.mjs"],
+
+  // `@module-federation/vite` (PRD #4686) is the federation BUILD plugin the example module's
+  // Vite config uses (web/examples/ui-module, added in the next milestone); the host itself
+  // uses only the runtime. Until that config lands nothing imports it. REMOVE this entry when
+  // the example's vite.config.ts imports the plugin: knip will then hint that it is stale
+  // (treatConfigHintsAsErrors makes that a failure), which is the reminder.
+  "ignoreDependencies": ["@module-federation/vite"],
 
   // ---- SEVERITY STAGING (PRD #103 Decision 4, Success Criterion 2). ------------
   //

@@ -22,6 +22,7 @@ import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { Modal } from "./Modal";
 import { BoardIcon, ChatIcon, SearchIcon } from "./icons";
 import { visibleNavItems } from "./navItems";
+import { useNavSections } from "../modules/nav";
 import { KindIcon } from "./NeedsDecisionCard";
 
 type BrowseGroup = Extract<CommandGroup, "needs" | "actions" | "goto">;
@@ -339,6 +340,8 @@ export function CommandMenu({
     };
   }, []);
 
+  // The same merged sections the sidebar renders (PRD #4686), so the two never disagree.
+  const navSections = useNavSections();
   const sectionItems = useMemo(() => built.sectionCommandItems(isAdmin), [isAdmin]);
   const docItems = useMemo(() => built.docCommandItems(docsForIndex(isAdmin), headingsFor), [isAdmin, headingsFor]);
 
@@ -360,7 +363,7 @@ export function CommandMenu({
         });
       }
     }
-    const goto: CommandItem[] = visibleNavItems(isAdmin).map((n) => ({
+    const goto: CommandItem[] = visibleNavItems(isAdmin, navSections).map((n) => ({
       id: `goto:${n.key}`,
       group: "goto",
       label: n.label,
@@ -387,6 +390,7 @@ export function CommandMenu({
     decisionState,
     demo,
     isAdmin,
+    navSections,
     extraItems,
     sectionItems,
     agentState,

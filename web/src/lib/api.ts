@@ -478,6 +478,35 @@ async function request<T>(
   return payload as T;
 }
 
+// moduleApiRequest is the transport behind a runtime web module's `sdk.api.request`
+// (PRD #4686). `path` is relative to /api and must start with "/". It rejects, with a
+// 400 ApiError and no fetch, anything that could leave /api/: absolute URLs, "//",
+// backslashes, encoded separators or dots (%2f, %5c, %2e, any case), "." / ".."
+// segments and control characters; then checks the normalized URL still sits under
+// /api/. A passing path goes to the private request() unchanged, so the session
+// cookie, CSRF header, passive handling, the 401 logout path and vault-lock handling
+// all apply. Mock (demo) builds never touch the network.
+export function moduleApiRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+  if (MOCK_MODE) return Promise.reject(new ApiError(503, "not available in demo mode"));
+  const reject = (why: string) => Promise.reject(new ApiError(400, `invalid module api path: ${why}`));
+  if (typeof path !== "string" || !path.startsWith("/")) return reject("must start with /");
+  if (path.includes("\\")) return reject("backslash");
+  if (path.includes("//")) return reject("empty segment");
+  for (const ch of path) {
+    const code = ch.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f || /\s/.test(ch)) return reject("control or whitespace character");
+  }
+  if (/%(2f|5c|2e)/i.test(path)) return reject("encoded separator or dot");
+  const pathname = path.split(/[?#]/)[0];
+  if (pathname.split("/").some((seg) => seg === "." || seg === "..")) return reject("dot segment");
+  try {
+    if (!new URL(`/api${path}`, window.location.origin).pathname.startsWith("/api/")) return reject("leaves /api/");
+  } catch {
+    return reject("unparseable");
+  }
+  return request<T>(method, path, body);
+}
+
 // uploadBrandingLogo PUTs a RAW image body to the admin logo endpoint (PRD #685).
 // It cannot use request(), which force-sets Content-Type: application/json and
 // JSON.stringifies the body — the backend PutBrandingLogo reads the raw bytes with

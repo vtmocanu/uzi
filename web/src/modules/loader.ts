@@ -1,0 +1,187 @@
+// Loading a module's exposed page (PRD #4686, "Loader" and "Failure isolation").
+//
+// Uses the federation runtime's loadRemote, never React.lazy: a rejected lazy promise is
+// cached forever, which would defeat Retry. Each load is raced against a timeout; a late
+// arrival is discarded. Failures are classified so the error card can offer the right
+// action:
+//   transient    network/HTTP error or timeout before the module ever loaded in this
+//                document -> Retry (re-register with a fresh entry URL, load again)
+//   incompatible shared-version refusal, missing expose, contract major mismatch ->
+//                no action (Retry cannot fix it)
+//   stale        a chunk load failing AFTER the module already loaded in this document
+//                (a rollout replaced the files) -> Reload page. A browser keeps a
+//                successfully imported remoteEntry.js for the life of the document, so
+//                re-registering can never swap v1 for v2 in place.
+
+import type { ComponentType } from "react";
+import { HOST_CONTRACT, type HostSdkV1 } from "./sdk";
+import type { ModuleEntry } from "./manifest";
+
+export type LoadFailureKind = "transient" | "incompatible" | "stale";
+
+export const MODULE_LOAD_TIMEOUT_MS = 15000;
+
+// The runtime's shared-version refusal carries this text in the error (or its cause).
+const SHARE_REFUSAL = "does not satisfy the requirement of";
+// A remote that loads but does not expose the requested module. Best-effort pattern for
+// the runtime's own "not found" error (RUNTIME-014) and the remote container's
+// "does not exist in container" wording; the browser harness's `noexpose` fixture pins the
+// real text.
+const MISSING_EXPOSE = /RUNTIME-014|does not exist in container|not exposed/i;
+// The three engines word a failed dynamic import differently. Chromium and Firefox name
+// the URL; Safari names nothing.
+const DYNAMIC_IMPORT_FAILURE =
+  /Failed to fetch dynamically imported module|error loading dynamically imported module|Importing a module script failed/i;
+// The runtime's own script/chunk load failure (RUNTIME-008, "Failed to load script resources").
+const MF_SCRIPT_FAILURE = /RUNTIME-008|Failed to load script/i;
+
+export class ModuleLoadError extends Error {
+  kind: LoadFailureKind;
+  cause?: unknown;
+  constructor(kind: LoadFailureKind, message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "ModuleLoadError";
+    this.kind = kind;
+    this.cause = options?.cause;
+  }
+}
+
+export type ModulePageComponent = ComponentType<{ sdk: HostSdkV1 }>;
+
+// Modules that completed a load in THIS document, and per-module counters.
+const loadedOnce = new Set<string>();
+const attemptToken = new Map<string, number>();
+const inflight = new Map<string, Promise<ModulePageComponent>>();
+let retryCounter = 0;
+
+export function hasModuleLoaded(id: string): boolean {
+  return loadedOnce.has(id);
+}
+
+// Test helper.
+export function resetModuleLoaderForTests(): void {
+  loadedOnce.clear();
+  attemptToken.clear();
+  inflight.clear();
+  retryCounter = 0;
+}
+
+function timeoutMs(): number {
+  const override = (globalThis as { __UZI_MODULE_LOAD_TIMEOUT_MS__?: unknown }).__UZI_MODULE_LOAD_TIMEOUT_MS__;
+  return typeof override === "number" && Number.isFinite(override) && override > 0 ? override : MODULE_LOAD_TIMEOUT_MS;
+}
+
+function messageOf(err: unknown): string {
+  const parts: string[] = [];
+  for (let e: unknown = err, depth = 0; e != null && depth < 4; depth++) {
+    parts.push(e instanceof Error ? e.message : String(e));
+    e = (e as { cause?: unknown } | null)?.cause;
+  }
+  return parts.join(" | ");
+}
+
+// A chunk/script load error after the module already loaded in this document. The
+// dynamic-import patterns match any URL (or none, for Safari) because the failing chunk is
+// the module's own; an unrelated URL is not stale of THIS module, so when a URL is named
+// it must sit under /modules/<id>/.
+export function isStaleChunkError(err: unknown, id: string): boolean {
+  const msg = messageOf(err);
+  if (MF_SCRIPT_FAILURE.test(msg)) return true;
+  if (!DYNAMIC_IMPORT_FAILURE.test(msg)) return false;
+  const url = /https?:\/\/[^\s)'"]+/.exec(msg);
+  if (url === null) return true;
+  try {
+    return new URL(url[0]).pathname.startsWith(`/modules/${id}/`);
+  } catch {
+    return false;
+  }
+}
+
+export function classifyLoadError(err: unknown, id: string): ModuleLoadError {
+  if (err instanceof ModuleLoadError) return err;
+  const msg = messageOf(err);
+  if (msg.includes(SHARE_REFUSAL)) {
+    return new ModuleLoadError("incompatible", `This module needs a shared library version this uzi does not provide: ${msg}`, { cause: err });
+  }
+  if (MISSING_EXPOSE.test(msg)) {
+    return new ModuleLoadError("incompatible", `The module does not expose the configured page: ${msg}`, { cause: err });
+  }
+  if (loadedOnce.has(id) && isStaleChunkError(err, id)) {
+    return new ModuleLoadError("stale", `A module file changed after it loaded: ${msg}`, { cause: err });
+  }
+  return new ModuleLoadError("transient", msg, { cause: err });
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, id: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      done = true;
+      reject(new ModuleLoadError("transient", `Timed out after ${ms} ms loading module "${id}"`));
+    }, ms);
+    p.then(
+      (v) => {
+        if (done) return; // a late arrival is discarded
+        done = true;
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e: unknown) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+async function doLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
+  const { id } = entry;
+  const token = (attemptToken.get(id) ?? 0) + 1;
+  attemptToken.set(id, token);
+  try {
+    const federation = await import("./federation");
+    const page = entry.page.replace(/^\.\//, "");
+    const mod = (await withTimeout(federation.loadModuleRemote(`${id}/${page}`), timeoutMs(), id)) as {
+      default?: unknown;
+      hostContract?: unknown;
+    } | null;
+    if (attemptToken.get(id) !== token) {
+      throw new ModuleLoadError("transient", `A newer load of module "${id}" superseded this one`);
+    }
+    if (mod == null || mod.default == null) {
+      throw new ModuleLoadError("incompatible", `The module does not expose the configured page "${entry.page}"`);
+    }
+    if (mod.hostContract !== HOST_CONTRACT) {
+      throw new ModuleLoadError(
+        "incompatible",
+        `The module targets host contract ${String(mod.hostContract ?? "none")}; this uzi supports contract ${HOST_CONTRACT}`,
+      );
+    }
+    loadedOnce.add(id);
+    return mod.default as ModulePageComponent;
+  } catch (e) {
+    throw classifyLoadError(e, id);
+  }
+}
+
+// Loads (or joins the in-flight load of) the module's page component. Rejects with a
+// ModuleLoadError.
+export function loadModulePage(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
+  const running = inflight.get(entry.id);
+  if (running) return running;
+  const p = doLoad(entry).finally(() => {
+    if (inflight.get(entry.id) === p) inflight.delete(entry.id);
+  });
+  inflight.set(entry.id, p);
+  return p;
+}
+
+// Retry for a transient first-load failure: re-register the remote with a fresh entry URL,
+// then load again. Not an update mechanism.
+export async function retryModuleLoad(entry: Pick<ModuleEntry, "id" | "page">): Promise<ModulePageComponent> {
+  const federation = await import("./federation");
+  federation.reRegisterModule(entry.id, ++retryCounter);
+  return loadModulePage(entry);
+}
