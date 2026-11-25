@@ -46,15 +46,14 @@ func newAnFixture(t *testing.T, year int) *anFixture {
 	h.analyticsDeps = newAnalyticsDeps(pool)
 	f := &anFixture{t: t, h: h, router: router, pool: pool, now: time.Date(year, 6, 15, 12, 0, 0, 0, time.UTC)}
 	h.now = func() time.Time { return f.now }
-	clear := func() {
-		cliMustExec(t, pool, `DELETE FROM runs WHERE created_at >= make_timestamptz($1, 1, 1, 0, 0, 0, 'UTC')
-		                                          AND created_at <  make_timestamptz($1 + 1, 1, 1, 0, 0, 0, 'UTC')`, year)
-	}
-	clear()
+	// Deletions are limited to rows of fixture-created users (cliSeedUser's cli-<id>@e2e
+	// emails), so they can never remove an unrelated run that happens to sit in the year.
+	cliMustExec(t, pool, `DELETE FROM runs WHERE created_at >= make_timestamptz($1, 1, 1, 0, 0, 0, 'UTC')
+	                                          AND created_at <  make_timestamptz($1 + 1, 1, 1, 0, 0, 0, 'UTC')
+	                                          AND user_id IN (SELECT id FROM users WHERE email LIKE 'cli-%@e2e')`, year)
 	t.Cleanup(func() {
 		cliMustExec(t, pool, `DELETE FROM runs WHERE user_id = ANY($1)`, f.users)
 		cliMustExec(t, pool, `DELETE FROM users WHERE id = ANY($1)`, f.users)
-		clear()
 	})
 	return f
 }
@@ -349,6 +348,22 @@ func TestAnalyticsAdminUserScopesLiveDB(t *testing.T) {
 	}
 	if opt := anDecodeOptions(t, f.cookie(admin, "/api/admin/analytics/options")); opt.SelectedUser != "all" {
 		t.Fatalf("omitted user selected_user = %q, want all", opt.SelectedUser)
+	}
+
+	// Spend carries selected_user with Options semantics: all, or the selected user's id.
+	for name, got := range map[string]string{
+		"omitted user": anDecodeSpend(t, f.cookie(admin, "/api/admin/analytics/spend")).SelectedUser,
+		"user=all":     sall.SelectedUser,
+	} {
+		if got != "all" {
+			t.Fatalf("spend %s selected_user = %q, want all", name, got)
+		}
+	}
+	if sa.SelectedUser != a.String() || sb.SelectedUser != b.String() {
+		t.Fatalf("spend selected_user for a/b = %q/%q, want %s/%s", sa.SelectedUser, sb.SelectedUser, a, b)
+	}
+	if got := anDecodeSpend(t, f.cookie(admin, "/api/analytics/spend")).SelectedUser; got != admin.String() {
+		t.Fatalf("owner-route spend selected_user = %q, want the caller %s", got, admin)
 	}
 
 	// Options with a selected user narrow the repos and keep the user list.

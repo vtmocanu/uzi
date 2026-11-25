@@ -39,8 +39,24 @@ func (d Date) Before(o Date) bool { return d.utcMidnight().Before(o.utcMidnight(
 func (d Date) Weekday() time.Weekday { return d.utcMidnight().Weekday() }
 
 // DaysUntil returns the number of calendar days from d to o.
-func (d Date) DaysUntil(o Date) int {
-	return int(o.utcMidnight().Sub(d.utcMidnight()) / (24 * time.Hour))
+// It is integer civil arithmetic: a time.Duration saturates at about 292 years.
+func (d Date) DaysUntil(o Date) int { return daysFromCivil(o) - daysFromCivil(d) }
+
+// daysFromCivil is the day count of d from 1970-01-01 (proleptic Gregorian, Hinnant's algorithm).
+func daysFromCivil(d Date) int {
+	y, m := d.Year, int(d.Month)
+	if m <= 2 {
+		y--
+	}
+	era := y / 400
+	if y < 0 {
+		era = (y - 399) / 400
+	}
+	yoe := y - era*400
+	mp := (m + 9) % 12
+	doy := (153*mp+2)/5 + d.Day - 1
+	doe := yoe*365 + yoe/4 - yoe/100 + doy
+	return era*146097 + doe - 719468
 }
 
 // String formats d as YYYY-MM-DD.

@@ -68,13 +68,18 @@ bill.
   or `spend`) may be in flight, and the owner and admin variants share that
   slot. Nothing queues.
 - A request that finds no slot answers 503 with `Retry-After: 1` before any
-  database work.
+  analytics database work. Authentication runs earlier (bearer and cookie
+  auth may read or update token metadata), so a busy request is not free of
+  database access overall.
 - An admitted request has an 8 second budget, enforced by a request deadline
   and `SET LOCAL statement_timeout = '8s'`. Hitting it also answers 503 with
   `Retry-After: 1`. Other database failures are a plain 500 with no detail.
-- All reads of one request (user and repo checks, history start, the
-  statement, and the timezone list on its first, cached load) run in a single `REPEATABLE READ` read-only
-  transaction, so they agree with each other. JIT is off inside it.
+- All analytics reads of one request, after authentication (user and repo
+  checks, history start, the statement, and the timezone list on its first,
+  cached load), run in a single `REPEATABLE READ` read-only transaction, so
+  they agree with each other. JIT is off inside it. Authentication reads happen
+  before it, and a warmed timezone cache comes from an earlier request, not
+  from this snapshot.
 
 ## Calendar
 
@@ -90,9 +95,11 @@ creation time**, not by when cost was incurred.
   midnight, the instants after the rollback that read as the earlier date again
   fall in the later bucket, because a bucket is the interval between two first
   midnights.
-- The last bucket ends at `generated_at` and is `partial`. Right at a local
-  midnight it is `[now, now)`: empty but still present, all zeros, with null
-  ratios and their reasons.
+- The last bucket ends at `generated_at` and is `partial`. For day buckets,
+  right at a local midnight it is `[now, now)`: empty but still present, all
+  zeros, with null ratios and their reasons. For `all`, whose buckets are
+  Monday-anchored weeks, the final bucket is empty only when `now` is exactly
+  at its own boundary (the start of a bucket), not at every midnight.
 - `7d`, `30d` and `90d` are the last N local calendar dates including today
   (daily buckets, `bucket_width_days` 1). `previous_from` / `previous_to` are
   the immediately preceding N dates. `all` has no previous period.
@@ -208,7 +215,8 @@ On the owner route `users` is null with reason `not_applicable`.
   accepted as a filter.
 - It reads no usage and no history start, so it is cheap.
 - Admin `user=<uuid>` narrows the repo list to that user's connections and
-  echoes `selected_user`.
+  echoes `selected_user`. The Spend response carries the same `selected_user`
+  (`all` or the user id; the caller's id on the owner route).
 
 ## Performance limit
 

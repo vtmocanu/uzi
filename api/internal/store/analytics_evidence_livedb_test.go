@@ -28,7 +28,8 @@ import (
 // Issue #4684 (m5): plan and runtime evidence for the Spend statements and the options reads.
 // This is a measurement harness, not a gate: it is compiled only with -tags analyticsevidence
 // and runs only with UZI_ANALYTICS_PLAN_EVIDENCE=1 against a throwaway database (it
-// TRUNCATEs users CASCADE). Run, one named package at a time:
+// TRUNCATEs users CASCADE) that carries the uzi_test_harness.database_marker row seeded by
+// e2e/test-database-marker.sql; without it the run fails before touching anything. Run, one named package at a time:
 //
 //	cd api && UZI_ANALYTICS_PLAN_EVIDENCE=1 UZI_TEST_DATABASE_URL=... \
 //	  go test -tags analyticsevidence -count=1 -v -timeout 50m \
@@ -169,7 +170,6 @@ type evHarness struct {
 	topOwner uuid.UUID
 	runs     int
 	modes    []string
-	sets     []string // extra session settings, e.g. "SET jit = off"
 }
 
 func (h *evHarness) logf(format string, a ...any) {
@@ -205,6 +205,13 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 	if os.Getenv("UZI_ANALYTICS_PLAN_EVIDENCE") != "1" {
 		t.Skip("UZI_ANALYTICS_PLAN_EVIDENCE=1 not set; this is a measurement harness, not a gate")
 	}
+	// Verify the throwaway marker BEFORE anything migrates, runs DDL or TRUNCATEs. A missing
+	// marker fails (never skips): the operator asked for a destructive harness.
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Fatal("UZI_TEST_DATABASE_URL not set; the evidence harness needs a throwaway database")
+	}
+	pmRequireThrowawayDB(context.Background(), t, dsn)
 	ctx, pool := openAnalyticsViewsDB(t)
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -228,13 +235,6 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 		h.log = f
 	}
 	h.simple(`SET statement_timeout = 0`)
-	if s := os.Getenv("UZI_EVIDENCE_SET"); s != "" {
-		h.sets = strings.Split(s, ";")
-		for _, stmt := range h.sets {
-			h.simple(stmt)
-		}
-		h.logf("SESSION SETTINGS: %s", s)
-	}
 	for _, ix := range evIndexes {
 		h.simple("DROP INDEX IF EXISTS " + ix.name)
 	}
@@ -538,14 +538,14 @@ func (h *evHarness) timeWorkload(w evWorkload, mode string) evTiming {
 		h.t.Fatalf("acquire: %v", err)
 	}
 	defer c.Release()
-	stmts := append([]string{`SET statement_timeout = 0`, fmt.Sprintf("SET plan_cache_mode = force_%s_plan", mode)}, h.sets...)
+	stmts := []string{`SET statement_timeout = 0`, fmt.Sprintf("SET plan_cache_mode = force_%s_plan", mode)}
 	for _, s := range stmts {
 		if _, err := c.Exec(h.ctx, s, pgx.QueryExecModeSimpleProtocol); err != nil {
 			h.t.Fatalf("%s: %v", s, err)
 		}
 	}
-	// The connection returns to the pool; RESET ALL clears plan_cache_mode, statement_timeout and
-	// the extra settings (it leaves pgx's client-side statement cache valid, unlike DISCARD ALL).
+	// The connection returns to the pool; RESET ALL clears plan_cache_mode and statement_timeout
+	// (it leaves pgx's client-side statement cache valid, unlike DISCARD ALL).
 	defer func() { _, _ = c.Exec(context.Background(), `RESET ALL`, pgx.QueryExecModeSimpleProtocol) }()
 	q := store.New(c)
 	warm, n := 3, h.runs

@@ -30,6 +30,7 @@ type spendFixture struct {
 	pool   *pgxpool.Pool
 	q      *store.Queries
 	epochs map[string]int
+	users  []uuid.UUID // owners this fixture created
 }
 
 func newSpendFixture(t *testing.T) *spendFixture {
@@ -44,15 +45,19 @@ func newSpendFixture(t *testing.T) *spendFixture {
 // same database) and again when it ends. run_usage rows go with their runs (ON DELETE CASCADE).
 func (f *spendFixture) claimYear(year int) {
 	f.t.Helper()
-	clear := func() {
+	// Deletions are limited to rows of fixture-created users: at the start, any user with the
+	// fixture's spend-<tag>-<id>@e2e email (leftovers of an earlier run); at the end, this
+	// fixture's own users. An unrelated run in the same year is never touched.
+	clear := func(userClause string, arg any) {
 		if _, err := f.pool.Exec(context.Background(),
 			`DELETE FROM runs WHERE created_at >= make_timestamptz($1, 1, 1, 0, 0, 0, 'UTC')
-			                    AND created_at <  make_timestamptz($1 + 1, 1, 1, 0, 0, 0, 'UTC')`, year); err != nil {
+			                    AND created_at <  make_timestamptz($1 + 1, 1, 1, 0, 0, 0, 'UTC')
+			                    AND `+userClause, year, arg); err != nil {
 			f.t.Fatalf("clear year %d: %v", year, err)
 		}
 	}
-	clear()
-	f.t.Cleanup(clear)
+	clear(`user_id IN (SELECT id FROM users WHERE email LIKE $2)`, "spend-%@e2e")
+	f.t.Cleanup(func() { clear(`user_id = ANY($2)`, f.users) })
 }
 
 // spendOwner is a user with one forge connection.
@@ -66,18 +71,26 @@ func (f *spendFixture) owner(tag string) spendOwner {
 	mustExec(f.ctx, f.t, f.pool,
 		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
 		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, o.Conn, o.User, []byte{0x1})
+	f.users = append(f.users, o.User)
 	return o
 }
 
 // repo adds a repo to the owner's connection and returns its id and path.
 func (f *spendFixture) repo(o spendOwner, tag string) (uuid.UUID, string) {
 	f.t.Helper()
+	return f.repoWithProject(o, tag, spendSeq.Add(1)+9_000_000)
+}
+
+// repoWithProject is repo with an explicit forge_project_id, so two owners' connections can
+// reference the same external project.
+func (f *spendFixture) repoWithProject(o spendOwner, tag string, forgeProjectID int64) (uuid.UUID, string) {
+	f.t.Helper()
 	id := uuid.New()
 	path := fmt.Sprintf("g/spend-%s-%s", tag, id)
 	mustExec(f.ctx, f.t, f.pool,
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		 VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/r', 'main', true)`,
-		id, o.Conn, spendSeq.Add(1)+9_000_000, path)
+		id, o.Conn, forgeProjectID, path)
 	return id, path
 }
 

@@ -12,6 +12,7 @@
   "bucket_width_days": 0,
   "buckets": null,
   "rolling": null,
+  "selected_user": "",
   "untracked_chat_runs": 0,
   "totals": {
     "current": {

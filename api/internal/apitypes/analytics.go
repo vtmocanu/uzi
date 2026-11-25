@@ -275,6 +275,9 @@ type AnalyticsBreakdownDTO struct {
 // are untracked: they appear only in UntrackedChatRuns and in no cost, token or ratio figure.
 type AnalyticsSpendDTO struct {
 	AnalyticsEnvelopeDTO
+	// SelectedUser matches the options response: "all" for an admin response spanning every
+	// user, else the user id (the caller on the owner route).
+	SelectedUser      string                  `json:"selected_user"`
 	UntrackedChatRuns int64                   `json:"untracked_chat_runs"`
 	Totals            AnalyticsSpendTotalsDTO `json:"totals"`
 	// Series is the ungrouped spend per bucket: series[i] is the cell of buckets[i].

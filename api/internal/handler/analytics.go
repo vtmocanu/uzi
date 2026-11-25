@@ -243,7 +243,8 @@ func parseCanonicalUUID(v string) (uuid.UUID, bool) {
 		return uuid.Nil, false
 	}
 	id, err := uuid.Parse(v)
-	return id, err == nil
+	// The nil UUID is never a real repo or user; treating it as a filter value would read as "no filter".
+	return id, err == nil && id != uuid.Nil
 }
 
 // splitChoices and breakdownChoices are the grouping dimensions this scope may use; grouping
@@ -723,6 +724,7 @@ func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.Analy
 
 	out := apitypes.AnalyticsSpendDTO{
 		AnalyticsEnvelopeDTO: env,
+		SelectedUser:         req.scope().User,
 		UntrackedChatRuns:    doc.UntrackedChatRuns,
 		Series:               m.cells(doc.Buckets),
 		CostPerCompletedRun:  m.ratioPanel(doc.CostPerCompletedRun),

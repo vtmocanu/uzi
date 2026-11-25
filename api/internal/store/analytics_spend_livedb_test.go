@@ -690,8 +690,13 @@ func TestAnalyticsSpendCrossOwnerDuplicatePRLiveDB(t *testing.T) {
 	f.claimYear(2003)
 	now := utcAt(2003, 6, 15, 12, 0, 0)
 	a, b := f.owner("dup-a"), f.owner("dup-b")
-	ra, _ := f.repo(a, "dup")
-	rb, _ := f.repo(b, "dup")
+	// The same external project and the same mr_iid, each on the owner's own connection.
+	project := spendSeq.Add(1) + 9_500_000
+	ra, _ := f.repoWithProject(a, "dup-a", project)
+	rb, _ := f.repoWithProject(b, "dup-b", project)
+	if a.Conn == b.Conn {
+		t.Fatal("test setup: both owners share one connection")
+	}
 	run := func(o spendOwner, r uuid.UUID, cost string) {
 		id := f.run(spendRun{Owner: o.User, Repo: r, At: utcAt(2003, 6, 10, 9, 0, 0), MR: 77, MRState: "merged"})
 		f.metered(id, "model-a", cost)

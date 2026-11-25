@@ -86,9 +86,23 @@ type fpCase struct {
 	fallback bool
 }
 
-func forwardProgress(t *testing.T, zoneName string, cases []fpCase) {
+// zoneBoundsDefect reports whether Go's ZoneBounds still returns the known-wrong segment end
+// for probe: wantEnd is the (too early) end the defect produces. The fallback-step assertions
+// hold only under that precondition; if Go fixes it, the dayStart values are still asserted.
+func zoneBoundsDefect(t *testing.T, loc *time.Location, probe, wantEnd time.Time) bool {
+	t.Helper()
+	_, end := probe.In(loc).ZoneBounds()
+	if end.Equal(wantEnd) {
+		return true
+	}
+	t.Logf("ZoneBounds(%s) end = %s, not the known defect %s: fallback-step assertions skipped", probe, end.UTC(), wantEnd)
+	return false
+}
+
+func forwardProgress(t *testing.T, zoneName string, defect func(*testing.T, *time.Location) bool, cases []fpCase) {
 	t.Helper()
 	loc := zone(t, zoneName)
+	checkSteps := defect(t, loc)
 	for _, c := range cases {
 		var steps int
 		var got time.Time
@@ -99,6 +113,9 @@ func forwardProgress(t *testing.T, zoneName string, cases []fpCase) {
 		}
 		eq(t, zoneName+" "+c.date.String(), got, c.want)
 		t.Logf("%s %s fallback steps: %d", zoneName, c.date, steps)
+		if !checkSteps {
+			continue
+		}
 		if c.fallback && steps == 0 {
 			t.Errorf("%s %s: expected fallback steps, got 0", zoneName, c.date)
 		}
@@ -112,14 +129,18 @@ func forwardProgress(t *testing.T, zoneName string, cases []fpCase) {
 }
 
 func TestDayStartForwardProgressNewYork2040(t *testing.T) {
-	forwardProgress(t, "America/New_York", []fpCase{
+	forwardProgress(t, "America/New_York", func(t *testing.T, loc *time.Location) bool {
+		return zoneBoundsDefect(t, loc, utc(2040, 12, 31, 12, 0), utc(2040, 12, 31, 0, 0))
+	}, []fpCase{
 		{Date{2040, 12, 31}, utc(2040, 12, 31, 5, 0), true},
 		{Date{2041, 1, 1}, utc(2041, 1, 1, 5, 0), true},
 	})
 }
 
 func TestDayStartForwardProgressBucharest2044(t *testing.T) {
-	forwardProgress(t, "Europe/Bucharest", []fpCase{
+	forwardProgress(t, "Europe/Bucharest", func(t *testing.T, loc *time.Location) bool {
+		return zoneBoundsDefect(t, loc, utc(2044, 12, 31, 12, 0), utc(2044, 12, 31, 0, 0))
+	}, []fpCase{
 		// East of UTC the search segment for 2044-12-31 (starting at
 		// 2044-12-29T22:00Z) is still valid, so no fallback is needed.
 		{Date{2044, 12, 31}, utc(2044, 12, 30, 22, 0), false},
@@ -256,4 +277,52 @@ func tilingError(b Bounds, loc *time.Location) error {
 		}
 	}
 	return nil
+}
+
+func TestDaysUntilBeyondDurationRange(t *testing.T) {
+	// 1700-01-01 to 2026-11-25 is far beyond the ~292 years a time.Duration holds.
+	a, b := Date{1700, 1, 1}, Date{2026, 11, 25}
+	want := int(b.utcMidnight().Unix()-a.utcMidnight().Unix()) / 86400
+	if want != 119_397 {
+		t.Fatalf("test setup: expected day count %d", want)
+	}
+	if got := a.DaysUntil(b); got != 119_397 {
+		t.Errorf("DaysUntil = %d, want 119397", got)
+	}
+	if got := b.DaysUntil(a); got != -119_397 {
+		t.Errorf("reverse DaysUntil = %d, want -119397", got)
+	}
+	if got := (Date{2024, 2, 28}).DaysUntil(Date{2024, 3, 1}); got != 2 {
+		t.Errorf("leap-year span = %d, want 2", got)
+	}
+	if got := a.AddDays(119_397); got != b {
+		t.Errorf("AddDays = %s, want %s", got, b)
+	}
+}
+
+func TestComputeBoundsAllWindowEarliest1700(t *testing.T) {
+	loc := zone(t, "UTC")
+	now := utc(2026, 11, 25, 12, 0)
+	earliest := utc(1700, 1, 1, 0, 0)
+	b, err := ComputeBounds(now, loc, WindowAll, &earliest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.WidthWeeks < 1 || len(b.Buckets) == 0 || len(b.Buckets) > 104 {
+		t.Fatalf("width %d weeks, %d buckets", b.WidthWeeks, len(b.Buckets))
+	}
+	// 1700-01-01 is a Friday; buckets are Monday-anchored, so the first starts 1699-12-28.
+	if first := b.Buckets[0].Start; first.After(earliest) || earliest.Sub(first) >= 7*24*time.Hour {
+		t.Errorf("first bucket start %s does not anchor the earliest run %s to its Monday", first, earliest)
+	}
+	span := DateOf(b.Buckets[0].Start, loc).DaysUntil(DateOf(now, loc))
+	if span < 119_000 {
+		t.Errorf("span %d days, want about 119397", span)
+	}
+	for i, bk := range b.Buckets[:len(b.Buckets)-1] {
+		if got := DateOf(bk.Start, loc).DaysUntil(DateOf(bk.End, loc)); got != 7*b.WidthWeeks {
+			t.Errorf("bucket %d is %d days wide, want %d", i, got, 7*b.WidthWeeks)
+		}
+	}
+	checkTiling(t, b, loc)
 }

@@ -80,6 +80,7 @@ var analyticsRoutes = []analyticsRoute{
 
 func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 	someUUID := uuid.New().String()
+	nilUUID := uuid.Nil.String()
 	cases := []struct {
 		name  string
 		route analyticsRoute
@@ -108,6 +109,12 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"bad repo", analyticsRoutes[1], "repo=not-a-uuid", "invalid repo"},
 		{"braced repo", analyticsRoutes[1], "repo=%7B" + someUUID + "%7D", "invalid repo"},
 		{"empty repo", analyticsRoutes[1], "repo=", "invalid repo"},
+		{"nil repo owner spend", analyticsRoutes[1], "repo=" + nilUUID, "invalid repo"},
+		{"nil repo owner options", analyticsRoutes[0], "repo=" + nilUUID, "invalid repo"},
+		{"nil repo admin options", analyticsRoutes[2], "repo=" + nilUUID, "invalid repo"},
+		{"nil repo admin spend", analyticsRoutes[3], "repo=" + nilUUID, "invalid repo"},
+		{"nil user admin spend", analyticsRoutes[3], "user=" + nilUUID, "invalid user"},
+		{"nil user admin options", analyticsRoutes[2], "user=" + nilUUID, "invalid user"},
 		{"bad harness", analyticsRoutes[1], "harness=gemini", "invalid harness"},
 		{"bad kind", analyticsRoutes[1], "kind=reliability", "invalid kind"},
 		{"admin bad user", analyticsRoutes[3], "user=nobody", "invalid user"},
@@ -402,7 +409,8 @@ func TestMapAnalyticsSpendDollarsAndEmptySlices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := mustParseAnalytics(t, "window=7d", false, analytics.SectionSpend, uuid.New())
+	callerID := uuid.New()
+	req := mustParseAnalytics(t, "window=7d", false, analytics.SectionSpend, callerID)
 	val := "0.250000"
 	doc := store.AnalyticsSpendDoc{}
 	doc.Totals.Current.Cost = "12.345678"
@@ -412,6 +420,9 @@ func TestMapAnalyticsSpendDollarsAndEmptySlices(t *testing.T) {
 	dto, err := mapAnalyticsSpend(req, bounds, doc)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if dto.SelectedUser != callerID.String() {
+		t.Fatalf("selected_user = %q, want the caller %s", dto.SelectedUser, callerID)
 	}
 	if dto.Totals.Current.CostUSD != 12.345678 {
 		t.Fatalf("cost_usd = %v, want 12.345678", dto.Totals.Current.CostUSD)

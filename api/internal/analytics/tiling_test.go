@@ -94,11 +94,7 @@ func TestTilingEveryZone(t *testing.T) {
 	samples, windows := 0, 0
 	seenSig := map[string]bool{}
 	perYear := map[int]time.Duration{}
-	prefix := os.Getenv("ANALYTICS_TILING_ZONE_PREFIX") // dev aid: narrow the zone set
 	for _, name := range names {
-		if !strings.HasPrefix(name, prefix) {
-			continue
-		}
 		loc, err := time.LoadLocation(name)
 		if err != nil {
 			continue
