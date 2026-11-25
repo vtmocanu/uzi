@@ -33,9 +33,13 @@
 -- kind fails the build instead of silently recording unavailable) with the cross-check lane
 -- only on a cross_check run. The audit of every writer that can put a run in a slot status
 -- found each is an owner-gated claim or a slot move that keeps worker_id (see the PRD #4693
--- Decision Log). A worker's isolated_lane flag is recorded and is a proven lane. Anything else
--- records 'unavailable' with NULL counts, never a guessed number. Caps, freshness, heartbeat,
--- kind, ephemeral and isolated_lane are always recorded.
+-- Decision Log). A slot-holding run is proven on the isolated lane only when its egress-profile
+-- binding matches the worker's isolated_lane flag, mirroring ClaimRun's two-way clause
+-- ((r.egress_profile_id IS NOT NULL) = worker_isolated_lane): a profile-bound run on a
+-- non-isolated worker, or an unprofiled run on an isolated worker, records 'unavailable'. Chat
+-- is never profile-bound (runs_egress_profile_not_chat), so it never matches an isolated worker.
+-- Anything else records 'unavailable' with NULL counts, never a guessed number. Caps, freshness,
+-- heartbeat, kind, ephemeral and isolated_lane are always recorded.
 WITH clock AS MATERIALIZED (
     SELECT COALESCE(sqlc.narg('observed_at')::timestamptz, statement_timestamp()) AS obs,
            date_bin('5 minutes', COALESCE(sqlc.narg('observed_at')::timestamptz, statement_timestamp()),
@@ -60,6 +64,7 @@ WITH clock AS MATERIALIZED (
                count(*) FILTER (WHERE r.kind = 'chat') AS chat_active,
                COALESCE(bool_or(
                    r.user_id <> p.user_id
+                   OR ((r.egress_profile_id IS NOT NULL) <> p.isolated_lane)
                    OR NOT (
                        (r.cross_check_lane AND r.kind = 'cross_check')
                        OR (NOT r.cross_check_lane AND r.kind IN (

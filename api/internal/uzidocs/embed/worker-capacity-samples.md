@@ -6,8 +6,9 @@ audience: operator
 
 # Worker capacity samples
 
-Every five minutes the API records one capacity sample per worker in the
-`worker_capacity_samples` table. The history is for later fleet-utilization
+The API records at most one capacity sample per worker per five-minute bucket
+in the `worker_capacity_samples` table; a bucket the pass does not reach for a
+worker stays empty (a gap) and is never backfilled. The history is for later fleet-utilization
 reporting; there is no read API, UI or CLI for it yet.
 
 ## What a sample holds
@@ -58,7 +59,10 @@ queued rows hold no slot and are not counted.
 ## Attribution fails closed
 
 Counts are recorded only when every slot-holding run on the worker belongs to
-the worker's owner and has an audited run kind and lane. Otherwise the sample
+the worker's owner and has an audited run kind and lane. A run is on a proven
+lane only when its egress-profile binding matches the worker's isolated-lane
+flag (a profile-bound run on an isolated-lane worker, or an unprofiled run on
+any other worker), as the claim requires. Otherwise the sample
 has `attribution = unavailable` and no counts. Caps, freshness and heartbeat
 are always recorded.
 
@@ -99,8 +103,12 @@ estimate (not measured) is nearer 28 MiB per worker-year.
 | Write-ahead log per 1,000-sample batch | about 0.4 MB (steady state) |
 | Deleting an owner with one worker-year of samples | about 0.13 s and 20 MB of write-ahead log; it grows linearly with the owner's history and runs in one transaction |
 
-A sweeper pass took about 40 ms once every worker was sampled for the bucket,
-and at most about 170 ms while sampling 4,000 workers.
+Over 22 passes in one bucket (2 that sampled the fleet, then 20 with nothing
+left to sample), pass wall time was at most 171 ms (sampling 4,000 workers),
+p95 98 ms (nearest rank), and about 40 ms (at most 47 ms) once every worker was
+sampled. With all but 100 workers already sampled, a batch statement ran in
+29 ms: one primary-key probe per worker (5,000) and the runs probe only for the
+100 selected workers.
 
 ## How the pass runs
 
@@ -109,7 +117,8 @@ The pass runs on the existing sweeper tick, once per tick, in up to 4 batches of
 overlapping API replicas from running it at once; a replica that does not get
 the lock does nothing that tick. Each batch is one statement with a server
 statement timeout of 1.75 s and a lock timeout of 300 ms. The pass ends at the
-first failed batch; remaining workers are sampled on a later tick. The 1.75 s
+first failed batch; unreached workers may be sampled on a later tick in the
+same bucket, otherwise that bucket is a gap for them. The 1.75 s
 statement timeout is a second bound: the client-side work deadline usually ends
 a slow batch first by closing the connection, after which the lock is released
 when the database session ends.

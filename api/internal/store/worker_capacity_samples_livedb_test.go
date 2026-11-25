@@ -43,6 +43,8 @@ type wcsFx struct {
 	q     *store.Queries
 	n     int
 	repos map[uuid.UUID]uuid.UUID
+	// egress, when set, binds the next inserted issue run to that egress profile.
+	egress uuid.UUID
 }
 
 func newWcsFx(t *testing.T) *wcsFx {
@@ -131,6 +133,9 @@ func (f *wcsFx) run(owner uuid.UUID, kind, status string, worker uuid.UUID) uuid
 	case "issue", "self_improve":
 		add("repo_id", repo)
 		add("issue_iid", f.n)
+		if f.egress != uuid.Nil && kind == "issue" {
+			add("egress_profile_id", f.egress)
+		}
 	case "ci_fix":
 		add("repo_id", repo)
 		add("pipeline_id", f.n)
@@ -161,6 +166,34 @@ func (f *wcsFx) run(owner uuid.UUID, kind, status string, worker uuid.UUID) uuid
 	}
 	f.exec(`INSERT INTO runs (`+cols+`) VALUES (`+vals+`)`, args...)
 	return id
+}
+
+// profileRun inserts an issue run bound to a fresh egress profile (the run shape the isolated lane
+// claims), in the given status, on worker (uuid.Nil for none).
+func (f *wcsFx) profileRun(owner uuid.UUID, status string, worker uuid.UUID) uuid.UUID {
+	f.t.Helper()
+	profile := uuid.New()
+	f.exec(`INSERT INTO egress_profiles (id, name, hosts) VALUES ($1, $2, '{docs.example.com}')`,
+		profile, "wcs-"+profile.String()[:20])
+	f.egress = profile
+	defer func() { f.egress = uuid.Nil }()
+	return f.run(owner, "issue", status, worker)
+}
+
+// isolatedWorker creates the run-bound isolated-lane worker for runID and returns its id. The run
+// is moved to running on it by the caller.
+func (f *wcsFx) isolatedWorker(owner, runID uuid.UUID, name string) uuid.UUID {
+	f.t.Helper()
+	w, err := f.q.CreateEphemeralHostedWorker(f.ctx, store.CreateEphemeralHostedWorkerParams{
+		UserID: owner, Name: name, TokenHash: []byte(name + "-token-hash-0123456789abcdef!"),
+		TemplateDeclared: pgtype.Text{String: "default", Valid: true}, HostedSize: pgtype.Text{String: "small", Valid: true},
+		DockerEnabled: pgtype.Bool{Bool: false, Valid: true}, EphemeralRunID: runID, AnthropicBindMode: "default", IsolatedLane: true,
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.exec(`UPDATE workers SET status='online', last_heartbeat_at=$2 WHERE id=$1`, w.ID, wcsAt(0))
+	return w.ID
 }
 
 // laneRun inserts a claimed cross-check run on the durable cross-check lane.
@@ -440,17 +473,11 @@ func TestWorkerCapacitySampleOccupancyLiveDB(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		f.run(owner, "issue", "running", over)
 	}
-	// an isolated-lane worker is sampled like any other with its flag recorded
-	isoRun := f.run(owner, "issue", "queued", uuid.Nil)
-	iso, err := f.q.CreateEphemeralHostedWorker(f.ctx, store.CreateEphemeralHostedWorkerParams{
-		UserID: owner, Name: "iso", TokenHash: []byte("iso-token-hash-0123456789abcdef!"),
-		TemplateDeclared: pgtype.Text{String: "default", Valid: true}, HostedSize: pgtype.Text{String: "small", Valid: true},
-		DockerEnabled: pgtype.Bool{Bool: false, Valid: true}, EphemeralRunID: isoRun, AnthropicBindMode: "default", IsolatedLane: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.exec(`UPDATE runs SET status='running', worker_id=$2 WHERE id=$1`, isoRun, iso.ID)
+	// an isolated-lane worker holding its profile-bound run (the shape ClaimRun's lane clause admits)
+	// is sampled like any other with its flag recorded
+	isoRun := f.profileRun(owner, "queued", uuid.Nil)
+	isoID := f.isolatedWorker(owner, isoRun, "iso")
+	f.exec(`UPDATE runs SET status='running', worker_id=$2 WHERE id=$1`, isoRun, isoID)
 
 	f.tick(0, 100)
 	wantCounts(t, "all statuses", f.sampleAt(all, 0), "owner", 5, 0, 0)
@@ -462,7 +489,7 @@ func TestWorkerCapacitySampleOccupancyLiveDB(t *testing.T) {
 	if o.MaxRuns == nil || *o.MaxRuns != 1 {
 		t.Errorf("over-cap worker cap = %v, want 1", o.MaxRuns)
 	}
-	is := f.sampleAt(iso.ID, 0)
+	is := f.sampleAt(isoID, 0)
 	wantCounts(t, "isolated lane", is, "owner", 1, 0, 0)
 	if !is.IsolatedLane || !is.Ephemeral {
 		t.Errorf("isolated worker sample = %+v, want isolated_lane and ephemeral recorded", is)
@@ -494,7 +521,21 @@ func TestWorkerCapacitySampleAttributionLiveDB(t *testing.T) {
 	f.exec(`INSERT INTO runs (id, user_id, kind, status, worker_id, issue_title, issue_description)
  VALUES ($1,$2,'future_kind','running',$3,'x','x')`, uuid.New(), owner, unproven)
 
+	// the lane clause is two-way, as in ClaimRun: an unprofiled run on an isolated-lane worker and a
+	// profile-bound run on a non-isolated worker are both outside the proven shape
+	mmRunA := f.run(owner, "issue", "queued", uuid.Nil)
+	mmIso := f.isolatedWorker(owner, mmRunA, "mma")
+	f.exec(`UPDATE runs SET status='running', worker_id=$2 WHERE id=$1`, mmRunA, mmIso)
+	mmPlain := f.worker(owner, wcsWorkerOpts{heartbeat: &hb})
+	f.profileRun(owner, "running", mmPlain)
+
 	f.tick(0, 100)
+	a := f.sampleAt(mmIso, 0)
+	wantCounts(t, "unprofiled run on an isolated worker", a, "unavailable", 0, 0, 0)
+	if !a.IsolatedLane || !a.Ephemeral {
+		t.Errorf("unavailable isolated sample lost its flags: %+v", a)
+	}
+	wantCounts(t, "profile-bound run on a non-isolated worker", f.sampleAt(mmPlain, 0), "unavailable", 0, 0, 0)
 	c := f.sampleAt(cross, 0)
 	wantCounts(t, "cross-owner slot run", c, "unavailable", 0, 0, 0)
 	if c.MaxRuns == nil || *c.MaxRuns != 4 || c.Freshness != "online" || c.Heartbeat == nil {
@@ -662,6 +703,62 @@ func TestWorkerCapacitySampleClockRegressionLiveDB(t *testing.T) {
 	}
 	if got := f.samples(w); len(got) != 1 || !got[0].Bucket.Equal(wcsBucket(1)) {
 		t.Errorf("samples = %+v, want exactly the B+1 sample", got)
+	}
+}
+
+// A bucket with no tick stays empty: a worker sampled at B and again at B+2 has exactly those two
+// samples, nothing is backfilled at B+1.
+func TestWorkerCapacitySampleMissedBucketStaysEmptyLiveDB(t *testing.T) {
+	f := newWcsFx(t)
+	owner := f.user()
+	hb := wcsAt(0)
+	w := f.worker(owner, wcsWorkerOpts{heartbeat: &hb})
+	if row := f.tick(0, 10); row.Inserted != 1 {
+		t.Fatalf("tick at B inserted %d, want 1", row.Inserted)
+	}
+	if row := f.tick(2, 10); row.Inserted != 1 {
+		t.Fatalf("tick at B+2 inserted %d, want 1", row.Inserted)
+	}
+	got := f.samples(w)
+	if len(got) != 2 || !got[0].Bucket.Equal(wcsBucket(0)) || !got[1].Bucket.Equal(wcsBucket(2)) {
+		t.Errorf("samples = %d, want exactly the B and B+2 samples with none at B+1: %+v", len(got), got)
+	}
+}
+
+// Close on a session whose connection is open but inside a transaction (open or failed) must not
+// run the unlock: it reports no proven unlock, closes the connection, and the lock ends with the
+// backend.
+func TestWorkerCapacitySampleCloseNonIdleLiveDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		stmts  []string
+		status byte
+	}{
+		{"open transaction", []string{"BEGIN"}, 'T'},
+		{"failed transaction", []string{"BEGIN", "SELECT 1/0"}, 'E'},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newWcsFx(t)
+			p := f.probePool(t)
+			s, got, err := store.OpenWorkerCapacitySampleSession(f.ctx, p.pool, 10*time.Second, 5*time.Second)
+			if err != nil || !got {
+				t.Fatalf("open session: got=%v err=%v", got, err)
+			}
+			t.Cleanup(func() { _, _ = s.Close(context.Background()) })
+			for _, st := range c.stmts {
+				_ = s.ExecForTest(f.ctx, st) // the failing statement is expected to error
+			}
+			if s.TxStatusForTest() != c.status || s.Idle() {
+				t.Fatalf("setup: tx status %q idle=%v, want %q and not idle", s.TxStatusForTest(), s.Idle(), c.status)
+			}
+			unlocked, err := s.Close(f.ctx)
+			if unlocked || err != nil {
+				t.Errorf("Close on a non-idle session: unlocked=%v err=%v, want false/nil (no unlock attempted)", unlocked, err)
+			}
+			f.waitNoSessions(t, p.tag)
+			f.waitLockFree(t)
+		})
 	}
 }
 
