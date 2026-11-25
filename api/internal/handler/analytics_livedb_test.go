@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -401,6 +402,96 @@ func TestAnalyticsAdminUserScopesLiveDB(t *testing.T) {
 	// Admin-all accepts any existing repo.
 	if rec := f.cookie(admin, "/api/admin/analytics/spend?repo="+repoB.String()); rec.Code != http.StatusOK {
 		t.Fatalf("admin-all with an existing repo = %d, want 200", rec.Code)
+	}
+}
+
+// Owner decision (#4684): the all-time window is not offered for admin all-users Spend.
+func TestAnalyticsAllUsersWindowChoicesLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2039)
+	admin, owner := f.user(true), f.user(false)
+
+	for _, c := range []struct {
+		path string
+		want []string
+	}{
+		{"/api/admin/analytics/options", []string{"7d", "30d", "90d"}},
+		{"/api/admin/analytics/options?user=all", []string{"7d", "30d", "90d"}},
+		{"/api/admin/analytics/options?user=" + owner.String(), []string{"7d", "30d", "90d", "all"}},
+	} {
+		if got := anDecodeOptions(t, f.cookie(admin, c.path)).Windows; !slices.Equal(got, c.want) {
+			t.Fatalf("%s windows = %v, want %v", c.path, got, c.want)
+		}
+	}
+	if got, want := anDecodeOptions(t, f.cookie(owner, "/api/analytics/options")).Windows, []string{"7d", "30d", "90d", "all"}; !slices.Equal(got, want) {
+		t.Fatalf("owner windows = %v, want %v", got, want)
+	}
+
+	omitted := f.cookie(admin, "/api/admin/analytics/spend?window=all")
+	explicit := f.cookie(admin, "/api/admin/analytics/spend?window=all&user=all")
+	if omitted.Code != http.StatusBadRequest || explicit.Code != http.StatusBadRequest {
+		t.Fatalf("admin all-users window=all = %d and %d, want 400 and 400", omitted.Code, explicit.Code)
+	}
+	if omitted.Body.String() != explicit.Body.String() {
+		t.Fatalf("400 bodies differ: %q vs %q", omitted.Body.String(), explicit.Body.String())
+	}
+}
+
+// window=all for one user: the run sits more than 30 days back, so the default window misses
+// it while the all-time window reaches it, from the Monday of its ISO week (2039-04-01 is a Friday).
+func TestAnalyticsAllTimeWindowSingleUserLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2039)
+	admin, owner := f.user(true), f.user(false)
+	repo, _ := f.repoOwnedBy(owner, "alltime")
+	f.run(owner, repo, time.Date(2039, 4, 1, 9, 0, 0, 0, time.UTC), "4.250000")
+	wantStart := time.Date(2039, 3, 28, 0, 0, 0, 0, time.UTC)
+
+	for _, c := range []struct {
+		name, base, selected string
+		viewer               uuid.UUID
+	}{
+		{"owner", "/api/analytics/spend", owner.String(), owner},
+		{"admin user=uuid", "/api/admin/analytics/spend?user=" + owner.String() + "&", owner.String(), admin},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sep := "?"
+			if strings.Contains(c.base, "?") {
+				sep = ""
+			}
+			rec := f.cookie(c.viewer, c.base+sep+"window=all")
+			dto := anDecodeSpend(t, rec)
+			if dto.Window != "all" {
+				t.Fatalf("window = %q, want all", dto.Window)
+			}
+			if dto.HistoryStart == nil || !dto.HistoryStart.Equal(wantStart) {
+				t.Fatalf("history_start = %v, want %v", dto.HistoryStart, wantStart)
+			}
+			if !dto.From.Equal(*dto.HistoryStart) {
+				t.Fatalf("from = %v, want history_start %v", dto.From, dto.HistoryStart)
+			}
+			if dto.BucketWidthDays <= 0 || dto.BucketWidthDays%7 != 0 {
+				t.Fatalf("bucket_width_days = %d, want a positive multiple of 7", dto.BucketWidthDays)
+			}
+			if dto.Totals.Current.Runs != 1 {
+				t.Fatalf("runs = %d, want 1", dto.Totals.Current.Runs)
+			}
+			anNear(t, "cost", dto.Totals.Current.CostUSD, 4.25)
+			if dto.SelectedUser != c.selected {
+				t.Fatalf("selected_user = %q, want %s", dto.SelectedUser, c.selected)
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if _, present := raw["previous_from"]; present {
+				t.Fatalf("previous_from present for window=all: %s", raw["previous_from"])
+			}
+
+			// The default 30d window does not reach the run.
+			def := anDecodeSpend(t, f.cookie(c.viewer, strings.TrimSuffix(c.base, "&")))
+			if def.Totals.Current.Runs != 0 {
+				t.Fatalf("30d runs = %d, want 0", def.Totals.Current.Runs)
+			}
+		})
 	}
 }
 

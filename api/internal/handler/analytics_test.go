@@ -100,6 +100,8 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"options breakdown", analyticsRoutes[2], "breakdown=kind", "invalid breakdown"},
 		{"unknown param", analyticsRoutes[1], "bogus=1", "unknown parameter"},
 		{"admin unknown param", analyticsRoutes[3], "bogus=1", "unknown parameter"},
+		{"admin all-users window=all", analyticsRoutes[3], "window=all", "window all not available for all users"},
+		{"admin user=all window=all", analyticsRoutes[3], "window=all&user=all", "window all not available for all users"},
 		{"bad window", analyticsRoutes[1], "window=1y", "invalid window"},
 		{"empty window", analyticsRoutes[1], "window=", "invalid window"},
 		{"repeated window", analyticsRoutes[1], "window=7d&window=30d", "invalid window"},
@@ -164,6 +166,28 @@ func TestAnalyticsFirstBadParameterIsDeterministic(t *testing.T) {
 	}
 }
 
+// The all-users window=all refusal is the same response whether user is omitted or user=all.
+func TestAnalyticsAdminAllUsersWindowAllRefusalIsIdentical(t *testing.T) {
+	rt := analyticsRoutes[3]
+	var bodies []string
+	for _, q := range []string{"window=all", "window=all&user=all"} {
+		b := &countingBeginner{err: errors.New("must not begin")}
+		h := newAnalyticsUnitHandler(t, b)
+		rec := httptest.NewRecorder()
+		h.analyticsServe(rt, rec, analyticsGet(store.User{ID: uuid.New(), IsAdmin: true}, rt.path+"?"+q))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", q, rec.Code)
+		}
+		if got := b.calls.Load(); got != 0 {
+			t.Fatalf("%s: BeginTx called %d times, want 0", q, got)
+		}
+		bodies = append(bodies, rec.Body.String())
+	}
+	if bodies[0] != bodies[1] || !strings.Contains(bodies[0], "window all not available for all users") {
+		t.Fatalf("bodies differ or lack the message: %q vs %q", bodies[0], bodies[1])
+	}
+}
+
 // A well-formed query passes validation and reaches the snapshot (one BeginTx).
 func TestAnalyticsAcceptedQueriesReachTheSnapshot(t *testing.T) {
 	someUUID := uuid.New().String()
@@ -179,6 +203,13 @@ func TestAnalyticsAcceptedQueriesReachTheSnapshot(t *testing.T) {
 		{analyticsRoutes[3], "split=user&breakdown=user"},
 		{analyticsRoutes[3], "user=" + someUUID + "&split=usage_model"},
 		{analyticsRoutes[2], "user=" + someUUID},
+		{analyticsRoutes[3], "window=all&user=" + someUUID},
+		{analyticsRoutes[3], "window=7d"},
+		{analyticsRoutes[3], "window=30d"},
+		{analyticsRoutes[3], "window=90d"},
+		{analyticsRoutes[3], "window=7d&user=all"},
+		{analyticsRoutes[3], "window=30d&user=all"},
+		{analyticsRoutes[3], "window=90d&user=all"},
 	}
 	for _, tc := range cases {
 		b := &countingBeginner{err: errors.New("stop here")}

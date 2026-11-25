@@ -220,6 +220,13 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 		}
 	}
 
+	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
+	// per-run totals for finished runs. Options still accepts and ignores window, so the
+	// check is spend-only.
+	if section == analytics.SectionSpend && !slices.Contains(req.windowChoices(), string(req.window)) {
+		return req, "window all not available for all users"
+	}
+
 	splits, breakdowns := req.splitChoices(), req.breakdownChoices()
 	req.split, req.breakdown = "usage_model", "repo"
 	if v := q.Get("split"); v != "" {
@@ -245,6 +252,16 @@ func parseCanonicalUUID(v string) (uuid.UUID, bool) {
 	id, err := uuid.Parse(v)
 	// The nil UUID is never a real repo or user; treating it as a filter value would read as "no filter".
 	return id, err == nil && id != uuid.Nil
+}
+
+// windowChoices are the windows this scope may use; the all-time window is not offered for
+// an admin response spanning every user.
+func (r analyticsRequest) windowChoices() []string {
+	w := slices.Clone(analyticsWindows)
+	if r.allUsers {
+		w = slices.DeleteFunc(w, func(s string) bool { return s == string(analytics.WindowAll) })
+	}
+	return w
 }
 
 // splitChoices and breakdownChoices are the grouping dimensions this scope may use; grouping
@@ -416,7 +433,7 @@ func (d *analyticsDeps) options(ctx context.Context, s *store.AnalyticsSnapshot,
 		Scope:        req.scope(),
 		GeneratedAt:  now,
 		SelectedUser: req.scope().User,
-		Windows:      slices.Clone(analyticsWindows),
+		Windows:      req.windowChoices(),
 		Kinds:        append(runkind.All(), analyticsKindSets...),
 		Harnesses:    slices.Clone(analyticsHarnesses),
 		Splits:       req.splitChoices(),
