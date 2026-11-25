@@ -349,23 +349,28 @@ describe("provider judge: reported reasons and fallbacks are scrubbed of the key
     assert.ok(!rationale.includes(KEY.slice(0, 12)), "no partial key prefix survives the clip");
   });
 
-  it("a key straddling a trace clip (plan, failure reason, message evidence) is scrubbed before the prompt clips it", async () => {
-    // plan_md clips at 6000, failure_reason at 800 and each message summary at 600: each key starts
-    // just inside its cap, so clipping first would leave a key prefix in the prompt.
-    const keyed: JudgeTraceResponse = {
-      ...trace,
-      target: { ...trace.target, plan_md: `${"p".repeat(5990)}${KEY}`, failure_reason: `${"f".repeat(790)}${KEY}` },
-      messages: [{ seq: 1, kind: "assistant", agent: "lead", agent_instance: null, created_at: "2026-11-25T10:00:00Z",
-        payload: { text: `${"m".repeat(500)}${KEY}` } } as never],
-    };
-    const api = fakeClient({ getTrace: async () => keyed });
-    const { seen } = await run([assistant(verdict()), success()], providerClaim(), { client: api });
-    assert.equal(seen.calls, 1, "the model pass ran");
-    // The pass hands the SDK an async stream of user messages; the scripted queryFn never drains it.
-    const parts: unknown[] = [];
-    for await (const m of seen.prompt as AsyncIterable<unknown>) parts.push(m);
-    const prompt = JSON.stringify(parts);
-    assert.ok(prompt.includes("p".repeat(100)) && prompt.includes("f".repeat(100)), "the clipped fields reached the prompt");
-    assert.ok(!prompt.includes(KEY.slice(0, 8)), "no key prefix survives a trace clip");
-  });
+  // Each clip keeps cap - 12 characters before its "…[truncated]" marker (plan_md 6000 -> 5988,
+  // failure_reason 800 -> 788, a message payload preview 600 -> 588, rendered as {"text":"<value>
+  // so the value starts at offset 9). Each key starts ten characters before its retained boundary,
+  // so clipping before scrubbing would leave a key prefix in the prompt. One field per case.
+  // (A scrubbed field is shorter than its cap, so the scrubbed prompt holds the filler and no marker.)
+  const cases: Array<[string, string, (t: JudgeTraceResponse) => JudgeTraceResponse]> = [
+    ["plan_md", "p", (t) => ({ ...t, target: { ...t.target, plan_md: `${"p".repeat(5978)}${KEY}` } })],
+    ["failure_reason", "f", (t) => ({ ...t, target: { ...t.target, failure_reason: `${"f".repeat(778)}${KEY}` } })],
+    ["message evidence", "m", (t) => ({ ...t, messages: [{ seq: 1, kind: "assistant", agent: "lead", agent_instance: null,
+      created_at: "2026-11-25T10:00:00Z", payload: { text: `${"m".repeat(569)}${KEY}` } } as never] })],
+  ];
+  for (const [field, filler, keyed] of cases) {
+    it(`a key straddling the ${field} clip is scrubbed from the trace before the prompt clips it`, async () => {
+      const api = fakeClient({ getTrace: async () => keyed(trace) });
+      const { seen } = await run([assistant(verdict()), success()], providerClaim(), { client: api });
+      assert.equal(seen.calls, 1, "the model pass ran");
+      // The pass hands the SDK an async stream of user messages; the scripted queryFn never drains it.
+      const parts: unknown[] = [];
+      for await (const m of seen.prompt as AsyncIterable<unknown>) parts.push(m);
+      const prompt = JSON.stringify(parts);
+      assert.ok(prompt.includes(filler.repeat(500)), "the field reached the prompt");
+      assert.ok(!prompt.includes(KEY.slice(0, 8)), "no key prefix survives the clip");
+    });
+  }
 });
