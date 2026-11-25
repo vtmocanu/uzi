@@ -79,8 +79,8 @@ run's earlier MR rather than the current one.
 ## Retention
 
 There is no age-based expiry. History rows are deleted only by the repository
-cascade (`ON DELETE CASCADE` from `repos`). Each PR state change inserts one event row (a few hundred bytes) and updates
-the PR's single head row in place.
+cascade (`ON DELETE CASCADE` from `repos`). Each PR state change inserts one event row (a few hundred bytes) and upserts
+the PR's single head row.
 
 ## Delivery semantics
 
@@ -111,11 +111,15 @@ History is what the watcher saw, not a complete record of every PR.
 - **Non-owner observations.** History is recorded only when the run's user owns
   the repository's forge connection. Any other observation still updates
   `mr_state` but writes no history.
-- **Issue-lane watch rules.** For issue-linked runs the watcher observes only
-  the issue's latest run, and only while that run is `completed`; for an open
-  issue it also needs the card in Human Review or a stored `mr_state` of
-  `closed`. An MR outside those conditions is not observed, so its close or
-  merge is not recorded (the close-edge gap below is one case of this).
+- **Issue-lane watch rules.** On a repository without an external issue
+  tracker, the watcher observes only an issue's latest run, and only while that
+  run is `completed`. For an open issue it also needs the card in Human Review
+  or a stored `mr_state` of `closed`; for a closed issue it stops once the run's
+  `mr_state` is merged or closed, so a later reopen is not recorded. An MR
+  outside those conditions is not observed, so its close or merge is not
+  recorded (the close-edge gap below is one case of this). Repositories linked
+  to an external issue tracker are watched by the board-free lane instead
+  (next item).
 - **Board-free self-eviction.** Board-free runs leave the watch candidate set
   once their `mr_state` is terminal, so they are no longer observed.
 - **Close-edge gap.** On the opened-to-closed edge the board card move runs
