@@ -718,8 +718,9 @@ func TestCodexCAPartialDeletionRestartRecoversOnTheOriginalClaim(t *testing.T) {
 
 // Same boundary, but the pressure stays on: the data claim is recycled once /nix is back
 // by the restarted process. Its live stamped /data claim is the evidence here (that
-// recycle sets the carry and the record again before its delete), so this test does not
-// on its own guard the record; the restart-after-delete tests do.
+// recycle sets the carry before its delete; the record is already present from the
+// pre-restart recycle, so it is not re-patched), so this test does not on its own guard
+// the record; the restart-after-delete tests do.
 func TestCodexCAPartialDeletionRestartThenRerecycleKeepsTheEnv(t *testing.T) {
 	m, c, w, cfg, _, before := caPartialDelete(t)
 	ns := cfg.Namespace
