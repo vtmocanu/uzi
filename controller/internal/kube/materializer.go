@@ -1038,18 +1038,22 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 		}
 	}
 	for _, name := range names {
+		// A stamped /data claim is the only durable proof the Secret has the Codex CA
+		// key; carry it across the delete so the replacement claim is stamped too. The
+		// carry is set BEFORE the delete, whatever its outcome: an apiserver that commits
+		// the delete but loses the response must not drop the evidence. If the delete
+		// really failed and the claim stays live, the next tick's observation of a live
+		// own-namespace claim clears the carry.
+		if name == dataPVCName(w.ID) {
+			if c := ownDataClaim(w, obs, ns); c != nil && c.CodexExtraCA {
+				m.setCodexCACarry(w.ID, ns)
+			}
+		}
 		err := m.client.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, name, metav1.DeleteOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("delete pvc %s for recycle: %w", name, err))
 		} else {
 			m.log.Info("recycling hosted worker volumes: deleted pvc", "worker_id", w.ID, "pvc", name, "namespace", ns)
-		}
-		// A stamped /data claim is the only durable proof the Secret has the Codex CA
-		// key; carry it across the delete so the replacement claim is stamped too.
-		if err == nil && name == dataPVCName(w.ID) {
-			if c := ownDataClaim(w, obs, ns); c != nil && c.CodexExtraCA {
-				m.setCodexCACarry(w.ID, ns)
-			}
 		}
 	}
 	return errors.Join(errs...)

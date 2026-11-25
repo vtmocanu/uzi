@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 	"time"
 
@@ -280,14 +281,19 @@ func TestCodexCAUnadmittedKeylessWakeWritesNoTemplate(t *testing.T) {
 	}
 	wc.c.ClearActions()
 	wc.mustTick(t)
-	patches := wc.allPatches(t, "w1")
-	if len(patches) > 1 {
-		t.Fatalf("w1 patches = %d, want at most the op binding", len(patches))
-	}
-	if len(patches) == 1 {
-		requireOnlyOpBinding(t, patches[0], string(before.UID), before.ResourceVersion)
+	// Exactly the annotation-only op binding of patchWakeOpAnnotation, nothing else.
+	wc.requirePatchCount(t, "w1", 1)
+	requireOnlyOpBinding(t, wc.allPatches(t, "w1")[0], string(before.UID), before.ResourceVersion)
+	if got := caDeploymentWrites(wc.c); len(got) != 1 || got[0] != "patch" {
+		t.Errorf("deployment writes = %v, want the single op-binding patch", got)
 	}
 	after := wc.dep(t, "w1")
+	if after.Annotations[annotationHibernationOp] != wakeCanaryOp {
+		t.Errorf("op annotation = %q, want the op bound", after.Annotations[annotationHibernationOp])
+	}
+	if !reflect.DeepEqual(after.Spec, before.Spec) {
+		t.Error("the keyless wake changed the Deployment spec (template or replicas)")
+	}
 	if caHasEnv(after) || depHash(after) != depHash(before) {
 		t.Errorf("template changed: env=%v hash %s -> %s", caHasEnv(after), depHash(before), depHash(after))
 	}
@@ -332,17 +338,34 @@ func TestCodexCAInterruptedProvisioningSameProcessStamps(t *testing.T) {
 	if err := caTick(t, m, w); err == nil {
 		t.Fatal("rejected claim create was not reported")
 	}
+	if _, err := c.CoreV1().Secrets(ns).Get(context.Background(), secretName("w1"), metav1.GetOptions{}); err != nil {
+		t.Fatalf("tick 1: secret not created: %v", err)
+	}
+	if caClaim(t, c, ns, dataPVCName("w1")) != nil {
+		t.Fatal("tick 1: the rejected data claim exists")
+	}
 	if d := caDep(t, c, ns, "w1"); d != nil {
 		t.Fatal("deployment created beside a missing data claim")
 	}
-	for i := 0; i < 2; i++ {
-		caMustTick(t, m, w)
-	}
+	// Retry tick: the carry from tick 1 makes the frozen decision true, so the claim is
+	// stamped and the Deployment is created with the env in this same tick.
+	caMustTick(t, m, w)
 	if !caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
 		t.Fatal("retry did not stamp the data claim")
 	}
-	if d := caDep(t, c, ns, "w1"); d == nil || !caHasEnv(d) {
-		t.Fatalf("deployment = %v, want the env over the stamped claim", d)
+	d := caDep(t, c, ns, "w1")
+	if d == nil || !caHasEnv(d) {
+		t.Fatalf("retry tick: deployment = %v, want created with the env", d)
+	}
+	hash := depHash(d)
+	// Next tick: the stamp is observed; no Deployment write and an equal hash.
+	c.ClearActions()
+	caMustTick(t, m, w)
+	if got := caDeploymentWrites(c); len(got) != 0 {
+		t.Fatalf("next tick wrote deployments: %v", got)
+	}
+	if got := depHash(caDep(t, c, ns, "w1")); got != hash {
+		t.Fatalf("hash moved %s -> %s", hash, got)
 	}
 }
 
@@ -517,6 +540,33 @@ func TestCodexCAPressureRecycleRestartDropsTheEnv(t *testing.T) {
 	}
 }
 
+// AC8c (default admission): the same restart without the operator's force-roll. A lone
+// worker has no roll coverage, so the drift between the retained Deployment (rendered with
+// the env) and the now-keyless render is NOT admitted: the retained Deployment gets no
+// template write, so it is neither given nor stripped of anything, while the replacement
+// claim is minted unstamped. Only ForceRoll (the test above) admits the replacement.
+func TestCodexCAPressureRecycleRestartDefaultAdmissionWritesNoTemplate(t *testing.T) {
+	m, c, w, cfg := recycleFixture(t, true)
+	before := depHash(caDep(t, c, cfg.Namespace, "w1"))
+	caRecycleTick1(t, m, c, w)
+	m = matrixRestart(m)
+	w.DiskPressure = false
+	c.ClearActions()
+	for i := 0; i < 4; i++ {
+		caMustTick(t, m, w)
+	}
+	if got := templatePatches(c); len(got) != 0 {
+		t.Fatalf("default admission patched the template of %v", got)
+	}
+	if caStamped(caClaim(t, c, cfg.Namespace, dataPVCName("w1"))) {
+		t.Error("replacement claim stamped after a restart")
+	}
+	d := caDep(t, c, cfg.Namespace, "w1")
+	if got := depHash(d); got != before {
+		t.Errorf("retained deployment hash moved %s -> %s without admission", before, got)
+	}
+}
+
 // AC8d: the data claim stays Terminating for a tick in the same process. The carry must
 // survive it (a Terminating claim never clears the carry), no second delete is issued,
 // the replacement is stamped, and the env is kept.
@@ -564,6 +614,39 @@ func TestCodexCAPressureRecycleTerminatingDataClaimKeepsTheCarry(t *testing.T) {
 	}
 }
 
+// AC8e: the apiserver commits the data claim delete but the response is lost. The carry is
+// set from the observed stamp before the delete, so the replacement claim is stamped and
+// the Deployment keeps the env.
+func TestCodexCAPressureRecycleLostDeleteAckKeepsTheCarry(t *testing.T) {
+	m, c, w, cfg := recycleFixture(t, false)
+	ns := cfg.Namespace
+	c.PrependReactor("delete", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		name := a.(k8stesting.DeleteAction).GetName()
+		if name != dataPVCName("w1") {
+			return false, nil, nil
+		}
+		if err := c.Tracker().Delete(a.GetResource(), a.GetNamespace(), name); err != nil {
+			return true, nil, err
+		}
+		return true, nil, errors.New("lost delete response")
+	})
+	if err := caTick(t, m, w); err == nil {
+		t.Fatal("lost delete response was not reported")
+	}
+	if p := caClaim(t, c, ns, dataPVCName("w1")); p != nil {
+		t.Fatal("fixture: the data claim delete did not commit")
+	}
+	// Same cadence as the other recycle tests (pressure stays on): the replacement is
+	// minted on the next tick and the one after it is the next recycle.
+	caMustTick(t, m, w)
+	if !caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
+		t.Error("replacement data claim is not stamped")
+	}
+	if d := caDep(t, c, ns, "w1"); d == nil || !caHasEnv(d) {
+		t.Fatalf("recreated deployment = %v, want the env", d)
+	}
+}
+
 // AC9: a worker whose data claim is stamped but whose Deployment is gone gets it back with the env.
 func TestCodexCAStampedClaimWithoutDeploymentRecreatesWithEnv(t *testing.T) {
 	cfg := caCfg()
@@ -608,7 +691,16 @@ func TestCodexCABundleChangeReachesOnlyNewWorkers(t *testing.T) {
 	live := RenderDeployment(cfg.withCodexCA(true), w1, testSpec(t, "base", "m"))
 	objs := append(caClaims("w1", true), live)
 	m, c := caMat(t, cfg, objs...)
+	cfgA := m.cfg.withCodexCA(true)
 	m.cfg.ExtraCAPEM = []byte("extra-ca-B")
+	// The existing worker's roll target is non-vacuously unchanged: the template rendered
+	// for the stamped worker under bundle B hashes the same as under bundle A.
+	spec := testSpec(t, "base", "m")
+	hashA := depHash(RenderDeployment(cfgA, w1, spec))
+	hashB := depHash(RenderDeployment(m.cfg.withCodexCA(true), w1, spec))
+	if hashA == "" || hashA != hashB {
+		t.Fatalf("target hash for the stamped worker moved with the bundle: %q -> %q", hashA, hashB)
+	}
 	w2 := caWorker("w2")
 	caMustTick(t, m, w1, w2)
 	if got := depHash(caDep(t, c, ns, "w1")); got != depHash(live) {
