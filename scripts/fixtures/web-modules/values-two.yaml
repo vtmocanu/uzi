@@ -1,0 +1,21 @@
+# Fixture for scripts/assert-web-modules-render.sh: two modules: dotted host verbatim, IPv4 verbatim, adminOnly true, a label of exactly 40 non-ASCII characters
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: first
+      version: "2.1.0"
+      page: Page
+      label: "éééééééééééééééééééééééééééééééééééééééé"
+      icon: factory
+      navGroup: factory
+      adminOnly: true
+      upstream: first.tools.svc.cluster.local:9000
+    - id: second
+      version: "0.0.1"
+      page: Admin
+      label: Second
+      icon: terminal
+      navGroup: modules
+      adminOnly: false
+      upstream: 10.0.0.1:8080

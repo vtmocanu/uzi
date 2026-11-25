@@ -1740,6 +1740,18 @@ tasks:
       # / runCacheCapFraction relayed verbatim as strings, typed values refused, compose
       # passthrough), same no-workflow-edit wiring.
       - ./scripts/assert-run-cache-cap-render.sh
+      # Also runs the runtime web modules render check (PRD #4686: web.modules[] validation, the
+      # public modules.json projection, the per-module nginx locations against the shared
+      # fixture, and the subPath mounts), same no-workflow-edit wiring.
+      - ./scripts/assert-web-modules-render.sh
+
+  render:web-modules-check:
+    desc: assert the chart renders web.modules[] (modules.json projection, nginx locations, subPath mounts, checksum) and refuses invalid modules
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-web-modules-render.sh
 
   render:run-cache-cap-check:
     desc: assert the chart relays workers.runCacheCapMaxBytes/runCacheCapFraction verbatim as strings to the controller and refuses typed values
@@ -2938,7 +2950,7 @@ tasks:
       - task: test:web-modules-browser
 
   test:web-modules-browser:
-    desc: web runtime-modules harness - builds the host and example module, drives real Chromium (PRD #4686)
+    desc: web runtime-modules harness - builds the host and example module, drives real Chromium (PRD 4686)
     dir: web
     env:
       TZ: UTC

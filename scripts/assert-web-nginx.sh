@@ -42,6 +42,11 @@
 # (127.0.0.11) in every variant: the throwaway network has no other DNS a name could be
 # resolved by, so it stands in for the cluster DNS IP the chart's web.nginx.resolver names.
 # Module resolution is independent of the chart's dynamicResolution (false here).
+# The chart variants (chart, chartdyn) do not use the fixture: their modules.json and locations.conf
+# are the ConfigMap keys the chart renders from web.modules[] (chart-modules.yaml, built below), so
+# real nginx runs the blocks the chart emits; the stub also answers to modup.uzi.svc.cluster.local,
+# the host a dotless `modup` upstream expands to. The compose and mock variants still use the
+# fixture template until the compose generator (scripts/web-modules-gen.py) lands.
 #
 # Three more passes: (1) the image defaults, once per variant, using the real
 # web/nginx-modules-default/ dir and no fixture modules (/modules.json is `[]`, an unknown
@@ -167,18 +172,42 @@ awk '
   skip { next }
   { print }
 ' "$ROOT/deploy/chart/Chart.yaml" > "$CHART/Chart.yaml"
-# render_chart <out-conf> [helm --set args...]
+# The modules the chart variants run: web.modules[] rendered by the chart itself, so real nginx
+# loads the blocks the chart emits (the compose and mock variants use the fixture template).
+# `example` is the module origin (the stub, alias modup); a dotless upstream expands to
+# <host>.<release namespace>.svc.cluster.local, so the stub also answers to modup.uzi.svc.cluster.local
+# (the render below uses --namespace uzi). The ghosts exist only to prove an absent upstream does
+# not stop nginx: one name never resolves, one resolves to a port nothing listens on. `cc` proves
+# the Cache-Control map variable cannot collide with a module whose id is `cc`.
+cat > "$W/chart-modules.yaml" <<'CHARTMODULES'
+web:
+  nginx:
+    resolver: 127.0.0.11
+  modules:
+    - {id: example, version: 1.0.0, page: Page, label: Example, icon: package, navGroup: modules, upstream: "modup:8080"}
+    - {id: ghost-dns, version: 1.0.0, page: Page, label: Ghost DNS, icon: package, navGroup: modules, upstream: "ghost.invalid:8080"}
+    - {id: ghost-conn, version: 1.0.0, page: Page, label: Ghost Conn, icon: package, navGroup: modules, upstream: "modup:9"}
+    - {id: cc, version: 1.0.0, page: Page, label: CC, icon: package, navGroup: modules, upstream: "modup:8080"}
+CHARTMODULES
+# render_chart <out-conf> <out-modules-dir> [helm --set args...]: default.conf plus the chart's
+# modules.json and locations.conf (the two keys web-deployment.yaml mounts under uzi-modules/).
 render_chart() {
-  local out="$1"; shift
-  helm template uzi "$CHART" --namespace uzi --show-only templates/web-configmap.yaml "$@" > "$W/cm.yaml" 2> "$W/cm.err" \
+  local out="$1" moddir="$2"; shift 2
+  helm template uzi "$CHART" --namespace uzi --show-only templates/web-configmap.yaml -f "$W/chart-modules.yaml" "$@" > "$W/cm.yaml" 2> "$W/cm.err" \
     || { cat "$W/cm.err" >&2; broken "helm template of web-configmap.yaml failed"; }
+  mkdir -p "$moddir"
   yq '.data["default.conf"]' "$W/cm.yaml" > "$out" || broken "yq could not read default.conf"
-  if [ ! -s "$out" ] || [ "$(head -n 1 "$out")" = "null" ]; then
-    broken "the chart rendered no default.conf"
-  fi
+  yq '.data["modules.json"]' "$W/cm.yaml" > "$moddir/modules.json" || broken "yq could not read modules.json"
+  yq '.data["modules-locations.conf"]' "$W/cm.yaml" > "$moddir/locations.conf" || broken "yq could not read modules-locations.conf"
+  local f
+  for f in "$out" "$moddir/modules.json" "$moddir/locations.conf"; do
+    if [ ! -s "$f" ] || [ "$(head -n 1 "$f")" = "null" ]; then
+      broken "the chart rendered no ${f##*/}"
+    fi
+  done
 }
-render_chart "$W/chart.conf"
-render_chart "$W/chartdyn.conf" --set web.nginx.dynamicResolution=true --set web.nginx.resolver=127.0.0.11
+render_chart "$W/chart.conf" "$W/uzi-modules.chart"
+render_chart "$W/chartdyn.conf" "$W/uzi-modules.chartdyn" --set web.nginx.dynamicResolution=true
 cp "$ROOT/web/nginx.conf" "$W/compose.conf"
 cp "$ROOT/web/nginx.mock.conf" "$W/mock.conf"
 
@@ -328,9 +357,10 @@ location ^~ /modules/example/ {
     alias /usr/share/nginx/stub/mod/;
 }
 STUBMOD
-# The module config of each web container: `example` is served by the stub (alias modup);
-# the ghosts exist only to prove an absent upstream does not stop nginx (one name never
-# resolves, one resolves to a port nothing listens on).
+# The module config of the compose and mock containers: `example` is served by the stub (alias
+# modup); the ghosts exist only to prove an absent upstream does not stop nginx (one name never
+# resolves, one resolves to a port nothing listens on). The chart containers get the same set
+# from the chart's own render (chart-modules.yaml above), not from this fixture template.
 MOD_RESOLVER=127.0.0.11
 MODULES_JSON='[{"id":"example","version":"1.0.0","page":"Page","label":"Example","icon":"package","navGroup":"modules","adminOnly":false}]'
 LOC_TEMPLATE="$ROOT/scripts/fixtures/web-modules/location.example.conf"
@@ -338,7 +368,7 @@ render_loc() { # <resolver> <upstream> [<id> <var-suffix>]
   sed -e "s/@UZI_RESOLVER@/$1/g" -e "s/@UZI_UPSTREAM@/$2/g" \
     -e "s#/modules/example/#/modules/${3:-example}/#" -e "s/uzi_module_example/uzi_module_${4:-example}/g" "$LOC_TEMPLATE"
 }
-for v in $VARIANTS; do
+for v in compose mock; do
   mkdir -p "$W/uzi-modules.$v"
   printf '%s\n' "$MODULES_JSON" > "$W/uzi-modules.$v/modules.json"
   {
@@ -348,9 +378,8 @@ for v in $VARIANTS; do
     render_loc "$MOD_RESOLVER" modup:8080 cc cc
   } > "$W/uzi-modules.$v/locations.conf"
 done
-# The dynamic-resolution chart variant gets the same module dir as the static chart.
-cp -R "$W/uzi-modules.chart" "$W/uzi-modules.chartdyn"
 ! grep -q '@UZI_' "$W/uzi-modules.compose/locations.conf" || broken "location template placeholders not fully substituted"
+! grep -q '@UZI_' "$W/uzi-modules.chart/locations.conf" || broken "the chart left a location placeholder in locations.conf"
 # nginx runs as uid 101 inside the image: everything copied in must be world-readable.
 # Exercise the exact owner-input proxy ceiling and its first rejected byte.
 dd if=/dev/zero of="$W/approval-exact.bin" bs=1048576 count=17 2>/dev/null
@@ -381,7 +410,7 @@ start_ctr() {
   fi
 }
 
-start_ctr "wnginx-$$-up" "$W/stub.conf" "" --network-alias api --network-alias modup --dns-option ndots:0
+start_ctr "wnginx-$$-up" "$W/stub.conf" "" --network-alias api --network-alias modup --network-alias modup.uzi.svc.cluster.local --dns-option ndots:0
 # docker cp creates a missing destination directory when the source is a directory.
 docker cp "$STUB/." "wnginx-$$-up:/usr/share/nginx/stub" || broken "docker cp stub fixtures failed"
 docker start "wnginx-$$-up" >/dev/null || { container_logs "wnginx-$$-up"; broken "stub upstream did not start"; }
@@ -735,7 +764,7 @@ for v in $VARIANTS; do
   # The manifest.
   fetch "$v-m-json" "$port" /modules.json
   check "/modules.json: status 200 (got $STATUS)" has_status 200
-  check "/modules.json: body is the fixture" [ "$(cat "$W/$v-m-json.b")" = "$MODULES_JSON" ]
+  check "/modules.json: body is the module dir's modules.json (the fixture, or the chart's render)" raw_eq "$v-m-json" "$W/uzi-modules.$v/modules.json"
   check "/modules.json: exactly one Cache-Control no-cache" cc_is "$v-m-json" no-cache
   check "/modules.json: Content-Type application/json" hhas "$v-m-json" content-type application/json
   sec_headers "$v-m-json" "/modules.json"

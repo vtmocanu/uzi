@@ -1,0 +1,13 @@
+# Fixture for scripts/assert-web-modules-render.sh: adminOnly given as a string
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: bad
+      version: "1.0.0"
+      page: Page
+      label: Bad
+      icon: package
+      navGroup: modules
+      adminOnly: "true"
+      upstream: svc:80

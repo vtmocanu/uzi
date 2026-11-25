@@ -1787,6 +1787,37 @@ web:
     # The cluster DNS resolver IP (only used when dynamicResolution: true). Find it
     # with `kubectl -n kube-system get svc kube-dns -o jsonpath={.spec.clusterIP}`.
     resolver: ""
+  # Runtime web modules (PRD #4686): UI modules served by their own Deployment and loaded
+  # into the SPA at run time, so adding one needs no web image rebuild. Each entry:
+  #   id        (required) ^[a-z][a-z0-9-]{0,31}$, unique. The module is served at /modules/<id>/
+  #             and rendered by the SPA at /m/<id>/*.
+  #   version   (required) a string shown to admins in error cards (quote it: 1.0 is a number).
+  #   page      (required) the module's exposed page name.
+  #   label     (required) the nav label, 1 to 40 characters, no control or invisible characters.
+  #   icon      (required) one of activity board book bot bug chat clock factory file-text gear git
+  #             home key package scale search server shield skill terminal.
+  #   navGroup  (required) work | factory | modules (the sidebar section).
+  #   adminOnly (optional) boolean, default false. A UI visibility rule only: a signed-in user
+  #             can still fetch /modules.json and the module files. Never put a secret in a module.
+  #   upstream  (required) [http://]HOST:PORT of the module's static server; HOST is a lowercase
+  #             DNS-1123 name or an IPv4 address, PORT 1-65535, nothing else (no path or query).
+  #             A dotless HOST (a Service name) expands to <host>.<release namespace>.svc.cluster.local.
+  #             The upstream never appears in /modules.json.
+  # PREREQUISITE: web.nginx.resolver must be set (above): nginx resolves each module upstream per
+  # request, so an absent module is a 502 for its own path and never stops nginx or the web pod.
+  # The list is rendered into the web ConfigMap and mounted with subPath, so a change rolls the
+  # web pods through checksum/nginx; during the rollout pods can serve different generations.
+  # Example:
+  #   modules:
+  #     - id: example
+  #       version: "1.0.0"
+  #       page: Page
+  #       label: Example
+  #       icon: package
+  #       navGroup: modules
+  #       adminOnly: false
+  #       upstream: example-module:8080
+  modules: []
   ingress:
     enabled: true
     className: nginx

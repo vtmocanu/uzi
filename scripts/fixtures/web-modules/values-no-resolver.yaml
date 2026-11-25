@@ -1,0 +1,10 @@
+# Fixture for scripts/assert-web-modules-render.sh: a module with web.nginx.resolver left empty
+web:
+  modules:
+    - id: bad
+      version: "1.0.0"
+      page: Page
+      label: Bad
+      icon: package
+      navGroup: modules
+      upstream: svc:80

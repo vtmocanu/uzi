@@ -220,4 +220,11 @@ data:
             add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'" always;
         }
     }
+  # Runtime web modules (PRD #4686), from web.modules[] (see _web-modules.tpl). Mounted with
+  # subPath at /etc/nginx/uzi-modules/ by web-deployment.yaml; kept in THIS template so
+  # checksum/nginx (a hash of this file's render) rolls the pods when the list changes.
+  modules.json: |
+    {{- include "uzi.webModules.json" . | nindent 4 }}
+  modules-locations.conf: |
+    {{- include "uzi.webModules.locations" . | nindent 4 }}
 {{- end }}
