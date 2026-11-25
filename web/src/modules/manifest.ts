@@ -22,6 +22,9 @@ export interface ModuleEntry {
 const MODULE_ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const NAV_GROUPS: readonly string[] = ["work", "factory", "modules"];
 const LABEL_MAX = 40;
+// C0/C1 controls, zero-width and directional marks (U+200B-200F), bidi embeddings and
+// overrides (U+202A-202E), bidi isolates (U+2066-2069), and the line/paragraph separators.
+const UNSAFE_TEXT_RE = /[\p{Cc}\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/u;
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim() !== "";
@@ -57,6 +60,12 @@ export function parseModuleList(json: unknown): ModuleEntry[] {
     if ([...label].length > LABEL_MAX) {
       skip(id, `label is longer than ${LABEL_MAX} characters`);
       return;
+    }
+    for (const field of ["label", "version"] as const) {
+      if (UNSAFE_TEXT_RE.test(e[field] as string)) {
+        skip(id, `${field} contains control or invisible formatting characters`);
+        return;
+      }
     }
     if (!isModuleIconName(e.icon)) {
       skip(id, `unknown icon ${JSON.stringify(String(e.icon).slice(0, 48))}`);

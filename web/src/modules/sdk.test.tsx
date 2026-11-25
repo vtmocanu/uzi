@@ -115,6 +115,29 @@ describe("sdk.api.request through the real path", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("rejects a C1 control character (U+0085) with no fetch", async () => {
+    const err = await createHostSdk({ user, navigate }).api.request("GET", "/a\u0085b").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["TRACE", "get", "CONNECT", ""])("rejects method %j with no fetch", async (method) => {
+    const err = await createHostSdk({ user, navigate })
+      .api.request(method as never, "/x")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows %2F and // in the query and fetches under /api/", async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(json(200, {})));
+    const sdk = createHostSdk({ user, navigate });
+    await sdk.api.request("GET", "/x?branch=a%2Fb");
+    await sdk.api.request("GET", "/x?next=//e#frag%2f");
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(["/api/x?branch=a%2Fb", "/api/x?next=//e#frag%2f"]);
+  });
+
   it("accepts the root and a deep path", async () => {
     fetchMock.mockImplementation(() => Promise.resolve(json(200, {})));
     const sdk = createHostSdk({ user, navigate });

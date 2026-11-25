@@ -136,6 +136,23 @@ describe("timeout", () => {
     expect(MODULE_LOAD_TIMEOUT_MS).toBe(15000);
   });
 
+  it("with no override, a never-settling load rejects as transient at exactly 15000 ms", async () => {
+    vi.useFakeTimers();
+    try {
+      fed.loadModuleRemote.mockReturnValue(new Promise(() => {}));
+      let settled: ModuleLoadError | null = null;
+      const p = failure(loadModulePage(entry)).then((e) => (settled = e));
+      await vi.advanceTimersByTimeAsync(14999);
+      expect(settled).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      await p;
+      expect(settled).not.toBeNull();
+      expect((settled as unknown as ModuleLoadError).kind).toBe("transient");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects as transient after the override and discards a late arrival", async () => {
     (globalThis as { __UZI_MODULE_LOAD_TIMEOUT_MS__?: number }).__UZI_MODULE_LOAD_TIMEOUT_MS__ = 30;
     let arrive!: (v: unknown) => void;

@@ -74,6 +74,52 @@ describe("vite-mf-no-new-function", () => {
     assert.throws(() => run(UTILS, `${root}/dist/utils.js`), /expected 2\.9\.3/);
   });
 
+  it("buildStart throws when the resolved sdk version is not the pin", () => {
+    const p = mfNoNewFunction({ resolveSdkVersion: () => "2.9.4" });
+    assert.throws(() => p.buildStart(), /expected 2\.9\.3/);
+  });
+
+  it("buildStart passes on the pinned version, and the real install is the pin", () => {
+    mfNoNewFunction({ resolveSdkVersion: () => PINNED_SDK_VERSION }).buildStart();
+    mfNoNewFunction().buildStart();
+  });
+
+  function buildPlugin() {
+    const p = mfNoNewFunction({ resolveSdkVersion: () => PINNED_SDK_VERSION });
+    p.configResolved({ command: "build" });
+    p.buildStart();
+    return p;
+  }
+
+  it("buildEnd throws when the federation runtime was loaded but the targets never were", () => {
+    const p = buildPlugin();
+    p.transform("export {}", "/x/node_modules/@module-federation/runtime-core/dist/index.js");
+    assert.throws(() => p.buildEnd(), /never transformed/);
+  });
+
+  it("buildEnd throws when only one target was transformed", () => {
+    const root = fixture("half", PINNED_SDK_VERSION, { "utils.js": UTILS });
+    const p = buildPlugin();
+    p.transform(UTILS, `${root}/dist/utils.js`);
+    assert.throws(() => p.buildEnd(), /node\.js/);
+  });
+
+  it("buildEnd passes when both targets were transformed, when no federation module was loaded, and after a build error", () => {
+    const root = fixture("both", PINNED_SDK_VERSION, { "utils.js": UTILS, "node.js": NODE });
+    const p = buildPlugin();
+    p.transform(UTILS, `${root}/dist/utils.js`);
+    p.transform(NODE, `${root}/dist/node.js`);
+    p.buildEnd();
+
+    const none = buildPlugin();
+    none.transform("export {}", "/x/src/main.ts");
+    none.buildEnd();
+
+    const failed = buildPlugin();
+    failed.transform("export {}", "/x/node_modules/@module-federation/runtime-core/dist/index.js");
+    failed.buildEnd(new Error("other failure"));
+  });
+
   it("the stub throws when called, not when evaluated", async () => {
     const root = fixture("stub", PINNED_SDK_VERSION, { "node.js": NODE });
     const out = run(NODE, `${root}/dist/node.js`).code;

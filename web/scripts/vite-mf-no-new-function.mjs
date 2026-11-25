@@ -15,6 +15,9 @@
 // literal or change what is stubbed. Bump the pin and the snippets together.
 
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const PINNED_SDK_VERSION = "2.9.3";
 
@@ -51,11 +54,7 @@ function rewriteSdk(code, id, readVersion) {
   const suffix = Object.keys(SDK_SNIPPETS).find((s) => clean.endsWith(s));
   if (!suffix) return null;
   const version = readVersion(sdkRootOf(clean));
-  if (version !== PINNED_SDK_VERSION) {
-    throw new Error(
-      `vite-mf-no-new-function: installed @module-federation/sdk is ${version}, expected ${PINNED_SDK_VERSION}; re-pin the snippets in web/scripts/vite-mf-no-new-function.mjs`,
-    );
-  }
+  assertPinned(version);
   let out = code;
   for (const snippet of SDK_SNIPPETS[suffix]) {
     const n = countOccurrences(out, snippet);
@@ -73,13 +72,70 @@ function readInstalledVersion(root) {
   return JSON.parse(readFileSync(`${root}/package.json`, "utf8")).version;
 }
 
-export function mfNoNewFunction() {
+function assertPinned(version) {
+  if (version !== PINNED_SDK_VERSION) {
+    throw new Error(
+      `vite-mf-no-new-function: installed @module-federation/sdk is ${version}, expected ${PINNED_SDK_VERSION}; re-pin the snippets in web/scripts/vite-mf-no-new-function.mjs`,
+    );
+  }
+}
+
+// The sdk's package.json is not in its "exports" map, so resolve the entry point from
+// the web directory and walk up to the package root that names the sdk.
+function resolveInstalledSdkVersion() {
+  const webDir = fileURLToPath(new URL("..", import.meta.url));
+  let dir = dirname(createRequire(join(webDir, "package.json")).resolve("@module-federation/sdk"));
+  for (;;) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (pkg.name === "@module-federation/sdk") return pkg.version;
+    } catch {
+      // no package.json here; keep walking up
+    }
+    const parent = dirname(dir);
+    if (parent === dir) throw new Error("vite-mf-no-new-function: could not locate the @module-federation/sdk package root");
+    dir = parent;
+  }
+}
+
+/**
+ * `options.resolveSdkVersion` is a test seam; production resolves the installed sdk.
+ * Beyond the per-file checks, the plugin fails a build that does not transform both
+ * target files while any @module-federation/ module was part of it, so an sdk layout
+ * change cannot pass silently.
+ */
+export function mfNoNewFunction(options = {}) {
+  const resolveSdkVersion = options.resolveSdkVersion ?? resolveInstalledSdkVersion;
+  const transformed = new Set();
+  let sawFederation = false;
+  let isBuild = false;
   return {
     name: "uzi-mf-no-new-function",
     enforce: "pre",
+    configResolved(config) {
+      isBuild = config.command === "build";
+    },
+    buildStart() {
+      transformed.clear();
+      sawFederation = false;
+      assertPinned(resolveSdkVersion());
+    },
     transform(code, id) {
+      const clean = id.split("?")[0].replace(/\\/g, "/");
+      if (clean.includes("@module-federation/")) sawFederation = true;
       const out = rewriteSdk(code, id, readInstalledVersion);
-      return out === null ? null : { code: out, map: null };
+      if (out === null) return null;
+      transformed.add(Object.keys(SDK_SNIPPETS).find((s) => clean.endsWith(s)));
+      return { code: out, map: null };
+    },
+    buildEnd(error) {
+      if (error || !isBuild || !sawFederation) return;
+      const missing = Object.keys(SDK_SNIPPETS).filter((s) => !transformed.has(s));
+      if (missing.length > 0) {
+        throw new Error(
+          `vite-mf-no-new-function: the federation runtime is in the build but ${missing.join(", ")} was never transformed; the sdk layout changed, re-pin web/scripts/vite-mf-no-new-function.mjs`,
+        );
+      }
     },
   };
 }
