@@ -396,6 +396,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Custom Codex providers support current model slots and runtime admission ([#4626](https://github.com/vtmocanu/uzi/pull/4626)).**
   GPT-6.2 Sol and Astra mappings round-trip through Settings and the CLI; provider health and wake admission require a single v3-capable worker, while reaping retains previously claimed workers and custody.
 
+- **Worker toolchain refreshes preserve their package resolution model ([#3311](https://github.com/vtmocanu/uzi/pull/3311), [#4653](https://github.com/vtmocanu/uzi/pull/4653)).**
+  Refresh in an isolated Devbox project, preserving explicit pins and rejecting manifest migrations or partial locks before publication.
+
+- **uzi-lander's merge guard retries a torn run-listing read instead of refusing, and the post-merge `--sha` watch reports scheduled and dispatched runs as advisory ([#4670](https://github.com/vtmocanu/uzi/pull/4670)).**
+  `merge.sh` re-reads a release-guard `total_count` mismatch up to 3 times before refusing; `watch-run-ci.sh --sha` reports schedule/workflow_dispatch runs in an ADVISORY block and gates on every other run, and gives no verdict on a listing that reaches its 51-row limit.
+
+- **A Claude credential switch after a permanent message failure in the restore window now holds the run on the switch fence ([#4652](https://github.com/vtmocanu/uzi/pull/4652), [#4666](https://github.com/vtmocanu/uzi/pull/4666)).**
+  On a worker that supports in-place credential switches, a Claude run whose restore predecessor is still guarded now holds on the switch fence, instead of a plain retained stop, when an op-fenced credential switch is pending after a permanent message failure. Codex runs are unchanged.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -626,6 +635,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Weekly-limit park explanations ([#4123](https://github.com/vtmocanu/uzi/pull/4123)).**
   A run parked on its 7-day usage limit or paused by the weekly reserve now says why uzi did not move it to another credential, what will happen next, and the copyable command to change it, on the run page, `uzi run get`, the TUI and the Slack park message.
 
+- **Admins can share a Claude provider definition that every user uses with their own key ([#4324](https://github.com/vtmocanu/uzi/pull/4324), [#4656](https://github.com/vtmocanu/uzi/pull/4656)).**
+  Each user attaches, tests and selects their own key, so the admin never holds it; the URL and auth style are fixed at creation, the Claude engine only, and the redirect risk accepted for custom providers applies.
+
 ### Changed
 
 - **Routine dependency updates ([#4650](https://github.com/vtmocanu/uzi/pull/4650)).**
@@ -843,6 +855,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Codex defaults use GPT-6.2 Sol on the current runtime ([#4626](https://github.com/vtmocanu/uzi/pull/4626), [#4649](https://github.com/vtmocanu/uzi/pull/4649)).**
   Root/planning and the independent judge default advance with runtime 0.171.0 and v3 admission; explicit choices remain, and cache writes use the owner-selected 30-minute Standard estimate with accepted 12-hour underestimation risk.
+
+- **Existing CLAUDE.md opt-ins now also reach plan cross-checks ([#4519](https://github.com/vtmocanu/uzi/pull/4519), [#4675](https://github.com/vtmocanu/uzi/pull/4675)).**
+  When both the Repo instructions and cross-checker CLAUDE.md settings are on, the plan checker gets the root CLAUDE.md from the plan's frozen base commit, with symlinks resolved only within the commit; otherwise it sees an explicit status.
+
+- **Settings Models reads in sections and sits next to Account & tokens ([#4665](https://github.com/vtmocanu/uzi/pull/4665), [#4667](https://github.com/vtmocanu/uzi/pull/4667)).**
+  Each model group is its own card, the saved effective value shows as a compact tag, and Appearance moves to the last Settings tab.
+
+- **Settings Models shows a saved value only where the control does not, and offers Reset to default ([#4671](https://github.com/vtmocanu/uzi/pull/4671), [#4672](https://github.com/vtmocanu/uzi/pull/4672)).**
+  The saved-value tag under every Models cell is gone: a muted line appears only for an unsaved change, an unavailable value or a value the select hides, and screen readers still hear every saved value. A value you changed from its default has a Reset to default button.
 
 ### Security
 
