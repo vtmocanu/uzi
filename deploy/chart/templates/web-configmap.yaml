@@ -24,9 +24,13 @@ data:
     #   - 200/206/304 anywhere else               -> no-cache (remoteEntry.js and friends)
     #   - everything else (302, 404, 502, ...)    -> no-store, so an error is never cached and an
     #                                                asset 404 is never immutable
-    # $uri is the normalized path nginx matched, so an encoded or dot-segment path cannot spoof it.
-    # Always used as `add_header Cache-Control $uzi_module_cc always;`.
-    map "$status:$uri" $uzi_module_cc {
+    # The decision uses $uri (the normalized path nginx matched), while the upstream gets the raw
+    # $request_uri. An encoded or dot-segment path can therefore pick the immutable policy for an
+    # attacker-chosen URL key (the cache key the browser sees); low impact, since the URL is its own
+    # cache key and a module can only make itself cacheable under a path it already serves.
+    # The variable is $uzi_modcc, outside the per-module $uzi_module_<id> namespace, so a module whose id is `cc` cannot collide.
+    # Always used as `add_header Cache-Control $uzi_modcc always;`.
+    map "$status:$uri" $uzi_modcc {
         "~^(200|206|304):/modules/[a-z][a-z0-9-]*/assets/" "public, max-age=31536000, immutable";
         "~^(200|206|304):" "no-cache";
         default "no-store";

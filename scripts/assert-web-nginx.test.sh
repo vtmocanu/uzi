@@ -146,9 +146,9 @@ run_pull() {
 # creates_end_with <case> <ref>: exactly 4 docker create lines, each ending in " <ref>".
 creates_end_with() {
   n=$(grep -c '^docker create ' "$TMP/$1.log" || true)
-  [ "$n" = 4 ] || fail "$1: want 4 docker create lines, got $n"
+  [ "$n" = 8 ] || fail "$1: want 8 docker create lines, got $n"
   m=$(grep '^docker create ' "$TMP/$1.log" | grep -cF " $2" || true)
-  [ "$m" = 4 ] || fail "$1: want all 4 creates to end with ' $2', got $m"
+  [ "$m" = 8 ] || fail "$1: want all 8 creates to end with ' $2', got $m"
   grep '^docker create ' "$TMP/$1.log" | grep -qvF -- " $2" \
     && fail "$1: a docker create does not end with ' $2'"
   return 0
@@ -167,8 +167,9 @@ expect_net_rm() {
 # mktemp and reaches Docker without relying on this harness's scratch parent.
 fresh="$TMP/fresh-checkout"
 mkdir -p "$fresh/web" "$fresh/deploy"
-cp "$ROOT/web/Dockerfile" "$ROOT/web/nginx.conf" "$ROOT/web/nginx.mock.conf" "$fresh/web/"
+cp "$ROOT/web/Dockerfile" "$ROOT/web/Dockerfile.mock" "$ROOT/web/nginx.conf" "$ROOT/web/nginx.mock.conf" "$fresh/web/"
 cp "$ROOT/web/nginx-main.conf" "$ROOT/web/nginx-modules.js" "$fresh/web/"
+cp -R "$ROOT/web/nginx-modules-default" "$fresh/web/"
 mkdir -p "$fresh/scripts/fixtures/web-modules"
 cp "$ROOT/scripts/fixtures/web-modules/location.example.conf" "$fresh/scripts/fixtures/web-modules/"
 cp -R "$ROOT/deploy/chart" "$fresh/deploy/chart"
@@ -236,7 +237,7 @@ for source in stdout stderr file; do
     || fail "leak-$source: chart cookie log assertion did not detect leak"
   ! grep -qF 'wnginx-request-' "$TMP/leak-$source.out" \
     || fail "leak-$source: sentinel printed in script output"
-  [ "$(rms "leak-$source" | wc -l | tr -d ' ')" = 4 ] \
+  [ "$(rms "leak-$source" | wc -l | tr -d ' ')" = 8 ] \
     || fail "leak-$source: owned containers not cleaned"
 done
 unset FAKE_LEAK_SOURCE

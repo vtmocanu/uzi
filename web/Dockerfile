@@ -98,6 +98,8 @@ COPY web/nginx.conf /etc/nginx/conf.d/default.conf
 # (`[]`, no locations); the chart or compose mounts real ones over it, so the image never
 # needs a rebuild to enable a module. COPY keeps the files root-owned and world-readable
 # (mode 0644 from git, dirs 0755), which the unprivileged nginx user (uid 101) can read.
+# COPY keeps the build-context modes, so a checkout with a restrictive umask would produce an
+# image nginx cannot read; the context modes are what matter, not the base image's.
 COPY web/nginx-main.conf /etc/nginx/nginx.conf
 COPY web/nginx-modules.js /etc/nginx/uzi-modules.js
 COPY web/nginx-modules-default/ /etc/nginx/uzi-modules/

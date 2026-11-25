@@ -43,6 +43,16 @@
 # resolved by, so it stands in for the cluster DNS IP the chart's web.nginx.resolver names.
 # Module resolution is independent of the chart's dynamicResolution (false here).
 #
+# Three more passes: (1) the image defaults, once per variant, using the real
+# web/nginx-modules-default/ dir and no fixture modules (/modules.json is `[]`, an unknown
+# module is a 404 no-store); the Dockerfiles' COPY of that dir, nginx-main.conf and
+# nginx-modules.js is checked by name in both Dockerfiles, and both Dockerfiles must pin the
+# same final-stage nginx digest (this script reads only web/Dockerfile's). (2) A module whose id
+# is `cc`, which must not collide with the Cache-Control map variable ($uzi_modcc). (3) The
+# chart rendered with web.nginx.dynamicResolution=true and web.nginx.resolver=127.0.0.11 (the
+# docker DNS stand-in), asserted for the module routes and an absent upstream only: its api
+# upstream is the cluster-DNS name of the Service, which this network cannot resolve.
+#
 # Everything is read from <repo-root> (default: this script's parent directory), so it can
 # be pointed at a git archive export of an older commit to prove it goes red there.
 #
@@ -61,6 +71,9 @@ ROOT=$(cd -- "${1:-$SCRIPT_DIR/..}" && pwd)
 
 CSP="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'"
 VARIANTS="compose chart mock"
+# Response headers the module location must hide beyond the cache, cookie, security and X-Accel
+# ones (the stub origin sends each one).
+HIDDEN_EXTRA="Service-Worker-Allowed Clear-Site-Data Strict-Transport-Security Refresh Permissions-Policy Content-Security-Policy-Report-Only Access-Control-Allow-Origin Access-Control-Allow-Credentials Access-Control-Allow-Methods Access-Control-Allow-Headers Access-Control-Expose-Headers Report-To NEL"
 
 broken() { echo "BROKEN: $*" >&2; exit 2; }
 
@@ -68,7 +81,8 @@ for tool in docker helm yq curl gzip cmp; do
   command -v "$tool" >/dev/null 2>&1 || broken "$tool not on PATH"
 done
 docker info >/dev/null 2>&1 || broken "docker daemon not reachable"
-for f in web/Dockerfile web/nginx.conf web/nginx.mock.conf web/nginx-main.conf web/nginx-modules.js \
+for f in web/Dockerfile web/Dockerfile.mock web/nginx.conf web/nginx.mock.conf web/nginx-main.conf web/nginx-modules.js \
+  web/nginx-modules-default/modules.json web/nginx-modules-default/locations.conf \
   scripts/fixtures/web-modules/location.example.conf deploy/chart/Chart.yaml; do
   [ -f "$ROOT/$f" ] || broken "missing $ROOT/$f"
 done
@@ -153,12 +167,18 @@ awk '
   skip { next }
   { print }
 ' "$ROOT/deploy/chart/Chart.yaml" > "$CHART/Chart.yaml"
-helm template uzi "$CHART" --namespace uzi --show-only templates/web-configmap.yaml > "$W/cm.yaml" 2> "$W/cm.err" \
-  || { cat "$W/cm.err" >&2; broken "helm template of web-configmap.yaml failed"; }
-yq '.data["default.conf"]' "$W/cm.yaml" > "$W/chart.conf" || broken "yq could not read default.conf"
-if [ ! -s "$W/chart.conf" ] || [ "$(head -n 1 "$W/chart.conf")" = "null" ]; then
-  broken "the chart rendered no default.conf"
-fi
+# render_chart <out-conf> [helm --set args...]
+render_chart() {
+  local out="$1"; shift
+  helm template uzi "$CHART" --namespace uzi --show-only templates/web-configmap.yaml "$@" > "$W/cm.yaml" 2> "$W/cm.err" \
+    || { cat "$W/cm.err" >&2; broken "helm template of web-configmap.yaml failed"; }
+  yq '.data["default.conf"]' "$W/cm.yaml" > "$out" || broken "yq could not read default.conf"
+  if [ ! -s "$out" ] || [ "$(head -n 1 "$out")" = "null" ]; then
+    broken "the chart rendered no default.conf"
+  fi
+}
+render_chart "$W/chart.conf"
+render_chart "$W/chartdyn.conf" --set web.nginx.dynamicResolution=true --set web.nginx.resolver=127.0.0.11
 cp "$ROOT/web/nginx.conf" "$W/compose.conf"
 cp "$ROOT/web/nginx.mock.conf" "$W/mock.conf"
 
@@ -259,6 +279,19 @@ add_header X-Accel-Limit-Rate "1" always;
 add_header X-Accel-Buffering "no" always;
 add_header X-Accel-Charset "wnginx-upstream" always;
 add_header X-Accel-Uzi-Probe "wnginx-upstream" always;
+add_header Service-Worker-Allowed "/wnginx-upstream" always;
+add_header Clear-Site-Data "\"cache\", \"wnginx-upstream\"" always;
+add_header Strict-Transport-Security "max-age=1; wnginx-upstream" always;
+add_header Refresh "0; url=/wnginx-upstream" always;
+add_header Permissions-Policy "camera=(), wnginx-upstream=()" always;
+add_header Content-Security-Policy-Report-Only "default-src *; report-uri wnginx-upstream" always;
+add_header Access-Control-Allow-Origin "wnginx-upstream" always;
+add_header Access-Control-Allow-Credentials "true" always;
+add_header Access-Control-Allow-Methods "GET, wnginx-upstream" always;
+add_header Access-Control-Allow-Headers "wnginx-upstream" always;
+add_header Access-Control-Expose-Headers "wnginx-upstream" always;
+add_header Report-To "wnginx-upstream" always;
+add_header NEL "wnginx-upstream" always;
 STUBPOISON
 # Static files (Range gives 206, If-Modified-Since gives 304), a missing file (404), an echo
 # of the request headers the module origin received, and two relative redirects.
@@ -266,7 +299,15 @@ cat > "$STUB/mod-locations.conf" <<'STUBMOD'
 location = /modules/example/echo {
     include /usr/share/nginx/stub/mod-poison.conf;
     default_type text/plain;
-    return 200 "echo cookie=[$http_cookie] authorization=[$http_authorization] method=[$request_method]";
+    return 200 "echo cookie=[$http_cookie] authorization=[$http_authorization] proxyauth=[$http_proxy_authorization] csrf=[$http_x_csrf_token] method=[$request_method]";
+}
+location = /modules/cc/bad {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    return 502;
+}
+location ^~ /modules/cc/ {
+    include /usr/share/nginx/stub/mod-poison.conf;
+    alias /usr/share/nginx/stub/mod/;
 }
 location = /modules/example/go {
     include /usr/share/nginx/stub/mod-poison.conf;
@@ -304,8 +345,11 @@ for v in $VARIANTS; do
     render_loc "$MOD_RESOLVER" modup:8080
     render_loc "$MOD_RESOLVER" "ghost.invalid:8080" ghost-dns ghost_dns
     render_loc "$MOD_RESOLVER" modup:9 ghost-conn ghost_conn
+    render_loc "$MOD_RESOLVER" modup:8080 cc cc
   } > "$W/uzi-modules.$v/locations.conf"
 done
+# The dynamic-resolution chart variant gets the same module dir as the static chart.
+cp -R "$W/uzi-modules.chart" "$W/uzi-modules.chartdyn"
 ! grep -q '@UZI_' "$W/uzi-modules.compose/locations.conf" || broken "location template placeholders not fully substituted"
 # nginx runs as uid 101 inside the image: everything copied in must be world-readable.
 # Exercise the exact owner-input proxy ceiling and its first rejected byte.
@@ -357,9 +401,24 @@ for v in $VARIANTS; do
   docker start "wnginx-$$-$v" >/dev/null || { container_logs "wnginx-$$-$v"; broken "$v web container did not start"; }
 done
 
+# The image-defaults containers (one per variant, the real web/nginx-modules-default/ dir, no
+# fixture modules) and the dynamic-resolution chart container.
+for v in $VARIANTS; do
+  start_ctr "wnginx-$$-$v-def" "$W/$v.conf" "$DOC" --dns-option ndots:0 -p 127.0.0.1::8080
+  docker cp "$ROOT/web/nginx-main.conf" "wnginx-$$-$v-def:/etc/nginx/nginx.conf" || broken "docker cp main conf to $v-def failed"
+  docker cp "$ROOT/web/nginx-modules.js" "wnginx-$$-$v-def:/etc/nginx/uzi-modules.js" || broken "docker cp njs file to $v-def failed"
+  docker cp "$ROOT/web/nginx-modules-default/." "wnginx-$$-$v-def:/etc/nginx/uzi-modules" || broken "docker cp default modules to $v-def failed"
+  docker start "wnginx-$$-$v-def" >/dev/null || { container_logs "wnginx-$$-$v-def"; broken "$v-def web container did not start"; }
+done
+start_ctr "wnginx-$$-chartdyn" "$W/chartdyn.conf" "$DOC" --dns-option ndots:0 -p 127.0.0.1::8080
+docker cp "$ROOT/web/nginx-main.conf" "wnginx-$$-chartdyn:/etc/nginx/nginx.conf" || broken "docker cp main conf to chartdyn failed"
+docker cp "$ROOT/web/nginx-modules.js" "wnginx-$$-chartdyn:/etc/nginx/uzi-modules.js" || broken "docker cp njs file to chartdyn failed"
+docker cp "$W/uzi-modules.chartdyn/." "wnginx-$$-chartdyn:/etc/nginx/uzi-modules" || broken "docker cp uzi-modules to chartdyn failed"
+docker start "wnginx-$$-chartdyn" >/dev/null || { container_logs "wnginx-$$-chartdyn"; broken "chartdyn web container did not start"; }
+
 # port_of <variant>: the published loopback port, kept in a file (bash 3 has no assoc arrays).
 port_of() { cat "$W/port.$1"; }
-for v in $VARIANTS; do
+for v in $VARIANTS $(for x in $VARIANTS; do printf '%s-def ' "$x"; done) chartdyn; do
   p=$(docker port "wnginx-$$-$v" 8080/tcp | grep '^127\.0\.0\.1:' | head -n 1 | sed 's/.*://' || true)
   [ -n "$p" ] || broken "no published port for $v"
   echo "$p" > "$W/port.$v"
@@ -424,6 +483,11 @@ cc_not_immutable() { ! hhas "$1" cache-control immutable; }
 cc_is() { [ "$(hcount "$1" cache-control)" = 1 ] && [ "$(hvals "$1" cache-control)" = "$2" ]; }
 no_upstream_marks() { ! grep -qi 'wnginx-upstream' "$W/$1.h"; }
 no_accel() { ! grep -qi '^x-accel-' "$W/$1.h"; }
+# no_hidden_extra <tag>: none of $HIDDEN_EXTRA is present, by name.
+no_hidden_extra() {
+  local h
+  for h in $HIDDEN_EXTRA; do [ "$(hcount "$1" "$h")" = 0 ] || return 1; done
+}
 no_cookie_expires() { [ "$(hcount "$1" set-cookie)" = 0 ] && [ "$(hcount "$1" expires)" = 0 ]; }
 body_has() { grep -qF -- "$2" "$W/$1.b"; }
 body_lacks() { ! grep -qF -- "$2" "$W/$1.b"; }
@@ -436,6 +500,7 @@ mod_cell() {
   check "$label: exactly one Cache-Control '$cc'" cc_is "$tag" "$cc"
   check "$label: no upstream header value leaked" no_upstream_marks "$tag"
   check "$label: no X-Accel-* header" no_accel "$tag"
+  check "$label: no Service-Worker-Allowed, Clear-Site-Data, HSTS, Refresh, Permissions-Policy, CSP-Report-Only, CORS, Report-To or NEL" no_hidden_extra "$tag"
   check "$label: no Set-Cookie or Expires" no_cookie_expires "$tag"
   sec_headers "$tag" "$label"
 }
@@ -497,6 +562,16 @@ main_line_places() {
   [ "$(head -n 1 "$ROOT/web/nginx-main.conf")" = "$LOAD_LINE" ] &&
     [ "$(grep -xF -B1 -e "$INCLUDE_LINE" "$ROOT/web/nginx-main.conf" | head -n 1)" = "$IMPORT_LINE" ]
 }
+MOCK_IMAGE=$(awk '/^FROM nginxinc\/nginx-unprivileged/ { print $2; exit }' "$ROOT/web/Dockerfile.mock")
+same_digest() { [ -n "$MOCK_IMAGE" ] && [ "${MOCK_IMAGE##*@}" = "$DIGEST" ]; }
+check "web/Dockerfile.mock pins the same final-stage nginx image digest as web/Dockerfile" same_digest
+dockerfile_copies() {
+  grep -qxF 'COPY web/nginx-main.conf /etc/nginx/nginx.conf' "$ROOT/$1" &&
+    grep -qxF 'COPY web/nginx-modules.js /etc/nginx/uzi-modules.js' "$ROOT/$1" &&
+    grep -qxF 'COPY web/nginx-modules-default/ /etc/nginx/uzi-modules/' "$ROOT/$1"
+}
+check "web/Dockerfile COPYs nginx-main.conf, nginx-modules.js and nginx-modules-default/" dockerfile_copies web/Dockerfile
+check "web/Dockerfile.mock COPYs nginx-main.conf, nginx-modules.js and nginx-modules-default/" dockerfile_copies web/Dockerfile.mock
 check "web/nginx-main.conf minus the two added lines equals the pinned image's nginx.conf" main_without_added
 check "web/nginx-main.conf adds exactly one load_module and one js_import line" main_line_counts
 check "load_module is the first line and js_import sits directly before the conf.d include" main_line_places
@@ -506,12 +581,15 @@ check "load_module is the first line and js_import sits directly before the conf
 V="module-origin"
 docker exec "wnginx-$$-up" wget -S -q -O /dev/null http://127.0.0.1:8080/modules/example/remoteEntry.js >"$W/origin.h" 2>&1 || true
 for hn in Set-Cookie Expires Cache-Control Content-Security-Policy X-Frame-Options X-Content-Type-Options Referrer-Policy \
-  X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset X-Accel-Uzi-Probe; do
+  X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset X-Accel-Uzi-Probe \
+  $HIDDEN_EXTRA; do
   check "control: the module origin sends $hn" grep -qi "^ *$hn:" "$W/origin.h"
 done
 docker exec "wnginx-$$-up" wget -q -O - --header 'Cookie: ctl-cookie' --header 'Authorization: ctl-auth' \
+  --header 'Proxy-Authorization: ctl-pauth' --header 'X-CSRF-Token: ctl-csrf' \
   http://127.0.0.1:8080/modules/example/echo >"$W/origin.echo" 2>/dev/null || true
 check "control: the module origin echoes Cookie and Authorization when sent" grep -qF 'cookie=[ctl-cookie] authorization=[ctl-auth]' "$W/origin.echo"
+check "control: the module origin echoes Proxy-Authorization and X-CSRF-Token when sent" grep -qF 'proxyauth=[ctl-pauth] csrf=[ctl-csrf]' "$W/origin.echo"
 
 for v in $VARIANTS; do
   V=$v
@@ -625,16 +703,26 @@ for v in $VARIANTS; do
   fetch "$v-m-range" "$port" "$R" -H 'Range: bytes=0-9'
   check "module range body is the first 10 bytes" [ "$(cat "$W/$v-m-range.b")" = "$(head -c 10 "$STUB/mod/remoteEntry.js")" ]
   # Request headers: Cookie and Authorization are cleared before the module origin.
-  fetch "$v-m-echo" "$port" /modules/example/echo -H "Cookie: wnginx-modcookie-$$" -H "Authorization: Bearer wnginx-modauth-$$"
+  fetch "$v-m-echo" "$port" /modules/example/echo -H "Cookie: wnginx-modcookie-$$" -H "Authorization: Bearer wnginx-modauth-$$" \
+    -H "Proxy-Authorization: Basic wnginx-modpauth-$$" -H "X-CSRF-Token: wnginx-modcsrf-$$"
   check "echo: status 200 (got $STATUS)" has_status 200
   check "echo: Cookie not forwarded" body_has "$v-m-echo" 'cookie=[]'
   check "echo: Authorization not forwarded" body_has "$v-m-echo" 'authorization=[]'
+  check "echo: Proxy-Authorization not forwarded" body_has "$v-m-echo" 'proxyauth=[]'
+  check "echo: X-CSRF-Token not forwarded" body_has "$v-m-echo" 'csrf=[]'
   check "echo: no sentinel reached the module origin" body_lacks "$v-m-echo" "wnginx-mod"
   # Methods: GET and HEAD only.
   for m in POST PUT DELETE; do
     mod_cell "$m is refused" "$v-m-$m" "$port" /modules/example/echo 403 no-store -X "$m" --data x
     check "$m: the module origin was not reached" body_lacks "$v-m-$m" "echo cookie="
   done
+  # A module whose id is `cc` (its variable is $uzi_module_cc): the Cache-Control map variable
+  # must not share that name, or the header would carry the upstream host:port.
+  mod_cell "cc module entry" "$v-m-cc200" "$port" /modules/cc/remoteEntry.js 200 no-cache
+  mod_cell "cc module asset" "$v-m-ccasset" "$port" /modules/cc/assets/app-0123abcd.js 200 "$IMM"
+  mod_cell "cc module 404" "$v-m-cc404" "$port" /modules/cc/missing.js 404 no-store
+  mod_cell "cc module upstream 502" "$v-m-cc502" "$port" /modules/cc/bad 502 no-store
+  check "cc module: Cache-Control carries no host:port" [ -z "$(hvals "$v-m-cc200" cache-control | grep -F modup || true)" ]
   # Unknown id and absent upstream.
   mod_cell "unknown module id" "$v-m-nope" "$port" /modules/nope/x 404 no-store
   check "unknown module id: body is not the SPA index" not_index "$v-m-nope"
@@ -658,6 +746,36 @@ for v in $VARIANTS; do
     check "cookie proof: sentinels absent from web logs" cookie_logs_absent "$v"
   fi
 done
+
+# Image defaults: the real web/nginx-modules-default/ dir, no fixture modules.
+for v in $VARIANTS; do
+  V="$v-defaults"
+  port=$(port_of "$v-def")
+  if docker exec "wnginx-$$-$v-def" nginx -t >"$W/$v-def.t" 2>&1; then ok "nginx -t"; else bad "nginx -t ($(tr '\n' ' ' < "$W/$v-def.t"))"; fi
+  fetch "$v-def-json" "$port" /modules.json
+  check "/modules.json: status 200 (got $STATUS)" has_status 200
+  check "/modules.json: Content-Type application/json" hhas "$v-def-json" content-type application/json
+  check "/modules.json: body is []" [ "$(cat "$W/$v-def-json.b")" = '[]' ]
+  check "/modules.json: exactly one Cache-Control no-cache" cc_is "$v-def-json" no-cache
+  sec_headers "$v-def-json" "/modules.json"
+  mod_cell "default image, unknown module" "$v-def-x" "$port" /modules/x/y 404 no-store
+  fetch "$v-def-spa" "$port" /
+  check "/ is the SPA index (got $STATUS)" raw_eq "$v-def-spa" "$DOC/index.html"
+done
+
+# The chart with dynamicResolution=true and resolver 127.0.0.11: module routes and an absent upstream.
+V="chartdyn"
+port=$(port_of chartdyn)
+if docker exec "wnginx-$$-chartdyn" nginx -t >"$W/chartdyn.t" 2>&1; then ok "nginx -t"; else bad "nginx -t ($(tr '\n' ' ' < "$W/chartdyn.t"))"; fi
+check "the rendered chart has a resolver 127.0.0.11 line" grep -q 'resolver 127.0.0.11' "$W/chartdyn.conf"
+mod_cell "module path 200" "$V-m-r200" "$port" /modules/example/remoteEntry.js 200 no-cache
+mod_cell "asset 200" "$V-m-a200" "$port" /modules/example/assets/app-0123abcd.js 200 "$IMM"
+mod_cell "cc module entry" "$V-m-cc200" "$port" /modules/cc/remoteEntry.js 200 no-cache
+mod_cell "unresolvable upstream" "$V-m-dns" "$port" /modules/ghost-dns/x 502 no-store
+mod_cell "refused upstream" "$V-m-conn" "$port" /modules/ghost-conn/x 502 no-store
+fetch "$V-spa" "$port" /
+check "/ is still served with absent module upstreams (got $STATUS)" has_status 200
+check "/ is the SPA index" raw_eq "$V-spa" "$DOC/index.html"
 
 V="summary"
 if [ "$fail" = 0 ]; then echo "OK: every property holds"; exit 0; fi
