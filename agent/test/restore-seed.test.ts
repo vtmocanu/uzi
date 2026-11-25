@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import {
   GitCache, RestoreCompositeError, RestoreSeedError,
@@ -12,9 +13,14 @@ import {
 } from "../src/git.js";
 import type { GitAuthorityHooks } from "../src/git-authority-hooks.js";
 import { restoreDigest, type RestoreWindow } from "../src/restore-journal.js";
-import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
+import { attemptClonePath, cloneKeyOf, formatAttemptId } from "../src/attempt-path.js";
+import { InventorySourceExclusionRefusal } from "../src/inventory-exclusion.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+import { LiveAttemptRegistry, inventoryClearVerdict, quiesceRunAttempt, setQuiescenceViewForTests } from "../src/run-quiescence.js";
+import { scopedRealView } from "./fake-proc.js";
+import { restoreHermeticView } from "./setup/hermetic-proc.js";
+import { realProcfsSkip } from "./real-procfs.js";
 
 // issue #3644 Gate B (plan 3.4, 3.9): GitCache.seedIndependentAttempt against a real bare and real Git. Every step's failure is a
 // typed RestoreSeedError naming the window it left; a fresh discoverOpaque / resolveBranchJournal reads each window back; the
@@ -1030,5 +1036,114 @@ describe("sanity of the happy-path fixture", () => {
   it("P's journal digest is sha256 of the raw value", () => {
     assert.equal(restoreDigest(pRaw), sha256(pRaw));
     assert.ok(RestoreCompositeError);
+  });
+});
+
+describe("seedIndependentAttempt: the same-key inventory exclusion (issue #4632)", () => {
+  it("refuses an excluded key whose restore-class probe is not clear, unwrapped, before any write", async () => {
+    const canonical = cache.runnerClonePath(bare, KEY);
+    const calls: Array<{ cloneKey: string; protectedMarkers?: string[] }> = [];
+    cache.setInventoryExclusionProbe(async (req) => { calls.push(req); return "not_clear"; });
+    (cache as unknown as { inventoryExclusion: { addEntry(b: string, k: string, e: unknown): void } }).inventoryExclusion
+      .addEntry(bare, cloneKeyOf(canonical).cloneKey, { id: "e1", clonePath: canonical, gitStarted: true, pending: new Set() });
+    const before = config();
+    const ledger = ledgerValues();
+    const trace: Trace = { steps: [] };
+    let caught: unknown;
+    try { await cache.seedIndependentAttempt(seedInput(trace)); } catch (err) { caught = err; }
+    assert.ok(caught instanceof InventorySourceExclusionRefusal, `expected the exclusion refusal, got ${String(caught)}`);
+    assert.equal(caught instanceof RestoreSeedError, false, "the refusal is not wrapped");
+    assert.equal(calls.length, 1, "the restore-class probe ran once");
+    assert.deepEqual(calls[0]!.protectedMarkers, [`${RUN}:${P_ID}`]);
+    assert.deepEqual(config(), before, "the bare config is byte-identical");
+    assert.deepEqual(ledgerValues(), ledger, "no successor ledger entry");
+    assert.equal(rawKey(S_KEY), undefined, "no restore entry");
+    assert.equal(fs.existsSync(S_PATH), false);
+    assert.deepEqual(trace.steps, [], "no callback ran");
+  });
+});
+
+// 5f with a REAL process: a detached unmarked `sleep` whose cwd is the opaque predecessor's path. The probe is the runner's own
+// observe-only probe shape (capture mode, forced helper) over the real process table; only the registry of the exclusion entry
+// is planted, as an inventory section that started git would have left it.
+const REAL_PROC_SKIP: string | false = process.platform !== "linux" ? "reads procfs (Linux only)" : realProcfsSkip("restore-seed");
+describe("seedIndependentAttempt: the restore-class clear against a real opaque-path sibling (issue #4632, 5f)", { skip: REAL_PROC_SKIP }, () => {
+  let scratch: string;
+  let pidFile: string;
+  const spawned: number[] = [];
+  beforeEach(() => {
+    scratch = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-restore-5f-"));
+    pidFile = path.join(scratch, "pids");
+    fs.writeFileSync(pidFile, "");
+    setQuiescenceViewForTests(scopedRealView({ pidFiles: [pidFile] }));
+  });
+  afterEach(() => {
+    for (const pid of spawned.splice(0)) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+    restoreHermeticView();
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+  const gone = (pid: number): boolean => {
+    try { const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8"); return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z"); } catch { return true; }
+  };
+  async function untilGone(pid: number): Promise<void> {
+    const end = Date.now() + 5_000;
+    while (!gone(pid)) { if (Date.now() > end) throw new Error(`pid ${pid} did not exit`); await new Promise((r) => setTimeout(r, 10)); }
+  }
+  /** setsid + background + the intermediate shell exits: the sleep is reparented away, unmarked, with cwd `cwd`. */
+  function detachSleep(cwd: string): number {
+    execFileSync("setsid", ["sh", "-c", `sleep 300 </dev/null >/dev/null 2>&1 & echo $! >> '${pidFile}'`], {
+      cwd, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdio: ["ignore", "ignore", "ignore"],
+    });
+    const pid = Number(fs.readFileSync(pidFile, "utf8").split("\n").filter(Boolean).at(-1));
+    spawned.push(pid);
+    return pid;
+  }
+  const exclusion = (): { addEntry(b: string, k: string, e: unknown): void; excluded(b: string, k: string): boolean } =>
+    (cache as unknown as { inventoryExclusion: { addEntry(b: string, k: string, e: unknown): void; excluded(b: string, k: string): boolean } }).inventoryExclusion;
+
+  it("a restore seed is admitted over P's live sibling (nothing signalled, entry kept); a later full clear refuses while it lives and admits after it exits", async () => {
+    const canonical = cache.runnerClonePath(bare, KEY);
+    const cloneKey = cloneKeyOf(canonical).cloneKey;
+    const registry = new LiveAttemptRegistry();
+    const probes: Array<{ targetPaths: string[]; protectedMarkers?: string[] }> = [];
+    cache.setInventoryExclusionProbe(async (req) => {
+      probes.push({ targetPaths: req.targetPaths, ...(req.protectedMarkers ? { protectedMarkers: req.protectedMarkers } : {}) });
+      const out = await quiesceRunAttempt({
+        mode: "capture", attempt: undefined, cloneKey: req.cloneKey, targetPaths: req.targetPaths, processes: true, dockerHost: undefined,
+        registry, otherClaimInFlight: false, site: "inventory_source:clear_probe", forceHelper: true, observeOnly: true,
+        deadlineAt: req.deadlineAt, ...(req.protectedMarkers ? { protectedMarkers: req.protectedMarkers } : {}),
+      });
+      return inventoryClearVerdict(out.process);
+    });
+    const sleepPid = detachSleep(P_PATH);
+    assert.equal(fs.readlinkSync(`/proc/${sleepPid}/cwd`), fs.realpathSync(P_PATH), "the sleep's cwd is the predecessor's path");
+    assert.equal(gone(sleepPid), false);
+    exclusion().addEntry(bare, cloneKey, { id: "e1", clonePath: canonical, gitStarted: true, pending: new Set() });
+
+    // 1. The restore-class clear never scans the opaque P path, so the seed is admitted although the sleep lives.
+    const trace: Trace = { steps: [] };
+    const seeded = await cache.seedIndependentAttempt(seedInput(trace));
+    assert.equal(seeded.path, S_PATH);
+    assert.equal(probes.length, 1, "exactly the restore-class probe ran");
+    assert.equal(probes[0]!.targetPaths.includes(P_PATH), false, "the restore scope never names P's path");
+    assert.deepEqual(probes[0]!.protectedMarkers, [`${RUN}:${P_ID}`]);
+    assert.equal(gone(sleepPid), false, "nothing signalled the sleep");
+    assert.equal(exclusion().excluded(bare, cloneKey), true, "a restore verdict removes nothing: the entry is still present");
+    assert.ok(fs.existsSync(path.join(S_PATH, ".git")), "S was seeded");
+
+    // 2. A full clear of the same key (no restore entry any more) scans every non-live path of the key, P's included.
+    gitIn(bare, ["config", "--unset-all", S_KEY]);
+    const priv = cache as unknown as { refuseExcludedKey(b: string, br: string, c: string, isLive: (p: string) => boolean, cls: "full" | "restore"): Promise<void> };
+    const isLive = (p: string): boolean => p === S_PATH;
+    await assert.rejects(priv.refuseExcludedKey(bare, BRANCH, canonical, isLive, "full"),
+      (e: unknown) => e instanceof InventorySourceExclusionRefusal && e.reason === "excluded");
+    assert.equal(probes.at(-1)!.targetPaths.includes(P_PATH), true, "the full scope names P's path");
+    assert.equal(gone(sleepPid), false, "the refused full clear signalled nothing either");
+    assert.equal(exclusion().excluded(bare, cloneKey), true);
+
+    process.kill(sleepPid, "SIGKILL");
+    await untilGone(sleepPid);
+    await priv.refuseExcludedKey(bare, BRANCH, canonical, isLive, "full");
+    assert.equal(exclusion().excluded(bare, cloneKey), false, "a full clear over a quiescent key removes the entry");
   });
 });

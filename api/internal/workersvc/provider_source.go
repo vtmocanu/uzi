@@ -134,21 +134,6 @@ func (r ProviderSourceResult) Err() error {
 // ProviderAllowFunc maps a base URL to the allowlist entry it equals exactly (config.ProviderBaseURLAllowed).
 type ProviderAllowFunc func(candidate string) (entry string, ok bool)
 
-// providerSourceReader is the read surface of the source resolution; *store.Queries satisfies it.
-type providerSourceReader interface {
-	GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID) (store.GetUserClaudeProviderSourceRow, error)
-}
-
-// EvaluateClaudeProviderSource applies the usability rules to one GetUserClaudeProviderSource row:
-// the provider exists, is owned (the query joins owner-scoped), is not retired, its CURRENT
-// revision's base URL is still allowlisted, and the provider's key row exists, is kind
-// anthropic_compatible_key for that provider, and is enabled.
-func EvaluateClaudeProviderSource(row store.GetUserClaudeProviderSourceRow, allow ProviderAllowFunc) ProviderSourceResult {
-	return EvaluateProviderSource(providers.EngineClaude, store.GetUserProviderSourceRow{
-		ProviderID: row.ProviderID, Engine: row.Engine, Protocol: pgtype.Text{String: providers.ProtocolAnth, Valid: true}, CurrentRevision: row.CurrentRevision, RetiredAt: row.RetiredAt, BaseUrl: row.BaseUrl, AuthStyle: row.AuthStyle, ModelMap: row.ModelMap, KeySecretID: row.KeySecretID, KeyKind: row.KeyKind, KeyProviderID: row.KeyProviderID, KeyDisabledAt: row.KeyDisabledAt, KeyEnablementRev: row.KeyEnablementRev,
-	}, allow)
-}
-
 func providerKeyKind(engine string) string {
 	if engine == providers.EngineCodex {
 		return store.KindOpenAICompatibleKey
@@ -224,27 +209,9 @@ func EvaluateProviderSource(engine string, row store.GetUserProviderSourceRow, a
 	}}
 }
 
-// ResolveClaudeProviderSource reads and evaluates the owner's engine provider source on q. It is
-// the single helper the handler (settings route), the resolver and the freeze share.
-func ResolveClaudeProviderSource(ctx context.Context, q providerSourceReader, userID uuid.UUID, allow ProviderAllowFunc) (ProviderSourceResult, error) {
-	row, err := q.GetUserClaudeProviderSource(ctx, userID)
-	if err != nil {
-		return ProviderSourceResult{}, fmt.Errorf("claude provider source: %w", err)
-	}
-	return EvaluateClaudeProviderSource(row, allow), nil
-}
-
 // providerAllow is the service's allowlist matcher (Params mirrors config's operator settings).
 func (s *Service) providerAllow(candidate string) (string, bool) {
 	return providers.MatchAllowed(s.p.ProviderAllowedBaseURLs, candidate, s.p.ProviderAllowLoopback)
-}
-
-// claudeProviderSource resolves the owner's source on q with the service's allowlist.
-func (s *Service) claudeProviderSource(ctx context.Context, q providerSourceReader, userID uuid.UUID) (ProviderSourceResult, error) {
-	if generic, ok := q.(engineProviderSourceReader); ok {
-		return ResolveProviderSource(ctx, generic, userID, providers.EngineClaude, s.providerAllow)
-	}
-	return ResolveClaudeProviderSource(ctx, q, userID, s.providerAllow)
 }
 
 // bindingParams are the five binding columns an insert closure passes; the zero value is a vendor

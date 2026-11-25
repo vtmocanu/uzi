@@ -1,5 +1,5 @@
 // AdminShell: one header + tab bar shared by the admin surfaces (Users, Rate limits,
-// Tool allowlist, Blocked repos, Instance, Workers, Branding, Site lists, Products, Health). The same
+// Tool allowlist, Blocked repos, Instance, Workers, Branding, Site lists, Shared providers, Products, Health). The same
 // treatment SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
 // sidebar for admins and hid that they are one area — this instance's controls.
@@ -28,6 +28,8 @@ export const TABS = [
   // Optional external-products/jobs controls follow instance configuration. Site lists
   // come first: jobs use them, and products can only allow lists that already exist.
   { to: "/admin/egress-profiles", label: "Site lists" },
+  // PRD #4324: Claude gateway definitions users select with their own key.
+  { to: "/admin/shared-providers", label: "Shared providers" },
   { to: "/admin/products", label: "Products" },
   { to: "/admin/health", label: "Health", pip: true },
 ];

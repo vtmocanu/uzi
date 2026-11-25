@@ -1,4 +1,4 @@
-import { it } from "node:test";
+import { beforeEach, it } from "node:test";
 import { inventoryCloneKey, type InventorySourceBoundaryContext, type InventorySourceDiagnostic } from "../src/recovery.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -7,7 +7,14 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { passthroughInventorySection } from "./helpers.js";
 installHarness();
+// issue #4632: this suite drives the runner boundary over a fixture bare path ("/fixture/repo.git") and a stubbed
+// git, so the real locked section (which reads the bare's config) cannot run here; opt this suite into the passthrough.
+// The section's own behavior is covered by git-inventory-exclusion.test.ts and runner-inventory-seed-serialization.test.ts.
+beforeEach(() => {
+  git.withInventorySourceLock = passthroughInventorySection as unknown as typeof git.withInventorySourceLock;
+});
 
 type BoundaryRunner = {
   withInventorySourceBoundary(context: InventorySourceBoundaryContext, action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained">;

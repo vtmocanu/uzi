@@ -827,9 +827,10 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 
 // overlayProviderNames sets provider_name on runs bound to a custom model provider (PRD #4320).
 // runToDTO maps provider_id independently. One batched read covers every bound run in the call and
-// matches each provider under the run's own owner, so a name never crosses users; only the owner
-// and admin run reads call it, never the shared board. A deleted provider (or a failed lookup,
-// which is logged) leaves the name null while the id stays.
+// matches each provider under visibility to the run's own owner (their own or an admin-shared
+// definition; the name is user- or admin-authored text), so a name never crosses users; only the
+// owner and admin run reads call it, never the shared board. A deleted or invisible provider (or a
+// failed lookup, which is logged) leaves the name null while the id stays.
 func (h *Handler) overlayProviderNames(ctx context.Context, dtos ...*apitypes.RunDTO) {
 	var ids []uuid.UUID
 	byID := make(map[uuid.UUID][]*apitypes.RunDTO)

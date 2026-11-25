@@ -18,6 +18,11 @@ describe("CODEX_ROLE_MODELS", () => {
     );
   });
 
+  it("accepts both 6.2 role ids and keeps custom roots out of roles", () => {
+    for (const m of ["gpt-6.2-sol", "gpt-6.2-astra"]) assert.equal(isCodexRoleModel(m), true);
+    for (const m of ["custom-root", "custom-planning", "gpt-6.2-luna"]) assert.equal(isCodexRoleModel(m), false);
+  });
+
   it("isCodexRoleModel accepts every member", () => {
     for (const m of CODEX_ROLE_MODELS) assert.equal(isCodexRoleModel(m), true, m);
   });

@@ -1010,8 +1010,8 @@ the route is cookie-only, so the CLI cannot write them.
   guidance: additional checks for this repository; it cannot remove the
   required checks, change the output format or the read-only rules". It adds
   checks; it cannot loosen the required ones.
-- **Give the checker this repository's CLAUDE.md** lets the checker see the
-  repository's conventions. For a new check, the worker freshly fetches the
+- **Give the cross-checkers this repository's CLAUDE.md** lets the checkers see
+  the repository's conventions. For a new code check, the worker freshly fetches the
   configured default branch (or uses worker-owned default-branch discovery)
   and freezes its tip as **`repo_instructions_commit`**. It reads the root
   `CLAUDE.md` at that commit. The diff's **base commit** remains the merge base
@@ -1022,6 +1022,10 @@ the route is cookie-only, so the CLI cannot write them.
   as fenced advisory data; a `CLAUDE.md` change in the diff is review
   evidence, not instruction. This consent is separate from the lead's
   **Repo instructions** setting (see [Skills](./skills.md#repo-instructions-opt-in-default-off)).
+
+The code-check paragraphs here and below describe code checks. The same toggle
+also reaches plan checks, which behave differently; see [Plan
+checks](#plan-checks-and-repository-instructions).
 
 Guidance, the instructions toggle, text and instruction commit are frozen into
 the check when it is created; later edits affect new checks only. Forking from
@@ -1067,6 +1071,59 @@ invocation or repair rerun. Finalize independently imports work with its existin
 guards and separate 50-minute boundary; it is not a snapshot retry. Storage
 settlement can outlast an allowance; see [Checkpoint budgets](./configuration.md#checkpoints-two-tiers-prd-122-m8-prd-267).
 These source/test boundaries do not establish hosted acceptance.
+
+#### Plan checks and repository instructions
+
+The same **Give the cross-checkers this repository's CLAUDE.md** toggle also
+gates the plan cross-checker, a third recipient. The plan checker gets the text
+only when both the lead's **Repo instructions** setting and this toggle are on.
+The API reads both in one statement when the checker child is **claimed** and
+sends the result as `plan_repo_instructions_enabled` on that claim. Code claims
+never carry it, and the code-check wire format, pinning and freezing are
+unchanged. There is no migration.
+
+- **Consent timing differs.** A plan check reads consent when its checker child
+  is claimed, so changing a toggle can affect a plan check that is already
+  waiting to be claimed. A code check freezes consent when the check is created.
+- **Source.** The worker reads the root `CLAUDE.md` from its bare repository at
+  the plan candidate's frozen `base_commit`, before the checkout exists. It
+  uses the same git-plumbing reader as the code check: symlinks are followed
+  only inside the commit tree (at most 8 hops, never outside the repository or
+  into `.git/`), the target must be a regular file, a file over 64 KiB is
+  dropped, never truncated, and import lines are stripped. It never reads the
+  worktree or the filesystem.
+- **Framing.** The text is in the checker's data prompt inside a nonce fence,
+  described as the root `CLAUDE.md` recorded in the plan candidate's frozen
+  `base_commit`, not necessarily the bytes the lead read, and untrusted and
+  advisory. A short worker-authored preface names the only genuine fences;
+  lookalikes in the text are data.
+- **Trust caveat.** On a resumed or successor run, `base_commit` is the
+  branch's own previously pushed tip, so its `CLAUDE.md` may come from an
+  earlier attempt and is not part of the planning diff. Unlike a code check,
+  a plan check does not guarantee that the run could not write the instructions
+  it is checked against.
+- **When nothing is supplied** the data prompt carries an explicit status:
+  `disabled` (consent off, or an older API without the field), `absent`,
+  `refused` (an escaping, broken, looping or non-blob link, or a non-regular root entry such as a directory or submodule), `too_large`, or
+  `unknown` (a read error, a missing commit, or the read budget expired).
+- **Read budget.** The checker waits for the read at most the shortest of 15
+  seconds, the claim deadline and its remaining model time; a late result is
+  discarded. The read counts against the checker's model time.
+- **Run status line.** With consent on, the checker child run (not the lead) shows one line,
+  `plan cross-check repository instructions read: <status>`. It reports the
+  read, not delivery: a later checkout failure can follow a `supplied` line. If
+  the base commit is unavailable the line says `unknown`, and the existing
+  exact-checkout requirement then fails the check with no model call.
+- **Unchanged.** Briefs, tool permissions and the file-read helper are
+  unchanged; a direct read of a symlinked `CLAUDE.md` in the checkout is still
+  denied.
+
+Rollout: an older worker on a newer API delivers nothing (the field is inert in
+its candidate JSON); a newer worker on an older API reports `disabled`. The
+always-present field counts toward the checker claim size limit (2 MiB for
+legacy plan claims, 64 MiB for validated `semantic_v1`); a legacy plan claim
+within about 40 bytes of 2 MiB is now refused cleanly. See the [dated ADR
+amendment](../adr/0246-trusted-repo-instructions.md#plan-cross-checker-issue-4519-2026-11-24).
 
 ### Snapshot cleanup
 

@@ -67,10 +67,12 @@ type RawCredentialOverride struct {
 // gpt-6-luna: the agent's set carries it (the Now summary model, PRD #2603, and so also honoured
 // as a template role pin), while this picker and Codex frozen-run vocabulary deliberately leave it out.
 var codexModels = map[string]bool{
-	"gpt-6-astra": true,
-	"gpt-5.6-sol": true,
-	"gpt-6-sol":   true,
-	"gpt-6.1-sol": true,
+	"gpt-6-astra":   true,
+	"gpt-5.6-sol":   true,
+	"gpt-6-sol":     true,
+	"gpt-6.1-sol":   true,
+	"gpt-6.2-sol":   true,
+	"gpt-6.2-astra": true,
 }
 
 // codexCuratedModelsSlice returns the curated Codex model ids (codexModels) as a sorted slice,

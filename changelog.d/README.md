@@ -29,7 +29,12 @@ checks structure, not citation identity. At release cut, a shipping mainline com
 that introduced exactly one pending fragment contributes its trailing PR identity
 to that fragment's rendered headline, or its short SHA when no PR suffix exists.
 Existing citations and tracked fragment bytes are preserved. Zero or multiple
-pending introductions receive no automatic repair. The release oracle still requires the
+pending introductions receive no automatic repair. Before merging a `vtmocanu/uzi`
+PR into main, the lander's `merge.sh` refuses (exit 15) one that adds two or more
+fragments unless an added fragment's headline cites the PR number or a same-repo
+issue this merge closes; the PR number satisfies the oracle when the squash subject
+carries its `(#PR)`, while a commit-message-only form such as `Fixes: #12` may not.
+The release oracle still requires the
 shipping commit's identity in the assembled release section (subject issue/PR,
 same-repo closing reference, or short SHA; forge lookup can resolve closed
 issues). A fragment touch is not an oracle exemption.

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -8,7 +9,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -59,7 +62,7 @@ func (h *Handler) providerProbe() (*providers.Prober, *providers.ProbeLimiter) {
 	return h.providerProber, h.providerProbeLimiter
 }
 
-// TestMyProvider probes one of the caller's providers (POST /api/me/providers/{id}/test): a bounded
+// TestMyProvider probes a provider visible to the caller, with the caller's own key (POST /api/me/providers/{id}/test): a bounded
 // request in the profile's protocol and, if it succeeds, a forced single-tool request at its base URL
 // with its key. The key is opened for the call and dropped after it; the response carries the two
 // outcomes and nothing from the gateway's bodies. The result is stored for the current revision.
@@ -72,7 +75,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	row, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	row, err := h.q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: id, UserID: user.ID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusNotFound, "provider not found")
 		return
@@ -144,7 +147,7 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 	// both revisions in one snapshot after opening and before any network request,
 	// so a new destination's key can never be sent to the old destination. Edits
 	// after this check can only leave us sending the old key to its old endpoint.
-	current, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	current, err := h.q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: id, UserID: user.ID})
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && (current.CurrentRevision != row.CurrentRevision ||
 		current.KeySecretID != row.KeySecretID || !row.KeyEnablementRev.Valid ||
 		current.KeyEnablementRev != row.KeyEnablementRev || current.KeyDisabledAt.Valid || current.RetiredAt.Valid) {
@@ -169,25 +172,71 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	n, err := h.q.UpsertModelProviderProbeResult(r.Context(), store.UpsertModelProviderProbeResultParams{
-		AuthResult:  res.Auth,
-		ToolResult:  pgconv.Text(res.Tool),
-		ProviderID:  id,
-		OwnerUserID: user.ID,
-		Revision:    row.CurrentRevision,
-	})
+	written, err := h.recordProviderProbeResult(r.Context(), user.ID, id, row, res.Auth, res.Tool)
 	if err != nil {
 		internalProviderError(w, "store provider probe result", err)
 		return
 	}
-	if n == 0 {
+	if !written {
 		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
 		return
 	}
-	fresh, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
-	if err != nil || !fresh.ProbeAuthResult.Valid {
+	fresh, err := h.q.GetVisibleProviderForUse(r.Context(), store.GetVisibleProviderForUseParams{ID: id, UserID: user.ID})
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		internalProviderError(w, "read provider probe result", err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"probe": providerDTO(providerRow(fresh)).Probe})
+	// No current evidence after the commit means the key rotated, or the provider changed, after the
+	// write: the same benign race as a lost write, not a server fault.
+	if err != nil || !fresh.ProbeAuthResult.Valid || fresh.RetiredAt.Valid {
+		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"probe": providerDTO(fresh).Probe})
+}
+
+// recordProviderProbeResult stores a Test result for the exact tuple the probe ran against: the
+// provider revision, the key row and its enablement revision, all captured before the dial. It runs in
+// one short transaction AFTER the probe returned (no lock spans the network call) and takes the
+// provider row lock before the key row lock, the order every key mutation uses. A rotation, disable,
+// delete, edit or retire that committed first leaves a lock with no row, so a late result writes
+// nothing and the caller reports the conflict; one still in flight is waited for and re-checked.
+func (h *Handler) recordProviderProbeResult(ctx context.Context, userID, providerID uuid.UUID, row providerRow, auth, tool string) (bool, error) {
+	if h.pool == nil {
+		return false, store.ErrVaultTransactionRequired
+	}
+	tx, err := h.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
+	q := store.New(tx)
+	if _, err := q.LockVisibleProviderForEvidence(ctx, store.LockVisibleProviderForEvidenceParams{ID: providerID, UserID: userID, Revision: row.CurrentRevision}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !row.KeySecretID.Valid || !row.KeyEnablementRev.Valid {
+		return false, nil
+	}
+	if _, err := q.LockProviderKeyForEvidence(ctx, store.LockProviderKeyForEvidenceParams{
+		KeyID: row.KeySecretID.Bytes, UserID: userID, ProviderID: pgtype.UUID{Bytes: providerID, Valid: true}, KeyRev: row.KeyEnablementRev.Int64,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := q.UpsertProviderKeyTestResult(ctx, store.UpsertProviderKeyTestResultParams{
+		ProviderID: providerID, UserID: userID, Revision: row.CurrentRevision, KeySecretID: row.KeySecretID.Bytes,
+		KeyEnablementRev: row.KeyEnablementRev.Int64, AuthResult: auth, ToolResult: pgconv.Text(tool),
+	}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
 }

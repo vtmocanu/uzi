@@ -2070,8 +2070,8 @@ var pmBreadth = []pmEntry{
 	{"CountModelProvidersForOwner", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.CountModelProvidersForOwner(ctx, f.User)
 	}},
-	{"GetUserClaudeProviderSource", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
-		return q.GetUserClaudeProviderSource(ctx, f.User)
+	{"GetUserProviderSource", pmSome, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
+		return q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: f.User, Engine: "claude"})
 	}},
 	{"ListModelProvidersForOwner", pmEmpty, func(ctx context.Context, q *store.Queries, f *pmFixture) (any, error) {
 		return q.ListModelProvidersForOwner(ctx, f.User)

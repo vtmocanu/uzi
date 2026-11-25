@@ -1,0 +1,15 @@
+{
+  "id": "",
+  "name": "",
+  "engine": "",
+  "retired": false,
+  "current_revision": 0,
+  "protocol": "",
+  "base_url": "",
+  "auth_style": "",
+  "model_map": {},
+  "credential_mode": null,
+  "has_key": false,
+  "key_enabled": false,
+  "probe": null
+}

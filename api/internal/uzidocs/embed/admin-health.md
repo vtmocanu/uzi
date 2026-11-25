@@ -692,7 +692,8 @@ seven days, including the cutoff. That timestamp is the last usage fold,
 including redelivery, not the exact inference time.
 
 The check compares observed model IDs with the API's embedded price table
-for this release. The currently priced set and the distinction between
+for this release. Coverage includes the GPT-6.2 Sol and Astra rows; it does
+not verify cache-write retention or billed cost (see [cost estimates](./run-cost.md#metered-subscription-and-unreported-cost)). The currently priced set and the distinction between
 **no price** and **promotional price expired** use the same UTC clock;
 promotions expire at midnight UTC on their review date. Counts are distinct
 runs per model, not usage rows. Priced models are excluded before the

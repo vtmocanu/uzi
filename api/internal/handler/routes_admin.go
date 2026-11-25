@@ -156,6 +156,12 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// cookie-only writes in the group below. No limiter: a local read.
 			r.Get("/egress-profiles", h.AdminListEgressProfiles)
 			r.Get("/egress-profiles/{name}", h.AdminGetEgressProfile)
+			// Admin-shared provider definitions (PRD #4324): list and show, with the selected-user and
+			// attached-key counts and never a key or a per-user result. A uza_ token may read them
+			// (`uzi admin provider list|get`); every write is cookie-only, in the group below. A
+			// personal provider id is a 404.
+			r.Get("/providers", h.AdminListSharedProviders)
+			r.Get("/providers/{id}", h.AdminGetSharedProvider)
 		})
 		// Hosted worker sizes (PRD #4213 M2): the editor's read. Browser-session only (PRD: no
 		// new CLI-readable route), so any Bearer, uza_ included, 401s before the handler.
@@ -301,6 +307,15 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Post("/egress-profiles", h.AdminCreateEgressProfile)
 			r.Put("/egress-profiles/{name}", h.AdminUpdateEgressProfile)
 			r.Delete("/egress-profiles/{name}", h.AdminDeleteEgressProfile)
+			// Admin-shared provider writes (PRD #4324): create, name/model-map edit, retire, guarded
+			// delete. Cookie-only admin writes, so a uza_ Bearer 401s before the handler and the CLI
+			// stays read-only. Base URL and auth style are fixed at creation. No limiter, no
+			// per-user lock: a local write (create takes the advisory catalogue lock; edit, retire and
+			// delete take the definition row lock first).
+			r.Post("/providers", h.AdminCreateSharedProvider)
+			r.Patch("/providers/{id}", h.AdminPatchSharedProvider)
+			r.Post("/providers/{id}/retire", h.AdminRetireSharedProvider)
+			r.Delete("/providers/{id}", h.AdminDeleteSharedProvider)
 		})
 	})
 }

@@ -36,7 +36,7 @@ func TestTaskReviewCodexClaimLiveDB(t *testing.T) {
 		t.Fatalf("FreezeCodexBinding on the review run: %v", err)
 	}
 
-	base := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	base := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
 	capable := append(append([]string{}, base...), capability.TaskReviewSettingsV1)
 	assemble := func(caps []string, gen int64) *ClaimPayload {
 		t.Helper()

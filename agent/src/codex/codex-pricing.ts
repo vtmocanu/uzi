@@ -20,6 +20,14 @@
 // Standard and leave every unknown model `unreported`. A future protocol that surfaces the tier
 // must gate a non-Standard tier (Batch/Flex/Fast) to `unreported` here.
 
+// CACHE WRITES (owner policy, 2026-11-23): cache_write selects the 30-minute rate for
+// every old and new row as an estimate, not observed retention duration or billed money.
+// Missing TTL alone NEVER unprices a complete positive-write breakdown. A 12-hour write
+// can therefore be underestimated under this accepted policy; all independent refusals remain.
+// Inspected worker constructions leave TTL unset. The documented 30m default requires BOTH
+// request and breakpoint overrides absent; bounded captures do not establish all upstream
+// compaction, child, review, recovery or inherited settings. See ADR-1106 (2026-11-23).
+
 import { readFileSync } from "node:fs";
 import type { CodexUsageBreakdown } from "./transport.js";
 import table from "./codex-pricing.json" with { type: "json" };

@@ -736,8 +736,8 @@ enabling: rotate them to address that exposure.
   unreadable when that key is replaced. Protected tokens already sealed under
   a DEK remain decryptable with their password-wrapped key; replacing the
   server key alone does not invalidate them. See [Vault choice](#vault-choice).
-- **Which model runs against it?** See [Worker model](./worker-model.md),
-  further down the Settings page, to pick or override the Claude model your
-  runs use.
-- **Looking for the theme picker?** It's the **Appearance** section further
-  down this same Settings page; see [Appearance](./appearance.md).
+- **Which model runs against it?** The **Models** tab, right after Account &
+  tokens in Settings, picks or overrides the Claude model your runs use; see
+  [Worker model](./worker-model.md).
+- **Looking for the theme picker?** It's the **Appearance** tab, the last one
+  in Settings; see [Appearance](./appearance.md).

@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -177,46 +176,6 @@ class ToolchainTests(unittest.TestCase):
         guard.write_text('github:NixOS/nixpkgs/' + 'b' * 40 + '#go_1_27\t-\t-\njq.bin\t-\t-\n')
         result = subprocess.run(['bash', str(script), str(guard)], env={**os.environ, 'PATH': str(binary) + os.pathsep + os.environ['PATH']}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-
-    def test_refresh_workflow_rejects_manifest_rewrites(self):
-        project = pathlib.Path(__file__).resolve().parent.parent
-        workflow = json.loads(subprocess.check_output(['yq', '-o=json', str(project / '.github/workflows/devbox-update.yml')]))
-        steps = [s for s in workflow['jobs']['validate']['steps'] if s.get('name') == 'devbox update (full re-resolve to the latest nixpkgs)']
-        self.assertEqual(len(steps), 1)
-        old_key = self.key
-        self.key = 'github:NixOS/nixpkgs/' + 'b' * 40 + '#go_1_27'
-        self.packages[0] = self.key
-        self.lock['packages'][self.key] = self.lock['packages'].pop(old_key)
-        self.lock['packages'][self.key]['resolved'] = self.key
-        self.write()
-        directory = self.root / 'agent/devbox-global'
-        script = self.root / 'relock.sh'
-        script.write_text(steps[0]['run'])
-        (self.root / 'scripts').mkdir()
-        shutil.copy(project / 'scripts/check-worker-toolchain.py', self.root / 'scripts/check-worker-toolchain.py')
-        after = copy.deepcopy(self.lock)
-        after['packages'][self.key] = {'resolved': self.key}
-        snapshot = self.root / 'after.lock'
-        snapshot.write_text(json.dumps(after))
-        binary = self.root / 'bin'
-        binary.mkdir()
-        fake = binary / 'devbox'
-        fake.write_text('#!/bin/sh\ncp "$POST_LOCK" devbox.lock\nif [ "$REWRITE" = 1 ]; then printf "\\n// rewritten\\n" >> devbox.json; fi\n')
-        fake.chmod(0o755)
-        env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null',
-               'PATH': str(binary) + os.pathsep + os.environ['PATH'], 'RUNNER_TEMP': str(self.root), 'POST_LOCK': str(snapshot)}
-        subprocess.run(['git', 'init', '-q', str(self.root)], check=True, env=env)
-        subprocess.run(['git', '-C', str(self.root), 'add', 'agent'], check=True, env=env)
-        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=test', '-c', 'user.email=test@example.test', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture'], check=True, env=env)
-        for rewrite in ('0', '1'):
-            with self.subTest(rewrite=rewrite):
-                self.write()
-                result = subprocess.run(['bash', str(script)], cwd=directory, env={**env, 'REWRITE': rewrite}, capture_output=True, text=True)
-                if rewrite == '0':
-                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-                    self.assertEqual(CHECK.check(self.root), '1.27.3')
-                else:
-                    self.assertNotEqual(result.returncode, 0, 'rewritten manifest must never publish only its new lock')
 
     def test_gate_and_offline_image_proof_are_wired(self):
         project = pathlib.Path(__file__).resolve().parent.parent

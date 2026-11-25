@@ -238,8 +238,6 @@ func automaticHarnessEligible(res resolvedHarness, explicit *Harness, origin har
 type harnessResolverStore interface {
 	providerLaneSourceReader
 	engineProviderSourceReader
-	// PRD #4320 M4: the owner's Claude provider source, read before the vendor token rule.
-	GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID) (store.GetUserClaudeProviderSourceRow, error)
 	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	GetUserDefaultHarness(ctx context.Context, id uuid.UUID) (pgtype.Text, error)

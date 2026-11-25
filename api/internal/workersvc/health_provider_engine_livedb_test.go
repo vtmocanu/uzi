@@ -18,10 +18,13 @@ func TestHealthProviderEngineCountLiveDB(t *testing.T) {
 		{"claude-only", []string{"claude_provider_v1"}, 1, 0},
 		{"codex-provider-only", []string{"codex_provider_v1"}, 0, 0},
 		{"codex-no-runtime", []string{"codex_provider_v1", "codex_harness_v1"}, 0, 0},
-		{"codex-no-harness", []string{"codex_provider_v1", "codex_runtime_v2"}, 0, 0},
+		{"codex-no-harness", []string{"codex_provider_v1", "codex_runtime_v2", "codex_runtime_v3"}, 0, 0},
+		{"codex-no-v2", []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v3"}, 0, 0},
+		{"codex-native-v3", []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, 0, 0},
 		{"codex-native", []string{"codex_harness_v1", "codex_runtime_v2"}, 0, 0},
-		{"codex-full", []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"}, 0, 1},
-		{"both", []string{"claude_provider_v1", "codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"}, 1, 1},
+		{"codex-provider-v2-only", []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"}, 0, 0},
+		{"codex-full", []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, 0, 1},
+		{"both", []string{"claude_provider_v1", "codex_provider_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)
@@ -45,13 +48,13 @@ func TestHealthProviderEngineCountLiveDB(t *testing.T) {
 
 func TestHealthProviderEngineSplitWorkersLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	e.seedWorker(t, []string{"claude_provider_v1", "codex_provider_v1"})
-	e.seedWorker(t, []string{"codex_harness_v1", "codex_runtime_v2"})
+	e.seedWorker(t, []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"})
+	e.seedWorker(t, []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"})
 	arg := store.CountOnlineWorkersSatisfyingProviderParams{UserID: e.userID, Engine: "codex"}
 	if got, err := e.q.CountOnlineWorkersSatisfyingProvider(e.ctx, arg); err != nil || got != 0 {
 		t.Fatalf("split capabilities count=%d err=%v want=0", got, err)
 	}
-	full := e.seedWorker(t, []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2"})
+	full := e.seedWorker(t, []string{"codex_provider_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"})
 	if got, err := e.q.CountOnlineWorkersSatisfyingProvider(e.ctx, arg); err != nil || got != 1 {
 		t.Fatalf("full worker count=%d err=%v want=1", got, err)
 	}

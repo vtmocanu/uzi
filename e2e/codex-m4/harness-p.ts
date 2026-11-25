@@ -119,6 +119,8 @@ export interface ProtocolObservation {
   readonly turnStatus: string | undefined;
   /** Every `/v1/responses` request body the fake provider received. */
   readonly providerRequests: readonly ResponsesBody[];
+  /** Actual config.toml bytes emitted through the production launcher (loopback test endpoint). */
+  readonly emittedConfigTomls: readonly string[];
   /** Any error the fake provider recorded (an auth mismatch, oversize, etc.). */
   readonly providerErrors: readonly string[];
   /** The measured startup+turn wall time in ms (bounded by {@link P_SUITE_DEADLINE_MS}). */
@@ -391,10 +393,16 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       ownedDataRoot,
       ...(opts.codeModeHost !== undefined ? { codeModeHost: opts.codeModeHost } : {}),
     });
+    const emittedConfigTomls: string[] = [];
     const deps: LauncherDeps = {
       env: opts.launcherEnv ?? { UZI_UID_SPLIT: "1" },
       resolveRunnerUid: () => runnerUid,
-      makeRunnerTrees: fakeMakeRunnerTrees,
+      makeRunnerTrees: (request) => {
+        for (const file of request.files) {
+          if (path.basename(file.path) === "config.toml") emittedConfigTomls.push(file.content);
+        }
+        return fakeMakeRunnerTrees(request);
+      },
       removeRunnerTree: fakeRemoveRunnerTree,
       spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid, envSink, opts.omitLauncherGuardForTest),
       appServerAuthOpenAIBaseUrlForTest: provider.baseUrl,
@@ -529,6 +537,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       spawnEnv: envSink.env ?? {},
       turnStatus,
       providerRequests: provider.requests.slice(measuredRequestOffset),
+      emittedConfigTomls,
       primingRequests: provider.requests.slice(0, measuredRequestOffset),
       turnParams, threadParams, primingTurnParams, coldRestart,
       providerErrors: [...provider.errors],

@@ -119,5 +119,6 @@ func TestProviderListDisabledWithoutAllowlist(t *testing.T) {
 	}
 }
 
-// Compile-time pin: the shared row alias must stay convertible from the single-row query.
-var _ = providerRow(store.GetModelProviderForOwnerRow{})
+// Compile-time pin: the shared row alias must stay convertible from the list query, so the list and
+// the single-row read build identical DTOs.
+var _ = providerRow(store.ListVisibleProvidersRow{})

@@ -189,7 +189,9 @@ reuse the same text and nonce. A fresh execution, including a newly claimed
 resume, snapshots afresh. Subagent definitions receive no such block; their
 existing static advice is unchanged. The code checker's
 [separate consent and frozen-commit sourcing](./cross-check.md#code-cross-check)
-are unchanged.
+are unchanged. This setting is also one of the two consents the plan
+cross-checker needs before it receives the root `CLAUDE.md` from the plan's
+frozen base commit; see [Cross-check](./cross-check.md#owner-guidance-and-repository-instructions).
 
 Native project loading stays disabled: Claude keeps `settingSources: []`,
 and Codex keeps `project_doc_max_bytes = 0`, an explicitly `untrusted`

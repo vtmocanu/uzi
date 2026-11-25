@@ -441,3 +441,41 @@ It is not a subagent: it is a separate run on the other model family.
   column, stored pins and digests; Down destroys provenance and is not a normal
   rollback. Hosted acceptance remains pending; see the PRD's follow-up status.
 
+### Plan cross-checker (issue #4519, 2026-11-24)
+
+The plan cross-checker is a third recipient, after the lead and the code
+checker. Like the code checker it is a separate run on the other model family,
+not a subagent.
+
+- **Both consents, one snapshot.** It gets the text only when the lead's
+  `repo_claudemd_enabled` and `cross_check_repo_instructions_enabled` are both
+  on. The API reads both in one statement when the checker child is claimed and
+  sends the conjunction as `plan_repo_instructions_enabled` on plan claims only;
+  the worker also requires the claim payload's `repo.claudemd_enabled`. There is no
+  migration, and code claims are unchanged.
+- **Consent timing differs from the code check.** A plan check reads consent at
+  claim, so a toggle change can affect a plan check already waiting to be
+  claimed. A code check freezes consent when the check is created.
+- **Sourcing.** The worker reads the root `CLAUDE.md` from its bare repository
+  at the plan candidate's frozen `base_commit`, before the checkout exists,
+  with the same commit-tree reader as the code check
+  (`agent/src/repo-instructions-at-commit.ts`): git plumbing only, symlinks
+  followed only inside the commit tree, at most 8 hops, a regular blob, 64 KiB
+  cap with the file dropped rather than truncated, imports stripped.
+- **Framing.** The text is nonce-fenced advisory data in the checker's data
+  prompt, labelled as the `CLAUDE.md` recorded in the candidate's frozen
+  `base_commit`, not necessarily the bytes the lead read, and untrusted. When
+  nothing is supplied the prompt carries an explicit status (`disabled`,
+  `absent`, `refused`, `too_large` or `unknown`). The read is bounded by a
+  budget that counts against the checker's model time.
+- **Trust caveat.** On a resumed or successor run, `base_commit` is the
+  branch's own previously pushed tip, so its `CLAUDE.md` may come from an
+  earlier attempt and is not in the planning diff. The code check's claim that a
+  run cannot write the instructions it is checked against does not extend to
+  plan checks.
+- **Rollout.** An older worker on a newer API delivers nothing; a newer worker
+  on an older API reports `disabled`. The always-present field counts toward the
+  checker claim envelope (2 MiB for legacy plan claims, 64 MiB for validated
+  `semantic_v1`), so a legacy plan claim within about 40 bytes of 2 MiB is now
+  refused cleanly. See [Cross-check](../docs/cross-check.md#plan-checks-and-repository-instructions).
+

@@ -310,6 +310,13 @@ var wantRouteMounts = []routeMount{
 	// writes cookie-only; every one a local DB statement with no forge call → noLimiter.
 	{"GET", "/api/admin/egress-profiles", noLimiter},
 	{"GET", "/api/admin/egress-profiles/{name}", noLimiter},
+	// Admin-shared provider definitions (PRD #4324): local DB reads and writes, no egress.
+	{"GET", "/api/admin/providers", noLimiter},
+	{"GET", "/api/admin/providers/{id}", noLimiter},
+	{"POST", "/api/admin/providers", noLimiter},
+	{"PATCH", "/api/admin/providers/{id}", noLimiter},
+	{"POST", "/api/admin/providers/{id}/retire", noLimiter},
+	{"DELETE", "/api/admin/providers/{id}", noLimiter},
 	// PRD #3989: admin-issued reset link, a cookie-only admin DB write with no per-user limiter.
 	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},

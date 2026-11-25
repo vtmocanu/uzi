@@ -282,7 +282,7 @@ func TestEphemeralCodexAdmissionBeforeLimitLiveDB(t *testing.T) {
 			fx := priorityFixture(t, db)
 			priorityTrigger(fx, trigger)
 			if _, err := fx.pool.Exec(fx.ctx, "UPDATE workers SET protocol_capabilities=$2 WHERE user_id=$1", fx.userID,
-				[]string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"}); err != nil {
+				[]string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_custom_model_v1"}); err != nil {
 				t.Fatal(err)
 			}
 			alias := fx.seedEphemeralAdmissionAlias()

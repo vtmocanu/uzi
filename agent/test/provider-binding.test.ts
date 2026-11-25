@@ -7,6 +7,7 @@ import {
   ProviderBindingError,
   ProviderModelUnmappedError,
   resolveProviderModel,
+  resolveCodexProviderModelSlot,
   sdkCredentialFromBinding,
   stripProviderCost,
 } from "../src/provider-binding.js";
@@ -226,7 +227,7 @@ function codexBinding(over: Record<string, unknown> = {}): Record<string, unknow
 
 describe("Codex provider wire decode", () => {
   it("decodes all exact slots and rebuilds every nested entry without unknown fields or references", () => {
-    const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]
+    const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"]
       .map(id => [id, { model: "gateway/target", context_window: 10_000_000, extra: "discard" }]));
     const raw = codexBinding({ model_map: map, extra: "discard" });
     const got = decodeProviderBinding({ provider: raw }, NOT_LOOPBACK_ENV)!;
@@ -235,6 +236,7 @@ describe("Codex provider wire decode", () => {
     assert.equal(got.auth_style, "bearer");
     assert.ok(!("extra" in got));
     assert.notEqual(got.model_map, map);
+    assert.deepEqual(Object.keys(got.model_map).sort(), Object.keys(map).sort());
     for (const [id, entry] of Object.entries(got.model_map)) {
       assert.deepEqual(entry, { model: "gateway/target", context_window: 10_000_000 });
       assert.notEqual(entry, map[id]);
@@ -242,6 +244,19 @@ describe("Codex provider wire decode", () => {
     assert.throws(() => sdkCredentialFromBinding(got), (e: unknown) => e instanceof Error &&
       "reason" in e && e.reason === "provider_lane_unsupported" && e.message === "provider_lane_unsupported");
   });
+
+  for (const slot of ["gpt-6.2-sol", "gpt-6.2-astra"] as const) {
+    it(`${slot} uses its mapping, implicit misses use default, and explicit misses refuse`, () => {
+      const fallback = { default: { model: "gateway/default", context_window: 32768 } };
+      const mapped = { ...fallback, [slot]: { model: "gateway/" + slot, context_window: 65536 } };
+      assert.equal(resolveCodexProviderModelSlot(slot, mapped), slot);
+      assert.equal(resolveCodexProviderModelSlot(slot, mapped, true), slot);
+      assert.equal(resolveCodexProviderModelSlot(slot, fallback), "default");
+      assert.equal(fallback[resolveCodexProviderModelSlot(undefined, fallback) as "default"].model, "gateway/default");
+      assert.throws(() => resolveCodexProviderModelSlot(slot, fallback, true),
+        (e: unknown) => e instanceof ProviderModelUnmappedError && e.reason === "provider_model_unmapped");
+    });
+  }
 
   for (const [name, over] of [
     ["protocol", { protocol: "anthropic_messages" }],

@@ -64,7 +64,9 @@ func newPCFix(t *testing.T) *pcFix {
 	}
 	pf.key = k.ID
 	t.Cleanup(func() {
-		_, _ = fx.env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, fx.userID)
+		if _, err := fx.env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, fx.userID); err != nil {
+			t.Errorf("clear the Claude source in cleanup: %v", err)
+		}
 	})
 	return pf
 }
@@ -594,13 +596,13 @@ func TestProviderSameRunContinuationUsesFrozenBindingLiveDB(t *testing.T) {
 		t.Fatalf("first Claim = (%v, %v)", first != nil, err)
 	}
 	// The owner selects the provider, edits it (revision 2 at another URL) and then clears the source.
-	pf.env.exec(`UPDATE users SET claude_provider_id = $2 WHERE id = $1`, pf.userID, pf.provider)
+	pf.env.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, pf.userID, pf.provider)
 	if _, err := pf.env.pool.Exec(pf.env.ctx, `UPDATE model_providers SET current_revision = 2 WHERE id = $1`, pf.provider); err != nil {
 		t.Fatal(err)
 	}
 	pf.env.exec(`INSERT INTO model_provider_revisions (provider_id, revision, protocol, base_url, auth_style, model_map)
 	    VALUES ($1, 2, 'anthropic_messages', $2, 'x_api_key', $3::jsonb)`, pf.provider, pvBase, `{"haiku":{"model":"new-haiku"}}`)
-	pf.env.exec(`UPDATE users SET claude_provider_id = NULL WHERE id = $1`, pf.userID)
+	pf.env.exec(`UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, pf.userID)
 	// Requeue the same run (as a worker restart would) and claim again.
 	pf.env.exec(`UPDATE runs SET status = 'queued', claim_released_at = NULL WHERE id = $1`, runID)
 	again, err := pf.svc.Claim(pf.env.ctx, pf.worker(t), nil)

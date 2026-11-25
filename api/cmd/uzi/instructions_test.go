@@ -255,6 +255,15 @@ var knownInstructions = []knownInstruction{
 			"client and assert the messages name it.",
 	},
 	{
+		command:  "uzi admin provider list",
+		evidence: evidenceGoTest,
+		where:    "TestAdminProviderGetPersonalIDIsNotFound",
+		note: "RUNTIME: `uzi admin provider get` of an id or name that no shared definition carries " +
+			"exits 4 and points at `uzi admin provider list` (admin_provider.go). " +
+			"TestAdminProviderGetPersonalIDIsNotFound runs the real cobra command against a fake " +
+			"client and asserts the exit code and that the command is named.",
+	},
+	{
 		command:  "uzi provider use",
 		evidence: evidenceGoTest,
 		where:    "TestProviderUseRefusesUnusableBeforeWrite",

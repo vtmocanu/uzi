@@ -18,7 +18,7 @@ func frozenWaitingCodeFixture(ctx context.Context, t *testing.T, phase, shape, o
 	f := fx.f
 	worker := prepareFrozenRecoveryChild(ctx, t, fx, phase)
 	mustExec(ctx, t, f.pool, "UPDATE workers SET protocol_capabilities=$2,max_cross_check_slots=1 WHERE id=$1", worker,
-		[]string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2"})
+		[]string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"})
 	mustExec(ctx, t, f.pool, `UPDATE runs SET kind='task',interactive=true,status='awaiting_followup',
  issue_iid=NULL,branch='uzi/interactive-test',worker_id=$2,claim_generation=1,claim_released_at=NULL
  WHERE id=$1`, f.runID, worker)

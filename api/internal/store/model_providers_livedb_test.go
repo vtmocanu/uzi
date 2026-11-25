@@ -255,13 +255,13 @@ func TestProviderKeyCompositeForeignKeyLiveDB(t *testing.T) {
 		t.Fatalf("cross-owner key error = %v, want no owned provider row", err)
 	}
 	// Direct writes remain protected by the owner-bound FK too.
-	_, err := pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id)
-        VALUES ($1, 'anthropic_compatible_key', 'foreign', 'ct', 'master', $2)`, b, pa.ID)
+	_, err := pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id, provider_scope_id)
+        VALUES ($1, 'anthropic_compatible_key', 'foreign', 'ct', 'master', $2, $1)`, b, pa.ID)
 	if code, c := pgCodeC(err); code != "23503" || c != "user_secrets_provider_fkey" {
 		t.Fatalf("cross-owner direct key error = %v (%s %s)", err, code, c)
 	}
 	// B cannot select A's provider as a source either.
-	if _, err := pool.Exec(ctx, `UPDATE users SET claude_provider_id = $2 WHERE id = $1`, b, pa.ID); err == nil {
+	if _, err := pool.Exec(ctx, `UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, b, pa.ID); err == nil {
 		t.Fatal("user B selected user A's provider as the Claude source")
 	} else if code, c := pgCodeC(err); code != "23503" || c != "users_claude_provider_fkey" {
 		t.Fatalf("cross-owner source error = %v (%s %s)", err, code, c)
@@ -290,14 +290,14 @@ func TestUserSecretsProviderKeyChecksLiveDB(t *testing.T) {
 	if code, c := pgCodeC(err); code != "23514" || c != "user_secrets_provider_key_check" {
 		t.Errorf("keyless provider-kind insert = %v (%s %s), want user_secrets_provider_key_check", err, code, c)
 	}
-	_, err = pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id)
-		VALUES ($1, 'anthropic_token', 'x', 'x', 'master', $2)`, owner, p.ID)
+	_, err = pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id, provider_scope_id)
+		VALUES ($1, 'anthropic_token', 'x', 'x', 'master', $2, $1)`, owner, p.ID)
 	if code, c := pgCodeC(err); code != "23514" || c != "user_secrets_provider_key_check" {
 		t.Errorf("provider_id on an anthropic_token = %v (%s %s), want user_secrets_provider_key_check", err, code, c)
 	}
 	// auto_eligible stays unreachable for the kind.
-	_, err = pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id, auto_eligible)
-		VALUES ($1, 'anthropic_compatible_key', 'ae', 'x', 'master', $2, true)`, owner, p.ID)
+	_, err = pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id, provider_scope_id, auto_eligible)
+		VALUES ($1, 'anthropic_compatible_key', 'ae', 'x', 'master', $2, $1, true)`, owner, p.ID)
 	if err == nil {
 		t.Error("an auto_eligible provider key was accepted")
 	}
@@ -347,7 +347,7 @@ func TestModelProviderDeleteAndSourceLiveDB(t *testing.T) {
 	if _, err := insertProviderKey(ctx, q, owner, p.ID); err != nil {
 		t.Fatal(err)
 	}
-	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = $2 WHERE id = $1`, owner, p.ID)
+	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, owner, p.ID)
 
 	// Deleting a selected provider is refused by ON DELETE RESTRICT and removes nothing.
 	_, err := q.DeleteModelProvider(ctx, store.DeleteModelProviderParams{ID: p.ID, OwnerUserID: owner})
@@ -372,7 +372,7 @@ func TestModelProviderDeleteAndSourceLiveDB(t *testing.T) {
 		t.Fatalf("foreign delete = %d, %v; want 0", n, err)
 	}
 	// Once unselected, the delete cascades to the revisions and the key.
-	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = NULL WHERE id = $1`, owner)
+	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, owner)
 	if n, err := q.DeleteModelProvider(ctx, store.DeleteModelProviderParams{ID: p.ID, OwnerUserID: owner}); err != nil || n != 1 {
 		t.Fatalf("delete = %d, %v", n, err)
 	}
@@ -390,7 +390,7 @@ func TestDeleteUserCascadesWithSelectedProviderLiveDB(t *testing.T) {
 	if _, err := insertProviderKey(ctx, q, owner, p.ID); err != nil {
 		t.Fatal(err)
 	}
-	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = $2 WHERE id = $1`, owner, p.ID)
+	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, owner, p.ID)
 	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, owner); err != nil {
 		t.Fatalf("deleting a user whose selected provider cascades: %v", err)
 	}

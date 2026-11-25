@@ -108,7 +108,7 @@ func TestAgentSourceRequestClaimGateLiveDB(t *testing.T) {
 		{"default", func(*crFix) {}, nil},
 		{"capability_aware off", func(f *crFix) { f.svc.capabilitySettings = fakeCapabilitySettings{on: false} }, nil},
 		{"old worker reporting every other protocol capability", func(*crFix) {}, []string{
-			capability.CompletionInterlockV1, capability.CIConfigGuardV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+			capability.CompletionInterlockV1, capability.CIConfigGuardV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3,
 			capability.RecoveryArchiveV1, capability.CrossCheckV1, capability.JobRunnerV1, capability.GateRevisionV1,
 		}},
 	} {

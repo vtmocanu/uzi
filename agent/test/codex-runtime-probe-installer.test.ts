@@ -207,6 +207,11 @@ describe("install-codex.sh ↔ probeCodexRuntime end-to-end format agreement", (
     const s = state!;
     const receipt = JSON.parse(await readFile(s.receiptPath, "utf8")) as Record<string, unknown>;
 
+    // Synthetic archive digest overrides never certify the published release archive.
+    assert.equal(receipt.schemaVersion, 1);
+    assert.equal(receipt.prefix, s.prefix);
+    assert.equal(receipt.versionRoot, s.versionRoot);
+    assert.equal(receipt.muslTarget, s.arch === "amd64" ? "x86_64-unknown-linux-musl" : "aarch64-unknown-linux-musl");
     // Top-level binding the probe cross-checks against version/arch/digest.
     assert.equal(receipt.codexVersion, s.version, "receipt.codexVersion");
     assert.equal(receipt.targetArch, s.arch, "receipt.targetArch");

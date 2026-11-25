@@ -20,7 +20,7 @@ func codexProviderFixture() apitypes.ProviderDTO {
 func TestProviderCodexCreateAndRender(t *testing.T) {
 	fc := &uzicli.FakeClient{ProviderResult: codexProviderFixture()}
 	args := []string{"provider", "create", "--engine", "codex", "--name", "code", "--base-url", "https://gw.example.com/anthropic", "--model", "default=gateway:0"}
-	for _, alias := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"} {
+	for _, alias := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"} {
 		args = append(args, "--model", alias+"=claude-gateway:100000")
 	}
 	_, stderr, code := runCLI(t, fakeEnv(fc), args...)
@@ -39,7 +39,7 @@ func TestProviderCodexCreateAndRender(t *testing.T) {
 	if code != 0 {
 		t.Fatal(code)
 	}
-	for _, want := range []string{"ENGINE", "codex", "default=gateway:0", "gpt-6-astra=claude-gateway:100000", "gpt-5.6-sol=", "gpt-6-sol=", "gpt-6.1-sol=", "gpt-6-luna="} {
+	for _, want := range []string{"ENGINE", "codex", "default=gateway:0", "gpt-6-astra=claude-gateway:100000", "gpt-5.6-sol=", "gpt-6-sol=", "gpt-6.1-sol=", "gpt-6.2-sol=claude-gateway:100000", "gpt-6.2-astra=claude-gateway:100000", "gpt-6-luna="} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %s: %s", want, out)
 		}
@@ -48,9 +48,9 @@ func TestProviderCodexCreateAndRender(t *testing.T) {
 
 func TestModelsCellCodexSanitizesEveryEntry(t *testing.T) {
 	entry := &apitypes.ModelEntryDTO{Model: "unsafe\nmodel"}
-	mm := apitypes.ModelMapDTO{Default: entry, GPT6Astra: entry, GPT56Sol: entry, GPT6Sol: entry, GPT61Sol: entry, GPT6Luna: entry}
+	mm := apitypes.ModelMapDTO{Default: entry, GPT6Astra: entry, GPT56Sol: entry, GPT6Sol: entry, GPT61Sol: entry, GPT62Sol: entry, GPT62Astra: entry, GPT6Luna: entry}
 	got := modelsCell(mm)
-	if strings.Contains(got, "\n") || strings.Count(got, "unsafe") != 6 {
+	if strings.Contains(got, "\n") || strings.Count(got, "unsafe") != 8 {
 		t.Fatalf("unsafe or missing cells: %q", got)
 	}
 }
@@ -150,5 +150,25 @@ func TestProviderUseRoutesOnlySelectedEngine(t *testing.T) {
 		if code != uzicli.ExitUsage || fc.ProviderSourceCalls != 0 {
 			t.Fatal("invalid stored engine wrote source")
 		}
+	}
+}
+
+func TestProviderCodexNewSlotsEditRoundtrip(t *testing.T) {
+	for _, slot := range []string{"gpt-6.2-sol", "gpt-6.2-astra"} {
+		t.Run(slot, func(t *testing.T) {
+			fc := &uzicli.FakeClient{ProviderList: enabledList(codexProviderFixture()), ProviderResult: codexProviderFixture()}
+			_, stderr, code := runCLI(t, fakeEnv(fc), "provider", "edit", "code", "--model", "default=base", "--model", slot+"=edited:100000")
+			if code != 0 || fc.LastProviderPatch == nil {
+				t.Fatalf("edit: %d %s", code, stderr)
+			}
+			got := modelsCell(*fc.LastProviderPatch.ModelMap)
+			if !strings.Contains(got, slot+"=edited:100000") {
+				t.Fatal(got)
+			}
+			_, _, code = runCLI(t, fakeEnv(fc), "provider", "edit", "code", "--model", "default=base", "--model", slot+"=edited:8191")
+			if code != uzicli.ExitUsage {
+				t.Fatal("accepted invalid context")
+			}
+		})
 	}
 }

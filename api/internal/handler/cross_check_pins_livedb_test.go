@@ -190,7 +190,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	}
 	initial := request("{}", 200)
 	if initial[0].Harness != "claude" || !initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
-		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "high" || initial[1].Model != nil ||
+		*initial[1].ResolvedModel != "gpt-6.2-sol" || initial[1].ResolvedEffort != "high" || initial[1].Model != nil ||
 		initial[1].EffortSource != "cross-check default" || initial[0].ResolvedEffort != "high" {
 		t.Fatalf("defaults/both-cells-active: %+v", initial)
 	}

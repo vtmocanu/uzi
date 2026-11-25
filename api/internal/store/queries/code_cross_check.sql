@@ -211,3 +211,10 @@ SELECT repo.code_cross_check_guidance, repo.cross_check_repo_instructions_enable
 FROM repos repo JOIN forge_connections c ON c.id = repo.connection_id
 WHERE repo.id = @repo_id AND c.user_id = @user_id
 FOR NO KEY UPDATE OF repo;
+
+-- name: GetPlanCrossCheckRepoInstructionsConsent :one
+-- Plan-only consent to deliver the repo's root CLAUDE.md to the plan checker. Both flags are
+-- read from one repos row version in one statement; no row lock is taken.
+SELECT (repo.repo_claudemd_enabled AND repo.cross_check_repo_instructions_enabled)::boolean AS consent
+FROM repos repo JOIN forge_connections c ON c.id = repo.connection_id
+WHERE repo.id = @repo_id AND c.user_id = @user_id;

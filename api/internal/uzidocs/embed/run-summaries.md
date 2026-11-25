@@ -129,8 +129,8 @@ Claude value and the Codex picker your own Codex value. The same card shows a
 read-only **Summaries run on: Same as the run** line, since summaries always run
 on the run's own harness. Leave a picker on its **Default**
 option (it names the model and where it comes from, for example
-`Default · haiku (built-in)`) to inherit; **Saved effective value** under it
-shows the model in effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
+`Default · haiku (built-in)`) to inherit; when the option does not already
+name the model in effect, a line under it does. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
 lanes as `summary` rows. See
 [Admin settings](./admin-settings.md#instance-model-defaults) for the
 instance-wide defaults of both lanes (the **Instance model defaults** card has

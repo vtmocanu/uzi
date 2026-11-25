@@ -14,7 +14,7 @@ func TestAssembleCodexClaimEffortLaneLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 	svc.SetVault(env.vlt)
 	run := mustRun(t, env, f.runID)
-	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 	for _, c := range []struct {
 		shared string
 		codex  any

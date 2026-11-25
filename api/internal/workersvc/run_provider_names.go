@@ -18,10 +18,11 @@ type runProviderNameStore interface {
 
 // ProviderNamesForRuns returns the current name of the model provider each run was bound to
 // (PRD #4320), keyed by run id, from ONE batched read. The name is matched under the run's own
-// owner, so it never crosses users. A run with no binding, or whose provider has since been
-// deleted, is absent from the map (null on the wire). Callers pass only runs that carry a
-// binding, so a page of vendor runs costs no query. The name is user-authored text: every
-// renderer must treat it as plain text.
+// owner under visibility (a provider the owner holds or an admin-shared one), so it never crosses
+// users. A run with no binding, or whose provider has since been deleted or is not visible to its
+// owner, is absent from the map (null on the wire). Callers pass only runs that carry a
+// binding, so a page of vendor runs costs no query. The name is user- or admin-authored text:
+// every renderer must treat it as plain text.
 func (s *Service) ProviderNamesForRuns(ctx context.Context, runIDs []uuid.UUID) (map[uuid.UUID]string, error) {
 	if len(runIDs) == 0 {
 		return map[uuid.UUID]string{}, nil

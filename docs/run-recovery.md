@@ -1498,6 +1498,40 @@ still gates release (terminal exits, below); on parks it is diagnostic:
 The coverage proof and the inventory's status reads on a kept clone take no
 optional index locks, so they do not rewrite the clone's index.
 
+Each clone's inventory source proof runs under the repository's bare lock: the
+before-scan, the runner's git (the status read, or the content proof) and the
+after-scan. Scans go through the out-of-process helper with a deadline. The
+whole section has 12 s, and waiting for the lock has 30 s. Before it spawns
+anything, the proof installs an in-memory exclusion keyed by bare repository and
+clone key. Once runner git has started, the exclusion clears only when every
+operation it started has settled and a fresh observe-only probe over the full
+same-key seed scope reads clear. The probe ignores marked processes of other
+attempts; unmarked residue in scope keeps the exclusion. So does an unreadable process
+owned by the runner user, unless the worker can tie it (by process id and start
+time) to another live attempt or a worker-launched process; a persistent untied
+one can strand same-key seeds until requeues run out. A failed process-table
+read or the deadline also keeps it. The helper scans in the section enforce the
+section deadline themselves, and no stage starts after it.
+
+While a key is excluded, a same-key seed or orphan reclaim refuses
+nonterminally: it waits once (up to 30 s), retries once, then stops for retry
+with custody kept, logging `retained inventory proof still settling on this
+clone key; stopping claim for retry`. A restore seed is admitted on its narrower
+restore scope without clearing the exclusion, and a full clear is deferred while
+a restore entry holds the branch. A restore seed that is still refused after its
+one wait and retry is refused with `inventory_source_exclusion`.
+
+The proof adds two checks, `source_lock_unavailable` (the bare lock was not
+acquired in time, or a reclaim admission on the key is active) and
+`source_settlement_unproven` (the section hit its deadline, was stopped, or a
+leftover exclusion could not be cleared). Both refuse as
+`inventory_source_not_quiescent:<check>` and keep custody.
+
+The exclusion lives in worker memory for the life of the process. That is safe
+where the worker's PID namespace ends with it (tini as PID 1, as shipped). Other
+postures are logged once as not namespace-scoped, and after a restart the seed
+sweep behaves as before.
+
 A later claim of the issue (a newer generation of the same run, or a different
 run) starts on a fresh path on every worker and leaves the retained clone
 untouched. On a Docker-wired (attempt-path) worker that is a fresh attempt. On a
@@ -3377,7 +3411,8 @@ unlink. The proof keeps the execution tail and reservation, the live-attempt pat
 quiescence before and after, and the clone identity (path, branch, HEAD, `dev:ino`) equal
 to what describe printed. It skips only the worktree cleanliness check, because the tree
 is left in place. A writer the proof cannot rule out refuses
-`inventory_source_not_quiescent:<check>` and nothing is touched.
+`inventory_source_not_quiescent:<check>` and nothing is touched (the checks
+are listed in [ADR-2507](../adr/2507-inventory-source-diagnostics.md)).
 
 **Deletion.** Canonical bundles first, then records without a hold binding, then other
 binding-carrying records, then the anchor record last, then the run directory if empty.

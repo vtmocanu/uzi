@@ -34,7 +34,7 @@ func TestCodexProviderRoutesLiveDB(t *testing.T) {
 	base := gw.URL + "/v1"
 	f := newProviderFixture(t, base, testGatewayURL)
 	f.h.cfg.ProviderAllowLoopback = true
-	const expectedMap = `{"default":{"model":"gateway-default","context_window":200000},"gpt-6-astra":{"model":"gateway-astra","context_window":210000},"gpt-5.6-sol":{"model":"gateway-56-sol","context_window":220000},"gpt-6-sol":{"model":"gateway-sol","context_window":300000},"gpt-6.1-sol":{"model":"gateway-61-sol","context_window":310000},"gpt-6-luna":{"model":"gateway-luna","context_window":320000}}`
+	const expectedMap = `{"default":{"model":"gateway-default","context_window":200000},"gpt-6-astra":{"model":"gateway-astra","context_window":210000},"gpt-5.6-sol":{"model":"gateway-56-sol","context_window":220000},"gpt-6-sol":{"model":"gateway-sol","context_window":300000},"gpt-6.1-sol":{"model":"gateway-61-sol","context_window":310000},"gpt-6.2-sol":{"model":"gateway-62-sol","context_window":330000},"gpt-6.2-astra":{"model":"gateway-62-astra","context_window":340000},"gpt-6-luna":{"model":"gateway-luna","context_window":320000}}`
 	assertMap := func(value any) {
 		t.Helper()
 		actual, err := json.Marshal(value)
@@ -49,7 +49,7 @@ func TestCodexProviderRoutesLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("six-ID model map roundtrip: got %s want %s", actual, expectedMap)
+			t.Fatalf("eight-slot model map roundtrip: got %s want %s", actual, expectedMap)
 		}
 	}
 	p := f.create(t, `{"name":"codex","engine":"codex","protocol":"openai_responses","base_url":"`+base+`","auth_style":"bearer","model_map":`+expectedMap+`}`)
@@ -147,7 +147,15 @@ func TestCodexProviderRoutesLiveDB(t *testing.T) {
 	if hits.Load() != 2 || !bytes.Equal(keyBefore, keyAfter) || revBefore != revAfter {
 		t.Errorf("wrong kind mutated key: hits=%d revision=%d -> %d ciphertext changed=%v", hits.Load(), revBefore, revAfter, !bytes.Equal(keyBefore, keyAfter))
 	}
-	cliMustExec(t, f.pool, `UPDATE user_secrets SET kind = 'openai_compatible_key' WHERE user_id = $1 AND provider_id = $2`, f.user, p.ID)
+	rec = cookieReq(t, f.router, http.MethodDelete, id+"/key", f.jwt, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete wrong-kind key: %d %s, want 204", rec.Code, rec.Body.String())
+	}
+	rec = cookieReq(t, f.router, http.MethodDelete, id+"/key", f.jwt, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete removed key: %d %s, want 404", rec.Code, rec.Body.String())
+	}
+	f.setKey(t, p.ID) // The slot is free for a correctly sealed Codex key again.
 	// A valid ciphertext sealed for the Claude kind cannot authenticate as a Codex key.
 	cliMustExec(t, f.pool, `UPDATE user_secrets SET ciphertext = (SELECT ciphertext FROM user_secrets WHERE user_id = $1 AND provider_id = $2) WHERE user_id = $1 AND provider_id = $3`, f.user, claude.ID, p.ID)
 	rec = bearerReqBody(f.router, http.MethodPost, id+"/test", f.uzc, "")

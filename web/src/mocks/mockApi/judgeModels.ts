@@ -7,7 +7,7 @@ import type { Harness, ModelSettingCell } from "../../lib/apiTypes";
 // the judge_models cells and the session's effective_judge_model, so the two never drift.
 
 // The compiled-in judge built-ins per harness, pinned to judge.json `builtins`.
-export const MOCK_JUDGE_BUILTINS = { claude: "opus", codex: "gpt-6.1-sol" } as const;
+export const MOCK_JUDGE_BUILTINS = { claude: "opus", codex: "gpt-6.2-sol" } as const;
 
 export interface MockJudgeResolution {
   model: string;

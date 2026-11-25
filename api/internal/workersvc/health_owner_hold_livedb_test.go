@@ -138,7 +138,7 @@ func assertOwnerHold(t *testing.T, p *pinAgreementEnv, at time.Time, wantReason 
 		AffinityCutoff:  ownerHoldStamp(at.Add(-p.ceiling)), StaleRequeueCutoff: StaleRequeueCutoff(at, p.grace),
 		SpreadCutoff: ownerHoldStamp(at.Add(-9 * time.Second)), BackgroundGraceCutoff: ownerHoldStamp(at.Add(-15 * time.Minute)),
 		CrossCheckEvaluatedAt: ownerHoldStamp(at), CrossCheckAffinityCutoff: ownerHoldStamp(at.Add(-2 * time.Minute)),
-		WorkerCaps: []string{}, WorkerProtocolCaps: []string{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1},
+		WorkerCaps: []string{}, WorkerProtocolCaps: []string{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1},
 		CodexCuratedModels: codexCuratedModelsSlice(),
 	}
 	run, err := p.e.q.ClaimRun(p.e.ctx, cp)
@@ -227,7 +227,7 @@ func TestOwnerHoldReleaseAndControlsLiveDB(t *testing.T) {
 				// about the owner pin skipping a cross_check kind, and a previously claimed Codex
 				// checker is now admitted only to its recorded worker (issue #4476), so a Codex
 				// checker could not model the peer taking over.
-				protocols := []string{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
+				protocols := []string{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}
 				p.e.exec(t, `UPDATE workers SET protocol_capabilities=$2 WHERE user_id=$1`, p.e.userID, protocols)
 				for i, id := range []uuid.UUID{p.gapRun, p.satRun} {
 					lead := uuid.New()

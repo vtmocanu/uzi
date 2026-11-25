@@ -3796,6 +3796,6 @@ describe("Board — run-start preview (#3261)", () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [token("openai_api_key")] });
     serve(1, named(1, "default start"));
     renderBoard();
-    expect((await screen.findAllByRole("button", { name: /If started now: Codex · gpt-6\.1-sol · medium/ })).length).toBe(3);
+    expect((await screen.findAllByRole("button", { name: /If started now: Codex · gpt-6\.2-sol · medium/ })).length).toBe(3);
   });
 });

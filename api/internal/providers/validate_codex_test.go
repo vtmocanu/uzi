@@ -7,7 +7,7 @@ import (
 
 func TestCodexProfileValidation(t *testing.T) {
 	valid := ModelMap{"default": {Model: "gateway/default"}}
-	for _, id := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"} {
+	for _, id := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"} {
 		valid[id] = ModelEntry{Model: "gateway/" + id}
 	}
 	if err := ValidateProfile(EngineCodex, ProtocolResponses, AuthBearer, valid); err != nil {
@@ -33,10 +33,12 @@ func TestCodexProfileValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, n := range []int{MinContextWindow - 1, MinContextWindow, MaxContextWindow, MaxContextWindow + 1} {
-		err := ValidateModelMapForEngine(EngineCodex, ModelMap{"default": {Model: "x", ContextWindow: &n}})
-		if (err == nil) != (n >= MinContextWindow && n <= MaxContextWindow) {
-			t.Fatalf("context %d: %v", n, err)
+	for _, slot := range []string{"default", "gpt-6.2-sol", "gpt-6.2-astra"} {
+		for _, n := range []int{MinContextWindow - 1, MinContextWindow, MaxContextWindow, MaxContextWindow + 1} {
+			err := ValidateModelMapForEngine(EngineCodex, ModelMap{"default": {Model: "x"}, slot: {Model: "x", ContextWindow: &n}})
+			if (err == nil) != (n >= MinContextWindow && n <= MaxContextWindow) {
+				t.Fatalf("context %d: %v", n, err)
+			}
 		}
 	}
 	if err := ValidateModelMap(ModelMap{"haiku": {Model: "legacy"}}); err != nil {

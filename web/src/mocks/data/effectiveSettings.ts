@@ -156,9 +156,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "judge_model",
           "fixed_at": "claim",
@@ -1892,9 +1892,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "worker_model",
           "fixed_at": "claim",
@@ -1918,9 +1918,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "planning_model",
           "fixed_at": "claim",
@@ -1942,9 +1942,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "judge_model",
           "fixed_at": "claim",
@@ -2109,9 +2109,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "cross_check_worker_default",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "cross_check_worker_default",
             "setting": "cross_check_plan",
             "fixed_at": "claim",
@@ -2135,9 +2135,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "cross_check_worker_default",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "cross_check_worker_default",
             "setting": "cross_check_code",
             "fixed_at": "claim",
@@ -2292,7 +2292,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "worker_model": {
             "harness": "codex",
             "model": "gpt-6-sol",
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
             "resolved_model": "gpt-6-sol",
             "source": "run_override"
@@ -2378,9 +2378,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "worker_model": {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "worker_model",
             "fixed_at": "claim",
@@ -2414,7 +2414,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "subagents": {
             "mode": "own_pins",
-            "lead_value": "gpt-6.1-sol",
+            "lead_value": "gpt-6.2-sol",
             "pinned": [],
             "pinned_truncated": false,
             "notes": [
@@ -2446,9 +2446,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           "worker_model": {
             "harness": "codex",
             "model": null,
-            "default_model": "gpt-6.1-sol",
+            "default_model": "gpt-6.2-sol",
             "default_source": "builtin",
-            "resolved_model": "gpt-6.1-sol",
+            "resolved_model": "gpt-6.2-sol",
             "source": "builtin",
             "setting": "worker_model",
             "fixed_at": "claim",
@@ -2487,7 +2487,7 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
           },
           "subagents": {
             "mode": "follow_lead",
-            "lead_value": "gpt-6.1-sol",
+            "lead_value": "gpt-6.2-sol",
             "pinned": [],
             "pinned_truncated": false,
             "notes": [
@@ -2677,9 +2677,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "judge_model",
           "fixed_at": "claim",
@@ -3303,9 +3303,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "judge_model",
           "fixed_at": "claim",
@@ -4061,9 +4061,9 @@ export const RECORDED_EFFECTIVE_SCENARIOS: RecordedEffectiveScenario[] = [
         {
           "harness": "codex",
           "model": null,
-          "default_model": "gpt-6.1-sol",
+          "default_model": "gpt-6.2-sol",
           "default_source": "builtin",
-          "resolved_model": "gpt-6.1-sol",
+          "resolved_model": "gpt-6.2-sol",
           "source": "builtin",
           "setting": "judge_model",
           "fixed_at": "claim",

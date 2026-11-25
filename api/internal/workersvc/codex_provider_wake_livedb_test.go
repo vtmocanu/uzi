@@ -40,7 +40,7 @@ func frozenCodexWakeRun(t *testing.T, p *provFix) store.Run {
 }
 
 func codexWakeCaps() []string {
-	return []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexProviderV1, capability.RepoAgentSourceV1}
+	return []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexProviderV1, capability.RepoAgentSourceV1}
 }
 
 func setWakeCaps(f *hibFx, id uuid.UUID, caps []string) {
@@ -123,6 +123,7 @@ func TestProviderWakeCapabilityControls(t *testing.T) {
 		{"claude", harnessClaude, []string{capability.ClaudeProviderV1}, true},
 		{"claude_codex_only", harnessClaude, codexWakeCaps(), false},
 		{"codex", harnessCodex, codexWakeCaps(), true},
+		{"codex_v2_only", harnessCodex, []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}, false},
 		{"codex_no_provider", harnessCodex, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false},
 		{"codex_no_harness", harnessCodex, []string{capability.CodexProviderV1, capability.CodexRuntimeV2}, false},
 		{"codex_no_runtime", harnessCodex, []string{capability.CodexProviderV1, capability.CodexHarnessV1}, false},
@@ -150,6 +151,7 @@ func TestCodexProviderWakePlacementLiveDB(t *testing.T) {
 		{"legacy", nil},
 		{"claude_A1_only", []string{capability.ClaudeProviderV1}},
 		{"codex_runtime_only", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}},
+		{"codex_provider_v2_only", []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, f := codexProviderWakeFixture(t)
@@ -300,6 +302,7 @@ func TestCodexProviderDemandWakeRejectsIneligibleLiveDB(t *testing.T) {
 		{"legacy", nil},
 		{"claude_A1_only", []string{capability.ClaudeProviderV1}},
 		{"codex_runtime_only", []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}},
+		{"codex_provider_v2_only", []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, f := codexProviderWakeFixture(t)
@@ -380,6 +383,85 @@ func TestCodexProviderWakeCapabilityLossReleaseLiveDB(t *testing.T) {
 		t.Fatalf("replacement wake=%s want %s", got, replacement)
 	}
 	wantCodexWake(t, f, r.ID, replacement)
+}
+
+func TestCodexProviderWakeRuntimeV3LossReleaseActualClaimLiveDB(t *testing.T) {
+	p, f := codexProviderWakeFixture(t)
+	const plain = "inert-v3-wake-provider-key"
+	sealed, err := p.env.box.Seal([]byte(plain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.env.exec("UPDATE user_secrets SET ciphertext=$2 WHERE id=$1", p.key, sealed)
+	p.env.sealBotPAT(t, p.userID)
+	w := f.sleepingWorker()
+	setWakeCaps(f, w, codexWakeCaps())
+	r := frozenCodexWakeRun(t, p)
+	wantCodexWake(t, f, r.ID, w)
+	if released, err := f.svc.ReleaseStaleWake(f.env.ctx, r.ID); err != nil || released {
+		t.Fatalf("compatible wake release=%v, %v", released, err)
+	}
+	// A separate compatible wake must survive the same SQL listing that selects
+	// the capability-loss target. Settle it offline so it cannot suppress demand.
+	control := f.sleepingWorker()
+	setWakeCaps(f, control, codexWakeCaps())
+	controlRun := frozenCodexWakeRun(t, p)
+	wantCodexWake(t, f, controlRun.ID, control)
+	settleCodexWakeReplacement(t, f, control)
+	f.env.exec(`UPDATE workers SET status='offline' WHERE id=$1`, control)
+	setWakeCaps(f, w, []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2})
+	rows, err := f.env.q.ListStaleHibernationWakes(f.env.ctx, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := false
+	for _, row := range rows {
+		if row.RunID == controlRun.ID {
+			t.Fatal("compatible control selected as a stale wake")
+		}
+		if row.RunID == r.ID {
+			if row.WorkerID != w {
+				t.Fatalf("stale wake worker=%s want %s", row.WorkerID, w)
+			}
+			selected = true
+		}
+	}
+	if !selected {
+		t.Fatal("SQL listing omitted capability-loss wake")
+	}
+	if released, err := f.svc.ReleaseStaleWake(f.env.ctx, r.ID); err != nil || !released {
+		t.Fatalf("incompatible wake release=%v, %v", released, err)
+	}
+	if f.wakeRows(r.ID) != 0 {
+		t.Fatal("capability loss left a stale wake row")
+	}
+	if released, err := f.svc.ReleaseStaleWake(f.env.ctx, controlRun.ID); err != nil || released {
+		t.Fatalf("compatible control release=%v, %v", released, err)
+	}
+	replacement := f.sleepingWorker()
+	setWakeCaps(f, replacement, codexWakeCaps())
+	if got := wakeCandidate(t, f, r.ID); got != replacement {
+		t.Fatalf("replacement wake=%s want %s", got, replacement)
+	}
+	wantCodexWake(t, f, r.ID, replacement)
+
+	settleCodexWakeReplacement(t, f, replacement)
+	payload, err := f.svc.Claim(f.env.ctx, f.row(replacement), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload == nil || payload.RunID != r.ID.String() || payload.Secrets.Provider == nil {
+		t.Fatal("replacement did not claim frozen provider run")
+	}
+	a := payload.Secrets.Provider
+	if a.ProviderID != p.provider.String() || a.Engine != harnessCodex || a.Protocol != "openai_responses" ||
+		a.Revision != 1 || a.BaseURL != pvBase || a.AuthStyle != "bearer" ||
+		a.ModelMap["default"].Model != "gateway" || a.Credential != plain {
+		t.Fatal("replacement lost frozen provider authority")
+	}
+	if got := mustRun(t, f.env, r.ID); bindingOfRun(got) != bindingOfRun(r) || got.ClaimGeneration != r.ClaimGeneration+1 {
+		t.Fatal("replacement changed binding or failed to advance generation")
+	}
 }
 
 func TestCodexProviderWakeKeepsBusyCustodyFencesLiveDB(t *testing.T) {

@@ -39,6 +39,11 @@ import path from "node:path";
 export const CODEX_HARNESS_CAPABILITY = "codex_harness_v1";
 /** This build has the current runtime/catalog and honors claimed Codex effort. */
 export const CODEX_RUNTIME_V2_CAPABILITY = "codex_runtime_v2";
+/** This build targets the adopted 0.171.0 runtime. */
+export const CODEX_RUNTIME_V3_CAPABILITY = "codex_runtime_v3";
+
+// Bounded five-member contract, mirrored from CODEX_MEMBERS in codex-package.lock.
+const REQUIRED_MEMBERS = ["bin/codex", "bin/codex-code-mode-host", "codex-package.json", "codex-path/rg", "codex-resources/bwrap"] as const;
 
 /** PRD #1551 (D6): the protocol capability advertised ONLY by a worker whose Codex
  *  renderer can pass a validated CUSTOM (non-curated) worker-root model through unchanged
@@ -70,10 +75,10 @@ export const CODEX_PROBE_EXPECTATION: {
   readonly version: string;
   readonly lockDigest: Readonly<Record<string, string>>;
 } = {
-  version: "0.169.0",
+  version: "0.171.0",
   lockDigest: {
-    amd64: "3b8ed091149cc63a59046b9f094bcfa21cdb4dda15ede441ce369bcee4a71ba0",
-    arm64: "c8d0b4ab2a97c595b70b10412d36d0d5464dcef1e1d3246b073d48017cdf5a4f",
+    amd64: "8391d67757496bfd14893eca6cbf0c96994bf2627566ff1f018f70600c9ef6b3",
+    arm64: "d8c43bee6cf11b01eb18b95f4d7961092bc40228180808859e70dabb7784c1c9",
   },
 };
 
@@ -111,6 +116,10 @@ interface ReceiptMember {
 /** The receipt shape written by install-codex.sh. All fields are validated defensively
  *  (the file is a build artifact, but the probe must never trust it structurally). */
 interface Receipt {
+  schemaVersion?: unknown;
+  muslTarget?: unknown;
+  prefix?: unknown;
+  versionRoot?: unknown;
   codexVersion?: unknown;
   targetArch?: unknown;
   lockDigest?: unknown;
@@ -186,6 +195,9 @@ export async function probeCodexRuntime(opts: ProbeCodexRuntimeOptions = {}): Pr
       return notCapable(`receipt is not a JSON object at ${receiptPath}`);
     }
 
+    if (receipt.schemaVersion !== 1 || Array.isArray(receipt)) {
+      return notCapable("receipt schema is unsupported");
+    }
     // --- verify version + arch + lock digest against the compile-time expectation ---
     if (receipt.codexVersion !== expectedVersion) {
       return notCapable(`receipt version ${String(receipt.codexVersion)} != expected ${expectedVersion}`);
@@ -195,6 +207,12 @@ export async function probeCodexRuntime(opts: ProbeCodexRuntimeOptions = {}): Pr
     }
     if (receipt.lockDigest !== expectedLockDigest) {
       return notCapable(`receipt lock digest does not match the pinned tarball for ${arch}`);
+    }
+
+    const target = arch === "amd64" ? "x86_64-unknown-linux-musl" : arch === "arm64" ? "aarch64-unknown-linux-musl" : undefined;
+    if (!target || receipt.muslTarget !== target) return notCapable("receipt musl target does not match runtime arch");
+    if (receipt.prefix !== prefix || receipt.versionRoot !== path.join(prefix, expectedVersion)) {
+      return notCapable("receipt install roots do not match expected paths");
     }
 
     const members = receipt.members;
@@ -208,6 +226,9 @@ export async function probeCodexRuntime(opts: ProbeCodexRuntimeOptions = {}): Pr
     // relocated/mismatched receipt and to reject any `..` traversal in the member name.
     const versionRoot = path.join(prefix, expectedVersion);
 
+    if (members.length !== REQUIRED_MEMBERS.length) return notCapable("receipt required member set mismatch");
+    const seen = new Set<string>();
+    // At most five entries: the first invalid entry refuses the whole receipt.
     for (const entry of members as ReceiptMember[]) {
       if (
         !entry ||
@@ -224,6 +245,10 @@ export async function probeCodexRuntime(opts: ProbeCodexRuntimeOptions = {}): Pr
       if (rel.startsWith("..") || path.isAbsolute(rel)) {
         return notCapable(`receipt member ${entry.member} escapes the version root`);
       }
+      if (!REQUIRED_MEMBERS.some((member) => member === entry.member) || seen.has(entry.member)) {
+        return notCapable("receipt required member set mismatch");
+      }
+      seen.add(entry.member);
       if (entry.path !== expectedAbs) {
         return notCapable(`receipt member path ${entry.path} != expected ${expectedAbs}`);
       }

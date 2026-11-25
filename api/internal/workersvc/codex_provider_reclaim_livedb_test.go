@@ -30,7 +30,7 @@ func selectCodexReclaimReplacement(t *testing.T, f *codexBindingFix) {
 
 func codexReclaimWorker(f *codexBindingFix) store.Worker {
 	return store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{
-		capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2,
+		capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3,
 		capability.ClaudeProviderV1,
 	}}
 }

@@ -1842,6 +1842,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				// capableIgnoringCodexLead: a worker that would qualify but for
 				// cross_check_codex_lead_v1, which only a Claude checker child needs.
 				capableIgnoringCodexLead := false
+				capableIgnoringRuntimeV3 := false
 				claudeChecker := run.Kind == "cross_check" && run.Harness == harnessClaude
 				for _, worker := range workers {
 					if worker.Status == "online" && store.WorkerAcceptsNewIntake(store.Worker{
@@ -1856,7 +1857,14 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 						(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
 						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
 						(!r.PhaseModelsRequired || slices.Contains(worker.ProtocolCapabilities, phaseModelsCapability(Harness(r.Harness)))) &&
-						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
+						((run.Harness != harnessCodex && !run.CodexMaterialRevision.Valid && !run.CodexSecretID.Valid) || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
+						requiresRuntime := run.Harness == harnessCodex || run.CodexMaterialRevision.Valid || run.CodexSecretID.Valid
+						if requiresRuntime && !slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV3) {
+							if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
+								capableIgnoringRuntimeV3 = true
+							}
+							continue
+						}
 						capableIgnoringCodexLead = true
 						if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
 							capable = true
@@ -1865,6 +1873,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 					}
 				}
 				if !capable {
+					if capableIgnoringRuntimeV3 {
+						return reasonNoCurrentCodexRuntime
+					}
 					if capableIgnoringCodexLead {
 						return reasonNoCrossCheckCodexLeadCapableWorker
 					}

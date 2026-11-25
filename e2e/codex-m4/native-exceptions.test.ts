@@ -4,7 +4,7 @@ import { P_LAYER_SKIP } from "./p-platform.js";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ASYNC_ARGS, ASYNC_QUESTIONS, EXCEPTIONS_TITLE, runtimeInventory } from "./native-exceptions.js";
+import { ASYNC_MESSAGE_TITLES, ASYNC_ARGS, ASYNC_QUESTIONS, EXCEPTIONS_TITLE, runtimeInventory } from "./native-exceptions.js";
 import { codeModeExecStep, dummyCredential, nestedWorkerCallScript, scriptedStepsResponder, toolCallbackTexts } from "./fake-provider.js";
 import { loadProtocolModules, runProtocolTurn, type ProtocolModules } from "./harness-p.js";
 
@@ -13,6 +13,54 @@ before(async () => {
   if (P_LAYER_SKIP !== false) return;
   mods = await loadProtocolModules();
 });
+
+// One bounded local-provider turn per new catalog model, with no worker grants.
+for (const [model, title] of Object.entries(ASYNC_MESSAGE_TITLES)) {
+  test(title, { skip: P_LAYER_SKIP, timeout: 119_000 }, async (t) => {
+    let spawns = 0, fileops = 0;
+    const message = "Controlled loopback async message";
+    const obs = await runProtocolTurn(mods, {
+      model, lifecycle: "start", origin: "root", codeModeHost: true,
+      credential: dummyCredential(),
+      grants: { role: "coder", phase: "implement", allowedTools: new Set(), allowedSkills: new Set(), isRoot: true },
+      respond: scriptedStepsResponder([
+        { kind: "call", callId: "native-message", name: "send_message_to_user_async", args: { message } },
+        codeModeExecStep("nested-message", 'await tools.send_message_to_user_async({ message: "nested must fail" });'),
+        { kind: "finish", text: "controlled turn finished" },
+      ]),
+      spawnCommand: async () => { spawns++; throw new Error("unexpected worker spawn"); },
+      fileop: { op: async () => { fileops++; throw new Error("unexpected worker file effect"); } },
+    });
+    t.diagnostic(JSON.stringify({ binary: obs.binaryEvidence, elapsedMs: obs.elapsedMs }));
+    assert.equal(obs.turnStatus, "completed");
+    assert.deepEqual(obs.providerErrors, []);
+    assert.ok(obs.providerRequests.length >= 3, "all scripted steps reached the loopback provider");
+    for (const request of obs.providerRequests) {
+      assert.equal(request.model, model, "actual provider model on every request");
+      const inventory = runtimeInventory([request]);
+      assert.equal(inventory.observed, true);
+      assert.deepEqual(inventory.unparsed, []);
+      assert.ok(inventory.structuredNames.includes("functions.send_message_to_user_async"));
+      assert.equal(inventory.nestedNames.includes("send_message_to_user_async"), false);
+    }
+    assert.deepEqual([...new Set(toolCallbackTexts(obs.providerRequests, "native-message"))], ['{"accepted":true}']);
+    assert.ok(toolCallbackTexts(obs.providerRequests, "nested-message").some(text =>
+      /TypeError/.test(text) && /send_message_to_user_async/.test(text)), "DirectModelOnly helper cannot run inside code mode");
+    const messages = obs.notes.filter(note => note.kind === "activity" && note.method === "item/completed")
+      .map(note => (note.params as { item?: Record<string, unknown> }).item)
+      .filter(item => item?.delivery === "async");
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0]?.id, "native-message");
+    assert.equal(messages[0]?.type, "agentMessage");
+    assert.equal(messages[0]?.text, message);
+    assert.equal(messages[0]?.phase, "final_answer");
+    assert.equal(messages[0]?.questions == null, true);
+    assert.deepEqual(obs.callbacks, [], "native message never reaches the worker broker");
+    assert.equal(spawns, 0);
+    assert.equal(fileops, 0);
+    recordEvidence(title, "pass");
+  });
+}
 
 test(EXCEPTIONS_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const scratch = path.resolve(__dirname, "../../.uzi/scratch");

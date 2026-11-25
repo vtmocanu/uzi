@@ -58,7 +58,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_enabled: "false",
   judge_model: "opus",
   // The server reports the built-in as the effective value of an unset key (source "default").
-  codex_judge_model: "gpt-6.1-sol",
+  codex_judge_model: "gpt-6.2-sol",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
@@ -128,7 +128,7 @@ const response = (
   } as Record<string, Src>,
   defaults: {
     judge_model: "opus",
-    codex_judge_model: "gpt-6.1-sol",
+    codex_judge_model: "gpt-6.2-sol",
     summary_model: "haiku",
     codex_summary_model: "gpt-6-luna",
   },
@@ -788,7 +788,7 @@ describe("AdminSettings — run judge policy (PRD #46, #3259)", () => {
     renderPage();
     const line = await screen.findByTestId("judge-instance-default");
     expect(line.textContent).toContain(
-      "Instance default: Claude opus (built-in) · Codex gpt-6.1-sol (built-in)",
+      "Instance default: Claude opus (built-in) · Codex gpt-6.2-sol (built-in)",
     );
   });
 
@@ -811,7 +811,7 @@ describe("AdminSettings — instance model defaults grid (PRD #3245, #3248, #325
     renderPage();
     const expected: [string, string][] = [
       ["Judge model, Claude", "Default · opus (built-in)"],
-      ["Judge model, Codex", "Default · gpt-6.1-sol (built-in)"],
+      ["Judge model, Codex", "Default · gpt-6.2-sol (built-in)"],
       ["Summary model, Claude", "Default · haiku (built-in)"],
       ["Summary model, Codex", "Default · gpt-6-luna (built-in)"],
     ];
@@ -1199,7 +1199,7 @@ describe("AdminSettings — agent source (PRD #602 M5)", () => {
         role.claude_model || (role.name === "lead" ? "Default · SDK/account default (built-in)" : "Default · follows lead"),
       );
       expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe(
-        role.codex_model || (role.name === "lead" ? "Default · built-in (gpt-6.1-sol)" : "Default · follows lead"),
+        role.codex_model || (role.name === "lead" ? "Default · built-in (gpt-6.2-sol)" : "Default · follows lead"),
       );
       expect(row.queryByText("Model", { exact: true })).toBeNull();
     }

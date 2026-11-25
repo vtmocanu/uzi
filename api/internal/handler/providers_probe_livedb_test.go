@@ -31,6 +31,11 @@ type fakeProviderGateway struct {
 	mu   sync.Mutex
 	mode string // "ok" | "unauthorized"
 	auth []string
+	// rejectAuth lists Authorization header values answered 401 whatever the mode (per-key outcomes).
+	rejectAuth map[string]bool
+	// onRequest, when set, runs on the gateway goroutine after the request is recorded and before it
+	// is answered: the "between the dial and the evidence write" interleaving point.
+	onRequest func()
 }
 
 func newFakeProviderGateway(t *testing.T) *fakeProviderGateway {
@@ -41,7 +46,14 @@ func newFakeProviderGateway(t *testing.T) *fakeProviderGateway {
 		g.mu.Lock()
 		g.auth = append(g.auth, r.Header.Get("Authorization"))
 		mode := g.mode
+		if g.rejectAuth[r.Header.Get("Authorization")] {
+			mode = "unauthorized"
+		}
+		hook := g.onRequest
 		g.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		if mode == "unauthorized" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -196,7 +208,7 @@ func TestProviderTestProbeLiveDB(t *testing.T) {
 	}
 	var rows int
 	if err := f.pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM model_provider_probe_results WHERE provider_id = $1`, p.ID).Scan(&rows); err != nil || rows != 1 {
+		`SELECT count(*) FROM model_provider_key_test_results WHERE provider_id = $1`, p.ID).Scan(&rows); err != nil || rows != 1 {
 		t.Fatalf("probe result rows = %d, %v; want 1", rows, err)
 	}
 
@@ -211,7 +223,7 @@ func TestProviderTestProbeLiveDB(t *testing.T) {
 	}
 	var rev int
 	if err := f.pool.QueryRow(context.Background(),
-		`SELECT count(*), max(revision) FROM model_provider_probe_results WHERE provider_id = $1`, p.ID).Scan(&rows, &rev); err != nil || rows != 1 || rev != 2 {
+		`SELECT count(*), max(revision) FROM model_provider_key_test_results WHERE provider_id = $1`, p.ID).Scan(&rows, &rev); err != nil || rows != 1 || rev != 2 {
 		t.Fatalf("probe rows = %d at revision %d, %v; want 1 at revision 2", rows, rev, err)
 	}
 }
@@ -299,5 +311,56 @@ func TestProviderTestProbeRateLimitedLiveDB(t *testing.T) {
 	release()
 	if rec := bearerReqBody(f.router, http.MethodPost, id+"/test", f.uzc, ""); rec.Code != http.StatusOK {
 		t.Errorf("test after the slot was freed = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Interleave a committed key rotation after the probe's evidence write, before its final re-read.
+type providerProbeFinalReadInterleave struct {
+	store.DBTX
+	mu     sync.Mutex
+	reads  int
+	inHook bool
+	before func()
+}
+
+func (db *providerProbeFinalReadInterleave) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: GetVisibleProviderForUse ") {
+		db.mu.Lock()
+		db.reads++
+		fire := db.reads == 3 && !db.inHook
+		if fire {
+			db.inHook = true
+		}
+		db.mu.Unlock()
+		if fire {
+			db.before()
+		}
+	}
+	return db.DBTX.QueryRow(ctx, sql, args...)
+}
+
+// A key rotated after the evidence write commits leaves no current evidence for the final re-read:
+// that is the benign edit race (409), not a server error.
+func TestProviderTestProbeRotationAfterWriteIs409LiveDB(t *testing.T) {
+	f, _, createBody := probeFixture(t)
+	p := f.create(t, createBody)
+	path := "/api/me/providers/" + p.ID
+	if rec := cookieReq(t, f.router, http.MethodPut, path+"/key", f.jwt, `{"key":"`+testProviderKey+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set key = %d %s", rec.Code, rec.Body.String())
+	}
+	fired := false
+	hook := &providerProbeFinalReadInterleave{DBTX: f.pool, before: func() {
+		fired = true
+		if rec := cookieReq(t, f.router, http.MethodPut, path+"/key", f.jwt, `{"key":"replacement-gateway-key-0002"}`); rec.Code != http.StatusOK {
+			t.Fatalf("rotate key = %d %s", rec.Code, rec.Body.String())
+		}
+	}}
+	f.h.q = store.New(hook)
+	rec := bearerReqBody(f.router, http.MethodPost, path+"/test", f.uzc, "")
+	if !fired {
+		t.Fatal("the probe never reached its final re-read")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Errorf("probe = %d %s, want 409", rec.Code, rec.Body.String())
 	}
 }

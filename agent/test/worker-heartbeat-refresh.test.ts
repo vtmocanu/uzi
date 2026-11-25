@@ -50,6 +50,7 @@ it("regular Worker ticks retain 15s cadence, original report and nonce, epochs a
   assert.ok((registered.protocol_capabilities as string[]).includes("milestone_reconciliation_claim_v1"),
     "reconciled claims require generation-stamped publish, input and memory requests");
   assert.equal((registered.protocol_capabilities as string[]).includes("codex_runtime_v2"), false);
+  assert.equal((registered.protocol_capabilities as string[]).includes("codex_runtime_v3"), false);
   const stop = new AbortController();
   const loop = loops.heartbeatLoop(stop.signal);
   const flush = async () => { for (let n = 0; n < 10; n++) await new Promise<void>(resolve => setImmediate(resolve)); };

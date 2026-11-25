@@ -8,7 +8,7 @@ import { GitCache } from "../src/git.js";
 import type { RecoveryExactHold } from "../src/protocol.js";
 import { RunRunner } from "../src/runner.js";
 import { setQuiescenceViewForTests } from "../src/run-quiescence.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, passthroughInventorySection } from "./helpers.js";
 import { makeFakeProcRoot, plantInScope } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { binding, closed, environment, fixture, git, inventory, patch, type Variant } from "./fixtures/recovery-bindingless-compat.js";
@@ -232,6 +232,8 @@ async function boundaryWorld(identityOf: (read: number) => string = () => "stabl
         clones: [{ clonePath, branch: w.f.context.branch, runId: w.runId, identity: identityOf(reads.inventory) }] };
     },
     worktreeStatus: async () => { reads.status++; return [] as string[]; },
+    // The boundary runs inside the inventory source section (#4632); its real lock reads the bare config this fixture lacks.
+    withInventorySourceLock: passthroughInventorySection,
   };
   const runner = new RunRunner({} as never, fakeGit as never, () => { throw new Error("no executor"); }, nullLogger(), 20, undefined, { pollMs: 5 });
   const diagnostics: Array<{ check: string }> = [];

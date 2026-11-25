@@ -363,7 +363,7 @@ func (fx *fleetFixture) onlineWorkerCount() int {
 func phaseProtocols(harness string, phase bool) []string {
 	caps := []string{}
 	if harness == "codex" {
-		caps = append(caps, "codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1")
+		caps = append(caps, "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_custom_model_v1")
 	}
 	if phase {
 		if harness == "codex" {
@@ -396,7 +396,7 @@ func TestCodexCustomPlanningPeerAndSaturationLiveDB(t *testing.T) {
 			fx := newFleetFixture(t)
 			optInEphemeral(fx)
 			mustExec(fx.ctx, t, fx.pool, "UPDATE users SET planning_codex_model = 'private-plan', default_codex_model = 'gpt-6-sol' WHERE id = $1", fx.userID)
-			phase := []string{"codex_harness_v1", "codex_runtime_v2", "codex_phase_models_v1"}
+			phase := []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_phase_models_v1"}
 			both := append(append([]string{}, phase...), "codex_custom_model_v1")
 			caps := both
 			if mode == "busy without custom" {
@@ -452,7 +452,7 @@ func TestCodexPlanningCustomCapabilitiesLiveDB(t *testing.T) {
 			}
 			var workers []uuid.UUID
 			for _, extra := range tc.caps {
-				caps := append([]string{"codex_harness_v1", "codex_runtime_v2"}, extra...)
+				caps := append([]string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, extra...)
 				workers = append(workers, phaseWorkerRow(fx, "worker", capOf(1), caps))
 			}
 			h := phaseHealthRow(fx, run)
@@ -473,7 +473,7 @@ func TestCodexPlanningCustomCapabilitiesLiveDB(t *testing.T) {
 				t.Fatalf("gap=%v want=%v", gap[run], tc.want == 0)
 			}
 			for i, w := range workers {
-				caps := append([]string{"codex_harness_v1", "codex_runtime_v2"}, tc.caps[i]...)
+				caps := append([]string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"}, tc.caps[i]...)
 				id, ok := phaseClaim(fx, w, caps)
 				if ok != (tc.want > 0) || (ok && id != run) {
 					t.Fatalf("claim=(%v,%v) want=%v", id, ok, tc.want > 0)

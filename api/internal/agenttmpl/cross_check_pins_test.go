@@ -13,9 +13,9 @@ func TestResolveCrossCheckPins(t *testing.T) {
 		{"acceptance", "codex", ptr("gpt-6-astra"), ptr("xhigh"), ptr("gpt-6-sol"), nil, nil, ptr("gpt-6-astra"), "xhigh", "pin", "pin"},
 		{"default", "codex", nil, nil, ptr("gpt-6-sol"), nil, nil, ptr("gpt-6-sol"), "high", "worker default", "cross-check default"},
 		{"worker low does not lower checker", "codex", nil, nil, ptr("gpt-6-astra"), nil, nil, ptr("gpt-6-astra"), "high", "worker default", "cross-check default"},
-		{"product", "codex", nil, nil, nil, ptr("opus"), nil, ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
-		{"independent effort", "codex", nil, ptr("xhigh"), nil, nil, nil, ptr("gpt-6.1-sol"), "xhigh", "worker default", "pin"},
-		{"codex low pin kept", "codex", nil, ptr("low"), nil, nil, nil, ptr("gpt-6.1-sol"), "low", "worker default", "pin"},
+		{"product", "codex", nil, nil, nil, ptr("opus"), nil, ptr("gpt-6.2-sol"), "high", "worker default", "cross-check default"},
+		{"independent effort", "codex", nil, ptr("xhigh"), nil, nil, nil, ptr("gpt-6.2-sol"), "xhigh", "worker default", "pin"},
+		{"codex low pin kept", "codex", nil, ptr("low"), nil, nil, nil, ptr("gpt-6.2-sol"), "low", "worker default", "pin"},
 		{"claude template", "claude", nil, nil, nil, ptr("sonnet"), nil, ptr("sonnet"), "high", "worker default", "cross-check default"},
 		{"claude sdk", "claude", nil, nil, nil, nil, nil, nil, "high", "worker default", "cross-check default"},
 		{"claude lane", "claude", nil, nil, ptr("haiku"), ptr("sonnet"), nil, ptr("haiku"), "high", "worker default", "cross-check default"},
@@ -24,10 +24,10 @@ func TestResolveCrossCheckPins(t *testing.T) {
 		{"codex template", "codex", nil, nil, nil, ptr("opus"), ptr("gpt-6-luna"), ptr("gpt-6-luna"), "high", "worker default", "cross-check default"},
 		{"codex lane beats template", "codex", nil, nil, ptr("gpt-6-sol"), ptr("sonnet"), ptr("gpt-6-luna"), ptr("gpt-6-sol"), "high", "worker default", "cross-check default"},
 		{"codex pin beats lane and template", "codex", ptr("gpt-6-astra"), nil, ptr("gpt-6-sol"), ptr("sonnet"), ptr("gpt-6-luna"), ptr("gpt-6-astra"), "high", "pin", "cross-check default"},
-		{"codex rejects Claude alias template", "codex", nil, nil, nil, ptr("opus"), ptr("sonnet"), ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
-		{"codex rejects unknown template", "codex", nil, nil, nil, nil, ptr("custom-codex"), ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
-		{"codex empty template", "codex", nil, nil, nil, nil, ptr(""), ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
-		{"codex blank template", "codex", nil, nil, nil, nil, ptr("   "), ptr("gpt-6.1-sol"), "high", "worker default", "cross-check default"},
+		{"codex rejects Claude alias template", "codex", nil, nil, nil, ptr("opus"), ptr("sonnet"), ptr("gpt-6.2-sol"), "high", "worker default", "cross-check default"},
+		{"codex rejects unknown template", "codex", nil, nil, nil, nil, ptr("custom-codex"), ptr("gpt-6.2-sol"), "high", "worker default", "cross-check default"},
+		{"codex empty template", "codex", nil, nil, nil, nil, ptr(""), ptr("gpt-6.2-sol"), "high", "worker default", "cross-check default"},
+		{"codex blank template", "codex", nil, nil, nil, nil, ptr("   "), ptr("gpt-6.2-sol"), "high", "worker default", "cross-check default"},
 		{"codex template with explicit effort", "codex", nil, ptr("low"), nil, nil, ptr("gpt-6-luna"), ptr("gpt-6-luna"), "low", "worker default", "pin"},
 		{"claude pin beats lane and both templates", "claude", ptr("opus"), nil, ptr("haiku"), ptr("sonnet"), ptr("gpt-6-luna"), ptr("opus"), "high", "pin", "cross-check default"},
 		{"claude customClaude template", "claude", nil, nil, nil, ptr("customClaude"), ptr("gpt-6-luna"), ptr("customClaude"), "high", "worker default", "cross-check default"},
@@ -120,5 +120,42 @@ func TestCrossCheckDefaultEffortIsALevel(t *testing.T) {
 	}
 	if UziDefaultEffort != "medium" || UziDefaultCodexEffort != "medium" {
 		t.Fatal("ordinary worker effort defaults changed")
+	}
+}
+
+func TestM2ModelWriteBoundaries(t *testing.T) {
+	for _, model := range []string{"gpt-6.2-sol", "gpt-6.2-astra"} {
+		for _, raw := range []string{model, " " + model + " "} {
+			if got, err := ValidateFamilyModel("codex", raw); err != nil || got != model {
+				t.Errorf("Codex write %q: %q, %v", raw, got, err)
+			}
+			if _, err := ValidateFamilyModel("claude", raw); err == nil {
+				t.Errorf("Claude checker accepted %q", raw)
+			}
+			if _, err := ValidateClaudeLaneModel(raw); err == nil {
+				t.Errorf("Claude lane accepted %q", raw)
+			}
+			if got, err := ValidateTemplatePin("codex", raw); err != nil || got != model {
+				t.Errorf("Codex role %q: %q, %v", raw, got, err)
+			}
+			if _, err := ValidateTemplatePin("claude", raw); err == nil {
+				t.Errorf("Claude role accepted %q", raw)
+			}
+		}
+		got := ResolveCrossCheck("codex", nil, nil, nil, nil, &model)
+		if got.Model == nil || *got.Model != model {
+			t.Errorf("template fallback dropped %s: %+v", model, got)
+		}
+	}
+	for _, model := range []string{"custom-root", "custom-planning"} {
+		if got, err := ValidateFamilyModel("codex", model); err != nil || got != model {
+			t.Errorf("custom write %s: %q, %v", model, got, err)
+		}
+		if _, err := ValidateTemplatePin("codex", model); err == nil {
+			t.Errorf("role accepted custom %s", model)
+		}
+	}
+	if got, err := ValidateFamilyModel("claude", " gpt-6-luna "); err != nil || got != "gpt-6-luna" {
+		t.Errorf("legacy Claude checker luna pin: %q, %v", got, err)
 	}
 }

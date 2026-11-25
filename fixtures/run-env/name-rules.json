@@ -1,7 +1,7 @@
 {
   "harness_versions": {
     "claude_agent_sdk": "0.3.325",
-    "codex": "0.169.0"
+    "codex": "0.171.0"
   },
   "denied_names": [
     "HOME",
@@ -74,7 +74,14 @@
     "ENABLE_BETA_TRACING_DETAILED",
     "ENABLE_ENHANCED_TELEMETRY_BETA",
     "BETA_TRACING_ENDPOINT",
-    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    "SPIFFE_ENDPOINT_SOCKET",
+    "SSH2_CLIENT",
+    "COMSPEC",
+    "DENO_CERT",
+    "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "AWS_ENDPOINT_URL"
   ],
   "denied_prefixes": [
     "UZI_",
@@ -99,7 +106,10 @@
     "PERL5",
     "NIX_",
     "DEVBOX_",
-    "BUN_"
+    "BUN_",
+    "OTEL_LOG_",
+    "OTEL_EXPORTER_OTLP_",
+    "AWS_ENDPOINT_URL_"
   ],
   "denied_suffixes": [
     "_PROXY"
@@ -314,6 +324,90 @@
       "harness": "codex",
       "decision": "allowed",
       "reason": "read by commands the agent runs; the app-server environment never receives user variables"
+    },
+    {
+      "name": "SPIFFE_ENDPOINT_SOCKET",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "workload identity endpoint read by login/src/auth/workload_identity.rs ProcessEnvironment::read in Codex 0.171.0; denied as a repo variable even though the app-server replacement environment does not receive user variables"
+    },
+    {
+      "name": "SSH2_CLIENT",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "presence changes credential brokerage in network-proxy/src/credential_broker.rs; denied for child command environments as well as harness controls"
+    },
+    {
+      "name": "COMSPEC",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "Windows helper interpreter selected by http-headers-helper/src/lib.rs shell_command; reserved even though the app-server replacement environment does not receive user variables"
+    },
+    {
+      "name": "DENO_CERT",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "explicit child TLS CA preserved by network-proxy/src/proxy.rs via certs.rs CHILD_ONLY_CA_ENV_KEYS, not imported as proxy roots; denied to protect child trust configuration"
+    },
+    {
+      "name": "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "explicit child TLS CA preserved by network-proxy/src/proxy.rs via certs.rs CHILD_ONLY_CA_ENV_KEYS, not imported as proxy roots; denied to protect child trust configuration"
+    },
+    {
+      "name": "OTEL_RESOURCE_ATTRIBUTES",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "resource attributes and statusline collector eligibility in tui/src/statusline_metrics.rs; denied despite isolation of the app-server replacement environment"
+    },
+    {
+      "name": "AWS_ENDPOINT_URL",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "AWS endpoint routing override; reserved in child environments without banning ordinary AWS application configuration"
+    },
+    {
+      "name": "OTEL_LOG_LEVEL",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "log control covered by OTEL_LOG_; reserved without banning every OTEL_ application variable"
+    },
+    {
+      "name": "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "OTLP headers affect metrics export and statusline eligibility in otel/src/metrics/client.rs and tui/src/statusline_metrics.rs; denied by OTEL_EXPORTER_OTLP_"
+    },
+    {
+      "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "OTLP export destination control; denied by OTEL_EXPORTER_OTLP_ without a broad OTEL_ ban"
+    },
+    {
+      "name": "AWS_ENDPOINT_URL_S3",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "service endpoint routing override denied by AWS_ENDPOINT_URL_; ordinary AWS_REGION remains allowed"
+    },
+    {
+      "name": "OPENAI_IDENTITY_TOKEN_SOURCE",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "workload identity token source read by login/src/auth/workload_identity.rs ProcessEnvironment::read; already denied by OPENAI_"
+    },
+    {
+      "name": "OPENAI_SPIFFE_AUDIENCE",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "workload identity audience read by login/src/auth/workload_identity.rs ProcessEnvironment::read; already denied by OPENAI_"
+    },
+    {
+      "name": "OPENAI_SPIFFE_ID",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "workload identity ID read by login/src/auth/workload_identity.rs ProcessEnvironment::read; already denied by OPENAI_"
     }
   ]
 }

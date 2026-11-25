@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { rangeScanBytes } from "../src/codex/broker.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "../src/protocol.js";
@@ -242,6 +243,11 @@ it("production turn/start sends the unchanged Plan schema and omits Code schema 
   const threads = r.requests.filter(frame => frame.method === "thread/start");
   assert.equal(threads.length, 1);
   assertNoNativeServers(threads[0]!.params!.config);
+  for (const frame of [threads[0]!, turns[0]!]) {
+   assert.equal(frame.params!.model, "unknown-check-model");
+   assertNoTtlOverrides(frame.params, stage + " cross-check " + frame.method + " full params");
+  }
+  assert.equal(turns[0]!.params!.effort, "high");
   assert.equal(threads[0]!.params!.ephemeral, true);
   assert.equal(r.requests.some(f => f.method === "thread/resume"), false);
   assert.deepEqual(threads[0]!.params!.environments, [], stage + " thread disables native environments");
@@ -466,6 +472,7 @@ function assertOneAttempt(r: ReturnType<typeof rig>, turn = true): void {
  assert.equal(r.requests.filter((f) => f.method === "thread/start").length, 1);
  assert.equal(r.requests.filter((f) => f.method === "turn/start").length, turn ? 1 : 0);
  for (const frame of r.requests.filter((f) => f.method === "thread/start" || f.method === "turn/start")) {
+  assertNoTtlOverrides(frame.params, "cross-check one attempt " + frame.method + " full params");
   assert.equal(frame.params!.model, "gpt-6-astra");
   if (frame.method === "turn/start") assert.equal(frame.params!.effort, "xhigh");
  }

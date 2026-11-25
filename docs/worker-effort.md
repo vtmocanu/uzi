@@ -318,9 +318,14 @@ To see the effort your next run would use before it starts, read the read-only
 
 ## Worker rollout
 
-Codex claims require a worker advertising `codex_runtime_v2`: the current
-runtime/catalog baseline and correct claimed-effort handling. Until the
+Codex claims require `codex_runtime_v3` in addition to `codex_harness_v1` and
+`codex_runtime_v2`: the current runtime/catalog baseline and correct
+claimed-effort handling. The gate also covers a Codex material revision or
+secret binding, independently of optional capability requirements. Until the
 worker image is updated, Codex runs wait with the reason **no worker with the
 current Codex runtime is online; waiting for the worker roll**. This applies
 to hosted workers and local compose workers, including Codex judges and
 reviews. Claude runs are unaffected by that gate.
+
+For API-first, worker-first and rollback ordering, see the
+[current baseline](./configuration.md#current-codex-worker-baseline).

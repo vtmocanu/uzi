@@ -1233,7 +1233,7 @@ export interface ClaimCodexProviderBinding {
   auth_style: "bearer";
   credential: string;
   model_map: { default: ClaimProviderModel } & Partial<Record<
-    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna", ClaimProviderModel>>;
+    "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.2-sol" | "gpt-6.2-astra" | "gpt-6-luna", ClaimProviderModel>>;
 }
 
 export type ClaimProviderBinding = ClaimClaudeProviderBinding | ClaimCodexProviderBinding;
@@ -1709,9 +1709,13 @@ export interface ClaimPlanCrossCheck {
   size_class: string;
   base_commit: string;
   planning_diff: string;
+  /** Plan stage only: the server's claim-time repository-instructions consent for this check. */
+  plan_repo_instructions_enabled?: boolean;
+  /** Worker-produced from the bare repository at base_commit, never accepted from the server. */
+  repo_instructions_evidence?: import("./plan-cross-check-instructions.js").PlanRepoInstructionsEvidence;
 }
 
-export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff" | "plan_repo_instructions_enabled" | "repo_instructions_evidence"> {
   coverage_supported?: boolean;
   /** Computed locally from Git, never trusted from a server claim. */
   code_inventory?: import("./code-cross-check-coverage.js").CodeInventory;

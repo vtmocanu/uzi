@@ -18,12 +18,12 @@ func TestResolveWorkerDefaultModel(t *testing.T) {
 		// Cases carried over from the retired workersvc.CodexWorkerDefaultModel table.
 		{"codex lane wins over pin", "codex", sp("gpt-6-sol"), nil, sp("gpt-6-astra"), "gpt-6-sol", "user_default"},
 		{"codex lane custom id passes through", "codex", sp("gpt-custom-1"), nil, sp("gpt-6-astra"), "gpt-custom-1", "user_default"},
-		{"codex provider default", "codex", nil, nil, nil, "gpt-6.1-sol", "builtin"},
-		{"codex empty lane is unset", "codex", sp(""), nil, nil, "gpt-6.1-sol", "builtin"},
-		{"codex empty lane still wins over a role-model pin", "codex", sp(""), nil, sp("gpt-6-luna"), "gpt-6.1-sol", "builtin"},
+		{"codex provider default", "codex", nil, nil, nil, "gpt-6.2-sol", "builtin"},
+		{"codex empty lane is unset", "codex", sp(""), nil, nil, "gpt-6.2-sol", "builtin"},
+		{"codex empty lane still wins over a role-model pin", "codex", sp(""), nil, sp("gpt-6-luna"), "gpt-6.2-sol", "builtin"},
 		{"codex lead role-model pin", "codex", nil, nil, sp("gpt-6-luna"), "gpt-6-luna", "template"},
-		{"codex pin outside the role models is ignored", "codex", nil, nil, sp("gpt-custom-1"), "gpt-6.1-sol", "builtin"},
-		{"codex claude alias pin is ignored", "codex", nil, nil, sp("opus"), "gpt-6.1-sol", "builtin"},
+		{"codex pin outside the role models is ignored", "codex", nil, nil, sp("gpt-custom-1"), "gpt-6.2-sol", "builtin"},
+		{"codex claude alias pin is ignored", "codex", nil, nil, sp("opus"), "gpt-6.2-sol", "builtin"},
 		// Claude.
 		{"claude lane", "claude", sp("sonnet"), sp("opus"), nil, "sonnet", "user_default"},
 		{"claude lane holding a Codex role id is unset, template wins", "claude", sp("gpt-6-sol"), sp("opus"), nil, "opus", "template"},
@@ -58,11 +58,11 @@ func TestWorkerDefaultVsCrossCheckWorkerStep(t *testing.T) {
 		{"no lane, no template claude", "claude", nil, nil, nil, "", "", false},
 		{"no lane, filtered luna claude", "claude", nil, sp("gpt-6-luna"), nil, "", "", false},
 		{"no lane, template codex", "codex", nil, nil, sp("gpt-6-luna"), "gpt-6-luna", "gpt-6-luna", false},
-		{"no lane, no template codex", "codex", nil, nil, nil, "gpt-6.1-sol", "gpt-6.1-sol", false},
+		{"no lane, no template codex", "codex", nil, nil, nil, "gpt-6.2-sol", "gpt-6.2-sol", false},
 		{"lane value codex", "codex", sp("gpt-6-sol"), nil, nil, "gpt-6-sol", "gpt-6-sol", false},
 		{"lane value claude", "claude", sp("sonnet"), nil, nil, "sonnet", "sonnet", false},
 		// Legacy-only divergences.
-		{"empty codex lane", "codex", sp(""), nil, nil, "gpt-6.1-sol", "", true},
+		{"empty codex lane", "codex", sp(""), nil, nil, "gpt-6.2-sol", "", true},
 		{"claude lane holding a Codex role id", "claude", sp("gpt-6-sol"), sp("opus"), nil, "opus", "gpt-6-sol", true},
 	} {
 		worker, _ := ResolveWorkerDefaultModel(c.harness, c.lane, c.tmplClaude, c.tmplCx)

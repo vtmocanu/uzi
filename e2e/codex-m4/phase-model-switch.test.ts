@@ -39,7 +39,7 @@ before(async () => {
   if (P_LAYER_SKIP) return;
   const config = await loadPackagedConfig();
   const bin = resolveCodexBin().codexBin;
-  assertBinaryVersion(bin, "0.169.0");
+  assertBinaryVersion(bin, "0.171.0");
   fs.mkdirSync("../.uzi/scratch", { recursive: true });
   root = fs.mkdtempSync(path.resolve("../.uzi/scratch/phase-model-"));
   const home = path.join(root, "home"), cwd = path.join(root, "cwd");
@@ -270,7 +270,7 @@ test("Codex phase case 6: cold segmented accounting recovers larger historical r
   assert.ok(observed.coldSegmentedAccounting);
   const warmResult = observed.switch as { resumed: { model: string }; wire: { model?: unknown } };
   const coldResult = observed.cold as { reclaimed: { model: string }; wire: { model?: unknown } };
-  console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.169.0", efforts: observed.efforts, effortReports: observed.effortReports, requests: observed.requests,
+  console.log(`PHASE_CODEX_EVIDENCE ${JSON.stringify({ pin: "0.171.0", efforts: observed.efforts, effortReports: observed.effortReports, requests: observed.requests,
     warmResumeModel: warmResult.resumed.model, warmRequestModel: warmResult.wire.model,
     coldResumeModel: coldResult.reclaimed.model, coldRequestModelWithoutTurnOverride: coldResult.wire.model, warmControl: observed.warmControl,
     coldSegmentedAccounting: observed.coldSegmentedAccounting, credentialFreeAdoption: observed.adoption })}`);
