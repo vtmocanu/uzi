@@ -827,8 +827,11 @@ disables native `Bash` and `Monitor`. What changes for those runs
   status, so a trailing `grep` with no match marks the result an error even
   when earlier output shows success. A code above 128 can also mean the shell
   or its last command was stopped by a signal, which the number alone does not
-  establish. Every non-zero `Exit code` result carries a note saying so;
-  timeout, cancellation and memory-guard results have their own headlines.
+  establish. Every non-zero `Exit code` result carries a note saying so.
+  Timeout, cancellation and supervision-failure results have their own
+  `Command ...` headlines. The call the memory guard selects receives a
+  `worker_memory_pressure` JSON result instead, while a command stopped when
+  no such result takes precedence can still report an ordinary `Exit code`.
 - `Monitor` is unavailable, native `TaskStop` is unchanged, and a role whose
   shell grants are all scoped `Bash(...)` entries is unavailable on that run.
   Inherit-all roles are unchanged. With the guard disabled nothing changes.
