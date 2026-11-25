@@ -180,8 +180,8 @@ Anthropic token.
 - **The provider key is redacted** from the judge's output, review, usage and failure text.
 - **Codex.** A Codex judge for an owner who has only a Claude source runs on its usual Codex credential
   and ignores the Claude source. Neither harness ever falls back to the other. A Codex judge for an owner
-  whose **Codex source** is a model provider (their own, or an admin-shared definition with their own
-  enabled key) runs on that provider the same way, see [A Codex judge on a model provider](#a-codex-judge-on-a-model-provider).
+  whose **Codex source** is a model provider (their own; shared Codex definitions are #4633) runs on
+  that provider the same way, see [A Codex judge on a model provider](#a-codex-judge-on-a-model-provider).
 
 When the judge cannot be created on your provider, the automatic judge is [skipped](#a-skipped-judge) and
 **Run judge** is refused, with the same reasons (see [A skipped judge](#a-skipped-judge)); nothing falls
@@ -191,8 +191,8 @@ back to an Anthropic token.
 
 A Codex judge for an owner whose **Codex source** is a model provider runs on that provider, with your
 provider key and no vendor Codex credential. The provider and its revision are frozen onto the judge when it
-is created; a later change to your source affects new judges only. A queued judge whose source changed
-between the decision and the freeze fails creation with `judge_policy_changed` (retry-safe, nothing is
+is created; a later change to your source affects new judges only. A judge whose source changes between
+the decision and the freeze (both inside creation) fails creation with `judge_policy_changed` (retry-safe, nothing is
 created). It never falls back to a vendor Codex credential.
 
 - **No pin keeps it a vendor judge.** Unlike Claude, there is no judge pin that keeps a Codex judge on the
@@ -210,13 +210,14 @@ created). It never falls back to a vendor Codex credential.
   claimed, it ends failed with `credential_unavailable`, never parked.
 - **Other failures.** A timeout, an abort, a cleanup failure or an error the worker cannot classify fails
   the judge with no review. Any other classified model error (a bad request, an unauthorized answer, a
-  server error that carries a status) produces the deterministic fallback review, scrubbed of the key.
+  server error that carries a status) produces the deterministic fallback review, scrubbed of the key,
+  as do a prompt that cannot be built (the model is never called) and model output that cannot be parsed.
 - **The provider key is redacted** in its raw, escaped and invisible-separated forms from the review, model
   name, usage, failure reasons, logs and the terminal journal. A worker may later re-send an already
   journaled terminal log through its own logger; that body is key-free.
 - **Capability and rollout.** The judge needs a worker advertising `codex_provider_judge_v1` (advertised
-  by workers that run the Codex harness). Without one, the judge stays queued and health shows a reason that
-  no Codex-provider-judge-capable worker is available. During a rolling API deploy, a new replica can
+  by workers that run the Codex harness). Without one, the judge stays queued and health shows "no worker that
+  supports Codex provider judges (codex_provider_judge_v1) is online". During a rolling API deploy, a new replica can
   create a Codex provider judge that an old replica selects and refuses terminally (`credential_unavailable`,
   no review, no automatic retry); a manual **Run judge** after the rollout succeeds. Finish the API and
   worker rollout before relying on it.
@@ -526,12 +527,12 @@ or `null`. It is non-null only when the run has no review and no pending judge,
 so it never appears next to either of them; `reason` is one of
 `no_usable_credential`, `credential_disabled`, `codex_pool_unavailable`,
 `provider_lane_unsupported`, `provider_source_unusable` or
-`provider_model_unmapped`. `provider_lane_unsupported` is now recorded only for
-rows with that reason are now historical: a `"harness": "claude"` row predates a
+`provider_model_unmapped`. `provider_lane_unsupported` is no longer recorded for a judge;
+rows with that reason are historical: a `"harness": "claude"` row predates a
 Claude source binding a judge, and a `"harness": "codex"` row predates a Codex
 source binding one. Both are shown in the past tense (for Codex, "the selected
 Codex source is a model provider, which the Codex judge did not support at the
-time"); **Run judge** on such a row now creates the judge. `provider_source_unusable` means your Claude source could not serve
+time"); **Run judge** on such a row now creates the judge. `provider_source_unusable` means your Claude or Codex source could not serve
 the judge (retired, off the operator allowlist, or without your enabled
 key), and `provider_model_unmapped` means the provider's model map does not map the
 judge's model. Without
@@ -602,7 +603,7 @@ It shows only while the run has no review and no judge in flight. Clicking
 naming what is missing (an Anthropic token, a usable credential for the judge's
 harness, or a pooled Codex account), shown inline in the panel, and the skip stays.
 A provider refusal is a typed 409 instead: `provider_source_unusable` or
-`provider_model_unmapped`. A fourth, `judge_policy_changed`, means your judge settings changed while the judge was
+`provider_model_unmapped`. A third, `judge_policy_changed`, means your judge settings changed while the judge was
 being created; nothing was created and nothing fell back to an Anthropic token, so try again.
 
 ## Filing an issue from a recommendation

@@ -287,9 +287,9 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
   PostgreSQL keepalive is configured for this transaction, so the owner's credential writes (token, provider and key changes) can stall in
   the meantime. Codex pool credential creates already have the same exposure.
 - **Codex provider judges (#4574).** A Codex judge for an owner whose Codex source is a provider needs the
-  worker capability `codex_provider_judge_v1` instead, advertised by workers that run the Codex harness.
-  Without one the judge stays queued and health reads that no Codex-provider-judge-capable worker is
-  available; the same gates (claim, placement, wake, reap) and rollout notes apply, and
+  worker capability `codex_provider_judge_v1` on top of the Codex provider capabilities, advertised by
+  workers that run the Codex harness. Without one the judge stays queued and health reads "no worker that
+  supports Codex provider judges (codex_provider_judge_v1) is online"; the same gates (claim, placement, wake, reap) and rollout notes apply, and
   [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider) covers the rolling-deploy caveat.
 - **Weekly reserve exempt.** Provider-bound runs, provider judges included, are exempt from the vendor
   [weekly usage reserve](./rate-limits.md#weekly-usage-reserve): it protects vendor allowances only, and

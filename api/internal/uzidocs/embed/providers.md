@@ -286,8 +286,8 @@ Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit
 
 ### The Codex judge on a provider
 
-A Codex judge for an owner whose **Codex** source is a provider (their own, or an admin-shared definition
-with their own enabled key) runs on that provider, frozen when the judge is created, with no vendor
+A Codex judge for an owner whose **Codex** source is a provider (their own; shared Codex definitions are
+#4633) runs on that provider, frozen when the judge is created, with no vendor
 fallback. A selected Codex source always wins; there is no judge pin that keeps it a vendor judge. An
 owner with only a Claude source gets a Codex judge on the vendor Codex credential, ignoring the Claude
 source. The judge model resolves through the provider's model map: an exact key, else the required
