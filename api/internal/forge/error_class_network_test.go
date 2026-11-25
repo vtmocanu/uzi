@@ -72,20 +72,21 @@ func TestNetworkClassExcluded(t *testing.T) {
 }
 
 // TestNetworkClassExclusionsBeatAllowlist pins each exclusion arm: every excluded
-// cause is joined with an allowlisted ECONNRESET, so removing (or reordering) an
-// exclusion turns that row into network and fails it.
+// cause is joined with an allowlisted ECONNRESET, so removing any one exclusion
+// turns its row into network and fails it. The nxdomain row also sets IsTemporary,
+// pinning that IsNotFound is checked first.
 func TestNetworkClassExclusionsBeatAllowlist(t *testing.T) {
 	reset := syscall.ECONNRESET
 	for name, cause := range map[string]error{
 		"canceled":         context.Canceled,
-		"cert verify":      &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}},
+		"cert verify":      &tls.CertificateVerificationError{Err: errors.New("x")},
 		"unknown ca":       x509.UnknownAuthorityError{},
 		"hostname":         x509.HostnameError{Certificate: &x509.Certificate{}, Host: "x"},
 		"invalid cert":     x509.CertificateInvalidError{Reason: x509.Expired},
 		"record header":    tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"},
 		"addr error":       &net.AddrError{Err: "missing port in address", Addr: "x"},
 		"parse error":      &net.ParseError{Type: "IP address", Text: "x"},
-		"dns nxdomain":     &net.DNSError{Err: "no such host", Name: "x", IsNotFound: true},
+		"dns nxdomain":     &net.DNSError{Err: "no such host", Name: "x", IsNotFound: true, IsTemporary: true},
 		"dns without flag": &net.DNSError{Err: "odd", Name: "x"},
 	} {
 		t.Run(name, func(t *testing.T) {
