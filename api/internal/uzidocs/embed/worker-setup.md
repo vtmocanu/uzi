@@ -821,6 +821,12 @@ disables native `Bash` and `Monitor`. What changes for those runs
 - Inline output is capped at 30000 characters (start and end preview). A
   best-effort spill file under `.uzi/scratch/uzi-cmd/` is capped at 64 MiB and
   truncated beyond that; it is bounded, not a promise of full output.
+- A result starts with `Exit code: N`, the exit status of the supervised shell
+  invocation. For a simple sequence that ran to completion that is normally
+  the last command's status, so a trailing `grep` with no match marks the
+  result an error even when earlier output shows success. A code above 128 can
+  also mean the shell was stopped by a signal, which the number alone does not
+  establish. Every non-zero result carries a note saying so.
 - `Monitor` is unavailable, native `TaskStop` is unchanged, and a role whose
   shell grants are all scoped `Bash(...)` entries is unavailable on that run.
   Inherit-all roles are unchanged. With the guard disabled nothing changes.
