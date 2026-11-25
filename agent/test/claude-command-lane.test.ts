@@ -972,6 +972,7 @@ test("an unresolved prepared outcome never hides the command's own exit code and
     assert.match(body, /real-output/);
     assert.match(body, /memory-guard intervention was pending and unconfirmed/);
     assert.doesNotMatch(body, /stopped by the worker memory guard/);
+    assert.equal(body.includes(SHELL_STATUS_PHRASE), code !== 0, "the non-zero exit note rides alongside the pending note");
     assert.equal(r.isError, code !== 0);
     assert.equal(h.lane.poisoned, false);
   }
