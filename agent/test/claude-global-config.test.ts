@@ -21,9 +21,7 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 
 /**
- * PRD #4416: direct tests of the config-directory preparation and of the spawn seam. One uid cannot
- * show the kernel's sticky/ownership enforcement (the runner being unable to rename or write into
- * the worker-owned directory); these tests show the worker-side behaviour: what is built, what is
+ * Direct tests of the config-directory preparation and of the spawn seam: what is built, what is
  * reused, what is moved aside, what is refused, and that nothing is followed or deleted.
  */
 
@@ -939,13 +937,14 @@ describe("the bounded runner helper", () => {
   });
 
   it("a helper that ignores its own timeout is cut off by the intermediary's kill within the bound, and the preparation treats it as transient", { skip: !fs.existsSync("/bin/sh") || !fs.existsSync("/bin/sleep") }, () => {
+    const SHORT_TIMEOUT_MS = 200;
     const t0 = Date.now();
-    assert.throws(() => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 8"]), TrustedExecutionRefusal);
+    assert.throws(() => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 3"], SHORT_TIMEOUT_MS), TrustedExecutionRefusal);
     const elapsed = Date.now() - t0;
-    assert.ok(elapsed < 4_500, `returned after ${elapsed} ms`);
+    assert.ok(elapsed < 2_000, `returned after ${elapsed} ms`);
     // The same through the preparation: it refuses and moves nothing.
     fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
-    const stuck = (): HelperResult => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 8"]);
+    const stuck = (): HelperResult => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 3"], SHORT_TIMEOUT_MS);
     assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: stuck }), TrustedExecutionRefusal);
     assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), []);
   });

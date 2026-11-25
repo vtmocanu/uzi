@@ -1090,10 +1090,12 @@ export class Worker {
           // worker advertising it, and client.ts requireProviderCapability still refuses a provider
           // claim on a registration that did not advertise it.
           CLAUDE_PROVIDER_CAPABILITY,
-          // PRD #4416 M2: this image decodes run_env / run_env_redact, injects the variables into the
-          // lead lane's env and registers the secret forms for redaction. Advertised UNCONDITIONALLY: the
-          // api sends variables only to a worker advertising it and requeues a claim for one that lacks it.
-          RUN_ENV_CAPABILITY,
+          // run_env_v1: this image decodes run_env / run_env_redact, injects the variables into the
+          // lead lane's env and registers the secret forms for redaction. Advertised only under the
+          // uid split (uidSplitActive); a single-uid worker does not advertise it, so the api's
+          // placement clause keeps runs that carry variables (or secret receipts) off it.
+          // sdk-executor's phaseSetup refusal (assertRunEnvDeliverable) is the second check.
+          ...(uidSplitActive() ? [RUN_ENV_CAPABILITY] : []),
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

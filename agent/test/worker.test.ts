@@ -1064,7 +1064,6 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "issue_key_v1",
     "claude_phase_models_v1",
     "claude_provider_v1",
-    "run_env_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // #4007 slice B is production-dark: its capability is never advertised in any permutation below.
@@ -1204,6 +1203,19 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       [...ALWAYS_PRESENT_PROTOCOL_CAPS, "pending_outcome_scoped_claim_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
+  });
+
+  it("advertises run_env_v1 only under the uid split", async () => {
+    const prior = process.env.UZI_UID_SPLIT;
+    try {
+      process.env.UZI_UID_SPLIT = "1";
+      assert.ok((await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "advertised with the split active");
+      delete process.env.UZI_UID_SPLIT;
+      assert.ok(!(await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "not advertised without the split");
+    } finally {
+      if (prior === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = prior;
+    }
   });
 
   it("advertises codex_refresh_recovery_v1 without API protocol_features or Codex availability requirements", async () => {

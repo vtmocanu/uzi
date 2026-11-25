@@ -1,41 +1,21 @@
 // Prepare the Claude CLI's config directory before every CLI start (PRD #4416).
 //
-// Threat. The pinned Claude CLI honours an `env` block in its global config (for example
-// OTEL_LOG_RAW_API_BODIES, NODE_OPTIONS or ANTHROPIC_BASE_URL), regardless of `settingSources: []`.
-// The CLI runs as the runner uid and so does the agent's Bash tool, so an agent that can write
-// the config can change the next CLI start's environment, with the provider credential already in
-// it. The same holds for a config the CLI reads from `<HOME>/.claude.json`, `<HOME>/.claude/.config.json`
-// and `<HOME>/.claude/remote-settings.json` when CLAUDE_CONFIG_DIR is unset.
-//
 // Policy. The CLI is pointed at a directory the runner cannot change, with CLAUDE_CONFIG_DIR
 // (sdk-env.ts sets it to claudeConfigDir(HOME), a protected key; spawnDetached refuses to start a
-// CLI whose CLAUDE_CONFIG_DIR is anything else). The CLI then reads `<dir>/.claude.json`; in the
-// probes an env block planted in `<HOME>/.claude.json`, `<HOME>/.claude/.config.json` or
-// `<HOME>/.claude/settings.json` was not applied (with controls), nor one in an unsigned
-// `<HOME>/.claude/remote-settings.json` (fake-key session, no positive control; ADR-4416). The
+// CLI whose CLAUDE_CONFIG_DIR is anything else). The CLI then reads `<dir>/.claude.json`. The
 // directory holds exactly:
 //   .claude.json   the fixed bytes CLAUDE_GLOBAL_CONFIG_BYTES, mode 0444
 //   projects       symlink to ../.claude/projects  (transcripts, so resume and -c keep working)
 //   tasks          symlink to ../.claude/tasks     (the task-list tools need a writable tasks dir)
 // and is worker-owned, never group- or world-writable (a setgid bit inherited from HOME is
 // tolerated): mode 0755 under the uid split (the runner cannot write it), 0555 with one uid (the CLI
-// is then the directory's owner and would otherwise write it; with 0555 the pinned CLI saves and
-// creates nothing, see the probes below, so the next start finds it unchanged and reuses it).
+// is then the directory's owner and cannot create entries in it, so the next start finds it
+// unchanged and reuses it).
 // Only those two links are made: session-env and shell-snapshots (sourced by Bash),
 // plugins, hooks, skills, commands and agents (configuration and code) are not linked,
 // so the CLI finds them absent in a directory it cannot create them in. Only ONE of `.claude.json`
 // and `.config.json` is present, because the CLI prints a warning when both exist and prefers
 // `.config.json`.
-//
-// Probes (pinned CLI 2.1.325, fake API): with a non-writable directory of exactly this shape the
-// CLI starts, its saves fail silently with no temp files, Bash/Read/Write/Edit work, transcripts
-// land in `<HOME>/.claude/projects` through the link, and `--resume <id>` and `-c` find them;
-// TaskCreate works only with the `tasks` link (target writable). A directory the CLI CAN write
-// (one uid, mode 0755) gains backups/, plugins/, sessions/, .last-cleanup and a rewritten
-// `.claude.json`, and gives no protection: it renames over 0444 files. In `-p` probes against a
-// fake API (no completed turn), an `env` block written to the config while the CLI ran was not
-// applied, and an unsigned remote-settings env block was not applied (no positive control); the
-// scope of both is in ADR-4416.
 //
 // Boundary. Under the uid split (uidSplitActive) the trusted layout is:
 //   - HOME is a real directory (fs.realpathSync(HOME) === HOME, lstat is not a symlink) owned by the
@@ -55,13 +35,10 @@
 // single-uid start, or these tests) gives NO protection: the CLI and the agent are the worker's own
 // uid, so the agent can alter the directory between the last check and the CLI's read; the checks
 // below then only repair what an earlier turn left, and no ownership or ancestor check is made.
-// Kernel enforcement of the sticky and ownership boundary cannot be shown with one uid and is not
-// tested there.
 //
 // Run variables. A run's user variables reach the CLI environment only under the split
 // (sdk-executor.ts refuses a run that carries any when uidSplitActive() is false, and sdk-env.ts
-// buildSdkEnv throws the same refusal): with one uid this directory gives no protection, so a
-// variable could carry the same effect as a planted config `env` block.
+// buildSdkEnv throws the same refusal).
 //
 // Reuse and rebuild. The directory is never opened through a symlink and nothing in it is ever
 // deleted. A real directory with exactly the expected entries in the expected state is reused (so
@@ -125,10 +102,9 @@
 // The CLI reads the linked `<HOME>/.claude/projects` (transcripts, per-project memory) and
 // `<HOME>/.claude/tasks`, which stay runner-writable data. `<HOME>/.claude.json` and the
 // configuration files under `<HOME>/.claude` (`.config.json`, `settings.json`,
-// `remote-settings.json`) are neither replaced nor removed: they were not applied in the probes once
-// CLAUDE_CONFIG_DIR is set.
+// `remote-settings.json`) are neither replaced nor removed.
 //
-// No HOME in the env: no-op (the probe-style spawns that carry no HOME do not start a CLI). A spawn
+// No HOME in the env: no-op (spawns that carry no HOME do not start a CLI). A spawn
 // that carries a provider credential but no HOME is refused by spawnDetached (sdk-spawn.ts) before
 // this module runs, since the CLI would then fall back to the runner's passwd HOME.
 import { spawnSync } from "node:child_process";
@@ -298,11 +274,11 @@ function readHelperOutput(file: string): string {
 
 /** Run `command args` through a worker-uid `/bin/sh` intermediary that starts it in the background
  *  with stdout going to a file in a worker-private directory (mkdtemp, mode 0700) and waits for it.
- *  spawnSync waits only on that sh, with a 4 s timeout and SIGKILL, which the worker uid can always
+ *  spawnSync waits only on that sh, with a timeout (default 4 s) and SIGKILL, which the worker uid can always
  *  deliver; all of spawnSync's stdio is ignored, so no pipe is held by a helper that outlives it. The
  *  helper's exit status is the sh's. A spawn error, a timeout or a signal on the sh, or output over
  *  64 KiB, throws a refusal. */
-export function runBounded(command: string, args: readonly string[]): HelperResult {
+export function runBounded(command: string, args: readonly string[], timeoutMs: number = HELPER_SPAWN_TIMEOUT_MS): HelperResult {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-helper-"));
   try {
     const out = path.join(dir, "out");
@@ -311,7 +287,7 @@ export function runBounded(command: string, args: readonly string[]): HelperResu
       env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
       shell: false,
       stdio: "ignore",
-      timeout: HELPER_SPAWN_TIMEOUT_MS,
+      timeout: timeoutMs,
       killSignal: "SIGKILL",
     });
     if (r.error || r.signal !== null) throw refuse("a runner helper did not complete");
@@ -557,8 +533,7 @@ function ensureConfigDir(home: string, dir: string, step: (name: string) => void
     if (seen.state === "rewrite") {
       rewriteConfig(home, dir);
       step("rewritten");
-      // A rewrite on the last attempt is verified here: falling out of the loop would refuse a
-      // directory that is now good.
+      // The rewrite is re-inspected here, including on the last attempt.
       step("inspect");
       if (inspect(dir).state === "ok") return;
       continue;
@@ -568,8 +543,8 @@ function ensureConfigDir(home: string, dir: string, step: (name: string) => void
     try {
       step("built");
       if (seen.state === "bad") {
-        // Another prepare may have replaced the bad directory since it was inspected: never move
-        // aside a directory that is no longer the one that was judged.
+        // Only the entry that was inspected (same dev and ino) is moved aside; a replaced or
+        // absent entry re-enters the loop.
         const now = fs.lstatSync(dir, { throwIfNoEntry: false });
         if (now === undefined || now.dev !== seen.dev || now.ino !== seen.ino) continue;
         renameAside(dir);

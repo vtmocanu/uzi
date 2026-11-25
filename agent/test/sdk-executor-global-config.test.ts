@@ -16,10 +16,9 @@ import { resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 /**
- * PRD #4416: the Claude CLI honours an `env` block in its global config, and the agent (same uid as
- * the CLI) can write config files. Through the real SdkExecutor and the REAL spawnDetached (no
- * `opts.spawn`), every CLI start must find the fixed bytes in `$CLAUDE_CONFIG_DIR/.claude.json` and
- * no `.config.json` there, whatever a previous leg, a planted file or a planted symlink left, and
+ * Through the real SdkExecutor and the REAL spawnDetached (no `opts.spawn`), every CLI start must
+ * find the fixed bytes in `$CLAUDE_CONFIG_DIR/.claude.json` and no `.config.json` there, whatever
+ * an earlier leg, a planted file or a planted symlink left, and
  * nothing outside that directory may be followed or removed. The "CLI" is a node child that reports
  * what it finds under `$CLAUDE_CONFIG_DIR`. These tests run with one uid, which gives no kernel
  * protection; the split-mode cases only exercise the worker-side checks.
@@ -152,10 +151,8 @@ const dumpDir = (leg: number): string => fs.readFileSync(dumpPath(leg) + ".dir",
 const EXPECTED_DUMP_DIR = (): string => `${configDir()}|.claude.json,projects,tasks`;
 
 describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at every start (PRD #4416)", () => {
-  // What this checks: at every start the CLI is pointed at the prepared directory and finds the fixed
-  // bytes there, and what an agent planted under HOME does not change that. The dump reads only that
-  // directory, so it cannot show that the real CLI ignores the planted files: that is the pinned-CLI
-  // probe, probe-m3 (g) in the PRD #4416 probe notes.
+  // At every start the CLI is pointed at the prepared directory and finds the fixed bytes there,
+  // whatever an agent planted under HOME. The dump reads only that directory.
   it("(a) the CLI is pointed at the prepared directory and finds the fixed bytes at every start, whatever was planted under HOME", async () => {
     const exec = makeExecutor(
       twoLegs((leg) => {
@@ -227,9 +224,7 @@ describe("SdkExecutor + spawnDetached: the CLI config directory is prepared at e
   }
 
   it("(c) a symlink at the config directory and a symlinked .claude are replaced, never followed or removed through", async () => {
-    // A symlinked `.claude` and a symlinked config directory are renamed aside, never followed. (The
-    // split path is covered directly in claude-global-config.test.ts: the real spawn under the split
-    // would exec setpriv.)
+    // A symlinked `.claude` and a symlinked config directory are renamed aside, never followed.
     const outsideClaude = path.join(workDir, "outside-claude");
     const outsideDir = path.join(workDir, "outside-dir");
     for (const d of [outsideClaude, outsideDir]) fs.mkdirSync(d);
