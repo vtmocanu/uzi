@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -185,6 +186,16 @@ func TestAnalyticsAdminAllUsersWindowAllRefusalIsIdentical(t *testing.T) {
 	}
 	if bodies[0] != bodies[1] || !strings.Contains(bodies[0], msgAnalyticsWindowAllAllUsers) {
 		t.Fatalf("bodies differ or lack the message: %q vs %q", bodies[0], bodies[1])
+	}
+	// Pin the documented reason as a literal, independent of the handler's constant.
+	var e struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(bodies[0]), &e); err != nil {
+		t.Fatalf("decode %q: %v", bodies[0], err)
+	}
+	if e.Error != "window all not available for all users" {
+		t.Fatalf("error = %q, want the documented reason", e.Error)
 	}
 }
 

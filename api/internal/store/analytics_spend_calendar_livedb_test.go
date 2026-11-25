@@ -402,6 +402,9 @@ func TestAnalyticsSpendParityWithAdminUsageTotalsLiveDB(t *testing.T) {
 	f.claimYear(2004)
 	o := f.owner("adminparity")
 	repo, _ := f.repo(o, "adminparity")
+	// No HTTP route reaches this all-users window=all execution: the admin all-users scope
+	// rejects window=all with a 400 (owner decision at landing). The store statement is kept
+	// and tested here for lifetime parity and the deferred follow-up.
 	// A far-past year of its own, plus the whole shared database below: window all, with
 	// now strictly after every run in the database, must equal the lifetime admin totals.
 	for i := 0; i < 3; i++ {
