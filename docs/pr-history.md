@@ -6,9 +6,12 @@ audience: operator
 
 # Pull request merge and close history
 
-uzi's MR-state watcher records every pull request (PR) or merge request state
-change it observes, with the forge's own merge/close time kept apart from the
-time uzi noticed. Nothing reads this history yet: no API route, page or command
+uzi's MR-state watcher records the pull request (PR) or merge request state
+changes it persists, with the forge's own merge/close time kept apart from the
+time uzi noticed. Not every fetched change is persisted: a failed prerequisite
+(such as a board move or rework cancel), a run whose owner does not own the
+forge connection, and an older or tied observation all leave history unchanged
+(see Coverage limits). Nothing reads this history yet: no API route, page or command
 exposes it (PRD #4691). It accumulates so that later read features have real
 data, because the forge's timestamps are not refetched once a watcher stops
 watching a PR. History that was not captured when the watcher saw it cannot be
@@ -27,7 +30,7 @@ statement) with `runs.mr_state` and has exactly its durability.
 | `state` | Current known state: `opened`, `closed`, `merged` or `locked`. |
 | `observed_at` | Observation watermark: the newest observation time that reached the head. |
 | `last_provider_at` | Newest provider-reported merge/close time seen. Never decreases. |
-| `first_merged_at`, `first_merged_source` | When the PR first merged and whether that time is `provider` or `observation_fallback`. Set once. |
+| `first_merged_at`, `first_merged_source` | The first merge uzi recorded for the PR: the provider's merge time when `first_merged_source` is `provider`, otherwise (`observation_fallback`) the time uzi first recorded the PR as merged. Set once. |
 | `last_changed`, `last_from_state`, `last_to_state`, `last_event_provider_at`, `last_time_source`, `last_bootstrap`, `last_first_merge` | Transport-only: they carry the latest transition to the event insert inside the statement. They are not history; do not read them. |
 
 **`pr_history_events`**: append-only transitions.
@@ -39,7 +42,7 @@ statement) with `runs.mr_state` and has exactly its durability.
 | `time_source` | `provider` (`provider_at` is set) or `observation_fallback` (`provider_at` is NULL). |
 | `observed_at` | When uzi observed the transition (captured in Go right after the forge fetch returns). |
 | `bootstrap` | True for the first observation of a PR, which is not a witnessed transition. |
-| `first_merge` | True on the one event where the PR first merged. A unique partial index allows at most one per PR. |
+| `first_merge` | True on the one event where uzi first recorded the PR as merged. A unique partial index allows at most one per PR. |
 
 `(repo_id, mr_iid)` means forge connection, repository and PR number: the same
 external PR connected by two owners is two identities. Unchanged repeated
@@ -62,7 +65,7 @@ definitions only. **Mapping against live forge deployments is UNVERIFIED.**
 
 ### Zero and absent timestamps
 
-In Go, a nil, zero, or outside 1970-01-01 to 9999-12-31 (UTC) provider time is
+In Go, a nil, zero, or outside [1970-01-01, 10000-01-01) (UTC) provider time is
 treated as unknown. In SQL, a provider time after the observation time, or
 older than the newest provider time already on the head, is also dropped to
 NULL, so the event is `observation_fallback` rather than carrying an inverted
@@ -142,8 +145,9 @@ History is what the watcher saw, not a complete record of every PR.
   can deadlock (SQLSTATE 40P01): neither delete prelocks a `cross_check`
   child. If the watcher loses, it retries on the next tick and the repo is
   gone. If the delete loses, the handler returns its generic error (HTTP 500)
-  and the user can retry the delete; the watcher's write has committed by then,
-  so the race is over. This is accepted without extra locking. Both outcomes
+  and the user can retry the delete. The watcher's write commits independently
+  of that response and may still be in flight when the error arrives, so an
+  immediate retry can race it again. This is accepted without extra locking. Both outcomes
   are pinned for the repository delete by
   `TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB` in
   `api/internal/store/pr_history_livedb_test.go`; the connection-delete case

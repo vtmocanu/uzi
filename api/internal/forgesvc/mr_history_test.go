@@ -57,6 +57,7 @@ func TestProviderTimeParam(t *testing.T) {
 		{"pre-1970", timePtr(time.Date(1969, 12, 31, 23, 59, 59, 0, time.UTC)), false, time.Time{}},
 		{"epoch is valid", timePtr(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)), true, time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)},
 		{"post-9999", timePtr(time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)), false, time.Time{}},
+		{"9999 final fractional second is valid", timePtr(time.Date(9999, 12, 31, 23, 59, 59, 500_000_000, time.UTC)), true, time.Date(9999, 12, 31, 23, 59, 59, 500_000_000, time.UTC)},
 		{"9999 end is valid", timePtr(time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)), true, time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)},
 		{"normal converts to UTC", &normal, true, normal.UTC()},
 	}
@@ -156,7 +157,7 @@ func TestBoardFreeTerminalEdgeCapturesObservationBeforeCancel(t *testing.T) {
 // state as already recorded and writes nothing (the control subtest).
 func TestFailedHistoryWriteIsRetriedWithTimestamps(t *testing.T) {
 	mergedAt := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-	run := func(t *testing.T, failOnce error) *fakeStore {
+	run := func(t *testing.T, failOnce error) (*fakeStore, *fakeForge) {
 		t.Helper()
 		runID, repoID := uuid.New(), uuid.New()
 		opened := forge.MRStateOpened
@@ -174,26 +175,65 @@ func TestFailedHistoryWriteIsRetriedWithTimestamps(t *testing.T) {
 				t.Fatalf("tick %d: %v", i, err)
 			}
 		}
-		return st
+		return st, f
 	}
 
 	t.Run("failed write is retried", func(t *testing.T) {
-		st := run(t, errors.New("transient"))
-		if len(st.mrStateWrites) != 2 {
-			t.Fatalf("expected the failed write and one retry, got %d", len(st.mrStateWrites))
+		st, f := run(t, errors.New("transient"))
+		if len(st.mrStateWrites) != 2 || len(f.mrReturnedAt) != 2 {
+			t.Fatalf("expected the failed write and one retry over two fetches, got writes=%d fetches=%d", len(st.mrStateWrites), len(f.mrReturnedAt))
 		}
-		first, second := st.mrStateWrites[0], st.mrStateWrites[1]
-		if !timeEq(first.ProviderAt, mergedAt) || !timeEq(second.ProviderAt, mergedAt) {
-			t.Fatalf("ProviderAt not carried: %+v / %+v", first.ProviderAt, second.ProviderAt)
-		}
-		if !first.ObservedAt.Valid || !second.ObservedAt.Valid || second.ObservedAt.Time.Before(first.ObservedAt.Time) {
-			t.Fatalf("ObservedAt not valid/monotone: %+v / %+v", first.ObservedAt, second.ObservedAt)
+		for i, w := range st.mrStateWrites {
+			if !timeEq(w.ProviderAt, mergedAt) {
+				t.Fatalf("write %d ProviderAt not carried: %+v", i, w.ProviderAt)
+			}
+			// Each write's observation time is taken after ITS OWN fetch returned: a retry
+			// that reused the first attempt's ObservedAt would be before the second marker.
+			if !w.ObservedAt.Valid || w.ObservedAt.Time.Before(f.mrReturnedAt[i]) {
+				t.Fatalf("write %d ObservedAt %+v is before its fetch returned at %v", i, w.ObservedAt, f.mrReturnedAt[i])
+			}
 		}
 	})
 	t.Run("control: successful write is not repeated", func(t *testing.T) {
-		st := run(t, nil)
+		st, _ := run(t, nil)
 		if len(st.mrStateWrites) != 1 {
 			t.Fatalf("expected exactly one write without a failure, got %d", len(st.mrStateWrites))
 		}
 	})
+}
+
+// A failed rework cancel leaves mr_state unadvanced; the next eligible poll with a
+// working cancel records the same terminal edge, with its provider time.
+func TestCancelFailureThenRetryRecordsEdge(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	mergedAt := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	st := &fakeStore{
+		boardFreeCandidates: []store.ListBoardFreeMRStateWatchCandidatesRow{boardFreeCand(runID, 13, strptr(forge.MRStateOpened))},
+		persistMRState:      true,
+	}
+	mr := forgeMR(13, forge.MRStateMerged)
+	mr.MergedAt = &mergedAt
+	f := &fakeForge{mr: mr}
+	canceller := &fakeReworkCanceller{err: errors.New("cancel failed")}
+	svc := newTestService(st)
+	svc.SetReworkCanceller(canceller)
+
+	if err := svc.SyncBoardFreeMRStates(context.Background(), repoID, testProjectID, f); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if len(st.mrStateWrites) != 0 {
+		t.Fatalf("a failed cancel must not record, got %d writes", len(st.mrStateWrites))
+	}
+	canceller.err = nil
+	if err := svc.SyncBoardFreeMRStates(context.Background(), repoID, testProjectID, f); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	assertRecorded(t, st, runID, forge.MRStateMerged)
+	if len(f.mrReturnedAt) != 2 || len(canceller.started) != 2 {
+		t.Fatalf("markers: fetch=%d cancel=%d", len(f.mrReturnedAt), len(canceller.started))
+	}
+	w := st.mrStateWrites[0]
+	if !timeEq(w.ProviderAt, mergedAt) || w.ObservedAt.Time.Before(f.mrReturnedAt[1]) {
+		t.Fatalf("retry write = %+v, want ProviderAt %v and ObservedAt after the second fetch %v", w, mergedAt, f.mrReturnedAt[1])
+	}
 }

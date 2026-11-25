@@ -457,6 +457,23 @@ func TestPRHistoryProviderTimeLiveDB(t *testing.T) {
 		fx.assertHead(1, "merged", prhAt(5), nil, ptrOf(prhAt(5)), prhS("observation_fallback"))
 	})
 
+	t.Run("range boundaries through the generated query", func(t *testing.T) {
+		// The forgesvc conversion passes values in [1970-01-01, 10000-01-01) UTC. The epoch
+		// is stored as a provider time; the last fractional second of year 9999 is accepted
+		// by the statement and, being after the observation, falls back in SQL.
+		fx := newPRHFixture(t)
+		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		last := time.Date(9999, 12, 31, 23, 59, 59, 500_000_000, time.UTC)
+		runA := fx.newRun(1, "")
+		fx.mustObserve(runA, "closed", prhAt(1), &epoch)
+		fx.assertEvents(1, wantEvent{To: "closed", ProviderAt: &epoch, TimeSource: "provider", ObservedAt: prhAt(1), Bootstrap: true})
+		fx.assertHead(1, "closed", prhAt(1), &epoch, nil, nil)
+		runB := fx.newRun(2, "")
+		fx.mustObserve(runB, "merged", prhAt(2), &last)
+		fx.assertEvents(2, wantEvent{To: "merged", TimeSource: "observation_fallback", ObservedAt: prhAt(2), Bootstrap: true, FirstMerge: true})
+		fx.assertHead(2, "merged", prhAt(2), nil, ptrOf(prhAt(2)), prhS("observation_fallback"))
+	})
+
 	t.Run("inverted provider time falls back", func(t *testing.T) {
 		fx := newPRHFixture(t)
 		run := fx.newRun(1, "")
@@ -648,14 +665,29 @@ func TestPRHistoryAtomicityLiveDB(t *testing.T) {
 			}
 		})
 
-		n, err := fx.observe(run, "closed", prhAt(2), nil)
+		// The writer's connection stays checked out while the checks run, so the pool
+		// answers them from a different backend: a guaranteed second session.
+		connW, err := fx.pool.Acquire(fx.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writerPID := prhPID(fx.ctx, t, connW)
+		n, err := prhObserve(fx.ctx, store.New(connW.Conn()), run, "closed", prhAt(2), nil)
 		var pgErr *pgconn.PgError
 		if !errors.As(err, &pgErr) || pgErr.Code != "P0001" || pgErr.Message != "pr_history_test_forced_failure" {
+			connW.Release()
 			t.Fatalf("SetRunMRState = (%d, %v), want P0001 pr_history_test_forced_failure", n, err)
 		}
-		fx.assertMRState(run, "opened")
-		fx.assertHead(1, "opened", prhAt(1), nil, nil, nil)
-		fx.assertEvents(1, wantEvent{To: "opened", TimeSource: "observation_fallback", ObservedAt: prhAt(1), Bootstrap: true})
+		if checkerPID := prhPID(fx.ctx, t, fx.pool); checkerPID == writerPID {
+			connW.Release()
+			t.Fatalf("checker session pid %d equals writer pid", checkerPID)
+		}
+		func() {
+			defer connW.Release()
+			fx.assertMRState(run, "opened")
+			fx.assertHead(1, "opened", prhAt(1), nil, nil, nil)
+			fx.assertEvents(1, wantEvent{To: "opened", TimeSource: "observation_fallback", ObservedAt: prhAt(1), Bootstrap: true})
+		}()
 
 		// Control: with the trigger disabled the same call succeeds and writes the event.
 		fx.exec(fmt.Sprintf(`ALTER TABLE pr_history_events DISABLE TRIGGER %s`, trg))
@@ -741,6 +773,45 @@ func prhWaitBlocked(ctx context.Context, t *testing.T, pool *pgxpool.Pool, block
 	}
 }
 
+// prhRes is a goroutine's statement result.
+type prhRes struct {
+	n   int64
+	err error
+}
+
+// prhRollback rolls tx back on its own bounded context, so a cancelled test context
+// never leaves a connection checked out (pool.Close in cleanup would then block).
+func prhRollback(tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
+
+// prhJoin returns a deferred func that cancels the session context and waits (bounded)
+// for the goroutine to finish, so a test that fails early never releases or rolls back
+// a connection the goroutine is still using.
+func prhJoin(cancel context.CancelFunc, finished <-chan struct{}) func() {
+	return func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
+
+// prhRecv waits (bounded) for a goroutine result.
+func prhRecv(t *testing.T, ch <-chan prhRes, what string) prhRes {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(30 * time.Second):
+		t.Fatalf("%s did not finish within 30s", what)
+		return prhRes{}
+	}
+}
+
 func prhSQLState(err error) string {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -788,57 +859,59 @@ func TestPRHistoryPrelockedDeleteOrderLiveDB(t *testing.T) {
 	for _, v := range variants {
 		t.Run(v.name+"/observation holds run lock first", func(t *testing.T) {
 			fx := newPRHFixture(t)
+			ctx, cancel := context.WithTimeout(fx.ctx, 90*time.Second)
+			defer cancel()
 			run := fx.newRun(1, "opened")
-			txA, err := fx.pool.Begin(fx.ctx)
+			txA, err := fx.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = txA.Rollback(fx.ctx) }()
-			pidA := prhPID(fx.ctx, t, txA)
+			defer prhRollback(txA)
+			pidA := prhPID(ctx, t, txA)
 			var one int
-			if err := txA.QueryRow(fx.ctx, `SELECT 1 FROM runs WHERE id=$1 FOR NO KEY UPDATE`, run).Scan(&one); err != nil {
+			if err := txA.QueryRow(ctx, `SELECT 1 FROM runs WHERE id=$1 FOR NO KEY UPDATE`, run).Scan(&one); err != nil {
 				t.Fatal(err)
 			}
 
-			connB, err := fx.pool.Acquire(fx.ctx)
+			connB, err := fx.pool.Acquire(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer connB.Release()
-			pidB := prhPID(fx.ctx, t, connB)
-			type res struct {
-				n   int64
-				err error
-			}
-			done := make(chan res, 1)
+			pidB := prhPID(ctx, t, connB)
+			done := make(chan prhRes, 1)
+			finished := make(chan struct{})
 			go func() {
-				n, err := v.del(fx.ctx, store.New(connB.Conn()), fx)
-				done <- res{n, err}
+				defer close(finished)
+				n, err := v.del(ctx, store.New(connB.Conn()), fx)
+				done <- prhRes{n, err}
 			}()
-			prhWaitBlocked(fx.ctx, t, fx.pool, pidB, pidA)
+			defer prhJoin(cancel, finished)()
+			prhWaitBlocked(ctx, t, fx.pool, pidB, pidA)
 
 			// Session C: B waiting on the run lock must not already hold the repo (or connection) row.
-			txC, err := fx.pool.Begin(fx.ctx)
+			txC, err := fx.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := txC.QueryRow(fx.ctx, `SELECT 1 FROM repos WHERE id=$1 FOR KEY SHARE NOWAIT`, fx.repoID).Scan(&one); err != nil {
+			defer prhRollback(txC)
+			if err := txC.QueryRow(ctx, `SELECT 1 FROM repos WHERE id=$1 FOR KEY SHARE NOWAIT`, fx.repoID).Scan(&one); err != nil {
 				t.Fatalf("repos FOR KEY SHARE NOWAIT while B waits: %v", err)
 			}
 			if v.extraC != nil {
-				if err := v.extraC(fx.ctx, fx, txC); err != nil {
+				if err := v.extraC(ctx, fx, txC); err != nil {
 					t.Fatalf("forge_connections FOR KEY SHARE NOWAIT while B waits: %v", err)
 				}
 			}
-			if err := txC.Rollback(fx.ctx); err != nil {
+			if err := txC.Rollback(ctx); err != nil {
 				t.Fatal(err)
 			}
 
-			n, err := prhBeginObserve(fx.ctx, txA, run, "merged", prhAt(1))
+			n, err := prhBeginObserve(ctx, txA, run, "merged", prhAt(1))
 			if err != nil || n != 1 {
 				t.Fatalf("A observe = (%d, %v), want (1, nil); sqlstate %q", n, err, prhSQLState(err))
 			}
-			if err := txA.Commit(fx.ctx); err != nil {
+			if err := txA.Commit(ctx); err != nil {
 				t.Fatalf("A commit: %v", err)
 			}
 			select {
@@ -862,34 +935,35 @@ func TestPRHistoryPrelockedDeleteOrderLiveDB(t *testing.T) {
 
 		t.Run(v.name+"/delete commits first then observation returns 0", func(t *testing.T) {
 			fx := newPRHFixture(t)
+			ctx, cancel := context.WithTimeout(fx.ctx, 90*time.Second)
+			defer cancel()
 			run := fx.newRun(1, "opened")
-			txB, err := fx.pool.Begin(fx.ctx)
+			txB, err := fx.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = txB.Rollback(fx.ctx) }()
-			n, err := v.del(fx.ctx, store.New(txB), fx)
+			defer prhRollback(txB)
+			n, err := v.del(ctx, store.New(txB), fx)
 			if err != nil || n != 1 {
 				t.Fatalf("B delete in tx = (%d, %v)", n, err)
 			}
-			connA, err := fx.pool.Acquire(fx.ctx)
+			connA, err := fx.pool.Acquire(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer connA.Release()
-			pidA := prhPID(fx.ctx, t, connA)
-			pidB := prhPID(fx.ctx, t, txB)
-			type res struct {
-				n   int64
-				err error
-			}
-			done := make(chan res, 1)
+			pidA := prhPID(ctx, t, connA)
+			pidB := prhPID(ctx, t, txB)
+			done := make(chan prhRes, 1)
+			finished := make(chan struct{})
 			go func() {
-				n, err := prhObserve(fx.ctx, store.New(connA.Conn()), run, "merged", prhAt(1), nil)
-				done <- res{n, err}
+				defer close(finished)
+				n, err := prhObserve(ctx, store.New(connA.Conn()), run, "merged", prhAt(1), nil)
+				done <- prhRes{n, err}
 			}()
-			prhWaitBlocked(fx.ctx, t, fx.pool, pidA, pidB)
-			if err := txB.Commit(fx.ctx); err != nil {
+			defer prhJoin(cancel, finished)()
+			prhWaitBlocked(ctx, t, fx.pool, pidA, pidB)
+			if err := txB.Commit(ctx); err != nil {
 				t.Fatalf("B commit: %v", err)
 			}
 			select {
@@ -971,19 +1045,15 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		return tx
 	}
 
-	type res struct {
-		n   int64
-		err error
-	}
-
 	t.Run("watcher loses", func(t *testing.T) {
 		fx, p := setup(t)
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
 		f := fx.f
 		dt := prhDeadlockTimeout(ctx, t, f.pool)
 
 		txA := begin(ctx, t, f.pool, "")
-		defer func() { _ = txA.Rollback(ctx) }()
+		defer prhRollback(txA)
 		pidA := prhPID(ctx, t, txA)
 		var one int
 		if err := txA.QueryRow(ctx, `SELECT 1 FROM runs WHERE id=$1 FOR NO KEY UPDATE`, fx.checkerID).Scan(&one); err != nil {
@@ -991,16 +1061,19 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		}
 
 		txB := begin(ctx, t, f.pool, "")
-		defer func() { _ = txB.Rollback(ctx) }()
+		defer prhRollback(txB)
 		pidB := prhPID(ctx, t, txB)
-		doneB := make(chan res, 1)
+		doneB := make(chan prhRes, 1)
+		finished := make(chan struct{})
 		go func() {
+			defer close(finished)
 			n, err := store.New(txB).DeleteRepoForUser(ctx, store.DeleteRepoForUserParams{ID: f.repoID, UserID: f.userID})
 			if err == nil {
 				err = txB.Commit(ctx)
 			}
-			doneB <- res{n, err}
+			doneB <- prhRes{n, err}
 		}()
+		defer prhJoin(cancel, finished)()
 		prhWaitBlocked(ctx, t, f.pool, pidB, pidA)
 		time.Sleep(2*dt + 500*time.Millisecond)
 
@@ -1008,14 +1081,14 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		if errA == nil {
 			errA = txA.Commit(ctx)
 		}
-		rB := <-doneB
+		rB := prhRecv(t, doneB, "B (delete)")
 		if got := prhSQLState(errA); got != "40P01" {
 			t.Fatalf("A (watcher) = (%d, %v) sqlstate %q, want 40P01", nA, errA, got)
 		}
 		if rB.err != nil || rB.n != 1 {
 			t.Fatalf("B (delete) = (%d, %v) sqlstate %q, want committed with 1 row", rB.n, rB.err, prhSQLState(rB.err))
 		}
-		_ = txA.Rollback(ctx)
+		prhRollback(txA)
 		if c := p.count(`SELECT count(*) FROM repos WHERE id=$1`, f.repoID); c != 0 {
 			t.Fatalf("repo remains: %d", c)
 		}
@@ -1032,27 +1105,31 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 
 	t.Run("delete loses", func(t *testing.T) {
 		fx, p := setup(t)
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
 		f := fx.f
 
 		txA := begin(ctx, t, f.pool, "60s")
-		defer func() { _ = txA.Rollback(ctx) }()
+		defer prhRollback(txA)
 		pidA := prhPID(ctx, t, txA)
 		var one int
 		if err := txA.QueryRow(ctx, `SELECT 1 FROM runs WHERE id=$1 FOR NO KEY UPDATE`, fx.checkerID).Scan(&one); err != nil {
 			t.Fatal(err)
 		}
 		txB := begin(ctx, t, f.pool, "3s")
-		defer func() { _ = txB.Rollback(ctx) }()
+		defer prhRollback(txB)
 		pidB := prhPID(ctx, t, txB)
-		doneB := make(chan res, 1)
+		doneB := make(chan prhRes, 1)
+		finished := make(chan struct{})
 		go func() {
+			defer close(finished)
 			n, err := store.New(txB).DeleteRepoForUser(ctx, store.DeleteRepoForUserParams{ID: f.repoID, UserID: f.userID})
 			if err == nil {
 				err = txB.Commit(ctx)
 			}
-			doneB <- res{n, err}
+			doneB <- prhRes{n, err}
 		}()
+		defer prhJoin(cancel, finished)()
 		prhWaitBlocked(ctx, t, f.pool, pidB, pidA)
 
 		nA, errA := observeChild(ctx, txA, fx)
@@ -1062,11 +1139,11 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		if err := txA.Commit(ctx); err != nil {
 			t.Fatalf("A commit: %v", err)
 		}
-		rB := <-doneB
+		rB := prhRecv(t, doneB, "B (delete)")
 		if got := prhSQLState(rB.err); got != "40P01" {
 			t.Fatalf("B (delete) = (%d, %v) sqlstate %q, want 40P01", rB.n, rB.err, got)
 		}
-		_ = txB.Rollback(ctx)
+		prhRollback(txB)
 		if c := p.count(`SELECT count(*) FROM repos WHERE id=$1`, f.repoID); c != 1 {
 			t.Fatalf("repo count = %d, want 1 (delete lost)", c)
 		}

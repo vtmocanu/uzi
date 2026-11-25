@@ -345,17 +345,18 @@ func historyProviderTime(mr forge.MergeRequest) *time.Time {
 
 var (
 	providerTimeMin = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-	providerTimeMax = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	providerTimeEnd = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) // exclusive
+
 )
 
 // providerTimeParam maps a provider time to the statement's nullable parameter: nil,
-// zero, before 1970-01-01T00:00:00Z or after 9999-12-31T23:59:59Z (UTC) is NULL.
+// zero, before 1970-01-01T00:00:00Z or at/after 10000-01-01T00:00:00Z (UTC) is NULL.
 func providerTimeParam(t *time.Time) pgtype.Timestamptz {
 	if t == nil || t.IsZero() {
 		return pgtype.Timestamptz{}
 	}
 	u := t.UTC()
-	if u.Before(providerTimeMin) || u.After(providerTimeMax) {
+	if u.Before(providerTimeMin) || !u.Before(providerTimeEnd) {
 		return pgtype.Timestamptz{}
 	}
 	return pgtype.Timestamptz{Time: u, Valid: true}
