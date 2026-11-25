@@ -1,3 +1,35 @@
+import type {
+  AnalyticsScopeDTO,
+  AnalyticsBucketDTO,
+  AnalyticsRollingDTO,
+  AnalyticsEnvelopeDTO,
+  AnalyticsRepoOptionDTO,
+  AnalyticsRepoOptionsDTO,
+  AnalyticsUserOptionDTO,
+  AnalyticsUserOptionsDTO,
+  AnalyticsOptionsDTO,
+  AnalyticsDisclosureDTO,
+  AnalyticsCoverageDTO,
+  AnalyticsSpendBlockDTO,
+  AnalyticsSpendCellDTO,
+  AnalyticsSpendTotalsDTO,
+  AnalyticsSplitGroupDTO,
+  AnalyticsSplitDTO,
+  AnalyticsRatioDTO,
+  AnalyticsRatioCellDTO,
+  AnalyticsRatioPanelDTO,
+  AnalyticsCacheReadDTO,
+  AnalyticsTopRunDTO,
+  AnalyticsNullableNumberDTO,
+  AnalyticsOutcomesDTO,
+  AnalyticsBreakdownRowDTO,
+  AnalyticsBreakdownDTO,
+  AnalyticsSpendDTO,
+} from "./apiTypes";
+import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
+import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
+import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
+import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
 import type { CrossCheckHistoryDTO, CrossCheckHistoryAvailabilityDTO, FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
 import crossHistoryFull from "../../../fixtures/api-contract/cross_check_history.full.json";
 import crossHistoryZero from "../../../fixtures/api-contract/cross_check_history.zero.json";
@@ -2354,16 +2386,6 @@ it("created issues are optional detail metadata and excluded from summaries", ()
 });
 
 // ── Scoped usage analytics (issue #4684) ─────────────────────────────────────
-import type {
-  AnalyticsOptionsDTO,
-  AnalyticsSpendDTO,
-  AnalyticsSpendBlockDTO,
-  AnalyticsRatioPanelDTO,
-} from "./apiTypes";
-import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
-import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
-import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
-import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
 
 // The zero fixtures are json.Marshal of a zero DTO, so every slice is null there although the
 // handler emits [] on the real wire (the TS types say never-null arrays). NullSlices lets
@@ -2552,5 +2574,48 @@ describe("analytics spend contract (issue #4684)", () => {
     expect(zero.totals.current.cost_usd).toBe(0);
     expect(zero.totals.current.disclosure.incomplete).toBe(false);
     expect(zero.window).toBe("");
+  });
+});
+
+// Exact nullability of every analytics DTO: NullKeys lists the fields whose type admits null,
+// and each assertion pins that to the Go side's *T fields (api/internal/apitypes/analytics.go).
+// omitempty pointers (previous, previous_from, previous_to) are absent, never null, so they
+// are not listed. A field gaining null or losing it leaves a non-never diff and fails typecheck.
+describe("analytics DTO exact nullability (issue #4684)", () => {
+  type NullKeys<T> = { [K in keyof T]-?: null extends T[K] ? K : never }[keyof T];
+  type UnionDiff<A, B> = Exclude<A, B> | Exclude<B, A>;
+  const _scope: never = null as unknown as UnionDiff<NullKeys<AnalyticsScopeDTO>, never>;
+  const _bucket: never = null as unknown as UnionDiff<NullKeys<AnalyticsBucketDTO>, never>;
+  const _rolling: never = null as unknown as UnionDiff<NullKeys<AnalyticsRollingDTO>, never>;
+  const _envelope: never = null as unknown as UnionDiff<NullKeys<AnalyticsEnvelopeDTO>, "history_start">;
+  const _repoOption: never = null as unknown as UnionDiff<NullKeys<AnalyticsRepoOptionDTO>, never>;
+  const _repoOptions: never = null as unknown as UnionDiff<NullKeys<AnalyticsRepoOptionsDTO>, never>;
+  const _userOption: never = null as unknown as UnionDiff<NullKeys<AnalyticsUserOptionDTO>, never>;
+  const _userOptions: never = null as unknown as UnionDiff<NullKeys<AnalyticsUserOptionsDTO>, never>;
+  const _options: never = null as unknown as UnionDiff<NullKeys<AnalyticsOptionsDTO>, "users" | "users_reason">;
+  const _disclosure: never = null as unknown as UnionDiff<NullKeys<AnalyticsDisclosureDTO>, never>;
+  const _coverage: never = null as unknown as UnionDiff<NullKeys<AnalyticsCoverageDTO>, "value" | "reason">;
+  const _block: never = null as unknown as UnionDiff<NullKeys<AnalyticsSpendBlockDTO>, never>;
+  const _cell: never = null as unknown as UnionDiff<NullKeys<AnalyticsSpendCellDTO>, never>;
+  const _totals: never = null as unknown as UnionDiff<NullKeys<AnalyticsSpendTotalsDTO>, never>;
+  const _group: never = null as unknown as UnionDiff<NullKeys<AnalyticsSplitGroupDTO>, "key" | "label" | "id">;
+  const _split: never = null as unknown as UnionDiff<NullKeys<AnalyticsSplitDTO>, never>;
+  const _ratio: never = null as unknown as UnionDiff<NullKeys<AnalyticsRatioDTO>, "value" | "reason">;
+  const _ratioCell: never = null as unknown as UnionDiff<NullKeys<AnalyticsRatioCellDTO>, "value" | "reason">;
+  const _panel: never = null as unknown as UnionDiff<NullKeys<AnalyticsRatioPanelDTO>, never>;
+  const _cache: never = null as unknown as UnionDiff<NullKeys<AnalyticsCacheReadDTO>, "value" | "reason">;
+  const _topRun: never = null as unknown as UnionDiff<NullKeys<AnalyticsTopRunDTO>, "repo_id" | "repo_path">;
+  const _nullableNumber: never = null as unknown as UnionDiff<NullKeys<AnalyticsNullableNumberDTO>, "value" | "reason">;
+  const _outcomes: never = null as unknown as UnionDiff<NullKeys<AnalyticsOutcomesDTO>, never>;
+  const _row: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownRowDTO>, "key" | "label" | "id">;
+  const _breakdown: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownDTO>, never>;
+  const _spend: never = null as unknown as UnionDiff<NullKeys<AnalyticsSpendDTO>, "history_start">;
+  it("pins every analytics DTO's nullable fields", () => {
+    void [
+      _scope, _bucket, _rolling, _envelope, _repoOption, _repoOptions, _userOption, _userOptions, _options,
+      _disclosure, _coverage, _block, _cell, _totals, _group, _split, _ratio, _ratioCell, _panel, _cache,
+      _topRun, _nullableNumber, _outcomes, _row, _breakdown, _spend,
+    ];
+    expect(true).toBe(true);
   });
 });

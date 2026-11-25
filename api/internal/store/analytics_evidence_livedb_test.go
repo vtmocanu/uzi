@@ -341,15 +341,35 @@ func (h *evHarness) logDisk(label string) {
 
 // ---- workloads ----
 
+// evSpendOpts are the optional filters of a spend workload. The zero value reproduces the
+// unfiltered call: every kind, no harness filter, repo names hidden (the owner route).
+type evSpendOpts struct {
+	harness     string   // "" means no harness filter
+	kinds       []string // nil means runkind.All()
+	revealRepos bool     // the admin route sets this on the owner-scoped statement
+}
+
 func (h *evHarness) spendWorkload(name string, owner uuid.UUID, win analytics.Window, split, breakdown string) evWorkload {
 	h.t.Helper()
-	kinds := runkind.All()
+	return h.spendWorkloadWith(name, owner, win, split, breakdown, evSpendOpts{})
+}
+
+func (h *evHarness) spendWorkloadWith(name string, owner uuid.UUID, win analytics.Window, split, breakdown string, opts evSpendOpts) evWorkload {
+	h.t.Helper()
+	kinds := opts.kinds
+	if kinds == nil {
+		kinds = runkind.All()
+	}
+	var harness pgtype.Text
+	if opts.harness != "" {
+		harness = pgtype.Text{String: opts.harness, Valid: true}
+	}
 	var hist pgtype.Timestamptz
 	var err error
 	if owner != uuid.Nil {
-		hist, err = h.q.AnalyticsOwnerHistoryStart(h.ctx, store.AnalyticsOwnerHistoryStartParams{UserID: owner, Kinds: kinds})
+		hist, err = h.q.AnalyticsOwnerHistoryStart(h.ctx, store.AnalyticsOwnerHistoryStartParams{UserID: owner, Harness: harness, Kinds: kinds})
 	} else {
-		hist, err = h.q.AnalyticsAllHistoryStart(h.ctx, store.AnalyticsAllHistoryStartParams{Kinds: kinds})
+		hist, err = h.q.AnalyticsAllHistoryStart(h.ctx, store.AnalyticsAllHistoryStartParams{Harness: harness, Kinds: kinds})
 	}
 	if err != nil {
 		h.t.Fatalf("history start: %v", err)
@@ -368,14 +388,15 @@ func (h *evHarness) spendWorkload(name string, owner uuid.UUID, win analytics.Wi
 		prev = spendTS(*b.PreviousFrom)
 	}
 	ownerP := store.AnalyticsOwnerSpendParams{
-		UserID: owner, RevealRepos: false,
+		UserID: owner, RevealRepos: opts.revealRepos, Harness: harness,
 		Now: spendTS(b.Now), From: spendTS(b.From), PreviousFrom: prev, FoldFrom: spendTS(b.FoldFrom),
 		BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
 		RollStarts: spendTSs(b.RollStarts), RollEnds: spendTSs(b.RollEnds),
 		Kinds: kinds, DeliveryKinds: runkind.Delivery(), Split: split, Breakdown: breakdown,
 	}
 	allP := store.AnalyticsAllSpendParams{
-		Now: spendTS(b.Now), From: spendTS(b.From), PreviousFrom: prev, FoldFrom: spendTS(b.FoldFrom),
+		Harness: harness,
+		Now:     spendTS(b.Now), From: spendTS(b.From), PreviousFrom: prev, FoldFrom: spendTS(b.FoldFrom),
 		BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
 		RollStarts: spendTSs(b.RollStarts), RollEnds: spendTSs(b.RollEnds),
 		Kinds: kinds, DeliveryKinds: runkind.Delivery(), Split: split, Breakdown: breakdown,
@@ -468,6 +489,11 @@ func (h *evHarness) workloads() []evWorkload {
 		h.spendWorkload("admin-all-window-user-user", uuid.Nil, analytics.WindowAll, "user", "user"),
 		h.spendWorkload("admin-30d-repo-repo", uuid.Nil, analytics.Window30d, "repo", "repo"),
 		h.spendWorkload("admin-all-window-repo-repo", uuid.Nil, analytics.WindowAll, "repo", "repo"),
+		h.spendWorkload("owner-window-all", h.topOwner, analytics.WindowAll, "harness", "kind"),
+		h.spendWorkloadWith("owner-30d-harness-kind", h.topOwner, analytics.Window30d, "harness", "kind",
+			evSpendOpts{harness: "claude", kinds: []string{runkind.Issue}}),
+		h.spendWorkloadWith("admin-user-30d-harness-kind", h.topOwner, analytics.Window30d, "harness", "kind",
+			evSpendOpts{harness: "claude", kinds: []string{runkind.Issue}, revealRepos: true}),
 	}
 	all = append(all, h.optionWorkloads()...)
 	only := os.Getenv("UZI_EVIDENCE_ONLY")
