@@ -1,0 +1,12 @@
+[
+  {
+    "id": "example",
+    "version": "1.0.0",
+    "page": "./Page",
+    "label": "Example",
+    "icon": "package",
+    "navGroup": "modules",
+    "adminOnly": false,
+    "upstream": "example-module:8080"
+  }
+]

@@ -64,6 +64,10 @@
   // `scripts/modules-browser-test.mjs` is the runtime-modules harness (`npm run
   // test:modules-browser`); knip reaches it through that package.json script, and it imports
   // browser-launch.mjs and modules-manifest-traversal.mjs, so those need no line.
+  // `scripts/modules-compose-check.mjs` (PRD #4686) is the browser step of the opt-in compose
+  // acceptance (`task test:web-modules-compose`): scripts/web-modules-compose-acceptance.sh
+  // copies it into a Playwright container and runs it with node, so no package.json script
+  // or import reaches it. It imports browser-launch.mjs, which therefore needs no line.
   // `nginx-modules.js` (PRD #4686) is the njs module the web nginx loads (`js_import` in
   // nginx-main.conf, COPY'd into both web images). Nothing in the JS graph imports it; its
   // `default` export is read by nginx, so `exports` is ignored for it below.
@@ -72,6 +76,7 @@
     "nginx-modules.js",
     "scripts/gen-favicon-png.mjs",
     "scripts/csp-build-scan.mjs",
+    "scripts/modules-compose-check.mjs",
     "examples/ui-module/vite.config.ts",
     "examples/ui-module/src/Page.tsx"
   ],

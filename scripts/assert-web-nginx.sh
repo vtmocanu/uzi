@@ -33,20 +33,20 @@
 # /etc/nginx/uzi-modules/ naming one module `example`), and the stub upstream answers as that
 # module's origin (alias `modup`) with deliberately hostile headers. The per-module location is
 # scripts/fixtures/web-modules/location.example.conf, the block the chart and the compose
-# generator emit. Asserted in all three configs: the host security headers and CSP exactly
-# once, every upstream cache/cookie/security header and every X-Accel-* header stripped,
-# X-Accel-Redirect not followed, Cookie and Authorization not forwarded, GET and HEAD only,
+# generator emit (scripts/web-modules-gen.test.sh and assert-web-modules-render.sh diff both).
+# Asserted in all three configs: the host security headers and CSP exactly once, every upstream
+# cache/cookie/security header and every X-Accel-* header stripped, X-Accel-Redirect not followed, Cookie and Authorization not forwarded, GET and HEAD only,
 # the Cache-Control split per path and final status, /modules.json, an unknown id, an absent
 # upstream (nginx still starts), and that web/nginx-main.conf is the pinned image's own
 # nginx.conf plus exactly the two njs lines. The module resolver is Docker's embedded DNS
 # (127.0.0.11) in every variant: the throwaway network has no other DNS a name could be
 # resolved by, so it stands in for the cluster DNS IP the chart's web.nginx.resolver names.
 # Module resolution is independent of the chart's dynamicResolution (false here).
-# The chart variants (chart, chartdyn) do not use the fixture: their modules.json and locations.conf
-# are the ConfigMap keys the chart renders from web.modules[] (chart-modules.yaml, built below), so
-# real nginx runs the blocks the chart emits; the stub also answers to modup.uzi.svc.cluster.local,
-# the host a dotless `modup` upstream expands to. The compose and mock variants still use the
-# fixture template until the compose generator (scripts/web-modules-gen.py) lands.
+# The chart variants (chart, chartdyn) take their modules.json and locations.conf from the
+# ConfigMap keys the chart renders from web.modules[] (chart-modules.yaml, built below), so real
+# nginx runs the blocks the chart emits; the stub also answers to modup.uzi.svc.cluster.local,
+# the host a dotless `modup` upstream expands to. The compose and mock variants take theirs from
+# scripts/web-modules-gen.py, run on the same four modules.
 #
 # Three more passes: (1) the image defaults, once per variant, using the real
 # web/nginx-modules-default/ dir and no fixture modules (/modules.json is `[]`, an unknown
@@ -82,13 +82,13 @@ HIDDEN_EXTRA="Service-Worker-Allowed Clear-Site-Data Strict-Transport-Security R
 
 broken() { echo "BROKEN: $*" >&2; exit 2; }
 
-for tool in docker helm yq curl gzip cmp; do
+for tool in docker helm yq curl gzip cmp python3; do
   command -v "$tool" >/dev/null 2>&1 || broken "$tool not on PATH"
 done
 docker info >/dev/null 2>&1 || broken "docker daemon not reachable"
 for f in web/Dockerfile web/Dockerfile.mock web/nginx.conf web/nginx.mock.conf web/nginx-main.conf web/nginx-modules.js \
   web/nginx-modules-default/modules.json web/nginx-modules-default/locations.conf \
-  scripts/fixtures/web-modules/location.example.conf deploy/chart/Chart.yaml; do
+  scripts/fixtures/web-modules/location.example.conf scripts/web-modules-gen.py deploy/chart/Chart.yaml; do
   [ -f "$ROOT/$f" ] || broken "missing $ROOT/$f"
 done
 
@@ -173,7 +173,7 @@ awk '
   { print }
 ' "$ROOT/deploy/chart/Chart.yaml" > "$CHART/Chart.yaml"
 # The modules the chart variants run: web.modules[] rendered by the chart itself, so real nginx
-# loads the blocks the chart emits (the compose and mock variants use the fixture template).
+# loads the blocks the chart emits (the compose and mock variants use the compose generator).
 # `example` is the module origin (the stub, alias modup); a dotless upstream expands to
 # <host>.<release namespace>.svc.cluster.local, so the stub also answers to modup.uzi.svc.cluster.local
 # (the render below uses --namespace uzi). The ghosts exist only to prove an absent upstream does
@@ -360,25 +360,23 @@ STUBMOD
 # The module config of the compose and mock containers: `example` is served by the stub (alias
 # modup); the ghosts exist only to prove an absent upstream does not stop nginx (one name never
 # resolves, one resolves to a port nothing listens on). The chart containers get the same set
-# from the chart's own render (chart-modules.yaml above), not from this fixture template.
-MOD_RESOLVER=127.0.0.11
-MODULES_JSON='[{"id":"example","version":"1.0.0","page":"Page","label":"Example","icon":"package","navGroup":"modules","adminOnly":false}]'
-LOC_TEMPLATE="$ROOT/scripts/fixtures/web-modules/location.example.conf"
-render_loc() { # <resolver> <upstream> [<id> <var-suffix>]
-  sed -e "s/@UZI_RESOLVER@/$1/g" -e "s/@UZI_UPSTREAM@/$2/g" \
-    -e "s#/modules/example/#/modules/${3:-example}/#" -e "s/uzi_module_example/uzi_module_${4:-example}/g" "$LOC_TEMPLATE"
-}
+# from the chart's own render (chart-modules.yaml above).
+# The compose and mock variants get their uzi-modules dir from the compose generator itself
+# (scripts/web-modules-gen.py), run on the same module set the chart variants render, so real
+# nginx loads the blocks and the public list the generator emits. The generator's resolver is
+# Docker's embedded DNS (127.0.0.11), which is the resolver of the throwaway network here too.
+cat > "$W/gen-modules.json" <<'GENMODULES'
+[
+  {"id": "example", "version": "1.0.0", "page": "Page", "label": "Example", "icon": "package", "navGroup": "modules", "upstream": "modup:8080"},
+  {"id": "ghost-dns", "version": "1.0.0", "page": "Page", "label": "Ghost DNS", "icon": "package", "navGroup": "modules", "upstream": "ghost.invalid:8080"},
+  {"id": "ghost-conn", "version": "1.0.0", "page": "Page", "label": "Ghost Conn", "icon": "package", "navGroup": "modules", "upstream": "modup:9"},
+  {"id": "cc", "version": "1.0.0", "page": "Page", "label": "CC", "icon": "package", "navGroup": "modules", "upstream": "modup:8080"}
+]
+GENMODULES
 for v in compose mock; do
-  mkdir -p "$W/uzi-modules.$v"
-  printf '%s\n' "$MODULES_JSON" > "$W/uzi-modules.$v/modules.json"
-  {
-    render_loc "$MOD_RESOLVER" modup:8080
-    render_loc "$MOD_RESOLVER" "ghost.invalid:8080" ghost-dns ghost_dns
-    render_loc "$MOD_RESOLVER" modup:9 ghost-conn ghost_conn
-    render_loc "$MOD_RESOLVER" modup:8080 cc cc
-  } > "$W/uzi-modules.$v/locations.conf"
+  python3 -I "$ROOT/scripts/web-modules-gen.py" "$W/gen-modules.json" "$W/uzi-modules.$v" >/dev/null || broken "web-modules-gen.py failed for $v"
 done
-! grep -q '@UZI_' "$W/uzi-modules.compose/locations.conf" || broken "location template placeholders not fully substituted"
+! grep -q '@' "$W/uzi-modules.compose/locations.conf" || broken "the generator left a placeholder in locations.conf"
 ! grep -q '@UZI_' "$W/uzi-modules.chart/locations.conf" || broken "the chart left a location placeholder in locations.conf"
 # nginx runs as uid 101 inside the image: everything copied in must be world-readable.
 # Exercise the exact owner-input proxy ceiling and its first rejected byte.

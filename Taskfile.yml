@@ -343,6 +343,11 @@ tasks:
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
       - task: test:web-nginx-cleanup
+      # Hermetic contract of the compose web-modules generator (scripts/web-modules-gen.py, PRD
+      # #4686): the upstream list and the chart values fixtures it shares with the chart's
+      # render driver, no-write-on-invalid, modes, rename order and the projection. Needs
+      # python3, jq and yq (the same tools test:refresh-role-manifest already needs here).
+      - task: test:web-modules-gen
       # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
       # fake `go install` failing then succeeding, no real gitleaks and no network,
       # proving a transient proxy failure is retried while a broken scan is not.
@@ -1120,6 +1125,11 @@ tasks:
     desc: hermetic cleanup-ownership contract for assert-web-nginx.sh (fake docker/helm/yq, no network)
     cmds:
       - ./scripts/assert-web-nginx.test.sh
+
+  test:web-modules-gen:
+    desc: hermetic contract of scripts/web-modules-gen.py, the compose web-modules generator (no docker, no network)
+    cmds:
+      - ./scripts/web-modules-gen.test.sh
 
   test:sqlc-drift-gate:
     desc: hermetic sqlc release acquisition and drift-gate contracts (fixture archives, no network)
@@ -3467,6 +3477,17 @@ tasks:
     # task reports either failure as 201.
     cmds:
       - ./scripts/assert-web-nginx.sh
+
+  test:web-modules-compose:
+    desc: Opt-in live compose acceptance of runtime web modules (PRD 4686, m5); builds the stack from source
+    # Runs scripts/web-modules-compose-acceptance.sh: a throwaway project mh-4686-<pid> rendered
+    # to a literal file with `env -i`, built once, started with no modules and then with the
+    # example module, driven by a Playwright container. Needs a docker daemon with compose,
+    # jq, yq and python3; the api image builds from source, so it takes many minutes. NOT wired
+    # into gate, gate:repo or gate:web. Exit 2 means the instrument is broken, 1 means a check
+    # failed, and task reports either failure as 201.
+    cmds:
+      - ./scripts/web-modules-compose-acceptance.sh
 
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)
