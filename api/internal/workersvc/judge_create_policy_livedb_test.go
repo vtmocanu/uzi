@@ -758,9 +758,9 @@ func TestJudgeSkipProviderReasonsCommittedLiveDB(t *testing.T) {
 		userID, repoID := seedCodexOnlyOriginUser(t, env)
 		svc := judgeEnqueueSvc(env, userID)
 		provider, _ := seedCodexProviderKeyFor(t, env, userID)
-		env.exec(`UPDATE users SET codex_provider_id = $2 WHERE id = $1`, userID, provider)
+		env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = id WHERE id = $1`, userID, provider)
 		t.Cleanup(func() {
-			_, _ = env.pool.Exec(env.ctx, `UPDATE users SET codex_provider_id = NULL WHERE id = $1`, userID)
+			_, _ = env.pool.Exec(env.ctx, `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, userID)
 		})
 		target := seedJudgeTarget(t, env, userID, repoID, "codex", 9811)
 		svc.maybeEnqueueJudge(env.ctx, target)
@@ -889,7 +889,7 @@ func TestCodexJudgeClaudeSourceOwnerLiveDB(t *testing.T) {
 	provider, _ := seedProviderFor(t, env, userID, pvDefaultMap)
 	env.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, userID, provider)
 	t.Cleanup(func() {
-		_, _ = env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL, codex_provider_id = NULL WHERE id = $1`, userID)
+		_, _ = env.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL, codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, userID)
 	})
 
 	auto := seedJudgeTarget(t, env, userID, repoID, "claude", 9821)
@@ -912,7 +912,7 @@ func TestCodexJudgeClaudeSourceOwnerLiveDB(t *testing.T) {
 
 	// A Codex source refuses the Codex judge on both paths.
 	codexProvider, _ := seedCodexProviderKeyFor(t, env, userID)
-	env.exec(`UPDATE users SET codex_provider_id = $2 WHERE id = $1`, userID, codexProvider)
+	env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = id WHERE id = $1`, userID, codexProvider)
 	refusedAuto := seedJudgeTarget(t, env, userID, repoID, "claude", 9823)
 	svc.maybeEnqueueJudge(env.ctx, refusedAuto)
 	noJudgeAnywhere(t, env, refusedAuto.ID, "a Codex source")
