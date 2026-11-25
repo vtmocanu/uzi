@@ -215,10 +215,12 @@ Planned, Later) rather than a hardcoded column, so a backlog placement is
 never lost. A manual drag always wins — move a card by hand after a run has
 started and automation leaves it alone from then on. Moves are best-effort
 against the forge: one that fails (e.g. GitLab briefly unreachable) is
-retried in the background every 30 seconds for the first 30 minutes, then
-every 10 minutes (batch-limited); retries stop once the move has been pending
-for 24 hours, without blocking the run. When a newer run starts on the same
-issue, an older run's pending move is dropped so it cannot move the newer
+retried in the background, without blocking the run, every 30 seconds for the
+first 30 minutes and then every 10 minutes (batch-limited, oldest first).
+Retries stop once the move has been pending for 24 hours; move the card by
+hand then (admin health's `board.drift` lists these moves). When a newer run
+is created for the same issue, an older run's pending move is skipped, and its
+marker cleared, the next time it is attempted, so it does not move the newer
 run's card.
 
 Closing a completed run's merge request without merging it is treated as

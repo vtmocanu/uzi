@@ -174,7 +174,7 @@ Tracked as GitLab issue vtmocanu/uzi#12; PRD at `prds/done/12-board-run-lifecycl
 - Issues move board columns automatically with the run lifecycle: In Progress while agents work, a review column once the MR is open. Hand-dragging is the defect being fixed.
 - The board shows that runs happened/are happening: run badges + MR link on the card; the board updates itself (no manual Refresh).
 - Clicking an issue stays in-platform: an in-app issue view with its runs and a start-run action. GitLab remains reachable via an explicit icon.
-- Failed forge column moves are retried via reconciliation — not dropped, not a persisted move queue. (2026-07-04 user review; the "no retry, next lifecycle event heals it" stance was rejected because `completed` is terminal.) Retries run every 30 s for the first 30 minutes, then every 10 minutes (batch-limited) until the move has been pending for 24 hours; a run's retry is skipped when its context read sees a strictly later run on the same repo and issue (#4704). (AI-synced 2026-11-25)
+- Failed forge column moves are retried via reconciliation — not dropped, not a persisted move queue. (2026-07-04 user review; the "no retry, next lifecycle event heals it" stance was rejected because `completed` is terminal.) Retries run every 30 s for the first 30 minutes, then every 10 minutes (batch-limited) until the move has been pending for 24 hours; a run's move (inline or retry) is skipped and its marker cleared when its context read sees a strictly later run on the same repo and issue (#4704). (AI-synced 2026-11-25)
 
 ## Feature #14 — UI redesign: "ember" theme
 
