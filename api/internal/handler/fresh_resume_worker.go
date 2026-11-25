@@ -219,6 +219,9 @@ func (h *Handler) refuseFreshPreSeedOnGuard(w http.ResponseWriter, r *http.Reque
 // transfer. It reports whether it wrote that reply. An unreadable probe is "no": the caller's own reply
 // stands.
 func (h *Handler) refuseFreshPreSeed(w http.ResponseWriter, r *http.Request, wkr store.Worker, run store.Run) bool {
+	if h.q == nil { // handlers wired without a store (unit tests) have no transfer to probe
+		return false
+	}
 	row, err := h.q.GetActiveFreshResumeForRun(r.Context(), run.ID)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
