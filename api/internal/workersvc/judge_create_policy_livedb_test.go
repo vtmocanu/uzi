@@ -973,7 +973,7 @@ func TestCodexProviderJudgeUnusableSourceLiveDB(t *testing.T) {
 			c.env.exec(`UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, c.key)
 		}, SourceUnusableKeyDisabled},
 		{"model map without a default", func(c *cjFix) {
-			p, _ := c.seedCodexProviderWithMap(`{"gpt-x":{"model":"y"}}`)
+			p, _ := c.seedCodexProviderWithMap(`{"gpt-6-sol":{"model":"y"}}`)
 			c.selectSource(p)
 		}, SourceUnusableInvalid},
 	}

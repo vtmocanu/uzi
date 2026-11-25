@@ -1198,7 +1198,8 @@ var ErrJudgePolicyChanged = errors.New("judge_policy_changed")
 // judgeLaneDecision is the judge's creation decision over one policy read (PRD #4322 M1a).
 type judgeLaneDecision struct {
 	// Vendor is true when the judge resolves vendor credentials only; false is the provider branch
-	// (a Claude judge bound to the owner's Claude source).
+	// (a Claude judge bound to the owner's Claude source, or a Codex judge bound to the owner's
+	// Codex source).
 	Vendor bool
 	// Harness is the judge's engine (Claude or Codex); it selects which source the provider branch
 	// freezes and which drift rule applies.
@@ -1265,20 +1266,25 @@ func requireJudgeAnthropicDefault(ctx context.Context, q judgeTokenReader, userI
 // no pin policy: it compares only the selected Codex source (decision, frozen and the locked re-read)
 // and ignores the Anthropic pin.
 func judgePolicyDrift(dec judgeLaneDecision, frozen uuid.UUID, now store.GetUserJudgeLanePolicyRow) error {
-	if dec.Harness == HarnessCodex {
+	switch dec.Harness {
+	case HarnessCodex:
 		if !dec.Policy.CodexProviderID.Valid || uuid.UUID(dec.Policy.CodexProviderID.Bytes) != frozen ||
 			!now.CodexProviderID.Valid || uuid.UUID(now.CodexProviderID.Bytes) != frozen {
 			return ErrJudgePolicyChanged
 		}
 		return nil
-	}
-	if !dec.Policy.ClaudeProviderID.Valid || uuid.UUID(dec.Policy.ClaudeProviderID.Bytes) != frozen {
+	case HarnessClaude:
+		if !dec.Policy.ClaudeProviderID.Valid || uuid.UUID(dec.Policy.ClaudeProviderID.Bytes) != frozen {
+			return ErrJudgePolicyChanged
+		}
+		if now.JudgeAnthropicBindMode != dec.Policy.JudgeAnthropicBindMode || now.JudgeAnthropicSecretID != dec.Policy.JudgeAnthropicSecretID {
+			return ErrJudgePolicyChanged
+		}
+		return nil
+	default:
+		// Fail closed: only Claude and Codex judges have a provider lane.
 		return ErrJudgePolicyChanged
 	}
-	if now.JudgeAnthropicBindMode != dec.Policy.JudgeAnthropicBindMode || now.JudgeAnthropicSecretID != dec.Policy.JudgeAnthropicSecretID {
-		return ErrJudgePolicyChanged
-	}
-	return nil
 }
 
 // judgeLaneNonAtomic is the judge decision for the creation paths that have no transaction (no

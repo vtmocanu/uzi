@@ -72,7 +72,7 @@ func TestDecideJudgeLane(t *testing.T) {
 func TestJudgePolicyDriftPrecedence(t *testing.T) {
 	a, b, secret := uuidOf(1), uuidOf(2), uuidOf(3)
 	base := store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModeDefault, ClaudeProviderID: a}
-	dec := judgeLaneDecision{Policy: base}
+	dec := judgeLaneDecision{Harness: HarnessClaude, Policy: base}
 	withPin := base
 	withPin.JudgeAnthropicBindMode, withPin.JudgeAnthropicSecretID = BindModePinned, secret
 	otherMode := base
@@ -94,7 +94,7 @@ func TestJudgePolicyDriftPrecedence(t *testing.T) {
 		{"pin secret changed", frozenA, otherSecret, dec, ErrJudgePolicyChanged},
 		{"pinned", frozenA, withPin, dec, ErrJudgePolicyChanged},
 		{"both changed", frozenB, withPin, dec, ErrJudgePolicyChanged},
-		{"decision had no source", frozenA, base, judgeLaneDecision{Policy: store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModeDefault}}, ErrJudgePolicyChanged},
+		{"decision had no source", frozenA, base, judgeLaneDecision{Harness: HarnessClaude, Policy: store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: BindModeDefault}}, ErrJudgePolicyChanged},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := judgePolicyDrift(tc.dec, tc.frozen, tc.now); !errors.Is(err, tc.want) {

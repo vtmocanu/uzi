@@ -209,7 +209,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// repos → forge_connections and returns no rows for a repo-less judge run, which
 	// the no-rows branch below would then fail as an owner mismatch, #1691)
 	// and before the bot-PAT open. A vendor judge's claim carries only the Anthropic token; a
-	// provider-bound Claude judge carries only its frozen provider binding, and a provider refusal
+	// provider-bound judge (Claude or Codex) carries only its frozen provider binding, and a provider refusal
 	// fails it terminally (credential_unavailable) rather than parking it (PRD #4322 D-G).
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,

@@ -1142,12 +1142,14 @@ func judgeDefaultChoice(c secretChoice) secretChoice {
 // claim (it can be MB).
 //
 // PRD #1429 M3 (D4): harness-authoritative, the judge-lane repair mirroring the ordinary
-// lane's claim_assembly.go one. A Codex judge run (run.Harness == harnessCodex) NEVER calls
+// lane's claim_assembly.go one. A vendor Codex judge run (run.Harness == harnessCodex) NEVER calls
 // judgeChoice / openWithAutoRetry / recordRunCredential: it opens no Anthropic credential,
 // writes no run_credential_epochs Anthropic row, and AnthropicOAuthToken stays "". Its
 // Secrets.Codex is attached below through the SAME codexClaimSecrets authority path the
 // ordinary lane uses — which is why this now takes the CLAIMING WORKER (wkr); codexClaimSecrets
-// needs it. A Claude judge run is byte-identical to before this repair. The judge lane still
+// needs it. A provider-bound judge (Claude or Codex) never reaches codexClaimSecrets and carries
+// only secrets.provider, its frozen binding. A vendor Claude judge run is byte-identical to before
+// this repair. The judge lane still
 // forks BEFORE GetRunClaimContext (a judge run has no repo) — that fork lives in
 // claim_assembly.go's assembleClaim, unchanged.
 func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
