@@ -1,0 +1,6 @@
+# Fixture for scripts/assert-web-modules-render.sh: a list entry that is not a map
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - just-a-string

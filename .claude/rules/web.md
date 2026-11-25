@@ -19,7 +19,7 @@ task test:web-browser  # *.browser.test.tsx in headless Chromium; first run: cd 
 task typecheck:web     # or check-docs:web, individually
 cd web && npx vitest run src/pages/Foo.test.tsx   # single file — no Task target
 cd web && npm run build                 # check-docs + tsc --noEmit + vite build
-cd web && VITE_UZI_MOCK=1 npm run dev   # mock mode — no backend, no network at all
+cd web && VITE_UZI_MOCK=1 npm run dev   # mock mode — no backend, no API calls; the only request beyond static assets is the same-origin /modules.json
 ```
 
 - knip gates every rule at `error`, including the unused-export/type family (#596): a new unused export reddens `task deadcode:web`. A missing knip loud-SKIPs (exit 0) locally, exits 2 in CI (`UZI_DEADCODE_WEB_REQUIRED=1`).
@@ -48,7 +48,7 @@ cd web && VITE_UZI_MOCK=1 npm run dev   # mock mode — no backend, no network a
 ## `vite dev` / `vite preview` talk to your live stack
 
 - `web/vite.config.ts` proxies `/api` to `http://127.0.0.1:8080` via `server.proxy` and has no `preview` override, so `vite preview` inherits it (`resolvePreviewOptions` returns `proxy: preview?.proxy ?? server.proxy`, vite 6.4.3). `web/package.json` ships `"preview": "vite preview"`, so a page that POSTs on mount writes to real uzi. Same class as the bare-`docker compose up` hazard in `.claude/rules/stack.md`.
-- Mitigate with `VITE_UZI_MOCK=1`: it replaces `api` wholesale, so the app makes no network calls at all.
+- Mitigate with `VITE_UZI_MOCK=1`: it replaces `api` wholesale, so the app makes no API calls (the only request beyond static assets is the same-origin `/modules.json`).
 - For the shipped `realApi` path, register every interception route before the first `open`. Precedence is not last-registered-wins: `unroute` a broad pattern rather than layering a narrow one over it.
 - Stub `/api/repos`, `/api/forge/connections` and `/api/runs` besides the endpoint under test, or their 401s trip the global logout redirect to `/login` before the surface renders.
 

@@ -404,6 +404,8 @@ audited_prd_refs = %w[
   api/internal/uzidocs/embed/skills.md
   api/internal/uzidocs/embed/slack.md
   api/internal/uzidocs/embed/vault-threat-model.md
+  api/internal/uzidocs/embed/web-modules-dev.md
+  api/internal/uzidocs/embed/web-modules.md
   api/internal/uzidocs/embed/worker-docker.md
   api/internal/workersvc/credential_override_livedb_test.go
   api/internal/workersvc/prd_done_path.go
@@ -438,6 +440,8 @@ audited_prd_refs = %w[
   docs/skills.md
   docs/slack.md
   docs/vault-threat-model.md
+  docs/web-modules-dev.md
+  docs/web-modules.md
   docs/worker-docker.md
   e2e/codex-m0/README.md
   e2e/codex-m4/MAINTAINER-HANDOFF.md

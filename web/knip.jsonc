@@ -48,7 +48,49 @@
   // their own (`index.html` -> `src/main.tsx`, `vite.config.ts`, the test files), and
   // those are additive to this. Verified by measurement, not by assumption: with this
   // key present the report is unchanged except for the one file it removes.
-  "entry": ["public/theme-preinit.js", "scripts/gen-favicon-png.mjs"],
+  //
+  // `scripts/csp-build-scan.mjs` (PRD #4686) is a CLI run as `node scripts/csp-build-scan.mjs
+  // <build dir>...` by the module build checks, and its test spawns it as a child process
+  // rather than importing it, so nothing in the module graph reaches it. An entry, not an
+  // ignore, for the same reason as the favicon generator.
+  // `examples/ui-module` (PRD #4686) is the example runtime web module, a separate Vite
+  // build with NO package.json of its own (it resolves web's node_modules). Nothing in the
+  // host's module graph imports it: its vite.config.ts is run by `vite build --config`
+  // (the example's Dockerfile) and imported by the browser harness, and src/Page.tsx is the
+  // `./Page` expose named by a STRING in that config, which knip cannot follow. Entries, not
+  // ignores, so the module's own imports and dependencies stay in scope (it is where
+  // `@module-federation/vite` is used). src/SubView.tsx is reached from Page.tsx.
+  //
+  // `scripts/modules-browser-test.mjs` is the runtime-modules harness (`npm run
+  // test:modules-browser`); knip reaches it through that package.json script, and it imports
+  // browser-launch.mjs and modules-manifest-traversal.mjs, so those need no line.
+  // `scripts/modules-compose-check.mjs` (PRD #4686) is the browser step of the opt-in compose
+  // acceptance (`task test:web-modules-compose`): scripts/web-modules-compose-acceptance.sh
+  // copies it into a Playwright container and runs it with node, so no package.json script
+  // or import reaches it. It imports browser-launch.mjs, which therefore needs no line.
+  // `nginx-modules.js` (PRD #4686) is the njs module the web nginx loads (`js_import` in
+  // nginx-main.conf, COPY'd into both web images). Nothing in the JS graph imports it; its
+  // `default` export is read by nginx, so `exports` is ignored for it below.
+  "entry": [
+    "public/theme-preinit.js",
+    "nginx-modules.js",
+    "scripts/gen-favicon-png.mjs",
+    "scripts/csp-build-scan.mjs",
+    "scripts/modules-compose-check.mjs",
+    "examples/ui-module/vite.config.ts",
+    "examples/ui-module/src/Page.tsx"
+  ],
+
+  // The two example entries above export for their CONSUMER, not for other files: Page.tsx's
+  // `default`, `hostContract` and `reactRefs` are read by the host's federation runtime (and
+  // the browser harness) through the module container at run time, and vite.config.ts's
+  // `default` is read by the vite CLI. No import statement names them, so `exports` would
+  // flag all of them. Scoped to exactly those two files and that one issue type.
+  "ignoreIssues": {
+    "nginx-modules.js": ["exports"],
+    "examples/ui-module/src/Page.tsx": ["exports"],
+    "examples/ui-module/vite.config.ts": ["exports"]
+  },
 
   // ---- SEVERITY STAGING (PRD #103 Decision 4, Success Criterion 2). ------------
   //

@@ -92,5 +92,16 @@ FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:44e36330f74d4f3a1d4e222acca9
 # Links this package to the repository on the registry (GHCR reads this label).
 LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
 COPY web/nginx.conf /etc/nginx/conf.d/default.conf
+# Runtime web modules (PRD #4686). The main nginx.conf is the base image's own plus a
+# load_module for njs and a js_import (scripts/assert-web-nginx.sh diffs it against the pinned
+# image and allows exactly those two lines). The uzi-modules dir holds the empty defaults
+# (`[]`, no locations); the chart or compose mounts real ones over it, so the image never
+# needs a rebuild to enable a module. COPY keeps the files root-owned and world-readable
+# (mode 0644 from git, dirs 0755), which the unprivileged nginx user (uid 101) can read.
+# COPY keeps the build-context modes, so a checkout with a restrictive umask would produce an
+# image nginx cannot read; the context modes are what matter, not the base image's.
+COPY web/nginx-main.conf /etc/nginx/nginx.conf
+COPY web/nginx-modules.js /etc/nginx/uzi-modules.js
+COPY web/nginx-modules-default/ /etc/nginx/uzi-modules/
 COPY --from=build /app/web/dist /usr/share/nginx/html
 EXPOSE 8080

@@ -1,0 +1,13 @@
+# Fixture for scripts/assert-web-modules-render.sh: one module: http:// stripped, dotless host expanded, unknown field dropped, adminOnly omitted
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: my-mod
+      version: "1.0.0"
+      page: Page
+      label: "Ünï ✓"
+      icon: package
+      navGroup: work
+      upstream: http://svc:8080
+      secret: not-public

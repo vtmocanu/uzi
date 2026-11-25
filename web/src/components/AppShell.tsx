@@ -30,7 +30,8 @@ import { JudgeTodoContext } from "./JudgeTodoContext";
 import { FindingsOpenContext, FindingsOpenValueContext } from "./FindingsOpenContext";
 import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
-import { NAV_SECTIONS, type NavBadgeKey } from "./navItems";
+import { type NavBadgeKey } from "./navItems";
+import { useNavSections } from "../modules/nav";
 import { SIDEBAR_MOTION_ICONS, useNavIconMotion } from "./sidebarMotion";
 import { CommandMenu } from "./CommandMenu";
 import { CommandMenuContext } from "./CommandMenuContext";
@@ -661,6 +662,8 @@ function SidebarContent({
   const navigate = useNavigate();
   const location = useLocation();
   const demoMode = useDemoMode();
+  // NAV_SECTIONS merged with the runtime module list (PRD #4686); re-renders when it resolves.
+  const navSections = useNavSections();
   // The Admin entry's health pip (PRD #1484 M5): a severity entry point in the sidebar (D1),
   // fed by the ONE shared HealthStatusProvider — no second poll here, and a non-admin never
   // fetches (the provider's isAdmin gate leaves doc null, so no pip). NavItem derives the
@@ -816,7 +819,7 @@ function SidebarContent({
       </div>
 
       <nav className="flex-1 space-y-1 overflow-y-auto px-2 pb-4 lg:space-y-0.5 lg:pb-2">
-        {NAV_SECTIONS.map((section, i) => {
+        {navSections.map((section) => {
           const items = section.items
             .filter((def) => !def.adminOnly || user?.is_admin)
             .map((def) => (
@@ -849,12 +852,15 @@ function SidebarContent({
                   ))}
               </Fragment>
             ));
+          // A labelled section whose items are all hidden (a Modules section holding only
+          // admin-only entries, for a non-admin) renders nothing, not an empty heading.
+          if (section.group !== null && items.length === 0) return null;
           return section.leading ? (
-            <div key={i} className="space-y-0.5 pt-3 lg:pt-2">
+            <div key={section.id} className="space-y-0.5 pt-3 lg:pt-2">
               {items}
             </div>
           ) : (
-            <NavGroup key={i} label={section.group ?? undefined} collapsed={collapsed}>
+            <NavGroup key={section.id} label={section.group ?? undefined} collapsed={collapsed}>
               {items}
             </NavGroup>
           );

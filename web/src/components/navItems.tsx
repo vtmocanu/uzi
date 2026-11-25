@@ -43,9 +43,12 @@ export type NavDef = {
   hint?: string;
 };
 
-export type NavGroupName = "Work" | "Factory";
+export type NavGroupName = "Work" | "Factory" | "Modules";
 
 export type NavSection = {
+  // A stable identity: AppShell keys the sidebar sections by it, so merging the runtime
+  // module list in (a new "modules" section, extra items) never remounts a neighbour.
+  id: "leading" | "work" | "factory" | "modules" | "system";
   // null: no label (the leading Overview block and the bottom cluster).
   group: NavGroupName | null;
   // The leading block renders without a NavGroup rule above it.
@@ -54,8 +57,9 @@ export type NavSection = {
 };
 
 export const NAV_SECTIONS: NavSection[] = [
-  { group: null, leading: true, items: [{ key: "overview", label: "Overview", to: "/dashboard", icon: <HomeIcon /> }] },
+  { id: "leading", group: null, leading: true, items: [{ key: "overview", label: "Overview", to: "/dashboard", icon: <HomeIcon /> }] },
   {
+    id: "work",
     group: "Work",
     items: [
       { key: "repos", label: "Repos", to: "/repos", icon: <BoardIcon />, exactOnly: true },
@@ -73,6 +77,7 @@ export const NAV_SECTIONS: NavSection[] = [
     ],
   },
   {
+    id: "factory",
     group: "Factory",
     items: [
       { key: "agents", label: "Agents", to: "/agents", icon: <BotIcon /> },
@@ -91,6 +96,7 @@ export const NAV_SECTIONS: NavSection[] = [
   // and the five admin pages each held a sidebar row; they are now one tabbed Admin
   // destination (AdminShell), the same treatment the Settings tabs give user surfaces.
   {
+    id: "system",
     group: null,
     items: [
       // Forge has no standalone entry (Decision 3): it lives only under the Settings tabs,
@@ -112,8 +118,10 @@ export type VisibleNavItem = NavDef & {
 };
 
 // The flat, ordered list of destinations a viewer can reach.
-export function visibleNavItems(isAdmin: boolean): VisibleNavItem[] {
-  return NAV_SECTIONS.flatMap((section) =>
+// `sections` is NAV_SECTIONS merged with the runtime module list (modules/nav.ts) when the
+// caller has one.
+export function visibleNavItems(isAdmin: boolean, sections: NavSection[] = NAV_SECTIONS): VisibleNavItem[] {
+  return sections.flatMap((section) =>
     section.items
       .filter((item) => !item.adminOnly || isAdmin)
       .map((item) => ({
