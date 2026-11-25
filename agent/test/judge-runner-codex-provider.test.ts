@@ -581,6 +581,15 @@ describe("codex provider judge: key redaction", () => {
     assert.ok(lines.some(l => /provider judge failed terminally/.test(l)), "the terminal branch logged");
   });
 
+  it("a gateway-limit settlement logs the limit branch with no key form", async () => {
+    const lines: string[] = [];
+    const calls = await exec(scriptedFactory(failScript(RATE)), codexClaim(), { log: capturingLog(lines) });
+    assertLimit(calls);
+    assert.ok(lines.some(l => /judge model call hit a usage limit/.test(l)), "the limit branch logged");
+    assertNoKey(lines.join("\n"), "log");
+    assertNoKey(JSON.stringify(calls.states), "wire");
+  });
+
   it("a getTrace error echoing the key keeps the fallback review and logs scrubbed", async () => {
     const lines: string[] = [];
     const api = fakeClient({ getTrace: async () => { throw new RequestError("GET", "/trace", 502, `bad gateway ${ECHO()}`); } });
@@ -677,7 +686,13 @@ describe("codex provider judge: call surface", () => {
     const source = fs.readFileSync(fileURLToPath(new URL("../src/judge-runner.ts", import.meta.url)), "utf8");
     const imports = source.split("\n").filter(line => /^\s*import\b/.test(line) || /^\s*}\s*from\b/.test(line));
     assert.ok(imports.length > 5);
-    for (const line of imports) assert.ok(!/from\s+"\.\/(git|forge|gitlab|github)[^"]*"/.test(line), `forbidden import: ${line}`);
+    // Every module specifier in any form (static, side-effect, re-export, dynamic import(), require()).
+    const specifiers = [...source.matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'`]([^"'`]+)["'`]/g)].map(m => m[1]!);
+    assert.ok(specifiers.length > 5, "the specifier scan found the imports");
+    for (const spec of specifiers) {
+      assert.ok(!/(^|[/.])(git|forge|gitlab|github|forgejo|gitea)([-./]|$)/i.test(spec), `forbidden import: ${spec}`);
+      assert.ok(!/^(node:)?child_process$/.test(spec), `forbidden import: ${spec}`);
+    }
   });
 });
 

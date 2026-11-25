@@ -291,7 +291,10 @@ export class JudgeRunner {
       ? makeTextRedactor(providerKeyForms(providerCredential))
       : (s) => s;
     // Issue #4574: a provider judge journals and logs its terminal through a scrubbing logger, so the
-    // outbox's own log lines (a failed send's error text can echo the gateway key) never carry the key.
+    // outbox's log lines for THIS resolve (a failed send's error text can echo the gateway key) are
+    // scrubbed. The journaled body itself is key-free. A later re-send by the worker's own resolve
+    // (after execute() returned) logs through the worker logger, unscrubbed; that send carries no key,
+    // so only an api that echoes a key it was never sent could surface one there (accepted limit).
     // Vendor mode keeps the shared deps untouched.
     const terminalDeps: TerminalOutboxDeps | undefined = providerCredential && this.terminalDeps
       ? { ...this.terminalDeps, log: redactingLogger(this.log, providerScrub) }
