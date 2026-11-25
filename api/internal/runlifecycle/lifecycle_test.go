@@ -621,7 +621,7 @@ func TestReconcileWindowCutoffs(t *testing.T) {
 	if fast == nil {
 		t.Fatalf("no fast-lane ListPendingColumnMoves call among %+v", fs.pendingArgs)
 	}
-	if !fast.GraceCutoff.Time.Equal(testNow.Add(-l.grace)) {
+	if !fast.GraceCutoff.Time.Equal(testNow.Add(-15 * time.Second)) {
 		t.Fatalf("grace cutoff = %v, want now-grace", fast.GraceCutoff.Time)
 	}
 	if fast.MaxBatch != l.batch {
@@ -677,8 +677,9 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 }
 
 const (
-	fastCrossMsg = "still pending after the fast retry window"
-	giveUpMsg    = "gave up after the retry window"
+	// Both crossings must log at WARN: the level is part of the needle.
+	fastCrossMsg = `level=WARN msg="run lifecycle: column move still pending after the fast retry window`
+	giveUpMsg    = `level=WARN msg="run lifecycle: column move gave up after the retry window`
 )
 
 // logLinesWith counts log lines containing every needle.
@@ -757,7 +758,7 @@ func TestReconcileSlowLaneCadence(t *testing.T) {
 			t.Fatalf("fast calls = %d, want %d", len(fast), wantCalls)
 		}
 		last := fast[len(fast)-1]
-		if !last.GraceCutoff.Time.Equal(cur.Add(-l.grace)) || !last.GiveupCutoff.Time.Equal(cur.Add(-l.fastWindow)) {
+		if !last.GraceCutoff.Time.Equal(cur.Add(-15*time.Second)) || !last.GiveupCutoff.Time.Equal(cur.Add(-l.fastWindow)) {
 			t.Fatalf("fast args = %+v at %v", last, cur)
 		}
 	}

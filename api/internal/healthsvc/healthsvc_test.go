@@ -1045,8 +1045,12 @@ func TestBoardDrift(t *testing.T) {
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q (%q), want %q", c.Severity, c.Summary, tc.wantSev)
 			}
-			if tc.wantSev != sevUnknown && c.Summary != tc.wantSummary {
-				t.Fatalf("summary = %q, want %q", c.Summary, tc.wantSummary)
+			wantSummary := tc.wantSummary
+			if tc.wantSev == sevUnknown {
+				wantSummary = "This signal is temporarily unavailable."
+			}
+			if c.Summary != wantSummary {
+				t.Fatalf("summary = %q, want %q", c.Summary, wantSummary)
 			}
 			if tc.wantEvidence == nil {
 				if len(c.Evidence) != 0 {

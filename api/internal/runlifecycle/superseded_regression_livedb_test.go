@@ -89,9 +89,12 @@ func TestSupersededRunRetryDoesNotMoveNewerRunsCardLiveDB(t *testing.T) {
 	        origin_column, board_column, move_pending_since, created_at)
 	      VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, 'failed', 'Upcoming', $6, $7, $8)`,
 		oldID, user, repo, issueN, "agent/issue-"+oldID.String(), board.ColumnInProgress, pendingSince, now.Add(-2*time.Hour))
-	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status, created_at)
-	      VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, 'queued', $6)`,
-		newID, user, repo, issueN, "agent/issue-"+newID.String(), now.Add(-time.Hour))
+	// The newer run is running and also expects In Progress (its origin was the
+	// old run's In Progress placement), so both baselines match the card.
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status,
+	        origin_column, board_column, created_at)
+	      VALUES ($1, $2, $3, 'issue', $4, 't', 'd', $5, 'running', $6, $6, $7)`,
+		newID, user, repo, issueN, "agent/issue-"+newID.String(), board.ColumnInProgress, now.Add(-time.Hour))
 
 	pending, err := q.ListPendingColumnMoves(ctx, store.ListPendingColumnMovesParams{
 		GraceCutoff:  supRegTS(pendingSince),
