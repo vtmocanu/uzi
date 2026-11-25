@@ -380,6 +380,7 @@ type fakeStore struct {
 	mrStateWrites          []store.SetRunMRStateParams
 	mrStateWriteAt         []time.Time // when each SetRunMRState call happened
 	mrStateFailOnce        error       // when set, the FIRST SetRunMRState call fails (args still recorded)
+	persistMRState         bool        // when set, a successful SetRunMRState updates the matching board-free candidate's mr_state
 
 	// Pipeline sync (PRD #6) scripting + capture.
 	watchedRefs      []store.ListWatchedRunRefsForRepoRow
@@ -539,6 +540,13 @@ func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStatePara
 	s.mrStateWriteAt = append(s.mrStateWriteAt, time.Now())
 	if s.mrStateFailOnce != nil && len(s.mrStateWrites) == 1 {
 		return 0, s.mrStateFailOnce
+	}
+	if s.persistMRState {
+		for i := range s.boardFreeCandidates {
+			if s.boardFreeCandidates[i].ID == arg.ID {
+				s.boardFreeCandidates[i].MrState = pgtype.Text{String: arg.MrState, Valid: true}
+			}
+		}
 	}
 	return 1, nil
 }

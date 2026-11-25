@@ -311,10 +311,14 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 // re-observed next tick, and the guards make the retry a no-op if the card has
 // already moved.
 //
-// PRD #4691: the same statement records PR merge/close history. A lost reply (the write
-// committed but the caller saw an error) is fine: the watchers' same-state fast path
-// keys on runs.mr_state, which that one atomic statement wrote together with the
-// history, so the next tick sees the state as already recorded and does not retry.
+// PRD #4691: the same statement records PR merge/close history. Delivery is best
+// effort, never exactly-once. A lost reply (the write committed but the caller saw an
+// error) leaves no duplicate: runs.mr_state and the history committed together, so a
+// still-eligible run's next tick takes the same-state fast path. A write that really
+// failed is re-observed on the next eligible tick with a later observed_at; a
+// transition that happens before that retry, or a run that stops being eligible, goes
+// unrecorded; and a provider time missing from the first recorded event is never
+// back-filled by a later identical observation (docs/pr-history.md, coverage limits).
 func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, mr forge.MergeRequest, observedAt time.Time) {
 	if _, err := s.q.SetRunMRState(ctx, store.SetRunMRStateParams{
 		ID:         runID,

@@ -151,32 +151,49 @@ func TestBoardFreeTerminalEdgeCapturesObservationBeforeCancel(t *testing.T) {
 }
 
 // A failed write leaves mr_state as it was, so the next eligible poll observes the
-// same edge again and hands over the provider time and a fresh observation time.
+// same edge again and hands over the provider time and a fresh observation time. The
+// fake persists successful writes, so without the failure the second tick sees the
+// state as already recorded and writes nothing (the control subtest).
 func TestFailedHistoryWriteIsRetriedWithTimestamps(t *testing.T) {
-	runID, repoID := uuid.New(), uuid.New()
 	mergedAt := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
-	st := &fakeStore{
-		boardFreeCandidates: []store.ListBoardFreeMRStateWatchCandidatesRow{boardFreeCand(runID, 13, nil)},
-		mrStateFailOnce:     errors.New("transient"),
-	}
-	mr := forgeMR(13, forge.MRStateMerged)
-	mr.MergedAt = &mergedAt
-	f := &fakeForge{mr: mr}
-	svc := newTestService(st)
-
-	for i := 0; i < 2; i++ {
-		if err := svc.SyncBoardFreeMRStates(context.Background(), repoID, testProjectID, f); err != nil {
-			t.Fatalf("tick %d: %v", i, err)
+	run := func(t *testing.T, failOnce error) *fakeStore {
+		t.Helper()
+		runID, repoID := uuid.New(), uuid.New()
+		opened := forge.MRStateOpened
+		st := &fakeStore{
+			boardFreeCandidates: []store.ListBoardFreeMRStateWatchCandidatesRow{boardFreeCand(runID, 13, &opened)},
+			mrStateFailOnce:     failOnce,
+			persistMRState:      true,
 		}
+		mr := forgeMR(13, forge.MRStateMerged)
+		mr.MergedAt = &mergedAt
+		f := &fakeForge{mr: mr}
+		svc := newTestService(st)
+		for i := 0; i < 2; i++ {
+			if err := svc.SyncBoardFreeMRStates(context.Background(), repoID, testProjectID, f); err != nil {
+				t.Fatalf("tick %d: %v", i, err)
+			}
+		}
+		return st
 	}
-	if len(st.mrStateWrites) != 2 {
-		t.Fatalf("expected the failed write and one retry, got %d", len(st.mrStateWrites))
-	}
-	first, second := st.mrStateWrites[0], st.mrStateWrites[1]
-	if !timeEq(first.ProviderAt, mergedAt) || !timeEq(second.ProviderAt, mergedAt) {
-		t.Fatalf("ProviderAt not carried: %+v / %+v", first.ProviderAt, second.ProviderAt)
-	}
-	if !first.ObservedAt.Valid || !second.ObservedAt.Valid || second.ObservedAt.Time.Before(first.ObservedAt.Time) {
-		t.Fatalf("ObservedAt not valid/monotone: %+v / %+v", first.ObservedAt, second.ObservedAt)
-	}
+
+	t.Run("failed write is retried", func(t *testing.T) {
+		st := run(t, errors.New("transient"))
+		if len(st.mrStateWrites) != 2 {
+			t.Fatalf("expected the failed write and one retry, got %d", len(st.mrStateWrites))
+		}
+		first, second := st.mrStateWrites[0], st.mrStateWrites[1]
+		if !timeEq(first.ProviderAt, mergedAt) || !timeEq(second.ProviderAt, mergedAt) {
+			t.Fatalf("ProviderAt not carried: %+v / %+v", first.ProviderAt, second.ProviderAt)
+		}
+		if !first.ObservedAt.Valid || !second.ObservedAt.Valid || second.ObservedAt.Time.Before(first.ObservedAt.Time) {
+			t.Fatalf("ObservedAt not valid/monotone: %+v / %+v", first.ObservedAt, second.ObservedAt)
+		}
+	})
+	t.Run("control: successful write is not repeated", func(t *testing.T) {
+		st := run(t, nil)
+		if len(st.mrStateWrites) != 1 {
+			t.Fatalf("expected exactly one write without a failure, got %d", len(st.mrStateWrites))
+		}
+	})
 }
