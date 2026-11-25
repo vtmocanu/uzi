@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+
+	"code.gitea.io/sdk/gitea"
 )
 
 func (f *forgejo) VerifyToken(ctx context.Context) (BotIdentity, error) {
@@ -21,20 +23,29 @@ func (f *forgejo) VerifyToken(ctx context.Context) (BotIdentity, error) {
 	// error is deliberately NOT redacted — it carries only the server's
 	// self-reported version string plus uzi's copy, no secret, and CreateConnection
 	// surfaces it to the user verbatim.
-	raw, _, err := c.ServerVersion()
+	raw, resp, err := c.ServerVersion()
 	if err != nil {
-		return BotIdentity{}, f.wrapErr("read server version", err)
+		return BotIdentity{}, f.wrapErrStatus("read server version", err, statusOf(resp))
 	}
 	if err := f.checkForgejoVersion(raw); err != nil {
 		return BotIdentity{}, err
 	}
-	u, _, err := c.GetMyUserInfo()
+	u, resp, err := c.GetMyUserInfo()
 	if err != nil {
-		return BotIdentity{}, f.wrapErr("verify token", err)
+		return BotIdentity{}, f.wrapErrStatus("verify token", err, statusOf(resp))
 	}
 	// Forgejo always emits is_admin (no omitempty), so false means a real
 	// non-admin — the privilege checker treats true as a violation.
 	return BotIdentity{ForgeUserID: u.ID, Username: u.UserName, IsAdmin: u.IsAdmin}, nil
+}
+
+// statusOf returns the HTTP status of a gitea SDK response, or 0 when the call
+// produced none (nil response, transport failure).
+func statusOf(resp *gitea.Response) int {
+	if resp == nil || resp.Response == nil {
+		return 0
+	}
+	return resp.StatusCode
 }
 
 func (f *forgejo) TokenInfo(ctx context.Context) (TokenInfo, error) {

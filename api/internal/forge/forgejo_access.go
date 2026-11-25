@@ -100,7 +100,7 @@ func (f *forgejo) DefaultBranchProtection(ctx context.Context, projectID int64, 
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return BranchProtection{Protected: false, WriteRoleCanPush: true, WriteRoleCanMerge: true}, nil
 		}
-		return BranchProtection{}, f.wrapErr("branch protection", err)
+		return BranchProtection{}, f.wrapErrStatus("branch protection", err, statusOf(resp))
 	}
 	// user_can_push / user_can_merge are the calling bot's authoritative rights.
 	// Forgejo folds the write-role capability and any per-user grant into these two

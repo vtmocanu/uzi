@@ -110,7 +110,11 @@ func (g *github) DefaultBranchProtection(ctx context.Context, projectID int64, b
 	if err != nil {
 		// Rulesets should be readable at write role; if we cannot read them we cannot
 		// authoritatively determine push/merge on a protected branch. Fail-safe.
-		return BranchProtection{Protected: true, ProtectionUnverified: true}, nil
+		return BranchProtection{
+			Protected:            true,
+			ProtectionUnverified: true,
+			UnverifiedReadClass:  Class(g.wrapErr("branch rulesets", err)),
+		}, nil
 	}
 	if rules != nil && (len(rules.PullRequest) > 0 || len(rules.NonFastForward) > 0) {
 		// A readable, active, enforced ruleset covers the branch and blocks a direct
