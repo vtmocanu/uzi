@@ -65,6 +65,44 @@ func TestAdminProviderListTable(t *testing.T) {
 	}
 }
 
+// A Codex-engine shared definition renders its engine next to a Claude one in both list and get.
+func TestAdminProviderRendersCodexEngine(t *testing.T) {
+	claude := sharedAdminFixture(sharedTestID, "claudegw")
+	codex := sharedAdminFixture(sharedOtherID, "codexgw")
+	codex.Engine, codex.Protocol, codex.AuthStyle = "codex", "openai_responses", "bearer"
+	fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{claude, codex}}
+
+	out, errOut, code := runCLI(t, fakeEnv(fc), "admin", "provider", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("list: exit = %d, stderr %q", code, errOut)
+	}
+	engines := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 2 {
+			engines[f[0]] = f[1]
+		}
+	}
+	if engines["claudegw"] != "claude" || engines["codexgw"] != "codex" {
+		t.Errorf("list engines = %v, want claudegw=claude codexgw=codex:\n%s", engines, out)
+	}
+
+	for name, want := range map[string]string{"claudegw": "claude", "codexgw": "codex"} {
+		out, errOut, code := runCLI(t, fakeEnv(fc), "admin", "provider", "get", name)
+		if code != uzicli.ExitOK {
+			t.Fatalf("get %s: exit = %d, stderr %q", name, code, errOut)
+		}
+		got := ""
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) == 2 && f[0] == "engine" {
+				got = f[1]
+			}
+		}
+		if got != want {
+			t.Errorf("get %s: engine = %q, want %q:\n%s", name, got, want, out)
+		}
+	}
+}
+
 func TestAdminProviderListJSONAndEmpty(t *testing.T) {
 	fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{sharedAdminFixture(sharedTestID, "corp")}}
 	out, _, code := runCLI(t, fakeEnv(fc), "--json", "admin", "provider", "list")

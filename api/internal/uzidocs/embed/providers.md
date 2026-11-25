@@ -329,11 +329,12 @@ Codex providers on the judge and cross-check lanes are tracked in #4574.
 
 ## Admin-shared providers
 
-An admin can define a **Claude** gateway once and share it with everyone on the instance. You see it
-in Settings, **Custom providers**, next to your own, marked **Managed by your admin**, and in
-`uzi provider list` with `admin` in the MANAGED BY column. The admin fixes its name, base URL, auth
-style and model map. **You supply and control your own key**: you attach it, test it and select the
-definition as your Claude source exactly as for your own provider. The admin never sees your key, and
+An admin can define a **Claude** or a **Codex** gateway once and share it with everyone on the
+instance. You see it in Settings, **Custom providers**, next to your own, marked **Managed by your
+admin**, and in `uzi provider list` with `admin` in the MANAGED BY column. The admin fixes its
+engine, name, base URL, auth style and model map. **You supply and control your own key**: you attach
+it, test it and select the definition as your Claude or Codex source (matching its engine) exactly as
+for your own provider. The admin never sees your key, and
 you never see anyone else's key or Test results.
 
 - **Before you attach a key or select it**, Settings shows a disclosure. It says what the admin
@@ -348,12 +349,14 @@ you never see anyone else's key or Test results.
 - **The key and Test are yours.** **Test** uses your key and shows only your own result ("Latest test
   of your key"). Replacing, rotating or disabling your key, or an admin model-map edit, makes your old
   result read as not tested again. Another user's pass or failure never shows on your row.
-- **Select and clear.** **Use as Claude source** opens the disclosure first; confirm to select.
-  `uzi provider use <name|id>` selects it too (the CLI says "(shared by your admin)"). Clear it like
-  any source (**Stop using**, or `uzi provider use --none --engine claude`). Without a key of your
-  own, selecting is refused with `provider_source_unusable` and leaves your source unchanged. If
-  your Claude source is unset, new Claude runs keep using your Anthropic token when available. If an
-  already-selected shared definition loses your key, new Claude runs are refused without falling back.
+- **Select and clear.** **Use as Claude source** (or **Use as Codex source** for a Codex definition)
+  opens the disclosure first; confirm to select. `uzi provider use <name|id>` selects it too (the CLI
+  says "(shared by your admin)"). Clear it like any source (**Stop using**, or
+  `uzi provider use --none --engine claude` / `--engine codex`). Without a key of your own, selecting
+  is refused with `provider_source_unusable` and leaves your source unchanged. If your source for that
+  engine is unset, new runs keep using your vendor credential when available. If an already-selected
+  shared definition loses your key, new runs on that engine are refused without falling back to the
+  vendor credential.
 - **You cannot change the definition.** Rename, model map, endpoint, retire and delete are not
   offered for it. `uzi provider edit` and `uzi provider retire` refuse a shared definition ("managed by
   your admin") before sending any change. You can still disable or delete your own key on it.
@@ -363,21 +366,42 @@ you never see anyone else's key or Test results.
   says so. **Deleting** is refused while any user has it selected (`provider_in_use_as_source`); once
   nobody does, it also deletes every user's attached key and Test results, and a run still
   bound to it stops at its next claim as `provider_binding_stale`.
-- **Codex.** A shared definition is Claude only. Shared Codex definitions are tracked in #4633.
+- **Codex.** A shared Codex definition uses the `openai_responses` protocol with Bearer auth and a
+  model map that has a `default` slot, and the key you attach to it is your own `openai_compatible_key`.
+  It follows the same rules as a Claude one: a fresh Codex run freezes the current revision and your
+  key, an admin edit makes a new revision for fresh runs only, and rotating, disabling or deleting your
+  key makes the next claim of a bound run fail as `provider_binding_stale`. Retiring it refuses fresh
+  runs while runs already started, including reclaimed ones, keep their binding. The key and Test
+  results are yours alone; the admin sees counts only. Your Codex runs never fall back to the vendor
+  Codex credential while it is your selected source.
 - **The accepted redirect risk applies to a shared definition under either auth style** (owner
   decision, 2026-11-20), and the operator allowlist still governs where its URL may point.
 
 ### Admin: manage shared providers
 
-In the web app, **Admin → Shared providers** (admin only). Create a definition (name, one of the
-allowed base URLs, auth style, model map; it has no key), edit its name and model map, retire it, or
-delete it. The base URL and auth style are fixed once created: to change either, create a new
-definition, and each user must then select it and attach a key again. Each row shows how many users
+In the web app, **Admin → Shared providers** (admin only). Create a definition (engine, name, one of
+the allowed base URLs, auth style, model map; it has no key), edit its name and model map, retire it,
+or delete it. **The engine is chosen at creation**: Claude is the default and Codex the alternative.
+A Codex definition uses `openai_responses` with Bearer auth and needs a `default` model slot. When a
+create request omits the protocol, it defaults to `anthropic_messages` for Claude and
+`openai_responses` for Codex (creating your own provider does not default a Codex protocol). The
+engine, base URL and auth style are fixed once created: to change any of them, create a new
+definition, and each user must then select it and attach a key again. An edit checks the new model map
+against the definition's own engine. Each row shows how many users
 selected it and how many personal keys are attached. Delete is refused while anyone has it selected
-and otherwise says how many keys go with it, then reports the count it removed. Up to 50 shared
+and otherwise says how many keys go with it, then reports the count it removed. Selection counts cover both engines. Up to 50 shared
 definitions can exist, retired ones included. Every change writes a structured `provider_audit` log
 line with the actor and provider ids (never a key). All writes are browser-only (cookie and CSRF), and
-a `uza_` token returns 401 on them. `uzi admin provider list` and `uzi admin provider get <id|name>`
+a `uza_` token returns 401 on them.
+
+**Codex redirect exposure.** The admin controls the base URL of a shared Codex definition, and that URL
+receives every recipient's key as a Bearer token on every request. The pinned Codex runtime follows
+redirects and can forward request bodies and the Bearer header beyond the approved URL, and the
+allowlist is admission control, not confinement to that host (see the Codex warning at the top of
+this page). Share only a gateway you trust not to redirect; the create form says so. A mistake here
+exposes every recipient who attached a key, not one user.
+
+`uzi admin provider list` and `uzi admin provider get <id|name>`
 are the read-only terminal view and need an admin-read token. Design and the lock and rollback
 details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 
