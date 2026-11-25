@@ -596,9 +596,10 @@ func TestSharedBindingToAnotherRecipientsKeyIsStaleLiveDB(t *testing.T) {
 	}
 }
 
-// TestSharedClaudeDefinitionNeverServesACodexRunLiveDB: a shared Claude definition never serves a Codex run. A
-// codex-harness run bound to it (with B's Claude key) is a corrupt reference and refuses stale on the
-// claim and the finisher's re-check, never decrypting the key.
+// TestSharedClaudeDefinitionNeverServesACodexRunLiveDB: cross-engine, a shared definition of one engine
+// never serves a run of the other. A codex-harness run bound to a shared CLAUDE definition (with B's
+// Claude key) is a corrupt reference and refuses stale on the claim and the finisher's re-check, never
+// decrypting the key, and that definition is never selectable as the Codex source.
 func TestSharedClaudeDefinitionNeverServesACodexRunLiveDB(t *testing.T) {
 	pf := newSharedPCFix(t)
 	spy := &keyOpenSpy{Store: pf.svc.q, rd: pf.svc.q.(providerClaimReader)}
