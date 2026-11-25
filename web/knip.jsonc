@@ -53,14 +53,34 @@
   // <build dir>...` by the module build checks, and its test spawns it as a child process
   // rather than importing it, so nothing in the module graph reaches it. An entry, not an
   // ignore, for the same reason as the favicon generator.
-  "entry": ["public/theme-preinit.js", "scripts/gen-favicon-png.mjs", "scripts/csp-build-scan.mjs"],
+  // `examples/ui-module` (PRD #4686) is the example runtime web module, a separate Vite
+  // build with NO package.json of its own (it resolves web's node_modules). Nothing in the
+  // host's module graph imports it: its vite.config.ts is run by `vite build --config`
+  // (the example's Dockerfile) and imported by the browser harness, and src/Page.tsx is the
+  // `./Page` expose named by a STRING in that config, which knip cannot follow. Entries, not
+  // ignores, so the module's own imports and dependencies stay in scope (it is where
+  // `@module-federation/vite` is used). src/SubView.tsx is reached from Page.tsx.
+  //
+  // `scripts/modules-browser-test.mjs` is the runtime-modules harness (`npm run
+  // test:modules-browser`); knip reaches it through that package.json script, and it imports
+  // browser-launch.mjs and modules-manifest-traversal.mjs, so those need no line.
+  "entry": [
+    "public/theme-preinit.js",
+    "scripts/gen-favicon-png.mjs",
+    "scripts/csp-build-scan.mjs",
+    "examples/ui-module/vite.config.ts",
+    "examples/ui-module/src/Page.tsx"
+  ],
 
-  // `@module-federation/vite` (PRD #4686) is the federation BUILD plugin the example module's
-  // Vite config uses (web/examples/ui-module, added in the next milestone); the host itself
-  // uses only the runtime. Until that config lands nothing imports it. REMOVE this entry when
-  // the example's vite.config.ts imports the plugin: knip will then hint that it is stale
-  // (treatConfigHintsAsErrors makes that a failure), which is the reminder.
-  "ignoreDependencies": ["@module-federation/vite"],
+  // The two example entries above export for their CONSUMER, not for other files: Page.tsx's
+  // `default`, `hostContract` and `reactRefs` are read by the host's federation runtime (and
+  // the browser harness) through the module container at run time, and vite.config.ts's
+  // `default` is read by the vite CLI. No import statement names them, so `exports` would
+  // flag all of them. Scoped to exactly those two files and that one issue type.
+  "ignoreIssues": {
+    "examples/ui-module/src/Page.tsx": ["exports"],
+    "examples/ui-module/vite.config.ts": ["exports"]
+  },
 
   // ---- SEVERITY STAGING (PRD #103 Decision 4, Success Criterion 2). ------------
   //

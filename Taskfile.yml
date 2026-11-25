@@ -2927,6 +2927,32 @@ tasks:
       # Playwright's image, which ships it. UZI_WEB_BROWSER_CHROMIUM=<path> runs any other
       # Chromium instead.
       - npm run test:browser
+      # Then the built-mode harness for runtime web modules (PRD #4686): it builds the host
+      # and the example module, so it needs the same Chromium and no more.
+      - task: test:web-modules-browser
+
+  test:web-modules-browser:
+    desc: web runtime-modules harness - builds the host and example module, drives real Chromium (PRD #4686)
+    dir: web
+    env:
+      TZ: UTC
+    cmds:
+      # test:scripts is node --test over web/scripts/*.test.mjs (the CSP scan, the sdk
+      # transform pin and the manifest traversal); test:modules-browser is the harness itself
+      # (scripts/modules-browser-test.mjs: in-process builds and servers, the scenarios, the
+      # process-group cleanup assertions and the SIGTERM self-test).
+      - npm run test:scripts
+      - npm run test:modules-browser
+
+  test:web-browser:in-container:
+    desc: Opt-in run test:web-browser's tests in the pinned CI Playwright image (docker) against HEAD plus uncommitted changes
+    # For a host whose Chromium cannot start (a worker: the profile socket path is too long
+    # under .uzi/scratch). Exports the candidate to .uzi/scratch/snap-<slot> (SLOT, default
+    # inrun), copies it and web/node_modules into a `docker create --init` container, runs the
+    # browser tests there and removes the container. Not wired into any gate. Exit 2 = the
+    # instrument is broken; the details are in scripts/web-browser-in-container.sh.
+    cmds:
+      - ./scripts/web-browser-in-container.sh
 
   # ----------------------------------------------------------- agent (npm) ----
   test:stale-worker-cancel-e2e:

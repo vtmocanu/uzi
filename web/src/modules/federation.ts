@@ -71,3 +71,26 @@ export function loadModuleRemote(request: string): Promise<unknown> {
   countModuleStat("loadRemote");
   return loadRemote<unknown>(request);
 }
+
+// Harness-only (like __uziModuleStats): the host's own React and router references, so the
+// browser harness can prove a remote's `reactRefs` export is the SAME function object (one
+// React, one router across the host and every remote). Dead-code eliminated from shipped
+// builds, where __UZI_TEST_HOOKS__ is false.
+declare global {
+  interface Window {
+    __uziHostReactRefs?: {
+      useState: typeof React.useState;
+      createElement: typeof React.createElement;
+      jsx: typeof JsxRuntime.jsx;
+      useNavigate: typeof ReactRouterDom.useNavigate;
+    };
+  }
+}
+if (__UZI_TEST_HOOKS__) {
+  window.__uziHostReactRefs = {
+    useState: React.useState,
+    createElement: React.createElement,
+    jsx: JsxRuntime.jsx,
+    useNavigate: ReactRouterDom.useNavigate,
+  };
+}

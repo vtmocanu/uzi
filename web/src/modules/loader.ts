@@ -23,17 +23,21 @@ export const MODULE_LOAD_TIMEOUT_MS = 15000;
 
 // The runtime's shared-version refusal carries this text in the error (or its cause).
 const SHARE_REFUSAL = "does not satisfy the requirement of";
-// A remote that loads but does not expose the requested module. Best-effort pattern for
-// the runtime's own "not found" error (RUNTIME-014) and the remote container's
-// "does not exist in container" wording; the browser harness's `noexpose` fixture pins the
-// real text.
-const MISSING_EXPOSE = /RUNTIME-014|does not exist in container|not exposed/i;
+// A remote that loads but does not expose the requested module. Pinned from observation
+// (browser harness `noexpose` fixture, @module-federation/vite 1.25.0 remote against the
+// 2.9.3 runtime): the remote container's own get() throws, and the runtime passes it through
+// with no RUNTIME-xxx code:
+//   "[Module Federation] Module ./Missing does not exist in container."
+const MISSING_EXPOSE = /\[Module Federation\] Module \S+ does not exist in container/;
 // The three engines word a failed dynamic import differently. Chromium and Firefox name
 // the URL; Safari names nothing.
 const DYNAMIC_IMPORT_FAILURE =
   /Failed to fetch dynamically imported module|error loading dynamically imported module|Importing a module script failed/i;
-// The runtime's own script/chunk load failure (RUNTIME-008, "Failed to load script resources").
-const MF_SCRIPT_FAILURE = /RUNTIME-008|Failed to load script/i;
+// The runtime's own script load failure, pinned from observation (a module whose
+// remoteEntry.js request fails, in the browser harness):
+//   "[ Federation Runtime ]: Failed to load script resources. #RUNTIME-008 args: {...}
+//    Original Error Message: Failed to fetch dynamically imported module: <url>"
+const MF_SCRIPT_FAILURE = /RUNTIME-008|Failed to load script resources/;
 
 export class ModuleLoadError extends Error {
   kind: LoadFailureKind;

@@ -16,7 +16,9 @@
     "preview": "vite preview",
     "deps-check": "npm ls --depth=0",
     "audit": "npm audit --audit-level=high --include=dev",
-    "test:browser": "vitest run --config vitest.browser.config.ts"
+    "test:browser": "vitest run --config vitest.browser.config.ts",
+    "test:scripts": "node --test scripts/*.test.mjs",
+    "test:modules-browser": "node scripts/modules-browser-test.mjs"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",

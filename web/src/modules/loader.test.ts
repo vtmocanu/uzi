@@ -82,9 +82,12 @@ describe("loadModulePage", () => {
     expect((await failure(loadModulePage(entry))).kind).toBe("incompatible");
   });
 
-  it("classifies a missing expose as incompatible", async () => {
-    fed.loadModuleRemote.mockRejectedValue(new Error("[ Federation Runtime ]: RUNTIME-014 expose ./Nope not found"));
-    expect((await failure(loadModulePage(entry))).kind).toBe("incompatible");
+  it("classifies the observed missing-expose error as incompatible", async () => {
+    // Text observed in the browser harness (`noexpose` fixture): the remote container's get().
+    fed.loadModuleRemote.mockRejectedValue(new Error("[Module Federation] Module ./Missing does not exist in container."));
+    const err = await failure(loadModulePage(entry));
+    expect(err.kind).toBe("incompatible");
+    expect(err.message).toContain("does not expose the configured page");
   });
 
   it("treats any other runtime error, including a different RUNTIME-015 text, as transient", async () => {
@@ -110,7 +113,11 @@ describe("stale classification after a first successful load", () => {
     ["Chromium", "Failed to fetch dynamically imported module: http://localhost/modules/demo/assets/Sub-abc.js"],
     ["Firefox", "error loading dynamically imported module: http://localhost/modules/demo/assets/Sub-abc.js"],
     ["Safari, which names no URL", "Importing a module script failed."],
-    ["an MF script load error", "[ Federation Runtime ]: RUNTIME-008 Failed to load script resources"],
+    // Text observed in the browser harness when a module's remoteEntry.js request fails.
+    [
+      "an MF script load error (observed text)",
+      '[ Federation Runtime ]: Failed to load script resources. #RUNTIME-008 args: {"remoteName":"demo","resourceUrl":"http://localhost/modules/demo/remoteEntry.js"} Original Error Message: Failed to fetch dynamically imported module: http://localhost/modules/demo/remoteEntry.js',
+    ],
   ])("%s is stale", async (_n, message) => {
     fed.loadModuleRemote.mockRejectedValue(new TypeError(message));
     expect((await failure(loadModulePage(entry))).kind).toBe("stale");
