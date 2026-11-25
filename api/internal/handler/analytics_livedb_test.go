@@ -442,6 +442,40 @@ func TestAnalyticsOptionsTruncationLiveDB(t *testing.T) {
 	}
 }
 
+func TestAnalyticsUsersListTruncationLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2035)
+	admin := f.user(true)
+	prefix := "0an4684-trunc-" + uuid.NewString()[:8] + "-"
+	t.Cleanup(func() {
+		cliMustExec(t, f.pool, `DELETE FROM users WHERE email LIKE $1`, prefix+"%")
+	})
+	cliMustExec(t, f.pool,
+		`INSERT INTO users (id, email, password_hash, is_admin, vault_mode)
+		 SELECT gen_random_uuid(), $1 || lpad(g::text, 4, '0') || '@e2e', 'x', false, 'unprotected'
+		 FROM generate_series(1, 205) g`, prefix)
+	var lastID uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `SELECT id FROM users WHERE email = $1`, prefix+"0205@e2e").Scan(&lastID); err != nil {
+		t.Fatal(err)
+	}
+
+	opt := anDecodeOptions(t, f.cookie(admin, "/api/admin/analytics/options"))
+	if opt.Users == nil || len(opt.Users.Items) != 200 || !opt.Users.Truncated {
+		t.Fatalf("users = %+v, want 200 items and truncated", opt.Users)
+	}
+	for _, it := range opt.Users.Items {
+		if it.ID == lastID.String() {
+			t.Fatal("the 205th user must be cut from the list")
+		}
+	}
+	// A valid user that was cut off the list is still accepted as a selection.
+	if rec := f.cookie(admin, "/api/admin/analytics/spend?user="+lastID.String()); rec.Code != http.StatusOK {
+		t.Fatalf("truncated-off user = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	if rec := f.cookie(admin, "/api/admin/analytics/options?user="+lastID.String()); rec.Code != http.StatusOK {
+		t.Fatalf("truncated-off user on options = %d, want 200", rec.Code)
+	}
+}
+
 func TestAnalyticsEmptyPopulationNullReasonsLiveDB(t *testing.T) {
 	f := newAnFixture(t, 2035)
 	owner := f.user(false)

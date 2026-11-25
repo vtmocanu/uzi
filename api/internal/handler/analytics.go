@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -32,7 +33,8 @@ import (
 //
 // Request order: (1) syntax validation with no database access, (2) single-flight admission
 // that never blocks, (3) one REPEATABLE READ READ ONLY snapshot holding the timezone check,
-// the selected-user and repo authority checks, the history-start read and the statement.
+// the selected-user and repo authority checks and, for spend only, the history-start read and
+// the statement; options reads no history start.
 
 const (
 	analyticsRouteOwner = "owner"
@@ -143,7 +145,8 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	if admin {
 		allowed = append(allowed, "user")
 	}
-	for key := range q {
+	// Sorted so that, with several bad parameters, the first error is always the same one.
+	for _, key := range slices.Sorted(maps.Keys(q)) {
 		if !slices.Contains(allowed, key) {
 			// split and breakdown on /options, and user on the owner route, get a message that names them.
 			switch key {
@@ -306,7 +309,14 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 	}
 	now := h.clock().UTC().Truncate(time.Microsecond)
 
-	req, msg := parseAnalyticsRequest(r.URL.Query(), admin, section, user.ID)
+	// r.URL.Query() drops pairs it cannot parse (a ';' or bad percent-encoding), so parse
+	// directly and refuse the request instead of silently falling back to defaults.
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid query")
+		return
+	}
+	req, msg := parseAnalyticsRequest(query, admin, section, user.ID)
 	if msg != "" {
 		httpx.Error(w, http.StatusBadRequest, msg)
 		return

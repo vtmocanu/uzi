@@ -112,6 +112,8 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"bad kind", analyticsRoutes[1], "kind=reliability", "invalid kind"},
 		{"admin bad user", analyticsRoutes[3], "user=nobody", "invalid user"},
 		{"admin empty user", analyticsRoutes[3], "user=", "invalid user"},
+		{"semicolon pair", analyticsRoutes[1], "window=7d;x=1", "invalid query"},
+		{"bad percent-encoding", analyticsRoutes[1], "window=%zz", "invalid query"},
 		{"admin options bad user", analyticsRoutes[2], "user=nobody", "invalid user"},
 	}
 	for _, tc := range cases {
@@ -130,6 +132,28 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 				t.Fatalf("BeginTx called %d times for a syntax error, want 0", got)
 			}
 		})
+	}
+}
+
+// With several bad parameters the 400 message is the same every time.
+func TestAnalyticsFirstBadParameterIsDeterministic(t *testing.T) {
+	rt := analyticsRoutes[1]
+	var first string
+	for i := 0; i < 50; i++ {
+		h := newAnalyticsUnitHandler(t, &countingBeginner{err: errors.New("must not begin")})
+		rec := httptest.NewRecorder()
+		h.analyticsServe(rt, rec, analyticsGet(store.User{ID: uuid.New()}, rt.path+"?bogus=1&user=x"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		if i == 0 {
+			first = rec.Body.String()
+			if !strings.Contains(first, "unknown parameter") {
+				t.Fatalf("body = %s, want the sorted-first key (bogus) named", first)
+			}
+		} else if rec.Body.String() != first {
+			t.Fatalf("run %d body = %s, want %s", i, rec.Body.String(), first)
+		}
 	}
 }
 
