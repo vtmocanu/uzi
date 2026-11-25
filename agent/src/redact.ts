@@ -400,9 +400,9 @@ function prefixFunction(s: string): Int32Array {
 
 /** The finder that looks for each secret (at least MIN_SECRET_LEN long): `indexOf` of its first MIN_SECRET_LEN units
  *  finds a candidate, and the full comparison is charged, so a long secret against periodic text cannot spend more
- *  than the budget. Overlapping occurrences of one secret are reported too (replaceSpans merges them): after a hit a
- *  secret with a border (a self-overlapping one) resumes one unit past the hit, any other secret after it, since only
- *  a border lets two of its occurrences overlap. A miss resumes one unit later. */
+ *  than the budget. Overlapping occurrences of one secret are reported too (replaceSpans merges them): an occurrence
+ *  starting inside a hit must start at a shift that leaves a border of the secret, so after a hit only those border
+ *  shifts are tried (each charged) and the search resumes at the hit's end. A miss resumes one unit later. */
 export function spansOfEach(secrets: readonly string[]): SpanFinder {
   return (text, work) => {
     const spans: Array<[number, number]> = [];

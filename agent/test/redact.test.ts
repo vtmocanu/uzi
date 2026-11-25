@@ -226,7 +226,7 @@ describe("makeTextRedactor with a long periodic secret", () => {
 
   it("redacts every overlapping occurrence of a periodic secret and no partial one", () => {
     const secret = "abababababababab"; // 16 units, period 2
-    const run = "ab".repeat(12); // three overlapping occurrences at shifts 0, 2, ..., 8
+    const run = "ab".repeat(12); // five overlapping occurrences at shifts 0, 2, 4, 6, 8
     assert.equal(makeTextRedactor([secret])(`<${run}>`), `<${REDACTED}>`);
     const partial = "ab".repeat(7); // 14 units: shorter than the secret, so not an occurrence
     assert.equal(makeTextRedactor([secret])(`<${partial}>`), `<${partial}>`);
