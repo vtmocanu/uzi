@@ -126,10 +126,12 @@ func TestRunEnvClaimStaleEpochDeliversNothingLiveDB(t *testing.T) {
 			var receiptsBefore []receiptRow
 			var generationBefore int64
 			if trigger == "redact" {
-				// Deliver once, then retire the version: the next claim holds it only as a
-				// redact-only receipt.
+				// A second live secret, delivered and receipted with the first: an accepted
+				// next claim would advance its receipt to the new generation. Deliver once,
+				// then retire API_KEY: the next claim holds it only as a redact-only receipt.
+				fx.put(t, "OTHER_KEY", true, envSecretValue("other"))
 				if p := fx.claim(t); p == nil || runEnvByName(p)["API_KEY"].Value != secret {
-					t.Fatalf("first claim = %+v", p)
+					t.Fatalf("first claim delivered=%v, want API_KEY delivered", p != nil)
 				}
 				fx.env.exec(`UPDATE run_env_vars SET retired_at = now() WHERE user_id=$1 AND name='API_KEY'`, fx.userID)
 				fx.requeue(runID)
@@ -341,7 +343,7 @@ func TestRunEnvRedactRouteStaleEpochIsVaultLockedLiveDB(t *testing.T) {
 	secret := envSecretValue("route")
 	fx.put(t, "API_KEY", true, secret)
 	if p := fx.claim(t); p == nil || runEnvByName(p)["API_KEY"].Value != secret {
-		t.Fatalf("claim = %+v", p)
+		t.Fatalf("claim delivered=%v, want the secret delivered", p != nil)
 	}
 	q := &epochRaceQueries{Queries: fx.env.q, trigger: "receipts", after: fx.enableAndLock(t)}
 	fx.svc.q = q
@@ -417,6 +419,16 @@ func TestRunEnvRedactRecheckAfterRefetchLiveDB(t *testing.T) {
 		}, false, ErrRunNotOwned},
 		{"epoch moves again after the opens", func(fx *reFix, _ uuid.UUID) {
 			fx.env.exec(`UPDATE users SET vault_epoch = vault_epoch + 1 WHERE id = $1`, fx.userID)
+		}, true, ErrRunEnvVaultLocked},
+		// The epoch moves but the vault stays usable (unprotected, so no unlock is required):
+		// only the epoch comparison refuses.
+		{"epoch moves with the vault usable after the opens", func(fx *reFix, _ uuid.UUID) {
+			if err := fx.env.vlt.Disable(fx.env.ctx, fx.userID); err != nil {
+				t.Errorf("disable protection: %v", err)
+			}
+			if fx.env.vlt.RequiresUnlock(fx.env.ctx, fx.userID) {
+				t.Error("the vault still requires unlock after disable")
+			}
 		}, true, ErrRunEnvVaultLocked},
 		{"vault locks after the opens", func(fx *reFix, _ uuid.UUID) {
 			fx.env.vlt.Lock(fx.userID)

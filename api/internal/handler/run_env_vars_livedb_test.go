@@ -1027,7 +1027,7 @@ func TestRunEnvListPlainValueOpensAtRowEpochLiveDB(t *testing.T) {
 	}
 	// A list read after the change carries the new epoch and withholds because the vault is locked.
 	if l := f.list(); !l.VaultLocked {
-		t.Fatalf("list after protect+lock = %+v; want vault_locked", l)
+		t.Fatalf("list after protect+lock: vault_locked=%v variables=%d; want vault_locked", l.VaultLocked, len(l.Variables))
 	}
 }
 

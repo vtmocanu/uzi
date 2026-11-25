@@ -369,8 +369,12 @@ var (
 // (RunEnvRedactOpen), else ErrRunEnvRedactClosed. The route is read-only, so there is no
 // generation or repo check. After the opens, the ownership and openness checks run again and
 // the owner's vault epoch must still equal the one the versions were opened at with the vault
-// not requiring unlock; a failure there returns the same typed refusal and no version. The result carries plaintext secrets: the caller must never log or
-// cache it.
+// not requiring unlock; a failure there returns the same typed refusal and no version. A vault
+// state read that fails with an invalid state or no vault is ErrRunEnvHistoryUnavailable (as on
+// the open path); any other failure of the state read, the authority read or the openness read is
+// a reader failure. Authority, openness and the owner's epoch and lock state are checked after
+// the last open; a change committed after that check and before the response is written is not
+// fenced. The result carries plaintext secrets: the caller must never log or cache it.
 func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid.UUID) (RunEnvRedactResponse, error) {
 	run, err := s.runEnvRedactAuthority(ctx, wkr, runID)
 	if err != nil {
@@ -413,10 +417,11 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	if !hasEpoch {
 		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
 	}
-	if s.vlt == nil {
-		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
-	}
+	// A nil s.vlt is not reachable here: every open above returns an error without one.
 	state, err := s.vlt.State(ctx, run.UserID)
+	if errors.Is(err, vault.ErrInvalidState) || errors.Is(err, vault.ErrNotConfigured) {
+		return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
+	}
 	if err != nil {
 		return RunEnvRedactResponse{}, fmt.Errorf("%w: run env redact vault state: %w", secretopen.ErrReaderFailure, err)
 	}
