@@ -15,41 +15,87 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// The standalone fleet counts pass independently; only the per-worker
+// intersection can reject this fixture. A separate current worker can satisfy
+// aggregate runtime availability without supporting cross-checks.
+type crossCheckRuntimeHealthStore struct{ *healthFakeStore }
+
+func (f crossCheckRuntimeHealthStore) CountOnlineWorkersSatisfyingCodexHarness(context.Context, uuid.UUID) (int64, error) {
+	return 1, nil
+}
+func (f crossCheckRuntimeHealthStore) CountOnlineWorkersSatisfyingCodexRuntime(context.Context, uuid.UUID) (int64, error) {
+	return 1, nil
+}
+
 func TestHealthCrossCheckPinsWorkerReason(t *testing.T) {
-	for _, tc := range []struct {
-		name                         string
-		pinned, pinAware, checkAware bool
-		want                         string
-	}{
-		{"missing pin support", true, false, true, reasonNoCrossCheckPinCapableWorker},
-		{"unPinned old worker", false, false, true, reasonPlanCrossCheckWaiting},
-		{"pin aware worker", true, true, true, reasonPlanCrossCheckWaiting},
-		{"missing check support", false, false, false, reasonNoCrossCheckWorker},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := stalledRunRow()
-			r.Status, r.Kind = "queued", runkind.CrossCheck
-			r.StatusSince = ago(2 * time.Hour)
-			r.CrossCheckPinRequired = tc.pinned
-			fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
-			fs.onlineWorkers, fs.freeSlotWorkers, fs.eligibleWorkers = 1, 1, 1
-			fs.crossCheckRun = store.Run{Kind: runkind.CrossCheck, Harness: "codex"}
-			caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
-			if tc.checkAware {
-				caps = append(caps, capability.CrossCheckV1)
-			}
-			if tc.pinAware {
-				caps = append(caps, capability.CrossCheckPinsV1)
-			}
-			fs.crossCheckWorkers = []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: caps}}
-			if tc.checkAware && (!tc.pinned || tc.pinAware) {
-				fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1, Claimable: 1}
-			}
-			svc.detectRunHealth(context.Background(), t0)
-			if w := lastWrite(t, fs, r.ID); w.HealthReason.String != tc.want {
-				t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
-			}
-		})
+	for _, indicator := range []string{"harness", "material", "secret"} {
+		for _, tc := range []struct {
+			name                                    string
+			pinned, pinAware, checkAware, runtimeV3 bool
+			want                                    string
+		}{
+			{"missing runtime v3", true, true, true, false, reasonNoCurrentCodexRuntime},
+			{"unpinned runtime gap", false, false, true, false, reasonNoCurrentCodexRuntime},
+			{"runtime and pin gap", true, false, true, false, reasonNoCrossCheckPinCapableWorker},
+			{"runtime and check gap", false, false, false, false, reasonNoCrossCheckWorker},
+			{"missing pin support", true, false, true, true, reasonNoCrossCheckPinCapableWorker},
+			{"unPinned old worker", false, false, true, true, reasonPlanCrossCheckWaiting},
+			{"pin aware worker", true, true, true, true, reasonPlanCrossCheckWaiting},
+			{"missing check support", false, false, false, true, reasonNoCrossCheckWorker},
+		} {
+			t.Run(indicator+"/"+tc.name, func(t *testing.T) {
+				r := stalledRunRow()
+				r.Status, r.Kind = "queued", runkind.CrossCheck
+				r.StatusSince = ago(2 * time.Hour)
+				r.CrossCheckPinRequired = tc.pinned
+				r.Harness = "codex"
+				switch indicator {
+				case "material":
+					r.Harness = "claude"
+					r.CodexMaterialRevision = pgtype.Int8{Int64: 1, Valid: true}
+				case "secret":
+					r.Harness = "claude"
+					r.CodexSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+				}
+				if !tc.runtimeV3 {
+					// GetRunByID can have binding indicators absent from the earlier list snapshot.
+					r.Harness = "claude"
+					r.CodexMaterialRevision = pgtype.Int8{}
+					r.CodexSecretID = pgtype.UUID{}
+				}
+
+				fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
+				svc.q = crossCheckRuntimeHealthStore{fs}
+				fs.onlineWorkers, fs.freeSlotWorkers, fs.eligibleWorkers = 1, 1, 1
+				fs.crossCheckRun = store.Run{Kind: runkind.CrossCheck, Harness: "codex"}
+				switch indicator {
+				case "material":
+					fs.crossCheckRun.Harness = "claude"
+					fs.crossCheckRun.CodexMaterialRevision = pgtype.Int8{Int64: 1, Valid: true}
+				case "secret":
+					fs.crossCheckRun.Harness = "claude"
+					fs.crossCheckRun.CodexSecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+				}
+				caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+				if tc.runtimeV3 {
+					caps = append(caps, capability.CodexRuntimeV3)
+				}
+				if tc.checkAware {
+					caps = append(caps, capability.CrossCheckV1, capability.CrossCheckCodexLeadV1)
+				}
+				if tc.pinAware {
+					caps = append(caps, capability.CrossCheckPinsV1)
+				}
+				fs.crossCheckWorkers = []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: caps}}
+				if tc.checkAware && tc.runtimeV3 && (!tc.pinned || tc.pinAware) {
+					fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{StrictEligible: 1, Claimable: 1}
+				}
+				svc.detectRunHealth(context.Background(), t0)
+				if w := lastWrite(t, fs, r.ID); w.HealthReason.String != tc.want {
+					t.Fatalf("reason = %q, want %q", w.HealthReason.String, tc.want)
+				}
+			})
+		}
 	}
 }
 

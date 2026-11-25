@@ -77,3 +77,55 @@ func TestSetCrossCheckWarnsPerCheckerDirectionLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// Exercise the HTTP response, including the SQL availability query, for each
+// additive baseline requirement. A single worker supplies every unrelated feature.
+func TestSetCrossCheckCodeRequiresCurrentRuntimeLiveDB(t *testing.T) {
+	for _, missing := range []string{capability.CodexRuntimeV3, capability.CodexRuntimeV2, capability.CodexHarnessV1, ""} {
+		t.Run("missing-"+missing, func(t *testing.T) {
+			h, pool := secretsCRUDHandler(t)
+			h.wsvc = workersvc.New(h.q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
+			user := mkSecretUser(t, pool)
+			ctx := context.Background()
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() { exec("DELETE FROM users WHERE id=$1", user) })
+			exec(`INSERT INTO user_secrets (id,user_id,kind,label,is_default,ciphertext,sealed_with) VALUES ($1,$2,'anthropic_token','a',true,'\x01','master')`, uuid.New(), user)
+			secret := uuid.New()
+			exec(`INSERT INTO user_secrets (id,user_id,kind,label,is_default,ciphertext,sealed_with) VALUES ($1,$2,'openai_api_key','c',true,'\x01','master')`, secret, user)
+			if _, err := h.q.InsertCodexCredentialState(ctx, store.InsertCodexCredentialStateParams{UserSecretID: secret, UserID: user, Status: "static"}); err != nil {
+				t.Fatal(err)
+			}
+			caps := []string{"cross_check_code_v1", "cross_check_lane_v1"}
+			for _, c := range []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3} {
+				if c != missing {
+					caps = append(caps, c)
+				}
+			}
+			id := uuid.New()
+			exec(`INSERT INTO workers (id,user_id,name,token_hash,status,protocol_capabilities,max_cross_check_slots) VALUES ($1,$2,$3,$4,'online',$5,1)`, id, user, "w-"+id.String(), id[:], caps)
+			rec := httptest.NewRecorder()
+			h.SetCrossCheck(rec, userReq(http.MethodPut, "/api/me/cross-check", `{"code":true}`, user, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Warning string `json:"code_warning"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			want := ""
+			if missing != "" {
+				want = "No online worker can check code locally on both model families; upgrade the worker that runs your lead. Code checks require that same worker and never block publication."
+			}
+			if body.Warning != want {
+				t.Fatalf("code_warning=%q want=%q", body.Warning, want)
+			}
+		})
+	}
+}

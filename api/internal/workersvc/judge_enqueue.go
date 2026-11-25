@@ -271,16 +271,19 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// Codex gets no separate presence pre-check. Keyed on the RESOLVED judge harness, not
 	// the target's: a Claude target judged on Codex needs no Anthropic token, a Codex target
 	// judged on Claude does.
-	// PRD #4320 (judge lane): an owner whose Claude source is a model provider has no judge until
-	// PRD #4322, whatever harness the judge would run on. Checked before the vendor-token presence
-	// check so a provider-only owner (no Anthropic token) sees the provider reason, not a missing
-	// credential. The atomic create below refuses the same way and covers a source selected after
-	// this read.
-	if rq, ok := s.harnessStore(); ok {
-		if lerr := s.refuseProviderLane(ctx, rq, run.UserID); errors.Is(lerr, ErrProviderLaneUnsupported) || errors.Is(lerr, ErrProviderSourceUnusable) {
+	// Selection policy precedes vendor credential checks and is repeated by atomic creation.
+	rq, ok := s.q.(providerLaneSourceReader)
+	if !ok {
+		slog.Warn("judge enqueue: lane query surface unavailable", "run", run.ID)
+		return
+	}
+	if lerr := s.refuseProviderLane(ctx, rq, run.UserID, judgeHarness); lerr != nil {
+		if errors.Is(lerr, ErrProviderLaneUnsupported) {
 			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
-			return
+		} else {
+			slog.Warn("judge enqueue: lane source check", "run", run.ID, "error", lerr)
 		}
+		return
 	}
 	if judgeHarness != HarnessCodex {
 		if _, err := s.q.GetUserSecretCiphertext(ctx, store.GetUserSecretCiphertextParams{
@@ -329,7 +332,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: run.RepoID}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
+	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: run.RepoID}) // Enforce the engine-aware unsupported-lane selection policy.
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -342,7 +345,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		if errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
 			// PRD #4320: a provider-sourced owner has no judge until PRD #4322; not a failure, and
 			// (PRD #1429 D4) the refusal needs a visible reason.
-			slog.Info("judge enqueue: owner's Claude source is a model provider, no judge created", "run", run.ID, "error", err)
+			slog.Info("judge enqueue: owner's provider source is a model provider, no judge created", "run", run.ID, "error", err)
 			s.recordJudgeSkip(ctx, run.ID, judgeHarness, JudgeSkipProviderLaneUnsupported)
 			return
 		}

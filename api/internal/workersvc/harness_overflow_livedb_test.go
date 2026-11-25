@@ -212,7 +212,9 @@ func TestHarnessOverflowCodexDefaultAndHoldsLiveDB(t *testing.T) {
 				fx.cooldown(fx.codex, -30*time.Second)
 				fx.env.exec(`UPDATE codex_account_admission_throttle SET spread_width_ms=60000 WHERE provider_account_id=$1`, fx.codex.account)
 			case "limit":
-				fx.limitReached(fx.codex, 1000)
+				// Reset 1000s after now, not after poolEpoch (process start): an absolute
+				// reset inside the last minute before the run reads as a pre-reset reading.
+				fx.limitReached(fx.codex, time.Now().Unix()-poolEpoch+1000)
 			case "unknown":
 				fx.env.exec(`DELETE FROM codex_account_rate_limits WHERE provider_account_id=$1`, fx.codex.account)
 			case "pool empty":
@@ -393,7 +395,7 @@ func TestHarnessOverflowCodexPreferredDefaultLiveDB(t *testing.T) {
 				fx.reading(fx.codex, 10)
 				fx.cooldown(fx.codex, time.Hour)
 			case "limit":
-				fx.limitReached(fx.codex, 1000)
+				fx.limitReached(fx.codex, time.Now().Unix()-poolEpoch+1000)
 			case "reserve unknown":
 				fx.reserve(20)
 				fx.env.exec(`DELETE FROM codex_account_rate_limits WHERE provider_account_id=$1`, fx.codex.account)

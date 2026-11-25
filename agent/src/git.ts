@@ -42,6 +42,18 @@ import type { AuthorityReadBound, SlotSnapshot } from "./completion-authority.js
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
+  INVENTORY_FULL_PROBE_MIN_MS,
+  INVENTORY_LAZY_CLEAR_MS,
+  INVENTORY_LOCK_ACQUIRE_MS,
+  INVENTORY_SECTION_BUDGET_MS,
+  InventoryExclusionRegistry,
+  InventorySourceExclusionRefusal,
+  SEED_CLEAR_BUDGET_MS,
+  detectNamespaceRestartBoundary,
+  withinDeadline,
+  type ExclusionEntry,
+} from "./inventory-exclusion.js";
+import {
   ATTEMPT_ID_RE,
   attemptClonePath,
   attemptGeneration,
@@ -455,6 +467,46 @@ export class RecoveryDeadlineExhaustedError extends Error {
 /** reserveRecoveryIteration refused because the episode window is spent (attempts or deadline). */
 export class RecoveryBudgetExhaustedError extends Error {
   constructor() { super("recovery budget exhausted"); }
+}
+
+/** The owner record's bare storage identity (device or inode) differs while its path, branch, key and run
+ *  match. Thrown only by readRecoveryOwner under exactly that condition; every other binding change keeps the
+ *  generic "recovery owner binding changed". The message deliberately avoids the substrings the runner maps
+ *  on (clock, budget, blocked). `recorded`/`current` are non-secret device/inode strings. */
+export class RecoveryOwnerBareIdentityError extends Error {
+  constructor(readonly recorded: { dev: string; ino: string }, readonly current: { dev: string; ino: string },
+    readonly record: RecoveryOwnerRecord) {
+    super("recovery owner binding changed: bare storage identity");
+    this.name = "RecoveryOwnerBareIdentityError";
+  }
+}
+
+/** issue #4627: the only form of the bare-identity error that authorizes the runner's owner hold. Constructed at
+ *  exactly one site, the read-only probe in reserveRecoveryIteration, after every probe fence passed and before
+ *  anything was written. A RecoveryOwnerBareIdentityError raised by any other owner read (the ordinary read, a
+ *  write's readback) stays the base class and keeps today's preservation_failed path. Same message as the base. */
+export class RecoveryOwnerBareIdentityHoldError extends RecoveryOwnerBareIdentityError {
+  constructor(probed: RecoveryOwnerBareIdentityError) {
+    super(probed.recorded, probed.current, probed.record);
+    this.name = "RecoveryOwnerBareIdentityHoldError";
+  }
+}
+
+/** Typed only when both identities parse as `[path, dev, ino]` string triples with the same path and a
+ *  differing device or inode. Anything else (path change, unparsable value) answers undefined. */
+function bareIdentityDifference(recorded: string, current: string):
+  { recorded: { dev: string; ino: string }; current: { dev: string; ino: string } } | undefined {
+  const parse = (raw: string): [string, string, string] | undefined => {
+    try {
+      const v: unknown = JSON.parse(raw);
+      return Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "string")
+        ? [v[0] as string, v[1] as string, v[2] as string] : undefined;
+    } catch { return undefined; }
+  };
+  const a = parse(recorded);
+  const b = parse(current);
+  if (!a || !b || a[0] !== b[0] || (a[1] === b[1] && a[2] === b[2])) return undefined;
+  return { recorded: { dev: a[1], ino: a[2] }, current: { dev: b[1], ino: b[2] } };
 }
 
 export class ScratchPublicationError extends Error {
@@ -978,8 +1030,52 @@ export interface InventoryContentProofBounds {
   maxContentBytes?: number;
   /** Epoch ms the caller's operation ends; the proof's total budget is clipped to it. A passed deadline is unreadable. */
   deadlineAt?: number;
+  /** Polled before every git call: true makes the call unreadable, so an abandoned inventory section starts no new git. */
+  stopped?: () => boolean;
 }
 export const INVENTORY_CONTENT_PROOF_BOUNDS = { maxEntries: 50_000, maxBytes: 8 * 1024 * 1024, maxContentBytes: 256 * 1024 * 1024 } as const;
+
+/** issue #4632: what the registered observe-only probe is asked about one clone key. */
+export interface InventoryExclusionProbeRequest {
+  bare: string;
+  cloneKey: string;
+  canonicalPath: string;
+  targetPaths: string[];
+  deadlineAt: number;
+  protectedMarkers?: string[];
+}
+/** The runner registers this; without one every clear is `not_clear` (fail closed). */
+export type InventoryExclusionProbe = (req: InventoryExclusionProbeRequest) => Promise<"clear" | "not_clear">;
+export type InventoryStageResult<R> = { ok: true; value: R } | { ok: false; why: "stopped" | "deadline" };
+/** What the body of {@link GitCache.withInventorySourceLock} sees. Callbacks arriving after `stopped()` never change the verdict. */
+export interface InventorySection {
+  readonly deadlineAt: number;
+  /** True once the deadline passed, the caller aborted or the section ended. Poll it before every git call. */
+  stopped(): boolean;
+  /** Call before the first git process of the section may start. Keeps the entry until a full clear. */
+  markGitStarted(): void;
+  /** Runs `fn` as tracked work: refused once stopped, abandoned (but still tracked until it settles) at the deadline. */
+  stage<R>(fn: () => Promise<R>): Promise<InventoryStageResult<R>>;
+  /** Reports whether the after-scan found the clone quiescent; only a true value lets step 7 clear. */
+  afterScanQuiescent(v: boolean): void;
+  noteAbort(): void;
+}
+export type InventoryKeptReason = "full_probe_skipped" | "full_probe_not_clear" | "full_probe_deferred_restore" | "unsettled";
+export type InventorySourceLockResult<T> =
+  /** `heldMs` (time B was held, from acquisition to just before returning) is absent when B was never acquired. */
+  | { kind: "refused"; check: "source_lock_unavailable" | "source_settlement_unproven"; detail: string; heldMs?: number }
+  /** `aborted`: an abort (caller signal, ambient scope or `live` going false) was observed after the section started. */
+  | { kind: "ran"; value: T | undefined; timedOut: boolean; aborted: boolean; entryKept: boolean; keptReason?: InventoryKeptReason; heldMs: number };
+export interface InventorySourceLockOptions {
+  clonePath: string;
+  branch: string;
+  isLive: (p: string) => boolean;
+  deadlineMs?: number;
+  signal?: AbortSignal;
+  /** Checked before every stage starts; false latches the section as aborted. */
+  live?: () => boolean;
+  log?: Logger;
+}
 /** Used by the PREDECESSOR path only; the ordinary terminal FINAL keeps `worktreeStatus`.
  *  Total wall budget for the WHOLE content proof (or the whole residue listing), shared by all of its git calls:
  *  each call's timeout is the time left in it, and an exhausted budget is unreadable. */
@@ -4291,6 +4387,10 @@ export type TrackingUpdateResult =
       "receipt_pending_failed" | "tracking_update_failed" | "owner_stamp_failed" | "receipt_commit_failed";
       /** issue #4481: the incoming head fetchAgentBranch refused at the owed cap (`owed_limit` only). */
       refusedSha?: string };
+/** {@link GitCache.owedTipRetained}: the write-free twin of retainCurrentOwedCandidate's result. `unretained`
+ *  means the tip is not provably retained by an exact existing owed pin; nothing was written and the caller
+ *  decides whether to run retainCurrentOwedCandidate. */
+export type OwedTipRetainedResult = TrackingUpdateResult | { kind: "unretained" };
 /** One validated read of a bare's owed metadata (see GitCache.readOwedMetadataUnderLock). */
 interface OwedMetadata {
   names: string[];
@@ -4353,6 +4453,14 @@ class OwedCandidateLimitError extends Error {
   constructor(readonly sha?: string, readonly sealed = false, readonly alreadyLedgered = false) {
     super("owed candidate limit reached");
     this.name = "OwedCandidateLimitError";
+  }
+}
+
+/** A retention ref (owed pin or refused-head ref) already exists at a different target; it is left untouched. */
+export class RetentionRefTargetMismatchError extends Error {
+  constructor(readonly ref: string) {
+    super("retention ref target mismatch");
+    this.name = "RetentionRefTargetMismatchError";
   }
 }
 
@@ -4575,6 +4683,12 @@ export class GitCache {
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  /** issue #4632: the bare-lock keys held by the current async context (see {@link GitCache.withLock}). */
+  private readonly heldLocks = new AsyncLocalStorage<ReadonlySet<string>>();
+  /** issue #4632: same-key exclusions of retained-recovery inventory sections. In memory by design. */
+  private readonly inventoryExclusion = new InventoryExclusionRegistry();
+  private inventoryProbe: InventoryExclusionProbe | undefined;
+  private restartBoundaryChecked = false;
   /** issue #3780: attempt records, keyed token -> `barePath\0branch`. Written only under the bare lock by
    *  promoteTrackingUnderLock; a new GitCache (a restart) starts empty, so stranded state stays refused. */
   private readonly trackingAttempts = new WeakMap<TrackingAttemptToken, Map<string, TrackingAttemptRecord>>();
@@ -6467,6 +6581,264 @@ export class GitCache {
     return this.withLock(barePath, fn);
   }
 
+  /** True when the current async context already holds the bare lock `key` (set by {@link GitCache.withLock}). */
+  private holdsLock(key: string): boolean {
+    return this.heldLocks.getStore()?.has(key) === true;
+  }
+
+  /** issue #4632: registered by the runner; see {@link InventoryExclusionProbe}. */
+  setInventoryExclusionProbe(fn: InventoryExclusionProbe): void {
+    this.inventoryProbe = fn;
+  }
+
+  /** Resolves when every piece of work an inventory section of this key started has settled (the runner's bounded wait). */
+  inventoryExclusionSettled(barePath: string, cloneKey: string): Promise<void> {
+    return this.inventoryExclusion.settled(barePath, cloneKey);
+  }
+
+  /**
+   * issue #4632: try to clear the key's exclusion, under an already held bare lock. `full` removes every settled entry on a
+   * clear verdict; `restore` only admits this one call (the entry stays). No entry admits at once. A `full` clear under a
+   * restore entry is deferred without any probe or lstat. The probe runs only when everything an entry started has settled,
+   * and a verdict that arrives after `deadlineAt` is not trusted. Any failure is `not_clear`. Every read, scope discovery
+   * and probe the call races against the deadline is registered as pending on every entry of the key, so a timed-out one
+   * keeps the key unsettled (no removal, no admission) until it has really settled. `stillLive` is checked synchronously
+   * right before a removal; it defaults to the call's own deadline check.
+   */
+  private async clearExclusion(
+    bare: string, branch: string, canonical: string, isLive: (p: string) => boolean, cls: "full" | "restore",
+    deadlineAt: number, opaque?: ReadonlySet<string>, protectedMarkers?: string[], stillLive?: () => boolean,
+  ): Promise<"admit" | "deferred_restore" | "not_clear"> {
+    const { cloneKey } = cloneKeyOf(canonical);
+    const reg = this.inventoryExclusion;
+    if (!reg.excluded(bare, cloneKey)) return "admit";
+    // Sampled before this call registers any work of its own, so it cannot block itself.
+    const settledAtStart = reg.allPendingSettled(bare, cloneKey);
+    const track = <R,>(work: Promise<R>): Promise<R> => {
+      for (const e of reg.entriesOf(bare, cloneKey)) reg.trackPending(e, work);
+      return work;
+    };
+    try {
+      let entries: string[] | undefined;
+      if (cls === "full") {
+        entries = await withinDeadline(track(this.configEntries(bare)), deadlineAt);
+        if (this.restoreHolder(entries, branch) !== undefined) return "deferred_restore";
+      }
+      if (!settledAtStart) return "not_clear";
+      const probe = this.inventoryProbe;
+      if (!probe) return "not_clear";
+      const ledger = await withinDeadline(track(this.readAttemptLedger(bare, branch, entries)), deadlineAt);
+      const targetPaths = await withinDeadline(track(cls === "full"
+        ? this.nonLiveKeyPaths(canonical, ledger, isLive)
+        : this.restoreSeedSweepPaths(canonical, ledger, isLive, opaque ?? new Set())), deadlineAt);
+      const before = reg.entriesOf(bare, cloneKey).map((e) => e.id);
+      const verdict = await withinDeadline(track(probe({
+        bare, cloneKey, canonicalPath: canonical, targetPaths, deadlineAt,
+        ...(protectedMarkers ? { protectedMarkers } : {}),
+      })), deadlineAt);
+      if (Date.now() > deadlineAt || verdict !== "clear" || (stillLive && !stillLive())) return "not_clear";
+      if (cls === "full") {
+        for (const e of reg.entriesOf(bare, cloneKey)) {
+          if (before.includes(e.id) && reg.entrySettled(e)) reg.removeEntry(bare, cloneKey, e.id);
+        }
+      }
+      return "admit";
+    } catch {
+      return "not_clear";
+    }
+  }
+
+  /** Seed-site guard (under the held bare lock): refuses nonterminally while the key is excluded and cannot be cleared. */
+  private async refuseExcludedKey(
+    bare: string, branch: string, canonical: string, isLive: (p: string) => boolean, cls: "full" | "restore",
+    opaque?: ReadonlySet<string>, protectedMarkers?: string[],
+  ): Promise<void> {
+    const { cloneKey } = cloneKeyOf(canonical);
+    if (!this.inventoryExclusion.excluded(bare, cloneKey)) return;
+    const verdict = await this.clearExclusion(bare, branch, canonical, isLive, cls, Date.now() + SEED_CLEAR_BUDGET_MS, opaque, protectedMarkers);
+    if (verdict === "admit") return;
+    throw new InventorySourceExclusionRefusal(bare, cloneKey, canonical, verdict === "deferred_restore" ? "deferred_restore" : "excluded");
+  }
+
+  /**
+   * issue #4632: run a retained-recovery inventory proof as a section under the repo's bare lock B, with a same-key exclusion
+   * installed for as long as anything the section started may still be in scope of a same-key seed's sweep. Never nests
+   * under B and never runs under a scope that releases the lock itself.
+   */
+  async withInventorySourceLock<T>(
+    barePath: string, opts: InventorySourceLockOptions, body: (section: InventorySection) => Promise<T>,
+  ): Promise<InventorySourceLockResult<T>> {
+    const refused = (check: "source_lock_unavailable" | "source_settlement_unproven", detail: string): InventorySourceLockResult<T> =>
+      ({ kind: "refused", check, detail });
+    if (this.holdsLock(barePath)) return refused("source_lock_unavailable", "nested inside the bare lock");
+    if (this.boundaryProcesses.getStore()?.beforeLockRelease) return refused("source_lock_unavailable", "a boundary scope releases the bare lock itself");
+    // The section is bound by the same ambient scopes withLock honours (boundary, recovery operation, report proof,
+    // maintenance budget): their signals abort it and their remaining time caps D, measured from this call.
+    let ambientSignals: AbortSignal[];
+    let ambientDeadlineAt = Infinity;
+    try {
+      const boundary = this.boundaryProcesses.getStore();
+      const recovery = this.recoveryOperation();
+      const report = this.reportProofs.getStore();
+      const maintenance = MaintenanceBudget.current();
+      ambientSignals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()]
+        .filter((s): s is AbortSignal => s !== undefined);
+      const remaining = Math.min(recovery ? this.recoveryRemaining(recovery) : Infinity,
+        report ? report.deadline - Date.now() : Infinity, maintenance ? maintenance.remainingMs() : Infinity);
+      if (remaining <= 0 || ambientSignals.some((s) => s.aborted)) return refused("source_lock_unavailable", "the ambient scope is already over");
+      ambientDeadlineAt = Date.now() + remaining;
+    } catch {
+      return refused("source_lock_unavailable", "the ambient scope is already over");
+    }
+    const signal = AbortSignal.any([...ambientSignals, ...(opts.signal ? [opts.signal] : [])]);
+    const acquire = AbortSignal.any([AbortSignal.timeout(INVENTORY_LOCK_ACQUIRE_MS), signal]);
+    let acquired = false;
+    try {
+      return await this.withLock(barePath, async () => {
+        acquired = true;
+        return this.runInventorySection(barePath, { ...opts, signal }, body, ambientDeadlineAt);
+      }, acquire);
+    } catch (err) {
+      if (!acquired && err instanceof Error && err.message === GIT_LOCK_WAIT_ABORT_MESSAGE) {
+        return refused("source_lock_unavailable", "the bare lock was not acquired in time");
+      }
+      throw err;
+    }
+  }
+
+  private async runInventorySection<T>(
+    barePath: string, opts: InventorySourceLockOptions, body: (section: InventorySection) => Promise<T>,
+    ambientDeadlineAt: number = Infinity,
+  ): Promise<InventorySourceLockResult<T>> {
+    const reg = this.inventoryExclusion;
+    const log = opts.log ?? this.log;
+    const { cloneKey, canonicalPath } = cloneKeyOf(opts.clonePath);
+    // B is held from here (the start of the locked fn) until just before this returns.
+    const startedAt = Date.now();
+    const heldMs = (): number => Date.now() - startedAt;
+    const deadlineAt = Math.min(startedAt + (opts.deadlineMs ?? INVENTORY_SECTION_BUDGET_MS), ambientDeadlineAt);
+    // (1) A leftover entry of an earlier section is cleared lazily; a key that stays excluded is not provable.
+    const lazy = await this.clearExclusion(barePath, opts.branch, canonicalPath, opts.isLive, "full", Math.min(deadlineAt, startedAt + INVENTORY_LAZY_CLEAR_MS));
+    if (reg.excluded(barePath, cloneKey)) return { kind: "refused", check: "source_settlement_unproven", detail: `same-key exclusion not cleared (${lazy})`, heldMs: heldMs() };
+    // (2) A reclaim in flight may already be sweeping this key.
+    const age = reg.admissionAge(barePath, cloneKey);
+    if (age !== undefined) return { kind: "refused", check: "source_lock_unavailable", detail: `a reclaim admission is active (age ${age} ms)`, heldMs: heldMs() };
+    // (3)
+    const entry: ExclusionEntry = { id: randomUUID(), clonePath: opts.clonePath, gitStarted: false, pending: new Set() };
+    reg.addEntry(barePath, cloneKey, entry);
+    if (!this.restartBoundaryChecked) {
+      this.restartBoundaryChecked = true;
+      const boundary = detectNamespaceRestartBoundary();
+      if (!boundary.scoped) log.warn("inventory exclusion: restart boundary not namespace-scoped; same-key exclusion does not survive a worker restart", { detail: boundary.detail });
+    }
+    // (4)
+    let latch = false;
+    let aborted = false;
+    let timedOut = false;
+    let scanQuiescent = false;
+    let wake!: () => void;
+    const stopSignal = new Promise<void>((resolve) => { wake = resolve; });
+    const stop = (why: "abort" | "deadline"): void => {
+      latch = true;
+      if (why === "abort") aborted = true; else timedOut = true;
+      wake();
+    };
+    const timer = setTimeout(() => stop("deadline"), Math.max(0, deadlineAt - Date.now()));
+    const onAbort = (): void => stop("abort");
+    if (opts.signal?.aborted) onAbort(); else opts.signal?.addEventListener("abort", onAbort, { once: true });
+    const section: InventorySection = {
+      deadlineAt,
+      stopped: () => latch,
+      markGitStarted: () => { entry.gitStarted = true; },
+      stage: async <R,>(fn: () => Promise<R>): Promise<InventoryStageResult<R>> => {
+        if (latch) return { ok: false, why: "stopped" };
+        // The deadline timer can lag D (a busy event loop): a continuation running after D must not start a stage.
+        if (Date.now() >= deadlineAt) { stop("deadline"); return { ok: false, why: "deadline" }; }
+        if (opts.live && !opts.live()) { stop("abort"); return { ok: false, why: "stopped" }; }
+        let work: Promise<R>;
+        try { work = fn(); } catch (error) { work = Promise.reject(error); }
+        reg.trackPending(entry, work);
+        const outcome = await Promise.race([
+          work.then((value) => ({ k: "value" as const, value }), (error: unknown) => ({ k: "error" as const, error })),
+          stopSignal.then(() => ({ k: "stop" as const })),
+        ]);
+        if (outcome.k === "stop") { latch = true; return { ok: false, why: timedOut ? "deadline" : "stopped" }; }
+        if (outcome.k === "error") throw outcome.error;
+        return { ok: true, value: outcome.value };
+      },
+      afterScanQuiescent: (v: boolean) => { if (!latch) scanQuiescent = v; },
+      noteAbort: () => { if (!latch) stop("abort"); },
+    };
+    const result = await Promise.race([
+      (async () => body(section))().then((value) => ({ k: "done" as const, value }), (error: unknown) => ({ k: "threw" as const, error })),
+      stopSignal.then(() => ({ k: "stopped" as const })),
+    ]);
+    // Step 7: only a body that ran to its end, started git, settled everything and found the clone quiescent may clear.
+    let probe: "skipped" | "cleared" | "not_clear" | "deferred_restore" = "skipped";
+    if (result.k === "done" && entry.gitStarted && reg.entrySettled(entry) && !aborted && !timedOut && scanQuiescent
+        && deadlineAt - Date.now() >= INVENTORY_FULL_PROBE_MIN_MS) {
+      // An abort or the deadline while the probe is pending latches; the clear then keeps the entry.
+      const verdict = await this.clearExclusion(barePath, opts.branch, canonicalPath, opts.isLive, "full", deadlineAt,
+        undefined, undefined, () => !latch && !aborted);
+      probe = verdict === "admit" ? "cleared" : verdict;
+    }
+    latch = true;
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onAbort);
+    const settled = reg.entrySettled(entry);
+    if (!entry.gitStarted && settled) reg.removeEntry(barePath, cloneKey, entry.id);
+    const entryKept = reg.entriesOf(barePath, cloneKey).some((e) => e.id === entry.id);
+    let keptReason: InventoryKeptReason | undefined;
+    if (entryKept) {
+      keptReason = !settled ? "unsettled" : probe === "not_clear" ? "full_probe_not_clear"
+        : probe === "deferred_restore" ? "full_probe_deferred_restore" : "full_probe_skipped";
+      const exit = result.k === "threw" ? "body_error" : timedOut ? "deadline" : aborted ? "abort" : "done";
+      if (keptReason === "unsettled" || timedOut || aborted) {
+        log.warn("recovery: inventory_source_settlement_unproven", { bare: barePath, key: cloneKey, clone: opts.clonePath, exit, elapsed_ms: Date.now() - startedAt });
+      } else {
+        log.info("recovery: inventory_source_exclusion_retained", { bare: barePath, key: cloneKey, reason: keptReason });
+      }
+    }
+    if (result.k === "threw") throw result.error;
+    return {
+      kind: "ran", value: result.k === "done" ? result.value : undefined, timedOut, aborted, entryKept,
+      ...(keptReason ? { keptReason } : {}), heldMs: heldMs(),
+    };
+  }
+
+  /**
+   * issue #4632: run `fn` (a reclaim of the targets' clones) with a per-call admission on every target key, so an inventory
+   * section refuses meanwhile. The keys are cleared first under the bare lock, which is released before `fn` runs.
+   */
+  async withReclaimAdmission<T>(
+    barePath: string, targets: Array<{ path: string; branch: string }>, isLive: (p: string) => boolean, fn: () => Promise<T>,
+  ): Promise<T> {
+    const id = randomUUID();
+    const registered: string[] = [];
+    try {
+      await this.withBareLock(barePath, async () => {
+        const keys = new Map<string, { canonical: string; branch: string }>();
+        for (const t of targets) {
+          const k = cloneKeyOf(t.path);
+          if (!keys.has(k.cloneKey)) keys.set(k.cloneKey, { canonical: k.canonicalPath, branch: t.branch });
+        }
+        for (const [cloneKey, k] of keys) {
+          const verdict = await this.clearExclusion(barePath, k.branch, k.canonical, isLive, "full", Date.now() + SEED_CLEAR_BUDGET_MS);
+          if (verdict !== "admit" || this.inventoryExclusion.excluded(barePath, cloneKey)) {
+            throw new InventorySourceExclusionRefusal(barePath, cloneKey, k.canonical, verdict === "deferred_restore" ? "deferred_restore" : "excluded");
+          }
+        }
+        for (const cloneKey of keys.keys()) {
+          this.inventoryExclusion.addAdmission(barePath, cloneKey, id);
+          registered.push(cloneKey);
+        }
+      });
+      return await fn();
+    } finally {
+      for (const cloneKey of registered) this.inventoryExclusion.removeAdmission(barePath, cloneKey, id);
+    }
+  }
+
   /**
    * issue #1597 M2 — is a git operation in progress in the runner clone? A metadata-only probe of
    * the clone's gitdir (no git child, no credentials): resolves the gitdir (a `.git` FILE carrying
@@ -7400,6 +7772,8 @@ export class GitCache {
       }
       const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
       if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
+      // issue #4632: a retained inventory proof's work may still be in scope of this key.
+      await this.refuseExcludedKey(barePath, branch, clonePath, reseed.isLive, "full");
       // issue #3404: a fresh seed on this repo waits for any unresolved shared-bare mutation, before any effect.
       await this.assertBareClear(barePath, "seed-canonical");
       await this.admitSource(clonePath, "seed-canonical");
@@ -7659,6 +8033,8 @@ export class GitCache {
       if (await this.pathPresent(clonePath)) {
         throw new Error(`${REASON_WORKER_RESIDUE_BLOCKED}: the fresh attempt clone path already exists (${sanitizeForLog(path.basename(clonePath), 160)}); nothing seeded`);
       }
+      // issue #4632: a retained inventory proof's work may still be in scope of this key.
+      await this.refuseExcludedKey(barePath, branch, canonical, attempt.isLive, "full");
       // issue #3404: a fresh seed on this repo waits for any unresolved shared-bare mutation, before any effect.
       await this.assertBareClear(barePath, "seed-attempt");
       await this.admitSource(clonePath, "seed-attempt");
@@ -12377,9 +12753,21 @@ export class GitCache {
       // issue #1786: a retained stopped canonical clone is never adopted or captured.
       await this.assertNoStoppedMarker(barePath, journal.clonePath, journal);
       if (journal.runId !== runId) throw new ForeignRetainedRecoveryError();
-      await this.checkedRecovery(barePath, branch, key, journal);
+      // issue #4627: a not-blocked journal with a typed bare-identity mismatch is read without the legacy
+      // attribution repair (its ledger append), so the claim can hold without any write.
+      const repair = !(journal.recovery?.stage !== "blocked" &&
+        await this.typedBareIdentityChange(barePath, branch, key, runId));
+      await this.checkedRecovery(barePath, branch, key, journal, false, undefined, repair);
       return { barePath, journal };
     });
+  }
+
+  /** Read-only probe: the typed bare-identity error when the owner record read raises it, else undefined.
+   *  Every other error is swallowed so the caller's existing sequence (and its error precedence) is unchanged. */
+  private async typedBareIdentityChange(barePath: string, branch: string, key: string, runId: string):
+    Promise<RecoveryOwnerBareIdentityError | undefined> {
+    try { await this.readRecoveryOwner(barePath, branch, key, runId); return undefined; }
+    catch (error) { return error instanceof RecoveryOwnerBareIdentityError ? error : undefined; }
   }
 
   /**
@@ -12433,8 +12821,15 @@ export class GitCache {
     if (!entries.length) return undefined;
     if (entries.length !== 1 || !entries[0]!.startsWith(name + "\n")) throw new Error("duplicate or missing recovery owner record");
     const record = parseRecoveryOwner(entries[0]!.slice(name.length + 1));
-    if (record.bare !== await this.recoveryOwnerBareIdentity(barePath) || record.branch !== branch ||
-        record.key !== key || record.runId !== runId) throw new Error("recovery owner binding changed");
+    const identity = await this.recoveryOwnerBareIdentity(barePath);
+    if (record.bare !== identity || record.branch !== branch ||
+        record.key !== key || record.runId !== runId) {
+      if (record.bare !== identity && record.branch === branch && record.key === key && record.runId === runId) {
+        const typed = bareIdentityDifference(record.bare, identity);
+        if (typed) throw new RecoveryOwnerBareIdentityError(typed.recorded, typed.current, record);
+      }
+      throw new Error("recovery owner binding changed");
+    }
     return record;
   }
 
@@ -12523,6 +12918,28 @@ export class GitCache {
     if (!Number.isSafeInteger(episode) || (episode as number) < 0) episode = undefined;
     return this.withLock(barePath, async () => {
       await this.assertNoRestoreEntry(barePath, branch, expected.runId); // issue #3644: P's key is never touched while a restore entry exists
+      // issue #4627: a typed bare-identity mismatch is classified read-only BEFORE the repairing read below.
+      const typedChange = await this.typedBareIdentityChange(barePath, branch, key, expected.runId);
+      if (typedChange) {
+        // Step 1: the read-only source check (allowLegacyRepair=false) refuses a changed source first.
+        const probed = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
+        const probedOld = probed.recovery;
+        // Step 2: the same pure stale fence as below.
+        if (probedOld?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < probedOld.claimGeneration)) {
+          throw new Error("stale recovery claim fence");
+        }
+        // Step 3: a blocked journal keeps today's disposition: the blocked error before the owner read for
+        // a non-renewable blocker, the generic binding error for the two renewable ones.
+        if (probedOld?.stage === "blocked") {
+          if (probedOld.blocker !== "budget_exhausted" && probedOld.blocker !== "adoption_failed") throw new Error("recovery episode is blocked");
+          throw new Error("recovery owner binding changed");
+        }
+        // Step 4: only the exact committed reservation may surface the typed error.
+        if (probedOld === undefined || typedChange.record.state !== "committed" ||
+            !ownerJournalMatches(typedChange.record, probed)) throw new Error("recovery owner binding changed");
+        // Step 5: nothing was written; only here does the hold-authorizing form reach the runner.
+        throw new RecoveryOwnerBareIdentityHoldError(typedChange);
+      }
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const old = journal.recovery;
       if (old?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < old.claimGeneration)) {
@@ -18781,6 +19198,9 @@ export class GitCache {
       }
       const opaque = this.restoreBasisPaths(entries);
       opaque.add(p.clonePath);
+      const protectedMarkers = [`${runId}:${p.attemptId}`];
+      // issue #4632: admit-only (the entry stays), so P's retained clone is never lstat'd and never swept.
+      await this.refuseExcludedKey(barePath, branch, canonical, input.isLive, "restore", opaque, protectedMarkers);
       if (await this.pathPresent(sPath)) return refuse("successor_path_exists");
       const unchanged = await input.predecessorUnchanged().catch((err: unknown) => refuse("predecessor_check_failed", err));
       if (!unchanged) return refuse("predecessor_classification_changed");
@@ -18825,7 +19245,7 @@ export class GitCache {
 
       step = "before_seed";
       const targets = await this.restoreSeedSweepPaths(canonical, ledger, input.isLive, opaque);
-      await input.beforeSeed(targets, canonical, [`${runId}:${p.attemptId}`]).catch((err: unknown) => refuse("before_seed_refused", err));
+      await input.beforeSeed(targets, canonical, protectedMarkers).catch((err: unknown) => refuse("before_seed_refused", err));
 
       // The census and beforeSeed callbacks ran with the pin only checked before them (plan 3.7): re-verify it now that the
       // `seeding` entry is durable, so a pin deleted from inside a callback refuses here instead of seeding a `ready` entry.
@@ -18851,7 +19271,7 @@ export class GitCache {
         ? this.withRecoveryOperation(input.signal ?? new AbortController().signal, Date.now() + (input.deadlineMs ?? Infinity), locked)
         : locked());
     } catch (err) {
-      if (err instanceof RestoreSeedError) throw err;
+      if (err instanceof RestoreSeedError || err instanceof InventorySourceExclusionRefusal) throw err;
       const message = err instanceof Error ? err.message : "";
       const reason = err instanceof RestoreCompositeError ? "restore_composite" : err instanceof AuthorityRefusedError ? "authority_refused"
         : /deadline/i.test(message) ? "git_deadline" : err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError") ? "aborted" : "seed_failed";
@@ -24348,11 +24768,13 @@ try {
    * could trip the detector without the tree ever having been verified. The caller
    * treats `null` as "cannot assert unchanged" (no trip).
    */
-  async worktreeStatus(cwd: string): Promise<string[] | null> {
+  async worktreeStatus(cwd: string, opts?: { timeoutMs?: number }): Promise<string[] | null> {
     try {
       // GIT_OPTIONAL_LOCKS=0: the inventory boundary reads a kept clone, and a plain status would
       // refresh (rewrite) its .git/index stat cache.
-      const out = await this.runGitAsRunner(cwd, ["status", "--porcelain"], { env: { GIT_OPTIONAL_LOCKS: "0" } });
+      const out = await this.runGitAsRunner(cwd, ["status", "--porcelain"], {
+        env: { GIT_OPTIONAL_LOCKS: "0" }, ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      });
       return out.split("\n").filter((l) => l.length > 0);
     } catch (err) {
       this.log.debug("fingerprint git status failed (→ null, cannot assert unchanged)", {
@@ -24507,7 +24929,7 @@ try {
     const endsAt = Math.min(Date.now() + INVENTORY_PROOF_TOTAL_BUDGET_MS, bounds.deadlineAt ?? Infinity);
     const call = async (args: string[], input?: Buffer) => {
       const remaining = endsAt - Date.now();
-      if (remaining <= 0) return undefined;
+      if (remaining <= 0 || bounds.stopped?.()) return undefined;
       // GIT_NO_REPLACE_OBJECTS: a replace ref must not make the proof read a different blob than the index names.
       const pins = [`--git-dir=${gitDir}`, `--work-tree=${cwd}`,
         "-c", "core.fileMode=true", "-c", "core.ignoreCase=false", "-c", "core.excludesFile=/dev/null"];
@@ -30033,13 +30455,17 @@ try {
     return `context-${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}.json`;
   }
 
-  private async persistOwedContext(c: StoredOwedContext): Promise<void> {
-    const name = this.contextName(c);
-    const record = { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath,
+  private owedContextRecord(c: StoredOwedContext): Record<string, unknown> {
+    return { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath,
       generation: c.generation, kind: c.kind, defaultIdentity: c.defaultIdentity
         ? { ref: c.defaultIdentity.ref, sha: c.defaultIdentity.sha } : null,
       ...("origin" in c ? { origin: c.origin, producer: c.producer }
         : c.generation === null ? { legacy: true } : {}) };
+  }
+
+  private async persistOwedContext(c: StoredOwedContext): Promise<void> {
+    const name = this.contextName(c);
+    const record = this.owedContextRecord(c);
     const existing = await this.readOwedFile(c.barePath, name);
     if (existing !== undefined) {
       if (JSON.stringify(existing) !== JSON.stringify(record)) throw new Error("owed context identity changed");
@@ -30074,6 +30500,8 @@ try {
     await this.assertBareClear(c.barePath, "owed-pin");
     await this.requireOwedCommit(c.barePath, sha);
     const ref = `refs/uzi-owed/${c.runId}/${sha}`;
+    // issue #4627: a wrong-target ref refuses here, before the cap, marker, context or candidate writes.
+    const refState = await this.classifyRetentionRefUnderLock(c.barePath, ref, sha);
     const held = (await this.runGit(c.barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${c.runId}/`]))
       .split("\n").filter(Boolean).map((line) => line.split(" ")[0]!);
     if (!held.includes(ref) && held.length >= this.maxOwedCandidates) {
@@ -30100,7 +30528,7 @@ try {
     const old = await this.readOwedFile(c.barePath, name);
     if (old !== undefined && JSON.stringify(old) !== JSON.stringify(record)) throw new Error("invalid owed candidate record");
     if (old === undefined) await this.writeOwedFile(c.barePath, name, record);
-    await this.runGit(c.barePath, ["update-ref", ref, sha]);
+    if (refState === "absent") await this.createRetentionRefUnderLock(c.barePath, ref, sha);
     if (await this.checkedRefSha(c.barePath, ref) !== sha) throw new Error("owed pin readback mismatch");
   }
 
@@ -30374,7 +30802,10 @@ try {
     // and a failure of either latches this run ineligible for the process lifetime.
     const refWritten = await attempt(async () => {
       const ref = `refs/uzi-incoming/${c.runId}/${generation}/refused-${sha}`;
-      await this.runGit(c.barePath, ["update-ref", ref, sha]);
+      // issue #4627: created only when absent; a wrong target throws here (ref untouched) and latches below.
+      if (await this.classifyRetentionRefUnderLock(c.barePath, ref, sha) === "absent") {
+        await this.createRetentionRefUnderLock(c.barePath, ref, sha);
+      }
       return await this.checkedRefSha(c.barePath, ref) === sha;
     });
     const ledgerWritten = await attempt(async () => {
@@ -30654,13 +31085,37 @@ try {
 
   /** Checked enumeration distinguishes a genuinely absent exact ref from a failed read. */
   private async checkedRefSha(barePath: string, ref: string): Promise<string | undefined> {
+    const sha = await this.rawRefSha(barePath, ref);
+    if (sha === undefined) return undefined;
+    await this.requireOwedCommit(barePath, sha);
+    return sha;
+  }
+
+  /** The exact ref's object id without requiring a commit; undefined only when the ref is genuinely absent. */
+  private async rawRefSha(barePath: string, ref: string): Promise<string | undefined> {
     const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", ref]);
     const matches = out.trim().split("\n").filter((line) => line.startsWith(ref + " "));
     if (matches.length === 0) return undefined;
     if (matches.length !== 1) throw new Error("ambiguous tracking ref");
-    const sha = matches[0]!.slice(ref.length + 1);
-    await this.requireOwedCommit(barePath, sha);
-    return sha;
+    return matches[0]!.slice(ref.length + 1);
+  }
+
+  /** issue #4627, read-only, caller holds the bare lock. A retention ref is only ever created, never moved:
+   *  absent and same-OID are accepted, any other target throws {@link RetentionRefTargetMismatchError} (after
+   *  one warning naming the ref and its current OID) before the caller writes anything. */
+  private async classifyRetentionRefUnderLock(barePath: string, ref: string, sha: string): Promise<"absent" | "same"> {
+    const current = await this.rawRefSha(barePath, ref);
+    if (current === undefined) return "absent";
+    if (current === sha) return "same";
+    this.log.warn("retention ref target mismatch; ref left untouched", { ref, current });
+    throw new RetentionRefTargetMismatchError(ref);
+  }
+
+  /** Create-only: the zero expected-old value makes git refuse when the ref appeared meanwhile; `--no-deref`
+   *  stops a symbolic ref at the destination from redirecting the write. Reads the ref back. */
+  private async createRetentionRefUnderLock(barePath: string, ref: string, sha: string): Promise<void> {
+    await this.runGit(barePath, ["update-ref", "--no-deref", ref, sha, "0".repeat(sha.length)]);
+    if (await this.checkedRefSha(barePath, ref) !== sha) throw new Error("retention ref readback mismatch");
   }
   private checkedTrackingSha(barePath: string, branch: string): Promise<string | undefined> {
     return this.checkedRefSha(barePath, runnerTrackingRef(branch));
@@ -31323,6 +31778,60 @@ try {
     });
   }
 
+  /**
+   * issue #4627: the strictly write-free twin of {@link retainCurrentOwedCandidate}, for a claim exit that must
+   * not touch the predecessor's bare (a held bare-identity change). It mirrors that method exactly up to the
+   * pin step and answers the same `updated` / `not_updated` kinds, but only counts the tip as retained when
+   * the exact owed pin (`refs/uzi-owed/<run>/<sha>` resolving to the sha), its candidate record and its owed
+   * context file already exist with identical content. In every other case it returns `{ kind: "unretained" }`
+   * having written nothing; the caller then runs {@link retainCurrentOwedCandidate} unchanged (exception E1).
+   * Episode refs and recovery pins never count as retention. A runner tells "unretained" apart by
+   * `result.kind === "unretained"`; any other result is final.
+   */
+  async owedTipRetained(barePath: string, opts: FetchAgentBranchOptions): Promise<OwedTipRetainedResult> {
+    opts = this.snapshotOwedOptions(opts);
+    await this.validateOwedContext(barePath, opts.context.branch, opts.context);
+    this.validateConfirmedSha(opts.remotelyConfirmedSha);
+    return this.withLock(barePath, async () => {
+      const observed = await this.observeTrackingUnderLock(barePath, opts.context.branch);
+      if (!observed?.sha || observed.owner?.runId !== opts.context.runId) {
+        return { kind: "not_updated", reason: "ownership_unknown" };
+      }
+      try {
+        const producing = await this.producingContext(barePath, opts.context.branch, observed.owner);
+        const sealed = refusalFileGenerations(await this.refusalNames(barePath), "final", opts.context.runId);
+        const pinned = producing.generation !== null && producing.generation > 0 ? producing.generation : opts.context.generation;
+        const callerGeneration = opts.context.generation ?? 0;
+        if (sealed.some((g) => g > 0 && ((pinned !== null && pinned > 0 && g >= pinned) || (callerGeneration > 0 && g >= callerGeneration)))) {
+          return { kind: "not_updated", reason: "ownership_unknown" };
+        }
+        const done: OwedTipRetainedResult = { kind: "updated", trackingRef: runnerTrackingRef(opts.context.branch),
+          candidateSha: observed.sha, retainedShas: [], divergence: "none" };
+        if (await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha)) return done;
+        const sha = observed.sha;
+        try {
+          await this.assertBareClear(barePath, "owed-pin");
+          if (await this.rawRefSha(barePath, `refs/uzi-owed/${producing.runId}/${sha}`) !== sha) return { kind: "unretained" };
+          const context = this.contextName(producing);
+          const record = { version: 1, runId: producing.runId, context, sha };
+          const candidate = await this.readOwedFile(barePath, `candidate-${producing.runId}-${sha}-${context.slice(8, -5)}.json`);
+          if (candidate === undefined || JSON.stringify(candidate) !== JSON.stringify(record)) return { kind: "unretained" };
+          const stored = await this.readOwedFile(barePath, context);
+          if (stored === undefined || JSON.stringify(stored) !== JSON.stringify(this.owedContextRecord(producing))) return { kind: "unretained" };
+        } catch (cause) {
+          const abort = this.boundaryAbortError(cause);
+          if (abort) throw abort;
+          return { kind: "unretained" };
+        }
+        return { ...done, retainedShas: [sha] };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
+      }
+    });
+  }
+
   /** Local archive cleanup is separate from remote publication reconciliation. The caller
    * supplies authenticated FINAL roots and journal pins. One finite pass under the bare lock;
    * unknown recovery-source attribution retains custody; tracking consumers retain contexts.
@@ -31880,7 +32389,7 @@ try {
             if (restrictionProgress) restrictionProgress.cause = "unknown";
             throw error;
           }
-          const value = await fn();
+          const value = await this.heldLocks.run(new Set([...(this.heldLocks.getStore() ?? []), key]), fn);
           try { this.checkRecoveryInterruption(); }
           catch (error) {
             if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";

@@ -356,8 +356,8 @@ export function ScheduleModal({
   // A sweep default's baked catalog guidance is read-only and travels in a SEPARATE
   // DTO field (issue #675); the editable `guidance` state above is the owner overlay.
   const bakedGuidance = editing?.baked_guidance ?? "";
-  // Per-schedule model override; "" = use the owner's worker model (Run defaults →
-  // Harness and worker models) for the schedule's harness.
+  // Per-schedule model override; "" = use the owner's worker model (Settings →
+  // Models) for the schedule's harness.
   // Applies to ALL targets (unlike guidance). Injection-suspect custom IDs are gated
   // below (modelWarning) mirroring the server's ValidateModel reject.
   const [model, setModel] = useState<string>(editing?.model ?? "");

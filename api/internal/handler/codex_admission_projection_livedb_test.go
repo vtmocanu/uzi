@@ -25,7 +25,7 @@ func TestCodexAdmissionOwnerActionsLiveDB(t *testing.T) {
 	fx.bindEphemeralAdmission(run, alias)
 	fx.holdEphemeralAdmission(alias)
 	worker := fx.onlineWorker("codex", false)
-	caps := []string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"}
+	caps := []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "codex_custom_model_v1"}
 	if _, err := fx.pool.Exec(fx.ctx, "UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", worker, caps); err != nil {
 		t.Fatal(err)
 	}

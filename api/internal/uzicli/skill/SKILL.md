@@ -228,6 +228,7 @@ uzi run resume-now <run-id>
 uzi run resume <run-id>
 uzi run set-token <run-id> (<label> | --auto | --default | --inherit)
 uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
+uzi run ci-autofix <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
 uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
@@ -333,6 +334,8 @@ uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <l
 uzi admin review stats
 uzi admin egress-profile list
 uzi admin egress-profile show <name>
+uzi admin provider list   # read-only: admin-shared provider definitions with selected-user and key counts
+uzi admin provider get <id|name>
 uzi skill status [--target claude|codex|all]
 uzi skill install [--force] [--target claude|codex|all]
 uzi skill install-hook [--target claude|codex|all]
@@ -419,7 +422,11 @@ uzi version
   is passed through and the server validates it; `reset` clears to the inherited value.
   Prints the changed row with its source, from a fresh effective-settings read; when
   that read fails the stored value is shown, the write still exits 0 and the read error
-  goes to stderr. `--json` prints the server's `{"settings": ...}` envelope unchanged.
+  goes to stderr. `--json` prints the server's `{"settings": ..., "effective": ...}` envelope
+  unchanged (`effective` is null with `effective_error` if the server's own read failed).
+  The route allows 19 fields (the Settings → Models page saves through it); a 400 adds an
+  `errors` array per problem. The writes commit in one transaction; the response reads
+  are separate queries after it, not a snapshot.
   Usage exit 2 (no request) on an unknown setting, a missing, invalid or unwanted
   `--harness`, or an invalid value. Exit 6 with "the save may or may not have been
   applied; check with `uzi settings get`" when the commit outcome is unknown, and with
@@ -913,6 +920,14 @@ uzi version
   usage error (exit 2); a foreign/unknown run is a 404 (exit 4). The write is inert once
   the MR is merged or closed. Prints the updated run, whose `MR_REWORK` row reads
   inherit/on/off.
+- `uzi run ci-autofix <run-id>` — set the per-run override for AUTOMATIC CI fixes on the
+  run's branch. Tri-state like `mr-rework` (`--enabled`, `--enabled=false`, `--clear` to
+  inherit; `--clear` with `--enabled` is exit 2; a foreign/unknown run is exit 4), editable
+  after completion. The override that counts is the branch's selected run (newest
+  non-cancelled issue/ci_fix/prompt/self_improve run with an MR); the output names the run
+  that governs and any of your in-flight CI fix runs, which keep their own copied value.
+  The admin gate always wins and manual `uzi ci fix` is never blocked. It does not expire.
+  Prints the updated run (`CI_AUTOFIX` row); `--json` emits the full result envelope.
 - `uzi run rework <run-id> [-m|--message <text>]` — start ONE on-demand MR-rework cycle
   on a **completed** run whose MR is open, PAST the automatic cap (PRD #1202) — the way to
   rework an MR after the automatic watcher has stopped. It SKIPS the cap, the quiet-period
@@ -1979,8 +1994,10 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
 - `uzi token test <label> [--kind anthropic|codex|openai-key]` — test one enabled credential on demand. A label shared by kinds requires `--kind`. The response is a bounded, metadata-only outcome (`ok`, `rejected`, `permission_denied`, or `inconclusive`); Anthropic may spend about one token on its Messages check. Saving a credential does not wait for this verdict.
 - `uzi provider list|create|edit|test|retire|use` — your model providers: named
   Anthropic-compatible gateways Claude can be pointed at (docs: `uzi docs show providers`).
-  `list` shows NAME, URL, AUTH, MODELS, KEY (`yes`/`no`/`disabled`), TEST (`<auth>/<tool>` or `-`)
-  and RETIRED; under `--json` it is `{enabled, providers, allowed_base_urls}`, and `enabled:false`
+  `list` shows NAME, URL, AUTH, MODELS, KEY (`yes`/`no`/`disabled`), TEST (`<auth>/<tool>` or `-`),
+  RETIRED and MANAGED BY (`you` for your own, `admin` for a definition your admin shares, whose key is your own;
+  `edit` and `retire` refuse those, and a name shared by an owned and a shared definition needs
+  the id for `use`/`test`); under `--json` it is `{enabled, providers, allowed_base_urls}`, and `enabled:false`
   means the operator has not configured an allowlist. `create` needs `--name`, `--base-url`
   (exactly an allowlisted URL) and `--model haiku=<model>[:<window>]` (repeatable for sonnet,
   opus, fable). `edit` renames and/or replaces the whole model map. `test` prints the auth and

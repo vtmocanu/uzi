@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -9,11 +10,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // newProviderCmd — `uzi provider` manages the caller's model providers (PRD #4320): a named
-// Anthropic-compatible gateway the Claude engine can be pointed at.
+// gateway for a Claude or Codex engine.
 //
 // The CLI covers list / create / edit / test / retire / use, which are RequireUser routes. The KEY
 // (add, replace, remove, enable/disable), a destination change (base URL, auth style) and
@@ -24,7 +26,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "provider",
 		Short: "List, create, edit, test, retire and select your model providers",
-		Long: "Manage model providers: named Anthropic-compatible gateways that Claude can be pointed at.\n\n" +
+		Long: "Manage model providers: named gateways for Claude or Codex.\n\n" +
 			"The base URL must be one your operator allowed (UZI_PROVIDER_ALLOWED_BASE_URLS); ask\n" +
 			"your operator which ones. Adding or replacing the provider's API key, changing its\n" +
 			"base URL or auth style, and deleting it are web-only (Settings), because they handle\n" +
@@ -76,25 +78,27 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(out.Providers))
 			for _, d := range out.Providers {
 				rows = append(rows, []string{
-					cellText(d.Name), cellText(d.BaseURL), cellText(d.AuthStyle),
+					cellText(d.Name), cellText(d.Engine), cellText(d.BaseURL), cellText(d.AuthStyle),
 					modelsCell(d.ModelMap), providerKeyCell(d), providerTestCell(d.Probe), boolStr(d.Retired),
+					providerManagedCell(d),
 				})
 			}
-			return p.Table([]string{"NAME", "URL", "AUTH", "MODELS", "KEY", "TEST", "RETIRED"}, rows)
+			return p.Table([]string{"NAME", "ENGINE", "URL", "AUTH", "MODELS", "KEY", "TEST", "RETIRED", "MANAGED BY"}, rows)
 		},
 	}
 
-	var cName, cBaseURL, cAuthStyle string
+	var cName, cBaseURL, cAuthStyle, cEngine string
 	var cModels []string
 	create := &cobra.Command{
 		Use:   "create",
 		Short: "Create a model provider (add its key in the web Settings afterwards)",
 		Long: "Create a model provider. --base-url must be one of the URLs your operator allowed, exactly\n" +
-			"as listed (path included). --model maps a Claude alias to a gateway model and is repeatable:\n" +
-			"alias=model[:context_window], with alias one of haiku, sonnet, opus, fable. haiku is required.\n" +
-			"Set the context window to the gateway model's real window. The smallest window set on any\n" +
+			"as listed (path included). --model maps an engine model slot to a gateway model and is repeatable:\n" +
+			"alias=model[:context_window]. Claude: haiku (required), sonnet, opus, fable. Codex: default (required), gpt-6-astra,\n" +
+			"gpt-5.6-sol, gpt-6-sol, gpt-6.1-sol, gpt-6.2-sol, gpt-6.2-astra, gpt-6-luna. Codex requires bearer auth.\n" +
+			"Set the context window to the gateway model's real window. Claude: the smallest window set on any\n" +
 			"model applies to all of them; with none set, uzi assumes 200000.\n" +
-			"Caveat: the Claude CLI may apply its own window to model names it recognizes as Anthropic\n" +
+			"Claude caveat: the Claude CLI may apply its own window to model names it recognizes as Anthropic\n" +
 			"models (for example claude-sonnet-4-5), ignoring both a configured window and uzi's 200000\n" +
 			"default (measured at Claude Code 2.1.325).\n\n" +
 			"The API key is added in the web Settings, never from the CLI.",
@@ -113,16 +117,22 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if mm.Haiku.Model == "" {
-				return uzicli.Exitf(uzicli.ExitUsage, "--model haiku=<model> is required (Claude's background calls use the haiku slot)")
+			protocol, err := providerProtocol(cEngine)
+			if err != nil {
+				return err
 			}
-			warnClaudeWindow(env, mm)
+			if err := validateCLIProfile(cEngine, protocol, cAuthStyle, mm); err != nil {
+				return err
+			}
+			if cEngine == "claude" {
+				warnClaudeWindow(env, mm)
+			}
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
 			d, err := c.CreateProvider(cmd.Context(), apitypes.ProviderCreateRequest{
-				Name: strings.TrimSpace(cName), Engine: "claude", Protocol: "anthropic_messages",
+				Name: strings.TrimSpace(cName), Engine: cEngine, Protocol: protocol,
 				BaseURL: strings.TrimSpace(cBaseURL), AuthStyle: cAuthStyle, ModelMap: mm,
 			})
 			if err != nil {
@@ -139,10 +149,11 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
+	create.Flags().StringVar(&cEngine, "engine", "claude", "provider engine: claude or codex")
 	create.Flags().StringVar(&cName, "name", "", "provider name (unique among your providers, case-insensitively)")
 	create.Flags().StringVar(&cBaseURL, "base-url", "", "gateway base URL, exactly as your operator allowed it")
 	create.Flags().StringVar(&cAuthStyle, "auth-style", "bearer", "how the key is sent: bearer or x_api_key")
-	create.Flags().StringArrayVar(&cModels, "model", nil, "alias=model[:context_window], repeatable; haiku is required (digits after the last colon are the window; a name ending in :0 or containing other colons stays whole)")
+	create.Flags().StringArrayVar(&cModels, "model", nil, "alias=model[:context_window], repeatable; required: Claude haiku, Codex default (digits after the last colon are the window; a name ending in :0 or containing other colons stays whole)")
 
 	var eName, eBaseURL, eAuthStyle string
 	var eModels []string
@@ -170,24 +181,27 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 				n := strings.TrimSpace(eName)
 				req.Name = &n
 			}
+
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			target, err := resolveProvider(cmd, c, args[0], resolveOwned)
+			if err != nil {
+				return err
+			}
 			if len(eModels) > 0 {
 				mm, err := parseModelFlags(eModels)
 				if err != nil {
 					return err
 				}
-				if mm.Haiku.Model == "" {
-					return uzicli.Exitf(uzicli.ExitUsage, "--model haiku=<model> is required: a new model map replaces the old one")
+				if err := validateCLIProfile(target.Engine, target.Protocol, target.AuthStyle, mm); err != nil {
+					return err
 				}
-				warnClaudeWindow(env, mm)
+				if target.Engine == "claude" {
+					warnClaudeWindow(env, mm)
+				}
 				req.ModelMap = &mm
-			}
-			c, err := env.client(gf)
-			if err != nil {
-				return err
-			}
-			target, err := resolveProvider(cmd, c, args[0])
-			if err != nil {
-				return err
 			}
 			d, err := c.EditProvider(cmd.Context(), target.ID, req)
 			if err != nil {
@@ -216,7 +230,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Probe a provider's gateway (auth and tool calls); neither result certifies compatibility",
 		Long: "Send a small probe to the provider's gateway from the api and print two separate results:\n" +
 			"auth (ok, rejected, inconclusive) and tool calls (passed, not_supported, inconclusive, not_run).\n" +
-			"Neither result certifies that the gateway is fully compatible with Claude. The provider needs its\n" +
+			"Neither result certifies that the gateway is fully compatible with its engine. The provider needs its\n" +
 			"key (added in the web Settings) to be tested. Tests are rate limited per user.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -224,7 +238,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			target, err := resolveProvider(cmd, c, args[0])
+			target, err := resolveProvider(cmd, c, args[0], resolveVisible)
 			if err != nil {
 				return err
 			}
@@ -251,7 +265,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 						p.Printf("%s\n", hint)
 					}
 				}
-				p.Printf("Neither result certifies full compatibility with Claude.\n")
+				p.Printf("Neither result certifies full compatibility with its engine.\n")
 			}
 			return nil
 		},
@@ -268,7 +282,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			target, err := resolveProvider(cmd, c, args[0])
+			target, err := resolveProvider(cmd, c, args[0], resolveOwned)
 			if err != nil {
 				return err
 			}
@@ -288,18 +302,25 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 
 	var useNone bool
+	var useEngine string
 	use := &cobra.Command{
 		Use:   "use <name|id> | --none",
-		Short: "Run your Claude runs on a model provider, or back on Anthropic with --none",
-		Long: "Select the model provider your Claude runs use, by name or id, or clear the selection with\n" +
-			"--none so Claude runs use Anthropic directly again. A provider must not be retired, must have\n" +
-			"an enabled key (added in the web Settings) and must have a base URL your operator still allows.\n" +
-			"The selection applies to runs you start afterwards; a run already started keeps what it was\n" +
-			"bound to. Codex runs are unaffected.",
+		Short: "Select or clear a model provider for its engine",
+		Long: "Select a provider for its engine. An optional --engine must match the profile.\n" +
+			"Clear only one engine's selection with --none --engine claude|codex.\n" +
+			"The provider needs an enabled key and an allowed base URL. Existing runs keep their binding.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if useNone == (len(args) == 1) {
 				return uzicli.Exitf(uzicli.ExitUsage, "pass a provider name or id, or --none (not both)")
+			}
+			if useNone && !cmd.Flags().Changed("engine") {
+				return uzicli.Exitf(uzicli.ExitUsage, "--none requires explicit --engine claude|codex")
+			}
+			if cmd.Flags().Changed("engine") {
+				if _, err := providerProtocol(useEngine); err != nil {
+					return err
+				}
 			}
 			c, err := env.client(gf)
 			if err != nil {
@@ -307,47 +328,82 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			var want *string
 			var name string
+			var sharedTarget bool
 			if !useNone {
-				target, err := resolveProvider(cmd, c, args[0])
+				target, err := resolveProvider(cmd, c, args[0], resolveVisible)
 				if err != nil {
 					return err
 				}
+				if _, err := providerProtocol(target.Engine); err != nil {
+					return err
+				}
+				if cmd.Flags().Changed("engine") && useEngine != target.Engine {
+					return uzicli.Exitf(uzicli.ExitUsage, "--engine does not match provider engine")
+				}
+				useEngine = target.Engine
 				if err := providerUsableRefusal(target); err != nil {
 					return err
 				}
-				want, name = &target.ID, target.Name
+				want, name, sharedTarget = &target.ID, target.Name, isSharedProvider(target)
 			}
-			got, err := c.SetClaudeProviderSource(cmd.Context(), want)
+			var got *string
+			if useEngine == "codex" {
+				got, err = c.SetCodexProviderSource(cmd.Context(), want)
+			} else {
+				got, err = c.SetClaudeProviderSource(cmd.Context(), want)
+			}
 			if err != nil {
 				return providerUseErr(err)
 			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
-				return p.JSON(struct {
-					ClaudeProviderID *string `json:"claude_provider_id"`
-					Name             *string `json:"name"`
-				}{got, nilIfEmpty(name)})
+				return p.JSON(map[string]any{useEngine + "_provider_id": got, "name": nilIfEmpty(name)})
 			}
 			if !gf.quiet {
 				if got == nil {
-					p.Printf("Claude runs now use Anthropic directly (no model provider selected).\n")
+					if useEngine == "claude" {
+						p.Printf("Claude runs now use Anthropic directly (no model provider selected).\n")
+					} else {
+						p.Printf("Codex runs now use their native source (no model provider selected).\n")
+					}
 				} else {
-					p.Printf("Claude runs you start now use provider %q.\n", cellText(name))
+					suffix := ""
+					if sharedTarget {
+						suffix = " (shared by your admin)"
+					}
+					p.Printf("%s runs you start now use provider %q%s.\n", cellText(useEngine), cellText(name), suffix)
 				}
 			}
 			return nil
 		},
 	}
-	use.Flags().BoolVar(&useNone, "none", false, "clear the selection: Claude runs use Anthropic directly")
+	use.Flags().StringVar(&useEngine, "engine", "", "selection engine: claude or codex (required with --none)")
+	use.Flags().BoolVar(&useNone, "none", false, "clear the selection for the explicit --engine")
 
 	cmd.AddCommand(list, create, edit, test, retire, use)
 	return cmd
 }
 
-// resolveProvider lists the caller's providers and picks the one an argument names: an exact id,
-// else a name matched case-insensitively (names are unique per owner case-insensitively). A
-// feature-off server and an unknown name are distinct, readable errors raised before any write.
-func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string) (apitypes.ProviderDTO, error) {
+// providerResolveMode says which definitions an argument may name (PRD #4324).
+type providerResolveMode int
+
+const (
+	// resolveVisible: any definition the caller can see, owned or admin-shared (use, test). A name
+	// shared by an owned and a shared definition is refused as ambiguous; an id is always exact.
+	resolveVisible providerResolveMode = iota
+	// resolveOwned: only the caller's own definitions (edit, retire). A shared definition is
+	// managed by the admin, so naming only one is refused before any request.
+	resolveOwned
+)
+
+// isSharedProvider reports an admin-shared definition (a non-nil credential mode).
+func isSharedProvider(d apitypes.ProviderDTO) bool { return d.CredentialMode != nil }
+
+// resolveProvider lists the providers visible to the caller and picks the one an argument names:
+// an exact id, else a name matched case-insensitively (names are unique per owner
+// case-insensitively, but an owned and a shared definition may share one). A feature-off server and
+// an unknown name are distinct, readable errors raised before any write.
+func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string, mode providerResolveMode) (apitypes.ProviderDTO, error) {
 	arg = strings.TrimSpace(arg)
 	out, err := c.ListProviders(cmd.Context())
 	if err != nil {
@@ -359,20 +415,69 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string) (apitypes.
 	}
 	for _, d := range out.Providers {
 		if d.ID == arg {
+			if mode == resolveOwned && isSharedProvider(d) {
+				return apitypes.ProviderDTO{}, sharedManagedRefusal(d)
+			}
 			return d, nil
 		}
 	}
+	var named []apitypes.ProviderDTO
 	for _, d := range out.Providers {
 		if strings.EqualFold(d.Name, arg) {
-			return d, nil
+			named = append(named, d)
 		}
+	}
+	if mode == resolveOwned {
+		var owned []apitypes.ProviderDTO
+		for _, d := range named {
+			if !isSharedProvider(d) {
+				owned = append(owned, d)
+			}
+		}
+		if len(owned) == 0 && len(named) > 0 {
+			return apitypes.ProviderDTO{}, sharedManagedRefusal(named[0])
+		}
+		named = owned
+	}
+	switch len(named) {
+	case 0:
+	case 1:
+		return named[0], nil
+	default:
+		ids := make([]string, 0, len(named))
+		for _, d := range named {
+			kind := "yours"
+			if isSharedProvider(d) {
+				kind = "admin"
+			}
+			ids = append(ids, fmt.Sprintf("%s (%s)", cellText(d.ID), kind))
+		}
+		return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+			// Ids first and the name capped: errors print through cellText (200-rune cap), so a
+			// long or quote-heavy name truncates itself before any id (all ids fit for up to 4 matches;
+			// 5+ EqualFold-equal names, e.g. s/U+017F variants, can still cut the last id).
+			"pass an id: %s (%d providers are named \"%s\")",
+			strings.Join(ids, ", "), len(named), capCell(cellText(arg), 40))
 	}
 	return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitNotFound,
 		"no provider named or with id %q; `uzi provider list` shows yours", cellText(arg))
 }
 
+// sharedManagedRefusal is the refusal for an edit or retire aimed at an admin-shared definition:
+// only an admin changes it (in the web UI), so no request is sent.
+func sharedManagedRefusal(d apitypes.ProviderDTO) error {
+	// Errors print through cellText, which caps at 200 runes: the name is capped at 40 runes and
+	// quoted plainly (no %q escaping growth), so the fix step is never cut off.
+	hint := "; you can select it with `uzi provider use`"
+	if d.Retired {
+		hint = ""
+	}
+	return uzicli.Exitf(uzicli.ExitConflict,
+		"provider \"%s\" is managed by your admin; only an admin can change it%s", capCell(cellText(d.Name), 40), hint)
+}
+
 // providerUsableRefusal refuses, before any write, a provider the list already shows cannot be the
-// Claude source, with the one step that fixes it. The server applies the same rules (and the
+// engine source, with the one step that fixes it. The server applies the same rules (and the
 // operator allowlist, which the list does not show), so this only saves a round trip and names
 // the fix; it is never the authority.
 func providerUsableRefusal(d apitypes.ProviderDTO) error {
@@ -450,6 +555,22 @@ func parseModelFlags(vals []string) (apitypes.ModelMapDTO, error) {
 		}
 		seen[alias] = true
 		switch alias {
+		case "default":
+			mm.Default = &entry
+		case "gpt-6-astra":
+			mm.GPT6Astra = &entry
+		case "gpt-5.6-sol":
+			mm.GPT56Sol = &entry
+		case "gpt-6-sol":
+			mm.GPT6Sol = &entry
+		case "gpt-6.1-sol":
+			mm.GPT61Sol = &entry
+		case "gpt-6.2-sol":
+			mm.GPT62Sol = &entry
+		case "gpt-6.2-astra":
+			mm.GPT62Astra = &entry
+		case "gpt-6-luna":
+			mm.GPT6Luna = &entry
 		case "haiku":
 			mm.Haiku = entry
 		case "sonnet":
@@ -459,7 +580,7 @@ func parseModelFlags(vals []string) (apitypes.ModelMapDTO, error) {
 		case "fable":
 			mm.Fable = &entry
 		default:
-			return mm, uzicli.Exitf(uzicli.ExitUsage, "unknown model alias %q; use haiku, sonnet, opus or fable", cellText(alias))
+			return mm, uzicli.Exitf(uzicli.ExitUsage, "unknown model alias %q; use a Claude alias or Codex model ID", cellText(alias))
 		}
 	}
 	return mm, nil
@@ -493,7 +614,7 @@ func isAllDigits(s string) bool {
 }
 
 // modelsCell renders the model map for the MODELS column: alias=model[:window] in the order
-// haiku, sonnet, opus, fable, skipping unmapped aliases.
+// Claude aliases followed by Codex slots, skipping unmapped entries.
 func modelsCell(m apitypes.ModelMapDTO) string {
 	var parts []string
 	add := func(alias string, e *apitypes.ModelEntryDTO) {
@@ -511,6 +632,14 @@ func modelsCell(m apitypes.ModelMapDTO) string {
 	add("sonnet", m.Sonnet)
 	add("opus", m.Opus)
 	add("fable", m.Fable)
+	add("default", m.Default)
+	add("gpt-6-astra", m.GPT6Astra)
+	add("gpt-5.6-sol", m.GPT56Sol)
+	add("gpt-6-sol", m.GPT6Sol)
+	add("gpt-6.1-sol", m.GPT61Sol)
+	add("gpt-6.2-sol", m.GPT62Sol)
+	add("gpt-6.2-astra", m.GPT62Astra)
+	add("gpt-6-luna", m.GPT6Luna)
 	return strings.Join(parts, " ")
 }
 
@@ -548,8 +677,46 @@ func probeHint(p *apitypes.ProviderProbeDTO) string {
 
 func printProvider(p *uzicli.Printer, d apitypes.ProviderDTO) {
 	p.Printf("Provider %q (%s)\n", cellText(d.Name), cellText(d.ID))
+	p.Printf("  engine: %s\n", cellText(d.Engine))
 	p.Printf("  url:    %s\n", cellText(d.BaseURL))
 	p.Printf("  auth:   %s\n", cellText(d.AuthStyle))
 	p.Printf("  models: %s\n", dashOr(modelsCell(d.ModelMap)))
 	p.Printf("  key:    %s\n", providerKeyCell(d))
+}
+
+// providerManagedCell renders MANAGED BY: "admin" for an admin-shared definition, "you" for your own.
+// Both values are fixed literals, so no server text is drawn here.
+func providerManagedCell(d apitypes.ProviderDTO) string {
+	if isSharedProvider(d) {
+		return "admin"
+	}
+	return "you"
+}
+
+// providerProtocol rejects absent or unknown stored engines rather than defaulting them.
+func providerProtocol(engine string) (string, error) {
+	switch engine {
+	case providers.EngineClaude:
+		return providers.ProtocolAnth, nil
+	case providers.EngineCodex:
+		return providers.ProtocolResponses, nil
+	default:
+		return "", uzicli.Exitf(uzicli.ExitUsage, "invalid provider engine %q; use claude or codex", cellText(engine))
+	}
+}
+
+func validateCLIProfile(engine, protocol, auth string, mm apitypes.ModelMapDTO) error {
+	// The DTO and shared core use the same wire vocabulary.
+	data, err := json.Marshal(mm)
+	if err != nil {
+		return err
+	}
+	var models providers.ModelMap
+	if err := json.Unmarshal(data, &models); err != nil {
+		return err
+	}
+	if err := providers.ValidateProfile(engine, protocol, auth, models); err != nil {
+		return uzicli.Exitf(uzicli.ExitUsage, "invalid provider profile: %s", err)
+	}
+	return nil
 }

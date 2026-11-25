@@ -28,6 +28,7 @@
   "default_harness": null,
   "judge_runs_on": null,
   "claude_provider_id": null,
+  "codex_provider_id": null,
   "default_claude_model": null,
   "default_codex_model": null,
   "judge_models": null,

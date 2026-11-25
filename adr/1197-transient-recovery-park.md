@@ -2071,6 +2071,11 @@ parked). Design and the restore itself:
   nothing is reaped. Resume claims again and holds again unchanged on this release; it grants no
   authority over the predecessor. A stale claim, a credential switch, lost ownership and an owner
   Cancel propagate unchanged.
+- **A permanent message failure (#4644).** From route selection until the seed hands off, a permanent
+  refusal of the run's messages (the batcher breaker) reports no `failed`, reaps nothing and keeps
+  custody. During this hold the park still proceeds. Elsewhere in that window the flight stops
+  nonterminally, and an active credential switch still takes its own path. A trip just before the hold
+  flag is set, or during a source-end decline report, stops nonterminally without the owner hold.
 
 **Accounting.** The park holds the predecessor's custody hold and the current generation's, and an
 owner Resume adds a claim and a hold, each counting toward `custody_hold_limit`. An owner-held hosted
@@ -2144,3 +2149,115 @@ is NULL after a crash: the park falls back to the generic hold, which is the saf
 checking, as 00425 does, then refuses while any run is parked on this cause with
 `secret_remediation_active`, because dropping the column would erase the only record that Resume must be
 refused. Cancel those runs first.
+
+## Amendment 2026-11-23, #4627: a changed bare storage identity holds for its owner
+
+Decision record (AI-synced 2026-11-23). This extends the #3527 owner hold
+([amendment](#amendment-2026-10-27-3527-owner-held-retained-adoption-retry)) and the #3644 hold
+([amendment](#amendment-2026-11-09-3644-an-unsupported-predecessor-holds-for-its-owner)) to one more
+classification, made before any source action: a device or inode change alone, on the first reservation of
+a claim on a journal that is not blocked, now parks at `recovery_wait` / `retained_recovery_adoption_failed`
+instead of failing the run. As in #3644, the cause here means only that continuation was refused before any
+source effect. No `adoption_failed` blocker is persisted and no quiescence is proven.
+
+**Decision.**
+
+- **Nothing new on the wire.** No new cause, field, schema, migration or `recovery_wait_detail` value.
+  Device and inode stay part of the execution binding: execution is refused, the owner record is not
+  rebound, no execution grant is consumed, and nothing is captured or sent to a model.
+- **Classification at the owner read.** `readRecoveryOwner` in `agent/src/git.ts` raises the typed
+  `RecoveryOwnerBareIdentityError` only when the record's branch, key and run match, both identities parse
+  as `[path, dev, ino]` triples, the path is equal and only the device or inode differs. Every other
+  mismatch (a path change, an unparsable value, a branch, key or run difference) keeps the generic
+  `recovery owner binding changed`. The typed message avoids the substrings the runner maps on (`clock`,
+  `budget`, `blocked`).
+  The runner holds only on `RecoveryOwnerBareIdentityHoldError`, a subclass with the same message that
+  only the read-only probe below constructs, after all its fences pass and before anything is written. A
+  storage-identity change detected later in the same reservation (the ordinary owner read after the probe
+  passed, or an owner-record write's readback) raises the base class, is not held, and fails closed as
+  `preservation_failed` with work and custody kept on the worker.
+- **Limits.** The hold applies only on the first reservation iteration of a claim (before any capture,
+  teardown or journal write) and only when the journal is not blocked. A blocked journal, renewable or
+  not, keeps today's disposition: the #3580 re-hold for an `adoption_failed` or `budget_exhausted`
+  blocker, and for any other blocker the run still ends failed with local work and custody kept. A later iteration and a changed reservation keep
+  today's path.
+- **Read-only probe and exact fence.** In `reserveRecoveryIteration` a probe runs first, under the lock.
+  It writes nothing: a read-only source check, the stale-claim fence, the not-blocked guard (a non-renewable
+  blocked journal gets today's `recovery episode is blocked`; only a `budget_exhausted` or `adoption_failed`
+  blocked journal gets the generic binding error), and an exact reservation fence (the committed owner record
+  must match the journal's reservation). Only then is the typed error rethrown. Legacy retained discovery
+  reads a not-blocked journal with the typed mismatch without the attribution repair; a journal that would
+  need the repair is refused read-only through the existing discovery failure path with custody kept. It
+  is not held.
+- **Writer and preconditions.** `holdForBareIdentityChange` in `agent/src/runner.ts` is modelled on
+  `holdUnsupportedRestore`. It parks only with the API feature
+  `recovery_cause_retained_recovery_adoption_failed`, a positive claim generation and a first `running`
+  report acknowledged as `running`; otherwise today's path applies. It emits one conditionally worded
+  guidance line (inspect with `uzi run recovery <run>`, export or recover rather than Resume, a claimed
+  Resume holds again and adds a custody hold up to `custody_hold_limit`, Cancel ends the run), attempts to
+  confirm delivery within a bound (logging `guidance_unconfirmed` on failure and parking anyway), then uses
+  the existing park writer and ends in a nonterminal stop. An unconfirmed park adds one corrective line. A stale claim,
+  a credential switch, lost ownership and an owner Cancel propagate as in #3644.
+- **Teardown guard.** The park's process reap and cache drop are skipped for this hold, as for #3644, so
+  the HOME the flight holds is not touched.
+- **Owed-tip rule.** The exit first asks a write-free helper (`owedTipRetained`) whether an exact owed pin
+  (ref, candidate record and context file, all identical) already retains the tip, or whether the tip is
+  remotely covered; then it writes nothing and the predecessor's refs are unchanged. Otherwise
+  (exception E1) it runs today's `retainCurrentOwedCandidate` unchanged. Its writes are the existing
+  additive set: below the cap, the candidate record and one new owed ref (the context file only when
+  absent); when the pin fills the cap, also the owed-path marker; already at the cap, a refusal ref, a ledger
+  row and the marker instead of a pin, which is `not_updated`. It never moves or deletes an existing ref and
+  never touches the journal, owner record, attempt mode or attempt ledger. Episode refs and recovery pins do
+  not count as retention, because their own cleanup can delete them. On an inventory-guarded exit the
+  existing refusal-provenance admission record is written as on any guarded exit. A Codex exit whose
+  terminal disposal is unproven skips owed retention, as before.
+- **Additive-only retention refs.** Both writers of retention refs (`pinOwedUnderLock` for
+  `refs/uzi-owed/<run>/<sha>` and `recordRefusalUnderLock` for the refused-head ref under
+  `refs/uzi-incoming/`) now classify the destination read-only first: absent is created with
+  `update-ref --no-deref <ref> <sha>` and the zero object id as expected old value, an identical target is
+  reused, and a different target throws `RetentionRefTargetMismatchError` after one warning
+  (`retention ref target mismatch; ref left untouched`). In the owed pin writer the mismatch throws before any
+  other write. In the refusal-ref writer the recording step catches the mismatch, the ledger and marker steps
+  still run, and the run is then latched refusal-incomplete (the existing fail-closed path). This applies to
+  every caller, not only the hold. Previously an unconditional `update-ref` moved the wrong target, which
+  silently healed it. Now the ref stays wrong until an operator acts: the run's owed inventory stays
+  unreadable and fail-closed with custody kept, and a wrong refusal ref stays as evidence. The operator
+  inspects with `uzi run recovery <run>`, then exports or recovers the work, or discards or settles the
+  run's holds through the existing routes. No deletion tool is added.
+- **A refused or unconfirmed park.** The park request (and, on an uncertain ACK, at most one replay) was
+  sent; after it the worker sends no further state report, posts one corrective status line saying the hold
+  was not confirmed, and stops nonterminally with custody kept. A definitive 400 leaves the run `running` on
+  the server. An unconfirmed park may also have been applied with every ACK lost, in which case the owner
+  hold stands. When the run is still `running`, the worker has dropped it from its active-run snapshot, so the
+  ordinary missing-flight requeue accounting applies (a charged requeue below `RUN_MAX_REQUEUES`, then
+  `worker_requeue_exhausted` at the cap when recovery evidence or unresolved custody is recorded, otherwise
+  `worker_lost`).
+
+**Edges not held.** A blocked journal; a typed mismatch on a later iteration; a changed reservation;
+a not-blocked adopting journal that would need legacy attribution repair (refused read-only today, as it
+failed before); a mismatch of path, branch, key or run. They keep today's path.
+
+**Out of scope.** Continuing across a remount (rebinding the owner record to the new storage identity) is
+not decided here: #4494 Direction 1 and #4628.
+
+**Accounting.** As in #3644, the park holds the current generation's custody hold; an owner Resume adds a
+claim and a hold, each counting toward `custody_hold_limit`.
+
+## Amendment 2026-11-23, #4645: a permanent message failure after a confirmed hold or wall park
+
+Decision record (AI-synced 2026-11-23). Like the #4644 permanent-message-failure branch above and the #4627
+bare-identity early return in `handlePermanentFailure`, this keeps a permanent refusal of the run's messages
+(the batcher breaker) from replacing a nonterminal disposition with a `failed` report.
+
+- **Guard.** `handlePermanentFailure` in `agent/src/runner.ts` returns, logging a warning, once
+  `holdOrWallParkConfirmed` is set: the server answered `paused` to a completion hold (including the
+  interlocked completion hold), a preflight hold, a phase-switch hold or a wall park on this flight. No
+  terminal is journaled, nothing is aborted and no terminal provider reap runs, so on Codex the guard adds no
+  credentialed boundary (refresh or release) after the confirmation. The park's own shutdown and cleanup are unchanged.
+- **Precedence.** The guard sits after the worker-memory branch, which keeps its custody retention,
+  `RetainedRecoveryStop` abort and reconciliation ownership, and after the #4644 restore-window branch.
+- **Scope.** Only a trip after positive confirmation is covered. A trip while a hold request is
+  unresolved or refused, during the phase-switch flush before its request, during the wall pre-park flush
+  or the park report, or in a callback that entered before the flag was set keeps today's handling. Those
+  windows, a shared nonterminal-disposition lifecycle and the server-side replay check after Resume are
+  tracked in #4646.

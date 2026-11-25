@@ -31,7 +31,7 @@ func TestPlanCrossCheckInvalidMilestonesRouterLiveDB(t *testing.T) {
 	token := "milestone-admission-" + uuid.NewString()
 	hash := sha256.Sum256([]byte(token))
 	worker := uuid.New()
-	caps := []string{"cross_check_v1", "cross_check_rounds_v1", "codex_harness_v1", "codex_runtime_v2", "completion_interlock_v1", "codex_completion_interlock_v1", capability.CrossCheckOwnerSteeringV1}
+	caps := []string{"cross_check_v1", "cross_check_rounds_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "completion_interlock_v1", "codex_completion_interlock_v1", capability.CrossCheckOwnerSteeringV1}
 	cliMustExec(t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status,protocol_capabilities,max_concurrent_runs) VALUES($1,$2,'admission',$3,'online',$4,8)`, worker, owner, hash[:], caps)
 	cliMustExec(t, pool, `UPDATE runs SET worker_id=$2,harness='claude',auto_approve=true,plan_cross_check_required=true,claim_generation=1 WHERE id=$1`, lead, worker)
 	sealed := mustSealT(ctx, t, h.box, []byte("milestone-admission-fixture-"+uuid.NewString()))

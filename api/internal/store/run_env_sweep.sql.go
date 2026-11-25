@@ -94,7 +94,7 @@ type ListRunEnvSweepUsersParams struct {
 }
 
 // PRD #4416 M2: the retired-version sweeper and the history-full answer. Both read
-// fn_run_env_run_held (migration 00514) as the one definition of a held run.
+// fn_run_env_run_held (migration 00532) as the one definition of a held run.
 // Owners with work for the sweeper, after a cursor and in id order: a retired or pending-deletion
 // version (run_env_vars_sweep_idx), or a variable identity that no row and no receipt references
 // any more (run_env_var_ids_user_idx).

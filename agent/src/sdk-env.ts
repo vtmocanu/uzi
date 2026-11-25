@@ -27,7 +27,8 @@
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { claudeConfigDir } from "./claude-config-dir.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
-import { runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
 import { foldRunEnv, runEnvInjectedSet, type RunEnvInjectedSet, type RunEnvInjection } from "./run-env-inject.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
@@ -239,6 +240,15 @@ function sdkPreFoldEnv(
   return env;
 }
 
+/** The refusal text for a run that carries user variables on a worker without the uid split. */
+export const REASON_RUN_ENV_NEEDS_SPLIT = "run environment variables need the protected two-uid worker";
+
+/** Refuse (before anything starts) a run that carries user variables unless the uid split is active:
+ *  with one uid the CLI's config directory gives no protection (claude-global-config.ts). */
+export function assertRunEnvDeliverable(vars: readonly unknown[] | undefined): void {
+  if (vars !== undefined && vars.length > 0 && !uidSplitActive()) throw new TrustedExecutionRefusal(REASON_RUN_ENV_NEEDS_SPLIT);
+}
+
 /** The keys buildSdkEnv refuses to let a user variable take (the credential, HOME and the pinned ANTHROPIC_* keys). */
 const isSdkRunEnvProtected = (k: string): boolean => PROTECTED_ENV_KEYS.has(k);
 
@@ -298,6 +308,7 @@ export function buildSdkEnv(
   runTmpdir?: string,
   runEnv?: RunEnvInjection,
 ): SdkEnv {
+  assertRunEnvDeliverable(runEnv?.vars);
   const env = sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir);
   // PRD #4416 M2: user variables, after the tool profile and before every worker-set key below.
   foldRunEnv(env, runEnv, isSdkRunEnvProtected);

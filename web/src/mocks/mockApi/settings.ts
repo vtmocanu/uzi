@@ -28,12 +28,12 @@ import { daysAgo, mockBuildInfo, MOCK_WEEKLY_WARNING_MARGIN_PTS } from "../data"
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
-import { mockClaudeProviderId } from "./providers";
+import { mockClaudeProviderId, mockCodexProviderId } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
 import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheckSettings";
-import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ModelSettingCell, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
+import type { CatalogDefault, CodexAccountMode, CrossCheckPinDTO, EffectiveSettings, EffortSettingCell, Harness, ModelSettingCell, ModelSettingsFieldError, ModelSettingsPatch, ModelSettingsSaveResponse, ScheduleSettingsPreview, ScheduleSettingsPreviewRequest, StartPreview, StartPreviewRequest } from "../../lib/apiTypes";
 import { RECORDED_EFFECTIVE_SCENARIOS, type RecordedEffectiveScenario } from "../data/effectiveSettings";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
@@ -95,11 +95,11 @@ const SEED_USER_SETTINGS: UserSettings = {
   // while an explicit null resets that field to "Same as the run".
   judge_model: null,
   // PRD #3245: the Codex judge lane; null = inherit. Resolved per harness into
-  // judge_models (mockJudgeModelCells) and edited on Run defaults.
+  // judge_models (mockJudgeModelCells) and edited on Models.
   codex_judge_model: null,
   summary_model: null,
   // PRD #3248: the Codex summary lane; null = inherit. Resolved per harness into
-  // summary_models (mockSummaryModelCells) and edited on Run defaults.
+  // summary_models (mockSummaryModelCells) and edited on Models.
   codex_summary_model: null,
   // PRD #1570: the task-review lanes; null = the built-in. Resolved into task_review_models.
   task_review_model: null,
@@ -574,7 +574,7 @@ export function mockWeeklyWarningMarginPts(): number {
 // PRD #1551 D3: the effective-harness lane the deprecated default_model projects to and
 // bridges through. A codex pin resolves to Codex, a claude pin to Claude; with no pin it
 // follows D11 — Codex only when it is the SOLE usable harness — and falls back to Claude
-// when no harness is usable at all. The grouped Run Defaults card never sends or reads
+// when no harness is usable at all. The Models tab never sends or reads
 // default_model, so this serves only the bounded stale-client bridge and the response
 // projection, mirroring the server.
 function effectiveLegacyLane(harness: UserSettings["default_harness"]): "claude" | "codex" {
@@ -640,18 +640,37 @@ function mockPlanningModel(raw: string | null | undefined, harness: Harness = "c
   return trimmed;
 }
 
-// The mock has no lead-template pin; each default follows its worker lane or built-in.
-function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude"): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" })[] {
+// Each default uses the order the server's planningModelCells composes: the worker lane
+// (user_default), else the given lead pin for the harness (template), else the built-in. The pin
+// comes from mockLeadModelPins, which only approximates the server's lead pins (see there).
+function mockPlanningModelCells(planning: string | null | undefined, lane: string | null | undefined, harness: Harness = "claude", leadPin: string | null = null): (ModelSettingCell & { source: "builtin" | "user_default" | "user_planning_default" | "template" })[] {
   const valid = (m: string) => harness === "codex" ? !KNOWN_CLAUDE_ALIASES.includes(m) : !CODEX_ROLE_MODELS.includes(m);
   const laneModel = lane?.trim() ?? "";
+  const pin = leadPin?.trim() ?? "";
   const def = laneModel !== "" && valid(laneModel)
     ? { model: laneModel, source: "user_default" as const }
-    : { model: harness === "codex" ? "gpt-6.1-sol" : "", source: "builtin" as const };
+    : pin !== "" && valid(pin)
+      ? { model: pin, source: "template" as const }
+      : { model: harness === "codex" ? "gpt-6.2-sol" : "", source: "builtin" as const };
   const stored = planning?.trim() ?? "";
   const set = stored !== "" && valid(stored);
   return [{ harness, model: planning ?? null,
     default_model: def.model, default_source: def.source,
     resolved_model: set ? stored : def.model, source: set ? "user_planning_default" : def.source }];
+}
+
+// A mock stand-in for the lead template's per-harness model pin the planning Defaults resolve
+// through; it does not reproduce the server's leadClaudePin / leadCodexPin. Claude: a delivered
+// mock lead template's non-null Claude model, else the active recording's template-sourced worker
+// default. Codex: only that recorded fallback. Not modelled: a delivered lead template whose model
+// is null (the mock still falls back to the recording, where the server would have no pin) and a
+// lead template's Codex model.
+function mockLeadModelPins(): Record<Harness, string | null> {
+  const recorded = (h: Harness) => {
+    const c = recordedEffectiveScenario().get.models?.find(m => m.setting === "worker_model" && m.harness === h);
+    return c?.default_source === "template" ? c.default_model : null;
+  };
+  return { claude: (state.session ? mockDefaultClaudeModel() : null) ?? recorded("claude"), codex: recorded("codex") };
 }
 
 function mockPlanningEffortCells(
@@ -699,7 +718,7 @@ function mySettingsResponse(): { settings: UserSettings } {
     const pin = userSettings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness);
     const model = pin?.model ?? null, effort = pin?.effort ?? null;
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
-      : userSettings.default_codex_model ?? "gpt-6.1-sol";
+      : userSettings.default_codex_model ?? "gpt-6.2-sol";
     // An unpinned checker effort is the server's cross-check default, never the worker effort.
     return { stage, harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
       resolved_effort: effort ?? "high", model_source: model === null ? "worker default" : "pin",
@@ -724,7 +743,8 @@ function mySettingsResponse(): { settings: UserSettings } {
     { ...mockEffortCell("codex", userSettings.default_codex_effort), catalog_default: { ...MOCK_CODEX_CATALOG_SAMPLES[mockCodexCatalogSample] } },
   ];
   const leadEfforts = state.session ? mockLeadTemplateEfforts() : { claude: null, codex: null };
-  const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex")];
+  const leadPins = mockLeadModelPins();
+  const planning_models = [...mockPlanningModelCells(userSettings.planning_claude_model, userSettings.default_claude_model, "claude", leadPins.claude), ...mockPlanningModelCells(userSettings.planning_codex_model, userSettings.default_codex_model, "codex", leadPins.codex)];
   const planning_efforts = [...mockPlanningEffortCells(userSettings.planning_claude_effort, userSettings.default_effort, "claude", leadEfforts.claude), ...mockPlanningEffortCells(userSettings.planning_codex_effort, userSettings.default_codex_effort, "codex", leadEfforts.codex)];
   const task_review_efforts = mockTaskReviewEffortCells(
     { claude: userSettings.task_review_effort, codex: userSettings.codex_task_review_effort },
@@ -739,8 +759,9 @@ function mySettingsResponse(): { settings: UserSettings } {
   // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
   // settings blob) so it can never outlive the in-memory provider list it points into.
   const claude_provider_id = mockClaudeProviderId();
+  const codex_provider_id = mockCodexProviderId();
   const effective_sidebar_motion = userSettings.sidebar_motion ?? DEFAULT_SIDEBAR_MOTION;
-  return { settings: { ...userSettings, ...reserve, claude_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts,
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, codex_provider_id, effective_sidebar_motion, cross_check_pins, judge_models, summary_models, task_review_models, task_review_efforts, effort_settings, planning_models, planning_efforts,
     planning_claude_model: userSettings.planning_claude_model ?? null,
     planning_claude_effort: userSettings.planning_claude_effort ?? null,
     planning_codex_model: userSettings.planning_codex_model ?? null,
@@ -987,7 +1008,7 @@ function withPlanning(view: EffectiveSettings): EffectiveSettings {
     const model = userSettings[`planning_${harness}_model`], effort = userSettings[`planning_${harness}_effort`];
     if (model !== undefined) {
       const lane = userSettings[`default_${harness}_model`];
-      const [m] = mockPlanningModelCells(model, lane, harness);
+      const [m] = mockPlanningModelCells(model, lane, harness, mockLeadModelPins()[harness]);
       const inherited = lane != null ? m : view.models.find(c => c.setting === "worker_model" && c.harness === harness) ?? m;
       const resolved = model === null ? inherited : m;
       view.models = view.models.map(c => c.setting !== "planning_model" || c.harness !== harness ? c
@@ -1019,6 +1040,358 @@ function scheduleRequestKey(r: ScheduleSettingsPreviewRequest): string {
   const o = r.credential_override;
   const override = o === undefined ? "absent" : o === null ? "null" : [o.mode, o.secret_id ?? null];
   return JSON.stringify([r.target ?? null, r.harness ?? null, r.model ?? null, r.override_subagent_model ?? false, override]);
+}
+
+// stageSettingsPatch applies a PUT /me/settings-style patch to a COPY of `base`: only the
+// fields present in the body, mirroring the real handler so a theme-only save never clears
+// the model and vice versa. It throws the first ApiError and never touches `base`, so a
+// caller commits only after every field validates (the real handler's validate-all-then-write
+// ordering). Shared by putMySettings and putMyModelSettings, so both accept and reject alike.
+function stageSettingsPatch(base: UserSettings, patch: UserSettingsPatch): UserSettings {
+  let next = { ...base };
+  if ("vault_auto_reunlock" in patch) {
+    if (typeof patch.vault_auto_reunlock !== "boolean") throw new ApiError(400, "vault_auto_reunlock must be boolean");
+    next.vault_auto_reunlock = patch.vault_auto_reunlock;
+  }
+  if ("cross_check_pins" in patch) {
+    const list: unknown = patch.cross_check_pins;
+    if (!Array.isArray(list) || list.length > 4) throw new ApiError(400, "cross_check_pins: expected at most four cells");
+    const pins = (base.cross_check_pins ?? []).map(p => ({ ...p }));
+    const seen = new Set<string>();
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ApiError(400, "cross_check_pins: invalid cell");
+      const cell = raw as Record<string, unknown>;
+      const name = `cross_check_pins[${cell.stage}/${cell.harness}]`;
+      if ((cell.stage !== "plan" && cell.stage !== "code") || (cell.harness !== "claude" && cell.harness !== "codex"))
+        throw new ApiError(400, `${name}: invalid stage/harness`);
+      if (Object.keys(cell).some(k => !["stage", "harness", "model", "effort"].includes(k)))
+        throw new ApiError(400, `${name}: unknown field`);
+      const harness: Harness = cell.harness;
+      const stage = cell.stage;
+      const key = `${stage}/${harness}`;
+      if (seen.has(key)) throw new ApiError(400, `${name}: duplicate cell`);
+      seen.add(key);
+      const previous = pins.find(p => p.stage === stage && p.harness === harness);
+      const pin: CrossCheckPinDTO = previous ?? { stage, harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: true };
+      for (const field of ["model", "effort"] as const) {
+        if (!(field in cell)) continue;
+        const value = cell[field];
+        if (value !== null && typeof value !== "string") throw new ApiError(400, `${name}.${field}: expected string or null`);
+        const normalized = typeof value === "string" ? normalizeCheckerValue(value) : "";
+        const warning = field === "model" ? checkerModelWarning(normalized, harness)
+          : normalized && !["low", "medium", "high", "xhigh", "max"].includes(normalized) ? "invalid effort" : "";
+        if (warning) throw new ApiError(400, `${name}.${field}: ${warning}`);
+        pin[field] = normalized || null;
+      }
+      if (!previous && ("model" in cell || "effort" in cell)) pins.push(pin);
+    }
+    next.cross_check_pins = pins;
+  }
+  if (patch.default_model !== undefined) {
+    // PRD #1551 D3: the deprecated legacy field is bridged to the effective-harness
+    // lane, never stored on its own. The effective harness is the pin supplied in
+    // THIS patch when present, else the stored pin (resolved through D11). A value that
+    // conflicts with an explicit lane sent in the same body is a 400, and the same
+    // cross-vocabulary rule as the explicit lane applies. New clients never send this.
+    const pin = patch.default_harness !== undefined ? patch.default_harness : base.default_harness;
+    const lane = effectiveLegacyLane(pin);
+    const trimmed = patch.default_model?.trim() ?? "";
+    const val = trimmed === "" ? null : trimmed;
+    if (lane === "codex") {
+      if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
+        throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
+      }
+      if (patch.default_codex_model !== undefined && (patch.default_codex_model?.trim() || null) !== val) {
+        throw new ApiError(400, "default_model conflicts with default_codex_model");
+      }
+      next = { ...next, default_codex_model: val };
+    } else {
+      if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
+        throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
+      }
+      if (patch.default_claude_model !== undefined && (patch.default_claude_model?.trim() || null) !== val) {
+        throw new ApiError(400, "default_model conflicts with default_claude_model");
+      }
+      next = { ...next, default_claude_model: val };
+    }
+  }
+  if (patch.default_claude_model !== undefined) {
+    // Blank clears to inherit (null); every known Codex role id is rejected here
+    // (cross-vocabulary 400). Other custom Claude ids remain accepted.
+    const trimmed = patch.default_claude_model?.trim() ?? "";
+    const val = trimmed === "" ? null : trimmed;
+    if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
+      throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
+    }
+    next = { ...next, default_claude_model: val };
+  }
+  if (patch.default_codex_model !== undefined) {
+    // PRD #1551 M1/D3/D5: blank clears to inherit (null); a known Claude alias is
+    // rejected here (cross-vocabulary 400). Unlike the other lanes the Codex lane
+    // accepts a custom id, so any non-Claude-alias id is stored as given.
+    const trimmed = patch.default_codex_model?.trim() ?? "";
+    const val = trimmed === "" ? null : trimmed;
+    if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
+      throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
+    }
+    if (val !== null && /\s/u.test(val)) {
+      throw new ApiError(400, "default_codex_model: model must be a single token with no spaces");
+    }
+    next = { ...next, default_codex_model: val };
+  }
+  if (patch.default_effort !== undefined) {
+    next = { ...next, default_effort: mockDefaultEffort(patch.default_effort) };
+  }
+  if (patch.default_codex_effort !== undefined) {
+    next = { ...next, default_codex_effort: mockDefaultEffort(patch.default_codex_effort) };
+  }
+  // PRD #3252: absent keeps, null/blank clears. Both validate before `next` is committed,
+  // so a bad field writes nothing.
+  if (patch.planning_codex_model !== undefined) next = { ...next, planning_codex_model: mockPlanningModel(patch.planning_codex_model, "codex") };
+  if (patch.planning_codex_effort !== undefined) next = { ...next, planning_codex_effort: mockPlanningEffort(patch.planning_codex_effort, "codex") };
+  if (patch.planning_claude_model !== undefined) {
+    next = { ...next, planning_claude_model: mockPlanningModel(patch.planning_claude_model) };
+  }
+  if (patch.planning_claude_effort !== undefined) {
+    next = { ...next, planning_claude_effort: mockPlanningEffort(patch.planning_claude_effort) };
+  }
+  if (patch.judge_model !== undefined) {
+    // Blank clears to inherit; otherwise validateClaudeJudgeModel's ValidateClaudeLaneModel
+    // (the byte cap, no control/format characters or whitespace, no Codex role id, PRD #3245).
+    const trimmed = patch.judge_model?.trim() ?? "";
+    const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+    if (modelError !== "") throw new ApiError(400, `judge_model: ${modelError}`);
+    next = { ...next, judge_model: trimmed === "" ? null : trimmed };
+  }
+  if (patch.codex_judge_model !== undefined) {
+    // PRD #3245: blank clears to inherit; otherwise a curated Codex id only, mirroring
+    // the server's validateCodexJudgeModel.
+    const trimmed = patch.codex_judge_model?.trim() ?? "";
+    if (trimmed !== "" && !CODEX_CURATED_MODELS.includes(trimmed)) {
+      throw new ApiError(400, `codex_judge_model: "${trimmed}" is not a supported Codex model`);
+    }
+    next = { ...next, codex_judge_model: trimmed === "" ? null : trimmed };
+  }
+  if (patch.summary_model !== undefined) {
+    // Same rules as judge_model (PRD #362 M2, PRD #3248): the server's Claude-lane validator.
+    const trimmed = patch.summary_model?.trim() ?? "";
+    const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+    if (modelError !== "") throw new ApiError(400, `summary_model: ${modelError}`);
+    next = { ...next, summary_model: trimmed === "" ? null : trimmed };
+  }
+  if (patch.codex_summary_model !== undefined) {
+    // PRD #3248: blank clears to inherit; otherwise a Codex role id only, mirroring the
+    // server's validateCodexSummaryModel.
+    const trimmed = patch.codex_summary_model?.trim() ?? "";
+    if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
+      throw new ApiError(400, `codex_summary_model: "${trimmed}" is not a supported Codex model`);
+    }
+    next = { ...next, codex_summary_model: trimmed === "" ? null : trimmed };
+  }
+  if (patch.task_review_model !== undefined) {
+    // PRD #1570: blank clears to the built-in; the Claude lane refuses a Codex role id,
+    // mirroring the server's Claude-lane validator.
+    const trimmed = patch.task_review_model?.trim() ?? "";
+    const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
+    if (modelError !== "") {
+      throw new ApiError(400, `task_review_model: ${modelError}`);
+    }
+    next = { ...next, task_review_model: trimmed === "" ? null : trimmed };
+  }
+  if (patch.codex_task_review_model !== undefined) {
+    const trimmed = patch.codex_task_review_model?.trim() ?? "";
+    if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
+      throw new ApiError(400, `codex_task_review_model: "${trimmed}" is not a supported Codex model`);
+    }
+    next = { ...next, codex_task_review_model: trimmed === "" ? null : trimmed };
+  }
+  if (patch.task_review_effort !== undefined) {
+    next = { ...next, task_review_effort: mockTaskReviewEffort(patch.task_review_effort, "task_review_effort") };
+  }
+  if (patch.codex_task_review_effort !== undefined) {
+    next = { ...next, codex_task_review_effort: mockTaskReviewEffort(patch.codex_task_review_effort, "codex_task_review_effort") };
+  }
+  if (patch.theme !== undefined) {
+    const t = patch.theme?.trim() ?? "";
+    if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
+    // PRD #1167 "Lights on" m2: a valid legacy theme value also FOLDS into the
+    // appearance columns — it sets the matching-polarity slot AND pins appearance_mode
+    // to that polarity, mirroring the Go legacy mapping. Any explicit appearance_* field
+    // in the same PUT wins, because those are applied AFTER this block below. An empty
+    // value clears the legacy override AND the migrated appearance override (mode +
+    // dark slot), mirroring the server's legacy-reset coherence.
+    if (t === "") {
+      next = { ...next, theme: null, appearance_mode: null, dark_theme: null };
+    } else {
+      const polarity = THEME_POLARITY[t as Theme];
+      next = {
+        ...next,
+        theme: t,
+        appearance_mode: polarity,
+        ...(polarity === "light" ? { light_theme: t } : { dark_theme: t }),
+      };
+    }
+  }
+  // PRD #1167 "Lights on" m2: the four raw appearance overrides. Tri-state like the rest
+  // of the patch — absent leaves the field, present-null clears it back to inherit, and a
+  // value is validated (polarity-aware for the theme slots) then set. Applied AFTER the
+  // legacy theme fold above, so an explicit field wins when both are sent in one PUT.
+  if (patch.appearance_mode !== undefined) {
+    if (patch.appearance_mode !== null && !isAppearanceMode(patch.appearance_mode)) {
+      throw new ApiError(400, "appearance_mode: must be one of system, light, dark");
+    }
+    next = { ...next, appearance_mode: patch.appearance_mode };
+  }
+  if (patch.light_theme !== undefined) {
+    if (patch.light_theme !== null && !isLightTheme(patch.light_theme)) {
+      throw new ApiError(400, "light_theme: must be a light theme");
+    }
+    next = { ...next, light_theme: patch.light_theme };
+  }
+  if (patch.dark_theme !== undefined) {
+    if (patch.dark_theme !== null && !isDarkTheme(patch.dark_theme)) {
+      throw new ApiError(400, "dark_theme: must be a dark theme");
+    }
+    next = { ...next, dark_theme: patch.dark_theme };
+  }
+  if (patch.typeface !== undefined) {
+    if (patch.typeface !== null && !isTypeface(patch.typeface)) {
+      throw new ApiError(400, "typeface: must be one of system, plex");
+    }
+    next = { ...next, typeface: patch.typeface };
+  }
+  if (patch.sidebar_motion !== undefined) {
+    // Tri-state: true/false sets, null clears back to inherit; anything else is a 400.
+    if (patch.sidebar_motion !== null && typeof patch.sidebar_motion !== "boolean") {
+      throw new ApiError(400, "sidebar_motion: must be a boolean or null");
+    }
+    next = { ...next, sidebar_motion: patch.sidebar_motion };
+  }
+  if (patch.sidebar_token_ids !== undefined) {
+    // Whole-set replace, mirroring how the real handler would treat a list
+    // value; null clears back to default-only. Ids are stored as given — a
+    // stale id (deleted token) is harmless, it just matches nothing.
+    next = { ...next, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
+  }
+  if (patch.sidebar_codex_account_ids !== undefined) {
+    // Whole-set replace, mirroring the real handler; null clears back to default-only.
+    // The Codex sibling of sidebar_token_ids (PRD #1209 M3).
+    next = { ...next, sidebar_codex_account_ids: patch.sidebar_codex_account_ids ?? [] };
+  }
+  if (patch.mr_rework_enabled !== undefined) {
+    // Tri-state (PRD #700 M6): present-false opts out, present-true re-enables,
+    // present-null clears back to the default-ON state (stored as null). Mirrors
+    // the server treating an absent/null value as ON.
+    next = { ...next, mr_rework_enabled: patch.mr_rework_enabled ?? null };
+  }
+  if (patch.now_summary_enabled !== undefined) {
+    // Tri-state like mr_rework_enabled (PRD #2603): null clears back to the default ON.
+    next = { ...next, now_summary_enabled: patch.now_summary_enabled ?? null };
+  }
+  if (patch.default_harness !== undefined) {
+    // Tri-state (PRD #1429 M1/D3, review fix M4a): present-null clears to "no
+    // preference" (implicit run creation falls through D11); a claude|codex value
+    // sets the pin; anything else is a 400 — mirrors the server's validateHarness so
+    // Models saves (and their notice text) match the real handler in the demo.
+    if (patch.default_harness !== null && patch.default_harness !== "claude" && patch.default_harness !== "codex") {
+      throw new ApiError(400, "default_harness: must be one of claude, codex");
+    }
+    next = { ...next, default_harness: patch.default_harness };
+  }
+  if (patch.judge_runs_on !== undefined) {
+    // Tri-state like default_harness (PRD #3257): null clears to "same as the run"; anything
+    // but claude|codex is a 400, as the server's validateJudgeRunsOn.
+    if (patch.judge_runs_on !== null && patch.judge_runs_on !== "claude" && patch.judge_runs_on !== "codex") {
+      throw new ApiError(400, "invalid judge_runs_on");
+    }
+    next = { ...next, judge_runs_on: patch.judge_runs_on };
+  }
+  return next;
+}
+
+// PRD #3263: PUT /me/model-settings' closed allowlist, in the server's decode order
+// (handler/model_settings.go decodeModelSettingsRequest), so the FIRST error matches the
+// real client's flat error/field pair.
+const MODEL_SETTINGS_SCALAR_KEYS = [
+  "default_claude_model", "default_codex_model", "default_effort", "default_codex_effort",
+  "judge_model", "codex_judge_model", "summary_model", "codex_summary_model",
+  "task_review_model", "codex_task_review_model", "task_review_effort", "codex_task_review_effort",
+  "default_harness", "judge_runs_on",
+  "planning_claude_model", "planning_claude_effort", "planning_codex_model", "planning_codex_effort",
+] as const;
+const MODEL_SETTINGS_KEYS: ReadonlySet<string> = new Set([...MODEL_SETTINGS_SCALAR_KEYS, "cross_check_pins"]);
+
+// A one-shot write-failure injection for tests and demos, mirroring the server's failure
+// model: "write_failed" is a pre-commit 500 (nothing written), "commit_unknown" the 500 whose
+// outcome is unknown (the mock does not apply it), "saved_readback_failed" a durable write whose
+// readback failed, and "effective_readback_failed" a 200 without a prediction.
+type MockModelSettingsFailure = "write_failed" | "commit_unknown" | "saved_readback_failed" | "effective_readback_failed";
+let nextModelSettingsFailure: MockModelSettingsFailure | null = null;
+export function failNextMockModelSettingsWrite(failure: MockModelSettingsFailure | null): void {
+  nextModelSettingsFailure = failure;
+}
+
+// validateModelSettingsBody collects EVERY defect of a PUT /me/model-settings body without
+// writing anything: unknown keys first (sorted, at most five, as the server caps them), then each
+// scalar through the same stageSettingsPatch validators putMySettings uses, then each pin cell
+// member with its stage/harness/member identity.
+function validateModelSettingsBody(body: Record<string, unknown>): ModelSettingsFieldError[] {
+  const unknown = Object.keys(body).filter((k) => !MODEL_SETTINGS_KEYS.has(k)).sort();
+  if (unknown.length > 0) return unknown.slice(0, 5).map((k) => ({ field: k, message: `unknown field ${k}` }));
+  const errors: ModelSettingsFieldError[] = [];
+  const messageOf = (err: unknown) => (err instanceof ApiError ? err.message : String(err));
+  for (const key of MODEL_SETTINGS_SCALAR_KEYS) {
+    if (!(key in body)) continue;
+    const value = body[key];
+    if (value !== null && typeof value !== "string") {
+      errors.push({ field: key, message: `${key}: must be a string or null` });
+      continue;
+    }
+    try {
+      stageSettingsPatch(userSettings, { [key]: value } as UserSettingsPatch);
+    } catch (err) {
+      errors.push({ field: key, message: messageOf(err) });
+    }
+  }
+  if ("cross_check_pins" in body) {
+    const list = body.cross_check_pins;
+    if (!Array.isArray(list) || list.length > 4) {
+      errors.push({ field: "cross_check_pins", message: "cross_check_pins: expected at most four cells" });
+      return errors;
+    }
+    const seen = new Set<string>();
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        errors.push({ field: "cross_check_pins", message: "cross_check_pins: invalid cell" });
+        continue;
+      }
+      const cell = raw as Record<string, unknown>;
+      const name = `cross_check_pins[${String(cell.stage)}/${String(cell.harness)}]`;
+      if ((cell.stage !== "plan" && cell.stage !== "code") || (cell.harness !== "claude" && cell.harness !== "codex")) {
+        errors.push({ field: "cross_check_pins", message: `${name}: invalid stage/harness` });
+        continue;
+      }
+      const stage = cell.stage, harness: Harness = cell.harness;
+      if (Object.keys(cell).some((k) => !["stage", "harness", "model", "effort"].includes(k))) {
+        errors.push({ field: "cross_check_pins", message: `${name}: unknown field`, stage, harness });
+        continue;
+      }
+      if (seen.has(`${stage}/${harness}`)) {
+        errors.push({ field: "cross_check_pins", message: `${name}: duplicate cell`, stage, harness });
+        continue;
+      }
+      seen.add(`${stage}/${harness}`);
+      for (const member of ["model", "effort"] as const) {
+        if (!(member in cell)) continue;
+        try {
+          stageSettingsPatch(userSettings, { cross_check_pins: [{ stage, harness, [member]: cell[member] as string | null }] });
+        } catch (err) {
+          errors.push({ field: "cross_check_pins", message: messageOf(err), stage, harness, member });
+        }
+      }
+    }
+  }
+  return errors;
 }
 
 export const settingsApi = {
@@ -1762,6 +2135,18 @@ export const settingsApi = {
       withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on),
       mockLeadTemplateEfforts(),
       { claude: userSettings.default_effort, codex: userSettings.default_codex_effort });
+    view.models = view.models.map(c => {
+      if (c.setting !== "worker_model") return c;
+      const model = c.harness === "claude" ? userSettings.default_claude_model : userSettings.default_codex_model;
+      return model ? { ...c, model, resolved_model: model, source: "user_default" } : c;
+    });
+    view.efforts = view.efforts.map(c => {
+      if (c.setting !== "worker_effort") return c;
+      const pref = c.harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
+      if (!pref) return c;
+      const { effort, resolved_effort, source, mode } = mockEffortCell(c.harness, pref);
+      return { ...c, effort, resolved_effort, source: source === "user_default" ? "user_default" : "builtin", mode };
+    });
     return delay(withPlanning(view), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
@@ -1785,282 +2170,43 @@ export const settingsApi = {
     return delay(structuredClone(hit.response), 60);
   },
   putMySettings: async (patch: UserSettingsPatch) => {
-    // PATCH-like: apply only the fields present in the body, mirroring the real
-    // handler so a theme-only save never clears the model and vice versa. Staged
-    // into a LOCAL copy first and committed only after every field validates, so a
+    // Staged into a LOCAL copy first and committed only after every field validates, so a
     // body whose first field is valid and second is not (e.g. appearance_mode:"light"
-    // + light_theme:"ember") returns 400 without half-applying — matching the real
-    // handler's validate-all-then-write ordering.
-    let next = { ...userSettings };
-    if ("vault_auto_reunlock" in patch) {
-      if (typeof patch.vault_auto_reunlock !== "boolean") throw new ApiError(400, "vault_auto_reunlock must be boolean");
-      next.vault_auto_reunlock = patch.vault_auto_reunlock;
-    }
-    if ("cross_check_pins" in patch) {
-      const list: unknown = patch.cross_check_pins;
-      if (!Array.isArray(list) || list.length > 4) throw new ApiError(400, "cross_check_pins: expected at most four cells");
-      const pins = (userSettings.cross_check_pins ?? []).map(p => ({ ...p }));
-      const seen = new Set<string>();
-      for (const raw of list) {
-        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ApiError(400, "cross_check_pins: invalid cell");
-        const cell = raw as Record<string, unknown>;
-        const name = `cross_check_pins[${cell.stage}/${cell.harness}]`;
-        if ((cell.stage !== "plan" && cell.stage !== "code") || (cell.harness !== "claude" && cell.harness !== "codex"))
-          throw new ApiError(400, `${name}: invalid stage/harness`);
-        if (Object.keys(cell).some(k => !["stage", "harness", "model", "effort"].includes(k)))
-          throw new ApiError(400, `${name}: unknown field`);
-        const harness: Harness = cell.harness;
-        const stage = cell.stage;
-        const key = `${stage}/${harness}`;
-        if (seen.has(key)) throw new ApiError(400, `${name}: duplicate cell`);
-        seen.add(key);
-        const previous = pins.find(p => p.stage === stage && p.harness === harness);
-        const pin: CrossCheckPinDTO = previous ?? { stage, harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: true };
-        for (const field of ["model", "effort"] as const) {
-          if (!(field in cell)) continue;
-          const value = cell[field];
-          if (value !== null && typeof value !== "string") throw new ApiError(400, `${name}.${field}: expected string or null`);
-          const normalized = typeof value === "string" ? normalizeCheckerValue(value) : "";
-          const warning = field === "model" ? checkerModelWarning(normalized, harness)
-            : normalized && !["low", "medium", "high", "xhigh", "max"].includes(normalized) ? "invalid effort" : "";
-          if (warning) throw new ApiError(400, `${name}.${field}: ${warning}`);
-          pin[field] = normalized || null;
-        }
-        if (!previous && ("model" in cell || "effort" in cell)) pins.push(pin);
-      }
-      next.cross_check_pins = pins;
-    }
-    if (patch.default_model !== undefined) {
-      // PRD #1551 D3: the deprecated legacy field is bridged to the effective-harness
-      // lane, never stored on its own. The effective harness is the pin supplied in
-      // THIS patch when present, else the stored pin (resolved through D11). A value that
-      // conflicts with an explicit lane sent in the same body is a 400, and the same
-      // cross-vocabulary rule as the explicit lane applies. New clients never send this.
-      const pin = patch.default_harness !== undefined ? patch.default_harness : userSettings.default_harness;
-      const lane = effectiveLegacyLane(pin);
-      const trimmed = patch.default_model?.trim() ?? "";
-      const val = trimmed === "" ? null : trimmed;
-      if (lane === "codex") {
-        if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
-          throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
-        }
-        if (patch.default_codex_model !== undefined && (patch.default_codex_model?.trim() || null) !== val) {
-          throw new ApiError(400, "default_model conflicts with default_codex_model");
-        }
-        next = { ...next, default_codex_model: val };
-      } else {
-        if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
-          throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
-        }
-        if (patch.default_claude_model !== undefined && (patch.default_claude_model?.trim() || null) !== val) {
-          throw new ApiError(400, "default_model conflicts with default_claude_model");
-        }
-        next = { ...next, default_claude_model: val };
-      }
-    }
-    if (patch.default_claude_model !== undefined) {
-      // Blank clears to inherit (null); every known Codex role id is rejected here
-      // (cross-vocabulary 400). Other custom Claude ids remain accepted.
-      const trimmed = patch.default_claude_model?.trim() ?? "";
-      const val = trimmed === "" ? null : trimmed;
-      if (val !== null && CODEX_ROLE_MODELS.includes(val)) {
-        throw new ApiError(400, "default_claude_model: a Codex model is not valid for the Claude lane");
-      }
-      next = { ...next, default_claude_model: val };
-    }
-    if (patch.default_codex_model !== undefined) {
-      // PRD #1551 M1/D3/D5: blank clears to inherit (null); a known Claude alias is
-      // rejected here (cross-vocabulary 400). Unlike the other lanes the Codex lane
-      // accepts a custom id, so any non-Claude-alias id is stored as given.
-      const trimmed = patch.default_codex_model?.trim() ?? "";
-      const val = trimmed === "" ? null : trimmed;
-      if (val !== null && KNOWN_CLAUDE_ALIASES.includes(val)) {
-        throw new ApiError(400, "default_codex_model: a Claude model is not valid for the Codex lane");
-      }
-      next = { ...next, default_codex_model: val };
-    }
-    if (patch.default_effort !== undefined) {
-      next = { ...next, default_effort: mockDefaultEffort(patch.default_effort) };
-    }
-    if (patch.default_codex_effort !== undefined) {
-      next = { ...next, default_codex_effort: mockDefaultEffort(patch.default_codex_effort) };
-    }
-    // PRD #3252: absent keeps, null/blank clears. Both validate before `next` is committed,
-    // so a bad field writes nothing.
-    if (patch.planning_codex_model !== undefined) next = { ...next, planning_codex_model: mockPlanningModel(patch.planning_codex_model, "codex") };
-    if (patch.planning_codex_effort !== undefined) next = { ...next, planning_codex_effort: mockPlanningEffort(patch.planning_codex_effort, "codex") };
-    if (patch.planning_claude_model !== undefined) {
-      next = { ...next, planning_claude_model: mockPlanningModel(patch.planning_claude_model) };
-    }
-    if (patch.planning_claude_effort !== undefined) {
-      next = { ...next, planning_claude_effort: mockPlanningEffort(patch.planning_claude_effort) };
-    }
-    if (patch.judge_model !== undefined) {
-      // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with
-      // internal whitespace is rejected, mirroring the server's ValidateModel.
-      const trimmed = patch.judge_model?.trim() ?? "";
-      if (trimmed !== "" && /\s/.test(trimmed)) {
-        throw new ApiError(400, "judge_model must be a single token with no spaces");
-      }
-      // The Claude-lane guard (PRD #3245), mirroring validateClaudeJudgeModel.
-      if (CODEX_ROLE_MODELS.includes(trimmed)) {
-        throw new ApiError(400, "judge_model: model is a Codex model id");
-      }
-      next = { ...next, judge_model: trimmed === "" ? null : trimmed };
-    }
-    if (patch.codex_judge_model !== undefined) {
-      // PRD #3245: blank clears to inherit; otherwise a curated Codex id only, mirroring
-      // the server's validateCodexJudgeModel.
-      const trimmed = patch.codex_judge_model?.trim() ?? "";
-      if (trimmed !== "" && !CODEX_CURATED_MODELS.includes(trimmed)) {
-        throw new ApiError(400, `codex_judge_model: "${trimmed}" is not a supported Codex model`);
-      }
-      next = { ...next, codex_judge_model: trimmed === "" ? null : trimmed };
-    }
-    if (patch.summary_model !== undefined) {
-      // Same rules as judge_model (PRD #362 M2): blank clears to inherit, a value with
-      // internal whitespace is rejected, mirroring the server's ValidateModel.
-      const trimmed = patch.summary_model?.trim() ?? "";
-      if (trimmed !== "" && /\s/.test(trimmed)) {
-        throw new ApiError(400, "summary_model must be a single token with no spaces");
-      }
-      // The Claude-lane guard (PRD #3248), like judge_model above.
-      if (CODEX_ROLE_MODELS.includes(trimmed)) {
-        throw new ApiError(400, "summary_model: model is a Codex model id");
-      }
-      next = { ...next, summary_model: trimmed === "" ? null : trimmed };
-    }
-    if (patch.codex_summary_model !== undefined) {
-      // PRD #3248: blank clears to inherit; otherwise a Codex role id only, mirroring the
-      // server's validateCodexSummaryModel.
-      const trimmed = patch.codex_summary_model?.trim() ?? "";
-      if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
-        throw new ApiError(400, `codex_summary_model: "${trimmed}" is not a supported Codex model`);
-      }
-      next = { ...next, codex_summary_model: trimmed === "" ? null : trimmed };
-    }
-    if (patch.task_review_model !== undefined) {
-      // PRD #1570: blank clears to the built-in; the Claude lane refuses a Codex role id,
-      // mirroring the server's Claude-lane validator.
-      const trimmed = patch.task_review_model?.trim() ?? "";
-      const modelError = trimmed === "" ? "" : claudeReviewModelError(trimmed);
-      if (modelError !== "") {
-        throw new ApiError(400, `task_review_model: ${modelError}`);
-      }
-      next = { ...next, task_review_model: trimmed === "" ? null : trimmed };
-    }
-    if (patch.codex_task_review_model !== undefined) {
-      const trimmed = patch.codex_task_review_model?.trim() ?? "";
-      if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
-        throw new ApiError(400, `codex_task_review_model: "${trimmed}" is not a supported Codex model`);
-      }
-      next = { ...next, codex_task_review_model: trimmed === "" ? null : trimmed };
-    }
-    if (patch.task_review_effort !== undefined) {
-      next = { ...next, task_review_effort: mockTaskReviewEffort(patch.task_review_effort, "task_review_effort") };
-    }
-    if (patch.codex_task_review_effort !== undefined) {
-      next = { ...next, codex_task_review_effort: mockTaskReviewEffort(patch.codex_task_review_effort, "codex_task_review_effort") };
-    }
-    if (patch.theme !== undefined) {
-      const t = patch.theme?.trim() ?? "";
-      if (t !== "" && !isTheme(t)) throw new ApiError(400, `unknown theme: "${t}"`);
-      // PRD #1167 "Lights on" m2: a valid legacy theme value also FOLDS into the
-      // appearance columns — it sets the matching-polarity slot AND pins appearance_mode
-      // to that polarity, mirroring the Go legacy mapping. Any explicit appearance_* field
-      // in the same PUT wins, because those are applied AFTER this block below. An empty
-      // value clears the legacy override AND the migrated appearance override (mode +
-      // dark slot), mirroring the server's legacy-reset coherence.
-      if (t === "") {
-        next = { ...next, theme: null, appearance_mode: null, dark_theme: null };
-      } else {
-        const polarity = THEME_POLARITY[t as Theme];
-        next = {
-          ...next,
-          theme: t,
-          appearance_mode: polarity,
-          ...(polarity === "light" ? { light_theme: t } : { dark_theme: t }),
-        };
-      }
-    }
-    // PRD #1167 "Lights on" m2: the four raw appearance overrides. Tri-state like the rest
-    // of the patch — absent leaves the field, present-null clears it back to inherit, and a
-    // value is validated (polarity-aware for the theme slots) then set. Applied AFTER the
-    // legacy theme fold above, so an explicit field wins when both are sent in one PUT.
-    if (patch.appearance_mode !== undefined) {
-      if (patch.appearance_mode !== null && !isAppearanceMode(patch.appearance_mode)) {
-        throw new ApiError(400, "appearance_mode: must be one of system, light, dark");
-      }
-      next = { ...next, appearance_mode: patch.appearance_mode };
-    }
-    if (patch.light_theme !== undefined) {
-      if (patch.light_theme !== null && !isLightTheme(patch.light_theme)) {
-        throw new ApiError(400, "light_theme: must be a light theme");
-      }
-      next = { ...next, light_theme: patch.light_theme };
-    }
-    if (patch.dark_theme !== undefined) {
-      if (patch.dark_theme !== null && !isDarkTheme(patch.dark_theme)) {
-        throw new ApiError(400, "dark_theme: must be a dark theme");
-      }
-      next = { ...next, dark_theme: patch.dark_theme };
-    }
-    if (patch.typeface !== undefined) {
-      if (patch.typeface !== null && !isTypeface(patch.typeface)) {
-        throw new ApiError(400, "typeface: must be one of system, plex");
-      }
-      next = { ...next, typeface: patch.typeface };
-    }
-    if (patch.sidebar_motion !== undefined) {
-      // Tri-state: true/false sets, null clears back to inherit; anything else is a 400.
-      if (patch.sidebar_motion !== null && typeof patch.sidebar_motion !== "boolean") {
-        throw new ApiError(400, "sidebar_motion: must be a boolean or null");
-      }
-      next = { ...next, sidebar_motion: patch.sidebar_motion };
-    }
-    if (patch.sidebar_token_ids !== undefined) {
-      // Whole-set replace, mirroring how the real handler would treat a list
-      // value; null clears back to default-only. Ids are stored as given — a
-      // stale id (deleted token) is harmless, it just matches nothing.
-      next = { ...next, sidebar_token_ids: patch.sidebar_token_ids ?? [] };
-    }
-    if (patch.sidebar_codex_account_ids !== undefined) {
-      // Whole-set replace, mirroring the real handler; null clears back to default-only.
-      // The Codex sibling of sidebar_token_ids (PRD #1209 M3).
-      next = { ...next, sidebar_codex_account_ids: patch.sidebar_codex_account_ids ?? [] };
-    }
-    if (patch.mr_rework_enabled !== undefined) {
-      // Tri-state (PRD #700 M6): present-false opts out, present-true re-enables,
-      // present-null clears back to the default-ON state (stored as null). Mirrors
-      // the server treating an absent/null value as ON.
-      next = { ...next, mr_rework_enabled: patch.mr_rework_enabled ?? null };
-    }
-    if (patch.now_summary_enabled !== undefined) {
-      // Tri-state like mr_rework_enabled (PRD #2603): null clears back to the default ON.
-      next = { ...next, now_summary_enabled: patch.now_summary_enabled ?? null };
-    }
-    if (patch.default_harness !== undefined) {
-      // Tri-state (PRD #1429 M1/D3, review fix M4a): present-null clears to "no
-      // preference" (implicit run creation falls through D11); a claude|codex value
-      // sets the pin; anything else is a 400 — mirrors the server's validateHarness so
-      // Run Defaults saves (and its notice text) match the real handler in the demo.
-      if (patch.default_harness !== null && patch.default_harness !== "claude" && patch.default_harness !== "codex") {
-        throw new ApiError(400, "default_harness: must be one of claude, codex");
-      }
-      next = { ...next, default_harness: patch.default_harness };
-    }
-    if (patch.judge_runs_on !== undefined) {
-      // Tri-state like default_harness (PRD #3257): null clears to "same as the run"; anything
-      // but claude|codex is a 400, as the server's validateJudgeRunsOn.
-      if (patch.judge_runs_on !== null && patch.judge_runs_on !== "claude" && patch.judge_runs_on !== "codex") {
-        throw new ApiError(400, "invalid judge_runs_on");
-      }
-      next = { ...next, judge_runs_on: patch.judge_runs_on };
-    }
-    // Every field validated: commit the staged copy in one shot, then persist.
-    userSettings = next;
+    // + light_theme:"ember") returns 400 without half-applying.
+    userSettings = stageSettingsPatch(userSettings, patch);
     persistSettings();
     return delay(mySettingsResponse());
+  },
+  // PRD #3263: PUT /me/model-settings, mirroring handler.PutMyModelSettings: validate the WHOLE
+  // body first and answer every defect in one 400 (first also as error/field) with nothing
+  // written; only a valid body is applied, in one step, and answered with the canonical
+  // settings plus the existing effective-settings projection.
+  putMyModelSettings: async (patch: ModelSettingsPatch): Promise<ModelSettingsSaveResponse> => {
+    requireSession();
+    const body: unknown = patch;
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new ApiError(400, "invalid request body", { error: "invalid request body" });
+    const errors = validateModelSettingsBody(body as Record<string, unknown>);
+    if (errors.length > 0) {
+      throw new ApiError(400, errors[0].message, { error: errors[0].message, field: errors[0].field, errors });
+    }
+    const failure = nextModelSettingsFailure;
+    nextModelSettingsFailure = null;
+    if (failure === "write_failed") throw new ApiError(500, "internal error", { error: "internal error" });
+    if (failure === "commit_unknown") {
+      const message = "the save may or may not have been applied; check with `uzi settings get`";
+      throw new ApiError(500, message, { error: message, reason: "settings_commit_unknown" });
+    }
+    userSettings = stageSettingsPatch(userSettings, patch as UserSettingsPatch);
+    persistSettings();
+    if (failure === "saved_readback_failed") {
+      const message = "settings saved; reading them back failed";
+      throw new ApiError(500, message, { error: message, reason: "settings_saved_readback_failed" });
+    }
+    const { settings } = mySettingsResponse();
+    if (failure === "effective_readback_failed") {
+      return delay({ settings, effective: null, effective_error: "settings_effective_readback_failed" });
+    }
+    return { settings, effective: await settingsApi.getEffectiveSettings() };
   },
   // ── Slack linking (PRD #25 M3) ───────────────────────────────────────────────
   getMySlack: async () => delay(slackLinkResponse()),

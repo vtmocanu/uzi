@@ -13,8 +13,6 @@ import { RunDefaults } from "./RunDefaults";
 import { api, ApiError, type User } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import type { ModelSettingCell, UserSettings } from "../lib/apiTypes";
-import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
-import { mockTemplates } from "../mocks/data";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -59,15 +57,6 @@ vi.mock("../lib/api", async (importActual) => {
       testMySlackDM: vi.fn(),
     },
   };
-});
-// Observe the public parent/child settings seam while rendering the real grid.
-const deliveredSettings = vi.hoisted(() => vi.fn<(settings: UserSettings) => void>());
-vi.mock("../components/CrossCheckDefaults", async importActual => {
-  const actual = await importActual<typeof import("../components/CrossCheckDefaults")>();
-  return { ...actual, CrossCheckDefaults: (props: Parameters<typeof actual.CrossCheckDefaults>[0]) => {
-    deliveredSettings(props.settings);
-    return <actual.CrossCheckDefaults {...props} />;
-  } };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
@@ -291,7 +280,7 @@ describe("Run defaults — run judge opt-in (PRD #46, Decision 7)", () => {
     // PRD #3245 / #3257: the judge spends your credential for the harness it runs on (chosen
     // under Judge runs on), not always Anthropic and not the reviewed run's credential.
     expect(text).toContain(
-      "reviewed by an LLM using your own credential for the harness it runs on, chosen below: your Anthropic token on Claude, your Codex credential on Codex.",
+      "reviewed by an LLM using your own credential for the harness it runs on, shown below: your Anthropic token on Claude, your Codex credential on Codex.",
     );
     expect(text).not.toContain("credential of the run\u2019s harness");
     expect(text).toMatch(/recommend/i);
@@ -348,7 +337,7 @@ describe("Run defaults — run judge opt-in (PRD #46, Decision 7)", () => {
   });
 });
 
-describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)", () => {
+describe("Run defaults — judge enforced banner (PRD #69 M4)", () => {
   it("shows no enforced banner when the admin has not enforced the judge", async () => {
     const { container } = render(
       <MemoryRouter>
@@ -366,7 +355,7 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
       appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       judge_models: [
         { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
+        { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
       ],
     } });
     render(
@@ -389,576 +378,7 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
         <RunDefaults />
       </MemoryRouter>,
     );
-    await screen.findByLabelText("Claude judge model");
-    expect(screen.getByText(/ENFORCED/).textContent).toContain("(Claude runs on sonnet)");
-  });
-
-  it("saves the per-user Claude judge model through PUT /me/settings", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByText("Run judge");
-    // The judge-model picker offers a "haiku" option; selecting it dirties Save.
-    const select = screen.getByLabelText("Claude judge model") as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "haiku" } });
-    fireEvent.click(screen.getByText("Save judge models"));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_model: "haiku" }));
-  });
-});
-
-// PRD #3245: one judge model per harness. The lanes follow the worker-model lane rules,
-// the Default labels and In-effect lines come from the server's judge_models cells, and
-// one Save sends only the lanes that changed.
-describe("Run defaults — judge model per harness (PRD #3245)", () => {
-  const key = (kind: string) => ({
-    id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
-    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
-  });
-  const cells = (): ModelSettingCell[] => [
-    { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
-  ];
-  const judgeSettings = (over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
-    settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, summary_model: null,
-      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-      judge_model: null, codex_judge_model: "gpt-6-sol", judge_models: cells(),
-      ...over,
-    },
-  });
-  const optionValues = (select: HTMLSelectElement) => Array.from(select.options).map((o) => o.value);
-  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-
-  it("Codex-only: the Codex judge select offers exactly the curated models and no Other (#1454)", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    renderPage();
-    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
-    expect(optionValues(codex)).toEqual(["inherit", ...CODEX_CURATED_MODELS]);
-    expect(optionValues(codex)).not.toContain("custom");
-    expect(codex.value).toBe("gpt-6-sol");
-    // A Codex-only user sees only the Codex judge lane (the worker-lane rule).
-    expect(screen.queryByLabelText("Claude judge model")).toBeNull();
-  });
-
-  it("Claude-only: the Claude judge select offers the Claude aliases plus Other, and no Codex lane", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    renderPage();
-    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
-    expect(optionValues(claude)).toEqual(["inherit", "opus", "sonnet", "haiku", "fable", "custom"]);
-    expect(screen.queryByLabelText("Codex judge model")).toBeNull();
-  });
-
-  it("both usable: both lanes show; no credential: the Claude lane alone", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    renderPage();
-    expect(await screen.findByLabelText("Claude judge model")).toBeTruthy();
-    expect(screen.getByLabelText("Codex judge model")).toBeTruthy();
-    cleanup();
-    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-    renderPage();
-    expect(await screen.findByLabelText("Claude judge model")).toBeTruthy();
-    expect(screen.queryByLabelText("Codex judge model")).toBeNull();
-  });
-
-  it("labels Default and the In-effect line from judge_models, wired by aria-describedby", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    renderPage();
-    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
-    const codex = screen.getByLabelText("Codex judge model") as HTMLSelectElement;
-    expect(claude.options[0].textContent).toBe("Default \u00b7 sonnet (instance default)");
-    expect(codex.options[0].textContent).toBe("Default \u00b7 gpt-6.1-sol (built-in)");
-    const claudeEffect = document.getElementById(claude.getAttribute("aria-describedby") ?? "");
-    const codexEffect = document.getElementById(codex.getAttribute("aria-describedby") ?? "");
-    expect(claudeEffect?.textContent).toBe("In effect: sonnet \u00b7 instance default");
-    expect(codexEffect?.textContent).toBe("In effect: gpt-6-sol \u00b7 your choice");
-  });
-
-  it("harness help says Default · automatic (not 'Use my default') and summary help is per-lane (#3255, #3248)", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    renderPage();
-    await screen.findByLabelText("Claude judge model");
-    const harnessHelp = screen.getByText(/to let uzi use your only usable/).textContent ?? "";
-    expect(harnessHelp).toContain("Default · automatic");
-    expect(harnessHelp).not.toContain("Use my default");
-    const harnessOptions = Array.from((screen.getByLabelText("Default harness") as HTMLSelectElement).options).map((o) => o.text);
-    expect(harnessOptions.some((t) => t.includes("Use my default"))).toBe(false);
-    expect(screen.getByText(/Used for the intent summary and the plan summary on Codex runs/).textContent).toContain("Codex pull request descriptions use their own model");
-  });
-
-  it("saves only the dirty lane, and adopts the response's In-effect cell", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    const saved = cells();
-    saved[1] = { ...saved[1], model: null, resolved_model: "gpt-6.1-sol", source: "builtin" };
-    mockApi.putMySettings.mockResolvedValue(judgeSettings({ codex_judge_model: null, judge_models: saved }));
-    renderPage();
-    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
-    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
-    expect(save.disabled).toBe(true);
-    fireEvent.change(codex, { target: { value: "inherit" } });
-    fireEvent.click(save);
-    // Only the Codex lane changed, so only it is sent; null means Default.
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_judge_model: null }));
-    await waitFor(() =>
-      expect(document.getElementById("codex-judge-model-effect")?.textContent).toBe("In effect: gpt-6.1-sol \u00b7 built-in"),
-    );
-    expect(save.disabled).toBe(true);
-  });
-
-  it("sends both lanes when both changed", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings());
-    mockApi.putMySettings.mockResolvedValue(judgeSettings({ judge_model: "haiku", codex_judge_model: "gpt-6-astra" }));
-    renderPage();
-    fireEvent.change(await screen.findByLabelText("Claude judge model"), { target: { value: "haiku" } });
-    fireEvent.change(screen.getByLabelText("Codex judge model"), { target: { value: "gpt-6-astra" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save judge models" }));
-    await waitFor(() =>
-      expect(mockApi.putMySettings).toHaveBeenCalledWith({ judge_model: "haiku", codex_judge_model: "gpt-6-astra" }),
-    );
-  });
-
-  it("refuses to save an empty custom Claude judge model instead of resetting to Default", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: "haiku" }));
-    renderPage();
-    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
-    await waitFor(() => expect(claude.value).toBe("haiku"));
-    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
-    fireEvent.change(claude, { target: { value: "custom" } });
-    expect(claude.value).toBe("custom");
-    expect(screen.getByText("Enter a model ID, or choose Default.").getAttribute("role")).toBe("alert");
-    expect(save.disabled).toBe(true);
-    // Filling the ID clears the refusal and enables Save (the positive half above
-    // proves this query finds the message when it is rendered).
-    fireEvent.change(screen.getByLabelText("Custom Claude judge model ID"), { target: { value: "claude-opus-4-8" } });
-    expect(screen.queryByText("Enter a model ID, or choose Default.")).toBeNull();
-    expect(save.disabled).toBe(false);
-  });
-
-  // gpt-6-luna is a Codex role model but not a curated one, so it pins the warning to
-  // the role set (CODEX_ROLE_MODELS), not the curated picker list.
-  it.each(["gpt-6-astra", "gpt-6-luna"])(
-    "flags a stored Codex id (%s) in the Claude lane and shows what is in effect instead",
-    async (id) => {
-      mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-      // The server drops the Codex id from the Claude lane, so the cell resolves to the
-      // instance default (sonnet), exactly as cells() describes it.
-      const legacy = cells();
-      legacy[0] = { ...legacy[0], model: id };
-      mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: id, judge_models: legacy }));
-      const { container } = renderPage();
-      const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
-      await waitFor(() => expect(claude.value).toBe("custom"));
-      expect(document.getElementById("judge-model-effect")?.textContent).toBe("In effect: sonnet \u00b7 instance default");
-      expect(container.textContent).toContain(
-        `Not a Claude model: ${id} is a Codex model, so Claude judges skip it. Choose Default to clear it.`,
-      );
-    },
-  );
-
-  it("a stored Codex id in the Claude lane does not block saving the Codex lane", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    // The server resolver drops the stored gpt-6-luna, so the Claude cell resolves to
-    // the instance default.
-    const legacy = cells();
-    legacy[0] = { ...legacy[0], model: "gpt-6-luna" };
-    mockApi.getMySettings.mockResolvedValue(judgeSettings({ judge_model: "gpt-6-luna", judge_models: legacy }));
-    mockApi.putMySettings.mockResolvedValue(
-      judgeSettings({ judge_model: "gpt-6-luna", codex_judge_model: "gpt-6-astra", judge_models: legacy }),
-    );
-    renderPage();
-    const claude = (await screen.findByLabelText("Claude judge model")) as HTMLSelectElement;
-    await waitFor(() => expect(claude.value).toBe("custom"));
-    const save = screen.getByRole("button", { name: "Save judge models" }) as HTMLButtonElement;
-    expect(save.disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText("Codex judge model"), { target: { value: "gpt-6-astra" } });
-    // The Claude lane is untouched, so its warning does not gate this save.
-    expect(save.disabled).toBe(false);
-    fireEvent.click(save);
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
-    expect(mockApi.putMySettings.mock.calls[0][0]).toStrictEqual({ codex_judge_model: "gpt-6-astra" });
-  });
-});
-
-describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
-  it("renders the Run summaries card with the summary-model picker", async () => {
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByText("Run summaries");
-    expect(screen.getByLabelText("Claude summary model")).toBeTruthy();
-  });
-
-  it("saves the per-user summary model through PUT /me/settings", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByText("Run summaries");
-    // The summary-model picker offers a "haiku" option; selecting it dirties Save.
-    const select = screen.getByLabelText("Claude summary model") as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "haiku" } });
-    fireEvent.click(screen.getByText("Save Claude summary model"));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ summary_model: "haiku" }));
-  });
-});
-
-describe("Run defaults — summary model per harness (PRD #3248)", () => {
-  const key = (kind: string) => ({
-    id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
-    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
-  });
-  const cells = (): ModelSettingCell[] => [
-    { harness: "claude", model: null, default_model: "haiku", default_source: "builtin", resolved_model: "haiku", source: "builtin" },
-    { harness: "codex", model: "gpt-6-astra", default_model: "gpt-6.1-sol", default_source: "instance_default", resolved_model: "gpt-6-astra", source: "user_default" },
-  ];
-  const summarySettings = (over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
-    settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null,
-      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-      summary_model: null, codex_summary_model: "gpt-6-astra", summary_models: cells(),
-      ...over,
-    },
-  });
-  const optionValues = (select: HTMLSelectElement) => Array.from(select.options).map((o) => o.value);
-  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-
-  it("Codex-only: the Codex summary select offers exactly the Codex role models, and no Claude lane", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings());
-    renderPage();
-    const codex = (await screen.findByLabelText("Codex summary model")) as HTMLSelectElement;
-    expect(optionValues(codex)).toEqual(["inherit", ...CODEX_ROLE_MODELS]);
-    expect(optionValues(codex)).not.toContain("custom");
-    expect(optionValues(codex)).not.toContain("opus");
-    expect(codex.value).toBe("gpt-6-astra");
-    expect(screen.queryByLabelText("Claude summary model")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Save Claude summary model" })).toBeNull();
-  });
-
-  it("both usable: both lanes show, with Default and In-effect lines from summary_models", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings());
-    renderPage();
-    const claude = (await screen.findByLabelText("Claude summary model")) as HTMLSelectElement;
-    const codex = screen.getByLabelText("Codex summary model") as HTMLSelectElement;
-    expect(optionValues(claude)).toEqual(["inherit", "opus", "sonnet", "haiku", "fable", "custom"]);
-    expect(claude.options[0].textContent).toBe("Default \u00b7 haiku (built-in)");
-    expect(codex.options[0].textContent).toBe("Default \u00b7 gpt-6.1-sol (instance default)");
-    expect(document.getElementById(claude.getAttribute("aria-describedby") ?? "")?.textContent).toBe("In effect: haiku \u00b7 built-in");
-    expect(document.getElementById(codex.getAttribute("aria-describedby") ?? "")?.textContent).toBe("In effect: gpt-6-astra \u00b7 your choice");
-  });
-
-  it("the card copy is harness-neutral", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings());
-    renderPage();
-    await screen.findByLabelText("Claude summary model");
-    const card = screen.getByText("Run summaries").closest("div")!;
-    expect(card.textContent).toMatch(/on the same harness the run uses, with your own credential\s+for that harness/);
-    expect(screen.queryByText(/your own Anthropic token(?!s)/)).toBeNull();
-  });
-
-  it("Codex Save sends only the Codex field; blank means null", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings());
-    const saved = cells();
-    saved[1] = { ...saved[1], model: null, resolved_model: "gpt-6.1-sol", source: "instance_default" };
-    mockApi.putMySettings.mockResolvedValue(summarySettings({ codex_summary_model: null, summary_models: saved }));
-    renderPage();
-    const codex = (await screen.findByLabelText("Codex summary model")) as HTMLSelectElement;
-    const save = screen.getByRole("button", { name: "Save Codex summary model" }) as HTMLButtonElement;
-    expect(save.disabled).toBe(true);
-    fireEvent.change(codex, { target: { value: "inherit" } });
-    fireEvent.click(save);
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ codex_summary_model: null }));
-    await waitFor(() =>
-      expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6.1-sol \u00b7 instance default"),
-    );
-  });
-
-  it("Claude Save sends only the Claude field", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings());
-    mockApi.putMySettings.mockResolvedValue(summarySettings({ summary_model: "sonnet" }));
-    renderPage();
-    fireEvent.change(await screen.findByLabelText("Claude summary model"), { target: { value: "sonnet" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save Claude summary model" }));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ summary_model: "sonnet" }));
-  });
-
-  it("out-of-order lane saves keep each lane's own cell: a late Claude response cannot restore a stale Codex cell", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings());
-    const codexSaved = cells();
-    codexSaved[1] = { ...codexSaved[1], model: "gpt-6-luna", resolved_model: "gpt-6-luna" };
-    const claudeSaved = cells();
-    claudeSaved[0] = { ...claudeSaved[0], model: "sonnet", resolved_model: "sonnet", source: "user_default" };
-    let resolveClaude: (v: { settings: UserSettings }) => void = () => {};
-    let resolveCodex: (v: { settings: UserSettings }) => void = () => {};
-    mockApi.putMySettings.mockImplementation((patch: object) =>
-      new Promise((resolve) => {
-        if ("summary_model" in patch) resolveClaude = resolve as typeof resolveClaude;
-        else resolveCodex = resolve as typeof resolveCodex;
-      }));
-    renderPage();
-    fireEvent.change(await screen.findByLabelText("Codex summary model"), { target: { value: "gpt-6-luna" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save Codex summary model" }));
-    fireEvent.change(screen.getByLabelText("Claude summary model"), { target: { value: "sonnet" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save Claude summary model" }));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(2));
-    resolveCodex(summarySettings({ codex_summary_model: "gpt-6-luna", summary_models: codexSaved }));
-    await waitFor(() =>
-      expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6-luna · your choice"),
-    );
-    // The Claude save was issued before the Codex one landed, so its response carries the OLD Codex cell.
-    resolveClaude(summarySettings({ summary_model: "sonnet", summary_models: claudeSaved }));
-    await waitFor(() =>
-      expect(document.getElementById("summary-model-effect")?.textContent).toBe("In effect: sonnet · your choice"),
-    );
-    expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6-luna · your choice");
-  });
-
-  it.each(["gpt-6-astra", "gpt-6-luna"])("flags a stored Codex id (%s) in the Claude lane and blocks its Save", async (id) => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-    mockApi.getMySettings.mockResolvedValue(summarySettings({ summary_model: id }));
-    renderPage();
-    const claude = (await screen.findByLabelText("Claude summary model")) as HTMLSelectElement;
-    await waitFor(() => expect(claude.value).toBe("custom"));
-    expect(screen.getByText(/Not a Claude model/)).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Save Claude summary model" }) as HTMLButtonElement).disabled).toBe(true);
-  });
-});
-
-describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
-  it("retains a stored Codex effort but hides its control when Codex is unavailable", async () => {
-    mockApi.getMySettings.mockResolvedValue({ settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, default_codex_effort: "max",
-      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
-      dark_theme: null, typeface: null, theme: null,
-    } });
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByLabelText("Claude effort");
-    expect(screen.queryByLabelText("Codex effort")).toBeNull();
-    expect(screen.queryByText("Save Codex effort")).toBeNull();
-    expect(mockApi.putMySettings).not.toHaveBeenCalled();
-  });
-  it("saves and clears Codex effort without sending or resetting the Claude choice", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [{
-      id: "codex-effort-fixture", kind: "openai_api_key", label: "Codex fixture",
-      is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
-      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
-    }] });
-    mockApi.getMySettings.mockResolvedValue({ settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "high", default_codex_effort: "low",
-      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
-      dark_theme: null, typeface: null, theme: null,
-    } });
-    mockApi.putMySettings.mockResolvedValue({ settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "high", default_codex_effort: "medium",
-      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
-      dark_theme: null, typeface: null, theme: null,
-    } });
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const codex = await screen.findByLabelText("Codex effort") as HTMLSelectElement;
-    const claude = screen.getByLabelText("Claude effort") as HTMLSelectElement;
-    fireEvent.change(claude, { target: { value: "max" } });
-    fireEvent.change(codex, { target: { value: "medium" } });
-    fireEvent.click(screen.getByText("Save Codex effort"));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "medium" }));
-    expect(claude.value).toBe("max");
-    mockApi.putMySettings.mockResolvedValue({ settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "high", default_codex_effort: null,
-      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
-      dark_theme: null, typeface: null, theme: null,
-    } });
-    fireEvent.change(codex, { target: { value: "" } });
-    fireEvent.click(screen.getByText("Save Codex effort"));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: null }));
-    expect(claude.value).toBe("max");
-  });
-  // PRD #3247: the ordinary worker cards offer the preference-only Runtime default.
-  describe("Runtime default (PRD #3247)", () => {
-    const base = { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
-    const codexSecret = { id: "codex-rt", kind: "openai_api_key", label: "Codex fixture", is_default: true, enabled: true, disabled_at: null, auto_eligible: false, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
-    const optionList = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => [o.value, o.text]);
-
-    it("offers Runtime default with each harness's label and the card copy", async () => {
-      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
-      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });
-      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-      const claude = await screen.findByLabelText("Claude effort");
-      const codex = await screen.findByLabelText("Codex effort");
-      expect(optionList(claude)[1]).toEqual(["runtime", "Runtime default · value not reported"]);
-      // No catalog_default on the response: the unknown wording, not the retired one.
-      expect(optionList(codex)[1]).toEqual(["runtime", "Runtime default · catalog default unknown until a Codex run reports it"]);
-      expect(screen.getByText(/Runtime default sends no level, so Claude Code or Codex decides; a resumed session may keep the level it last used\./)).toBeTruthy();
-    });
-
-    // Issue #3251: the Codex option text comes from the server's catalog_default.
-    const cells = (catalog_default?: unknown) => [
-      { harness: "claude", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit" },
-      { harness: "codex", effort: null, default_effort: "medium", default_source: "builtin", resolved_effort: "medium", source: "builtin", mode: "explicit",
-        ...(catalog_default === undefined ? {} : { catalog_default }) },
-    ] as unknown as UserSettings["effort_settings"];
-    const dto = (over: object = {}) => ({ state: "known", effort: "medium", model: "gpt-6.1-sol", runtime_version: "0.164.0", observed_at: "2026-11-05T09:30:00Z", ...over });
-    const codexOption = async (catalog_default?: unknown) => {
-      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
-      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null, effort_settings: cells(catalog_default) } });
-      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-      return optionList(await screen.findByLabelText("Codex effort"))[1];
-    };
-
-    it.each([
-      ["known", dto(), "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0)"],
-      ["none", dto({ effort: "none" }), "Runtime default · catalog default: none (no reasoning level requested) (gpt-6.1-sol, Codex 0.164.0)"],
-      ["ultra", dto({ effort: "ultra" }), "Runtime default · catalog default: ultra (Codex substitutes another level) (gpt-6.1-sol, Codex 0.164.0)"],
-      ["varies", dto({ state: "varies" }), "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0) · may differ on workers still on another version"],
-      ["unknown", dto({ state: "unknown", effort: null, model: null, runtime_version: null, observed_at: null }), "Runtime default · catalog default unknown until a Codex run reports it"],
-      ["absent", undefined, "Runtime default · catalog default unknown until a Codex run reports it"],
-    ])("labels the Codex option for a %s catalog default", async (_name, catalog_default, label) => {
-      expect(await codexOption(catalog_default)).toEqual(["runtime", label]);
-      // Claude's option is unchanged by the Codex catalog.
-      expect(optionList(screen.getByLabelText("Claude effort"))[1]).toEqual(["runtime", "Runtime default · value not reported"]);
-    });
-
-    it("renders a hostile model string as literal option text", async () => {
-      const hostile = "<img src=x onerror=alert(1)>";
-      const [, text] = await codexOption(dto({ model: hostile }));
-      expect(text).toBe(`Runtime default · catalog default: medium (${hostile}, Codex 0.164.0)`);
-      expect(document.querySelector("img[src='x']")).toBeNull();
-    });
-
-    it("refreshes the label from the PUT response after a Codex save", async () => {
-      expect((await codexOption(dto()))[1]).toContain("medium (gpt-6.1-sol, Codex 0.164.0)");
-      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: null, default_codex_effort: "high",
-        effort_settings: cells(dto({ effort: "none", runtime_version: "0.165.0" })) } });
-      fireEvent.change(screen.getByLabelText("Codex effort"), { target: { value: "high" } });
-      fireEvent.click(screen.getByText("Save Codex effort"));
-      await waitFor(() => expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
-        "Runtime default · catalog default: none (no reasoning level requested) (gpt-6.1-sol, Codex 0.165.0)"));
-    });
-
-    it.each(["Claude", "Codex"] as const)("adopts only its own catalog lane after a %s effort save", async (harness) => {
-      expect((await codexOption(dto()))[1]).toContain("Codex 0.164.0");
-      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base,
-        default_effort: harness === "Claude" ? "high" : null, default_codex_effort: harness === "Codex" ? "high" : null,
-        effort_settings: cells(dto({ state: "varies" })) } });
-      fireEvent.change(screen.getByLabelText(`${harness} effort`), { target: { value: "high" } });
-      fireEvent.click(screen.getByText(`Save ${harness} effort`));
-      await screen.findByText(harness === "Claude"
-        ? "Reasoning effort set to high. It applies to your next run."
-        : "Codex reasoning effort set to high. It applies at the next claim.");
-      expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
-        "Runtime default · catalog default: medium (gpt-6.1-sol, Codex 0.164.0)" +
-        (harness === "Codex" ? " · may differ on workers still on another version" : ""));
-    });
-
-    it("refreshes the label from the PUT response after a Codex model save", async () => {
-      expect((await codexOption(dto()))[1]).toContain("(gpt-6.1-sol, Codex 0.164.0)");
-      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: null, default_codex_effort: null,
-        default_codex_model: "gpt-6-sol", effort_settings: cells(dto({ model: "gpt-6-sol", effort: "high" })) } });
-      fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
-      fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
-      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith(expect.objectContaining({ default_codex_model: "gpt-6-sol" })));
-      await waitFor(() => expect(optionList(screen.getByLabelText("Codex effort"))[1][1]).toBe(
-        "Runtime default · catalog default: high (gpt-6-sol, Codex 0.164.0)"));
-    });
-
-    it("saving runtime sends the token and announces Runtime default, never 'runtime'", async () => {
-      mockApi.listSecrets.mockResolvedValue({ secrets: [codexSecret] });
-      mockApi.getMySettings.mockResolvedValue({ settings: { ...base, default_effort: null, default_codex_effort: null } });
-      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "runtime", default_codex_effort: null } });
-      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-      fireEvent.change(await screen.findByLabelText("Claude effort"), { target: { value: "runtime" } });
-      fireEvent.click(screen.getByText("Save Claude effort"));
-      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: "runtime" }));
-      await screen.findByText("Claude reasoning effort set to Runtime default. Claude Code decides at your next run.");
-      mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...base, default_effort: "runtime", default_codex_effort: "runtime" } });
-      fireEvent.change(screen.getByLabelText("Codex effort"), { target: { value: "runtime" } });
-      fireEvent.click(screen.getByText("Save Codex effort"));
-      await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "runtime" }));
-      await screen.findByText("Codex reasoning effort set to Runtime default. Codex decides at the next claim.");
-    });
-  });
-
-  it("loads and shows the saved effort", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
-    expect(select.value).toBe("low");
-  });
-
-  it("changing the dropdown enables Save and sends the chosen level", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
-    const save = screen.getByText("Save Claude effort") as HTMLButtonElement;
-    // Inherit is the saved value, so Save starts disabled (not dirty).
-    expect(save.disabled).toBe(true);
-    fireEvent.change(select, { target: { value: "low" } });
-    expect(save.disabled).toBe(false);
-    fireEvent.click(save);
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: "low" }));
-  });
-
-  it("selecting Inherit sends default_effort: null", async () => {
-    mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "max", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
-    });
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "" } });
-    fireEvent.click(screen.getByText("Save Claude effort"));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: null }));
+    await waitFor(() => expect(screen.getByText(/ENFORCED/).textContent).toContain("(Claude runs on sonnet)"));
   });
 });
 
@@ -1499,548 +919,46 @@ describe("Run defaults — Now line switch (PRD #2603)", () => {
   });
 });
 
-// PRD #1551 M3: the grouped "Harness and worker models" card. The default harness and
-// the two retained per-harness model lanes are one decision saved in ONE PUT; changing
-// the harness never touches a model; the active-lane badge follows the effective harness;
-// a failed save keeps the form dirty. Each test names the mutation it fails on.
-describe("Run defaults — harness and worker models card (PRD #1551 M3)", () => {
-  const anthropicToken = {
-    id: "sec-anthropic",
-    kind: "anthropic_token",
-    label: "console-key",
-    is_default: true,
-    enabled: true,
-    disabled_at: null,
-    auto_eligible: false,
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-  };
-  const codexKey = {
-    id: "sec-codex",
-    kind: "openai_api_key",
-    label: "codex-key",
-    is_default: true,
-    enabled: true,
-    disabled_at: null,
-    auto_eligible: false,
-    created_at: "2026-01-01T00:00:00Z",
-    updated_at: "2026-01-01T00:00:00Z",
-  };
-
-  // A complete UserSettings response with the two lanes, overridable per test.
-  const settings = (over: Record<string, unknown> = {}) => ({
+// Harness overflow stays here (PRD #3263 M3); the default harness it depends on is saved in
+// Models, so the toggle reads the saved default and explains when it cannot apply.
+describe("Run defaults — harness overflow availability", () => {
+  const key = (kind: string) => ({
+    id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+  });
+  const settings = (over: Partial<UserSettings> = {}) => ({
     settings: {
-      default_harness: null,
-      judge_runs_on: null,
-      harness_overflow_enabled: false, default_model: null,
-      default_claude_model: null,
-      default_codex_model: null,
-      default_effort: null,
-      judge_model: null,
-      summary_model: null,
-      appearance_mode: null,
-      light_theme: null,
-      dark_theme: null,
-      typeface: null,
-      theme: null,
+      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null,
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       ...over,
-    },
+    } as UserSettings,
   });
-
-  // Locate the lane <div> that contains a provider heading, so a badge/label assertion
-  // can be scoped to one lane rather than the whole card.
-  const laneOf = (heading: string) =>
-    screen.getByRole("heading", { name: heading }).closest("div.rounded-lg") as HTMLElement;
-
-  const saveButton = () =>
-    screen.getByRole("button", { name: "Save defaults" }) as HTMLButtonElement;
-
-  it.each(CODEX_ROLE_MODELS)("recovers the stored Claude role ID %s only after explicit reset", async id => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: ` ${id} ` }));
-    mockApi.putMySettings.mockResolvedValue(settings({ default_harness: "codex", default_codex_model: "gpt-6-sol" }));
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await waitFor(() => expect((screen.getByLabelText("Custom Claude model ID") as HTMLInputElement).value).toBe(` ${id} `));
-    expect(screen.getByText(/^Not a Claude model/).textContent).toContain("stored value is skipped");
-    expect(screen.getByText(/^Not a Claude model/).textContent).toContain("existing Claude worker default");
-    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
-    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
-    expect(saveButton().disabled).toBe(true);
-    fireEvent.click(saveButton());
-    expect(mockApi.putMySettings).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Reset to Default" }));
-    await waitFor(() => expect((screen.getByLabelText("Claude model") as HTMLSelectElement).value).toBe("inherit"));
-    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
-    expect(mockApi.putMySettings).not.toHaveBeenCalled();
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({
-      default_harness: "codex", default_claude_model: null, default_codex_model: "gpt-6-sol",
-    }));
-  });
-
-  it.each(["claude-private-model", "gpt-looking-custom"])("keeps custom Claude ID %s saveable", async id => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: id }));
-    mockApi.putMySettings.mockResolvedValue(settings({ default_claude_model: id, default_harness: "codex" }));
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await waitFor(() => expect((screen.getByLabelText("Custom Claude model ID") as HTMLInputElement).value).toBe(id));
-    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
-    expect(screen.queryByRole("button", { name: "Reset to Default" })).toBeNull();
-    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({
-      default_harness: "codex", default_claude_model: id, default_codex_model: null,
-    }));
-  });
-
-  it("recovers hidden Claude luna, preserving Codex and harness drafts after a failed reset-save", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "gpt-6-luna", default_harness: "codex" }));
-    let rejectSave!: (reason: Error) => void;
-    mockApi.putMySettings.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectSave = reject; }));
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByText(/^Not a Claude model/);
-    expect(screen.queryByLabelText("Claude model")).toBeNull();
-    expect(screen.queryByLabelText("Default harness")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
-    expect(saveButton().disabled).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Reset to Default" }));
-    expect(mockApi.putMySettings).not.toHaveBeenCalled();
-    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    const patch = { default_harness: "codex", default_claude_model: null, default_codex_model: "gpt-6-sol" };
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith(patch));
-    expect(saveButton().disabled).toBe(true);
-    rejectSave(new ApiError(400, "Reset save failed"));
-    await screen.findByText("Reset save failed");
-    await waitFor(() => expect(saveButton().disabled).toBe(false));
-    expect(screen.queryByText(/^Not a Claude model/)).toBeNull();
-    expect((screen.getByLabelText("Codex model") as HTMLSelectElement).value).toBe("gpt-6-sol");
-    mockApi.putMySettings.mockResolvedValue(settings(patch));
-    fireEvent.click(saveButton());
-    await screen.findByText(/Defaults saved/);
-    expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, patch);
-  });
-
-  it("Default options name their actual source and never echo a saved pin (#3255)", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    const base = settings();
-    mockApi.getMySettings.mockResolvedValue({
-      settings: {
-        ...base.settings,
-        default_claude_model: "sonnet",
-        cross_check_pins: [
-          { stage: "plan", harness: "claude", model: null, effort: null, worker_default_model: "sonnet", resolved_model: "sonnet",
-            resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false },
-        ],
-      },
-    });
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const optionTexts = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => o.text);
-    const claude = await screen.findByLabelText("Claude model");
-    expect(optionTexts(claude)[0]).toBe("Default · lead template");
-    expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
-    expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
-    expect(optionTexts(screen.getByLabelText("Claude summary model"))[0]).toBe("Default");
-    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
-    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · lead template's effort, else medium (built-in)");
-    expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
-  });
-
-  it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // Selector present (this same query is the positive control the single-lane tests
-    // below pair their "no selector" negatives against).
-    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    expect(selector.value).toBe("inherit");
-    // Both lanes present.
-    expect(screen.getByLabelText("Claude model")).toBeTruthy();
-    expect(screen.getByLabelText("Codex model")).toBeTruthy();
-    expect(within(laneOf("Codex")).getByText("gpt-6.1-sol", { selector: "code" })).toBeTruthy();
-    expect(screen.getByLabelText("Codex effort")).toBeTruthy();
-    // Automatic with both usable is chosen per run by weekly limits: no lane is marked
-    // as the default, and the dedicated badge reads as such.
-    expect(screen.getByText("Chosen per run by weekly limits")).toBeTruthy();
-    expect(within(laneOf("Anthropic")).queryByText("Default harness")).toBeNull();
-    expect(within(laneOf("Codex")).queryByText("Default harness")).toBeNull();
-  });
-
-  it("both usable: the help text and retention copy say the harness is chosen per run by weekly limits", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    const { container } = render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByLabelText("Default harness");
-    const text = container.textContent ?? "";
-    expect(text).toContain("when both are usable it chooses per run by weekly limits");
-    expect(text).not.toContain("Claude when both are usable");
-  });
-
-  it("explicit default keeps the lane badge and drops the per-run badge", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "claude" }));
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByLabelText("Default harness");
-    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
-    expect(within(laneOf("Codex")).queryByText("Default harness")).toBeNull();
-    expect(screen.queryByText("Chosen per run by weekly limits")).toBeNull();
-  });
+  const overflowSwitch = () => screen.getByRole("switch", { name: /Overflow to the other harness/ });
+  const NOTE = /Overflow applies only when a Claude or Codex default harness is saved in Models/;
 
   it("disables the overflow toggle with an explanation under Default · automatic and enables it under an explicit default", async () => {
-    const overflowSwitch = () => screen.getByRole("switch", { name: /Overflow to the other harness/ });
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
     mockApi.getMySettings.mockResolvedValue(settings());
     const view = render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByLabelText("Default harness");
+    await waitFor(() => expect(screen.getByText(NOTE).textContent).toContain("With Default · automatic, uzi already picks by weekly limits."));
     expect(overflowSwitch().getAttribute("aria-disabled")).toBe("true");
-    const explanation = screen.getByText(/Overflow applies only when a Claude or Codex default harness is saved/);
-    expect(explanation.textContent).toContain("With Default · automatic, uzi already picks by weekly limits.");
-    expect(overflowSwitch().getAttribute("aria-describedby")?.split(" ")).toContain(explanation.id);
+    expect(overflowSwitch().getAttribute("aria-describedby")?.split(" ")).toContain(screen.getByText(NOTE).id);
     fireEvent.click(overflowSwitch());
     expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
     view.unmount();
     mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "codex" }));
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    await screen.findByLabelText("Default harness");
-    expect(overflowSwitch().getAttribute("aria-disabled")).not.toBe("true");
-    expect(screen.queryByText(/Overflow applies only when a Claude or Codex default harness is saved/)).toBeNull();
+    await waitFor(() => expect(overflowSwitch().getAttribute("aria-disabled")).not.toBe("true"));
+    expect(screen.queryByText(NOTE)).toBeNull();
   });
 
   it("with one usable harness and Default · automatic, the overflow note makes no weekly-limits claim", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
     mockApi.getMySettings.mockResolvedValue(settings());
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const note = await screen.findByText(/Overflow applies only when a Claude or Codex default harness is saved/);
-    expect(note.textContent).not.toContain("weekly limits");
-  });
-
-  it("both usable: the badge moves to the Codex lane when Codex is selected", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    // Before: automatic, so the per-run badge shows and no lane is marked.
-    expect(screen.getByText("Chosen per run by weekly limits")).toBeTruthy();
-    expect(within(laneOf("Anthropic")).queryByText("Default harness")).toBeNull();
-    fireEvent.change(selector, { target: { value: "claude" } });
-    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
-    fireEvent.change(selector, { target: { value: "codex" } });
-    expect(screen.queryByText("Chosen per run by weekly limits")).toBeNull();
-    // After: badge is on Codex and gone from Anthropic. Fails if the badge is pinned
-    // to a static lane instead of following the effective harness.
-    expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
-    expect(within(laneOf("Anthropic")).queryByText("Default harness")).toBeNull();
-  });
-
-  it("both usable: the retention copy names the current default harness", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    const { container } = render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    // Inherit → automatic.
-    expect(container.textContent ?? "").toMatch(/Harness selection is automatic/i);
-    fireEvent.change(selector, { target: { value: "codex" } });
-    expect(container.textContent ?? "").toMatch(/Codex is your default harness/i);
-    // Fails if the copy is static rather than keyed on the selection.
-    expect(container.textContent ?? "").not.toMatch(/Harness selection is automatic/i);
-  });
-
-  it("Claude-only: shows just the Claude lane with the badge and no selector", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // Positive: the Claude lane and its badge render.
-    expect(await screen.findByLabelText("Claude model")).toBeTruthy();
-    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
-    // Negatives, each paired with a positive control proving the query works when the
-    // element IS present: the selector (found in the both-usable test above) and the
-    // Codex lane (found in the both-usable test above).
-    expect(screen.queryByLabelText("Default harness")).toBeNull();
-    expect(screen.queryByLabelText("Codex model")).toBeNull();
-  });
-
-  it("Codex-only: shows just the Codex lane with the badge and no selector", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // Positive: the Codex lane and its badge render (inherit resolves to Codex when it
-    // is the sole usable harness, so the badge follows onto the only lane).
-    expect(await screen.findByLabelText("Codex model")).toBeTruthy();
-    expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
-    // Negatives paired with the both-usable positives.
-    expect(screen.queryByLabelText("Claude model")).toBeNull();
-    expect(screen.queryByLabelText("Default harness")).toBeNull();
-  });
-
-  // Stale-pin edge cases (PRD #1551 M3 review): a stored default_harness that is no
-  // longer usable. The server's D11 resolver (harness_resolver.go, rung 2) SKIPS an
-  // unusable stored default and falls through to availability, so the badge must follow
-  // the same resolution — not short-circuit on the raw stored pin, which would light no
-  // lane at all when the pin is unusable and the selector is hidden.
-  it("stale Claude pin, only Codex usable: badge is on the sole visible (Codex) lane", async () => {
-    mockAuth(baseUser);
-    // Only Codex usable, but the stored default is a now-stale "claude".
-    mockApi.listSecrets.mockResolvedValue({ secrets: [codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "claude" }));
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // Positive control: the Codex lane renders and the selector is hidden.
-    expect(await screen.findByLabelText("Codex model")).toBeTruthy();
-    expect(screen.queryByLabelText("Default harness")).toBeNull();
-    // The badge follows the effective harness (Codex, the sole usable one) onto the only
-    // visible lane. Fails before the fix — the raw "claude" pin short-circuits the
-    // resolver, so NO lane gets the badge.
-    expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
-  });
-
-  it("stale Codex pin, only Claude usable: badge is on the sole visible (Claude) lane", async () => {
-    mockAuth(baseUser);
-    // Only Claude usable, but the stored default is a now-stale "codex".
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "codex" }));
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // Positive control: the Claude lane renders and the selector is hidden.
-    expect(await screen.findByLabelText("Claude model")).toBeTruthy();
-    expect(screen.queryByLabelText("Default harness")).toBeNull();
-    // The badge follows the effective harness (Claude, the sole usable one) onto the
-    // only visible lane. Fails before the fix — the raw "codex" pin short-circuits the
-    // resolver, so NO lane gets the badge.
-    expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
-  });
-
-  it("zero credentials: preserves the Claude lane so a model can be preconfigured, with no selector", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // Positive: the Claude lane is shown even with no usable harness (success criterion 4).
-    expect(await screen.findByLabelText("Claude model")).toBeTruthy();
-    // Negatives paired with the both-usable positives.
-    expect(screen.queryByLabelText("Codex model")).toBeNull();
-    expect(screen.queryByLabelText("Default harness")).toBeNull();
-  });
-
-  it("switching the harness leaves both saved model choices intact", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(
-      settings({ default_claude_model: "opus", default_codex_model: "gpt-6-sol" }),
-    );
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const claudeSel = (await screen.findByLabelText("Claude model")) as HTMLSelectElement;
-    const codexSel = screen.getByLabelText("Codex model") as HTMLSelectElement;
-    await waitFor(() => expect(claudeSel.value).toBe("opus"));
-    await waitFor(() => expect(codexSel.value).toBe("gpt-6-sol"));
-    // Switch the harness — the two lanes must not change. Fails if a reset-on-switch
-    // rule (the retired D6 behaviour) is reintroduced.
-    fireEvent.change(screen.getByLabelText("Default harness"), { target: { value: "codex" } });
-    expect((screen.getByLabelText("Claude model") as HTMLSelectElement).value).toBe("opus");
-    expect((screen.getByLabelText("Codex model") as HTMLSelectElement).value).toBe("gpt-6-sol");
-  });
-
-  it("Save sends exactly one PUT carrying the three fields and never default_model", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockResolvedValue(
-      settings({ default_harness: "codex", default_claude_model: "sonnet", default_codex_model: "gpt-6-sol" }),
-    );
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    fireEvent.change(selector, { target: { value: "codex" } });
-    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "sonnet" } });
-    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
-    // Deep-equality: the exact three keys, and NO default_model. Fails if the page
-    // splits the save into several PUTs or smuggles the legacy field.
-    expect(mockApi.putMySettings).toHaveBeenCalledWith({
-      default_harness: "codex",
-      default_claude_model: "sonnet",
-      default_codex_model: "gpt-6-sol",
-    });
-    await screen.findByText(/Defaults saved/i);
-  });
-
-  it("clearing a lane to Inherit sends null for that lane", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "opus" }));
-    mockApi.putMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const claudeSel = (await screen.findByLabelText("Claude model")) as HTMLSelectElement;
-    await waitFor(() => expect(claudeSel.value).toBe("opus"));
-    fireEvent.change(claudeSel, { target: { value: "inherit" } });
-    fireEvent.click(saveButton());
-    await waitFor(() =>
-      expect(mockApi.putMySettings).toHaveBeenCalledWith({
-        default_harness: null,
-        default_claude_model: null,
-        default_codex_model: null,
-      }),
-    );
-  });
-
-  it("Codex lane: offers a custom ID with a Codex-specific label and placeholder", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockResolvedValue(settings({ default_codex_model: "gpt-5.6-terra" }));
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const codexSel = (await screen.findByLabelText("Codex model")) as HTMLSelectElement;
-    // Positive control: the Other… escape hatch is present on the Run Defaults Codex lane
-    // (it is withheld for schedule/template Codex callers).
-    expect(within(codexSel).getByRole("option", { name: /Other/ })).toBeTruthy();
-    fireEvent.change(codexSel, { target: { value: "custom" } });
-    const custom = screen.getByLabelText("Custom Codex model ID") as HTMLInputElement;
-    // Provider-specific placeholder — fails if the Claude placeholder leaks into the Codex lane.
-    expect(custom.placeholder).toBe("gpt-…");
-    fireEvent.change(custom, { target: { value: "gpt-5.6-terra" } });
-    fireEvent.click(saveButton());
-    await waitFor(() =>
-      expect(mockApi.putMySettings).toHaveBeenCalledWith({
-        default_harness: null,
-        default_claude_model: null,
-        default_codex_model: "gpt-5.6-terra",
-      }),
-    );
-  });
-
-  it("Claude lane: the custom input carries a Claude-specific label and placeholder", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings({ default_claude_model: "claude-opus-4-8" }));
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    // A non-alias saved value initializes the lane into custom mode.
-    const custom = (await screen.findByLabelText("Custom Claude model ID")) as HTMLInputElement;
-    expect(custom.value).toBe("claude-opus-4-8");
-    expect(custom.placeholder).toBe("claude-…");
-  });
-
-  it("a failed save keeps the form dirty and shows one actionable error", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "a Codex model is not valid for the Claude lane"));
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    fireEvent.change(selector, { target: { value: "codex" } });
-    // Positive control: Save is enabled once the form is dirty.
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    expect(await screen.findByText("a Codex model is not valid for the Claude lane")).toBeTruthy();
-    // Still dirty, so Save stays live for a retry. Fails if a failed save wrongly
-    // advances the saved snapshot (which would disable Save).
-    expect(saveButton().disabled).toBe(false);
-  });
-
-  it("Save is disabled until something is dirty", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    await screen.findByLabelText("Default harness");
-    // Clean form: disabled.
-    expect(saveButton().disabled).toBe(true);
-    // Dirtying any one field enables it (positive control).
-    fireEvent.change(screen.getByLabelText("Codex model"), { target: { value: "gpt-6-sol" } });
-    expect(saveButton().disabled).toBe(false);
-  });
-
-  it("labels the model selects and keeps keyboard focus on them (a11y)", async () => {
-    mockAuth(baseUser);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
-    mockApi.getMySettings.mockResolvedValue(settings());
-    render(
-      <MemoryRouter>
-        <RunDefaults />
-      </MemoryRouter>,
-    );
-    const claudeSel = (await screen.findByLabelText("Claude model")) as HTMLSelectElement;
-    // The visible label names ONLY the select (SELECT tag), and focus lands on it by
-    // identity (web.md: assert focus by identity, not text).
-    expect(claudeSel.tagName).toBe("SELECT");
-    claudeSel.focus();
-    expect(document.activeElement).toBe(claudeSel);
-    const codexSel = screen.getByLabelText("Codex model") as HTMLSelectElement;
-    codexSel.focus();
-    expect(document.activeElement).toBe(codexSel);
+    // Positive control: the load landed (the Claude judge lane's credential reads the token).
+    await screen.findByText("Your default token (anthropic_token)");
+    expect(screen.getByText(NOTE).textContent).not.toContain("weekly limits");
   });
 });
 
@@ -2053,190 +971,21 @@ it("usage-limit provider regression #2360: shared default has neutral copy", () 
   expect((screen.getByLabelText("Pause my new runs on a usage limit instead of failing them") as HTMLInputElement).checked).toBe(false);
 });
 
-describe("B1 independent settings responses", () => {
-  const initial: UserSettings = {
-    default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_claude_model: "opus", default_codex_model: "gpt-6.1-sol",
-    default_effort: "low", default_codex_effort: "low", judge_model: null, summary_model: null,
-    appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-    cross_check_pins: [
-      { stage: "plan", harness: "claude", model: null, effort: null, worker_default_model: "opus", resolved_model: "opus",
-        resolved_effort: "low", model_source: "worker default", effort_source: "worker default", active: false },
-      { stage: "plan", harness: "codex", model: null, effort: null, worker_default_model: "gpt-6.1-sol", resolved_model: "gpt-6.1-sol", resolved_effort: "low", model_source: "worker default", effort_source: "worker default", active: true },
-    ],
-  };
-  const modelResponse = (response: Partial<UserSettings>): UserSettings => ({ ...initial, ...response,
-    cross_check_pins: initial.cross_check_pins!.map(cell => ({ ...cell,
-      worker_default_model: response.cross_check_pins?.find(p => p.harness === cell.harness)?.worker_default_model === null ? null : cell.harness === "claude" ? ("default_claude_model" in response ? response.default_claude_model ?? "template-inherited" : "opus")
-        : response.default_codex_model ?? "gpt-6.1-sol",
-      resolved_model: "stale-pin-hint", resolved_effort: "stale-effort-hint", model_source: "pin" as const, active: !cell.active,
-    })).reverse(),
-  });
-  const currentSettings = () => deliveredSettings.mock.calls[deliveredSettings.mock.calls.length - 1][0];
-  const expectHints = (response?: Partial<UserSettings>) => {
-    const metadata = response ? modelResponse(response).cross_check_pins! : initial.cross_check_pins!;
-    expect(currentSettings().cross_check_pins).toEqual(initial.cross_check_pins!.map(cell => ({ ...cell,
-      worker_default_model: metadata.find(p => p.harness === cell.harness)!.worker_default_model,
-    })));
-  };
-  const cases = [
-    { name: "model", label: "Claude model", value: "haiku", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: "haiku", default_codex_model: "gpt-6.1-sol" },
-      response: { default_claude_model: "haiku" }, checker: "Claude checker model", expected: "haiku" },
-    { name: "Codex model", label: "Codex model", value: "gpt-6-sol", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: "opus", default_codex_model: "gpt-6-sol" },
-      response: { default_codex_model: "gpt-6-sol" }, checker: "Codex checker model", expected: "gpt-6-sol" },
-    { name: "model reset", label: "Claude model", value: "inherit", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: null, default_codex_model: "gpt-6.1-sol" },
-      response: { default_claude_model: null }, checker: "Claude checker model", expected: "template-inherited" },
-    { name: "SDK model reset", label: "Claude model", value: "inherit", button: "Save defaults",
-      patch: { default_harness: null, default_claude_model: null, default_codex_model: "gpt-6.1-sol" },
-      response: { default_claude_model: null, cross_check_pins: [{ ...initial.cross_check_pins![0], worker_default_model: null }] }, checker: "Claude checker model", expected: "SDK/account default" },
-    { name: "Claude effort reset", label: "Claude effort", value: "", button: "Save Claude effort",
-      patch: { default_effort: null }, response: { default_effort: null }, checker: "Claude checker effort", expected: "high" },
-    { name: "Codex effort", label: "Codex effort", value: "max", button: "Save Codex effort",
-      patch: { default_codex_effort: "max" }, response: { default_codex_effort: "max" }, checker: "Codex checker effort", expected: "high" },
-    { name: "Claude effort", label: "Claude effort", value: "max", button: "Save Claude effort",
-      patch: { default_effort: "max" }, response: { default_effort: "max" }, checker: "Claude checker effort", expected: "high" },
-    { name: "Codex effort reset", label: "Codex effort", value: "", button: "Save Codex effort",
-      patch: { default_codex_effort: null }, response: { default_codex_effort: null }, checker: "Codex checker effort", expected: "high" },
-  ];
-  beforeEach(() => {
-    mockApi.getMySettings.mockResolvedValue({ settings: initial });
-    mockApi.listAgentTemplates.mockResolvedValue({ templates: [{ ...mockTemplates[0], id: "lead", name: "lead", scope: "global", user_id: null, model: "template-inherited" }] });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [{ id: "lead", name: "lead", description: "", scope: "global", is_builtin: false, global_default: true, my_override: null, effective: true }] });
-    mockApi.listSecrets.mockResolvedValue({ secrets: ["anthropic_token", "openai_api_key"].map(kind => ({
-      id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
-      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
-    })) });
-  });
-  // A checker effort Default is the cross-check default whatever the worker effort is.
-  const label = (checker: string, value: string) =>
-    expect(within(screen.getByLabelText(checker)).getByRole("option", {
-      name: `Default · ${value} (${checker.endsWith("effort") ? "cross-check default" : "worker default"})`,
-    })).toBeTruthy();
-  const start = (label: string, value: string, button: string) => {
-    fireEvent.change(screen.getByLabelText(label), { target: { value } });
-    const save = screen.getByRole("button", { name: button }) as HTMLButtonElement;
-    expect(save.disabled).toBe(false);
-    fireEvent.click(save);
-  };
-  const finish = async (reply: (v: { settings: UserSettings }) => void, settings: UserSettings, button: string) => {
-    reply({ settings });
-    await waitFor(() => expect((screen.getByRole("button", { name: button }) as HTMLButtonElement).disabled).toBe(true));
-  };
-  for (const worker of cases) {
-    for (const sibling of ["grid", "judge", "summary", "MR"] as const) {
-      it.each([true, false])(`${worker.name} with ${sibling}, worker first=%s`, async workerFirst => {
-        const replies: Array<(v: { settings: UserSettings }) => void> = [];
-        mockApi.putMySettings.mockImplementation(() => new Promise(resolve => { replies.push(resolve); }));
-        render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-        await screen.findByLabelText("Claude checker model");
-        expect(currentSettings()).toEqual(initial);
-        if (sibling === "grid") start("Claude checker model", "sonnet", "Save cross-check defaults");
-        if (sibling === "judge") start("Claude judge model", "sonnet", "Save judge models");
-        if (sibling === "summary") start("Claude summary model", "sonnet", "Save Claude summary model");
-        if (sibling === "MR") fireEvent.click(screen.getByLabelText("Auto-rework MR review comments on my runs"));
-        start(worker.label, worker.value, worker.button);
-        expect(mockApi.putMySettings).toHaveBeenLastCalledWith(worker.patch);
-        const siblingSettings: UserSettings = { ...initial, judge_model: "sonnet", summary_model: "sonnet", mr_rework_enabled: false,
-          cross_check_pins: [{ ...initial.cross_check_pins![0], model: "sonnet", resolved_model: "sonnet", model_source: "pin" }] };
-        const finishSibling = async () => {
-          replies[0]({ settings: siblingSettings });
-          if (sibling === "MR") await waitFor(() => expect((screen.getByLabelText("Auto-rework MR review comments on my runs") as HTMLInputElement).disabled).toBe(false));
-          else await waitFor(() => expect((screen.getByRole("button", { name: sibling === "grid" ? "Save cross-check defaults" : sibling === "judge" ? "Save judge models" : "Save Claude summary model" }) as HTMLButtonElement).disabled).toBe(true));
-        };
-        if (workerFirst) {
-          await finish(replies[1], worker.button === "Save defaults" ? modelResponse(worker.response) : { ...initial, ...worker.response }, worker.button);
-          await waitFor(() => label(worker.checker, worker.expected));
-          await finishSibling();
-        } else {
-          await finishSibling();
-          await finish(replies[1], worker.button === "Save defaults" ? modelResponse(worker.response) : { ...initial, ...worker.response }, worker.button);
-        }
-        await waitFor(() => label(worker.checker, worker.expected));
-        expect((screen.getByLabelText(worker.label) as HTMLSelectElement).value).toBe(worker.value);
-        expectHints(worker.button === "Save defaults" ? worker.response : undefined);
-        expect(mockApi.listAgentTemplates).not.toHaveBeenCalled();
-        expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
-        if (sibling === "grid") expect((screen.getByLabelText("Claude checker model") as HTMLSelectElement).value).toBe("sonnet");
-        if (sibling === "judge") expect((screen.getByLabelText("Claude judge model") as HTMLSelectElement).value).toBe("sonnet");
-        if (sibling === "summary") expect((screen.getByLabelText("Claude summary model") as HTMLSelectElement).value).toBe("sonnet");
-      });
-    }
-  }
-  for (const model of cases.filter(c => c.button === "Save defaults")) {
-  for (const effort of cases.filter(c => c.name.includes("effort"))) {
-    it.each([true, false])(`${model.name} and ${effort.name}, model first=%s`, async modelFirst => {
-      const replies: Array<(v: { settings: UserSettings }) => void> = [];
-      mockApi.putMySettings.mockImplementation(() => new Promise(resolve => { replies.push(resolve); }));
-      render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-      await screen.findByLabelText("Claude checker model");
-      start(model.label, model.value, model.button);
-      start(effort.label, effort.value, effort.button);
-      expect(mockApi.putMySettings).toHaveBeenNthCalledWith(1, model.patch);
-      expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, effort.patch);
-      const modelDone = () => finish(replies[0], modelResponse(model.response), model.button);
-      const effortDone = () => finish(replies[1], { ...initial, ...effort.response }, effort.button);
-      if (modelFirst) { await modelDone(); await waitFor(() => label(model.checker, model.expected)); await effortDone(); }
-      else { await effortDone(); await waitFor(() => label(effort.checker, effort.expected)); await modelDone(); }
-      await waitFor(() => label(model.checker, model.expected));
-      await waitFor(() => label(effort.checker, effort.expected));
-      expectHints(model.response);
-      expect(currentSettings().default_effort).toBe("default_effort" in effort.response ? effort.response.default_effort : initial.default_effort);
-      expect(currentSettings().default_codex_effort).toBe("default_codex_effort" in effort.response ? effort.response.default_codex_effort : initial.default_codex_effort);
-      expect(mockApi.listAgentTemplates).not.toHaveBeenCalled();
-      expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
-    });
-  }
-  }
-});
-
-describe("checker effort selects stay free of the preference-only runtime token (PRD #3247)", () => {
-  it("offers runtime on the worker select but not on the checker select", async () => {
-    mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: "runtime",
-      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-      cross_check_pins: [
-        { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "high", model_source: "worker default" as const, effort_source: "cross-check default" as const, active: false },
-      ] } });
+// PRD #3263 M2: the checker model/effort grid moved to Models, saved with every other model
+// choice there (ModelsSettings.test.tsx covers its Defaults, guards and custom IDs). Run
+// defaults keeps only the plan/code cross-check enables and links to Models.
+describe("cross-check model and effort live in Models", () => {
+  it("shows the enables and a Models link, and no checker controls or separate save", async () => {
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const checker = await screen.findByLabelText("Claude checker effort") as HTMLSelectElement;
-    expect(Array.from(checker.options).map((o) => o.value)).not.toContain("runtime");
-    expect(Array.from((screen.getByLabelText("Claude effort") as HTMLSelectElement).options).map((o) => o.value)).toContain("runtime");
-    expect(within(checker).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
-  });
-});
-
-describe("checker defaults follow committed worker settings", () => {
-  it("refreshes the worker model and effort Defaults while retaining checker drafts", async () => {
-    const initial = { default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_claude_model: "opus",
-      default_effort: null, judge_model: null, summary_model: null, appearance_mode: null,
-      light_theme: null, dark_theme: null, typeface: null, theme: null, cross_check_pins: [
-      { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "medium", model_source: "worker default" as const, effort_source: "worker default" as const, active: false },
-    ] };
-    mockApi.getMySettings.mockResolvedValue({ settings: initial });
-    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-    const checker = await screen.findByLabelText("Claude checker model") as HTMLSelectElement;
-    fireEvent.change(checker, { target: { value: "sonnet" } });
-    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "haiku" } });
-    expect(within(checker).getByRole("option", { name: "Default · opus (worker default)" })).toBeTruthy();
-    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", cross_check_pins: initial.cross_check_pins.map(cell => ({ ...cell, worker_default_model: "haiku" })) } });
-    fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
-    await waitFor(() => expect(within(checker).getByRole("option", { name: "Default · haiku (worker default)" })).toBeTruthy());
-    expect(checker.value).toBe("sonnet");
-    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "max" } });
-    const checkerEffort = screen.getByLabelText("Claude checker effort");
-    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
-    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, default_claude_model: "haiku", default_effort: "max" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save Claude effort" }));
-    await waitFor(() => expect((screen.getByRole("button", { name: "Save Claude effort" }) as HTMLButtonElement).disabled).toBe(true));
-    expect(within(checkerEffort).getByRole("option", { name: "Default · high (cross-check default)" })).toBeTruthy();
-    expect(checker.value).toBe("sonnet");
-    mockApi.putMySettings.mockResolvedValueOnce({ settings: { ...initial, cross_check_pins: [
-      { stage: "plan", harness: "claude", model: "sonnet", effort: null, worker_default_model: "haiku", resolved_model: "sonnet",
-        resolved_effort: "max", model_source: "pin", effort_source: "worker default", active: false },
-    ] } });
-    fireEvent.click(screen.getByRole("button", { name: "Save cross-check defaults" }));
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ cross_check_pins: [{ stage: "plan", harness: "claude", model: "sonnet" }] }));
+    await waitFor(() => expect(screen.getByText("Runs on")).toBeTruthy());
+    expect(screen.getByText(/Plan cross-check · Required before implementation/)).toBeTruthy();
+    expect(screen.getByText(/Code cross-check · Advisory before publication/)).toBeTruthy();
+    const pointer = screen.getByText(/Model and effort for each cross-check stage are set in/);
+    expect(pointer.textContent).toBe("Model and effort for each cross-check stage are set in Models.");
+    expect(within(pointer).getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
+    expect(screen.queryByLabelText(/checker (model|effort)/)).toBeNull();
+    expect(screen.queryByRole("table", { name: "Cross-check defaults" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save cross-check defaults" })).toBeNull();
   });
 });
 
@@ -2521,7 +1270,7 @@ describe("harness overflow autosave", () => {
   const control = () => screen.getByRole("switch", { name: label }) as HTMLButtonElement;
   const checked = () => control().getAttribute("aria-checked") === "true";
 
-  it("saves on and explicitly off, hydrates on reload, and keeps model saves independent", async () => {
+  it("saves on and explicitly off, hydrates on reload, and never writes other settings", async () => {
     let stored = false;
     const initial = (await mockApi.getMySettings()).settings;
     mockApi.getMySettings.mockImplementation(async () => ({ settings: { ...initial, default_harness: "claude" as const, harness_overflow_enabled: stored } }));
@@ -2573,7 +1322,7 @@ describe("harness overflow autosave", () => {
     mockApi.setHarnessOverflow.mockReturnValueOnce(new Promise(resolve => { finishOverflow = resolve; }));
     mockApi.putMySettings.mockReturnValueOnce(new Promise(resolve => { finishSettings = resolve; }));
     renderPage();
-    await screen.findByRole("switch", { name: label });
+    await waitFor(() => expect(control().getAttribute("aria-disabled")).not.toBe("true"));
     control().focus();
     fireEvent.click(control());
     expect(control().getAttribute("aria-disabled")).toBe("true");
@@ -2586,501 +1335,287 @@ describe("harness overflow autosave", () => {
     const overflow = () => finishOverflow({ harness_overflow_enabled: true });
     const settings = () => finishSettings({ settings: { ...initial, now_summary_enabled: false } });
     (overflowFirst ? overflow : settings)();
-    await waitFor(() => expect(overflowFirst ? checked() : deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(overflowFirst ? true : false));
+    const nowLine = () => screen.getByLabelText("Model-written Now line") as HTMLInputElement;
+    await waitFor(() => expect(overflowFirst ? checked() : nowLine().checked).toBe(overflowFirst ? true : false));
     (overflowFirst ? settings : overflow)();
     await waitFor(() => {
       expect(checked()).toBe(true);
-      expect(deliveredSettings.mock.lastCall?.[0].harness_overflow_enabled).toBe(true);
-      expect(deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(false);
+      expect(nowLine().checked).toBe(false);
+      expect(nowLine().disabled).toBe(false);
     });
   });
 });
 
-// PRD #3257: "Judge runs on". The select is always shown (never gated on a usable credential
-// or on enforcement), saves at once, and an explicit harness is never rewritten for the user.
-describe("Run defaults — Judge runs on (PRD #3257)", () => {
-  const key = (kind: string) => ({
+// PRD #3263 M3: Run defaults is behavior-only. Every model and effort editor moved to Models
+// (ModelsSettings.test.tsx and modelsDraft.test.ts cover their Defaults, warnings, Runtime
+// default and Same as the run); this page keeps the behavior controls and shows the judge's
+// routing, models and credentials read-only with a Change in Models link.
+describe("Run defaults is behavior-only (PRD #3263 M3)", () => {
+  const key = (kind: string, over: Record<string, unknown> = {}) => ({
     id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
-    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", ...over,
+  });
+  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+
+  it("shows no model, effort, harness, planning, judge, summary or task-review editor and no model save", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    const { container } = renderPage();
+    // Positive control: the page has loaded and the judge summary rendered both lanes.
+    await screen.findByText("Codex judge model");
+    for (const name of [
+      /worker model/i, /^Claude model$/, /^Codex model$/, /reasoning effort/i, /^(Claude|Codex) effort$/,
+      /planning (model|effort)/i, /^Default harness$/, /^Judge runs on$/, /judge model/i, /summary model/i,
+      /task-review (model|effort)/i, /task review (model|effort)/i,
+    ]) {
+      expect(screen.queryByLabelText(name), String(name)).toBeNull();
+    }
+    expect(container.querySelectorAll("select")).toHaveLength(1); // only the judge token picker
+    expect(screen.getByLabelText("Token the judge spends")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Save / })).toBeNull();
+    for (const title of ["Harness and worker models", "Reasoning effort", "Planning"]) {
+      expect(screen.queryByRole("heading", { name: title }), title).toBeNull();
+    }
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps every behavior control", async () => {
+    renderPage();
+    await screen.findByText("Run judge");
+    for (const label of [
+      "Enable autopilot for my account",
+      "Pause my new runs on a usage limit instead of failing them",
+      "Alert me when my 7-day limit resets early",
+      "Judge my finished runs",
+      "Model-written Now line",
+      "Automatically fix my failed CI pipelines",
+      "Include the Co-Authored-By: Claude trailer in my worker commits",
+      "Auto-rework MR review comments on my runs",
+    ]) {
+      expect(screen.getByLabelText(label), label).toBeTruthy();
+    }
+    expect(screen.getByText(/Plan cross-check · Required before implementation/)).toBeTruthy();
+    expect(screen.getByText(/Code cross-check · Advisory before publication/)).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Keep a weekly usage reserve" })).toBeTruthy();
+    // specs/human.md pins the overflow label verbatim.
+    expect(screen.getByRole("switch", { name: "Overflow to the other harness when my default is near its limits" })).toBeTruthy();
+  });
+
+  it("points the emptied summary and task-review cards at Models", async () => {
+    renderPage();
+    const summaries = await screen.findByText(/The summary model for each harness is set in/);
+    expect(summaries.textContent).toBe("The summary model for each harness is set in Models.");
+    expect(within(summaries).getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
+    const taskReview = screen.getByText(/pass uses are set in/);
+    expect(taskReview.textContent).toBe("The model and effort the optional uzi handoff --review pass uses are set in Models.");
+    expect(within(taskReview).getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
+    const overflow = screen.getByText(/Your default harness and worker models are set in/);
+    expect(within(overflow).getByRole("link", { name: "Models" }).getAttribute("href")).toBe("/settings/models");
+  });
+});
+
+// The judge's read-only summary: routing from the saved judge_runs_on, each lane's model from the
+// server-resolved judge_models cells, and each lane's credential from the judge's own binding
+// (Claude) or the owned Codex credentials, never from a lead credential prediction.
+describe("Run defaults — judge summary (PRD #3263 M3)", () => {
+  const key = (kind: string, over: Record<string, unknown> = {}) => ({
+    id: kind, kind, label: kind, is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", ...over,
   });
   const cells = (): ModelSettingCell[] => [
     { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
-    { harness: "codex", model: null, default_model: "gpt-6.1-sol", default_source: "builtin", resolved_model: "gpt-6.1-sol", source: "builtin" },
+    { harness: "codex", model: "gpt-6-sol", default_model: "gpt-6.2-sol", default_source: "builtin", resolved_model: "gpt-6-sol", source: "user_default" },
   ];
-  const judgeSettings = (judgeRunsOn: UserSettings["judge_runs_on"]): { settings: UserSettings } => ({
+  const judgeSettings = (judgeRunsOn: UserSettings["judge_runs_on"], over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
     settings: {
       default_harness: null, judge_runs_on: judgeRunsOn, harness_overflow_enabled: false, default_model: null,
       default_effort: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null,
-      typeface: null, theme: null, judge_model: null, codex_judge_model: null, judge_models: cells(),
+      typeface: null, theme: null, judge_model: null, codex_judge_model: "gpt-6-sol", judge_models: cells(), ...over,
     },
   });
   const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-  const runsOn = () => screen.getByLabelText("Judge runs on") as HTMLSelectElement;
-  // The dimming wrapper of a control: the nearest ancestor carrying the not-used opacity.
+  const summary = () => screen.getByRole("region", { name: "Where your judge runs" });
+  // The summary as label → value pairs, in order.
+  const pairs = () =>
+    Array.from(summary().querySelectorAll("dt")).map((dt) => [dt.textContent, dt.nextElementSibling?.textContent]);
   const dimmed = (el: HTMLElement) => el.closest(".opacity-45") !== null;
-  // Echo the PUT back as the server would: the patched judge_runs_on, everything else as loaded.
-  const echoPut = () =>
-    mockApi.putMySettings.mockImplementation(async (patch) => judgeSettings(patch.judge_runs_on ?? null));
 
-  it("keeps Judge runs on disabled until the initial load lands, so a load cannot overwrite a choice", async () => {
-    let finish: (v: { settings: UserSettings }) => void = () => {};
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-    mockApi.getMySettings.mockReturnValue(new Promise((res) => { finish = res; }));
-    renderPage();
-    expect(runsOn().disabled).toBe(true);
-    finish(judgeSettings("claude"));
-    await waitFor(() => expect(runsOn().disabled).toBe(false));
-    expect(runsOn().value).toBe("claude");
-  });
-
-  it("offers Same as the run, Claude and Codex in that order, defaulting to Same as the run", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+  it("names the routing, each lane's model in effect and its credential, with a Change in Models link", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token", { label: "personal" }), key("openai_api_key")] });
     mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
     renderPage();
-    await screen.findByLabelText("Claude judge model");
-    expect(Array.from(runsOn().options).map((o) => [o.value, o.text])).toEqual([
-      ["", "Same as the run"], ["claude", "Claude"], ["codex", "Codex"],
+    await waitFor(() => expect(pairs()).toHaveLength(5));
+    expect(pairs()).toEqual([
+      ["Runs on", "Same as the run" + "Claude runs use the Claude judge model, Codex runs the Codex model. To judge every run on one harness, change it in Models."],
+      ["Claude judge model", "sonnet · instance default"],
+      ["Claude judge credential", "Your default token (personal)"],
+      ["Codex judge model", "gpt-6-sol · your choice"],
+      ["Codex judge credential", "Your usable Codex credential when the judge is queued"],
     ]);
-    expect(runsOn().value).toBe("");
-    const help = document.getElementById("judge-runs-on-help");
-    expect(runsOn().getAttribute("aria-describedby")).toBe("judge-runs-on-help");
-    expect(help?.textContent).toBe(
-      "Claude runs use the Claude judge model, Codex runs the Codex model. Pick Claude or Codex to judge every run on one harness.",
-    );
+    const link = within(summary()).getByRole("link", { name: "Change in Models" });
+    expect(link.getAttribute("href")).toBe("/settings/models");
+    expect(summary().textContent ?? "").not.toContain("Not used:");
   });
 
-  it("saves each choice at once: codex, claude, then null for Same as the run", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
-    echoPut();
+  it("shows the Claude provider restriction ahead of Codex credential readiness", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex", { claude_provider_id: "gateway" }));
     renderPage();
-    await screen.findByLabelText("Codex judge model");
-    fireEvent.change(runsOn(), { target: { value: "codex" } });
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: "codex" }));
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    expect(runsOn().value).toBe("codex");
-    expect(document.getElementById("judge-runs-on-help")?.textContent).toBe(
-      "Every run is judged on Codex, so Claude runs get a Codex judge. If Codex can't run, the judge is skipped, never charged to Claude.",
-    );
-    fireEvent.change(runsOn(), { target: { value: "claude" } });
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: "claude" }));
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    expect(runsOn().value).toBe("claude");
-    fireEvent.change(runsOn(), { target: { value: "" } });
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenLastCalledWith({ judge_runs_on: null }));
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    expect(runsOn().value).toBe("");
-    expect(mockApi.putMySettings).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(pairs()).toContainEqual(["Codex judge credential", "Judge runs are skipped while a custom Claude provider is selected"]));
+    expect(pairs()).toContainEqual(["Codex judge model", "gpt-6-sol · your choice"]);
   });
 
-  // A deferred PUT the test settles by hand, so it can observe the select mid-save.
-  const deferredPut = () => {
-    const pending: Array<{ patch: Parameters<typeof api.putMySettings>[0]; resolve: () => void; reject: (e: unknown) => void }> = [];
-    mockApi.putMySettings.mockImplementation((patch) => new Promise((resolve, reject) => {
-      pending.push({ patch, resolve: () => resolve(judgeSettings(patch.judge_runs_on ?? null)), reject });
-    }));
-    return pending;
+  it("does not claim a linked Codex alias makes a judge usable", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("codex_auth", { codex_status: "linked", auto_eligible: true })] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex", { codex_account_mode: "auto" }));
+    renderPage();
+    await waitFor(() => expect(pairs()).toContainEqual(["Codex judge credential", "Codex credential availability is checked when the judge is queued"]));
+  });
+
+  it("drops a previous viewer's credential while loading the next viewer", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token", { label: "previous viewer token" })] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    const page = () => <MemoryRouter><RunDefaults /></MemoryRouter>;
+    const { rerender } = render(page());
+    await screen.findByText("Your default token (previous viewer token)");
+    let release!: (value: Awaited<ReturnType<typeof api.listSecrets>>) => void;
+    mockApi.listSecrets.mockReturnValue(new Promise(resolve => { release = resolve; }));
+    mockAuth({ ...baseUser, id: "u2" });
+    rerender(page());
+    expect(screen.queryByText(/previous viewer token/)).toBeNull();
+    release({ secrets: [key("anthropic_token", { label: "next viewer token" })] });
+    await screen.findByText("Your default token (next viewer token)");
+    expect(screen.queryByText(/previous viewer token/)).toBeNull();
+  });
+
+  it("marks the lane the saved routing leaves unused in full contrast, and keeps the token picker operable", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex"));
+    renderPage();
+    await waitFor(() => expect(pairs()[0][1]).toContain("Codex"));
+    expect(pairs()[0][1]).toBe(
+      "Codex" + "Every run is judged on Codex, so Claude runs get a Codex judge. If Codex can't run, the judge is skipped, never charged to Claude.",
+    );
+    expect(pairs()[1]).toEqual(["Claude judge model", "sonnet · instance default" + "Not used: the judge runs on Codex"]);
+    expect(pairs()[3]).toEqual(["Codex judge model", "gpt-6-sol · your choice"]);
+    // The summary never fades: a not-used lane says so in words.
+    expect(summary().querySelector("[class*='opacity']")).toBeNull();
+    const token = screen.getByLabelText("Token the judge spends") as HTMLSelectElement;
+    expect(dimmed(token)).toBe(true);
+    expect(token.disabled).toBe(false);
+    expect(document.getElementById(token.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Not used: the judge runs on Codex");
+  });
+
+  it.each([
+    ["auto", 0, "Auto-select from the pool (empty, so your default token)"],
+    ["auto", 1, "Auto-select from the pool"],
+    ["pinned", 1, "Pinned to cheap-console"],
+    ["default", 0, "Your default token (default)"],
+  ] as const)("reads the Claude credential from the judge's own binding (%s, %d pooled)", async (mode, pooled, text) => {
+    mockAuth({ ...baseUser, judge_anthropic_bind_mode: mode, judge_anthropic_secret_id: mode === "pinned" ? "sec-cheap" : null });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [
+      key("anthropic_token", { id: "sec-default", label: "default" }),
+      key("anthropic_token", { id: "sec-cheap", label: "cheap-console", is_default: false, auto_eligible: pooled > 0 }),
+    ] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
+    renderPage();
+    await waitFor(() => expect(pairs()).toHaveLength(3));
+    expect(pairs()[2]).toEqual(["Claude judge credential", text]);
+  });
+
+  it("says a lane is skipped when it has no usable credential, and never rewrites the explicit choice", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex"));
+    renderPage();
+    await waitFor(() => expect(pairs()).toHaveLength(5));
+    expect(pairs()[4]).toEqual(["Codex judge credential", "No usable Codex credential, so Codex judges are skipped"]);
+    expect(document.getElementById("judge-runs-on-unusable")?.textContent).toBe(
+      "Codex has no usable credential, so the judge is skipped on every run until you add one in Account & tokens. Your choice stays saved.",
+    );
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+  });
+
+  it("shows only the usable lane for a single-harness user, and Unavailable without judge cells", async () => {
+    mockAuth(baseUser, { effectiveJudgeModel: "" });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings(null, { judge_models: undefined }));
+    renderPage();
+    await waitFor(() => expect(pairs()).toHaveLength(3));
+    expect(pairs().slice(1)).toEqual([
+      ["Codex judge model", "Unavailable"],
+      ["Codex judge credential", "Your usable Codex credential when the judge is queued"],
+    ]);
+  });
+
+  // Before the credential facts and saved settings load (and when that load fails) the
+  // pre-load defaults would read as "no usable token" and "no saved default harness": the
+  // summary and overflow make neither claim.
+  const FALSE_CLAIMS = [
+    /No usable Anthropic token/,
+    /No usable Codex credential/,
+    /has no usable credential/,
+    /Overflow applies only when a Claude or Codex default harness is saved in Models/,
+  ];
+  const overflowSwitch = () => screen.getByRole("switch", { name: /Overflow to the other harness/ });
+  const expectNoFalseClaims = () => {
+    for (const claim of FALSE_CLAIMS) expect(screen.queryByText(claim), String(claim)).toBeNull();
+    expect(summary().querySelector("dl")).toBeNull();
+    expect(overflowSwitch().getAttribute("aria-disabled")).toBe("true");
   };
 
-  it("keeps the select enabled and focused while the save is in flight", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
-    const pending = deferredPut();
+  it("shows a loading skeleton and no credential or overflow claim while settings load", async () => {
+    mockApi.listSecrets.mockReturnValue(new Promise(() => {}));
+    mockApi.getMySettings.mockReturnValue(new Promise(() => {}));
     renderPage();
-    await screen.findByLabelText("Codex judge model");
-    runsOn().focus();
-    expect(document.activeElement).toBe(runsOn());
-    fireEvent.change(runsOn(), { target: { value: "codex" } });
-    await waitFor(() => expect(pending).toHaveLength(1));
-    // Disabling the focused select would drop focus to <body> in a real browser, so a second
-    // ArrowDown would do nothing: it stays enabled and reports busy instead.
-    expect(runsOn().getAttribute("aria-busy")).toBe("true");
-    expect(runsOn().disabled).toBe(false);
-    expect(document.activeElement).toBe(runsOn());
-    pending[0].resolve();
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    expect(runsOn().value).toBe("codex");
-    expect(document.activeElement).toBe(runsOn());
+    expect(summary().querySelector("[aria-busy='true']")).not.toBeNull();
+    expect(summary().querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
+    expectNoFalseClaims();
+    expect(summary().textContent).not.toContain("Unavailable");
+    // The disabled toggle names why: its describedby includes the loading note, not the
+    // Unavailable one (that is only for a failed load).
+    const loading = document.getElementById("harness-overflow-loading");
+    expect(loading?.textContent).toBe("Loading your saved default harness");
+    expect(loading?.className).toContain("sr-only");
+    const describedBy = overflowSwitch().getAttribute("aria-describedby")?.split(" ");
+    expect(describedBy).toEqual(["harness-overflow-scope", "harness-overflow-loading"]);
+    fireEvent.click(overflowSwitch());
+    expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
   });
 
-  it("queues a change made mid-save and sends it after the first, never interleaved", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
-    const pending = deferredPut();
-    renderPage();
-    await screen.findByLabelText("Codex judge model");
-    fireEvent.change(runsOn(), { target: { value: "claude" } });
-    await waitFor(() => expect(pending).toHaveLength(1));
-    fireEvent.change(runsOn(), { target: { value: "codex" } });
-    // Only one request is ever in flight; the select shows the latest pending choice.
-    expect(pending).toHaveLength(1);
-    expect(runsOn().value).toBe("codex");
-    pending[0].resolve();
-    await waitFor(() => expect(pending).toHaveLength(2));
-    expect(pending.map((p) => p.patch)).toEqual([{ judge_runs_on: "claude" }, { judge_runs_on: "codex" }]);
-    expect(runsOn().value).toBe("codex");
-    pending[1].resolve();
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    expect(runsOn().value).toBe("codex");
-    expect(mockApi.putMySettings).toHaveBeenCalledTimes(2);
-  });
-
-  it("falls back to the last saved choice when a queued save fails", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
-    const pending = deferredPut();
-    renderPage();
-    await screen.findByLabelText("Codex judge model");
-    fireEvent.change(runsOn(), { target: { value: "claude" } });
-    await waitFor(() => expect(pending).toHaveLength(1));
-    fireEvent.change(runsOn(), { target: { value: "codex" } });
-    pending[0].resolve();
-    await waitFor(() => expect(pending).toHaveLength(2));
-    pending[1].reject(new ApiError(500, "boom"));
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    // Claude was saved; the failed Codex save falls back to it, not to the original value.
-    expect(runsOn().value).toBe("claude");
-    expect(screen.getByText(/boom|Failed to change where the judge runs/)).toBeTruthy();
-  });
-
-  it("falls back to the stored choice and says why when the save fails", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings("claude"));
-    mockApi.putMySettings.mockRejectedValue(new ApiError(500, "boom"));
-    renderPage();
-    await screen.findByLabelText("Claude judge model");
-    await waitFor(() => expect(runsOn().value).toBe("claude"));
-    fireEvent.change(runsOn(), { target: { value: "codex" } });
-    await waitFor(() => expect(runsOn().getAttribute("aria-busy")).toBeNull());
-    expect(runsOn().value).toBe("claude");
-    expect(screen.getByText(/boom|Failed to change where the judge runs/)).toBeTruthy();
-  });
-
-  it.each([false, true])(
-    "keeps an explicit Codex selected after the Codex credential is removed, and says it is skipped (enforced: %s)",
-    async (enforced) => {
-      mockAuth(baseUser, { judgeEnforcedByAdmin: enforced });
-      mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-      mockApi.getMySettings.mockResolvedValue(judgeSettings("codex"));
-      renderPage();
-      await screen.findByLabelText("Codex judge model");
-      await waitFor(() => expect(runsOn().value).toBe("codex"));
-      // Positive control for the negative below: the note's id exists only when shown.
-      expect(document.getElementById("judge-runs-on-unusable")).toBeNull();
-      cleanup();
-
-      // The Codex credential is gone: the page loads again with only the Anthropic token.
-      mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
-      renderPage();
-      await screen.findByLabelText("Claude judge model");
-      await waitFor(() => expect(runsOn().value).toBe("codex"));
-      expect(runsOn().disabled).toBe(false);
-      const note = document.getElementById("judge-runs-on-unusable");
-      expect(note?.textContent).toBe(
-        "Codex has no usable credential, so the judge is skipped on every run until you add one in Account & tokens. Your choice stays saved.",
-      );
-      expect(runsOn().getAttribute("aria-describedby")).toBe("judge-runs-on-help judge-runs-on-unusable");
-      // The chosen harness keeps its judge-model lane even though Codex is unusable.
-      expect(screen.getByLabelText("Codex judge model")).toBeTruthy();
-      // Nothing rewrote the stored choice.
-      expect(mockApi.putMySettings).not.toHaveBeenCalled();
-      if (enforced) {
-        expect(screen.getByText(/ENFORCED/).textContent).toContain("(Codex, with gpt-6.1-sol)");
-      }
-    },
-  );
-
-  it("shows the chosen harness's lane without a usable credential and dims the other lane as not used", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
+  it("says Unavailable, and makes no credential or overflow claim, when settings fail to load", async () => {
+    mockApi.listSecrets.mockRejectedValue(new ApiError(500, "secrets unavailable"));
     mockApi.getMySettings.mockResolvedValue(judgeSettings("codex"));
     renderPage();
-    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
-    const claude = screen.getByLabelText("Claude judge model") as HTMLSelectElement;
-    expect(dimmed(codex)).toBe(false);
-    expect(dimmed(claude)).toBe(true);
-    const claudeNote = document.getElementById(claude.getAttribute("aria-describedby") ?? "");
-    expect(claudeNote?.textContent).toBe("Not used: the judge runs on Codex · sonnet (instance default)");
-    expect(dimmed(claudeNote!)).toBe(false);
-    expect(document.getElementById(codex.getAttribute("aria-describedby") ?? "")?.textContent)
-      .toBe("In effect: gpt-6.1-sol · built-in");
-    expect(screen.getByText(/only the Codex judge model is used/)).toBeTruthy();
+    await screen.findByText("secrets unavailable");
+    expect(summary().textContent).toContain("Unavailable until your settings load");
+    expect(summary().querySelectorAll(".animate-pulse")).toHaveLength(0);
+    expectNoFalseClaims();
+    const note = document.getElementById("harness-overflow-unavailable");
+    expect(note?.textContent).toContain("Unavailable until your settings load");
+    expect(overflowSwitch().getAttribute("aria-describedby")?.split(" ")).toContain("harness-overflow-unavailable");
+    expect(document.getElementById("harness-overflow-loading")).toBeNull();
+    fireEvent.click(overflowSwitch());
+    expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
   });
 
-  it("dims the Codex lane when the judge runs on Claude, and dims nothing for Same as the run", async () => {
+  it("wraps each dt/dd pair in its own group", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings("claude"));
-    renderPage();
-    const codex = (await screen.findByLabelText("Codex judge model")) as HTMLSelectElement;
-    expect(dimmed(codex)).toBe(true);
-    expect(dimmed(screen.getByLabelText("Claude judge model"))).toBe(false);
-    expect(document.getElementById("codex-judge-model-effect")?.textContent)
-      .toBe("Not used: the judge runs on Claude · gpt-6.1-sol (built-in)");
-    cleanup();
     mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
-    const { container } = renderPage();
-    await screen.findByLabelText("Codex judge model");
-    // Positive control above; with Same as the run nothing is dimmed or marked not used.
-    expect(container.querySelector(".opacity-45")).toBeNull();
-    expect(container.textContent ?? "").not.toContain("Not used:");
-    expect(container.textContent ?? "").toContain(
-      "With Same as the run, the judge runs on the harness of the run it reviews, so each harness has its own judge model.",
-    );
-  });
-
-  it("dims the token picker with Not used when the judge runs on Codex, keeping it operable", async () => {
-    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
-    mockApi.getMySettings.mockResolvedValue(judgeSettings("codex"));
     renderPage();
-    const token = (await screen.findByLabelText("Token the judge spends")) as HTMLSelectElement;
-    await waitFor(() => expect(dimmed(token)).toBe(true));
-    expect(token.disabled).toBe(false);
-    const note = document.getElementById(token.getAttribute("aria-describedby") ?? "");
-    expect(note?.textContent).toBe("Not used: the judge runs on Codex");
-    expect(dimmed(note!)).toBe(false);
-    expect(screen.getByText(/Used whenever the judge runs on Claude/)).toBeTruthy();
-    cleanup();
-    mockApi.getMySettings.mockResolvedValue(judgeSettings("claude"));
-    renderPage();
-    const live = (await screen.findByLabelText("Token the judge spends")) as HTMLSelectElement;
-    await waitFor(() => expect(runsOn().value).toBe("claude"));
-    expect(dimmed(live)).toBe(false);
-    expect(live.getAttribute("aria-describedby")).toBeNull();
+    await waitFor(() => expect(pairs()).toHaveLength(5));
+    const groups = Array.from(summary().querySelector("dl")!.children);
+    expect(groups).toHaveLength(5);
+    for (const g of groups) {
+      expect(Array.from(g.children).map((c) => c.tagName)).toEqual(["DT", "DD"]);
+    }
   });
 
   it("closes the card with the skip footnote", async () => {
     mockApi.getMySettings.mockResolvedValue(judgeSettings(null));
     renderPage();
-    await screen.findByLabelText("Claude judge model");
+    await screen.findByText("Run judge");
     expect(screen.getByText(/If the judge’s harness can’t run/).textContent).toBe(
       "If the judge’s harness can’t run, the judge is skipped, never charged to the other provider.",
     );
-  });
-});
-
-describe("Run defaults — Claude planning model and effort (PRD #3252)", () => {
-  const modelCell = (over: Partial<ModelSettingCell> = {}): ModelSettingCell => ({
-    harness: "claude", model: null, default_model: "sonnet", default_source: "user_default", resolved_model: "sonnet", source: "user_default", ...over,
-  });
-  const effortCell = (over: object = {}) => ({
-    harness: "claude", effort: null, default_effort: "high", default_source: "user_default", resolved_effort: "high", source: "user_default", mode: "explicit", ...over,
-  });
-  const settings = (over: object = {}): { settings: UserSettings } => ({
-    settings: {
-      default_harness: null, judge_runs_on: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null,
-      appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
-      planning_claude_model: null, planning_claude_effort: null,
-      planning_models: [modelCell()], planning_efforts: [effortCell()],
-      ...over,
-    } as UserSettings,
-  });
-  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-  const saveBtn = () => screen.getByText("Save planning defaults") as HTMLButtonElement;
-
-  it("renders the Planning card with the verbatim intro and default labels from the cells", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
-    expect(screen.getByText("Planning")).toBeTruthy();
-    expect(screen.getByText("Use a different model and reasoning effort while a run plans. When the plan is approved the run continues on your worker model and effort above; if it plans again, it uses these. Planning stays on the run's harness. Handoff (task) runs also plan first. A model chosen by a schedule or when starting the run applies to both phases.")).toBeTruthy();
-    expect(model.options[0].text).toMatch(/^Same as the run · sonnet \(/);
-    expect(effort.options[0].text).toMatch(/^Same as the run · high \(/);
-    expect(Array.from(effort.options).map((o) => o.value)).not.toContain("runtime");
-    expect(saveBtn().disabled).toBe(true);
-  });
-
-  it("uses the runtime and SDK-default wording for those defaults", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings({
-      planning_models: [modelCell({ default_model: "", default_source: "builtin" })],
-      planning_efforts: [effortCell({ default_effort: "runtime", mode: "runtime_default" })],
-    }));
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
-    expect(model.options[0].text).toBe("Same as the run · the SDK decides");
-    expect(effort.options[0].text).toBe("Same as the run · runtime default (your choice)");
-  });
-
-  it("names the source of each default in the Same as the run label", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings({
-      planning_models: [modelCell({ default_model: "sonnet", default_source: "user_default" })],
-      planning_efforts: [effortCell({ default_effort: "medium", default_source: "builtin" })],
-    }));
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    expect(model.options[0].text).toBe("Same as the run · sonnet (your choice)");
-    expect((screen.getByLabelText("Claude planning effort") as HTMLSelectElement).options[0].text)
-      .toBe("Same as the run · medium (built-in)");
-    cleanup();
-    mockApi.getMySettings.mockResolvedValue(settings({
-      planning_models: [modelCell({ default_model: "opus", default_source: "template" })],
-    }));
-    renderPage();
-    expect(((await screen.findByLabelText("Claude planning model")) as HTMLSelectElement).options[0].text)
-      .toBe("Same as the run · opus (lead template)");
-    cleanup();
-    mockApi.getMySettings.mockResolvedValue(settings({
-      planning_efforts: [effortCell({ default_effort: "high", default_source: "template", resolved_effort: "high", source: "template" })],
-    }));
-    renderPage();
-    expect(((await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement).options[0].text)
-      .toBe("Same as the run · high (lead template)");
-  });
-
-  it("refreshes the Same as the run effort label after the Claude effort is saved", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockResolvedValue(settings({
-      default_effort: "low",
-      planning_efforts: [effortCell({ default_effort: "low", resolved_effort: "low" })],
-    }));
-    renderPage();
-    const planningEffort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
-    expect(planningEffort.options[0].text).toMatch(/^Same as the run · high \(/);
-    fireEvent.change(screen.getByLabelText("Claude effort"), { target: { value: "low" } });
-    fireEvent.click(screen.getByText("Save Claude effort"));
-    await waitFor(() => expect(planningEffort.options[0].text).toMatch(/^Same as the run · low \(/));
-  });
-
-  it("refreshes the Same as the run model label after the worker model is saved", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockResolvedValue(settings({
-      default_claude_model: "opus",
-      planning_models: [modelCell({ default_model: "opus" })],
-    }));
-    renderPage();
-    const planningModel = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    expect(planningModel.options[0].text).toMatch(/^Same as the run · sonnet \(/);
-    fireEvent.change(screen.getByLabelText("Claude model"), { target: { value: "opus" } });
-    fireEvent.click(screen.getByText("Save defaults"));
-    await waitFor(() => expect(planningModel.options[0].text).toMatch(/^Same as the run · opus \(/));
-  });
-
-  it("sends only the dirty field in one PUT and adopts the response", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockResolvedValue(settings({
-      planning_claude_effort: "max",
-      planning_efforts: [effortCell({ effort: "max", resolved_effort: "max", source: "user_planning_default" })],
-    }));
-    renderPage();
-    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
-    fireEvent.change(effort, { target: { value: "max" } });
-    expect(saveBtn().disabled).toBe(false);
-    fireEvent.click(saveBtn());
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(1));
-    expect(mockApi.putMySettings).toHaveBeenCalledWith({ planning_claude_effort: "max" });
-    await waitFor(() => expect(saveBtn().disabled).toBe(true));
-    expect((screen.getByLabelText("Claude planning effort") as HTMLSelectElement).value).toBe("max");
-  });
-
-  it("Same as the run sends null and is disabled while busy", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings({ planning_claude_effort: "max" }));
-    let release!: (v: { settings: UserSettings }) => void;
-    mockApi.putMySettings.mockReturnValue(new Promise((r) => { release = r; }));
-    renderPage();
-    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
-    fireEvent.change(effort, { target: { value: "" } });
-    fireEvent.click(saveBtn());
-    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ planning_claude_effort: null }));
-    expect(saveBtn().disabled).toBe(true);
-    release(settings());
-    await waitFor(() => expect(effort.value).toBe(""));
-  });
-
-  it("a model warning blocks the save", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    fireEvent.change(model, { target: { value: "custom" } });
-    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: "two words" } });
-    expect(screen.getByText("Model must be a single token with no spaces.")).toBeTruthy();
-    expect(saveBtn().disabled).toBe(true);
-    expect(mockApi.putMySettings).not.toHaveBeenCalled();
-  });
-
-  it("warns about a Codex model id and blocks the save", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    const codexId = CODEX_ROLE_MODELS[0];
-    fireEvent.change(model, { target: { value: "custom" } });
-    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: codexId } });
-    expect(screen.getByText(
-      `Not a Claude model: ${codexId} is a Codex model, so Claude planning skips it. Choose Same as the run to clear it.`,
-    )).toBeTruthy();
-    expect(model.getAttribute("aria-describedby")).toContain("planning-model-warning");
-    expect(saveBtn().disabled).toBe(true);
-  });
-
-  it("blocks the save on an empty custom model and describes the select with the message", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    fireEvent.change(model, { target: { value: "custom" } });
-    // A dirty effort alone would enable Save, so the empty custom model is the only blocker.
-    fireEvent.change(screen.getByLabelText("Claude planning effort"), { target: { value: "low" } });
-    const msg = screen.getByText("Enter a custom model ID, or choose Same as the run.");
-    expect(msg.getAttribute("role")).toBe("alert");
-    expect(model.getAttribute("aria-describedby")).toContain(msg.id);
-    expect(saveBtn().disabled).toBe(true);
-    fireEvent.change(await screen.findByLabelText("Custom Claude planning model ID"), { target: { value: "opus" } });
-    expect(screen.queryByText("Enter a custom model ID, or choose Same as the run.")).toBeNull();
-    expect(saveBtn().disabled).toBe(false);
-  });
-
-  it("shows a 400 under the effort select when the server names the effort", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh, max"));
-    renderPage();
-    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
-    const model = screen.getByLabelText("Claude planning model") as HTMLSelectElement;
-    fireEvent.change(effort, { target: { value: "low" } });
-    fireEvent.click(saveBtn());
-    const msg = await screen.findByText(/planning_claude_effort: effort must be one of/);
-    expect(msg.id).toBe("planning-effort-error");
-    // After the effort select, and nothing described under the model select.
-    expect(effort.compareDocumentPosition(msg) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(model.getAttribute("aria-describedby")).toBeNull();
-    expect(document.getElementById("planning-model-error")).toBeNull();
-  });
-
-  it("shows a 400 under the model select when the server names the model, and clears it on edit", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_model: model must be at most 100 characters"));
-    renderPage();
-    const model = (await screen.findByLabelText("Claude planning model")) as HTMLSelectElement;
-    const effort = screen.getByLabelText("Claude planning effort") as HTMLSelectElement;
-    fireEvent.change(model, { target: { value: "opus" } });
-    fireEvent.click(saveBtn());
-    const msg = await screen.findByText(/planning_claude_model: model must be at most/);
-    expect(model.getAttribute("aria-describedby")).toBe(msg.id);
-    expect(effort.compareDocumentPosition(msg) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
-    expect(document.getElementById("planning-effort-error")).toBeNull();
-    fireEvent.change(model, { target: { value: "sonnet" } });
-    expect(screen.queryByText(/planning_claude_model: model must be at most/)).toBeNull();
-    expect(model.getAttribute("aria-describedby")).toBeNull();
-  });
-
-  it("clears an effort error when the effort is edited", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "planning_claude_effort: effort must be one of low, medium, high, xhigh, max"));
-    renderPage();
-    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
-    fireEvent.change(effort, { target: { value: "low" } });
-    fireEvent.click(saveBtn());
-    await screen.findByText(/planning_claude_effort: effort must be one of/);
-    fireEvent.change(effort, { target: { value: "high" } });
-    expect(screen.queryByText(/planning_claude_effort: effort must be one of/)).toBeNull();
-  });
-
-  it("shows an unattributable 400 under both fields", async () => {
-    mockApi.getMySettings.mockResolvedValue(settings());
-    mockApi.putMySettings.mockRejectedValue(new ApiError(400, "bad planning pair"));
-    renderPage();
-    const effort = (await screen.findByLabelText("Claude planning effort")) as HTMLSelectElement;
-    fireEvent.change(effort, { target: { value: "low" } });
-    fireEvent.click(saveBtn());
-    expect(await screen.findAllByText("bad planning pair")).toHaveLength(2);
-    expect(screen.getByLabelText("Claude planning model").getAttribute("aria-describedby")).toBe("planning-model-error");
   });
 });
 

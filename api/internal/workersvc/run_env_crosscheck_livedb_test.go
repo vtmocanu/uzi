@@ -73,15 +73,15 @@ func TestRunEnvCrossCheckChildGetsTargetRedactOnlyLiveDB(t *testing.T) {
 			varID := seedLeadSecret(t, f, "API_KEY", envSecretValue("lead"))
 			p := laneClaim(t, f, "cross_check", nil)
 			if p == nil || p.RunID != f.runID.String() {
-				t.Fatalf("checker not claimed: %+v", p)
+				t.Fatalf("checker not claimed: %s", payloadShape(p))
 			}
 			if len(p.Secrets.RunEnv) != 0 {
-				t.Fatalf("checker was delivered run_env: %+v", p.Secrets.RunEnv)
+				t.Fatalf("checker was delivered run_env: %s", envShape(p.Secrets.RunEnv))
 			}
 			got := p.Secrets.RunEnvRedact
 			if len(got) != 1 || got[0].VarID != varID.String() || got[0].Rev != 1 || got[0].Name != "API_KEY" ||
 				got[0].Scope != "repo" || got[0].Value != envSecretValue("lead") {
-				t.Fatalf("run_env_redact = %+v, want the lead's one secret version", got)
+				t.Fatalf("run_env_redact = %s, want the lead's one secret version", redactShape(got))
 			}
 			if n := checkerReceiptCount(t, f, f.runID); n != 0 {
 				t.Fatalf("checker child has %d receipts, want none", n)
@@ -91,7 +91,7 @@ func TestRunEnvCrossCheckChildGetsTargetRedactOnlyLiveDB(t *testing.T) {
 			}
 			res, err := f.svc.RunEnvRedact(f.env.ctx, wkrRow(t, f.env, f.workerID), f.runID)
 			if err != nil || !res.Protected || len(res.Versions) != 1 || res.Versions[0] != got[0] {
-				t.Fatalf("redact route for the child = %+v, %v; want the target's version", res, err)
+				t.Fatalf("redact route for the child = %s, %v; want the target's version", redactRespShape(res), err)
 			}
 		})
 	}
@@ -104,11 +104,11 @@ func TestRunEnvCrossCheckChildWithoutSecretReceiptsGetsNothingLiveDB(t *testing.
 	crossCheckEnvCapable(f, true)
 	p := laneClaim(t, f, "cross_check", nil)
 	if p == nil || len(p.Secrets.RunEnv) != 0 || len(p.Secrets.RunEnvRedact) != 0 {
-		t.Fatalf("payload = %+v, want a claim with no run environment", p)
+		t.Fatalf("payload = %s, want a claim with no run environment", payloadShape(p))
 	}
 	res, err := f.svc.RunEnvRedact(f.env.ctx, wkrRow(t, f.env, f.workerID), f.runID)
 	if err != nil || res.Protected || len(res.Versions) != 0 {
-		t.Fatalf("redact route = %+v, %v; want {protected:false}", res, err)
+		t.Fatalf("redact route = %s, %v; want {protected:false}", redactRespShape(res), err)
 	}
 }
 
@@ -138,7 +138,7 @@ func TestRunEnvCrossCheckUnmaskableHistoryIsCheckerUnavailableLiveDB(t *testing.
 				varID := seedLeadSecret(t, f, "API_KEY", envSecretValue("lead"))
 				tc.mutate(f, varID)
 				if p := laneClaim(t, f, "cross_check", nil); p != nil {
-					t.Fatalf("an unmaskable checker was delivered a payload: %+v", p.Secrets.RunEnvRedact)
+					t.Fatalf("an unmaskable checker was delivered a payload: %s", redactShape(p.Secrets.RunEnvRedact))
 				}
 				var verdict, outcome, reason string
 				if err := f.env.pool.QueryRow(f.env.ctx, `SELECT COALESCE(verdict,''), COALESCE(outcome,''), COALESCE(reason_class,'')
@@ -212,7 +212,7 @@ func TestRunEnvRedactCustodyHoldAuthorizesLiveDB(t *testing.T) {
 	owned := func(w store.Worker, why string) {
 		t.Helper()
 		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, w, runID); err != nil || !res.Protected || len(res.Versions) != 1 {
-			t.Fatalf("%s: %+v, %v; want the run's versions", why, res, err)
+			t.Fatalf("%s: %s, %v; want the run's versions", why, redactRespShape(res), err)
 		}
 	}
 	notOwned(wkr, "a worker with no hold on a run that moved")
@@ -258,7 +258,7 @@ func TestRunEnvRedactGuardedCustodyHoldNeedsLiveHolderLiveDB(t *testing.T) {
 			res, err := fx.svc.RunEnvRedact(fx.env.ctx, wkr, runID)
 			if tc.liveIsHost {
 				if err != nil || !res.Protected || len(res.Versions) != 1 {
-					t.Fatalf("%+v, %v; want the run's versions", res, err)
+					t.Fatalf("%s, %v; want the run's versions", redactRespShape(res), err)
 				}
 			} else if !errors.Is(err, ErrRunNotOwned) {
 				t.Fatalf("err = %v, want ErrRunNotOwned", err)
@@ -281,7 +281,7 @@ func TestRunEnvRedactNonLeadLaneRunIsUnprotectedLiveDB(t *testing.T) {
 	            'queued', now(), $3, 0, 0, 3600)`, runID, fx.userID, fx.workerID)
 	res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
 	if err != nil || res.Protected || len(res.Versions) != 0 {
-		t.Fatalf("%+v, %v; want {protected:false}", res, err)
+		t.Fatalf("%s, %v; want {protected:false}", redactRespShape(res), err)
 	}
 }
 
@@ -307,7 +307,7 @@ func TestRunEnvRedactCrossCheckChildBoundedLiveDB(t *testing.T) {
 		t.Run(stage+"/open check is served", func(t *testing.T) {
 			f := setup(t, stage)
 			if res, err := redact(f); err != nil || !res.Protected || len(res.Versions) != 1 {
-				t.Fatalf("%+v, %v; want the lead's version", res, err)
+				t.Fatalf("%s, %v; want the lead's version", redactRespShape(res), err)
 			}
 		})
 		t.Run(stage+"/terminal child is closed", func(t *testing.T) {
@@ -329,7 +329,7 @@ func TestRunEnvRedactCrossCheckChildBoundedLiveDB(t *testing.T) {
 			f.env.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
 				released_at=now(),updated_at=now() WHERE id=$1`, hold)
 			if res, err := redact(f); err != nil || !res.Protected {
-				t.Fatalf("%+v, %v; want protected", res, err)
+				t.Fatalf("%s, %v; want protected", redactRespShape(res), err)
 			}
 			f.env.exec(`UPDATE recovery_captures SET state='available' WHERE id=$1`, capture)
 			if _, err := redact(f); !errors.Is(err, ErrRunEnvRedactClosed) {

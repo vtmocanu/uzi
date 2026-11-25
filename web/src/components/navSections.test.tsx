@@ -28,6 +28,19 @@ describe("navSections", () => {
     expect(items.every((i) => !i.adminOnly)).toBe(true);
   });
 
+  // PRD #3263: model vocabulary finds Models; Run defaults keeps only behaviour words, plus
+  // "harness"/"overflow" for the harness-overflow setting that stays there.
+  it("advertises Models for model searches and keeps Run defaults behaviour-only", () => {
+    const models = admin.find((i) => i.to === "/settings/models")!;
+    expect(models.label).toBe("Settings › Models");
+    expect(models.keywords).toEqual(
+      expect.arrayContaining(["model", "models", "effort", "harness", "planning", "cross-check", "judge", "summary"]),
+    );
+    const runDefaults = admin.find((i) => i.to === "/settings/run-defaults")!;
+    expect(runDefaults.keywords).not.toContain("model");
+    expect(runDefaults.keywords).toEqual(expect.arrayContaining(["run", "defaults", "harness", "overflow"]));
+  });
+
   it("mirrors the Admin shell tabs, naming the Instance tab Settings", () => {
     const items = admin.filter((i) => i.key.startsWith("admin:"));
     const tabs = ADMIN_TABS.map((t) => ({

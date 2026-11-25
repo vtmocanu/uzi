@@ -220,7 +220,7 @@ func TestHeartbeatProtocolRefreshImmediatelyClaimableLiveDB(t *testing.T) {
 	svc := New(e.q, box, testParams())
 	svc.SetTxBeginner(e.pool)
 	current, err := svc.Heartbeat(e.ctx, w, nil, nil, nil, &ProtocolRefresh{
-		RegisterNonce: nonce, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2},
+		RegisterNonce: nonce, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3},
 		MaxConcurrentRuns: 1, MaxCrossCheckSlots: 0,
 	})
 	if err != nil {

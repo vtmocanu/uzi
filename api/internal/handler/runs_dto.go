@@ -382,10 +382,12 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// nullable column to *bool so null (inherit) survives to the wire distinct from
 		// an explicit true/false.
 		MrReworkEnabled: boolPtrValue(r.MrReworkEnabled),
-		LimitResetsAt:   timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
-		RetryNotBefore:  timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
-		LimitWaitCount:  r.LimitWaitCount,
-		RateLimitType:   textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
+		// Issue #4617: the per-run CI-autofix override, same tri-state mapping.
+		CiAutofixEnabled: boolPtrValue(r.CiAutofixEnabled),
+		LimitResetsAt:    timePtr(r.LimitResetsAt.Valid, r.LimitResetsAt.Time),
+		RetryNotBefore:   timePtr(r.RetryNotBefore.Valid, r.RetryNotBefore.Time),
+		LimitWaitCount:   r.LimitWaitCount,
+		RateLimitType:    textPtrValue(r.RateLimitType.Valid, r.RateLimitType.String),
 		// PRD #1392 M1: the forge pre-clone park surface. RecoveryWaitCause is the typed cause
 		// (null = untyped/legacy park); RecoveryRetryNotBefore is the recovery-park promotion
 		// stamp (the recovery-park analog of RetryNotBefore, a distinct column); ForgeParkCount
@@ -825,9 +827,10 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 
 // overlayProviderNames sets provider_name on runs bound to a custom model provider (PRD #4320).
 // runToDTO maps provider_id independently. One batched read covers every bound run in the call and
-// matches each provider under the run's own owner, so a name never crosses users; only the owner
-// and admin run reads call it, never the shared board. A deleted provider (or a failed lookup,
-// which is logged) leaves the name null while the id stays.
+// matches each provider under visibility to the run's own owner (their own or an admin-shared
+// definition; the name is user- or admin-authored text), so a name never crosses users; only the
+// owner and admin run reads call it, never the shared board. A deleted or invisible provider (or a
+// failed lookup, which is logged) leaves the name null while the id stays.
 func (h *Handler) overlayProviderNames(ctx context.Context, dtos ...*apitypes.RunDTO) {
 	var ids []uuid.UUID
 	byID := make(map[uuid.UUID][]*apitypes.RunDTO)

@@ -1,9 +1,10 @@
+import { extraCaPem } from "./extra-ca.js";
 // PRD #1156 (M3a) — the isolated per-root Codex launch primitive.
 //
 // This is the reusable library the production worker adapter (and the m3a lifecycle
 // test) calls to launch ONE supervisor root: a static Go supervisor
 // (`/usr/local/bin/uzi-codex-supervisor`, built by a sibling unit) which forks the
-// pinned Codex app-server (`/opt/uzi-codex/0.169.0/bin/codex app-server`). It
+// pinned Codex app-server (`/opt/uzi-codex/0.171.0/bin/codex app-server`). It
 // composes the worker→runner/runner-cmd uid boundaries in `runner-uid.ts`.
 //
 // SUPPORTED PROFILE (fail-closed): this primitive is supported ONLY under the A1
@@ -61,7 +62,9 @@ import {
   buildCodexConfigToml,
   buildCodexLoopbackTestConfigToml,
   buildCodexProductionConfigToml,
+  buildCodexProviderConfigToml,
 } from "./config.js";
+import type { ClaimCodexProviderBinding } from "../protocol.js";
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
 import { ResidueQuarantinedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -83,7 +86,7 @@ const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 /** The pinned, image-baked Codex app-server binary. Exported so the production adapter
  *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
  *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */
-export const CODEX_BIN = "/opt/uzi-codex/0.169.0/bin/codex";
+export const CODEX_BIN = "/opt/uzi-codex/0.171.0/bin/codex";
 /** The pinned, image-baked supervisor trust anchor. Exported for the same reason. */
 export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 /** The fixed provider child argv (`codex app-server`). Exported so the production
@@ -110,12 +113,15 @@ export interface CodexLaunchProvider {
 }
 
 export interface CodexLaunchSpec {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   /** A RUNNER-WRITABLE root, OUTSIDE the target repo, under which fresh per-launch
    * HOME/CODEX_HOME/XDG/TMPDIR trees are created runner-owned mode 0700. Managed-auth
    * provider roots add only session-reader-group traverse on the root and CODEX_HOME, plus
    * read access on CODEX_HOME/sessions, so the worker can persist that safe subset. */
   readonly ownedDataRoot: string;
-  readonly provider: CodexLaunchProvider;
+  readonly provider?: CodexLaunchProvider;
+  /** Exclusive frozen custom-provider authority; model selects a mapped slot. */
+  readonly providerBinding?: ClaimCodexProviderBinding;
   readonly model: string;
   /** Provider roots require the pinned Codex path. Command roots may select a trusted
    *  absolute child executable, but never the supervisor trust anchor. */
@@ -741,6 +747,12 @@ function pathsOverlap(a: string, b: string): boolean {
 
 /** Validate the trusted construction contract for every caller, not only the JSON CLI. */
 function validateLaunchContract(spec: CodexLaunchSpec): void {
+  if (spec.codexExtraCa !== undefined) {
+    if (spec.kind !== "provider" || spec.authMode !== "provider" || !spec.providerBinding) {
+      throw new TrustedExecutionRefusal("extra CA requires a custom provider binding");
+    }
+    extraCaPem(spec.codexExtraCa);
+  }
   if (spec.kind !== "provider" && spec.kind !== "command") throw new TrustedExecutionRefusal("kind must be provider or command");
   if (!isAbsolute(spec.ownedDataRoot) || resolve(spec.ownedDataRoot) === sep || resolve(spec.ownedDataRoot) !== spec.ownedDataRoot) {
     throw new TrustedExecutionRefusal("ownedDataRoot must be a canonical absolute non-root path");
@@ -759,14 +771,25 @@ function validateLaunchContract(spec: CodexLaunchSpec): void {
       throw new TrustedExecutionRefusal("provider roots must use the pinned Codex app-server target");
     }
   }
-  if (!/^[A-Z][A-Z0-9_]*$/.test(spec.provider.envKey) || RESERVED_PROVIDER_ENV_KEYS.has(spec.provider.envKey)) {
+  if (spec.authMode === "provider" || spec.providerBinding !== undefined) {
+    if (!spec.useAppServerAuth || spec.authMode !== "provider" || spec.providerBinding === undefined || spec.provider !== undefined) {
+      throw new TrustedExecutionRefusal("provider binding requires exclusive managed provider authority");
+    }
+    buildCodexProviderConfigToml({
+      binding: spec.providerBinding, model: spec.model as keyof ClaimCodexProviderBinding["model_map"],
+      projectPath: spec.cwd, codeModeHost: spec.codeModeHost ?? false,
+    });
+  } else if (spec.provider === undefined) {
+    throw new TrustedExecutionRefusal("vendor or transitional provider authority is missing");
+  }
+  if (spec.provider !== undefined && (!/^[A-Z][A-Z0-9_]*$/.test(spec.provider.envKey) || RESERVED_PROVIDER_ENV_KEYS.has(spec.provider.envKey))) {
     throw new TrustedExecutionRefusal("provider envKey is invalid or reserved by the launcher allowlist");
   }
   if (spec.useAppServerAuth) {
     if (spec.kind !== "provider") {
       throw new TrustedExecutionRefusal("app-server auth is only supported for a provider root");
     }
-    if (spec.authMode !== "subscription" && spec.authMode !== "api_key") {
+    if (spec.authMode !== "subscription" && spec.authMode !== "api_key" && spec.authMode !== "provider") {
       throw new TrustedExecutionRefusal("app-server auth requires an explicit subscription or api_key mode");
     }
   }
@@ -794,9 +817,10 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
   if (spec.kind === "provider") env.CODEX_EXEC_SERVER_URL = "none";
   // An app-server-auth root delivers its credential over the login RPC, NOT the env: never
   // inject the provider var for it (the credential must not be readable in /proc/<pid>/environ).
-  if (spec.kind === "provider" && !spec.useAppServerAuth && spec.provider.credentialValue !== undefined) {
+  if (spec.kind === "provider" && !spec.useAppServerAuth && spec.provider?.credentialValue !== undefined) {
     env[spec.provider.envKey] = spec.provider.credentialValue;
   }
+  if (spec.providerBinding && spec.codexExtraCa) env.CODEX_CA_CERTIFICATE = join(trees.codexHome, "provider-extra-ca.crt");
   return env;
 }
 
@@ -941,6 +965,9 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   validateLaunchContract(spec);
+  if (spec.authMode === "provider" && deps.appServerAuthOpenAIBaseUrlForTest !== undefined) {
+    throw new TrustedExecutionRefusal("provider binding forbids a loopback endpoint override");
+  }
   if (spec.crossCheckReadOnly && (!spec.useAppServerAuth || spec.kind !== "provider")) {
     throw new Error("cross-check confinement requires a managed-auth provider root");
   }
@@ -971,7 +998,13 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   //    dependency instead emits its authenticated HTTP loopback provider. Every other root
   //    keeps the transitional env-key config, byte-identical to before this seam.
   let configText: string;
-  if (spec.useAppServerAuth) {
+  if (spec.useAppServerAuth && spec.authMode === "provider") {
+    if (spec.providerBinding === undefined) throw new TrustedExecutionRefusal("provider binding is missing");
+    configText = buildCodexProviderConfigToml({
+      binding: spec.providerBinding, model: spec.model as keyof ClaimCodexProviderBinding["model_map"],
+      projectPath: spec.cwd, codeModeHost: spec.codeModeHost ?? false,
+    });
+  } else if (spec.useAppServerAuth) {
     // validateLaunchContract already refused an absent/invalid authMode; re-narrow for the
     // (non-optional) production builder input rather than assert non-null.
     const authMode = spec.authMode;
@@ -985,7 +1018,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   } else {
     configText = buildCodexConfigToml({
       model: spec.model,
-      provider: { name: spec.provider.name, baseUrl: spec.provider.baseUrl, envKey: spec.provider.envKey, wireApi: "responses" },
+      provider: { name: spec.provider!.name, baseUrl: spec.provider!.baseUrl, envKey: spec.provider!.envKey, wireApi: "responses" },
       projectPath: spec.cwd,
     });
   }
@@ -1005,7 +1038,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
         }
       : {}),
     ...(spec.seedSession ? { sessionSeedDir } : {}),
-    files: [{ path: configPath, content: configText, mode: 0o600 }],
+    files: [{ path: configPath, content: configText, mode: 0o600 },
+      ...(spec.codexExtraCa ? [{ path: join(trees.codexHome, "provider-extra-ca.crt"), content: extraCaPem(spec.codexExtraCa), mode: 0o600 }] : [])],
   });
 
   // 5. Replaced env allowlist (NOT merged).

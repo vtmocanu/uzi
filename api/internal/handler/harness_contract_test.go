@@ -31,10 +31,10 @@ import (
 // implicit-fallback matrix and the atomic freeze/rollback are proven end to end against a real
 // Postgres in workersvc's create_run_atomic_livedb_test.go + harness_resolver_livedb_test.go.
 
-// overrideContractDB answers ONLY GetUserSecretMetaByIDOfKind (the owner-scoped pinned-token
-// lookup ResolveCredentialOverride makes for a pinned request) as a HIT, so a pinned Anthropic
-// override on a Claude harness resolves to a real override. Any other query is a test failure —
-// it would mean the validator advanced somewhere these tests do not probe.
+// overrideContractDB answers GetUserSecretMetaByIDOfKind (the owner-scoped pinned-token
+// lookup ResolveCredentialOverride makes for a pinned request) as a HIT and GetUserProviderSource
+// for Claude as NULL, so a pinned Anthropic override resolves using the vendor ladder.
+// Any other query is a test failure.
 type overrideContractDB struct{ t *testing.T }
 
 func (overrideContractDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
@@ -45,13 +45,19 @@ func (overrideContractDB) Query(context.Context, string, ...any) (pgx.Rows, erro
 	return nil, pgx.ErrNoRows
 }
 
-func (d overrideContractDB) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
+func (d overrideContractDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	if strings.Contains(sql, "name: GetUserSecretMetaByIDOfKind") {
 		// A token the caller owns of kind anthropic_token: err==nil (the row is discarded by
 		// ResolveCredentialOverride, which only distinguishes found vs pgx.ErrNoRows).
 		return fakeScanRow{func(...any) error { return nil }}
 	}
-	if strings.Contains(sql, "name: GetUserClaudeProviderSource") {
+	if strings.HasPrefix(sql, "-- name: GetUserProviderSource :one\n") {
+		if len(args) != 2 || args[0] != "claude" {
+			d.t.Fatalf("GetUserProviderSource args = %v, want [claude userID]", args)
+		}
+		if _, ok := args[1].(uuid.UUID); !ok {
+			d.t.Fatalf("GetUserProviderSource userID type = %T, want uuid.UUID", args[1])
+		}
 		// PRD #4320: the owner has no Claude provider source (every column NULL), so the validator
 		// keeps its vendor behaviour. Scan leaves the zero value, which is that NULL row.
 		return fakeScanRow{func(...any) error { return nil }}

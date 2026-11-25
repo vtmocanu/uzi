@@ -1027,6 +1027,18 @@ export const runsApi = {
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
+  // Issue #4617: set (or clear) a run's per-run CI-autofix override. The demo has no
+  // sibling-run governance, so the hints are empty.
+  setRunCiAutofix: async (id: string, enabled: boolean | null) => {
+    const run = getRun(id);
+    if (!run) throw new ApiError(404, "run not found");
+    patchRun(id, { ci_autofix_enabled: enabled });
+    return delay(
+      { run: { ...getRun(id)! }, ci_autofix_governing_run_id: null, ci_autofix_inflight_fix_run_ids: [] },
+      80,
+    );
+  },
+
   // PRD #1202: start an ON-DEMAND MR-review-rework run for a run's open MR. Mirrors the
   // server's shape: 404 on an unknown run (the demo caller owns every non-other-user run,
   // so ownership is not modelled separately). On success it fabricates a NEW `mr_rework`

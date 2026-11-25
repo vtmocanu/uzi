@@ -1,3 +1,4 @@
+import { PRIVATE_CA_TITLE } from "./private-ca-title.js";
 // PRD #1287 — Codex adapter clause contributions. C3/C4 APPEND the real U/P policy,
 // construction, trust, lifecycle and failure-closure rows here (shared fake-provider
 // scenarios are owned by C3).
@@ -10,17 +11,18 @@
 //      the receipts gate (`check:codex-m4-receipts`, the LEAD merge gate) exits non-zero until the
 //      maintainer discharges every O clause with a record in the gitignored candidate manifest.
 
+import { PROVIDER_ADVICE_SUMMARY_TITLE, PROVIDER_ROOT_TITLES } from "./titles-provider.js";
 import type { ClauseRow } from "./clause.js";
 import { PHASE_MODEL_TITLES } from "./phase-model-titles.js";
 import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
-import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
+import { ASYNC_MESSAGE_TITLES, EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
   NATIVE_PATCH_INERT_TITLES,
-  CODEX_P_NATIVE_ABSENT_TITLE,
+  CODEX_P_NATIVE_ABSENT_TITLES,
   CODEX_P_ISOLATION_ENV_TITLE,
-  CODEX_P_SHELL_POLICY_TITLE,
-  CODEX_P_FILE_POLICY_TITLE,
+  CODEX_P_SHELL_POLICY_TITLES,
+  CODEX_P_FILE_POLICY_TITLES,
   CODEX_U_NATIVE_DISPATCH_TITLE,
   CODEX_U_SHELL_VARIANTS_TITLE,
   CODEX_U_FILE_VARIANTS_TITLE,
@@ -29,6 +31,7 @@ import {
   CODEX_U_SIGNAL_ORIGIN_TITLE,
   CODEX_U_SIGNAL_REPLAY_TITLE,
   CODEX_U_TRUST_CONSTRUCTION_TITLE,
+  CODEX_P_NO_TTL_TITLES,
 } from "./titles-c3.js";
 import {
   CODEX_U_LIFECYCLE_SYNC_CHILD_TITLE,
@@ -45,6 +48,47 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-private-ca-uid-resume-cleanup-invalid-sources",
+    adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "candidate base worker entrypoint/loadConfig/buildRunExecutor/default launcher/pinned app-server",
+    positiveControl: "private CA interrupts an active callback continuation, proves owned-root settlement, and fresh-executor resume retains the same runtime session and callback call/output history",
+    negativeOracle: "runner cannot read source; staged exact PEM is UID 10002 mode 0600 outside sessions; owned roots disappear after capture/disposal; five invalid sources fail; no-extra/unrelated TLS refuse and stalled TLS times out",
+    intendedOutcome: "all ten packaged fixture cases execute on the candidate base image; selected UID split, resume and cleanup observations only; no environment/archive/vendor-control or broader lifecycle claim",
+    tests: [PRIVATE_CA_TITLE],
+  },
+  {
+    id: "codex-p-bound-provider-root-direct", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "CodexExecutor/default adapter/launchCodexRoot/config/auth/transport with pinned app-server HTTP",
+    positiveControl: "authenticated real Responses traffic and callback continuation reach the selected listener",
+    negativeOracle: "missing/wrong bearer, discovery and oversized fixture input never advance Responses; no vendor credential calls",
+    intendedOutcome: "immutable binding reaches launcher config and apiKey login; one root is removed after disposal; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ROOT_TITLES.direct],
+  },
+  {
+    id: "codex-p-bound-provider-root-same-origin-redirect", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "CodexExecutor/default adapter/launchCodexRoot/config/auth/transport with pinned app-server HTTP",
+    positiveControl: "HTTP 307/308 accepted same-origin receiver completes the callback continuation",
+    negativeOracle: "origin and receiver logs match exact POST method, raw body and bearer; no discovery or extra receiver traffic",
+    intendedOutcome: "pinned runtime forwards bearer and body on accepted same-origin redirects; characterization is not confinement; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ROOT_TITLES.same307, PROVIDER_ROOT_TITLES.same308],
+  },
+  {
+    id: "codex-p-bound-provider-root-cross-port-redirect", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "CodexExecutor/default adapter/launchCodexRoot/config/auth/transport with pinned app-server HTTP",
+    positiveControl: "authenticated origin receives POST and redirects the real pinned runtime across ports",
+    negativeOracle: "receiver sees identical POST body without bearer, rejects 401 and produces no Responses frames; exactly one origin and receiver request",
+    intendedOutcome: "pinned runtime strips cross-port bearer but forwards body; executor rejects and disposes its root; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ROOT_TITLES.cross307, PROVIDER_ROOT_TITLES.cross308],
+  },
+  {
+    id: "codex-p-bound-provider-advice-summary", adapter: "codex", layer: "P", family: "Credential isolation",
+    seam: "makeProductionCodexAdviceHarnessFactory/makeProductionLaunchAdviceRoot/CodexAdviceHarness via runReadOnlyModelPass (advice) and SummaryRunner (summary) with launchCodexRoot, app-server auth and pinned app-server HTTP",
+    positiveControl: "an advice pass and a plan-summary pass each reach the authenticated Responses fake with the bound key as the only bearer, the mapped gateway model and the slot's model_context_window",
+    negativeOracle: "a clean control pass returns its text unchanged while the pass that echoes the raw, JSON-escaped and percent-encoded key is redacted; zero release/refresh/admission client calls; no other credential header or log line carries the key",
+    intendedOutcome: "provider-bound advice and summary passes run on the frozen binding with the key over the app-server login only; OS provisioning/supervisor evidence is simulated, with no UID separation, kernel drainage or session-staging proof",
+    tests: [PROVIDER_ADVICE_SUMMARY_TITLE],
+  },
   {
     id: "codex-p-phase-model-switch", adapter: "codex", layer: "P", family: "Persisted context and usage replay",
     seam: "pinned app-server with production config/auth/transport and two process roles",
@@ -80,8 +124,8 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     seam: "harness-p: production launcher/config/auth/transport/broker; pinned async handler and clock",
     positiveControl: "lock-bound receipt/member verification + codex --version; live provider traffic and later real code-mode uzi_bash callback",
     negativeOracle: "no currentTime/read to uzi, no filesystem effect, only the control worker command; advice zero callbacks; no answer supplied",
-    intendedOutcome: "async accepted JSON text and delivery/questions; exact successful UTC formats; root start/resume, worker-created child and advice start on all three supported metadata models",
-    tests: [EXCEPTIONS_TITLE],
+    intendedOutcome: "async accepted JSON text and delivery/questions; exact successful UTC formats; root start/resume, worker-created child and advice start on the three older metadata models; both 6.2 models expose direct async messages with zero worker effects and reject nested invocation",
+    tests: [EXCEPTIONS_TITLE, ...Object.values(ASYNC_MESSAGE_TITLES)],
   },
   {
     // C1 REAL, EXECUTED P row — the startup/allowed-callback smoke (startup-smoke.test.ts).
@@ -212,7 +256,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "no alternate native execution authority or retained writable terminal exists on the "
       + "production path for the representative effectful deny probes; the authority-free code host "
       + "and #1566 async-question/read-only UTC exceptions remain reachable",
-    tests: [CODEX_P_NATIVE_ABSENT_TITLE],
+    tests: Object.values(CODEX_P_NATIVE_ABSENT_TITLES),
   },
   {
     id: "codex-u-native-bypass-broker-deny",
@@ -242,7 +286,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "git push and a synthetic provider-HOME secret read are denied and NEVER reach the command "
       + "spawn seam (zero spawn count), so neither runs a marker nor discloses the synthetic secret",
     intendedOutcome: "shell screening is reached on the real protocol; a forbidden command produces no effect while an allowed one does",
-    tests: [CODEX_P_SHELL_POLICY_TITLE],
+    tests: Object.values(CODEX_P_SHELL_POLICY_TITLES),
   },
   {
     id: "codex-u-shell-variants",
@@ -273,7 +317,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
       "an outside-worktree path and a credential/secret path (the D6 codex-data prefix) are denied "
       + "BEFORE the fileop client (no fileop op recorded against a forbidden path)",
     intendedOutcome: "production path enforcement denies before the effect on the real protocol; allowed workspace ops work",
-    tests: [CODEX_P_FILE_POLICY_TITLE],
+    tests: Object.values(CODEX_P_FILE_POLICY_TITLES),
   },
   {
     id: "codex-u-file-variants",
@@ -392,6 +436,18 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     tests: [CODEX_U_SIGNAL_REPLAY_TITLE],
   },
 
+  {
+    id: "codex-p-no-ttl-overrides",
+    adapter: "codex",
+    layer: "P",
+    family: "Repository trust",
+    seam: "launchCodexRoot config and actual API-key provider request",
+    positiveControl: "the pinned binary completes with nonempty structured input for each selected model",
+    negativeOracle: "every observed provider body, emitted config and exercised thread/turn request has no TTL override",
+    intendedOutcome: "worker construction leaves TTL unset on the exercised path for both models",
+    tests: Object.values(CODEX_P_NO_TTL_TITLES),
+  },
+
   // ── Repository trust ──
   {
     id: "codex-u-trust-construction",
@@ -403,7 +459,7 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     negativeOracle:
       "the fixed config pins project_doc_max_bytes=0 + trust_level untrusted and supported suppression; "
       + "exact false feature keys test construction, not runtime suppression: apply_patch_freeform is "
-      + "removed/ignored and model catalog metadata overrides code_mode/code_mode_only at pin 0.167.0. "
+      + "removed/ignored and model catalog metadata overrides code_mode/code_mode_only at 0.167.0 (pin 0.169.0, not re-measured). "
       + "Native patch remains advertised under the run host; registration is not authority. Unknown "
       + "keys are rejected, no AGENTS.md/.codex input is taken, and start/resume reassert untrusted "
       + "config. Root thread/start and turn/start select environments:[]; thread/resume has no such "

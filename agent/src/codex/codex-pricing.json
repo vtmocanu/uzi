@@ -1,5 +1,5 @@
 {
-  "version": "openai-standard-2026-10-09",
+  "version": "openai-standard-2026-11-23",
   "input_tier_threshold_tokens": 272000,
   "models": {
     "gpt-6-astra": {
@@ -96,6 +96,44 @@
         "cached_input": 0.02,
         "cache_write": 0.25,
         "output": 0.75
+      }
+    },
+    "gpt-6.2-sol": {
+      "verified_at": "2026-11-23",
+      "sources": [
+        "https://developers.openai.com/api/docs/pricing",
+        "https://developers.openai.com/api/docs/models/gpt-6.2-sol"
+      ],
+      "low": {
+        "uncached_input": 2,
+        "cached_input": 0.1,
+        "cache_write": 2.5,
+        "output": 10
+      },
+      "high": {
+        "uncached_input": 4,
+        "cached_input": 0.2,
+        "cache_write": 5,
+        "output": 15
+      }
+    },
+    "gpt-6.2-astra": {
+      "verified_at": "2026-11-23",
+      "sources": [
+        "https://developers.openai.com/api/docs/pricing",
+        "https://developers.openai.com/api/docs/models/gpt-6.2-astra"
+      ],
+      "low": {
+        "uncached_input": 8,
+        "cached_input": 0.4,
+        "cache_write": 10,
+        "output": 40
+      },
+      "high": {
+        "uncached_input": 16,
+        "cached_input": 0.8,
+        "cache_write": 20,
+        "output": 60
       }
     }
   }

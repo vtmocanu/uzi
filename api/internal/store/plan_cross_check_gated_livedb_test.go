@@ -624,7 +624,7 @@ func TestGatedPlanCrossCheckChildAndLiveLiveDB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := setupGatedRun(ctx, t)
 			mustExec(ctx, t, f.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`,
-				f.workerID, []string{"codex_harness_v1", "codex_runtime_v2", "cross_check_v1", "codex_custom_model_v1"})
+				f.workerID, []string{"codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3", "cross_check_v1", "codex_custom_model_v1"})
 			mustExec(ctx, t, f.pool, "UPDATE runs SET "+tc.set+" WHERE id = $1", f.runID)
 			child, err := f.q.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
 				ChildID: uuid.New(), ChildHarness: "codex", BudgetWallSeconds: 300, LeadRunID: f.runID,

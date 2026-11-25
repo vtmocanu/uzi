@@ -194,3 +194,26 @@ export async function waitForTestEvent<T>(event: Promise<T>, label: string, time
     clearTimeout(timer);
   }
 }
+
+/**
+ * issue #4632: stands in for GitCache.withInventorySourceLock in runner tests whose bare repository is a fixture path or
+ * a fake git object. The real section's step-7 clear reads the bare's config, which these fixtures do not have, so a
+ * passing proof would leave its same-key exclusion standing for the next proof of the same key. The section semantics
+ * themselves are covered by git-inventory-exclusion.test.ts.
+ */
+export const passthroughInventorySection = async <T>(
+  _bare: string, _opts: unknown,
+  body: (section: {
+    deadlineAt: number; stopped(): boolean; markGitStarted(): void;
+    stage<R>(fn: () => Promise<R>): Promise<{ ok: true; value: R }>;
+    afterScanQuiescent(v: boolean): void; noteAbort(): void;
+  }) => Promise<T>,
+): Promise<{ kind: "ran"; value: T; timedOut: false; entryKept: false }> => ({
+  kind: "ran",
+  value: await body({
+    deadlineAt: Date.now() + 60_000, stopped: () => false, markGitStarted: () => {},
+    stage: async fn => ({ ok: true as const, value: await fn() }),
+    afterScanQuiescent: () => {}, noteAbort: () => {},
+  }),
+  timedOut: false, entryKept: false,
+});

@@ -21,7 +21,7 @@ const mockApi = vi.mocked(api);
 
 const DEFAULTS = {
   judge_model: "opus",
-  codex_judge_model: "gpt-6.1-sol",
+  codex_judge_model: "gpt-6.2-sol",
   summary_model: "haiku",
   codex_summary_model: "gpt-6-luna",
 };
@@ -88,7 +88,7 @@ describe("InstanceModelDefaultsCard grid (#3259)", () => {
     expect(summaryClaude().value).toBe("inherit");
     expect(summaryCodex().value).toBe("inherit");
     expect(optionText(judgeClaude())).toContain("Default · opus (built-in)");
-    expect(optionText(judgeCodex())).toContain("Default · gpt-6.1-sol (built-in)");
+    expect(optionText(judgeCodex())).toContain("Default · gpt-6.2-sol (built-in)");
     expect(optionText(summaryClaude())).toContain("Default · haiku (built-in)");
     expect(optionText(summaryCodex())).toContain("Default · gpt-6-luna (built-in)");
     expect(save().disabled).toBe(true);

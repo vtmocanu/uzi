@@ -8,13 +8,13 @@ import { Input, Select } from "./ui";
 // Claude keeps today's aliases (this is the single shared source for that set, PRD
 // #17 risk: alias drift — reused by the agent-template editor and the per-user
 // default-model setting) plus a free-text "Other…" custom escape hatch. Codex's
-// picker has EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol`/`gpt-6.1-sol` as curated
+// picker uses CODEX_CURATED_MODELS (including gpt-6.2-sol/astra) as curated
 // options, with no catalog discovery — matching D6's "the product-owned Codex picker
 // remains exactly" rule. Custom entry defaults off for Codex; worker defaults and
 // dedicated checker pins explicitly opt in.
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
 // Mirror agent/src/codex/codex-executor.ts CODEX_PRODUCTION_PROVIDER.model.
-export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
+export const DEFAULT_CODEX_MODEL = "gpt-6.2-sol";
 // The curated Codex list lives in lib/codexModels.ts (PRD #3245), pinned to the shared
 // fixtures/codex-models/models.json; it includes DEFAULT_CODEX_MODEL.
 const CODEX_MODEL_ALIASES = CODEX_CURATED_MODELS;
@@ -48,7 +48,7 @@ function deriveMode(value: string, aliases: readonly string[]): Mode {
 // PRD #1551 M3: `allowCustom` is an explicit opt-in that overrides the harness default.
 // Historically custom entry was "Claude yes, Codex no" (PRD #1429 D6). Codex's picker
 // stays closed for schedule/template callers. The per-user Codex worker-model lane
-// and dedicated plan cross-check pins on Run Defaults opt into the "Other…" escape
+// and dedicated plan cross-check pins on Models opt into the "Other…" escape
 // hatch. Callers that omit allowCustom keep the harness-derived default.
 export function ModelSelect({
   value,
@@ -77,7 +77,7 @@ export function ModelSelect({
   harness?: Harness;
   // Whether the "Other… (custom model ID)" menu entry is offered. Omitted ⇒ the
   // historical harness default (Claude allows custom, Codex does not), so
-  // ScheduleModal / AgentTemplateEditor render unchanged. Run Defaults' Codex lane
+  // ScheduleModal / AgentTemplateEditor render unchanged. Models' Codex lane
   // and dedicated plan cross-check pins pass `allowCustom` to open that escape hatch
   // (PRD #1551 D5 and #2151).
   allowCustom?: boolean;

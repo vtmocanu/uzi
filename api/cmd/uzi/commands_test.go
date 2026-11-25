@@ -58,7 +58,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	subWant := map[string][]string{
-		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "extend", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "pause", "resume", "rework", "export", "recovery", "discard", "fetches", "held", "lead-config"},
+		"run": {"list", "get", "logs", "wait", "review", "create", "approve", "reject", "revise", "cancel", "stop", "scope", "extend", "follow-up", "answer", "inputs", "expedite", "resume-now", "mr-rework", "ci-autofix", "pause", "resume", "rework", "export", "recovery", "discard", "fetches", "held", "lead-config"},
 		// backlog is the PRD #98 M7 read; `file` (PRD #365 M2) files a recommendation
 		// as a forge issue from the CLI, mirroring `findings file`.
 		"review": {"show", "backlog", "resolve", "dismiss", "undo", "stats", "file"},
@@ -552,7 +552,7 @@ func TestReviewShowJudgeSkip(t *testing.T) {
 		{"codex", "no_usable_credential", "Judge skipped 2026-11-10: Codex had no usable credential."},
 		{"codex", "credential_disabled", "Judge skipped 2026-11-10: the Codex credential is disabled."},
 		{"codex", "codex_pool_unavailable", "Judge skipped 2026-11-10: no pooled Codex account was available."},
-		{"claude", "provider_lane_unsupported", "Judge skipped 2026-11-10: the Claude source is a model provider, which the judge does not support yet."},
+		{"claude", "provider_lane_unsupported", "Judge skipped 2026-11-10: the selected source is a model provider, which the judge does not support yet."},
 		{"claude", "no_usable_credential", "Judge skipped 2026-11-10: Claude had no usable credential."},
 	}
 	for _, tc := range cases {
@@ -2070,6 +2070,134 @@ func TestRunMrReworkNotFound(t *testing.T) {
 	}
 	if fc.LastMrReworkRunID != "r1" {
 		t.Errorf("targeted run %q, want r1 — the write must still have been reached", fc.LastMrReworkRunID)
+	}
+}
+
+// TestRunCIAutofixVerb covers `uzi run ci-autofix <id>`: tri-state like mr-rework (bare and
+// --enabled send true, --enabled=false sends false, --clear sends nil).
+func TestRunCIAutofixVerb(t *testing.T) {
+	run := func(t *testing.T, extra ...string) *uzicli.FakeClient {
+		t.Helper()
+		fc := &uzicli.FakeClient{CIAutofixResult: uzicli.SetRunCIAutofixResult{Run: apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "completed"}}}
+		args := append([]string{"run", "ci-autofix", "r1"}, extra...)
+		_, _, code := runCLI(t, fakeEnv(fc), args...)
+		if code != uzicli.ExitOK {
+			t.Fatalf("run ci-autofix %v exit = %d, want 0", extra, code)
+		}
+		if fc.LastCIAutofixRunID != "r1" {
+			t.Errorf("targeted run %q, want r1", fc.LastCIAutofixRunID)
+		}
+		return fc
+	}
+	if got := run(t).LastCIAutofixEnabled; got == nil || !*got {
+		t.Errorf("bare ci-autofix sent %v, want an explicit true", got)
+	}
+	if got := run(t, "--enabled=false").LastCIAutofixEnabled; got == nil || *got {
+		t.Errorf("--enabled=false sent %v, want an explicit false", got)
+	}
+	if got := run(t, "--clear").LastCIAutofixEnabled; got != nil {
+		t.Errorf("--clear sent %v, want nil (clear to inherit)", *got)
+	}
+}
+
+func TestRunCIAutofixClearAndEnabledConflict(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "ci-autofix", "r1", "--clear", "--enabled")
+	if code != uzicli.ExitUsage {
+		t.Fatalf("exit = %d, want %d (usage)", code, uzicli.ExitUsage)
+	}
+	if fc.LastCIAutofixRunID != "" {
+		t.Error("a usage error still reached the write; the command must refuse before calling the API")
+	}
+}
+
+func TestRunCIAutofixNotFound(t *testing.T) {
+	fc := &uzicli.FakeClient{SetRunCIAutofixErr: uzicli.Exitf(uzicli.ExitNotFound, "run not found")}
+	_, _, code := runCLI(t, fakeEnv(fc), "run", "ci-autofix", "r1")
+	if code != uzicli.ExitNotFound {
+		t.Fatalf("exit = %d, want %d (not found)", code, uzicli.ExitNotFound)
+	}
+	if fc.LastCIAutofixRunID != "r1" {
+		t.Errorf("targeted run %q, want r1 — the write must still have been reached", fc.LastCIAutofixRunID)
+	}
+}
+
+// The human output is the run detail plus a governing-run note and an in-flight note, each
+// only when the server sent the data.
+func TestRunCIAutofixNotes(t *testing.T) {
+	off := false
+	gov := "gov-run-1"
+	dto := apitypes.RunDTO{ID: "r1", Kind: "issue", Status: "completed", CiAutofixEnabled: &off}
+
+	t.Run("both notes", func(t *testing.T) {
+		fc := &uzicli.FakeClient{CIAutofixResult: uzicli.SetRunCIAutofixResult{
+			Run: dto, GoverningRunID: &gov, InflightFixRunIDs: []string{"fix-a", "fix-b"},
+		}}
+		out, _, code := runCLI(t, fakeEnv(fc), "run", "ci-autofix", "r1", "--enabled=false")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d", code)
+		}
+		for _, want := range []string{
+			"run gov-run-1 governs automatic CI fixes on this branch; edit that run to change them",
+			"CI fix run(s) fix-a, fix-b in flight on this branch keep their own setting; cancel them or set it on them too",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output missing %q:\n%s", want, out)
+			}
+		}
+	})
+	t.Run("no notes", func(t *testing.T) {
+		fc := &uzicli.FakeClient{CIAutofixResult: uzicli.SetRunCIAutofixResult{Run: dto, InflightFixRunIDs: []string{}}}
+		out, _, code := runCLI(t, fakeEnv(fc), "run", "ci-autofix", "r1", "--enabled=false")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d", code)
+		}
+		if strings.Contains(out, "governs automatic") || strings.Contains(out, "in flight") {
+			t.Errorf("unexpected notes:\n%s", out)
+		}
+		if !strings.Contains(out, "CI_AUTOFIX") {
+			t.Errorf("run detail should carry the CI_AUTOFIX row:\n%s", out)
+		}
+	})
+	t.Run("json envelope", func(t *testing.T) {
+		fc := &uzicli.FakeClient{CIAutofixResult: uzicli.SetRunCIAutofixResult{Run: dto, InflightFixRunIDs: []string{}}}
+		out, _, code := runCLI(t, fakeEnv(fc), "run", "ci-autofix", "r1", "--enabled=false", "--json")
+		if code != uzicli.ExitOK {
+			t.Fatalf("exit = %d", code)
+		}
+		for _, want := range []string{`"ci_autofix_governing_run_id": null`, `"ci_autofix_inflight_fix_run_ids": []`, `"run":`} {
+			if !strings.Contains(out, want) {
+				t.Errorf("json output missing %q:\n%s", want, out)
+			}
+		}
+	})
+}
+
+// `uzi run get` shows CI_AUTOFIX as inherit/on/off.
+func TestRunGetShowsCIAutofix(t *testing.T) {
+	on, off := true, false
+	for _, tc := range []struct {
+		name string
+		in   *bool
+		want string
+	}{{"inherit", nil, "inherit"}, {"on", &on, "on"}, {"off", &off, "off"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "completed", CiAutofixEnabled: tc.in}}}
+			out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+			if code != uzicli.ExitOK {
+				t.Fatalf("exit = %d", code)
+			}
+			ok := false
+			for _, line := range strings.Split(out, "\n") {
+				f := strings.Fields(line)
+				if len(f) == 2 && f[0] == "CI_AUTOFIX" && f[1] == tc.want {
+					ok = true
+				}
+			}
+			if !ok {
+				t.Errorf("want CI_AUTOFIX row %q in:\n%s", tc.want, out)
+			}
+		})
 	}
 }
 

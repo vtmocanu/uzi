@@ -500,6 +500,67 @@ func newRunMrReworkCmd(env Env, gf *globalFlags) *cobra.Command {
 	return mrRework
 }
 
+// newRunCIAutofixCmd builds `uzi run ci-autofix`.
+func newRunCIAutofixCmd(env Env, gf *globalFlags) *cobra.Command {
+	ciAutofix := &cobra.Command{
+		Use:   "ci-autofix <run-id>",
+		Short: "Set whether automatic CI fixes run on this run's branch (--enabled[=false], or --clear to inherit)",
+		Long: "Set the per-run override for AUTOMATIC CI fixes on this run's branch. Tri-state, and " +
+			"editable on a COMPLETED run:\n\n" +
+			"  --enabled            allow automatic CI fixes on this run's branch\n" +
+			"  --enabled=false      stop them (a red pipeline is never auto-fixed)\n" +
+			"  --clear              clear the override back to inherit (follow your account default)\n\n" +
+			"The override that counts is the one on the branch's selected run: the newest non-cancelled " +
+			"issue, ci_fix, prompt or self-improve run that has an MR. A ci_fix repair run inherits the " +
+			"value and can become the selected run, so after a repair, re-enable it by editing that run; " +
+			"the command prints the governing run when it is another of your runs. The admin gate always wins. A manual Fix CI " +
+			"(the web button or the ci fix command) is never blocked by this setting. The override does not expire, so " +
+			"re-enable it when you are done.\n\n" +
+			"A foreign or unknown run is a 404 (exit 4). Prints the run's resulting CI_AUTOFIX state " +
+			"(inherit/on/off); --json prints the full result including the governing run and your " +
+			"in-flight CI fix runs.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			clear, _ := cmd.Flags().GetBool("clear")
+			var enabled *bool
+			if clear {
+				if cmd.Flags().Changed("enabled") {
+					return uzicli.Exitf(uzicli.ExitUsage, "--clear and --enabled are mutually exclusive")
+				}
+			} else {
+				v, _ := cmd.Flags().GetBool("enabled")
+				enabled = &v
+			}
+			res, err := c.SetRunCIAutofix(cmd.Context(), args[0], enabled)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(res)
+			}
+			if err := renderRunDetail(p, res.Run); err != nil {
+				return err
+			}
+			if res.GoverningRunID != nil {
+				p.Printf("run %s governs automatic CI fixes on this branch; edit that run to change them\n", *res.GoverningRunID)
+			}
+			if len(res.InflightFixRunIDs) > 0 {
+				p.Printf("CI fix run(s) %s in flight on this branch keep their own setting; cancel them or set it on them too\n",
+					strings.Join(res.InflightFixRunIDs, ", "))
+			}
+			return nil
+		},
+	}
+	ciAutofix.Flags().Bool("enabled", true, "whether automatic CI fixes run on this run's branch; pass --enabled=false to turn them off")
+	ciAutofix.Flags().Bool("clear", false, "clear the per-run override back to inherit (follow your account default)")
+	return ciAutofix
+}
+
 // newRunReworkCmd builds `uzi run rework`.
 func newRunReworkCmd(env Env, gf *globalFlags) *cobra.Command {
 	rework := &cobra.Command{

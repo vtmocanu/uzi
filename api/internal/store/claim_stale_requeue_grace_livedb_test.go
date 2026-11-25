@@ -44,7 +44,7 @@ func (fx *rollAffinityFixture) staleClaim(workerID uuid.UUID, grace, ceiling tim
 		IsDockerWorker:     false,
 		// The Codex protocol caps are harmless for a Claude run and let the Codex cycle test
 		// reach the pin instead of being refused by the protocol clause.
-		WorkerProtocolCaps: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1},
+		WorkerProtocolCaps: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1},
 	})
 }
 
@@ -316,7 +316,7 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 	w := fx.worker("W", 2*time.Minute, false)
 	p := fx.worker("P", 0, false)
 	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities = $2 WHERE id = ANY($1)`,
-		[]uuid.UUID{w, p}, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
+		[]uuid.UUID{w, p}, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1})
 
 	secret, err := insertSecret(fx.ctx, fx.pool, fx.userID, store.KindCodexAuth, "codex-"+uuid.NewString(), false)
 	if err != nil {

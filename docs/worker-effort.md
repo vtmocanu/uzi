@@ -7,7 +7,7 @@ audience: user
 # Reasoning effort
 
 Choose reasoning effort independently for your Claude and Codex runs in
-**Settings → Run defaults → Reasoning effort**. Both product defaults are
+**Settings → Models → Worker runs → Worker effort**. Both product defaults are
 **medium**. Leave a control on **Default · lead template's effort, else medium (built-in)** to use that default,
 choose `low`, `medium`, `high`, `xhigh` or `max` for that harness, or choose
 **Runtime default** to send no level.
@@ -91,16 +91,16 @@ Codex catalog advisory below still applies to the lead only.
 ## Planning effort
 
 Claude and Codex runs can plan at a different effort than they implement.
-In **Settings → Run defaults → Planning**, each harness's planning effort
+In **Settings → Models → Planning**, each harness's planning effort
 takes `low`, `medium`, `high`, `xhigh` or `max`; its empty option,
-**Same as the run**, plans at the run's own effort. The shared
-**Save planning defaults** button saves changed fields for both harnesses.
+**Same as the run**, plans at the run's own effort. The page's one **Save changes**
+button saves changed fields for both harnesses.
 The empty option names the lead template tier when that supplies the run's
 effort, for example **Same as the run · high (lead template)**, matching what
 a run actually plans at.
-There is no Runtime default choice for planning effort, and
-the setting is written through `PUT /api/me/settings` (cookie-only) or that
-card; no CLI command sets it. Phases, scope and the planning model are in
+Planning effort has no Runtime default choice. Save from Models or use
+`PUT /api/me/model-settings`, which accepts `uzc_` and `uza_` tokens.
+The existing `PUT /api/me/settings` route remains cookie-only. Phases, scope and the planning model are in
 [Worker model](./worker-model.md#planning-model-and-effort).
 
 - **Any combination is allowed.** A planning effort can be set while your
@@ -123,9 +123,9 @@ card; no CLI command sets it. Phases, scope and the planning model are in
 
 ## Set an override
 
-1. Open **Settings → Run defaults → Reasoning effort**.
-2. Pick the **Claude effort** or **Codex effort** level, **Runtime default**, or **Default · lead template's effort, else medium (built-in)**.
-3. Click **Save Claude effort** or **Save Codex effort**.
+1. Open **Settings → Models → Worker runs**.
+2. In the **Worker effort** row, pick the Claude or Codex level, **Runtime default**, or **Default · lead template's effort, else medium (built-in)**.
+3. Click **Save changes**.
 
 The controls offer five levels; Codex's `ultra` catalog level is deliberately
 not offered. Lower levels favor speed and cost; higher levels reason longer.
@@ -318,9 +318,14 @@ To see the effort your next run would use before it starts, read the read-only
 
 ## Worker rollout
 
-Codex claims require a worker advertising `codex_runtime_v2`: the current
-runtime/catalog baseline and correct claimed-effort handling. Until the
+Codex claims require `codex_runtime_v3` in addition to `codex_harness_v1` and
+`codex_runtime_v2`: the current runtime/catalog baseline and correct
+claimed-effort handling. The gate also covers a Codex material revision or
+secret binding, independently of optional capability requirements. Until the
 worker image is updated, Codex runs wait with the reason **no worker with the
 current Codex runtime is online; waiting for the worker roll**. This applies
 to hosted workers and local compose workers, including Codex judges and
 reviews. Claude runs are unaffected by that gate.
+
+For API-first, worker-first and rollback ordering, see the
+[current baseline](./configuration.md#current-codex-worker-baseline).

@@ -1120,7 +1120,7 @@ A related knob does not hold a worker back: the controller also forwards `UZI_CO
 This is a narrower version of the message above, and only shows up when the
 run's effective worker or planning root uses a [custom Codex
 ID](./worker-model.md#custom-codex-model). A curated Codex model
-(`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`) does not need
+(`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra`) does not need
 the custom-model capability; a custom root model additionally
 needs a worker advertising `codex_custom_model_v1`, which only ships with a
 newer worker image.
@@ -1128,8 +1128,8 @@ newer worker image.
 - Ask your admin to upgrade or roll the hosted worker fleet to an image that
   advertises `codex_custom_model_v1`. An old worker never claims the run and
   never silently substitutes `gpt-6-astra`; it stays queued instead.
-- Or switch to one of the curated Codex models in [Settings → Run
-  defaults](./worker-model.md#harness-and-worker-models) if you don't need
+- Or switch to one of the curated Codex models in [Settings →
+  Models](./worker-model.md#harness-and-worker-models) if you don't need
   the custom ID right now.
 
 A resumed run can stay tied to its previous worker until the configured
@@ -1164,7 +1164,7 @@ custom models and the required separate-planning capability.
   capability when needed). Ephemeral and hosted placement provisions
   a current worker for such a run on its own once hosting can supply one.
 - Or clear the planning model and planning effort for the run's harness in
-  [Settings → Run defaults](./worker-model.md#planning-model-and-effort) if you
+  [Settings → Models](./worker-model.md#planning-model-and-effort) if you
   don't need them right now. A run that already queued uses the settings
   resolved when a worker claims it, so the change reaches it at its next claim.
 
@@ -1428,12 +1428,20 @@ gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.2-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,
 which sends no effort level. See [Reasoning effort](worker-effort.md).
 
-Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
-silently use the old model/catalog or ignore the requested effort. Codex runs
-queue until the worker image rolls, on hosted workers and compose alike.
+Every Codex-indicating claim (harness `codex`, a material revision, or a secret
+binding) requires `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3`.
+This gate is independent of `required_capabilities`, the capability-aware
+switch and `fn_worker_can_claim`; clearing optional requirements cannot bypass it.
+Codex runs wait for a compatible worker on hosted workers and compose alike.
+
+With an API-first rollout, old workers leave Codex runs waiting until the worker
+roll. Worker-first retains v1/v2 compatibility with the older API. Rolling back
+the v3 migration with Down reopens the weaker baseline; operators must account
+for that admission change. This is not a zero-downtime guarantee.
+See [ADR-1106](../adr/1106-codex-harness.md) for the runtime audit.

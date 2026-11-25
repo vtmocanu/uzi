@@ -143,17 +143,15 @@ export interface SecretDependents {
 }
 
 // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
-export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable" | "default" | "gpt-6-astra" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.2-sol" | "gpt-6.2-astra" | "gpt-6-luna";
 
 export interface ProviderModelEntry {
   model: string;
   context_window?: number;
 }
 
-// haiku is required by the server; the other roles are optional.
-export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
-  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
->;
+// The engine requires haiku (Claude) or default (Codex); remaining entries are optional.
+export type ProviderModelMap = Partial<Record<ProviderModelRole, ProviderModelEntry>>;
 
 export type ProviderAuthStyle = "bearer" | "x_api_key";
 
@@ -166,6 +164,27 @@ export interface ProviderProbe {
 export interface ProviderDTO {
   id: string;
   name: string;
+  engine: "claude" | "codex";
+  retired: boolean;
+  current_revision: number;
+  protocol: "anthropic_messages" | "openai_responses";
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+  /** null for a personal provider; "per_user_key" for an admin-shared definition (PRD #4324),
+   *  whose has_key, key_enabled and probe then describe the caller's own key only. */
+  credential_mode: "per_user_key" | null;
+  has_key: boolean;
+  key_enabled: boolean;
+  probe: ProviderProbe | null;
+}
+
+// ── Admin-shared providers (PRD #4324) ───────────────────────────────────────
+/** GET /api/admin/providers row: a shared definition plus two counts. It never carries a key
+ *  or any user's Test evidence. Endpoint and auth style are fixed at creation. */
+export interface AdminSharedProvider {
+  id: string;
+  name: string;
   engine: "claude";
   retired: boolean;
   current_revision: number;
@@ -173,9 +192,21 @@ export interface ProviderDTO {
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
-  has_key: boolean;
-  key_enabled: boolean;
-  probe: ProviderProbe | null;
+  credential_mode: "per_user_key";
+  selected_user_count: number;
+  attached_key_count: number;
+}
+
+export interface AdminSharedProviderList {
+  providers: AdminSharedProvider[];
+}
+
+/** POST /api/admin/providers body: keyless, Claude only. */
+export interface AdminSharedProviderCreateInput {
+  name: string;
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
 }
 
 export interface ProvidersList {
@@ -185,6 +216,8 @@ export interface ProvidersList {
 }
 
 export interface CreateProviderInput {
+  engine?: ProviderDTO["engine"];
+  protocol?: ProviderDTO["protocol"];
   name: string;
   base_url: string;
   auth_style: ProviderAuthStyle;
@@ -542,7 +575,7 @@ export interface UserSettings {
    *  default_model, and a curated Codex id is rejected here (D3 cross-vocabulary 400). */
   default_claude_model?: string | null;
   /** Per-user Codex worker-model default (PRD #1551 M1/D2); null = inherit the Codex
-   *  fallback (gpt-6.1-sol). Optional for the same back-compat reason. Unlike the other
+   *  fallback (gpt-6.2-sol). Optional for the same back-compat reason. Unlike the other
    *  lanes it accepts a custom id (D5), but a known Claude alias is rejected here (D3). */
   default_codex_model?: string | null;
   /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
@@ -655,6 +688,7 @@ export interface UserSettings {
    *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
    *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
   claude_provider_id?: string | null;
+  codex_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -727,6 +761,60 @@ export interface UserSettingsPatch {
   /** Per-user "Judge runs on" (PRD #3257); same tri-state as default_harness: a value sets the
    *  judge harness, null clears back to "same as the run", absent leaves it unchanged. */
   judge_runs_on?: Harness | null;
+}
+
+/** One cross_check_pins cell of PUT /me/model-settings: omitted members stay unchanged,
+ *  null clears that member's override. */
+export interface ModelSettingsPinPatch {
+  stage: "plan" | "code";
+  harness: Harness;
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** PUT /api/me/model-settings body (PRD #3263): the closed 19-key allowlist, written in one
+ *  transaction. Omitted keys stay unchanged; null clears an override. Values are validated
+ *  server-side, so the scalars are plain strings here. */
+export interface ModelSettingsPatch {
+  default_harness?: string | null;
+  default_claude_model?: string | null;
+  default_codex_model?: string | null;
+  default_effort?: string | null;
+  default_codex_effort?: string | null;
+  planning_claude_model?: string | null;
+  planning_claude_effort?: string | null;
+  planning_codex_model?: string | null;
+  planning_codex_effort?: string | null;
+  judge_runs_on?: string | null;
+  judge_model?: string | null;
+  codex_judge_model?: string | null;
+  summary_model?: string | null;
+  codex_summary_model?: string | null;
+  task_review_model?: string | null;
+  codex_task_review_model?: string | null;
+  task_review_effort?: string | null;
+  codex_task_review_effort?: string | null;
+  cross_check_pins?: ModelSettingsPinPatch[];
+}
+
+/** The 200 body of PUT /me/model-settings: the canonical settings read after commit, and the
+ *  effective-settings prediction. `effective` is null, with effective_error
+ *  "settings_effective_readback_failed", when only the prediction could not be read: the save
+ *  still committed. */
+export interface ModelSettingsSaveResponse {
+  settings: UserSettings;
+  effective: EffectiveSettings | null;
+  effective_error?: string;
+}
+
+/** One entry of the 400 `errors` array of PUT /me/model-settings. stage/harness/member are set
+ *  only for a cross_check_pins cell defect. */
+export interface ModelSettingsFieldError {
+  field: string;
+  message: string;
+  stage?: "plan" | "code";
+  harness?: Harness;
+  member?: "model" | "effort";
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
@@ -4224,6 +4312,9 @@ export interface Run {
    *  per-run override. Kept `boolean | null` (never `any`) to preserve the
    *  omitted-vs-null-vs-value distinction, exactly like mr_state's nullability. */
   mr_rework_enabled?: boolean | null;
+  /** Issue #4617: this run's per-run CI-autofix override. null/absent = inherit the owner's
+   *  Settings default; an explicit true/false overrides it for this run's branch. */
+  ci_autofix_enabled?: boolean | null;
   /** PRD #1202 D11: the OWNER-ONLY view of the automatic rework loop guard, so the owner
    *  can see why the watcher stopped. `mr_rework_auto_cycles` is the automatic cycles spent
    *  (0 when none), `mr_rework_auto_cap` the live admin cap. Both are populated only on the
@@ -5148,6 +5239,16 @@ export interface UsageTail {
   coverage: "complete" | "partial";
   coverage_reasons: string[];
   models: UsageTailModel[];
+}
+
+/** Issue #4617: PUT /runs/{id}/ci-autofix response. The two optional-looking hints name
+ *  OTHER runs on the same branch so the UI can tell the owner where the setting is read. */
+export interface SetRunCiAutofixResponse {
+  run: Run;
+  /** The run whose override currently governs automatic CI fixes on this branch, or null. */
+  ci_autofix_governing_run_id: string | null;
+  /** CI-fix runs already in flight on this branch; they keep their own setting. */
+  ci_autofix_inflight_fix_run_ids: string[];
 }
 
 // RunListItem is a run row for the index + admin overview: the run plus display

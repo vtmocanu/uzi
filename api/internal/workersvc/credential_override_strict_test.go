@@ -23,12 +23,6 @@ func (s *storedOverrideMetaStore) GetUserSecretMetaByIDOfKind(_ context.Context,
 	return s.row, s.err
 }
 
-// GetUserClaudeProviderSource answers "no provider source": a stored override is checked against
-// the owner's source first, and a surface that cannot read it now fails closed.
-func (s *storedOverrideMetaStore) GetUserClaudeProviderSource(context.Context, uuid.UUID) (store.GetUserClaudeProviderSourceRow, error) {
-	return store.GetUserClaudeProviderSourceRow{}, nil
-}
-
 func TestCheckStoredCredentialOverrideEnabled(t *testing.T) {
 	user, id := uuid.New(), uuid.New()
 	pin := &CredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &id}
@@ -87,4 +81,13 @@ func TestCheckStoredCredentialOverrideEnabled(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (s *storedOverrideMetaStore) GetUserProviderSource(context.Context, store.GetUserProviderSourceParams) (store.GetUserProviderSourceRow, error) {
+	return store.GetUserProviderSourceRow{}, nil
+}
+
+// GetUserProviderLaneSources preserves the fixture's unselected-source policy.
+func (f *storedOverrideMetaStore) GetUserProviderLaneSources(context.Context, uuid.UUID) (store.GetUserProviderLaneSourcesRow, error) {
+	return store.GetUserProviderLaneSourcesRow{}, nil
 }

@@ -41,7 +41,9 @@ func (h *Handler) runEnvRedactor() runEnvRedactor {
 // held publication in flight and no terminal preservation bound or publishing, or is a
 // cross-check child that is terminal or whose check is no longer open, with the same exceptions.
 // 409 vault_locked when the owner's vault is locked, 409 run_env_history_unavailable when a
-// receipted version is missing or cannot be opened. The body carries plaintext secrets:
+// receipted version is missing or cannot be opened. Authority, openness and the owner's epoch and
+// lock state are checked after the last open; a change committed after that check and before the
+// response is written is not fenced. The body carries plaintext secrets:
 // Cache-Control: no-store on every answer, and nothing here logs it.
 func (h *Handler) WorkerRunEnvRedact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")

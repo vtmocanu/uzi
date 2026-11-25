@@ -805,15 +805,18 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				continue // Unknown mutations require a new observation before sibling work.
 			}
 			if !e.admitted {
-				// Independent fenced maintenance and mutation-free wake settlement
-				// are allowed even while image admission waits.
+				// Independent fenced maintenance, wake settlement and its
+				// annotation-only op binding are allowed even while image admission
+				// waits; no replica or template mutation is.
 				if ns, err := m.cfg.Placement(w); err == nil {
 					if spec, err := m.resolveWorker(w); err == nil {
 						if e.blocked == "" {
 							var err error
 							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
-								// The wake's own mutation guard still requires e.admitted.
-								// A ready participant needs only to report settlement.
+								// Template and replica mutations of the wake still require
+								// e.admitted. The one unadmitted write is the annotation-only
+								// op binding (patchWakeOpAnnotation); a bound participant
+								// then reports settlement.
 								err = m.hibernateWake(ctx, w, e.o, ns, spec)
 							} else {
 								_, err = m.reconcileDinD(ctx, w, obs, ns, spec)
@@ -1189,7 +1192,17 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// There is no get on Secrets, so "create if absent" is not available to us — and
 		// does not need to be. Issue the create and treat AlreadyExists as success. That
 		// is the WHOLE of Secret idempotence, and it needs no read.
-		_, err := m.client.CoreV1().Secrets(ns).Create(ctx, RenderSecret(m.cfg, w, *w.JoinToken), metav1.CreateOptions{})
+		secret := RenderSecret(m.cfg, w, *w.JoinToken)
+		// Kubernetes limits the sum of Data values, including duplicate CA copies.
+		// Budget the rendered object and actual token, without exposing either.
+		remaining := corev1.MaxSecretSize
+		for _, value := range secret.Data {
+			if len(value) > remaining {
+				return fmt.Errorf("worker secret data exceeds Kubernetes %d-byte limit", corev1.MaxSecretSize)
+			}
+			remaining -= len(value)
+		}
+		_, err := m.client.CoreV1().Secrets(ns).Create(ctx, secret, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			// The error is from the apiserver about an object it rejected; it does not carry
 			// the Secret's data. Still, nothing here interpolates the token.

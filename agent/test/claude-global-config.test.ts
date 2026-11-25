@@ -4,18 +4,24 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
-import { CLAUDE_GLOBAL_CONFIG_BYTES, prepareClaudeConfigDir, type PrepareDeps } from "../src/claude-global-config.js";
+import {
+  CLAUDE_GLOBAL_CONFIG_BYTES,
+  helperCommand,
+  prepareClaudeConfigDir,
+  runBounded,
+  type HelperResult,
+  type PrepareDeps,
+} from "../src/claude-global-config.js";
+import { RUNNER_UID, setprivRunnerArgs } from "../src/runner-uid.js";
 import { claudeConfigDir } from "../src/claude-config-dir.js";
 import { rmHomeTree, PURGE_CHILDREN_SCRIPT } from "../src/rmtree.js";
 import { spawnDetached } from "../src/sdk-spawn.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 
 /**
- * PRD #4416: direct tests of the config-directory preparation and of the spawn seam. One uid cannot
- * show the kernel's sticky/ownership enforcement (the runner being unable to rename or write into
- * the worker-owned directory); these tests show the worker-side behaviour: what is built, what is
+ * Direct tests of the config-directory preparation and of the spawn seam: what is built, what is
  * reused, what is moved aside, what is refused, and that nothing is followed or deleted.
  */
 
@@ -39,13 +45,53 @@ let outside: string;
 let savedSplit: string | undefined;
 let counter = 0;
 
-/** The runner-uid mkdir stand-in for tests: the same argv, run directly (these tests are one uid). */
-const mkdirStub = (args: readonly string[]): number => {
-  execFileSync("/bin/mkdir", [...args]);
-  return 0;
+/** The runner-uid helper stand-in for tests: the same argv, run directly (these tests are one uid). */
+const runDirect = (bin: string, args: readonly string[]): HelperResult => {
+  const r = spawnSync(bin, [...args], { encoding: "utf8" });
+  return { status: r.status, signal: r.signal, stdout: r.stdout ?? "" };
 };
+
+/** One line of the stat helper's output, as `stat -c '%u|%a|%F|%n'` prints it. */
+const statLine = (uid: number, mode: string, kind: string, p: string): string => `${uid}|${mode}|${kind}|${p}\n`;
+
+interface ModelOptions {
+  /** Force the exit status of the n-th (1-based) mkdir; undefined runs the real mkdir. */
+  mkdir?: (args: readonly string[], n: number) => number | undefined;
+  /** What the stat helper returns; a function can throw to model a stuck helper. */
+  stat?: string | HelperResult | ((args: readonly string[]) => HelperResult);
+}
+
+/** A runner-uid helper model that records every call: real mkdir, scripted stat. */
+function helpers(o: ModelOptions = {}): { run: (bin: string, args: readonly string[]) => HelperResult; calls: Array<{ bin: string; args: string[] }> } {
+  const calls: Array<{ bin: string; args: string[] }> = [];
+  let mkdirs = 0;
+  const run = (bin: string, args: readonly string[]): HelperResult => {
+    calls.push({ bin, args: [...args] });
+    if (bin === "/bin/stat") {
+      const out = typeof o.stat === "function" ? o.stat(args) : o.stat ?? { status: 1, signal: null, stdout: "" };
+      return typeof out === "string" ? { status: 0, signal: null, stdout: out } : out;
+    }
+    const forced = bin === "/bin/mkdir" ? o.mkdir?.(args, ++mkdirs) : undefined;
+    if (forced !== undefined) return { status: forced, signal: null, stdout: "" };
+    return runDirect(bin, args);
+  };
+  return { run, calls };
+}
+
+/** Ancestor stats that hide the host's real layout: every path is a root-owned 0755 directory unless overridden. */
+function ancestors(over: Record<string, { mode?: number; uid?: number; gid?: number }> = {}): (p: string) => fs.Stats {
+  return (p) => {
+    const st = fs.lstatSync(p);
+    return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { mode: 0o40755, uid: 0, gid: 0, ...over[p] });
+  };
+}
+
 const prep = (env: Parameters<typeof prepareClaudeConfigDir>[0], deps: PrepareDeps = {}): void =>
-  prepareClaudeConfigDir(env, { mkdirAsRunner: mkdirStub, ...deps });
+  prepareClaudeConfigDir(env, {
+    runAsRunner: runDirect,
+    ...(process.env.UZI_UID_SPLIT === "1" ? { lstatAncestor: ancestors() } : {}),
+    ...deps,
+  });
 /** rm -rf that first restores owner write on directories (the one-uid directory is 0555). */
 function rmAll(p: string): void {
   let st: fs.Stats;
@@ -59,21 +105,6 @@ function rmAll(p: string): void {
     for (const e of fs.readdirSync(p)) rmAll(path.join(p, e));
   }
   fs.rmSync(p, { recursive: true, force: true });
-}
-
-/** Run `fn` with fs.statSync reporting the parent directory with the given mode and gid. */
-function withParent(mode: number, gid: number, fn: () => void, parentOf?: string): void {
-  const real = fs.statSync;
-  const parent = parentOf ?? path.dirname(home);
-  (fs as { statSync: typeof fs.statSync }).statSync = ((p: fs.PathLike, ...rest: unknown[]) => {
-    const st = (real as (...a: unknown[]) => fs.Stats)(p, ...rest);
-    return String(p) === parent ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { mode, gid }) : st;
-  }) as typeof fs.statSync;
-  try {
-    fn();
-  } finally {
-    (fs as { statSync: typeof fs.statSync }).statSync = real;
-  }
 }
 
 const dirOf = (): string => claudeConfigDir(home);
@@ -121,59 +152,53 @@ describe("prepareClaudeConfigDir: build and reuse", () => {
     assert.deepStrictEqual(fs.readdirSync(home).sort(), [".claude", ".uzi-claude-config"], "no temp or stale entry left");
   });
 
-  it("creates the targets through the runner-uid mkdir seam only, with a fixed argv, and repeats nothing", () => {
-    const calls: string[][] = [];
-    const rec = (args: readonly string[]): number => {
-      calls.push([...args]);
-      return mkdirStub(args);
-    };
-    prepareClaudeConfigDir(envOf(), { mkdirAsRunner: rec });
+  it("creates the targets through the runner-uid helper seam only, with a fixed argv, and repeats nothing", () => {
+    const h = helpers();
+    prepareClaudeConfigDir(envOf(), { runAsRunner: h.run });
     const claude = path.join(home, ".claude");
-    assert.deepStrictEqual(calls, [
-      ["-p", "-m", "700", "--", claude],
-      ["-p", "-m", "700", "--", path.join(claude, "projects"), path.join(claude, "tasks")],
+    assert.deepStrictEqual(h.calls, [
+      { bin: "/bin/mkdir", args: ["-p", "-m", "700", "--", claude] },
+      { bin: "/bin/mkdir", args: ["-p", "-m", "700", "--", path.join(claude, "projects"), path.join(claude, "tasks")] },
     ]);
-    prepareClaudeConfigDir(envOf(), { mkdirAsRunner: rec });
-    assert.strictEqual(calls.length, 2, "existing targets spawn nothing");
+    prepareClaudeConfigDir(envOf(), { runAsRunner: h.run });
+    assert.strictEqual(h.calls.length, 2, "existing targets spawn nothing");
     fs.rmSync(path.join(claude, "tasks"), { recursive: true });
-    prepareClaudeConfigDir(envOf(), { mkdirAsRunner: rec });
-    assert.deepStrictEqual(calls[2], ["-p", "-m", "700", "--", path.join(claude, "tasks")]);
+    prepareClaudeConfigDir(envOf(), { runAsRunner: h.run });
+    assert.deepStrictEqual(h.calls[2], { bin: "/bin/mkdir", args: ["-p", "-m", "700", "--", path.join(claude, "tasks")] });
   });
 
-  it("a failing runner-uid mkdir refuses the start and builds no config directory", () => {
-    let calls = 0;
-    assert.throws(
-      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { calls++; return 1; } }),
-      /the runner could not create \.claude/,
-    );
-    assert.strictEqual(calls, 1, "the .claude creation is not retried");
+  it("a failing runner-uid mkdir of .claude refuses the start and builds no config directory", () => {
+    const h = helpers({ mkdir: () => 1 });
+    assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: h.run }), /the runner could not create \.claude/);
+    assert.strictEqual(h.calls.length, 1, "the .claude creation is not retried and no stat probe runs");
     assert.ok(!fs.existsSync(dirOf()));
   });
 
-  for (const status of [126, 127, 2]) {
+  for (const status of [124, 125, 126, 127, 137, 2]) {
     it(`a runner mkdir exiting ${status} (not mkdir's own failure status 1) refuses without moving .claude aside`, () => {
       fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
       fs.writeFileSync(path.join(home, ".claude", "projects", "keep.jsonl"), "x");
-      let calls = 0;
-      assert.throws(
-        () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { calls++; return status; } }),
-        /did not complete/,
-      );
-      assert.strictEqual(calls, 1);
+      const h = helpers({ mkdir: () => status });
+      assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: h.run }), /did not complete/);
+      assert.strictEqual(h.calls.length, 1);
       assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0, "no aside");
       assert.ok(fs.existsSync(path.join(home, ".claude", "projects", "keep.jsonl")));
     });
   }
 
-  it("a transient runner mkdir failure (spawn error, signal, timeout) refuses this start and keeps .claude in place", () => {
-    fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
-    fs.writeFileSync(path.join(home, ".claude", "projects", "keep.jsonl"), "x");
-    assert.throws(
-      () => prepareClaudeConfigDir(envOf(), { mkdirAsRunner: () => { throw new TrustedExecutionRefusal("transient"); } }),
-      TrustedExecutionRefusal,
-    );
-    assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0, "no aside on a transient failure");
-    assert.ok(fs.existsSync(path.join(home, ".claude", "projects", "keep.jsonl")), "the transcripts stay where resume finds them");
+  it("a transient runner helper failure (a throw, a signal, a null status) refuses this start and keeps .claude in place", () => {
+    const outcomes: Array<(bin: string, args: readonly string[]) => HelperResult> = [
+      () => { throw new TrustedExecutionRefusal("transient"); },
+      () => ({ status: null, signal: "SIGKILL", stdout: "" }),
+      () => ({ status: null, signal: null, stdout: "" }),
+    ];
+    for (const outcome of outcomes) {
+      fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
+      fs.writeFileSync(path.join(home, ".claude", "projects", "keep.jsonl"), "x");
+      assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: outcome }), TrustedExecutionRefusal);
+      assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0, "no aside on a transient failure");
+      assert.ok(fs.existsSync(path.join(home, ".claude", "projects", "keep.jsonl")), "the transcripts stay where resume finds them");
+    }
   });
 
   it("one uid: a CLI that tries to write the directory fails, so repeated starts reuse it and leave no stale copy", { skip: process.getuid?.() === 0 }, () => {
@@ -222,6 +247,26 @@ describe("prepareClaudeConfigDir: build and reuse", () => {
     prep(envOf());
     assertFixedDir(dirOf());
     assert.deepStrictEqual(staleNames(), []);
+  });
+
+  it("under the split, a successful rewrite on the last attempt after three re-corruptions is not a refusal", () => {
+    process.env.UZI_UID_SPLIT = "1";
+    prep(envOf());
+    const file = path.join(dirOf(), ".claude.json");
+    fs.chmodSync(file, 0o644);
+    fs.writeFileSync(file, MALICIOUS);
+    let rewrites = 0;
+    prep(envOf(), {
+      onStep: (name) => {
+        if (name !== "rewritten") return;
+        if (++rewrites <= 3) {
+          fs.chmodSync(file, 0o644);
+          fs.writeFileSync(file, MALICIOUS);
+        }
+      },
+    });
+    assert.strictEqual(rewrites, 4);
+    assertFixedDir(dirOf());
   });
 
   it("a session transcript under HOME/.claude/projects is visible through the directory (resume)", () => {
@@ -430,37 +475,150 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
     assertFixedDir(dirOf());
   });
 
-  it("a runner mkdir that fails once is retried after .claude is moved aside; failing twice refuses", () => {
-    fs.mkdirSync(path.join(home, ".claude"));
-    let calls = 0;
-    prepareClaudeConfigDir(envOf(), {
-      mkdirAsRunner: (a) => {
-        if (++calls === 1) return 1;
-        return mkdirStub(a);
-      },
+  describe("a failed targets mkdir moves .claude aside only on a positive obstruction (uid split)", () => {
+    const claude = (): string => path.join(home, ".claude");
+    const clean = (): string => statLine(RUNNER_UID, "700", "directory", claude());
+    const failTargetsOnce = (_args: readonly string[], n: number): number | undefined => (n === 1 ? 1 : undefined);
+    const failEveryTargets = (args: readonly string[]): number | undefined => (args.at(-1) === claude() ? undefined : 1);
+    const statArgs = (...missing: string[]): string[] => ["-c", "%u|%a|%F|%n", "--", claude(), ...missing];
+    beforeEach(() => {
+      process.env.UZI_UID_SPLIT = "1";
+      fs.mkdirSync(claude());
     });
-    assert.strictEqual(calls, 3, "targets (fails), .claude, targets");
-    assert.strictEqual(claudeStale().length, 1);
-    assertTargets();
+    const untouched = (): void => {
+      assert.strictEqual(claudeStale().length, 0, "no aside");
+      assert.ok(fs.statSync(claude()).isDirectory());
+      assert.ok(!fs.existsSync(dirOf()), "no config directory is built");
+    };
 
-    const h = path.join(root, "twice");
-    fs.mkdirSync(path.join(h, ".claude"), { recursive: true });
-    // Only the TARGETS mkdir exits non-zero; creating .claude itself succeeds, so the retry-once
-    // guard (not the .claude creation) is what refuses.
-    const claudeH = path.join(h, ".claude");
-    const calls2: string[][] = [];
-    assert.throws(
-      () => prepareClaudeConfigDir(envOf(h), {
-        mkdirAsRunner: (a) => {
-          calls2.push([...a]);
-          return a.length === 5 && a[4] === claudeH ? mkdirStub(a) : 1;
-        },
-      }),
-      TrustedExecutionRefusal,
-    );
-    assert.strictEqual(calls2.length, 3, "targets exit 1, .claude aside and recreated, targets exit 1 again, then refusal");
-    assert.strictEqual(fs.readdirSync(h).filter((e) => e.startsWith(".claude.stale-")).length, 1, "exactly one aside");
-    assert.ok(!fs.existsSync(claudeConfigDir(h)), "no config directory is built");
+    it("a file planted at a target: .claude is moved aside once, the targets are recreated, the start proceeds", () => {
+      const projects = path.join(claude(), "projects");
+      const h = helpers({
+        mkdir: failTargetsOnce,
+        stat: clean() + statLine(RUNNER_UID, "600", "regular empty file", projects),
+      });
+      prep(envOf(), { runAsRunner: h.run });
+      assert.strictEqual(claudeStale().length, 1);
+      assertTargets();
+      assertFixedDir(dirOf());
+      assert.deepStrictEqual(h.calls[1], { bin: "/bin/stat", args: statArgs(projects, path.join(claude(), "tasks")) });
+      assert.deepStrictEqual(h.calls.map((c) => c.bin), ["/bin/mkdir", "/bin/stat", "/bin/mkdir", "/bin/mkdir"]);
+    });
+
+    const obstructions: Array<[string, () => string]> = [
+      ["a regular file at a target", () => clean() + statLine(RUNNER_UID, "600", "regular file", "PROJECTS")],
+      ["an empty regular file at a target", () => clean() + statLine(RUNNER_UID, "600", "regular empty file", "PROJECTS")],
+      ["a symlink at a target", () => clean() + statLine(RUNNER_UID, "777", "symbolic link", "PROJECTS")],
+      ["a fifo at a target", () => clean() + statLine(RUNNER_UID, "600", "fifo", "PROJECTS")],
+      ["a .claude owned by another uid", () => statLine(RUNNER_UID + 100, "700", "directory", "CLAUDE")],
+      ["a .claude without owner read", () => statLine(RUNNER_UID, "300", "directory", "CLAUDE")],
+      ["a .claude without owner write", () => statLine(RUNNER_UID, "500", "directory", "CLAUDE")],
+      ["a .claude without owner search", () => statLine(RUNNER_UID, "600", "directory", "CLAUDE")],
+      ["a .claude with mode 0", () => statLine(RUNNER_UID, "0", "directory", "CLAUDE")],
+    ];
+    for (const [label, make] of obstructions) {
+      it(`${label} is a positive obstruction`, () => {
+        const out = make().replaceAll("PROJECTS", path.join(claude(), "projects")).replaceAll("CLAUDE", claude());
+        const h = helpers({ mkdir: failTargetsOnce, stat: out });
+        prep(envOf(), { runAsRunner: h.run });
+        assert.strictEqual(claudeStale().length, 1);
+        assertTargets();
+      });
+    }
+
+    it("a second obstruction after the move refuses, with exactly one aside", () => {
+      const out = clean() + statLine(RUNNER_UID, "600", "regular file", path.join(claude(), "projects"));
+      const h = helpers({ mkdir: failEveryTargets, stat: out });
+      assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /could not create the \.claude targets/);
+      assert.strictEqual(claudeStale().length, 1);
+      assert.deepStrictEqual(h.calls.map((c) => c.bin), ["/bin/mkdir", "/bin/stat", "/bin/mkdir", "/bin/mkdir", "/bin/stat"]);
+      assert.ok(!fs.existsSync(dirOf()));
+    });
+
+    it("a setpriv user-lookup failure (mkdir exit 1, no stat output) refuses and leaves .claude in place", () => {
+      const h = helpers({ mkdir: failTargetsOnce, stat: { status: 1, signal: null, stdout: "" } });
+      assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /did not complete/);
+      untouched();
+    });
+
+    it("a capacity failure (mkdir exit 1, stat shows clean directories) refuses and leaves .claude in place", () => {
+      const h = helpers({ mkdir: failTargetsOnce, stat: clean() });
+      assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /did not complete/);
+      untouched();
+    });
+
+    it("output for paths that were not asked about, or only share a prefix, is not evidence", () => {
+      const projects = path.join(claude(), "projects");
+      const stat = clean() + statLine(RUNNER_UID, "600", "regular file", `${projects}x`) + statLine(RUNNER_UID, "600", "regular file", path.join(home, "other"))
+        + statLine(RUNNER_UID, "600", "regular file", `${projects}/`) + `garbage\n${RUNNER_UID}|600|regular file\n`;
+      const h = helpers({ mkdir: failTargetsOnce, stat });
+      assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /did not complete/);
+      untouched();
+    });
+
+    it("a stuck or killed stat helper refuses and leaves .claude in place", () => {
+      const outcomes: Array<(args: readonly string[]) => HelperResult> = [
+        () => { throw new TrustedExecutionRefusal("stuck"); },
+        () => ({ status: null, signal: "SIGKILL", stdout: "" }),
+      ];
+      for (const stat of outcomes) {
+        const h = helpers({ mkdir: failTargetsOnce, stat });
+        assert.throws(() => prep(envOf(), { runAsRunner: h.run }), TrustedExecutionRefusal);
+        untouched();
+      }
+    });
+
+    it("stat's exit status is ignored: partial output with a positive obstruction still counts", () => {
+      const out = statLine(RUNNER_UID, "600", "regular file", path.join(claude(), "projects"));
+      const h = helpers({ mkdir: failTargetsOnce, stat: { status: 124, signal: null, stdout: out } });
+      prep(envOf(), { runAsRunner: h.run });
+      assert.strictEqual(claudeStale().length, 1);
+    });
+
+    it("a total deadline passed between helpers refuses before the next spawn and keeps the tree", () => {
+      let t = 0;
+      const h = helpers({ mkdir: () => 1, stat: clean() });
+      const slow = (bin: string, args: readonly string[]): HelperResult => {
+        const r = h.run(bin, args);
+        t += 11_000;
+        return r;
+      };
+      assert.throws(() => prep(envOf(), { runAsRunner: slow, now: () => t }), /time limit/);
+      assert.deepStrictEqual(h.calls.map((c) => c.bin), ["/bin/mkdir"], "no helper starts once the deadline has passed");
+      untouched();
+    });
+
+    it("a deadline not yet reached lets every helper run", () => {
+      let t = 0;
+      const h = helpers({ mkdir: failTargetsOnce, stat: clean() + statLine(RUNNER_UID, "600", "regular file", path.join(claude(), "projects")) });
+      const step = (bin: string, args: readonly string[]): HelperResult => {
+        t += 2_000;
+        return h.run(bin, args);
+      };
+      prep(envOf(), { runAsRunner: step, now: () => t });
+      assert.strictEqual(claudeStale().length, 1);
+    });
+  });
+
+  describe("one uid: no stat or timeout helper; the worker inspects .claude itself", () => {
+    const claude = (): string => path.join(home, ".claude");
+    beforeEach(() => fs.mkdirSync(claude(), { mode: 0o700 }));
+
+    it("mkdir failing with clean directories refuses, spawns only mkdir and leaves .claude in place", () => {
+      const h = helpers({ mkdir: () => 1 });
+      assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: h.run }), /did not complete/);
+      assert.deepStrictEqual([...new Set(h.calls.map((c) => c.bin))], ["/bin/mkdir"]);
+      assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0);
+    });
+
+    it("mkdir failing with an owner-unwritable .claude moves it aside once and the start proceeds", () => {
+      fs.chmodSync(claude(), 0o500);
+      const h = helpers({ mkdir: (_a, n) => (n === 1 ? 1 : undefined) });
+      prepareClaudeConfigDir(envOf(), { runAsRunner: h.run });
+      assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 1);
+      assert.deepStrictEqual([...new Set(h.calls.map((c) => c.bin))], ["/bin/mkdir"]);
+      assertFixedDir(dirOf());
+    });
   });
 
   describe("one uid: a 0555 config directory that was tampered with is detected and rebuilt", { skip: process.getuid?.() === 0 }, () => {
@@ -512,49 +670,76 @@ describe("prepareClaudeConfigDir: the uid-split checks", () => {
     assert.strictEqual(fs.readFileSync(path.join(outside, ".config.json"), "utf8"), "SENTINEL-CONFIG");
   });
 
-  it("refuses a HOME whose parent is world-writable and not sticky; group-writable (a hosted 2775 data root) and sticky parents are accepted", () => {
-    const parent = path.join(root, "parent");
-    fs.mkdirSync(parent);
-    const h = path.join(parent, "h");
-    fs.mkdirSync(h);
-    fs.chmodSync(parent, 0o777);
-    assert.throws(() => prep(envOf(h)), TrustedExecutionRefusal);
-    assert.deepStrictEqual(fs.readdirSync(h), []);
-    fs.chmodSync(parent, 0o2775);
-    // The hosted data root is group worker (10001); this test process's own group is not that.
-    withParent(0o42775, 10001, () => prep(envOf(h)), parent);
-    assertFixedDir(claudeConfigDir(h));
-    fs.rmSync(claudeConfigDir(h), { recursive: true });
-    fs.chmodSync(parent, 0o777);
-    assert.throws(() => prep(envOf(h)), TrustedExecutionRefusal);
-    fs.chmodSync(parent, 0o1777);
-    prep(envOf(h));
-    assertFixedDir(claudeConfigDir(h));
-    // Single-uid: no such check.
+  const self = (): number => process.getuid?.() ?? 0;
+  const parentOf = (): string => path.dirname(home);
+  const grandparentOf = (): string => path.dirname(parentOf());
+  const withAncestors = (over: Record<string, { mode?: number; uid?: number; gid?: number }>): PrepareDeps => ({ lstatAncestor: ancestors(over) });
+  const refusedNothingBuilt = (deps: PrepareDeps, message?: RegExp): void => {
+    assert.throws(() => prep(envOf(), deps), message ?? TrustedExecutionRefusal);
+    assert.deepStrictEqual(fs.readdirSync(home), [], "nothing was built");
+  };
+
+  it("refuses a HOME whose parent is world-writable and not sticky; a sticky world-writable parent is accepted", () => {
+    refusedNothingBuilt(withAncestors({ [parentOf()]: { mode: 0o40777, uid: self() } }), /world-writable/);
+    prep(envOf(), withAncestors({ [parentOf()]: { mode: 0o41777, uid: self() } }));
+    assertFixedDir(dirOf());
+  });
+
+  it("single-uid: no ancestor check is made", () => {
     delete process.env.UZI_UID_SPLIT;
-    fs.rmSync(claudeConfigDir(h), { recursive: true });
-    fs.chmodSync(parent, 0o777);
-    prep(envOf(h));
-  });
-});
-
-describe("prepareClaudeConfigDir: a group-writable non-sticky parent in a runner group", () => {
-  beforeEach(() => {
-    process.env.UZI_UID_SPLIT = "1";
+    prep(envOf(), withAncestors({ [parentOf()]: { mode: 0o40777, uid: 12345 } }));
+    assertFixedDir(dirOf());
   });
 
-  for (const gid of [10002, 10003, 10004]) {
-    it(`refuses gid ${gid} with mode 2775 (group-writable, not sticky)`, () => {
-      withParent(0o40775, gid, () => assert.throws(() => prep(envOf()), TrustedExecutionRefusal));
-      assert.deepStrictEqual(fs.readdirSync(home), [], "nothing was built");
-    });
-  }
+  it("refuses a parent owned by a runner uid, and any ancestor owned by neither root nor the worker", () => {
+    for (const uid of [10002, 10003, 12345].filter((u) => u !== self())) {
+      refusedNothingBuilt(withAncestors({ [parentOf()]: { uid } }), /owned by neither root nor the worker/);
+      refusedNothingBuilt(withAncestors({ [grandparentOf()]: { uid } }), /owned by neither root nor the worker/);
+      refusedNothingBuilt(withAncestors({ "/": { uid } }), /owned by neither root nor the worker/);
+    }
+    prep(envOf(), withAncestors({ [parentOf()]: { uid: self() }, [grandparentOf()]: { uid: 0 } }));
+    assertFixedDir(dirOf());
+  });
 
-  it("accepts the hosted 2775 data root (group 10001), a sticky parent in a runner group, and a parent not group-writable", () => {
-    for (const [mode, gid] of [[0o42775, 10001], [0o41775, 10002], [0o40755, 10002]] as const) {
-      withParent(mode, gid, () => prep(envOf()));
-      assertFixedDir(dirOf());
-      fs.rmSync(dirOf(), { recursive: true, force: true });
+  it("refuses a HOME owned by another uid and builds nothing; a HOME owned by the worker is accepted", () => {
+    const asOwnedBy = (uid: number) => (p: string): fs.Stats => Object.assign(Object.create(Object.getPrototypeOf(fs.lstatSync(p))), fs.lstatSync(p), { uid });
+    refusedNothingBuilt({ lstatHome: asOwnedBy(self() + 1) }, /HOME is not owned by the worker/);
+    prep(envOf(), { lstatHome: asOwnedBy(self()) });
+    assertFixedDir(dirOf());
+  });
+
+  it("refuses an ancestor that is a symlink, at any depth", () => {
+    for (const p of [parentOf(), grandparentOf(), "/"]) {
+      refusedNothingBuilt(withAncestors({ [p]: { mode: 0o120777 } }), /not a real directory/);
+    }
+  });
+
+  it("refuses a HOME that is reached through a symlinked directory", () => {
+    const link = path.join(root, "linkdir");
+    fs.symlinkSync(parentOf(), link);
+    const viaLink = path.join(link, path.basename(home));
+    assert.throws(() => prep(envOf(viaLink)), /not its own real path/);
+    assert.deepStrictEqual(fs.readdirSync(home), []);
+  });
+
+  it("refuses a non-sticky group-writable ancestor in a runner group, at any depth", () => {
+    for (const gid of [10002, 10003, 10004]) {
+      refusedNothingBuilt(withAncestors({ [parentOf()]: { mode: 0o40775, gid } }), /group-writable by a runner group/);
+      refusedNothingBuilt(withAncestors({ [grandparentOf()]: { mode: 0o42775, gid } }), /group-writable by a runner group/);
+    }
+  });
+
+  it("refuses a non-sticky world-writable ancestor above the parent", () => {
+    refusedNothingBuilt(withAncestors({ [grandparentOf()]: { mode: 0o40777 } }), /world-writable/);
+  });
+
+  it("accepts the hosted 2775 data root (group 10001), a sticky ancestor in a runner group, and ancestors that are not group-writable", () => {
+    for (const [mode, gid] of [[0o42775, 10001], [0o41775, 10002], [0o40755, 10002], [0o43775, 10001]] as const) {
+      for (const p of [parentOf(), grandparentOf()]) {
+        prep(envOf(), withAncestors({ [p]: { mode, gid, uid: self() } }));
+        assertFixedDir(dirOf());
+        fs.rmSync(dirOf(), { recursive: true, force: true });
+      }
     }
   });
 });
@@ -609,7 +794,8 @@ describe("prepareClaudeConfigDir: a hostile process acting between any two steps
           setup();
           let n = 0;
           const deps: PrepareDeps = {
-            mkdirAsRunner: mkdirStub,
+            runAsRunner: runDirect,
+            lstatAncestor: ancestors(),
             onStep: () => {
               if (n++ === at) {
                 try {
@@ -736,5 +922,139 @@ describe("a HOME that contains the config directory reclaims fully", () => {
     });
     assert.strictEqual(purged, 1);
     assert.ok(!fs.existsSync(home));
+  });
+});
+
+describe("the bounded runner helper", () => {
+  it("under the split each helper is the runner-uid setpriv around timeout -s KILL 2", () => {
+    assert.deepStrictEqual(helperCommand("/bin/mkdir", ["-p", "--", "/x"], true), {
+      command: "/bin/setpriv",
+      args: [...setprivRunnerArgs(), "/usr/bin/timeout", "-s", "KILL", "2", "/bin/mkdir", "-p", "--", "/x"],
+    });
+    assert.deepStrictEqual(helperCommand("/bin/stat", ["-c", "%u", "--", "/x"], false), {
+      command: "/bin/stat",
+      args: ["-c", "%u", "--", "/x"],
+    });
+  });
+
+  it("the helper's stdout reaches the caller through the intermediary's output file", () => {
+    const r = runBounded("/bin/sh", ["-c", "printf '10002|2700|directory|/x\\n'"]);
+    assert.deepStrictEqual(r, { status: 0, signal: null, stdout: "10002|2700|directory|/x\n" });
+    assert.strictEqual(runBounded("/bin/sh", ["-c", "exit 1"]).status, 1);
+  });
+
+  it("a helper that ignores its own timeout is cut off by the intermediary's kill within the bound, and the preparation treats it as transient", { skip: !fs.existsSync("/bin/sh") || !fs.existsSync("/bin/sleep") }, () => {
+    const SHORT_TIMEOUT_MS = 200;
+    const t0 = Date.now();
+    assert.throws(() => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 3"], SHORT_TIMEOUT_MS), TrustedExecutionRefusal);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 2_000, `returned after ${elapsed} ms`);
+    // The same through the preparation: it refuses and moves nothing.
+    fs.mkdirSync(path.join(home, ".claude", "projects"), { recursive: true });
+    const stuck = (): HelperResult => runBounded("/bin/sh", ["-c", "trap '' TERM; exec sleep 3"], SHORT_TIMEOUT_MS);
+    assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: stuck }), TrustedExecutionRefusal);
+    assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), []);
+  });
+
+  it("output over 64 KiB refuses, and a stat helper doing that moves nothing", () => {
+    const big = (): HelperResult => runBounded("/bin/sh", ["-c", "head -c 70000 /dev/zero"]);
+    assert.throws(() => big(), /output limit/);
+    process.env.UZI_UID_SPLIT = "1";
+    const claude = path.join(home, ".claude");
+    fs.mkdirSync(claude);
+    const h = helpers({ mkdir: () => 1, stat: () => big() });
+    assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /output limit/);
+    assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".stale-")), []);
+    assert.ok(fs.statSync(claude).isDirectory());
+  });
+
+  it("a command that does not exist returns status 127", () => {
+    const r = runBounded(path.join(root, "no-such-binary"), []);
+    assert.strictEqual(r.status, 127);
+  });
+
+  it("leaves no output directory behind", () => {
+    const savedTmp = process.env.TMPDIR;
+    const priv = fs.mkdtempSync(path.join(root, "tmpdir-"));
+    process.env.TMPDIR = priv;
+    try {
+      runBounded("/bin/sh", ["-c", "true"]);
+      assert.throws(() => runBounded("/bin/sh", ["-c", "head -c 70000 /dev/zero"]));
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+    }
+    assert.deepStrictEqual(fs.readdirSync(priv), []);
+  });
+});
+
+describe("prepareClaudeConfigDir: the final rename failing", () => {
+  const eacces = (): never => {
+    throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+  };
+
+  it("EACCES with a valid directory a concurrent prepare installed reuses it and builds nothing more", () => {
+    let calls = 0;
+    prep(envOf(), {
+      rename: (from, to) => {
+        calls++;
+        prep(envOf()); // the winner installs its own directory first
+        assert.ok(from !== to);
+        eacces();
+      },
+    });
+    assert.strictEqual(calls, 1);
+    assertFixedDir(dirOf());
+    assert.deepStrictEqual(staleNames(), []);
+    assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".tmp-")), [], "the loser's temp is removed");
+  });
+
+  it("EACCES with nothing valid at the destination refuses and leaves no temp", () => {
+    assert.throws(() => prep(envOf(), { rename: () => eacces() }), TrustedExecutionRefusal);
+    assert.ok(!fs.existsSync(dirOf()));
+    assert.deepStrictEqual(fs.readdirSync(home).filter((f) => f.includes(".tmp-")), []);
+  });
+
+  it("a changed entry at the destination re-enters the loop: the bad entry is moved aside and the next attempt installs", () => {
+    let n = 0;
+    prep(envOf(), {
+      rename: (from, to) => {
+        if (++n === 1) {
+          fs.mkdirSync(dirOf());
+          fs.writeFileSync(path.join(dirOf(), "planted"), "x");
+          eacces();
+        }
+        fs.renameSync(from, to);
+      },
+    });
+    assert.strictEqual(n, 2);
+    assertFixedDir(dirOf());
+    assert.strictEqual(staleNames().length, 1);
+  });
+
+  it("a successful install on the last attempt after three failed ones is not a refusal", () => {
+    let n = 0;
+    prep(envOf(), {
+      rename: (from, to) => {
+        if (++n <= 3) {
+          fs.mkdirSync(dirOf());
+          fs.writeFileSync(path.join(dirOf(), "planted"), "x");
+          throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+        }
+        fs.renameSync(from, to);
+      },
+    });
+    assert.strictEqual(n, 4);
+    assertFixedDir(dirOf());
+  });
+
+  it("EEXIST-class errors with another valid directory present reuse it", () => {
+    prep(envOf(), {
+      rename: () => {
+        prep(envOf());
+        throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+      },
+    });
+    assertFixedDir(dirOf());
   });
 });

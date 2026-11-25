@@ -399,8 +399,8 @@ SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE;
 -- usage reserve, NULL threshold = off.
 -- judge_runs_on (PRD #3257) rides it too; NULL means the judge runs on the harness of the run it
 -- reviews, the settings surface exposes it as nullable claude|codex.
--- claude_provider_id (PRD #4320 M4) rides it too, read-only on the settings surface: the owner's
--- Claude model-provider source (NULL = the vendor ladder); written only by PUT /me/providers/claude-source.
+-- claude_provider_id (PRD #4320 M4) and codex_provider_id ride it too, read-only on the settings surface: the owner's
+-- per-engine model-provider sources (NULL = the respective vendor ladder); written only by the source routes.
 -- planning_claude_model and planning_claude_effort (PRD #3252) ride it too: the owner's Claude
 -- planning pair, NULL = "Same as the run"; written by SetUserPlanningClaude.
 -- task_review_model and codex_task_review_model (PRD #1570) ride it too: the owner's per-harness
@@ -408,7 +408,7 @@ SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE;
 -- matching efforts, NULL = inherit the worker effort.
 -- weekly_warning_margin_pts (PRD #4123 M2) rides it too: the early weekly-limit warning margin
 -- (0 = off, default 15); written by SetUserWeeklyWarningMargin.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion, planning_claude_model, planning_claude_effort, planning_codex_model, planning_codex_effort, task_review_model, codex_task_review_model, task_review_effort, codex_task_review_effort, weekly_warning_margin_pts FROM users WHERE id = $1;
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, codex_provider_id, sidebar_motion, planning_claude_model, planning_claude_effort, planning_codex_model, planning_codex_effort, task_review_model, codex_task_review_model, task_review_effort, codex_task_review_effort, weekly_warning_margin_pts FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

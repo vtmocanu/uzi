@@ -190,7 +190,8 @@ func decodePlanningEffort(raw json.RawMessage, field string) (pgtype.Text, *sett
 	return pgtype.Text{String: e, Valid: true}, nil
 }
 
-// decodeDefaultHarnessField validates default_harness (PUT /api/me/settings only).
+// decodeDefaultHarnessField validates default_harness (PUT /api/me/settings and PUT
+// /api/me/model-settings).
 func decodeDefaultHarnessField(raw json.RawMessage) (pgtype.Text, *settingsFieldError) {
 	const field = "default_harness"
 	v, ferr := decodeNullableText(raw, field)

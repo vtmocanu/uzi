@@ -681,8 +681,9 @@ func (m *Materializer) wakeHeldForPods(w protocol.DesiredWorker, obs reconcile.O
 
 // wakeRollAdmitted keeps unreserved wakes on their existing hibernation-owned
 // path. A wake with open roll evidence must pass ordinary admission, including
-// the tick's uncertainty and migration fences. Readiness reporting needs no new
-// mutation admission, so a restored participant can still settle its wake.
+// the tick's uncertainty and migration fences. Template and replica mutations
+// therefore still require e.admitted; the one unadmitted write is the
+// annotation-only op binding of patchWakeOpAnnotation (see wakeAnnotationPermitted).
 func wakeRollAdmitted(ctx context.Context, id string) bool {
 	e := rollFrom(ctx, id)
 	if e == nil || (e.hibernation && !hibernationRollReservation(e) && !e.snapshotIncomplete) {
@@ -691,6 +692,52 @@ func wakeRollAdmitted(ctx context.Context, id string) bool {
 	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
 	return tick != nil && !e.hibernation && e.admitted &&
 		!tick.uncertain[coverageKey(e.coverage)] && !migrationLaneFenced(tick, e.coverage)
+}
+
+// wakeAnnotationPermitted reports whether an unadmitted wake may still write its op
+// annotation. It keeps wakeRollAdmitted's uncertainty and migration fences, adds the
+// entry-block, snapshot-complete and retained-history-retirement guards, and drops only
+// e.admitted. Some terms repeat the pass-2 caller's
+// filters and are kept for direct-call safety. historyRetireUnknown is set only by
+// retireHibernationHistory, which skips non-preparing workers, so for a waking entry it
+// is defensive only. A pool-level hold (blocker or poolReason with e.blocked == "")
+// deliberately does not stop this write: an annotation-only write changes neither
+// replicas nor the template, so it cannot undo a participant's Deployment fence (the
+// #4485 gate).
+func wakeAnnotationPermitted(ctx context.Context, id string) bool {
+	e := rollFrom(ctx, id)
+	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
+	return e != nil && tick != nil && !e.hibernation && e.blocked == "" && !e.snapshotIncomplete &&
+		!e.historyRetireUnknown && !tick.uncertain[coverageKey(e.coverage)] && !migrationLaneFenced(tick, e.coverage)
+}
+
+// patchWakeOpAnnotation sends one merge patch that sets only the hibernation-op
+// annotation, preconditioned on the observed uid and resourceVersion. Unlike
+// conditionedPatch it adds no operator labels or annotations. A Conflict writes nothing
+// and returns nil; any response that does not prove the advanced resourceVersion is an error.
+func (m *Materializer) patchWakeOpAnnotation(ctx context.Context, ns string, obs reconcile.ObservedWorker, name, op string) error {
+	if obs.DeploymentUID == "" || obs.DeploymentResourceVersion == "" {
+		return fmt.Errorf("hibernation mutation requires observed UID/resourceVersion")
+	}
+	body, err := json.Marshal(map[string]any{"metadata": map[string]any{
+		"uid":             obs.DeploymentUID,
+		"resourceVersion": obs.DeploymentResourceVersion,
+		"annotations":     map[string]string{annotationHibernationOp: op},
+	}})
+	if err != nil {
+		return err
+	}
+	got, err := m.client.AppsV1().Deployments(ns).Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
+	if err != nil {
+		if apierrors.IsConflict(err) {
+			return nil
+		}
+		return fmt.Errorf("patch deployment: %w", err)
+	}
+	if got == nil || string(got.UID) != obs.DeploymentUID || got.ResourceVersion == "" || got.ResourceVersion == obs.DeploymentResourceVersion {
+		return fmt.Errorf("patch deployment: response lacks the advanced resourceVersion")
+	}
+	return nil
 }
 
 // hibernateWake brings a hibernated worker back at its current template. It
@@ -738,6 +785,13 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 	drifted := obs.SpecHash != wantHash || obs.Generation != w.Generation
 	if asleep || obs.HibernationOp != op || drifted {
 		if !wakeRollAdmitted(ctx, w.ID) {
+			// An unadmitted wake (for example the canary of an in-flight roll) may still
+			// bind its op when that is the only thing missing: one replica, the current
+			// template, an older op. Nothing else is written.
+			if op != "" && obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 1 &&
+				!drifted && obs.HibernationOp != op && wakeAnnotationPermitted(ctx, w.ID) {
+				return m.patchWakeOpAnnotation(ctx, ns, obs, dep.Name, op)
+			}
 			return nil
 		}
 		// ONE conditioned patch: replicas 1, the current template and the op

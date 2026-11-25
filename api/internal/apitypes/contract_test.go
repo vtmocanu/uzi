@@ -107,6 +107,9 @@ func contractCases() []contractCase {
 		newContractCase[AdminUsageDTO]("admin_usage"),
 		newContractCase[RunOutcomesDTO]("run_outcomes"),
 		newContractCase[UserSettingsDTO]("user_settings"),
+		newContractCase[ProviderDTO]("provider"),
+		newContractCase[AdminSharedProviderDTO]("admin_shared_provider"),
+		newContractCase[AdminSharedProviderListDTO]("admin_shared_provider_list"),
 		// PRD #3254 M2: the effective-settings view. The model and effort cells embed the shared
 		// settings cells, so the full fixtures carry the embedded fields inline (like
 		// RunListItemDTO). The start-preview body is a request too: its full.json round-trips

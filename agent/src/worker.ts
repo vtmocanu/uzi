@@ -2,7 +2,7 @@ import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import { CLAUDE_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
 import { RUN_ENV_CAPABILITY } from "./run-env-claim.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
@@ -30,7 +30,7 @@ import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { memoryLauncherPreflight, type MemoryLauncherPreflightResult } from "./claude-command/preflight.js";
-import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
+import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_RUNTIME_V3_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { reportProofTiming } from "./report-proof-timing.js";
@@ -1090,10 +1090,12 @@ export class Worker {
           // worker advertising it, and client.ts requireProviderCapability still refuses a provider
           // claim on a registration that did not advertise it.
           CLAUDE_PROVIDER_CAPABILITY,
-          // PRD #4416 M2: this image decodes run_env / run_env_redact, injects the variables into the
-          // lead lane's env and registers the secret forms for redaction. Advertised UNCONDITIONALLY: the
-          // api sends variables only to a worker advertising it and requeues a claim for one that lacks it.
-          RUN_ENV_CAPABILITY,
+          // run_env_v1: this image decodes run_env / run_env_redact, injects the variables into the
+          // lead lane's env and registers the secret forms for redaction. Advertised only under the
+          // uid split (uidSplitActive); a single-uid worker does not advertise it, so the api's
+          // placement clause keeps runs that carry variables (or secret receipts) off it.
+          // sdk-executor's phaseSetup refusal (assertRunEnvDeliverable) is the second check.
+          ...(uidSplitActive() ? [RUN_ENV_CAPABILITY] : []),
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];
@@ -1125,12 +1127,17 @@ export class Worker {
         if (this.config.codexHarness?.advertise) {
           protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
           protocolCapabilities.push(CODEX_RUNTIME_V2_CAPABILITY);
+          protocolCapabilities.push(CODEX_RUNTIME_V3_CAPABILITY);
           protocolCapabilities.push(CODEX_COMPLETION_INTERLOCK_CAPABILITY);
           // PRD #1551 (D6): this build's renderer can pass a validated custom worker-root
           // model through unchanged, so advertise the custom-model capability under the same
           // gate. The API holds a custom-root Codex run for a worker that lacks it.
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
           protocolCapabilities.push(CODEX_PHASE_MODELS_CAPABILITY);
+          // PRD #4323: this build runs a provider-bound Codex claim on the frozen binding (the
+          // gateway key only, the mapped gateway model passed through unchanged), so it advertises
+          // codex_provider_v1 under the same gate and strictly with codex_custom_model_v1 above.
+          protocolCapabilities.push(CODEX_PROVIDER_CAPABILITY);
         }
         // issue #3639: the settlement capability rides only with the pressure capability (the same guard), so a worker
         // that cannot park for memory never offers to deliver a settlement receipt.

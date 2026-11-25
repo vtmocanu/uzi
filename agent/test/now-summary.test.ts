@@ -20,6 +20,8 @@ import {
 } from "../src/now-summary.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
+import { createCodexProviderExecutionAuthority } from "../src/codex/select.js";
+import { providerKeyForms } from "../src/redact.js";
 import { LimitReachedError } from "../src/limit.js";
 import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
 import { ownedSummaryFactories } from "../src/codex/summary-ownership.js";
@@ -158,6 +160,69 @@ async function running(h: ReturnType<typeof harness>, ...ids: string[]): Promise
   h.c.observeFrame(toolUse("lead", "Read", { file_path: "first.md" }));
   await h.clock.advance(0);
 }
+
+function providerNow(ignoreAbort = false) {
+  const h = harness({ codex: true, ignoreAbort });
+  const binding = createCodexProviderExecutionAuthority({
+    provider_id: "now-fixture", revision: 1, engine: "codex", protocol: "openai_responses",
+    auth_style: "bearer", base_url: "https://gateway.example/v1",
+    credential: 'fixture/key<&"encoded', model_map: { default: { model: "gateway-model" } },
+  });
+  const diagnostics: unknown[] = [];
+  h.deps.claim.codex = { ...h.deps.claim.codex!, binding };
+  h.deps.log = { ...nullLogger(), warn: (...args: unknown[]) => { diagnostics.push(args); } };
+  h.c = new NowSummaryController(h.deps);
+  return { ...h, binding, diagnostics };
+}
+
+describe("provider Now focused proofs", () => {
+  for (const stop of ["cancel", "claim-fence loss"] as const) {
+    it(`provider Now ${stop} aborts pending work and rejects late publication`, async () => {
+      const h = providerNow(true);
+      await running(h);
+      assert.equal(h.calls.length, 1);
+      if (stop === "cancel") h.st.life.abort();
+      else h.st.fence = "retired claim";
+      const stopped = h.c.stop();
+      assert.equal(h.calls[0]!.opts.signal!.aborted, true);
+      await h.clock.advance(NOW_STOP_BOUND_MS);
+      await stopped;
+      h.calls[0]!.opts.onUsage?.(usage(17, 5));
+      h.calls[0]!.resolve("Stale provider result");
+      await settle();
+      assert.deepEqual(h.notes(), []);
+      assert.equal(h.clock.pendingTimers, 0);
+    });
+  }
+
+  it("provider Now scrubs encoded text, usage member names and errors without logger helpers", async () => {
+    const h = providerNow();
+    const forms = providerKeyForms(h.binding.providerBinding.credential);
+    await running(h);
+    h.calls[0]!.opts.onUsage?.(Object.fromEntries(forms.map((form, i) => [
+      `model-${i}-${form}`, { inputTokens: 17, outputTokens: 5, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    ])));
+    h.calls[0]!.resolve("Working " + forms.join(" "));
+    await settle();
+    assert.equal(h.notes().length, 1);
+    const models = h.notes()[0]!.model_usage as AdviceUsageSnapshot;
+    assert.equal(Object.keys(models).length, forms.length);
+    for (const value of Object.values(models)) assert.equal(value.inputTokens, 17);
+    await h.clock.advance(NOW_MIN_INTERVAL_MS);
+    h.c.observeProgress(progress(["m2"], ["m1"]), frozen("m1", "m2"));
+    h.c.observeFrame(toolUse("lead", "Read", { file_path: "next.md" }));
+    await h.clock.advance(0);
+    assert.equal(h.calls.length, 2);
+    h.calls[1]!.reject(new Error(forms.join(" ")));
+    await settle();
+    assert.ok(h.diagnostics.length > 0);
+    for (const form of forms) {
+      assert.equal(JSON.stringify(h.notes()).includes(JSON.stringify(form).slice(1, -1)), false);
+      assert.equal(JSON.stringify(h.diagnostics).includes(JSON.stringify(form).slice(1, -1)), false);
+    }
+    await h.c.stop();
+  });
+});
 
 // Test-only provider whose raw run deliberately ignores abort. Completion includes its finally.
 function realCodexPass(owned: boolean) {
@@ -1141,7 +1206,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
     binding: {
       authMode: mode, accessToken: "B-token", capability: "B-cap",
       ...(mode === "subscription" ? { generation: 8, chatgptAccountId: "B-account", chatgptPlanType: null } : {}),
-    } as NonNullable<ReadOnlyModelPassOpts["codex"]>["binding"],
+    } as import("../src/codex/select.js").CodexBinding,
   });
 
   it("permits the switch-owned lifecycle stop but never a pause or terminal stop", async () => {
@@ -1162,6 +1227,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
       h.c.observeSetting();
       await h.clock.advance(0);
       assert.equal(h.calls.length, 2);
+      assert.ok(h.calls[1]!.opts.codex!.binding.authMode !== "provider");
       assert.equal(h.calls[1]!.opts.codex!.binding.accessToken, replace ? "B-token" : "A-token");
       h.calls[1]!.resolve("settled");
       await settle();
@@ -1287,6 +1353,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
       await held;
       await h.clock.advance(0);
       const next = h.calls[1]!;
+      assert.ok(next.opts.codex!.binding.authMode !== "provider");
       assert.equal(next.opts.codex!.binding.accessToken, "B-token");
       assert.equal(next.opts.codex!.binding.authMode, b.binding.authMode);
       assert.notEqual(next.opts.codex!.binding, old.binding);
@@ -1296,6 +1363,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
       assert.equal(next.opts.codex!.buildHarness, old.buildHarness);
       await next.opts.codex!.buildHarness(next.opts.codex!);
       assert.equal(h.factoryCalls.length, 1);
+      assert.ok(h.factoryCalls[0]!.binding.authMode !== "provider");
       assert.equal(h.factoryCalls[0]!.binding.accessToken, "B-token");
       assert.equal(h.factoryCalls[0]!.binding.authMode, b.binding.authMode);
       assert.equal(h.factoryCalls[0]!.claimGeneration, 7);

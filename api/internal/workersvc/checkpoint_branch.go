@@ -32,6 +32,12 @@ func checkpointBranch(kind string, runID uuid.UUID, issueIid pgtype.Int8) (strin
 	}
 }
 
+// CheckpointBranch is the exported form of checkpointBranch for callers outside the
+// package (the per-run CI-autofix handler derives a run's ref from it).
+func CheckpointBranch(kind string, runID uuid.UUID, issueIid pgtype.Int8) (string, bool) {
+	return checkpointBranch(kind, runID, issueIid)
+}
+
 // selfImproveBranch mirrors the worker's agent/src/self-improve.ts selfImproveBranch:
 // uzi/self-improve/<runId>, keyed on the run uuid (fresh per cycle). The worker's
 // runId == this runID.String() (both canonical lowercase-hyphenated), pinned by the

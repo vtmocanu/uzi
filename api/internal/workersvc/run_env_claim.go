@@ -367,28 +367,18 @@ var (
 // hold this worker took (the worker recovering a run another claim has since moved); anything
 // else is ErrRunNotOwned. When versions would be returned, the requested run must still be open
 // (RunEnvRedactOpen), else ErrRunEnvRedactClosed. The route is read-only, so there is no
-// generation or repo check. The result carries plaintext secrets: the caller must never log or
-// cache it.
+// generation or repo check. After the opens, the ownership and openness checks run again and
+// the owner's vault epoch must still equal the one the versions were opened at with the vault
+// not requiring unlock; a failure there returns the same typed refusal and no version. A vault
+// state read that fails with an invalid state or no vault is ErrRunEnvHistoryUnavailable (as on
+// the open path); any other failure of the state read, the authority read or the openness read is
+// a reader failure. Authority, openness and the owner's epoch and lock state are checked after
+// the last open; a change committed after that check and before the response is written is not
+// fenced. The result carries plaintext secrets: the caller must never log or cache it.
 func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid.UUID) (RunEnvRedactResponse, error) {
-	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return RunEnvRedactResponse{}, ErrRunNotOwned
-	}
+	run, err := s.runEnvRedactAuthority(ctx, wkr, runID)
 	if err != nil {
-		return RunEnvRedactResponse{}, fmt.Errorf("run env redact run: %w", err)
-	}
-	if run.WorkerID != pgconv.UUID(wkr.ID) {
-		// An open custody hold the worker took on this run also authorizes it; an
-		// inventory-guarded hold additionally requires the worker still to be its live holder.
-		held, err := s.q.WorkerHoldsOpenCustodyForRun(ctx, store.WorkerHoldsOpenCustodyForRunParams{
-			RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID,
-		})
-		if err != nil {
-			return RunEnvRedactResponse{}, fmt.Errorf("run env redact custody: %w", err)
-		}
-		if !held {
-			return RunEnvRedactResponse{}, ErrRunNotOwned
-		}
+		return RunEnvRedactResponse{}, err
 	}
 	governing, _ := runEnvGoverningRun(run)
 	if governing == uuid.Nil {
@@ -401,17 +391,10 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	if len(rows) == 0 {
 		return RunEnvRedactResponse{Protected: false}, nil
 	}
-	open, err := s.q.RunEnvRedactOpen(ctx, runID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return RunEnvRedactResponse{}, ErrRunNotOwned
+	if err := s.runEnvRedactOpenCheck(ctx, runID); err != nil {
+		return RunEnvRedactResponse{}, err
 	}
-	if err != nil {
-		return RunEnvRedactResponse{}, fmt.Errorf("run env redact open: %w", err)
-	}
-	if !open {
-		return RunEnvRedactResponse{}, ErrRunEnvRedactClosed
-	}
-	versions, _, _, err := s.openReceiptVersions(ctx, run.UserID, governing, rows)
+	versions, epoch, hasEpoch, err := s.openReceiptVersions(ctx, run.UserID, governing, rows)
 	switch {
 	case errors.Is(err, errVaultLocked):
 		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
@@ -420,7 +403,75 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	case err != nil:
 		return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
 	}
+	// The opens (and a stale-seal refetch) took time: the worker's authority over the run, the
+	// run's openness and the owner's vault state are checked again before any value leaves. The
+	// same two checks ran before the opens.
+	if _, err := s.runEnvRedactAuthority(ctx, wkr, runID); err != nil {
+		return RunEnvRedactResponse{}, err
+	}
+	if err := s.runEnvRedactOpenCheck(ctx, runID); err != nil {
+		return RunEnvRedactResponse{}, err
+	}
+	// Versions are only ever opened with an epoch; a result without one cannot be fenced and is
+	// refused as the transient locked answer (a later request re-reads), never delivered.
+	if !hasEpoch {
+		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
+	}
+	// A nil s.vlt is not reachable here: every open above returns an error without one.
+	state, err := s.vlt.State(ctx, run.UserID)
+	if errors.Is(err, vault.ErrInvalidState) || errors.Is(err, vault.ErrNotConfigured) {
+		return RunEnvRedactResponse{}, ErrRunEnvHistoryUnavailable
+	}
+	if err != nil {
+		return RunEnvRedactResponse{}, fmt.Errorf("%w: run env redact vault state: %w", secretopen.ErrReaderFailure, err)
+	}
+	if state.VaultEpoch != epoch || s.vlt.RequiresUnlock(ctx, run.UserID) {
+		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
+	}
 	return RunEnvRedactResponse{Protected: true, Versions: versions}, nil
+}
+
+// runEnvRedactAuthority resolves the run for the worker's user and checks the worker still
+// holds it: the run's worker_id is this worker, or this worker holds an open recovery custody
+// hold on it (an inventory-guarded hold additionally requires the worker still to be its live
+// holder). Anything else is ErrRunNotOwned.
+func (s *Service) runEnvRedactAuthority(ctx context.Context, wkr store.Worker, runID uuid.UUID) (store.Run, error) {
+	run, err := s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Run{}, ErrRunNotOwned
+	}
+	if err != nil {
+		return store.Run{}, fmt.Errorf("run env redact run: %w", err)
+	}
+	if run.WorkerID == pgconv.UUID(wkr.ID) {
+		return run, nil
+	}
+	held, err := s.q.WorkerHoldsOpenCustodyForRun(ctx, store.WorkerHoldsOpenCustodyForRunParams{
+		RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID,
+	})
+	if err != nil {
+		return store.Run{}, fmt.Errorf("run env redact custody: %w", err)
+	}
+	if !held {
+		return store.Run{}, ErrRunNotOwned
+	}
+	return run, nil
+}
+
+// runEnvRedactOpenCheck is the route's openness check: a vanished run is ErrRunNotOwned and a run
+// past the point the route answers for it is ErrRunEnvRedactClosed.
+func (s *Service) runEnvRedactOpenCheck(ctx context.Context, runID uuid.UUID) error {
+	open, err := s.q.RunEnvRedactOpen(ctx, runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrRunNotOwned
+	}
+	if err != nil {
+		return fmt.Errorf("run env redact open: %w", err)
+	}
+	if !open {
+		return ErrRunEnvRedactClosed
+	}
+	return nil
 }
 
 // mapRunEnvOpenError maps a secretopen failure to the claim lane's domain errors: a locked

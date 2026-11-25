@@ -40,7 +40,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_enabled: "false",
   judge_model: "opus",
   // The server reports the built-in as the effective value of an unset key (source "default").
-  codex_judge_model: "gpt-6.1-sol",
+  codex_judge_model: "gpt-6.2-sol",
   judge_enforce_all: "false",
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",

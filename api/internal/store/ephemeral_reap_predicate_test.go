@@ -73,8 +73,14 @@ func TestEphemeralReapPredicateIdenticalAcrossLockAndDelete(t *testing.T) {
 		}
 	}
 	for name, p := range map[string]string{"lock": lock, "delete": del} {
-		if !strings.Contains(p, "NOT ('claude_provider_v1' = ANY(w.protocol_capabilities))") {
-			t.Errorf("%s predicate does not carry the claude_provider_v1 arm (g)", name)
+		normalized := strings.Join(strings.Fields(p), " ")
+		for _, clause := range []string{
+			"(r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))",
+			"(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))",
+		} {
+			if !strings.Contains(normalized, clause) {
+				t.Errorf("%s predicate lacks engine-specific provider arm %q", name, clause)
+			}
 		}
 		if !strings.Contains(p, "isolated_fetch_v1") {
 			t.Errorf("%s predicate lost the isolated_fetch_v1 arm (e)", name)

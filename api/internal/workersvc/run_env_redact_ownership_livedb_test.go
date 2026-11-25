@@ -65,7 +65,7 @@ func TestRunEnvForeignOwnerLiveRowIsNotDeliveredLiveDB(t *testing.T) {
 	}
 	got := runEnvByName(p)
 	if len(got) != 1 || got["MINE"].Value != envSecretValue("mine") || len(p.Secrets.RunEnvRedact) != 0 {
-		t.Fatalf("delivered %+v redact %+v; want only MINE", got, p.Secrets.RunEnvRedact)
+		t.Fatalf("delivered %s; want only MINE", payloadShape(p))
 	}
 }
 
@@ -104,11 +104,11 @@ func TestRunEnvRedactReturnsEverySecretVersionLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !res.Protected || len(res.Versions) != 1 {
-		t.Fatalf("response = %+v; want protected with the one receipted secret version", res)
+		t.Fatalf("response = %s; want protected with the one receipted secret version", redactRespShape(res))
 	}
 	v := res.Versions[0]
 	if v.VarID != keyVar.String() || v.Rev != 1 || v.Name != "API_KEY" || v.Scope != "repo" || v.Value != envSecretValue("one") {
-		t.Fatalf("version = %+v", v)
+		t.Fatalf("version = %s", redactShape([]ClaimRunEnvRedact{v}))
 	}
 }
 
@@ -121,7 +121,7 @@ func TestRunEnvRedactUnprotectedWithoutSecretReceiptsLiveDB(t *testing.T) {
 	}
 	res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
 	if err != nil || res.Protected || len(res.Versions) != 0 {
-		t.Fatalf("response = %+v, %v; want {protected:false}", res, err)
+		t.Fatalf("response = %s, %v; want {protected:false}", redactRespShape(res), err)
 	}
 }
 
@@ -155,7 +155,7 @@ func TestRunEnvRedactOwnershipLiveDB(t *testing.T) {
 	// A released claim keeps its worker as affinity: the worker that last held the run reads it.
 	fx.env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, runID)
 	if res, err := fx.svc.RunEnvRedact(fx.env.ctx, wkr, runID); err != nil || !res.Protected {
-		t.Fatalf("last holder: %+v, %v", res, err)
+		t.Fatalf("last holder: %s, %v", redactRespShape(res), err)
 	}
 	fx.env.exec(`DELETE FROM runs WHERE id = $1`, runID)
 	if _, err := fx.svc.RunEnvRedact(fx.env.ctx, wkr, runID); !errors.Is(err, ErrRunNotOwned) {
@@ -216,7 +216,7 @@ func TestRunEnvRedactPublicationPendingArmsAloneLiveDB(t *testing.T) {
 	served := func(t *testing.T, fx *reFix, runID uuid.UUID, why string) {
 		t.Helper()
 		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); err != nil || !res.Protected {
-			t.Fatalf("%s: %+v, %v; want served", why, res, err)
+			t.Fatalf("%s: %s, %v; want served", why, redactRespShape(res), err)
 		}
 	}
 	closed := func(t *testing.T, fx *reFix, runID uuid.UUID, why string) {
@@ -290,7 +290,7 @@ func TestRunEnvRedactBoundedByRunStateLiveDB(t *testing.T) {
 	t.Run("non-terminal run is served", func(t *testing.T) {
 		fx, runID, _ := redactFix(t)
 		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); err != nil || !res.Protected {
-			t.Fatalf("%+v, %v; want protected", res, err)
+			t.Fatalf("%s, %v; want protected", redactRespShape(res), err)
 		}
 	})
 	t.Run("terminal run with nothing pending is closed", func(t *testing.T) {
@@ -310,7 +310,7 @@ func TestRunEnvRedactBoundedByRunStateLiveDB(t *testing.T) {
 		terminal(fx, runID)
 		res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
 		if err != nil || res.Protected {
-			t.Fatalf("%+v, %v; want {protected:false}", res, err)
+			t.Fatalf("%s, %v; want {protected:false}", redactRespShape(res), err)
 		}
 	})
 	t.Run("terminal run with an open custody hold of this worker is served", func(t *testing.T) {
@@ -324,7 +324,7 @@ func TestRunEnvRedactBoundedByRunStateLiveDB(t *testing.T) {
 				released_at=now(),updated_at=now() WHERE id=$1`, hold)
 		})
 		if res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID); err != nil || !res.Protected {
-			t.Fatalf("%+v, %v; want protected", res, err)
+			t.Fatalf("%s, %v; want protected", redactRespShape(res), err)
 		}
 	})
 }

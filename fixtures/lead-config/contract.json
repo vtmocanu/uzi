@@ -278,9 +278,9 @@
       "config": {
         "default_effort_source": "user_default"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effortMode": "runtime_default",
         "effortSource": "user_default"
@@ -314,9 +314,9 @@
         "default_effort": "medium",
         "default_effort_source": "builtin"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effort": "medium",
         "effortMode": "explicit",
@@ -340,7 +340,7 @@
         "default_effort": "high",
         "default_effort_source": "user_default"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "schedule_pin",
@@ -366,7 +366,7 @@
         "default_effort": "xhigh",
         "default_effort_source": "user_default"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "user_default",
@@ -391,9 +391,9 @@
         "default_effort_source": "builtin"
       },
       "templateModel": "opus",
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effort": "medium",
         "effortMode": "explicit",
@@ -416,7 +416,7 @@
         "default_model_source": "user_default",
         "default_effort_source": "builtin"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "user_default",
@@ -429,9 +429,9 @@
       "harness": "codex",
       "phase": "plan",
       "config": {},
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effortMode": "runtime_default",
         "effortSource": "builtin"
@@ -450,7 +450,7 @@
           "model": "gpt-6-astra"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "template",
@@ -475,7 +475,7 @@
           "model": null
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-luna",
         "modelSource": "template",
@@ -494,9 +494,9 @@
           "model": "opus"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effortMode": "runtime_default",
         "effortSource": "builtin"
@@ -518,7 +518,7 @@
           "model": "gpt-6-luna"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "user_default",
@@ -549,7 +549,7 @@
           "model": "gpt-6-luna"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-5.6-sol",
         "modelSource": "schedule_pin",
@@ -590,7 +590,7 @@
           "model": "gpt-6-luna"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-luna",
         "modelSource": "template",
@@ -638,9 +638,9 @@
           "model": "gpt-6-luna"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effortMode": "runtime_default",
         "effortSource": "builtin"
@@ -664,7 +664,7 @@
           "model": "gpt-5.6-sol"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-luna",
         "modelSource": "template",
@@ -690,7 +690,7 @@
           "model": "gpt-5.6-sol"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-luna",
         "modelSource": "template",
@@ -768,7 +768,7 @@
           "model": "gpt-6-luna"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-luna",
         "modelSource": "template",
@@ -800,7 +800,7 @@
           "model": "gpt-6-luna"
         }
       ],
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-sol",
         "modelSource": "schedule_pin",
@@ -879,7 +879,7 @@
         "default_effort": "medium",
         "default_effort_source": "builtin"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-sol",
         "modelSource": "run_override",
@@ -958,9 +958,9 @@
         "default_effort": "xhigh",
         "default_effort_source": "run_override"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effort": "xhigh",
         "effortMode": "explicit",
@@ -1292,9 +1292,9 @@
         "default_effort": "low",
         "default_effort_source": "template"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effort": "low",
         "effortMode": "explicit",
@@ -1343,9 +1343,9 @@
       "config": {
         "default_effort_source": "user_default"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "modelSource": "builtin",
         "effortMode": "runtime_default",
         "effortSource": "user_default"
@@ -1544,7 +1544,7 @@
           "effort_source": "user_planning_default"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "user_planning_default",
@@ -1578,7 +1578,7 @@
           "effort_source": "user_planning_default"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6.1-sol",
         "modelSource": "run_override",
@@ -1609,7 +1609,7 @@
           "effort_source": "user_default"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "owner-custom-plan",
         "modelSource": "user_planning_default",
@@ -1635,7 +1635,7 @@
         "default_effort": "medium",
         "default_effort_source": "user_default"
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6.1-sol",
         "modelSource": "user_default",
@@ -1667,7 +1667,7 @@
           "effort_source": "user_planning_default"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "user_planning_default",
@@ -1702,7 +1702,7 @@
           "effort_source": "user_planning_default"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6.1-sol",
         "modelSource": "user_default",
@@ -1737,7 +1737,7 @@
           "effort_source": "template"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6-astra",
         "modelSource": "user_planning_default",
@@ -1772,7 +1772,7 @@
           "effort_source": "template"
         }
       },
-      "providerDefaultModel": "gpt-6.1-sol",
+      "providerDefaultModel": "gpt-6.2-sol",
       "expect": {
         "model": "gpt-6.1-sol",
         "modelSource": "user_default",

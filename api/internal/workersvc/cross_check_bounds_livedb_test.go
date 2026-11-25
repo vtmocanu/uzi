@@ -121,7 +121,7 @@ func TestCheckerAssemblyRefusalFinishesExactClaimLiveDB(t *testing.T) {
 }
 
 func checkerBoundsWorker(f codexRunFixture) store.Worker {
-	return store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+	return store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 }
 
 func TestCheckerStoredAssemblyContextBoundsLiveDB(t *testing.T) {

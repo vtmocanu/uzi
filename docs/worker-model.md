@@ -13,21 +13,20 @@ unaffected.
 
 ## Harness and worker models
 
-Both settings live together in one **Settings → Run defaults** card:
+Every model and effort choice lives on one **Settings → Models** page, with a
+single sticky **Save changes** bar. The first group, **Worker runs**, and the **Default
+harness** picker above it hold the settings described here:
 
-- A **default harness** picker, shown only when you have a usable credential
-  for both Claude and Codex. It decides which harness a run uses when
+- A **default harness** picker. It decides which harness a run uses when
   nothing else names one. With an explicit default it is subject to the
   optional creation-time overflow below.
-- One **model lane per usable harness**: Anthropic and Codex side by side
-  when both are usable, or a single lane when only one is. With no usable
-  credential yet, the card still shows the Claude lane so you can
-  preconfigure it before connecting one.
+- A **Worker model** row with a Claude and a Codex cell side by side, and a
+  **Worker effort** row ([Reasoning effort](./worker-effort.md)).
 
 Each picker's empty option is a **Default · …** label naming where the value
 comes from: the Claude model picker reads `Default · lead template` (the
 `lead` template's model) and the Codex model picker reads
-`Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
+`Default · gpt-6.2-sol (built-in)`. The harness picker's empty option reads
 `Default · automatic`: uzi picks your only usable harness, or, when both are
 usable, chooses by weekly limits for eligible new issue runs (started
 manually, by autopilot or by a schedule, with no explicit harness or issue
@@ -44,17 +43,25 @@ on](./scheduling.md#which-harness-a-schedule-runs-on)).
 
 Switching the default harness never clears either model. Each lane is its
 own retained preference, so alternating between Claude and Codex keeps both
-choices intact. The lane matching your effective default harness carries a
-**Default harness** badge. Click **Save defaults** to save the harness and
-both lanes together, in one request.
+choices intact. Click **Save changes** to save the harness, both lanes and
+every other change on the page together, in one request. A Default option
+names the value a run would resolve today and where it comes from, such as
+`Default · opus (lead template)`. Where the control does not already say it, a
+line under the control shows the **saved effective value** (for example
+`→ Claude · automatic` under **Default · automatic**, or **Unavailable** if the
+server could not read it); screen readers always hear it. An edit changes the
+saved value only after you save; until then a changed cell shows the **Saved**
+value and marks itself **Unsaved**. A value you changed from its default
+offers **Reset to default**, which you then save like any other edit. Leaving
+the page with unsaved changes asks you to **Stay** or **Discard**.
 
-![Settings, Run defaults, showing the grouped Harness and worker models card with side-by-side Claude and Codex model lanes](img/worker-model-settings.png)
+![Settings, Models, showing the Worker runs rows: Worker model and Worker effort, each with a Claude and a Codex cell, and Reset to default under a saved choice](img/worker-model-settings.png)
 
 ## Overflow to the other harness
 
 In **Settings → Run defaults**, turn on **Overflow to the other harness when my default is near its limits**.
 This per-user boolean is off by default and saves automatically, separately
-from **Save defaults**. The CLI equivalent is
+from the Models **Save changes** bar. The CLI equivalent is
 `uzi settings harness-overflow on|off`; `uzi settings get` reads it back.
 Overflow applies only when your default harness is an explicit Claude or
 Codex. With **Default · automatic** the toggle has no effect: the card
@@ -100,15 +107,14 @@ reads that harness's model lane:
    harness.
 3. Your **worker model** for that harness, if set.
 4. The harness fallback: the `lead` template's Claude pin (`opus` by default)
-   for Claude, or its Codex pin, else `gpt-6.1-sol`, for Codex.
+   for Claude, or its Codex pin, else `gpt-6.2-sol`, for Codex.
 5. Whatever the underlying SDK/your account defaults to.
 
-The lead's Codex fallback requires a worker from this release. Older Codex
-workers fall through to the built-in provider model (`gpt-6.1-sol`) when no
-schedule or worker-model setting takes precedence. Roll out the API first,
-then the hosted worker; hosted validation of this behavior remains pending.
-The pickers' existing **Default · …** labels above are unchanged pending
-separate UI work.
+The current root/planning fallback is `gpt-6.2-sol`. Explicit user, instance,
+run, schedule and template choices are not migrated. The independent Codex
+judge built-in also uses `gpt-6.2-sol`; task review and PR descriptions retain
+`gpt-6-sol`, and summaries retain `gpt-6-luna`. See the
+[current baseline](#current-codex-worker-baseline) for rollout ordering.
 
 An incompatible frozen schedule or legacy model (e.g. a Claude alias pinned
 on a run that resolves to Codex) falls back to your lane for that harness,
@@ -143,7 +149,7 @@ choice is stored on the run and shown with the source **this run**
   override); otherwise 400.
 - **Checked against the run's harness at create.** Claude accepts a Claude
   alias or custom model ID but not a Codex model ID; Codex accepts only the
-  curated models (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`).
+  curated models (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra`).
   An incompatible pair returns 422 with `code: model_incompatible_with_harness`
   and the resolved `harness`, and creates no run. With an explicit harness the
   check runs before the forge is read. uzi never substitutes another model.
@@ -174,16 +180,17 @@ on `gpt-6.1-sol` at `medium`. Each harness retains its own optional per-user
 planning model and effort. Left empty, they read **Same as the run**
 and the run uses one model and effort throughout, as before.
 
-- **Set them in the web app.** **Settings → Run defaults → Planning** has a
-  model picker and an effort picker for each usable harness; the same
-  **Save planning defaults** button saves the changed Claude and Codex fields
-  together. The intro on the card explains the two phases. The empty option reads like
+- **Set them in the web app.** **Settings → Models → Planning** has a
+  model picker and an effort picker for each harness; the page's one **Save changes**
+  button saves the changed Claude and Codex fields together with the rest of
+  the page. The empty option reads like
   `Same as the run · <model> (<where it comes from>)`.
-- **Or through the API.** `PUT /api/me/settings` takes a planning model and a
+- **Or through the API.** `PUT /api/me/model-settings` takes a planning model and a
   planning effort per harness: `planning_claude_model`,
   `planning_claude_effort`, `planning_codex_model` and `planning_codex_effort`
   (absent leaves it unchanged, `null` clears it, a value sets it). That
-  endpoint is cookie-only; there is no CLI setter for planning settings yet. `uzi settings get` shows them (see [the CLI
+  endpoint accepts `uzc_` and `uza_` tokens. The existing `PUT /api/me/settings`
+  route is cookie-only. `uzi settings get` shows both planning lanes (see [the CLI
   reference](./cli.md#effective-settings)).
 - **Planning effort** takes `low`, `medium`, `high`, `xhigh` or `max`, with no
   runtime option; see [Reasoning effort](./worker-effort.md#planning-effort).
@@ -295,7 +302,7 @@ and [the CLI reference](./cli.md#waiting-for-a-state-uzi-run-wait).
 
 Saving the Claude worker lane (`default_claude_model`, or legacy
 `default_model` when resolved to Claude) rejects these known Codex role IDs:
-`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol` and `gpt-6.1-sol`.
+`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol` and `gpt-6.2-astra`.
 This is a closed list, not model-family guessing: valid custom Claude IDs
 outside it remain accepted. The Codex lane's accepted models are unchanged.
 
@@ -309,17 +316,15 @@ wins. Frozen Claude schedule or legacy run models reject the same Codex role
 IDs and fall back to the validated Claude lane or its default. Codex frozen
 model acceptance and cross-check pin rules are unchanged.
 
-In **Settings → Run defaults**, **Not a Claude model** identifies the
-problem. Click **Reset to Default** to clear the draft, then **Save
-defaults** to persist it. The warning and reset action also appear when
-only Codex is usable and the Claude picker is hidden, because the grouped
-save resends both lanes. `uzi settings get --json` still shows the stored
+In **Settings → Models**, **Not a Claude model** identifies the
+problem and does not block saving. Choose **Default** to clear the value, then
+click **Save changes** to persist it. `uzi settings get --json` still shows the stored
 preference until you save a change; there is no new CLI command.
 
 ## Custom Codex model
 
 Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol`,
-`gpt-6-sol` and `gpt-6.1-sol`, plus **Other (custom model ID)**, the same escape hatch
+`gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol` and `gpt-6.2-astra`, plus **Other (custom model ID)**, the same escape hatch
 Claude has always had. uzi validates the string for length and unsafe
 characters but makes no provider call at save time; an unavailable or
 unsupported ID only fails visibly on your first run, exactly like an
@@ -343,7 +348,7 @@ see [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-cu
 
 The review pass of a [handoff](./handoff.md#the-review--then-fix-loop)
 (`uzi handoff --review`) has its own model per harness, set under **Settings →
-Run defaults → Task review**. It is independent of your worker model: a custom
+Models → Helper runs → Task review model**. It is independent of your worker model: a custom
 or curated worker choice never reaches the review.
 
 | Harness | Accepts | Empty means |
@@ -373,7 +378,7 @@ effort](#task-review-effort).
 ## Task review effort
 
 Each harness's review also has its own reasoning effort, next to the model under
-**Settings → Run defaults → Task review**. It accepts `low`, `medium`, `high`,
+**Settings → Models → Helper runs → Task review effort**. It accepts `low`, `medium`, `high`,
 `xhigh` or `max`, or **Runtime default** (`runtime`), which sends no level and
 lets the runtime decide.
 
@@ -512,7 +517,7 @@ Where to see it:
   recorded. API-equivalent cost compares work, not a bill; subscription
   users may consume purchased credits. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
 - **Separate from the judge model.** The [run judge](./judge.md) runs on
-  its own per-harness judge models (Claude `opus` and Codex `gpt-6.1-sol` by
+  its own per-harness judge models (Claude `opus` and Codex `gpt-6.2-sol` by
   default), set per user or instance-wide by an admin. Your worker-model
   settings here have no effect on them.
 - **Separate from reasoning effort.** Your [reasoning
@@ -521,13 +526,21 @@ Where to see it:
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.2-sol`
 when no schedule model, worker-model override or lead Codex pin is set.
 Explicit model preferences remain unchanged. Both harnesses inherit medium
 reasoning effort; Claude and Codex keep separate overrides, and each can
 instead be set to **Runtime default**, which sends no effort level. See
 [Reasoning effort](worker-effort.md).
 
-Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
-silently use the old model/catalog or ignore the requested effort. Codex runs
-queue until the worker image rolls, on hosted workers and compose alike.
+Every Codex-indicating claim (harness `codex`, a material revision, or a secret
+binding) requires `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3`.
+This gate is independent of `required_capabilities`, the capability-aware
+switch and `fn_worker_can_claim`; clearing optional requirements cannot bypass it.
+Codex runs wait for a compatible worker on hosted workers and compose alike.
+
+With an API-first rollout, old workers leave Codex runs waiting until the worker
+roll. Worker-first retains v1/v2 compatibility with the older API. Rolling back
+the v3 migration with Down reopens the weaker baseline; operators must account
+for that admission change. This is not a zero-downtime guarantee.
+See [ADR-1106](../adr/1106-codex-harness.md) for the runtime audit.

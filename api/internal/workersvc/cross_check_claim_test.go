@@ -42,7 +42,7 @@ func TestPlanCrossCheckClaimInputLiveDB(t *testing.T) {
 	svc.SetTxBeginner(env.pool)
 	child := mustRun(t, env, f.runID)
 	worker := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{
-		capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
+		capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}}
 	payload, err := svc.assembleClaim(env.ctx, worker, child)
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +138,7 @@ func TestPlanCrossCheckClaimBounds(t *testing.T) {
 		{"diff bytes", func(r *store.CrossCheck) { r.PlanningDiff.String = strings.Repeat("x", 512*1024+1) }},
 		{"milestone count", func(r *store.CrossCheck) { r.Milestones = []byte("[" + strings.Repeat("{},", 64) + "{}]") }},
 		{"base sha", func(r *store.CrossCheck) { r.BaseCommit.String = "main" }},
+		{"other valid base sha", func(r *store.CrossCheck) { r.BaseCommit.String = strings.Repeat("b", 40) }},
 		{"digest mismatch", func(r *store.CrossCheck) { r.CandidateDigest = []byte("other") }},
 		{"null milestones", func(r *store.CrossCheck) { r.Milestones = []byte("null") }},
 	} {

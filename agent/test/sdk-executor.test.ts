@@ -10878,6 +10878,17 @@ describe("SdkExecutor prompts: the listed run variables are the injected ones", 
   const rv = (name: string, value: string): ClaimRunEnvVar =>
     ({ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name, value, secret: false, description: "" });
 
+  // Run variables are delivered only under the uid split.
+  let priorSplit: string | undefined;
+  beforeEach(() => {
+    priorSplit = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+  });
+  afterEach(() => {
+    if (priorSplit === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = priorSplit;
+  });
+
   it("omits a variable the tool profile already set, and lists a normal one", async () => {
     const provision: SdkExecutorOptions["provision"] = async () => ({ toolEnv: { NPM_TOKEN: "x" } });
     const { queryFn, turns } = fakeTurns([

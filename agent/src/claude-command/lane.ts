@@ -45,6 +45,9 @@ export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 export const MAX_COMMAND_TIMEOUT_MS = 3_600_000;
 export const MAX_CONCURRENT_COMMANDS = 8;
 const SPILL_CAP_BYTES = 64 * 1024 * 1024;
+/** Appended to every non-zero `exit` result: the code is the supervised shell's status, so
+ *  passing output from earlier commands can sit above it, and a code over 128 is ambiguous. */
+const NONZERO_EXIT_NOTE = "A non-zero exit code is the exit status of the supervised shell invocation. For a simple sequence that ran to completion, that is normally the status of its last command, so output above from earlier commands may still show success. A code above 128 can also mean the shell or its last command was stopped by a signal (128 + signal number), including a stop from outside the command, but a command can exit with such a code directly, so the number alone does not establish the cause.";
 export const MAX_COMMAND_BYTES = 131_000;
 export const DEFAULT_GRACE_MS = 5000;
 export const DEFAULT_CLEANUP_MS = 10_000;
@@ -644,6 +647,7 @@ export class ClaudeCommandLane {
       if (!eofSeen) {
         notes.push("Output may be incomplete: a background process kept the output open after the command ended and was stopped.");
       }
+      if (first.kind === "exit" && first.code !== 0) notes.push(NONZERO_EXIT_NOTE);
       return notes;
     };
     const { headline, isError } = this.headlineOf(first, timeoutMs);

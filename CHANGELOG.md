@@ -363,6 +363,48 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **CI repair guidance coordinates one fixer before branch work or merge ([#4615](https://github.com/vtmocanu/uzi/pull/4615)).**
   The bundled CLI skill checks CI-fix and rework ownership and scheduled default-branch repairs, preserving held work during local takeover.
 
+- **A run whose data volume was remounted with a new device or inode now holds for its owner instead of failing ([#4627](https://github.com/vtmocanu/uzi/pull/4627), [#4637](https://github.com/vtmocanu/uzi/pull/4637)).**
+  Only the first claim attempt on a journal that is not blocked is held; execution stays refused and nothing is rebound, so export or recover the work (`uzi run recovery <run>`) rather than Resume. Owed and refusal retention refs found at a wrong target are no longer silently moved: the worker logs `retention ref target mismatch; ref left untouched`, keeps custody and leaves the run's owed inventory fail-closed until you export, recover or settle its holds.
+
+- **Models settings keep warning that a lost save may still finish ([#4639](https://github.com/vtmocanu/uzi/pull/4639), [#4642](https://github.com/vtmocanu/uzi/pull/4642)).**
+  After a save whose response was lost, a successful retry or Reload no longer hides the warning that the earlier request may still commit and replace the shown values.
+
+- **Claude Fable 5.2 estimated tails and side passes are priced ([#4625](https://github.com/vtmocanu/uzi/pull/4625), [#4640](https://github.com/vtmocanu/uzi/pull/4640)).**
+  The standard Anthropic price table gains a claude-fable-5-2 row, so interrupted Fable 5.2 sessions and API-equivalent summary and Now usage record an estimate instead of staying unpriced.
+
+- **`POST /api/v1/jobs` answers a provider-sourced owner with the typed refusal instead of a 500 ([#4541](https://github.com/vtmocanu/uzi/pull/4541), [#4543](https://github.com/vtmocanu/uzi/pull/4543)).**
+  When the account's Claude source is a model provider, which jobs do not support yet, the create now returns 409 `provider_lane_unsupported`, the same refusal other run-creation surfaces give, rather than a logged internal error; no job is created either way.
+
+- **Worker images ship native git-http-backend ([#4624](https://github.com/vtmocanu/uzi/pull/4624)).**
+  Both worker templates install Alpine's git-daemon subpackage, so smart-HTTP recovery-restore and forge-fake tests run on workers instead of failing for a missing backend.
+
+- **CI fixes and MR rework still stop when their target merges during an issue sync failure ([#4631](https://github.com/vtmocanu/uzi/pull/4631)).**
+  The poller checks the target directly even if the issue list could not be refreshed.
+
+- **A restored run no longer fails when the api permanently refuses its messages before the restore finishes ([#4644](https://github.com/vtmocanu/uzi/pull/4644), [#4648](https://github.com/vtmocanu/uzi/pull/4648)).**
+  During the independent restore of a retained run, including its owner hold for an unsupported predecessor, the worker now holds the run or stops it without failing it, keeps the predecessor's work and reaps nothing.
+
+- **A held or time-parked run no longer turns into a failed run when the api permanently refuses its last messages ([#4645](https://github.com/vtmocanu/uzi/pull/4645), [#4655](https://github.com/vtmocanu/uzi/pull/4655)).**
+  Once the server has confirmed a preflight, completion or phase-switch hold or a wall-clock park, a permanent message refusal during the flight's last drain keeps that hold or park: the worker reports no `failed` and starts no extra abort or reap.
+
+- **A hosted worker that is an in-flight roll's canary now finishes waking ([#4659](https://github.com/vtmocanu/uzi/pull/4659), [#4668](https://github.com/vtmocanu/uzi/pull/4668)).**
+  The controller writes the wake's op annotation without roll admission when nothing else about the Deployment changes, so the wake settles instead of timing out.
+
+- **A retained clone's inventory proof no longer fails a same-key successor ([#4632](https://github.com/vtmocanu/uzi/pull/4632), [#4643](https://github.com/vtmocanu/uzi/pull/4643)).**
+  The proof runs under the repository's bare lock with an in-memory same-key exclusion, and same-key seeds wait once, retry once, then stop for retry with custody kept. An unreadable process the worker can tie to another live attempt (such as the Codex supervisor) no longer blocks the proof.
+
+- **Custom Codex providers support current model slots and runtime admission ([#4626](https://github.com/vtmocanu/uzi/pull/4626)).**
+  GPT-6.2 Sol and Astra mappings round-trip through Settings and the CLI; provider health and wake admission require a single v3-capable worker, while reaping retains previously claimed workers and custody.
+
+- **Worker toolchain refreshes preserve their package resolution model ([#3311](https://github.com/vtmocanu/uzi/pull/3311), [#4653](https://github.com/vtmocanu/uzi/pull/4653)).**
+  Refresh in an isolated Devbox project, preserving explicit pins and rejecting manifest migrations or partial locks before publication.
+
+- **uzi-lander's merge guard retries a torn run-listing read instead of refusing, and the post-merge `--sha` watch reports scheduled and dispatched runs as advisory ([#4670](https://github.com/vtmocanu/uzi/pull/4670)).**
+  `merge.sh` re-reads a release-guard `total_count` mismatch up to 3 times before refusing; `watch-run-ci.sh --sha` reports schedule/workflow_dispatch runs in an ADVISORY block and gates on every other run, and gives no verdict on a listing that reaches its 51-row limit.
+
+- **A Claude credential switch after a permanent message failure in the restore window now holds the run on the switch fence ([#4652](https://github.com/vtmocanu/uzi/pull/4652), [#4666](https://github.com/vtmocanu/uzi/pull/4666)).**
+  On a worker that supports in-place credential switches, a Claude run whose restore predecessor is still guarded now holds on the switch fence, instead of a plain retained stop, when an op-fenced credential switch is pending after a permanent message failure. Codex runs are unchanged.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -569,7 +611,37 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admins can read another user's held publications and filter the debug run listing by status ([#4614](https://github.com/vtmocanu/uzi/pull/4614), [#4620](https://github.com/vtmocanu/uzi/pull/4620)).**
   `uzi run held <id>` joins the flag-gated, audited admin run debug reads (`UZI_ADMIN_RUN_DEBUG`, `uza_` token), and `uzi admin runs --all` gains `--status s[,s]` and `--user <email>`; held expiry stays owner-only.
 
+- **A repo linked to YouTrack now moves cards, creates issues and writes comments in YouTrack ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4477](https://github.com/vtmocanu/uzi/pull/4477)).**
+  Board moves write the issue's State through a per-repo column-to-State mapping set at `GET`/`PUT /api/repos/{id}/issue-tracker-link/states` (no UI yet); close never lands on a won't-fix State, a column move refuses an issue YouTrack already shows as resolved (only an explicit reopen from the Closed lane moves it; a drag to Closed still closes it), issues uzi creates carry the eligibility tag where a forge issue would carry the uzi label, and removing that tag is still refused, and a finding, self-improve or proposal label that has the same name as the eligibility tag, or a finding label that is also the autopilot label, is refused instead of filing an eligible or unmarked issue. There is no close-on-merge, and the web and CLI settings, docs and the live YouTrack pass are still pending.
+
+- **Early weekly-limit warning with a per-user margin ([#4123](https://github.com/vtmocanu/uzi/pull/4123)).**
+  Runs on an Anthropic token or Codex account that is near or at its effective weekly limit now show a warning with the reason and fix on the run page, the Overview decision card, `uzi run get` and the TUI; the margin (default 15 points, 0 turns it off) is set in Run defaults or with `uzi settings warning-margin`.
+
+- **User-owned Responses-compatible providers run on the Codex engine ([#4323](https://github.com/vtmocanu/uzi/pull/4323), [#4638](https://github.com/vtmocanu/uzi/pull/4638)).**
+  Create, test and select a `codex`/`openai_responses` provider (Bearer key, operator-allowlisted exact base URL) with `uzi provider use`; Codex runs then use only that frozen gateway and key with no vendor fallback. Codex judge and plan/code cross-check refuse for such owners until #4574, the pinned runtime follows redirects and does not bound response size, and deploy the API before workers (`codex_provider_v1`).
+
+- **Automatic CI fixes can be turned off for one run's branch ([#4617](https://github.com/vtmocanu/uzi/pull/4617), [#4647](https://github.com/vtmocanu/uzi/pull/4647)).**
+  `uzi run ci-autofix <run-id> --enabled=false`, the run page checkbox or `PUT /api/runs/{id}/ci-autofix` sets a per-run override (or `--clear` to follow your account default); the branch's newest run with an MR decides and every new CI fix copies its value, the automatic path re-checks it before starting a fix, and the admin switch still wins.
+
+- **`uzi admin run-writers` finds active ci_fix and mr_rework writers across owners ([#4618](https://github.com/vtmocanu/uzi/pull/4618), [#4621](https://github.com/vtmocanu/uzi/pull/4621)).**
+  The read-only admin lookup needs the admin run debug flag and an `admin_ro` token, and exits non-zero when the answer is incomplete.
+
+- **Choose the task-review model and effort per harness ([#1570](https://github.com/vtmocanu/uzi/pull/1570)).**
+  Set them under Settings, Run defaults, Task review, or with `uzi settings set task-review-model|task-review-effort --harness claude|codex <value>`; effort takes low, medium, high, xhigh, max or runtime (Runtime default), reset follows your worker effort, and a worker older than this release runs the built-in review and notes `task_review_settings_omitted` in the run feed.
+
+- **Slack warning before the weekly limit ([#4123](https://github.com/vtmocanu/uzi/pull/4123)).**
+  Owners with a linked Slack account get one best-effort DM per credential per observed weekly period when a token or Codex account with active runs nears its effective weekly limit, listing the affected runs with the reason and fix.
+
+- **Weekly-limit park explanations ([#4123](https://github.com/vtmocanu/uzi/pull/4123)).**
+  A run parked on its 7-day usage limit or paused by the weekly reserve now says why uzi did not move it to another credential, what will happen next, and the copyable command to change it, on the run page, `uzi run get`, the TUI and the Slack park message.
+
+- **Admins can share a Claude provider definition that every user uses with their own key ([#4324](https://github.com/vtmocanu/uzi/pull/4324), [#4656](https://github.com/vtmocanu/uzi/pull/4656)).**
+  Each user attaches, tests and selects their own key, so the admin never holds it; the URL and auth style are fixed at creation, the Claude engine only, and the redirect risk accepted for custom providers applies.
+
 ### Changed
+
+- **Routine dependency updates ([#4650](https://github.com/vtmocanu/uzi/pull/4650)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
   Dependency manifest and image bumps that carry no entry of their own.
@@ -769,6 +841,30 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The worker's Codex runtime moves to rust-v0.169.0 ([#4605](https://github.com/vtmocanu/uzi/pull/4605)).**
   Every registered Codex version and digest pin follows the new package lock.
 
+- **Active CI-fix and MR-rework runs are cancelled when their pull request merges or closes ([#4616](https://github.com/vtmocanu/uzi/pull/4616), [#4622](https://github.com/vtmocanu/uzi/pull/4622)).**
+  The forge poller checks at most 32 runs per repo per pass and a publication backstop refuses with `target_terminal`; a paused or recovery_wait ci_fix is not cancelled while parked (the MR watcher still cancels a parked mr_rework), and persistent storage failure can still end a run failed.
+
+- **Claude SDK 0.3.325, a 200k default for provider models, and more protected repo-variable names ([#4611](https://github.com/vtmocanu/uzi/pull/4611), [#4619](https://github.com/vtmocanu/uzi/pull/4619)).**
+  Provider runs assume a 200k context window unless a `context_window` is configured (the CLI's own default is now 1M), and the provider warnings now say the CLI may ignore a window for names it recognizes as Anthropic models. Repo variables may no longer use names starting with `BUN_`, nor `NODE_INSPECTOR_IPC`, `VSCODE_INSPECTOR_OPTIONS`, `API_FORCE_IDLE_TIMEOUT`, `ENABLE_TOOL_SEARCH`, `SLASH_COMMAND_TOOL_CHAR_BUDGET`, `AUTOMODE_DECISION_LOG`, `NODE_USE_SYSTEM_CA`, `ENABLE_BETA_TRACING_DETAILED`, `ENABLE_ENHANCED_TELEMETRY_BETA`, `BETA_TRACING_ENDPOINT`, `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, `TEMP`, `TMP` or `SYSTEMDRIVE`; an existing variable under such a name can still be disabled or deleted, but not enabled or edited.
+
+- **Settings has a Models tab with one save for every model choice ([#3263](https://github.com/vtmocanu/uzi/pull/3263), [#4636](https://github.com/vtmocanu/uzi/pull/4636)).**
+  The default harness, the worker, planning, task-review and cross-check models and efforts, and the judge routing and judge and summary models moved from Run defaults to one Settings → Models grid that saves in one transaction; `PUT /api/me/model-settings` now accepts 19 fields (with `uza_`/`uzc_` tokens too), returns per-field `errors` on a 400 and `{settings, effective}` on success, and the writes are atomic while the response reads are separate queries, not a snapshot.
+
+- **Task reviews now send your worker effort when you set no review effort ([#1570](https://github.com/vtmocanu/uzi/pull/1570)).**
+  Before, a review sent no effort; now an unset review effort follows your worker effort for that harness (Runtime default sends none), and the built-in medium is sent when that is unset too, so unconfigured owners see reviews run at medium; set the review effort to runtime to keep the old behaviour.
+
+- **Codex defaults use GPT-6.2 Sol on the current runtime ([#4626](https://github.com/vtmocanu/uzi/pull/4626), [#4649](https://github.com/vtmocanu/uzi/pull/4649)).**
+  Root/planning and the independent judge default advance with runtime 0.171.0 and v3 admission; explicit choices remain, and cache writes use the owner-selected 30-minute Standard estimate with accepted 12-hour underestimation risk.
+
+- **Existing CLAUDE.md opt-ins now also reach plan cross-checks ([#4519](https://github.com/vtmocanu/uzi/pull/4519), [#4675](https://github.com/vtmocanu/uzi/pull/4675)).**
+  When both the Repo instructions and cross-checker CLAUDE.md settings are on, the plan checker gets the root CLAUDE.md from the plan's frozen base commit, with symlinks resolved only within the commit; otherwise it sees an explicit status.
+
+- **Settings Models reads in sections and sits next to Account & tokens ([#4665](https://github.com/vtmocanu/uzi/pull/4665), [#4667](https://github.com/vtmocanu/uzi/pull/4667)).**
+  Each model group is its own card, the saved effective value shows as a compact tag, and Appearance moves to the last Settings tab.
+
+- **Settings Models shows a saved value only where the control does not, and offers Reset to default ([#4671](https://github.com/vtmocanu/uzi/pull/4671), [#4672](https://github.com/vtmocanu/uzi/pull/4672)).**
+  The saved-value tag under every Models cell is gone: a muted line appears only for an unsaved change, an unavailable value or a value the select hides, and screen readers still hear every saved value. A value you changed from its default has a Reset to default button.
+
 ### Security
 
 - **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
@@ -791,6 +887,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Codex native patch tools stay inert after cold resume ([#4509](https://github.com/vtmocanu/uzi/pull/4509), [#4526](https://github.com/vtmocanu/uzi/pull/4526)).**
   App-server roots have no default local execution environment, explicitly disable native goals and preserve worker-owned edits; real-binary tests cover refusal and resource-helper behavior across restarts.
+
+- **The API no longer ships a gorilla/websocket version affected by GO-2026-6278 ([#4654](https://github.com/vtmocanu/uzi/pull/4654)).**
+  The indirect `github.com/gorilla/websocket` dependency moves from v1.5.3 to `v1.5.4-0.20240701034025-d67f41855da4`; `govulncheck` reported v1.5.3 as reachable through the Slack Socket Mode client, and upstream has no tagged release carrying the fix.
 
 ### Removed
 

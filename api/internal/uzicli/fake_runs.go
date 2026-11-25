@@ -282,6 +282,20 @@ func (f *FakeClient) SetRunMrRework(_ context.Context, id string, enabled *bool)
 	return f.MrReworkRun, nil
 }
 
+// SetRunCIAutofix records the run id and tri-state pointer before any error branch
+// (like SetRunMrRework) and returns the canned result.
+func (f *FakeClient) SetRunCIAutofix(_ context.Context, id string, enabled *bool) (SetRunCIAutofixResult, error) {
+	f.LastCIAutofixRunID = id
+	f.LastCIAutofixEnabled = enabled
+	if f.SetRunCIAutofixErr != nil {
+		return SetRunCIAutofixResult{}, f.SetRunCIAutofixErr
+	}
+	if f.Err != nil {
+		return SetRunCIAutofixResult{}, f.Err
+	}
+	return f.CIAutofixResult, nil
+}
+
 // RunRework records the run id and guidance it was called with and returns the canned
 // run. It captures BEFORE the error branch (mirroring SetRunMrRework) so a test asserting
 // a 409/404/400 still proves the write was reached with the right args; RunReworkErr wins

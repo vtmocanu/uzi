@@ -59,36 +59,47 @@ export function installHarness(
 ): void {
   // issue #2213: a runner flow over a planted unreadable process latches the worker-wide quarantine.
   resetResidueQuarantineAfterEach();
-  beforeEach(async (t) => {
-    api = new FakeApi(TOKEN);
-    baseUrl = await api.listen();
-    fx = makeFixture({}, { testName: t.fullName ?? t.name });
-    git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
-    homeDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-runnerhome-"));
-    client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
-      sleep: async () => {},
-      terminalRetrySchedule: [1, 1],
-      ...clientOptions,
-    });
-  });
+  beforeEach(async (t) => { await setUpHarness(t, clientOptions); });
 
   afterEach(async () => {
     // Node runs afterEach before t.after. Join test-owned flights while their API and paths
     // still exist; a t.after join alone can otherwise recreate a fixture after its removal.
+    await tearDownHarness(beforeCleanup);
+  });
+}
+
+/** The per-test setup installHarness registers as beforeEach; exported so one test can tear down and rebuild a fresh scene. */
+export async function setUpHarness(
+  t: { fullName?: string; name: string },
+  clientOptions: { httpTimeoutMs?: number; fetch?: typeof fetch } = {},
+): Promise<void> {
+  api = new FakeApi(TOKEN);
+  baseUrl = await api.listen();
+  fx = makeFixture({}, { testName: t.fullName ?? t.name });
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+  homeDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "uzi-runnerhome-"));
+  client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+    sleep: async () => {},
+    terminalRetrySchedule: [1, 1],
+    ...clientOptions,
+  });
+}
+
+/** The per-test teardown installHarness registers as afterEach. */
+export async function tearDownHarness(beforeCleanup?: () => Promise<void>): Promise<void> {
+  try {
+    if (beforeCleanup) await beforeCleanup();
+  } finally {
     try {
-      if (beforeCleanup) await beforeCleanup();
+      await api.close();
     } finally {
       try {
-        await api.close();
+        fx.cleanup();
       } finally {
-        try {
-          fx.cleanup();
-        } finally {
-          fs.rmSync(homeDir, { recursive: true, force: true });
-        }
+        fs.rmSync(homeDir, { recursive: true, force: true });
       }
     }
-  });
+  }
 }
 
 /**

@@ -23,8 +23,8 @@ function renderEditor(name: string) {
   return screen.getByLabelText("Claude model") as HTMLSelectElement;
 }
 
-const LEAD_MODEL_HELP = "A model chosen at start or a schedule's model, then your Run defaults model for that harness, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses gpt-6.1-sol.";
-const LEAD_EFFORT_HELP = "An effort chosen at start, then your Run defaults effort for that harness (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.";
+const LEAD_MODEL_HELP = "A model chosen at start or a schedule's model, then your worker model for that harness in Settings → Models, take precedence over this pin; with none of these and no pin, Claude uses the SDK/account default and Codex uses gpt-6.2-sol.";
+const LEAD_EFFORT_HELP = "An effort chosen at start, then your worker effort for that harness in Settings → Models (a level or Runtime default), take precedence over this pin; with none of these and no pin, the lead runs at built-in medium.";
 const MODEL_HELP = "Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Use the run's resolved model for subagents too” on overrides these model pins; effort pins are kept.";
 
 describe("AgentTemplateEditor model Default label (#3255)", () => {
@@ -32,7 +32,7 @@ describe("AgentTemplateEditor model Default label (#3255)", () => {
     const select = renderEditor("lead");
     expect(select.options[0]?.text).toBe("Default · SDK/account default (built-in)");
     const codex = screen.getByLabelText("Codex model") as HTMLSelectElement;
-    expect(codex.options[0]?.text).toBe("Default · built-in (gpt-6.1-sol)");
+    expect(codex.options[0]?.text).toBe("Default · built-in (gpt-6.2-sol)");
     expect((screen.getByLabelText("Claude effort") as HTMLSelectElement).options[0]?.text).toBe("Default · built-in (medium)");
     expect((screen.getByLabelText("Codex effort") as HTMLSelectElement).options[0]?.text).toBe("Default · built-in (medium)");
     const modelHelp = screen.getByText(LEAD_MODEL_HELP);
@@ -75,7 +75,7 @@ describe("AgentTemplateEditor model Default label (#3255)", () => {
     );
     // shipped side of every row is the Default label; the unchanged Claude model is not listed.
     expect(screen.getAllByText("Default · built-in (medium)", { selector: "span.text-ok" })).toHaveLength(2);
-    expect(screen.getByText("Default · built-in (gpt-6.1-sol)", { selector: "span.text-ok" })).toBeTruthy();
+    expect(screen.getByText("Default · built-in (gpt-6.2-sol)", { selector: "span.text-ok" })).toBeTruthy();
     expect(screen.queryByText(/^Default$/, { selector: "span" })).toBeNull();
   });
 
@@ -187,7 +187,7 @@ describe("AgentTemplateEditor pin validation", () => {
     />);
     const codex = screen.getByLabelText("Codex model") as HTMLSelectElement;
     expect(Array.from(codex.options, (option) => option.value)).toEqual([
-      "inherit", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
+      "inherit", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna",
     ]);
     expect(screen.getByLabelText("Custom model ID")).toBeTruthy();
     fireEvent.submit(container.querySelector("form")!);

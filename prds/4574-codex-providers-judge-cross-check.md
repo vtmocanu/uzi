@@ -3,8 +3,8 @@
 **Issue**: [#4574](https://github.com/vtmocanu/uzi/issues/4574)
 **Priority**: High
 **Umbrella**: [#4319](https://github.com/vtmocanu/uzi/issues/4319)
-**Blocked by**: [#4323](https://github.com/vtmocanu/uzi/issues/4323) (Codex issue/task lane, provider-only claim delivery, engine-parameterized core, `codex_provider_v1`).
-**Disposition**: Prepared follow-up, blocked by #4323 and final architecture/spec approval. One slice per gated run; no on-deck sweep enrollment. Splitting and filing this PRD do not dispatch it or extend the #4323 dispatch grant; dispatch requires an applicable user grant.
+**Blocked by**: [#4323](https://github.com/vtmocanu/uzi/issues/4323) (landed in #4638), and merged [#4322](https://github.com/vtmocanu/uzi/issues/4322) M1a before #4574 M1. The remaining #4322 slices are not prerequisites.
+**Disposition**: Prepared follow-up. Dispatch waits for the applicable slice prerequisites and final architecture/spec approval. One slice per gated run; no on-deck sweep enrollment. Splitting and filing this PRD do not dispatch it or extend the #4323 dispatch grant; dispatch requires an applicable user grant.
 
 ## Problem and outcome
 
@@ -23,11 +23,13 @@ Jobs, chat and the isolated lane on Codex; admin-shared providers (#4324); new p
 
 Same invariants as #4323 and #4322: exclusive frozen binding on the five `runs.model_provider_*` columns, `enablement_rev` fence, provider-only claim (no `secrets.codex` block or vendor credential-operation capability), no vendor fallback, #4505 key-forms redaction on every lane output and the fail-closed upload scan, accepted redirect risk (owner 2026-11-19) unchanged. Lane settlement follows #4322's matrix (typed terminal failure for judge/checker child revocation; no generic provider parking of repo-less evaluators).
 
-Per-lane capabilities, alongside `codex_provider_v1`: `codex_provider_judge_v1` (M1) and `codex_provider_checker_v1` (M2, both stages). Each is advertised only once its consumer is complete, and is required in ClaimRun, the `claim_assembly.go` backstop, `fn_placement_admitting_workers` (additive replacement migration, draft number), health, demand and reap predicates. Old workers receive no lane claim; an unused capability is harmless.
+Per-lane capabilities, alongside `codex_provider_v1`: `codex_provider_judge_v1` (M1) and `codex_provider_checker_v1` (M2, both stages). Each is advertised only once its consumer is complete, and is required in ClaimRun, the `claim_assembly.go` backstop, `fn_placement_admitting_workers` (additive replacement migration, draft number), health, demand and reap predicates. Old workers receive no lane claim; an unused capability is harmless. Each slice's placement and claim predicate change is serial with #4322's: Up extends the live definition at landing and preserves every merged Claude lane predicate, and Down restores that exact immediate predecessor.
 
 ## Slices
 
 ### M1: Codex provider judge
+
+Reuse merged #4322 M1a judge authority, settlement and capability seams.
 
 At both judge creation sites (`judge_enqueue.go`, `judge_read.go`), when `judgeHarnessFor` selects Codex and the owner's Codex source is set, freeze that provider/key/revision at creation; null source keeps the existing Codex vendor default/account-mode resolver. Do not invent a Codex judge pin/auto setting or apply `judge_anthropic_bind_mode`. Later source edits affect new judge rows only. Validate the actual judge model against the frozen Codex map. Wire `judge-runner.ts` through the #4323 provider arm. Test provider-only owner, unset source, source change while queued, revoked final delivery and gateway limit (`provider_gateway_limit`, terminal).
 

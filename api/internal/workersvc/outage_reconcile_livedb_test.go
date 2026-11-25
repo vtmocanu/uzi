@@ -773,7 +773,7 @@ func newOutageCodexFlight(t *testing.T, mode string) outageCodexFlight {
 	f.svc.SetVault(env.vlt)
 	f.svc.SetTxBeginner(env.pool)
 	w, nonce, err := f.svc.Register(env.ctx, hbWorker(t, env, f.workerID), "m1-test", "base", nil, nil,
-		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1, capability.CodexAccountParkV1}, nil)
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.RecoveryArchiveV1, capability.CodexAccountParkV1}, nil)
 	if err != nil || nonce == "" {
 		t.Fatalf("initial Register: nonce present=%v err=%v", nonce != "", err)
 	}

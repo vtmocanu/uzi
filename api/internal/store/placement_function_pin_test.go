@@ -112,11 +112,11 @@ func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 	for _, c := range []string{
 		"milestone_reconciliation_claim_v1", "task_checkpoint_coordinates_v1", "publication_resume_v1",
 		"completion_interlock_v1", "ci_config_guard_v1", "repo_agent_source_v1", "agent_source_request_v1",
-		"provider_policy_hold_v1", "ci_artifacts_v1", "codex_harness_v1", "codex_runtime_v2",
+		"provider_policy_hold_v1", "ci_artifacts_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3",
 		"codex_completion_interlock_v1", "codex_custom_model_v1", "cross_check_v1",
 		"cross_check_codex_lead_v1", "cross_check_semantic_plan_v1", "cross_check_owner_steering_v1",
 		"completion_semantic_publication_v1", "cross_check_code_v1", "cross_check_lane_v1",
-		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "run_env_v1",
+		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "codex_provider_v1", "run_env_v1",
 	} {
 		want["'"+c+"' = ANY(w.protocol_capabilities)"] = 1
 	}

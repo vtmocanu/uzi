@@ -70,7 +70,7 @@ Codex. The detail page uses the same per-family lines. Empty pins use the same h
 - Subagent model: **Default · follows lead**, for either harness.
 - Subagent effort: **Default · follows the run's effort**, for either harness.
 - Lead (or orchestrator), Claude model: **Default · SDK/account default (built-in)**.
-- Lead (or orchestrator), Codex model: **Default · built-in (gpt-6.1-sol)**.
+- Lead (or orchestrator), Codex model: **Default · built-in (gpt-6.2-sol)**.
 - Lead (or orchestrator), effort, either harness: **Default · built-in (medium)**.
 
 A subagent whose four pins are all empty collapses to the two Default lines
@@ -85,10 +85,10 @@ a note above the table (**For your lead runs**). It refreshes after you change
 stored-pin cells are shared and never change per viewer.
 
 For the lead, the editor help states the precedence. Model: a model chosen when
-starting the run or a schedule's model, then your **Run defaults** model, beat
+starting the run or a schedule's model, then your **Settings → Models** worker model, beat
 the pin; with none and no pin, Claude uses the SDK/account default and Codex
-uses gpt-6.1-sol. Effort: an effort chosen when starting the run, then your
-**Run defaults** effort (a level or Runtime default), beat the pin; otherwise
+uses gpt-6.2-sol. Effort: an effort chosen when starting the run, then your
+**Settings → Models** worker effort (a level or Runtime default), beat the pin; otherwise
 the built-in medium. The subagent help keeps that **Use the run's resolved model
 for subagents too** overrides model pins only.
 
@@ -99,7 +99,7 @@ A template stores two independent pins: `model` is the **Claude pin**, and
 For a subagent, an empty pin follows the model the run resolved for the lead.
 The schedule's model takes precedence over your worker-model lane, then the
 selected lead template's pin for the run's harness. An empty lead pin falls
-back to the SDK/account default for Claude or `gpt-6.1-sol` for Codex. The
+back to the SDK/account default for Claude or `gpt-6.2-sol` for Codex. The
 shipped lead has a Claude pin of `opus` and an empty Codex pin.
 
 A subagent's own pin for the run's harness takes precedence over following
@@ -113,10 +113,10 @@ pending hosted validation.
 Save-time rules apply to builtin, global and personal templates:
 
 - The Claude pin accepts aliases such as `opus` and `sonnet` and custom model
-  IDs, except the five supported Codex role IDs below. Model IDs must satisfy
+  IDs, except the supported Codex role IDs below. Model IDs must satisfy
   the shared syntax rules (at most 100 bytes, no control or format characters).
 - The Codex pin accepts `gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`,
-  `gpt-6-sol` and `gpt-6.1-sol`. Other IDs, including custom Codex IDs and
+  `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol` and `gpt-6.2-astra`. Other IDs, including custom Codex IDs and
   Claude aliases, are rejected.
 - JSON `null` or a blank string clears a pin. Omitting `codex_model` on create
   leaves it empty; omitting it on update preserves the stored Codex pin.

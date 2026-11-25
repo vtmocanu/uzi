@@ -31,11 +31,16 @@ WORKDIR /app
 # v2 subcommand plugin (`docker compose`), buildx the build plugin.
 # Retry apk on a transient Alpine-mirror blip (issue #739). 5 attempts, n*3s backoff;
 # the setpriv assertion stays outside the loop (it is not a network step).
+# /bin/stat and /usr/bin/timeout (busybox applets) are the fixed runner-uid helpers agent/src/claude-global-config.ts runs
+# (a bounded `stat -c` probe and the timeout wrapper); the assertion fails the build if either is missing or
+# `stat -c` does not print the expected fields.
 # acl (#4486): /usr/bin/getfacl is the managed-bare ACL observer the epoch proof runs by absolute path.
 # git-daemon: Alpine ships git-http-backend only in this subpackage; native smart-HTTP tests
 # (handler recovery-restore LiveDB, pushbroker, e2e/forge-fake mr-get) need it. Inert: nothing starts git-daemon.
 RUN n=0; until apk add --no-cache git git-daemon bash tini curl xz tar setpriv acl docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid \
+    && test -x /bin/stat && test -x /usr/bin/timeout \
+    && /usr/bin/timeout -s KILL 2 /bin/stat -c '%u|%a|%F|%n' -- / | grep -q '^0|[0-7]*|directory|/$' \
     && test -x /usr/bin/getfacl && /usr/bin/getfacl --version | grep -q '^getfacl ' \
     && test -x /usr/bin/setfacl \
     && test -x "$(git --exec-path)/git-http-backend"
@@ -438,7 +443,7 @@ RUN chmod -R a+rX /nix \
 # manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
 # build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
 # (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
-# `codex-cli 0.169.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# `codex-cli 0.171.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
 # sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
 # helpers + lock are removed after (no residue); NO auth/config/session state is baked.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.

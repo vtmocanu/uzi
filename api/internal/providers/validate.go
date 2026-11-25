@@ -32,7 +32,7 @@ type ModelEntry struct {
 	ContextWindow *int   `json:"context_window,omitempty"`
 }
 
-// ModelMap maps a Claude alias to its gateway model.
+// ModelMap maps an engine-specific model key to its gateway model.
 type ModelMap map[string]ModelEntry
 
 // ValidateKey checks a pasted provider key: 16..4096 characters, each printable ASCII 0x21..0x7E
@@ -56,11 +56,27 @@ func ValidateKey(key string) error {
 // ModelAliases, haiku present, each model 1..MaxModelLen of [A-Za-z0-9._:/@-], and an optional
 // integer context window within [MinContextWindow, MaxContextWindow].
 func ValidateModelMap(m ModelMap) error {
+	return validateModelMap(m, ModelAliases, HaikuAlias)
+}
+
+// ValidateModelMapForEngine validates the exact model vocabulary of an engine.
+func ValidateModelMapForEngine(engine string, m ModelMap) error {
+	switch engine {
+	case EngineClaude:
+		return ValidateModelMap(m)
+	case EngineCodex:
+		return validateModelMap(m, []string{"default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"}, "default")
+	default:
+		return errors.New("unsupported provider engine")
+	}
+}
+
+func validateModelMap(m ModelMap, aliases []string, required string) error {
 	if len(m) > MaxModelMapEntries {
 		return fmt.Errorf("model map must have at most %d entries", MaxModelMapEntries)
 	}
-	if _, ok := m[HaikuAlias]; !ok {
-		return errors.New("model map must define haiku")
+	if _, ok := m[required]; !ok {
+		return fmt.Errorf("model map must define %s", required)
 	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -69,13 +85,16 @@ func ValidateModelMap(m ModelMap) error {
 	sort.Strings(keys)
 	for _, k := range keys {
 		known := false
-		for _, a := range ModelAliases {
+		for _, a := range aliases {
 			if a == k {
 				known = true
 			}
 		}
 		if !known {
-			return errors.New("model map keys must be opus, sonnet, haiku or fable")
+			if required == HaikuAlias {
+				return errors.New("model map keys must be opus, sonnet, haiku or fable")
+			}
+			return fmt.Errorf("model map keys must be one of %v", aliases)
 		}
 		e := m[k]
 		if e.Model == "" || len(e.Model) > MaxModelLen {
@@ -91,12 +110,14 @@ func ValidateModelMap(m ModelMap) error {
 	return nil
 }
 
-// Auth styles and the single protocol and engine accepted today.
+// Supported provider engines, protocols and auth styles.
 const (
-	AuthBearer   = "bearer"
-	AuthXAPIKey  = "x_api_key"
-	EngineClaude = "claude"
-	ProtocolAnth = "anthropic_messages"
+	AuthBearer        = "bearer"
+	AuthXAPIKey       = "x_api_key"
+	EngineClaude      = "claude"
+	EngineCodex       = "codex"
+	ProtocolResponses = "openai_responses"
+	ProtocolAnth      = "anthropic_messages"
 )
 
 // ValidateAuthStyle accepts bearer or x_api_key.
@@ -105,4 +126,24 @@ func ValidateAuthStyle(s string) error {
 		return errors.New("auth_style must be bearer or x_api_key")
 	}
 	return nil
+}
+
+// ValidateProfile validates engine/protocol/auth pairing before credentials are used.
+func ValidateProfile(engine, protocol, authStyle string, models ModelMap) error {
+	switch engine {
+	case EngineClaude:
+		if protocol != ProtocolAnth {
+			return errors.New("claude requires anthropic_messages")
+		}
+		if err := ValidateAuthStyle(authStyle); err != nil {
+			return err
+		}
+	case EngineCodex:
+		if protocol != ProtocolResponses || authStyle != AuthBearer {
+			return errors.New("codex requires openai_responses with bearer auth")
+		}
+	default:
+		return errors.New("unsupported provider engine")
+	}
+	return ValidateModelMapForEngine(engine, models)
 }

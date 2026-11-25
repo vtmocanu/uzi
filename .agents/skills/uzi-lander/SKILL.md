@@ -491,8 +491,9 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
 
    For `vtmocanu/uzi` main, exit 12 means main changed changelog-policy files since the PR's merge-base: rebase or merge main, wait for fresh exact-head CI, re-run `merge.sh`; merges outside it bypass this guard.
    That check uses the helper's own checkout and an exact GitHub origin URL allowlist for `vtmocanu/uzi`.
-   Exit 13 (`MIGRATION_COLLISION`) means an added, renamed or copied migration destination is at or below the live base head: run `land-prep.sh` to renumber, then require fresh exact-head CI and review. Unreadable PR files or base migrations refuse with exit 2. The final check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
+   Exit 13 (`MIGRATION_COLLISION`): an added/renamed/copied migration is at or below the live base head: renumber with `land-prep.sh`, then get fresh exact-head CI and review. Unreadable PR files or base migrations: exit 2. The check shares takeover's parser; a base move outside the lander lock after the snapshot remains a race.
    Exit 14 (`ACTIVE_HELPER`): wait or cancel with terminal/custody verification. Exit 4: ownership unreadable. Neither permits out-of-band merge.
+   Exit 15 (`CHANGELOG_FRAGMENTS_UNCITED`): 2+ added fragments, no headline cites the PR or a same-repo issue this merge closes; add `#PR` to one.
    It refuses on a moved head, an active helper, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI that a merge would still supersede on
@@ -505,12 +506,11 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    post-merge CI watch — exit 9 if it is not merged yet). Do this
    BEFORE `reap`/`release`, or the trail is purged before it was ever written (#1510).
 7. **Post-merge CI.** `S/watch-run-ci.sh --sha MERGE_SHA --follow --interval 60 --max-ticks 200` in the background
-   (main runs finish, so a followed head can wait a whole run before starting; exit 2 is not red: re-arm).
-   Pass the exact SHA from `merge.sh`; never hand-complete a prefix. The poller resolves it
-   through GitHub and exits 3 before polling when it is invalid or unknown.
-   Exit 0 green (a partial dispatch counts; confirm a gate fix another way), 1 red (use the
-   per-job live-log commands it prints, then follow the repair-ownership check below before fixing on a branch, never `main`; flake → file, and
-   rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no run appeared
+   (main runs finish, so a followed head can wait a whole run; exit 2 is not red: re-arm, except a limit-reached one: merge-mechanics).
+   Pass the exact SHA from `merge.sh`, never a prefix; an invalid or unknown SHA exits 3 before polling.
+   Exit 0 gating runs green (schedule/dispatch: ADVISORY; a partial workflow set counts; confirm a gate fix another way), 1 red (use its
+   per-job live-log commands, then follow the repair-ownership check below before fixing on a branch, never `main`; flake → file, and
+   rerun only while that SHA is still the `main` head), 2 budget exhausted, 3 no gating run
    or lookup failed. `--follow` prints each
    `FOLLOW sha=OLD -> NEW` switch to the current branch head without resetting `--max-ticks`;
    the final verdict covers the last watched SHA. Without it, 4 superseded → re-watch the current `main` head

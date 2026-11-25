@@ -326,6 +326,13 @@ type FakeClient struct {
 	MrReworkRun         apitypes.RunDTO
 	SetRunMrReworkErr   error
 
+	// SetRunCIAutofix capture, mirroring the MR-rework fields above: the run id, the
+	// tri-state pointer, the canned result, and a write-specific error.
+	LastCIAutofixRunID   string
+	LastCIAutofixEnabled *bool
+	CIAutofixResult      SetRunCIAutofixResult
+	SetRunCIAutofixErr   error
+
 	// RunRework capture (PRD #1202 M1): LastReworkRunID is the run id `uzi run rework`
 	// targeted; LastReworkGuidance is the guidance it sent (from -m or stdin, "" when
 	// none). ReworkRun is the canned success reply; RunReworkErr wins over the blanket Err
@@ -425,6 +432,11 @@ type FakeClient struct {
 	MarginCalls   int
 	LastMarginPts int
 
+	// SharedProviders drives AdminListSharedProviders and AdminGetSharedProvider (PRD #4324); an id
+	// not in the list is an ExitNotFound error, like the server's 404. SharedProviderGets counts gets.
+	SharedProviders    []apitypes.AdminSharedProviderDTO
+	SharedProviderGets int
+
 	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
 	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
 	// what the command sent.
@@ -436,11 +448,12 @@ type FakeClient struct {
 	LastProviderID      string
 	ProviderRetireCalls int
 	ProviderTestCalls   int
-	// ProviderSourceCalls counts SetClaudeProviderSource; LastProviderSource is the id it was last
+	// ProviderSourceCalls counts provider source writes; LastProviderSource is the id it was last
 	// asked to select (nil = clear) and ProviderSourceSet says it was called at all.
-	ProviderSourceCalls int
-	ProviderSourceSet   bool
-	LastProviderSource  *string
+	LastProviderSourceEngine string
+	ProviderSourceCalls      int
+	ProviderSourceSet        bool
+	LastProviderSource       *string
 
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO

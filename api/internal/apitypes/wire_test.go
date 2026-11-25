@@ -264,6 +264,8 @@ var runDTOKeys = []string{
 	// tell "no per-run opinion" (null) from an explicit true/false and render the
 	// effective inherited value.
 	"mr_rework_enabled",
+	// Issue #4617: the per-run CI-autofix override, same tri-state *bool, NOT omitempty.
+	"ci_autofix_enabled",
 	// PRD #1202 D11: the owner-only automatic-rework loop-guard view (cycles spent / live
 	// cap), both nullable *int, populated only on the owner's run-detail read.
 	"mr_rework_auto_cycles", "mr_rework_auto_cap",
@@ -1236,6 +1238,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"codex_judge_model", "judge_models", "judge_runs_on",
 		// PRD #4320: the provider the Claude lane runs on (null ⇒ vendor ladder).
 		"claude_provider_id",
+		// Issue #4323: the Codex provider source (null ⇒ vendor ladder).
+		"codex_provider_id",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
 		// PRD #1570: the per-harness task-review models (null ⇒ built-in) and their read-only cells.

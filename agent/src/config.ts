@@ -1,4 +1,5 @@
 import os from "node:os";
+import { captureExtraCa, type ValidatedExtraCa } from "./codex/extra-ca.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { LogLevel } from "./log.js";
@@ -31,6 +32,8 @@ export type ExecutorKind = "sdk" | "stub";
 export type CommandSandboxMode = "off" | "required" | "best-effort";
 
 export interface Config {
+  /** Trusted public CA snapshot captured before worker provisioning. */
+  codexExtraCa?: ValidatedExtraCa;
   recoveryDecodedLimitBytes: number;
   apiUrl: string;
   workerToken: string;
@@ -635,12 +638,14 @@ function memoryGuardConfig(env: NodeJS.ProcessEnv): NonNullable<Config["memoryGu
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const codexExtraCa = captureExtraCa(env.UZI_CODEX_CA_FILE);
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
   const dataDir = env.UZI_DATA_DIR?.trim() || "/data";
   const recoveryDecodedLimitBytes = parseRecoveryDecodedLimitBytes(env.UZI_RECOVERY_DECODED_LIMIT_BYTES);
   return {
     apiUrl,
+    codexExtraCa,
     recoveryDecodedLimitBytes,
     workerToken: resolveWorkerToken(env),
     dataDir,

@@ -225,8 +225,11 @@ a running one.
   Both harnesses use this rule. Run models follow the model chosen when the
   run was started (`runs.model_source = 'run_override'`), else the frozen
   schedule pin (`schedule_pin`), then the owner's per-harness lane, the selected
-  lead's harness pin, then the SDK/account default for Claude or `gpt-6.1-sol`
-  for Codex. A run-chosen model or effort is validated at create (a bad
+  lead's harness pin, then the SDK/account default for Claude or `gpt-6.2-sol`
+  for Codex. The root/planning fallback and independent Codex judge built-in
+  are `gpt-6.2-sol` (#4626); explicit user, instance, run, schedule and template
+  choices are not migrated. Task review and PR descriptions retain `gpt-6-sol`,
+  summaries `gpt-6-luna`. A run-chosen model or effort is validated at create (a bad
   shape is a 400; a model the harness cannot run is a 422
   `model_incompatible_with_harness`), frozen across requeue and reclaim, and,
   if the claim can no longer honor it, parks the run `paused` on hold
@@ -553,6 +556,36 @@ provisioning counts a provider-bound run as demand and reaps an online ephemeral
 capability. Design record, route split, inheritance rules and rollback hazards:
 [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md); user docs:
 [docs/providers.md](docs/providers.md).
+
+**Codex engine (PRD #4323).** The same core serves a second engine arm: a provider with engine
+`codex` and protocol `openai_responses` (Bearer only), keyed by `openai_compatible_key` and selected
+per engine in `users.codex_provider_id` (`uzi provider use`; clearing names `--engine`). Resolution,
+freezing and the claim checks are engine-parameterized, not copied. A Codex provider claim is
+**provider-only**: the key travels only in `claim.secrets.provider`, there is no `secrets.codex`
+block (the decoder refuses both), no vendor release or refresh is called, and
+`/codex/release` and `/codex/refresh` refuse the run. The worker advertises `codex_provider_v1`
+with the Codex harness capabilities; the api admits the claim only to a worker with
+`codex_provider_v1` + `codex_harness_v1` + `codex_runtime_v2`, so the api rolls before the workers.
+The issue/task/prompt/self_improve lane, its in-run advice, summary and task-review passes, and
+retries, resume and cold resume use the frozen binding (provider, revision, key `enablement_rev`);
+`mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
+Interim refusals (`provider_lane_unsupported`, follow-up #4574): the Codex judge is skipped for an
+owner with a provider source, plan and code cross-check refuse when either side is Codex-provider
+bound (a Claude lead with plan cross-check owned by someone with a Codex source gets a human plan
+gate), and jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
+model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);
+[ADR-4320, Codex engine](adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)
+records the claim ordering and recovery model.
+
+**Admin-shared definitions (PRD #4324).** An admin can publish a keyless Claude definition
+(`owner_user_id IS NULL`, `credential_mode = 'per_user_key'`) from Admin → Shared providers. Every
+user sees it next to their own providers, attaches their own sealed key and selects it as their
+Claude source; the admin never sees a key. Endpoint and auth style are fixed at creation (admin
+edits change only the name and model map), keys and selections are pinned to the definition's
+scope by composite foreign keys to `model_providers (scope_owner_id, id)`, Test results are kept
+per user, and delete is refused while anyone has it selected. Codex shared definitions are #4633.
+Design record, lock orders and migration failure model:
+[adr/4324-admin-shared-providers.md](adr/4324-admin-shared-providers.md).
 
 ## Claude rate-limit visibility (PRD #53)
 
@@ -985,7 +1018,7 @@ DTO also exposes read-only `worker_default_model` counterfactual metadata
 using the existing allocated lead/orchestrator selection in native SQL name
 order when the Claude worker model is unset; a null first-template model
 then means SDK/account default. Codex without a saved worker model falls
-back to `gpt-6.1-sol`.
+back to `gpt-6.2-sol`.
 
 A non-null model or effort pin in the Codex cell requires
 `cross_check_pins_v1`; unpinned checks still accept older
@@ -1005,7 +1038,7 @@ Other startup failures retain #2149 handling, including model errors with
 worker defaults or effort-only pins. Both pin cells are active; the Claude cell
 applies to the Claude checker of a Codex lead. At Default, both checker stages
 follow the checker family's model lane, then the first delivered lead's pin for
-that family, then the Claude SDK default or Codex's `gpt-6.1-sol`. Template
+that family, then the Claude SDK default or Codex's `gpt-6.2-sol`. Template
 fallbacks retain `worker default` model provenance. Checker effort stays
 independent: an explicit effort pin wins, otherwise `high` with
 `cross-check default` provenance. A pinned Claude model rejected by the SDK
@@ -3356,3 +3389,15 @@ land.
 ## Release authorization
 
 The release workflow (manual dispatch and opt-in nightly RCs) isolates App credentials from repository code: preparation uses the shared cutter and coverage policy, then a separate job validates a bundle and atomically pushes permitted refs. RC and stable use separate principals; stable requires an Environment reviewer. The local fallback remains. [ADR-3512](adr/3512-release-automation.md) records the accepted main-write trust boundary, staged rollout and deferred recovery work.
+
+
+### Codex runtime admission baseline
+
+Runtime 0.171.0 adds `codex_runtime_v3` alongside the compatible
+`codex_harness_v1` and `codex_runtime_v2` advertisements. ClaimRun and placement
+require all three when harness is `codex`, `codex_material_revision` is non-null,
+or `codex_secret_id` is non-null, independently of `required_capabilities`,
+`fn_worker_can_claim` and the capability-aware switch. See
+[ADR-1106](adr/1106-codex-harness.md) for the audit and
+[rollout ordering](docs/configuration.md#current-codex-worker-baseline) for
+API-first waiting, worker-first compatibility and the weaker Down baseline.

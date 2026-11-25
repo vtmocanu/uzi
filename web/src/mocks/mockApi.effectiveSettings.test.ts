@@ -172,7 +172,7 @@ describe("getEffectiveSettings", () => {
     expect(await mockApi.getEffectiveSettings()).toEqual(behavior.scenarios[0].get);
   });
 
-  it("keeps the recorded resolution when a preference is set, naming the template only as the default", async () => {
+  it("resolves the stored preference, naming the template only as the default", async () => {
     const template = {
       ...templates[0]!, id: "b-lead-3258b", name: "lead", scope: "builtin" as const, is_builtin: true,
       model: null, codex_model: null, effort: null, codex_effort: "high",
@@ -185,7 +185,11 @@ describe("getEffectiveSettings", () => {
         await mockApi.putMySettings({ default_codex_effort: pref });
         const got = await mockApi.getEffectiveSettings();
         const codex = got.efforts.find((c) => c.setting === "worker_effort" && c.harness === "codex");
-        expect(codex).toEqual({ ...recorded, default_effort: "high", default_source: "template" });
+        expect(codex).toEqual({
+          ...recorded, default_effort: "high", default_source: "template",
+          effort: pref, resolved_effort: pref === "runtime" ? null : pref,
+          mode: pref === "runtime" ? "runtime_default" : "explicit", source: "user_default",
+        });
       }
     } finally {
       await mockApi.putMySettings({ default_codex_effort: null });
@@ -231,11 +235,11 @@ describe("recorded planning resets", () => {
     return (await import("./mockApi")).mockApi;
   }
 
-  function expectOtherCellsUnchanged(got: EffectiveSettings, before: EffectiveSettings, harness: Harness) {
+  function expectOtherCellsUnchanged(got: EffectiveSettings, before: EffectiveSettings, harness: Harness, workerChanged = false) {
     const otherCells = (view: EffectiveSettings) => ({
       ...view,
-      models: view.models.filter(c => c.setting !== "planning_model" || c.harness !== harness),
-      efforts: view.efforts.filter(c => c.setting !== "planning_effort" || c.harness !== harness),
+      models: view.models.filter(c => c.harness !== harness || (c.setting !== "planning_model" && !(workerChanged && c.setting === "worker_model"))),
+      efforts: view.efforts.filter(c => c.harness !== harness || (c.setting !== "planning_effort" && !(workerChanged && c.setting === "worker_effort"))),
     });
     expect(otherCells(got)).toEqual(otherCells(before));
   }
@@ -320,7 +324,11 @@ describe("recorded planning resets", () => {
           .toMatchObject({ model: null, resolved_model: model, source: "user_default" });
         expect(got.efforts.find(c => c.setting === "planning_effort" && c.harness === harness))
           .toMatchObject({ effort: null, resolved_effort: effort === "runtime" ? null : "low", source: "user_default", mode: effort === "runtime" ? "runtime_default" : "explicit" });
-        expectOtherCellsUnchanged(got, before, harness);
+        expect(got.models.find(c => c.setting === "worker_model" && c.harness === harness))
+          .toMatchObject({ model, resolved_model: model, source: "user_default" });
+        expect(got.efforts.find(c => c.setting === "worker_effort" && c.harness === harness))
+          .toMatchObject({ effort, resolved_effort: effort === "runtime" ? null : effort, source: "user_default", mode: effort === "runtime" ? "runtime_default" : "explicit" });
+        expectOtherCellsUnchanged(got, before, harness, true);
       });
     });
   }

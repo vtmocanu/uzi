@@ -129,6 +129,72 @@ func (q *Queries) GetLiveRunEnvVarByNameForUpdate(ctx context.Context, arg GetLi
 	return i, err
 }
 
+const getLiveRunEnvVarByNameWithEpoch = `-- name: GetLiveRunEnvVarByNameWithEpoch :one
+SELECT r.id, r.var_id, r.user_id, r.repo_id, r.name, r.secret, r.description, r.ciphertext, r.sealed_with,
+       r.value_bytes, r.rev, r.retired_at, r.disabled_at, r.pending_delete_at, r.created_at, r.updated_at,
+       r.aad_version, u.vault_epoch
+FROM run_env_vars r
+JOIN users u ON u.id = r.user_id
+WHERE r.user_id = $1 AND r.repo_id = $2 AND r.name = $3
+  AND r.retired_at IS NULL AND r.pending_delete_at IS NULL
+`
+
+type GetLiveRunEnvVarByNameWithEpochParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+	Name   string      `json:"name"`
+}
+
+type GetLiveRunEnvVarByNameWithEpochRow struct {
+	ID              uuid.UUID          `json:"id"`
+	VarID           uuid.UUID          `json:"var_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          pgtype.UUID        `json:"repo_id"`
+	Name            string             `json:"name"`
+	Secret          bool               `json:"secret"`
+	Description     string             `json:"description"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	SealedWith      string             `json:"sealed_with"`
+	ValueBytes      int32              `json:"value_bytes"`
+	Rev             int32              `json:"rev"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
+	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
+	VaultEpoch      int64              `json:"vault_epoch"`
+}
+
+// The live row of a repo-scope name with the owner's users.vault_epoch read in the same
+// statement, so the handler opens a plain value at the epoch its ciphertext was read at
+// (secretopen.OpenSealedAtEpoch). A plain read outside any transaction.
+func (q *Queries) GetLiveRunEnvVarByNameWithEpoch(ctx context.Context, arg GetLiveRunEnvVarByNameWithEpochParams) (GetLiveRunEnvVarByNameWithEpochRow, error) {
+	row := q.db.QueryRow(ctx, getLiveRunEnvVarByNameWithEpoch, arg.UserID, arg.RepoID, arg.Name)
+	var i GetLiveRunEnvVarByNameWithEpochRow
+	err := row.Scan(
+		&i.ID,
+		&i.VarID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Name,
+		&i.Secret,
+		&i.Description,
+		&i.Ciphertext,
+		&i.SealedWith,
+		&i.ValueBytes,
+		&i.Rev,
+		&i.RetiredAt,
+		&i.DisabledAt,
+		&i.PendingDeleteAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AadVersion,
+		&i.VaultEpoch,
+	)
+	return i, err
+}
+
 const getRunEnvFormBudgetUsage = `-- name: GetRunEnvFormBudgetUsage :one
 SELECT coalesce(sum(value_bytes), 0)::bigint AS secret_bytes
 FROM run_env_vars

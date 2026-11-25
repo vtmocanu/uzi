@@ -112,8 +112,8 @@ task test:codex-m3b:host
 task check:codex-m4-receipts
 ```
 
-`test:codex-m4` needs the pinned `codex-cli 0.169.0` package (`agent/codex/codex-package.lock`):
-either the image-baked absolute path at `/opt/uzi-codex/0.169.0`, or a rootless test-cache
+`test:codex-m4` needs the pinned `codex-cli 0.171.0` package (`agent/codex/codex-package.lock`):
+either the image-baked absolute path at `/opt/uzi-codex/0.171.0`, or a rootless test-cache
 provision via `provision.ts` (`install-codex.sh` with SHA256-verified layout) on a Linux
 contributor/CI host without the baked package. D7 point 3's strict macOS Linux-container
 invocation is now reproducibly callable: `task test:codex-m4:macos` runs
@@ -234,7 +234,7 @@ These are known, accepted limitations recorded honestly, not defects hiding behi
   observed provider traffic. It does not traverse nested tools or prove nested `apply_patch`
   absent. The [exact inventory matrix](native-patch-inert.test.ts) covers the four curated
   models on fresh and truly cold roots, with nested/direct patch refusal and working nested
-  worker patch/exec controls. At pin 0.167.0, `apply_patch_freeform` is removed/ignored and
+  worker patch/exec controls. Measured at 0.167.0 (pin 0.169.0, not re-measured), `apply_patch_freeform` is removed/ignored and
   model metadata overrides `code_mode` / `code_mode_only`; native patch remains advertised.
   Registration grants no execution authority: explicit `environments: []` at root thread/start
   and turns (including child/advice/cross-check/cold resume), plus replaced launcher

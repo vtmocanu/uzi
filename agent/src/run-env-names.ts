@@ -7,7 +7,7 @@
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
   claude_agent_sdk: "0.3.325",
-  codex: "0.169.0",
+  codex: "0.171.0",
 } as const;
 
 /** The worker invariants a denylist entry protects (fixtures/run-env/name-rules.json "invariants"). */
@@ -216,6 +216,9 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "VSCODE_INSPECTOR_OPTIONS", invariant: "harness_control", note: "TypeScript debug-mode selector read by the bundled Claude CLI" },
   { value: "SYSTEMDRIVE", invariant: "managed_dirs", note: "system directory selection (uppercase spelling of the Windows SystemDrive)" },
   { value: "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", invariant: "provider_auth", note: "makes the Claude CLI treat the worker-set gateway as the first-party Anthropic API" },
+  { value: "SPIFFE_ENDPOINT_SOCKET", invariant: "provider_auth", note: "workload identity endpoint Codex reads to obtain provider credentials" },
+  { value: "SSH2_CLIENT", invariant: "git_authority", note: "its presence changes Codex network proxy credential brokerage" },
+  { value: "OTEL_RESOURCE_ATTRIBUTES", invariant: "harness_control", note: "telemetry resource attributes and statusline collector eligibility in Codex" },
 ];
 
 /** Name prefixes reserved for the worker and the agent harnesses. */
@@ -255,6 +258,7 @@ export const RUN_ENV_DENIED_PREFIXES: readonly RunEnvDeniedRule[] = [
   { value: "OTEL_EXPORTER_OTLP_", invariant: "network_wiring", note: "telemetry exporter endpoints and headers the harness reads" },
   { value: "GCE_METADATA_", invariant: "network_wiring", note: "metadata server address the harness's Google auth reads" },
   { value: "AWS_ENDPOINT_URL_BEDROCK", invariant: "network_wiring", note: "Bedrock endpoint the harness reads; covers AWS_ENDPOINT_URL_BEDROCK_RUNTIME" },
+  { value: "AWS_ENDPOINT_URL_", invariant: "network_wiring", note: "AWS per-service endpoint overrides (Codex 0.171.0 reserves the whole family); also covers the more specific AWS_ENDPOINT_URL_BEDROCK prefix and the STS and SSO names above, which stay for their documented rationale" },
 ];
 
 /** Name suffixes that change network routing. */

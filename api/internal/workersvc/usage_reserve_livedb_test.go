@@ -58,7 +58,7 @@ func newReserveFix(t *testing.T, threshold int16, pause bool) *reserveFix {
 	svc.SetTxBeginner(env.pool)
 	fx := &reserveFix{t: t, env: env, svc: svc, userID: userID, repoID: repoID, workerID: workerID, targetID: uuid.New(), newRunID: uuid.New}
 	env.exec(`UPDATE workers SET last_heartbeat_at = now(), protocol_capabilities = $2 WHERE id = $1`,
-		workerID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
+		workerID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3})
 	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
 	          VALUES ($1, $2, $3, 'issue', 3522, 't', 'd', 'completed')`, fx.targetID, userID, repoID)
 	fx.setReserve(threshold, pause)

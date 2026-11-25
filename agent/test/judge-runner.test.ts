@@ -702,10 +702,10 @@ describe("JudgeRunner", () => {
   // PRD #1551 (M2, D5): the Codex JUDGE path is unchanged — it still passes only the claim's
   // (trimmed) judge_model. With judge_model UNSET the advice request carries an empty model,
   // which renderCodexAdvice drops and codex-advice-harness resolves to the provider default
-  // (gpt-6.1-sol) via `rendered.model ?? provider.model`. The judge NEVER adopts the review
+  // (gpt-6.2-sol) via `rendered.model ?? provider.model`. The judge NEVER adopts the review
   // model or a worker default. Discriminating: were the judge to inject gpt-6-sol/a lane model,
   // req.model would not be empty.
-  it("a Codex judge with judge_model unset passes an empty model (→ provider gpt-6.1-sol fallback) (PRD #1551)", async () => {
+  it("a Codex judge with judge_model unset passes an empty model (→ provider gpt-6.2-sol fallback) (PRD #1551)", async () => {
     const { client } = fakeClient(emptyTrace);
     let reqModel: string | undefined = "UNSET";
     const codexModelJson = JSON.stringify({ verdict: "ok", summary: "codex advice", recommendations: [] });

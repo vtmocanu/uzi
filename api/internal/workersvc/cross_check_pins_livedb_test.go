@@ -21,7 +21,7 @@ func setCheckerPin(f crossCheckContentionFixture, harness string, model, effort 
 }
 
 func checkerPinCaps(pins, custom bool) []string {
-	caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CrossCheckOwnerSteeringV1}
+	caps := []string{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CrossCheckOwnerSteeringV1}
 	if pins {
 		caps = append(caps, capability.CrossCheckPinsV1)
 	}
@@ -71,7 +71,7 @@ func TestCrossCheckPinsResolutionLiveDB(t *testing.T) {
 		{"model-only", "gpt-6-astra", nil, "gpt-6-sol", "low", "gpt-6-astra", "high", "pin", "cross-check default"},
 		{"effort-only", nil, "xhigh", "gpt-6-sol", "high", "gpt-6-sol", "xhigh", "worker default", "pin"},
 		{"low effort pin kept", nil, "low", "gpt-6-sol", "max", "gpt-6-sol", "low", "worker default", "pin"},
-		{"default-null-model", nil, nil, nil, "medium", "gpt-6.1-sol", "high", "worker default", "cross-check default"},
+		{"default-null-model", nil, nil, nil, "medium", "gpt-6.2-sol", "high", "worker default", "cross-check default"},
 		{"default-later-lane-edit", nil, nil, "gpt-6-astra", "low", "gpt-6-astra", "high", "worker default", "cross-check default"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -115,6 +115,18 @@ the service tier. These figures compare work across harnesses, **not a
 bill**; subscription users may also consume purchased credits beyond
 included usage.
 
+For old and new Codex price rows, `cache_write` selects the **30-minute
+Standard estimate**, not measured cache duration or billed money. Missing TTL
+alone never makes a complete positive-write breakdown unpriced; the independent
+refusals above still apply. The inspected worker constructions leave TTL unset.
+The provider's documented 30-minute default requires both request TTL and
+breakpoint overrides to be absent; upstream compaction, child, review, recovery,
+inheritance and mixed-breakpoint paths remain unverified. Pricing an actual
+12-hour write at the selected 30-minute rate underestimates it, an owner-accepted
+residual. There is no duration parameter, 12-hour schema selector or runtime TTL
+input. See [ADR-1106's M4 evidence](../adr/1106-codex-harness.md#bounded-worker-construction-and-observed-request-regression)
+for verified rates, source quotes and the bounded observation.
+
 Claude summary and Now entries without a provider cost are priced from uzi's
 standard Anthropic table. For Haiku 4.5's dated and undated model IDs,
 `inference_geo: "not_available"` uses standard pricing: these table rows predate
@@ -198,8 +210,8 @@ carries it as `usage_estimated_tail`). The design is in
 `adr/2014-run-usage-estimated-tail.md`.
 
 - **It is an estimate, with provenance.** The dollar figure is priced from
-  Anthropic's official standard pricing page as fetched on 2026-11-04 and
-  recorded as a version id (`anthropic-standard-2026-11-04`), shown beside the
+  Anthropic's official standard pricing page as fetched on 2026-11-23 and
+  recorded as a version id (`anthropic-standard-2026-11-23`), shown beside the
   figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
   cent).
 - **Unpriced means unknown, never $0.** A model the table does not know, a

@@ -12,7 +12,7 @@
 
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -375,9 +375,9 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await assertSentinelIntact();
   });
 
-  // PRD #4416 review: under the split HOME/.claude is runner-private, so the worker cannot look
-  // inside it. A runner-planted file at a target must not refuse every later start of that HOME
-  // (the shared chat root): the failed runner mkdir moves .claude aside once and recreates it.
+  // Under the split HOME/.claude is runner-private, so the worker cannot look inside it. A
+  // runner-planted file at a target does not refuse the start: the failed runner mkdir is followed by
+  // the runner-uid stat probe, which shows the file, and .claude is moved aside once and recreated.
   it("a runner-planted file at .claude/projects does not refuse the start: .claude is moved aside and rebuilt (#4416)", async () => {
     const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004417");
     await fs.mkdir(home);
@@ -398,6 +398,105 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     assert.equal(await fs.readFile(path.join(cliEnv.CLAUDE_CONFIG_DIR, ".claude.json"), "utf8"), config.CLAUDE_GLOBAL_CONFIG_BYTES);
     await rmtree.rmHomeTree(home);
     assert.equal(await exists(home), false);
+  });
+
+  // The runner creates a world-writable sticky directory; a worker HOME inside it has a parent the
+  // runner owns, so the runner could rename the HOME's entry. The trusted layout refuses it.
+  it("a worker HOME whose parent the runner created is refused before anything is built (#4416)", async () => {
+    const outer = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004418");
+    await fs.mkdir(outer);
+    await fs.chmod(outer, 0o2770);
+    const runnerDir = path.join(outer, "runner-made");
+    asRunner(`set -e; umask 000; mkdir "$1"; chmod 1777 "$1"`, runnerDir);
+    const home = path.join(runnerDir, "home");
+    await fs.mkdir(home);
+    const cliEnv = { HOME: home, CLAUDE_CONFIG_DIR: configDir.claudeConfigDir(home) };
+
+    assert.throws(() => config.prepareClaudeConfigDir(cliEnv), /ancestor of HOME is owned by neither root nor the worker/);
+
+    assert.deepEqual(await fs.readdir(home), [], "no .claude, config directory or temp was created");
+    await rmtree.rmHomeTree(outer);
+    assert.equal(await exists(outer), false);
+  });
+
+  // The runner-uid helpers the preparation runs, in their real wrapper: the stat probe prints the
+  // exact line format the module parses (the setgid bit HOME carries is inherited by .claude, so the
+  // fields are checked, not a mode string), and a helper that does not finish returns control to the
+  // worker within the bound.
+  it("the runner-uid stat helper prints the parsed line format (#4416)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004419");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    asRunner(`set -e; umask 077; mkdir -p "$1/.claude"; echo x > "$1/.claude/projects"`, home);
+    const claude = path.join(home, ".claude");
+    const projects = path.join(claude, "projects");
+
+    const stat = config.helperCommand("/bin/stat", ["-c", "%u|%a|%F|%n", "--", claude, projects], true);
+    const r = config.runBounded(stat.command, stat.args);
+    assert.equal(r.status, 0);
+    const lines = r.stdout.split("\n").filter((l) => l !== "").map((l) => l.split("|"));
+    assert.equal(lines.length, 2);
+    const [dirLine, fileLine] = lines;
+    assert.equal(dirLine![0], String(runnerUid.RUNNER_UID));
+    assert.equal(Number.parseInt(dirLine![1]!, 8) & 0o700, 0o700, "the owner has rwx");
+    assert.equal(dirLine![2], "directory");
+    assert.equal(dirLine![3], claude);
+    assert.equal(fileLine![0], String(runnerUid.RUNNER_UID));
+    assert.equal(fileLine![2], "regular file");
+    assert.equal(fileLine![3], projects);
+
+    await rmtree.rmHomeTree(home);
+    assert.equal(await exists(home), false);
+  });
+
+  it("the worker regains control within the bound from a runner helper it cannot signal (#4416)", async () => {
+    // Under the split the worker uid cannot signal the runner-uid helper; only the worker-uid
+    // intermediary is killed, so runBounded returns whether the helper dies on its own or is stopped.
+    const sleep = config.helperCommand("/bin/sleep", ["10"], true);
+    const t0 = Date.now();
+    const killed = config.runBounded(sleep.command, sleep.args);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 4500, `the helper returned after ${elapsed} ms`);
+    assert.notEqual(killed.status, 0);
+
+    // Another runner process stops both the helper and its timeout: nothing runner-side can end it.
+    const stopper = [
+      'sig="$1"; n="$2"; i=0',
+      'while [ "$i" -lt "$n" ]; do',
+      '  for p in /proc/[0-9]*; do',
+      '    id="${p#/proc/}"; [ "$id" = "$$" ] && continue',
+      `    c=$(tr '\\0' ' ' < "$p/cmdline" 2>/dev/null) || continue`,
+      '    case "$c" in *"sle""ep 7 "*) kill -"$sig" "$id" 2>/dev/null ;; esac',
+      "  done",
+      "  i=$((i+1)); sleep 0.1",
+      "done",
+    ].join("\n");
+    const wrapped = runnerUid.runnerCommand("/bin/sh", ["-c", stopper, "sh", "STOP", "45"]);
+    const watcher = spawn(wrapped.command, wrapped.args, { stdio: "ignore" });
+    // The watcher runs as the runner uid, which the worker cannot signal: it ends on its own after
+    // its fixed number of passes, and the test only waits for that exit.
+    watcher.on("error", () => undefined);
+    const watcherExited = new Promise<void>((resolve) => {
+      const bound = setTimeout(resolve, 20_000);
+      watcher.once("exit", () => {
+        clearTimeout(bound);
+        resolve();
+      });
+      watcher.once("error", () => {
+        clearTimeout(bound);
+        resolve();
+      });
+    });
+    const stuck = config.helperCommand("/bin/sleep", ["7"], true);
+    const t1 = Date.now();
+    try {
+      assert.throws(() => config.runBounded(stuck.command, stuck.args));
+      const stoppedElapsed = Date.now() - t1;
+      assert.ok(stoppedElapsed < 5000, `the stopped helper returned after ${stoppedElapsed} ms`);
+    } finally {
+      asRunner(stopper, "KILL", "3");
+      await watcherExited;
+    }
   });
 
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -12,14 +11,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 )
 
 // PRD #3245: 00348_codex_judge_model.sql copies a curated judge_model into the
 // new Codex lane (users and the instance key) and leaves the Claude lane untouched. The
-// SQL literal list must equal agenttmpl.CuratedCodexModels, which is itself pinned to
-// fixtures/codex-models/models.json, so this test iterates that set.
+// vocabulary is fixed to that applied migration, independent of today's curated
+// models. New model adoption must not change which historical settings it copied.
 
 // codexJudgeMigrationDB stands a throwaway database at the given version and returns its
 // pool and DSN. The migration version is derived from the file name, so a renumber needs no edit.
@@ -182,13 +179,9 @@ func cjCodexColumns(t *testing.T, pool *pgxpool.Pool) int {
 	return n
 }
 
-func curatedIDs() []string {
-	ids := make([]string, 0, len(agenttmpl.CuratedCodexModels))
-	for id := range agenttmpl.CuratedCodexModels {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids
+func codexJudgeMigrationIDs() []string {
+	// Keep the historical 00348 Up vocabulary, including its older model controls.
+	return []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"}
 }
 
 func TestCodexJudgeModelMigrationUsersLiveDB(t *testing.T) {
@@ -205,12 +198,12 @@ func TestCodexJudgeModelMigrationUsersLiveDB(t *testing.T) {
 		wantCopy any // nil = column stays NULL
 	}
 	var rows []seeded
-	for _, id := range curatedIDs() {
+	for _, id := range codexJudgeMigrationIDs() {
 		for _, padded := range []string{id, "  " + id + "  ", "\t" + id + "\n", id + "\v"} {
 			rows = append(rows, seeded{cjSeedUser(t, pool, padded), padded, id})
 		}
 	}
-	for _, notCurated := range []string{"gpt-6-luna", "opus", "", "gpt-7-x", "gpt-6-sol extra", "vgpt-6-sol"} {
+	for _, notCurated := range []string{"gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna", "opus", "", "gpt-7-x", "gpt-6-sol extra", "vgpt-6-sol"} {
 		rows = append(rows, seeded{cjSeedUser(t, pool, notCurated), notCurated, nil})
 	}
 	rows = append(rows, seeded{cjSeedUser(t, pool, nil), nil, nil})
@@ -250,7 +243,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 	updatedAt := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 
 	t.Run("curated padded value is copied trimmed with its author and time", func(t *testing.T) {
-		for _, id := range curatedIDs() {
+		for _, id := range codexJudgeMigrationIDs() {
 			pool, dsn := fixture.Clone(t)
 			admin := cjSeedUser(t, pool, nil)
 			raw := "\t" + id + " \n\v"
@@ -275,7 +268,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 		}
 	})
 
-	for _, notCopied := range []string{"gpt-6-luna", "opus", "", "vgpt-6-sol"} {
+	for _, notCopied := range []string{"gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna", "opus", "", "vgpt-6-sol"} {
 		t.Run("no Codex row for "+notCopied, func(t *testing.T) {
 			pool, dsn := fixture.Clone(t)
 			cjExec(t, pool, `INSERT INTO app_settings (key, value) VALUES ('judge_model', $1)`, notCopied)

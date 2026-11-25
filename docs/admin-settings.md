@@ -120,7 +120,7 @@ the lane of its own harness. The four keys are `judge_model`,
   (`codex_summary_model`) takes the Codex role models, including `gpt-6-luna`,
   with no custom ID.
 - **Default · <built-in> (built-in)** resets a lane to the built-in (`opus`,
-  `gpt-6.1-sol`, `haiku`, `gpt-6-luna` for the four lanes in order), which the
+  `gpt-6.2-sol`, `haiku`, `gpt-6-luna` for the four lanes in order), which the
   lane then follows, including future changes to it. Picking a model pins it.
 - A key set from the environment shows read-only as **Set from the
   environment** and is never sent on save.
@@ -129,7 +129,7 @@ the lane of its own harness. The four keys are `judge_model`,
 - A rejected value (a 400 reading `<key>: <message>`) shows under that field.
   Other validation errors show on the card. A server error or network failure
   warns that the save may or may not have been applied and tells you to reload.
-- A user's own choice under **Settings → Run defaults** still wins over these
+- A user's own choice under **Settings → Models** still wins over these
   defaults; the admin value applies while they haven't chosen.
 
 The judge kill-switch, enforcement, cooldown and daily budget stay on the
@@ -142,7 +142,7 @@ sends a model key.
 The **Run judge** card holds the global kill-switch for the [run judge](./judge.md),
 the enforcement checkbox, and the per-user spend guards below, with its own
 **Save**. That Save never sends a model key: the judge models (**Claude judge
-model**, `opus` by default, and **Codex judge model**, `gpt-6.1-sol` by default)
+model**, `opus` by default, and **Codex judge model**, `gpt-6.2-sol` by default)
 are set in the **Instance model defaults** card, see
 [Instance model defaults](#instance-model-defaults). The card shows the current
 choice as a read-only **Instance default: Claude … · Codex … · users may
@@ -178,7 +178,7 @@ own run's harness (user lane, then instance lane, then built-in):
 | Setting | Default | Controls |
 |---|---|---|
 | `judge_model` | empty (built-in `opus`) | The instance Claude judge model. Claude aliases and ids only; Codex ids are rejected. |
-| `codex_judge_model` | empty (built-in `gpt-6.1-sol`) | The instance Codex judge model. Must be one of the curated Codex models (the ones the Codex worker model picker offers); no custom ids. An empty or whitespace-only value resets it to the built-in. Users set their own value under **Settings → Run defaults → Run judge → Codex judge model**; a blank personal value inherits this one. |
+| `codex_judge_model` | empty (built-in `gpt-6.2-sol`) | The instance Codex judge model. Must be one of the curated Codex models (the ones the Codex worker model picker offers); no custom ids. An empty or whitespace-only value resets it to the built-in. Users set their own value under **Settings → Models → Helper runs → Judge model**; a blank personal value inherits this one. |
 
 A value not valid for the run's harness is skipped with a
 `harness_model_fallback` note and resolution falls through. A Codex id
@@ -216,7 +216,7 @@ console keys, remember that an enforced `opus` judge spends their
 plan/rate-limit **quota**, not dollars — a busy judge can eat into the quota
 their real runs need. Pin **Claude judge model** to `haiku`/`sonnet` before
 enforcing (in **Instance model defaults**), or leave enforcement off and let users opt in with their own
-per-user model choice (**Settings → Run defaults → Run judge → Claude judge model** and **Codex judge model**).
+per-user model choice (**Settings → Models → Helper runs → Judge model**, one value per harness).
 
 ### Spend guards
 
@@ -244,9 +244,8 @@ instance default summary models (**Claude summary model**, `summary_model`, and
 [Instance model defaults](#instance-model-defaults). A run reads only the lane
 of its own harness.
 
-Each user can override either lane for their own runs from **Settings → Run
-defaults → Run summaries**, with a **Claude summary model** and a **Codex
-summary model** picker. Their **Default** option names the model and where it
+Each user can override either lane for their own runs from **Settings →
+Models → Helper runs → Summary model**, with a Claude and a Codex picker. Their **Default** option names the model and where it
 comes from (for example `Default · haiku (built-in)`); the admin value applies
 while they haven't chosen. Codex intent and plan summaries run at low effort.
 Both lanes spend the run owner's own credential for the run's harness: an

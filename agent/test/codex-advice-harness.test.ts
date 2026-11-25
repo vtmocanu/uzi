@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { AdmissionClock, flushUntil } from "./operation-admission-clock.js";
@@ -16,7 +17,7 @@ import {
 } from "../src/codex/codex-advice-harness.js";
 import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../src/harness.js";
-import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import type { Logger } from "../src/log.js";
 import { runReadOnlyModelPass } from "../src/model-pass.js";
@@ -27,6 +28,7 @@ import { CodexAdviceCredentialBridge, CODEX_PRODUCTION_PROVIDER, makeCodexAdvice
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import {
+  CODEX_PROVIDER_FIRST_RESPONSE_MS,
   createCodexAppServerAuth,
   type CodexAppServerAuthSession,
 } from "../src/codex/appserver-auth.js";
@@ -281,7 +283,7 @@ function makeHarness(
     dispose?: () => Promise<void>;
     disposeThrows?: boolean;
     log?: Logger;
-    authMode?: "subscription" | "api_key";
+    authMode?: "subscription" | "api_key" | "provider";
     now?: () => Date;
   } = {},
 ): Bits {
@@ -313,6 +315,60 @@ function makeHarness(
   });
   return { harness, transport, launchSpecs, disposeCalls: () => disposeCalls };
 }
+
+describe("CodexAdviceHarness: initial provider response deadline", () => {
+  for (const control of ["timeout", "native", "cancel", "response", "late", "terminal", "outer"] as const) {
+    it(`handles ${control} after ACK`, async t => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const bits = makeHarness({ authMode: control === "native" ? "api_key" : "provider" });
+      const controller = new AbortController();
+      let failure: unknown;
+      let settled = false;
+      // "outer": the advice request's own timeout is earlier than the provider allowance.
+      const timeoutMs = control === "outer" ? 60_000 : 10 * CODEX_PROVIDER_FIRST_RESPONSE_MS;
+      const pending = bits.harness.run(makeAdviceRequest({ signal: controller.signal, timeoutMs }), noThrowPolicy)
+        .catch(error => { failure = error; }).finally(() => { settled = true; });
+      const flush = async (): Promise<void> => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)); };
+      try {
+        await flush();
+        assert.ok(bits.transport.requests.some(r => r.method === "turn/start"));
+        if (control === "cancel") controller.abort();
+        if (control === "response") bits.transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "th-1", turnId: "tn-1", delta: "hello" } });
+        if (control === "terminal") bits.transport.push(turnCompleted());
+        await flush();
+        // Past the 10 s local setup budget: a silent provider is still within its own allowance.
+        t.mock.timers.tick(11_000);
+        await flush();
+        if (control === "late") bits.transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "th-1", turnId: "tn-1", delta: "late" } });
+        await flush();
+        if (control === "timeout" || control === "outer") assert.equal(settled, false, "setup budget does not bound the first response");
+        t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS);
+        await flush();
+        if (control === "timeout") {
+          assert.equal(settled, true);
+          assert.ok(failure instanceof CodexTransportError);
+          assert.equal(failure.failure.category, "timeout");
+          assert.equal(failure.failure.message, "codex provider initial response deadline exceeded");
+          assert.equal(bits.transport.closes > 0, true);
+          assert.equal(bits.disposeCalls(), 1);
+        } else if (control === "outer") {
+          assert.equal(settled, true);
+          assert.ok(!(failure instanceof CodexTransportError), "the earlier advice timeout keeps its own outcome");
+          assert.match(String((failure as Error)?.message), /model call exceeded 60000ms/);
+        } else if (control !== "cancel") {
+          assert.equal(failure, undefined);
+          assert.equal(settled, control === "terminal");
+          if (!settled) { bits.transport.push(turnCompleted()); await pending; assert.equal(failure, undefined); }
+        } else {
+          assert.equal(settled, true);
+          assert.ok(!(failure instanceof CodexTransportError));
+        }
+      } finally { controller.abort(); await pending; }
+    });
+  }
+});
 
 // --- tests --------------------------------------------------------------------------
 
@@ -588,13 +644,19 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     assert.equal(bits.disposeCalls(), 1, "the root disposer runs exactly once");
   });
 
-  it("turn/start carries the rendered prompt + model + effort", async () => {
+  it("no TTL overrides: turn/start carries the rendered prompt + model + effort", async () => {
     const bits = makeHarness();
     bits.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     await bits.harness.run(makeAdviceRequest({ effort: "high", prompt: "please review" }), noThrowPolicy);
 
     const start = bits.transport.requests.find((r) => r.method === "turn/start");
     assert.ok(start);
+    assert.equal(bits.transport.requests.filter(r => r.method === "turn/start").length, 1);
+    assertNoTtlOverrides(start.params, "advice turn full params");
+    const threads = bits.transport.requests.filter(r => r.method === "thread/start");
+    assert.equal(threads.length, 1);
+    assert.equal((threads[0]!.params as Record<string, unknown>).model, "gpt-6-astra");
+    assertNoTtlOverrides(threads[0]!.params, "advice start full params");
     const params = start.params as Record<string, unknown>;
     assert.deepEqual(params.environments, [], "the advice turn disables native execution environments");
     assert.deepEqual(params.input, [{ type: "text", text: "please review" }]);
@@ -722,6 +784,9 @@ describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () =
       assert.ok(start);
       const params = start.params as Record<string, unknown>;
       const config = params.config as Record<string, unknown>;
+      assert.equal(bits.transport.requests.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(params.model, "gpt-6-astra");
+      assertNoTtlOverrides(params, "advice guarded start full params");
       assertNoNativeServers(config);
       assert.equal(params.ephemeral, true);
       assert.equal(bits.transport.requests.some(r => r.method === "thread/resume"), false);
@@ -1939,6 +2004,154 @@ describe("Codex summary skip reasons (#3248 M3)", () => {
         it(`${name} stays silent`, async () => {
           settled(await drive(pass, d), []);
         });
+      }
+    });
+  }
+});
+
+describe("provider advice foundation", () => {
+  it("executes the production factory with frozen routing, managed login and unpriced usage", async () => {
+    const { createCodexProviderExecutionAuthority } = await import("../src/codex/select.js");
+    const { createHash } = await import("node:crypto");
+    const binding = createCodexProviderExecutionAuthority({
+      provider_id: "advice-gateway", revision: 3, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example/v1", auth_style: "bearer", credential: "advice-fixture-key",
+      model_map: { default: { model: "gpt-6-luna", context_window: 64000 }, "gpt-6-luna": { model: "mapped-mini", context_window: 32000 } },
+    });
+    for (const [requested, slot, model, context] of [
+      ["gpt-6-luna", "gpt-6-luna", "mapped-mini", 32000],
+      ["internal-vendor-default", "default", "gpt-6-luna", 64000],
+    ] as const) {
+      let disposed = 0;
+      const specs: CodexAdviceLaunchSpec[] = [];
+      const transport = new FakeTransport(authResponder);
+      transport.push(tokenUsage(bdown(100, 20), bdown(100, 20))).push(agentMessage("provider answer")).push(turnCompleted()).end();
+      const client = new Proxy({}, { get: (_target, name) => { throw new Error("vendor call: " + String(name)); } });
+      const factory = makeProductionCodexAdviceHarnessFactory(client as never, noopLog, "/unused", {
+        launchRoot: async spec => { specs.push(spec); return { transport, cwd: "/isolated", dispose: async () => { disposed++; } }; },
+      });
+      const harness = await factory({ runId: "provider-advice", binding });
+      let usage: AdviceUsageSnapshot | undefined;
+      const result = await harness.run(makeAdviceRequest({ model: requested, usageObserver: u => { usage = u; } }), noThrowPolicy);
+      assert.equal(result.text, "provider answer");
+      assert.equal(disposed, 1);
+      assert.equal(specs[0]!.providerBinding, binding.providerBinding);
+      assert.ok(Object.isFrozen(specs[0]!.providerBinding));
+      assert.equal(specs[0]!.providerSlot, slot);
+      assert.equal(specs[0]!.model, model);
+      const identity = "uzi-provider-" + createHash("sha256").update(JSON.stringify(["advice-gateway", 3])).digest("hex");
+      assert.equal(specs[0]!.provider.name, identity);
+      assert.equal(specs[0]!.provider.baseUrl, binding.providerBinding.base_url);
+      assert.equal(specs[0]!.credentialValue, undefined);
+      assert.deepEqual(transport.requests.find(r => r.method === "account/login/start")?.params,
+        { type: "apiKey", apiKey: "advice-fixture-key" });
+      const thread = transport.requests.find(r => r.method === "thread/start")!.params as Record<string, unknown>;
+      assert.equal(thread.model, model);
+      assert.equal(thread.modelProvider, identity);
+      assert.deepEqual(thread.environments, []);
+      assert.deepEqual(thread.dynamicTools, []);
+      assert.equal((thread.config as Record<string, unknown>).model_context_window, context);
+      assert.equal(usage?.[model]?.inputTokens, 100);
+      assert.equal(usage?.[model]?.outputTokens, 20);
+      assert.equal(usage?.[model]?.costStatus, "unreported");
+      assert.equal(usage?.[model]?.costUSD, undefined);
+    }
+  });
+
+  it("redacts encoded provider text, usage member collisions and thrown errors with a minimal logger", async () => {
+    const { createCodexProviderExecutionAuthority } = await import("../src/codex/select.js");
+    const { providerKeyForms } = await import("../src/redact.js");
+    const key = 'provider-advice/<&"fixture';
+    const binding = createCodexProviderExecutionAuthority({
+      provider_id: "redact-advice", revision: 1, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example/v1", auth_style: "bearer", credential: key,
+      model_map: { default: { model: "mapped" } },
+    });
+    const forms = providerKeyForms(key);
+    let observed: AdviceUsageSnapshot | undefined;
+    const options = {
+      provider: binding.providerBinding, label: "summary", prompt: "p", systemPrompt: "s",
+      homeRoot: "/unused", homePrefix: "unused-", timeoutMs: 5000, denyReason: "denied", log: noopLog,
+      queryFn: (() => { throw new Error("Claude must not run"); }) as never,
+      onUsage: (u: AdviceUsageSnapshot) => { observed = u; },
+      codex: { runId: "provider", binding, buildHarness: (async () => ({
+        run: async (request: AdviceRequest) => {
+          request.usageObserver?.(Object.fromEntries(forms.map(form => [form, { inputTokens: 2, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "unreported" as const }])));
+          return { text: forms.join(" | ") };
+        },
+      })) as never },
+    };
+    const text = await runReadOnlyModelPass(options);
+    for (const form of forms) {
+      assert.equal(text.includes(form), false);
+      assert.equal(JSON.stringify(observed).includes(form), false);
+    }
+    assert.equal(Object.values(observed!)[0]!.inputTokens, forms.length * 2);
+    for (const form of forms) {
+      options.codex.buildHarness = (async () => { throw new Error(form, { cause: { [form]: form } }); }) as never;
+      await assert.rejects(runReadOnlyModelPass(options), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message.includes(form), false);
+        assert.equal(JSON.stringify(error.cause).includes(form), false);
+        return true;
+      });
+    }
+  });
+});
+
+// Issue #4323: the task-review model is uzi-selected, never an explicit owner pin, so on a provider
+// claim it resolves through its own map key when present and the `default` slot otherwise. The
+// configured review effort passes through unchanged.
+describe("provider task review: model resolution and effort (issue #4323)", () => {
+  const reviewClaim = (model: string | undefined, effort: string | undefined) => ({
+    run_id: "review-run", claim_generation: 3, kind: "task", review_target_run_id: "target", branch: "topic",
+    last_seq: 0, agents: [], repo: { clone_url: "https://example.test/repo.git", default_branch: "main" },
+    ...(model !== undefined ? { task_review_model: model } : {}),
+    ...(effort !== undefined ? { task_review_effort: effort } : {}),
+    secrets: { forge_pat: "", provider: {
+      provider_id: "review-gateway", revision: 1, engine: "codex", protocol: "openai_responses",
+      base_url: "https://gateway.example/v1", auth_style: "bearer", credential: "review-fixture-key-0123456789",
+      model_map: { default: { model: "corp-default" }, "gpt-6.1-sol": { model: "corp-sol" } },
+    } },
+  }) as unknown as import("../src/protocol.js").ClaimResponse;
+
+  for (const [label, model, effort, wire] of [
+    ["a mapped review model uses its own key", "gpt-6.1-sol", "high", "corp-sol"],
+    ["an unmapped review model uses the default slot", "gpt-6-luna", "low", "corp-default"],
+    ["no configured review model uses the built-in model through the default slot", undefined, undefined, "corp-default"],
+  ] as const) {
+    it(label, async () => {
+      const fs = await import("node:fs/promises");
+      const { fileURLToPath } = await import("node:url");
+      const { ReviewRunner } = await import("../src/review-runner.js");
+      await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
+      const homeRoot = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/p4323-review-", import.meta.url)));
+      let posted: { status?: string; summary?: string } | undefined;
+      const failures: unknown[] = [];
+      const client = {
+        hasFeature: () => false,
+        reportState: async (_id: string, body: { status: string }) => { if (body.status === "failed") failures.push(body); return { applied: true }; },
+        postMessages: async () => {},
+        postTaskReview: async (_id: string, value: unknown) => { posted = value as typeof posted; },
+      } as unknown as import("../src/client.js").WorkerClient;
+      const transport = new FakeTransport(authResponder);
+      transport.push(agentMessage(JSON.stringify({ status: "complete", summary: "Reviewed", findings: [] }))).push(turnCompleted()).end();
+      const specs: CodexAdviceLaunchSpec[] = [];
+      const factory = makeProductionCodexAdviceHarnessFactory(client, noopLog, homeRoot, {
+        launchRoot: async spec => { specs.push(spec); return { transport, cwd: homeRoot, dispose: async () => {} }; },
+      });
+      try {
+        await new ReviewRunner(client, { ensureClone: async () => "bare", reviewDiff: async () => "diff" } as never, noopLog,
+          { homeRoot, modelTimeoutMs: 5000, codexAdviceHarnessFactory: factory }).execute(reviewClaim(model, effort));
+        assert.equal(posted?.summary, "Reviewed", JSON.stringify(failures));
+        const thread = transport.requests.find(r => r.method === "thread/start")!.params as { model?: string };
+        const turn = transport.requests.find(r => r.method === "turn/start")!.params as { model?: string; effort?: string };
+        assert.equal(thread.model, wire);
+        assert.equal(turn.model, wire);
+        if (effort === undefined) assert.equal(Object.hasOwn(turn, "effort"), false);
+        else assert.equal(turn.effort, effort);
+      } finally {
+        await fs.rm(homeRoot, { recursive: true, force: true });
       }
     });
   }

@@ -26,7 +26,7 @@ import (
 // SetUserDefaultEffort/SetUserJudgeModel/SetUserSummaryModel/SetUserTheme UPDATEs QueryRow a
 // single Text RETURNING column (discarded by the handler) and SetUserSidebarTokens a uuid[]
 // one; SetUserHarnessModels (PRD #1551 M1) PATCHes the harness, both lanes and the legacy
-// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-two (default_model,
+// default_model in one conditional UPDATE; GetUserSettings QueryRows twenty-five (default_model,
 // default_effort, judge_model, summary_model, theme, sidebar_token_ids,
 // mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface — the four
 // appearance columns joined the read in PRD #1167 M1 — default_harness, which joined
@@ -373,7 +373,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[4].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-	case 33: // GetUserSettings: both planning pairs, per-harness task-review models/efforts, and weekly_warning_margin_pts (PRD #4123).
+	case 34: // GetUserSettings: 22 settings columns + two provider IDs + sidebar_motion + both planning pairs, per-harness task-review models/efforts, and weekly_warning_margin_pts (PRD #4123).
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -452,35 +452,42 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[21].(*pgtype.Text); ok {
 			*p = r.judgeRunsOn
 		}
-		// sidebar_motion (issue #4510) is the 24th column, after claude_provider_id.
-		if p, ok := dest[23].(*pgtype.Bool); ok {
+		// Provider sources (issues #4320/#4323) are both NULL in this general settings fake.
+		if p, ok := dest[22].(*pgtype.UUID); ok {
+			*p = pgtype.UUID{}
+		}
+		if p, ok := dest[23].(*pgtype.UUID); ok {
+			*p = pgtype.UUID{}
+		}
+		// sidebar_motion (issue #4510) is the 25th column, after both provider IDs.
+		if p, ok := dest[24].(*pgtype.Bool); ok {
 			*p = r.sidebarMotion
 		}
-		// planning_claude_model and planning_claude_effort (PRD #3252) are columns 25 and 26.
-		if p, ok := dest[24].(*pgtype.Text); ok {
+		// planning_claude_model and planning_claude_effort (PRD #3252) are columns 26 and 27.
+		if p, ok := dest[25].(*pgtype.Text); ok {
 			*p = r.planningModel
 		}
-		if p, ok := dest[25].(*pgtype.Text); ok {
+		if p, ok := dest[26].(*pgtype.Text); ok {
 			*p = r.planningEffort
 		}
-		*dest[26].(*pgtype.Text) = r.planningCodexModel
-		*dest[27].(*pgtype.Text) = r.planningCodexEffort
+		*dest[27].(*pgtype.Text) = r.planningCodexModel
+		*dest[28].(*pgtype.Text) = r.planningCodexEffort
 		// task-review models follow both planning pairs.
-		if p, ok := dest[28].(*pgtype.Text); ok {
+		if p, ok := dest[29].(*pgtype.Text); ok {
 			*p = r.taskReview
 		}
-		if p, ok := dest[29].(*pgtype.Text); ok {
+		if p, ok := dest[30].(*pgtype.Text); ok {
 			*p = r.codexTaskReview
 		}
 		// task-review efforts follow the task-review models.
-		if p, ok := dest[30].(*pgtype.Text); ok {
+		if p, ok := dest[31].(*pgtype.Text); ok {
 			*p = r.taskReviewEffort
 		}
-		if p, ok := dest[31].(*pgtype.Text); ok {
+		if p, ok := dest[32].(*pgtype.Text); ok {
 			*p = r.codexTaskReviewEffort
 		}
-		// weekly_warning_margin_pts (PRD #4123) is the 33rd column, after the task-review columns.
-		if p, ok := dest[32].(*int16); ok {
+		// weekly_warning_margin_pts (PRD #4123) is the 34th column, after the task-review columns.
+		if p, ok := dest[33].(*int16); ok {
 			*p = r.weeklyMargin
 		}
 	}

@@ -56,14 +56,41 @@ func (f *envFixture) do(method, suffix, body string) *httptest.ResponseRecorder 
 	return cookieReq(f.t, f.router, method, f.path(suffix), f.jwt, body)
 }
 
+// respShape, dtoShape, listShape describe a response or variable for a failure message by status,
+// body length, error code, field, rule, state, revision and booleans, never a value or a body.
+func respShape(rec *httptest.ResponseRecorder) string {
+	var e struct{ Code, Field, Rule string }
+	_ = json.Unmarshal(rec.Body.Bytes(), &e)
+	return fmt.Sprintf("status=%d bodyLen=%d code=%q field=%q rule=%q", rec.Code, rec.Body.Len(), e.Code, e.Field, e.Rule)
+}
+
+func dtoShape(v *apitypes.RunEnvVarDTO) string {
+	if v == nil {
+		return "no variable"
+	}
+	return fmt.Sprintf("%s#%d(secret=%v state=%s valuePresent=%v valueLen=%d withheld=%v disabled=%v descLen=%d)",
+		v.Name, v.Rev, v.Secret, v.State, v.Value != nil, len(ptrStr(v.Value)), v.ValueWithheld, v.DisabledAt != nil, len(v.Description))
+}
+
+func ptrStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func listShape(l apitypes.RunEnvListDTO) string {
+	parts := make([]string, 0, len(l.Variables))
+	for i := range l.Variables {
+		parts = append(parts, dtoShape(&l.Variables[i]))
+	}
+	return fmt.Sprintf("%d variables [%s] counts=%+v vaultLocked=%v", len(l.Variables), strings.Join(parts, " "), l.Counts, l.VaultLocked)
+}
+
 func (f *envFixture) must(rec *httptest.ResponseRecorder, want int) {
 	f.t.Helper()
 	if rec.Code != want {
-		body := rec.Body.String()
-		if len(body) > 300 {
-			body = body[:300] + "..."
-		}
-		f.t.Fatalf("status = %d, want %d; body: %s", rec.Code, want, body)
+		f.t.Fatalf("status = %d, want %d; %s", rec.Code, want, respShape(rec))
 	}
 }
 
@@ -139,7 +166,7 @@ func (f *envFixture) requireSnapshot(before map[string]string, after string) {
 	now := f.rowSnapshot("PAYMENTS_SANDBOX_KEY", "PAYMENTS_SANDBOX_URL")
 	for n, b := range before {
 		if now[n] != b {
-			f.t.Fatalf("%s changed by %s:\n before %s\n after  %s", n, after, b, now[n])
+			f.t.Fatalf("%s changed by %s", n, after)
 		}
 	}
 }
@@ -181,7 +208,7 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if v := f.find(l, "PAYMENTS_SANDBOX_URL"); v == nil || v.Value == nil || *v.Value != "https://sandbox.example.test" {
-		t.Fatalf("a Bearer list lost the plain value: %+v", v)
+		t.Fatalf("a Bearer list lost the plain value: %s", dtoShape(v))
 	}
 	if strings.Contains(rec.Body.String(), secretFixture(1)) {
 		t.Fatal("the Bearer list carried a secret value")
@@ -200,7 +227,7 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 	} {
 		rec := bearerReqBody(f.router, c.method, f.path(c.suffix), token, c.body)
 		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("Bearer %s %s = %d, want 401; body: %s", c.method, c.suffix, rec.Code, rec.Body.String())
+			t.Errorf("Bearer %s %s = %d, want 401; %s", c.method, c.suffix, rec.Code, respShape(rec))
 		}
 	}
 	if got := f.rowCount("true"); got != 2 {
@@ -254,11 +281,11 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	// Create a secret (the default) and a plain variable, each with a description.
 	created := f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"value": secret, "description": "sandbox key"}), http.StatusCreated)
 	if !created.Secret || created.Rev != 1 || created.Value != nil || created.State != apitypes.RunEnvStateEnabled {
-		t.Fatalf("created secret = %+v", created)
+		t.Fatalf("created secret = %s", dtoShape(&created))
 	}
 	plain := f.put("PAYMENTS_SANDBOX_URL", jsonBody(map[string]any{"value": "https://sandbox.example.test", "secret": false, "description": "sandbox base url"}), http.StatusCreated)
 	if plain.Secret || plain.Value == nil || *plain.Value != "https://sandbox.example.test" {
-		t.Fatalf("created plain = %+v", plain)
+		t.Fatalf("created plain = %s", dtoShape(&plain))
 	}
 	rec := f.do(http.MethodGet, "", "")
 	if strings.Contains(rec.Body.String(), secret) {
@@ -269,10 +296,10 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	}
 	l := f.list()
 	if l.Counts != (apitypes.RunEnvCountsDTO{Total: 2, Disabled: 0, PendingDeletion: 0, Limit: 50}) || l.VaultLocked || len(l.Variables) != 2 {
-		t.Fatalf("list = %+v", l)
+		t.Fatalf("list = %s", listShape(l))
 	}
 	if k := f.find(l, "PAYMENTS_SANDBOX_KEY"); k == nil || k.Value != nil || k.ValueWithheld || k.Description != "sandbox key" {
-		t.Fatalf("secret in list = %+v", k)
+		t.Fatalf("secret in list = %s", dtoShape(k))
 	}
 	// The ciphertext at rest holds the value, not the other way around.
 	var ct []byte
@@ -287,11 +314,11 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	var rowAfter uuid.UUID
 	_ = f.pool.QueryRow(context.Background(), `SELECT id FROM run_env_vars WHERE name='PAYMENTS_SANDBOX_KEY' AND repo_id=$1`, f.repo).Scan(&rowAfter)
 	if edited.Rev != 1 || edited.Description != "rotated nightly" || rowAfter != rowID || f.rowCount("name='PAYMENTS_SANDBOX_KEY'") != 1 {
-		t.Fatalf("description-only save wrote a version: %+v (row %s -> %s)", edited, rowID, rowAfter)
+		t.Fatalf("description-only save wrote a version: %s (row %s -> %s)", dtoShape(&edited), rowID, rowAfter)
 	}
 	// An empty body on an existing variable is a no-op, not a rotation.
 	if noop := f.put("PAYMENTS_SANDBOX_KEY", `{}`, http.StatusOK); noop.Rev != 1 {
-		t.Fatalf("empty save changed rev: %+v", noop)
+		t.Fatalf("empty save changed rev: %s", dtoShape(&noop))
 	}
 
 	// A value writes rev+1 under the same var_id; with no receipt the previous version is
@@ -300,7 +327,7 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	_ = f.pool.QueryRow(context.Background(), `SELECT var_id FROM run_env_vars WHERE name='PAYMENTS_SANDBOX_KEY' AND repo_id=$1`, f.repo).Scan(&varID)
 	rotated := f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"value": secretFixture(2)}), http.StatusOK)
 	if rotated.Rev != 2 || rotated.Description != "rotated nightly" {
-		t.Fatalf("rotated = %+v; the description must carry over", rotated)
+		t.Fatalf("rotated = %s; the description must carry over", dtoShape(&rotated))
 	}
 	var revs int
 	var gotVar uuid.UUID
@@ -312,13 +339,13 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"secret": false}), http.StatusUnprocessableEntity)
 	toPlain := f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"secret": false, "value": "now-a-plain-value"}), http.StatusOK)
 	if toPlain.Secret || toPlain.Rev != 3 || toPlain.Value == nil || *toPlain.Value != "now-a-plain-value" {
-		t.Fatalf("secret to plain = %+v", toPlain)
+		t.Fatalf("secret to plain = %s", dtoShape(&toPlain))
 	}
 	// plain -> secret reseals the stored value as a new version; the value is readable
 	// to the vault, never to the response.
 	toSecret := f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"secret": true}), http.StatusOK)
 	if !toSecret.Secret || toSecret.Rev != 4 || toSecret.Value != nil {
-		t.Fatalf("plain to secret = %+v", toSecret)
+		t.Fatalf("plain to secret = %s", dtoShape(&toSecret))
 	}
 	var sealed []byte
 	var marker string
@@ -337,7 +364,7 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	}
 	opened, err := f.h.vault.Open(f.owner, sealedKind, marker, sealed)
 	if err != nil || string(opened) != "now-a-plain-value" {
-		t.Fatalf("resealed value = %q, %v", opened, err)
+		t.Fatalf("resealed value matches=%v len=%d, %v", string(opened) == "now-a-plain-value", len(opened), err)
 	}
 	// A stored plain value too short to be a secret cannot be flipped.
 	f.put("SHORT_PLAIN", jsonBody(map[string]any{"value": "1234567", "secret": false}), http.StatusCreated)
@@ -347,17 +374,17 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	off := f.do(http.MethodPost, "/PAYMENTS_SANDBOX_KEY/disable", "")
 	f.must(off, http.StatusOK)
 	if k := f.find(f.list(), "PAYMENTS_SANDBOX_KEY"); k.State != apitypes.RunEnvStateDisabled || k.Rev != 4 || k.DisabledAt == nil {
-		t.Fatalf("after disable = %+v", k)
+		t.Fatalf("after disable = %s", dtoShape(k))
 	}
 	if l := f.list(); l.Counts.Disabled != 1 {
 		t.Fatalf("counts = %+v", l.Counts)
 	}
 	if kept := f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"value": secretFixture(5)}), http.StatusOK); kept.State != apitypes.RunEnvStateDisabled || kept.Rev != 5 {
-		t.Fatalf("rotation of a disabled variable = %+v", kept)
+		t.Fatalf("rotation of a disabled variable = %s", dtoShape(&kept))
 	}
 	f.must(f.do(http.MethodPost, "/PAYMENTS_SANDBOX_KEY/enable", ""), http.StatusOK)
 	if k := f.find(f.list(), "PAYMENTS_SANDBOX_KEY"); k.State != apitypes.RunEnvStateEnabled || k.DisabledAt != nil {
-		t.Fatalf("after enable = %+v", k)
+		t.Fatalf("after enable = %s", dtoShape(k))
 	}
 	f.must(f.do(http.MethodPost, "/MISSING_ONE/disable", ""), http.StatusNotFound)
 
@@ -368,11 +395,11 @@ func TestRunEnvLifecycleLiveDB(t *testing.T) {
 	var d apitypes.RunEnvDeleteDTO
 	_ = json.Unmarshal(del.Body.Bytes(), &d)
 	if d.State != "deleted" || f.rowCount("name='PAYMENTS_SANDBOX_KEY'") != 0 {
-		t.Fatalf("delete = %+v, rows %d", d, f.rowCount("name='PAYMENTS_SANDBOX_KEY'"))
+		t.Fatalf("delete state = %q, rows %d", d.State, f.rowCount("name='PAYMENTS_SANDBOX_KEY'"))
 	}
 	f.must(f.do(http.MethodDelete, "/PAYMENTS_SANDBOX_KEY", ""), http.StatusNotFound)
 	if again := f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"value": secretFixture(6)}), http.StatusCreated); again.Rev != 1 {
-		t.Fatalf("re-created = %+v", again)
+		t.Fatalf("re-created = %s", dtoShape(&again))
 	}
 	var newVar uuid.UUID
 	_ = f.pool.QueryRow(context.Background(), `SELECT var_id FROM run_env_vars WHERE name='PAYMENTS_SANDBOX_KEY' AND repo_id=$1`, f.repo).Scan(&newVar)
@@ -458,7 +485,7 @@ func TestRunEnvValueAndNameRulesLiveDB(t *testing.T) {
 	f.put("NUL_VALUE", body(map[string]any{"value": "abc\u0000defgh", "secret": false}), http.StatusUnprocessableEntity)
 	f.put("NUL_SECRET", body(map[string]any{"value": "abcdefgh\u0000"}), http.StatusUnprocessableEntity)
 	if e := f.put("EMPTY_PLAIN", body(map[string]any{"value": "", "secret": false}), http.StatusCreated); e.Value == nil || *e.Value != "" {
-		t.Fatalf("empty plain = %+v", e)
+		t.Fatalf("empty plain = %s", dtoShape(&e))
 	}
 	f.put("EMPTY_SECRET", body(map[string]any{"value": ""}), http.StatusUnprocessableEntity)
 	f.put("SEVEN", body(map[string]any{"value": "1234567"}), http.StatusUnprocessableEntity)
@@ -485,12 +512,12 @@ func TestRunEnvValueAndNameRulesLiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/ECHO_CHECK", body(map[string]any{"value": "short"}))
 	f.must(rec, http.StatusUnprocessableEntity)
 	if strings.Contains(rec.Body.String(), "short\"") {
-		t.Errorf("the error echoes the value: %s", rec.Body.String())
+		t.Errorf("the error echoes the value: %s", respShape(rec))
 	}
 	// A failed rotation changes nothing.
 	f.put("EIGHT", body(map[string]any{"value": "short"}), http.StatusUnprocessableEntity)
 	if k := f.find(f.list(), "EIGHT"); k.Rev != 1 {
-		t.Fatalf("a refused rotation moved rev: %+v", k)
+		t.Fatalf("a refused rotation moved rev: %s", dtoShape(k))
 	}
 }
 
@@ -508,7 +535,7 @@ func TestRunEnvScopeLimitsLiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/ONE_TOO_MANY", jsonBody(map[string]any{"value": "v", "secret": false}))
 	f.must(rec, http.StatusConflict)
 	if conflictCode(rec) != "env_limit_reached" {
-		t.Fatalf("51st variable: %s", rec.Body.String())
+		t.Fatalf("51st variable: %s", respShape(rec))
 	}
 	if f.rowCount("true") != 50 {
 		t.Fatalf("rows = %d", f.rowCount("true"))
@@ -529,7 +556,7 @@ func TestRunEnvScopeLimitsLiveDB(t *testing.T) {
 	rec = g.do(http.MethodPut, "/ONE_BYTE_OVER", jsonBody(map[string]any{"value": "a", "secret": false}))
 	g.must(rec, http.StatusConflict)
 	if conflictCode(rec) != "env_limit_reached" {
-		t.Fatalf("value-byte limit: %s", rec.Body.String())
+		t.Fatalf("value-byte limit: %s", respShape(rec))
 	}
 	// Shrinking one makes room for exactly the freed bytes, no more.
 	g.put("BIG_0", jsonBody(map[string]any{"value": strings.Repeat("a", 65535), "secret": false}), http.StatusOK)
@@ -562,7 +589,7 @@ func TestRunEnvRetiredVersionsAndHistoryBudgetLiveDB(t *testing.T) {
 	}
 	l := f.list()
 	if len(l.Variables) != 1 || l.Variables[0].Rev != 3 || l.Counts.Total != 1 {
-		t.Fatalf("list with retired history = %+v", l)
+		t.Fatalf("list with retired history = %s", listShape(l))
 	}
 	// A plain version is never retired, even when receipted.
 	f.put("PLAIN_ONE", jsonBody(map[string]any{"value": "one", "secret": false}), http.StatusCreated)
@@ -594,10 +621,10 @@ func TestRunEnvRetiredVersionsAndHistoryBudgetLiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/SECOND", jsonBody(map[string]any{"value": secretFixture(12)}))
 	f.must(rec, http.StatusConflict)
 	if code(rec) != "env_history_full" {
-		t.Fatalf("201st retired version: %s", rec.Body.String())
+		t.Fatalf("201st retired version: %s", respShape(rec))
 	}
 	if k := f.find(f.list(), "SECOND"); k.Rev != 2 {
-		t.Fatalf("a refused rotation changed the variable: %+v", k)
+		t.Fatalf("a refused rotation changed the variable: %s", dtoShape(k))
 	}
 
 	// With the budget full, Disable and Delete are never refused. Delete of a receipted
@@ -661,7 +688,7 @@ func TestRunEnvRetiredByteBudgetBoundaryLiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/BIG_SECRET", jsonBody(map[string]any{"value": strings.Repeat("u", 1000)}))
 	f.must(rec, http.StatusConflict)
 	if !strings.Contains(rec.Body.String(), "env_history_full") {
-		t.Fatalf("one byte-budget past: %s", rec.Body.String())
+		t.Fatalf("one byte-budget past: %s", respShape(rec))
 	}
 }
 
@@ -686,7 +713,7 @@ func TestRunEnvLockedVaultLiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/NEW_ONE", jsonBody(map[string]any{"value": secretFixture(2)}))
 	f.must(rec, http.StatusConflict)
 	if !strings.Contains(rec.Body.String(), `"vault_locked"`) {
-		t.Fatalf("locked write: %s", rec.Body.String())
+		t.Fatalf("locked write: %s", respShape(rec))
 	}
 	rec = f.do(http.MethodPut, "/PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"value": secretFixture(3)}))
 	f.must(rec, http.StatusConflict)
@@ -699,10 +726,10 @@ func TestRunEnvLockedVaultLiveDB(t *testing.T) {
 	// The list shows names and metadata with plain values withheld.
 	l := f.list()
 	if !l.VaultLocked || len(l.Variables) != 2 {
-		t.Fatalf("locked list = %+v", l)
+		t.Fatalf("locked list = %s", listShape(l))
 	}
 	if u := f.find(l, "PAYMENTS_SANDBOX_URL"); u == nil || u.Value != nil || !u.ValueWithheld {
-		t.Fatalf("locked plain = %+v", u)
+		t.Fatalf("locked plain = %s", dtoShape(u))
 	}
 	// Metadata-only changes need no key.
 	f.put("PAYMENTS_SANDBOX_KEY", jsonBody(map[string]any{"description": "still editable"}), http.StatusOK)
@@ -728,18 +755,18 @@ func TestRunEnvCiphertextSwapDoesNotOpenLiveDB(t *testing.T) {
 	}
 	// Control: reading is fine before any swap.
 	if v := f.find(f.list(), "SECOND_PLAIN"); v == nil || v.Value == nil || *v.Value != "second-plain-value" {
-		t.Fatalf("control read: %+v", v)
+		t.Fatalf("control read: %s", dtoShape(v))
 	}
 	other := envSecondRepo(t, f.pool, f.repo)
 	swap("FIRST_PLAIN", "SECOND_PLAIN") // name swap
 	l := f.list()
 	if v := f.find(l, "SECOND_PLAIN"); v == nil || v.Value != nil || !v.ValueWithheld || l.VaultLocked {
-		t.Fatalf("a plain value moved to another name opened: %+v (locked=%v)", v, l.VaultLocked)
+		t.Fatalf("a plain value moved to another name opened: %s (locked=%v)", dtoShape(v), l.VaultLocked)
 	}
 	// secret -> plain row: relabelling a secret ciphertext as plain does not open either.
 	swap("A_SECRET", "FIRST_PLAIN")
 	if v := f.find(f.list(), "FIRST_PLAIN"); v == nil || v.Value != nil || !v.ValueWithheld {
-		t.Fatalf("a secret ciphertext relabelled plain opened: %+v", v)
+		t.Fatalf("a secret ciphertext relabelled plain opened: %s", dtoShape(v))
 	}
 	// Repo swap: a row of another repo of the same owner and name.
 	f.put("CROSS_REPO", jsonBody(map[string]any{"value": "cross-repo-value", "secret": false}), http.StatusCreated)
@@ -751,7 +778,7 @@ func TestRunEnvCiphertextSwapDoesNotOpenLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if v := f.find(f.list(), "CROSS_REPO"); v == nil || v.Value != nil || !v.ValueWithheld {
-		t.Fatalf("a ciphertext moved to another repo opened: %+v", v)
+		t.Fatalf("a ciphertext moved to another repo opened: %s", dtoShape(v))
 	}
 }
 
@@ -852,7 +879,7 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 				t.Fatalf("unexpected row %s", key)
 			}
 			if string(pt) != exp {
-				t.Fatalf("%s plaintext = %q, want %q", key, pt, exp)
+				t.Fatalf("%s plaintext differs from the expected value (len %d, want len %d)", key, len(pt), len(exp))
 			}
 			seen[key] = true
 		}
@@ -867,14 +894,14 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 	}
 	opensAll(store.SealedWithDEK)
 	if v := f.find(f.list(), "LIVE_PLAIN"); v == nil || v.Value == nil || *v.Value != "https://sandbox.example.test" {
-		t.Fatalf("plain value after enable: %+v", v)
+		t.Fatalf("plain value after enable: %s", dtoShape(v))
 	}
 	if err := h.vault.Disable(context.Background(), owner); err != nil {
 		t.Fatalf("disable with env rows: %v", err)
 	}
 	opensAll(store.SealedWithMasterAAD)
 	if v := f.find(f.list(), "LIVE_PLAIN"); v == nil || v.Value == nil {
-		t.Fatalf("plain value after disable: %+v", v)
+		t.Fatalf("plain value after disable: %s", dtoShape(v))
 	}
 
 	// Reset removes every env row of the owner (live, retired, pending, both scopes).
@@ -910,7 +937,7 @@ func TestRunEnvRecreateAgainstPendingDeletionLimitsLiveDB(t *testing.T) {
 		rec := f.do(http.MethodPut, "/S_49", secretBody(49))
 		f.must(rec, http.StatusConflict)
 		if envConflictCode(rec) != "env_limit_reached" {
-			t.Fatalf("re-create at the limit: %s", rec.Body.String())
+			t.Fatalf("re-create at the limit: %s", respShape(rec))
 		}
 		// One live variable fewer (it has no receipt, so it is dropped at once): 48 live + 1
 		// pending fit, and the name comes back as a new variable.
@@ -934,7 +961,7 @@ func TestRunEnvRecreateAgainstPendingDeletionLimitsLiveDB(t *testing.T) {
 		rec := f.do(http.MethodPut, "/BIG_3", jsonBody(map[string]any{"value": strings.Repeat("b", 9)}))
 		f.must(rec, http.StatusConflict) // 262136 + 9 > 262144
 		if envConflictCode(rec) != "env_limit_reached" {
-			t.Fatalf("re-create over the byte limit: %s", rec.Body.String())
+			t.Fatalf("re-create over the byte limit: %s", respShape(rec))
 		}
 		f.put("BIG_3", jsonBody(map[string]any{"value": strings.Repeat("b", 8)}), http.StatusCreated) // exactly 262144
 	})
@@ -952,10 +979,10 @@ func TestRunEnvValueSaveKeepsConcurrentDescriptionLiveDB(t *testing.T) {
 	}
 	got := f.put("API_BASE", jsonBody(map[string]any{"value": "second-value"}), http.StatusOK)
 	if got.Rev != 2 || got.Description != "new" {
-		t.Fatalf("new version lost the concurrent description: rev=%d description=%q", got.Rev, got.Description)
+		t.Fatalf("new version lost the concurrent description: rev=%d descriptionLen=%d", got.Rev, len(got.Description))
 	}
 	if v := f.find(f.list(), "API_BASE"); v == nil || v.Description != "new" || v.Value == nil || *v.Value != "second-value" {
-		t.Fatalf("list: %+v", v)
+		t.Fatalf("list: %s", dtoShape(v))
 	}
 }
 
@@ -972,7 +999,7 @@ func TestRunEnvDescriptionSaveOfDeletedRowIs409LiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/API_BASE", jsonBody(map[string]any{"description": "new"}))
 	f.must(rec, http.StatusConflict)
 	if envConflictCode(rec) != "env_changed" {
-		t.Fatalf("description save of a deleted row: %s", rec.Body.String())
+		t.Fatalf("description save of a deleted row: %s", respShape(rec))
 	}
 }
 
@@ -1012,22 +1039,22 @@ func TestRunEnvListPlainValueOpensAtRowEpochLiveDB(t *testing.T) {
 	asRow := runEnvRowFromList
 	epoch := row.VaultEpoch
 	// Control: at the epoch the row was read at, the value opens.
-	dto, locked := h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)
+	dto, locked := h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, epoch)
 	if locked || dto.Value == nil || *dto.Value != "https://sandbox.example.test" {
-		t.Fatalf("control open = %+v locked=%v", dto, locked)
+		t.Fatalf("control open: value present=%v withheld=%v locked=%v", dto.Value != nil, dto.ValueWithheld, locked)
 	}
 
 	if err := h.vault.Enable(ctx, owner, password); err != nil {
 		t.Fatal(err)
 	}
 	h.vault.Lock(owner)
-	dto, locked = h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, &epoch)
+	dto, locked = h.runEnvDTOAt(ctx, owner, repo, asRow(row), false, epoch)
 	if !locked || dto.Value != nil || !dto.ValueWithheld {
-		t.Fatalf("a row read before the owner protected and locked opened: %+v locked=%v", dto, locked)
+		t.Fatalf("a row read before the owner protected and locked opened: value present=%v withheld=%v locked=%v", dto.Value != nil, dto.ValueWithheld, locked)
 	}
 	// A list read after the change carries the new epoch and withholds because the vault is locked.
 	if l := f.list(); !l.VaultLocked {
-		t.Fatalf("list after protect+lock = %+v; want vault_locked", l)
+		t.Fatalf("list after protect+lock: vault_locked=%v variables=%d; want vault_locked", l.VaultLocked, len(l.Variables))
 	}
 }
 
@@ -1048,7 +1075,7 @@ func TestRunEnvListReportsLockedVaultForSecretOnlyLiveDB(t *testing.T) {
 	}
 	h.vault.Lock(owner)
 	if l := f.list(); !l.VaultLocked || len(l.Variables) != 1 || !l.Variables[0].Secret {
-		t.Fatalf("a secret-only list of a locked vault = %+v; want vault_locked", l)
+		t.Fatalf("a secret-only list of a locked vault = %s; want vault_locked", listShape(l))
 	}
 
 	u := newEnvFixture(t)
@@ -1144,16 +1171,16 @@ func TestRunEnvRotationVaultMaterialHeadroomLiveDB(t *testing.T) {
 	rec := f.do(http.MethodPut, "/ROTATE_ME", jsonBody(map[string]any{"value": strings.Repeat("r", 50000)}))
 	f.must(rec, http.StatusConflict)
 	if envConflictCode(rec) != "env_history_full" {
-		t.Fatalf("rotation past the vault material budget: %s", rec.Body.String())
+		t.Fatalf("rotation past the vault material budget: %s", respShape(rec))
 	}
 	// The refusal speaks about the variable save, not about enabling or disabling the vault.
 	for _, vaultWording := range []string{"vault conversion", "Your mode and credentials"} {
 		if strings.Contains(rec.Body.String(), vaultWording) {
-			t.Fatalf("the 409 carries the vault-conversion text %q: %s", vaultWording, rec.Body.String())
+			t.Fatalf("the 409 carries the vault-conversion text %q: %s", vaultWording, respShape(rec))
 		}
 	}
 	if v := f.find(f.list(), "ROTATE_ME"); v == nil || v.Rev != 1 {
-		t.Fatalf("a refused rotation moved the variable: %+v", v)
+		t.Fatalf("a refused rotation moved the variable: %s", dtoShape(v))
 	}
 	f.put("ROTATE_ME", jsonBody(map[string]any{"value": strings.Repeat("r", 10000)}), http.StatusOK) // growth inside the slack
 }
@@ -1180,7 +1207,7 @@ func TestRunEnvPutSurrogateEscapesLiveDB(t *testing.T) {
 		f.put(c.name, c.body, http.StatusCreated)
 		got := f.find(f.list(), c.name)
 		if got == nil || got.Value == nil || *got.Value != c.want {
-			t.Fatalf("%s stored %+v, want %q", c.name, got, c.want)
+			t.Fatalf("%s stored %s, want a value of length %d", c.name, dtoShape(got), len(c.want))
 		}
 	}
 }
@@ -1196,15 +1223,15 @@ func TestRunEnvDeniedStoredNameCanBeDisabledAndDeletedLiveDB(t *testing.T) {
 	f.must(f.do(http.MethodPut, "/PATH", jsonBody(map[string]any{"value": "/usr/bin", "secret": false})), http.StatusUnprocessableEntity)
 	f.must(f.do(http.MethodPost, "/PATH/disable", ""), http.StatusOK)
 	if k := f.find(f.list(), "PATH"); k == nil || k.State != apitypes.RunEnvStateDisabled {
-		t.Fatalf("after disable = %+v", k)
+		t.Fatalf("after disable = %s", dtoShape(k))
 	}
 	en := f.do(http.MethodPost, "/PATH/enable", "")
 	f.must(en, http.StatusUnprocessableEntity)
 	if b := en.Body.String(); !strings.Contains(b, `"rule"`) || !strings.Contains(b, `"field"`) {
-		t.Fatalf("enable body = %s, want the rule error", b)
+		t.Fatalf("enable body (len %d) lacks the rule and field keys", len(b))
 	}
 	if k := f.find(f.list(), "PATH"); k == nil || k.State != apitypes.RunEnvStateDisabled {
-		t.Fatalf("after refused enable = %+v", k)
+		t.Fatalf("after refused enable = %s", dtoShape(k))
 	}
 	f.must(f.do(http.MethodDelete, "/PATH", ""), http.StatusOK)
 	if n := f.rowCount("name='PATH'"); n != 0 {
@@ -1238,10 +1265,10 @@ func (f *envFixture) putSized(name string, n int, want int) *httptest.ResponseRe
 func (f *envFixture) mustBudgetRefusal(rec *httptest.ResponseRecorder) {
 	f.t.Helper()
 	if envConflictCode(rec) != "env_forms_budget" {
-		f.t.Fatalf("want env_forms_budget, got %s", rec.Body.String())
+		f.t.Fatalf("want env_forms_budget, got %s", respShape(rec))
 	}
 	if !strings.Contains(rec.Body.String(), fmt.Sprint(runenv.MaxClaimSecretBytes)) {
-		f.t.Fatalf("the refusal does not name the limit: %s", rec.Body.String())
+		f.t.Fatalf("the refusal does not name the limit: %s", respShape(rec))
 	}
 }
 

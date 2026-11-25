@@ -37,6 +37,8 @@ func TestCoverage(t *testing.T) {
 		{"gpt-6-sol", "2026-11-21T00:00:00Z", Priced},
 		{"gpt-6-astra", "2026-11-21T00:00:00Z", Priced},
 		{"gpt-6-luna", "2027-01-01T00:00:00Z", Priced},
+		{"gpt-6.2-sol", "2027-01-01T00:00:00Z", Priced},
+		{"gpt-6.2-astra", "2027-01-01T00:00:00Z", Priced},
 	} {
 		now, err := time.Parse(time.RFC3339, tc.clock)
 		if err != nil {
@@ -48,10 +50,10 @@ func TestCoverage(t *testing.T) {
 	}
 	before := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
 	after := before.AddDate(0, 0, 1)
-	if got := PricedModels(before); !reflect.DeepEqual(got, []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}) {
+	if got := PricedModels(before); !reflect.DeepEqual(got, []string{"gpt-5.6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"}) {
 		t.Fatalf("before: %v", got)
 	}
-	if got := PricedModels(after); !reflect.DeepEqual(got, []string{"gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}) {
+	if got := PricedModels(after); !reflect.DeepEqual(got, []string{"gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"}) {
 		t.Fatalf("after: %v", got)
 	}
 }
@@ -237,7 +239,7 @@ func TestRawNumbersAndDuplicates(t *testing.T) {
 			t.Errorf("last-wins/own key: %v", err)
 		}
 	}
-	if _, err := loadPricing([]byte(strings.Replace(raw, `"version":"openai-standard-2026-10-09"`, `"version":"ok","version":null`, 1))); err == nil {
+	if _, err := loadPricing([]byte(strings.Replace(raw, `"version":"openai-standard-2026-11-23"`, `"version":"ok","version":null`, 1))); err == nil {
 		t.Fatal("accepted invalid final duplicate")
 	}
 }

@@ -7,10 +7,11 @@ import {
   ProviderBindingError,
   ProviderModelUnmappedError,
   resolveProviderModel,
+  resolveCodexProviderModelSlot,
   sdkCredentialFromBinding,
   stripProviderCost,
 } from "../src/provider-binding.js";
-import type { ClaimProviderBinding } from "../src/protocol.js";
+import type { ClaimClaudeProviderBinding } from "../src/protocol.js";
 import type { EmittedMessage } from "../src/executor.js";
 
 // PRD #4320 modules 5 and 7. The key is assembled at runtime: no provider-token-shaped literal in source.
@@ -32,8 +33,10 @@ function binding(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
-function decode(provider: unknown, extra: Record<string, unknown> = {}, env = NOT_LOOPBACK_ENV): ClaimProviderBinding | undefined {
-  return decodeProviderBinding({ forge_pat: "pat", anthropic_oauth_token: "", provider, ...extra }, env);
+function decode(provider: unknown, extra: Record<string, unknown> = {}, env = NOT_LOOPBACK_ENV): ClaimClaudeProviderBinding | undefined {
+  const result = decodeProviderBinding({ forge_pat: "pat", anthropic_oauth_token: "", provider, ...extra }, env);
+  if (result) assert.equal(result.engine, "claude");
+  return result;
 }
 
 function refuses(provider: unknown, rule: RegExp, extra: Record<string, unknown> = {}, env = NOT_LOOPBACK_ENV): void {
@@ -84,7 +87,7 @@ describe("decodeProviderBinding (PRD #4320 module 5)", () => {
   });
 
   it("refuses an unknown engine, protocol or auth style, and a non-positive revision", () => {
-    refuses(binding({ engine: "codex" }), /engine/);
+    refuses(binding({ engine: "unknown" }), /engine/);
     refuses(binding({ protocol: "openai_responses" }), /protocol/);
     refuses(binding({ auth_style: "basic" }), /auth_style/);
     refuses(binding({ revision: 0 }), /revision/);
@@ -215,4 +218,69 @@ describe("stripProviderCost and isGatewayLimitStatus (PRD #4320 P7, D11)", () =>
     assert.equal(isGatewayLimitStatus(529), true);
     for (const s of [400, 401, 403, 500, 502, 503, 408, null, undefined]) assert.equal(isGatewayLimitStatus(s), false, String(s));
   });
+});
+
+function codexBinding(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return binding({ engine: "codex", protocol: "openai_responses",
+    model_map: { default: { model: "gateway/default", context_window: 8192 } }, ...over });
+}
+
+describe("Codex provider wire decode", () => {
+  it("decodes all exact slots and rebuilds every nested entry without unknown fields or references", () => {
+    const map = Object.fromEntries(["default", "gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"]
+      .map(id => [id, { model: "gateway/target", context_window: 10_000_000, extra: "discard" }]));
+    const raw = codexBinding({ model_map: map, extra: "discard" });
+    const got = decodeProviderBinding({ provider: raw }, NOT_LOOPBACK_ENV)!;
+    assert.equal(got.engine, "codex");
+    assert.equal(got.protocol, "openai_responses");
+    assert.equal(got.auth_style, "bearer");
+    assert.ok(!("extra" in got));
+    assert.notEqual(got.model_map, map);
+    assert.deepEqual(Object.keys(got.model_map).sort(), Object.keys(map).sort());
+    for (const [id, entry] of Object.entries(got.model_map)) {
+      assert.deepEqual(entry, { model: "gateway/target", context_window: 10_000_000 });
+      assert.notEqual(entry, map[id]);
+    }
+    assert.throws(() => sdkCredentialFromBinding(got), (e: unknown) => e instanceof Error &&
+      "reason" in e && e.reason === "provider_lane_unsupported" && e.message === "provider_lane_unsupported");
+  });
+
+  for (const slot of ["gpt-6.2-sol", "gpt-6.2-astra"] as const) {
+    it(`${slot} uses its mapping, implicit misses use default, and explicit misses refuse`, () => {
+      const fallback = { default: { model: "gateway/default", context_window: 32768 } };
+      const mapped = { ...fallback, [slot]: { model: "gateway/" + slot, context_window: 65536 } };
+      assert.equal(resolveCodexProviderModelSlot(slot, mapped), slot);
+      assert.equal(resolveCodexProviderModelSlot(slot, mapped, true), slot);
+      assert.equal(resolveCodexProviderModelSlot(slot, fallback), "default");
+      assert.equal(fallback[resolveCodexProviderModelSlot(undefined, fallback) as "default"].model, "gateway/default");
+      assert.throws(() => resolveCodexProviderModelSlot(slot, fallback, true),
+        (e: unknown) => e instanceof ProviderModelUnmappedError && e.reason === "provider_model_unmapped");
+    });
+  }
+
+  for (const [name, over] of [
+    ["protocol", { protocol: "anthropic_messages" }],
+    ["style", { auth_style: "x_api_key" }],
+    ["missing default", { model_map: { "gpt-6-astra": { model: "a" } } }],
+    ["inherited default", { model_map: Object.create({ default: { model: "a" } }) }],
+    ["unknown slot", { model_map: { default: { model: "a" }, privateSlot: { model: "a" } } }],
+    ["Claude slot", { model_map: { default: { model: "a" }, haiku: { model: "a" } } }],
+    ["model", { model_map: { default: { model: "bad model" } } }],
+    ["oversized model", { model_map: { default: { model: "a".repeat(257) } } }],
+    ["low context", { model_map: { default: { model: "a", context_window: 8191 } } }],
+    ["high context", { model_map: { default: { model: "a", context_window: 10_000_001 } } }],
+    ["fractional context", { model_map: { default: { model: "a", context_window: 8192.5 } } }],
+    ["invalid optional", { model_map: { default: { model: "a" }, "gpt-6-sol": null } }],
+  ] as const) {
+    it(`refuses invalid Codex ${name} with bounded rule text`, () => {
+      assert.throws(() => decodeProviderBinding({ provider: codexBinding(over) }, NOT_LOOPBACK_ENV),
+        (e: unknown) => e instanceof ProviderBindingError && e.message.length < 160 &&
+          !e.message.includes(KEY) && !e.message.includes("privateSlot"));
+    });
+  }
+  for (const extra of [{ anthropic_oauth_token: "vendor-fixture" }, { codex: { auth_mode: "api_key" } }]) {
+    it("refuses Codex mixed vendor credentials", () => {
+      assert.throws(() => decodeProviderBinding({ provider: codexBinding(), ...extra }, NOT_LOOPBACK_ENV), ProviderBindingError);
+    });
+  }
 });

@@ -479,7 +479,9 @@ WHERE a.user_id = @user_id AND a.id = @provider_account_id
 -- has no reading and therefore evaluates to "unknown". The reading is joined with the SAME
 -- current-reading rule GetCodexAccountRateLimitsForUser applies (every enabled linked alias of
 -- the account must appear in the stored enablement_sig at its current revision), so a reading
--- from before a disable and re-enable reads as no reading until the next poll.
+-- from before a disable and re-enable reads as no reading until the next poll. Only the two
+-- vendor kinds are Codex aliases: a stray state row on any other kind (an openai_compatible_key
+-- provider key) is never an alias.
 SELECT s.user_secret_id AS alias_id,
        (s.status = 'static')::boolean AS unmetered,
        (rl.provider_account_id IS NOT NULL)::boolean AS has_reading,
@@ -503,4 +505,5 @@ LEFT JOIN codex_account_rate_limits rl
     )
 WHERE s.user_id = @user_id
   AND us.disabled_at IS NULL
+  AND us.kind IN ('openai_api_key', 'codex_auth')
 ORDER BY s.user_secret_id;

@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -26,8 +27,13 @@ type epochRaceQueries struct {
 	trigger string // "effective", "redact" or "receipts"
 	once    sync.Once
 	after   func()
-	reads   int
-	byName  map[string]int
+	second  func() // runs right after the trigger statement's second read, when set
+	// afterOpenCheck runs right after the second RunEnvRedactOpen call, the one that follows
+	// the opens.
+	afterOpenCheck func()
+	openChecks     int
+	reads          int
+	byName         map[string]int
 }
 
 func (q *epochRaceQueries) fire(name string) {
@@ -38,7 +44,19 @@ func (q *epochRaceQueries) fire(name string) {
 	q.byName[name]++
 	if name == q.trigger {
 		q.once.Do(q.after)
+		if q.byName[name] == 2 && q.second != nil {
+			q.second()
+		}
 	}
+}
+
+func (q *epochRaceQueries) RunEnvRedactOpen(ctx context.Context, id uuid.UUID) (bool, error) {
+	open, err := q.Queries.RunEnvRedactOpen(ctx, id)
+	q.openChecks++
+	if q.openChecks == 2 && q.afterOpenCheck != nil {
+		q.afterOpenCheck()
+	}
+	return open, err
 }
 
 func (q *epochRaceQueries) ListRunEnvEffectiveForRun(ctx context.Context, id uuid.UUID) ([]store.ListRunEnvEffectiveForRunRow, error) {
@@ -105,14 +123,20 @@ func TestRunEnvClaimStaleEpochDeliversNothingLiveDB(t *testing.T) {
 			runID := fx.queuedRun(t, "issue")
 			secret := envSecretValue(trigger)
 			fx.put(t, "API_KEY", true, secret)
+			var receiptsBefore []receiptRow
+			var generationBefore int64
 			if trigger == "redact" {
-				// Deliver once, then retire the version: the next claim holds it only as a
-				// redact-only receipt.
+				// A second live secret, delivered and receipted with the first: an accepted
+				// next claim would advance its receipt to the new generation. Deliver once,
+				// then retire API_KEY: the next claim holds it only as a redact-only receipt.
+				fx.put(t, "OTHER_KEY", true, envSecretValue("other"))
 				if p := fx.claim(t); p == nil || runEnvByName(p)["API_KEY"].Value != secret {
-					t.Fatalf("first claim = %+v", p)
+					t.Fatalf("first claim delivered=%v, want API_KEY delivered", p != nil)
 				}
 				fx.env.exec(`UPDATE run_env_vars SET retired_at = now() WHERE user_id=$1 AND name='API_KEY'`, fx.userID)
 				fx.requeue(runID)
+				receiptsBefore = fx.receipts(t, runID)
+				generationBefore = mustRun(t, fx.env, runID).ClaimGeneration
 			}
 			q := &epochRaceQueries{Queries: fx.env.q, trigger: trigger, after: fx.enableAndLock(t)}
 			fx.svc.q = q
@@ -121,16 +145,38 @@ func TestRunEnvClaimStaleEpochDeliversNothingLiveDB(t *testing.T) {
 				t.Fatalf("Claim: %v", err)
 			}
 			if p != nil && payloadHasValue(p, secret) {
-				t.Fatalf("claim delivered the plaintext after the owner protected and locked: %+v", p.Secrets)
+				t.Fatalf("claim delivered the plaintext after the owner protected and locked: run_env=%d redact=%d", len(p.Secrets.RunEnv), len(p.Secrets.RunEnvRedact))
 			}
 			if p != nil {
-				t.Fatalf("claim = %+v, want an idle (requeued) claim", p.Secrets)
+				t.Fatalf("claim: run_env=%d redact=%d, want an idle (requeued) claim", len(p.Secrets.RunEnv), len(p.Secrets.RunEnvRedact))
 			}
 			if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.HoldReason.Valid || r.FailOrigin.Valid {
 				t.Fatalf("status=%s hold=%v fail=%v, want queued with nothing parked or failed", r.Status, r.HoldReason, r.FailOrigin)
 			}
 			if q.byName[trigger] != 2 { // the stale seal was re-read once
 				t.Fatalf("%s list reads = %d, want 2 (the read and one re-read)", trigger, q.byName[trigger])
+			}
+			// No receipt is written or advanced by the refused claim.
+			after := fx.receipts(t, runID)
+			if trigger == "effective" {
+				if len(after) != 0 {
+					t.Fatalf("receipts = %d, want none", len(after))
+				}
+				return
+			}
+			if !slices.Equal(after, receiptsBefore) {
+				t.Fatalf("receipts changed by the refused claim: before=%d after=%d", len(receiptsBefore), len(after))
+			}
+			// The refused claim attempt advanced the run's fence (ClaimRun bumps claim_generation
+			// per flight, and a requeue keeps it); no receipt records that generation.
+			g := mustRun(t, fx.env, runID).ClaimGeneration
+			if g <= generationBefore {
+				t.Fatalf("claim_generation = %d, want it above %d after the refused claim attempt", g, generationBefore)
+			}
+			for _, r := range after {
+				if r.last >= g {
+					t.Fatalf("receipt last_claim_generation = %d records the refused flight %d", r.last, g)
+				}
 			}
 		})
 	}
@@ -156,13 +202,18 @@ func TestRunEnvClaimStaleEpochRefetchOpensLiveDB(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if p == nil || runEnvByName(p)["API_KEY"].Value != secret {
-		t.Fatalf("claim = %+v, want the refetched row opened and delivered", p)
+		t.Fatalf("claim delivered=%v, want the refetched row opened and delivered", p != nil)
 	}
 	if q.byName["effective"] != 2 {
 		t.Fatalf("effective list reads = %d, want 2", q.byName["effective"])
 	}
-	if r := mustRun(t, fx.env, runID); r.Status != "claimed" {
+	r := mustRun(t, fx.env, runID)
+	if r.Status != "claimed" {
 		t.Fatalf("status = %s, want claimed", r.Status)
+	}
+	got := fx.receipts(t, runID)
+	if len(got) != 1 || got[0].name != "API_KEY" || got[0].last != r.ClaimGeneration {
+		t.Fatalf("receipts = %d, want one API_KEY receipt at claim generation %d", len(got), r.ClaimGeneration)
 	}
 }
 
@@ -192,13 +243,13 @@ func TestRunEnvClaimEpochChangeAfterOpenDeliversNothingLiveDB(t *testing.T) {
 		t.Fatal("assembly hook never ran")
 	}
 	if p != nil {
-		t.Fatalf("claim = %+v, want an idle (requeued) claim", p.Secrets)
+		t.Fatalf("claim: run_env=%d redact=%d, want an idle (requeued) claim", len(p.Secrets.RunEnv), len(p.Secrets.RunEnvRedact))
 	}
 	if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.HoldReason.Valid || r.FailOrigin.Valid {
 		t.Fatalf("status=%s hold=%v fail=%v, want queued with nothing parked or failed", r.Status, r.HoldReason, r.FailOrigin)
 	}
 	if got := fx.receipts(t, runID); len(got) != 0 {
-		t.Fatalf("receipts = %+v, want none", got)
+		t.Fatalf("receipts = %d, want none", len(got))
 	}
 }
 
@@ -220,7 +271,7 @@ func TestRunEnvCrossCheckStaleEpochDeliversNothingLiveDB(t *testing.T) {
 	f.svc.q = q
 	p := laneClaim(t, f, "cross_check", nil)
 	if p != nil {
-		t.Fatalf("checker claimed with redact=%+v run_env=%+v after the owner protected and locked", p.Secrets.RunEnvRedact, p.Secrets.RunEnv)
+		t.Fatalf("checker claimed with redact=%d run_env=%d after the owner protected and locked", len(p.Secrets.RunEnvRedact), len(p.Secrets.RunEnv))
 	}
 	// The receipts were re-read once, and the check is still open: the child is queued with no
 	// failure origin (a requeue), not decided checker_unavailable.
@@ -267,7 +318,7 @@ func TestRunEnvCrossCheckEpochChangeAfterOpenDeliversNothingLiveDB(t *testing.T)
 		t.Fatal("assembly hook never ran")
 	}
 	if p != nil {
-		t.Fatalf("checker claimed with redact=%+v after the epoch changed before the commit", p.Secrets.RunEnvRedact)
+		t.Fatalf("checker claimed with redact=%d after the epoch changed before the commit", len(p.Secrets.RunEnvRedact))
 	}
 	child := mustRun(t, f.env, f.runID)
 	if child.Status != "queued" || child.FailOrigin.Valid || child.HoldReason.Valid {
@@ -292,16 +343,135 @@ func TestRunEnvRedactRouteStaleEpochIsVaultLockedLiveDB(t *testing.T) {
 	secret := envSecretValue("route")
 	fx.put(t, "API_KEY", true, secret)
 	if p := fx.claim(t); p == nil || runEnvByName(p)["API_KEY"].Value != secret {
-		t.Fatalf("claim = %+v", p)
+		t.Fatalf("claim delivered=%v, want the secret delivered", p != nil)
 	}
 	q := &epochRaceQueries{Queries: fx.env.q, trigger: "receipts", after: fx.enableAndLock(t)}
 	fx.svc.q = q
 	res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
 	if !errors.Is(err, ErrRunEnvVaultLocked) || len(res.Versions) != 0 {
-		t.Fatalf("RunEnvRedact = %+v, %v; want ErrRunEnvVaultLocked and no version", res, err)
+		t.Fatalf("RunEnvRedact versions=%d err=%v; want ErrRunEnvVaultLocked and no version", len(res.Versions), err)
 	}
 	// The retry re-read the list once: two reads in all.
 	if q.reads != 2 || q.byName["receipts"] != 2 {
 		t.Fatalf("receipt reads = %d, want 2 (the read and one re-read)", q.reads)
+	}
+}
+
+// A stale seal whose refetch opens, cross-check lane: the owner enables protection (and stays
+// unlocked) between the receipts read and the open. The re-read rows are sealed at the new epoch,
+// so the checker is claimed with the redact value. The child writes no receipt of its own and the
+// lead's receipt is untouched.
+func TestRunEnvCrossCheckStaleEpochRefetchOpensLiveDB(t *testing.T) {
+	f, w := admissionCheckerBase(t, "plan")
+	f, _ = admissionCheckerSubmit(t, f, w, "plan", 0, nil)
+	crossCheckEnvCapable(f, true)
+	armProtection(t, f.env, f.userID)
+	secret := envSecretValue("child-refetch")
+	seedLeadSecret(t, f, "API_KEY", secret)
+	q := &epochRaceQueries{Queries: f.env.q, trigger: "receipts", after: func() {
+		if err := f.env.vlt.Enable(f.env.ctx, f.userID, codexRacePassword); err != nil {
+			t.Errorf("enable protection: %v", err)
+		}
+	}}
+	f.svc.q = q
+	p := laneClaim(t, f, "cross_check", nil)
+	if p == nil || len(p.Secrets.RunEnvRedact) != 1 || !payloadHasValue(p, secret) || len(p.Secrets.RunEnv) != 0 {
+		t.Fatalf("checker claimed=%v, want the refetched redact value delivered", p != nil)
+	}
+	if q.byName["receipts"] != 2 {
+		t.Fatalf("receipt reads = %d, want 2", q.byName["receipts"])
+	}
+	if child := mustRun(t, f.env, f.runID); child.Status != "claimed" {
+		t.Fatalf("child status = %s, want claimed", child.Status)
+	}
+	if n := checkerReceiptCount(t, f, f.runID); n != 0 {
+		t.Fatalf("checker child has %d receipts, want none", n)
+	}
+	var first, last int64
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT first_claim_generation, last_claim_generation FROM run_env_receipts WHERE run_id=$1`, f.lead).Scan(&first, &last); err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 || last != 1 {
+		t.Fatalf("lead receipt generations = %d..%d, want 1..1 unchanged", first, last)
+	}
+}
+
+// The redact route re-checks its authority after a forced refetch: the owner enables protection
+// (unlocked) between the read and the open, so the versions are re-read and open at the new epoch;
+// then the run closes, ownership moves, or the vault changes before the response. Each is the
+// typed refusal and no version. With nothing changing after the refetch, the versions are delivered.
+func TestRunEnvRedactRecheckAfterRefetchLiveDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		change func(fx *reFix, runID uuid.UUID)
+		late   bool // the change lands after the opens, at the second openness check
+		want   error
+	}{
+		{"nothing changes", nil, false, nil},
+		{"run closes", func(fx *reFix, runID uuid.UUID) {
+			fx.env.exec(`UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, runID)
+		}, false, ErrRunEnvRedactClosed},
+		{"ownership moves", func(fx *reFix, runID uuid.UUID) {
+			other := uuid.New()
+			fx.env.exec(`INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')`,
+				other, fx.userID, other.String(), other[:])
+			fx.env.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, runID, other)
+		}, false, ErrRunNotOwned},
+		{"epoch moves again after the opens", func(fx *reFix, _ uuid.UUID) {
+			fx.env.exec(`UPDATE users SET vault_epoch = vault_epoch + 1 WHERE id = $1`, fx.userID)
+		}, true, ErrRunEnvVaultLocked},
+		// The epoch moves but the vault stays usable (unprotected, so no unlock is required):
+		// only the epoch comparison refuses.
+		{"epoch moves with the vault usable after the opens", func(fx *reFix, _ uuid.UUID) {
+			if err := fx.env.vlt.Disable(fx.env.ctx, fx.userID); err != nil {
+				t.Errorf("disable protection: %v", err)
+			}
+			if fx.env.vlt.RequiresUnlock(fx.env.ctx, fx.userID) {
+				t.Error("the vault still requires unlock after disable")
+			}
+		}, true, ErrRunEnvVaultLocked},
+		{"vault locks after the opens", func(fx *reFix, _ uuid.UUID) {
+			fx.env.vlt.Lock(fx.userID)
+		}, true, ErrRunEnvVaultLocked},
+		{"epoch moves again before the opens", func(fx *reFix, _ uuid.UUID) {
+			fx.env.exec(`UPDATE users SET vault_epoch = vault_epoch + 1 WHERE id = $1`, fx.userID)
+		}, false, ErrRunEnvVaultLocked},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newREFix(t, true)
+			armProtection(t, fx.env, fx.userID)
+			runID := fx.queuedRun(t, "issue")
+			secret := envSecretValue("recheck")
+			fx.put(t, "API_KEY", true, secret)
+			if p := fx.claim(t); p == nil || runEnvByName(p)["API_KEY"].Value != secret {
+				t.Fatalf("claim delivered=%v", p != nil)
+			}
+			q := &epochRaceQueries{Queries: fx.env.q, trigger: "receipts", after: func() {
+				if err := fx.env.vlt.Enable(fx.env.ctx, fx.userID, codexRacePassword); err != nil {
+					t.Errorf("enable protection: %v", err)
+				}
+			}}
+			switch {
+			case tc.change != nil && tc.late:
+				q.afterOpenCheck = func() { tc.change(fx, runID) }
+			case tc.change != nil:
+				q.second = func() { tc.change(fx, runID) }
+			}
+			fx.svc.q = q
+			res, err := fx.svc.RunEnvRedact(fx.env.ctx, fx.worker(t), runID)
+			if q.byName["receipts"] != 2 {
+				t.Fatalf("receipt reads = %d, want 2 (the read and one re-read)", q.byName["receipts"])
+			}
+			if tc.want == nil {
+				if err != nil || !res.Protected || len(res.Versions) != 1 || res.Versions[0].Value != secret {
+					t.Fatalf("control: err=%v protected=%v versions=%d", err, res.Protected, len(res.Versions))
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) || res.Protected || len(res.Versions) != 0 {
+				t.Fatalf("err=%v protected=%v versions=%d; want the typed refusal and no version", err, res.Protected, len(res.Versions))
+			}
+		})
 	}
 }

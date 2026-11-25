@@ -31,10 +31,16 @@ job receives CI variables. Tools that read the environment work unchanged.
 - **Precedence**: user variables have the lowest precedence. A name the worker
   sets itself is never replaced or removed by a variable, and the worker drops
   a variable whose name breaks the rules below, with a run event naming it.
-- **Worker support**: delivery needs a worker that reports `run_env_v1`. A run
-  whose repo has variables is never claimed by an older worker, and run health
-  says "no online worker supports repo variables (run_env_v1); upgrade a worker"
-  while none is online. Cross-check children get no variables, but one claimed
+- **Worker support**: delivery needs a worker that reports `run_env_v1`, and a
+  worker reports it only when the worker and the agent run as separate users
+  (the protected two-uid worker: compose workers by default, k8s with
+  `UZI_WORKER_UID_SPLIT`; see [Configuration](configuration.md)). A run whose
+  repo has variables is never claimed by an older or single-user worker, and
+  run health says "no online worker supports repo variables (run_env_v1); repo
+  variables need a current two-uid worker (UZI_UID_SPLIT, or UZI_WORKER_UID_SPLIT
+  on hosted workers)" while none is online. Such a run waits for a two-user
+  worker; if a single-user worker is somehow handed one, it refuses the run
+  before starting anything. Cross-check children get no variables, but one claimed
   by a worker without `run_env_v1` ends as checker unavailable, which asks for a
   human decision; upgrade the worker to avoid it.
 
@@ -245,16 +251,29 @@ Every Claude CLI start runs with its global config taken from a directory the
 worker prepares under the run's home (`.uzi-claude-config`) and the agent cannot
 write when the worker and the agent run as separate users. An `env` block the
 agent writes to the usual config files in the home is not read, so it does not
-apply at the next start. With a single user (some small installs) there is no
-such protection, because the agent has the worker's own permissions. If something
-unexpected sits at that path, the worker moves it aside (`.uzi-claude-config.stale-*`,
-`.claude.stale-*`) and rebuilds. It fails the run instead of starting the CLI when
-it cannot do that or cannot trust the layout: the rename fails (for example a
-read-only data volume), the home directory fails the worker's ownership and parent
-mode checks, preparing the transcript directories fails again after the one retry
-or fails for another reason (a transient spawn failure refuses that start only), or
-the directory keeps changing while the worker prepares it. ADR-4416 has the
-details and the limits.
+apply at the next start. Variables are delivered to Claude runs only on that
+protected two-user worker. A single-user worker (some small installs) does not
+report `run_env_v1`, so a run that carries variables is not placed on it and
+waits for a two-user worker. Ordinary launches without variables still start
+there, with the directory prepared read-only and owned by the same user; that
+gives no protection against the agent's own user and is not an integrity
+boundary.
+
+If something unexpected sits at that path, the worker moves it aside
+(`.uzi-claude-config.stale-*`, `.claude.stale-*`) and rebuilds. It fails the run
+instead of starting the CLI when it cannot do that or cannot trust the layout:
+the rename fails (for example a read-only data volume), the home directory or
+one of its parent directories fails the worker's ownership and mode checks (a
+symlink, an owner other than root or the worker, world-writable without the
+sticky bit, or group-writable by a runner group without it), preparing the
+transcript directories fails (the worker moves `.claude` aside only when a
+check shows a planted file, a wrong owner or an unusable mode, and only once;
+any other failure, a full disk included, refuses that start and keeps
+`.claude`), the preparation passes its 10 second limit, or the directory keeps
+changing while the worker prepares it. Every preparation error is reported as
+this refusal, not as a disk park. The preparation blocks the worker for up to
+about 14 seconds in the worst case; a helper stuck in uninterruptible I/O is not
+bounded. ADR-4416 has the details and the limits.
 
 ## Name and value rules
 
@@ -279,7 +298,8 @@ denied:
   `BUN_`, `CCR_`, `SELF_HOSTED_RUNNER_`, `BUGHUNTER_`, `_CLAUDE_`, `ANT_OTEL_`,
   `ANT_CLAUDE_`, `OTEL_LOG_`, `LC_`, `GCM_`, `OTEL_EXPORTER_OTLP_`,
   `GCE_METADATA_`, `AWS_ENDPOINT_URL_BEDROCK` (which also covers
-  `AWS_ENDPOINT_URL_BEDROCK_AGENT*`).
+  `AWS_ENDPOINT_URL_BEDROCK_AGENT*`), `AWS_ENDPOINT_URL_` (every per-service
+  AWS endpoint override, such as `AWS_ENDPOINT_URL_S3`).
   The `BUN_` prefix also refuses Bun application settings such as `BUN_INSTALL`
   and `BUN_CONFIG_REGISTRY` as repo variables: the bundled Claude CLI is a Bun
   executable whose runtime reads `BUN_*` controls.
@@ -295,8 +315,10 @@ denied:
   endpoints of the AWS credential exchange, STS, IAM Identity Center and SSO
   OIDC, that the Bedrock harness's AWS SDK credential chain can use; denied for
   consistency with `AWS_ENDPOINT_URL`), and any `OTEL_EXPORTER_OTLP_*`, `GCE_METADATA_*` or
-  `AWS_ENDPOINT_URL_BEDROCK*` name. The other per-service names, such as
-  `AWS_ENDPOINT_URL_S3`, stay allowed.
+  `AWS_ENDPOINT_URL_*` name, including `AWS_ENDPOINT_URL_S3`. Other AWS
+  settings such as `AWS_REGION` stay allowed. Codex 0.171.0 adds the names
+  `SPIFFE_ENDPOINT_SOCKET`, `SSH2_CLIENT` and `OTEL_RESOURCE_ATTRIBUTES` to
+  the denied set.
 - Harness controls: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `API_TIMEOUT_MS`, `MAX_THINKING_TOKENS`, `MAX_MCP_OUTPUT_TOKENS`,
   `NODE_INSPECTOR_IPC`, `VSCODE_INSPECTOR_OPTIONS`, `API_FORCE_IDLE_TIMEOUT`,
@@ -306,7 +328,7 @@ denied:
 - Telemetry switches the Claude CLI reads outside the denied prefixes:
   `ENABLE_BETA_TRACING_DETAILED`, `ENABLE_ENHANCED_TELEMETRY_BETA`,
   `BETA_TRACING_ENDPOINT`. `OTEL_*` names outside the denied `OTEL_LOG_` and
-  `OTEL_EXPORTER_OTLP_` prefixes are allowed for your own application: the CLI
+  `OTEL_EXPORTER_OTLP_` prefixes and `OTEL_RESOURCE_ATTRIBUTES` are allowed for your own application: the CLI
   starts no third-party OpenTelemetry exporter unless
   `CLAUDE_CODE_ENABLE_TELEMETRY` (denied by the `CLAUDE_` prefix) or the beta
   tracing pair above is set, and the worker never sets them. `OTEL_LOG_` is

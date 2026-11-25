@@ -6,10 +6,13 @@ audience: user
 
 # Model providers
 
-A **model provider** is a named, Anthropic-compatible gateway (a company LLM proxy, for
-example) that you register with its own API key and a map from Claude's model names to the
-gateway's models. Settings has a **Custom providers** card for them, and `uzi provider` covers
-the same ground from a terminal.
+A **model provider** is a named gateway (a company LLM proxy, for example) that you register
+with its own API key and a map from an engine's model names to the gateway's models. A
+**Claude** provider is Anthropic-compatible; a **Codex** provider is Responses-compatible
+(OpenAI Responses protocol, Bearer auth). Settings has a **Custom providers** card for them,
+and `uzi provider` covers the same ground from a terminal. Most of this page applies to both
+engines; [Use a provider as your Codex source](#use-a-provider-as-your-codex-source) lists
+what differs.
 
 > **Runs through a provider are active, and the Claude CLI follows gateway redirects.** The
 > pinned Claude CLI follows HTTP redirects from a gateway. A gateway that answers with a redirect
@@ -21,6 +24,15 @@ the same ground from a terminal.
 > (`UZI_PROVIDER_ALLOWED_BASE_URLS`) is therefore the **only control** on where provider traffic
 > starts: allowlist only gateways you trust not to redirect, and prefer Bearer auth, which limits
 > cross-host key exposure.
+>
+> **Codex providers carry the same accepted risk.** The pinned Codex runtime follows redirects
+> too, and can forward request bodies (your prompts, plus code and tool output) and the Bearer
+> header beyond the approved URL. The allowlist is admission control, not confinement; the Test
+> probe refuses redirects, the runtime does not (owner decision, 2026-11-19). The runtime also
+> puts no byte limit on the model responses it reads from the gateway (HTTP bodies and SSE
+> streams), so a hostile or broken gateway can exhaust that worker's memory and interrupt your concurrent
+> runs on it (owner decision, 2026-11-22; limiter parked as #4600). Allowlist only gateways you
+> trust. See [ADR-4320](../adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23).
 >
 > Two operational notes. A worker image that predates providers never claims a provider run:
 > the run stays queued with "no worker that supports model providers is online" until the worker
@@ -37,7 +49,8 @@ equal one entry **exactly, path included**, for example `https://gw.example.com/
 Nothing is matched by host or prefix. The Settings form offers the allowed URLs to pick from,
 and `uzi provider list --json` prints them as `allowed_base_urls`. If your operator has not
 set the list, the feature is off: Settings says so, and `uzi provider list` prints a message
-instead of a table.
+instead of a table. A Codex provider's URL is the one the Responses requests are sent under
+(Test posts to `<base_url>/responses`), for example `https://gw.example.com/openai`.
 
 ## Create a provider
 
@@ -50,10 +63,13 @@ uzi provider create --name corp-gw \
   --model sonnet=corp-sonnet:200000
 ```
 
+- **Engine.** `--engine claude` (the default) or `--engine codex`. The rest of this list is the
+  Claude form; a Codex provider differs as described under
+  [Use a provider as your Codex source](#use-a-provider-as-your-codex-source).
 - **Name.** Unique among your providers, ignoring case. You can have up to 20, retired ones
   included.
 - **Auth style.** `bearer` (the default) sends the key as a bearer token; `x_api_key` sends it
-  in the `x-api-key` header. Use whichever your gateway expects.
+  in the `x-api-key` header. Use whichever your gateway expects. A Codex provider is Bearer only.
 - **Model map.** `--model alias=model[:context_window]`, repeatable, with `alias` one of
   `haiku`, `sonnet`, `opus` or `fable`. **`haiku` is required**: Claude's background calls use
   the small/fast slot, which is `haiku`. Set `context_window` to the gateway model's real
@@ -96,13 +112,13 @@ replaces the whole map, so repeat every alias you want to keep.
 and reports them as two separate lines:
 
 - **auth**: `ok`, `rejected` or `inconclusive`. Does the key authenticate and does the endpoint
-  speak the Messages protocol?
+  speak the Messages protocol (for a Codex provider, the Responses protocol)?
 - **tools**: `passed`, `not_supported`, `inconclusive` or `not_run` (Settings words them as plain sentences). Does the gateway return a
   tool call when asked for one? It is `not_run` when auth did not succeed.
 
 `inconclusive` means the gateway could not be judged (a network error, a timeout, a redirect or
 an unexpected reply), which is not a failure of the key. **Neither result certifies full
-compatibility with Claude.** A gateway can pass both and still differ on streaming, long
+compatibility with the engine.** A gateway can pass both and still differ on streaming, long
 contexts or other features.
 
 The probe is dialed from the api directly, not from a worker, and it ignores proxy
@@ -125,16 +141,18 @@ Settings names it as your current Claude source. From a terminal:
 
 ```sh
 uzi provider use corp-gw     # select by name or id
-uzi provider use --none      # back to your Anthropic token
+uzi provider use --none --engine claude   # back to your Anthropic token
 ```
 
-If the operator turns custom providers off while one is selected, Settings still offers
-**Stop using**. You can clear the source there or with `uzi provider use --none` to use
+`use` sets the source of the provider's own engine, and clearing needs `--engine claude|codex`
+(see [Use a provider as your Codex source](#use-a-provider-as-your-codex-source)). If the
+operator turns custom providers off while one is selected, Settings still offers **Stop using**.
+You can clear the source there or with `uzi provider use --none --engine claude` to use
 Anthropic for new runs.
 
 Both call `PUT /api/me/providers/claude-source` and accept a Bearer token, since selecting reveals no
 key and cannot move a destination. The selection applies to runs you start afterwards. A selection is refused (409 `provider_source_unusable`)
-unless the provider is yours, not retired, on the operator's allowlist and has an enabled key.
+unless the provider is yours (or an [admin-shared definition](#admin-shared-providers)), not retired, on the operator's allowlist and has an enabled key of yours.
 
 - **A set source is never skipped.** If it becomes unusable (retired, its URL removed from the
   allowlist, its key missing or disabled), new runs are refused with `provider_source_unusable`.
@@ -147,8 +165,12 @@ unless the provider is yours, not retired, on the operator's allowlist and has a
   usage is never compared with vendor readings, and your run never moves to another engine's
   credential.
 - **Lanes that cannot use a provider refuse.** The judge, jobs and cross-check lanes refuse an
-  owner whose source is set, with `provider_lane_unsupported`, including that owner's runs that
-  use an Anthropic token. The isolated research lane refuses provider runs.
+  owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
+  that use an Anthropic token. The refused judge is a visible skip on the run ("the selected
+  source is a model provider, which the judge does not support yet"). A plan cross-check whose
+  checker would be refused sends the plan to the human plan gate instead; for a Codex lead that
+  means a Codex lead with plan cross-check, owned by someone with a Claude source, waits for you
+  to approve the plan. The isolated research lane refuses provider runs.
 - **Models.** Every model the run uses (the lead, each agent template, summaries and advice
   passes) must be in the provider's model map. An unmapped alias or a full Anthropic model id is
   refused with `provider_model_unmapped`; uzi never swaps it for another model.
@@ -184,10 +206,174 @@ show as **unknown** for provider runs: the model names are the gateway's, so the
 table does not apply. Token counts are still recorded, and run, time and
 concurrency limits still apply.
 
+## Use a provider as your Codex source
+
+A **Codex provider** (engine `codex`, protocol `openai_responses`) is a gateway that speaks the
+OpenAI Responses protocol, at an operator-allowlisted exact base URL, with **Bearer auth only**.
+Your **Codex source** decides which credential your Codex runs use. It is separate from your
+Claude source: each engine has its own selection. Unset (the default), Codex runs use your Codex
+login or OpenAI key exactly as before. Set to a provider, they use that gateway and key only. No
+Codex subscription login (`codex_auth`) and no OpenAI vendor key is forwarded, and a run never
+falls back to one.
+
+```sh
+uzi provider create --engine codex --name code-gw \
+  --base-url https://gw.example.com/openai \
+  --model default=gw-model-a:200000 \
+  --model gpt-6-sol=gw-model-b:200000
+uzi provider use code-gw                     # sets your Codex source (the provider's engine)
+uzi provider use --none --engine codex       # back to your Codex login or OpenAI key
+```
+
+The key is added in the web Settings, as for a Claude provider, and is stored as its own kind
+(`openai_compatible_key`): it is never an OpenAI vendor key, and a Claude provider's key cannot be
+attached to a Codex provider or the reverse. In Settings, **Custom providers** has an engine
+selector, and each row offers **Use as Codex source** or **Stop using**. `uzi provider use <name>`
+picks the source from the provider's engine; clearing needs the engine named
+(`--none --engine claude|codex`), because the two selections are independent. Both call
+`PUT /api/me/providers/codex-source` or `.../claude-source` and accept a Bearer token.
+
+- **Model map.** `default` is required. The optional keys are the Codex model ids uzi can send:
+  `gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.2-sol`, `gpt-6.2-astra` and `gpt-6-luna`. Each entry is
+  `model[:context_window]` as for Claude (8,192 to 10,000,000 tokens).
+  - **An explicit model you pick** (`--model` on a run, or a model pinned on a schedule) resolves
+    only through its own key. If the map has no such key the run is refused with
+    `provider_model_unmapped` before any credential is sent.
+  - **A model uzi picks** (the default model, the planning default and the task-review model)
+    resolves through its own key when the map has one, otherwise through `default`.
+  - **Effort** values pass through to the gateway unchanged.
+  - **Context window.** A map entry's `context_window` sets the runtime's
+    `model_context_window` for that model. Without one, the runtime's own fallback applies, which
+    may not match the gateway model.
+- **A set source is never skipped.** If it becomes unusable (retired, URL removed from the
+  allowlist, key missing or disabled), new Codex runs are refused with `provider_source_unusable`,
+  even when you hold a usable Codex login, OpenAI key or Claude token. Deleting a selected provider
+  is refused (`provider_in_use_as_source`). A set source also turns automatic harness choice off.
+- **No account switching or overrides.** A per-run credential override and in-place Codex account
+  switching are refused for provider runs, and `codex_auth` is never delivered to them.
+- **Usage and cost** are unknown for provider runs, as for Claude, and gateway model names are
+  never priced from the vendor table.
+
+### What a Codex run keeps
+
+Codex issue, task, prompt and self-improve runs, including their in-run advice, summary and
+task-review passes, use only the provider, revision and key frozen at creation: there is no
+vendor fallback. Retries, resume and cold resume keep that binding. Rework (`mr_rework`) and
+follow-up runs inherit it. CI-fix and handoff runs have no source run: they use your current
+Codex source, and are refused when it is set but unusable.
+
+Rotating or disabling the key, or a revision or allowlist change, takes effect at the run's
+**next actual claim**, not mid-claim (cancel is the immediate stop), as the typed
+`provider_binding_stale` outcome (cancel and start a new run) or, for a removed allowlist entry,
+`provider_destination_not_allowed`. A gateway 429 or overloaded answer parks the run as
+`provider_gateway_limit`, retried after 1, 5 and then 15 minutes, then it waits for you to
+Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit)).
+
+### What a Codex provider run does not do
+
+- **Judge.** A Codex judge is skipped for an owner with a provider source (a Claude or a Codex
+  source), with the visible skip "the selected source is a model provider, which the judge does
+  not support yet." A Claude judge follows your Claude source as described above.
+- **Cross-check.** Plan and code cross-check refuse when either side would be bound to a Codex
+  provider, with `provider_lane_unsupported`. For the plan stage this means a human plan gate: a
+  Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker
+  refused and waits for you to approve the plan. The code stage records the checker as
+  unavailable with no verdict.
+- **Jobs and chat** are Claude-only and unchanged by a Codex source. A job refuses with
+  `provider_lane_unsupported` while your **Claude** source is set; a Codex source does not
+  affect them.
+
+Codex providers on the judge and cross-check lanes are tracked in #4574.
+
+### Operators: rollout and keys
+
+- **Capability.** Workers advertise `codex_provider_v1` together with the Codex harness
+  capabilities. The api admits a Codex provider claim only to a worker advertising
+  `codex_provider_v1`, `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3` on the same
+  worker; otherwise the run stays queued and its health reads "no worker that supports model
+  providers is online" (it counts only workers with all four). Deploy the api before the workers.
+  Update worker image overrides and separately managed workers to the current runtime too.
+- **Old ephemeral workers.** A registered worker missing v3 can be reaped and replaced when its
+  bound Codex provider run is queued and has never been claimed. Missing v3 alone does not
+  authorize reaping a previously claimed run's worker; active assignments and open custody also
+  prevent reaping. Provision/reap ticks and per-user caps bound rate and concurrency, but
+  replacement cycles can continue indefinitely until the provisioned image advertises v3.
+- **Credential delivery.** A Codex provider claim carries the gateway key only in its provider
+  object, with no vendor Codex credential block, so there is no vendor release or refresh for it
+  (`/codex/release` and `/codex/refresh` refuse provider runs).
+- **Key protection.** The key is redacted by its exact encodings (raw, JSON-escaped, `\/`, HTML-safe,
+  percent-encoded) from model, review and summary output, PR text and forge pushes. Transformed
+  encodings are not detected, and the private recovery archive is not scanned, as for Claude
+  providers (#4505).
+- **Runtime.** The pinned Codex runtime is 0.171.0. The cited maintainer observation that the
+  response body limit was unset was made on 2026-11-23 at tag `rust-v0.169.0`; it is historical
+  evidence, not a response-size guarantee for the current pin. Updating the pin does not by
+  itself remove the owner-accepted model-response ingestion risk above.
+
+## Admin-shared providers
+
+An admin can define a **Claude** gateway once and share it with everyone on the instance. You see it
+in Settings, **Custom providers**, next to your own, marked **Managed by your admin**, and in
+`uzi provider list` with `admin` in the MANAGED BY column. The admin fixes its name, base URL, auth
+style and model map. **You supply and control your own key**: you attach it, test it and select the
+definition as your Claude source exactly as for your own provider. The admin never sees your key, and
+you never see anyone else's key or Test results.
+
+- **Before you attach a key or select it**, Settings shows a disclosure. It says what the admin
+  decides (the endpoint and auth style, fixed when the definition was created, so your admin cannot
+  repoint your key to another gateway; the model map, which decides which gateway model and context
+  window your own key pays for on your next fresh run, and which an admin edit changes without asking
+  you) and what you hold (your own key, stored encrypted for your account only, which you can rotate,
+  disable or delete at any time). It also repeats the redirect warning above: your key is sent to that
+  endpoint on every request, a redirecting gateway can resend your prompts and code to another host
+  and your key to another path on the same host, and with `x_api_key` auth it can forward the key
+  itself to another host.
+- **The key and Test are yours.** **Test** uses your key and shows only your own result ("Latest test
+  of your key"). Replacing, rotating or disabling your key, or an admin model-map edit, makes your old
+  result read as not tested again. Another user's pass or failure never shows on your row.
+- **Select and clear.** **Use as Claude source** opens the disclosure first; confirm to select.
+  `uzi provider use <name|id>` selects it too (the CLI says "(shared by your admin)"). Clear it like
+  any source (**Stop using**, or `uzi provider use --none --engine claude`). Without a key of your
+  own, selecting is refused with `provider_source_unusable` and leaves your source unchanged. If
+  your Claude source is unset, new Claude runs keep using your Anthropic token when available. If an
+  already-selected shared definition loses your key, new Claude runs are refused without falling back.
+- **You cannot change the definition.** Rename, model map, endpoint, retire and delete are not
+  offered for it. `uzi provider edit` and `uzi provider retire` refuse a shared definition ("managed by
+  your admin") before sending any change. You can still disable or delete your own key on it.
+- **When your admin changes it.** A model-map edit makes a new revision for your next fresh run;
+  runs already started keep the one they froze. **Retiring** stops new selections and fresh runs. If
+  you had it selected, it stays selected but is unusable until you choose another source, and Settings
+  says so. **Deleting** is refused while any user has it selected (`provider_in_use_as_source`); once
+  nobody does, it also deletes every user's attached key and Test results, and a run still
+  bound to it stops at its next claim as `provider_binding_stale`.
+- **Codex.** A shared definition is Claude only. Shared Codex definitions are tracked in #4633.
+- **The accepted redirect risk applies to a shared definition under either auth style** (owner
+  decision, 2026-11-20), and the operator allowlist still governs where its URL may point.
+
+### Admin: manage shared providers
+
+In the web app, **Admin → Shared providers** (admin only). Create a definition (name, one of the
+allowed base URLs, auth style, model map; it has no key), edit its name and model map, retire it, or
+delete it. The base URL and auth style are fixed once created: to change either, create a new
+definition, and each user must then select it and attach a key again. Each row shows how many users
+selected it and how many personal keys are attached. Delete is refused while anyone has it selected
+and otherwise says how many keys go with it, then reports the count it removed. Up to 50 shared
+definitions can exist, retired ones included. Every change writes a structured `provider_audit` log
+line with the actor and provider ids (never a key). All writes are browser-only (cookie and CSRF), and
+a `uza_` token returns 401 on them. `uzi admin provider list` and `uzi admin provider get <id|name>`
+are the read-only terminal view and need an admin-read token. Design and the lock and rollback
+details: [ADR-4324](../adr/4324-admin-shared-providers.md).
+
 ## Gateways behind a private CA
 
+For a Codex provider, the worker's existing extra-CA bundle is delivered to the Codex runtime with
+TLS verification left on, so a private-CA gateway works there. A stalled connection fails with a
+typed timeout (setup through the first model response is bounded at 10 seconds per runtime
+root); it is reported as a certificate error only when the runtime reports one. This page does not
+separately document the `workers.uidSplit` case for Codex; the paragraph below describes Claude.
+
 The Test probe trusts the operator's `workers.extraCA` bundle (the chart also mounts it into the
-api pod). Under the chart's `workers.uidSplit`, the Claude CLI runs as a different uid that
+api pod). For a Claude provider under the chart's `workers.uidSplit`, the Claude CLI runs as a different uid that
 cannot read that bundle, so `workers.extraCA` reaches only the worker process there, not the CLI.
 A private-CA gateway can therefore pass **Test** and still fail from a run on a uid-split worker.
 Workers without `uidSplit` are covered. (The isolated research lane refuses provider runs, so it
@@ -201,7 +387,9 @@ cannot be edited or tested. **Delete** removes it for good and is web-only.
 
 ## From the CLI
 
-`uzi provider list` shows NAME, URL, AUTH, MODELS, KEY (`yes`, `no` or `disabled`), TEST
-(`<auth>/<tools>` from the last test, or `-`) and RETIRED. `<name|id>` matches an id exactly or
-a name ignoring case. Refusals print the server's machine-readable `reason` after the message.
+`uzi provider list` shows NAME, ENGINE, URL, AUTH, MODELS, KEY (`yes`, `no` or `disabled`), TEST
+(`<auth>/<tools>` from the last test, or `-`), RETIRED and MANAGED BY (`you`, or `admin` for an
+[admin-shared definition](#admin-shared-providers)). `<name|id>` matches an id exactly or
+a name ignoring case; when an owned and a shared definition have the same name, `use` and `test`
+exit 2 and ask for an id. Refusals print the server's machine-readable `reason` after the message.
 See [the CLI reference](./cli.md#model-providers-uzi-provider).

@@ -239,7 +239,7 @@ const (
 	// receives repo variables (an enabled live variable, or a secret delivery receipt) whose
 	// owner has no online worker self-reporting 'run_env_v1': ClaimRun's standalone run_env
 	// clause can never be satisfied until a worker that injects the variables comes online.
-	reasonNoRunEnvCapableWorker             = "no online worker supports repo variables (run_env_v1); upgrade a worker"
+	reasonNoRunEnvCapableWorker             = "no online worker supports repo variables (run_env_v1); repo variables need a current two-uid worker (UZI_UID_SPLIT, or UZI_WORKER_UID_SPLIT on hosted workers)"
 	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
@@ -260,12 +260,13 @@ const (
 	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
 	// reasonNoProviderCapableWorker (PRD #4320 module 5) is emitted for a PROVIDER-BOUND queued run
 	// (runs.model_provider_key_mode set) whose owner has NO online worker advertising the
-	// 'claude_provider_v1' protocol capability. Like reasonNoCodexCapableWorker it names a
+	// provider protocol for the frozen engine (plus the Codex harness/runtime on that same worker).
+	// Like reasonNoCodexCapableWorker it names a
 	// NON-BYPASSABLE block: ClaimRun's dedicated provider clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so the run waits until a worker that
-	// supports provider claims comes online. Provider execution is activated (#4505): current worker
-	// images advertise the capability, so this names only a fleet of older images (the hosted fleet
-	// is pinned separately from the app tier). Maps to the SAME healthWaitingWorker enum
+	// supports that engine's provider claims comes online. Claude provider execution is activated
+	// (#4505); Codex advertisement remains gated on completed delivery. The hosted worker fleet
+	// is pinned separately from the app tier. Maps to the SAME healthWaitingWorker enum
 	// (runs.health_reason is free text).
 	reasonNoProviderCapableWorker = "no worker that supports model providers is online"
 	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
@@ -1744,15 +1745,13 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			return reasonNoCurrentCodexRuntime
 		}
 	}
-	// PRD #4320 module 5: a PROVIDER-BOUND run whose owner has NO online worker advertising
-	// claude_provider_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable provider clause can never be
-	// satisfied). Placed right after the Codex rungs for the same reason they sit ahead of the
-	// priority-class re-label. r.ModelProviderKeyMode is the claim clause's own discriminator, so the
-	// pill and the claim can never disagree. Read errors fall through.
+	// Provider-bound runs need one worker satisfying their frozen engine's full
+	// provider protocol intersection. Keep this ahead of the priority re-label.
+	// Read errors fall through, as with the other capability rungs.
 	if r.ModelProviderKeyMode.Valid {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
+		c, cerr := s.q.CountOnlineWorkersSatisfyingProvider(ctx, store.CountOnlineWorkersSatisfyingProviderParams{UserID: r.UserID, Engine: r.Harness})
 		if cerr != nil {
-			slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
+			slog.Error("health: count online workers satisfying provider", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoProviderCapableWorker
 		}
@@ -1864,6 +1863,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				// capableIgnoringCodexLead: a worker that would qualify but for
 				// cross_check_codex_lead_v1, which only a Claude checker child needs.
 				capableIgnoringCodexLead := false
+				capableIgnoringRuntimeV3 := false
 				claudeChecker := run.Kind == "cross_check" && run.Harness == harnessClaude
 				for _, worker := range workers {
 					if worker.Status == "online" && store.WorkerAcceptsNewIntake(store.Worker{
@@ -1878,7 +1878,14 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 						(!r.CrossCheckPinRequired || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckPinsV1)) &&
 						(!r.CodexCustomRoot || slices.Contains(worker.ProtocolCapabilities, capability.CodexCustomModelV1)) &&
 						(!r.PhaseModelsRequired || slices.Contains(worker.ProtocolCapabilities, phaseModelsCapability(Harness(r.Harness)))) &&
-						(run.Harness != harnessCodex || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
+						((run.Harness != harnessCodex && !run.CodexMaterialRevision.Valid && !run.CodexSecretID.Valid) || (slices.Contains(worker.ProtocolCapabilities, capability.CodexHarnessV1) && slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV2))) {
+						requiresRuntime := run.Harness == harnessCodex || run.CodexMaterialRevision.Valid || run.CodexSecretID.Valid
+						if requiresRuntime && !slices.Contains(worker.ProtocolCapabilities, capability.CodexRuntimeV3) {
+							if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
+								capableIgnoringRuntimeV3 = true
+							}
+							continue
+						}
 						capableIgnoringCodexLead = true
 						if !claudeChecker || slices.Contains(worker.ProtocolCapabilities, capability.CrossCheckCodexLeadV1) {
 							capable = true
@@ -1887,6 +1894,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 					}
 				}
 				if !capable {
+					if capableIgnoringRuntimeV3 {
+						return reasonNoCurrentCodexRuntime
+					}
 					if capableIgnoringCodexLead {
 						return reasonNoCrossCheckCodexLeadCapableWorker
 					}

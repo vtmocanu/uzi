@@ -40,6 +40,9 @@
 //     disposal; a cleanup warning NEVER replaces the primary failure; partial text is
 //     NEVER returned after a timeout.
 
+import { createHash } from "node:crypto";
+import type { ClaimCodexProviderBinding } from "../protocol.js";
+import { resolveCodexProviderModelSlot } from "../provider-binding.js";
 import { ownedSummaryHarnesses } from "./summary-ownership.js";
 import { renderCodexAdvice } from "./render.js";
 import {
@@ -67,7 +70,7 @@ import type {
   HarnessThrownFailure,
 } from "../harness.js";
 import type { CodexProviderConfig } from "./codex-harness.js";
-import type { CodexAppServerAuthSession } from "./appserver-auth.js";
+import { CODEX_PROVIDER_FIRST_RESPONSE_MS, codexInitialResponseWait, codexConnectionBudget, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "./transport.js";
 import type { RenderedCodexAdvice } from "./render.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
@@ -96,6 +99,9 @@ export class CodexAdviceError extends Error {
  *  launcher-fixed values plus the private credential; it NEVER carries a run worktree, a
  *  broker/handler registry, agents or tools — the advice ceiling by construction. */
 export interface CodexAdviceLaunchSpec {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
+  readonly providerBinding?: ClaimCodexProviderBinding;
+  readonly providerSlot?: keyof ClaimCodexProviderBinding["model_map"];
   readonly kind: "advice";
   /** The advice lane label (judge/review/summary); used only for the launcher's own
    *  isolation naming/diagnostics, never model-visible. */
@@ -140,6 +146,8 @@ interface AdviceOperation {
   close(): void;
 }
 export interface CodexAdviceHarnessOptions {
+  readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
+  readonly providerBinding?: ClaimCodexProviderBinding;
   readonly operationScope?: () => AdviceOperation;
   readonly admissionReporter?: import("./admission-signal.js").CodexAdmissionReporter;
   readonly launchRoot: LaunchAdviceRootSeam;
@@ -150,7 +158,10 @@ export interface CodexAdviceHarnessOptions {
   readonly credentialValue?: string;
   /** PRD #2603: the credential mode the price table projects usage cost under. Absent ⇒ the
    *  usage snapshot carries tokens with an `unreported` cost. */
-  readonly authMode?: "subscription" | "api_key";
+  readonly authMode?: "subscription" | "api_key" | "provider";
+  /** Provider first-response allowance (default {@link CODEX_PROVIDER_FIRST_RESPONSE_MS}).
+   *  Internal test seam only: no env, claim or provider configuration reaches it. */
+  readonly providerFirstResponseMs?: number;
   /** Injected clock for the price table's promotional boundary. Defaults to the wall clock. */
   readonly now?: () => Date;
   readonly log: Logger;
@@ -231,10 +242,13 @@ export class CodexAdviceHarness implements AdviceHarness {
   private admissionAttempt?: import("./admission-signal.js").AdmissionAttempt;
   private readonly launchRoot: LaunchAdviceRootSeam;
   private readonly provider: CodexProviderConfig;
+  private readonly providerBinding?: ClaimCodexProviderBinding;
+  private readonly codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
   private readonly appServerAuth?: CodexAppServerAuthSession;
   // Transitional private input; never combined with the pinned app-server auth path.
   private readonly credentialValue?: string;
-  private readonly authMode?: "subscription" | "api_key";
+  private readonly authMode?: "subscription" | "api_key" | "provider";
+  private readonly providerFirstResponseMs: number;
   private readonly now: () => Date;
   private readonly log: Logger;
 
@@ -244,9 +258,15 @@ export class CodexAdviceHarness implements AdviceHarness {
     this.operationScope = opts.operationScope;
     this.admissionReporter = opts.admissionReporter;
     this.authMode = opts.authMode;
+    this.providerFirstResponseMs = opts.providerFirstResponseMs ?? CODEX_PROVIDER_FIRST_RESPONSE_MS;
     this.now = opts.now ?? (() => new Date());
     this.launchRoot = opts.launchRoot;
-    this.provider = opts.provider;
+    this.providerBinding = opts.providerBinding;
+    this.codexExtraCa = opts.providerBinding ? opts.codexExtraCa : undefined;
+    this.provider = opts.providerBinding ? { ...opts.provider,
+      name: "uzi-provider-" + createHash("sha256").update(JSON.stringify([opts.providerBinding.provider_id, opts.providerBinding.revision])).digest("hex"),
+      baseUrl: opts.providerBinding.base_url, model: opts.providerBinding.model_map.default.model,
+    } : opts.provider;
     if (opts.appServerAuth !== undefined && opts.credentialValue !== undefined) {
       throw new CodexAdviceError({
         category: "protocol",
@@ -284,7 +304,8 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
     }
 
-    const model = rendered.model ?? this.provider.model;
+    const providerSlot = this.providerBinding ? resolveCodexProviderModelSlot(request.model, this.providerBinding.model_map) : undefined;
+    const model = this.providerBinding ? this.providerBinding.model_map[providerSlot!]!.model : rendered.model ?? this.provider.model;
 
     // Internal abort: fired by the external request.signal OR the wall-clock timeout. It
     // bounds the thread/turn RPCs and the notifications race so a hung pass settles.
@@ -322,11 +343,15 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
       return disposePromise;
     };
+    const connectionBudget = codexConnectionBudget(this.authMode);
     const work = (async (): Promise<AdviceResult> => {
       const launched = await this.launchRoot({
         kind: "advice",
         label: request.label,
         provider: this.provider,
+        providerBinding: this.providerBinding,
+        ...(this.codexExtraCa ? { codexExtraCa: this.codexExtraCa } : {}),
+        providerSlot,
         model,
         // PRIVATE → the isolated launcher env ONLY; never a thread/turn param or frame.
         credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
@@ -336,7 +361,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       });
       disposeSeam = launched.dispose;
       transportSeam = launched.transport;
-      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver, operation);
+      return this.consume(launched.transport, launched.cwd, rendered, model, policy, internalAbort.signal, request.usageObserver, operation, connectionBudget);
     })();
 
     // Late-disposal owner: a launch that resolves AFTER the finally already ran (a slow
@@ -419,19 +444,24 @@ export class CodexAdviceHarness implements AdviceHarness {
     signal: AbortSignal,
     usageObserver?: AdviceRequest["usageObserver"],
     operation?: AdviceOperation,
+    connectionBudget?: () => number,
   ): Promise<AdviceResult> {
     // Authentication is setup, so it completes before any thread/model work.
-    await this.appServerAuth?.authenticate(transport, signal);
-    const threadId = await this.startThread(transport, cwd, rendered, model, signal);
+    await this.appServerAuth?.authenticate(transport, signal, connectionBudget);
+    const threadId = await this.startThread(transport, cwd, rendered, model, signal, connectionBudget);
     // PRD #2603: a fresh accountant per call, one fresh (non-resumed) thread, so a duplicate or
     // stale `thread/tokenUsage/updated` note is never counted twice (the accountant's magnitude
     // gate) and nothing carries over from another call.
     const accountant = new CodexUsageAccountant();
     accountant.registerThread(threadId, model ?? this.provider.model, false);
-    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal, operation);
+    const turnId = await this.startTurnRpc(transport, threadId, rendered, model, signal, operation, connectionBudget);
 
     // Single-consumer: obtain the notifications iterator exactly once.
     const notes = transport.notifications();
+    // Local setup ended at the turn/start acknowledgment; the first model response gets its own
+    // provider allowance. The request's own timeout and owner abort keep their outcomes.
+    const responseWait = codexInitialResponseWait(
+      connectionBudget === undefined ? undefined : this.providerFirstResponseMs, threadId, turnId);
     let text = "";
     // Running byte sum of the accumulated advice text, so the total is bounded against an
     // unbounded/looping stream (see MAX_ADVICE_TEXT_BYTES). Kept O(n) total: each appended
@@ -456,13 +486,19 @@ export class CodexAdviceHarness implements AdviceHarness {
 
     try {
       for (;;) {
-        const step = await Promise.race([notes.next(), aborted]);
-        if (step === "aborted") {
+        // One outstanding read; expiry never starts a second reader or closes custody.
+        const step = await Promise.race([notes.next().then(step => {
+          if (!step.done) responseWait.observe(step.value);
+          return step;
+        }), aborted, responseWait.ready.then(() => "deadline" as const)]);
+        if (signal.aborted || step === "aborted") {
           // Owner/timeout abort wins. End the stream WITHOUT a terminal and WITHOUT
           // returning partial text: the race's rejection is the primary failure and this
           // throw is swallowed by awaitSettled.
           throw new CodexAdviceError({ category: "aborted", message: `codex advice ${rendered.label} aborted` });
         }
+        responseWait.assertOpen();
+        if (step === "deadline") throw new CodexAdviceError({ category: "protocol", message: "unexpected response deadline wake" });
         if (step.done) {
           // Clean EOF with no terminal is Codex's own unexpected-EOF → a protocol throw
           // (a transport failure is thrown, not returned; mirrors CodexHarness rule 9).
@@ -543,6 +579,7 @@ export class CodexAdviceHarness implements AdviceHarness {
         }
       }
     } finally {
+      responseWait.clear();
       if (onAbort) signal.removeEventListener("abort", onAbort);
       // The outer run owner closes auth admission, transport, and owned auth tasks in
       // cycle-free order after this work settles. Policy still runs before that closure.
@@ -554,7 +591,7 @@ export class CodexAdviceHarness implements AdviceHarness {
    *  mode is unknown or the model cannot be priced), never invented. */
   private usageSnapshot(accountant: CodexUsageAccountant): AdviceUsageSnapshot | undefined {
     const byModel = accountant.aggregateByModel(
-      this.authMode === undefined ? undefined : { authMode: this.authMode, now: this.now() },
+      this.authMode === undefined || this.authMode === "provider" ? undefined : { authMode: this.authMode, now: this.now() },
     );
     if (byModel === undefined) return undefined;
     const out: Record<string, AdviceModelUsage> = {};
@@ -611,6 +648,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     rendered: RenderedCodexAdvice,
     model: string | undefined,
     signal: AbortSignal,
+    connectionBudget?: () => number,
   ): Promise<string> {
     // issue #2213: synchronous, immediately before the provider dispatch (also checked in the transport).
     assertResidueQuarantineOpen("provider_turn");
@@ -624,10 +662,12 @@ export class CodexAdviceHarness implements AdviceHarness {
         ephemeral: true,
         environments: [],
         dynamicTools: [],
-        config: this.adviceThreadConfig(cwd),
+        config: { ...this.adviceThreadConfig(cwd),
+          ...(this.providerBinding ? { model_context_window: this.providerBinding.model_map[resolveCodexProviderModelSlot(rendered.model, this.providerBinding.model_map)]!.context_window } : {}),
+        },
         developerInstructions: rendered.systemPrompt,
       },
-      { signal },
+      { signal, deadlineMs: connectionBudget?.() },
     );
     const id = res?.thread?.id;
     if (typeof id !== "string" || id.length === 0) {
@@ -643,6 +683,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     model: string | undefined,
     signal: AbortSignal,
     operation?: AdviceOperation,
+    connectionBudget?: () => number,
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
@@ -658,7 +699,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       check();
     } while (permit?.() === false);
     this.admissionAttempt = this.admissionReporter?.begin(threadId);
-    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
+    const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal, deadlineMs: connectionBudget?.() });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {
       throw new CodexAdviceError({ category: "protocol", message: "codex advice turn/start returned no turn id" });

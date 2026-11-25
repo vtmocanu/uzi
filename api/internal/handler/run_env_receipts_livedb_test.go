@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/google/uuid"
@@ -16,6 +17,16 @@ import (
 
 // PRD #4416 M2: version-2 sealing context and the real receipt query behind the
 // retire path, through the handler against PostgreSQL.
+
+// envRevs lists the revisions of a version map for failure messages (the rows hold ciphertext).
+func envRevs(m map[int32]envVersionRow) []int32 {
+	out := make([]int32, 0, len(m))
+	for r := range m {
+		out = append(out, r)
+	}
+	slices.Sort(out)
+	return out
+}
 
 type envVersionRow struct {
 	id         uuid.UUID
@@ -64,11 +75,11 @@ func TestRunEnvVersionTwoCiphertextCannotSwapVersionsLiveDB(t *testing.T) {
 	f.put("SWAP_ME", jsonBody(map[string]any{"value": secretFixture(2)}), http.StatusOK)
 	v := f.versions("SWAP_ME")
 	if len(v) != 2 || v[1].aadVersion != runenv.AADVersion2 || v[2].aadVersion != runenv.AADVersion2 {
-		t.Fatalf("versions = %+v; want rev 1 and 2, both aad_version 2", v)
+		t.Fatalf("%d versions %v; want rev 1 and 2, both aad_version 2", len(v), envRevs(v))
 	}
 	for rev, want := range map[int32]string{1: secretFixture(1), 2: secretFixture(2)} {
 		if got, err := f.openVersion("SWAP_ME", v[rev]); err != nil || got != want {
-			t.Fatalf("rev %d opens to %q, %v; want %q", rev, got, err, want)
+			t.Fatalf("rev %d opens to a value of length %d (matches=%v), %v; want length %d", rev, len(got), got == want, err, len(want))
 		}
 	}
 	// Swap: the rev-1 ciphertext in the rev-2 row.
@@ -76,7 +87,7 @@ func TestRunEnvVersionTwoCiphertextCannotSwapVersionsLiveDB(t *testing.T) {
 	swapped.ct, swapped.marker = v[1].ct, v[1].marker
 	cjTestExec(t, f, `UPDATE run_env_vars SET ciphertext=$2, sealed_with=$3 WHERE id=$1`, swapped.id, swapped.ct, swapped.marker)
 	if got, err := f.openVersion("SWAP_ME", f.versions("SWAP_ME")[2]); err == nil {
-		t.Fatalf("the rev-1 ciphertext opened as rev 2: %q", got)
+		t.Fatalf("the rev-1 ciphertext opened as rev 2 (value length %d)", len(got))
 	}
 }
 
@@ -114,7 +125,7 @@ func TestRunEnvRotationHonoursSecretReceiptsLiveDB(t *testing.T) {
 		t.Fatalf("a plain rotation left %d versions, want 1 (plain receipts retain nothing)", n)
 	}
 	if got, err := f.openVersion("HELD_TOKEN", f.versions("HELD_TOKEN")[1]); err != nil || got != secretFixture(1) {
-		t.Fatalf("the retained version opens to %q, %v", got, err)
+		t.Fatalf("the retained version opens to a value of length %d (matches=%v), %v", len(got), got == secretFixture(1), err)
 	}
 }
 
@@ -157,7 +168,7 @@ func TestRunEnvDeleteWithRealReceiptsLiveDB(t *testing.T) {
 	}
 	var d apitypes.RunEnvDeleteDTO
 	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil || d.State != apitypes.RunEnvStatePendingDeletion {
-		t.Fatalf("delete body = %s (%v), want pending_deletion", rec.Body.String(), err)
+		t.Fatalf("delete body = %s (%v), want pending_deletion", respShape(rec), err)
 	}
 	if f.rowCount("name='HELD_SECRET' AND pending_delete_at IS NOT NULL") != 1 {
 		t.Fatal("the receipted secret was not kept pending deletion")
@@ -192,10 +203,10 @@ func TestRunEnvHistoryFullWithRealReceiptsLiveDB(t *testing.T) {
 	var e struct{ Code string }
 	_ = json.Unmarshal(rec.Body.Bytes(), &e)
 	if e.Code != "env_history_full" {
-		t.Fatalf("rotation of a receipted secret at the budget: %s", rec.Body.String())
+		t.Fatalf("rotation of a receipted secret at the budget: %s", respShape(rec))
 	}
 	if k := f.find(f.list(), "HELD_TOKEN"); k == nil || k.Rev != 1 {
-		t.Fatalf("a refused rotation changed the variable: %+v", k)
+		t.Fatalf("a refused rotation changed the variable: %s", dtoShape(k))
 	}
 	// Nothing holds a receipt for OTHER_TOKEN: its old version is dropped, not retained.
 	f.put("OTHER_TOKEN", jsonBody(map[string]any{"value": secretFixture(4)}), http.StatusOK)
@@ -226,15 +237,15 @@ func TestRunEnvVersionOnePlainRowConvertsToSecretLiveDB(t *testing.T) {
 	versions := f.versions("LEGACY_PLAIN")
 	live, ok := versions[2]
 	if !ok {
-		t.Fatalf("versions = %+v, want a new rev 2", versions)
+		t.Fatalf("%d versions %v, want a new rev 2", len(versions), envRevs(versions))
 	}
 	if live.aadVersion != runenv.AADVersion2 {
 		t.Fatalf("converted row aad_version = %d, want 2", live.aadVersion)
 	}
 	if got, err := f.openVersion("LEGACY_PLAIN", live); err != nil || got != "legacy-plain-value" {
-		t.Fatalf("the converted secret opens to %q, %v", got, err)
+		t.Fatalf("the converted secret opens to a value of length %d (matches=%v), %v", len(got), got == "legacy-plain-value", err)
 	}
 	if k := f.find(f.list(), "LEGACY_PLAIN"); k == nil || !k.Secret || k.Value != nil {
-		t.Fatalf("listed variable = %+v, want a secret without a value", k)
+		t.Fatalf("listed variable = %s, want a secret without a value", dtoShape(k))
 	}
 }

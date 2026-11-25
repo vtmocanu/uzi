@@ -650,6 +650,44 @@ test("the spill path is built from the resolved worktree, so a symlinked worktre
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+// Recs 7/13/15: a non-zero exit result explains itself, since earlier commands' passing output
+// can sit above the shell's final (non-zero) status. The flag and headline stay unchanged.
+const SHELL_STATUS_PHRASE = "exit status of the supervised shell invocation";
+const AMBIGUOUS_CAUSE_PHRASE = "the number alone does not establish the cause";
+
+test("a non-zero exit result keeps earlier output and explains that the code is the shell's final status", { timeout: 10000 }, async () => {
+  const h = harness();
+  h.script.current = (root) => { root.stdout.write("rc=0\n"); setImmediate(() => root.exitWith(1)); };
+  const r = await h.call({ command: "gate; grep nomatch log" });
+  const body = text(r);
+  assert.match(body, /^Exit code: 1\n/);
+  assert.equal(r.isError, true);
+  assert.ok(body.includes("rc=0"), "earlier output stays visible");
+  assert.ok(body.includes(SHELL_STATUS_PHRASE), body);
+  assert.ok(body.includes("normally the status of its last command"), body);
+});
+
+test("an exit 0 result carries no exit-status note", { timeout: 10000 }, async () => {
+  const h = harness();
+  h.script.current = (root) => { root.stdout.write("rc=0\n"); setImmediate(() => root.exitWith(0)); };
+  const r = await h.call({ command: "echo rc=0" });
+  const body = text(r);
+  assert.match(body, /^Exit code: 0\n/);
+  assert.equal(r.isError, false);
+  assert.ok(!body.includes(SHELL_STATUS_PHRASE), body);
+  assert.ok(!body.includes(AMBIGUOUS_CAUSE_PHRASE), body);
+});
+
+test("a code above 128 is reported as ambiguous, not diagnosed as a signal kill", { timeout: 10000 }, async () => {
+  const h = harness();
+  h.script.current = (root) => { setImmediate(() => root.exitWith(143)); };
+  const r = await h.call({ command: "exit 143" });
+  const body = text(r);
+  assert.match(body, /^Exit code: 143(\n|$)/);
+  assert.equal(r.isError, true);
+  assert.ok(body.includes(AMBIGUOUS_CAUSE_PHRASE), body);
+});
+
 test("the whole result text, headline and notes included, stays within 30000 characters", { timeout: 20000 }, async () => {
   for (const size of [29_980, 29_990, 29_999, 30_000, 30_001, 60_000]) {
     const h = harness();
@@ -657,6 +695,7 @@ test("the whole result text, headline and notes included, stays within 30000 cha
     const body = text(await h.call({ command: "gen" }));
     assert.ok(body.length <= 30_000, `${String(size)} chars of output returned ${String(body.length)}`);
     assert.match(body, /^Exit code: 3/);
+    assert.ok(body.includes(SHELL_STATUS_PHRASE), `${String(size)}: the non-zero exit note survives the cap`);
   }
   // The truncation note must be truthful when the raw output was below the limit and only the
   // headline pushed the result over it (29,990 chars + "Exit code: 3").
@@ -933,6 +972,7 @@ test("an unresolved prepared outcome never hides the command's own exit code and
     assert.match(body, /real-output/);
     assert.match(body, /memory-guard intervention was pending and unconfirmed/);
     assert.doesNotMatch(body, /stopped by the worker memory guard/);
+    assert.equal(body.includes(SHELL_STATUS_PHRASE), code !== 0, "the non-zero exit note rides alongside the pending note");
     assert.equal(r.isError, code !== 0);
     assert.equal(h.lane.poisoned, false);
   }
@@ -1082,6 +1122,7 @@ test("the server description states the lane's limits and the transport timeout 
     "Foreground only", "run_in_background is refused", "no long-running mode", "120000 ms", "3600000 ms", "60 minutes",
     "blocker", "repository root", "cd dir && command", "30000 characters", ".uzi/scratch/uzi-cmd/<id>.log", "64 MiB", "At most 8 commands",
     "best-effort copy", "may be absent or truncated",
+    "exit status of the supervised shell invocation", "a `grep` with no match", "which the number alone does not establish",
   ]) {
     assert.ok(GUARDED_COMMAND_DESCRIPTION.includes(phrase), phrase);
   }

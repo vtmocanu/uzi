@@ -26,7 +26,7 @@ func codeCrossCheckFixture(t *testing.T) *planCrossCheckDeletionFixture {
 	mustExec(ctx, t, f.pool, "DELETE FROM cross_checks WHERE id=$1", fx.crossCheckID)
 	mustExec(ctx, t, f.pool, "UPDATE runs SET code_cross_check_required=true WHERE id=$1", f.runID)
 	mustExec(ctx, t, f.pool, `UPDATE workers SET protocol_capabilities = $2, max_cross_check_slots = 1 WHERE id=$1`,
-		f.workerID, []string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2"})
+		f.workerID, []string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2", "codex_runtime_v3"})
 	mustExec(ctx, t, f.pool, "UPDATE runs SET worker_id=$2 WHERE id=$1", fx.checkerID, f.workerID)
 	return fx
 }

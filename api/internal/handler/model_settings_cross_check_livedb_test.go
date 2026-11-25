@@ -573,7 +573,9 @@ func TestModelSettingsWrittenColumnsAreNotKeyColumnsLiveDB(t *testing.T) {
 	f := newEffFix(t, nil)
 	written := []string{"default_claude_model", "default_codex_model", "default_model", "default_harness",
 		"default_effort", "default_codex_effort", "judge_model", "codex_judge_model", "judge_runs_on",
-		"summary_model", "codex_summary_model"}
+		"summary_model", "codex_summary_model", "task_review_model", "codex_task_review_model",
+		"task_review_effort", "codex_task_review_effort",
+		"planning_claude_model", "planning_claude_effort", "planning_codex_model", "planning_codex_effort"}
 	rows, err := f.pool.Query(f.ctx, `SELECT a.attname FROM pg_attribute a
 		WHERE a.attrelid = 'users'::regclass AND a.attnum > 0 AND NOT a.attisdropped AND (
 			EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = a.attrelid AND i.indisunique AND a.attnum = ANY(i.indkey::int2[]))

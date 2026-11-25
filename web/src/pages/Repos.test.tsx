@@ -193,7 +193,19 @@ async function openCrossCheckPanel(name: string): Promise<HTMLElement> {
   return screen.getByRole("group", { name: new RegExp(`Code cross-check for ${name}`) });
 }
 
-const CLAUDEMD_SWITCH = "Give the checker this repository's CLAUDE.md (read from the base commit)";
+const CLAUDEMD_SWITCH = "Give the cross-checkers this repository's CLAUDE.md";
+
+describe("Repos — cross-checker CLAUDE.md copy (issue #4519)", () => {
+  it("describes code-check and plan-check sourcing and plan consent timing", async () => {
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    const text = panel.textContent ?? "";
+    expect(text).toContain("Code checks read the root CLAUDE.md at a freshly fetched default-branch tip, so a run cannot write the instructions it is checked against");
+    expect(text).toContain("Plan checks read it at the plan\u2019s frozen base commit, and only when the lead\u2019s Repo instructions setting is also on");
+    expect(text).toContain("so a change here also affects a plan check still waiting to start");
+    expect(text).toContain("plan: frozen base commit");
+    expect(text).not.toContain("merge base");
+  });
+});
 
 describe("Repos — Code cross-check panel (PRD #2170 M3)", () => {
   it("shows a Default badge + Manage on an enabled repo and nothing on a disabled one", async () => {
@@ -257,7 +269,7 @@ describe("Repos — Code cross-check panel (PRD #2170 M3)", () => {
       code_cross_check_guidance: "Check migrations.",
       cross_check_repo_instructions_enabled: false,
     });
-    expect(await within(panel).findByText(/^Saved\./)).toBeTruthy();
+    expect(await within(panel).findByText("Saved. New code cross-checks use these settings; plan cross-checks read the CLAUDE.md setting when their checker starts.")).toBeTruthy();
     expect(within(rowFor("vtmocanu/uzi")).getByText("Guidance")).toBeTruthy();
     expect(save().disabled).toBe(true);
   });

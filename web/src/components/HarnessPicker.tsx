@@ -2,8 +2,8 @@
 //
 // Modeled on TokenPicker: a labeled <select> exposing the explicit states a human can
 // pick — "inherit" (let the server's D11 resolver choose, the true default) plus
-// "claude"/"codex". Reused at the start-run flow (IssueView/Board), Run Defaults, and
-// the schedule modal.
+// "claude"/"codex". Reused at the start-run flow (IssueView/Board) and the schedule
+// modal; the default harness itself is chosen in Settings → Models.
 //
 // The CALLER decides whether to render this at all: it appears only when BOTH
 // harnesses are usable (lib/harnessSelection.ts's bothHarnessesUsable) — a
@@ -29,7 +29,7 @@ export function HarnessPicker({
   id?: string;
   disabled?: boolean;
   className?: string;
-  // Text of the "inherit" option. Only Run defaults overrides it (it has no "my default" to defer to).
+  // Text of the "inherit" option; callers pass their own wording of what inherit resolves to.
   inheritLabel?: string;
 }) {
   return (

@@ -31,7 +31,7 @@ import (
 //go:embed testdata/claim-provenance-legacy/*.sql testdata/claim-provenance-legacy/*.json
 var claimProvenanceLegacyFixtures embed.FS
 
-var guardCodexCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
+var guardCodexCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexCustomModelV1}
 
 // guardClaim runs ClaimRun as w with the given protocol capabilities, grace disabled and a 30m
 // ceiling (the same modeled cutoffs as the stale-requeue tests).

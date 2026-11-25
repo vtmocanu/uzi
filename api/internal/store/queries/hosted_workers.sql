@@ -272,7 +272,7 @@ WHERE w.ephemeral
 --       register nonce, snapshot_register_nonce, is not one: an older image sends none, and
 --       that is the image this arm exists to reap.)
 --   (g) PRD #4320 / #4505: a worker that is online (online_since set) but does not advertise
---       'claude_provider_v1' while its bound run is provider-bound (model_provider_key_mode set) and
+--       its bound run's engine-specific provider capability while that run is provider-bound (model_provider_key_mode set) and
 --       still non-terminal. An old image cannot pass ClaimRun's non-bypassable provider clause, so it
 --       can never claim that run, yet it holds the run's uq_workers_ephemeral_run slot and one
 --       owner-cap slot. No deadline, like (d) and (e); the busy and custody guards above still apply.
@@ -280,8 +280,14 @@ WHERE w.ephemeral
 --       slot so the provider run is demand again (ListUnplaceableQueuedRunsForEphemeral) and a fresh
 --       worker is provisioned. Re-provision churn is limited in concurrency (the per-user
 --       ephemeral cap) and in rate (the provision and reap ticks), but the total number of
---       cycles is NOT bounded while an image without claude_provider_v1 is provisioned; that is
+--       cycles is NOT bounded while an image without the required provider capability is provisioned; that is
 --       accepted, as for arm (e), until the worker image pin advertises it (ADR-4320, 2026-11-19).
+--   (h) registered Codex provider workers missing runtime v3, only while their bound run
+--       is queued and never admitted (claim_generation = 0). Previously claimed runs retain
+--       their uniqueness slot for this incompatibility; native runs are excluded.
+--       The register-before-heartbeat caveat in (e) applies here too. Existing cap and
+--       tick limits bound concurrency and rate, but total reprovision cycles remain
+--       unbounded while the provisioned image lacks v3. Busy and custody guards apply.
 --   (f) PRD #2006: arm (a) is spared while the worker's ephemeral lease is live at
 --       clock_timestamp(); the lease ending (expiry, drain, re-register) makes (a) true again.
 --
@@ -338,10 +344,21 @@ WHERE w.ephemeral
       OR (w.isolated_lane AND w.online_since IS NOT NULL
           AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
       OR (w.online_since IS NOT NULL
-          AND NOT ('claude_provider_v1' = ANY(w.protocol_capabilities))
           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
                       AND r.model_provider_key_mode IS NOT NULL
+                      AND NOT (
+                          (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                          OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
+                              AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+                              AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                       AND r.status NOT IN ('completed', 'failed', 'cancelled')))
+      OR (w.online_since IS NOT NULL
+          AND NOT ('codex_runtime_v3' = ANY(w.protocol_capabilities))
+          AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
+                      AND r.model_provider_key_mode IS NOT NULL
+                      AND r.harness = 'codex'
+                      AND r.status = 'queued'
+                      AND r.claim_generation = 0))
   )
 FOR UPDATE OF w SKIP LOCKED;
 
@@ -397,10 +414,21 @@ WHERE w.id = ANY(@ids::uuid[])
       OR (w.isolated_lane AND w.online_since IS NOT NULL
           AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
       OR (w.online_since IS NOT NULL
-          AND NOT ('claude_provider_v1' = ANY(w.protocol_capabilities))
           AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
                       AND r.model_provider_key_mode IS NOT NULL
+                      AND NOT (
+                          (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities))
+                          OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
+                              AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+                              AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                       AND r.status NOT IN ('completed', 'failed', 'cancelled')))
+      OR (w.online_since IS NOT NULL
+          AND NOT ('codex_runtime_v3' = ANY(w.protocol_capabilities))
+          AND EXISTS (SELECT 1 FROM runs r WHERE r.id = w.ephemeral_run_id
+                      AND r.model_provider_key_mode IS NOT NULL
+                      AND r.harness = 'codex'
+                      AND r.status = 'queued'
+                      AND r.claim_generation = 0))
   );
 
 -- name: LeaseClockNow :one

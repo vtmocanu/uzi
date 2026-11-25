@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { Worker } from "../src/worker.js";
 import { CODEX_PHASE_MODELS_CAPABILITY } from "../src/lead-config-report.js";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
+import { probeCodexRuntime, CODEX_PROBE_EXPECTATION } from "../src/codex/codex-runtime-probe.js";
+import { resolveCodexHarnessAvailability } from "../src/codex/codex-capability.js";
 import path from "node:path";
+import os from "node:os";
 import { Outbox } from "../src/outbox.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { api, client, fx, gitlabClaim, fakeGitlab, runnerWith, installHarness, deferred, worktreeDirFor } from "./runner-harness.js";
@@ -18,7 +22,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { JobRunner } from "../src/job-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
-import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
+import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_RUNTIME_V3_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { StatsCollector } from "../src/stats.js";
 import { recordingLogger } from "./helpers.js";
@@ -1060,7 +1064,6 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "issue_key_v1",
     "claude_phase_models_v1",
     "claude_provider_v1",
-    "run_env_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // #4007 slice B is production-dark: its capability is never advertised in any permutation below.
@@ -1109,13 +1112,59 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     return captured();
   }
 
+  it("registers v1/v2/v3 together only after receipt and isolation proof", async () => {
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "m2-worker-receipt-"));
+    try {
+      const version = CODEX_PROBE_EXPECTATION.version;
+      const versionRoot = path.join(prefix, version);
+      // Tiny synthetic member contents; archive digest binds the receipt, not these bytes.
+      const names = ["bin/codex", "bin/codex-code-mode-host", "codex-package.json", "codex-path/rg", "codex-resources/bwrap"];
+      const members = names.map(member => {
+        const abs = path.join(versionRoot, member);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, member);
+        fs.chmodSync(abs, 0o755);
+        return { member, path: abs, mode: "755", sha256: createHash("sha256").update(member).digest("hex") };
+      });
+      const valid = { schemaVersion: 1, codexVersion: version, targetArch: "amd64",
+        muslTarget: "x86_64-unknown-linux-musl", lockDigest: CODEX_PROBE_EXPECTATION.lockDigest.amd64,
+        prefix, versionRoot, members };
+      const faults = ["valid", "stale169", "json", "schema", "digest", "missing", "duplicate", "unexpected", "arch", "musl", "uid", "landlock", "landlock-error"] as const;
+      // Thirteen serial cases; failure stops this proof and cleanup always removes our fixture.
+      for (const fault of faults) {
+        const receipt = structuredClone(valid);
+        if (fault === "stale169") receipt.codexVersion = "0.169.0";
+        if (fault === "schema") receipt.schemaVersion = 2;
+        if (fault === "digest") receipt.lockDigest = "0".repeat(64);
+        if (fault === "missing") receipt.members.pop();
+        if (fault === "duplicate") receipt.members[4] = receipt.members[0]!;
+        if (fault === "unexpected") receipt.members[4]!.member = "extra";
+        if (fault === "arch") receipt.targetArch = "arm64";
+        if (fault === "musl") receipt.muslTarget = "aarch64-unknown-linux-musl";
+        fs.writeFileSync(path.join(prefix, `${version}.receipt.json`), fault === "json" ? "{" : JSON.stringify(receipt));
+        const probed = await probeCodexRuntime({ prefix, arch: "amd64" });
+        const codexHarness = resolveCodexHarnessAvailability({
+          receiptCapable: probed.capable, receiptReason: probed.reason,
+          uidSplit: fault !== "uid", mode: "required",
+          landlock: fault === "landlock" ? "unavailable" : fault === "landlock-error" ? "error" : "available",
+        });
+        const caps = await advertisedCapabilities(fakeConfig({ codexHarness }));
+        for (const cap of [CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_RUNTIME_V3_CAPABILITY]) {
+          assert.equal(caps?.includes(cap), fault === "valid", `${fault}: ${cap}`);
+        }
+      }
+    } finally {
+      fs.rmSync(prefix, { recursive: true, force: true });
+    }
+  });
+
   it("appends codex_harness_v1 when the combined availability result advertises", async () => {
     const caps = await advertisedCapabilities(
       fakeConfig({ codexHarness: { advertise: true, degraded: false, landlock: "available" } }),
     );
     assert.deepStrictEqual(
       caps,
-      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_PHASE_MODELS_CAPABILITY, "pending_outcome_scoped_claim_v1"],
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_RUNTIME_V3_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_PHASE_MODELS_CAPABILITY, "codex_provider_v1", "pending_outcome_scoped_claim_v1"],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -1124,6 +1173,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(
       fakeConfig({ codexHarness: { advertise: true, degraded: true, landlock: "unavailable" } }),
     );
+    assert.ok(caps?.includes(CODEX_RUNTIME_V2_CAPABILITY));
+    assert.ok(caps?.includes(CODEX_RUNTIME_V3_CAPABILITY));
     assert.ok(
       caps?.includes(CODEX_HARNESS_CAPABILITY),
       "a degraded best-effort worker still advertises codex_harness_v1 (it can run Codex, unconfined)",
@@ -1152,6 +1203,19 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       [...ALWAYS_PRESENT_PROTOCOL_CAPS, "pending_outcome_scoped_claim_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
+  });
+
+  it("advertises run_env_v1 only under the uid split", async () => {
+    const prior = process.env.UZI_UID_SPLIT;
+    try {
+      process.env.UZI_UID_SPLIT = "1";
+      assert.ok((await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "advertised with the split active");
+      delete process.env.UZI_UID_SPLIT;
+      assert.ok(!(await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "not advertised without the split");
+    } finally {
+      if (prior === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = prior;
+    }
   });
 
   it("advertises codex_refresh_recovery_v1 without API protocol_features or Codex availability requirements", async () => {

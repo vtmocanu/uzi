@@ -180,7 +180,7 @@ describe("provider key scan: park and shutdown uploads", () => {
   });
 });
 
-describe("provider key scan: the final branch push (every forge)", () => {
+describe("provider key scan: the final branch push (GitLab fixture)", () => {
   const branchOnOrigin = (iidN: number): boolean => {
     try {
       execFileSync("git", ["-C", fx.originPath, "rev-parse", "--verify", "--quiet", `refs/heads/agent/issue-${iidN}`], { stdio: "pipe" });

@@ -67,10 +67,12 @@ type RawCredentialOverride struct {
 // gpt-6-luna: the agent's set carries it (the Now summary model, PRD #2603, and so also honoured
 // as a template role pin), while this picker and Codex frozen-run vocabulary deliberately leave it out.
 var codexModels = map[string]bool{
-	"gpt-6-astra": true,
-	"gpt-5.6-sol": true,
-	"gpt-6-sol":   true,
-	"gpt-6.1-sol": true,
+	"gpt-6-astra":   true,
+	"gpt-5.6-sol":   true,
+	"gpt-6-sol":     true,
+	"gpt-6.1-sol":   true,
+	"gpt-6.2-sol":   true,
+	"gpt-6.2-astra": true,
 }
 
 // codexCuratedModelsSlice returns the curated Codex model ids (codexModels) as a sorted slice,
@@ -145,6 +147,21 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 			return insert(q, resolved)
 		}, origins...)
 		return run, err
+	}
+	if len(origins) > 0 && origins[0].RefuseProviderOwner {
+		if explicit == nil {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		if *explicit != HarnessClaude && *explicit != HarnessCodex {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		q, ok := s.q.(providerLaneSourceReader)
+		if !ok {
+			return store.Run{}, errHarnessStoreUnavailable
+		}
+		if err := s.refuseProviderLane(ctx, q, userID, *explicit); err != nil {
+			return store.Run{}, err
+		}
 	}
 	// In-memory unit fakeStore: no live *store.Queries and no real transaction. Resolve to Claude
 	// (what these fakes assert) and run the insert directly. An explicit non-Claude request is

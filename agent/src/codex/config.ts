@@ -15,7 +15,7 @@
 //     supported suppression settings. The production authentication builder below is narrower:
 //     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
 //
-// #4509, pin 0.167.0: apply_patch_freeform is removed/ignored; model catalog metadata
+// #4509, measured at 0.167.0 (pin 0.169.0, not re-measured): apply_patch_freeform is removed/ignored; model catalog metadata
 // overrides code_mode/code_mode_only. Native apply_patch remains advertised under the
 // code-mode host. Registration is not execution authority: explicit environments: []
 // at root thread/start and turn/start (including child, advice, cross-check and cold
@@ -33,6 +33,9 @@
 
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { lstatSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { decodeProviderBinding } from "../provider-binding.js";
+import type { ClaimCodexProviderBinding } from "../protocol.js";
 
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 
@@ -198,7 +201,7 @@ function validateProductionConfigOptions(opts: CodexProductionConfigOptions): vo
  * backend. The runtime merges configured providers with `or_insert`, so a caller cannot
  * override the built-in `openai` provider with a partial table. Its production request and
  * stream retry defaults therefore remain active by design; the zero-retry custom-provider
- * settings belong only to deterministic fake-provider tests.
+ * settings are supplied by the separate custom-provider builder when using a binding.
  *
  * `authMode` is required even though the TOML is identical for both modes. It forces the
  * trusted composition to make an explicit no-fallback choice, which the auth session then
@@ -210,10 +213,65 @@ export function buildCodexProductionConfigToml(opts: CodexProductionConfigOption
   return nativeDisabledConfigLines(opts.model, "openai", opts.projectPath, opts.codeModeHost ?? false).join("\n");
 }
 
+/** Trusted provider-only inputs. Model selects a map slot, never an arbitrary gateway ID.
+ * Destination authority remains with the API; decoding here checks shape only. */
+export interface CodexProviderConfigOptions {
+  readonly binding: ClaimCodexProviderBinding;
+  readonly model?: keyof ClaimCodexProviderBinding["model_map"];
+  readonly projectPath: string;
+  readonly codeModeHost?: boolean;
+}
+
+/** Build managed-login Responses HTTP config without granting execution authority.
+ * The credential is delivered separately through account/login/start, never TOML. */
+export function buildCodexProviderConfigToml(opts: CodexProviderConfigOptions): string {
+  if (Object.keys(opts).some(key => !["binding", "model", "projectPath", "codeModeHost"].includes(key))) {
+    throw new TrustedExecutionRefusal("Codex provider config received an unsupported option");
+  }
+  if (typeof opts.projectPath !== "string"
+    || (opts.codeModeHost !== undefined && typeof opts.codeModeHost !== "boolean")) {
+    throw new TrustedExecutionRefusal("Codex provider config requires a project path and boolean codeModeHost");
+  }
+  const binding = decodeProviderBinding({ provider: opts.binding });
+  if (binding?.engine !== "codex") {
+    throw new TrustedExecutionRefusal("Codex provider config requires a Codex binding");
+  }
+  // Unknown config/header/identity fields are refused, rather than forwarded.
+  if (Object.keys(opts.binding).some(key => ![
+    "provider_id", "revision", "engine", "protocol", "base_url", "auth_style", "credential", "model_map",
+  ].includes(key))) {
+    throw new TrustedExecutionRefusal("Codex provider binding received an unsupported option");
+  }
+  const slot = opts.model ?? "default";
+  if (!Object.hasOwn(binding.model_map, slot)) {
+    throw new TrustedExecutionRefusal("Codex provider model slot is unmapped");
+  }
+  const entry = binding.model_map[slot]!;
+  if (Object.keys(opts.binding.model_map[slot]!).some(key => key !== "model" && key !== "context_window")) {
+    throw new TrustedExecutionRefusal("Codex provider model received an unsupported option");
+  }
+  // Hash only non-secret authority identifiers; caller text never becomes a table identity.
+  const identity = createHash("sha256").update(JSON.stringify([binding.provider_id, binding.revision])).digest("hex");
+  const providerName = `uzi-provider-${identity}`;
+  return [
+    ...(entry.context_window === undefined ? [] : [`model_context_window = ${entry.context_window}`]),
+    ...nativeDisabledConfigLines(entry.model, providerName, opts.projectPath, opts.codeModeHost ?? false),
+    `[model_providers.${toml(providerName)}]`,
+    `name = ${toml(providerName)}`,
+    `base_url = ${toml(binding.base_url)}`,
+    'wire_api = "responses"',
+    "supports_websockets = false",
+    "requires_openai_auth = true",
+    "request_max_retries = 0",
+    "stream_max_retries = 0",
+    "",
+  ].join("\n");
+}
+
 /**
  * Build an authenticated custom-provider config for the in-container M3b fake. This
  * is deliberately separate from {@link buildCodexProductionConfigToml}: production
- * keeps the built-in `openai` provider and emits no endpoint override.
+ * vendor production keeps the built-in `openai` provider and emits no endpoint override.
  *
  * The built-in provider has WebSockets enabled and cannot be
  * overridden by a same-name provider table (`merge_configured_model_providers` uses

@@ -946,6 +946,13 @@ var queryInventory = []queryPin{
 			"absent, an older run's halted branch (newest run elsewhere, or branch NULL) is absent, and " +
 			"a second repo's halt on the same ref does not leak (the ledger join's repo_id scope). " +
 			"Also driven end to end by the handler's TestBoardCardAutofixHaltLiveDB"},
+	{"GetCIAutofixSelectedRun", "ci_autofix.sql", "TestCIAutofixSelectedRunMirrorsCandidateLiveDB",
+		"direct call (issue #4617): picks the same run as the ListCIAutofixCandidateRefs per_branch CTE " +
+			"for the newest run, a cancelled newest, a newer non-candidate kind and a newer run without " +
+			"mr_iid; pgx.ErrNoRows when nothing qualifies; carries the raw run and owner overrides"},
+	{"ListActiveCIFixRunIDsForRef", "ci_autofix.sql", "TestListActiveCIFixRunIDsForRefLiveDB",
+		"direct call (issue #4617): returns only the owner's active ci_fix id on the ref, not a completed " +
+			"one and not visible to another user"},
 	{"GetActiveCIFixTargetForRef", "ci_autofix.sql", unpinnedPin,
 		"Arrived in PRD #71 M6 for the detector's active-run swallow cap. No live-DB test in " +
 			"internal/store executes it yet: its only production caller is the M6 poller detector " +

@@ -1,3 +1,4 @@
+import { assertNoTtlOverrides } from "./codex-no-ttl-overrides.js";
 import { assertNoNativeServers } from "./codex-no-native-servers.js";
 import { rangeScanBytes } from "../src/codex/broker.js";
 import { m3ReduceAndPersist } from "./m3-projection-fixture.js";
@@ -40,6 +41,7 @@ import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type Har
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
+  CODEX_PROVIDER_FIRST_RESPONSE_MS,
   createCodexAppServerAuth,
   type CodexAppServerAuthMode,
   type CodexAppServerAuthSession,
@@ -1375,6 +1377,7 @@ function makeHarness(
     appServerAuth?: CodexAppServerAuthSession;
     credentialValue?: string;
     authMode?: CodexAppServerAuthMode;
+    providerFirstResponseMs?: number;
     accountant?: CodexUsageAccountant;
     phaseTransition?: CodexPhaseTransitionCell;
     onTokenUsageIncomplete?: (text: string) => void | Promise<void>;
@@ -1402,6 +1405,7 @@ function makeHarness(
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
     authMode: opts.authMode,
+    providerFirstResponseMs: opts.providerFirstResponseMs,
     accountant: opts.accountant,
     phaseTransition: opts.phaseTransition,
     onTokenUsageIncomplete: opts.onTokenUsageIncomplete,
@@ -2772,7 +2776,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     );
   });
 
-  it("thread/start carries worker dynamic tools, no native environment, explicit instructions/trust, and no hook bypass", async () => {
+  it("no TTL overrides: thread/start carries worker dynamic tools, no native environment, explicit instructions/trust, and no hook bypass", async () => {
     const { harness, transport } = makeHarness();
     transport.push(threadStarted()).end();
     const turn = harness.startTurn(makeRequest());
@@ -2781,8 +2785,11 @@ describe("CodexHarness: kind + thread configuration", () => {
 
     const start = transport.requests.find((r) => r.method === "thread/start");
     assert.ok(start, "thread/start was sent");
+    assert.equal(transport.requests.filter(r => r.method === "thread/start").length, 1);
     const params = rec(start.params);
     assert.equal(params.ephemeral, false, "run roots persist the rollout required by new-root resume");
+    assert.equal(params.model, "gpt-6-astra");
+    assertNoTtlOverrides(params, "root start/resume full params");
     const config = rec(params.config);
     assertNoNativeServers(config);
     assert.deepEqual(params.environments, [], "an empty environment list disables native shell and patch tools");
@@ -2793,7 +2800,10 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined, "the ignored legacy field is never sent");
     const startTurn = transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
     assert.ok(startTurn, "turn/start was sent after thread/start");
+    assertNoTtlOverrides(startTurn.params, "root fresh turn full params");
+    assert.equal(rec(startTurn.params).model, "gpt-6-astra");
     assert.deepEqual(rec(startTurn.params).environments, [], "every root turn disables native environments");
     assert.equal(config.project_doc_max_bytes, 0);
     const projects = rec(config.projects);
@@ -2804,7 +2814,7 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.doesNotMatch(JSON.stringify(params), /dangerously-bypass-hook-trust/);
   });
 
-  it("cold thread/resume on a fresh harness carries untrusted + doc_max 0 and disables turn environments", async () => {
+  it("no TTL overrides: cold thread/resume on a fresh harness carries untrusted + doc_max 0 and disables turn environments", async () => {
     const prior = makeHarness();
     prior.transport.push(threadStarted()).push(turnCompleted("completed")).end();
     await collect(prior.harness.startTurn(makeRequest()).events);
@@ -2821,19 +2831,25 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.equal(transport.requests.some((r) => r.method === "thread/start"), false, "resume does not start a fresh thread");
     const resume = transport.requests.find((r) => r.method === "thread/resume");
     assert.ok(resume, "thread/resume was sent");
+    assert.equal(transport.requests.filter(r => r.method === "thread/resume").length, 1);
     const params = rec(resume.params);
     assert.equal(params.threadId, "resumed-1");
     assert.equal(params.dynamicTools, undefined, "pinned thread/resume restores dynamic tools from persisted history");
     assert.equal(params.environments, undefined, "thread/resume has no environments field in the pinned protocol");
     assert.equal(params.developerInstructions, "you are the lead");
     assert.equal(params.instructions, undefined);
+    assert.equal(params.model, "gpt-6-astra");
+    assertNoTtlOverrides(params, "root start/resume full params");
     const config = rec(params.config);
     assertNoNativeServers(config);
     assert.equal(config.project_doc_max_bytes, 0);
     assert.deepEqual(rec(config.projects)[WORKSPACE], { trust_level: "untrusted" });
     assert.doesNotMatch(JSON.stringify(params), /bypass_hook_trust/);
     const startTurn = transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
     assert.ok(startTurn, "turn/start was sent after resume");
+    assertNoTtlOverrides(startTurn.params, "root resumed turn full params");
+    assert.equal(rec(startTurn.params).model, "gpt-6-astra");
     assert.deepEqual(
       rec(startTurn.params).environments,
       [],
@@ -3189,6 +3205,23 @@ describe("CodexHarness: cost projection from the run auth mode (PRD #1332 C4b / 
     const term = terminal(await collect(harness.startTurn(makeRequest()).events));
     const mu = entryOf(term, "gpt-6-astra");
     assert.equal(mu.costStatus, "unreported");
+    assert.ok(!("costUSD" in mu));
+    assert.deepEqual(term.metrics.cost, { kind: "unreported" });
+  });
+
+  it("provider auth preserves tokens without vendor-id collision pricing", async () => {
+    const { harness, transport } = makeHarness({ authMode: "provider" });
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(tokenUsage({ inputTokens: 300, outputTokens: 200, totalTokens: 500 }, { inputTokens: 300, outputTokens: 200, totalTokens: 500 }))
+      .push(turnCompleted("completed"))
+      .end();
+    const term = terminal(await collect(harness.startTurn(makeRequest()).events));
+    const mu = entryOf(term, "gpt-6-astra");
+    assert.equal(mu.costStatus, "unreported");
+    assert.equal(mu.inputTokens, 300);
+    assert.equal(mu.outputTokens, 200);
     assert.ok(!("costUSD" in mu));
     assert.deepEqual(term.metrics.cost, { kind: "unreported" });
   });
@@ -3893,6 +3926,75 @@ describe("CodexHarness: provider error classification folds into the terminal (P
     assert.equal(thrown.failure.category, "rate_limit");
     assert.ok(thrown.original instanceof CodexTurnFailedError);
     assert.equal(thrown.original.failOrigin, "rate_limited");
+  });
+
+  it("M3: provider gateway terminals park without vendor evidence or resets", async () => {
+    const positives: unknown[] = ["rateLimitExceeded", "serverOverloaded"];
+    for (const tag of ["httpConnectionFailed", "responseTooManyFailedAttempts", "responseStreamConnectionFailed", "responseStreamDisconnected"]) {
+      for (const httpStatusCode of [429, 529]) positives.push({ [tag]: { httpStatusCode } });
+    }
+    for (const info of positives) {
+      for (const source of ["terminal", "notification"]) {
+        const { harness, transport } = makeHarness({ authMode: "provider" });
+        transport.push(threadStarted()).push({
+          kind: "rate_limits_updated", method: "account/rateLimits/updated",
+          rateLimits: { primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 2000000000 } }, params: {},
+        });
+        if (source === "notification") transport.push(codexError(info));
+        transport.push(turnCompletedWithError(source === "terminal" ? info : "other")).end();
+        const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+        assert.equal(terminal.limitEvidence, undefined);
+        const thrown = terminal.failure!.materialize({ resetsAtMs: 2000000000000, window: "five_hour" });
+        assert.ok(thrown.original instanceof LimitReachedError, JSON.stringify({ info, source }));
+        assert.equal(thrown.original.rateLimitType, "provider_gateway_limit");
+        assert.equal(thrown.original.resetsAtMs, undefined);
+        assert.equal(thrown.failure.category, "rate_limit");
+        assert.equal(thrown.failure.limit, undefined);
+      }
+    }
+  });
+
+  it("M3: provider gateway classification is closed and native failures retain their types", async () => {
+    const negatives: unknown[] = [
+      "usageLimitExceeded", "sessionBudgetExceeded", "unauthorized", "other",
+      "HTTP 429 rateLimitExceeded serverOverloaded", "flexUnavailable", "internalServerError",
+      { httpConnectionFailed: { httpStatusCode: 401 } },
+      { httpConnectionFailed: { httpStatusCode: 403 } },
+      { httpConnectionFailed: { httpStatusCode: 503 } },
+      { httpConnectionFailed: { httpStatusCode: "429" } },
+      { unknown: { httpStatusCode: 429 } }, { httpStatusCode: 529 },
+      { rateLimitExceeded: {} }, { activeTurnNotSteerable: { httpStatusCode: 429 } },
+    ];
+    for (const authMode of ["provider", "subscription", "api_key", undefined] as const) {
+      const cases = authMode === "provider" ? negatives : [...negatives, "rateLimitExceeded", "serverOverloaded", { httpConnectionFailed: { httpStatusCode: 429 } }];
+      for (const info of cases) {
+        const { harness, transport } = makeHarness({ authMode });
+        transport.push(threadStarted()).push(turnCompletedWithError(info)).end();
+        const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+        assert.equal(terminal.limitEvidence, undefined);
+        const thrown = terminal.failure!.materialize();
+        assert.ok(thrown.original instanceof CodexTurnFailedError, JSON.stringify({ authMode, info }));
+        assert.equal(thrown.failure.limit, undefined);
+      }
+    }
+  });
+
+  it("M3: provider gateway uses final classification precedence and ignores retrying errors", async () => {
+    for (const [notification, terminalInfo, willRetry, gateway] of [
+      ["rateLimitExceeded", "unauthorized", false, true],
+      ["unauthorized", "rateLimitExceeded", false, false],
+      ["rateLimitExceeded", "cyberPolicy", false, false],
+      ["unknownTag", "serverOverloaded", false, true],
+      ["rateLimitExceeded", "other", true, false],
+    ] as const) {
+      const { harness, transport } = makeHarness({ authMode: "provider" });
+      transport.push(threadStarted()).push(codexError(notification, { willRetry }))
+        .push(turnCompletedWithError(terminalInfo)).end();
+      const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+      const thrown = terminal.failure!.materialize();
+      assert.equal(thrown.original instanceof LimitReachedError, gateway);
+      assert.equal(terminal.limitEvidence, undefined);
+    }
   });
 
   it("#2360: only final usageLimitExceeded consumes subscription window evidence", async () => {
@@ -7496,6 +7598,35 @@ describe("CodexHarness: no-turn preparation", () => {
 });
 
 describe("CodexHarness: preparation deadline", () => {
+  for (const method of ["thread/start", "thread/resume", "turn/start"]) {
+    it(`provider pending ${method} uses the connection deadline`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      let sent!: () => void;
+      const ready = new Promise<void>(resolve => { sent = resolve; });
+      outbound.on("data", (chunk: Buffer) => {
+        const frame = JSON.parse(chunk.toString());
+        if (frame.method === method) { sent(); return; }
+        inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+      });
+      const { harness } = makeHarness({ authMode: "provider",
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) });
+      const request = makeRequest({ resumeSessionId: method === "thread/resume" ? "saved" : undefined });
+      const pending = method === "turn/start"
+        ? collect(harness.startTurn(request).events)
+        : harness.prepareRootAndThread(request, { allowFresh: true });
+      const rejected = assert.rejects(pending, error =>
+        error instanceof CodexTransportError && error.failure.category === "timeout");
+      try {
+        await ready;
+        t.mock.timers.tick(10_001);
+        await rejected;
+      } finally { await harness.close(); }
+    });
+  }
+
   it("retains a transport timeout without fresh fallback", async () => {
     const failure = new CodexTransportError({ category: "timeout", message: "deadline" });
     const transport = new FakeTransport(method => {
@@ -7508,5 +7639,133 @@ describe("CodexHarness: preparation deadline", () => {
         error => error === failure);
       assert.deepEqual(transport.requests.map(r => r.method), ["thread/resume"]);
     } finally { await harness.close(); }
+  });
+});
+
+describe("CodexHarness: initial provider response deadline", () => {
+  it("does not bound later long turns on the same root", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { harness, transport } = makeHarness({ authMode: "provider" });
+    const controller = new AbortController();
+    try {
+      transport.push(turnCompleted());
+      await collect(harness.startTurn(makeRequest()).events);
+      let settled = false;
+      const pending = collect(harness.startTurn(makeRequest({ signal: controller.signal })).events)
+        .finally(() => { settled = true; });
+      try {
+        await tick();
+        t.mock.timers.tick(60_000);
+        await tick();
+        assert.equal(settled, false);
+        transport.push(turnCompleted());
+        await pending;
+      } finally { controller.abort(); await pending; }
+    } finally { await harness.close(); }
+  });
+  for (const control of ["native", "cancel", "response", "callback", "terminal", "completed-output"] as const) {
+    it(`preserves ${control} authority beyond the initial wait`, async t => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const { harness, transport } = makeHarness({ authMode: control === "native" ? "api_key" : "provider" });
+      const controller = new AbortController();
+      let failure: unknown;
+      let settled = false;
+      const pending = collect(harness.startTurn(makeRequest({ signal: controller.signal })).events)
+        .catch(error => { failure = error; }).finally(() => { settled = true; });
+      try {
+        await tick();
+        if (control === "cancel") controller.abort();
+        if (control === "response") transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "th-1", turnId: "tn-1", delta: "hello" } });
+        if (control === "callback") transport.push({ kind: "activity", method: "item/tool/call", requestId: 91,
+          params: { threadId: "th-1", turnId: "tn-1", tool: "Read", arguments: {} } });
+        if (control === "completed-output") transport.push({ kind: "activity", method: "item/completed",
+          params: { threadId: "th-1", item: { type: "agentMessage", text: "hello" } } });
+        if (control === "terminal") transport.push(turnCompleted());
+        await tick();
+        t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS + 1);
+        await tick();
+        assert.equal(failure, undefined);
+        assert.equal(settled, control === "cancel" || control === "terminal");
+        if (!settled) { transport.push(turnCompleted()); await pending; }
+      } finally { controller.abort(); await pending; await harness.close(); }
+    });
+  }
+  for (const entry of ["fresh", "resume", "prepared"] as const) {
+    it(`times out pending response after ACK (entry=${entry})`, async t => {
+      const resume = entry === "resume";
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const transport = new FakeTransport();
+      const { harness } = makeHarness({ transport, authMode: "provider" });
+      const controller = new AbortController();
+      let failure: unknown;
+      let settled = false;
+      const request = makeRequest({ signal: controller.signal, resumeSessionId: resume ? "saved" : undefined });
+      if (entry === "prepared") await harness.prepareRootAndThread(request, { allowFresh: true });
+      const pending = collect(harness.startTurn(request).events)
+        .catch(error => { failure = error; }).finally(() => { settled = true; });
+      try {
+        await tick();
+        assert.ok(transport.requests.some(r => r.method === "turn/start"));
+        transport.push({ kind: "turn_started", method: "turn/started",
+          threadId: resume ? "resumed-1" : "th-1", turnId: "tn-1", params: {} });
+        transport.push({ kind: "activity", method: "log", params: { threadId: "th-1", message: "connecting" } });
+        transport.push({ kind: "codex_error", method: "error", threadId: resume ? "resumed-1" : "th-1",
+          turnId: "tn-1", willRetry: true, params: {} });
+        transport.push({ kind: "activity", method: "item/agentMessage/delta",
+          params: { threadId: "foreign", turnId: "tn-1", delta: "other response" } });
+        await tick();
+        t.mock.timers.tick(10_001);
+        await tick();
+        assert.equal(settled, false, "the spent local setup budget does not bound the first model response");
+        t.mock.timers.tick(CODEX_PROVIDER_FIRST_RESPONSE_MS);
+        await tick();
+        assert.equal(settled, true, "ACK, logs, retry and foreign output must not disable response deadline");
+        assert.ok(failure instanceof CodexTransportError);
+        assert.equal(failure.failure.category, "timeout");
+        assert.equal(failure.failure.message, "codex provider initial response deadline exceeded");
+      } finally { controller.abort(); await pending; await harness.close(); }
+    });
+  }
+});
+
+describe("CodexHarness: provider first-response allowance is separate from local setup", () => {
+  const deadlineMessage = "codex provider initial response deadline exceeded";
+
+  it("valid model output arriving after the 10 s setup budget still completes the turn", async (t) => {
+    let now = 1_000;
+    t.mock.method(performance, "now", () => now);
+    const transport = new FakeTransport(method => {
+      // The gateway queues the request: local setup is long spent before the model answers.
+      if (method === "turn/start") now += 11_000;
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport, authMode: "provider" });
+    transport.push(threadStarted()).push(agentMessage("slow but valid")).push(turnCompleted("completed")).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    const last = events.at(-1)!;
+    assert.equal(last.kind, "turn_finished");
+    if (last.kind !== "turn_finished") return;
+    assert.equal(last.terminal.outcome, "success", "a slow first response is not a setup failure");
+  });
+
+  it("the internal allowance seam bounds a first response that never arrives", async () => {
+    const { harness, transport } = makeHarness({ authMode: "provider", providerFirstResponseMs: 30 });
+    transport.push(threadStarted());
+    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (error: unknown) =>
+      error instanceof CodexTransportError && error.failure.category === "timeout" && error.failure.message === deadlineMessage);
+  });
+
+  it("an earlier owner abort keeps its own outcome instead of the provider timeout", async () => {
+    const { harness, transport } = makeHarness({ authMode: "provider" });
+    transport.push(threadStarted());
+    const controller = new AbortController();
+    const turn = collect(harness.startTurn(makeRequest({ signal: controller.signal })).events);
+    setTimeout(() => controller.abort(), 20);
+    const outcome = await turn.then(events => ({ events }), (error: unknown) => ({ error }));
+    if ("error" in outcome) {
+      assert.ok(!(outcome.error instanceof CodexTransportError && outcome.error.failure.message === deadlineMessage),
+        "the abort, not the 120 s provider allowance, ends the turn");
+    }
   });
 });

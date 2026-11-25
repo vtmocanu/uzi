@@ -586,6 +586,9 @@ type Store interface {
 	GetActiveCIFixTargetForRef(ctx context.Context, arg store.GetActiveCIFixTargetForRefParams) (pgtype.Int8, error)
 	// ListCIFixBindingCandidates: the recorded PRs a ci_fix on a ref may bind to (issue #4079).
 	ListCIFixBindingCandidates(ctx context.Context, arg store.ListCIFixBindingCandidatesParams) ([]int64, error)
+	// GetCIAutofixSelectedRun: the run the ci-autofix candidate listing selects for one
+	// branch (issue #4617); ErrNoRows means no selected run. Read in the ci_fix create tx.
+	GetCIAutofixSelectedRun(ctx context.Context, arg store.GetCIAutofixSelectedRunParams) (store.GetCIAutofixSelectedRunRow, error)
 	// LockRunBranch takes the per-(repo, branch) advisory lock that serializes issue /
 	// mr_rework / ci_fix creation on one agent branch (issue #1626, store.RunBranchLockClass).
 	LockRunBranch(ctx context.Context, repoID uuid.UUID, branch string) error
@@ -1222,11 +1225,9 @@ type Store interface {
 	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
-	// CountOnlineWorkersSatisfyingClaudeProvider backs PRD #4320 module 5's queued-reason rung: a
-	// PROVIDER-BOUND queued run whose owner has NO online worker advertising 'claude_provider_v1' gets
-	// reasonNoProviderCapableWorker. The Claude-provider twin of CountOnlineWorkersSatisfyingCodexHarness,
-	// off the hot path for the same reason.
-	CountOnlineWorkersSatisfyingClaudeProvider(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingProvider checks the frozen engine's provider protocol
+	// intersection for the queued reason, using one qualifying worker.
+	CountOnlineWorkersSatisfyingProvider(ctx context.Context, arg store.CountOnlineWorkersSatisfyingProviderParams) (int64, error)
 	CountOnlineWorkersSatisfyingCodexRuntime(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexCompletion checks the protocol intersection
 	// required by an interlocked Codex run, including a custom root when requested.

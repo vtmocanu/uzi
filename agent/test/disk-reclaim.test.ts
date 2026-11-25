@@ -12,8 +12,11 @@ import {
   DiskPressureController,
   modelPassMinAgeMs,
   runDiskReclaimPass,
+  setDefaultProcessesClearScanForTests,
   type DiskReclaimDeps,
+  type DiskReclaimSummary,
 } from "../src/disk-reclaim.js";
+import { scanRunProcesses, type RunProcessScan } from "../src/run-procs.js";
 import { dropRunCaches, type DropRunCachesOptions } from "../src/run-caches.js";
 import type { GoWorkRemoval } from "../src/go-work.js";
 import { noProcFd, RACED_FILES, seedRacedTree, startSwapRacer } from "./swap-racer.js";
@@ -113,6 +116,148 @@ function deps(d: { home: string; provision: string }, over: Partial<DiskReclaimD
 }
 
 const LINUX_ONLY = process.platform !== "linux" ? "no /proc/self/fd on this host: descriptor-pinned removal requires Linux" : false;
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+const REAL_DEFAULT_SCAN_SKIP =
+  SKIP_ROOT ||
+  (process.platform !== "linux" ? "the default check scans only on Linux" : realProcfsSkip("disk reclaim default processesClear: real proc tree"));
+
+const MAX_ATTEMPTS = 20;
+const MAX_WALL_MS = 10_000;
+
+/** One scan the default processesClear ran, as the recording wrapper saw it. */
+interface ScanRecord {
+  budgetMs: number | undefined;
+  result: RunProcessScan;
+}
+
+/** How passUntilDropped classified one attempt. */
+interface PassClass {
+  attempt: number;
+  outcome: "incomplete" | "dropped";
+  incompleteReasons: string[];
+}
+
+const describeScans = (scans: readonly ScanRecord[]) =>
+  JSON.stringify(scans.map((s) => ({ pids: s.result.pids, complete: s.result.complete, incompleteReasons: s.result.incompleteReasons })));
+
+/** A real `sleep` whose environ carries the run's HOME, the default scan wrapped to record what
+ *  it saw, and a one-shot slot to replace the next scan's result. */
+interface SleeperFixture {
+  run: { id: string; home: string; provision: string };
+  memo: CachesDroppedMemo;
+  base: DiskReclaimDeps;
+  records: ScanRecord[];
+  injectNext: { result?: RunProcessScan };
+  childPid: number;
+  stop: () => Promise<void>;
+}
+
+async function waitForHomeEnviron(pid: number, home: string): Promise<void> {
+  const want = `HOME=${home}`;
+  const start = Date.now();
+  while (Date.now() - start < 5_000) {
+    try {
+      if (fs.readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(want)) return;
+    } catch {
+      // not readable yet (or gone): keep polling until the bound
+    }
+    await delay(20);
+  }
+  throw new Error(`readiness: /proc/${pid}/environ never held ${want} within 5 s`);
+}
+
+async function withSleeper(fn: (f: SleeperFixture) => Promise<void>): Promise<void> {
+  const d = dataDir();
+  const run = seedRun(d);
+  const memo = new CachesDroppedMemo();
+  // An explicit 10 min pass deadline makes the scan budget the 30 s cap, whatever the load.
+  const base = deps(d, { cachesDropped: memo, statusOf: async () => "limit_wait", deadlineMs: 10 * 60_000 });
+  delete base.processesClear; // the production default
+  const records: ScanRecord[] = [];
+  const injectNext: { result?: RunProcessScan } = {};
+  try {
+    setDefaultProcessesClearScanForTests(async (home, worktree, pids, opts) => {
+      const injected = injectNext.result;
+      injectNext.result = undefined;
+      const result = injected ?? (await scanRunProcesses(home, worktree, pids, opts));
+      records.push({ budgetMs: opts?.budgetMs, result });
+      return result;
+    });
+    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore", env: { ...process.env, HOME: run.home } });
+    let exited = false;
+    const gone = new Promise<void>((resolve) => child.once("exit", () => ((exited = true), resolve())));
+    const stop = async () => {
+      child.kill("SIGKILL");
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_, rej) => {
+        timer = setTimeout(() => rej(new Error("sleep did not exit within 10 s of SIGKILL")), 10_000);
+      });
+      try {
+        await Promise.race([gone, timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      assert.equal(exited, true);
+    };
+    try {
+      assert.ok(child.pid !== undefined, "sleep failed to spawn");
+      await waitForHomeEnviron(child.pid, run.home);
+      await fn({ run, memo, base, records, injectNext, childPid: child.pid, stop });
+    } finally {
+      await stop();
+    }
+  } finally {
+    setDefaultProcessesClearScanForTests(undefined);
+  }
+}
+
+/**
+ * Runs passes until one drops the run's caches, classifying each attempt. At most MAX_ATTEMPTS
+ * attempts and MAX_WALL_MS of wall time, both checked between attempts: the caps cannot preempt
+ * an in-flight scan, so the worst case is 10 s plus one scan of up to 35 s (a 30 s scan budget
+ * plus 5 s helper slack): about 45 s.
+ *
+ * The only retried case is a kept pass whose scan was incomplete with zero pids. A kept pass with
+ * an attributed pid (complete or not) fails at once: the child is gone, so a pid is a real finding.
+ */
+async function passUntilDropped(
+  base: DiskReclaimDeps,
+  records: ScanRecord[],
+  childPid: number,
+): Promise<{ summary: DiskReclaimSummary; log: PassClass[] }> {
+  const log: PassClass[] = [];
+  const start = Date.now();
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS && (attempt === 1 || Date.now() - start <= MAX_WALL_MS); attempt++) {
+    const before = records.length;
+    const summary = await runDiskReclaimPass(base);
+    const scans = records.slice(before);
+    const last = scans[scans.length - 1];
+    assert.ok(scans.every((r) => r.budgetMs === 30_000), `attempt ${attempt}: every scan budget is 30 s: ${JSON.stringify(scans.map((r) => r.budgetMs))}`);
+    if (summary.cachesDropped === 1) {
+      if (last === undefined) throw new Error(`attempt ${attempt} dropped without a recorded scan (deadline/budget)`);
+      assert.ok(last.result.complete && last.result.pids.length === 0, `attempt ${attempt} dropped on a scan that was not complete and empty: ${describeScans(scans)}`);
+      log.push({ attempt, outcome: "dropped", incompleteReasons: [] });
+      return { summary, log };
+    }
+    assert.equal(summary.cachesKeptLiveProcesses, 1, `attempt ${attempt} neither dropped nor kept for a live process: ${describeScans(scans)}`);
+    if (last === undefined) throw new Error(`attempt ${attempt} kept the caches with no recorded scan (deadline/budget)`);
+    const pids = scans.flatMap((s) => s.result.pids);
+    if (pids.length > 0) {
+      const kind = pids.includes(childPid) ? "pid visibility after reap" : "foreign attribution";
+      throw new Error(`attempt ${attempt}: ${kind} (child ${childPid}): ${describeScans(scans)}`);
+    }
+    if (last.result.complete) throw new Error(`attempt ${attempt} kept the caches on a complete, empty scan: ${describeScans(scans)}`);
+    log.push({ attempt, outcome: "incomplete", incompleteReasons: [...(last.result.incompleteReasons ?? [])] });
+  }
+  throw new Error(`caches not dropped within ${MAX_ATTEMPTS} attempts / ${MAX_WALL_MS} ms; classifications: ${JSON.stringify(log)}`);
+}
+
+function assertCachesDropped(f: SleeperFixture): void {
+  assert.equal(f.memo.has(f.run.id), true);
+  for (const rel of CACHES) assert.equal(exists(path.join(f.run.home, rel)), false, `${rel} dropped`);
+}
 
 describe("runDiskReclaimPass (PRD #1809 D7)", () => {
   it("frees a process-ended park's caches and a terminal run's leftovers, keeping resume artifacts", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
@@ -319,34 +464,76 @@ describe("runDiskReclaimPass (PRD #1809 D7)", () => {
   });
 
   it("the DEFAULT process check reads this host's real proc tree: a live HOME-attributed process keeps the caches, its exit lets the drop", {
-    skip: SKIP_ROOT || (process.platform !== "linux" ? "the default check scans only on Linux" : realProcfsSkip("disk reclaim default processesClear: real proc tree")),
+    skip: REAL_DEFAULT_SCAN_SKIP,
   }, async () => {
-    const d = dataDir();
-    const run = seedRun(d);
-    const memo = new CachesDroppedMemo();
-    const base = deps(d, { cachesDropped: memo, statusOf: async () => "limit_wait" });
-    delete base.processesClear; // the production default
-    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore", env: { ...process.env, HOME: run.home } });
-    let exited = false;
-    const gone = new Promise<void>((resolve) => child.once("exit", () => ((exited = true), resolve())));
-    try {
-      await new Promise((r) => setTimeout(r, 200)); // let it exec, so its environ carries the HOME
-      const kept = await runDiskReclaimPass(base);
-      assert.equal(kept.cachesKeptLiveProcesses, 1);
-      assert.equal(kept.cachesDropped, 0);
-      assert.equal(memo.has(run.id), false, "not memoized");
-      for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), true, `${rel} kept`);
-    } finally {
-      child.kill("SIGKILL");
-    }
-    await gone;
-    assert.equal(exited, true);
-    const dropped = await runDiskReclaimPass(base);
-    assert.equal(dropped.cachesKeptLiveProcesses, 0);
-    assert.equal(dropped.cachesDropped, 1);
-    assert.equal(memo.has(run.id), true);
-    for (const rel of CACHES) assert.equal(exists(path.join(run.home, rel)), false, `${rel} dropped`);
+    await withSleeper(async (f) => {
+      const start = Date.now();
+      const incomplete: string[][] = [];
+      let seen = false;
+      try {
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS && (attempt === 1 || Date.now() - start <= MAX_WALL_MS); attempt++) {
+          const before = f.records.length;
+          const kept = await runDiskReclaimPass(f.base);
+          assert.equal(kept.cachesKeptLiveProcesses, 1, `attempt ${attempt}: live process must keep the caches`);
+          assert.equal(kept.cachesDropped, 0);
+          assert.equal(f.memo.has(f.run.id), false, "not memoized");
+          for (const rel of CACHES) assert.equal(exists(path.join(f.run.home, rel)), true, `${rel} kept`);
+          const scans = f.records.slice(before);
+          const last = scans[scans.length - 1];
+          if (last === undefined) throw new Error(`attempt ${attempt} kept with no recorded scan (deadline/budget)`);
+          const foreign = scans.flatMap((s) => s.result.pids).filter((p) => p !== f.childPid);
+          if (foreign.length > 0) throw new Error(`attempt ${attempt}: foreign attribution ${JSON.stringify(foreign)}: ${describeScans(scans)}`);
+          if (last.result.complete && last.result.pids.length === 1 && last.result.pids[0] === f.childPid) {
+            seen = true;
+            break;
+          }
+          if (last.result.complete) throw new Error(`attempt ${attempt}: complete scan without the child: ${describeScans(scans)}`);
+          incomplete.push([...(last.result.incompleteReasons ?? [])]);
+        }
+        assert.ok(seen, `no complete scan listed the child within the caps; incomplete reasons: ${JSON.stringify(incomplete)}`);
+      } finally {
+        await f.stop();
+      }
+      assert.ok(f.records.length > 0 && f.records.every((r) => r.budgetMs === 30_000), `every scan budget is 30 s: ${JSON.stringify(f.records.map((r) => r.budgetMs))}`);
+      const { summary } = await passUntilDropped(f.base, f.records, f.childPid);
+      assert.equal(summary.cachesKeptLiveProcesses, 0);
+      assert.equal(summary.cachesDropped, 1);
+      assertCachesDropped(f);
+    });
   });
+
+  for (const c of [
+    {
+      name: "an incomplete post-exit scan with no pids is retried, not read as clear",
+      injected: (_pid: number): RunProcessScan => ({ pids: [], complete: false, incompleteReasons: ["unresolved"] }),
+      rejects: undefined,
+    },
+    {
+      name: "a complete post-exit scan that still lists the exited pid fails as pid visibility after reap",
+      injected: (pid: number): RunProcessScan => ({ pids: [pid], complete: true, incompleteReasons: [] }),
+      rejects: /pid visibility after reap/,
+    },
+    {
+      name: "an incomplete post-exit scan that lists the exited pid fails as pid visibility after reap",
+      injected: (pid: number): RunProcessScan => ({ pids: [pid], complete: false, incompleteReasons: ["unresolved"] }),
+      rejects: /pid visibility after reap/,
+    },
+  ]) {
+    it(`the default process check drop half: ${c.name}`, { skip: REAL_DEFAULT_SCAN_SKIP }, async () => {
+      await withSleeper(async (f) => {
+        await f.stop();
+        f.injectNext.result = c.injected(f.childPid);
+        if (c.rejects) {
+          await assert.rejects(passUntilDropped(f.base, f.records, f.childPid), c.rejects);
+          return;
+        }
+        const { summary, log } = await passUntilDropped(f.base, f.records, f.childPid);
+        assert.equal(summary.cachesDropped, 1);
+        assert.deepEqual(log[0], { attempt: 1, outcome: "incomplete", incompleteReasons: ["unresolved"] });
+        assertCachesDropped(f);
+      });
+    });
+  }
 
   it("does not run the process check for a terminal run", { skip: LINUX_ONLY || SKIP_ROOT }, async () => {
     const d = dataDir();

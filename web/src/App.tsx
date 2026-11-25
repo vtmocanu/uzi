@@ -16,6 +16,7 @@ import { AdminProducts } from "./pages/AdminProducts";
 import { Settings } from "./pages/Settings";
 import { AppearanceSettings } from "./pages/AppearanceSettings";
 import { RunDefaults } from "./pages/RunDefaults";
+import { ModelsSettings } from "./pages/ModelsSettings";
 import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
@@ -28,6 +29,7 @@ import { Skills } from "./pages/Skills";
 import { ToolAllowlist } from "./pages/ToolAllowlist";
 import { AdminBlockedRepos } from "./pages/AdminBlockedRepos";
 import { AdminEgressProfiles } from "./pages/AdminEgressProfiles";
+import { AdminSharedProviders } from "./pages/AdminSharedProviders";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
@@ -114,6 +116,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/settings", element: <Settings />, guard: "protected" },
   // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
   { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },
+  // PRD #3263: every model and effort default in one grid, saved together.
+  { path: "/settings/models", element: <ModelsSettings />, guard: "protected" },
   // Run-behavior defaults, split out of the overloaded Account tab.
   { path: "/settings/run-defaults", element: <RunDefaults />, guard: "protected" },
   { path: "/settings/forge", element: <ForgeSettings />, guard: "protected" },
@@ -161,6 +165,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin/products", element: <AdminProducts />, guard: "admin" },
   // PRD #1906 M1w: egress profiles ("site lists"), the only write surface for them.
   { path: "/admin/egress-profiles", element: <AdminEgressProfiles />, guard: "admin" },
+  // PRD #4324: admin-shared Claude provider definitions (users attach their own keys).
+  { path: "/admin/shared-providers", element: <AdminSharedProviders />, guard: "admin" },
   // PRD #1484 M4: the Admin → Health tab. LAST row (D1), guarded admin like its siblings.
   { path: "/admin/health", element: <AdminHealth />, guard: "admin" },
 ];

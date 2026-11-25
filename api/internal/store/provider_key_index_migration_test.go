@@ -56,8 +56,8 @@ func TestProviderKeyIndexCatalogAndUniquenessLiveDB(t *testing.T) {
 	// A different label bypasses the generic (user, kind, label) unique index:
 	// only the provider index can reject this second key for the same provider.
 	_, err = pool.Exec(ctx, `INSERT INTO user_secrets
-        (user_id, kind, label, ciphertext, sealed_with, is_default, auto_eligible, provider_id)
-        VALUES ($1, 'anthropic_compatible_key', 'different-label', 'ct', 'master', false, false, $2)`, owner, p.ID)
+        (user_id, kind, label, ciphertext, sealed_with, is_default, auto_eligible, provider_id, provider_scope_id)
+        VALUES ($1, 'anthropic_compatible_key', 'different-label', 'ct', 'master', false, false, $2, $1)`, owner, p.ID)
 	if code, constraint := pgCodeC(err); code != "23505" || constraint != "user_secrets_one_provider_key" {
 		t.Fatalf("second provider key = %v, want the provider index's unique violation", err)
 	}

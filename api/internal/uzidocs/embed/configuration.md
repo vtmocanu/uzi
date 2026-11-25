@@ -268,6 +268,24 @@ provider run, which queues ("no worker that supports model providers is online")
 image overrides and Compose or separately run workers yourself, since only the chart's worker image
 pin is bumped by the release helper.
 
+**Codex providers (PRD #4323).** The same allowlist also admits Responses-compatible gateways for
+the Codex engine (engine `codex`, Bearer auth only); put the exact base URL in the list like any
+other. Workers advertise `codex_provider_v1` together with the Codex harness capabilities, and the
+api admits a Codex provider claim only to a worker advertising `codex_provider_v1`,
+`codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3` on the same worker, so
+**deploy the api before the workers**; until a
+capable worker is online such a run queues with the same "no worker that supports model providers
+is online" reason. Update worker image overrides and separately managed workers too. A registered
+ephemeral worker missing v3 may be reaped and replaced only while its bound Codex provider run is
+queued and never claimed; missing v3 alone does not authorize reaping a previously claimed run's
+worker, and busy/custody guards remain in force. Replacement cycles can continue until the image
+is updated (see [Operator rollout and keys](./providers.md#operators-rollout-and-keys)).
+The pinned Codex runtime follows redirects and can forward request bodies and the
+Bearer header beyond the approved URL, and it does not limit model-response size, so the allowlist
+is admission control, not confinement (see [Model providers](./providers.md) and
+[ADR-4320](../adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)). The worker's
+`workers.extraCA` bundle is also delivered to the Codex runtime with TLS verification on.
+
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
 fails the render). The chart checks every entry's shape (https only; no userinfo, query, fragment,
@@ -281,8 +299,8 @@ private-CA gateway always tests as inconclusive while runs may still reach it.
 
 ### The Test probe
 
-**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` with the
-provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
+**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` (a Codex
+provider: `<base_url>/responses`) with the provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
 protocol) and, only if that succeeds, a forced single-tool request (does the gateway return a
 `tool_use` block). Neither certifies full compatibility. The api must therefore be able to reach the
 gateway on the network, which is separate from any worker egress rule.
@@ -410,9 +428,9 @@ Checker model and effort follow the child's resolved claim and are recorded as d
 
 ### Plan cross-check model and effort pins
 
-The Plan cross-check row in Run defaults stores independent model and effort pins for each family. The model's **Default · value (worker default)** follows that family's worker model; the effort's **Default · high (cross-check default)** is `high` for every checker, whatever your worker effort is. Choosing a model leaves effort independent, and choosing effort leaves model independent. Reset either field to Default to remove its pin. Curated and custom model IDs are accepted after local syntax/family validation. Both cells are active: the Claude cell configures the Claude checker that checks a Codex lead, and at Default it follows the user's Claude worker default.
+The Plan cross-check rows in **Settings → Models → Cross-check** store independent model and effort pins for each family. The model's **Default · value (worker default)** follows that family's worker model; the effort's **Default · high (cross-check default)** is `high` for every checker, whatever your worker effort is. Choosing a model leaves effort independent, and choosing effort leaves model independent. Reset either field to Default to remove its pin. Curated and custom model IDs are accepted after local syntax/family validation. Both cells are active: the Claude cell configures the Claude checker that checks a Codex lead, and at Default it follows the user's Claude worker default.
 
-`GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan" | "code"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` (`pin` or `worker default`) and `effort_source` (`pin` or `cross-check default`; records made before this default show `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.1-sol`. Effort Default is `high` for both families and both stages; it does not follow the worker effort, which still defaults to `medium` for ordinary runs. Pin a lower effort per cell to trade review depth for latency and cost.
+`GET /api/me/settings` (also readable with a CLI token) returns `cross_check_pins`, keyed by `stage: "plan" | "code"` and `harness: "claude" | "codex"`. Each cell separates nullable stored `model` and `effort` from `resolved_model`, `resolved_effort`, independent `model_source` (`pin` or `worker default`) and `effort_source` (`pin` or `cross-check default`; records made before this default show `worker default`), and `active`. Read-only nullable `worker_default_model` describes what Default would resolve to even while a model is pinned. When the Claude worker model is unset, it uses the existing allocated lead/orchestrator selection in native SQL name order, including a null model on the first delivered template. A null Claude result means SDK/account default; Codex without a saved worker model resolves to the product fallback `gpt-6.2-sol`. Effort Default is `high` for both families and both stages; it does not follow the worker effort, which still defaults to `medium` for ordinary runs. Pin a lower effort per cell to trade review depth for latency and cost.
 
 The cookie-only `PUT /api/me/settings` accepts at most four keyed cells. Omitted cells or fields remain unchanged; explicit `null` resets a field to Default. Duplicate cells, unknown stages/families or fields, malformed model IDs, family mismatch and invalid effort are rejected. Submitted pin cells are validated before their transaction, so a bad cell writes no pin cells. GET metadata fields are not writable. `uzi settings set|reset cross-check` writes the same cells through `PUT /api/me/model-settings` ([CLI](./cli.md#changing-model-and-effort-settings)). Admin defaults and per-run overrides remain outside this release.
 
@@ -448,7 +466,7 @@ Each model and effort cell carries the stored choice, what **Default** would mea
 | Value | Resolution (first match wins) | `source` tokens |
 |---|---|---|
 | Harness | The harness you pick for this start; else your default harness (skipped, with note `user_default_harness_unusable`, when it has no usable credential); else automatic. | `run_override`, `user_default`, `automatic`, `chosen_at_create` |
-| Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.1-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
+| Worker model | Your model lane for the harness; else the `lead` template's pin; else the built-in (Codex `gpt-6.2-sol`; Claude has none, so the SDK or account decides). | `user_default`, `template`, `builtin` |
 | Judge and run-summary model | Your lane; else the instance default; else the built-in. If the instance settings cannot be read, the built-in applies and the cell carries note `instance_settings_unavailable`. The `judge_model` cell of the lane the judge will not run on (your explicit **Judge runs on** choice names the other harness) also carries note `not_used`. | `user_default`, `instance_default`, `builtin` |
 | Judge harness | Your **Judge runs on** choice (`claude` or `codex`); else the harness of the run being reviewed. | `user_default`, `same_as_run` |
 | Task-review model | Your lane for the harness (a stored value that is no longer valid is ignored); else the built-in (Codex `gpt-6-sol`; the Claude review sends no model, so the SDK decides). See [Task review model](./worker-model.md#task-review-model). | `user_default`, `builtin` |
@@ -500,7 +518,7 @@ Predicts a manual issue start with a given harness and token choice, validated b
 
 `harness` is `claude` or `codex`; omit it (or send null) for the default. `credential_override.mode` is `inherit`, `auto`, `default` or `pinned`; `secret_id` names the pinned token. A bad enum or uuid is a 400. Any override other than `inherit` makes the creation-time policies ineligible, as at creation.
 
-The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
+The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude or Codex source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
 
 When the harness is chosen at creation, `harness.value` and `credential` are null and `alternatives` lists Claude then Codex, neither marked as the likely choice. Each alternative is computed as if that harness were chosen and carries its own `credential`, or its own `refusal` and `refusal_detail`. The top-level `refusal` is set only when the request fails before a harness is decided, or when **every** alternative is refused for the **same** reason. When the reasons differ, the top-level `refusal` and `refusal_detail` stay null and each alternative keeps its own reason; one branch's reason is never promoted to stand for both. If one alternative is valid, nothing is promoted either.
 
@@ -1336,12 +1354,20 @@ fixture and 100 ms sampling; CNPG may run a different major version.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.169.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.171.0 and defaults to `gpt-6.2-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,
 which sends no effort level. See [Reasoning effort](worker-effort.md).
 
-Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
-silently use the old model/catalog or ignore the requested effort. Codex runs
-queue until the worker image rolls, on hosted workers and compose alike.
+Every Codex-indicating claim (harness `codex`, a material revision, or a secret
+binding) requires `codex_harness_v1`, `codex_runtime_v2` and `codex_runtime_v3`.
+This gate is independent of `required_capabilities`, the capability-aware
+switch and `fn_worker_can_claim`; clearing optional requirements cannot bypass it.
+Codex runs wait for a compatible worker on hosted workers and compose alike.
+
+With an API-first rollout, old workers leave Codex runs waiting until the worker
+roll. Worker-first retains v1/v2 compatibility with the older API. Rolling back
+the v3 migration with Down reopens the weaker baseline; operators must account
+for that admission change. This is not a zero-downtime guarantee.
+See [ADR-1106](../adr/1106-codex-harness.md) for the runtime audit.

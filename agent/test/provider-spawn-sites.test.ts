@@ -16,7 +16,7 @@ import { LimitReachedError } from "../src/limit.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import type { AgentTemplate, ClaimProviderBinding, ClaimResponse } from "../src/protocol.js";
+import type { AgentTemplate, ClaimClaudeProviderBinding, ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import { createLogger } from "../src/log.js";
@@ -33,7 +33,7 @@ const BASE_URL = "https://gw.example.test/anthropic";
 const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const nonexistentWorktree = nonexistentWorktreeFactory("uzi-provider-sites");
 
-function binding(over: Partial<ClaimProviderBinding> = {}): ClaimProviderBinding {
+function binding(over: Partial<ClaimClaudeProviderBinding> = {}): ClaimClaudeProviderBinding {
   return {
     provider_id: "p-1", revision: 2, engine: "claude", protocol: "anthropic_messages", base_url: BASE_URL, auth_style: "bearer",
     credential: KEY,

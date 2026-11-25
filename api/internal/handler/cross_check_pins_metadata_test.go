@@ -88,7 +88,7 @@ func TestCrossCheckMetadataSettings(t *testing.T) {
 				h.PutMySettings(rec, req)
 			}
 			cells := metadataCells(t, rec)
-			claude, codex := "", "gpt-6.1-sol"
+			claude, codex := "", "gpt-6.2-sol"
 			if saved {
 				claude, codex = "haiku", "gpt-6-sol"
 			}
@@ -200,7 +200,7 @@ func TestCrossCheckMetadataCorpusLiveDB(t *testing.T) {
 				want = "opus"
 			}
 			assertMetadataModel(t, c.Get[0].WorkerDefaultModel, want)
-			codex := "gpt-6.1-sol"
+			codex := "gpt-6.2-sol"
 			if c.Codex != nil {
 				codex = *c.Codex
 			}
@@ -303,13 +303,13 @@ func TestCrossCheckMetadataNativeLocaleDiscriminatorLiveDB(t *testing.T) {
 			}
 			assertMetadataModel(t, cells[0].WorkerDefaultModel, want)
 			assertMetadataModel(t, cells[0].ResolvedModel, "sonnet")
-			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.1-sol")
+			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.2-sol")
 			rec = httptest.NewRecorder()
 			h.PutMySettings(rec, userReq(http.MethodPut, "/api/me/settings", "{}", user, nil))
 			cells = metadataCells(t, rec)
 			assertMetadataModel(t, cells[0].WorkerDefaultModel, want)
 			assertMetadataModel(t, cells[0].ResolvedModel, "sonnet")
-			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.1-sol")
+			assertMetadataModel(t, cells[1].WorkerDefaultModel, "gpt-6.2-sol")
 		})
 	}
 }

@@ -1,7 +1,7 @@
 {
   "builtins": {
     "claude": "opus",
-    "codex": "gpt-6.1-sol"
+    "codex": "gpt-6.2-sol"
   },
   "cases": [
     {
@@ -25,7 +25,7 @@
       "want": {
         "model": "gpt-6-astra",
         "source": "user_default",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": []
       }
@@ -49,9 +49,9 @@
       "user": "",
       "instance": "",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": []
       }
@@ -75,9 +75,9 @@
       "user": " \t ",
       "instance": "",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": []
       }
@@ -127,9 +127,9 @@
       "user": "",
       "instance": "",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": []
       }
@@ -153,9 +153,9 @@
       "user": "",
       "instance": "  ",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": []
       }
@@ -280,9 +280,9 @@
       "user": "gpt-7-x",
       "instance": "",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": [
           "gpt-7-x"
@@ -295,9 +295,9 @@
       "user": "gpt-6-luna",
       "instance": "",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": [
           "gpt-6-luna"
@@ -310,9 +310,9 @@
       "user": "",
       "instance": "sonnet",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": [
           "sonnet"
@@ -325,9 +325,9 @@
       "user": "",
       "instance": "gpt-7-x",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": [
           "gpt-7-x"
@@ -356,9 +356,9 @@
       "user": "opus",
       "instance": "gpt-7-x",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": [
           "opus",
@@ -411,9 +411,9 @@
       "user": "",
       "instance": "",
       "want": {
-        "model": "gpt-6.1-sol",
+        "model": "gpt-6.2-sol",
         "source": "builtin",
-        "default_model": "gpt-6.1-sol",
+        "default_model": "gpt-6.2-sol",
         "default_source": "builtin",
         "dropped": []
       }
