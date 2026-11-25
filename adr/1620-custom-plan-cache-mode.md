@@ -446,5 +446,7 @@ Spend statement is costed above `jit_above_cost`, so PostgreSQL compiled about 4
 
 The measured generic plans were not JIT-compiled (costed below `jit_above_cost`) and are unchanged. The setting is transaction-local, so
 the pool and every other statement keep the server default. `window=all` for the admin
-all-users scope still exceeds the 8 s budget with JIT off; that is a recorded limit pending an
-owner decision, not something this addendum fixes.
+all-users scope still exceeds the 8 s budget with JIT off, so the API does not offer it: Spend
+answers 400 `window all not available for all users` before any database work (owner decision at
+landing, 2026-11-25), and all-time for that scope is deferred to a follow-up that adds per-run
+totals for finished runs. This addendum does not fix the latency.

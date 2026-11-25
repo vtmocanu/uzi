@@ -1,7 +1,7 @@
 # PRD #4684: Scoped run usage API: filter options and Spend
 
 **Issue:** #4684.
-**Status:** Implemented; owner decision pending on the admin all-users `window=all` latency limit.
+**Status:** Implemented; owner decision at landing (2026-11-25): admin all-users `window=all` is not offered (400), all-time deferred to a follow-up.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** API, DTO contracts, docs and specs. Additive view/index migrations only. No user-interface or command implementation. No changes under `.github/workflows/**`, including validation.
@@ -50,7 +50,7 @@ Register every literal route as `noLimiter` in `route_limiter_mounts_test.go`, a
 
 Validated parameters:
 
-- `window=7d|30d|90d|all`, default `30d`.
+- `window=7d|30d|90d|all`, default `30d`. The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists `7d`, `30d`, `90d` there and Spend answers 400 `window all not available for all users` before any database work (owner decision at landing, 2026-11-25).
 - `tz`, default `UTC` when omitted. Explicit empty and `Local` are invalid. Validate against a new cached lookup of `pg_timezone_names` (there is no existing Postgres-side precedent; `handler/schedules_catalog.go` validates with Go's `time.LoadLocation` and rejects `Local`). A name accepted by the database must also load in Go, because Go derives the bounds; test that pairing.
 - `repo=<uuid>`, `harness=claude|codex`, `kind=<registry kind>|delivery|supporting`.
 - Spend `split=user|usage_model|harness|repo|kind` (default `usage_model`) and `breakdown=user|primary_model|harness|repo|kind` (default `repo`).
@@ -99,6 +99,8 @@ Canonical PR identity is `(repo_id, mr_iid)`: `repos` is unique on `(connection_
 A PR is currently considered merged if any retained run with that identity has `mr_state='merged'`. Do not inspect only a helper run's stale state. Existing issue watchers update the relevant latest completed run; board-free watchers stop on terminal states. Disclose current-state coverage limitations.
 
 **Amendment D-B: scoped merge witnesses (owner-accepted, rev 6 plan review).** "Any retained run" above means any run in the response's own scope. A PR is merged when a run in that scope with the same `(repo_id, mr_iid)` has `mr_state = 'merged'`, whatever its creation time. Owner-shaped statements add `w.user_id = @user_id` to the witness; only the admin all-users statement has no owner predicate. An owner's figure therefore never depends on another owner's runs.
+
+Clarification (owner decision at landing, 2026-11-25): "the response's scope" means the owner scope: owner routes and admin `user=<uuid>` use that user's runs; admin all-users uses any run. Harness and kind filters choose which PRs are counted, not which runs may prove a merge, and the witness also ignores the repo and window filters. A same-owner `mr_rework` or other-harness run can therefore prove a PR merged without adding its cost to the filtered cohort. CodeRabbit's suggestion to filter the witness was declined. For an empty scope, `window=all` reports `bucket_width_days` 7 (weekly grain) with no buckets, where it previously reported 1.
 
 Select PR identities through filtered creation-cohort Delivery runs. Assign each selected PR to exactly one bucket, the earliest matching cohort run referencing it. Cost-per-merged-PR numerator includes every filtered cohort Delivery run carrying a selected PR, including prompt, failed attempts and rework; runs without a PR are outside this ratio. The denominator is distinct selected currently merged PRs. It is a cohort ratio, not a ledger or actual merge-day activity. Rolling ratios divide summed numerators by summed denominators, never average daily ratios. This attribution differs from the existing usage endpoints' PR counts; say so in the docs.
 
@@ -161,6 +163,7 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Repo masking on the owner route only | Owners must not learn foreign repo ids; an admin route has no such boundary, and an admin selecting a user may see that user's foreign repo (but cannot filter by it). Which applies comes from the mounted route, never a parameter; reject masking on admin routes. |
 | Snapshot helper in the `store` package (`RunAnalyticsSnapshot`) | One place owns the REPEATABLE READ READ ONLY transaction, the 8 s deadline, `SET LOCAL` settings and rollback; reject per-handler transaction code. |
 | `SET LOCAL jit = off` in the snapshot | Admin all-users Spend was JIT-compiling about 446 functions: 8.2 s with JIT, 1.3 s without (30d); reject a server-wide `jit` change. |
+| Admin all-users `window=all` not offered (owner decision at landing, 2026-11-25) | Measured 9.6-10.2 s against the 8 s budget, a 503. Options omits `all` for that scope and Spend answers 400 `window all not available for all users` before any database work; owner and admin `user=<uuid>` all-time and every bounded window are unchanged, and Options still accepts and ignores `window`. Admin all-users all-time deferred to a follow-up that adds per-run totals for finished runs; owner decision at landing. |
 | Keep the lateral `OFFSET 0` fold over shape (b) `run_id = ANY(ARRAY(SELECT ...))` | Shape (b) is 5-10% faster on custom plans but 30x to 170x slower on generic plans (owner 30d 9.2 s, admin 30d 215 s); the lateral stays bounded under both. See ADR-1620's #4684 addendum. |
 | No index added | Four candidates (`runs (created_at)` and three `runs (repo_id, mr_iid)` variants) gave at most 7.8% p95 gain (owner) and 4.9% (admin 30d), under the 20% bar, at 0.45-2.7 MB each; reject carrying write cost for noise. Numbers below. |
 
@@ -193,6 +196,6 @@ Generic plans get no JIT: admin 30d 1295 / 1312, owner 30d 289 / 291. Admin opti
 
 None was kept, so there is no index migration. Side effects noted: `created_at` takes the admin history-start `MIN` from 24 ms to 1.5 ms, and the merged-witness indexes turn a 30 ms sequential scan into a 1.5 ms index-only scan.
 
-**Finding, not fixed here:** admin all-users `window=all` takes 9.6-10.2 s with JIT off (15.7 s with it), over the 8 s `statement_timeout`, so it returns 503. In its plan the per-run `model_fold` lateral is the largest node (about 5.2 s of 117,550 per-run scans); the next is the breakdown and split ranking family (external-merge sorts and window passes over 117,550 rows, about 4 s inclusive), so removing the fold alone would still leave it near 5 s. Closing it needs a design decision: cap `all` for the admin all-users scope, precompute per-run totals, or a larger budget. No redesign was attempted. This is the open owner decision in the status line, and M1 stays unticked until it is made.
+**Finding, not fixed here:** admin all-users `window=all` takes 9.6-10.2 s with JIT off (15.7 s with it), over the 8 s `statement_timeout`, so it returns 503. In its plan the per-run `model_fold` lateral is the largest node (about 5.2 s of 117,550 per-run scans); the next is the breakdown and split ranking family (external-merge sorts and window passes over 117,550 rows, about 4 s inclusive), so removing the fold alone would still leave it near 5 s. Closing it needs a design decision: cap `all` for the admin all-users scope, precompute per-run totals, or a larger budget. No redesign was attempted. The owner decided at landing (2026-11-25) not to offer admin all-users `window=all`: it answers 400 `window all not available for all users`, and the all-time follow-up with per-run totals is deferred (see the Decision Log).
 
 **Not measured:** owner `window=all`; `mr_rework` and `cross_check` runs; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).

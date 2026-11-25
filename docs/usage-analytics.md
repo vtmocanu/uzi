@@ -34,7 +34,7 @@ bill.
 
 | Parameter | Values | Default | Notes |
 |---|---|---|---|
-| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). |
+| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend rejects `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
@@ -46,6 +46,9 @@ bill.
 - Every invalid value is a 400 naming its parameter (`invalid window`,
   `invalid tz`, ...). The message never echoes the value, SQL or other
   sensitive text.
+- Spend on the admin all-users scope with `window=all` is a 400,
+  `window all not available for all users`. It is answered before any
+  database work and is not a 503.
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
@@ -106,7 +109,8 @@ creation time**, not by when cost was incurred.
 - `all` starts at the Monday of the earliest matching run's week
   (`history_start`) and uses Monday-anchored week buckets of width 1, 2, 4, 8
   ... weeks: the smallest width that gives at most 104 buckets
-  (`bucket_width_days` is 7 times that). A scope with no runs has no buckets.
+  (`bucket_width_days` is 7 times that). A scope with no runs has no buckets, and for `all` it still reports
+  `bucket_width_days` 7 (weekly grain).
 - `rolling` has one point per bucket (same index): the seven local dates
   ending at the last date that bucket covers (today for the last bucket),
   whatever the bucket width. It uses real runs before `from` where they exist,
@@ -159,7 +163,7 @@ for the numerator's runs. A zero denominator gives `value: null` with a reason.
 | Ratio | Numerator | Denominator |
 |---|---|---|
 | `cost_per_completed_run` | Recorded non-chat cost of runs created in the range, any kind that passes the filters. | Completed Delivery runs created in the range. In-flight runs count in none of the finished or completed denominators. |
-| `cost_per_merged_pr` | Recorded cost of Delivery runs that carry a PR, created in the range (merged or not). | PRs with a merged witness. |
+| `cost_per_merged_pr` | Recorded cost of Delivery runs that carry a PR, created in the range (merged or not). | Distinct PRs in the filtered cohort that have a merged witness (see the rules below). |
 
 Delivery kinds are issue, mr_rework, ci_fix, prompt, self_improve, task and
 job. Supporting kinds are judge, cross_check and chat.
@@ -175,6 +179,10 @@ Merged-PR rules:
 - A PR is merged when any run **in the response's scope** with that identity has
   state `merged`, even a run created outside the window. Owner routes and
   `user=<uuid>` use only that user's runs; admin all-users uses every run.
+- The harness and kind filters choose which PRs are counted, not which runs may
+  prove a merge, and the witness also ignores the repo and window filters. A
+  same-owner `mr_rework` run or a run of another harness can therefore prove a
+  PR merged without adding its cost to the filtered cohort.
 - The merge state is the last one uzi saw. Board-free watchers stop at terminal
   states (see `api/internal/forgesvc/board_free_mr_watch.go`), so a PR merged
   or reopened after that is not seen.
@@ -230,10 +238,12 @@ about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 | Owner `30d` | about 0.25 s |
 | Owner `90d` | about 0.43 s |
 | Admin all-users `30d` | about 1.3 s |
-| Admin all-users `window=all` | about 10 s |
+| Admin all-users `window=all` (measured, not offered) | about 10 s |
 
-**Known limit:** an admin all-users `window=all` request over that much history
-exceeds the 8 second budget and answers 503. Narrower windows and owner
-requests are well inside it. Owner `all` was not measured. This is pending an
-owner decision (cap `all` for the admin all-users scope, precompute per-run
-totals, or a larger budget) and is not fixed by this API.
+**Decision:** admin all-users `window=all` is not offered. Options does not
+list `all` for that scope and Spend answers 400 `window all not available for
+all users` before any database work. The measured 10 s is over the 8 second
+budget, so the request would otherwise have been a 503. All-time stays
+available for the owner route and for admin `user=<uuid>`; owner `all` was not
+measured. Admin all-users all-time is deferred to a follow-up that adds per-run
+totals for finished runs (owner decision at landing).
