@@ -43,27 +43,34 @@ func TestProviderKeyFormsGoMatchesWorker(t *testing.T) {
 // TestScanCommandNotFoundScrubsProviderKeyBeforeMatch: a provider judge's key must never reach a
 // miss candidate, even partially (PRD #4322 M1a landing review). Three transformations can cut a
 // key before an evidence-level scrub sees it whole: the 200-byte evidence clip, the pattern match
-// (its token class stops at `/` and `%`), and the 512 KiB scan-budget cut (the zsh form ends in
-// the token). The scrub therefore runs on each whole row first. A plain `jq` miss in the same
-// row is the control: the scan still finds real gaps. Without a scrub nothing changes.
+// (its token class stops at `/` and `%`), the 512 KiB scan-budget cut (the zsh form ends in the
+// token) and a JSON-escaped ANSI separator inside the key. The provider scan therefore decodes
+// each whole row, strips invisible runs and scrubs before matching, and omits a row it cannot
+// inspect whole. A plain `jq` miss is the control: the scan still finds real gaps. Without a
+// scrub nothing changes.
 func TestScanCommandNotFoundScrubsProviderKeyBeforeMatch(t *testing.T) {
 	long := "gwk-" + strings.Repeat("A1b2", 60)    // 244 command-token chars: the clip cuts it
 	slashed := "gwp/" + strings.Repeat("C3d4", 10) // the exec form basenames it to a key suffix
-	zshAt := judgeScanByteBudget - 20              // the budget cut lands 20 bytes into the key
+	control := `{"text":"bash: jq: command not found"}`
 	cases := []struct {
-		name, key, payload string
+		name, key string
+		payloads  []string
 	}{
-		{"evidence clip", long, `{"text":"bash: jq: command not found\nbash: ` + long + `: command not found"}`},
-		{"command token is a key suffix", slashed, `{"text":"bash: jq: command not found\nexec: \"` + slashed + `\": executable file not found in $PATH"}`},
-		{"scan budget cut", long, func() string {
-			head := `{"text":"bash: jq: command not found\n`
-			lead := " zsh: command not found: "
-			return head + strings.Repeat(" ", zshAt-len(head)-len(lead)) + lead + long + `"}`
-		}()},
+		{"evidence clip", long, []string{`{"text":"bash: jq: command not found\nbash: ` + long + `: command not found"}`}},
+		{"command token is a key suffix", slashed, []string{`{"text":"bash: jq: command not found\nexec: \"` + slashed + `\": executable file not found in $PATH"}`}},
+		{"scan budget cut", long, []string{control, func() string {
+			// The budget cut would land 20 bytes into the key; the provider scan omits the row.
+			head, lead := `{"text":"`, " zsh: command not found: "
+			return head + strings.Repeat(" ", judgeScanByteBudget-len(control)-20-len(head)-len(lead)) + lead + long + `"}`
+		}()}},
+		{"escaped ANSI separator inside the key", long, []string{
+			// A real ESC in tool output is serialized into the JSONB text as \u001b.
+			`{"text":"bash: jq: command not found\nbash: ` + long[:20] + `\u001b[0m` + long[20:] + `: command not found"}`,
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rows := rawResultRows(tc.payload)
+			rows := rawResultRows(tc.payloads...)
 			leaked := func(ms []missCandidate) bool {
 				for _, m := range ms {
 					for _, s := range []string{m.Command, m.Evidence} {

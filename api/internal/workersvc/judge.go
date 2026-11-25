@@ -275,18 +275,31 @@ func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func
 		if scanned >= judgeScanByteBudget || len(out) >= judgeMissCandidateCap {
 			break
 		}
-		text := string(row.Payload)
+		var text string
 		if scrub != nil {
-			// Scrub the WHOLE row first: before the budget cut and the pattern match, either of
-			// which could split a key (the match stops at `/` or `%`) into pieces the scrub no
-			// longer recognises. Command identity stays raw-derived for the suppression lookups.
-			text = scrub(text)
+			// Provider judge: inspect only WHOLE rows, decoded. The budget cut, the pattern match
+			// (it stops at `/` or `%`) and a JSON-escaped invisible separator (`\u001b`) can each
+			// split a key into pieces the scrub no longer recognises, so a row that does not fit
+			// the remaining budget, or does not decode, is omitted rather than cut; the decoded
+			// text is scrubbed (invisible runs stripped, every key form replaced) before matching.
+			// Command identity stays as extracted for the suppression lookups.
+			if scanned+len(row.Payload) > judgeScanByteBudget {
+				continue
+			}
+			decoded, ok := decodedPayloadStrings(row.Payload)
+			if !ok {
+				continue
+			}
+			scanned += len(row.Payload)
+			text = scrub(decoded)
+		} else {
+			text = string(row.Payload)
+			if scanned+len(text) > judgeScanByteBudget {
+				text = text[:judgeScanByteBudget-scanned]
+			}
+			scanned += len(text)
+			text = payloadText([]byte(text))
 		}
-		if scanned+len(text) > judgeScanByteBudget {
-			text = text[:judgeScanByteBudget-scanned]
-		}
-		scanned += len(text)
-		text = payloadText([]byte(text))
 
 		forEachNotFound(text, func(cmd, evidence string, lowConfidence bool) {
 			cmd = normalizeCommandToken(cmd)

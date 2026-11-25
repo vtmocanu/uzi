@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -23,10 +24,10 @@ func providerKeyFormsGo(key string) []string {
 	if key == "" {
 		return nil
 	}
-	json := jsStringifyBody(key)
+	body := jsStringifyBody(key)
 	htmlSafe := func(upper bool) string {
 		var b strings.Builder
-		for _, r := range json {
+		for _, r := range body {
 			switch r {
 			case '<', '>', '&', ' ', ' ':
 				hex := fmt.Sprintf("%04x", r)
@@ -42,7 +43,7 @@ func providerKeyFormsGo(key string) []string {
 	}
 	pct := encodeURIComponent(key)
 	forms := []string{
-		key, json, strings.ReplaceAll(json, "/", `\/`), htmlSafe(false), htmlSafe(true),
+		key, body, strings.ReplaceAll(body, "/", `\/`), htmlSafe(false), htmlSafe(true),
 		pct, lowerPercentHex(pct),
 	}
 	if strings.Contains(key, " ") {
@@ -129,4 +130,38 @@ var percentHex = regexp.MustCompile(`%[0-9A-F]{2}`)
 
 func lowerPercentHex(s string) string {
 	return percentHex.ReplaceAllStringFunc(s, strings.ToLower)
+}
+
+// decodedPayloadStrings decodes a tool_result payload and joins every string value it holds
+// (object keys in sorted order, so the text is deterministic) with newlines. The provider pre-scan
+// matches this decoded text, so a JSON escape (`\u001b`, `\/`, `\"`) can no longer hide a key from
+// the scrub. A payload that does not decode reports false and is omitted, never matched raw.
+func decodedPayloadStrings(payload []byte) (string, bool) {
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return "", false
+	}
+	var parts []string
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case string:
+			parts = append(parts, t)
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		case map[string]any:
+			keys := make([]string, 0, len(t))
+			for k := range t {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				walk(t[k])
+			}
+		}
+	}
+	walk(v)
+	return strings.Join(parts, "\n"), true
 }
