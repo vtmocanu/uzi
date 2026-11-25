@@ -639,7 +639,7 @@ func TestWorkerCapacitySampleProductionClockLiveDB(t *testing.T) {
 		t.Fatalf("samples = %d, want 1", len(got))
 	}
 	obs := got[0].Observed
-	if !(lb.Before(obs) && !obs.After(ub)) {
+	if !lb.Before(obs) || obs.After(ub) {
 		t.Errorf("observed_at %v not in (%v, %v]; it was taken from the transaction start", obs, lb, ub)
 	}
 	if want := obs.UTC().Truncate(5 * time.Minute); !got[0].Bucket.Equal(want) {
