@@ -1,9 +1,9 @@
 -- +goose Up
 SET LOCAL lock_timeout = '5s';
 
--- PRD #4416 M2: composes on 00521_placement_codex_provider_capability.sql: fn_placement_admitting_workers
--- keeps every 00521 clause (including the engine-aware provider clause) and gains the run_env_v1 claim clause.
--- Down restores the 00521 Up definition.
+-- PRD #4416 M2: composes on 00523_codex_runtime_v3.sql: fn_placement_admitting_workers keeps every 00523 clause
+-- (the engine-aware Codex provider clause and the codex_runtime_v3 requirement) and gains the run_env_v1 claim clause.
+-- Down restores the 00523 Up definition.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -52,7 +52,7 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
@@ -120,6 +120,7 @@ $$;
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 
+-- Restore the exact 00523 Up function.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
     r runs,
@@ -164,7 +165,7 @@ CREATE OR REPLACE FUNCTION fn_placement_admitting_workers(
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
-                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
+                      OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))

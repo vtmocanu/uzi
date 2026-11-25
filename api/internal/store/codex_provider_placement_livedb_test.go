@@ -147,8 +147,10 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 
 func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
-	// The test pins the 00521 definition, so it stands the database at 00521 rather than at the head.
-	if err := store.MigrateTo(ctx, dsn, 521); err != nil {
+	// The fixtures need the head schema (model_providers columns added after 00523), so the database
+	// is migrated to the head; the test then steps the placement function back to its
+	// 00523_codex_runtime_v3 definition by applying the later run-env placement Down.
+	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -167,6 +169,12 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	const definition = `SELECT pg_get_functiondef('fn_placement_admitting_workers(runs,text,timestamptz,timestamptz,interval,boolean,text[])'::regprocedure)`
+	for _, stmt := range migrationDownStatements(t, "00533_run_env_placement.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// latest is the 00523_codex_runtime_v3 definition: the head definition minus the run-env clause.
 	var latest string
 	if err := tx.QueryRow(ctx, definition).Scan(&latest); err != nil {
 		t.Fatal(err)
@@ -242,6 +250,6 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if restored != latest {
-		t.Fatal("00523 Up did not restore exact latest definition")
+		t.Fatal("00523 Up did not restore the exact 00523 definition")
 	}
 }
