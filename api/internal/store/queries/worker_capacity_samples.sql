@@ -32,8 +32,9 @@
 -- runkind kinds; TestWorkerCapacitySampleKindAllowlistMatchesRunkind keeps it in sync, so a new
 -- kind fails the build instead of silently recording unavailable) with the cross-check lane
 -- only on a cross_check run. The audit of every writer that can put a run in a slot status
--- found each is an owner-gated claim or a slot move that keeps worker_id (see the PRD #4693
--- Decision Log). A slot-holding run is proven on the isolated lane only when its egress-profile
+-- found each is an owner-gated claim, a slot move that keeps worker_id, or a snapshot readoption
+-- of a run the same worker claimed at the same generation (see the PRD #4693 Decision Log); the
+-- gate below re-checks owner and lane on every slot-holding run rather than relying on that. A slot-holding run is proven on the isolated lane only when its egress-profile
 -- binding matches the worker's isolated_lane flag, mirroring ClaimRun's two-way clause
 -- ((r.egress_profile_id IS NOT NULL) = worker_isolated_lane): a profile-bound run on a
 -- non-isolated worker, or an unprofiled run on an isolated worker, records 'unavailable'. Chat
