@@ -286,8 +286,10 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
   transaction's locks until it notices the dead client; no server-side `idle_in_transaction_session_timeout` or
   PostgreSQL keepalive is configured for this transaction, so the owner's credential writes (token, provider and key changes) can stall in
   the meantime. Codex pool credential creates already have the same exposure.
-- **Weekly reserve unchanged.** The claim-time weekly-reserve check does not exempt provider-bound runs,
-  so it can apply to a provider judge as it does to an ordinary provider run (tracked as #4658).
+- **Weekly reserve exempt.** Provider-bound runs, provider judges included, are exempt from the vendor
+  [weekly usage reserve](./rate-limits.md#weekly-usage-reserve): it protects vendor allowances only, and
+  these runs spend their own gateway key. A run explicitly bound to a vendor credential stays subject to it.
+  The provider gateway's own limits, budgets and capability checks are unchanged.
 
 A provider judge sends the judged trace to the gateway, including the trace of a vendor-run; see
 [A judge on a model provider](./judge.md#a-judge-on-a-model-provider).
