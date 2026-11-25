@@ -972,8 +972,8 @@ func TestFreshResumeSeparateWorkerE2E(t *testing.T) {
 		}
 		// The stop is the SECOND generation's: the first one's lost reply logged its own.
 		logs := w.lastW2Log()
-		if !strings.Contains(logs, "fresh resume stopped nonterminally") {
-			t.Fatalf("no FreshReconcileStop in the restarted worker's log:\n%s", logs)
+		if !strings.Contains(logs, "fresh resume stopped nonterminally") || !strings.Contains(logs, `"reason":"attempt_differs"`) {
+			t.Fatalf("the restarted worker did not stop with attempt_differs:\n%s", logs)
 		}
 		if second.JournalAfter == nil || second.JournalAfter.AttemptID != edit["to"] {
 			t.Fatalf("custody not kept: journal after %+v, edited to %v", second.JournalAfter, edit["to"])
@@ -1007,8 +1007,9 @@ func TestFreshResumeSeparateWorkerE2E(t *testing.T) {
 		if after := w.w1Rows(); after != before {
 			t.Fatalf("W1's custody changed:\n%s\n%s", before, after)
 		}
-		if !strings.Contains(w.logs(), "bundle") && !strings.Contains(w.logs(), "fresh seed step failed") {
-			t.Fatalf("no bundle failure recorded:\n%s", w.logs())
+		// The fixture records the failing seed step; the junk bundle must fail at the fetch, not at a later step.
+		if l := w.lastW2Log(); !strings.Contains(l, "fresh seed step failed") || !strings.Contains(l, `"step":"fetchFreshBundle"`) {
+			t.Fatalf("no fetchFreshBundle failure recorded:\n%s", l)
 		}
 		w.assertW1Untouched("")
 	})
@@ -1060,7 +1061,8 @@ func TestFreshResumeSeparateWorkerE2E(t *testing.T) {
 		})
 	})
 
-	// 8: W2's claim generation moved: every fenced worker route refuses it.
+	// 8: W2's claim generation moved: the claim-generation-fenced routes (bundle, seeded, abandon) refuse it.
+	// The state route is fenced only on run, owner and destination, so it is not exercised here.
 	t.Run("stale_claim_refused", func(t *testing.T) {
 		w := newFreshE2EWorld(t, root, "capture")
 		w.startOK(apitypes.FreshResumeKindCapture, w.w1Result.M2)
@@ -1077,6 +1079,10 @@ func TestFreshResumeSeparateWorkerE2E(t *testing.T) {
 			w.wantRefused(w.workerCall(http.MethodGet, fmt.Sprintf("/bundle?claim_generation=%d", gen), w.w2Token, ""), what+" bundle")
 			w.wantRefused(w.workerCall(http.MethodPost, "/seeded", w.w2Token, freshSeededBody(gen, freshE2EAttempt(gen), gen)), what+" seeded")
 			w.wantRefused(w.workerCall(http.MethodPost, "/abandon", w.w2Token, freshGenBody(gen)), what+" abandon")
+		}
+		// Positive control: the same route at the current generation, as the claimed destination, is served.
+		if rec := w.workerCall(http.MethodGet, fmt.Sprintf("/bundle?claim_generation=%d", g), w.w2Token, ""); rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+			t.Fatalf("bundle at the current generation = %d (%d bytes), want 200 with a body", rec.Code, rec.Body.Len())
 		}
 		stale(g-1, "an older generation")
 		stale(g+1, "a newer generation")

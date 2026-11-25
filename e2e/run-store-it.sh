@@ -303,7 +303,7 @@ fi
 # filter. Existing Go-only CI lanes neither require Node nor prove this composition.
 # It composes the real worker client (and, for the fresh resume proof, the real run runner)
 # with the real handler and Postgres. The explicit -timeout bounds the whole leg (the fresh
-# resume proof alone takes about two minutes without -race; every Node child is bounded
+# resume proof alone measured about 131s of test time (about 137s wall) under -race on one worker; every Node child is bounded
 # separately by the test), where Go's default 10m would otherwise be the only fence.
 if [ -n "${UZI_CODEX_REFRESH_LOSTREPLY_E2E:-}" ]; then
   E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/codex-recovery-log.XXXXXX")"
