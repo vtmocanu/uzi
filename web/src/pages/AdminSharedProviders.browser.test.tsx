@@ -11,7 +11,7 @@ import { api, type AdminSharedProvider } from "../lib/api";
 // Cancel takes focus (never the destructive button) with a visible focus ring.
 vi.mock("../lib/api", async original => {
   const actual = await original<typeof import("../lib/api")>();
-  return { ...actual, api: { adminListSharedProviders: vi.fn(), listProviders: vi.fn(), adminDeleteSharedProvider: vi.fn() } };
+  return { ...actual, api: { adminListSharedProviders: vi.fn(), listProviders: vi.fn(), adminDeleteSharedProvider: vi.fn(), adminPatchSharedProvider: vi.fn() } };
 });
 afterEach(cleanup);
 
@@ -49,4 +49,67 @@ it("keeps the card, fixed facts and delete confirmation inside a 390px viewport"
   expect(group.scrollWidth).toBeLessThanOrEqual(group.clientWidth + 1);
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
   expect(mock.adminDeleteSharedProvider).not.toHaveBeenCalled();
+});
+
+// Issue #4633: the create form defaults to Claude at phone width; Codex drops x-api-key and
+// swaps in its own slots, and the longer Codex form still wraps inside the viewport.
+it("defaults the create form to Claude at 390px, and a switch to Codex hides x-api-key without overflow", async () => {
+  await page.viewport(390, 844);
+  const mock = vi.mocked(api);
+  const url = "https://gateway.example.com/a/very/long/path/that/must/wrap/inside/the/form/openai/v1";
+  mock.adminListSharedProviders.mockResolvedValue({ providers: [] });
+  mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [url], providers: [] });
+  render(<MemoryRouter><div className="px-4"><AdminSharedProviders /></div></MemoryRouter>);
+  await userEvent.click(await screen.findByRole("button", { name: "New shared provider" }));
+  const formEl = screen.getByRole("form", { name: "New shared provider" });
+  const form = within(formEl);
+  const engine = form.getByLabelText("Engine") as HTMLSelectElement;
+  expect(engine.value).toBe("claude");
+  expect(form.getByLabelText("Haiku model (required)")).toBeTruthy();
+  const auth = () => form.getByLabelText("Auth style") as HTMLSelectElement;
+  expect([...auth().options].map(o => o.value)).toEqual(["bearer", "x_api_key"]);
+  await userEvent.selectOptions(engine, "codex");
+  expect([...auth().options].map(o => o.value)).toEqual(["bearer"]);
+  expect(form.queryByLabelText("Haiku model (required)")).toBeNull();
+  expect(form.getByLabelText("Default model (required)")).toBeTruthy();
+  await userEvent.selectOptions(form.getByLabelText("Base URL"), url);
+  expect(formEl.scrollWidth).toBeLessThanOrEqual(formEl.clientWidth + 1);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+});
+
+it("keeps the Codex edit form's focus order: name, then each Codex slot's model and window, then Save", async () => {
+  await page.viewport(390, 844);
+  const mock = vi.mocked(api);
+  const row: AdminSharedProvider = {
+    id: "c1", name: "codex-gateway", engine: "codex", retired: false, current_revision: 1,
+    protocol: "openai_responses", base_url: "https://gateway.example.com/v1", auth_style: "bearer",
+    model_map: { default: { model: "gw-code" } }, credential_mode: "per_user_key", selected_user_count: 0, attached_key_count: 0,
+  };
+  mock.adminListSharedProviders.mockResolvedValue({ providers: [row] });
+  mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [row.base_url], providers: [] });
+  render(<MemoryRouter><div className="px-4"><AdminSharedProviders /></div></MemoryRouter>);
+  await userEvent.click(await screen.findByRole("button", { name: "Edit codex-gateway" }));
+  const formEl = screen.getByRole("form", { name: "Edit codex-gateway" });
+  const form = within(formEl);
+  expect(form.queryByLabelText("Haiku model (required)")).toBeNull();
+  const expected = [
+    form.getByLabelText("Provider name"),
+    form.getByLabelText("Default model (required)"),
+    form.getByLabelText("Default context window"),
+    form.getByLabelText("gpt-6-astra model"),
+    form.getByLabelText("gpt-6-astra context window"),
+  ];
+  expected[0].focus();
+  for (const el of expected.slice(1)) {
+    await userEvent.tab();
+    expect(document.activeElement).toBe(el);
+  }
+  // The last slot's window is followed by Save, then Cancel.
+  form.getByLabelText("gpt-6-luna context window").focus();
+  await userEvent.tab();
+  expect(document.activeElement).toBe(form.getByRole("button", { name: "Save changes" }));
+  await userEvent.tab();
+  expect(document.activeElement).toBe(form.getByRole("button", { name: "Cancel" }));
+  expect(formEl.scrollWidth).toBeLessThanOrEqual(formEl.clientWidth + 1);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
 });

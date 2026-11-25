@@ -140,18 +140,41 @@ describe("mock admin-shared providers", () => {
   it("creates keyless, refuses a case-insensitive name collision, edits and retires", async () => {
     const api = await load();
     const { provider } = await api.adminCreateSharedProvider({
-      name: "new-gw", base_url: "https://gateway.example.com/v1", auth_style: "bearer", model_map: { haiku: { model: "gw" } },
+      engine: "claude", name: "new-gw", base_url: "https://gateway.example.com/v1", auth_style: "bearer", model_map: { haiku: { model: "gw" } },
     });
     expect(provider).toMatchObject({ selected_user_count: 0, attached_key_count: 0, credential_mode: "per_user_key" });
     expect((await api.listProviders()).providers.find(p => p.id === provider.id)).toMatchObject({ has_key: false, credential_mode: "per_user_key" });
     await expect(api.adminCreateSharedProvider({
-      name: "PLATFORM-gateway", base_url: "https://gateway.example.com/v1", auth_style: "bearer", model_map: { haiku: { model: "gw" } },
+      engine: "claude", name: "PLATFORM-gateway", base_url: "https://gateway.example.com/v1", auth_style: "bearer", model_map: { haiku: { model: "gw" } },
     })).rejects.toMatchObject({ status: 409, body: { reason: "provider_name_taken" } });
     await expect(api.adminPatchSharedProvider(provider.id, { name: "Platform-Gateway" })).rejects.toMatchObject({ status: 409 });
     const edited = (await api.adminPatchSharedProvider(provider.id, { model_map: { haiku: { model: "gw2" } } })).provider;
     expect(edited).toMatchObject({ current_revision: 2, model_map: { haiku: { model: "gw2" } } });
     await api.adminRetireSharedProvider(provider.id);
     await expect(api.adminPatchSharedProvider(provider.id, { name: "z" })).rejects.toMatchObject({ status: 409, body: { reason: "provider_retired" } });
+  });
+
+  it("creates a shared Codex definition, validates it against Codex and counts a Codex selection", async () => {
+    const api = await load();
+    await expect(api.adminCreateSharedProvider({
+      engine: "codex", name: "codex-xkey", base_url: "https://gateway.example.com/v1", auth_style: "x_api_key", model_map: { default: { model: "gw" } },
+    })).rejects.toMatchObject({ status: 400 });
+    await expect(api.adminCreateSharedProvider({
+      engine: "codex", name: "codex-haiku", base_url: "https://gateway.example.com/v1", auth_style: "bearer", model_map: { haiku: { model: "gw" } },
+    })).rejects.toMatchObject({ status: 400 });
+    const { provider } = await api.adminCreateSharedProvider({
+      engine: "codex", name: "codex-gw", base_url: "https://gateway.example.com/v1", auth_style: "bearer", model_map: { default: { model: "gw" } },
+    });
+    expect(provider).toMatchObject({ engine: "codex", protocol: "openai_responses", auth_style: "bearer", credential_mode: "per_user_key", selected_user_count: 0 });
+    // The edit validates against the definition's own engine: a Claude-only map is refused.
+    await expect(api.adminPatchSharedProvider(provider.id, { model_map: { haiku: { model: "gw" } } })).rejects.toMatchObject({ status: 400 });
+    await expect(api.adminPatchSharedProvider(provider.id, { model_map: { default: { model: "gw2" } } })).resolves.toMatchObject({ provider: { current_revision: 2 } });
+    await api.putProviderKey(provider.id, "c".repeat(24));
+    await expect(api.setClaudeProviderSource(provider.id)).rejects.toMatchObject({ status: 404 });
+    await expect(api.setCodexProviderSource(provider.id)).resolves.toEqual({ codex_provider_id: provider.id });
+    const view = (await api.adminListSharedProviders()).providers.find(p => p.id === provider.id)!;
+    expect(view).toMatchObject({ selected_user_count: 1, attached_key_count: 1 });
+    await expect(api.adminDeleteSharedProvider(provider.id)).rejects.toMatchObject({ status: 409, body: { reason: "provider_in_use_as_source" } });
   });
 
   // PRD #4324: retirement never clears a source or falls back. The selection stays (unusable),

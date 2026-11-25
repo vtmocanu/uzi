@@ -2206,7 +2206,8 @@ const realApi = {
   adminDeleteEgressProfile: (name: string) =>
     request<null>("DELETE", `/admin/egress-profiles/${encodeURIComponent(name)}`),
   // Admin-shared provider definitions (PRD #4324). Reads sit in the admin read group; every
-  // write is a cookie-only admin route. Create is keyless (each user attaches their own key);
+  // write is a cookie-only admin route. Create is keyless (each user attaches their own key)
+  // and sends the engine with its matching protocol;
   // PATCH changes the name and/or model map only (base_url/auth_style are a 400); DELETE is a
   // 409 provider_in_use_as_source while any user has the definition selected.
   adminListSharedProviders: () =>
@@ -2214,8 +2215,7 @@ const realApi = {
   adminCreateSharedProvider: (input: AdminSharedProviderCreateInput) =>
     request<{ provider: AdminSharedProvider }>("POST", "/admin/providers", {
       ...input,
-      engine: "claude",
-      protocol: "anthropic_messages",
+      protocol: input.engine === "codex" ? "openai_responses" : "anthropic_messages",
     }),
   adminPatchSharedProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
     request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}`, body),

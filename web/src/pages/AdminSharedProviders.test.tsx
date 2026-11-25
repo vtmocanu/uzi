@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 // PRD #4324 M4: Admin → Shared providers. Pins keyless create, name/model-map edit with the
 // endpoint shown read-only, retire, the delete confirmation's key and selection counts, and
-// the 409 refusals (selected-as-source, name collision).
+// the 409 refusals (selected-as-source, name collision). Issue #4633: the engine select
+// (Claude by default, or Codex) and the per-engine copy, slots and auth.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -104,6 +105,7 @@ describe("AdminSharedProviders — create", () => {
     fireEvent.click(form.getByRole("button", { name: "Create shared provider" }));
     await waitFor(() =>
       expect(mockApi.adminCreateSharedProvider).toHaveBeenCalledWith({
+        engine: "claude",
         name: "new-gw",
         base_url: URL_B,
         auth_style: "x_api_key",
@@ -112,6 +114,50 @@ describe("AdminSharedProviders — create", () => {
     );
     expect(await screen.findByText(/Shared provider new-gw created/)).toBeTruthy();
     expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2);
+  });
+
+  it("defaults to Claude, then switching to Codex resets the map and auth and creates a Codex definition", async () => {
+    mockApi.adminCreateSharedProvider.mockResolvedValue({ provider: shared({ id: "s2", name: "codex-gw", engine: "codex", protocol: "openai_responses", auth_style: "bearer" }) });
+    await renderPage([]);
+    fireEvent.click(screen.getByRole("button", { name: "New shared provider" }));
+    const form = within(screen.getByRole("form", { name: "New shared provider" }));
+    const engine = form.getByLabelText("Engine") as HTMLSelectElement;
+    // Before any switch: Claude, its slots and both auth styles.
+    expect(engine.value).toBe("claude");
+    expect(form.getByTestId("engine-protocol").textContent).toBe("Protocol: Anthropic Messages");
+    expect(form.getByLabelText("Haiku model (required)")).toBeTruthy();
+    expect(form.queryByLabelText("Default model (required)")).toBeNull();
+    const authValues = () => [...(form.getByLabelText("Auth style") as HTMLSelectElement).options].map((o) => o.value);
+    expect(authValues()).toEqual(["bearer", "x_api_key"]);
+    fireEvent.change(form.getByLabelText("Auth style"), { target: { value: "x_api_key" } });
+    fireEvent.change(form.getByLabelText("Haiku model (required)"), { target: { value: "typed-before-switch" } });
+
+    fireEvent.change(engine, { target: { value: "codex" } });
+    expect(form.getByTestId("engine-protocol").textContent).toBe("Protocol: OpenAI Responses");
+    expect(authValues()).toEqual(["bearer"]);
+    expect((form.getByLabelText("Auth style") as HTMLSelectElement).value).toBe("bearer");
+    expect(form.queryByLabelText("Haiku model (required)")).toBeNull();
+    const advice = form.getByTestId("auth-advice").textContent ?? "";
+    expect(advice).toMatch(/Codex runtime redirects may forward request bodies and authentication headers/);
+    expect(advice).not.toMatch(/but not another host/);
+
+    fireEvent.change(form.getByLabelText("Provider name"), { target: { value: "codex-gw" } });
+    fireEvent.change(form.getByLabelText("Base URL"), { target: { value: URL_B } });
+    fireEvent.click(form.getByRole("button", { name: "Create shared provider" }));
+    expect((await form.findByRole("alert")).textContent).toBe("Default model is required.");
+    expect(mockApi.adminCreateSharedProvider).not.toHaveBeenCalled();
+
+    fireEvent.change(form.getByLabelText("Default model (required)"), { target: { value: "gw-code" } });
+    fireEvent.click(form.getByRole("button", { name: "Create shared provider" }));
+    await waitFor(() =>
+      expect(mockApi.adminCreateSharedProvider).toHaveBeenCalledWith({
+        engine: "codex",
+        name: "codex-gw",
+        base_url: URL_B,
+        auth_style: "bearer",
+        model_map: { default: { model: "gw-code" } },
+      }),
+    );
   });
 
   it("validates locally before calling the server", async () => {
@@ -183,6 +229,25 @@ describe("AdminSharedProviders — edit", () => {
     expect((await form.findByRole("alert")).textContent).toMatch(/A shared provider with that name already exists/);
   });
 
+  it("labels a Codex definition by its engine and edits it with the Codex slots", async () => {
+    const codex = shared({ engine: "codex", protocol: "openai_responses", auth_style: "bearer", model_map: { default: { model: "gw-code" } } });
+    mockApi.adminPatchSharedProvider.mockResolvedValue({ provider: codex });
+    await renderPage([codex]);
+    expect(screen.getByText("Codex, OpenAI Responses, revision 2")).toBeTruthy();
+    expect(screen.getByText(/^Default:/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit platform-gateway" }));
+    const form = within(screen.getByRole("form", { name: "Edit platform-gateway" }));
+    expect(form.queryByLabelText("Haiku model (required)")).toBeNull();
+    expect((form.getByLabelText("Default model (required)") as HTMLInputElement).value).toBe("gw-code");
+    fireEvent.change(form.getByLabelText("gpt-6-luna model"), { target: { value: "gw-luna" } });
+    fireEvent.click(form.getByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(mockApi.adminPatchSharedProvider).toHaveBeenCalledWith("s1", {
+        model_map: { default: { model: "gw-code" }, "gpt-6-luna": { model: "gw-luna" } },
+      }),
+    );
+  });
+
   it("offers no edit or retire on a retired definition, only delete", async () => {
     await renderPage([shared({ retired: true })]);
     expect(screen.getByText("Retired")).toBeTruthy();
@@ -247,6 +312,21 @@ describe("AdminSharedProviders — delete", () => {
     const lead = box.getByTestId("delete-selected-s1").textContent ?? "";
     expect(lead).toMatch(/1 user has it selected as their Claude source\. Ask them to choose another source\./);
     expect(lead).not.toMatch(/Retire it/);
+  });
+
+  it("names the Codex source for a Codex definition in the delete confirmation and its refusal", async () => {
+    const codex = (over: Partial<AdminSharedProvider>) => shared({ engine: "codex", protocol: "openai_responses", auth_style: "bearer", model_map: { default: { model: "gw" } }, ...over });
+    mockApi.adminDeleteSharedProvider.mockRejectedValue(conflict("provider_in_use_as_source"));
+    await renderPage([codex({ selected_user_count: 0 })]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete platform-gateway" }));
+    const group = screen.getByRole("group", { name: "Confirm deleting platform-gateway" });
+    expect(within(group).getByTestId("delete-selected-s1").textContent).toBe("No user has it selected as their Codex source.");
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [codex({ selected_user_count: 2 })] });
+    fireEvent.click(within(group).getByRole("button", { name: "Delete definition and keys" }));
+    expect((await within(group).findByRole("alert")).textContent).toMatch(/selected as their Codex source/);
+    await waitFor(() =>
+      expect(screen.getByTestId("delete-selected-s1").textContent).toMatch(/2 users have it selected as their Codex source\./),
+    );
   });
 
   it("reloads on a 404, so a definition another admin deleted leaves no ghost card", async () => {
