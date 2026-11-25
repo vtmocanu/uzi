@@ -525,12 +525,22 @@ workers:
   #   configMap: an existing ConfigMap in the RELEASE namespace (e.g. a trust-manager
   #     Bundle target), by name and key.
   # Like the api CA, it is written into a worker's Secret when the worker is created:
-  # adding or changing it reaches new workers, so reprovision existing ones. The
-  # controller reads it at boot; an inline pem change restarts the controller, an edit
-  # to an existing ConfigMap needs a controller restart. Without workers.uidSplit,
-  # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
-  # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
-  # reprovisioning is still what delivers the CA to it.
+  # adding or changing it reaches new workers only, so reprovision existing ones (a bundle
+  # change A to B leaves them on A). The controller reads it at boot; an inline pem change
+  # restarts the controller, an edit to an existing ConfigMap needs a controller restart.
+  # UZI_CODEX_CA_FILE is rendered only for a non-isolated worker whose own Secret the
+  # controller has confirmed holds the Codex CA key (a uzi.dev/codex-extra-ca annotation on
+  # its /data PVC), so enabling this never rolls a uid-split worker whose Secret lacks the
+  # key; a Codex provider behind a private CA on such a worker fails TLS rather than crashing
+  # it. Without workers.uidSplit, turning it on also adds UZI_CLI_CA_FILE to the worker pod
+  # template, which can start paced worker rolls; those rolls never add UZI_CODEX_CA_FILE
+  # for a Secret that lacks the key, and a roll does not rewrite an existing Secret.
+  # Removing it withdraws only the Codex-specific setting; existing Secrets and
+  # NODE_EXTRA_CA_CERTS keep the original bundle. A Secret recreated by hand is not tracked.
+  # UPGRADE: workers created with the extra CA under earlier controllers have the key but no
+  # recorded evidence, so they roll once on upgrade and lose the Codex CA until reprovisioned;
+  # a controller restart between a worker's Secret create and its /data claim create, or
+  # during a /data recycle, can do the same.
   # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
   # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
   # no other api client; the api refuses to boot if the file is unreadable or holds no
