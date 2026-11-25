@@ -1023,3 +1023,45 @@ func TestClaimForgeTransientLateReportsAreRefusedLiveDB(t *testing.T) {
 	}
 	check("promoted")
 }
+
+// The test above runs on a run holding a pending Fresh policy episode, which SetState refuses before it
+// reaches the claim-generation fence. This one parks an ordinary started run (no policy episode), so a
+// stale-generation report can only be stopped by the fence itself.
+func TestClaimForgeTransientLateReportsHitGenerationFenceLiveDB(t *testing.T) {
+	x := newCFPFix(t)
+	x.env.exec(`UPDATE runs SET policy_preserve_required=false, policy_pending_fresh=false, policy_outcome_id=NULL,
+		policy_continuation_mode=NULL, policy_applying_worker_id=NULL, policy_applying_generation=NULL,
+		policy_source_generation=NULL, policy_resolved_at=NULL WHERE id=$1`, x.run)
+	r := x.mustPark()
+	if r.ClaimGeneration != 2 || r.PolicyPendingFresh || unresolvedPolicyEpisode(r) {
+		t.Fatalf("parked run generation=%d pending_fresh=%v unresolved=%v, want generation 2 and no policy episode", r.ClaimGeneration, r.PolicyPendingFresh, unresolvedPolicyEpisode(r))
+	}
+	check := func(stage string) {
+		t.Helper()
+		before := cfpSnap(t, x.env, x.run)
+		gen1 := int64(1)
+		for _, state := range []string{"failed", "running"} {
+			_, applied, err := x.f.svc.SetState(x.env.ctx, x.f.wkr, x.run, StateRequest{State: state, ClaimGeneration: &gen1})
+			if applied || !errors.Is(err, ErrStaleClaim) {
+				t.Errorf("%s: a %s report at generation 1 = applied %v, err %v, want ErrStaleClaim and not applied", stage, state, applied, err)
+			}
+		}
+		if after := cfpSnap(t, x.env, x.run); after != before {
+			t.Fatalf("%s: stale reports moved the run:\n%s\n%s", stage, before, after)
+		}
+	}
+	check("parked")
+	gen2 := int64(2)
+	before := cfpSnap(t, x.env, x.run)
+	if _, applied, _ := x.f.svc.SetState(x.env.ctx, x.f.wkr, x.run, StateRequest{State: "running", ClaimGeneration: &gen2}); applied {
+		t.Error("parked: a running report at generation 2 was applied")
+	}
+	if after := cfpSnap(t, x.env, x.run); after != before {
+		t.Fatalf("parked: the generation 2 running report moved the run:\n%s\n%s", before, after)
+	}
+	x.env.exec(`UPDATE runs SET recovery_retry_not_before=now()-interval '1 hour' WHERE id=$1`, x.run)
+	if _, err := x.env.q.PromoteRecoveryWaitRuns(x.env.ctx, pgconv.Time(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	check("promoted")
+}

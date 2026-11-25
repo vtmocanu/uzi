@@ -296,11 +296,15 @@ protection is the only blocking finding; and the run has already started once
 - **Not recorded:** no worker-origin cooldown and no worker health evidence, because
   the read happened on the api, not the worker. The claim's own half-open
   reservations are released by the existing lifecycle cleanup.
-- **Late reports:** the payload was never delivered. The park revokes the Codex claim
-  capability (`codex_cap_hash` cleared, epoch + 1) and keeps `claim_released_at` NULL
-  like the worker-path park, so reports at an older generation are refused while a
-  report at the parked generation, or one with no generation, is admitted exactly as
-  for today's worker-path park. This boundary is accepted.
+- **Late reports:** the payload was never delivered, so no flight holds the parked
+  generation. The park revokes the Codex claim capability (`codex_cap_hash` cleared,
+  epoch + 1). Like the worker-path park it keeps `claim_released_at` NULL, so a report
+  at an older generation is refused as a stale claim. A report at the parked generation,
+  or one with no generation from a worker without `credential_switch_v1` before
+  reconciliation, passes that fence exactly as for the worker-path park; the state's own
+  guard then decides (a `running` report matches nothing from `recovery_wait` or
+  `queued`, while a `failed` or cancel report can still end the run). This boundary is
+  accepted.
 - **Still terminal `guardrail_blocked`:** a never-started run; auth (401/403, a revoked
   or expired token); a client-build failure; an unknown error class; NXDOMAIN,
   certificate/TLS and address errors; a cancelled forge call (a cancelled claim request
