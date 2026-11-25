@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -134,6 +135,35 @@ func (fx *reFix) receipts(t *testing.T, runID uuid.UUID) []receiptRow {
 	return out
 }
 
+// envShape, redactShape, payloadShape and redactRespShape describe run-env claim data for failure
+// messages by name, revision, scope, secret flag and value length only, never the value.
+func envShape(vs []ClaimRunEnvVar) string {
+	parts := make([]string, 0, len(vs))
+	for _, v := range vs {
+		parts = append(parts, fmt.Sprintf("%s#%d(scope=%s secret=%v valueLen=%d)", v.Name, v.Rev, v.Scope, v.Secret, len(v.Value)))
+	}
+	return fmt.Sprintf("%d vars [%s]", len(vs), strings.Join(parts, " "))
+}
+
+func redactShape(vs []ClaimRunEnvRedact) string {
+	parts := make([]string, 0, len(vs))
+	for _, v := range vs {
+		parts = append(parts, fmt.Sprintf("%s#%d(scope=%s valueLen=%d)", v.Name, v.Rev, v.Scope, len(v.Value)))
+	}
+	return fmt.Sprintf("%d redact [%s]", len(vs), strings.Join(parts, " "))
+}
+
+func payloadShape(p *ClaimPayload) string {
+	if p == nil {
+		return "no payload"
+	}
+	return envShape(p.Secrets.RunEnv) + ", " + redactShape(p.Secrets.RunEnvRedact)
+}
+
+func redactRespShape(r RunEnvRedactResponse) string {
+	return fmt.Sprintf("protected=%v %s", r.Protected, redactShape(r.Versions))
+}
+
 func runEnvByName(p *ClaimPayload) map[string]ClaimRunEnvVar {
 	out := map[string]ClaimRunEnvVar{}
 	for _, v := range p.Secrets.RunEnv {
@@ -155,13 +185,13 @@ func TestRunEnvClaimDeliversAndReceiptsLiveDB(t *testing.T) {
 	got := runEnvByName(p)
 	if len(p.Secrets.RunEnv) != 2 || got["API_BASE_URL"].Value != "https://sandbox.example.test" || got["API_BASE_URL"].Secret ||
 		got["API_KEY"].Value != envSecretValue("one") || !got["API_KEY"].Secret {
-		t.Fatalf("run_env = %+v", p.Secrets.RunEnv)
+		t.Fatalf("run_env = %s", envShape(p.Secrets.RunEnv))
 	}
 	if got["API_KEY"].VarID != secretID.String() || got["API_KEY"].Rev != 1 || got["API_KEY"].Scope != runenv.ScopeRepo {
-		t.Fatalf("identity on the wire = %+v", got["API_KEY"])
+		t.Fatalf("identity on the wire = %s", envShape([]ClaimRunEnvVar{got["API_KEY"]}))
 	}
 	if len(p.Secrets.RunEnvRedact) != 0 {
-		t.Fatalf("redact = %+v, want none", p.Secrets.RunEnvRedact)
+		t.Fatalf("redact = %s, want none", redactShape(p.Secrets.RunEnvRedact))
 	}
 	// The snapshot is unexported metadata: it never reaches the wire.
 	raw, err := json.Marshal(p)
@@ -192,7 +222,7 @@ func TestRunEnvClaimRotationAfterFinishReachesNextClaimLiveDB(t *testing.T) {
 	runID := fx.queuedRun(t, "issue")
 	fx.put(t, "API_KEY", true, envSecretValue("one"))
 	if p := fx.claim(t); p == nil || runEnvByName(p)["API_KEY"].Value != envSecretValue("one") {
-		t.Fatalf("first claim = %+v", p)
+		t.Fatalf("first claim = %s", payloadShape(p))
 	}
 	fx.rotate(t, "API_KEY", envSecretValue("two"))
 	fx.requeue(runID)
@@ -201,16 +231,16 @@ func TestRunEnvClaimRotationAfterFinishReachesNextClaimLiveDB(t *testing.T) {
 		t.Fatal("second claim idle")
 	}
 	if v := runEnvByName(p2)["API_KEY"]; v.Value != envSecretValue("two") || v.Rev != 2 {
-		t.Fatalf("second claim run_env = %+v, want rev 2", p2.Secrets.RunEnv)
+		t.Fatalf("second claim run_env = %s, want rev 2", envShape(p2.Secrets.RunEnv))
 	}
 	if len(p2.Secrets.RunEnvRedact) != 1 || p2.Secrets.RunEnvRedact[0].Value != envSecretValue("one") || p2.Secrets.RunEnvRedact[0].Rev != 1 ||
 		p2.Secrets.RunEnvRedact[0].Name != "API_KEY" || p2.Secrets.RunEnvRedact[0].Scope != runenv.ScopeRepo {
-		t.Fatalf("second claim redact = %+v, want the rev 1 value once", p2.Secrets.RunEnvRedact)
+		t.Fatalf("second claim redact = %s, want the rev 1 value once", redactShape(p2.Secrets.RunEnvRedact))
 	}
 	fx.requeue(runID)
 	p3 := fx.claim(t)
 	if p3 == nil || len(p3.Secrets.RunEnvRedact) != 1 || len(p3.Secrets.RunEnv) != 1 {
-		t.Fatalf("third claim = %+v, want deduplicated redact", p3)
+		t.Fatalf("third claim = %s, want deduplicated redact", payloadShape(p3))
 	}
 	rs := fx.receipts(t, runID)
 	if len(rs) != 2 || rs[0].rev != 1 || rs[0].first != 1 || rs[0].last != 1 || rs[1].rev != 2 || rs[1].first != 2 || rs[1].last != 3 {
@@ -256,7 +286,7 @@ func TestRunEnvClaimRaceBetweenAssemblyAndFinishRequeuesLiveDB(t *testing.T) {
 				c.mutate(t, fx)
 			}}
 			if p := fx.claim(t); p != nil {
-				t.Fatalf("claim delivered %+v, want an idle (requeued) claim", p.Secrets.RunEnv)
+				t.Fatalf("claim delivered %s, want an idle (requeued) claim", envShape(p.Secrets.RunEnv))
 			}
 			if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.FailOrigin.Valid {
 				t.Fatalf("status=%s fail=%v, want queued", r.Status, r.FailOrigin)
@@ -286,7 +316,7 @@ func TestRunEnvClaimFirstVariableForIncapableWorkerRequeuesLiveDB(t *testing.T) 
 			afterAssembly:  func(_ context.Context, _ store.Run, _ *ClaimPayload, err error) { assemblyErr = err },
 		}
 		if p := fx.claim(t); p != nil {
-			t.Fatalf("delivered %+v", p.Secrets.RunEnv)
+			t.Fatalf("delivered %s", envShape(p.Secrets.RunEnv))
 		}
 		if !errors.Is(assemblyErr, errRunEnvCapabilityMissing) {
 			t.Fatalf("assembly error = %v, want errRunEnvCapabilityMissing", assemblyErr)
@@ -308,7 +338,7 @@ func TestRunEnvClaimFirstVariableForIncapableWorkerRequeuesLiveDB(t *testing.T) 
 			fx.put(t, "FIRST_VAR", false, "x")
 		}}
 		if p := fx.claim(t); p != nil {
-			t.Fatalf("delivered %+v", p.Secrets.RunEnv)
+			t.Fatalf("delivered %s", envShape(p.Secrets.RunEnv))
 		}
 		if r := mustRun(t, fx.env, runID); r.Status != "queued" {
 			t.Fatalf("status=%s, want queued", r.Status)
@@ -337,7 +367,7 @@ func TestRunEnvClaimLockedVaultRequeuesLiveDB(t *testing.T) {
 		fx.env.exec(`UPDATE users SET vault_mode='protected' WHERE id=$1`, fx.userID)
 	}}
 	if p := fx.claim(t); p != nil {
-		t.Fatalf("delivered %+v", p.Secrets.RunEnv)
+		t.Fatalf("delivered %s", envShape(p.Secrets.RunEnv))
 	}
 	if r := mustRun(t, fx.env, runID); r.Status != "queued" || r.FailOrigin.Valid || r.HoldReason.Valid {
 		t.Fatalf("status=%s fail=%v hold=%v, want a plain queued requeue", r.Status, r.FailOrigin, r.HoldReason)
@@ -350,7 +380,7 @@ func TestRunEnvClaimLockedVaultRequeuesLiveDB(t *testing.T) {
 func (fx *reFix) assertParkedHistoryUnavailable(t *testing.T, runID uuid.UUID, p *ClaimPayload) {
 	t.Helper()
 	if p != nil {
-		t.Fatalf("delivered %+v, want a parked claim", p.Secrets.RunEnv)
+		t.Fatalf("delivered %s, want a parked claim", envShape(p.Secrets.RunEnv))
 	}
 	r := mustRun(t, fx.env, runID)
 	if r.Status != "paused" || !r.HoldReason.Valid || r.HoldReason.String != "run_env_history_unavailable" || !r.ClaimReleasedAt.Valid || r.FailOrigin.Valid {
@@ -478,7 +508,7 @@ func TestRunEnvFinishHoldsShareLockWriterProceedsAfterLiveDB(t *testing.T) {
 	}}
 	p := fx.claim(t)
 	if p == nil || runEnvByName(p)["API_KEY"].Value != envSecretValue("one") {
-		t.Fatalf("claim = %+v, want rev 1 delivered", p)
+		t.Fatalf("claim = %s, want rev 1 delivered", payloadShape(p))
 	}
 	if !blocked {
 		t.Fatal("the writer was not observed waiting")
@@ -495,7 +525,7 @@ func TestRunEnvFinishHoldsShareLockWriterProceedsAfterLiveDB(t *testing.T) {
 	fx.requeue(runID)
 	p2 := fx.claim(t)
 	if p2 == nil || runEnvByName(p2)["API_KEY"].Value != envSecretValue("two") || len(p2.Secrets.RunEnvRedact) != 1 {
-		t.Fatalf("next claim = %+v, want the rotation and the old version for masking", p2)
+		t.Fatalf("next claim = %s, want the rotation and the old version for masking", payloadShape(p2))
 	}
 }
 

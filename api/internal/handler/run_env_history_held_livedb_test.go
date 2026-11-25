@@ -70,7 +70,7 @@ func TestRunEnvHistoryFullNamesHeldRunsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body.Code != "env_history_full" || body.HeldByRuns == nil {
-		t.Fatalf("answer = %s; want env_history_full with held_by_runs", rec.Body.String())
+		t.Fatalf("answer = %s; want env_history_full with held_by_runs", respShape(rec))
 	}
 	got := *body.HeldByRuns
 	if len(got) != 20 {
@@ -98,7 +98,7 @@ func TestRunEnvHistoryFullWithNoHeldRunsLiveDB(t *testing.T) {
 		HeldByRuns *[]string `json:"held_by_runs"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.HeldByRuns == nil || len(*body.HeldByRuns) != 0 {
-		t.Fatalf("answer = %s (%v); want an empty held_by_runs array", rec.Body.String(), err)
+		t.Fatalf("answer = %s (%v); want an empty held_by_runs array", respShape(rec), err)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestRunEnvDeleteWithReceiptFreesTheNameLiveDB(t *testing.T) {
 	f.must(rec, http.StatusAccepted)
 	var d apitypes.RunEnvDeleteDTO
 	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil || d.State != apitypes.RunEnvStatePendingDeletion {
-		t.Fatalf("delete body = %s (%v)", rec.Body.String(), err)
+		t.Fatalf("delete body = %s (%v)", respShape(rec), err)
 	}
 	f.put("REUSED_NAME", jsonBody(map[string]any{"value": secretFixture(2)}), http.StatusCreated)
 	var newVar uuid.UUID
@@ -142,7 +142,7 @@ func TestRunEnvSecretToPlainRetiresTheSecretSideLiveDB(t *testing.T) {
 		t.Fatal("the new live version is not plain")
 	}
 	if got, err := f.openVersion("HELD_SECRET", f.versions("HELD_SECRET")[1]); err != nil || got != secretFixture(1) {
-		t.Fatalf("the retired secret version opens to %q, %v", got, err)
+		t.Fatalf("the retired secret version opens to a value of length %d (matches=%v), %v", len(got), got == secretFixture(1), err)
 	}
 
 	f.put("FREE_SECRET", jsonBody(map[string]any{"value": "now-plain", "secret": false}), http.StatusOK)
