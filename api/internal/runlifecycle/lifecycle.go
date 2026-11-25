@@ -172,6 +172,7 @@ type moveContext struct {
 	tokenCiphertext []byte
 	originColumn    pgtype.Text
 	boardColumn     pgtype.Text
+	superseded      bool // a strictly later run exists on the same repo and issue (#4704)
 }
 
 // decision is the outcome of mapping a status to a target column: whether to move
@@ -333,6 +334,7 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 		tokenCiphertext: mc.TokenCiphertext,
 		originColumn:    mc.OriginColumn,
 		boardColumn:     mc.BoardColumn,
+		superseded:      mc.Superseded,
 	}
 }
 
@@ -340,6 +342,8 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 // not: never move a closed issue, and never override a manual drag (proceed only
 // if the card still sits where the automation last left it —
 // current == COALESCE(board_column, origin_column)). Outcomes:
+//   - a strictly later run on the same issue exists (superseded, #4704) → clear the
+//     marker and move nothing, before any other check;
 //   - forge move succeeds → record board_column and clear the marker;
 //   - manual drag / closed issue / unknown baseline → clear the marker (a
 //     definitive skip that retrying cannot fix);
@@ -350,6 +354,15 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 //     the column) → leave the marker for a later reconcile retry;
 //   - a linked issue missing from the cache → probeUncachedLinkedIssue decides.
 func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, dec decision) {
+	if mc.superseded {
+		// #4704: a strictly later run on the same issue owns the card; this run's
+		// move would clobber it (both may expect In Progress, so the manual-drag
+		// guard cannot tell). Clear the marker and move nothing. Known limit: a
+		// successor that becomes visible after the move-context read is not fenced.
+		slog.Info("run lifecycle: run superseded by a newer run on the same issue, skipping move", "run", runID, "issue", mc.issueIID)
+		l.clearPending(ctx, runID)
+		return
+	}
 	if !dec.act {
 		if dec.clear {
 			l.clearPending(ctx, runID)

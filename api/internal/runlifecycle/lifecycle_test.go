@@ -385,6 +385,69 @@ func TestReconcileRespectsManualDragFailedFirstWrite(t *testing.T) {
 	}
 }
 
+// supersededFixture is an older failed run whose card still sits where the automation
+// left it (In Progress), on an autopilot run so the terminal-comment hook is observable.
+func supersededFixture(superseded bool) (*fakeStore, *fakeMover, uuid.UUID) {
+	runID, repoID := uuid.New(), uuid.New()
+	mc := autopilotMoveCtx(repoID, 4, "failed", 0, "")
+	mc.OriginColumn = txt("Upcoming")
+	mc.BoardColumn = txt(board.ColumnInProgress)
+	mc.Superseded = superseded
+	fs := &fakeStore{
+		moveCtx: mc,
+		issue:   issueWith(repoID, 4, "opened", "PRD", board.ColumnInProgress),
+		columns: defaultCols(),
+		pending: []uuid.UUID{runID},
+	}
+	return fs, &fakeMover{}, runID
+}
+
+func TestReconcileSupersededRunMovesNothing(t *testing.T) {
+	fs, fm, runID := supersededFixture(true)
+	l := newTestLifecycle(fs, fm)
+
+	l.reconcileOne(context.Background(), runID)
+
+	if len(fm.moves) != 0 {
+		t.Fatalf("a superseded run must not move the card, got %v", fm.moves)
+	}
+	if len(fs.recorded) != 0 {
+		t.Fatalf("a superseded run must not record a board column, got %+v", fs.recorded)
+	}
+	if len(fs.cleared) != 1 || fs.cleared[0] != runID {
+		t.Fatalf("the pending marker must be cleared, got %v", fs.cleared)
+	}
+	// The fence covers the move only: the terminal-comment hook still runs.
+	if fs.claimCalls < 1 {
+		t.Fatalf("the terminal comment hook must still run, claimCalls=%d", fs.claimCalls)
+	}
+}
+
+func TestReconcileNotSupersededStillMoves(t *testing.T) {
+	fs, fm, runID := supersededFixture(false)
+	l := newTestLifecycle(fs, fm)
+
+	l.reconcileOne(context.Background(), runID)
+
+	if len(fm.moves) != 1 || fm.moves[0] != "Upcoming" {
+		t.Fatalf("a run with no successor restores its origin column, got %v", fm.moves)
+	}
+}
+
+func TestNotifySupersededRunMovesNothing(t *testing.T) {
+	fs, fm, runID := supersededFixture(true)
+	l := newTestLifecycle(fs, fm)
+
+	l.notifyOnce(context.Background(), runID, "failed")
+
+	if len(fm.moves) != 0 || len(fs.recorded) != 0 {
+		t.Fatalf("a superseded run must not move the card, got moves=%v recorded=%+v", fm.moves, fs.recorded)
+	}
+	if len(fs.cleared) != 1 || fs.cleared[0] != runID {
+		t.Fatalf("the pending marker must be cleared, got %v", fs.cleared)
+	}
+}
+
 func TestReconcileSkipsHealedMarker(t *testing.T) {
 	// The candidate scan returned a run, but by the re-read its marker was already
 	// cleared (inline move or manual drag won the race): no move, no clear.
