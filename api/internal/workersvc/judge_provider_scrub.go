@@ -61,59 +61,66 @@ func providerKeyFormsGo(key string) []string {
 	return out
 }
 
-// judgeProviderScrub returns the pre-scan scrub for a provider-bound judge claim. It replaces every
-// key form, then (mirroring agent/src/redact.ts redactAcrossInvisible) every key form that appears
-// with only invisible runs between its characters: the match runs on the visible projection and the
-// whole original span, separators included, is replaced. Text outside a matched span is kept
-// byte-for-byte, so newlines and other separators still divide commands. It runs BEFORE the
-// pre-scan matches or clips anything, so no partial key can reach the worker. A nil result (no
-// credential) leaves vendor-mode scanning byte-identical.
+// judgeProviderScrub returns the pre-scan scrub for a provider-bound judge claim. It finds every key
+// form both verbatim and (as agent/src/redact.ts redactAcrossInvisible does) with only invisible runs
+// between its characters, then replaces the union of those spans in one pass: the invisible match
+// runs on the visible projection and covers the whole original span, separators included. Both
+// passes read the ORIGINAL string and each search resumes one byte past a match's start, so neither
+// a verbatim replacement nor a self-overlapping occurrence can hide part of a key from the other.
+// Text outside a matched span is kept byte-for-byte, so newlines and other separators still divide
+// commands. It runs BEFORE the pre-scan matches or clips anything, so no partial key can reach the
+// worker. A nil result (no credential) leaves vendor-mode scanning byte-identical.
 func judgeProviderScrub(credential string) func(string) string {
 	forms := providerKeyFormsGo(credential)
 	if len(forms) == 0 {
 		return nil
 	}
-	return func(s string) string {
-		for _, f := range forms {
-			s = strings.ReplaceAll(s, f, judgeProviderRedacted)
-		}
-		return redactAcrossInvisibleGo(s, forms)
-	}
+	return func(s string) string { return redactKeySpansGo(s, forms) }
 }
 
-// redactAcrossInvisibleGo replaces each original span whose visible characters (invisible runs
-// removed) spell one of forms. Overlapping spans merge into one marker.
-func redactAcrossInvisibleGo(s string, forms []string) string {
-	locs := judgeInvisible.FindAllStringIndex(s, -1)
-	if len(locs) == 0 {
-		return s
-	}
-	vis := make([]byte, 0, len(s))
-	origin := make([]int, 0, len(s)) // vis[i] came from s[origin[i]]
-	keep := func(from, to int) {
-		for i := from; i < to; i++ {
-			vis = append(vis, s[i])
-			origin = append(origin, i)
+// appendMatchSpans appends every occurrence of each form in text, overlapping ones included, as an
+// original-string span; origin maps a text byte to its original index (nil = identity).
+func appendMatchSpans(spans [][2]int, text string, origin []int, forms []string) [][2]int {
+	at := func(i int) int {
+		if origin == nil {
+			return i
 		}
+		return origin[i]
 	}
-	prev := 0
-	for _, l := range locs {
-		keep(prev, l[0])
-		prev = l[1]
-	}
-	keep(prev, len(s))
-	v := string(vis)
-	var spans [][2]int
 	for _, f := range forms {
-		for off := 0; ; {
-			i := strings.Index(v[off:], f)
+		for off := 0; off < len(text); {
+			i := strings.Index(text[off:], f)
 			if i < 0 {
 				break
 			}
-			st, en := off+i, off+i+len(f)
-			spans = append(spans, [2]int{origin[st], origin[en-1] + 1})
-			off = en
+			st := off + i
+			spans = append(spans, [2]int{at(st), at(st+len(f)-1) + 1})
+			off = st + 1
 		}
+	}
+	return spans
+}
+
+// redactKeySpansGo replaces the merged union of every verbatim and invisible-separated occurrence
+// of forms in s with one marker per merged span.
+func redactKeySpansGo(s string, forms []string) string {
+	spans := appendMatchSpans(nil, s, nil, forms)
+	if locs := judgeInvisible.FindAllStringIndex(s, -1); len(locs) > 0 {
+		vis := make([]byte, 0, len(s))
+		origin := make([]int, 0, len(s)) // vis[i] came from s[origin[i]]
+		keep := func(from, to int) {
+			for i := from; i < to; i++ {
+				vis = append(vis, s[i])
+				origin = append(origin, i)
+			}
+		}
+		prev := 0
+		for _, l := range locs {
+			keep(prev, l[0])
+			prev = l[1]
+		}
+		keep(prev, len(s))
+		spans = appendMatchSpans(spans, string(vis), origin, forms)
 	}
 	if len(spans) == 0 {
 		return s
@@ -128,11 +135,9 @@ func redactAcrossInvisibleGo(s string, forms []string) string {
 				en = spans[i][1]
 			}
 		}
-		if st >= cursor {
-			b.WriteString(s[cursor:st])
-			b.WriteString(judgeProviderRedacted)
-			cursor = en
-		}
+		b.WriteString(s[cursor:st])
+		b.WriteString(judgeProviderRedacted)
+		cursor = en
 	}
 	b.WriteString(s[cursor:])
 	return b.String()

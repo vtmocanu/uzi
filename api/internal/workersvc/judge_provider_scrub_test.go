@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -111,6 +112,33 @@ func TestScanCommandNotFoundProviderKeepsSeparators(t *testing.T) {
 			got := scanCommandNotFoundScrubbed(rawResultRows(payload), scrub)
 			if len(got) != 1 || got[0].Command != "jq" {
 				t.Fatalf("want exactly jq, got %+v", got)
+			}
+		})
+	}
+}
+
+// TestJudgeProviderScrubOverlappingMatches: a key built from two identical blocks must leave no
+// block behind when a verbatim occurrence overlaps an invisible-separated one, or when
+// invisible-separated occurrences overlap each other (PR #4678 review).
+func TestJudgeProviderScrubOverlappingMatches(t *testing.T) {
+	block := "gwk-A1b2C3d4E5f6G7h8"
+	scrub := judgeProviderScrub(block + block)
+	const zw = "​"
+	for name, in := range map[string]string{
+		"verbatim overlaps invisible":  block + block + zw + block + ": command not found",
+		"invisible overlaps invisible": block + zw + block + zw + block + ": command not found",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := scrub(in)
+			if strings.Contains(strings.ReplaceAll(got, zw, ""), block) {
+				t.Fatalf("a key block survived the scrub: %q", got)
+			}
+			if !strings.HasSuffix(got, ": command not found") {
+				t.Fatalf("text outside the key changed: %q", got)
+			}
+			payload, _ := json.Marshal(map[string]string{"text": in})
+			if cands := scanCommandNotFoundScrubbed(rawResultRows(string(payload)), scrub); len(cands) != 0 {
+				t.Fatalf("a key block reached a candidate: %+v", cands)
 			}
 		})
 	}
