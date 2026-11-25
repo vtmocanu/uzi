@@ -66,9 +66,12 @@ are always recorded.
 
 A worker has at most one sample per five-minute bucket. A worker the pass does
 not reach in a bucket is a gap, not a zero. While an owner's account row is
-locked (for example during an account reset or owner deletion), batches that
-contain that owner's workers fail, and workers later in id order are gaps for
-those ticks. A failed batch can be retried in the same bucket without
+locked (for example during an account reset or owner deletion), any batch that
+contains one of that owner's workers fails as a whole, including other owners'
+workers in the same batch. Because that worker stays unsampled, it stays in the
+first batch of each later tick, so with 1,000 workers or fewer every worker is a
+gap until the lock is released, and in a larger fleet every worker from that
+batch onward is. A failed batch can be retried in the same bucket without
 duplicating samples.
 
 ## No age-based expiry

@@ -1100,10 +1100,10 @@ func run() error {
 			Name: "notification_slack_redeliver",
 			Run:  redeliverer.Pass,
 		},
-		// Worker capacity samples (issue #4693): record one row per worker whose state or
-		// run-slot occupancy changed, under a cross-replica session advisory lock and a 2 s
-		// total deadline (up to 4 batches of 1000 per tick). Always registered: with no
-		// changes it is one statement inserting nothing.
+		// Worker capacity samples (issue #4693): record at most one row per worker per
+		// five-minute bucket, under a cross-replica session advisory lock and a 2 s total
+		// deadline (up to 4 batches of 1000 per tick). Always registered: once every worker
+		// is sampled for the bucket it is one statement inserting nothing.
 		sweeper.Pass{
 			Name: "worker_capacity_samples",
 			Run:  capacitySampler.Pass,
