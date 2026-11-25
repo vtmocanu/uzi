@@ -87,8 +87,8 @@ Measured on PostgreSQL 17.12 with a synthetic workload (5,000 workers, 3
 slot-holding runs each, 100 workers per owner, about 10 million sample rows).
 Every registered worker row is sampled, online or offline, so each one writes
 288 samples a day, 105,120 a year, until the worker is deleted. The owner index
-compresses well with many workers per owner; with one worker per owner expect
-nearer 28 MiB per worker-year.
+compresses well with many workers per owner; with one worker per owner, an
+estimate (not measured) is nearer 28 MiB per worker-year.
 
 | Quantity | Value |
 |---|---|
