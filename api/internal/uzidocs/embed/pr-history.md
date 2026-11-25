@@ -28,7 +28,7 @@ statement) with `runs.mr_state` and has exactly its durability.
 | `observed_at` | Observation watermark: the newest observation time that reached the head. |
 | `last_provider_at` | Newest provider-reported merge/close time seen. Never decreases. |
 | `first_merged_at`, `first_merged_source` | When the PR first merged and whether that time is `provider` or `observation_fallback`. Set once. |
-| `last_*` columns | Transport-only: they carry the latest transition to the event insert inside the statement. They are not history; do not read them. |
+| `last_changed`, `last_from_state`, `last_to_state`, `last_event_provider_at`, `last_time_source`, `last_bootstrap`, `last_first_merge` | Transport-only: they carry the latest transition to the event insert inside the statement. They are not history; do not read them. |
 
 **`pr_history_events`**: append-only transitions.
 
@@ -79,8 +79,8 @@ run's earlier MR rather than the current one.
 ## Retention
 
 There is no age-based expiry. History rows are deleted only by the repository
-cascade (`ON DELETE CASCADE` from `repos`). Storage grows by a few rows per PR
-state change.
+cascade (`ON DELETE CASCADE` from `repos`). Each PR state change inserts one event row (a few hundred bytes) and updates
+the PR's single head row in place.
 
 ## Delivery semantics
 
@@ -111,6 +111,11 @@ History is what the watcher saw, not a complete record of every PR.
 - **Non-owner observations.** History is recorded only when the run's user owns
   the repository's forge connection. Any other observation still updates
   `mr_state` but writes no history.
+- **Issue-lane watch rules.** For issue-linked runs the watcher observes only
+  the issue's latest run, and only while that run is `completed`; for an open
+  issue it also needs the card in Human Review or a stored `mr_state` of
+  `closed`. An MR outside those conditions is not observed, so its close or
+  merge is not recorded (the close-edge gap below is one case of this).
 - **Board-free self-eviction.** Board-free runs leave the watch candidate set
   once their `mr_state` is terminal, so they are no longer observed.
 - **Close-edge gap.** On the opened-to-closed edge the board card move runs
@@ -127,11 +132,15 @@ History is what the watcher saw, not a complete record of every PR.
   exist only here.
 - **Cross-check child delete deadlock.** A repository or forge-connection
   delete racing the watcher on a `cross_check` child run that carries an MR
-  can deadlock (SQLSTATE 40P01). If the watcher loses, it retries on the next
-  tick and the repo is gone. If the delete loses, the user gets the normal
-  error response and a retry succeeds. This is accepted without extra
-  locking and is pinned by `TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB`
-  in `api/internal/store/pr_history_livedb_test.go`.
+  can deadlock (SQLSTATE 40P01): neither delete prelocks a `cross_check`
+  child. If the watcher loses, it retries on the next tick and the repo is
+  gone. If the delete loses, the handler returns its generic error (HTTP 500)
+  and the user can retry the delete; the watcher's write has committed by then,
+  so the race is over. This is accepted without extra locking. Both outcomes
+  are pinned for the repository delete by
+  `TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB` in
+  `api/internal/store/pr_history_livedb_test.go`; the connection-delete case
+  and the retry are not covered by a test.
 
 ## See also
 
