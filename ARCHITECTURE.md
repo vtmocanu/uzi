@@ -590,8 +590,8 @@ records the claim ordering and recovery model.
 **Admin-shared definitions (PRD #4324).** An admin can publish a keyless Claude or Codex definition
 (`owner_user_id IS NULL`, `credential_mode = 'per_user_key'`) from Admin → Shared providers; the
 engine is chosen at creation and never changes. Every user sees it next to their own providers,
-attaches their own sealed key and selects it as their Claude or Codex source; the admin never sees
-a key, and a Codex definition's admin-chosen URL receives every recipient's key (the accepted
+attaches their own sealed key and selects it as their Claude or Codex source; uzi's admin UI and API never show
+a key (whoever operates the gateway receives it), and a Codex definition's admin-chosen URL receives every recipient's key (the accepted
 redirect risk). Endpoint and auth style are fixed at creation (admin
 edits change only the name and model map), keys and selections (Claude and, since #4633, Codex)
 are pinned to the definition's scope by composite foreign keys to `model_providers (scope_owner_id, id)`,

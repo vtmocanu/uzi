@@ -7,7 +7,7 @@
 
 ## Decision (summary)
 
-An admin defines a Claude or Codex gateway once: a name, a base URL, an auth style and a model map. Every user then sees it next to their own providers, attaches **their own key** to it, tests it, and selects it as their Claude or Codex source (matching the definition's engine). The admin never holds, sees or can repoint anyone's key. User-owned providers are unchanged.
+An admin defines a Claude or Codex gateway once: a name, a base URL, an auth style and a model map. Every user then sees it next to their own providers, attaches **their own key** to it, tests it, and selects it as their Claude or Codex source (matching the definition's engine). Through uzi's admin UI and API the admin never holds, sees or can repoint anyone's key; whoever operates the gateway, the admin included if they run it, receives each key sent to it. User-owned providers are unchanged.
 
 Shipped: the admin catalogue (`/api/admin/providers`, the Admin **Shared providers** page, read-only `uzi admin provider list|get`), the shared visibility rule, the composite scope foreign keys, per-user Test evidence, the shared-aware freeze, select and key fences, and the user-facing disclosure.
 
