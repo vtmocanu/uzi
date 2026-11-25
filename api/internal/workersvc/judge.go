@@ -245,6 +245,13 @@ func normalizeCommandToken(cmd string) string {
 // ABSENT from the window is deliberately still scanned — the high-confidence forms must
 // report even with no invocation to corroborate against.
 func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
+	return scanCommandNotFoundScrubbed(rows, nil)
+}
+
+// scanCommandNotFoundScrubbed is scanCommandNotFound with an optional evidence scrub (a
+// provider-bound judge, PRD #4322 M1a) applied to each candidate's command and evidence BEFORE
+// the judgeEvidenceMaxLen clip. nil keeps vendor-mode evidence byte-identical.
+func scanCommandNotFoundScrubbed(rows []store.ListToolTraceForRunRow, scrub func(string) string) []missCandidate {
 	invoked := invokedExecutables(rows)
 	pinned := goRunPinnedTools(rows)
 	funcs := shellFunctionNames(rows)
@@ -317,10 +324,14 @@ func scanCommandNotFound(rows []store.ListToolTraceForRunRow) []missCandidate {
 			}
 			seen[cmd] = true
 			evidence = strings.TrimSpace(evidence)
+			command := cmd
+			if scrub != nil {
+				evidence, command = scrub(evidence), scrub(cmd)
+			}
 			if len(evidence) > judgeEvidenceMaxLen {
 				evidence = evidence[:judgeEvidenceMaxLen]
 			}
-			out = append(out, missCandidate{Command: cmd, Evidence: evidence, Seq: row.Seq})
+			out = append(out, missCandidate{Command: command, Evidence: evidence, Seq: row.Seq})
 		})
 	}
 	return out
@@ -1189,7 +1200,13 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	if run.TargetRunID.Valid {
 		id := uuid.UUID(run.TargetRunID.Bytes).String()
 		targetRunID = &id
-		signal = s.judgeSignal(ctx, uuid.UUID(run.TargetRunID.Bytes))
+		// PRD #4322 M1a: a provider-bound judge scrubs its key forms from the evidence before the
+		// pre-scan clips it (a cut key would reach the worker as an unmatchable partial prefix).
+		var scrub func(string) string
+		if providerBinding != nil {
+			scrub = judgeProviderScrub(providerBinding.Credential)
+		}
+		signal = s.judgeSignal(ctx, uuid.UUID(run.TargetRunID.Bytes), scrub)
 		// PRD #69 M7a Pass B: surface the reviewed run's TRUSTED failure ORIGIN
 		// (runs.fail_origin, the closed enum stamped at each failed write) so the judge
 		// can weigh the failure CLASS — e.g. no retry/backoff advice for a policy/config
@@ -1395,7 +1412,7 @@ func (s *Service) targetCostContext(ctx context.Context, targetID uuid.UUID) (*s
 // only, while the green index reads both kinds and joins them by tool_use_id. The
 // order is scan → index → suppress, and the wire contract is unchanged — a suppressed
 // miss is simply absent from MissingTools.
-func (s *Service) judgeSignal(ctx context.Context, targetID uuid.UUID) *JudgeSignal {
+func (s *Service) judgeSignal(ctx context.Context, targetID uuid.UUID, scrub func(string) string) *JudgeSignal {
 	rows, err := s.q.ListToolTraceForRun(ctx, store.ListToolTraceForRunParams{
 		RunID: targetID,
 		Lim:   judgeToolTraceRowCap,
@@ -1404,7 +1421,7 @@ func (s *Service) judgeSignal(ctx context.Context, targetID uuid.UUID) *JudgeSig
 		slog.Warn("judge signal: list tool trace", "target", targetID, "error", err)
 		return nil
 	}
-	misses := suppressResolved(scanCommandNotFound(rows), observedGreenTools(rows))
+	misses := suppressResolved(scanCommandNotFoundScrubbed(rows, scrub), observedGreenTools(rows))
 	if len(misses) == 0 {
 		return nil
 	}

@@ -498,3 +498,36 @@ func TestProviderJudgeGatewayLimitFailsTerminallyLiveDB(t *testing.T) {
 		}
 	})
 }
+
+// TestProviderJudgeClaimSignalScrubsKeyBeforeClipLiveDB: the claim-produced judge_signal of a
+// provider judge carries no partial key. The target's trace reports a missing command whose token
+// ends in the gateway key, long enough that the pre-scan's evidence clip would cut the key; the
+// server scrubs the key forms first, so the worker never receives a prefix its exact-form
+// redactor cannot match (PRD #4322 M1a landing review).
+func TestProviderJudgeClaimSignalScrubsKeyBeforeClipLiveDB(t *testing.T) {
+	p := newPJFix(t)
+	target := p.newTarget()
+	token := strings.Repeat("a", 170) + p.plain
+	p.env.exec(`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 900, 'tool_result', $2)`,
+		target.ID, `{"text":"bash: `+token+`: command not found"}`)
+	p.auto(target)
+	judge := p.mustJudge(target)
+	p.wantBoundTo(judge, p.provider, p.key, 1)
+
+	payload, err := p.svc.Claim(p.env.ctx, p.worker(), nil)
+	if err != nil || payload == nil || payload.RunID != judge.ID.String() {
+		t.Fatalf("Claim = (%+v, %v), want the provider judge", payload, err)
+	}
+	if payload.JudgeSignal == nil || len(payload.JudgeSignal.MissingTools) != 1 {
+		t.Fatalf("judge_signal = %+v, want the one missing-command candidate", payload.JudgeSignal)
+	}
+	m := payload.JudgeSignal.MissingTools[0]
+	for _, s := range []string{m.Command, m.Evidence} {
+		if strings.Contains(s, p.plain[:12]) {
+			t.Fatalf("a key prefix reached the claim: %q", s)
+		}
+		if !strings.Contains(s, judgeProviderRedacted) {
+			t.Fatalf("the key was not replaced before the clip: %q", s)
+		}
+	}
+}
