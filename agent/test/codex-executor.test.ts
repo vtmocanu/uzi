@@ -33014,7 +33014,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: JSON.stringify({ summary: `Plan summary built with ${(params.binding as CodexBinding).capability}`, deltas: [] }),
+            return { text: JSON.stringify({ summary: `Plan summary built by ${(params.binding as CodexBinding).capability === next.capability ? "flight B" : "another flight"}`, deltas: [] }),
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
@@ -33038,7 +33038,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: `Intent summary built with ${(params.binding as CodexBinding).capability}`,
+            return { text: `Intent summary built by ${(params.binding as CodexBinding).capability === next.capability ? "flight B" : "another flight"}`,
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;

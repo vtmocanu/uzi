@@ -205,3 +205,30 @@ describe("providerKeyForms", () => {
     assert.deepEqual(providerKeyForms("plainkey12345678"), ["plainkey12345678"]);
   });
 });
+
+describe("makeTextRedactor with a long periodic secret", () => {
+  // A 70 000 unit secret whose 8-unit prefix recurs every 9 units: every shift of one real occurrence is a
+  // prefix candidate, but only the shifts that leave a border of the secret can be occurrences.
+  const long = ["Q9Z7W4X2", "-"].join("").repeat(8000).slice(0, 70_000);
+
+  it("redacts the one real occurrence inside plain text without withholding", () => {
+    const text = `${"a".repeat(20_000)}${long}${"b".repeat(50_000)}`;
+    const out = makeTextRedactor([long])(text);
+    assert.equal(out, `${"a".repeat(20_000)}${REDACTED}${"b".repeat(50_000)}`);
+  });
+
+  it("redacts two overlapping occurrences sharing a border as one union and keeps a partial one", () => {
+    const secret = "abcdeabc"; // border "abc"
+    assert.equal(makeTextRedactor([secret])("<abcdeabcdeabc>"), `<${REDACTED}>`);
+    assert.equal(makeTextRedactor([secret])("<abcdeab>"), "<abcdeab>");
+    assert.equal(makeTextRedactor([secret])("<abcdeabcdeab>"), `<${REDACTED}deab>`);
+  });
+
+  it("redacts every overlapping occurrence of a periodic secret and no partial one", () => {
+    const secret = "abababababababab"; // 16 units, period 2
+    const run = "ab".repeat(12); // three overlapping occurrences at shifts 0, 2, ..., 8
+    assert.equal(makeTextRedactor([secret])(`<${run}>`), `<${REDACTED}>`);
+    const partial = "ab".repeat(7); // 14 units: shorter than the secret, so not an occurrence
+    assert.equal(makeTextRedactor([secret])(`<${partial}>`), `<${partial}>`);
+  });
+});

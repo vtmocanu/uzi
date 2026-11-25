@@ -384,8 +384,10 @@ export function replaceSpans(text: string, spans: Array<[number, number]>): stri
   return out + text.slice(cursor);
 }
 
-/** True when a proper prefix of `s` is also its suffix: only then can two occurrences of `s` overlap. */
-function hasBorder(s: string): boolean {
+/** The prefix function of `s`: fail[i] is the length of the longest proper prefix of s[0..i] that is also its
+ *  suffix. A proper prefix of `s` that is also its suffix (a border) exists only if fail[s.length - 1] > 0, and only
+ *  then can two occurrences of `s` overlap. */
+function prefixFunction(s: string): Int32Array {
   const fail = new Int32Array(s.length);
   let k = 0;
   for (let i = 1; i < s.length; i++) {
@@ -393,7 +395,7 @@ function hasBorder(s: string): boolean {
     if (s.charCodeAt(i) === s.charCodeAt(k)) k++;
     fail[i] = k;
   }
-  return k > 0;
+  return fail;
 }
 
 /** The finder that looks for each secret (at least MIN_SECRET_LEN long): `indexOf` of its first MIN_SECRET_LEN units
@@ -406,18 +408,30 @@ export function spansOfEach(secrets: readonly string[]): SpanFinder {
     const spans: Array<[number, number]> = [];
     for (const secret of secrets) {
       const prefix = secret.slice(0, MIN_SECRET_LEN);
-      let overlaps: boolean | undefined;
+      let fail: Int32Array | undefined;
       let at = text.indexOf(prefix);
       while (at !== -1) {
         charge(work, 1 + secret.length);
         let next = at + 1;
         if (text.startsWith(secret, at)) {
-          spans.push([at, at + secret.length]);
-          if (overlaps === undefined) {
+          const end = at + secret.length;
+          spans.push([at, end]);
+          if (fail === undefined) {
             charge(work, secret.length);
-            overlaps = hasBorder(secret);
+            fail = prefixFunction(secret);
           }
-          if (!overlaps) next = at + secret.length;
+          // Another occurrence starting inside this one must start at a shift that leaves a border of the
+          // secret, so only those shifts are tried (nearest first), and only while the occurrence still fits.
+          // text[at + shift ..< end) is already known to match, so one unit at `end` gates the full comparison.
+          for (let b = fail[secret.length - 1]!; b > 0; b = fail[b - 1]!) {
+            const start = end - b;
+            if (start + secret.length > text.length) break;
+            charge(work, 1);
+            if (text.charCodeAt(end) !== secret.charCodeAt(b)) continue;
+            charge(work, secret.length);
+            if (text.startsWith(secret, start)) spans.push([start, start + secret.length]);
+          }
+          next = end;
         }
         at = text.indexOf(prefix, next);
       }
