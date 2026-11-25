@@ -115,13 +115,16 @@ History is what the watcher saw, not a complete record of every PR.
   tracker, the watcher observes only an issue's latest run, and only while that
   run is `completed`. For an open issue it also needs the card in Human Review
   or a stored `mr_state` of `closed`; for a closed issue it stops once the run's
-  `mr_state` is merged or closed, so a later reopen is not recorded. An MR
+  `mr_state` is merged or closed, so a PR reopen while the issue stays closed is not recorded. An MR
   outside those conditions is not observed, so its close or merge is not
   recorded (the close-edge gap below is one case of this). Repositories linked
   to an external issue tracker are watched by the board-free lane instead
   (next item).
 - **Board-free self-eviction.** Board-free runs leave the watch candidate set
-  once their `mr_state` is terminal, so they are no longer observed.
+  once their `mr_state` is terminal, so they are no longer observed. One
+  exception: on a repository linked to an external issue tracker, an issue's
+  latest run with `mr_state` `closed` stays watched while the issue is open, so
+  a PR reopen is recorded; a merged run still leaves the set.
 - **Close-edge gap.** On the opened-to-closed edge the board card move runs
   first and the record second. If the move succeeds and the record fails, that
   close can go unrecorded, as it can for `mr_state` already.
