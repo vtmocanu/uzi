@@ -231,6 +231,116 @@ func TestProviderJudgeRotationBetweenAssemblyAndFinishLiveDB(t *testing.T) {
 	}
 }
 
+// TestProviderJudgeSharedDefinitionClaimLiveDB: PRD #4322 "a shared edit or retirement preserves a
+// valid frozen judge". A recipient's queued provider judge on an admin-shared per-user-key definition
+// survives the admin editing the definition (new revision, remapped models) and then retiring it:
+// providerBindingRefusal treats a retired provider as intact (retiring stops new selections only), so
+// the claim delivers the ORIGINAL revision's profile and the RECIPIENT's own key, no vendor token,
+// and the judge is not failed. Control: a fresh judge after the retirement is refused.
+func TestProviderJudgeSharedDefinitionClaimLiveDB(t *testing.T) {
+	p := newPJFix(t)
+	plainB := "gw-key-B-" + uuid.NewString()
+	p.useShared(plainB) // the recipient (the fixture owner): shared definition selected with their own key
+	// Another recipient and the admin each hold their own sealed key on the same definition; neither
+	// may ever be the key a claim for the fixture owner's judge opens.
+	other := p.env.seedUser(t)
+	seedSealedKey(t, p.env, other, p.provider, "gw-key-OTHER-"+uuid.NewString())
+	admin := p.env.seedUser(t)
+	seedSealedKey(t, p.env, admin, p.provider, "gw-key-ADMIN-"+uuid.NewString())
+
+	judge := p.createdJudge() // binds the shared revision 1 and the recipient's key
+	if uuid.UUID(mustRun(t, p.env, judge.ID).ModelProviderKeySecretID.Bytes) != p.key {
+		t.Fatalf("judge froze key %v, want the recipient's %s", mustRun(t, p.env, judge.ID).ModelProviderKeySecretID, p.key)
+	}
+
+	// While the judge is queued the admin edits the shared definition (revision 2, still mapping the
+	// judge model, but to different upstream models) and then retires it.
+	rev, err := p.env.q.BumpSharedModelProviderRevision(p.env.ctx, p.provider)
+	if err != nil || rev != 2 {
+		t.Fatalf("bump shared = (%d, %v), want revision 2", rev, err)
+	}
+	if err := p.env.q.InsertModelProviderRevision(p.env.ctx, store.InsertModelProviderRevisionParams{
+		ProviderID: p.provider, Revision: rev, Protocol: "anthropic_messages", BaseUrl: pvBase, AuthStyle: "bearer",
+		ModelMap: []byte(`{"opus":{"model":"edited-opus"},"sonnet":{"model":"edited-sonnet"},"haiku":{"model":"edited-haiku"}}`),
+	}); err != nil {
+		t.Fatalf("insert edited revision: %v", err)
+	}
+	if n, err := p.env.q.RetireSharedModelProvider(p.env.ctx, p.provider); err != nil || n != 1 {
+		t.Fatalf("retire shared = (%d, %v)", n, err)
+	}
+
+	// Control: a fresh judge after the retirement is refused.
+	fresh := p.newTarget()
+	p.auto(fresh)
+	p.wantNoJudge(fresh, "a retired definition")
+	wantSkip(t, p.env, fresh.ID, "claude", JudgeSkipProviderSourceUnusable)
+
+	payload, err := p.svc.Claim(p.env.ctx, p.worker(), nil)
+	if err != nil || payload == nil || payload.RunID != judge.ID.String() {
+		t.Fatalf("Claim = (%+v, %v), want the frozen provider judge", payload, err)
+	}
+	b := payload.Secrets.Provider
+	if b == nil || payload.Secrets.AnthropicOAuthToken != "" || payload.Secrets.Codex != nil {
+		t.Fatalf("secrets = %+v, want only a provider binding", payload.Secrets)
+	}
+	if b.ProviderID != p.provider.String() || b.Revision != 1 || b.BaseURL != pvBase || b.Credential != plainB ||
+		b.ModelMap["opus"].Model != "corp-opus" || b.ModelMap["opus"].Model == "edited-opus" {
+		t.Fatalf("binding = %+v, want the ORIGINAL revision 1 profile and the recipient's own key", b)
+	}
+	if payload.JudgeModel == nil || !modelMapped(b.ModelMap, *payload.JudgeModel) {
+		t.Fatalf("judge model = %v, want one mapped by the frozen revision", payload.JudgeModel)
+	}
+	if got := mustRun(t, p.env, judge.ID); got.Status != "claimed" || got.FailOrigin.Valid {
+		t.Fatalf("judge status=%s origin=%v, want claimed and not failed", got.Status, got.FailOrigin)
+	}
+	p.wantNoVendor(judge)
+}
+
+// TestProviderJudgeStaleFinisherLiveDB: the exact-generation fence on a judge provider refusal. The
+// key is revoked in the assembly-to-finish window (so an un-superseded finisher fails the judge
+// terminally, see TestProviderJudgeRotationBetweenAssemblyAndFinishLiveDB), but the claim was
+// meanwhile superseded by a newer generation. The
+// stale finisher delivers nothing and settles nothing: the newer claim's row is untouched.
+func TestProviderJudgeStaleFinisherLiveDB(t *testing.T) {
+	cases := []struct{ name, set string }{
+		{"newer generation, still claimed", "claim_generation = claim_generation + 1"},
+		{"newer generation, already running", "claim_generation = claim_generation + 1, status = 'running', started_at = now()"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPJFix(t)
+			judge := p.createdJudge()
+			assembled := false
+			var newer store.Run
+			p.svc.claimHooks = &claimTestHooks{
+				afterAssembly: func(_ context.Context, run store.Run, payload *ClaimPayload, err error) {
+					if run.ID == judge.ID && err == nil && payload != nil && payload.Secrets.Provider != nil {
+						assembled = true
+					}
+					// Revoke the key AND let a newer claim supersede this one.
+					p.env.exec(`UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, p.key)
+					p.env.exec(`UPDATE runs SET `+tc.set+` WHERE id = $1`, judge.ID)
+					newer = mustRun(t, p.env, judge.ID)
+				},
+			}
+			payload, err := p.svc.Claim(p.env.ctx, p.worker(), nil)
+			if err != nil || payload != nil {
+				t.Fatalf("Claim = (%v, %v), want idle: the stale finisher delivers nothing and does not error", payload != nil, err)
+			}
+			if !assembled {
+				t.Fatal("assembly did not succeed before the revocation, so the fence was not what refused")
+			}
+			got := mustRun(t, p.env, judge.ID)
+			if got.Status != newer.Status || got.WorkerID != newer.WorkerID || got.ClaimGeneration != newer.ClaimGeneration ||
+				got.Status == "failed" || got.FailOrigin.Valid || got.FailureReason.Valid || !got.UpdatedAt.Time.Equal(newer.UpdatedAt.Time) {
+				t.Fatalf("the newer claim's row was touched: got status=%s worker=%v gen=%d origin=%v reason=%v; want status=%s worker=%v gen=%d untouched",
+					got.Status, got.WorkerID, got.ClaimGeneration, got.FailOrigin, got.FailureReason, newer.Status, newer.WorkerID, newer.ClaimGeneration)
+			}
+			p.wantNoVendor(got)
+		})
+	}
+}
+
 func TestProviderJudgeCodexBoundRefusedLiveDB(t *testing.T) {
 	p := newPJFix(t)
 	target := p.newTarget()
