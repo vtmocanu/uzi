@@ -9053,17 +9053,14 @@ export class RunRunner {
     // issue #4644: the #3644 unsupported-predecessor owner hold is nonterminal too; every exit from holdUnsupportedRestore throws,
     // and its park is sent through reportState, so a tripped guidance flush still reaches the intended park.
     if (flight.orphanRemediationHold || flight.bareIdentityHold || flight.restoreUnsupportedHold) return;
-    // issue #4628: the fresh owner hold is nonterminal too (its park goes through reportState), and so is the pre-seed window:
-    // the transfer is claimed and not yet seeded, so a `failed` report is refused by the server anyway and would only read as a lost
-    // run. The sticky flag covers a cancel already spent. Owner note for the #4655 follow-on: holdOrWallParkConfirmed is never set in
-    // the pre-seed window, so a rework that returns early on it must keep these two checks beside it.
+    // issue #4628: the fresh owner hold is nonterminal too (its park goes through reportState) and stays early here. The pre-seed
+    // window (stage pre_receipt: the transfer is claimed and not yet seeded, so a `failed` report is refused by the server anyway)
+    // sits below the #4645/#4655 confirmed-disposition return, so a confirmed hold or wall park wins over it. The policyHold
+    // check below is disjoint from a fresh claim: the fresh claim's run base excludes policy_pending_fresh and codex_policy_hold
+    // (api/internal/store/migrations/00532_run_fresh_resumes.sql) and its destination is never the run's own or released worker
+    // (api/internal/store/queries/fresh_resume.sql), while flight.policyHold comes only from this worker's own outbox
+    // (preparePolicyAdmission).
     if (flight.freshResumeHold) { flight.freshResumeTransportStopped = true; return; }
-    if (flight.freshResume?.stage === "pre_receipt") {
-      flight.freshResumeTransportStopped = true;
-      this.retainWorkerMemoryCustody(flight);
-      if (!flight.cancel.signal.aborted) flight.cancel.abort(new FreshReconcileStop());
-      return;
-    }
     if (flight.policyHold || flight.iterationParkState !== "none") return;
     if (flight.workerMemory?.hold) {
       this.retainWorkerMemoryCustody(flight);
@@ -9087,6 +9084,13 @@ export class RunRunner {
     // reportWallPark window, and a callback already entered before the flag was set.
     if (flight.holdOrWallParkConfirmed) {
       flight.runLog.warn(CONFIRMED_DISPOSITION_TRIP_LOG, { run_id: flight.runId, reason });
+      return;
+    }
+    // issue #4628: the pre-seed window, nonterminal. The sticky flag covers a cancel already spent.
+    if (flight.freshResume?.stage === "pre_receipt") {
+      flight.freshResumeTransportStopped = true;
+      this.retainWorkerMemoryCustody(flight);
+      if (!flight.cancel.signal.aborted) flight.cancel.abort(new FreshReconcileStop());
       return;
     }
     if (flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
@@ -31952,6 +31956,7 @@ export class RunRunner {
         isLive: attemptSeed.isLive, beforeSeed: attemptSeed.beforeSeed, ...(attemptSeed.onSeeded ? { onSeeded: attemptSeed.onSeeded } : {}),
         guard: () => this.retainedLifecycleGuard(flight), signal: lifecycle, deadlineMs: RESTORE_SEED_DEADLINE_MS, outcome,
         seedScope: fn => this.inFlightAuthority(flight, fn, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)),
+        awaitExclusion: refusal => this.awaitInventoryExclusionSettled(flight, refusal),
       });
     } catch (error) {
       // `abandoned` only after the server closed the transfer: otherwise it stays `pre_receipt` and dispatchFailure abandons again.

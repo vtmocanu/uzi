@@ -27,6 +27,7 @@ import type { Logger } from "./log.js";
 import type { StateAck } from "./protocol.js";
 import { mintAttemptId } from "./run-quiescence.js";
 import type { FreshJournal } from "./fresh-journal.js";
+import { InventorySourceExclusionRefusal } from "./inventory-exclusion.js";
 
 export const FRESH_RESUME_CAPABILITY = "fresh_resume_v1";
 
@@ -182,6 +183,8 @@ export interface FreshSeedParams {
   seedScope?: <T>(fn: () => Promise<T>) => Promise<T>;
   /** Called between steps: it throws for a shutdown, a cancel or a lost claim, which then abandon the transfer. */
   guard?: () => void;
+  /** Waits (outside the bare lock) for a retained inventory exclusion to settle; the seed is retried once after it returns. */
+  awaitExclusion?: (refusal: InventorySourceExclusionRefusal) => Promise<void>;
   signal?: AbortSignal;
   deadlineMs?: number;
   /** Receives whether the abandon was answered as closed (see {@link FreshAbandonOutcome}). */
@@ -220,7 +223,16 @@ export async function seedFresh(deps: FreshDeps, p: FreshSeedParams): Promise<Fr
       isLive: p.isLive, beforeSeed: p.beforeSeed, ...(p.onSeeded ? { onSeeded: p.onSeeded } : {}),
       ...(p.signal ? { signal: p.signal } : {}), ...(p.deadlineMs !== undefined ? { deadlineMs: p.deadlineMs } : {}),
     });
-    seeded = await (p.seedScope ? p.seedScope(seed) : seed());
+    const scoped = (): Promise<RunnerClone> => (p.seedScope ? p.seedScope(seed) : seed());
+    try {
+      seeded = await scoped();
+    } catch (first) {
+      // issue #4643: one wait outside the bare lock for a retained inventory exclusion, then one retry. The evidence is not provided again.
+      if (!(first instanceof InventorySourceExclusionRefusal) || p.awaitExclusion === undefined) throw first;
+      try { await p.awaitExclusion(first); } catch (error) { guardFailure = { error }; throw error; }
+      guard();
+      seeded = await scoped();
+    }
     guard();
     const receipt = await deps.client.reportFreshResumeSeeded(p.runId, fr.id,
       { claim_generation: generation, attempt_id: attemptId, live_generation: generation }, p.signal);
@@ -242,6 +254,7 @@ export async function seedFresh(deps: FreshDeps, p: FreshSeedParams): Promise<Fr
 function errorReason(error: unknown): string {
   if (error instanceof FreshConfigLockedError) return "config_locked";
   if (error instanceof FreshSeedError) return error.reason;
+  if (error instanceof InventorySourceExclusionRefusal) return "inventory_source_exclusion";
   const refusal = freshResumeRefusalReason(error);
   if (refusal !== undefined) return refusal;
   if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return "aborted";

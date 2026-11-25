@@ -19491,6 +19491,9 @@ export class GitCache {
       const refSha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${artifact.artifactRef}^{commit}`])).trim();
       if (refSha !== artifact.artifactSha) return refuse("artifact_ref_mismatch");
 
+      step = "exclusion";
+      // issue #4643: a retained inventory proof's work may still be in scope of this key; refuse before any write (L0/L1).
+      await this.refuseExcludedKey(barePath, branch, canonical, input.isLive, "full");
       // Read-only, for both artifact kinds: nothing is written while a deletion on this bare is still unresolved.
       step = "bare_clear";
       await this.assertBareClear(barePath, "seed-attempt").catch((err: unknown) => refuse("bare_not_clear", err));
@@ -19527,7 +19530,7 @@ export class GitCache {
     } catch (err) {
       // A stays `fresh_pending` here: it becomes `fresh_unbound` only once the server has answered the caller's abandon as closed
       // (see seedFresh), or discovery reads a refused or cancelled transfer that was never seeded.
-      if (err instanceof FreshSeedError || err instanceof FreshConfigLockedError) throw err;
+      if (err instanceof FreshSeedError || err instanceof FreshConfigLockedError || err instanceof InventorySourceExclusionRefusal) throw err;
       const message = err instanceof Error ? err.message : "";
       throw new FreshSeedError(/deadline/i.test(message) ? "git_deadline" : "seed_failed", step, err);
     }

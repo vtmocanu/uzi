@@ -9,6 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { FreshConfigLockedError, FreshSeedError, GitCache, freshLocalState, parseAttemptLedgerEntry, type FreshSeedArtifact } from "../src/git.js";
+import { InventorySourceExclusionRefusal } from "../src/inventory-exclusion.js";
 import { FreshNoAuthority, commitFreshReceipt } from "../src/fresh-resume.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
 import { freshJournalKey, parseFreshJournal } from "../src/fresh-journal.js";
@@ -173,6 +174,52 @@ describe("fresh resume seed: L0 to L2 and the receipt commit (L4)", () => {
     // The caller's closed abandon is what moves it.
     assert.equal(await cache.markFreshUnbound(input), true);
     assert.equal(parseAttemptLedgerEntry(ledger().at(-1)!)?.state, "fresh_unbound");
+  });
+});
+
+describe("fresh resume seed: a retained inventory exclusion on the key (issue #4643)", () => {
+  let verdict: "clear" | "not_clear";
+  const canonical = (): string => cache.runnerClonePath(bare, KEY);
+
+  /** A section that started git and found the clone quiescent, with a probe that does not clear, leaves an exclusion entry. */
+  async function installExclusion(): Promise<void> {
+    verdict = "not_clear";
+    cache.setInventoryExclusionProbe(async () => verdict);
+    const r = await cache.withInventorySourceLock(bare, { clonePath: canonical(), branch: BRANCH, isLive: () => false }, async s => {
+      s.markGitStarted();
+      await s.stage(async () => 1);
+      s.afterScanQuiescent(true);
+    });
+    assert.equal(r.kind, "ran");
+    assert.equal(r.kind === "ran" && r.entryKept, true, "the fixture really left an exclusion entry");
+  }
+
+  it("refuses typed before any write: no clone path, journal, ledger entry or ref", async () => {
+    const sha = commitOn("work", mainTip(), { "a.txt": "a\n" }, "work a");
+    await cache.ensureClone(fx.originPath);
+    const { frid, artifact: art } = artifact("capture", sha);
+    await installExclusion();
+    const input = seedInput(frid, art);
+    const refsBefore = sh(bare, ["for-each-ref"]);
+    const configBefore = sh(bare, ["config", "--local", "--list"]);
+    await assert.rejects(cache.seedFreshAttempt(input), (err: unknown) =>
+      err instanceof InventorySourceExclusionRefusal && !(err instanceof FreshSeedError) && err.reason === "excluded");
+    assert.equal(fs.existsSync(`${canonical()}.attempt-${input.attemptId}`), false, "A's attempt clone path is absent");
+    assert.equal(configValue(freshJournalKey(BRANCH)), undefined, "no L0 journal");
+    assert.deepEqual(ledger(), [], "no L1 ledger entry");
+    assert.equal(sh(bare, ["for-each-ref"]), refsBefore, "no ref was created or moved in the bare");
+    assert.equal(sh(bare, ["config", "--local", "--list"]), configBefore, "no config key was written");
+  });
+
+  it("positive control: the same setup with a clearing probe seeds", async () => {
+    const sha = commitOn("work", mainTip(), { "a.txt": "a\n" }, "work a");
+    await cache.ensureClone(fx.originPath);
+    const { frid, artifact: art } = artifact("capture", sha);
+    await installExclusion();
+    verdict = "clear";
+    const seeded = await cache.seedFreshAttempt(seedInput(frid, art));
+    assert.equal(seeded.seededFrom, "fresh_resume");
+    assert.equal(parseAttemptLedgerEntry(ledger().at(-1)!)?.state, "fresh_pending");
   });
 });
 

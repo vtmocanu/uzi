@@ -5,6 +5,8 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
+import { InventorySourceExclusionRefusal } from "../src/inventory-exclusion.js";
+import { CONFIRMED_DISPOSITION_TRIP_LOG, RetainedRecoveryStop } from "../src/runner.js";
 import { parseAttemptLedgerEntry } from "../src/git.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import { quiesceRunAttempt, setQuiescenceViewForTests, type QuiesceRunOutcome, type QuiesceRunRequest } from "../src/run-quiescence.js";
@@ -225,6 +227,47 @@ describe("a fresh resume claim on the destination flight", () => {
     } finally { mock.restoreAll(); }
   });
 
+  it("a retained inventory exclusion twice: one wait, two seed attempts, one abandon, a nonterminal stop and no failed report (issue #4643)", async () => {
+    const sha = publishCheckpoint();
+    const { frid, claim } = freshClaimFor(8110, sha);
+    const refusal = (): InventorySourceExclusionRefusal => new InventorySourceExclusionRefusal(bare(), "key", undefined, "excluded");
+    const seeds = mock.method(git, "seedFreshAttempt", async () => { throw refusal(); });
+    const waits = mock.method(git, "inventoryExclusionSettled", async () => {});
+    try {
+      const { factory, started } = factoryFor(() => {});
+      await run(factory).execute(claim);
+      assert.equal(seeds.mock.callCount(), 2, "exactly two seed attempts");
+      assert.equal(waits.mock.callCount(), 1, "exactly one wait between them");
+      assert.equal(started(), 0);
+      const abandons = api.freshResumeCalls.filter(c => c.route === "abandon");
+      assert.equal(abandons.length, 1, "exactly one abandon");
+      assert.equal(abandons[0]!.frid, frid);
+      assert.equal(reported(claim.run_id).includes("failed"), false, "a nonterminal stop, never failed");
+      assert.ok(api.messages(claim.run_id).some(m => JSON.stringify(m.payload).includes("inventory_source_exclusion")), "the feed names the reason and says the run stays held");
+    } finally { mock.restoreAll(); }
+  });
+
+  it("a retained inventory exclusion once, then clear: the retry seeds and nothing is abandoned (issue #4643)", async () => {
+    const sha = publishCheckpoint();
+    const { claim } = freshClaimFor(8111, sha);
+    const real = git.seedFreshAttempt.bind(git);
+    let calls = 0;
+    const seeds = mock.method(git, "seedFreshAttempt", async (...args: Parameters<typeof real>) => {
+      if (++calls === 1) throw new InventorySourceExclusionRefusal(bare(), "key", undefined, "excluded");
+      return real(...args);
+    });
+    const waits = mock.method(git, "inventoryExclusionSettled", async () => {});
+    try {
+      const { factory, started } = factoryFor(() => {});
+      await run(factory).execute(claim);
+      assert.equal(seeds.mock.callCount(), 2);
+      assert.equal(waits.mock.callCount(), 1);
+      assert.equal(started(), 1, "the retry seeded and the model started");
+      assert.equal(api.freshResumeCalls.some(c => c.route === "abandon"), false);
+      assert.equal(api.freshResumeCalls.filter(c => c.route === "seeded").length, 1);
+    } finally { mock.restoreAll(); }
+  });
+
   it("an abandon the server did not accept leaves the seeded attempt fresh_pending, never fresh_unbound", async () => {
     const sha = publishCheckpoint();
     api.freshResume = { seededRefusal: "fresh_resume_attempt_mismatch", abandonStatus: 500 };
@@ -236,5 +279,43 @@ describe("a fresh resume claim on the destination flight", () => {
     assert.equal(api.freshResumeCalls.some(c => c.route === "abandon"), true);
     assert.equal(parseAttemptLedgerEntry(config(`uzi-attempts.${branch}.entry`).at(-1)!)?.state, "fresh_pending");
     assert.equal(reported(claim.run_id).includes("failed"), false);
+  });
+});
+
+describe("handlePermanentFailure in the fresh pre-seed window versus a confirmed disposition (issue #4628, #4645)", () => {
+  function drive(over: { confirmed: boolean }) {
+    const warns: string[] = [];
+    const flight = {
+      runId: "run-pf", claimGeneration: 1, holdOrWallParkConfirmed: over.confirmed, policyHold: false, iterationParkState: "none",
+      freshResume: { stage: "pre_receipt" }, cancel: new AbortController(),
+      runLog: { warn: (msg: string) => { warns.push(msg); }, info: () => {}, error: () => {} },
+    } as Record<string, unknown> & { cancel: AbortController };
+    const runner = run(factoryFor(() => {}).factory);
+    const terminal = mock.method(runner as unknown as { journalAndSendTerminal(): Promise<void> }, "journalAndSendTerminal", async () => {});
+    const call = (): Promise<void> => (runner as unknown as { handlePermanentFailure(c: unknown, f: unknown, r: string): Promise<void> })
+      .handlePermanentFailure({}, flight, "permanent");
+    return { flight, warns, terminal, call };
+  }
+
+  it("a confirmed hold or wall park wins: logged, no abort, no custody, no transport flag, no terminal, no abandon", async () => {
+    const { flight, warns, terminal, call } = drive({ confirmed: true });
+    await call();
+    assert.ok(warns.includes(CONFIRMED_DISPOSITION_TRIP_LOG), "the keeping-the-disposition warning was logged");
+    assert.equal(flight.cancel.signal.aborted, false);
+    assert.equal(flight.freshResumeTransportStopped, undefined);
+    for (const k of ["preserveRecoveryClone", "preserveSession", "retainedLocalCustody", "keepGuardedInventoryOpen"]) assert.equal(flight[k], undefined, k);
+    assert.equal(terminal.mock.callCount(), 0, "no failed terminal installed");
+    assert.equal(api.freshResumeCalls.some(c => c.route === "abandon"), false);
+  });
+
+  it("control: without the confirmed flag the pre-seed window still stops nonterminally (sticky flag, custody, abort)", async () => {
+    const { flight, warns, terminal, call } = drive({ confirmed: false });
+    await call();
+    assert.equal(warns.includes(CONFIRMED_DISPOSITION_TRIP_LOG), false);
+    assert.equal(flight.freshResumeTransportStopped, true);
+    assert.equal(flight.retainedLocalCustody, true);
+    assert.equal(flight.cancel.signal.aborted, true);
+    assert.ok(flight.cancel.signal.reason instanceof RetainedRecoveryStop);
+    assert.equal(terminal.mock.callCount(), 0);
   });
 });
