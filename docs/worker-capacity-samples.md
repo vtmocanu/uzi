@@ -71,22 +71,30 @@ contain that owner's workers fail, and workers later in id order are gaps for
 those ticks. A failed batch can be retried in the same bucket without
 duplicating samples.
 
-## Retention
+## No age-based expiry
 
-There is no age-based expiry. Samples are kept until their owner is deleted,
+No sample is deleted by age. Samples are kept until their owner is deleted,
 which removes them (cascade). Deleting a worker, including an ephemeral worker
 when its run ends, keeps its samples. A configurable, off-by-default deletion
-mechanism is a later issue (#4693).
+mechanism for analytics history is left to a later issue.
 
 ## Growth
 
+Measured on PostgreSQL 17.12 with a synthetic workload (5,000 workers, 3
+slot-holding runs each, about 10 million sample rows). An always-on worker
+writes 288 samples a day, 105,120 a year.
+
 | Quantity | Value |
 |---|---|
-| Bytes per row (table plus indexes) | TBD-MEASURED |
-| Rows per worker-year (105,120) | TBD-MEASURED |
-| 50 workers, per year | TBD-MEASURED |
-| 500 workers, per year | TBD-MEASURED |
-| Owner-delete cost | TBD-MEASURED |
+| Bytes per row (table plus indexes) | about 218 (134 table, 84 indexes) |
+| One always-on worker, per year | about 22 MiB |
+| 50 workers, per year | about 1.1 GiB |
+| 500 workers, per year | about 10.7 GiB |
+| Write-ahead log per 1,000-sample batch | about 0.4 MB (steady state) |
+| Deleting an owner with one worker-year of samples | about 0.13 s and 20 MB of write-ahead log; it grows linearly with the owner's history and runs in one transaction |
+
+A sweeper pass took about 40 ms once every worker was sampled for the bucket,
+and at most about 170 ms while sampling 4,000 workers.
 
 ## How the pass runs
 
