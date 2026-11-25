@@ -27,9 +27,10 @@ Several Codex aliases linked to one provider account share one gauge row and one
 bucket. The Anthropic exhaustion marks written by workers when a run hits a limit
 (`limit_report`) write no history, and neither does any other gauge write.
 
-Each row holds the accepted reading's timestamp, the credential revision it was read under, and
-only numbers, flags, window lengths and reset times. Raw provider bodies, credentials and
-signatures are never copied.
+Each row holds the accepted reading's timestamp, the revision it was read under (the token's
+enablement revision, or the Codex account's generation and credential revision), the Anthropic
+source label or the Codex bucket ids, and otherwise only numbers, flags, window lengths and reset
+times. Raw provider bodies, credentials and signatures are never copied.
 
 ## Five-minute buckets and gaps
 
@@ -44,8 +45,10 @@ A missing bucket means no accepted copy, never zero use. Gaps come from:
 - cadence drift: the default poll interval equals the bucket width (five minutes), so a poll
   that lands a little late can leave one bucket empty and fill the next without any failure.
   Treat the row counts below as an upper bound;
-- vault operations that hold the owner's `users` row lock. The copy's foreign key check waits on
-  that lock, so while one is running the copy can hit its 250 ms deadline and leave a gap.
+- operations that hold the owner's `users` row `FOR UPDATE` (vault operations, account reset,
+  CLI login). The copy's foreign key check waits on that lock, so while one is running the copy
+  can hit its 250 ms deadline and leave a gap. Ordinary updates of the `users` row do not block
+  it.
 
 ## What a copy checks
 
@@ -54,7 +57,8 @@ insert, and inserts nothing (a gap) unless all of these still hold:
 
 - The gauge row is exactly the reading the caller wrote: same owner and credential, same
   timestamp, source and values. A later accepted poll, or a worker exhaustion mark (which keeps the
-  timestamp but changes the source and percentage), therefore never becomes a sample.
+  timestamp but changes the source and percentage), therefore never gets copied in place of this
+  reading.
 - The credential is still enabled at the same enablement revision. For Codex the provider
   account must still be at the same generation and credential revision with an enabled linked
   alias, and the last poll attempt must still be that success (a later recorded failure skips
@@ -79,27 +83,38 @@ the policy is skipped whole, never truncated:
 
 Because of the 4 KiB bound, near-maximum readings are gaps. Measured: with 17 buckets, ids longer
 than about 78 to 86 bytes (depending on the window values) project to more than 4 KiB and are
-skipped; the normalizer's maximum (17 buckets, 99-byte ids, both windows) is always skipped.
+skipped; the normalizer's maximum (17 buckets, 99-byte ids, both windows) is skipped with
+realistic reset timestamps. With very small window and reset values the boundary moves above
+99 bytes, so such a reading is kept.
 
 When a window reports only a relative reset (`reset_after_seconds`), the stored reset is the
 success time plus that offset, flagged approximate (`rd` true in the projection).
 
 ## Retention and removal
 
-There is no age-based expiry and no sweeper: history is kept until the owner is deleted, which
-cascades both tables away. Deleting or rotating a credential keeps its history, because the
-identity column has no foreign key. Measured on one identity with a year of rows (105,120),
-deleting the owner as one statement took 0.14 s (Anthropic), 0.27 s (typical Codex) and 0.80 s
-(max Codex) right after a checkpoint, writing 21 to 213 MB of WAL (mostly full-page images), and
-about 0.1 to 0.25 s with about 6 MB of WAL otherwise.
+There is no age-based expiry and no sweeper: history is kept until the owner's `users` row is
+deleted, which cascades both tables away. uzi itself never deletes a `users` row (an admin can
+only deactivate a user, which keeps the history), so in practice the history is kept until an
+operator deletes that row by hand. Deleting or rotating a credential keeps its history, because
+the identity column has no foreign key.
+
+Deleting an owner removes all their history in one transaction. Measured on one identity with a
+year of rows (105,120) on a warm cache: 0.14 s (Anthropic), 0.27 s (typical Codex) and 0.80 s
+(max Codex), writing 21 to 213 MB of WAL. That is the realistic case, because pages of old
+history have been checkpointed since they last changed, so each one is written as a full page
+image. Only when the pages changed since the last checkpoint does it drop to about 6 MB of WAL.
+The cost grows linearly with identities and years, and leaves dead rows for autovacuum.
 
 Rolling the migration back (the Down section of `00536_provider_usage_samples.sql`) drops both
-tables and their history. Take a database backup first; it is the only recovery.
+tables and their history. Take a database backup first; it is the only recovery. Each
+`DROP TABLE` also takes an `ACCESS EXCLUSIVE` lock on `users` (to drop the foreign-key
+triggers), and the Down section sets no lock timeout, so a rollback can wait behind a long reader
+of `users` and block every query on it meanwhile. Run it when the database is quiet.
 
 ## Growth
 
-Measured on PostgreSQL 17 (heap plus primary-key index, as grown; one run each on a shared
-host, so indications). A full-cadence identity writes at most 105,120 rows a year, so these are
+Measured on PostgreSQL 17 (heap plus primary-key index, as grown; one or a few runs each on a
+shared host, so indications). A full-cadence identity writes at most 105,120 rows a year, so these are
 upper bounds:
 
 | Profile | Bytes per row | 1 identity / year | 10 identities | 100 identities |
@@ -109,16 +124,26 @@ upper bounds:
 | Codex account, largest admissible (17 buckets) | 2,128 | 224 MB | 2.24 GB | 22.4 GB |
 
 Bytes per row are as grown through the real copy path with many identities interleaved; a single
-identity loaded in time order packs a little tighter (201, 645 and 2,108 B). No row needed TOAST.
-The table has one index (the primary key), about 70 to 75% full as grown (90% when loaded in
-time order). WAL per copy is about 550 to 600 B (Anthropic), 850 to 900 B (typical Codex) and
-2.3 to 2.4 KB (max Codex) on average, including occasional full-page images; a same-bucket no-op
-writes none.
+identity loaded in time order packs a little tighter (about 200, 644 and 2,107 B). No value was
+stored out of line; the largest Codex projections are compressed inline (a 4,080-byte projection
+took 1,853 B), so their real size depends on how compressible the data is, and a less
+compressible admissible reading can take more than the largest row measured here.
+The table has one index (the primary key), about 68 to 76% full as grown (90% when loaded in
+time order).
+
+WAL per copy depends on checkpoints. In a burst of copies across thousands of identities it
+averaged 570 to 617 B (Anthropic), 873 to 902 B (typical Codex) and 2.3 to 2.4 KB (max Codex). At
+production cadence, though, each identity copies once per five minutes, the same as the default
+checkpoint interval, so most copies are the first change to their index page since the last
+checkpoint and carry a full page image. A dedicated experiment measured about 6.4 to 6.9 KB of
+WAL per copy that way (with `full_page_writes` on and `wal_compression` off), against about
+400 B without an intervening checkpoint. Size WAL archiving and backups for the higher figure:
+about 200 MB of WAL a day for 100 identities. A same-bucket no-op writes none.
 
 ## Copy cost
 
 - One extra statement per accepted reading: about 0.7 ms (Anthropic) and 0.9 ms (Codex) at p50
-  and 2 to 4 ms at p99 on an idle database, roughly doubling the database time of the gauge
+  and about 2 to 4 ms at p99 on an idle database, roughly doubling the database time of the gauge
   write, against a poll dominated by the outbound provider call. A same-bucket no-op costs about
   0.2 to 0.4 ms.
 - Each copy runs under a 250 ms deadline that covers pool acquisition and execution. On the test
@@ -126,14 +151,20 @@ writes none.
   response, without changing it.
 - A timed-out copy may still have committed: the statement can finish on the server near the
   deadline, or after the client gave up. A deadline error does not prove there is no row.
-- Under heavy lock contention (many owners' `users` rows locked at once) every timed-out copy
-  makes the pool discard its connection, so the pool opens a replacement for each. Measured with
-  100 concurrent copies on a 20-connection pool, 4,000 copies per pass: with no lock contention,
-  none of 8,000 copies per provider timed out (4,000 inserts, then 4,000 same-bucket no-ops).
-  With 5% of owners locked, all 200 blocked copies timed out, 3,800 inserted, and the pool opened
-  about 185 new connections. With half locked, about 1,800 inserted, the 2,000 blocked copies
-  and about 170 to 200 unblocked ones (queued for a connection) timed out, the pool opened about
-  1,900 new connections, and 20 to 38 of those unblocked timed-out copies had in fact committed.
+- The copy runs on the API's main connection pool (20 connections by default), so a blocked
+  copy holds a shared connection for up to 250 ms and the queueing below affects every API
+  request, not only copies.
+- A copy that times out while holding a connection makes the pool discard that connection and
+  send a cancel request (a second connection to the server), and the pool opens a replacement.
+  A copy that times out while still waiting for a connection discards nothing.
+- Measured with 100 concurrent copies on a 20-connection pool, 4,000 copies per pass:
+  - with no lock contention, none of 8,000 copies per provider timed out (4,000 inserts, then
+    4,000 same-bucket no-ops), though the p99 reached about 110 ms in one run;
+  - with 5% of owners locked, all 200 blocked copies timed out, 3,800 inserted, and the pool
+    opened about 185 new connections; on a second pass, 8 to 76 unblocked copies also timed out;
+  - with half locked, about 1,800 inserted, the 2,000 blocked copies and about 170 to 200
+    unblocked ones timed out, and the pool opened about 1,900 new connections. 20 to 38 of those
+    unblocked timed-out copies, and one blocked one, had in fact committed.
 - A failed, skipped or timed-out copy logs a fixed warning with a category (`timeout`, `error`
-  or `skipped`) and the row id, never the error text, and never changes the gauge, the
+  or `skipped`) and the token or provider account id, never the error text, and never changes the gauge, the
   notifications or the poll's backoff.
