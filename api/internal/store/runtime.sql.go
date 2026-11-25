@@ -13811,8 +13811,9 @@ type ListGaveUpColumnMovesRow struct {
 	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
 }
 
-// Runs whose pending marker crossed the 30-minute give-up boundary during the
-// last reconcile interval, for a one-shot warn log. The marker is deliberately
+// Runs whose pending marker crossed a threshold (30m pending, 24h give-up) within
+// the caller's cursor window, for a one-shot warn log; healthsvc's board.drift
+// also reads it with band cutoffs. The marker is deliberately
 // NOT cleared (a silent clear would hide the drift behind a correct-looking
 // badge); the next transition or manual drag clears it.
 func (q *Queries) ListGaveUpColumnMoves(ctx context.Context, arg ListGaveUpColumnMovesParams) ([]ListGaveUpColumnMovesRow, error) {
@@ -14230,9 +14231,10 @@ type ListPendingColumnMovesParams struct {
 // #1482), so a judge/chat/ci_fix/prompt/task run never enters this loop or the
 // give-up warning below, whose "manual heal" cannot exist for a card-less run.
 // Reconcile-loop candidates: runs with a pending column move that is older than a
-// short grace (so the inline move is not raced) and still inside the 30-minute
-// retry window (older markers have been given up on and are deliberately left
-// set). Only the id is returned — the loop re-reads each run's full context
+// short grace (so the inline move is not raced) and younger than the given
+// giveup_cutoff. The reconcile loop calls it twice: the fast lane (grace, 30m
+// window) every tick and the slow lane (30m..24h) at most every 10 minutes;
+// markers older than 24h are given up and deliberately left set. Only the id is returned — the loop re-reads each run's full context
 // (GetRunMoveContext) immediately before the write to narrow the clobber window
 // against a concurrent manual drag.
 func (q *Queries) ListPendingColumnMoves(ctx context.Context, arg ListPendingColumnMovesParams) ([]uuid.UUID, error) {
