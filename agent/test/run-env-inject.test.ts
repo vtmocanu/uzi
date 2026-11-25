@@ -1,8 +1,9 @@
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "../src/sdk-env.js";
+import { buildSdkEnv, REASON_RUN_ENV_NEEDS_SPLIT, sdkRunEnvInjected, type SdkCredential } from "../src/sdk-env.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { buildCommandEnv, commandRunEnvInjected, withCommandGitTrust } from "../src/codex/codex-executor.js";
 import { foldRunEnv, runEnvDropText, runEnvInjectedSet } from "../src/run-env-inject.js";
 import { runEnvClaimForms } from "../src/run-env-forms.js";
@@ -60,6 +61,28 @@ function assertOnlyAllowedAdded(
     if (!Object.hasOwn(baseline, name)) assert.ok(!Object.hasOwn(withVars, name), `${name} injected`);
   }
 }
+
+// These tests model the protected two-uid lead lane, the only posture on which buildSdkEnv delivers
+// run variables (sdk-env.ts assertRunEnvDeliverable). The single-uid refusal is pinned below and in
+// sdk-env.test.ts.
+let savedSplit: string | undefined;
+before(() => { savedSplit = process.env.UZI_UID_SPLIT; process.env.UZI_UID_SPLIT = "1"; });
+after(() => {
+  if (savedSplit === undefined) delete process.env.UZI_UID_SPLIT;
+  else process.env.UZI_UID_SPLIT = savedSplit;
+});
+
+describe("buildSdkEnv on a single-uid worker", () => {
+  it("refuses run variables and still builds an env without them", () => {
+    const cred: SdkCredential = { kind: "oauth", token: "dummy-oauth-token-do-not-scan-0000" };
+    delete process.env.UZI_UID_SPLIT;
+    try {
+      assert.throws(() => buildSdkEnv(cred, "/h", {}, undefined, undefined, undefined, undefined, { vars: [v("NPM_TOKEN")] }),
+        (err: unknown) => err instanceof TrustedExecutionRefusal && err.message === REASON_RUN_ENV_NEEDS_SPLIT);
+      assert.ok(!Object.hasOwn(buildSdkEnv(cred, "/h", {}, undefined, undefined, undefined, undefined, { vars: [] }), "NPM_TOKEN"));
+    } finally { process.env.UZI_UID_SPLIT = "1"; }
+  });
+});
 
 describe("buildSdkEnv with run variables", () => {
   const creds: Array<[string, SdkCredential]> = [
