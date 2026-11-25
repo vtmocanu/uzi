@@ -93,6 +93,9 @@ export const LEDGER_READER_TABLE: readonly LedgerReaderRow[] = [
     note: "moves only a fresh_pending entry of this run to fresh_unbound; any other state is left as it is" },
   { caller: "src/git.ts#commitFreshReceipt", role: "reader", disposition: "identity_only",
     note: "the receipt commit's own precondition: A's last value is this run's fresh_pending at this path (or already committed)" },
+  { caller: "src/git.ts#clearExclusion", role: "reader", disposition: "occupies",
+    note: "issue #4632's same-key exclusion clear reads the ledger only to list the probe's target paths (nonLiveKeyPaths / " +
+      "restoreSeedSweepPaths): a fresh entry's present path is probed like any other, and nothing is adopted, freed or compacted" },
   // ---- consumers of a ledger state ------------------------------------------------------------------------------------------
   { caller: "src/git.ts#nonLiveKeyPaths", role: "consumer", disposition: "occupies",
     note: "the seed-time sweep names the path of a non-live entry for a process scan only; nothing is deleted or adopted" },
