@@ -103,7 +103,7 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   `--active-jobs N` and a conservative incremental peak, including companion workflows,
   with `--peak-jobs N`. Treat the result as an estimate against the 20-job cap. Include
   pending demand when planning the push wave. A missing proof stays unknown.
-- **CI slots**: let the lane owner grant at most two concurrent PR CI runs alongside
+- **CI slots**: let the lane owner (tower) grant at most two concurrent PR CI runs alongside
   main CI. Size grants in jobs using the readiness report, including queued demand and
   companion workflows. A push without a slot is allowed. Identify the CI and KinD Smoke
   runs created for its exact head. For a queued run, use
@@ -119,7 +119,7 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   --main-ci-gate`. The flag refuses detected migration and trust markers or known red
   checks. All other guards run. Gate the batch on main CI and retain exact-tip release
   coverage.
-- **Batch grant**: have the lane owner authorize the ordered PR and full-SHA list for a
+- **Batch grant**: have the lane owner (tower) authorize the ordered PR and full-SHA list for a
   bounded window. Run `merge.sh` per PR and report each merge SHA. Return to the owner if
   a head or the order changes, a hold arrives, or the grant expires. The report alone
   grants no merge authority.
