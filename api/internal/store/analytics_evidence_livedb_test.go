@@ -41,8 +41,8 @@ import (
 //	UZI_EVIDENCE_KEEP=1     leave the seed in place (default: TRUNCATE at the end)
 //	UZI_EVIDENCE_RESEED=0   reuse an existing seed (skips the TRUNCATE and the seed)
 //	UZI_EVIDENCE_BASELINE=0 skip the baseline phase
-//	UZI_EVIDENCE_INDEXES=   comma list of candidate numbers 1-4 (default 1,2,3,4; "" or "0" none)
-//	UZI_EVIDENCE_ONLY=      comma list of workload-name substrings
+//	UZI_EVIDENCE_INDEXES=   comma list of candidate numbers 1-5 (default 1,2,3,4; "" or "0" none)
+//	UZI_EVIDENCE_ONLY=      comma list of workload-name substrings (cap- selects the #4731 capacity workloads)
 //	UZI_EVIDENCE_RUNS=20    measured executions per workload and mode
 //	UZI_EVIDENCE_MODES=     custom,generic (timing modes for the baseline)
 
@@ -288,6 +288,8 @@ var evIndexes = []struct{ name, ddl string }{
 	{"evid_runs_repo_mr_idx", `CREATE INDEX evid_runs_repo_mr_idx ON runs (repo_id, mr_iid) WHERE mr_iid IS NOT NULL`},
 	{"evid_runs_repo_mr_merged_idx", `CREATE INDEX evid_runs_repo_mr_merged_idx ON runs (repo_id, mr_iid) WHERE mr_state = 'merged'`},
 	{"evid_runs_user_repo_mr_merged_idx", `CREATE INDEX evid_runs_user_repo_mr_merged_idx ON runs (user_id, repo_id, mr_iid) WHERE mr_state = 'merged'`},
+	// #4731 candidate: the terminal-end arm of the admin all-users Capacity statement (no user prefix).
+	{"evid_runs_terminal_end_idx", `CREATE INDEX evid_runs_terminal_end_idx ON runs ((COALESCE(finished_at, status_since))) WHERE status IN ('completed', 'failed', 'cancelled')`},
 }
 
 func (h *evHarness) seed() {
@@ -297,6 +299,7 @@ func (h *evHarness) seed() {
 		for _, s := range evSeed {
 			h.simple(s)
 		}
+		h.seedCapacity()
 		h.logf("seed took %s", time.Since(start).Round(time.Second))
 	}
 	var nRuns, nUsage, nRepos, nUsers, nRunRepos int64
@@ -323,6 +326,7 @@ func (h *evHarness) seed() {
 	h.logf("%s", h.shape(`SELECT 'usage legs/run (with usage)', round(count(*)::numeric / count(DISTINCT run_id), 2) FROM run_usage`))
 	h.logf("%s", h.shape(`SELECT 'runs without usage (non-chat)', count(*) FROM runs r WHERE kind <> 'chat' AND NOT EXISTS (SELECT 1 FROM run_usage u WHERE u.run_id = r.id)`))
 	h.logf("%s", h.shape(`SELECT 'session_cumulative legs', count(*) FROM run_usage WHERE usage_basis = 'session_cumulative'`))
+	h.logCapacityShape()
 }
 
 func (h *evHarness) shape(sql string) string {
@@ -496,6 +500,7 @@ func (h *evHarness) workloads() []evWorkload {
 			evSpendOpts{harness: "claude", kinds: []string{runkind.Issue}, revealRepos: true}),
 	}
 	all = append(all, h.optionWorkloads()...)
+	all = append(all, h.capacityWorkloads()...)
 	only := os.Getenv("UZI_EVIDENCE_ONLY")
 	if only == "" {
 		return all
