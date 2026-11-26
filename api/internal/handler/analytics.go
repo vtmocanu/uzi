@@ -26,15 +26,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4684: the scoped usage analytics API.
+// Issue #4684: the scoped usage analytics API (Flow added by issue #4729).
 //
-//	GET /api/analytics/{options,spend}        the caller's own runs (requireUser)
-//	GET /api/admin/analytics/{options,spend}  admin read group (RequireAdminRO)
+//	GET /api/analytics/{options,spend,flow}        the caller's own runs (requireUser)
+//	GET /api/admin/analytics/{options,spend,flow}  admin read group (RequireAdminRO)
 //
 // Request order: (1) syntax validation with no database access, (2) single-flight admission
 // that never blocks, (3) one REPEATABLE READ READ ONLY snapshot holding the timezone check,
-// the selected-user and repo authority checks and, for spend only, the history-start read and
-// the statement; options reads no history start.
+// the selected-user and repo authority checks and, for spend and flow only, the history-start
+// read and the statement; options reads no history start.
 
 const (
 	analyticsRouteOwner = "owner"
@@ -221,9 +221,9 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	}
 
 	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
-	// per-run totals for finished runs. Options still accepts and ignores window, so the
-	// check is spend-only.
-	if section == analytics.SectionSpend && !slices.Contains(req.windowChoices(), string(req.window)) {
+	// per-run totals for finished runs, and Flow follows the same rule (issue #4729). Options
+	// still accepts and ignores window, so the check covers spend and flow only.
+	if (section == analytics.SectionSpend || section == analytics.SectionFlow) && !slices.Contains(req.windowChoices(), string(req.window)) {
 		return req, msgAnalyticsWindowAllAllUsers
 	}
 
@@ -303,6 +303,16 @@ func (h *Handler) AnalyticsSpend(w http.ResponseWriter, r *http.Request) {
 	h.serveAnalytics(w, r, false, analytics.SectionSpend)
 }
 
+// AnalyticsFlow serves GET /api/analytics/flow for the caller's own scope.
+func (h *Handler) AnalyticsFlow(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, false, analytics.SectionFlow)
+}
+
+// AdminAnalyticsFlow serves GET /api/admin/analytics/flow.
+func (h *Handler) AdminAnalyticsFlow(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, true, analytics.SectionFlow)
+}
+
 // AdminAnalyticsOptions serves GET /api/admin/analytics/options.
 func (h *Handler) AdminAnalyticsOptions(w http.ResponseWriter, r *http.Request) {
 	h.serveAnalytics(w, r, true, analytics.SectionOptions)
@@ -351,9 +361,12 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 	var body any
 	err = store.RunAnalyticsSnapshot(r.Context(), deps.begin, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
 		var ferr error
-		if section == analytics.SectionOptions {
+		switch section {
+		case analytics.SectionOptions:
 			body, ferr = deps.options(ctx, s, req, now)
-		} else {
+		case analytics.SectionFlow:
+			body, ferr = deps.flow(ctx, s, req, now)
+		default:
 			body, ferr = deps.spend(ctx, s, req, now)
 		}
 		return ferr
@@ -708,9 +721,8 @@ func (m *spendMapper) createdAt(s string) time.Time {
 // msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all spend request.
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
-// mapAnalyticsSpend builds the response from the calendar and the store document.
-func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {
-	m := &spendMapper{}
+// analyticsEnvelope builds the calendar envelope shared by the Spend and Flow responses.
+func analyticsEnvelope(req analyticsRequest, b analytics.Bounds) apitypes.AnalyticsEnvelopeDTO {
 	env := apitypes.AnalyticsEnvelopeDTO{
 		Scope:           req.scope(),
 		GeneratedAt:     b.Now.UTC(),
@@ -741,6 +753,13 @@ func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.Analy
 	for _, rp := range b.Rolling {
 		env.Rolling = append(env.Rolling, apitypes.AnalyticsRollingDTO{Start: rp.Start.UTC(), End: rp.End.UTC(), Partial: rp.Partial})
 	}
+	return env
+}
+
+// mapAnalyticsSpend builds the response from the calendar and the store document.
+func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {
+	m := &spendMapper{}
+	env := analyticsEnvelope(req, b)
 
 	out := apitypes.AnalyticsSpendDTO{
 		AnalyticsEnvelopeDTO: env,

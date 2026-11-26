@@ -63,10 +63,14 @@ func (h *Handler) analyticsServe(rt analyticsRoute, rec http.ResponseWriter, req
 	switch {
 	case !rt.admin && rt.section == analytics.SectionOptions:
 		h.AnalyticsOptions(rec, req)
+	case !rt.admin && rt.section == analytics.SectionFlow:
+		h.AnalyticsFlow(rec, req)
 	case !rt.admin:
 		h.AnalyticsSpend(rec, req)
 	case rt.section == analytics.SectionOptions:
 		h.AdminAnalyticsOptions(rec, req)
+	case rt.section == analytics.SectionFlow:
+		h.AdminAnalyticsFlow(rec, req)
 	default:
 		h.AdminAnalyticsSpend(rec, req)
 	}
@@ -77,6 +81,10 @@ var analyticsRoutes = []analyticsRoute{
 	{"owner spend", "/api/analytics/spend", false, analytics.SectionSpend},
 	{"admin options", "/api/admin/analytics/options", true, analytics.SectionOptions},
 	{"admin spend", "/api/admin/analytics/spend", true, analytics.SectionSpend},
+	// Issue #4729: appended so the positional indexes above stay valid. The route-wide tests
+	// that range over this table (busy, timeout, sanitized 500, unset deps) cover flow too.
+	{"owner flow", "/api/analytics/flow", false, analytics.SectionFlow},
+	{"admin flow", "/api/admin/analytics/flow", true, analytics.SectionFlow},
 }
 
 func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {

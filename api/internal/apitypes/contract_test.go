@@ -271,6 +271,11 @@ func contractCases() []contractCase {
 		// present-as-null by design.
 		newContractCase[AnalyticsOptionsDTO]("analytics_options"),
 		newContractCase[AnalyticsSpendDTO]("analytics_spend"),
+		// Issue #4729: the scoped run Flow response. Every slice (envelope, waiting states,
+		// bucket cells, histogram, limitations, filters.kinds) is non-omitempty (the zero.json
+		// carries nulls the handler normalizes to []); the nullable percentiles, filters.repo,
+		// filters.harness and the not_applicable reasons are present-as-null by design.
+		newContractCase[AnalyticsFlowDTO]("analytics_flow"),
 	}
 }
 

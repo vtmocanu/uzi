@@ -7037,3 +7037,230 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   top_runs: AnalyticsTopRunDTO[];
   breakdown: AnalyticsBreakdownDTO;
 }
+
+// Issue #4729: the scoped run Flow response (GET /api/analytics/flow and
+// /api/admin/analytics/flow). Every list is an array, never null; every block carries
+// time_basis and population; a null percentile always travels with a reason. The response
+// names no repo id or path beyond the caller's own repo selector echoed in filters.
+export interface AnalyticsFlowFiltersDTO {
+  repo: string | null;
+  harness: string | null;
+  kinds: string[];
+}
+
+export interface AnalyticsFlowWaitStateDTO {
+  state: string;
+  count: number;
+  oldest_status_since: string | null;
+  oldest_age_seconds: number | null;
+}
+
+export interface AnalyticsFlowWaitingDTO {
+  time_basis: string;
+  population: string;
+  states: AnalyticsFlowWaitStateDTO[];
+  total: number;
+}
+
+export interface AnalyticsFlowCreatedCellDTO {
+  index: number;
+  count: number;
+}
+
+export interface AnalyticsFlowCreatedDTO {
+  time_basis: string;
+  population: string;
+  total: number;
+  buckets: AnalyticsFlowCreatedCellDTO[];
+}
+
+export interface AnalyticsFlowOutcomeCountsDTO {
+  completed: number;
+  cancelled: number;
+  plan_rejected: number;
+  base_diverged: number;
+  failed: number;
+  total: number;
+}
+
+export interface AnalyticsFlowFinishedCellDTO extends AnalyticsFlowOutcomeCountsDTO {
+  index: number;
+}
+
+export interface AnalyticsFlowFinishedDTO {
+  time_basis: string;
+  population: string;
+  excluded_kinds: string[];
+  total: AnalyticsFlowOutcomeCountsDTO;
+  buckets: AnalyticsFlowFinishedCellDTO[];
+}
+
+export interface AnalyticsFlowActivityDTO {
+  created: AnalyticsFlowCreatedDTO;
+  finished: AnalyticsFlowFinishedDTO;
+}
+
+export interface AnalyticsFlowFirstStartDTO {
+  time_basis: string;
+  population: string;
+  approximate: boolean;
+  limitations: string[];
+  observed: number;
+  not_started: number;
+  invalid: number;
+  p50_seconds: AnalyticsNullableNumberDTO;
+  p90_seconds: AnalyticsNullableNumberDTO;
+}
+
+export interface AnalyticsFlowResponseReasonsDTO {
+  ambiguous: number;
+  no_presentation: number;
+  invalid_chronology: number;
+  excluded_disposition: number;
+  reconciliation_only: number;
+  legacy_unbound: number;
+}
+
+export interface AnalyticsFlowUnknownDTO {
+  total: number;
+  reasons: AnalyticsFlowResponseReasonsDTO;
+}
+
+export interface AnalyticsFlowPlanResponseDTO {
+  time_basis: string;
+  population: string;
+  approximate: boolean;
+  n: number;
+  p50_seconds: AnalyticsNullableNumberDTO;
+  p90_seconds: AnalyticsNullableNumberDTO;
+  unknown: AnalyticsFlowUnknownDTO;
+  not_approved: number;
+}
+
+export interface AnalyticsFlowStagesDTO {
+  created: number;
+  plan_settled: number;
+  completed: number;
+  pr_present: number;
+  merged: number;
+}
+
+export interface AnalyticsFlowPlanningDTO {
+  settled_human: number;
+  settled_auto: number;
+  skipped: number;
+  rejected: number;
+  in_progress: number;
+  failed: number;
+  cancelled: number;
+  unknown: number;
+}
+
+export interface AnalyticsFlowOutcomesDTO {
+  completed: number;
+  failed: number;
+  cancelled: number;
+  plan_rejected: number;
+  base_diverged: number;
+  in_progress: number;
+}
+
+export interface AnalyticsFlowFunnelDisclosureDTO {
+  historical_approval_only: number;
+  ambiguous_current: number;
+  legacy_evidence: number;
+}
+
+export interface AnalyticsFlowPRUnitCellDTO {
+  index: number;
+  present: number;
+  merged: number;
+}
+
+export interface AnalyticsFlowPRUnitsDTO {
+  present: number;
+  merged: number;
+  buckets: AnalyticsFlowPRUnitCellDTO[];
+}
+
+export interface AnalyticsFlowFunnelDTO {
+  time_basis: string;
+  population: string;
+  applicable: boolean;
+  reason: string | null;
+  stages: AnalyticsFlowStagesDTO;
+  planning: AnalyticsFlowPlanningDTO;
+  outcomes: AnalyticsFlowOutcomesDTO;
+  disclosure: AnalyticsFlowFunnelDisclosureDTO;
+  pr_units: AnalyticsFlowPRUnitsDTO;
+}
+
+export interface AnalyticsFlowApprovalReasonsDTO {
+  ambiguous: number;
+  legacy_unbound: number;
+  historical_approval_only: number;
+  no_evidence: number;
+}
+
+export interface AnalyticsFlowApprovalUnknownDTO {
+  total: number;
+  reasons: AnalyticsFlowApprovalReasonsDTO;
+}
+
+export interface AnalyticsFlowApprovalDTO {
+  time_basis: string;
+  population: string;
+  applicable: boolean;
+  reason: string | null;
+  total: number;
+  human: number;
+  auto_approve_configured: number;
+  unknown: AnalyticsFlowApprovalUnknownDTO;
+}
+
+export interface AnalyticsFlowHistogramBinDTO {
+  lower_seconds: number;
+  /** null for the last, open-ended bin. */
+  upper_seconds: number | null;
+  count: number;
+}
+
+export interface AnalyticsFlowElapsedCellDTO {
+  index: number;
+  /** The calendar's marker: the bucket still open at generated_at. */
+  partial: boolean;
+  n: number;
+  unfinished: number;
+  invalid: number;
+  incomplete: boolean;
+  p50_seconds: AnalyticsNullableNumberDTO;
+  p90_seconds: AnalyticsNullableNumberDTO;
+}
+
+export interface AnalyticsFlowElapsedDTO {
+  time_basis: string;
+  population: string;
+  applicable: boolean;
+  reason: string | null;
+  n: number;
+  unfinished: number;
+  invalid: number;
+  incomplete: boolean;
+  p50_seconds: AnalyticsNullableNumberDTO;
+  p90_seconds: AnalyticsNullableNumberDTO;
+  histogram: AnalyticsFlowHistogramBinDTO[];
+  buckets: AnalyticsFlowElapsedCellDTO[];
+}
+
+export interface AnalyticsFlowDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  filters: AnalyticsFlowFiltersDTO;
+  waiting_now: AnalyticsFlowWaitingDTO;
+  activity: AnalyticsFlowActivityDTO;
+  first_start_delay: AnalyticsFlowFirstStartDTO;
+  plan_response: AnalyticsFlowPlanResponseDTO;
+  delivery_funnel: AnalyticsFlowFunnelDTO;
+  approval: AnalyticsFlowApprovalDTO;
+  issue_elapsed: AnalyticsFlowElapsedDTO;
+}
