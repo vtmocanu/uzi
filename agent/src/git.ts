@@ -582,8 +582,10 @@ export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
  *  or `agent/issue-404` decide the verdict. A failure without retained stderr is permanent. */
 export function classifyGitStderr(error: unknown): "transient" | "permanent" {
   const retained = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
-  const stderr = retained?.stderr.trim();
-  return stderr ? classifyGitStderrText(stderr) : "permanent";
+  const raw = retained?.stderr ?? "";
+  // The #4716 shape check reads the untrimmed text so a malformed first banner line is never
+  // erased; the legacy rule keeps reading the trimmed text exactly as before.
+  return classifyPushStderr(raw, raw.trim());
 }
 
 const BARE_REMOTE_REJECTED_RETRYABLE = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\((?:failed|missing necessary objects)\)\s*$/;
@@ -606,9 +608,44 @@ const PUSH_FRAMING_LINES: RegExp[] = [
  * Any other line, a `remote:` diagnostic included, may state a reason and keeps today's classification.
  * Framing lines carry the branch and URL, so they are matched whole (`agent/issue-404` must not decide);
  * nothing inside any other line is masked.
+ * A third, separate exception (#4716) accepts GitHub's `(Internal Server Error)` refusal only together
+ * with its complete `remote:` banner; see {@link isGitHubIseRefusal}.
  */
 export function classifyGitStderrText(stderr: string): "transient" | "permanent" {
-  if (!stderr.trim()) return "permanent";
+  return classifyPushStderr(stderr, stderr);
+}
+
+// #4716: GitHub's server-error refusal, observed as a three-line `remote:` banner plus one
+// `(Internal Server Error)` ref-status line. Each line is matched whole and case-sensitively,
+// with only trailing spaces or tabs (git's sideband padding) allowed.
+const ISE_STATUS = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\(Internal Server Error\)[ \t]*$/;
+const ISE_BANNER: RegExp[] = [
+  /^remote: Internal Server Error[ \t]*$/,
+  /^remote: Request ID [0-9A-F]+(?::[0-9A-F]+)+[ \t]*$/,
+  /^remote: Time \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z[ \t]*$/,
+];
+const ISE_BASE_FRAMING = PUSH_FRAMING_LINES.filter((re) => re !== BARE_REMOTE_REJECTED_RETRYABLE);
+
+/**
+ * True only for the exact GitHub-observed server-error shape (#4716, ADR-0284 amendment): exactly one
+ * `! [remote rejected] <src> -> <dst> (Internal Server Error)` line, each of the three banner lines
+ * (`remote: Internal Server Error`, `remote: Request ID <HEX>(:<HEX>)+`, `remote: Time
+ * YYYY-MM-DDTHH:MM:SSZ`) exactly once, and otherwise only the ref-status-free framing lines. Any other
+ * line, a second ref-status line of any kind or a repeated or missing banner line keeps today's
+ * classification. The banner never widens the `(failed)` / `(missing necessary objects)` rule.
+ */
+function isGitHubIseRefusal(raw: string): boolean {
+  const lines = raw.split(/\r?\n|\r/);
+  const count = (re: RegExp) => lines.filter((l) => re.test(l)).length;
+  if (count(ISE_STATUS) !== 1 || ISE_BANNER.some((re) => count(re) !== 1)) return false;
+  return lines.every((l) => ISE_STATUS.test(l) || ISE_BANNER.some((re) => re.test(l)) || ISE_BASE_FRAMING.some((re) => re.test(l)));
+}
+
+/** `raw` feeds only the #4716 shape check; `legacy` is exactly the input the pre-#4716 rule read. */
+function classifyPushStderr(raw: string, legacy: string): "transient" | "permanent" {
+  if (!legacy.trim()) return "permanent";
+  if (isGitHubIseRefusal(raw)) return "transient";
+  const stderr = legacy;
   const lines = stderr.split(/\r?\n|\r/);
   // Every other line, any other `remote rejected` reason or a `[rejected]` line included, is not framing.
   // Both retryable reasons (`failed`, `missing necessary objects`) are a policy exception (#3929, #4438).
