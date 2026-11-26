@@ -271,6 +271,10 @@ func contractCases() []contractCase {
 		// present-as-null by design.
 		newContractCase[AnalyticsOptionsDTO]("analytics_options"),
 		newContractCase[AnalyticsSpendDTO]("analytics_spend"),
+		// Issue #4685: the Reliability response. Its envelope and panel slices are non-omitempty
+		// (the zero.json carries nulls the handler normalizes to []); reason and latest_failure
+		// are present-as-null by design and totals.previous is omitempty.
+		newContractCase[AnalyticsReliabilityDTO]("analytics_reliability"),
 	}
 }
 

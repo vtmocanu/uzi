@@ -1,0 +1,151 @@
+{
+  "scope": {
+    "route": "x",
+    "user": "x"
+  },
+  "generated_at": "2020-01-02T03:04:05Z",
+  "window": "x",
+  "timezone": "x",
+  "from": "2020-01-02T03:04:05Z",
+  "to": "2020-01-02T03:04:05Z",
+  "previous_from": "2020-01-02T03:04:05Z",
+  "previous_to": "2020-01-02T03:04:05Z",
+  "history_start": "2020-01-02T03:04:05Z",
+  "bucket_width_days": 1,
+  "buckets": [
+    {
+      "label": "x",
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "rolling": [
+    {
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "selected_user": "x",
+  "applicable": true,
+  "reason": "x",
+  "totals": {
+    "current": {
+      "finished": 1,
+      "outcomes": {
+        "completed": 1,
+        "cancelled": 1,
+        "plan_rejected": 1,
+        "base_diverged": 1,
+        "failed": 1
+      },
+      "failure_rate": {
+        "value": 1.5,
+        "reason": "x"
+      },
+      "requeued_runs": 1
+    },
+    "previous": {
+      "finished": 1,
+      "outcomes": {
+        "completed": 1,
+        "cancelled": 1,
+        "plan_rejected": 1,
+        "base_diverged": 1,
+        "failed": 1
+      },
+      "failure_rate": {
+        "value": 1.5,
+        "reason": "x"
+      },
+      "requeued_runs": 1
+    }
+  },
+  "series": [
+    {
+      "index": 1,
+      "finished": 1,
+      "outcomes": {
+        "completed": 1,
+        "cancelled": 1,
+        "plan_rejected": 1,
+        "base_diverged": 1,
+        "failed": 1
+      }
+    }
+  ],
+  "causes": {
+    "failed": 1,
+    "items": [
+      {
+        "rank": 1,
+        "is_other": true,
+        "origin": "x",
+        "runs": 1,
+        "share": 1.5
+      }
+    ]
+  },
+  "rolling_failure_rate": {
+    "overall": [
+      {
+        "index": 1,
+        "finished": 1,
+        "failed": 1,
+        "value": 1.5,
+        "reason": "x"
+      }
+    ],
+    "harnesses": [
+      {
+        "harness": "x",
+        "points": [
+          {
+            "index": 1,
+            "finished": 1,
+            "failed": 1,
+            "value": 1.5,
+            "reason": "x"
+          }
+        ]
+      }
+    ]
+  },
+  "breakdown": {
+    "dimension": "x",
+    "rows": [
+      {
+        "rank": 1,
+        "is_other": true,
+        "key": "x",
+        "label": "x",
+        "id": "x",
+        "n": 1,
+        "outcomes": {
+          "completed": 1,
+          "cancelled": 1,
+          "plan_rejected": 1,
+          "base_diverged": 1,
+          "failed": 1
+        },
+        "failure_rate": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "requeued_runs": 1
+      }
+    ]
+  },
+  "latest_failure": {
+    "failed_at": "2020-01-02T03:04:05Z",
+    "origin": "x",
+    "run_id": "x",
+    "user_id": "x",
+    "completed_since_last_failure": 1
+  },
+  "needs_landing": {
+    "runs": 1,
+    "caveat": "x"
+  }
+}
