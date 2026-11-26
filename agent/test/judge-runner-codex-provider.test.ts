@@ -340,6 +340,21 @@ describe("codex provider judge: routing", () => {
     assert.equal(calls.states.at(-1)?.status, "completed");
   });
 
+  it("a provider key split by the 180-character missing-tool clip never reaches the model prompt", async () => {
+    // The key starts at offset 160, so clip(command, 180) would keep only its first 20 characters:
+    // a partial key the exact-form redactor cannot match. The signal must be scrubbed before clipping.
+    const command = `${"x".repeat(160)}${KEY} --tail`;
+    const claim = codexClaim({ judge_signal: { missing_tools: [{ command, evidence: "not found" }] } });
+    const rec = newRec();
+    await exec(scriptedFactory(okScript, rec), claim);
+    assert.equal(rec.requests.length, 1, "harness.run was entered");
+    const prompt = rec.requests[0]!.prompt;
+    assert.ok(prompt.includes("x".repeat(160)), "the missing-tool command reached the prompt");
+    for (let n = 8; n <= KEY.length; n++) {
+      assert.ok(!prompt.includes(KEY.slice(0, n)), `the prompt carries a ${n}-character key prefix`);
+    }
+  });
+
   it("a missing factory is a terminal failure, not a fallback review", async () => {
     const calls = await exec(undefined);
     assertTerminalFailure(calls, /no Codex advice-harness factory/);

@@ -690,7 +690,7 @@ export class JudgeRunner {
     try {
       prompt = buildJudgePrompt(
         trace,
-        claim.judge_signal ?? null,
+        claim.judge_signal ? redactStrings(claim.judge_signal, scrub) : null,
         claim.known_improve_uzi_targets ?? [],
         claim.failure_class ?? null,
         claim.target_cost_status ?? null,
@@ -790,7 +790,7 @@ export class JudgeRunner {
     try {
       prompt = buildJudgePrompt(
         trace,
-        claim.judge_signal ?? null,
+        claim.judge_signal ? redactStrings(claim.judge_signal, scrub) : null,
         claim.known_improve_uzi_targets ?? [],
         claim.failure_class ?? null,
         claim.target_cost_status ?? null,
