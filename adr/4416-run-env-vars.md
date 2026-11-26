@@ -201,6 +201,14 @@ delivered them: a restart, a held or terminal publication, a recovery upload. It
   and its `cross_checks` row is open before its deadline, or while a publication is in flight for it.
   Otherwise the route answers 409 `run_env_redact_closed`, and the worker withholds the publish. The
   route's own 404 carries the code `run_env_run_not_found`.
+- **One state read after the open.** After the versions are opened, authority and openness are
+  checked again and the owner's vault epoch and unlock state are checked from one vault state read:
+  the epoch must still equal the one the versions were opened at and, only when the vault is
+  protected, that epoch's cached key must be present (`vault.UsableAtState`, no second read). A
+  moved epoch or a missing key is 409 `vault_locked` with no version. A state read that fails
+  stays a reader failure (500), not a locked answer; an invalid state or no vault is
+  `run_env_history_unavailable`. A change committed after that check and before the response is
+  written is not fenced.
 - **No generation bound.** A worker that last held the run may read the full receipted history
   whatever the current claim generation. This is accepted: the route is read-only, same user
   only, and the same worker was delivered those values by the claim that wrote the receipts.
@@ -418,9 +426,14 @@ every Claude CLI start in every lane, the worker:
 3. creates the `HOME/.claude/projects` and `HOME/.claude/tasks` targets as the runner uid with a
    fixed `/bin/mkdir -p -m 700` argv, so they are runner-owned and private, as when the CLI made
    them. The worker never writes or renames anything inside `.claude`. When that mkdir exits
-   non-zero, a second runner-uid helper (`/bin/stat -c '%u|%a|%F|%n'`) looks for a positive
-   obstruction: a matched non-directory, a `.claude` with a wrong owner, or one whose owner mode
-   lacks rwx. Only then is `.claude` renamed aside once and retried (transcripts stay in the aside
+   non-zero, a second runner-uid helper (`/bin/stat -c '%u|%g|%a|%F|%n'`) looks for a positive
+   obstruction: a matched non-directory, or a `.claude` whose effective mode bits for the runner
+   (owner bits if it is owned by the runner uid, else group bits if its gid is one of the runner's
+   groups 10002 or 10004, else other bits) lack write or search. A foreign owner or a missing read
+   whose bits still grant write and search is not an obstruction: that start is refused
+   transiently and `.claude` stays. The evidence is mode bits, so ACL entries are not seen: an ACL
+   granting access to a foreign-owned `.claude` could still read as an obstruction, and an ACL
+   mask can hide a deny, which fails closed as a refusal. Only on a positive obstruction is `.claude` renamed aside once and retried (transcripts stay in the aside
    copy, so a resume of that session finds none); a second obstruction refuses the start. Any
    other failure (spawn error, signal, timeout, an exit status other than 0 and 1, or exit 1
    with a lookup failure, a capacity failure, no stat output or a killed helper) refuses that
@@ -600,8 +613,9 @@ recovery described under R3.
   - the rename aside itself failing (for example a read-only data volume);
   - a second positive obstruction after `.claude` was moved aside once;
   - a mkdir failure with no positive obstruction (exit 1 with a lookup failure, a capacity failure,
-    no stat output or a killed helper; a spawn error, signal, timeout, or a status other than 0 and
-    1): that start only, `.claude` kept;
+    no stat output, a killed helper, or a foreign owner or missing read whose effective bits still
+    grant write and search; a spawn error, signal, timeout, or a status other than 0 and 1): that
+    start only, `.claude` kept;
   - a non-zero mkdir of `.claude` itself;
   - the preparation passing its 10 s deadline (checked before each helper spawn);
   - a HOME that fails the boundary checks (see Boundary: not worker-owned under the split, or an
@@ -615,7 +629,9 @@ recovery described under R3.
   A non-zero mkdir exit alone moves nothing, because exit 1 is not proof of a planted entry (mkdir
   also exits 1 on ENOSPC, EDQUOT or EIO, and `setpriv` exits 1 when it cannot resolve the runner
   user). `.claude` is moved aside only on a positive obstruction reported by the runner stat probe
-  (a matched non-directory, a wrong owner, or an owner mode without rwx); a lookup failure, a
+  (a matched non-directory, or effective mode bits for the runner, by owner, runner group or other,
+  that lack write or search; a foreign owner whose bits still grant both is not one, and ACLs are
+  not seen); a lookup failure, a
   capacity failure, no output or a killed helper refuses that start and keeps `.claude` in place.
   There is no exit-1 residual.
 
@@ -647,8 +663,12 @@ stay untested). R3 stays a follow-up that the maintainer files.
 **Known limit: the preparation is synchronous and bounded, not unbounded.** Every error in the
 preparation, a full disk included, is reported as this refusal, not as a disk park. The bound is:
 
-- each runner helper runs behind a worker-uid `/bin/sh` that `spawnSync` kills with SIGKILL after
-  4 s (the worker uid can always deliver it);
+- each runner helper runs behind a constant worker-uid Node intermediary (`process.execPath -e`,
+  argv only, no shell) that `spawnSync` kills with SIGKILL after 4 s (the worker uid can always
+  deliver it). The intermediary exits 127 if it cannot start the helper and 128+n when the helper
+  dies on signal n; the output limit stays 64 KiB. Dropping the shell closes CodeQL
+  `js/shell-command-injection-from-environment` alert 229, pending the PR's CodeQL re-scan. Node's
+  cold start per helper is unmeasured;
 - the runner helper itself runs under `timeout -s KILL 2`;
 - the whole preparation has a 10 s deadline, checked before each helper spawn.
 
