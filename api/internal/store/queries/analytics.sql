@@ -1250,8 +1250,10 @@ plan_resp AS (
 ),
 plan_legacy AS (
     SELECT count(*) AS n FROM (SELECT x.run_id FROM rcpt_c x
-                               WHERE NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id)
-                               GROUP BY x.run_id HAVING bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')) l
+                               GROUP BY x.run_id
+                               HAVING bool_or(x.gate_binding IS NULL)
+                                   OR (bool_or(x.gate_binding = 'unbound')
+                                       AND NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id))) l
 ),
 run_ev AS (
     SELECT x.run_id,
@@ -1677,8 +1679,10 @@ plan_resp AS (
 ),
 plan_legacy AS (
     SELECT count(*) AS n FROM (SELECT x.run_id FROM rcpt_c x
-                               WHERE NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id)
-                               GROUP BY x.run_id HAVING bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')) l
+                               GROUP BY x.run_id
+                               HAVING bool_or(x.gate_binding IS NULL)
+                                   OR (bool_or(x.gate_binding = 'unbound')
+                                       AND NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id))) l
 ),
 run_ev AS (
     SELECT x.run_id,

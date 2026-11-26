@@ -157,9 +157,10 @@ type AnalyticsFlowFirstStart struct {
 // same-revision gate presentation's created_at to the applied human input's created_at. N is
 // the number of timed pairs. Every other pair is either Unknown (with a reason) or
 // NotApproved (a presentation with no bound applied approve_plan receipt, disclosed, neither
-// timed nor unknown). A run whose only approve_plan evidence is legacy receipts (NULL or
-// unbound gate binding) adds one unknown; a run that has any presentation row or bound
-// applied receipt is classified by its pairs instead and is never also counted as legacy.
+// timed nor unknown). A run with a NULL-binding (pre-00260) approve_plan receipt adds one
+// unknown even when it also has pairs: that receipt belongs to an untimeable revision-0 gate.
+// A run with only 'unbound' receipts adds one unknown only when it has no pair at all; with
+// pairs, an unbound approve can never act on a gate, so its pair stays not_approved.
 // Percentiles are null with no_observations when N is 0.
 type AnalyticsFlowPlanResponse struct {
 	TimeBasis   string                  `json:"time_basis"`
@@ -177,8 +178,8 @@ type AnalyticsFlowPlanResponse struct {
 // presentation row), invalid_chronology (a receipt applied before it was created, or a
 // presentation created after the input), excluded_disposition (only superseded, declined or
 // advisory receipts), reconciliation_only (the single eligible receipt has disposition
-// 'applied'), legacy_unbound (a run with a NULL or unbound approve_plan receipt and no
-// presentation row or bound applied receipt at any revision).
+// 'applied'), legacy_unbound (a run with a NULL-binding approve_plan receipt, or one with
+// only unbound receipts and no presentation row or bound applied receipt at any revision).
 type AnalyticsFlowUnknown struct {
 	Total   int64                        `json:"total"`
 	Reasons AnalyticsFlowResponseReasons `json:"reasons"`
