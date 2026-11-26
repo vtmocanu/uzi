@@ -15,10 +15,7 @@ import (
 // (PRD #4173): upsert rotates in place, reads and deletes are owner-scoped, the unique key and the
 // https CHECK hold, and deleting the user cascades.
 func TestIssueTrackerConnectionLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "issue_tracker_conn_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "issue_tracker_conn_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
