@@ -249,6 +249,18 @@ alive). A wake not confirmed within 15 minutes records `wake_error` on the worke
 ("wake not confirmed within 15m"), shown as a wake error. The worker stays waking, and the error clears once
 the wake settles.
 
+A waking worker that is the pool's current canary settles its wake even while the
+pool is held as `duplicate canary reservations unresolved; explicit recovery
+required`. The controller binds its own op through the existing metadata-only
+op-annotation write, preconditioned on the observed UID and resourceVersion, and
+reports `ready` from a fresh observation on a later tick; several waking current
+canaries each bind only their own op. The pool stays held until an operator or a
+later roll resolves the duplicate. The wake is still refused when any pool entry
+made an ambiguous or unconfirmed write that tick, and a claim mirror on the canary's
+data claim, even a matching one, still holds it. A custody-held canary is allowed.
+Duplicate recovery itself is described under
+[Draining and cordoned](#draining-and-cordoned).
+
 A wake from zero replicas waits until the old pod has fully stopped, meaning every
 container (init and ephemeral included) has terminated. A pod whose containers are
 still running or stopping holds the wake, including a `Failed` (evicted) pod that is
@@ -908,6 +920,9 @@ waking from hibernation, the surviving canary is absent, terminating, stuck or
 otherwise not current, or there are three or more canaries. Two live canaries
 cannot use this absent-worker recovery; the existing old-incarnation proof may
 still cancel their reservations when both satisfy that proof.
+A wake no longer waits on this hold: a waking current canary settles its own wake
+first, and absent-worker recovery is then evaluated again. A live custody-held peer
+is still excluded from that recovery.
 When the absent worker has drifted, an operator can pause controller
 reconciliation, remove the stale `uzi.dev/image-roll` annotation from its data
 claim first (if present), and then remove it from the Deployment. Re-observe both
@@ -915,6 +930,13 @@ objects and verify the annotations are absent before resuming reconciliation;
 otherwise the retained mirror can restore the stale reservation. The worker then
 re-enters the roll as a fresh drifted participant. Other held shapes need
 case-specific recovery.
+
+Two cautions on that manual procedure. In one observed incident, an operator
+removed a stale reservation from a live, custody-held worker whose claims carried
+no mirror, and that cleared the hold. That was an incident-specific intervention,
+not a general procedure: a stale-looking reservation on a live worker is not enough
+evidence for removal. And scaling the controller to zero does not pause it under an
+ArgoCD self-healing install, because the sync restores it; pause self-heal first.
 
 Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
