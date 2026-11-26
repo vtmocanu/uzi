@@ -129,6 +129,22 @@ func qualityJudgeKinds() []string {
 	return out
 }
 
+// qualityPlanLeadKinds and qualityCodeLeadKinds are the lead kinds whose plan (code) cross-check
+// attempts the Quality statement counts, so the population matches qualityApplicable.
+func qualityPlanLeadKinds() []string { return qualityKindsWhere(runkind.PlanCrossCheckable) }
+
+func qualityCodeLeadKinds() []string { return qualityKindsWhere(runkind.CodeCrossCheckable) }
+
+func qualityKindsWhere(pred func(string) bool) []string {
+	out := []string{}
+	for _, k := range runkind.All() {
+		if pred(k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 func buildQualityStatement(req analyticsRequest, b analytics.Bounds) analyticsQualityStatement {
 	var repo pgtype.UUID
 	if req.repo != uuid.Nil {
@@ -145,6 +161,7 @@ func buildQualityStatement(req analyticsRequest, b analytics.Bounds) analyticsQu
 			BucketStarts: starts, BucketEnds: ends, From: analyticsTS(b.From), Now: analyticsTS(b.Now),
 			RepoID: repo, Harness: harness, Kinds: req.kinds, DeliveryKinds: runkind.Delivery(),
 			AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: qualityJudgeKinds(),
+			PlanLeadKinds: qualityPlanLeadKinds(), CodeLeadKinds: qualityCodeLeadKinds(),
 		}}
 	}
 	return analyticsQualityStatement{owner: &store.AnalyticsOwnerQualityParams{
@@ -152,6 +169,7 @@ func buildQualityStatement(req analyticsRequest, b analytics.Bounds) analyticsQu
 		UserID: req.scopeUser,
 		RepoID: repo, Harness: harness, Kinds: req.kinds, DeliveryKinds: runkind.Delivery(),
 		AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: qualityJudgeKinds(),
+		PlanLeadKinds: qualityPlanLeadKinds(), CodeLeadKinds: qualityCodeLeadKinds(),
 	}}
 }
 

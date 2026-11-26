@@ -109,10 +109,17 @@ func TestAnalyticsQualityStatementsDoNotDrift(t *testing.T) {
 				t.Errorf("%s statement lacks %q", name, want)
 			}
 		}
-		// Live pending has no time predicate at all: the snapshot instant bounds only decided and undated rows.
+		// The attempt population has no time predicate at all: malformed time evidence (an infinite or
+		// far-future created_at) must reach the dated rule and be disclosed as undated, not be dropped
+		// here. Only the decided_at window of cc_win bounds the dated series.
 		pend := b[strings.Index(b, "cc_base AS MATERIALIZED"):strings.Index(b, "cc_dec AS MATERIALIZED")]
-		if strings.Contains(pend, "@from") || strings.Contains(pend, "sqlc.arg('from')") {
-			t.Errorf("%s statement restricts cross-check attempts by the window start", name)
+		if strings.Contains(pend, "@from") || strings.Contains(pend, "sqlc.arg('from')") || strings.Contains(pend, "@now") {
+			t.Errorf("%s statement restricts cross-check attempts by time before classifying them", name)
+		}
+		for _, want := range []string{"lead.kind = ANY(@plan_lead_kinds::text[])", "lead.kind = ANY(@code_lead_kinds::text[])"} {
+			if !strings.Contains(pend, want) {
+				t.Errorf("%s statement cc_base lacks the stage-applicable lead kind filter %q", name, want)
+			}
 		}
 	}
 	// The generated constants (what actually runs) carry the same scope predicates.

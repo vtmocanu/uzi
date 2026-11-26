@@ -139,8 +139,8 @@ cc_base AS MATERIALIZED (
     WHERE ($5::uuid IS NULL OR lead.repo_id = $5::uuid)
       AND ($6::text IS NULL OR lead.harness = $6::text)
       AND lead.kind = ANY($7::text[]) AND lead.kind <> 'cross_check'
-      AND ((((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending'))
-             AND cc.interrupted_at IS NULL) OR cc.created_at < $4::timestamptz)
+      AND ((cc.stage = 'plan' AND lead.kind = ANY($9::text[]))
+        OR (cc.stage = 'code' AND lead.kind = ANY($10::text[])))
 ),
 cc_dec AS MATERIALIZED (
     SELECT b.id, b.stage, b.result, b.reason_class, b.interrupted_at, b.decided_at, b.created_at, b.findings, b.checker, b.is_pending,
@@ -228,8 +228,8 @@ cc_pending AS (
 ),
 jd AS MATERIALIZED (
     SELECT r.id, r.status, r.created_at,
-           (r.status = 'failed' AND (r.fail_origin = ANY($9::text[])
-             OR (r.iteration_count = 0 AND r.fail_origin = ANY($10::text[])))) AS skip_expr,
+           (r.status = 'failed' AND (r.fail_origin = ANY($11::text[])
+             OR (r.iteration_count = 0 AND r.fail_origin = ANY($12::text[])))) AS skip_expr,
            rv.id AS rv_id, rv.status AS rv_status, rv.verdict AS rv_verdict,
            EXISTS (SELECT 1 FROM judge_skips js WHERE js.target_run_id = r.id) AS skipped,
            width_bucket(r.created_at, $1::timestamptz[]) AS wb
@@ -238,7 +238,7 @@ jd AS MATERIALIZED (
     WHERE r.created_at >= $3::timestamptz AND r.created_at < $4::timestamptz
       AND ($5::uuid IS NULL OR r.repo_id = $5::uuid)
       AND ($6::text IS NULL OR r.harness = $6::text)
-      AND r.kind = ANY($11::text[])
+      AND r.kind = ANY($13::text[])
       AND r.kind = ANY($7::text[])
 ),
 jd2 AS MATERIALIZED (
@@ -303,6 +303,8 @@ type AnalyticsAllQualityParams struct {
 	Harness           pgtype.Text          `json:"harness"`
 	Kinds             []string             `json:"kinds"`
 	DeliveryKinds     []string             `json:"delivery_kinds"`
+	PlanLeadKinds     []string             `json:"plan_lead_kinds"`
+	CodeLeadKinds     []string             `json:"code_lead_kinds"`
 	AlwaysSkipOrigins []string             `json:"always_skip_origins"`
 	PrestartOrigins   []string             `json:"prestart_origins"`
 	JudgeKinds        []string             `json:"judge_kinds"`
@@ -324,8 +326,9 @@ type AnalyticsAllQualityParams struct {
 // membership subquery here would become an unhashed per-row SubPlan once the witness set
 // outgrew hash_mem.
 // CI fix: runs created in the window, their outcome class from run_outcome_classes.
-// Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
-// lead-time restriction. Stage selects the stored result field: plan reads verdict, code reads
+// Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
+// must be one whose stage can run a cross-check), with no creation-time restriction: time
+// evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
 // outcome (the legacy code verdict column is inert).
 // Judge: the target cohort by creation time, the stable skip rules by failure origin, and the
 // retained review (one row per target; a rejudge overwrites it in place).
@@ -339,6 +342,8 @@ func (q *Queries) AnalyticsAllQuality(ctx context.Context, arg AnalyticsAllQuali
 		arg.Harness,
 		arg.Kinds,
 		arg.DeliveryKinds,
+		arg.PlanLeadKinds,
+		arg.CodeLeadKinds,
 		arg.AlwaysSkipOrigins,
 		arg.PrestartOrigins,
 		arg.JudgeKinds,
@@ -481,8 +486,8 @@ cc_base AS MATERIALIZED (
       AND lead.user_id = $5::uuid  -- owner-only
       AND ($7::text IS NULL OR lead.harness = $7::text)
       AND lead.kind = ANY($8::text[]) AND lead.kind <> 'cross_check'
-      AND ((((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending'))
-             AND cc.interrupted_at IS NULL) OR cc.created_at < $4::timestamptz)
+      AND ((cc.stage = 'plan' AND lead.kind = ANY($10::text[]))
+        OR (cc.stage = 'code' AND lead.kind = ANY($11::text[])))
 ),
 cc_dec AS MATERIALIZED (
     SELECT b.id, b.stage, b.result, b.reason_class, b.interrupted_at, b.decided_at, b.created_at, b.findings, b.checker, b.is_pending,
@@ -570,8 +575,8 @@ cc_pending AS (
 ),
 jd AS MATERIALIZED (
     SELECT r.id, r.status, r.created_at,
-           (r.status = 'failed' AND (r.fail_origin = ANY($10::text[])
-             OR (r.iteration_count = 0 AND r.fail_origin = ANY($11::text[])))) AS skip_expr,
+           (r.status = 'failed' AND (r.fail_origin = ANY($12::text[])
+             OR (r.iteration_count = 0 AND r.fail_origin = ANY($13::text[])))) AS skip_expr,
            rv.id AS rv_id, rv.status AS rv_status, rv.verdict AS rv_verdict,
            EXISTS (SELECT 1 FROM judge_skips js WHERE js.target_run_id = r.id) AS skipped,
            width_bucket(r.created_at, $1::timestamptz[]) AS wb
@@ -581,7 +586,7 @@ jd AS MATERIALIZED (
       AND r.user_id = $5::uuid  -- owner-only
       AND ($6::uuid IS NULL OR r.repo_id = $6::uuid)
       AND ($7::text IS NULL OR r.harness = $7::text)
-      AND r.kind = ANY($12::text[])
+      AND r.kind = ANY($14::text[])
       AND r.kind = ANY($8::text[])
 ),
 jd2 AS MATERIALIZED (
@@ -647,6 +652,8 @@ type AnalyticsOwnerQualityParams struct {
 	Harness           pgtype.Text          `json:"harness"`
 	Kinds             []string             `json:"kinds"`
 	DeliveryKinds     []string             `json:"delivery_kinds"`
+	PlanLeadKinds     []string             `json:"plan_lead_kinds"`
+	CodeLeadKinds     []string             `json:"code_lead_kinds"`
 	AlwaysSkipOrigins []string             `json:"always_skip_origins"`
 	PrestartOrigins   []string             `json:"prestart_origins"`
 	JudgeKinds        []string             `json:"judge_kinds"`
@@ -668,8 +675,9 @@ type AnalyticsOwnerQualityParams struct {
 // membership subquery here would become an unhashed per-row SubPlan once the witness set
 // outgrew hash_mem.
 // CI fix: runs created in the window, their outcome class from run_outcome_classes.
-// Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
-// lead-time restriction. Stage selects the stored result field: plan reads verdict, code reads
+// Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
+// must be one whose stage can run a cross-check), with no creation-time restriction: time
+// evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
 // outcome (the legacy code verdict column is inert).
 // Judge: the target cohort by creation time, the stable skip rules by failure origin, and the
 // retained review (one row per target; a rejudge overwrites it in place).
@@ -684,6 +692,8 @@ func (q *Queries) AnalyticsOwnerQuality(ctx context.Context, arg AnalyticsOwnerQ
 		arg.Harness,
 		arg.Kinds,
 		arg.DeliveryKinds,
+		arg.PlanLeadKinds,
+		arg.CodeLeadKinds,
 		arg.AlwaysSkipOrigins,
 		arg.PrestartOrigins,
 		arg.JudgeKinds,

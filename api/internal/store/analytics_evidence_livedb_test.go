@@ -473,8 +473,15 @@ func (h *evHarness) seed() {
 // weight of cross_checks.
 func (h *evHarness) qualityShape() {
 	h.t.Helper()
-	const win = `TIMESTAMPTZ '` + evNowRFC + `' - interval '30 days'`
-	h.logf("QUALITY SEED SHAPE")
+	// The window the 30d workloads run on: ComputeBounds' UTC midnight 29 calendar days before
+	// today through now, not now minus 30 days.
+	b30, err := analytics.ComputeBounds(h.now, time.UTC, analytics.Window30d, nil)
+	if err != nil {
+		h.t.Fatalf("ComputeBounds 30d: %v", err)
+	}
+	win := `TIMESTAMPTZ '` + b30.From.UTC().Format(time.RFC3339Nano) + `'`
+	upper := `TIMESTAMPTZ '` + b30.Now.UTC().Format(time.RFC3339Nano) + `'`
+	h.logf("QUALITY SEED SHAPE (30d window %s to %s)", b30.From.UTC().Format(time.RFC3339), b30.Now.UTC().Format(time.RFC3339))
 	h.logf("%s", h.shape(`SELECT 'row counts', 'runs=' || (SELECT count(*) FROM runs) || ' mr_rework=' || (SELECT count(*) FROM runs WHERE kind = 'mr_rework')
 	    || ' cross_checks=' || (SELECT count(*) FROM cross_checks) || ' (plan ' || (SELECT count(*) FROM cross_checks WHERE stage = 'plan')
 	    || ', code ' || (SELECT count(*) FROM cross_checks WHERE stage = 'code') || ') run_reviews=' || (SELECT count(*) FROM run_reviews)
@@ -486,10 +493,10 @@ func (h *evHarness) qualityShape() {
 		{"overall", "true"},
 		{"largest owner", "user_id = (SELECT id FROM users WHERE email = 'evid-0001@e2e')"},
 	} {
-		h.logf("%s", h.shape(`SELECT '30d range selectivity of runs (`+scope.label+`)', round(100.0 * count(*) FILTER (WHERE created_at >= `+win+` AND created_at < TIMESTAMPTZ '`+evNowRFC+`') / count(*), 2) || '% of ' || count(*) || ' runs ('
+		h.logf("%s", h.shape(`SELECT '30d range selectivity of runs (`+scope.label+`)', round(100.0 * count(*) FILTER (WHERE created_at >= `+win+` AND created_at < `+upper+`) / count(*), 2) || '% of ' || count(*) || ' runs ('
 	        || count(*) FILTER (WHERE created_at >= `+win+`) || ' in window)' FROM runs WHERE `+scope.pred))
 		h.logf("%s", h.shape(`SELECT 'rw_seed cohort 30d (`+scope.label+`)', count(*) || ' PRs from ' || sum(c) || ' delivery runs' FROM
-	        (SELECT repo_id, mr_iid, count(*) AS c FROM runs WHERE created_at >= `+win+` AND created_at < TIMESTAMPTZ '`+evNowRFC+`'
+	        (SELECT repo_id, mr_iid, count(*) AS c FROM runs WHERE created_at >= `+win+` AND created_at < `+upper+`
 	         AND kind = ANY(ARRAY['issue','mr_rework','ci_fix','prompt','self_improve','task','job']) AND mr_iid IS NOT NULL AND repo_id IS NOT NULL AND `+scope.pred+`
 	         GROUP BY repo_id, mr_iid) x`))
 	}
@@ -510,7 +517,7 @@ func (h *evHarness) qualityShape() {
 	    (SELECT outcome, count(*) AS c, 1 AS n FROM cross_checks WHERE stage = 'code' GROUP BY 1) x`))
 	h.logf("%s", h.shape(`SELECT 'cross_checks decided in 30d window (plan / code), of which lead created before window', count(*) FILTER (WHERE cc.stage = 'plan') || ' / ' || count(*) FILTER (WHERE cc.stage = 'code')
 	    || ', older leads ' || count(*) FILTER (WHERE l.created_at < `+win+`)
-	    FROM cross_checks cc JOIN runs l ON l.id = cc.lead_run_id WHERE cc.decided_at >= `+win+` AND cc.decided_at < TIMESTAMPTZ '`+evNowRFC+`'`))
+	    FROM cross_checks cc JOIN runs l ON l.id = cc.lead_run_id WHERE cc.decided_at >= `+win+` AND cc.decided_at < `+upper+``))
 	h.logf("%s", h.shape(`SELECT 'pending attempts (plan / code)', count(*) FILTER (WHERE stage = 'plan' AND verdict = 'pending') || ' / ' || count(*) FILTER (WHERE stage = 'code' AND outcome = 'pending') FROM cross_checks`))
 	h.logf("%s", h.shape(`SELECT 'judge-eligible targets / reviewed / failed reviews / skips', t.n || ' / ' || t.rev || ' (' || round(100.0 * t.rev / t.n, 1) || '%) / ' || t.fl || ' / ' || t.sk FROM
 	    (SELECT count(*) AS n, count(rv.id) AS rev, count(rv.id) FILTER (WHERE rv.status = 'failed') AS fl, count(js.target_run_id) AS sk
@@ -654,14 +661,17 @@ func (h *evHarness) qualityWorkload(name string, owner uuid.UUID, win analytics.
 			judge = append(judge, k)
 		}
 	}
+	planLead, codeLead := qualityCall{}.leadKinds()
 	always, prestart := workersvc.JudgeSkipFailOrigins()
 	ownerP := store.AnalyticsOwnerQualityParams{
 		UserID: owner, Now: spendTS(b.Now), From: spendTS(b.From), BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
 		Kinds: kinds, DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+		PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
 	}
 	allP := store.AnalyticsAllQualityParams{
 		Now: spendTS(b.Now), From: spendTS(b.From), BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
 		Kinds: kinds, DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+		PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
 	}
 	w := evWorkload{name: name}
 	if owner != uuid.Nil {

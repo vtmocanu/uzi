@@ -140,6 +140,12 @@ func (f *qualityFixture) checkerRun(o spendOwner, repo, lead uuid.UUID, harness 
 	return id
 }
 
+// linkChecker points every cross-check attempt of a lead at its checker child run.
+func (f *qualityFixture) linkChecker(lead, checker uuid.UUID) {
+	f.t.Helper()
+	mustExec(f.ctx, f.t, f.pool, `UPDATE cross_checks SET checker_run_id = $2 WHERE lead_run_id = $1`, lead, checker)
+}
+
 // review inserts the retained review of a target.
 func (f *qualityFixture) review(target, user uuid.UUID, status, verdict string, at time.Time) {
 	f.t.Helper()
@@ -167,6 +173,20 @@ type qualityCall struct {
 	Kinds         []string
 	DeliveryKinds []string
 	JudgeKinds    []string
+}
+
+// leadKinds returns the production plan and code cross-check lead-kind lists.
+func (c qualityCall) leadKinds() (plan, code []string) {
+	plan, code = []string{}, []string{}
+	for _, k := range runkind.All() {
+		if runkind.PlanCrossCheckable(k) {
+			plan = append(plan, k)
+		}
+		if runkind.CodeCrossCheckable(k) {
+			code = append(code, k)
+		}
+	}
+	return plan, code
 }
 
 type qualityResult struct {
@@ -220,6 +240,7 @@ func (f *qualityFixture) quality(c qualityCall) qualityResult {
 func (f *qualityFixture) qualityRaw(c qualityCall, b analytics.Bounds) []byte {
 	f.t.Helper()
 	starts, ends, repo, harness, kinds, delivery, judge, always, prestart := c.params(b)
+	planLead, codeLead := c.leadKinds()
 	conn, err := f.pool.Acquire(f.ctx)
 	if err != nil {
 		f.t.Fatalf("acquire: %v", err)
@@ -237,13 +258,13 @@ func (f *qualityFixture) qualityRaw(c qualityCall, b analytics.Bounds) []byte {
 		raw, err = qs.AnalyticsOwnerQuality(f.ctx, store.AnalyticsOwnerQualityParams{
 			UserID: c.Owner, Now: spendTS(b.Now), From: spendTS(b.From), BucketStarts: starts, BucketEnds: ends,
 			RepoID: repo, Harness: harness, Kinds: kinds, DeliveryKinds: delivery, JudgeKinds: judge,
-			AlwaysSkipOrigins: always, PrestartOrigins: prestart,
+			AlwaysSkipOrigins: always, PrestartOrigins: prestart, PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
 		})
 	} else {
 		raw, err = qs.AnalyticsAllQuality(f.ctx, store.AnalyticsAllQualityParams{
 			Now: spendTS(b.Now), From: spendTS(b.From), BucketStarts: starts, BucketEnds: ends,
 			RepoID: repo, Harness: harness, Kinds: kinds, DeliveryKinds: delivery, JudgeKinds: judge,
-			AlwaysSkipOrigins: always, PrestartOrigins: prestart,
+			AlwaysSkipOrigins: always, PrestartOrigins: prestart, PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
 		})
 	}
 	if err != nil {

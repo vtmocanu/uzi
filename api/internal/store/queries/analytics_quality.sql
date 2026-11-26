@@ -134,8 +134,9 @@ cf_cells AS (
     FROM bk LEFT JOIN cfb x ON x.bidx = bk.idx
     GROUP BY bk.idx
 ),
--- Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
--- lead-time restriction. Stage selects the stored result field: plan reads verdict, code reads
+-- Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
+-- must be one whose stage can run a cross-check), with no creation-time restriction: time
+-- evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
 -- outcome (the legacy code verdict column is inert).
 cc_base AS MATERIALIZED (
     SELECT cc.id, cc.stage,
@@ -150,8 +151,8 @@ cc_base AS MATERIALIZED (
       AND lead.user_id = @user_id::uuid  -- owner-only
       AND (sqlc.narg('harness')::text IS NULL OR lead.harness = sqlc.narg('harness')::text)
       AND lead.kind = ANY(@kinds::text[]) AND lead.kind <> 'cross_check'
-      AND ((((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending'))
-             AND cc.interrupted_at IS NULL) OR cc.created_at < @now::timestamptz)
+      AND ((cc.stage = 'plan' AND lead.kind = ANY(@plan_lead_kinds::text[]))
+        OR (cc.stage = 'code' AND lead.kind = ANY(@code_lead_kinds::text[])))
 ),
 cc_dec AS MATERIALIZED (
     SELECT b.*,
@@ -438,8 +439,9 @@ cf_cells AS (
     FROM bk LEFT JOIN cfb x ON x.bidx = bk.idx
     GROUP BY bk.idx
 ),
--- Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
--- lead-time restriction. Stage selects the stored result field: plan reads verdict, code reads
+-- Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
+-- must be one whose stage can run a cross-check), with no creation-time restriction: time
+-- evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
 -- outcome (the legacy code verdict column is inert).
 cc_base AS MATERIALIZED (
     SELECT cc.id, cc.stage,
@@ -453,8 +455,8 @@ cc_base AS MATERIALIZED (
     WHERE (sqlc.narg('repo_id')::uuid IS NULL OR lead.repo_id = sqlc.narg('repo_id')::uuid)
       AND (sqlc.narg('harness')::text IS NULL OR lead.harness = sqlc.narg('harness')::text)
       AND lead.kind = ANY(@kinds::text[]) AND lead.kind <> 'cross_check'
-      AND ((((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending'))
-             AND cc.interrupted_at IS NULL) OR cc.created_at < @now::timestamptz)
+      AND ((cc.stage = 'plan' AND lead.kind = ANY(@plan_lead_kinds::text[]))
+        OR (cc.stage = 'code' AND lead.kind = ANY(@code_lead_kinds::text[])))
 ),
 cc_dec AS MATERIALIZED (
     SELECT b.*,

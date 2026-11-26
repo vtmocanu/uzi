@@ -28,9 +28,10 @@ import (
 //
 // Statement timeout (SQLSTATE 57014): the unit test
 // TestAnalyticsQualityStatementTimeoutIs503WithRetryAfterAndReleases pins the 503 mapping and
-// the slot release through the handler. The shared snapshot's real 57014 is covered at store level
-// by TestAnalyticsSnapshotStatementTimeoutLiveDB (#4684); like Spend, no handler-level LiveDB
-// timeout case is added here.
+// the slot release through the handler, and TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB
+// below drives a real 57014 through the live router (about 8 s, the snapshot's statement_timeout).
+// The shared snapshot's own 57014 is also covered at store level by
+// TestAnalyticsSnapshotStatementTimeoutLiveDB (#4684).
 
 func anDecodeQuality(t *testing.T, rec *httptest.ResponseRecorder) apitypes.AnalyticsQualityDTO {
 	t.Helper()
@@ -219,6 +220,76 @@ func TestAnalyticsQualityAuthorityErrorsLiveDB(t *testing.T) {
 	}
 	if dto.CIFix.Applicable || dto.CIFix.Reason == nil || *dto.CIFix.Reason != "not_applicable" {
 		t.Fatalf("kind=issue must make ci_fix not applicable: %+v", dto.CIFix.AnalyticsQualitySectionDTO)
+	}
+}
+
+// A kind filter whose kinds cannot run a plan cross-check (task has no plan gate) reports the plan
+// section as not applicable AND counts no plan attempts, while the code section still counts.
+func TestAnalyticsQualityPlanApplicabilityMatchesPopulationLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2044)
+	u := f.user(false)
+	repo, _ := f.repoOwnedBy(u, "task")
+	lead := f.run(u, repo, f.now.Add(-6*time.Hour), "1.000000")
+	cliMustExec(t, f.pool, `UPDATE runs SET kind = 'task', issue_iid = NULL, branch = 'uzi/task/' || id::text WHERE id = $1`, lead)
+	anSeedPlanCheck(t, f, lead, 1, "approve", f.now.Add(-2*time.Hour))
+	cliMustExec(t, f.pool,
+		`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, base_commit, head_commit, candidate_digest,
+		     verdict, outcome, reason_class, findings, decided_at, deadline_at, created_at, checker_harness,
+		     code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled,
+		     repo_instructions_text, repo_instructions_digest)
+		 VALUES ($1, 'code', 1, 0, repeat('a', 40), repeat('b', 40), '\x01'::bytea,
+		     'failed', 'completed', NULL, '[]'::jsonb, $2, $3::timestamptz + interval '1 hour', $3, 'codex',
+		     '{}'::jsonb, '', '', sha256(convert_to('', 'UTF8')), false, '', sha256(convert_to('', 'UTF8')))`,
+		lead, f.now.Add(-time.Hour), f.now.Add(-2*time.Hour))
+
+	dto := anDecodeQuality(t, f.cookie(u, "/api/analytics/quality?kind=task"))
+	if dto.CrossCheck.Plan.Applicable || dto.CrossCheck.Plan.DecidedInWindow != 0 {
+		t.Fatalf("kind=task plan = applicable %v decided %d, want not applicable with no counts", dto.CrossCheck.Plan.Applicable, dto.CrossCheck.Plan.DecidedInWindow)
+	}
+	if !dto.CrossCheck.Code.Applicable || dto.CrossCheck.Code.DecidedInWindow != 1 {
+		t.Fatalf("kind=task code = applicable %v decided %d, want applicable with 1", dto.CrossCheck.Code.Applicable, dto.CrossCheck.Code.DecidedInWindow)
+	}
+}
+
+// A real statement timeout through the live router: while another connection holds an ACCESS
+// EXCLUSIVE lock on runs the snapshot's first read waits until its 8 s statement_timeout, the
+// response is a 503 with Retry-After, and the admission slot is released for the next request.
+func TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2042)
+	u := f.user(false)
+	jwt := cliMintJWT(t, f.pool, u)
+
+	lockCtx := context.Background()
+	tx, err := f.pool.Begin(lockCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			_ = tx.Rollback(lockCtx)
+		}
+	}
+	t.Cleanup(release)
+	if _, err := tx.Exec(lockCtx, `LOCK TABLE runs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := cookieReq(t, f.router, http.MethodGet, "/api/analytics/quality", jwt, "")
+	release()
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("locked status = %d %s, want 503", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("503 carries no Retry-After header")
+	}
+	if !strings.Contains(rec.Body.String(), "analytics query timed out") {
+		t.Errorf("503 body = %q, want the query timed out text", rec.Body.String())
+	}
+
+	if next := cookieReq(t, f.router, http.MethodGet, "/api/analytics/quality", jwt, ""); next.Code != http.StatusOK {
+		t.Fatalf("request after the lock released = %d %s, want 200 (slot released)", next.Code, next.Body.String())
 	}
 }
 

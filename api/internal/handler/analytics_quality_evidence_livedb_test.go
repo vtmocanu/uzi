@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/analytics"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -86,10 +87,43 @@ func evHTTPEnvInt(name string, def int) int {
 	return def
 }
 
+// evHTTPPreflight runs on a plain read-only connection BEFORE cliLiveDB (which migrates and
+// writes): it fails, never skips, unless the database carries the throwaway marker row and the
+// retained evidence seed. It returns the seed's row counts.
+func evHTTPPreflight(t *testing.T, dsn string) (runs, rework, checks, reviews int64) {
+	t.Helper()
+	if dsn == "" {
+		t.Fatal("UZI_TEST_DATABASE_URL not set; the evidence harness needs the retained throwaway database")
+	}
+	ctx := context.Background()
+	c, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("preflight connect: %v", err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	var markers int
+	if err := c.QueryRow(ctx,
+		`SELECT count(*)::int FROM uzi_test_harness.database_marker WHERE marker = 'recovery-reset-v1'`).Scan(&markers); err != nil {
+		t.Fatalf("refusing to run: uzi_test_harness.database_marker unreadable: %v; initialise a throwaway database with e2e/test-database-marker.sql", err)
+	}
+	if markers != 1 {
+		t.Fatalf("refusing to run: uzi_test_harness.database_marker lacks recovery-reset-v1 (count %d); initialise a throwaway database with e2e/test-database-marker.sql", markers)
+	}
+	if err := c.QueryRow(ctx, `SELECT (SELECT count(*) FROM runs), (SELECT count(*) FROM runs WHERE kind = 'mr_rework'),
+	        (SELECT count(*) FROM cross_checks), (SELECT count(*) FROM run_reviews)`).Scan(&runs, &rework, &checks, &reviews); err != nil {
+		t.Fatalf("count seed: %v", err)
+	}
+	if runs < 100000 || rework == 0 || checks == 0 || reviews == 0 {
+		t.Fatalf("the evidence seed is absent (runs=%d mr_rework=%d cross_checks=%d run_reviews=%d); run the store harness first with UZI_EVIDENCE_KEEP=1", runs, rework, checks, reviews)
+	}
+	return runs, rework, checks, reviews
+}
+
 func TestQualityHTTPEvidenceLiveDB(t *testing.T) {
 	if os.Getenv("UZI_ANALYTICS_PLAN_EVIDENCE") != "1" {
 		t.Skip("UZI_ANALYTICS_PLAN_EVIDENCE=1 not set; this is a measurement harness, not a gate")
 	}
+	runs, rework, checks, reviews := evHTTPPreflight(t, os.Getenv("UZI_TEST_DATABASE_URL"))
 	h, router, pool := cliLiveDB(t)
 	// The analytics reads run on a pool sized like production (DB_MAX_CONNS default 20), which
 	// also sizes the admission gate; cliLiveDB's own pool only serves auth and the fixtures.
@@ -122,15 +156,6 @@ func TestQualityHTTPEvidenceLiveDB(t *testing.T) {
 		t.Log(line)
 	}
 
-	// The seed must be present: the store harness with UZI_EVIDENCE_KEEP=1 left it.
-	var runs, rework, checks, reviews int64
-	if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM runs), (SELECT count(*) FROM runs WHERE kind = 'mr_rework'),
-	        (SELECT count(*) FROM cross_checks), (SELECT count(*) FROM run_reviews)`).Scan(&runs, &rework, &checks, &reviews); err != nil {
-		t.Fatalf("count seed: %v", err)
-	}
-	if runs < 100000 || rework == 0 || checks == 0 || reviews == 0 {
-		t.Fatalf("the evidence seed is absent (runs=%d mr_rework=%d cross_checks=%d run_reviews=%d); run the store harness first with UZI_EVIDENCE_KEEP=1", runs, rework, checks, reviews)
-	}
 	var top uuid.UUID
 	if err := pool.QueryRow(context.Background(), `SELECT id FROM users WHERE email = 'evid-0001@e2e'`).Scan(&top); err != nil {
 		t.Fatalf("largest evidence owner: %v", err)

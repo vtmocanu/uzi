@@ -635,6 +635,7 @@ func qualityExecuteArgs(t *testing.T, ctx context.Context, owner uuid.UUID, b an
 			judge = append(judge, k)
 		}
 	}
+	planLead, codeLead := qualityCall{}.leadKinds()
 	always, prestart := workersvc.JudgeSkipFailOrigins()
 	capture := &capturingDBTX{}
 	cq := store.New(capture)
@@ -642,11 +643,13 @@ func qualityExecuteArgs(t *testing.T, ctx context.Context, owner uuid.UUID, b an
 		_, _ = cq.AnalyticsOwnerQuality(ctx, store.AnalyticsOwnerQualityParams{
 			UserID: owner, Now: ts(b.Now), From: ts(b.From), BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds),
 			Kinds: runkind.All(), DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+			PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
 		})
 	} else {
 		_, _ = cq.AnalyticsAllQuality(ctx, store.AnalyticsAllQualityParams{
 			Now: ts(b.Now), From: ts(b.From), BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds),
 			Kinds: runkind.All(), DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+			PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
 		})
 	}
 	lits := make([]string, len(capture.args))

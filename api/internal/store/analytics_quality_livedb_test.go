@@ -281,6 +281,10 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	decidedLead := lead("claude", at(13).Add(-2*time.Hour))
 	f.checkerRun(o, repo, decidedLead, "codex", at(13).Add(-time.Hour))
 	f.ccPlan(decidedLead, "approve", "approve", at(13).Add(-time.Hour), qualTS(at(13)), qualNull, "claude")
+	// A code attempt decided while its checker child is still winding down: decided, never pending.
+	codeLead := lead("claude", at(15).Add(-2*time.Hour))
+	f.ccCode(codeLead, "completed", nil, `[]`, at(15).Add(-time.Hour), qualTS(at(15)), qualNull, "codex")
+	f.linkChecker(codeLead, f.checkerRun(o, repo, codeLead, "codex", at(15).Add(-time.Hour)))
 	// Decided before the window: counted nowhere.
 	f.ccPlan(lead("claude", old), "approve", "approve", old, qualTS(old.Add(time.Hour)), qualNull, "claude")
 	// Undated: NULL, infinity, -infinity and backwards decision times.
@@ -291,6 +295,10 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	// Undated: created_at is -infinity with a finite decision time inside the window.
 	negLead := lead("claude", at(14))
 	f.ccPlanTS(negLead, "approve", "approve", qualNegInf, qualTS(at(14)), qualNull, "claude")
+	// Undated: created_at is +infinity (malformed) with a finite decision time inside the window.
+	f.ccPlanTS(lead("claude", at(14)), "revise", "revise", qualInf, qualTS(at(14)), qualNull, "claude")
+	// Undated: created_at far in the future, so the decision precedes it (backwards).
+	f.ccPlan(lead("claude", at(14)), "approve", "approve", qualNow.AddDate(0, 0, 365), qualTS(at(14)), qualNull, "claude")
 	// Pending plan on an old lead.
 	f.ccPlan(lead("claude", old), "pending", nil, old, qualNull, qualNull, "claude")
 	// Pending created after the request's Now: live pending has no time predicate.
@@ -306,6 +314,7 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	f.ccCode(lead("claude", at(4)), "completed", nil, `[]`, at(4), qualNull, qualNull, "codex")             // undated
 	f.ccCode(lead("claude", at(20)), "failed", "timed_out", nil, at(20), qualTS(at(19)), qualNull, "codex") // undated
 	f.ccCode(lead("claude", old), "pending", nil, `[]`, old, qualNull, qualNull, "codex")                   // pending, old
+	f.ccCodeTS(lead("claude", at(14)), "completed", nil, `[]`, qualInf, qualTS(at(14)), qualNull, "codex")  // undated: +infinity created_at
 	negCode := lead("claude", at(14))
 	f.ccCodeTS(negCode, "completed", nil, `[]`, qualNegInf, qualTS(at(14)), qualNull, "codex") // undated: -infinity created_at
 
@@ -317,20 +326,22 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	wantEq(t, "plan stored", p.StoredResult, store.AnalyticsQualityPlanResults{Approve: 4, Revise: 1, Block: 1, Failed: 3})
 	wantEq(t, "plan classes", p.Classes, store.AnalyticsQualityClasses{Passed: 4, RaisedIssues: 2, DidntFinish: 1, Replaced: 2})
 	wantEq(t, "plan checker harness", p.CheckerHarness, store.AnalyticsQualityCheckerHarness{Claude: 5, Codex: 1, Unknown: 3})
-	wantEq(t, "plan undated", p.Undated, store.AnalyticsQualityPlanUndated{Count: 5,
-		StoredResult: store.AnalyticsQualityPlanResults{Approve: 3, Revise: 1, Block: 1}})
+	wantEq(t, "plan undated", p.Undated, store.AnalyticsQualityPlanUndated{Count: 7,
+		StoredResult: store.AnalyticsQualityPlanResults{Approve: 4, Revise: 2, Block: 1}})
 
 	c := cc.Code
-	wantEq(t, "code decided", c.DecidedInWindow, 6)
+	wantEq(t, "code decided", c.DecidedInWindow, 7)
 	// Stage-specific result field: a completed code attempt with legacy verdict 'failed' is
 	// stored as completed.
-	wantEq(t, "code stored", c.StoredResult, store.AnalyticsQualityCodeResults{Completed: 5, Failed: 1})
-	wantEq(t, "code classes", c.Classes, store.AnalyticsQualityClasses{Passed: 2, RaisedIssues: 1, DidntFinish: 1, Replaced: 1, Unclassified: 1})
-	wantEq(t, "code checker harness", c.CheckerHarness, store.AnalyticsQualityCheckerHarness{Claude: 1, Codex: 4, Unknown: 1})
-	wantEq(t, "code undated", c.Undated, store.AnalyticsQualityCodeUndated{Count: 3,
-		StoredResult: store.AnalyticsQualityCodeResults{Completed: 2, Failed: 1}})
+	wantEq(t, "code stored", c.StoredResult, store.AnalyticsQualityCodeResults{Completed: 6, Failed: 1})
+	wantEq(t, "code classes", c.Classes, store.AnalyticsQualityClasses{Passed: 3, RaisedIssues: 1, DidntFinish: 1, Replaced: 1, Unclassified: 1})
+	wantEq(t, "code checker harness", c.CheckerHarness, store.AnalyticsQualityCheckerHarness{Claude: 1, Codex: 5, Unknown: 1})
+	wantEq(t, "code undated", c.Undated, store.AnalyticsQualityCodeUndated{Count: 4,
+		StoredResult: store.AnalyticsQualityCodeResults{Completed: 3, Failed: 1}})
 
+	// The code attempt decided with a running checker child is not pending.
 	wantEq(t, "pending", cc.Pending, store.AnalyticsQualityPending{Total: 3, Plan: 2, Code: 1})
+	wantEq(t, "code bucket day 15 (running checker)", c.Buckets[14].Decided, 1)
 
 	// Reconciliation: decided in window = stored results = classes = checker harness = buckets.
 	for name, s := range map[string]struct {
@@ -367,6 +378,32 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	wantEq(t, "excluded plan decided", none.Plan.DecidedInWindow, 0)
 	wantEq(t, "excluded plan undated", none.Plan.Undated.Count, 0)
 	wantEq(t, "excluded pending", none.Pending.Total, 0)
+}
+
+// The cross-check population follows the lead kinds whose stage can run a cross-check: a plan
+// attempt on a task lead (no plan gate) is not counted, a code attempt on it is.
+func TestQualityCrossCheckApplicablePopulationLiveDB(t *testing.T) {
+	f := newQualityFixture(t)
+	o := f.owner("cc-pop")
+	repo, _ := f.repo(o, "cc-pop")
+	at := qualDay(5, 9)
+	taskLead := f.run(spendRun{Owner: o.User, Repo: repo, Kind: runkind.Task, Harness: "claude", Status: "running", At: at.Add(-2 * time.Hour)})
+	f.ccPlan(taskLead, "approve", "approve", at.Add(-time.Hour), qualTS(at), qualNull, "claude")
+	pendingLead := f.run(spendRun{Owner: o.User, Repo: repo, Kind: runkind.Task, Harness: "claude", Status: "running", At: at.Add(-2 * time.Hour)})
+	f.ccPlan(pendingLead, "pending", nil, at.Add(-time.Hour), qualNull, qualNull, "claude")
+	f.ccCode(taskLead, "completed", nil, `[]`, at.Add(-time.Hour), qualTS(at), qualNull, "codex")
+	issueLead := f.lead(o, repo, "claude", at.Add(-2*time.Hour))
+	f.ccPlan(issueLead, "approve", "approve", at.Add(-time.Hour), qualTS(at), qualNull, "claude")
+
+	cc := f.quality(qualityCall{Owner: o.User, Now: qualNow, Kinds: []string{runkind.Task}}).Doc.CrossCheck
+	wantEq(t, "task-only plan decided", cc.Plan.DecidedInWindow, 0)
+	wantEq(t, "task-only plan undated", cc.Plan.Undated.Count, 0)
+	wantEq(t, "task-only code decided", cc.Code.DecidedInWindow, 1)
+	wantEq(t, "task-only pending", cc.Pending, store.AnalyticsQualityPending{})
+
+	both := f.quality(qualityCall{Owner: o.User, Now: qualNow}).Doc.CrossCheck
+	wantEq(t, "default plan decided", both.Plan.DecidedInWindow, 1)
+	wantEq(t, "default code decided", both.Code.DecidedInWindow, 1)
 }
 
 func classSum(c store.AnalyticsQualityClasses) int64 {
@@ -454,6 +491,37 @@ func TestQualityJudgeLiveDB(t *testing.T) {
 	r := call()
 	wantEq(t, "rejudged complete", r.Eligible.Complete, store.AnalyticsQualityJudgeComplete{Total: 3, Ideal: 0, OK: 1, Issues: 2})
 	wantEq(t, "rejudged bucket 2", r.Buckets[2], j.Buckets[2])
+
+	// The denominator is a retained-property count: neither the owner's judge opt-in nor the
+	// global judge setting changes any of it.
+	before, err := json.Marshal(call())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prior *string
+	if err := f.pool.QueryRow(f.ctx, `SELECT value FROM app_settings WHERE key = 'judge_enabled'`).Scan(&prior); err != nil && !strings.Contains(err.Error(), "no rows") {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if prior == nil {
+			_, _ = f.pool.Exec(context.Background(), `DELETE FROM app_settings WHERE key = 'judge_enabled'`)
+		} else {
+			_, _ = f.pool.Exec(context.Background(), `UPDATE app_settings SET value = $1 WHERE key = 'judge_enabled'`, *prior)
+		}
+	})
+	for _, on := range []bool{true, false} {
+		mustExec(f.ctx, t, f.pool, `UPDATE users SET judge_enabled = $2 WHERE id = $1`, o.User, on)
+		mustExec(f.ctx, t, f.pool,
+			`INSERT INTO app_settings (key, value) VALUES ('judge_enabled', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			map[bool]string{true: "true", false: "false"}[on])
+		after, err := json.Marshal(call())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Errorf("judge section changed with judge_enabled=%v:\n before %s\n after  %s", on, before, after)
+		}
+	}
 
 	// Kind filter on the cohort: no judge kinds leaves nothing eligible.
 	empty := f.quality(qualityCall{Owner: o.User, Now: qualNow, JudgeKinds: []string{}}).Doc.Judge
