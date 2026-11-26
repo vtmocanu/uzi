@@ -405,6 +405,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A Claude credential switch after a permanent message failure in the restore window now holds the run on the switch fence ([#4652](https://github.com/vtmocanu/uzi/pull/4652), [#4666](https://github.com/vtmocanu/uzi/pull/4666)).**
   On a worker that supports in-place credential switches, a Claude run whose restore predecessor is still guarded now holds on the switch fence, instead of a plain retained stop, when an op-fenced credential switch is pending after a permanent message failure. Codex runs are unchanged.
 
+- **Runs on a custom model provider are exempt from the vendor weekly usage reserve ([#4658](https://github.com/vtmocanu/uzi/pull/4658), [#4694](https://github.com/vtmocanu/uzi/pull/4694)).**
+  Provider-bound runs, judges and self-improve runs included, spend their own gateway key, so the vendor reserve does not hold or mark them and requests no new pause for them (a pending request is withdrawn, and a pause from one becomes eligible for release); runs explicitly bound to a vendor credential stay subject to it.
+
+- **The CLI run stream keeps reconnecting after a long api outage ([#4680](https://github.com/vtmocanu/uzi/pull/4680)).**
+  A reconcile tick no longer restarts the reconnect backoff, so a TUI run view redials and resumes live messages once the api is back.
+
+- **Codex cross-check Search now covers source files over 1 MiB ([#4683](https://github.com/vtmocanu/uzi/pull/4683), [#4687](https://github.com/vtmocanu/uzi/pull/4687)).**
+  Regular files are read in bounded 1 MiB chunks counted against the existing 16 MiB search byte total, stopping with a partial result at the budget; a file seen to change mid-scan is skipped.
+
+- **Overlapping secret occurrences are fully redacted ([#4688](https://github.com/vtmocanu/uzi/pull/4688), [#4690](https://github.com/vtmocanu/uzi/pull/4690)).**
+  The worker's text redactor now finds every eligible occurrence of a run-owned secret in the original text, overlapping and invisible-separated ones included, and replaces the union of those matches in one pass.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -638,6 +650,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admins can share a Claude provider definition that every user uses with their own key ([#4324](https://github.com/vtmocanu/uzi/pull/4324), [#4656](https://github.com/vtmocanu/uzi/pull/4656)).**
   Each user attaches, tests and selects their own key, so the admin never holds it; the URL and auth style are fixed at creation, the Claude engine only, and the redirect risk accepted for custom providers applies.
 
+- **Runtime web modules ([#4686](https://github.com/vtmocanu/uzi/pull/4686), [#4697](https://github.com/vtmocanu/uzi/pull/4697)).**
+  The web app can load operator-configured pages at runtime from /modules.json, with their own nav entries and a per-page error card, without rebuilding the web image. Operators enable modules with the Helm chart's `web.modules[]` (needs `web.nginx.resolver`) or the compose generator and override; see docs/web-modules.md.
+
+- **Owners can resume a held run on a separate hosted worker from saved evidence ([#4628](https://github.com/vtmocanu/uzi/pull/4628), [#4679](https://github.com/vtmocanu/uzi/pull/4679)).**
+  `uzi run fresh-resume` (and the web run page) seeds a different persistent hosted worker from a recovery capture or the checkpoint ref after showing the cutoff; the original worker's source and custody are kept and a healthy seeded run counts one extra custody admission unit. Off unless `UZI_FRESH_RESUME` is set on every replica; roll the binary back only with no pending or claimed transfer. If the destination clone key still has a retained inventory exclusion, the seed refuses before writing anything, waits once, retries once, and otherwise gives the transfer back and stops without failing the run.
+
+- **A Claude judge runs on the owner's model provider ([#4322](https://github.com/vtmocanu/uzi/pull/4322), [#4678](https://github.com/vtmocanu/uzi/pull/4678)).**
+  The provider is frozen when the judge is created, with no vendor fallback (an owner who pinned an Anthropic token gets a vendor judge instead); it needs workers advertising claude_provider_judge_v1, fails instead of parking on revocation or a gateway limit, and sends judged traces to the gateway.
+
 ### Changed
 
 - **Routine dependency updates ([#4650](https://github.com/vtmocanu/uzi/pull/4650)).**
@@ -864,6 +885,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Settings Models shows a saved value only where the control does not, and offers Reset to default ([#4671](https://github.com/vtmocanu/uzi/pull/4671), [#4672](https://github.com/vtmocanu/uzi/pull/4672)).**
   The saved-value tag under every Models cell is gone: a muted line appears only for an unsaved change, an unavailable value or a value the select hides, and screen readers still hear every saved value. A value you changed from its default has a Reset to default button.
+
+- **A non-zero guarded command result explains its exit code ([#4681](https://github.com/vtmocanu/uzi/pull/4681)).**
+  Claude runs under the memory guard now note that the code is the supervised shell's final status, so passing output from earlier commands can sit above it, and that a code above 128 does not by itself establish a signal kill.
 
 ### Security
 
