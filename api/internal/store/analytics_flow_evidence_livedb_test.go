@@ -379,6 +379,18 @@ func (h *evHarness) flowWorkloads() []flWorkload {
 			}
 		}
 	}
+	if len(out) == 0 {
+		names := make([]string, len(all))
+		for i, w := range all {
+			names[i] = w.name
+		}
+		h.t.Fatalf("UZI_EVIDENCE_ONLY=%q matches no workload (available: %s)", only, strings.Join(names, ", "))
+	}
+	names := make([]string, len(out))
+	for i, w := range out {
+		names[i] = w.name
+	}
+	h.logf("UZI_EVIDENCE_ONLY=%q selected %d of %d workloads: %s", only, len(out), len(all), strings.Join(names, ", "))
 	return out
 }
 
@@ -389,6 +401,8 @@ type flRecorder struct {
 	phases []string
 	// requestRows are the formatted request-path summary rows.
 	requestRows []string
+	// partial is non-empty when UZI_EVIDENCE_ONLY selected a subset of the workloads.
+	partial string
 }
 
 type flRow struct {
@@ -406,6 +420,54 @@ func flLabels(p *evPlan, sub string) []string {
 	return out
 }
 
+// flInputIndex is the only index a Flow plan may use to reach run_user_inputs.
+const flInputIndex = "idx_run_user_inputs_run_id"
+
+// flInputScanProblems checks EVERY plan node that touches run_user_inputs: it must be an Index
+// Scan or Index Only Scan on flInputIndex whose Index Cond references run_id, or a Bitmap Heap
+// Scan fed by a Bitmap Index Scan on flInputIndex with such a condition. An index that merely
+// appears elsewhere in the plan does not satisfy another node.
+func flInputScanProblems(n map[string]any) []string {
+	var out []string
+	condOK := func(m map[string]any) bool {
+		return evStr(m, "Index Name") == flInputIndex && strings.Contains(evStr(m, "Index Cond"), "run_id")
+	}
+	var bitmapOK func(m map[string]any) bool
+	bitmapOK = func(m map[string]any) bool {
+		if evStr(m, "Node Type") == "Bitmap Index Scan" && condOK(m) {
+			return true
+		}
+		for _, k := range evKids(m) {
+			if bitmapOK(k) {
+				return true
+			}
+		}
+		return false
+	}
+	var walk func(m map[string]any)
+	walk = func(m map[string]any) {
+		nt := evStr(m, "Node Type")
+		if evStr(m, "Relation Name") == "run_user_inputs" {
+			ok := false
+			switch nt {
+			case "Index Scan", "Index Only Scan":
+				ok = condOK(m)
+			case "Bitmap Heap Scan":
+				ok = bitmapOK(m)
+			}
+			if !ok {
+				out = append(out, fmt.Sprintf("run_user_inputs node %q (index %q, cond %q) is not an index scan on %s with run_id in its Index Cond",
+					nt, evStr(m, "Index Name"), evStr(m, "Index Cond"), flInputIndex))
+			}
+		}
+		for _, k := range evKids(m) {
+			walk(k)
+		}
+	}
+	walk(n)
+	return out
+}
+
 func (r *flRecorder) plan(w evWorkload, mode string, st evStmt, p *evPlan) {
 	h := r.h
 	ctx := fmt.Sprintf("%s %s plan_cache_mode=%s", st.name, w.name, mode)
@@ -417,9 +479,8 @@ func (r *flRecorder) plan(w evWorkload, mode string, st evStmt, p *evPlan) {
 			h.t.Errorf("%s: sequential scan of a gate-evidence table: %s", ctx, label)
 		}
 	}
-	touchesInputs := len(flLabels(p, "run_user_inputs")) > 0
-	if touchesInputs && !p.indexNames["idx_run_user_inputs_run_id"] {
-		h.t.Errorf("%s: run_user_inputs is not reached through idx_run_user_inputs_run_id", ctx)
+	for _, problem := range flInputScanProblems(p.root) {
+		h.t.Errorf("%s: %s", ctx, problem)
 	}
 	if blob, err := json.Marshal(p.root); err != nil {
 		h.t.Errorf("%s: re-encode plan: %v", ctx, err)
@@ -475,6 +536,9 @@ func (r *flRecorder) timing(phase string, w evWorkload, mode string, tm evTiming
 }
 
 func (r *flRecorder) table() {
+	if r.partial != "" {
+		r.h.logf("\n#### PARTIAL SELECTION: this summary covers only %s; it is not the full workload matrix", r.partial)
+	}
 	if len(r.requestRows) > 0 {
 		r.h.logf("\n#### SUMMARY [%s]: ms (requests | timeouts | first | median / p95 | max); excludes HTTP, auth middleware, admission, in-snapshot authorization, DTO mapping, JSON encoding of the DTO and network", flRequestPhase)
 		for _, row := range r.requestRows {
@@ -581,6 +645,13 @@ func TestAnalyticsFlowPlanEvidenceLiveDB(t *testing.T) {
 	h.flowSeed()
 	workloads := h.flowWorkloads()
 	rec := &flRecorder{h: h}
+	if only := os.Getenv("UZI_EVIDENCE_ONLY"); only != "" {
+		names := make([]string, len(workloads))
+		for i, w := range workloads {
+			names[i] = w.name
+		}
+		rec.partial = fmt.Sprintf("UZI_EVIDENCE_ONLY=%q (%s)", only, strings.Join(names, ", "))
+	}
 	h.onPlan, h.onTiming = rec.plan, rec.timing
 
 	if os.Getenv("UZI_EVIDENCE_BASELINE") != "0" {

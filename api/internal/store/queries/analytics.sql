@@ -1178,8 +1178,9 @@ start_delay AS (
     FROM cc c
 ),
 gate_runs AS MATERIALIZED (
-    -- Chat runs never publish a plan gate, so they are not probed for receipts.
-    SELECT c.id, c.gate_revision FROM cc c WHERE c.kind <> 'chat'
+    -- Plan response covers every scoped kind, chat included when selected; only the funnel and
+    -- approval cohorts (fr) restrict to issue and self_improve.
+    SELECT c.id, c.gate_revision FROM cc c
 ),
 rcpt AS MATERIALIZED (
     SELECT g.id AS run_id, g.gate_revision AS run_rev, i.gate_binding, i.gate_revision AS rev,
@@ -1251,9 +1252,7 @@ plan_resp AS (
 plan_legacy AS (
     SELECT count(*) AS n FROM (SELECT x.run_id FROM rcpt_c x
                                GROUP BY x.run_id
-                               HAVING bool_or(x.gate_binding IS NULL)
-                                   OR (bool_or(x.gate_binding = 'unbound')
-                                       AND NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id))) l
+                               HAVING bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')) l
 ),
 fr AS MATERIALIZED (
     SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
@@ -1270,8 +1269,7 @@ fr AS MATERIALIZED (
     LEFT JOIN LATERAL (
         SELECT count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) AS cur_n,
                count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev < c.gate_revision) AS hist_n,
-               (bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound')
-                    AND count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) <> 1) AS legacy,
+               bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound') AS legacy,
                count(*) AS any_receipt
         FROM (SELECT x.gate_binding, x.gate_revision AS rev,
                      COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
@@ -1610,8 +1608,9 @@ start_delay AS (
     FROM cc c
 ),
 gate_runs AS MATERIALIZED (
-    -- Chat runs never publish a plan gate, so they are not probed for receipts.
-    SELECT c.id, c.gate_revision FROM cc c WHERE c.kind <> 'chat'
+    -- Plan response covers every scoped kind, chat included when selected; only the funnel and
+    -- approval cohorts (fr) restrict to issue and self_improve.
+    SELECT c.id, c.gate_revision FROM cc c
 ),
 rcpt AS MATERIALIZED (
     SELECT g.id AS run_id, g.gate_revision AS run_rev, i.gate_binding, i.gate_revision AS rev,
@@ -1683,9 +1682,7 @@ plan_resp AS (
 plan_legacy AS (
     SELECT count(*) AS n FROM (SELECT x.run_id FROM rcpt_c x
                                GROUP BY x.run_id
-                               HAVING bool_or(x.gate_binding IS NULL)
-                                   OR (bool_or(x.gate_binding = 'unbound')
-                                       AND NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id))) l
+                               HAVING bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')) l
 ),
 fr AS MATERIALIZED (
     SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
@@ -1702,8 +1699,7 @@ fr AS MATERIALIZED (
     LEFT JOIN LATERAL (
         SELECT count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) AS cur_n,
                count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev < c.gate_revision) AS hist_n,
-               (bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound')
-                    AND count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) <> 1) AS legacy,
+               bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound') AS legacy,
                count(*) AS any_receipt
         FROM (SELECT x.gate_binding, x.gate_revision AS rev,
                      COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,

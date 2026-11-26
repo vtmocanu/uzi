@@ -338,23 +338,29 @@ func TestAnalyticsFlowGateEvidenceLiveDB(t *testing.T) {
 			gr(0)
 		}, gateWant{runs: 2, planning: store.AnalyticsFlowPlanning{Skipped: 1, Unknown: 1}}},
 
-		{"timed bound pair plus a stray unbound receipt is timed, proven and not legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
+		{"timed bound pair plus a stray unbound receipt is timed and human, and still discloses legacy evidence", func(f *spendFixture, gr func(int64) uuid.UUID) {
 			r := gr(1)
 			f.presentation(r, 1, gatePres)
 			f.receipt(r, elig)
 			f.receipt(r, receipt{Binding: "unbound", CreatedAt: flowAt(12, 10, 50), AppliedAt: flowAt(12, 10, 51)})
-		}, gateWant{runs: 1, n: 1, p50: 1800, planning: store.AnalyticsFlowPlanning{SettledHuman: 1}, human: 1}},
+		}, gateWant{runs: 1, n: 1, p50: 1800, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, planning: store.AnalyticsFlowPlanning{SettledHuman: 1},
+			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, human: 1}},
+
+		{"a revision-0 run with only a NULL-binding applied receipt is legacy, never human", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			f.receipt(gr(0), receipt{Binding: "legacy", CreatedAt: gateIn, AppliedAt: gateApplied})
+		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, planning: store.AnalyticsFlowPlanning{Unknown: 1},
+			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, approvalUnk: store.AnalyticsFlowApprovalReasons{LegacyUnbound: 1}}},
 
 		{"a run whose only legacy receipt is unbound counts as legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
 			f.receipt(gr(0), receipt{Binding: "unbound", CreatedAt: gateIn, AppliedAt: gateApplied})
 		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, planning: store.AnalyticsFlowPlanning{Unknown: 1},
 			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, approvalUnk: store.AnalyticsFlowApprovalReasons{LegacyUnbound: 1}}},
 
-		{"a presentation with only an unbound applied receipt is not approved and not legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
+		{"a presentation with only an unbound applied receipt is not approved and is legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
 			r := gr(1)
 			f.presentation(r, 1, gatePres)
 			f.receipt(r, receipt{Binding: "unbound", CreatedAt: gateIn, AppliedAt: gateApplied})
-		}, gateWant{runs: 1, notApproved: 1, planning: store.AnalyticsFlowPlanning{Unknown: 1},
+		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, notApproved: 1, planning: store.AnalyticsFlowPlanning{Unknown: 1},
 			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, approvalUnk: store.AnalyticsFlowApprovalReasons{LegacyUnbound: 1}}},
 
 		{"a run straddling the binding migration counts its NULL-binding receipt as legacy beside a not-approved pair", func(f *spendFixture, gr func(int64) uuid.UUID) {

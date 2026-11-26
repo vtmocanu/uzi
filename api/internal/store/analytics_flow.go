@@ -178,8 +178,8 @@ type AnalyticsFlowPlanResponse struct {
 // presentation row), invalid_chronology (a receipt applied before it was created, or a
 // presentation created after the input), excluded_disposition (only superseded, declined or
 // advisory receipts), reconciliation_only (the single eligible receipt has disposition
-// 'applied'), legacy_unbound (a run with a NULL-binding approve_plan receipt, or one with
-// only unbound receipts and no presentation row or bound applied receipt at any revision).
+// 'applied'), legacy_unbound (a run with legacy gate evidence: any approve_plan receipt with a
+// NULL or 'unbound' binding; such a run is counted once here, whatever its other pairs).
 type AnalyticsFlowUnknown struct {
 	Total   int64                        `json:"total"`
 	Reasons AnalyticsFlowResponseReasons `json:"reasons"`
@@ -255,8 +255,9 @@ type AnalyticsFlowOutcomes struct {
 // AnalyticsFlowFunnelDisclosure counts runs whose approval evidence is incomplete:
 // HistoricalApprovalOnly (an earlier-revision approval and none for the current revision),
 // AmbiguousCurrent (more than one eligible receipt for the current revision) and
-// LegacyEvidence (a NULL or unbound approve_plan receipt on a run without current-plan human
-// proof; a run with exactly one eligible current receipt is never counted here).
+// LegacyEvidence (a run with any NULL-binding or unbound approve_plan receipt, even when it
+// also has human proof for the current plan; the approval classification still ranks that
+// human proof first).
 type AnalyticsFlowFunnelDisclosure struct {
 	HistoricalApprovalOnly int64 `json:"historical_approval_only"`
 	AmbiguousCurrent       int64 `json:"ambiguous_current"`
