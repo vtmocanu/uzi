@@ -131,12 +131,12 @@ Each FK is dropped and re-added under the same name in one `ALTER`, so no window
 
 The guard in 00527, 00528 and users_codex_provider_scope refuses unless `model_providers_scope_owner_id_key` is a valid, unique index. This is the runbook for that refusal.
 
-**When the text takes effect.** The revised message appears only while an affected migration (00527, 00528 or users_codex_provider_scope) is still pending, including a retry after an earlier refusal: a refusal rolls the file back with no version row (`store.Migrate` runs `goose.UpContext`, `api/internal/store/migrate.go`), so it stays pending. goose skips versions already applied, so installs past these migrations never see it. An operator who sees the old "roll 00526 back and apply it again" message from an older image follows this runbook too; that advice is a dead end while shared selections or keys exist, because the 00528 and 00527 Downs refuse (Down guard G).
+**When the text takes effect.** The revised message appears only while an affected migration (00527, 00528 or users_codex_provider_scope) is still pending, including a retry after an earlier refusal: a refusal rolls the file back with no version row (`store.Migrate` runs `goose.UpContext`, `api/internal/store/migrate.go`), so it stays pending. goose skips versions already applied, so installs past these migrations never see it. An operator who sees the old "roll 00526 back and apply it again" message from an older image follows this runbook too; that advice is a dead end once 00527 is applied and shared keys or selections exist, because the 00528 and 00527 Downs refuse (see "Migration Downs are out of band" under Rollback hazards) and, at users_codex_provider_scope, the 00536-00538 Downs refuse too (Down guard G). While 00527 is still pending nothing depends on the index yet, but still follow this runbook.
 
-**Preconditions.** API stopped, and this returns zero rows:
+**Preconditions.** API stopped, and this returns zero rows. Run it as a superuser or a role with `pg_read_all_stats`: an ordinary role sees other roles' rows with `relid`, `command` and `phase` NULL, so a relid-only filter could return zero during a build. Any row returned means wait:
 
 ```sql
-SELECT pid, command, phase FROM pg_stat_progress_create_index WHERE relid = to_regclass('model_providers');
+SELECT pid, command, phase FROM pg_stat_progress_create_index WHERE relid = to_regclass('model_providers') OR relid IS NULL;
 ```
 
 **Inspection.** Run from the migration's database, role and search_path. `<schema>` is the schema of `to_regclass('model_providers')`:
@@ -156,13 +156,15 @@ SELECT conrelid::regclass, conname, conindid = to_regclass('model_providers_scop
 FROM pg_constraint
 WHERE contype = 'f' AND conrelid IN (to_regclass('user_secrets'), to_regclass('users'))
   AND conname IN ('user_secrets_provider_fkey', 'users_claude_provider_fkey');
+-- count of foreign keys on the index (any table)
+SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conindid = to_regclass('model_providers_scope_owner_id_key');
 -- migration head
 SELECT max(version_id) FROM goose_db_version WHERE is_applied;
 ```
 
 **Exact index definition:** `CREATE UNIQUE INDEX model_providers_scope_owner_id_key ON <schema>.model_providers USING btree (scope_owner_id, id)`.
 
-**Expected foreign keys per stage.** At 00528: `user_secrets_provider_fkey` is `FOREIGN KEY (provider_scope_id, provider_id) REFERENCES model_providers(scope_owner_id, id) ON DELETE CASCADE NOT VALID`, convalidated false. At users_codex_provider_scope: that definition without ` NOT VALID`, plus `users_claude_provider_fkey` = `FOREIGN KEY (claude_provider_scope_id, claude_provider_id) REFERENCES model_providers(scope_owner_id, id) ON DELETE RESTRICT`; both convalidated true, both `conindid` equal to the index oid. The referenced table prints schema-qualified when its schema is off the search_path.
+**Expected foreign keys per stage.** At 00527 the count query above must return 0: the named foreign keys still show their old owner-key forms (`user_secrets_provider_fkey` and `users_claude_provider_fkey` not on the index), which is expected and not "FKs different". At 00528 only `user_secrets_provider_fkey` is on the index (the count is 1); `users_claude_provider_fkey` still shows its owner-key form. At 00528: `user_secrets_provider_fkey` is `FOREIGN KEY (provider_scope_id, provider_id) REFERENCES model_providers(scope_owner_id, id) ON DELETE CASCADE NOT VALID`, convalidated false. At users_codex_provider_scope: that definition without ` NOT VALID`, plus `users_claude_provider_fkey` = `FOREIGN KEY (claude_provider_scope_id, claude_provider_id) REFERENCES model_providers(scope_owner_id, id) ON DELETE RESTRICT`; both convalidated true, both `conindid` equal to the index oid. The referenced table prints schema-qualified when its schema is off the search_path.
 
 | State | Action |
 |---|---|
@@ -170,8 +172,8 @@ SELECT max(version_id) FROM goose_db_version WHERE is_applied;
 | No relation of that name, refusing file 00528 or users_codex_provider_scope | Stop and inspect the FKs: the index was renamed, moved, or dropped with CASCADE, which also removed the FKs; recreating it only defers the failure to 00529 or silently loses the FKs |
 | relkind is not `i` (a table, a view, or a partitioned index `I`) | Stop |
 | An index on another table or schema, or a definition that is not exact | Stop; do not drop it or roll migrations back |
-| Exact definition, not unique | Stop (REINDEX cannot add uniqueness) |
-| Exact, unique, invalid, and the stage's FKs as expected (00527: no FK yet) | With the API stopped: `REINDEX INDEX <schema>.model_providers_scope_owner_id_key;` then retry. Keeps the index oid, the dependent FKs, selections and keys. Not REINDEX CONCURRENTLY (it gives the index a new oid) |
+| The exact definition without UNIQUE (a non-unique index) | Stop (REINDEX cannot add uniqueness) |
+| Exact, unique, invalid, and the stage's FKs as expected (00527: the count query returns 0) | With the API stopped: `REINDEX INDEX <schema>.model_providers_scope_owner_id_key;` then retry. Keeps the index oid, the dependent FKs, selections and keys. Not REINDEX CONCURRENTLY (it gives the index a new oid) |
 | Exact, unique, invalid, but the stage's FKs missing or different | Stop |
 | Exact, unique, valid (e.g. a recreate whose acknowledgement was lost) | Retry |
 
@@ -228,7 +230,7 @@ Draft numbers; they are renumbered at merge, so match by name: 00536 model_provi
 
 **Lock-order caveat.** The guard's order is not exactly the order every application path uses: some paths touch `users` or `user_secrets` before `model_providers`. A Down running against live traffic can therefore deadlock with such a path in a narrow window; PostgreSQL aborts one side and no data is lost. Run Downs with the API stopped. This ADR does not claim the guard's order matches the application's.
 
-**Failure model (narrowed).** The claim covers a migrator interruption while PostgreSQL stays available. Each file is one goose transaction (its statements plus the version row). An interrupted Up rolls back and re-runs at the next boot. An interrupted Down rolls back and keeps that file's version; in a multi-file down, the earlier files stay committed. The operator checks `goose version` and re-runs the down. A lost COMMIT acknowledgement is ambiguous: read `goose_db_version` first to see whether the file committed. No server-crash, storage or power-loss claim is made. This replaces, for 00536-00541, the broader process-crash wording of the failure model above.
+**Failure model (narrowed).** The claim covers a migrator interruption while PostgreSQL stays available. Each file is one goose transaction (its statements plus the version row). An interrupted Up rolls back and re-runs at the next boot. An interrupted Down rolls back and keeps that file's version; in a multi-file down, the earlier files stay committed. The operator checks `goose version` and re-runs the down. A lost COMMIT acknowledgement is ambiguous: read `goose_db_version` first to see whether the file committed. No server-crash, storage or power-loss claim is made. This matches the failure model above.
 
 ### Rollback change (image-only)
 

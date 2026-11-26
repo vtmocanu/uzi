@@ -14,10 +14,11 @@ import (
 )
 
 // Issue #4710: the scope-index guard in 00527, 00528 and users_codex_provider_scope names a recovery
-// that works while shared selections or keys exist. These tests run the runbook in the "Scope-index
-// recovery" section of adr/4324-admin-shared-providers.md literally against real Postgres: the
-// inspection queries decide which row of its state table applies, and the documented repair is then
-// run and the migration retried. Every test stands its own isolated database (sharedDB). Skipped
+// that works while shared selections or keys exist. These tests follow the runbook in the "Scope-index
+// recovery" section of adr/4324-admin-shared-providers.md against real Postgres: the helper runs the
+// precondition and count queries as written and reads the index and foreign key catalog rows the other
+// inspection queries show to pick the state-table row; the documented repair is then run and the
+// migration retried. Every test stands its own isolated database (sharedDB). Skipped
 // unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
 //
 // Several cases corrupt pg_index directly. That is a catalog stand-in for an interrupted concurrent
@@ -52,7 +53,7 @@ func wantRefusal(ctx context.Context, t *testing.T, pool *pgxpool.Pool, err erro
 	}
 }
 
-// runbookState is one fk row the runbook reads from pg_constraint.
+// runbookFK is one foreign key row the runbook reads from pg_constraint.
 type runbookFK struct {
 	found, onIndex, validated bool
 	def                       string
@@ -77,8 +78,8 @@ func readRunbookFK(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table,
 // its state table that applies.
 func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runbookStage) string {
 	t.Helper()
-	// Preconditions: no index build in progress on model_providers.
-	if n := scalar[int](ctx, t, pool, `SELECT count(*) FROM pg_stat_progress_create_index WHERE relid = to_regclass('model_providers')`); n != 0 {
+	// Preconditions: no index build in progress on model_providers (any row means wait).
+	if n := scalar[int](ctx, t, pool, `SELECT count(*) FROM pg_stat_progress_create_index WHERE relid = to_regclass('model_providers') OR relid IS NULL`); n != 0 {
 		return "stop-build-in-progress"
 	}
 	schema := scalar[string](ctx, t, pool, `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass('model_providers')`)
@@ -98,12 +99,12 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 		return "stop-not-index"
 	}
 
-	var onParent, valid, ready, unique bool
+	var onParent, valid, ready bool
 	var def string
 	var idx uint32
-	if err := pool.QueryRow(ctx, `SELECT indrelid = to_regclass($1 || '.model_providers'), indisvalid, indisready, indisunique,
+	if err := pool.QueryRow(ctx, `SELECT indrelid = to_regclass($1 || '.model_providers'), indisvalid, indisready,
             pg_get_indexdef(indexrelid), indexrelid::oid
-        FROM pg_index WHERE indexrelid = to_regclass('model_providers_scope_owner_id_key')`, schema).Scan(&onParent, &valid, &ready, &unique, &def, &idx); err != nil {
+        FROM pg_index WHERE indexrelid = to_regclass('model_providers_scope_owner_id_key')`, schema).Scan(&onParent, &valid, &ready, &def, &idx); err != nil {
 		t.Fatalf("read index: %v", err)
 	}
 	exact := "CREATE UNIQUE INDEX model_providers_scope_owner_id_key ON " + schema + ".model_providers USING btree (scope_owner_id, id)"
@@ -116,9 +117,6 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 		return "stop-not-unique"
 	default:
 		return "stop-wrong-definition"
-	}
-	if !unique {
-		return "stop-not-unique"
 	}
 	if valid && ready {
 		return "retry"
@@ -135,8 +133,8 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 	claudeDef := "FOREIGN KEY (claude_provider_scope_id, claude_provider_id) REFERENCES " + ref + "(scope_owner_id, id) ON DELETE RESTRICT"
 	switch stage {
 	case stage00527:
-		// No foreign key depends on the index yet.
-		if n := scalar[int](ctx, t, pool, `SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conindid = $1::oid`, idx); n != 0 {
+		// No foreign key depends on the index yet: the documented count query must return 0.
+		if n := scalar[int](ctx, t, pool, `SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conindid = to_regclass('model_providers_scope_owner_id_key')`); n != 0 {
 			return "stop-fks"
 		}
 	case stage00528:
@@ -225,7 +223,10 @@ func TestScopeIndexRecoveryCascadeAt00528LiveDB(t *testing.T) {
 		ctx, dsn, pool := sharedDB(t, "scope_idx_cascade_b_", 527)
 		mustExec(ctx, t, pool, `DROP INDEX `+scopeIndex+` CASCADE`)
 		recreateScopeIndex(ctx, t, pool)
-		mustExec(ctx, t, pool, `CREATE TABLE scope_decoy (s uuid, p uuid, CONSTRAINT user_secrets_provider_fkey FOREIGN KEY (s, p) REFERENCES model_providers (scope_owner_id, id))`)
+		// Matches the 00528-stage expectation in everything except the table it is on.
+		// NOT VALID only takes effect through ALTER TABLE; CREATE TABLE validates the empty table.
+		mustExec(ctx, t, pool, `CREATE TABLE scope_decoy (provider_scope_id uuid, provider_id uuid)`)
+		mustExec(ctx, t, pool, `ALTER TABLE scope_decoy ADD CONSTRAINT user_secrets_provider_fkey FOREIGN KEY (provider_scope_id, provider_id) REFERENCES model_providers (scope_owner_id, id) ON DELETE CASCADE NOT VALID`)
 		invalidateScopeIndex(ctx, t, pool)
 		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00528, 527)
 		wantRunbook(ctx, t, pool, stage00528, "stop-fks")
@@ -343,6 +344,27 @@ func TestScopeIndexRecoveryNotUniqueLiveDB(t *testing.T) {
 		// Catalog stand-in; normal operations cannot reach a non-unique index here.
 		mustExec(ctx, t, pool, `UPDATE pg_index SET indisunique = false WHERE indexrelid = 'model_providers_scope_owner_id_key'::regclass`)
 		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusalCodex, pred)
+		wantRunbook(ctx, t, pool, stageCodex, "stop-not-unique")
+	})
+}
+
+func TestScopeIndexRecoveryStopRowsLiveDB(t *testing.T) {
+	t.Run("a unique index with another column order is a wrong definition", func(t *testing.T) {
+		ctx, dsn, pool := sharedDB(t, "scope_idx_wrongdef_", 526)
+		mustExec(ctx, t, pool, `DROP INDEX `+scopeIndex)
+		mustExec(ctx, t, pool, `CREATE UNIQUE INDEX `+scopeIndex+` ON model_providers (id, scope_owner_id)`)
+		// Valid and unique would pass the guard; invalidate (catalog stand-in) so it refuses.
+		invalidateScopeIndex(ctx, t, pool)
+		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00527, 526)
+		wantRunbook(ctx, t, pool, stage00527, "stop-wrong-definition")
+	})
+	t.Run("users_codex_provider_scope with a missing Claude foreign key", func(t *testing.T) {
+		pred := sharedCodexPredecessor(t, resolveSharedCodexVersions(t).userScope)
+		ctx, dsn, pool := sharedDB(t, "scope_idx_codex_fks_", pred)
+		mustExec(ctx, t, pool, `ALTER TABLE users DROP CONSTRAINT users_claude_provider_fkey`)
+		invalidateScopeIndex(ctx, t, pool)
+		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusalCodex, pred)
+		wantRunbook(ctx, t, pool, stageCodex, "stop-fks")
 	})
 }
 

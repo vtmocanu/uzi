@@ -641,6 +641,7 @@ func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 			t.Errorf("00527 left the provider foreign key changed after refusing")
 		}
 		// Recovery: the documented REINDEX, which keeps the index oid and its dependents.
+		wantRunbook(ctx, t, pool, stage00527, "reindex")
 		reindexScopeIndex(ctx, t, pool)
 		if err := store.Migrate(ctx, dsn); err != nil {
 			t.Fatalf("Migrate after REINDEX: %v", err)
