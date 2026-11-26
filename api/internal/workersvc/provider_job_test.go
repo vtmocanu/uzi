@@ -114,7 +114,12 @@ type providerJobStore struct {
 	*providerClaimMatrixStore
 	inputs []store.ListJobInputsForClaimRow
 	files  []store.ListJobInputFilesForClaimRow
+	skills []store.ListProductSkillsForRunRow
 	clears int
+}
+
+func (s *providerJobStore) ListProductSkillsForRun(context.Context, uuid.UUID) ([]store.ListProductSkillsForRunRow, error) {
+	return s.skills, nil
 }
 
 func (s *providerJobStore) ClearJobResultForRun(context.Context, uuid.UUID) error {
@@ -136,6 +141,11 @@ type vendorJobStore struct {
 	*fakeStore
 	inputs []store.ListJobInputsForClaimRow
 	files  []store.ListJobInputFilesForClaimRow
+	skills []store.ListProductSkillsForRunRow
+}
+
+func (s *vendorJobStore) ListProductSkillsForRun(context.Context, uuid.UUID) ([]store.ListProductSkillsForRunRow, error) {
+	return s.skills, nil
 }
 
 func (s *vendorJobStore) ClearJobResultForRun(context.Context, uuid.UUID) error { return nil }
@@ -157,7 +167,7 @@ func (fx *providerJobFixture) vendorTwin(t *testing.T) (*Service, store.Run, sto
 		t.Fatal(err)
 	}
 	fs := &fakeStore{anthropic: token, defaultEffort: fx.store.defaultEffort, defaultModel: fx.store.defaultModel, defaultModelErr: fx.store.defaultModelErr}
-	svc := newOffModeService(&vendorJobStore{fakeStore: fs, inputs: fx.store.inputs, files: fx.store.files}, box, testParams())
+	svc := newOffModeService(&vendorJobStore{fakeStore: fs, inputs: fx.store.inputs, files: fx.store.files, skills: fx.store.skills}, box, fx.svc.p)
 	vendor := fx.run
 	vendor.ModelProviderID, vendor.ModelProviderRevision, vendor.ModelProviderKeyMode = pgtype.UUID{}, pgtype.Int4{}, pgtype.Text{}
 	vendor.ModelProviderKeySecretID, vendor.ModelProviderKeyRev = pgtype.UUID{}, pgtype.Int8{}
@@ -248,6 +258,13 @@ func TestProviderJobClaimParityWithVendorJob(t *testing.T) {
 		StorageName: txt("abc.csv"), Sha256: txt("abc"), ContentType: txt("text/csv"),
 	}}
 	fx.store.defaultEffort = txt("high")
+	// An approved product origin: two delivered skills (served in name order) and one dropped for size.
+	fx.svc.p.ProductSkillsEnabled = true
+	fx.store.skills = []store.ListProductSkillsForRunRow{
+		{ID: uuid.New(), Name: "zeta", Description: "zeta description.", Body: "z body"},
+		{ID: uuid.New(), Name: "alpha", Description: "alpha description.", Body: "a body"},
+		{ID: uuid.New(), Name: "huge", Description: "too big.", Body: strings.Repeat("x", fx.svc.p.SkillMaxBytes+1)},
+	}
 	wall := int32(900)
 	fx.run.BudgetWallSeconds = pgtype.Int4{Int32: wall, Valid: true}
 	vendorSvc, vendor, vendorWorker := fx.vendorTwin(t)
@@ -265,6 +282,11 @@ func TestProviderJobClaimParityWithVendorJob(t *testing.T) {
 	}
 	if pp.Secrets.Provider == nil || pp.Secrets.AnthropicOAuthToken != "" {
 		t.Fatalf("the provider claim did not take the provider path: %+v", pp.Secrets)
+	}
+	for name, p := range map[string]*ClaimPayload{"provider": pp, "vendor": vp} {
+		if len(p.Skills) != 2 || p.Skills[0].Name != "alpha" || p.Skills[1].Name != "zeta" || len(p.SkillsDropped) != 1 || p.SkillsDropped[0].Name != "huge" || p.SkillsDropped[0].Reason != DropTooLarge {
+			t.Fatalf("%s claim skills = %+v drops = %+v, want alpha+zeta delivered and huge dropped", name, p.Skills, p.SkillsDropped)
+		}
 	}
 	pp.RunID, vp.RunID = "", ""
 	pp.Secrets, vp.Secrets = ClaimSecrets{}, ClaimSecrets{}
@@ -339,10 +361,25 @@ func TestProviderJobClaimModelReadFailure(t *testing.T) {
 		if claimAssemblyTerminal(errors.New("x")) || !errors.Is(err, errCredentialUnavailable) {
 			t.Fatalf("err = %v, want it to keep the credential_unavailable family", err)
 		}
+		// The claim stays exactly as ClaimRun left it: no fenced terminal, requeue or park was written.
+		if fs := fx.store.fakeStore; fs.claimFailed != nil || fs.claimRequeued != nil || fs.claimParked != nil || fs.markedFailed != nil || fs.requeuedRun != nil || fs.claimCredParked != nil {
+			t.Fatalf("a transient model-read error wrote a settlement: failed=%+v requeued=%+v parked=%+v marked=%+v", fs.claimFailed, fs.claimRequeued, fs.claimParked, fs.markedFailed)
+		}
 	})
 	t.Run("non-transient: terminal credential_unavailable with a fixed reason", func(t *testing.T) {
 		fx := newProviderJobFixture(t, pvDefaultMap)
 		fx.store.defaultModelErr = errors.New("relation users: secret-raw-detail-7731")
+		payload, cerr := fx.svc.Claim(fx.ctx, fx.worker, nil)
+		if payload != nil || cerr != nil {
+			t.Fatalf("Claim = (%v, %v), want idle after the terminal settlement", payload != nil, cerr)
+		}
+		got := fx.store.claimFailed
+		if got == nil || got.FailOrigin.String != "credential_unavailable" {
+			t.Fatalf("fenced terminal = %+v, want origin credential_unavailable", got)
+		}
+		if got.FailureReason.String == "" || strings.Contains(got.FailureReason.String, "secret-raw-detail-7731") || !strings.HasSuffix(got.FailureReason.String, "the job's model settings could not be read") {
+			t.Fatalf("stored failure_reason %q must be the fixed sentence without the raw error", got.FailureReason.String)
+		}
 		_, err := fx.svc.assembleJobClaim(fx.ctx, fx.worker, fx.run)
 		if err == nil || isTransientClaimDBError(err) || claimAssemblyOrigin(err) != "credential_unavailable" {
 			t.Fatalf("err = %v, want a terminal credential_unavailable", err)
