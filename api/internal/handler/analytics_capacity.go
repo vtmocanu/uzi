@@ -33,8 +33,8 @@ const (
 	// statements fetch one more to detect truncation.
 	capacityIdentityCap = 200
 	// capacityVaultObserveBudget is the admin route's serial vault observation budget. It is
-	// checked between and after the lookups; a single in-flight read is bounded only by its own
-	// context, and TryStatus never waits for a lifecycle lock.
+	// checked between and after the lookups; reads run under the budget's context (a step that
+	// ignores cancellation can still finish after it), and TryStatus never waits for a lifecycle lock.
 	capacityVaultObserveBudget = 2 * time.Second
 
 	capacityTimeBasisOccupancy   = "interval_overlap"

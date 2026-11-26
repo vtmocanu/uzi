@@ -352,8 +352,8 @@ raw provider identifiers or poll-error text.
   reports `vault_locked` per identity (`polling_disabled` instead when Codex
   polling is turned off). The admin routes read each distinct owner without
   waiting for any user's vault lifecycle, under a 2 second budget that is
-  checked between and after the lookups (a single in-flight read is bounded by
-  its own context, not by the budget). If a state is contended, fails to read or
+  checked between and after the lookups (reads run under the budget's context;
+  a step that does not honour cancellation can still finish after it). If a state is contended, fails to read or
   the budget runs out, the Codex gauge is `unavailable` with reason `vault_status_unavailable`
   and occupancy is kept. This reason appears on the admin routes only.
 

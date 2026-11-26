@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -316,8 +317,10 @@ func TestAnalyticsCapacityPlanGuardNegativeControlLiveDB(t *testing.T) {
 	if !capJoinCarriesSubplan(withInit) {
 		t.Fatalf("calibration: the control plan has no join with an InitPlan or SubPlan child; the shape this test needs did not materialize")
 	}
-	if v := capPlanViolations(withInit, ""); len(v) == 0 {
-		t.Error("interval x bucket Nested Loop carrying an InitPlan child was not reported")
+	if v := capPlanViolations(withInit, ""); !slices.ContainsFunc(v, func(m string) bool {
+		return strings.Contains(m, "Nested Loop joins the interval/event set with the bucket set")
+	}) {
+		t.Errorf("interval x bucket Nested Loop carrying an InitPlan child was not reported as that join (got %v)", v)
 	}
 }
 
