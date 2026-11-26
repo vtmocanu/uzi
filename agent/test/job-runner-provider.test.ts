@@ -375,6 +375,35 @@ describe("provider job: a key echoed by the gateway never reaches the api or the
       assert.equal(calls.states.at(-1)!.status, "completed");
     });
   }
+
+  it("a numeric usage member named with the key is never restored under its raw name", async () => {
+    const { client, calls } = fakeClient();
+    const frame = {
+      ...PRICED,
+      usage: { ...PRICED.usage, ["x" + KEY]: 7 },
+      modelUsage: { ...PRICED.modelUsage, "corp-sonnet": { ...PRICED.modelUsage["corp-sonnet"], ["y" + KEY]: 9 } },
+    };
+    const qf = scripted(async function* ({ options }) { yield INIT_OK; await callSubmit(options, GOOD); yield frame; });
+    await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim());
+    assertPricedCounters(usageOf(calls));
+    assertNoKey(KEY, everywhere(calls), "usage member names");
+  });
+
+  it("two model names that scrub to the same name keep the summed entry", async () => {
+    const { client, calls } = fakeClient();
+    const frame = {
+      ...RESULT_OK,
+      usage: { input_tokens: 3, output_tokens: 4 },
+      // The raw key and its JSON `\/`-escaped form are both key forms, so both names scrub to "a-<marker>".
+      modelUsage: { ["a-" + KEY]: { inputTokens: 1, outputTokens: 2 }, ["a-" + KEY.replace("/", "\\/")]: { inputTokens: 10, outputTokens: 20 } },
+    };
+    const qf = scripted(async function* ({ options }) { yield INIT_OK; await callSubmit(options, GOOD); yield frame; });
+    await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim());
+    const mu = usageOf(calls)["modelUsage"] as Record<string, Record<string, unknown>>;
+    const totals = Object.values(mu).reduce((acc, e) => acc + Number(e["inputTokens"] ?? 0), 0);
+    assert.equal(totals, 11, "no model's input tokens are lost");
+    assertNoKey(KEY, everywhere(calls), "model names");
+  });
 });
 
 describe("provider job: gateway limit settlement reads the raw frame", () => {

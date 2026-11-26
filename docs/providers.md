@@ -181,7 +181,7 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   provider are not shipped yet. A job never parks: revocation or a gateway rate limit fails it. The
   same redirect risk applies, and the job's agent can see your provider key in its environment. The
   worker scrubs the key from what the job publishes and withholds output files that carry it, but
-  matching covers only the key's raw, JSON-escaped, `\/`, `\u00XX` and percent-encoded forms (other
+  matching covers only the key's raw, JSON-escaped, `\/`, `\u`-escaped and percent-encoded forms (other
   encodings such as base64 are not detected), so this guards against accidental
   publication only, not a malicious or prompt-injected job; see the linked section.
 - **Other lanes that cannot use a provider refuse.** The cross-check lane refuses an

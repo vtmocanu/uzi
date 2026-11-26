@@ -328,18 +328,35 @@ const isPlainRecord = (v: unknown): v is Record<string, unknown> => typeof v ===
 const finiteNumbersOf = (v: Record<string, unknown>): Record<string, number> =>
   Object.fromEntries(Object.entries(v).filter((e): e is [string, number] => typeof e[1] === "number" && Number.isFinite(e[1])));
 
-/** The scrubbed record with its numeric members dropped (a renamed counter leaves a summed placeholder
- *  member behind), then the raw record's finite numbers under their raw keys. */
-const withRawCounters = (scrubbed: unknown, raw: Record<string, unknown>): Record<string, unknown> => ({
-  ...Object.fromEntries(Object.entries(isPlainRecord(scrubbed) ? scrubbed : {}).filter(([, v]) => typeof v !== "number")),
-  ...finiteNumbersOf(raw),
-});
+/** The SDK's own usage counter names (result `usage` / assistant `message.usage` in snake_case, and
+ *  `modelUsage` entries in camelCase). Only these names are ever restored from the raw frame: any other
+ *  member name is provider-controlled text and stays as the scrub left it. Cost fields are not listed;
+ *  stripProviderCost drops them. */
+const SDK_USAGE_COUNTERS: ReadonlySet<string> = new Set([
+  "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+  "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
+  "webSearchRequests", "contextWindow", "maxOutputTokens",
+]);
+
+/** The scrubbed record minus any numeric member the scrub renamed (a name absent from the raw record,
+ *  e.g. a summed placeholder) and minus the SDK counters, then each SDK counter whose raw value is a
+ *  finite number, under its fixed SDK name. */
+const withRawCounters = (scrubbed: unknown, raw: Record<string, unknown>): Record<string, unknown> => {
+  const kept = Object.entries(isPlainRecord(scrubbed) ? scrubbed : {}).filter(
+    ([k, v]) => typeof v !== "number" || (Object.hasOwn(raw, k) && !SDK_USAGE_COUNTERS.has(k)),
+  );
+  const counters = Object.entries(finiteNumbersOf(raw)).filter(([k]) => SDK_USAGE_COUNTERS.has(k));
+  return { ...Object.fromEntries(kept), ...Object.fromEntries(counters) };
+};
 
 /** Scrubbing a frame rewrites member NAMES too, so a provider key equal to an SDK usage counter name
  *  (for example cacheReadInputTokens) would rename the field and the api's typed usage fold would
- *  record 0. After scrubbing, put back the finite numeric counters of the RAW frame under their raw
- *  keys: top-level `usage`, an assistant frame's `message.usage`, and each `modelUsage` entry (placed
- *  under the scrubbed model name). Only numbers are restored, never strings, so no key text returns. */
+ *  record 0. After scrubbing, put back the finite numeric values of the fixed SDK counter names
+ *  (SDK_USAGE_COUNTERS) from the RAW frame: top-level `usage`, an assistant frame's `message.usage`, and
+ *  each `modelUsage` entry (placed under the scrubbed model name). No other raw member name is restored,
+ *  so a key-bearing member name stays scrubbed; the only text that can reappear is a fixed SDK counter
+ *  name itself (a key equal to one is public text). Two models that scrub to the same name keep the
+ *  scrub's summed entry rather than one model's counters. */
 function restoreUsageCounters(raw: unknown, frame: unknown, scrub: TextRedactor): unknown {
   if (!isPlainRecord(raw) || !isPlainRecord(frame)) return frame;
   const out: Record<string, unknown> = { ...frame };
@@ -353,9 +370,12 @@ function restoreUsageCounters(raw: unknown, frame: unknown, scrub: TextRedactor)
   }
   if (isPlainRecord(raw["modelUsage"])) {
     const mu: Record<string, unknown> = { ...(isPlainRecord(out["modelUsage"]) ? out["modelUsage"] : {}) };
-    for (const [model, entry] of Object.entries(raw["modelUsage"])) {
-      if (!isPlainRecord(entry)) continue;
+    const entries = Object.entries(raw["modelUsage"]);
+    const scrubbedCount = new Map<string, number>();
+    for (const [model] of entries) scrubbedCount.set(scrub(model), (scrubbedCount.get(scrub(model)) ?? 0) + 1);
+    for (const [model, entry] of entries) {
       const key = scrub(model);
+      if (!isPlainRecord(entry) || scrubbedCount.get(key) !== 1) continue;
       mu[key] = withRawCounters(mu[key], entry);
     }
     out["modelUsage"] = mu;
