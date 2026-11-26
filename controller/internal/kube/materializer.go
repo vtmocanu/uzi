@@ -990,16 +990,6 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	}
 	if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
 		retained = true
-		// A retained /data recycle needs the own claim's UID and liveness. Refuse before
-		// the scale-down (and so before any delete, /nix included) when the own claim
-		// exists but is Terminating or has no UID.
-		if vols.Data {
-			if has, live := ownDataPresence(w, obs, ns); has {
-				if c := ownDataClaim(w, obs, ns); !live || (c != nil && c.UID == "") {
-					return fmt.Errorf("recycle data claim evidence unavailable; re-poll required")
-				}
-			}
-		}
 		if e.dep == nil || e.dep.DeletionTimestamp != nil {
 			return fmt.Errorf("recycle reservation deployment unavailable")
 		}
@@ -1016,6 +1006,16 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 		}
 		if len(e.pods) != 0 {
 			return nil
+		}
+		// A retained /data recycle needs the own claim's UID and liveness. Once the
+		// scale-down has completed and the pods are gone, refuse before any delete (/nix
+		// included) when the own claim exists but is Terminating or has no UID.
+		if vols.Data {
+			if has, live := ownDataPresence(w, obs, ns); has {
+				if c := ownDataClaim(w, obs, ns); !live || (c != nil && c.UID == "") {
+					return fmt.Errorf("recycle data claim evidence unavailable; re-poll required")
+				}
+			}
 		}
 	}
 	// Phase 1: optimistic deletion fences a delayed recycle after a pin change.

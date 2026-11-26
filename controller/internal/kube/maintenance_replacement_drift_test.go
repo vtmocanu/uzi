@@ -56,7 +56,7 @@ func newStampedDriftHarness(t *testing.T, deploymentUID, pvcUID string) *driftHa
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(o) != 1 || !newPlacementStamped(h.m.cfg, o[0]) {
+	if len(o) != 1 || !newPlacementStamped(h.m.cfg, h.w, o[0], h.m.cfg.Namespace) {
 		t.Fatalf("seeded worker is not observed as stamped: %+v", o)
 	}
 	spec, err := h.m.resolver.Resolve(h.w.Template, h.w.Size)

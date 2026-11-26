@@ -1,8 +1,11 @@
 package kube
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,13 +49,6 @@ func caTerminateClaim(t *testing.T, c *fake.Clientset, ns, name string) {
 	})
 }
 
-func caDeleteClaim(t *testing.T, c *fake.Clientset, ns, name string) {
-	t.Helper()
-	if err := c.Tracker().Delete(pvcRes, ns, name); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func caForeignData(uid string) *corev1.PersistentVolumeClaim {
 	f := pvcForNS("w1", "data", caDockerNS)
 	f.UID = "foreign-" + types.UID(uid)
@@ -89,6 +85,11 @@ func caSameClaim(t *testing.T, c *fake.Clientset, ns, name string, want *corev1.
 // (a) A foreign claim alone cannot authorize a /data delete, even with disk pressure on
 // and a controller restart in the middle: the own /data is provisioned, nothing is
 // deleted and the foreign claim is untouched.
+//
+// What this discriminates: the create gate (the own /data is created although a foreign
+// claim exists) and the restart recovery. The "no deletes" assertion alone also holds on
+// the base, because the young /nix keeps the cooldown active; delete authorization is
+// covered by (b) and (g).
 func TestCodexCAForeignClaimAloneCannotAuthorizeADataDelete(t *testing.T) {
 	m, c, w, cfg := caRetainedNoOwnData(t, true)
 	ns := cfg.Namespace
@@ -197,52 +198,80 @@ func TestCodexCAPausedRestoreIgnoresAForeignDataClaim(t *testing.T) {
 }
 
 // (d) The Deployment placement guard reads the own /data claim: with the own claim
-// Terminating no Deployment is created although a foreign claim is live.
+// Terminating no Deployment is created although a foreign claim is live. The control
+// leaves the own claim live and expects the Deployment.
 func TestCodexCADeploymentGuardIgnoresAForeignDataClaim(t *testing.T) {
-	cfg := caCfg()
-	cfg.DockerNamespace = caDockerNS
-	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
-	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}, m5Now)
-	w.JoinToken = token("uzw_w1")
-	own := pvcFor("w1", "data")
-	m, c := caMat(t, cfg, own, pvcNix("w1", "20Gi"), caForeignData("d"))
-	ns := cfg.Namespace
-	caTerminateClaim(t, c, ns, dataPVCName("w1"))
-	for i := 0; i < 3; i++ {
-		caMustTick(t, m, w)
-	}
-	if d := caDep(t, c, ns, "w1"); d != nil {
-		t.Fatalf("deployment %v created over a Terminating own data claim", d.Name)
+	for _, terminate := range []bool{true, false} {
+		name := "own-live-control"
+		if terminate {
+			name = "own-terminating"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := caCfg()
+			cfg.DockerNamespace = caDockerNS
+			cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
+			w := caWorker("w1")
+			m, c := caMat(t, cfg, append(caClaims("w1", true), caForeignData("d"))...)
+			ns := cfg.Namespace
+			if terminate {
+				caTerminateClaim(t, c, ns, dataPVCName("w1"))
+			}
+			for i := 0; i < 3; i++ {
+				caMustTick(t, m, w)
+			}
+			d := caDep(t, c, ns, "w1")
+			if terminate && d != nil {
+				t.Fatalf("deployment %v created over a Terminating own data claim", d.Name)
+			}
+			if !terminate && d == nil {
+				t.Fatal("control: no deployment created with a live own data claim")
+			}
+		})
 	}
 }
 
-// (e) New placement: a Terminating foreign /data claim, scanned last, does not hold back
-// the create of the own /data claim.
+// (e) New placement: a foreign /data claim, scanned last, whether Terminating or live and
+// unstamped, neither holds back the create of the own /data claim nor lends it its (missing)
+// placement stamp: the own claim is created stamped new.
 func TestCodexCAForeignTerminatingDataClaimDoesNotDeferTheOwnCreate(t *testing.T) {
-	cfg := caCfg()
-	cfg.DockerNamespace = caDockerNS
-	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
-	cfg.NodeSelector = map[string]string{"kubernetes.io/arch": "amd64"}
-	cfg.Tolerations = uziTaint
-	cfg.NewPlacementNodeSelector = map[string]string{"pool": "new"}
-	cfg.NewPlacementTolerations = newPlacementTaint
-	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}, m5Now)
-	dep := markedDeployment(t, cfg.withPlacement(true).withCodexCA(true), w, false)
-	zero := int32(0)
-	dep.Spec.Replicas = &zero
-	nix := pvcNix("w1", "20Gi")
-	nix.Annotations = map[string]string{AnnotationPlacement: placementNew}
-	foreign := caForeignData("e")
-	now := metav1.NewTime(m5Now)
-	foreign.DeletionTimestamp = &now
-	m, c := caMat(t, cfg, dep, nix, foreign)
-	obs := caObserve(t, m, "w1")
-	if obs.DataClaim == nil || obs.DataClaim.Namespace != caDockerNS || !obs.DataClaim.Terminating {
-		t.Fatalf("fixture: DataClaim = %+v, want the Terminating foreign claim", obs.DataClaim)
-	}
-	caMustTick(t, m, w)
-	if caClaim(t, c, cfg.Namespace, dataPVCName("w1")) == nil {
-		t.Fatal("the own data claim was not created")
+	for _, terminating := range []bool{true, false} {
+		name := "live-unstamped-foreign"
+		if terminating {
+			name = "terminating-foreign"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := caCfg()
+			cfg.DockerNamespace = caDockerNS
+			cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
+			cfg.NodeSelector = map[string]string{"kubernetes.io/arch": "amd64"}
+			cfg.Tolerations = uziTaint
+			cfg.NewPlacementNodeSelector = map[string]string{"pool": "new"}
+			cfg.NewPlacementTolerations = newPlacementTaint
+			w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}, m5Now)
+			dep := markedDeployment(t, cfg.withPlacement(true).withCodexCA(true), w, false)
+			zero := int32(0)
+			dep.Spec.Replicas = &zero
+			nix := pvcNix("w1", "20Gi")
+			nix.Annotations = map[string]string{AnnotationPlacement: placementNew}
+			foreign := caForeignData("e")
+			if terminating {
+				now := metav1.NewTime(m5Now)
+				foreign.DeletionTimestamp = &now
+			}
+			m, c := caMat(t, cfg, dep, nix, foreign)
+			obs := caObserve(t, m, "w1")
+			if obs.DataClaim == nil || obs.DataClaim.Namespace != caDockerNS || obs.DataClaim.Terminating != terminating {
+				t.Fatalf("fixture: DataClaim = %+v, want the foreign claim (terminating=%v)", obs.DataClaim, terminating)
+			}
+			caMustTick(t, m, w)
+			own := caClaim(t, c, cfg.Namespace, dataPVCName("w1"))
+			if own == nil {
+				t.Fatal("the own data claim was not created")
+			}
+			if got := own.Annotations[AnnotationPlacement]; got != placementNew {
+				t.Fatalf("own data claim placement stamp = %q, want %q", got, placementNew)
+			}
+		})
 	}
 }
 
@@ -282,6 +311,13 @@ func TestCodexCARecycleCooldownIgnoresAForeignDataClaimAge(t *testing.T) {
 // and writes no record.
 func TestCodexCARecycleWithoutOwnDataClaimWritesNothing(t *testing.T) {
 	m, c, w, cfg := caRetainedNoOwnData(t, true)
+	// A stamped foreign claim, so a carry change would be possible if it were read.
+	caSetClaim(t, c, caDockerNS, dataPVCName("w1"), func(p *corev1.PersistentVolumeClaim) {
+		p.Annotations[AnnotationCodexExtraCA] = codexExtraCAWritten
+	})
+	if m.codexCACarried("w1", cfg.Namespace) {
+		t.Fatal("fixture: carry set before the recycle")
+	}
 	obs := caObserve(t, m, "w1")
 	err := m.recycleWorkerVolumes(context.Background(), w, obs, cfg.Namespace, recycleVolumes{Nix: true, Data: true, Pressure: true})
 	if err != nil {
@@ -294,6 +330,9 @@ func TestCodexCARecycleWithoutOwnDataClaimWritesNothing(t *testing.T) {
 	}
 	if n := caRecordPatches(c); n != 0 {
 		t.Fatalf("record patches = %d, want 0", n)
+	}
+	if m.codexCACarried("w1", cfg.Namespace) {
+		t.Fatal("the carry was set by a recycle with no own data claim")
 	}
 }
 
@@ -317,8 +356,10 @@ func TestCodexCANixOnlyRecycleProceedsWithATerminatingOwnData(t *testing.T) {
 	}
 }
 
-// (i) Compatibility: a stamped own /data claim recycled while a live foreign claim exists
-// keeps the Codex CA across a restart between the delete and the replacement create.
+// (i) Regression: a stamped own /data claim recycled while a live foreign claim exists
+// keeps the Codex CA across a restart between the delete and the replacement create. This
+// is red on the base (the foreign claim shadowed the own one), so it is a regression test,
+// not a compatibility control.
 func TestCodexCAForeignDataClaimRetainedRecycleRestart(t *testing.T) {
 	foreign := caForeignData("i")
 	m, c, w, cfg := caRetained(t, true, "", true, foreign)
@@ -344,4 +385,70 @@ func TestCodexCAForeignDataClaimRetainedRecycleRestart(t *testing.T) {
 		t.Fatalf("deployment = %v, want replicas 1 with the env", d)
 	}
 	caSameClaim(t, c, caDockerNS, dataPVCName("w1"), want)
+}
+
+// (b2) The pressure arm's execution guard reads the own /data claim. Inside the cooldown
+// the arm logs the fixed token disk-recycle-skipped-cooldown; an own-absent worker with a
+// live foreign claim must not enter the arm at all, while an own-present one does.
+func TestCodexCAOwnDataAbsentDoesNotEnterThePressureArm(t *testing.T) {
+	const prefix = "disk-recycle-skipped-"
+	t.Run("own-absent-live-foreign", func(t *testing.T) {
+		m, _, w, _ := caRetainedNoOwnData(t, true)
+		var buf bytes.Buffer
+		m.log = slog.New(slog.NewTextHandler(&buf, nil))
+		caMustTick(t, m, w) // the tick that creates the own claim; it was absent when observed
+		if strings.Contains(buf.String(), prefix) {
+			t.Fatalf("pressure arm entered with no own /data claim; logs:\n%s", buf.String())
+		}
+	})
+	t.Run("own-present-control", func(t *testing.T) {
+		m, c, w, cfg := caRetained(t, true, "", true, caForeignData("b2"))
+		young := metav1.NewTime(m5Now)
+		for _, name := range []string{dataPVCName("w1"), nixPVCName("w1")} {
+			caSetClaim(t, c, cfg.Namespace, name, func(p *corev1.PersistentVolumeClaim) { p.CreationTimestamp = young })
+		}
+		var buf bytes.Buffer
+		m.log = slog.New(slog.NewTextHandler(&buf, nil))
+		caMustTick(t, m, w)
+		if tok := prefix + "cooldown worker=w1"; !strings.Contains(buf.String(), tok) {
+			t.Fatalf("control: logs missing %q; got:\n%s", tok, buf.String())
+		}
+	})
+}
+
+// A retained marked Deployment running at replicas 1 whose own /data claim is held
+// Terminating (deleted externally, pvc-protection) under disk pressure still scales to 0
+// first; only once the pods are gone does the recycle refuse, and nothing is deleted.
+func TestCodexCARetainedRecycleScalesDownBeforeRefusingATerminatingOwnData(t *testing.T) {
+	cfg := caCfg()
+	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", DiskPressure: true}, m5Now)
+	dep := markedDeployment(t, cfg.withCodexCA(true), w, false)
+	nix := pvcNix("w1", "20Gi")
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: cfg.Namespace, UID: "p1", Labels: objectLabels("w1")}}
+	m, c := caMat(t, cfg, append([]runtime.Object{dep, nix, pod}, caClaims("w1", true)[0])...)
+	ns := cfg.Namespace
+	if caReplicas(caDep(t, c, ns, "w1")) != 1 {
+		t.Fatal("fixture: deployment not at replicas 1")
+	}
+	caTerminateClaim(t, c, ns, dataPVCName("w1"))
+	recycle := func() error { return caTick(t, m, w) }
+	if err := recycle(); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if got := caReplicas(caDep(t, c, ns, "w1")); got != 0 {
+		t.Fatalf("replicas = %d after tick 1, want the scale-down to 0", got)
+	}
+	if got := caPVCDeletes(c); len(got) != 0 {
+		t.Fatalf("claims deleted on tick 1: %v", got)
+	}
+	if err := c.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), ns, pod.Name); err != nil {
+		t.Fatal(err)
+	}
+	err := recycle()
+	if err == nil || !strings.Contains(err.Error(), "recycle data claim evidence unavailable") {
+		t.Fatalf("tick 2 err = %v, want the evidence refusal", err)
+	}
+	if got := caPVCDeletes(c); len(got) != 0 {
+		t.Fatalf("claims deleted despite the refusal: %v", got)
+	}
 }
