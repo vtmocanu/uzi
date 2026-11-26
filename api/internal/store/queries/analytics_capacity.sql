@@ -1,0 +1,484 @@
+-- Issue #4731: scoped run diagnostics API, Capacity. Historical occupancy statements and the
+-- current provider gauge statements.
+--
+-- ADR-1184 D1: each statement is separate and an owner-shaped statement carries an
+-- unconditional user predicate; never merge an owner and an all-scope statement behind a flag.
+-- The two Capacity documents are kept textually identical except the lines tagged owner-only
+-- (a Go test drops them and fails on any other drift).
+--
+-- NO statement here may reference the workers table: historical capacity never consults
+-- current worker slots. Every instant comes from the parameters (no clock reads, no calendar
+-- arithmetic); timestamps leave as UTC strings so the session TimeZone is irrelevant.
+
+-- name: AnalyticsOwnerCapacity :one
+-- Issue #4731: the Capacity document, one jsonb value. Occupancy is the average number of
+-- concurrent ordinary runs: one retained interval per applicable run from first_started_at to
+-- its retained end (finished_at, else status_since, for a terminal run; the captured now
+-- for a nonterminal one), clipped to [from, now) and integrated by ONE sort-based sweep over
+-- the interval endpoints and the bucket edges (no interval self-join, no per-bucket rescan).
+-- The status lists are literal so the partial indexes on runs match each branch.
+WITH
+prm AS (SELECT @now::timestamptz AS now_ts, sqlc.arg('from')::timestamptz AS from_ts),
+pop AS MATERIALIZED (
+    SELECT r.kind, r.first_started_at AS s, COALESCE(r.finished_at, r.status_since) AS e,
+           (r.finished_at IS NULL) AS end_from_status_since, false AS ongoing
+    FROM runs r
+    WHERE r.status IN ('completed', 'failed', 'cancelled')
+      AND COALESCE(r.finished_at, r.status_since) > sqlc.arg('from')::timestamptz
+      AND r.created_at < @now::timestamptz
+      AND r.user_id = @user_id::uuid  -- owner-only
+      AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id')::uuid)
+      AND (sqlc.narg('harness')::text IS NULL OR r.harness = sqlc.narg('harness')::text)
+      AND r.kind = ANY(@kinds::text[])
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+    UNION ALL
+    SELECT r.kind, r.first_started_at AS s, @now::timestamptz AS e,
+           false AS end_from_status_since, true AS ongoing
+    FROM runs r
+    WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+      AND r.created_at < @now::timestamptz
+      AND r.user_id = @user_id::uuid  -- owner-only
+      AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id')::uuid)
+      AND (sqlc.narg('harness')::text IS NULL OR r.harness = sqlc.narg('harness')::text)
+      AND r.kind = ANY(@kinds::text[])
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+),
+pop_counts AS (
+    SELECT count(*) AS candidates,
+           count(*) FILTER (WHERE p.s IS NOT NULL AND p.s < m.now_ts AND p.e >= p.s) AS with_interval,
+           count(*) FILTER (WHERE p.s IS NULL) AS without_start,
+           count(*) FILTER (WHERE p.s IS NOT NULL AND (p.e < p.s OR p.s >= m.now_ts)) AS invalid_interval,
+           count(*) FILTER (WHERE p.end_from_status_since) AS end_from_status_since,
+           count(*) FILTER (WHERE p.ongoing) AS ongoing,
+           count(*) FILTER (WHERE p.kind = 'cross_check') AS cross_check_kind_included
+    FROM pop p CROSS JOIN prm m
+),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest(@bucket_starts::timestamptz[]), unnest(@bucket_ends::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+iv AS (
+    SELECT GREATEST(p.s, m.from_ts) AS cs, LEAST(p.e, m.now_ts) AS ce
+    FROM pop p CROSS JOIN prm m
+    WHERE p.s IS NOT NULL AND p.s < m.now_ts AND p.e >= p.s
+      AND GREATEST(p.s, m.from_ts) < LEAST(p.e, m.now_ts)
+),
+ev AS (
+    SELECT i.cs AS t, 1 AS d FROM iv i
+    UNION ALL
+    SELECT i.ce, -1 FROM iv i
+    UNION ALL
+    SELECT b.b_start, 0 FROM bk b
+    UNION ALL
+    SELECT b.b_end, 0 FROM bk b
+),
+pts AS (
+    SELECT e.t, sum(e.d) AS d FROM ev e GROUP BY e.t
+),
+run AS (
+    SELECT p.t, sum(p.d) OVER (ORDER BY p.t ROWS UNBOUNDED PRECEDING) AS occ, lead(p.t) OVER (ORDER BY p.t) AS nt
+    FROM pts p
+),
+seg AS (
+    SELECT width_bucket(x.t, @bucket_starts::timestamptz[]) AS idx,
+           x.occ * extract(epoch FROM x.nt - x.t) AS run_seconds
+    FROM run x CROSS JOIN prm m
+    WHERE x.nt IS NOT NULL AND x.t >= m.from_ts AND x.nt <= m.now_ts
+),
+occ_cells AS (
+    SELECT b.idx,
+           COALESCE(sum(g.run_seconds), 0) AS run_seconds,
+           extract(epoch FROM b.b_end - b.b_start) AS duration_seconds
+    FROM bk b
+    LEFT JOIN seg g ON g.idx = b.idx
+    GROUP BY b.idx, b.b_start, b.b_end
+),
+occ_total AS (
+    SELECT COALESCE((SELECT sum(g.run_seconds) FROM seg g), 0) AS run_seconds,
+           extract(epoch FROM m.now_ts - m.from_ts) AS duration_seconds
+    FROM prm m
+),
+uw AS MATERIALIZED (
+    SELECT width_bucket(r.created_at, @bucket_starts::timestamptz[]) AS wb, r.limit_wait_count
+    FROM runs r
+    WHERE r.created_at >= sqlc.arg('from')::timestamptz AND r.created_at < @now::timestamptz
+      AND r.user_id = @user_id::uuid  -- owner-only
+      AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id')::uuid)
+      AND (sqlc.narg('harness')::text IS NULL OR r.harness = sqlc.narg('harness')::text)
+      AND r.kind = ANY(@kinds::text[])
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+),
+uw_total AS (
+    SELECT count(*) FILTER (WHERE w.limit_wait_count > 0) AS waited, count(*) AS n FROM uw w
+),
+uw_cells AS (
+    SELECT b.idx,
+           count(w.wb) FILTER (WHERE w.limit_wait_count > 0) AS waited,
+           count(w.wb) AS n
+    FROM bk b
+    LEFT JOIN uw w ON w.wb = b.idx
+    GROUP BY b.idx
+)
+SELECT jsonb_build_object(
+    'generated_at', to_char((SELECT m.now_ts FROM prm m) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+    'population', (SELECT jsonb_build_object(
+        'candidates', c.candidates,
+        'with_interval', c.with_interval,
+        'without_start', c.without_start,
+        'invalid_interval', c.invalid_interval,
+        'end_from_status_since', c.end_from_status_since,
+        'ongoing', c.ongoing,
+        'cross_check_kind_included', c.cross_check_kind_included) FROM pop_counts c),
+    'occupancy', jsonb_build_object(
+        'window', (SELECT jsonb_build_object(
+            'run_seconds', t.run_seconds,
+            'duration_seconds', t.duration_seconds,
+            'average_concurrent_runs', CASE WHEN t.duration_seconds = 0 THEN NULL ELSE round(t.run_seconds / t.duration_seconds, 6) END,
+            'reason', CASE WHEN t.duration_seconds = 0 THEN 'zero_duration_range' END) FROM occ_total t),
+        'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+            'index', c.idx - 1,
+            'run_seconds', c.run_seconds,
+            'duration_seconds', c.duration_seconds,
+            'average_concurrent_runs', CASE WHEN c.duration_seconds = 0 THEN NULL ELSE round(c.run_seconds / c.duration_seconds, 6) END,
+            'reason', CASE WHEN c.duration_seconds = 0 THEN 'zero_duration_bucket' END) ORDER BY c.idx) FROM occ_cells c), '[]'::jsonb)),
+    'usage_wait', jsonb_build_object(
+        'window', (SELECT jsonb_build_object(
+            'count', t.waited,
+            'n', t.n,
+            'share', CASE WHEN t.n = 0 THEN NULL ELSE round(t.waited::numeric / t.n::numeric, 6) END,
+            'reason', CASE WHEN t.n = 0 THEN 'no_applicable_runs' END) FROM uw_total t),
+        'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+            'index', c.idx - 1,
+            'count', c.waited,
+            'n', c.n,
+            'share', CASE WHEN c.n = 0 THEN NULL ELSE round(c.waited::numeric / c.n::numeric, 6) END,
+            'reason', CASE WHEN c.n = 0 THEN 'no_applicable_runs' END) ORDER BY c.idx) FROM uw_cells c), '[]'::jsonb))
+)::jsonb AS doc;
+
+-- name: AnalyticsAllCapacity :one
+-- Issue #4731: the Capacity document, one jsonb value. Occupancy is the average number of
+-- concurrent ordinary runs: one retained interval per applicable run from first_started_at to
+-- its retained end (finished_at, else status_since, for a terminal run; the captured now
+-- for a nonterminal one), clipped to [from, now) and integrated by ONE sort-based sweep over
+-- the interval endpoints and the bucket edges (no interval self-join, no per-bucket rescan).
+-- The status lists are literal so the partial indexes on runs match each branch.
+WITH
+prm AS (SELECT @now::timestamptz AS now_ts, sqlc.arg('from')::timestamptz AS from_ts),
+pop AS MATERIALIZED (
+    SELECT r.kind, r.first_started_at AS s, COALESCE(r.finished_at, r.status_since) AS e,
+           (r.finished_at IS NULL) AS end_from_status_since, false AS ongoing
+    FROM runs r
+    WHERE r.status IN ('completed', 'failed', 'cancelled')
+      AND COALESCE(r.finished_at, r.status_since) > sqlc.arg('from')::timestamptz
+      AND r.created_at < @now::timestamptz
+      AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id')::uuid)
+      AND (sqlc.narg('harness')::text IS NULL OR r.harness = sqlc.narg('harness')::text)
+      AND r.kind = ANY(@kinds::text[])
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+    UNION ALL
+    SELECT r.kind, r.first_started_at AS s, @now::timestamptz AS e,
+           false AS end_from_status_since, true AS ongoing
+    FROM runs r
+    WHERE r.status NOT IN ('completed', 'failed', 'cancelled')
+      AND r.created_at < @now::timestamptz
+      AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id')::uuid)
+      AND (sqlc.narg('harness')::text IS NULL OR r.harness = sqlc.narg('harness')::text)
+      AND r.kind = ANY(@kinds::text[])
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+),
+pop_counts AS (
+    SELECT count(*) AS candidates,
+           count(*) FILTER (WHERE p.s IS NOT NULL AND p.s < m.now_ts AND p.e >= p.s) AS with_interval,
+           count(*) FILTER (WHERE p.s IS NULL) AS without_start,
+           count(*) FILTER (WHERE p.s IS NOT NULL AND (p.e < p.s OR p.s >= m.now_ts)) AS invalid_interval,
+           count(*) FILTER (WHERE p.end_from_status_since) AS end_from_status_since,
+           count(*) FILTER (WHERE p.ongoing) AS ongoing,
+           count(*) FILTER (WHERE p.kind = 'cross_check') AS cross_check_kind_included
+    FROM pop p CROSS JOIN prm m
+),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest(@bucket_starts::timestamptz[]), unnest(@bucket_ends::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+iv AS (
+    SELECT GREATEST(p.s, m.from_ts) AS cs, LEAST(p.e, m.now_ts) AS ce
+    FROM pop p CROSS JOIN prm m
+    WHERE p.s IS NOT NULL AND p.s < m.now_ts AND p.e >= p.s
+      AND GREATEST(p.s, m.from_ts) < LEAST(p.e, m.now_ts)
+),
+ev AS (
+    SELECT i.cs AS t, 1 AS d FROM iv i
+    UNION ALL
+    SELECT i.ce, -1 FROM iv i
+    UNION ALL
+    SELECT b.b_start, 0 FROM bk b
+    UNION ALL
+    SELECT b.b_end, 0 FROM bk b
+),
+pts AS (
+    SELECT e.t, sum(e.d) AS d FROM ev e GROUP BY e.t
+),
+run AS (
+    SELECT p.t, sum(p.d) OVER (ORDER BY p.t ROWS UNBOUNDED PRECEDING) AS occ, lead(p.t) OVER (ORDER BY p.t) AS nt
+    FROM pts p
+),
+seg AS (
+    SELECT width_bucket(x.t, @bucket_starts::timestamptz[]) AS idx,
+           x.occ * extract(epoch FROM x.nt - x.t) AS run_seconds
+    FROM run x CROSS JOIN prm m
+    WHERE x.nt IS NOT NULL AND x.t >= m.from_ts AND x.nt <= m.now_ts
+),
+occ_cells AS (
+    SELECT b.idx,
+           COALESCE(sum(g.run_seconds), 0) AS run_seconds,
+           extract(epoch FROM b.b_end - b.b_start) AS duration_seconds
+    FROM bk b
+    LEFT JOIN seg g ON g.idx = b.idx
+    GROUP BY b.idx, b.b_start, b.b_end
+),
+occ_total AS (
+    SELECT COALESCE((SELECT sum(g.run_seconds) FROM seg g), 0) AS run_seconds,
+           extract(epoch FROM m.now_ts - m.from_ts) AS duration_seconds
+    FROM prm m
+),
+uw AS MATERIALIZED (
+    SELECT width_bucket(r.created_at, @bucket_starts::timestamptz[]) AS wb, r.limit_wait_count
+    FROM runs r
+    WHERE r.created_at >= sqlc.arg('from')::timestamptz AND r.created_at < @now::timestamptz
+      AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id')::uuid)
+      AND (sqlc.narg('harness')::text IS NULL OR r.harness = sqlc.narg('harness')::text)
+      AND r.kind = ANY(@kinds::text[])
+      AND r.kind <> 'chat' AND NOT r.cross_check_lane
+),
+uw_total AS (
+    SELECT count(*) FILTER (WHERE w.limit_wait_count > 0) AS waited, count(*) AS n FROM uw w
+),
+uw_cells AS (
+    SELECT b.idx,
+           count(w.wb) FILTER (WHERE w.limit_wait_count > 0) AS waited,
+           count(w.wb) AS n
+    FROM bk b
+    LEFT JOIN uw w ON w.wb = b.idx
+    GROUP BY b.idx
+)
+SELECT jsonb_build_object(
+    'generated_at', to_char((SELECT m.now_ts FROM prm m) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+    'population', (SELECT jsonb_build_object(
+        'candidates', c.candidates,
+        'with_interval', c.with_interval,
+        'without_start', c.without_start,
+        'invalid_interval', c.invalid_interval,
+        'end_from_status_since', c.end_from_status_since,
+        'ongoing', c.ongoing,
+        'cross_check_kind_included', c.cross_check_kind_included) FROM pop_counts c),
+    'occupancy', jsonb_build_object(
+        'window', (SELECT jsonb_build_object(
+            'run_seconds', t.run_seconds,
+            'duration_seconds', t.duration_seconds,
+            'average_concurrent_runs', CASE WHEN t.duration_seconds = 0 THEN NULL ELSE round(t.run_seconds / t.duration_seconds, 6) END,
+            'reason', CASE WHEN t.duration_seconds = 0 THEN 'zero_duration_range' END) FROM occ_total t),
+        'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+            'index', c.idx - 1,
+            'run_seconds', c.run_seconds,
+            'duration_seconds', c.duration_seconds,
+            'average_concurrent_runs', CASE WHEN c.duration_seconds = 0 THEN NULL ELSE round(c.run_seconds / c.duration_seconds, 6) END,
+            'reason', CASE WHEN c.duration_seconds = 0 THEN 'zero_duration_bucket' END) ORDER BY c.idx) FROM occ_cells c), '[]'::jsonb)),
+    'usage_wait', jsonb_build_object(
+        'window', (SELECT jsonb_build_object(
+            'count', t.waited,
+            'n', t.n,
+            'share', CASE WHEN t.n = 0 THEN NULL ELSE round(t.waited::numeric / t.n::numeric, 6) END,
+            'reason', CASE WHEN t.n = 0 THEN 'no_applicable_runs' END) FROM uw_total t),
+        'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+            'index', c.idx - 1,
+            'count', c.waited,
+            'n', c.n,
+            'share', CASE WHEN c.n = 0 THEN NULL ELSE round(c.waited::numeric / c.n::numeric, 6) END,
+            'reason', CASE WHEN c.n = 0 THEN 'no_applicable_runs' END) ORDER BY c.idx) FROM uw_cells c), '[]'::jsonb))
+)::jsonb AS doc;
+
+-- name: AnalyticsOwnerAnthropicGauges :many
+-- Issue #4731: the OWNER's enabled Anthropic tokens with their current-revision reading, for the
+-- Capacity gauges. The identity CTE is ordered by a unique key and capped at 201 BEFORE the
+-- reading join, so a caller serves 200 and flags truncation; the outer query repeats the order.
+-- The reading join and the enabled-token predicate are copied from ListRateLimitsForUser.
+WITH ident AS (
+    SELECT s.id, s.label, s.is_default, s.enablement_rev
+    FROM user_secrets s
+    WHERE s.user_id = @user_id::uuid AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+    ORDER BY s.is_default DESC, lower(s.label) ASC, s.id ASC
+    LIMIT 201
+)
+SELECT s.id AS user_secret_id,
+       s.label,
+       s.is_default,
+       rl.five_hour_pct,
+       rl.five_hour_resets_at,
+       rl.seven_day_pct,
+       rl.seven_day_resets_at,
+       rl.source,
+       rl.synced_at
+FROM ident s
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
+ORDER BY s.is_default DESC, lower(s.label) ASC, s.id ASC;
+
+-- name: AnalyticsAllAnthropicGauges :many
+-- Issue #4731: every user's enabled Anthropic tokens with their current-revision reading, for the
+-- admin Capacity gauges. Same shape and caps as the owner statement, ordered by user first.
+-- vault_mode is the stored metadata mode (the handler's fallback when no live vault is wired).
+WITH ident AS (
+    SELECT s.id, s.label, s.is_default, s.enablement_rev, u.id AS user_id, u.email, u.vault_mode
+    FROM user_secrets s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+    ORDER BY u.email ASC, u.id ASC, s.is_default DESC, lower(s.label) ASC, s.id ASC
+    LIMIT 201
+)
+SELECT s.id AS user_secret_id,
+       s.label,
+       s.is_default,
+       s.user_id,
+       s.email,
+       s.vault_mode,
+       rl.five_hour_pct,
+       rl.five_hour_resets_at,
+       rl.seven_day_pct,
+       rl.seven_day_resets_at,
+       rl.source,
+       rl.synced_at
+FROM ident s
+LEFT JOIN anthropic_rate_limits rl
+       ON rl.user_secret_id = s.id AND rl.enablement_rev = s.enablement_rev
+ORDER BY s.email ASC, s.user_id ASC, s.is_default DESC, lower(s.label) ASC, s.id ASC;
+
+-- name: AnalyticsOwnerCodexGauges :many
+-- Issue #4731: the OWNER's canonical linked Codex accounts (enabled-alias EXISTS) with their
+-- current reading, for the Capacity gauges. The identity CTE is capped at 201 accounts ordered by
+-- the unique key BEFORE the reading join and alias roll-up, so aliases never multiply rows and a
+-- caller serves 200 and flags truncation. The reading join (with its enablement_sig fence) and
+-- the alias lateral are copied verbatim from GetCodexAccountRateLimitsForUser. attempt_error is
+-- deliberately not selected.
+WITH ident AS (
+    SELECT a.id, a.user_id, a.reauth_required, a.reauth_reason
+    FROM codex_provider_account a
+    WHERE a.user_id = @user_id
+        AND EXISTS (
+            SELECT 1 FROM codex_credential_state s
+            JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+            WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+                AND us.disabled_at IS NULL
+        )
+    ORDER BY a.id
+    LIMIT 201
+)
+SELECT
+    a.id                         AS provider_account_id,
+    COALESCE(al.labels, '{}')::text[] AS aliases,
+    COALESCE(al.is_default, false)    AS is_default,
+    a.reauth_required,
+    a.reauth_reason,
+    rl.buckets,
+    rl.observed_generation,
+    rl.observed_credential_revision,
+    rl.last_success_at,
+    rl.last_attempt_at,
+    rl.attempt_status
+FROM ident a
+LEFT JOIN codex_account_rate_limits rl
+    ON rl.user_id = a.user_id AND rl.provider_account_id = a.id
+    -- Current readings only (PRD #1732 D13, M4): every ENABLED linked alias must appear in
+    -- the reading's enablement_sig at its current revision (NULL = a pre-column row, which
+    -- covers exactly the revision-0 aliases). A reading from before a disable and re-enable
+    -- therefore reads as no reading (pending) until the re-enable's own poll lands one. A
+    -- sibling DISABLED while the account stayed live does not hide it (disabled aliases are
+    -- not checked), but a NEWLY LINKED enabled alias, or a sibling's re-enable, does: its
+    -- (id, rev) is not in the stamp, so the reading is not current until the next
+    -- successful poll re-stamps it, and a failed poll in that window drops it
+    -- (RecordCodexAccountPollFailure). Conservative by design.
+    AND NOT EXISTS (
+        SELECT 1 FROM codex_credential_state cs
+        JOIN user_secrets us ON us.id = cs.user_secret_id AND us.user_id = cs.user_id
+        WHERE cs.user_id = a.user_id AND cs.provider_account_id = a.id AND cs.status = 'linked'
+            AND us.disabled_at IS NULL
+            AND NOT CASE
+                WHEN rl.enablement_sig IS NULL THEN us.enablement_rev = 0
+                ELSE (us.id::text || ':' || us.enablement_rev::text)
+                     = ANY (string_to_array(rl.enablement_sig, ','))
+            END
+    )
+LEFT JOIN LATERAL (
+    SELECT array_agg(us.label ORDER BY us.is_default DESC, lower(us.label)) AS labels,
+           bool_or(us.is_default)                                           AS is_default
+    FROM codex_credential_state s
+    JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+    WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+        AND us.disabled_at IS NULL
+) al ON true
+ORDER BY a.id;
+
+-- name: AnalyticsAllCodexGauges :many
+-- Issue #4731: every user's canonical linked Codex accounts with their current reading, for the
+-- admin Capacity gauges. Same shape and caps as the owner statement, ordered by user first. The
+-- reading join and alias lateral are copied verbatim from ListCodexAccountRateLimits.
+-- vault_mode is the stored metadata mode (the handler's fallback when no live vault is wired).
+WITH ident AS (
+    SELECT a.id, a.user_id, a.reauth_required, a.reauth_reason, u.email, u.vault_mode
+    FROM codex_provider_account a
+    JOIN users u ON u.id = a.user_id
+    WHERE EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    ORDER BY u.email ASC, u.id ASC, a.id ASC
+    LIMIT 201
+)
+SELECT
+    a.user_id                    AS user_id,
+    a.email                      AS email,
+    a.vault_mode,
+    a.id                         AS provider_account_id,
+    COALESCE(al.labels, '{}')::text[] AS aliases,
+    COALESCE(al.is_default, false)    AS is_default,
+    a.reauth_required,
+    a.reauth_reason,
+    rl.buckets,
+    rl.observed_generation,
+    rl.observed_credential_revision,
+    rl.last_success_at,
+    rl.last_attempt_at,
+    rl.attempt_status
+FROM ident a
+LEFT JOIN codex_account_rate_limits rl
+    ON rl.user_id = a.user_id AND rl.provider_account_id = a.id
+    -- Current readings only (PRD #1732 D13, M4): every ENABLED linked alias must appear in
+    -- the reading's enablement_sig at its current revision (NULL = a pre-column row, which
+    -- covers exactly the revision-0 aliases). A reading from before a disable and re-enable
+    -- therefore reads as no reading (pending) until the re-enable's own poll lands one. A
+    -- sibling DISABLED while the account stayed live does not hide it (disabled aliases are
+    -- not checked), but a NEWLY LINKED enabled alias, or a sibling's re-enable, does: its
+    -- (id, rev) is not in the stamp, so the reading is not current until the next
+    -- successful poll re-stamps it, and a failed poll in that window drops it
+    -- (RecordCodexAccountPollFailure). Conservative by design.
+    AND NOT EXISTS (
+        SELECT 1 FROM codex_credential_state cs
+        JOIN user_secrets us ON us.id = cs.user_secret_id AND us.user_id = cs.user_id
+        WHERE cs.user_id = a.user_id AND cs.provider_account_id = a.id AND cs.status = 'linked'
+            AND us.disabled_at IS NULL
+            AND NOT CASE
+                WHEN rl.enablement_sig IS NULL THEN us.enablement_rev = 0
+                ELSE (us.id::text || ':' || us.enablement_rev::text)
+                     = ANY (string_to_array(rl.enablement_sig, ','))
+            END
+    )
+LEFT JOIN LATERAL (
+    SELECT array_agg(us.label ORDER BY us.is_default DESC, lower(us.label)) AS labels,
+           bool_or(us.is_default)                                           AS is_default
+    FROM codex_credential_state s
+    JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+    WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+        AND us.disabled_at IS NULL
+) al ON true
+ORDER BY a.email ASC, a.user_id ASC, a.id ASC;
