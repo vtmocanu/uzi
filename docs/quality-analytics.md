@@ -79,15 +79,18 @@ Same as [Spend](usage-analytics.md#admission-and-timeouts), with section key
 ## Clock and snapshot
 
 - The request clock (`now`) is captured in Go when the request arrives. It is
-  used only as a timestamp cutoff: the response's `to` and `generated_at`, the
-  end of the last bucket, and the upper bound on stored times.
+  never part of the database snapshot. It fixes today's local date, and so the
+  window start and the bucket boundaries (the calendar), and it is the cutoff
+  for the response's `to` and `generated_at`, the end of the last bucket, and
+  the upper bound on stored times.
 - Every value comes from one `REPEATABLE READ` read-only snapshot. The snapshot
   is fixed by the first query inside the transaction, not by the clock.
 - A write committed after the clock was captured but before the first query is
   visible, and counts when its stored time is before `now`. A write committed
   after the first query is not visible and appears on the next request.
-- Reviews and the pending cross-check count have no `now` bound: they read
-  whatever the snapshot holds. See the measures below.
+- Reviews, the pending cross-check count and the rework merge witness have no
+  `now` bound: they read whatever the snapshot holds, so a merge visible in the
+  snapshot counts regardless of time. See the measures below.
 
 The calendar (half-open Go-computed buckets, `all` as Monday-anchored weeks
 capped at 104 buckets, partial last bucket) is described in
@@ -105,7 +108,10 @@ The response is the shared envelope (`scope`, `generated_at`, `window`,
 route) and four measures: `rework`, `ci_fix`, `cross_check` (`plan`, `code`,
 `pending`) and `judge`. The Go fixtures pin the shape:
 `fixtures/api-contract/analytics_quality.full.json` (every field present) and
-`analytics_quality.zero.json` (an empty scope). Every count is a number of
+`analytics_quality.zero.json` (the marshalled zero-value DTO, which pins the
+nullability surface with null `rolling`, `limitations` and `kinds`; it is not a
+real response, which always emits `[]`, the three limitation strings and the
+effective kinds). Every count is a number of
 distinct items of its section's population, every class map has a fixed key
 list where an absent class is `0`, and arrays are never null.
 
@@ -194,14 +200,18 @@ inert and never exposed. Raw findings and prompts are never returned.
 
 - **`decided_in_window`** counts attempts decided in the window, by
   `decided_at`, however old their lead run. Replaced and interrupted attempts
-  are decided attempts too and appear in `classes.replaced`.
+  are decided attempts too and appear in `classes.replaced`, except a plan
+  attempt whose verdict (`approve`, `revise` or `block`, with `reason_class`
+  `verdict`) was recorded before the interruption (`decided_at <=
+  interrupted_at`): it keeps its class (`passed` or `raised_issues`).
 - **`classes`** classify each decided attempt the way the cross-check history
   does: `passed`, `raised_issues`, `didnt_finish`, `replaced`, `unclassified`.
   For code, a `completed` attempt is `raised_issues` when it has findings and
   `passed` when it has none; findings that cannot be counted are
   `unclassified`.
 - **`undated`** counts decided attempts with no usable decision time (missing,
-  non-finite, or earlier than the attempt's creation). They are in no bucket
+  non-finite, or earlier than the attempt's creation) or a non-finite creation
+  time (for example a `-infinity` `created_at`). They are in no bucket
   and the window is not applied to them (`window: "not_applied"`).
 - **`pending`** is a live count of attempts that are undecided and not
   interrupted, of any age, split into `plan` and `code`. The window is not
@@ -248,7 +258,10 @@ evidence. This covers every source, not only the starting cohort:
 - the cross-check leads;
 - the judge reviews (a review counts only for its target's owner).
 
-Admin all-users reads every user's evidence with no user restriction.
+Admin all-users applies no scope-user filter, so it reads every user's
+evidence, but the same-owner checks still apply: a review counts only if its
+user is the target's owner, and a rework link is verified only when the target
+and the rework share the owner.
 
 ## Repo visibility
 

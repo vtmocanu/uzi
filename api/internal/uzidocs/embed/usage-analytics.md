@@ -75,8 +75,8 @@ bill.
 ## Admission and timeouts
 
 - Capacity is a quarter of the database pool (`max(1, MaxConns / 4)`; the
-  default pool of 20 gives 5). One request per caller per section (`options`
-  or `spend`) may be in flight, and the owner and admin variants share that
+  default pool of 20 gives 5). One request per caller per section (`options`,
+  `spend` or `quality`) may be in flight, and the owner and admin variants share that
   slot. Nothing queues.
 - A request that finds no slot answers 503 with `Retry-After: 1` before any
   analytics database work. Authentication runs earlier (bearer and cookie
@@ -95,8 +95,9 @@ bill.
 ## Calendar
 
 Go computes every boundary and the SQL only tests half-open membership
-(`start <= created_at < end`) against those instants. Buckets are by **run
-creation time**, not by when cost was incurred.
+(`start <= created_at < end`) against those instants. For Spend, buckets are by **run
+creation time**, not by when cost was incurred. Quality measures have their
+own time bases; see [Quality analytics](quality-analytics.md#response-shape).
 
 - Buckets are contiguous: bucket D runs from the first instant whose local date
   is D (the first midnight at or after the previous bucket) to the first

@@ -1,7 +1,7 @@
 # PRD #4730: Scoped run diagnostics API: Quality
 
 **Issue:** #4730.
-**Status:** Done (#4730).
+**Status:** Done (#4730), completed 2026-11-26.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** Read-only API, DTO contracts, docs and specs. Additive indexes only when supported by plans. No lifecycle, tracking, interface or CLI changes. Implementation and validation leave `.github/workflows/**` untouched.
@@ -79,14 +79,14 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Add no index | The bar was a 20% p95 gain on a Quality workload or removal of the 8 s timeout risk. The rework index gained at most 7.2% p95, the `decided_at` index was never chosen and the worst timing is 2.4 s. |
 | Pending cross-checks have no time cutoff | Pending is a live count of undecided, uninterrupted attempts of any age, disclosed with `effective_filters` and `window: not_applied`. |
 | Decide cross-check applicability per stage | Plan and code use their own cross-checkable kinds (`runkind.PlanCrossCheckable`, `runkind.CodeCrossCheckable`), and pending applies when either does. |
-| Cover the SQLSTATE 57014 mapping with a unit test through `analyticsFail`, as #4684 does | No LiveDB statement-timeout pattern exists to reuse. |
+| Cover the SQLSTATE 57014 mapping with a unit test through `analyticsFail`, as #4684 does | #4684's analytics LiveDB tests have no statement-timeout case to mirror. |
 | Known follow-up: narrow `cc_base` | `cc_base` carries `findings` for every cross-check (about 109 MB temp spill at 4 MB `work_mem`, about 40% of the all-users time). A candidate fix computes `findings_count` only for in-window decisions. Not done here. |
 
 ## 8. Performance evidence
 
-Summary of the M1 evidence run (seed 0.4730, PostgreSQL 17.12, 4 vCPU, warm cache, `work_mem` 4MB).
+Summary of the M1 evidence run (seed 0.4730, PostgreSQL 17 (postgres:17 image), 4 vCPU, warm cache, `work_mem` 4MB).
 
-**Seed.** #4684's base seed (200 owners, largest owner 20.0% of runs, top 10 owners 59.3%) plus a Quality extension: 140,018 runs (20,018 `mr_rework`), 845,032 usage legs, 1,250 repos, 92,420 cross-checks (59,724 plan, 32,696 code), 35,722 reviews over 59,553 judge-eligible runs (60.0%, 15% of reviews failed). 30d range selectivity is 9.94% of runs (largest owner 10.02%). 24,935 PRs, 69.0% with a merge witness; reworks per PR 0/1/2/3+ are 13,725 / 6,243 / 3,051 / 1,916.
+**Seed.** #4684's base seed (200 owners, largest owner 20.0% of runs, top 10 owners 59.3%) plus a Quality extension: 140,018 runs (20,018 `mr_rework`), 845,032 usage legs, 1,250 repos, 92,420 cross-checks (59,724 plan, 32,696 code), 35,722 reviews over 59,553 judge-eligible runs (60.0%, 15% of reviews failed). Fan-out: 1.60 plan attempts per lead, and at most one review per eligible target (60% coverage). Statistics were fresh: the seed runs `ANALYZE` on `cross_checks`, `run_reviews`, `judge_skips` and `runs` after loading (`analytics_evidence_livedb_test.go`). 30d range selectivity is 9.94% of runs (largest owner 10.02%). 24,935 PRs, 69.0% with a merge witness; reworks per PR 0/1/2/3+ are 13,725 / 6,243 / 3,051 / 1,916.
 
 **Store timings** (ms, n=20, custom plan unless noted, statement timeout off, **JIT on**):
 
@@ -107,9 +107,14 @@ Summary of the M1 evidence run (seed 0.4730, PostgreSQL 17.12, 4 vCPU, warm cach
 | `GET /api/admin/analytics/quality?window=30d` (all users) | 625.2 | 646.8 | 682.8 |
 | `GET /api/admin/analytics/quality?user=<largest owner>&window=30d` | 205.7 | 216.1 | 216.4 |
 
+**Plan nodes and buffers** (`EXPLAIN (ANALYZE, BUFFERS)`, custom plan, 30d):
+
+- Owner 30d (largest owner, 2,811 runs): shared hit 13.5k / read 6.1k blocks, temp written 2,154 blocks; the same node shape as all-users.
+- Admin all-users 30d: shared hit 43,679 / read 23,179, temp written 14,000 blocks (about 109 MB). The dominant cost is `cc_base` (Seq Scan of 92,420 `cross_checks` hash-joined to a Seq Scan of 140,018 `runs`, 251 ms) and the `cc_dec`/`cc_win`/`cc_cls` materialisation (341 to 494 ms, 13,998 temp blocks); the rework CTEs total about 130 ms.
+
 **Corrections and caveats.**
 
-- The store timings ran with the PostgreSQL default JIT on. JIT fired on three custom-plan workloads (221 to 471 ms inside execution); production's analytics snapshot sets JIT off and the HTTP table ran through that path. The observation that generic plans are faster than custom on the all-users scopes is a JIT artifact, not a better plan.
+- The store timings ran with the PostgreSQL default JIT on. JIT fired on three custom-plan workloads (221 to 471 ms inside execution); production's analytics snapshot sets JIT off and the HTTP table ran through that path. Most of the all-users 30d gap between generic and custom plans is JIT, but with JIT time subtracted the custom plan is still slower (738 vs 657, 683 vs 609 and 758 vs 654 ms across three runs; temp written 14,000 vs 10,805 blocks), so the generic plan is about 10 to 15% cheaper there. For all-users `window=all` the gap is JIT.
 - The `cross_checks` immutability and write-once triggers (migrations 00312, 00325, 00360) are BEFORE INSERT OR UPDATE, not UPDATE-only. The seed inserts rows in their final state, which pass them.
 - The seed has no `cross_check` child runs, so its runs table is about 40% light for its cross-check volume, and it measures a single volume point.
 - Admin all-users `window=all` is refused by the API, so its 2.4 s timing is an upper bound for the all-users windows a request can reach. No workload approached the 8 s statement timeout.
@@ -137,6 +142,6 @@ At 64kB the old plan runs the witness CTE as an unhashed SubPlan (loops=2805, ab
 
 The rework index was chosen by the planner and gained at most 7.2%; the `decided_at` index was never chosen, because `cc_base` reads the whole table through a materialized CTE with no `decided_at` predicate. No migration was added.
 
-**Pre-existing flake (not from this change).** `TestRunUsageGenericPlanLiveDB`'s Spend all-scope check fails on HEAD once the shared test database has accumulated rows from earlier LiveDB runs, and passes on a freshly truncated database.
+**Flake observed on a shared database.** `TestRunUsageGenericPlanLiveDB`'s Spend all-scope check was observed failing on an accumulated shared database at a0a259b79 (this branch, which also adds Quality seed rows to that test); it passes on a fresh database. A base-commit reproduction was not recorded.
 
-**Verified and unverified before implementation.** Verified: the owner and admin plans, generic-plan behavior, witness and link association under the ownership boundary, cross-check stage fields, judge eligibility rules, request impact at the seed above, and that no index is warranted. Still unverified: legacy rework association completeness (the seed stamps every rework link, so it cannot show how many legacy rework runs lack one; counts are lower bounds), and behavior at other volumes or with cross-check child runs in the seed. Passing tests do not establish retention completeness.
+**Verified and still unverified.** Verified: the owner and admin plans, generic-plan behavior, witness and link association under the ownership boundary, cross-check stage fields, judge eligibility rules, request impact at the seed above, and that no index is warranted. Still unverified: legacy rework association completeness (the seed stamps every rework link, so it cannot show how many legacy rework runs lack one; counts are lower bounds), and behavior at other volumes or with cross-check child runs in the seed. Passing tests do not establish retention completeness.
