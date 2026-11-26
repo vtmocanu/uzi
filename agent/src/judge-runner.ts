@@ -21,7 +21,7 @@ import type { Logger } from "./log.js";
 import { makeTextRedactor, providerKeyForms, redactStrings, type TextRedactor } from "./redact.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, isErrorResult, mapSdkMessage } from "./sdk-messages.js";
-import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
+import { redactingLogger, runReadOnlyModelPass, safeReportFailed, type ModelPassSettlement } from "./model-pass.js";
 import {
   isGatewayLimitStatus,
   PROVIDER_GATEWAY_LIMIT,
@@ -40,8 +40,9 @@ import type { Outbox } from "./outbox.js";
 import type { EmittedMessage } from "./executor.js";
 import { classifyLimitFailure, LimitReachedError } from "./limit.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
-import { selectCodexBinding } from "./codex/select.js"; // PRD #1429 M3: the pure, fail-closed claim-shape discriminator — NOT a Codex class construction
-import type { CodexBinding } from "./codex/select.js";
+import { selectCodexBinding, selectCodexExecutionAuthority } from "./codex/select.js"; // PRD #1429 M3 / issue #4574: the pure, fail-closed claim-shape discriminator (vendor Codex block or Codex provider binding) — NOT a Codex class construction
+import type { CodexBinding, CodexProviderExecutionAuthority } from "./codex/select.js";
+import { isCodexHttpTaggedClassification, isCodexProviderGatewayLimit } from "./codex/terminal-normalize.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { errMessage } from "./util.js";
 import type {
@@ -289,6 +290,16 @@ export class JudgeRunner {
     const providerScrub: (s: string) => string = providerCredential
       ? makeTextRedactor(providerKeyForms(providerCredential))
       : (s) => s;
+    // Issue #4574: a provider judge journals and logs its terminal through a scrubbing logger, so the
+    // outbox's log lines for THIS resolve (a failed send's error text can echo the gateway key) are
+    // scrubbed. The journaled body itself is key-free. A later re-send by the worker's own resolve
+    // (after execute() returned) logs through the worker logger, unscrubbed; that send carries no key,
+    // so only an api that echoes a key it was never sent could surface one there (accepted limit).
+    // Vendor mode keeps the shared deps untouched.
+    const terminalDeps: TerminalOutboxDeps | undefined = providerCredential && this.terminalDeps
+      ? { ...this.terminalDeps, log: redactingLogger(this.log, providerScrub) }
+      : this.terminalDeps;
+    const failureScrub = providerCredential ? providerScrub : undefined;
     if (!targetId) {
       this.log.warn("judge claim missing target_run_id; failing", { run_id: judgeRunId });
       await safeReportFailed(
@@ -299,7 +310,8 @@ export class JudgeRunner {
         "judge claim carried no target run",
         undefined,
         claim.claim_generation,
-        this.terminalDeps,
+        terminalDeps,
+        failureScrub,
       );
       return;
     }
@@ -360,9 +372,26 @@ export class JudgeRunner {
       // discriminator the run lane uses (agent/src/main.ts's makeExecutor); a malformed
       // codex block falls through to the outer catch's deterministic fallback exactly like
       // any other trace/prep failure — the judge lane's "never spuriously fail" posture.
-      const selection = selectCodexBinding({ codex: claim.secrets.codex });
+      // Issue #4574: selectCodexExecutionAuthority is the same selector the summary lane uses; it also
+      // mints the frozen Codex provider authority from a Codex provider binding. A selection throw
+      // while a provider binding is present is a terminal provider failure (no deterministic fallback
+      // review); with no provider binding it keeps today's fallback behavior.
+      // Only a Codex-engine provider binding goes through the authority selector; a Claude provider
+      // binding (or none) keeps the exact pre-#4574 discriminator, so the Claude provider path is unchanged.
+      const codexProviderBound = (claim.secrets?.provider as { engine?: unknown } | undefined)?.engine === "codex";
+      let selection: ReturnType<typeof selectCodexExecutionAuthority>;
+      try {
+        if (codexProviderBound) selection = selectCodexExecutionAuthority(claim.secrets);
+        else selection = selectCodexBinding({ codex: claim.secrets.codex });
+      } catch (selectionErr) {
+        if (claim.secrets?.provider) throw new ProviderJudgeTerminalError(providerScrub(errMessage(selectionErr)));
+        throw selectionErr;
+      }
       if (selection.kind === "codex") {
-        const judged = await this.judgeCodex(claim, trace, selection.binding, signal);
+        const authority = selection.binding;
+        const judged = authority.authMode === "provider"
+          ? await this.judgeCodexProvider(claim, trace, authority, signal, providerScrub)
+          : await this.judgeCodex(claim, trace, authority, signal);
         review = judged.review;
         usageMessage = judged.usageMessage;
       } else if (claim.secrets?.provider) {
@@ -386,9 +415,9 @@ export class JudgeRunner {
       if (err instanceof ProviderJudgeTerminalError) {
         // PRD #4322 M1a: a provider judge with no usable model outcome fails terminally: no fallback
         // review, no `completed`. The message was redacted where the error was made.
-        this.log.warn("provider judge failed terminally", { run_id: judgeRunId, error: err.message });
-        await safeReportFailed(this.client, this.log, "judge", judgeRunId, err.message, undefined,
-          claim.claim_generation, this.terminalDeps);
+        this.log.warn("provider judge failed terminally", { run_id: judgeRunId, error: providerScrub(err.message) });
+        await safeReportFailed(this.client, this.log, "judge", judgeRunId, providerScrub(err.message), undefined,
+          claim.claim_generation, terminalDeps, failureScrub);
         required?.close();
         this.activeRuns?.remove(judgeRunId);
         return;
@@ -400,7 +429,7 @@ export class JudgeRunner {
         // it fails with the error text as failure_reason instead of an empty one.
         this.log.warn("judge model call hit a usage limit; failing the judge run", {
           run_id: judgeRunId,
-          error: errMessage(err),
+          error: providerScrub(errMessage(err)),
         });
         const hasFacts = err.rateLimitType !== undefined || err.resetsAtMs !== undefined;
         await safeReportFailed(
@@ -411,7 +440,8 @@ export class JudgeRunner {
           providerScrub(errMessage(err)),
           hasFacts ? err : undefined,
           claim.claim_generation,
-          this.terminalDeps,
+          terminalDeps,
+          failureScrub,
         );
         // The finally that removes it belongs to the post/complete try below, which this
         // return skips.
@@ -421,7 +451,7 @@ export class JudgeRunner {
       }
       this.log.warn("judge trace/prep failed; posting deterministic fallback", {
         run_id: judgeRunId,
-        error: errMessage(err),
+        error: providerScrub(errMessage(err)),
       });
       review = fallbackReview(claim.judge_signal, providerScrub);
       if (providerCredential) {
@@ -451,7 +481,7 @@ export class JudgeRunner {
             return;
           }
           // Accounting is best effort; a transport failure must not discard the verdict.
-          this.log.warn("judge usage post failed", { run_id: judgeRunId, error: errMessage(err) });
+          this.log.warn("judge usage post failed", { run_id: judgeRunId, error: providerScrub(errMessage(err)) });
         }
       }
       // PRD #1247 fix round (Greptile P1, pre-post probe): the initial running ack closes only the
@@ -497,7 +527,7 @@ export class JudgeRunner {
       // then resolve it. Fence 0 — the judge's own trace is a single advisory usage frame that gates
       // no api sub-work. The completion still carries the claim generation (#1247 M2 fix round: a
       // direct report, not the RunRunner stamping closure) so it is fenced not 409'd.
-      await postTerminalState(this.terminalDeps, this.client, {
+      await postTerminalState(terminalDeps, this.client, {
         runId: judgeRunId,
         claimGeneration: claim.claim_generation ?? 0,
         phase: "running",
@@ -506,7 +536,7 @@ export class JudgeRunner {
       });
       this.log.info("judge run completed", { run_id: judgeRunId, target: targetId, verdict: review.verdict });
     } catch (err) {
-      this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: errMessage(err) });
+      this.log.warn("judge post/complete failed", { run_id: judgeRunId, error: providerScrub(errMessage(err)) });
       await safeReportFailed(
         this.client,
         this.log,
@@ -515,7 +545,8 @@ export class JudgeRunner {
         providerScrub(errMessage(err)),
         err,
         claim.claim_generation,
-        this.terminalDeps,
+        terminalDeps,
+        failureScrub,
       );
     } finally {
       // PRD #1390 M2a: the judge is terminal here on every path — stop listing it.
@@ -659,7 +690,7 @@ export class JudgeRunner {
     try {
       prompt = buildJudgePrompt(
         trace,
-        claim.judge_signal ?? null,
+        claim.judge_signal ? redactStrings(claim.judge_signal, scrub) : null,
         claim.known_improve_uzi_targets ?? [],
         claim.failure_class ?? null,
         claim.target_cost_status ?? null,
@@ -715,6 +746,137 @@ export class JudgeRunner {
       const fb = redactStrings(fallbackReview(claim.judge_signal, scrub), scrub);
       fb.model = scrub(model);
       return { review: fb, usageMessage };
+    }
+  }
+
+  /** Issue #4574: the CODEX PROVIDER judge model call. The pass runs the Codex advice harness under the
+   *  frozen provider authority (no vendor credential, no operation scope); the model is the server-chosen
+   *  id, resolved by the harness through the bound map (a mapped key, else the `default` slot).
+   *
+   *  The prompt is built FIRST, as on the Claude provider path: a build failure posts the scrubbed
+   *  deterministic fallback and never invokes the factory.
+   *
+   *  Settlement reads ONLY the pass-owned {@link ModelPassSettlement} (typed advice terminal, the exact
+   *  policy error, the exact run-promise rejection, the exact value the pass threw), never message text.
+   *  First match wins and anything unmatched is terminal (failed, no review, never `completed`):
+   *   1. a recorded stop (timeout or abort);
+   *   2. a throw that is not the pass's recorded escaped value (a throw from the pass finally);
+   *   3. the escaped value is not the policy error for the recorded terminal (a build rejection, a
+   *      harness cleanup failure, a transport error);
+   *   4. the recorded error terminal: gateway limit by the shared predicate -> LimitReachedError
+   *      (provider_gateway_limit, enums only, no review); no/other/unknown classification, or an
+   *      HTTP-tagged transport variant with no status -> terminal; any other classified error -> the
+   *      scrubbed fallback review;
+   *   5. a normal return after a success terminal -> parse (unparseable -> scrubbed fallback);
+   *   6. anything else.
+   *  Every ProviderJudgeTerminalError message is the scrubbed error message or fixed text. */
+  private async judgeCodexProvider(
+    claim: ClaimResponse,
+    trace: ReducedJudgeTrace,
+    authority: CodexProviderExecutionAuthority,
+    signal: AbortSignal | undefined,
+    scrub: TextRedactor,
+  ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
+    const model = (claim.judge_model ?? "").trim();
+    const fallback = (): ReviewRequest => {
+      const fb = redactStrings(fallbackReview(claim.judge_signal, scrub), scrub);
+      fb.model = scrub(model);
+      return fb;
+    };
+    const safeMessage = (value: unknown): string => {
+      try { return scrub(errMessage(value)); } catch { return "provider judge model call failed"; }
+    };
+    let prompt: string;
+    try {
+      prompt = buildJudgePrompt(
+        trace,
+        claim.judge_signal ? redactStrings(claim.judge_signal, scrub) : null,
+        claim.known_improve_uzi_targets ?? [],
+        claim.failure_class ?? null,
+        claim.target_cost_status ?? null,
+        claim.target_cost_usd ?? null,
+      );
+    } catch (err) {
+      this.log.warn("judge prompt build failed; using deterministic fallback", { run_id: claim.run_id, error: safeMessage(err) });
+      return { review: fallback() };
+    }
+    const buildHarness = this.codexAdviceHarnessFactory;
+    if (!buildHarness) {
+      throw new ProviderJudgeTerminalError("judge claim carries a Codex provider binding but no Codex advice-harness factory is wired");
+    }
+    const settlement: ModelPassSettlement = { terminalSeen: false, policyErrorSet: false, rejectionSet: false, escapedSet: false };
+    let usageMessage: EmittedMessage | undefined;
+    let text = "";
+    let threw = false;
+    let caught: unknown;
+    try {
+      text = await runReadOnlyModelPass({
+        provider: authority.providerBinding as ClaimProviderBinding,
+        model,
+        effort: claim.config?.default_effort,
+        systemPrompt: JUDGE_SYSTEM_PROMPT,
+        prompt,
+        homeRoot: this.homeRoot,
+        homePrefix: "uzi-judge-",
+        label: "judge",
+        timeoutMs: this.modelTimeoutMs,
+        queryFn: this.queryFn,
+        denyReason: "the judge is read-only and runs no tools",
+        log: this.log,
+        signal,
+        codex: { runId: claim.run_id, claimGeneration: claim.claim_generation, binding: authority, buildHarness, settlement },
+        onUsage: (modelUsage) => {
+          usageMessage = redactStrings(stripProviderCost({ kind: "status", agent: JUDGE_AGENT, payload: { event: "result", modelUsage } }), scrub);
+        },
+      });
+    } catch (err) {
+      threw = true;
+      caught = err;
+    }
+
+    // 1. A recorded timeout or abort, whatever else happened.
+    if (settlement.stop !== undefined) {
+      throw new ProviderJudgeTerminalError(threw ? safeMessage(caught) : `provider judge model call stopped (${settlement.stop})`);
+    }
+    if (threw) {
+      // 2. Not the value the pass recorded as thrown: it came from the pass's finally.
+      if (!settlement.escapedSet || caught !== settlement.escaped) throw new ProviderJudgeTerminalError(safeMessage(caught));
+      // 3. Not the error the pass's own policy threw for the recorded terminal.
+      if (!settlement.policyErrorSet || !settlement.rejectionSet || settlement.rejection !== settlement.policyError) {
+        throw new ProviderJudgeTerminalError(safeMessage(caught));
+      }
+      const terminal = settlement.terminal;
+      if (!settlement.terminalSeen || terminal === undefined || !terminal.isError) throw new ProviderJudgeTerminalError(safeMessage(caught));
+      const classification = terminal.classification;
+      // 4a. A gateway limit: the shared predicate the run lane uses.
+      if (isCodexProviderGatewayLimit("failed", "provider", classification)) {
+        throw new LimitReachedError({ rateLimitType: PROVIDER_GATEWAY_LIMIT });
+      }
+      // 4b. No evidence what failed.
+      if (classification === undefined || classification.classification === "other" || classification.classification === "unknown") {
+        throw new ProviderJudgeTerminalError(safeMessage(caught));
+      }
+      // 4c. An HTTP-tagged transport variant without a status cannot be proven not to be a limit.
+      if (isCodexHttpTaggedClassification(classification) && classification.httpStatus === undefined) {
+        throw new ProviderJudgeTerminalError(safeMessage(caught));
+      }
+      // 4d. Any other classified provider error keeps the deterministic fallback review.
+      this.log.warn("provider judge model returned a classified error; using deterministic fallback", { run_id: claim.run_id });
+      return { review: fallback(), usageMessage };
+    }
+    // 5. A normal return needs a recorded success terminal and nothing else recorded.
+    const returned = settlement.terminal;
+    if (!settlement.terminalSeen || returned === undefined || returned.isError
+      || settlement.policyErrorSet || settlement.rejectionSet || settlement.escapedSet) {
+      // 6.
+      throw new ProviderJudgeTerminalError("provider judge model returned no usable result");
+    }
+    try {
+      const review = calibrateReview(parseReview(scrub(text), scrub(model)), claim.failure_class ?? null);
+      return { review: redactStrings(review, scrub), usageMessage };
+    } catch (err) {
+      this.log.warn("judge model output unusable; using deterministic fallback", { run_id: claim.run_id, error: safeMessage(err) });
+      return { review: fallback(), usageMessage };
     }
   }
 

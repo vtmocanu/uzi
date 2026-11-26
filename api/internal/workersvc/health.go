@@ -274,6 +274,10 @@ const (
 	// clause counted by CountOnlineWorkersSatisfyingProvider with Kind), so a fleet that only
 	// supports ordinary provider runs still leaves the judge queued, and this names why.
 	reasonNoProviderJudgeCapableWorker = "no worker that supports provider judges (claude_provider_judge_v1) is online"
+	// reasonNoCodexProviderJudgeCapableWorker (PRD #4574 M1) is the Codex twin: a provider-bound
+	// Codex JUDGE needs codex_provider_judge_v1 on top of the Codex provider trio and
+	// codex_provider_v1, so a fleet supporting only ordinary Codex provider runs leaves it queued.
+	reasonNoCodexProviderJudgeCapableWorker = "no worker that supports Codex provider judges (codex_provider_judge_v1) is online"
 	// reasonNoProviderJobCapableWorker (PRD #4322 M1b) is the job counterpart: a provider-bound JOB
 	// needs claude_provider_job_v1 (and claude_provider_v1) on a non-Docker job runner, so a fleet that
 	// only supports ordinary provider runs or vendor jobs still leaves it queued, and this names why.
@@ -1764,6 +1768,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		} else if c == 0 {
 			if r.Kind == runkind.Judge && r.Harness == harnessClaude {
 				return reasonNoProviderJudgeCapableWorker
+			}
+			if r.Kind == runkind.Judge && r.Harness == harnessCodex {
+				return reasonNoCodexProviderJudgeCapableWorker
 			}
 			if r.Kind == runkind.Job && r.Harness == harnessClaude {
 				return reasonNoProviderJobCapableWorker

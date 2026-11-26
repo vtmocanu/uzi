@@ -275,6 +275,9 @@ func contractCases() []contractCase {
 		// (the zero.json carries nulls the handler normalizes to []); reason and latest_failure
 		// are present-as-null by design and totals.previous is omitempty.
 		newContractCase[AnalyticsReliabilityDTO]("analytics_reliability"),
+		// Issue #4731: the Capacity response; every slice is non-omitempty and the nullable
+		// measures are present-as-null.
+		newContractCase[AnalyticsCapacityDTO]("analytics_capacity"),
 	}
 }
 

@@ -42,7 +42,8 @@ type harnessCreationOrigin struct {
 	// JudgeLane marks a judge creation (PRD #4322 M1a). The judge's own pin policy and provider
 	// sources decide its lane in the create transaction under the shared secret-mutation lock: a
 	// Claude judge is vendor (pinned with a credential, or no Claude source) or provider-bound to
-	// the owner's Claude source; a Codex judge is vendor-only and refused for a Codex source. It
+	// the owner's Claude source; a Codex judge is vendor (no Codex source) or provider-bound to the
+	// owner's Codex source (PRD #4574 M1). It
 	// requires an explicit recognized harness and is mutually exclusive with RefuseProviderOwner.
 	JudgeLane bool
 	// JobLane marks a job creation (PRD #4322 M1b). Under the shared secret-mutation lock, taken

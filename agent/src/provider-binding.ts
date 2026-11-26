@@ -35,6 +35,13 @@ export const CLAUDE_PROVIDER_JOB_CAPABILITY = "claude_provider_job_v1";
  *  and the api admits a Codex provider claim only on provider, harness and runtime v2. */
 export const CODEX_PROVIDER_CAPABILITY = "codex_provider_v1";
 
+/** The additional protocol capability a worker must advertise (at register) to accept a Codex
+ *  provider-bound JUDGE claim (issue #4574): this image runs the Codex provider judge path
+ *  (judge-runner.ts judgeCodexProvider). Advertised under the same gate as CODEX_PROVIDER_CAPABILITY;
+ *  the api places a Codex provider judge only on a worker advertising it, and client.ts
+ *  requireProviderCapability refuses one on a registration that did not. */
+export const CODEX_PROVIDER_JUDGE_CAPABILITY = "codex_provider_judge_v1";
+
 /** The reason a claim whose lane cannot serve a provider reports (the server refuses these lanes
  *  first; this is the worker's second layer). */
 export const PROVIDER_LANE_UNSUPPORTED = "provider_lane_unsupported";

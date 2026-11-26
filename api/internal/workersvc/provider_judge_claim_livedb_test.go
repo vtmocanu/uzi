@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -17,9 +18,9 @@ import (
 
 // provider_judge_claim_livedb_test.go is PRD #4322 M1a milestone m3 against a real Postgres: a
 // provider-bound Claude judge (created by the m2 policy) claims against its frozen binding, a
-// revoked or unmappable binding settles it terminally (never a park), a Codex-bound judge stays
-// refused, the health reason names the missing judge capability, and a limit report from a provider
-// judge never parks or waits. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
+// revoked or unmappable binding settles it terminally (never a park), the health reason names the
+// missing judge capability, and a limit report from a provider judge never parks or waits. PRD #4574
+// M1 adds the Codex twin: a Codex-bound judge claims only on a worker with codex_provider_judge_v1. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres;
 // run via ./e2e/run-store-it.sh. Every test name ends LiveDB so the store-IT sweep selects it.
 
 var pjFullCaps = []string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.ClaudeProviderV1, capability.ClaudeProviderJudgeV1}
@@ -341,24 +342,178 @@ func TestProviderJudgeStaleFinisherLiveDB(t *testing.T) {
 	}
 }
 
-func TestProviderJudgeCodexBoundRefusedLiveDB(t *testing.T) {
+// pjCodexBaseCaps is the Codex provider claim set WITHOUT codex_provider_judge_v1: what a worker that
+// serves ordinary Codex provider runs advertises before PRD #4574 M1.
+var pjCodexBaseCaps = []string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
+
+func pjCodexJudgeCaps() []string {
+	return append(append([]string{}, pjCodexBaseCaps...), capability.CodexProviderJudgeV1)
+}
+
+// pjcFix is a pjFix whose owner ALSO has a real, sealed, usable Codex source selected and judges on
+// Codex, and whose worker advertises the full Codex judge capability set. The owner holds no vendor
+// Codex credential, so a vendor fallback could not succeed either.
+type pjcFix struct {
+	*pjFix
+	cProvider uuid.UUID
+	cKey      uuid.UUID
+	cPlain    string
+}
+
+func newPJCFix(t *testing.T) *pjcFix {
+	t.Helper()
 	p := newPJFix(t)
-	target := p.newTarget()
-	id := uuid.New()
-	p.env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, target_run_id, harness,
-	    model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
-	    VALUES ($1, $2, 'judge', 't', 'd', 'claimed', $3, 'codex', $4, 1, 'user_key', $5, $6)`,
-		id, p.userID, target.ID, p.provider, p.key, p.keyRev())
-	w := p.worker()
-	w.ProtocolCapabilities = append(append([]string{}, pjFullCaps...), capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3)
-	spy := &keyOpenSpy{Store: p.svc.q, rd: p.svc.q.(providerClaimReader)}
-	p.svc.q = spy
-	_, err := p.svc.assembleClaim(p.env.ctx, w, mustRun(t, p.env, id))
-	if !errors.Is(err, errProviderLaneClaimRefused) {
-		t.Fatalf("assembleClaim = %v, want errProviderLaneClaimRefused", err)
+	c := &pjcFix{pjFix: p, cPlain: "codex-gw-key-" + uuid.NewString()}
+	prov, err := p.env.q.InsertModelProvider(p.env.ctx, store.InsertModelProviderParams{OwnerUserID: p.userID, Name: "pjc-" + uuid.NewString()[:8], Engine: harnessCodex})
+	if err != nil {
+		t.Fatalf("insert codex provider: %v", err)
 	}
-	if b, c := spy.bindingReads.Load(), spy.ciphertextReads.Load(); b != 0 || c != 0 {
-		t.Fatalf("the refusal reached the key: %d binding read(s), %d ciphertext read(s)", b, c)
+	if err := p.env.q.InsertModelProviderRevision(p.env.ctx, store.InsertModelProviderRevisionParams{
+		ProviderID: prov.ID, Revision: 1, Protocol: "openai_responses", BaseUrl: pvBase, AuthStyle: "bearer", ModelMap: []byte(`{"default":{"model":"gateway"}}`),
+	}); err != nil {
+		t.Fatalf("insert codex revision: %v", err)
+	}
+	sealed, err := p.env.box.Seal([]byte(c.cPlain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := p.env.q.InsertProviderKeySecret(p.env.ctx, store.InsertProviderKeySecretParams{
+		UserID: p.userID, Label: prov.ID.String(), Ciphertext: sealed, SealedWith: "master", ProviderID: pgtype.UUID{Bytes: prov.ID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("insert codex key: %v", err)
+	}
+	c.cProvider, c.cKey = prov.ID, key.ID
+	p.env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = (SELECT scope_owner_id FROM model_providers WHERE id = $2), judge_runs_on = 'codex' WHERE id = $1`, p.userID, c.cProvider)
+	t.Cleanup(func() {
+		_, _ = p.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, p.userID)
+	})
+	p.setCaps(pjCodexJudgeCaps())
+	return c
+}
+
+// createdCodexJudge creates the Codex provider judge for a fresh target and checks its binding.
+func (c *pjcFix) createdCodexJudge() store.Run {
+	c.t.Helper()
+	target := c.newTarget()
+	c.auto(target)
+	r := c.mustJudge(target)
+	if r.Harness != "codex" || !r.ModelProviderID.Valid || uuid.UUID(r.ModelProviderID.Bytes) != c.cProvider ||
+		!r.ModelProviderKeySecretID.Valid || uuid.UUID(r.ModelProviderKeySecretID.Bytes) != c.cKey ||
+		r.CodexSecretID.Valid || r.CodexAuthMode.Valid || r.AnthropicSecretID.Valid {
+		c.t.Fatalf("judge = harness %q binding %+v codex=%v auth=%v anthropic=%v, want a Codex judge bound to %s", r.Harness, bindingOfRun(r), r.CodexSecretID, r.CodexAuthMode, r.AnthropicSecretID, c.cProvider)
+	}
+	return r
+}
+
+// TestProviderJudgeCodexBoundRefusedLiveDB: the preservation control for a worker that lacks
+// codex_provider_judge_v1. A real Codex provider judge is refused by the Go backstop with no key read
+// and never claimed by the SQL clause, even though the worker holds the full Codex provider set.
+func TestProviderJudgeCodexBoundRefusedLiveDB(t *testing.T) {
+	c := newPJCFix(t)
+	judge := c.createdCodexJudge()
+
+	c.setCaps(pjCodexBaseCaps)
+	if payload, err := c.svc.Claim(c.env.ctx, c.worker(), nil); err != nil || payload != nil {
+		t.Fatalf("Claim by a worker without codex_provider_judge_v1 = (%v, %v), want idle", payload != nil, err)
+	}
+	if got := mustRun(t, c.env, judge.ID).Status; got != "queued" {
+		t.Fatalf("status = %s, want queued", got)
+	}
+
+	c.env.exec(`UPDATE runs SET status = 'claimed', worker_id = $2, claim_generation = 1 WHERE id = $1`, judge.ID, c.workerID)
+	w := c.worker()
+	spy := &keyOpenSpy{Store: c.svc.q, rd: c.svc.q.(providerClaimReader)}
+	orig := c.svc.q
+	c.svc.q = spy
+	_, err := c.svc.assembleClaim(c.env.ctx, w, mustRun(t, c.env, judge.ID))
+	c.svc.q = orig
+	if !errors.Is(err, errProviderLaneClaimRefused) {
+		t.Fatalf("assembleClaim without the judge capability = %v, want errProviderLaneClaimRefused", err)
+	}
+	if b, k := spy.bindingReads.Load(), spy.ciphertextReads.Load(); b != 0 || k != 0 {
+		t.Fatalf("the refusal reached the key: %d binding read(s), %d ciphertext read(s)", b, k)
+	}
+}
+
+// TestCodexProviderJudgeClaimLiveDB: a worker advertising the Codex trio, codex_provider_v1 and
+// codex_provider_judge_v1 claims the Codex provider judge. The payload carries only the provider
+// binding (engine codex, the sealed key opened), no Codex capability and no Anthropic token; the
+// run row gains no vendor Codex authority and no credential epoch; the judge model is the Codex
+// judge default.
+func TestCodexProviderJudgeClaimLiveDB(t *testing.T) {
+	c := newPJCFix(t)
+	judge := c.createdCodexJudge()
+	payload, err := c.svc.Claim(c.env.ctx, c.worker(), nil)
+	if err != nil || payload == nil || payload.RunID != judge.ID.String() {
+		t.Fatalf("Claim = (%+v, %v), want the Codex provider judge", payload, err)
+	}
+	b := payload.Secrets.Provider
+	if b == nil || payload.Secrets.Codex != nil || payload.Secrets.AnthropicOAuthToken != "" {
+		t.Fatalf("secrets = %+v, want only a provider binding", payload.Secrets)
+	}
+	if b.ProviderID != c.cProvider.String() || b.Engine != "codex" || b.Protocol != "openai_responses" || b.Revision != 1 || b.BaseURL != pvBase ||
+		b.Credential != c.cPlain || b.ModelMap["default"].Model != "gateway" {
+		t.Fatalf("binding = %+v", b)
+	}
+	if payload.JudgeModel == nil || *payload.JudgeModel != agenttmpl.DefaultCodexJudgeModel {
+		t.Fatalf("judge model = %v, want the Codex judge default %q", payload.JudgeModel, agenttmpl.DefaultCodexJudgeModel)
+	}
+	if payload.TargetRunID == nil {
+		t.Fatal("the judge claim lost its target")
+	}
+	got := mustRun(t, c.env, judge.ID)
+	if got.Status != "claimed" {
+		t.Fatalf("status = %s, want claimed", got.Status)
+	}
+	if got.CodexSecretID.Valid || got.CodexAuthMode.Valid || got.CodexMaterialRevision.Valid || len(got.CodexCapHash) != 0 || got.AnthropicSecretID.Valid {
+		t.Fatalf("vendor authority recorded: codex=%v auth=%v material=%v cap-hash=%d anthropic=%v",
+			got.CodexSecretID, got.CodexAuthMode, got.CodexMaterialRevision, len(got.CodexCapHash), got.AnthropicSecretID)
+	}
+	var epochs int
+	if err := c.env.pool.QueryRow(c.env.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1`, judge.ID).Scan(&epochs); err != nil || epochs != 0 {
+		t.Fatalf("run_credential_epochs rows = %d (err %v), want 0: no vendor or Codex capability epoch for a provider judge", epochs, err)
+	}
+}
+
+// TestCodexProviderJudgeRotationBetweenAssemblyAndFinishLiveDB: the Codex twin of
+// TestProviderJudgeRotationBetweenAssemblyAndFinishLiveDB. The binding is intact at assembly and
+// revoked only afterwards, so the finisher's locked re-check is what refuses: nothing is delivered
+// and the judge fails terminally (credential_unavailable), never parks.
+func TestCodexProviderJudgeRotationBetweenAssemblyAndFinishLiveDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		revoke func(c *pjcFix)
+	}{
+		{"key rotated", func(c *pjcFix) {
+			c.env.exec(`UPDATE user_secrets SET enablement_rev = enablement_rev + 1 WHERE id = $1`, c.cKey)
+		}},
+		{"key disabled", func(c *pjcFix) {
+			c.env.exec(`UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, c.cKey)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newPJCFix(t)
+			judge := c.createdCodexJudge()
+			assembled := false
+			c.svc.claimHooks = &claimTestHooks{
+				afterAssembly: func(_ context.Context, run store.Run, payload *ClaimPayload, err error) {
+					if run.ID == judge.ID && err == nil && payload != nil && payload.Secrets.Provider != nil {
+						assembled = true
+					}
+					tc.revoke(c)
+				},
+			}
+			payload, err := c.svc.Claim(c.env.ctx, c.worker(), nil)
+			if err != nil || payload != nil {
+				t.Fatalf("Claim = (%v, %v), want nothing delivered", payload != nil, err)
+			}
+			if !assembled {
+				t.Fatal("assembly did not succeed before the revocation, so the locked re-check was not what refused")
+			}
+			c.wantFailedTerminally(judge.ID, holdProviderBindingStale)
+		})
 	}
 }
 
@@ -424,6 +579,28 @@ func TestQueuedReasonNoProviderJudgeCapableWorkerLiveDB(t *testing.T) {
 	e.exec(t, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, w, []string{capability.ClaudeProviderV1, capability.ClaudeProviderJudgeV1})
 	if got := svc.queuedReason(e.ctx, time.Now(), row(run), thWithLimit(testCustodyLimit)); got == reasonNoProviderJudgeCapableWorker || got == reasonNoProviderCapableWorker {
 		t.Fatalf("queuedReason with a judge-capable worker = %q, want no provider capability reason", got)
+	}
+}
+
+// TestQueuedReasonNoCodexProviderJudgeCapableWorkerLiveDB: a provider-bound Codex judge whose owner
+// has only workers without codex_provider_judge_v1 is told so, and the reason clears once a capable
+// worker is online.
+func TestQueuedReasonNoCodexProviderJudgeCapableWorkerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	row := func(runID [16]byte) store.ListActiveRunsForHealthRow {
+		return store.ListActiveRunsForHealthRow{ID: runID, UserID: e.userID, Status: "queued", Health: healthOK, Harness: harnessCodex, Kind: runkind.Judge,
+			ModelProviderKeyMode: pgtype.Text{String: "user_key", Valid: true}}
+	}
+	run := e.seedQueuedRun(t, nil, nil)
+	w := e.seedWorker(t, pjCodexBaseCaps)
+	got := svc.queuedReason(e.ctx, time.Now(), row(run), thWithLimit(testCustodyLimit))
+	if got != reasonNoCodexProviderJudgeCapableWorker || !strings.Contains(got, capability.CodexProviderJudgeV1) {
+		t.Fatalf("queuedReason with only codex_provider_v1 workers = %q, want %q", got, reasonNoCodexProviderJudgeCapableWorker)
+	}
+	e.exec(t, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, w, pjCodexJudgeCaps())
+	if got := svc.queuedReason(e.ctx, time.Now(), row(run), thWithLimit(testCustodyLimit)); got == reasonNoCodexProviderJudgeCapableWorker || got == reasonNoProviderCapableWorker {
+		t.Fatalf("queuedReason with a Codex judge-capable worker = %q, want no provider capability reason", got)
 	}
 }
 

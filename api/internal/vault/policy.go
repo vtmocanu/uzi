@@ -248,6 +248,34 @@ func (v *Vault) Status(ctx context.Context, userID uuid.UUID) (Status, error) {
 	defer cancel()
 	release := v.acquireLifecycle(userID)
 	defer release()
+	return v.statusLocked(ctx, userID)
+}
+
+// TryStatus is Status that never waits for the per-user lifecycle boundary: when another
+// lifecycle operation holds it, TryStatus returns ok == false and no error, without invoking
+// the lifecycle wait observer (it is never a waiter). The observation callers use it where a
+// blocked read must degrade to "unknown" instead of queueing behind an unlock, lock or
+// conversion. When the boundary is free it reads exactly what Status reads.
+func (v *Vault) TryStatus(ctx context.Context, userID uuid.UUID) (Status, bool, error) {
+	if err := v.lifecycleContext(ctx); err != nil {
+		return Status{}, false, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, LifecycleTimeout)
+	defer cancel()
+	m := v.lifecycleMutex(userID)
+	if !m.TryLock() {
+		return Status{}, false, nil
+	}
+	defer m.Unlock()
+	status, err := v.statusLocked(ctx, userID)
+	if err != nil {
+		return Status{}, false, err
+	}
+	return status, true, nil
+}
+
+// statusLocked reads the status; the caller holds the user's lifecycle mutex.
+func (v *Vault) statusLocked(ctx context.Context, userID uuid.UUID) (Status, error) {
 	state, err := v.State(ctx, userID)
 	if err != nil {
 		return Status{}, err

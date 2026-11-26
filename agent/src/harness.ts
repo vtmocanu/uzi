@@ -230,6 +230,15 @@ export interface HarnessTerminal {
   usage?: HarnessUsage;
   metrics: HarnessMetrics;
   limitEvidence?: HarnessLimitEvidence;
+  // Issue #4574: the CLOSED Codex error classification the selected terminal carried (the same
+  // value the failure message suffix is built from; never raw provider text). Set ONLY by the
+  // Codex advice decoder (codex-advice-harness.ts decodeTerminal); the provider judge reads it
+  // through its pass-owned settlement record.
+  readonly codexClassification?: {
+    readonly classification: string;
+    readonly category: HarnessErrorCategory;
+    readonly httpStatus?: number;
+  };
 }
 
 export interface HarnessTerminalFailure {

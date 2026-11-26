@@ -68,7 +68,7 @@ func (h *Handler) SelfRateLimits(w http.ResponseWriter, r *http.Request) {
 			limits = h.okRateLimitDTO(
 				row.FiveHourPct, row.FiveHourResetsAt,
 				row.SevenDayPct, row.SevenDayResetsAt,
-				row.Source, row.SyncedAt,
+				row.Source, row.SyncedAt, time.Now(),
 			)
 		}
 		tokens = append(tokens, apitypes.TokenRateLimitDTO{
@@ -143,7 +143,7 @@ func (h *Handler) AdminRateLimits(w http.ResponseWriter, r *http.Request) {
 			limits = h.okRateLimitDTO(
 				u.FiveHourPct, u.FiveHourResetsAt,
 				u.SevenDayPct, u.SevenDayResetsAt,
-				u.Source, u.SyncedAt,
+				u.Source, u.SyncedAt, time.Now(),
 			)
 		}
 		grp := &users[len(users)-1]
@@ -187,9 +187,9 @@ func (h *Handler) adminRateVaultSnapshot(ctx context.Context, ownerID uuid.UUID,
 }
 
 // okRateLimitDTO builds the "ok" union branch from the stored gauge columns. stale
-// is computed server-side (D3); resets are rendered as epoch seconds (D7).
-func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamptz, sevenPct pgtype.Int2, sevenReset pgtype.Timestamptz, source pgtype.Text, syncedAt pgtype.Timestamptz) apitypes.RateLimitDTO {
-	stale := h.rateLimitStale(syncedAt)
+// is computed server-side (D3) against now; resets are rendered as epoch seconds (D7).
+func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamptz, sevenPct pgtype.Int2, sevenReset pgtype.Timestamptz, source pgtype.Text, syncedAt pgtype.Timestamptz, now time.Time) apitypes.RateLimitDTO {
+	stale := h.rateLimitStale(syncedAt, now)
 	// A NULL five_hour_pct means the account has no 5-hour window (plans where
 	// Anthropic removed it): FiveHour stays nil and is omitted from the JSON.
 	var five *apitypes.RateLimitWindow
@@ -210,8 +210,8 @@ func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamp
 // the effective poll interval. With the poller disabled (UZI_USAGE_POLL_INTERVAL=0)
 // existing rows are still served but always marked stale, since nothing refreshes
 // them.
-func (h *Handler) rateLimitStale(syncedAt pgtype.Timestamptz) bool {
-	return usagereserve.Stale(syncedAt.Time, syncedAt.Valid, h.cfg.UsagePollInterval, time.Now())
+func (h *Handler) rateLimitStale(syncedAt pgtype.Timestamptz, now time.Time) bool {
+	return usagereserve.Stale(syncedAt.Time, syncedAt.Valid, h.cfg.UsagePollInterval, now)
 }
 
 // epochPtr renders a stored reset timestamp as epoch seconds, or nil (→ JSON null)

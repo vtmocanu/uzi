@@ -5,7 +5,7 @@ import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "../src/provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
 
 // PRD #4320 / #4505: the pinned Claude CLI follows gateway redirects (see the PRD Decision Log), and
 // that risk was accepted on 2026-11-19 (ADR-4320), so the worker advertises claude_provider_v1 on
@@ -69,6 +69,15 @@ it("a Codex-harness worker advertises codex_provider_v1 together with the Codex 
   for (const c of [CODEX_PROVIDER_CAPABILITY, "codex_provider_v1", "codex_custom_model_v1", "codex_phase_models_v1", "codex_harness_v1", "codex_runtime_v2"]) {
     assert.equal(caps.includes(c), true, c);
   }
+});
+
+// Issue #4574: codex_provider_judge_v1 rides under the Codex harness gate, with codex_provider_v1.
+it("a Codex-harness worker advertises codex_provider_judge_v1; one without the harness does not", async () => {
+  const on = await registeredCaps(true);
+  assert.equal(on.includes(CODEX_PROVIDER_JUDGE_CAPABILITY), true);
+  assert.equal(on.includes("codex_provider_judge_v1"), true);
+  const off = await registeredCaps(false);
+  assert.equal(off.includes("codex_provider_judge_v1"), false);
 });
 
 it("a worker without the Codex harness does not advertise codex_provider_v1", async () => {

@@ -60,11 +60,18 @@ func (s *Service) resolveJudgeModelFor(ctx context.Context, q judgeModelReader, 
 
 // checkProviderJudgeModel is the judge arm of verifyRunBinding: a provider-bound judge runs ONE
 // model (no lead, planning or template models), resolved strictly, and it must map through the
-// frozen provider's model map. An unset judge model resolves to the built-in "opus" alias.
+// frozen provider's model map. An unset Claude judge model resolves to the built-in "opus" alias.
+//
+// A Codex provider judge only runs the strict read: a valid Codex model map always carries a
+// `default` entry and the worker maps the model key-or-default, so no model can be unmapped and no
+// modelMapped refusal applies.
 func (s *Service) checkProviderJudgeModel(ctx context.Context, q *store.Queries, run store.Run, src providerSource) error {
 	model, _, err := s.resolveJudgeModelFor(ctx, q, run.UserID, Harness(run.Harness), true)
 	if err != nil {
 		return err
+	}
+	if Harness(run.Harness) == HarnessCodex {
+		return nil
 	}
 	if !modelMapped(src.ModelMap, model) {
 		return &ProviderModelUnmappedError{Model: model, Source: "judge"}

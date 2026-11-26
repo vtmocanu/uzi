@@ -54,6 +54,7 @@ export const STRICT_P_SUITE: readonly string[] = [
   "startup-smoke.test.ts",
   "bound-provider-root.test.ts",
   "provider-advice-summary.test.ts",
+  "provider-advice-judge.test.ts",
   "policy-real.test.ts",
   "native-bypass.test.ts",
   "native-exceptions.test.ts",

@@ -555,6 +555,19 @@ revocation or an unmapped model at assembly or the final locked re-check fails i
 judged trace, a vendor run's included, to the gateway. Design: [PRD #4322](prds/4322-custom-providers-server-lanes.md);
 user docs: [docs/judge.md](docs/judge.md#a-judge-on-a-model-provider).
 
+The Codex judge follows the same freeze (PRD #4574 M1): for an owner whose Codex source is a provider,
+the creation transaction freezes that provider and revision onto the judge, with no vendor fallback and
+no pin that keeps it a vendor judge (a source change between decision and freeze fails creation with
+`ErrJudgePolicyChanged`). The claim carries only the provider binding and needs `codex_provider_judge_v1`
+(claim, placement, wake, reap, demand, health). The worker resolves the server-sent Codex judge model
+through the provider's map (exact key, else the required `default`; a map without `default` is an unusable
+source, never `provider_model_unmapped`). A typed settlement seam on the Codex pass classifies terminals:
+a gateway 429/529 fails the judge with `provider_gateway_limit` and no review, a revoked binding is
+`credential_unavailable`, timeouts, aborts and unclassified errors fail with no review, and other
+classified errors keep the scrubbed fallback review. The judged trace goes to the Codex gateway and any
+redirect it issues. User docs:
+[docs/judge.md](docs/judge.md#a-codex-judge-on-a-model-provider).
+
 The Test probe is dialed from the api, ignores proxy variables, never follows a redirect and
 admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
 flag, loopback addresses).
@@ -584,9 +597,9 @@ with the Codex harness capabilities; the api admits the claim only to a worker w
 The issue/task/prompt/self_improve lane, its in-run advice, summary and task-review passes, and
 retries, resume and cold resume use the frozen binding (provider, revision, key `enablement_rev`);
 `mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
-Interim refusals (`provider_lane_unsupported`, follow-up #4574): the Codex judge is skipped for an
-owner with a Codex source (an owner with only a Claude source gets a vendor Codex judge since PRD
-#4322 M1a; earlier rows for a Claude judge with a Claude source are historical), plan and code cross-check refuse when either side is Codex-provider
+Interim refusals (`provider_lane_unsupported`, follow-up #4574 M2): the Codex judge half is resolved
+(#4574 M1: a Codex-source owner's judge runs on the provider; earlier skip rows are historical), and
+plan and code cross-check refuse when either side is Codex-provider
 bound (a Claude lead with plan cross-check owned by someone with a Codex source gets a human plan
 gate), and jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
 model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);

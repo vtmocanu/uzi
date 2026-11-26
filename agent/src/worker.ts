@@ -3,7 +3,7 @@ import { freshResumeCapabilities } from "./fresh-resume.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "./provider-binding.js";
 import { RUN_ENV_CAPABILITY } from "./run-env-claim.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
@@ -1150,6 +1150,9 @@ export class Worker {
           // gateway key only, the mapped gateway model passed through unchanged), so it advertises
           // codex_provider_v1 under the same gate and strictly with codex_custom_model_v1 above.
           protocolCapabilities.push(CODEX_PROVIDER_CAPABILITY);
+          // Issue #4574: this build runs a Codex provider-bound JUDGE (judge-runner.ts
+          // judgeCodexProvider), so it advertises codex_provider_judge_v1 under the same gate.
+          protocolCapabilities.push(CODEX_PROVIDER_JUDGE_CAPABILITY);
         }
         // issue #3639: the settlement capability rides only with the pressure capability (the same guard), so a worker
         // that cannot park for memory never offers to deliver a settlement receipt.

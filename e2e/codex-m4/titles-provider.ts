@@ -10,3 +10,7 @@ export const PROVIDER_ROOT_TITLES = {
 /** PRD #4323: the provider-bound advice pass and summary pass through the production advice factory. */
 export const PROVIDER_ADVICE_SUMMARY_TITLE =
   "provider advice and summary passes run on the frozen binding through the production factory against the pinned app-server";
+
+/** Issue #4574: the provider-bound Codex judge through the production advice factory. */
+export const PROVIDER_ADVICE_JUDGE_TITLE =
+  "provider judge runs on the frozen binding through the production factory and settles a gateway 429 and 529 as a provider gateway limit against the pinned app-server";
