@@ -13,6 +13,7 @@ import (
 const (
 	SectionOptions = "options"
 	SectionSpend   = "spend"
+	SectionQuality = "quality"
 )
 
 // ErrBusy is returned by Acquire when the (caller, section) key is already

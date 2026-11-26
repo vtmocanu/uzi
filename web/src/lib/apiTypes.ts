@@ -7037,3 +7037,208 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   top_runs: AnalyticsTopRunDTO[];
   breakdown: AnalyticsBreakdownDTO;
 }
+
+// Issue #4730: the Quality response (GET /api/analytics/quality and
+// /api/admin/analytics/quality). Mirrors api/internal/apitypes/analytics_quality.go.
+
+/** Applicability header of one Quality measure; reason is null when applicable. */
+export interface AnalyticsQualitySectionDTO {
+  applicable: boolean;
+  reason: string | null;
+  time_basis: string;
+}
+
+export interface AnalyticsQualityReworkGroupsDTO {
+  zero: number;
+  one: number;
+  two: number;
+  three_plus: number;
+}
+
+export interface AnalyticsQualityReworkBucketDTO {
+  index: number;
+  prs: number;
+  groups: AnalyticsQualityReworkGroupsDTO;
+}
+
+export interface AnalyticsQualityReworkDTO extends AnalyticsQualitySectionDTO {
+  applicable_prs: number;
+  groups: AnalyticsQualityReworkGroupsDTO;
+  buckets: AnalyticsQualityReworkBucketDTO[];
+  unwitnessed_prs: number;
+  unverified_links: number;
+  shared_external_prs: number;
+  shared_detection_unavailable: number;
+  /** Always "retained_runs_only". */
+  retention: string;
+  /** Always null with reason "not_tracked". */
+  merge_day_activity: AnalyticsNullableNumberDTO;
+  run_end_to_merge_seconds: AnalyticsNullableNumberDTO;
+}
+
+export interface AnalyticsQualityCIFixBucketDTO {
+  index: number;
+  runs: number;
+  finished: number;
+  in_flight: number;
+  outcomes: AnalyticsOutcomesDTO;
+}
+
+export interface AnalyticsQualityCIFixDTO extends AnalyticsQualitySectionDTO {
+  runs: number;
+  finished: number;
+  in_flight: number;
+  outcomes: AnalyticsOutcomesDTO;
+  buckets: AnalyticsQualityCIFixBucketDTO[];
+}
+
+export interface AnalyticsQualityPlanResultsDTO {
+  approve: number;
+  revise: number;
+  block: number;
+  failed: number;
+}
+
+export interface AnalyticsQualityCodeResultsDTO {
+  completed: number;
+  failed: number;
+}
+
+export interface AnalyticsQualityClassesDTO {
+  passed: number;
+  raised_issues: number;
+  didnt_finish: number;
+  replaced: number;
+  unclassified: number;
+}
+
+export interface AnalyticsQualityCheckerHarnessDTO {
+  claude: number;
+  codex: number;
+  unknown: number;
+}
+
+export interface AnalyticsQualityPlanBucketDTO {
+  index: number;
+  decided: number;
+  stored_result: AnalyticsQualityPlanResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+}
+
+export interface AnalyticsQualityCodeBucketDTO {
+  index: number;
+  decided: number;
+  stored_result: AnalyticsQualityCodeResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+}
+
+export interface AnalyticsQualityPlanUndatedDTO {
+  /** Always "not_applied". */
+  window: string;
+  count: number;
+  stored_result: AnalyticsQualityPlanResultsDTO;
+}
+
+export interface AnalyticsQualityCodeUndatedDTO {
+  /** Always "not_applied". */
+  window: string;
+  count: number;
+  stored_result: AnalyticsQualityCodeResultsDTO;
+}
+
+export interface AnalyticsQualityPlanStageDTO extends AnalyticsQualitySectionDTO {
+  decided_in_window: number;
+  stored_result: AnalyticsQualityPlanResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+  checker_harness: AnalyticsQualityCheckerHarnessDTO;
+  undated: AnalyticsQualityPlanUndatedDTO;
+  buckets: AnalyticsQualityPlanBucketDTO[];
+}
+
+export interface AnalyticsQualityCodeStageDTO extends AnalyticsQualitySectionDTO {
+  decided_in_window: number;
+  stored_result: AnalyticsQualityCodeResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+  checker_harness: AnalyticsQualityCheckerHarnessDTO;
+  undated: AnalyticsQualityCodeUndatedDTO;
+  buckets: AnalyticsQualityCodeBucketDTO[];
+}
+
+export interface AnalyticsQualityEffectiveFiltersDTO {
+  /** Null when no repo filter was applied. */
+  repo: string | null;
+  /** Null when no harness filter was applied. */
+  harness: string | null;
+  kinds: string[];
+}
+
+export interface AnalyticsQualityPendingDTO extends AnalyticsQualitySectionDTO {
+  /** Always "not_applied". */
+  window: string;
+  total: number;
+  plan: number;
+  code: number;
+  effective_filters: AnalyticsQualityEffectiveFiltersDTO;
+}
+
+export interface AnalyticsQualityCrossCheckDTO {
+  plan: AnalyticsQualityPlanStageDTO;
+  code: AnalyticsQualityCodeStageDTO;
+  pending: AnalyticsQualityPendingDTO;
+}
+
+export interface AnalyticsQualityJudgeCandidatesDTO {
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface AnalyticsQualityJudgeCompleteDTO {
+  total: number;
+  ideal: number;
+  ok: number;
+  issues: number;
+}
+
+export interface AnalyticsQualityJudgeEligibleDTO {
+  total: number;
+  unreviewed: number;
+  unreviewed_skipped: number;
+  failed: number;
+  complete: AnalyticsQualityJudgeCompleteDTO;
+}
+
+export interface AnalyticsQualityJudgeExcludedDTO {
+  cancelled: number;
+  in_flight: number;
+  skip_origin: number;
+  reviewed_excluded: number;
+}
+
+export interface AnalyticsQualityJudgeBucketDTO {
+  index: number;
+  eligible: number;
+  complete: number;
+  /** Null with reason "no_applicable_runs" when eligible is zero. */
+  coverage: AnalyticsNullableNumberDTO;
+}
+
+export interface AnalyticsQualityJudgeDTO extends AnalyticsQualitySectionDTO {
+  candidates: AnalyticsQualityJudgeCandidatesDTO;
+  eligible: AnalyticsQualityJudgeEligibleDTO;
+  excluded: AnalyticsQualityJudgeExcludedDTO;
+  coverage: AnalyticsNullableNumberDTO;
+  buckets: AnalyticsQualityJudgeBucketDTO[];
+  /** Always "retained_target_properties". */
+  selection: string;
+  limitations: string[];
+}
+
+export interface AnalyticsQualityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  rework: AnalyticsQualityReworkDTO;
+  ci_fix: AnalyticsQualityCIFixDTO;
+  cross_check: AnalyticsQualityCrossCheckDTO;
+  judge: AnalyticsQualityJudgeDTO;
+}

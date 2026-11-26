@@ -25,11 +25,14 @@ import type {
   AnalyticsBreakdownRowDTO,
   AnalyticsBreakdownDTO,
   AnalyticsSpendDTO,
+  AnalyticsQualityDTO,
 } from "./apiTypes";
 import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
 import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
 import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
 import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
+import analyticsQualityFull from "../../../fixtures/api-contract/analytics_quality.full.json";
+import analyticsQualityZero from "../../../fixtures/api-contract/analytics_quality.zero.json";
 import type { CrossCheckHistoryDTO, CrossCheckHistoryAvailabilityDTO, FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
 import crossHistoryFull from "../../../fixtures/api-contract/cross_check_history.full.json";
 import crossHistoryZero from "../../../fixtures/api-contract/cross_check_history.zero.json";
@@ -2574,6 +2577,84 @@ describe("analytics spend contract (issue #4684)", () => {
     expect(zero.totals.current.cost_usd).toBe(0);
     expect(zero.totals.current.disclosure.incomplete).toBe(false);
     expect(zero.window).toBe("");
+  });
+});
+
+describe("analytics quality contract (issue #4730)", () => {
+  type Full = typeof analyticsQualityFull;
+  type Q = AnalyticsQualityDTO;
+  const _top: never = null as unknown as AnalyticsKeyDiff<Q, Full>;
+  const _rework: never = null as unknown as AnalyticsKeyDiff<Q["rework"], Full["rework"]>;
+  const _reworkGroups: never = null as unknown as AnalyticsKeyDiff<Q["rework"]["groups"], Full["rework"]["groups"]>;
+  const _reworkBucket: never = null as unknown as AnalyticsKeyDiff<Q["rework"]["buckets"][number], Full["rework"]["buckets"][number]>;
+  const _ciFix: never = null as unknown as AnalyticsKeyDiff<Q["ci_fix"], Full["ci_fix"]>;
+  const _ciFixBucket: never = null as unknown as AnalyticsKeyDiff<Q["ci_fix"]["buckets"][number], Full["ci_fix"]["buckets"][number]>;
+  const _cross: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"], Full["cross_check"]>;
+  const _plan: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["plan"], Full["cross_check"]["plan"]>;
+  const _planBucket: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["plan"]["buckets"][number], Full["cross_check"]["plan"]["buckets"][number]>;
+  const _planUndated: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["plan"]["undated"], Full["cross_check"]["plan"]["undated"]>;
+  const _code: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["code"], Full["cross_check"]["code"]>;
+  const _codeBucket: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["code"]["buckets"][number], Full["cross_check"]["code"]["buckets"][number]>;
+  const _codeUndated: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["code"]["undated"], Full["cross_check"]["code"]["undated"]>;
+  const _pending: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["pending"], Full["cross_check"]["pending"]>;
+  const _filters: never = null as unknown as AnalyticsKeyDiff<Q["cross_check"]["pending"]["effective_filters"], Full["cross_check"]["pending"]["effective_filters"]>;
+  const _judge: never = null as unknown as AnalyticsKeyDiff<Q["judge"], Full["judge"]>;
+  const _judgeEligible: never = null as unknown as AnalyticsKeyDiff<Q["judge"]["eligible"], Full["judge"]["eligible"]>;
+  const _judgeBucket: never = null as unknown as AnalyticsKeyDiff<Q["judge"]["buckets"][number], Full["judge"]["buckets"][number]>;
+  void [
+    _top, _rework, _reworkGroups, _reworkBucket, _ciFix, _ciFixBucket, _cross, _plan, _planBucket, _planUndated,
+    _code, _codeBucket, _codeUndated, _pending, _filters, _judge, _judgeEligible, _judgeBucket,
+  ];
+
+  // Nullability of the exported type itself.
+  const _historyNullable: IsNullable<Q["history_start"]> extends true ? true : never = true;
+  const _reasonNullable: IsNullable<Q["rework"]["reason"]> extends true ? true : never = true;
+  const _repoNullable: IsNullable<Q["cross_check"]["pending"]["effective_filters"]["repo"]> extends true ? true : never = true;
+  const _harnessNullable: IsNullable<Q["cross_check"]["pending"]["effective_filters"]["harness"]> extends true ? true : never = true;
+  const _coverageValueNullable: IsNullable<Q["judge"]["coverage"]["value"]> extends true ? true : never = true;
+  const _notTrackedNullable: IsNullable<Q["rework"]["merge_day_activity"]["value"]> extends true ? true : never = true;
+  const _bucketsNotNull: IsNullable<Q["judge"]["buckets"]> extends false ? true : never = true;
+  const _limitationsNotNull: IsNullable<Q["judge"]["limitations"]> extends false ? true : never = true;
+  const _kindsNotNull: IsNullable<Q["cross_check"]["pending"]["effective_filters"]["kinds"]> extends false ? true : never = true;
+  const _previousFromOptional: Record<never, never> extends Pick<Q, "previous_from"> ? true : never = true;
+  void [
+    _historyNullable, _reasonNullable, _repoNullable, _harnessNullable, _coverageValueNullable, _notTrackedNullable,
+    _bucketsNotNull, _limitationsNotNull, _kindsNotNull, _previousFromOptional,
+  ];
+
+  it("accepts the full fixture", () => {
+    const full: AnalyticsQualityDTO = analyticsQualityFull;
+    expect(full.selected_user).toBe("x");
+    expect(full.rework.groups.three_plus).toBe(1);
+    expect(full.rework.retention).toBe("x");
+    expect(full.rework.merge_day_activity).toEqual({ value: 1.5, reason: "x" });
+    expect(full.ci_fix.outcomes.plan_rejected).toBe(1);
+    expect(full.cross_check.plan.stored_result.approve).toBe(1);
+    expect(full.cross_check.code.stored_result.completed).toBe(1);
+    expect(full.cross_check.plan.undated.window).toBe("x");
+    expect(full.cross_check.pending.effective_filters.kinds).toEqual(["x"]);
+    expect(full.judge.eligible.complete.ideal).toBe(1);
+    expect(full.judge.buckets[0].coverage).toEqual({ value: 1.5, reason: "x" });
+    expect(full.judge.limitations).toEqual(["x"]);
+  });
+
+  it("accepts the zero fixture: slices null, nullable fields null", () => {
+    const zero: NullSlices<AnalyticsQualityDTO> = analyticsQualityZero;
+    expect("previous_from" in zero).toBe(false);
+    expect(zero.history_start).toBeNull();
+    for (const k of ["buckets", "rolling"] as const) expect(zero[k]).toBeNull();
+    expect(zero.rework.buckets).toBeNull();
+    expect(zero.ci_fix.buckets).toBeNull();
+    expect(zero.cross_check.plan.buckets).toBeNull();
+    expect(zero.cross_check.code.buckets).toBeNull();
+    expect(zero.judge.buckets).toBeNull();
+    expect(zero.judge.limitations).toBeNull();
+    expect(zero.cross_check.pending.effective_filters.kinds).toBeNull();
+    expect(zero.cross_check.pending.effective_filters.repo).toBeNull();
+    expect(zero.rework.reason).toBeNull();
+    expect(zero.judge.coverage.value).toBeNull();
+    expect(zero.rework.applicable).toBe(false);
+    expect(zero.rework.merge_day_activity.reason).toBeNull();
   });
 });
 

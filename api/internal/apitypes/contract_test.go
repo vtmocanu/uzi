@@ -271,6 +271,11 @@ func contractCases() []contractCase {
 		// present-as-null by design.
 		newContractCase[AnalyticsOptionsDTO]("analytics_options"),
 		newContractCase[AnalyticsSpendDTO]("analytics_spend"),
+		// Issue #4730: the Quality response. Every array (envelope buckets/rolling, the
+		// per-measure buckets, kinds, limitations) is non-omitempty (the zero.json carries
+		// nulls the handler normalizes to []); history_start, the section reasons, the
+		// coverage and not_tracked numbers and the effective repo/harness are present-as-null.
+		newContractCase[AnalyticsQualityDTO]("analytics_quality"),
 	}
 }
 
