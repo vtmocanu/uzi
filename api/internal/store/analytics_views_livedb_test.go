@@ -13,7 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// Issue #4684, migration 00536: the run_usage_model_totals and run_outcome_classes views
+// Issue #4684, migration 00542: the run_usage_model_totals and run_outcome_classes views
 // the analytics Spend statements fold over. Both tests skip without
 // UZI_TEST_DATABASE_URL (the store IT runner supplies a throwaway Postgres).
 
