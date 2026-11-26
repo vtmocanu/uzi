@@ -4,6 +4,7 @@ import { test, type TestContext } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
 import { Outbox } from "../src/outbox.js";
+import { RecoveryDeadlineExhaustedError } from "../src/git.js";
 import { performance } from "node:perf_hooks";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
@@ -34,6 +35,93 @@ function mockUnenrolledSource(t: TestContext, claim: ClaimResponse): () => void 
   };
 }
 
+type LaunchRoundTag = { round: "authority" | "clone"; seq: number };
+const launchRoundStore = new AsyncLocalStorage<LaunchRoundTag>();
+/** Per fixture: the original claim's first remediation round, pinned by observation and asserted by the control. */
+const LAUNCH_TARGET_ROUND = {
+  exhausted: "clone", lateAck: "clone", delayedFeedback: "clone", handoff: "clone",
+} as const satisfies Record<string, LaunchRoundTag["round"]>;
+const LAUNCH_GATE_CAP_MS = 1000;
+const LAUNCH_EXPIRY_WARNING = "remediation restriction read unavailable";
+
+/**
+ * The "slow launch" control: the launch-time restriction read returns, then its result is held until the
+ * inner bootstrap operation aborts (or a 1000 ms cap), modelling a loaded host. With the 200 ms launch budget
+ * that abort lands after the read and the launch round fails; with the 5000 ms launch budget the signal is
+ * still live at release and the executor is entered. Only the declared target round's first read with the exact
+ * source identity is gated; untagged calls are never gated.
+ */
+function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
+  const s = {
+    firstTagged: undefined as LaunchRoundTag | undefined, gated: undefined as LaunchRoundTag | undefined,
+    readReturned: false, releasedBy: undefined as "abort" | "cap" | undefined,
+    liveAtRelease: undefined as boolean | undefined, remainingMs: undefined as number | undefined,
+    abortReason: "none", entered: false,
+    warnings: [] as { message: string; class: unknown; tag: LaunchRoundTag | undefined }[],
+  };
+  const logger = nullLogger();
+  logger.child = () => logger;
+  logger.warn = (message, fields) => {
+    if (message === LAUNCH_EXPIRY_WARNING)
+      s.warnings.push({ message, class: (fields as { class?: unknown } | undefined)?.class, tag: launchRoundStore.getStore() });
+  };
+  const facts = () => " [launch control facts: " + JSON.stringify({
+    target, firstRound: s.firstTagged, gated: s.gated, readReturned: s.readReturned, releasedBy: s.releasedBy,
+    signalLiveAtRelease: s.liveAtRelease, remainingMs: s.remainingMs, abortReason: s.abortReason,
+    warnings: s.warnings, executorEntered: s.entered }) + "]";
+  const attach = (runner: RunRunner) => {
+    let seq = 0;
+    const priv = runner as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    for (const [round, name] of [["authority", "requireLaunchAuthority"], ["clone", "cloneRemediationRound"]] as const) {
+      const real = priv[name]!.bind(runner);
+      priv[name] = (...args) => launchRoundStore.run({ round, seq: ++seq }, () => real(...args));
+    }
+    const target$ = git as unknown as {
+      readRemediationRestrictionFacts: (bare: string, branch: string, runId: string) => Promise<unknown>;
+      recoveryOperations: AsyncLocalStorage<{ signal: AbortSignal; deadline: number }>;
+    };
+    const previous = target$.readRemediationRestrictionFacts.bind(git);
+    const expected = [git.barePathFor(claim.repo.clone_url), "agent/issue-2396", claim.run_id];
+    target$.readRemediationRestrictionFacts = async (bare, branch, runId) => {
+      const tag = launchRoundStore.getStore();
+      const result = await previous(bare, branch, runId);
+      const exact = bare === expected[0] && branch === expected[1] && runId === expected[2];
+      if (!tag || !exact) return result;
+      s.firstTagged ??= tag;
+      if (tag.round !== target || s.gated) return result;
+      s.gated = tag;
+      s.readReturned = true;
+      const frame = target$.recoveryOperations.getStore();
+      assert.ok(frame, "the gate runs inside the bootstrap recovery operation" + facts());
+      await new Promise<void>(resolve => {
+        const done = (by: "abort" | "cap") => { clearTimeout(timer); s.releasedBy ??= by; resolve(); };
+        const timer = setTimeout(() => done("cap"), LAUNCH_GATE_CAP_MS);
+        if (frame.signal.aborted) done("abort");
+        else frame.signal.addEventListener("abort", () => done("abort"), { once: true });
+      });
+      s.liveAtRelease = !frame.signal.aborted;
+      s.remainingMs = frame.deadline - Date.now();
+      const reason: unknown = frame.signal.reason;
+      s.abortReason = !frame.signal.aborted ? "none"
+        : reason instanceof RecoveryDeadlineExhaustedError ? "RecoveryDeadlineExhaustedError"
+        : (reason as { constructor?: { name?: string } } | undefined)?.constructor?.name ?? typeof reason;
+      return result;
+    };
+  };
+  return {
+    logger, attach, facts, markEntered: () => { s.entered = true; },
+    assertControl: () => {
+      assert.equal(s.firstTagged?.round, target, "the declared target is the first remediation round" + facts());
+      assert.ok(s.gated, "the target round was gated" + facts());
+      assert.equal(s.liveAtRelease, true, "the launch signal was live at release" + facts());
+      assert.ok(s.remainingMs! > 0, "the launch allowance remained at release" + facts());
+      assert.equal(s.warnings.filter(w => w.tag?.seq === s.gated!.seq).length, 0,
+        "no expiry warning for the gated round" + facts());
+      assert.equal(s.entered, true, "the executor was entered" + facts());
+    },
+  };
+}
+
 function realCapture(prepare: () => void | Promise<void> = () => {}): NonNullable<Executor["withCredentialFreeCapture"]> {
   const rig = codexRig();
   return (deadlineMs, action, purpose, signal) => rig.capture(deadlineMs, async context => {
@@ -45,21 +133,21 @@ function realCapture(prepare: () => void | Promise<void> = () => {}): NonNullabl
 const settings = { enabled: true as const, reserveBytes: 100, hysteresisBytes: 100,
   sampleMs: 2, responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 };
 
-async function until(predicate: () => boolean, timeoutMs = 3000) {
+async function until(predicate: () => boolean, timeoutMs = 3000, facts?: () => string) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
-    assert.ok(Date.now() < deadline, "bounded runner memory fixture wait");
+    if (Date.now() >= deadline) assert.fail("bounded runner memory fixture wait" + (facts?.() ?? ""));
     await new Promise(resolve => setTimeout(resolve, 2));
   }
 }
 
-async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string, facts?: () => string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       operation,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}${facts?.() ?? ""}`)), timeoutMs);
       }),
     ]);
   } finally {
@@ -428,9 +516,14 @@ for (const { verdict, slowRemediationMs } of exhaustedCases) {
   });
 }
 
-for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as const) {
-  test(`runner initially exhausted allowance ${verdict}: first accessor stops before model admission and retains owner custody`, async () => {
+const initiallyExhaustedCases = [
+  ...(["accepted", "ambiguous", "generation", "deadline"] as const).map(verdict => ({ verdict, slowLaunch: false })),
+  { verdict: "deadline" as const, slowLaunch: true },
+];
+for (const { verdict, slowLaunch } of initiallyExhaustedCases) {
+  test(`runner initially exhausted allowance ${verdict}: first accessor stops before model admission and retains owner custody${slowLaunch ? " (slow launch control)" : ""}`, async () => {
     const f = await setup(2);
+    const launch = slowLaunch ? launchControl(f.claim, LAUNCH_TARGET_ROUND.exhausted) : undefined;
     api.setOwnershipStatus(f.claim.run_id, "claimed", 7);
     fs.writeFileSync(homeDir + "/session-proof", "original session");
     let captures = 0, enrollments = 0, modelRequests = 0, proof = false;
@@ -450,6 +543,7 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     const executor: Executor = {
       withCredentialFreeCapture: realCapture(),
       run: async ctx => {
+        launch?.markEntered();
         try {
           assert.equal(api.states.at(-1)!.body.status, "running",
             "normal claimed redispatch reports Running before trusted capture");
@@ -477,10 +571,13 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     git.worktreeStatus = async () => [];
     if (verdict === "ambiguous") api.overrideStateStatus(f.claim.run_id, "running");
     try {
-      await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
-        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: verdict === "deadline" ? 200 : 5000 }).execute(f.claim);
+      const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
+          ...(verdict === "deadline" ? { memoryHoldDeadlineMs: 200 } : {}) });
+      launch?.attach(runner);
+      await runner.execute(f.claim);
       if (executorError) throw executorError;
-      assert.equal(proof, true, "actual RunRunner executor reached the first trusted accessor");
+      assert.equal(proof, true, "actual RunRunner executor reached the first trusted accessor" + (launch?.facts() ?? ""));
       assert.ok(started !== undefined, "elapsed clock anchored at the first trusted accessor");
       if (verdict === "deadline") assert.ok(performance.now() - started < 1500,
         "initial exhaustion shares the bounded owner deadline");
@@ -508,6 +605,7 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
           register_nonce: "original-memory-registration", claim_generation: 7, memory_episode: 3,
         }, "exact public owner ACK confirms the park");
       } else assert.equal(f.parkReceipts.some(ack => ack.memoryParkAccepted !== undefined), false);
+      launch?.assertControl();
     } finally { await f.memory.stop(); }
   });
 }
@@ -962,13 +1060,17 @@ function holdFirstPost(suffix: string, marker: string): { restore: () => void; h
   return { restore: () => { globalThis.fetch = realFetch; }, held: () => held };
 }
 
-for (const slow of [false, true]) {
-for (const claimCredential of [true, false]) {
-test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}${slow ? " (slow transport control)" : ""}`, async t => {
+const lateAckCases = [
+  ...[false, true].flatMap(slow => [true, false].map(claimCredential => ({ slow, claimCredential, slowLaunch: false }))),
+  { slow: false, claimCredential: true, slowLaunch: true },
+];
+for (const { slow, claimCredential, slowLaunch } of lateAckCases) {
+test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}${slow ? " (slow transport control)" : ""}${slowLaunch ? " (slow launch control)" : ""}`, async t => {
   const f = await setup(1);
   // This source is unenrolled. Keep unrelated remediation I/O out of the 200 ms
   // late-ACK budget; the drained capture scope, native ACK and stale-owner fences remain real.
   const verifyUnenrolledReads = mockUnenrolledSource(t, f.claim);
+  const launch = slowLaunch ? launchControl(f.claim, LAUNCH_TARGET_ROUND.lateAck) : undefined;
   const successorCredential = f.claim.secrets.codex;
   const monitoring = f.memory.run();
   const release = releaseGate();
@@ -1039,6 +1141,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
       }
     },
     run: async ctx => {
+      launch?.markEntered();
       const command = enroll(ctx);
       original = command.captured.flight as MemoryFlightProof;
       if (!claimCredential) delete f.claim.secrets.codex;
@@ -1049,16 +1152,25 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
       throw new Error("quiet retained stop");
     },
   };
-  const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
-    { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 });
+  const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
+    { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
+  launch?.attach(runner);
   const hold = slow ? holdFirstPost("/state", "worker_memory_pressure") : undefined;
   const work = runner.execute(f.claim);
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await until(() => nativeAck !== undefined);
+    await until(() => nativeAck !== undefined, 3000, launch?.facts);
     assert.equal(liveAtSend, true, "original park send starts before its owner deadline");
     if (hold) assert.equal(hold.held(), 1, "control: first park POST response was held");
     assert.ok(nativeAck!.memoryParkAccepted, "receipt derives from the native public memory-hold DTO");
-    await work;
+    // Race the join against the same 1500 ms perf-clock allowance the assertion below enforces, so a
+    // runner that waits for the uncooperative park return fails by name instead of by the test timeout.
+    try {
+      await Promise.race([work, new Promise<never>((_, reject) => {
+        deadlineTimer = setTimeout(() => reject(new Error("runner deadline does not wait for uncooperative park return")),
+          Math.max(0, 1500 - (performance.now() - (started ?? performance.now()))));
+      })]);
+    } finally { clearTimeout(deadlineTimer); }
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "runner deadline does not wait for uncooperative park return");
     assert.equal(protectedScope, true, "fake protected source runs inside real drained capture scope");
@@ -1163,8 +1275,8 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }
   verifyUnenrolledReads();
+  launch?.assertControl();
 });
-}
 }
 
 for (const interruption of ["registration", "generation", "shutdown", "cancel"] as const) {
@@ -1237,9 +1349,13 @@ for (const interruption of ["registration", "generation", "shutdown", "cancel"] 
   });
 }
 
-for (const slow of [false, true]) {
-test(`M3 delayed feedback beyond deadline retains original send and sink receipt without parking${slow ? " (slow transport control)" : ""}`, async () => {
+const delayedFeedbackCases = [
+  { slow: false, slowLaunch: false }, { slow: true, slowLaunch: false }, { slow: false, slowLaunch: true },
+];
+for (const { slow, slowLaunch } of delayedFeedbackCases) {
+test(`M3 delayed feedback beyond deadline retains original send and sink receipt without parking${slow ? " (slow transport control)" : ""}${slowLaunch ? " (slow launch control)" : ""}`, async () => {
   const f = await setup(1);
+  const launch = slowLaunch ? launchControl(f.claim, LAUNCH_TARGET_ROUND.delayedFeedback) : undefined;
   const monitoring = f.memory.run();
   const release = releaseGate();
   let original: MemoryFlightProof | undefined, sending = false, sendSignal: AbortSignal | undefined;
@@ -1263,6 +1379,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
   };
   fs.writeFileSync(homeDir + "/session-proof", "original session");
   const executor: Executor = { run: async ctx => {
+    launch?.markEntered();
     const command = enroll(ctx);
     original = command.captured.flight as MemoryFlightProof;
     started = performance.now();
@@ -1270,13 +1387,14 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     await command.captured.commands.watchOutcome(command.entry);
     throw new Error("quiet retained stop");
   } };
-  const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
-    { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 });
+  const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
+    { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
+  launch?.attach(runner);
   // Installed only after everything that can throw, directly before the try that restores it.
   const hold = slow ? holdFirstPost("/messages", "worker_memory_pressure") : undefined;
   const work = runner.execute(f.claim);
   try {
-    await until(() => sending);
+    await until(() => sending, 3000, launch?.facts);
     assert.equal(liveAtSend, true, "original feedback send starts before its owner deadline");
     const receipt = f.memory.sinkReceipts.find(r => r.kind === "feedback" && r.context.flight === original);
     assert.ok(receipt, "original feedback sink owns its completion receipt");
@@ -1304,6 +1422,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     assert.equal(f.memory.sinkReceipts.includes(receipt), false, "only settlement retires the receipt");
     assert.notEqual(original!.parked, true);
     assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
+    launch?.assertControl();
   } finally {
     hold?.restore();
     clearTimeout(rescue); release.resolve();
@@ -1820,12 +1939,15 @@ const handoffCases = [
     .map(scenario => ({ scenario, control: undefined as string | undefined })),
   { scenario: "already-parked" as const, control: "slow transport control" },
   { scenario: "withdrawn" as const, control: "slow capture control" },
+  { scenario: "unsettled" as const, control: "slow launch control" },
+  { scenario: "expired" as const, control: "slow launch control" },
 ];
 for (const { scenario, control } of handoffCases) {
   test(`memory pause handoff retains custody without an owner-pause disposition (${control ? `${scenario}, ${control}` : scenario})`, async t => {
     const f = await setup(1);
     const verifyUnenrolledReads = scenario === "unsettled" || scenario === "expired"
       ? mockUnenrolledSource(t, f.claim) : undefined;
+    const launch = control === "slow launch control" ? launchControl(f.claim, LAUNCH_TARGET_ROUND.handoff) : undefined;
     const monitoring = f.memory.run();
     const release = releaseGate();
     let context: RunContext | undefined, captured: MemoryFlightProof | undefined;
@@ -1899,6 +2021,7 @@ for (const { scenario, control } of handoffCases) {
         }
       }),
       run: async ctx => {
+        launch?.markEntered();
         context = ctx;
         try {
           if (scenario === "already-parked") {
@@ -1935,12 +2058,14 @@ for (const { scenario, control } of handoffCases) {
         throw ctx.signal?.reason ?? new PauseNowSignal();
       },
     };
-    runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
-      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: scenario === "unsettled" || scenario === "expired" ? 200 : 5000 });
+    runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, launch?.logger,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
+        ...(scenario === "unsettled" || scenario === "expired" ? { memoryHoldDeadlineMs: 200 } : {}) });
+    launch?.attach(runner);
     try {
       await runner.execute(f.claim);
       // execute() can return while the executor is still joining a long capture; wait for its assertions to finish.
-      await withTimeout(executorDone.promise, 7000, "executor assertions");
+      await withTimeout(executorDone.promise, 7000, "executor assertions", launch?.facts);
       if (executorError) throw executorError;
       if (scenario === "already-parked") assert.equal(parkAssertionsRan, true, "already-parked park assertions ran");
       if (control === "slow transport control") assert.equal(api.delayedMessages, 0, "the in-process transport never rides the delayed HTTP route");
@@ -1956,6 +2081,7 @@ for (const { scenario, control } of handoffCases) {
       await f.memory.stop(); await monitoring;
     }
     verifyUnenrolledReads?.();
+    launch?.assertControl();
   });
 }
 
