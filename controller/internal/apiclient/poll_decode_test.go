@@ -212,24 +212,25 @@ func TestBoundedPollRejectsConcatenatedGzipMembers(t *testing.T) {
 }
 
 func TestBoundedPollEvidenceSetsBeforeTypedAllocation(t *testing.T) {
-	caps := make([]string, 65)
-	for i := range caps {
-		caps[i] = fmt.Sprintf("cap_%d", i)
-	}
-	body, err := json.Marshal(map[string]any{"workers": []any{map[string]any{
-		"id":            "11111111-1111-1111-1111-111111111111",
-		"roll_evidence": map[string]any{"scheduling_capabilities": caps, "protocol_capabilities": []string{}},
-	}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if boundedWorker(body[len("{\"workers\":[") : len(body)-2]) {
-		t.Fatal("oversized evidence set passed pre-materialization bound")
+	// Otherwise-valid golden evidence, so only the pre-materialization count check
+	// can reject the oversized set (validSet would also reject it, but later).
+	for _, key := range []string{"scheduling_capabilities", "protocol_capabilities"} {
+		t.Run(key, func(t *testing.T) {
+			for _, tc := range []struct {
+				n    int
+				want bool
+			}{{maxCapabilitySet, true}, {maxCapabilitySet + 1, false}} {
+				body := goldenWorkerWithCapabilities(t, key, tc.n)
+				if got := boundedWorker(body[len("{\"workers\":[") : len(body)-2]); got != tc.want {
+					t.Fatalf("boundedWorker(%d %s) = %v, want %v", tc.n, key, got, tc.want)
+				}
+			}
+		})
 	}
 }
 
 func TestBoundedPollRejectsAmbiguousEvidenceBeforeTyping(t *testing.T) {
-	caps := make([]string, 65)
+	caps := make([]string, maxCapabilitySet+1)
 	for i := range caps {
 		caps[i] = fmt.Sprintf("cap_%d", i)
 	}

@@ -221,6 +221,7 @@ task vet:controller                        # or build:controller, individually
 |---|---|
 | `controller/internal/protocol/protocol_contract_test.go` | `../../../api/internal/hostedsvc/testdata/controller_poll_wire.json` |
 | `controller/internal/preset/preset_contract_test.go` (`goldenPath`, shared with `size_display_golden_test.go`) | `../../../api/internal/hostedsvc/testdata/{hosted_sizes,hosted_templates}.json` |
+| `controller/internal/apiclient/poll_capability_bound_test.go` | `../../../api/internal/hostedsvc/testdata/controller_poll_limits.json` (also read by `api/internal/capability`) |
 
 - Those cross-reads are the gate: they make two modules' independently-declared types and tables safe to drift apart, so a `(cached)` run silently retires the only check on the wire format. A warm `GOCACHE` (the job's `cache:`) arms the trap, so it is invisible until the build gets faster.
 

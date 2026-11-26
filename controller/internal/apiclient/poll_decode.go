@@ -19,6 +19,13 @@ import (
 const maxPollBytes = 4 << 20
 const maxPollWorkers = 512
 
+// maxCapabilitySet bounds each roll-evidence capability set (scheduling and protocol).
+// It must stay above the api's capability vocabularies (api/internal/capability), or a
+// worker advertising every name it knows makes decodePoll reject the whole fleet snapshot.
+// The shared limit lives in api/internal/hostedsvc/testdata/controller_poll_limits.json,
+// which both modules' tests read.
+const maxCapabilitySet = 256
+
 // decodePoll bounds compressed and decompressed bytes, independent of ContentLength.
 // Accept exactly one gzip member so empty members cannot evade the output budget.
 // Every rejected snapshot returns no workers and a payload-free error.
@@ -246,7 +253,7 @@ func boundedWorker(raw []byte) bool {
 			}
 			count := 0
 			for dec.More() {
-				if count == 64 {
+				if count == maxCapabilitySet {
 					return false
 				}
 				var s string
@@ -283,7 +290,7 @@ func validUUID(s string) bool {
 }
 
 func validSet(set []string) bool {
-	if len(set) > 64 {
+	if len(set) > maxCapabilitySet {
 		return false
 	}
 	seen := make(map[string]bool, len(set))
