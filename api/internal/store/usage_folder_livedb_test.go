@@ -220,8 +220,7 @@ func TestUsageFolderPassSkipsIneligibleRunsLiveDB(t *testing.T) {
 	e.wantState(t, "chat", chat, false, false)
 }
 
-// More eligible runs than the per-tick limit: successive Passes fold all of them, and a run
-// the materializer skipped (its state row held locked) is reselected after the cursor wraps.
+// More eligible runs than the per-tick limit: successive Passes fold all of them.
 func TestUsageFolderCursorProgressAndWrapLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{LaneLimit: 2})
@@ -700,13 +699,74 @@ func TestUsageFolderLaneQueryErrorBacksOffMissingLaneLiveDB(t *testing.T) {
 	passUntil(t, f, 6, func() bool { return e.isFresh(t, r) })
 }
 
+// A missing-lane query that fails after the run-by-run retry of a remembered deadline batch has
+// consumed more than half of the lane budget says nothing about the query (the retry ate its
+// time), so it must NOT start the MissingBackoff: the next Pass queries again at once.
+func TestUsageFolderLaneQueryErrorAfterRetryDoesNotBackOffLiveDB(t *testing.T) {
+	e := newFolderEnv(t)
+	db := &recordingDB{UsageFolderDB: e.pool}
+	var batchPhase atomic.Bool // true: a multi-run batch holding the marked runs hangs until the lane deadline
+	var retryPhase atomic.Bool // true: the first single-run call takes 400ms (more than half of 600ms)
+	var slept atomic.Bool
+	var a, b uuid.UUID
+	f := store.NewUsageFolder(db, store.UsageFolderOptions{
+		ParentTimeout: 10 * time.Second,
+		LaneTimeout:   600 * time.Millisecond,
+		LaneLimit:     2,
+		Now:           func() time.Time { return time.Unix(1_700_000_000, 0) }, // frozen: never passes the backoff
+		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
+			if batchPhase.Load() && len(ids) > 1 && (containsID(ids, a) || containsID(ids, b)) {
+				<-ctx.Done()
+				return 0, ctx.Err()
+			}
+			if retryPhase.Load() && len(ids) == 1 && slept.CompareAndSwap(false, true) {
+				select {
+				case <-time.After(400 * time.Millisecond):
+				case <-ctx.Done():
+				}
+			}
+			return e.realMaterialize(ctx, ids)
+		},
+	})
+	a = e.missingRun(t)
+	b = e.missingRun(t)
+
+	// Pass 1: the batch of the two newest missing runs hangs to the lane deadline and is remembered.
+	batchPhase.Store(true)
+	if _, err := f.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass 1: %v", err)
+	}
+	batchPhase.Store(false)
+
+	// Pass 2: the missing lane runs first (lanes alternate); its retry takes 400ms of the 600ms
+	// budget and succeeds, then the lane query fails with less than half a budget left.
+	retryPhase.Store(true)
+	db.failTx.Store(true)
+	if _, err := f.Pass(context.Background()); err == nil {
+		t.Fatal("Pass 2 with failing lane queries returned nil, want the query error")
+	}
+	if !slept.Load() {
+		t.Fatal("the run-by-run retry never ran: the deadline batch was not remembered")
+	}
+	retryPhase.Store(false)
+
+	// Pass 3, same frozen clock: no backoff was started, so both lanes query again.
+	before := db.begins.Load()
+	if _, err := f.Pass(context.Background()); err == nil {
+		t.Fatal("Pass 3 with failing lane queries returned nil")
+	}
+	if got := db.begins.Load() - before; got != 2 {
+		t.Fatalf("lane queries begun by Pass 3 = %d, want 2 (stale + missing: a query failure after the retry ate the budget must not back off)", got)
+	}
+}
+
 // What this proves: with sequential scans disabled and the generic plan forced, the missing-lane
 // query's window over runs is planned through idx_runs_usage_fold_missing (migration 00544), i.e.
 // the index exists and the query's predicate implies the partial index. It does NOT prove the
 // default planner picks that plan: at this fixture's scale a sequential scan is legitimately
 // cheaper. The window size MUST stay a SQL literal (asserted below as text): as a parameter the
 // generic plan flips to a hash anti join that seq-scans run_usage_fold_state at steady state
-// (measured 145ms against 11-18ms).
+// (a DBA measurement on a 1M-run seed, not asserted by this test).
 func TestUsageFolderMissingQueryPlanLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	const rows = 6000

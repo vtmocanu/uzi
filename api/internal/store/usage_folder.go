@@ -362,7 +362,7 @@ func (f *UsageFolder) staleLane(ctx context.Context) (int64, error) {
 // when a window is shorter than the full window; it backs off MissingBackoff only when the
 // whole traversal found no candidate. A failed query (including the lane deadline or the
 // server-side statement_timeout) also backs off, so a scan slower than the lane budget is
-// retried every MissingBackoff, not every tick, but only when the query had a full lane budget:
+// retried every MissingBackoff, not every tick, but only when the query had at least half a lane budget (fullBudget):
 // a deadline caused by retryPending having consumed the budget says nothing about the query.
 func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 	now := f.opt.Now()
