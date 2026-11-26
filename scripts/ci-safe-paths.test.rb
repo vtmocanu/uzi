@@ -403,6 +403,7 @@ audited_prd_refs = %w[
   api/internal/uzidocs/embed/seeded-plans.md
   api/internal/uzidocs/embed/skills.md
   api/internal/uzidocs/embed/slack.md
+  api/internal/uzidocs/embed/usage-analytics.md
   api/internal/uzidocs/embed/vault-threat-model.md
   api/internal/uzidocs/embed/web-modules-dev.md
   api/internal/uzidocs/embed/web-modules.md
@@ -439,6 +440,7 @@ audited_prd_refs = %w[
   docs/seeded-plans.md
   docs/skills.md
   docs/slack.md
+  docs/usage-analytics.md
   docs/vault-threat-model.md
   docs/web-modules-dev.md
   docs/web-modules.md

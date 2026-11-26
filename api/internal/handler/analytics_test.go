@@ -63,21 +63,34 @@ func (h *Handler) analyticsServe(rt analyticsRoute, rec http.ResponseWriter, req
 	switch {
 	case !rt.admin && rt.section == analytics.SectionOptions:
 		h.AnalyticsOptions(rec, req)
+	case !rt.admin && rt.section == analytics.SectionReliability:
+		h.AnalyticsReliability(rec, req)
 	case !rt.admin:
 		h.AnalyticsSpend(rec, req)
 	case rt.section == analytics.SectionOptions:
 		h.AdminAnalyticsOptions(rec, req)
+	case rt.section == analytics.SectionReliability:
+		h.AdminAnalyticsReliability(rec, req)
 	default:
 		h.AdminAnalyticsSpend(rec, req)
 	}
 }
 
+// The first four entries are indexed positionally by the tests below; reliability routes (#4685)
+// are appended after them.
 var analyticsRoutes = []analyticsRoute{
 	{"owner options", "/api/analytics/options", false, analytics.SectionOptions},
 	{"owner spend", "/api/analytics/spend", false, analytics.SectionSpend},
 	{"admin options", "/api/admin/analytics/options", true, analytics.SectionOptions},
 	{"admin spend", "/api/admin/analytics/spend", true, analytics.SectionSpend},
+	{"owner reliability", "/api/analytics/reliability", false, analytics.SectionReliability},
+	{"admin reliability", "/api/admin/analytics/reliability", true, analytics.SectionReliability},
 }
+
+const (
+	analyticsOwnerReliabilityRoute = 4
+	analyticsAdminReliabilityRoute = 5
+)
 
 func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 	someUUID := uuid.New().String()
@@ -125,6 +138,28 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"semicolon pair", analyticsRoutes[1], "window=7d;x=1", "invalid query"},
 		{"bad percent-encoding", analyticsRoutes[1], "window=%zz", "invalid query"},
 		{"admin options bad user", analyticsRoutes[2], "user=nobody", "invalid user"},
+		// Issue #4685: Reliability has a breakdown but no split.
+		{"owner reliability split", analyticsRoutes[analyticsOwnerReliabilityRoute], "split=harness", "invalid split"},
+		{"admin reliability split", analyticsRoutes[analyticsAdminReliabilityRoute], "split=usage_model", "invalid split"},
+		{"admin reliability split=user", analyticsRoutes[analyticsAdminReliabilityRoute], "split=user", "invalid split"},
+		{"owner reliability breakdown=user", analyticsRoutes[analyticsOwnerReliabilityRoute], "breakdown=user", "invalid breakdown"},
+		{"admin reliability user=<uuid> breakdown=user", analyticsRoutes[analyticsAdminReliabilityRoute], "user=" + someUUID + "&breakdown=user", "invalid breakdown"},
+		{"admin reliability window=all", analyticsRoutes[analyticsAdminReliabilityRoute], "window=all", msgAnalyticsWindowAllAllUsers},
+		{"admin reliability user=all window=all", analyticsRoutes[analyticsAdminReliabilityRoute], "window=all&user=all", msgAnalyticsWindowAllAllUsers},
+	}
+	// Every Spend syntax rejection applies unchanged to both Reliability routes (the split
+	// ones answer "invalid split" there because the parameter is not accepted at all).
+	for _, tc := range slices.Clone(cases) {
+		switch tc.route.name {
+		case "owner spend":
+			tc.route = analyticsRoutes[analyticsOwnerReliabilityRoute]
+		case "admin spend":
+			tc.route = analyticsRoutes[analyticsAdminReliabilityRoute]
+		default:
+			continue
+		}
+		tc.name = "reliability " + tc.name
+		cases = append(cases, tc)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -223,6 +258,14 @@ func TestAnalyticsAcceptedQueriesReachTheSnapshot(t *testing.T) {
 		{analyticsRoutes[3], "window=7d&user=all"},
 		{analyticsRoutes[3], "window=30d&user=all"},
 		{analyticsRoutes[3], "window=90d&user=all"},
+		// Issue #4685: Reliability, including the supporting-only kind filter (it still begins the
+		// snapshot, because the repo and user authority checks run before the inapplicable answer).
+		{analyticsRoutes[analyticsOwnerReliabilityRoute], ""},
+		{analyticsRoutes[analyticsOwnerReliabilityRoute], "window=all&tz=America/New_York&harness=codex&kind=delivery&breakdown=kind"},
+		{analyticsRoutes[analyticsOwnerReliabilityRoute], "kind=supporting&repo=" + someUUID},
+		{analyticsRoutes[analyticsAdminReliabilityRoute], "breakdown=user"},
+		{analyticsRoutes[analyticsAdminReliabilityRoute], "user=" + someUUID + "&window=all&breakdown=harness"},
+		{analyticsRoutes[analyticsAdminReliabilityRoute], "window=7d&user=all&kind=chat"},
 	}
 	for _, tc := range cases {
 		b := &countingBeginner{err: errors.New("stop here")}
