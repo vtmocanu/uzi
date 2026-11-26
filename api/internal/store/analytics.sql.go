@@ -104,6 +104,14 @@ model_fold AS MATERIALIZED (
         OFFSET 0
     ) m ON true
     WHERE c.kind <> 'chat'
+      AND NOT (c.status IN ('completed', 'failed', 'cancelled') AND EXISTS (SELECT 1 FROM run_usage_fold_state fs WHERE fs.run_id = c.id AND NOT fs.stale))  -- all-only
+    UNION ALL  -- all-only
+    SELECT c.id, mm.model, mm.input_tokens, mm.cache_read_tokens, mm.cache_creation_tokens,  -- all-only
+           mm.output_tokens, mm.cost_usd, mm.cost_status  -- all-only
+    FROM cohort c  -- all-only
+    JOIN run_usage_fold_state fs ON fs.run_id = c.id AND NOT fs.stale  -- all-only
+    LEFT JOIN run_usage_model_folds mm ON mm.run_id = c.id  -- all-only
+    WHERE c.kind <> 'chat' AND c.status IN ('completed', 'failed', 'cancelled')  -- all-only
 ),
 merged_witness AS MATERIALIZED (
     SELECT DISTINCT w.repo_id, w.mr_iid
@@ -587,6 +595,14 @@ type AnalyticsAllSpendParams struct {
 // Every range comes from the parameters (half-open: start <= created_at < end); there is no
 // calendar arithmetic here. Dollars are emitted as numeric strings, ratios as JSON numbers,
 // timestamps as UTC strings so the document does not depend on the session TimeZone.
+// all-only: Issue #4700: model_fold has two branches in THIS statement only (the owner statement
+// all-only: keeps the live fold; ADR-1184 D1 keeps the two statements separate). A terminal run
+// all-only: whose run_usage_fold_state row is fresh (stale = false) reads its stored
+// all-only: run_usage_model_folds rows (a fresh state with zero rows is a legitimately empty fold:
+// all-only: the LEFT JOIN yields one NULL-model row, as the live LEFT JOIN LATERAL does for a run
+// all-only: with no usage). Every other run (no state row, stale, or not terminal) is folded live
+// all-only: from run_usage_model_totals. The branches are disjoint, so a run is counted once, and
+// all-only: both select the same column types (the folds table and the view: bigint x4, numeric, text).
 func (q *Queries) AnalyticsAllSpend(ctx context.Context, arg AnalyticsAllSpendParams) ([]byte, error) {
 	row := q.db.QueryRow(ctx, analyticsAllSpend,
 		arg.From,
