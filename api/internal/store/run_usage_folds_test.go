@@ -40,7 +40,7 @@ func unguardedRunUsageWrite(stmt string) bool {
 	if !runUsageWriteRE.MatchString(stmt) {
 		return false
 	}
-	return !(runUsageLockRE.MatchString(stmt) && runUsageFromLk.MatchString(stmt))
+	return !runUsageLockRE.MatchString(stmt) || !runUsageFromLk.MatchString(stmt)
 }
 
 func writesRunUsage(s string) bool {
@@ -97,7 +97,7 @@ func TestRunUsageWritersTakeFoldLock_SQL(t *testing.T) {
 	}
 	guardedQueries := map[string]bool{}
 	for _, f := range files {
-		b, err := os.ReadFile(f)
+		b, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a Glob over this package's own queries/migrations dirs, not from input.
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +138,7 @@ func TestRunUsageWritersTakeFoldLock_SQL(t *testing.T) {
 			continue
 		}
 		later++
-		b, err := os.ReadFile(f)
+		b, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a Glob over this package's own queries/migrations dirs, not from input.
 		if err != nil {
 			t.Fatal(err)
 		}

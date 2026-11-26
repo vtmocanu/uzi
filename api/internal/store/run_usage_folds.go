@@ -46,9 +46,12 @@ func runUsageFoldStepDone(ctx context.Context, step string) {
 // (run_usage_model_folds) for the eligible runs among ids, and marks their
 // run_usage_fold_state rows fresh. It returns how many runs it folded. Eligible means a
 // terminal (completed, failed, cancelled), non-chat run whose usage_refolded flag is set;
-// anything else, and any run a concurrent writer or deleter currently holds locked, is
-// skipped and left exactly as it was (a skipped stale run stays stale and is picked up by a
-// later call). At most MaxRunUsageFoldBatch ids are accepted per call.
+// anything else is skipped and left exactly as it was. A run whose EXISTING state row a
+// concurrent writer or deleter holds locked is skipped too (it stays stale and a later call
+// picks it up). A run for which an open writer transaction has CREATED the state row (the
+// run had none) is not skipped: step (a) waits on that uncommitted row, and after the 2s
+// lock_timeout the WHOLE batch fails with SQLSTATE 55P03, nothing is folded, and the caller
+// retries. At most MaxRunUsageFoldBatch ids are accepted per call.
 //
 // Everything runs in ONE explicit READ COMMITTED transaction, and every step is its own
 // statement (see the migration 00543 header for the lock protocol). Invariants this code

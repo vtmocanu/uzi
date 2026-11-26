@@ -357,7 +357,7 @@ func TestRunUsageFoldWritersVsRunDeleteLiveDB(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						pid := int32(conn.Conn().PgConn().PID())
+						pid := int64(conn.Conn().PgConn().PID())
 						go func() {
 							defer conn.Release()
 							n, err := fn(f.env.ctx, store.New(conn))
@@ -372,7 +372,7 @@ func TestRunUsageFoldWritersVsRunDeleteLiveDB(t *testing.T) {
 						deadline := time.Now().Add(15 * time.Second)
 						for time.Now().Before(deadline) {
 							var wt *string
-							if err := f.env.pool.QueryRow(f.env.ctx, `SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1`, pid).Scan(&wt); err != nil {
+							if err := f.env.pool.QueryRow(f.env.ctx, `SELECT wait_event_type FROM pg_stat_activity WHERE pid::bigint = $1`, pid).Scan(&wt); err != nil {
 								t.Fatal(err)
 							}
 							if wt != nil && *wt == "Lock" {

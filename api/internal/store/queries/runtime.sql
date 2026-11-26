@@ -9933,8 +9933,9 @@ LIMIT @lim;
 -- never its evidence — the frame stamp on run_messages is the evidence.
 --
 -- Issue #4700 (fold freshness): the lk CTE calls fn_run_usage_fold_lock (migration 00543)
--- BEFORE the insert can run. It takes FOR KEY SHARE on the runs row (raising 23503 for a
--- missing run, exactly the FK violation the insert would raise) and marks the run's
+-- BEFORE the insert can run. It takes FOR KEY SHARE on the runs row (for a missing run it
+-- raises SQLSTATE 23503, the same code as the FK violation the insert would raise, but with
+-- no constraint name) and marks the run's
 -- run_usage_fold_state row stale, holding that row's lock until this transaction ends so a
 -- concurrent materializer can never mark a fold that predates this write fresh. The INSERT
 -- reads FROM lk WHERE lk.ok so the CTE is evaluated and ordered first.
@@ -10564,9 +10565,10 @@ UPDATE runs SET usage_refolded = true WHERE id = @id;
 -- without the old collapsed rows lingering. Runs in the same transaction as the fold;
 -- a refold of a run with no result frames simply leaves zero rows behind.
 -- Issue #4700: the lk CTE marks the run's fold state stale (fn_run_usage_fold_lock,
--- migration 00543) in the same statement. The EXISTS (... FROM lk) conjunct is a constant
--- InitPlan: under a generic plan it surfaces as a One-Time Filter, so the delete never
--- scans run_usage when the lock function returned false.
+-- migration 00543) in the same statement. The lock function returns true or raises (it never
+-- returns false): a missing run now raises SQLSTATE 23503. Its only caller, RefoldRunUsage,
+-- pre-locks the run row first, so that cannot happen there. The EXISTS (... FROM lk) conjunct
+-- is a constant InitPlan that keeps the CTE evaluated before the delete reads run_usage.
 WITH lk AS (SELECT fn_run_usage_fold_lock(@run_id) AS ok)
 DELETE FROM run_usage WHERE run_id = @run_id AND EXISTS (SELECT 1 FROM lk WHERE lk.ok);
 

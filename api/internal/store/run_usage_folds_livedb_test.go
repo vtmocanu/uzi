@@ -32,7 +32,6 @@ type foldEnv struct {
 	userID uuid.UUID
 	connID uuid.UUID
 	repoID uuid.UUID
-	iid    int64
 }
 
 var foldIIDMu sync.Mutex
@@ -141,15 +140,6 @@ func (e *foldEnv) foldRows(t *testing.T, q interface {
 	return out
 }
 
-func (e *foldEnv) usageRows(t *testing.T, run uuid.UUID) string {
-	t.Helper()
-	var s string
-	if err := e.pool.QueryRow(e.ctx, `SELECT COALESCE(string_agg(session_id||'/'||model||'/'||lineage_epoch||'='||input_tokens, ',' ORDER BY session_id, model, lineage_epoch), '') FROM run_usage WHERE run_id = $1`, run).Scan(&s); err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 func (e *foldEnv) materialize(t *testing.T, ids ...uuid.UUID) int64 {
 	t.Helper()
 	n, err := store.MaterializeRunUsageFolds(e.ctx, e.pool, ids)
@@ -158,8 +148,6 @@ func (e *foldEnv) materialize(t *testing.T, ids ...uuid.UUID) int64 {
 	}
 	return n
 }
-
-func eq(a, b []string) bool { return strings.Join(a, "|") == strings.Join(b, "|") }
 
 // opResult is the outcome of an operation started on its own backend.
 type opResult struct {
@@ -194,7 +182,7 @@ func (op *bgOp) waitBlocked(t *testing.T, e *foldEnv) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var wt *string
-		if err := e.pool.QueryRow(e.ctx, `SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1`, int32(op.pid)).Scan(&wt); err != nil {
+		if err := e.pool.QueryRow(e.ctx, `SELECT wait_event_type FROM pg_stat_activity WHERE pid::bigint = $1`, op.pid).Scan(&wt); err != nil {
 			t.Fatalf("pg_stat_activity: %v", err)
 		}
 		if wt != nil && *wt == "Lock" {
@@ -217,16 +205,6 @@ func (op *bgOp) wait(t *testing.T) opResult {
 	case <-time.After(20 * time.Second):
 		t.Fatal("operation did not finish (deadlock or lost wake-up)")
 		return opResult{}
-	}
-}
-
-func (op *bgOp) stillRunning() bool {
-	select {
-	case r := <-op.done:
-		op.done <- r
-		return false
-	default:
-		return true
 	}
 }
 
@@ -453,9 +431,11 @@ func TestRunUsageFoldIneligibleAndBatchBoundaryLiveDB(t *testing.T) {
 	}
 }
 
-// A writer that holds the state row (open transaction) makes the materializer skip the run,
-// both when the writer created the row and when the row was already stale (the upsert's
-// DO UPDATE ... WHERE is false, which must still hold the row lock).
+// A writer that holds an EXISTING state row (open transaction) makes the materializer skip the
+// run, both when the row was fresh and when it was already stale (the upsert's DO UPDATE ...
+// WHERE is false, which must still hold the row lock). A writer that CREATED the state row is
+// the "state_created_by_open_writer" subtest: the materializer does not skip it, it waits and
+// the whole batch fails with 55P03 after lock_timeout.
 func TestRunUsageFoldWriterHoldsLockMaterializerSkipsLiveDB(t *testing.T) {
 	for _, preStale := range []bool{false, true} {
 		t.Run(fmt.Sprintf("preexisting_stale_state=%t", preStale), func(t *testing.T) {
@@ -489,6 +469,82 @@ func TestRunUsageFoldWriterHoldsLockMaterializerSkipsLiveDB(t *testing.T) {
 				t.Fatalf("fold = %v, want the writer's 3000", got)
 			}
 		})
+	}
+
+	// The open writer created run A's state row (A had none): step (a) waits on the uncommitted
+	// row, lock_timeout (2s) fires and the whole batch [A, B] fails; nothing is folded.
+	t.Run("state_created_by_open_writer", func(t *testing.T) {
+		e := newFoldEnv(t)
+		a := e.run(t, "completed")
+		b := e.run(t, "completed")
+		if err := e.upsert(t, e.q, b, "s1", "model-b", 0, 2000); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := e.pool.Begin(e.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if err := e.upsert(t, e.q.WithTx(tx), a, "s1", "model-a", 0, 1000); err != nil {
+			t.Fatal(err)
+		}
+		e.wantState(t, "A while the writer is open", a, false, false)
+
+		n, err := store.MaterializeRunUsageFolds(e.ctx, e.pool, []uuid.UUID{a, b})
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("materialize = %d, %v; want a lock-timeout error (SQLSTATE 55P03)", n, err)
+		}
+		if got := e.foldRows(t, e.pool, b); len(got) != 0 {
+			t.Fatalf("B folded despite the failed batch: %v", got)
+		}
+		e.wantState(t, "B after the failed batch", b, true, true)
+
+		if err := tx.Commit(e.ctx); err != nil {
+			t.Fatal(err)
+		}
+		e.wantState(t, "A after writer commit", a, true, true)
+		if got := e.foldRows(t, e.pool, a); len(got) != 0 {
+			t.Fatalf("A has fold rows before any successful materialization: %v", got)
+		}
+
+		if n := e.materialize(t, a, b); n != 2 {
+			t.Fatalf("retry materialized %d, want 2", n)
+		}
+		if got := e.foldRows(t, e.pool, a); len(got) != 1 || !strings.HasPrefix(got[0], "model-a:1000:") {
+			t.Fatalf("A fold after retry = %v", got)
+		}
+		if got := e.foldRows(t, e.pool, b); len(got) != 1 || !strings.HasPrefix(got[0], "model-b:2000:") {
+			t.Fatalf("B fold after retry = %v", got)
+		}
+	})
+}
+
+// The materializer must stay READ COMMITTED: (d) has to see a writer commit that landed after
+// the transaction's first statement. Run A has a stale state row (no lock is taken at (a0) for
+// it); a concurrent upsert raises the model's tokens after (a0). Under REPEATABLE READ the
+// snapshot taken at (a0) would hide that write from (d) while (e) still marks the run fresh.
+func TestRunUsageFoldMaterializerSeesWriteAfterFirstStatementLiveDB(t *testing.T) {
+	e := newFoldEnv(t)
+	run := e.run(t, "completed")
+	if err := e.upsert(t, e.q, run, "s1", "model-a", 0, 1000); err != nil {
+		t.Fatal(err)
+	}
+	e.wantState(t, "precondition", run, true, true)
+	reached, release := pauseAt(t, "a0")
+	mat := e.matBG(t, run)
+	mustReach(t, reached)
+	if err := e.upsert(t, e.q, run, "s1", "model-a", 0, 5000); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if r := mat.wait(t); r.err != nil {
+		t.Fatalf("materializer: %v", r.err)
+	}
+	got := e.foldRows(t, e.pool, run)
+	_, stale := e.state(t, run)
+	if !stale && (len(got) != 1 || !strings.HasPrefix(got[0], "model-a:5000:")) {
+		t.Fatalf("run marked fresh with fold %v, want the write committed after (a0) (5000)", got)
 	}
 }
 

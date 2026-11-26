@@ -89,6 +89,7 @@ CREATE TRIGGER run_usage_fold_state_run_delete AFTER DELETE ON runs
 FOR EACH ROW EXECUTE FUNCTION fn_run_usage_fold_state_on_run_delete();
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TRIGGER run_usage_fold_state_run_delete ON runs;
 DROP FUNCTION fn_run_usage_fold_state_on_run_delete();
 DROP FUNCTION fn_run_usage_fold_lock(uuid);

@@ -39,6 +39,13 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 	// delete so a failed refold marks nothing and is retried on the next tick.
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Bound every lock wait below (the run pre-lock and the fold-state row the delete takes) so
+	// the boot refold loop cannot stall behind a long lock holder; a failure rolls back and the
+	// existing loop retries the run.
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '5s'"); err != nil {
+		return fmt.Errorf("refold usage (run %s): set lock_timeout: %w", run.ID, err)
+	}
+
 	qtx := q.WithTx(tx)
 
 	// Issue #4700: the runs row is the master lock of the run_usage fold-freshness protocol
