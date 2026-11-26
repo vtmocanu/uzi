@@ -51,11 +51,13 @@ func runUsageFoldStepDone(ctx context.Context, step string) {
 // picks it up). A run for which an open writer transaction has CREATED the state row (the
 // run had none), or for which a concurrent materializer is creating it, is not skipped:
 // step (a) waits on that uncommitted row, and after the 2s lock_timeout the WHOLE batch fails
-// with SQLSTATE 55P03, nothing is folded, and the caller retries. RefoldRunUsage holds the
-// runs row FOR UPDATE before it creates the state row, which makes (a0) skip that run. A
-// live UpsertRunUsage holds only fn_run_usage_fold_lock's FOR KEY SHARE on the runs row,
-// which (a0) does not skip, so step (a) waits until that writer's transaction ends. At most
-// MaxRunUsageFoldBatch ids are accepted per call.
+// with SQLSTATE 55P03, nothing is folded, and the caller retries. Both production writers
+// hold the runs row FOR UPDATE before they create the state row (RefoldRunUsage via
+// LockRunForUsageRefold; the workersvc append path via beginClaimMutation's
+// GetRunOwnedByWorkerForUpdate), which makes (a0) skip that run. The wait-then-55P03 case
+// applies only to a writer holding just fn_run_usage_fold_lock's FOR KEY SHARE (a bare
+// store-level UpsertRunUsage in its own transaction, e.g. manual DML) or to a concurrent
+// materializer creating the row. At most MaxRunUsageFoldBatch ids are accepted per call.
 //
 // Everything runs in ONE explicit READ COMMITTED transaction, and every step is its own
 // statement (see the migration 00543 header for the lock protocol). Invariants this code
