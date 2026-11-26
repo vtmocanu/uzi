@@ -6,22 +6,24 @@ audience: user
 
 # Usage analytics API
 
-A read-only API for spend over time: filter options, then a Spend document
-with daily (or weekly) buckets, ranked splits, two cost ratios, a cache-read
-ratio, the ten most expensive runs and a per-group breakdown. Everything is
+A read-only API for spend and capacity over time: filter options, a Spend
+document with daily (or weekly) buckets, ranked splits, two cost ratios, a
+cache-read ratio, the ten most expensive runs and a per-group breakdown, and a
+[Capacity](#capacity) document with approximate concurrent-run occupancy, a
+usage-wait share and current provider gauges. The historical figures are
 computed on the server from one database snapshot. It is API only: there is no
 web page or `uzi` command for it yet, and `GET /api/usage` and
 `GET /api/admin/usage` are unchanged.
 
 Every dollar figure is recorded spend (an estimate for comparison), not a
-bill.
+bill. Capacity reports no dollars.
 
 ## Routes and authorization
 
 | Scope | Routes | Who |
 |---|---|---|
-| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
-| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend` | An admin session, or a Bearer token with the `admin_ro` scope. |
+| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend`, `GET /api/analytics/capacity` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
+| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend`, `GET /api/admin/analytics/capacity` | An admin session, or a Bearer token with the `admin_ro` scope. |
 
 - The owner route never reads a user from the query. An admin calling it sees
   only their own runs, and a `user` parameter there is a 400.
@@ -34,26 +36,26 @@ bill.
 
 | Parameter | Values | Default | Notes |
 |---|---|---|---|
-| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend rejects `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
+| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend and Capacity reject `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
 | `kind` | a run kind, `delivery` or `supporting` | all kinds | `chat` is accepted but only feeds `untracked_chat_runs`. |
-| `split` (spend) | `usage_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `usage_model` | Top 5 groups plus Other. |
-| `breakdown` (spend) | `primary_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `repo` | Top 50 rows plus Other. |
+| `split` (spend only) | `usage_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `usage_model` | Top 5 groups plus Other. |
+| `breakdown` (spend only) | `primary_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `repo` | Top 50 rows plus Other. |
 | `user` (admin only) | `all` or a user UUID | `all` | Omitting it is byte-identical to `user=all`. |
 
 - Every invalid value is a 400 naming its parameter (`invalid window`,
   `invalid tz`, ...). The message never echoes the value, SQL or other
   sensitive text.
-- Spend on the admin all-users scope with `window=all` is a 400,
+- Spend and Capacity on the admin all-users scope with `window=all` are a 400,
   `window all not available for all users`. It is answered before any
   analytics database work (authentication runs first) and is not a 503.
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
   silently replaced by defaults.
-- `split` or `breakdown` on `/options`, and `split=user` or `breakdown=user`
+- `split` or `breakdown` on `/options` or `/capacity`, and `split=user` or `breakdown=user`
   anywhere but an admin all-users response, is `invalid split` or
   `invalid breakdown`.
 - A `repo` that does not exist and a `repo` the scope cannot see give the
@@ -67,8 +69,8 @@ bill.
 ## Admission and timeouts
 
 - Capacity is a quarter of the database pool (`max(1, MaxConns / 4)`; the
-  default pool of 20 gives 5). One request per caller per section (`options`
-  or `spend`) may be in flight, and the owner and admin variants share that
+  default pool of 20 gives 5). One request per caller per section (`options`,
+  `spend` or `capacity`) may be in flight, and the owner and admin variants share that
   slot. Nothing queues.
 - A request that finds no slot answers 503 with `Retry-After: 1` before any
   analytics database work. Authentication runs earlier (bearer and cookie
@@ -225,6 +227,128 @@ On the owner route `users` is null with reason `not_applicable`.
 - Admin `user=<uuid>` narrows the repo list to that user's connections and
   echoes `selected_user`. The Spend response carries the same `selected_user`
   (`all` or the user id; the caller's id on the owner route).
+
+## Capacity
+
+`GET /api/analytics/capacity` (owner) and `GET /api/admin/analytics/capacity`
+(admin) answer how busy ordinary work was and what the providers' meters read
+now. It takes `window`, `tz`, `repo`, `harness`, `kind` and, on the admin route,
+`user`, with the same validation and errors as Spend. It takes no `split` or
+`breakdown`. Authorization, the owner and admin scopes, admission (its own
+`capacity` slot) and the 8 second budget are as above, and `window=all` on the
+admin all-users scope is the same 400 `window all not available for all users`.
+The response carries the same calendar envelope as Spend. Its `previous_from`,
+`previous_to` and `rolling` fields are present, but Capacity reports no
+previous-period and no rolling series. The response is sent with
+`Cache-Control: private, no-store`.
+
+### Occupancy
+
+`occupancy` (`time_basis` `interval_overlap`, `unit` `average_concurrent_runs`)
+is the time-weighted average number of concurrent ordinary runs. Each run
+contributes one interval from `first_started_at` to its retained end
+(`COALESCE(finished_at, status_since)`), or to `generated_at` while it is not
+finished. It is an elapsed envelope: it includes time spent waiting and cannot
+recover claim or resume history, so it is not exact execution time or worker
+occupancy. There is no slot denominator, percentage or clamp, and no historical
+worker count is read.
+
+- Intervals are clipped to the range and integrated by one sort over their
+  endpoints and the bucket edges. Runs that began before the window contribute
+  only their overlap, and runs starting or ending at the same instant do not
+  change the integral.
+- Ordinary work only: chat runs and runs on a durable cross-check lane are
+  excluded. A `kind=cross_check` run that is not on a lane is included.
+  Retained lane assignment can be reset or absent, so the lane test is
+  historical evidence, not a reconstruction.
+- `window` and every bucket carry `run_seconds`, `duration_seconds`,
+  `average_concurrent_runs` and `reason`. Each bucket is divided by its own
+  actual duration (a 23 or 25 hour DST day, or the partial bucket for today),
+  not by a fixed day. A zero-duration bucket (the final `[now, now)` bucket at a
+  local midnight) has `average_concurrent_runs` null with reason
+  `zero_duration_bucket`; a zero-duration range has null with
+  `zero_duration_range`.
+- `population` counts the candidate runs: `candidates` is `with_interval` +
+  `without_start` + `invalid_interval`. A terminal run is a candidate when its
+  end is after the range start, a nonterminal run when it was created before
+  `generated_at`.
+
+  | Field | Meaning |
+  |---|---|
+  | `with_interval` | Runs with a valid interval, which feed the integral. |
+  | `without_start` | Runs with no `first_started_at`, excluded. |
+  | `invalid_interval` | Runs whose end is before their start, or whose first start falls after the request's captured clock (`generated_at`); excluded. |
+  | `end_from_status_since` | Terminal runs with no `finished_at`, whose end falls back to `status_since`. |
+  | `ongoing` | Nonterminal runs, ended at `generated_at`. |
+  | `cross_check_kind_included` | `cross_check` runs not on a lane that are included. |
+
+- `limitations` is a fixed, ordered list of `{code, runs}`. Method codes have
+  `runs` null: `elapsed_envelope_includes_waits`,
+  `claim_and_resume_history_not_recovered`, `lane_assignment_history_limited`.
+  Counted codes give the number of candidate runs they apply to:
+  `missing_start_excluded`, `invalid_interval_excluded`,
+  `end_from_status_since`, `ongoing_end_is_generated_at`,
+  `cross_check_kind_not_on_lane_included`.
+
+### Usage wait
+
+`usage_wait` (`time_basis` `created_at`, `cohort` `creation`, `basis`
+`limit_wait_count`) is the share of applicable runs created in the range whose
+retained `limit_wait_count` is above zero. `current` is the whole range and
+`buckets` are by creation time, each `{count, n, share, reason}`. It counts a
+counter, not episodes: a run that waited twice counts once, whether or not it is
+still parked, and no wait is placed in time. An empty cohort gives `share` null
+with `no_applicable_runs`. Applicable runs are the same ordinary-work population
+as occupancy, with no end-time condition.
+
+### Not tracked, filters
+
+- `not_tracked` lists measures this endpoint does not report, each with a null
+  `value` and reason `not_tracked`: `historical_provider_headroom`,
+  `slot_count`, `utilization`, `parked_duration`.
+- `filters` echoes `repo` (null when absent), `harness` (null when absent) and
+  `kinds`, the run kinds measured. `kinds` never lists `chat`. With `kind=chat`
+  the measures are empty and `excluded_kind_selected` is `chat` (else null).
+- `selected_user` is `all` or the user id, as in Spend.
+
+### Provider gauges
+
+`gauges.anthropic` and `gauges.codex` are the latest stored reading per
+enabled identity, whatever the window (`time_basis` `current_observation`).
+They are not part of the history. No provider is called, no credential is
+refreshed, percentages are never summed, and the response has no secret values,
+raw provider identifiers or poll-error text.
+
+- Each gauge has `status` (`available`, `unavailable`, `not_selected`),
+  `reason`, `effective_scope` and `identities`. `harness` selects the provider:
+  `claude` shows only Anthropic and `codex` only Codex; the other is
+  `not_selected` with reason `not_selected` and no identities.
+- A shared quota cannot be split by repo or kind. When `repo` or `kind` is
+  given, `effective_scope.unattributed_selectors` lists them (`repo` then
+  `kind`) with reason `shared_quota_not_attributable`; the identities are
+  unchanged. `effective_scope` also names the `user` (as `selected_user`) and
+  `provider`.
+- At most 200 identities per provider, in stable order. `truncated` is true when
+  more exist, and `set_state` is `empty` (a proven empty set), `complete` or
+  `truncated`; it is null unless the gauge is `available`. A Codex login with
+  several enabled aliases is one identity (one reading). On an admin all-users
+  response identities carry `user_id` and `email`; otherwise those are null.
+- A missing or obsolete reading keeps the existing rate-limit statuses (for
+  example `unavailable` for an Anthropic token with no current reading, `pending`
+  or `stale` for Codex). Statuses are judged at the request's captured clock.
+- A gauge read that fails with an ordinary database error marks that gauge
+  `unavailable` with reason `gauge_unavailable`; occupancy, usage wait and the
+  other gauge are kept. A gauge statement timeout or the snapshot deadline fails
+  the whole request with 503 and `Retry-After: 1`, like any other analytics
+  timeout.
+- Codex vault state (`vault_state_basis` `live_observation`) is read live after
+  the snapshot, not from it. The owner route reads the caller's own state and
+  fails closed: a locked or unreadable vault reports `vault_locked` per identity
+  (`polling_disabled` instead when Codex polling is turned off). The admin routes
+  read each distinct owner without waiting for any user's vault lifecycle, within
+  a 2 second budget. If a state is contended, fails to read or the budget runs
+  out, the Codex gauge is `unavailable` with reason `vault_status_unavailable`
+  and occupancy is kept. This reason appears on the admin routes only.
 
 ## Performance limit
 

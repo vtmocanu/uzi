@@ -1,7 +1,7 @@
 # PRD #4731: Scoped run diagnostics API: Capacity
 
 **Issue:** #4731.
-**Status:** Ready (#4684 merged).
+**Status:** Implemented (2026-11-26). Owner decisions on plan review: a gauge timeout or the snapshot deadline fails the whole request with 503; the admin vault observation is non-blocking.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** Read-only API, DTO contracts, docs and specs. Additive indexes only when supported by plans. No lifecycle, tracking, interface or CLI changes. Implementation and validation leave `.github/workflows/**` untouched.
@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [ ] M1 owner/admin Capacity diagnostics
+- [x] M1 owner/admin Capacity diagnostics
 
 ## 1. Problem
 
@@ -82,4 +82,8 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Separate current readings by owner and provider | Shared quotas cannot be attributed to an individual repo or run kind. |
 | Count runs with a usage-wait counter | Retained counters show entry into wait but cannot place individual episodes in time. |
 
-**Unverified before implementation**. Query plans, endpoint/identity cardinality impact and suite runtime.
+| A gauge statement timeout (57014) or the snapshot deadline fails the whole Capacity request with 503, like any analytics timeout (owner decision on plan review); only non-timeout gauge errors with a live snapshot leave occupancy intact. | Retrying a 503 is the same contract as every other analytics timeout; a savepoint keeps occupancy only for ordinary gauge errors. |
+| The admin vault observation is non-blocking (`TryLock`) with a 2 s budget and the owner route uses `RequiresUnlock` (owner decision on plan review). | A user's lifecycle operation must not stall an instance-wide read; contention, a read error or the budget gives `vault_status_unavailable` on the admin routes only, while the owner route fails closed (`vault_locked`). |
+| No index added. | No demonstrated gap within the 8 s budget (evidence below). A terminal-end index cut admin 7d to 35 ms but barely moved 90d. |
+
+**Measured (Nov 2026).** #4684's 120k-run seed, fresh `ANALYZE`, top owner 20.1% of runs. Statement times, custom / generic plan: owner 30d 27 / 26 ms; owner all-time 206 / 225 ms; admin all-users 7d 110 / 60 ms, 30d 232 / 131 ms, 90d 270 / 177 ms; admin 30d with `repo` 3.9 / 48.8 ms; admin all-time 1127 ms with a 42 MB disk sort (refused by the API, so not reachable). Owner paths use `runs_user_terminal_end_idx`, `runs_user_nonterminal_idx` and `runs_user_created_idx`. Admin all-users sequentially scans `runs` twice and scales linearly with total runs, about 0.19 s per 100k runs at 30d. Gauge statements took 1.2-30 ms at 201 identities.
