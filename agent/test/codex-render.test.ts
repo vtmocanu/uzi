@@ -605,7 +605,7 @@ describe("renderCodexRun — prompts", () => {
       const flatPrompt = prompt.replace(/\s+/g, " ");
       assert.ok(flatPrompt.includes(rule), "carries the go clean prohibition");
       // The lead-only cleanup permission must never reach a subagent.
-      for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only"]) {
+      for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only", "kept (filesystem episode not re-armed)"]) {
         assert.ok(!flatPrompt.includes(leadOnly), `subagent prompt carries lead-only ${JSON.stringify(leadOnly)}`);
       }
     }
