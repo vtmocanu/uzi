@@ -5,6 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryDeadlineExhaustedError } from "../src/git.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import type { CredentialFreeCaptureContext } from "../src/harness.js";
 import { performance } from "node:perf_hooks";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
@@ -210,8 +212,11 @@ function releaseGate() {
 type MemoryFlightProof = {
   parked?: boolean;
   retainedLocalCustody?: boolean;
+  claimGeneration?: number;
   workerMemory?: {
-    operation?: Promise<void>; settled?: boolean; closing?: Promise<void>;
+    operation?: Promise<void>; settled?: boolean; closing?: Promise<void>; executorRun?: Promise<void>;
+    closingDeadline?: number;
+    hold?: { deadline: number; context: { claim_generation: number; flight: unknown } };
     feedback: Map<string, { operation?: Promise<boolean> }>;
   };
   steering: {
@@ -240,6 +245,365 @@ function enroll(ctx: RunContext, toolId = "original-tool") {
     drain: async () => ({ confirmed: true }),
   });
   return { captured, entry, cancellations: () => cancellations };
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Custody deadline observer (test-only). One helper, installed in the four fixtures whose 200 ms owner budget was split
+// from the 5000 ms launch budget. It never changes behaviour: every wrapper runs the real method and only records.
+// Violations are collected (a throw inside a wrapped runner path would be swallowed by the runner's own catch) and
+// asserted once, after all original work is joined.
+// ---------------------------------------------------------------------------------------------------------------------
+type ObservedFixture = "exhausted" | "lateAck" | "delayedFeedback" | "handoff";
+type InvocationRole = "original" | "successor" | "duplicate";
+type AbortSource = "lifecycle" | "parent" | "budget" | "maintenance" | "own" | "unknown";
+type CustodyOutcome =
+  | { kind: "rejected-before-action" }
+  | { kind: "settled-without-abort" }
+  | { kind: "abort"; atDate: number; reasonClass: string; source: AbortSource; deadlineClass: boolean };
+interface CustodyRecord {
+  kind: "hold" | "close"; invocation: InvocationRole | undefined; requested: number;
+  parentDeadline: number | undefined; hasBudget: boolean; hasPending: boolean; effectiveDeadline: number;
+  entered: boolean; outcome?: CustodyOutcome;
+}
+interface PortRecord { aborted: boolean; reason: unknown; before?: { aborted: boolean; reason: unknown } }
+interface HeldLike { context?: unknown; signal?: AbortSignal; deadlineAt: number }
+interface SiteTag { site: string; held: HeldLike | undefined; flight: unknown }
+
+/**
+ * Held fetch-wait sites each fixture is expected to bracket, pinned from observer runs on the candidate and on a
+ * base-budget export (the four budget sites reverted). A listed site that ends up uncaptured fails.
+ */
+const EXPECTED_HELD_SITES: Record<string, readonly string[]> = {
+  "exhausted:accepted": ["captureRecoveryRestorePointBody"],
+  "exhausted:ambiguous": ["captureRecoveryRestorePointBody"],
+  "exhausted:deadline": ["captureRecoveryRestorePointBody"],
+  // No held fetch wait is created on these paths: the generation verdict fails before capture, late-ACK's capture stops at
+  // the WIP marker, delayed feedback has no capture lane and the handoff capture never reaches a fetch.
+  "exhausted:generation": [], "lateAck:lateAck": [], "delayedFeedback:delayedFeedback": [],
+  "handoff:unsettled": [], "handoff:expired": [],
+};
+
+const REAL_DATE_NOW = Date.now;
+const PRESSURE_PARK_NONCE = "original-memory-registration";
+const isDeadlineReason = (reason: unknown) => reason instanceof RecoveryDeadlineExhaustedError;
+const isAbortErrorReason = (reason: unknown) => reason instanceof DOMException && reason.name === "AbortError";
+const reasonClassOf = (reason: unknown) => isDeadlineReason(reason) ? "RecoveryDeadlineExhaustedError"
+  : (reason as { constructor?: { name?: string } } | undefined)?.constructor?.name ?? typeof reason;
+
+function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedFixture, scenario: string) {
+  const invocationStore = new AsyncLocalStorage<InvocationRole>();
+  const flightStore = new AsyncLocalStorage<{ flight: MemoryFlightProof; custody?: CustodyRecord }>();
+  const callerStore = new AsyncLocalStorage<"sink" | "reconcile">();
+  const siteStore = new AsyncLocalStorage<SiteTag>();
+  const violations: string[] = [];
+  const fail = (message: string) => { if (violations.length < 40) violations.push(message); };
+  let original: MemoryFlightProof | undefined;
+  let boundaryMs = 5000;
+  const begins: { flight: unknown; generation: unknown }[] = [];
+  const starts: { flight: unknown; caller: string; firstCall: boolean; operationSet: boolean }[] = [];
+  const preserves: { flight: unknown; promise: Promise<unknown>; store: { custody?: CustodyRecord } }[] = [];
+  const custody: CustodyRecord[] = [];
+  const captures: { signal: AbortSignal; deadlineAt: number; caller: AbortSignal | undefined; abortedAt?: number }[] = [];
+  const capturePromises: Promise<unknown>[] = [];
+  const t0BySignal = new Map<AbortSignal, number>();
+  const waits = new WeakMap<object, { timeoutMs: unknown; signal: unknown }>();
+  const reached = new Map<string, number>();
+  const captured = new Map<string, number>();
+  const uncaptured: string[] = [];
+  const ownerCalls: { name: string; flight: unknown }[] = [];
+  const ports: { park?: PortRecord; send?: PortRecord } = {};
+  let foreignWaits = 0;
+  const clock = { log: [] as { value: number; seq: number }[], logging: false };
+  const patchedNow = () => {
+    const value = REAL_DATE_NOW();
+    if (clock.logging) clock.log.push({ value, seq: clock.log.length });
+    return value;
+  };
+
+  // Mark the caller of startWorkerMemoryPreservation: the preserve sink is frozen at begin, so it is replaced there.
+  const begin = f.memory.begin.bind(f.memory);
+  f.memory.begin = (input, sinks) => {
+    const flight = (input as { flight?: unknown }).flight;
+    begins.push({ flight, generation: input.claim_generation });
+    original ??= flight as MemoryFlightProof;
+    return begin(input, { ...sinks,
+      preserve: (context, signal, remainingMs) => callerStore.run("sink", () => sinks.preserve(context, signal, remainingMs)) });
+  };
+
+  const g = git as unknown as {
+    withRecoveryOperation: (...args: any[]) => Promise<unknown>;
+    recoveryOperations: AsyncLocalStorage<{ signal: AbortSignal; deadline: number; budget?: MaintenanceBudget }>;
+  };
+  const realRecovery = g.withRecoveryOperation.bind(git);
+  g.withRecoveryOperation = (signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<unknown>,
+    ...rest: unknown[]) => {
+    const memory = original?.workerMemory;
+    const store = flightStore.getStore();
+    let kind: CustodyRecord["kind"] | undefined;
+    if (original && store) {
+      if (store.flight === original && !store.custody) {
+        kind = "hold";
+        if (!memory?.hold) fail("a custody operation started without a hold");
+        else if (deadline !== memory.hold.deadline) fail(`custody requested deadline ${deadline} !== hold.deadline ${memory.hold.deadline}`);
+      }
+    } else if (original && memory) {
+      if (memory.hold && deadline === memory.hold.deadline) fail("preservation work reached withRecoveryOperation with an invocation tag but no flight tag");
+      else if (memory.closingDeadline !== undefined && deadline === memory.closingDeadline &&
+          invocationStore.getStore() === "original") kind = "close";
+    }
+    if (!kind) return realRecovery(signal, deadline, action, ...rest);
+    const parent = g.recoveryOperations.getStore();
+    const budget = parent?.budget ?? MaintenanceBudget.current() ?? (rest[0] as MaintenanceBudget | undefined);
+    const pending = MaintenanceBudget.signal();
+    const record: CustodyRecord = { kind, invocation: invocationStore.getStore(), requested: deadline,
+      parentDeadline: parent?.deadline, hasBudget: MaintenanceBudget.current() !== undefined, hasPending: pending !== undefined,
+      effectiveDeadline: Math.min(deadline, parent?.deadline ?? Infinity), entered: false };
+    custody.push(record);
+    if (store) store.custody = record;
+    const settle = () => { record.outcome ??= record.entered ? { kind: "settled-without-abort" } : { kind: "rejected-before-action" }; };
+    const wrapped = async (combined: AbortSignal) => {
+      record.entered = true;
+      const onAbort = () => {
+        if (record.outcome) return;
+        const reason = combined.reason;
+        const source: AbortSource = signal.aborted && reason === signal.reason ? "lifecycle"
+          : parent?.signal.aborted && reason === parent.signal.reason ? "parent"
+          : budget?.ownsExpiry(reason) === true ? "budget"
+          : pending?.aborted && reason === pending.reason ? "maintenance"
+          : isDeadlineReason(reason) ? "own" : "unknown";
+        record.outcome = { kind: "abort", atDate: REAL_DATE_NOW(), reasonClass: reasonClassOf(reason), source,
+          deadlineClass: source === "own" || (source === "parent" && isDeadlineReason(reason)) };
+      };
+      if (combined.aborted) onAbort(); else combined.addEventListener("abort", onAbort, { once: true });
+      try { return await action(combined); } finally { combined.removeEventListener("abort", onAbort); }
+    };
+    return realRecovery(signal, deadline, wrapped, ...rest).then(
+      value => { settle(); return value; }, error => { settle(); throw error; });
+  };
+
+  const portRecord = (signal: AbortSignal): PortRecord => {
+    const record: PortRecord = { aborted: signal.aborted, reason: signal.aborted ? signal.reason : undefined };
+    if (!signal.aborted) signal.addEventListener("abort", () => { record.aborted = true; record.reason = signal.reason; }, { once: true });
+    return record;
+  };
+
+  const observeWait = (wait: { timeoutMs?: unknown; signal?: AbortSignal }) => {
+    const t1 = REAL_DATE_NOW();
+    const prior = waits.get(wait);
+    if (prior) {
+      if (prior.timeoutMs !== wait.timeoutMs || prior.signal !== wait.signal) fail("a forwarded wait object changed its timeoutMs or signal");
+      return;
+    }
+    waits.set(wait, { timeoutMs: wait.timeoutMs, signal: wait.signal });
+    const tag = siteStore.getStore();
+    if (!tag || tag.flight !== original || !tag.held) return;
+    if (wait.signal !== tag.held.signal) { foreignWaits++; return; }
+    const timeoutMs = wait.timeoutMs;
+    if (typeof timeoutMs !== "number") { fail(`${tag.site}: held wait has no numeric timeoutMs`); return; }
+    const model = (t: number) => Math.max(1, Math.min(boundaryMs, tag.held!.deadlineAt - t));
+    if (!Number.isFinite(tag.held.deadlineAt)) {
+      if (timeoutMs !== boundaryMs) fail(`${tag.site}: unbounded held capture must wait exactly ${boundaryMs}, got ${timeoutMs}`);
+      else captured.set(tag.site, (captured.get(tag.site) ?? 0) + 1);
+      return;
+    }
+    const t0 = t0BySignal.get(wait.signal!);
+    if (t0 === undefined) { uncaptured.push(`${tag.site}: no capture-entry t0 for the held signal`); return; }
+    if (!(model(t1) <= timeoutMs && timeoutMs <= model(t0)))
+      fail(`${tag.site}: timeoutMs ${timeoutMs} outside [f(t1)=${model(t1)}, f(t0)=${model(t0)}]`);
+    if (!(timeoutMs >= 1 && timeoutMs <= boundaryMs)) fail(`${tag.site}: timeoutMs ${timeoutMs} violates floor 1 / clamp ${boundaryMs}`);
+    if (!clock.log.some(entry => entry.value >= t0 && entry.value <= t1 && model(entry.value) === timeoutMs))
+      fail(`${tag.site}: timeoutMs ${timeoutMs} equals f(v) for no recorded Date.now value in [${t0}, ${t1}]`);
+    captured.set(tag.site, (captured.get(tag.site) ?? 0) + 1);
+  };
+
+  const facts = () => " [custody observer facts: " + JSON.stringify({
+    fixture, scenario, violations,
+    starts: starts.map(s => ({ original: s.flight === original, caller: s.caller, firstCall: s.firstCall, operationSet: s.operationSet })),
+    custody: custody.map(c => ({ ...c, outcome: c.outcome ?? "none" })),
+    captures: captures.map(c => ({ deadlineAt: c.deadlineAt, abortedAt: c.abortedAt, aborted: c.signal.aborted })),
+    ports: { park: ports.park && { ...ports.park, reason: reasonClassOf(ports.park.reason) },
+      send: ports.send && { ...ports.send, reason: reasonClassOf(ports.send.reason) } },
+    reachedSites: [...reached], capturedSites: [...captured], uncaptured, foreignWaits,
+    ownerCalls: ownerCalls.map(c => c.name) }) + "]";
+
+  return {
+    facts,
+    invoke<T>(role: InvocationRole, run: () => Promise<T>): Promise<T> { return invocationStore.run(role, run); },
+    /** Wraps one runner instance. Must run before that runner's execute. */
+    attach(runner: RunRunner, executor: Executor) {
+      if ((executor as { safety?: unknown }).safety !== undefined) fail("the fixture executor carries .safety, so a held capture could be authenticated");
+      boundaryMs = (runner as unknown as { codexBoundaryDeadlineMs: number }).codexBoundaryDeadlineMs;
+      const priv = runner as unknown as Record<string, (...args: any[]) => any>;
+      const wrap = (name: string, make: (real: (...args: any[]) => any) => (...args: any[]) => any) => {
+        const real = priv[name];
+        assert.equal(typeof real, "function", `runner private seam ${name} exists`);
+        priv[name] = make(real!.bind(runner));
+      };
+      wrap("startWorkerMemoryPreservation", real => (flight: MemoryFlightProof) => {
+        const firstCall = flight.workerMemory?.operation === undefined;
+        const caller = callerStore.getStore() ?? "other";
+        const result = real(flight);
+        starts.push({ flight, caller, firstCall, operationSet: flight.workerMemory?.operation !== undefined });
+        return result;
+      });
+      wrap("reconcileWorkerMemory", real => (flight: unknown) => callerStore.run("reconcile", () => real(flight)));
+      wrap("preserveWorkerMemory", real => (flight: MemoryFlightProof, hold: unknown) => {
+        const store: { flight: MemoryFlightProof; custody?: CustodyRecord } = { flight };
+        const promise = flightStore.run(store, () => real(flight, hold)) as Promise<unknown>;
+        preserves.push({ flight, promise, store });
+        return promise;
+      });
+      const sites: [string, (args: any[]) => { flight: unknown; held: HeldLike | undefined; authenticated: unknown }][] = [
+        ["transferRestorePointToTrustedBare", a => ({ flight: a[0], held: a[4], authenticated: undefined })],
+        ["captureRecoveryRestorePointBody", a => ({ flight: a[1], held: a[4]?.heldCapture, authenticated: a[4]?.heldAuthenticated })],
+        ["captureHoldContext", a => ({ flight: a[1], held: a[3]?.heldCapture, authenticated: a[3]?.heldAuthenticated })],
+      ];
+      for (const [site, read] of sites) wrap(site, real => (...args: any[]) => {
+        const { flight, held, authenticated } = read(args);
+        if (flight === original) {
+          if (authenticated !== undefined) fail(`${site}: a heldAuthenticated capture reached a held-fetch site`);
+          if (held) reached.set(site, (reached.get(site) ?? 0) + 1);
+          const store = flightStore.getStore();
+          if (store && store.flight !== flight) fail(`${site}: flight argument differs from the flight-tagged original`);
+        }
+        return siteStore.run({ site, held, flight }, () => real(...args));
+      });
+      wrap("fetchTracking", real => (...args: any[]) => {
+        const wait = args[6];
+        if (typeof wait === "object" && wait !== null) {
+          observeWait(wait);
+          const tag = siteStore.getStore();
+          if (tag && tag.flight === original && args[0] !== original) fail("fetchTracking flight argument is not the original flight");
+        }
+        return real(...args);
+      });
+      wrap("refusalGateInAuthority", real => (...args: any[]) => {
+        const wait = args[5];
+        if (typeof wait === "object" && wait !== null) observeWait(wait);
+        return real(...args);
+      });
+      for (const [name, flightIndex] of [["stopForOwedLimit", 0], ["owedStopReleaseWait", 0], ["retainAcceptedOwnerPause", 1]] as const)
+        wrap(name, real => (...args: any[]) => { ownerCalls.push({ name, flight: args[flightIndex] }); return real(...args); });
+    },
+    /** Wrap the original executor's capture lane: t0 per held signal, plus the capture-deadline abort record. */
+    wrapCapture(inner: NonNullable<Executor["withCredentialFreeCapture"]>): NonNullable<Executor["withCredentialFreeCapture"]> {
+      const wrapped = (deadlineMs: number, action: (context: CredentialFreeCaptureContext) => Promise<unknown>,
+        purpose?: "capture" | "cancel", signal?: AbortSignal, attempt?: unknown) => {
+        const run = inner(deadlineMs, context => {
+          t0BySignal.set(context.signal, REAL_DATE_NOW());
+          const record: (typeof captures)[number] = { signal: context.signal, deadlineAt: context.deadlineAt, caller: signal };
+          if (context.signal.aborted) record.abortedAt = REAL_DATE_NOW();
+          else context.signal.addEventListener("abort", () => { record.abortedAt ??= REAL_DATE_NOW(); }, { once: true });
+          captures.push(record);
+          return action(context);
+        }, purpose, signal, attempt as never);
+        capturePromises.push(run);
+        return run;
+      };
+      return wrapped as unknown as NonNullable<Executor["withCredentialFreeCapture"]>;
+    },
+    startClock() { clock.log.length = 0; clock.logging = true; Date.now = patchedNow; },
+    /** Fixture-port abort records: plain listeners, attached on the first correlated call only, no clock reads. */
+    observePark(args: Parameters<WorkerClient["reportState"]>) {
+      const body = args[1] as unknown as Record<string, unknown>;
+      if (args[0] !== f.claim.run_id || body.recovery_cause !== "worker_memory_pressure" || body.claim_generation !== 7 ||
+          body.register_nonce !== PRESSURE_PARK_NONCE || body.memory_episode !== 3) return;
+      if (ports.park) { fail("a second correlated park call reached the client"); return; }
+      if (args[2] === undefined) { fail("the correlated park call carried no signal"); return; }
+      ports.park = portRecord(args[2]);
+    },
+    observeSend(args: Parameters<WorkerClient["postMessages"]>) {
+      if (args[0] !== f.claim.run_id || args[2] !== 7) return;
+      if (ports.send) { fail("a second correlated pressure post reached the client"); return; }
+      if (args[3] === undefined) { fail("the correlated pressure post carried no signal"); return; }
+      ports.send = portRecord(args[3]);
+    },
+    /** Called straight after the fixture's existing race / await of the original work; only synchronous code follows. */
+    snapshotPort(which: "park" | "send") {
+      const record = ports[which];
+      assert.ok(record, `${which} port was observed` + facts());
+      record.before = { aborted: record.aborted, reason: record.reason };
+      assert.equal(record.before.aborted, true, `${which} signal aborted before the original work resolved` + facts());
+    },
+    /** Late-ACK: the original flight keeps generation 7 while the successor (generation 8) is admitted. */
+    assertOverlap(successor: MemoryFlightProof) {
+      assert.ok(original, "original flight observed" + facts());
+      assert.notEqual(successor, original, "successor is a different flight" + facts());
+      assert.equal(original.claimGeneration, 7, "original flight stays generation 7 during the overlap" + facts());
+      assert.equal(successor.claimGeneration, 8, "successor flight is generation 8" + facts());
+      assert.equal(original.workerMemory?.hold?.context.claim_generation, 7, "original hold context stays generation 7" + facts());
+      assert.notEqual(original.workerMemory?.settled, true, "original capture is still blocked during the overlap" + facts());
+    },
+    /** Join every piece of original work, then stop the clock recorder. Call at the end of the fixture's outer finally. */
+    async join() {
+      try {
+        const memory = original?.workerMemory;
+        await Promise.allSettled([memory?.operation, memory?.closing, memory?.executorRun,
+          ...preserves.map(entry => entry.promise), ...capturePromises,
+          ...f.memory.sinkReceipts.filter(receipt => receipt.context.flight === original).map(receipt => receipt.completion)]);
+      } finally {
+        clock.logging = false;
+        if (Date.now === patchedNow) Date.now = REAL_DATE_NOW;
+      }
+    },
+    /** All assertions; call only after join(). */
+    assertAll() {
+      const failures = [...violations];
+      const memory = original?.workerMemory;
+      if (!original) failures.push("no original flight was begun");
+      const firsts = starts.filter(s => s.flight === original && s.firstCall);
+      if (firsts.length !== 1) failures.push(`expected exactly one first preservation call for the original flight, saw ${firsts.length}`);
+      else {
+        if (!firsts[0]!.operationSet) failures.push("the first preservation call did not set the owner operation");
+        if (fixture === "exhausted" && firsts[0]!.caller !== "reconcile")
+          failures.push(`an initially exhausted allowance is first preserved by reconcile, saw ${firsts[0]!.caller}`);
+      }
+      if (original) {
+        if (original.claimGeneration !== 7) failures.push(`original flight generation ${original.claimGeneration}`);
+        if (memory?.hold?.context.claim_generation !== 7) failures.push("original hold context is not generation 7");
+        if (memory?.hold && memory.hold.context.flight !== original) failures.push("original hold context is bound to another flight");
+      }
+      for (const state of api.states) {
+        const body = state.body as unknown as Record<string, unknown>;
+        if (body.recovery_cause === "worker_memory_pressure" && body.claim_generation !== 7)
+          failures.push(`a memory park was reported under generation ${String(body.claim_generation)}`);
+      }
+      for (const call of ownerCalls) if (call.flight === original) failures.push(`${call.name} ran for the original flight`);
+      const holdOps = custody.filter(c => c.kind === "hold");
+      for (const op of custody) {
+        if (op.kind === "close" && op.requested !== memory?.closingDeadline) failures.push("close work requested a deadline other than closingDeadline");
+        if (op.outcome === undefined) failures.push("a custody operation recorded no outcome");
+      }
+      const deadlineAbort = (op: CustodyRecord) => op.outcome?.kind === "abort" && op.outcome.deadlineClass &&
+        op.outcome.atDate >= op.effectiveDeadline - 1;
+      const heldCase = fixture === "lateAck" || fixture === "delayedFeedback" || (fixture === "exhausted" && scenario === "deadline");
+      if (heldCase) for (const op of holdOps) {
+        if (op.outcome?.kind === "abort" && !op.outcome.deadlineClass)
+          failures.push(`a custody operation aborted from ${op.outcome.source} (${op.outcome.reasonClass}), not its deadline`);
+      }
+      // Late-ACK requires the record on every hold operation. Delayed feedback has no capture lane (runFreeCapture reports
+      // "incomplete" at once), so its custody operation settles without an abort: an abort is checked when one occurs.
+      // No upper bound is placed on a custody operation.
+      for (const op of holdOps) {
+        const required = fixture === "lateAck" || (fixture === "delayedFeedback" && op.outcome?.kind === "abort");
+        if (required && !deadlineAbort(op))
+          failures.push(`a custody operation has no deadline-class abort at or after its effective deadline (${JSON.stringify(op.outcome)})`);
+      }
+      if (fixture === "lateAck" && holdOps.length === 0) failures.push("late-ACK recorded no hold custody operation");
+      if (fixture === "exhausted" && scenario === "deadline") {
+        const captureAbort = captures.some(c => c.signal.aborted && !(c.caller?.aborted && c.signal.reason === c.caller.reason) &&
+          c.abortedAt !== undefined && c.abortedAt >= c.deadlineAt - 1);
+        if (!holdOps.some(deadlineAbort) && !captureAbort)
+          failures.push("neither a deadline-class custody abort nor a capture-deadline abort was recorded");
+      }
+      const accepted = (reason: unknown) => isDeadlineReason(reason) || isAbortErrorReason(reason);
+      if (ports.park && !accepted(ports.park.before?.reason)) failures.push(`park signal aborted with ${reasonClassOf(ports.park.before?.reason)}`);
+      if (ports.send && !accepted(ports.send.before?.reason)) failures.push(`send signal aborted with ${reasonClassOf(ports.send.before?.reason)}`);
+      const expected = EXPECTED_HELD_SITES[`${fixture}:${scenario}`] ?? [];
+      for (const site of expected) if (!captured.has(site)) failures.push(`expected held fetch site ${site} was not captured`);
+      assert.deepEqual(failures, [], "custody observer" + facts());
+    },
+  };
 }
 
 test("runner pressure joins the original tool/feed, refuses retries, rearms at sustained low Q and carries allowance across approval/input", async () => {
@@ -523,6 +887,7 @@ const initiallyExhaustedCases = [
 for (const { verdict, slowLaunch } of initiallyExhaustedCases) {
   test(`runner initially exhausted allowance ${verdict}: first accessor stops before model admission and retains owner custody${slowLaunch ? " (slow launch control)" : ""}`, async () => {
     const f = await setup(2);
+    const obs = observeCustody(f, "exhausted", verdict);
     const launch = slowLaunch ? launchControl(f.claim, LAUNCH_TARGET_ROUND.exhausted) : undefined;
     api.setOwnershipStatus(f.claim.run_id, "claimed", 7);
     fs.writeFileSync(homeDir + "/session-proof", "original session");
@@ -541,7 +906,7 @@ for (const { verdict, slowLaunch } of initiallyExhaustedCases) {
     const register = f.memory.commands.register.bind(f.memory.commands);
     f.memory.commands.register = (...args) => { enrollments++; return register(...args); };
     const executor: Executor = {
-      withCredentialFreeCapture: realCapture(),
+      withCredentialFreeCapture: obs.wrapCapture(realCapture()),
       run: async ctx => {
         launch?.markEntered();
         try {
@@ -575,7 +940,9 @@ for (const { verdict, slowLaunch } of initiallyExhaustedCases) {
         { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
           ...(verdict === "deadline" ? { memoryHoldDeadlineMs: 200 } : {}) });
       launch?.attach(runner);
-      await runner.execute(f.claim);
+      obs.attach(runner, executor);
+      obs.startClock();
+      await obs.invoke("original", () => runner.execute(f.claim));
       if (executorError) throw executorError;
       assert.equal(proof, true, "actual RunRunner executor reached the first trusted accessor" + (launch?.facts() ?? ""));
       assert.ok(started !== undefined, "elapsed clock anchored at the first trusted accessor");
@@ -605,8 +972,9 @@ for (const { verdict, slowLaunch } of initiallyExhaustedCases) {
           register_nonce: "original-memory-registration", claim_generation: 7, memory_episode: 3,
         }, "exact public owner ACK confirms the park");
       } else assert.equal(f.parkReceipts.some(ack => ack.memoryParkAccepted !== undefined), false);
-      launch?.assertControl();
-    } finally { await f.memory.stop(); }
+    } finally { await f.memory.stop(); await obs.join(); }
+    obs.assertAll();
+    launch?.assertControl();
   });
 }
 
@@ -1067,6 +1435,7 @@ const lateAckCases = [
 for (const { slow, claimCredential, slowLaunch } of lateAckCases) {
 test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}${slow ? " (slow transport control)" : ""}${slowLaunch ? " (slow launch control)" : ""}`, async t => {
   const f = await setup(1);
+  const obs = observeCustody(f, "lateAck", "lateAck");
   // This source is unenrolled. Keep unrelated remediation I/O out of the 200 ms
   // late-ACK budget; the drained capture scope, native ACK and stale-owner fences remain real.
   const verifyUnenrolledReads = mockUnenrolledSource(t, f.claim);
@@ -1108,6 +1477,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   client.reportState = async (...args) => {
     if (args[1].recovery_cause !== "worker_memory_pressure") return report(...args);
     parkSignal = args[2];
+    obs.observePark(args);
     liveAtSend = !args[2]?.aborted;
     // The uncooperative adapter ignores the owner abort, so the REAL client-validated receipt
     // is obtained even when the post outlives the deadline; abort is observed on parkSignal above.
@@ -1128,7 +1498,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   };
   git.commitWipMarker = async () => false;
   const executor: Executor = {
-    withCredentialFreeCapture: async (deadline, action, purpose, signal) => {
+    withCredentialFreeCapture: obs.wrapCapture(async (deadline, action, purpose, signal) => {
       try {
         return await rig.capture(deadline, async context => {
           captureContext = context;
@@ -1139,7 +1509,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
         captureReturnedGate.resolve();
         await cleanupRelease.promise;
       }
-    },
+    }),
     run: async ctx => {
       launch?.markEntered();
       const command = enroll(ctx);
@@ -1155,8 +1525,10 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
   launch?.attach(runner);
+  obs.attach(runner, executor);
   const hold = slow ? holdFirstPost("/state", "worker_memory_pressure") : undefined;
-  const work = runner.execute(f.claim);
+  obs.startClock();
+  const work = obs.invoke("original", () => runner.execute(f.claim));
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     await until(() => nativeAck !== undefined, 3000, launch?.facts);
@@ -1171,6 +1543,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
           Math.max(0, 1500 - (performance.now() - (started ?? performance.now()))));
       })]);
     } finally { clearTimeout(deadlineTimer); }
+    obs.snapshotPort("park");
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "runner deadline does not wait for uncooperative park return");
     assert.equal(protectedScope, true, "fake protected source runs inside real drained capture scope");
@@ -1197,7 +1570,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
       await duplicateRelease.promise;
       return false;
     };
-    queuedWork = runner.execute(f.claim);
+    queuedWork = obs.invoke("duplicate", () => runner.execute(f.claim));
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(duplicateEntered, false, "same-run duplicate cannot reach its gate while ACK is pending");
     f.pressure(100);
@@ -1219,8 +1592,8 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     const log = nullLogger();
     log.child = () => log;
     log.warn = log.error = (message, fields) => { successorLog.push(message + JSON.stringify(fields)); };
-    successorWork = runnerWith(() => ({ executor: nextExecutor }), fakeGitlab().gitlab, undefined, log,
-      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(next);
+    successorWork = obs.invoke("successor", () => runnerWith(() => ({ executor: nextExecutor }), fakeGitlab().gitlab, undefined, log,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(next));
     try {
       await until(() => successor !== undefined, 5000);
     } catch {
@@ -1235,6 +1608,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.equal(successor!.commands.remaining(successor!.context), 1, "reclaim uses persisted count, never resets allowance");
     assert.equal(successor!.commands.admitsCommands(successor!.context), true);
     const nextFlight = successor!.flight as MemoryFlightProof;
+    obs.assertOverlap(nextFlight);
     assert.notEqual(original!.workerMemory!.settled, true, "controlled release, not rescue, settles old park");
     const nextParked = nextFlight.parked;
     release.resolve();
@@ -1273,7 +1647,9 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     git.normalizeRetainedSourceObjects = originalReadiness;
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+    await obs.join();
   }
+  obs.assertAll();
   verifyUnenrolledReads();
   launch?.assertControl();
 });
@@ -1355,6 +1731,7 @@ const delayedFeedbackCases = [
 for (const { slow, slowLaunch } of delayedFeedbackCases) {
 test(`M3 delayed feedback beyond deadline retains original send and sink receipt without parking${slow ? " (slow transport control)" : ""}${slowLaunch ? " (slow launch control)" : ""}`, async () => {
   const f = await setup(1);
+  const obs = observeCustody(f, "delayedFeedback", "delayedFeedback");
   const launch = slowLaunch ? launchControl(f.claim, LAUNCH_TARGET_ROUND.delayedFeedback) : undefined;
   const monitoring = f.memory.run();
   const release = releaseGate();
@@ -1367,6 +1744,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
       // Observe the owned send before the real post can return: its latency is not part of the contract.
       sending = true;
       sendSignal = args[3];
+      obs.observeSend(args);
       liveAtSend = !args[3]?.aborted;
       // The uncooperative adapter ignores the owner abort, so the real post lands even when it
       // outlives the deadline; its native feed ACK is then withheld.
@@ -1390,9 +1768,11 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
   const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
   launch?.attach(runner);
+  obs.attach(runner, executor);
   // Installed only after everything that can throw, directly before the try that restores it.
   const hold = slow ? holdFirstPost("/messages", "worker_memory_pressure") : undefined;
-  const work = runner.execute(f.claim);
+  obs.startClock();
+  const work = obs.invoke("original", () => runner.execute(f.claim));
   try {
     await until(() => sending, 3000, launch?.facts);
     assert.equal(liveAtSend, true, "original feedback send starts before its owner deadline");
@@ -1404,6 +1784,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     let settled = false;
     void operation.then(() => { settled = true; });
     await work;
+    obs.snapshotPort("send");
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "uncooperative feedback does not defeat owner deadline");
     assert.equal(settled, false);
@@ -1422,7 +1803,6 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     assert.equal(f.memory.sinkReceipts.includes(receipt), false, "only settlement retires the receipt");
     assert.notEqual(original!.parked, true);
     assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
-    launch?.assertControl();
   } finally {
     hold?.restore();
     clearTimeout(rescue); release.resolve();
@@ -1431,7 +1811,10 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     await original?.workerMemory?.closing;
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+    await obs.join();
   }
+  obs.assertAll();
+  launch?.assertControl();
 });
 }
 
@@ -1948,6 +2331,7 @@ for (const { scenario, control } of handoffCases) {
     const verifyUnenrolledReads = scenario === "unsettled" || scenario === "expired"
       ? mockUnenrolledSource(t, f.claim) : undefined;
     const launch = control === "slow launch control" ? launchControl(f.claim, LAUNCH_TARGET_ROUND.handoff) : undefined;
+    const obs = scenario === "unsettled" || scenario === "expired" ? observeCustody(f, "handoff", scenario) : undefined;
     const monitoring = f.memory.run();
     const release = releaseGate();
     let context: RunContext | undefined, captured: MemoryFlightProof | undefined;
@@ -2058,12 +2442,15 @@ for (const { scenario, control } of handoffCases) {
         throw ctx.signal?.reason ?? new PauseNowSignal();
       },
     };
+    if (obs) executor.withCredentialFreeCapture = obs.wrapCapture(executor.withCredentialFreeCapture!);
     runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, launch?.logger,
       { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
         ...(scenario === "unsettled" || scenario === "expired" ? { memoryHoldDeadlineMs: 200 } : {}) });
     launch?.attach(runner);
+    obs?.attach(runner, executor);
     try {
-      await runner.execute(f.claim);
+      obs?.startClock();
+      await (obs ? obs.invoke("original", () => runner.execute(f.claim)) : runner.execute(f.claim));
       // execute() can return while the executor is still joining a long capture; wait for its assertions to finish.
       await withTimeout(executorDone.promise, 7000, "executor assertions", launch?.facts);
       if (executorError) throw executorError;
@@ -2079,7 +2466,9 @@ for (const { scenario, control } of handoffCases) {
       release.resolve();
       await captured?.workerMemory?.operation;
       await f.memory.stop(); await monitoring;
+      await obs?.join();
     }
+    obs?.assertAll();
     verifyUnenrolledReads?.();
     launch?.assertControl();
   });
