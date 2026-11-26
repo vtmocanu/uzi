@@ -212,6 +212,8 @@ type gateWant struct {
 	disc        store.AnalyticsFlowFunnelDisclosure
 	human, auto int64
 	approvalUnk store.AnalyticsFlowApprovalReasons
+	// notCompleted is how many of the runs a case turns into failed or cancelled runs.
+	notCompleted int64
 }
 
 // Gate fixture times (2033-06-12): a presentation at 10:05, a human input at 10:35 applied at
@@ -335,6 +337,41 @@ func TestAnalyticsFlowGateEvidenceLiveDB(t *testing.T) {
 			f.patch(gr(0), "plan_source = 'seeded', plan_md = 'p'")
 			gr(0)
 		}, gateWant{runs: 2, planning: store.AnalyticsFlowPlanning{Skipped: 1, Unknown: 1}}},
+
+		{"timed bound pair plus a stray unbound receipt is timed, proven and not legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			r := gr(1)
+			f.presentation(r, 1, gatePres)
+			f.receipt(r, elig)
+			f.receipt(r, receipt{Binding: "unbound", CreatedAt: flowAt(12, 10, 50), AppliedAt: flowAt(12, 10, 51)})
+		}, gateWant{runs: 1, n: 1, p50: 1800, planning: store.AnalyticsFlowPlanning{SettledHuman: 1}, human: 1}},
+
+		{"a run whose only legacy receipt is unbound counts as legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			f.receipt(gr(0), receipt{Binding: "unbound", CreatedAt: gateIn, AppliedAt: gateApplied})
+		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, planning: store.AnalyticsFlowPlanning{Unknown: 1},
+			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, approvalUnk: store.AnalyticsFlowApprovalReasons{LegacyUnbound: 1}}},
+
+		{"plan_rejected beats a current eligible receipt", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			r := gr(1)
+			f.patch(r, "status = 'failed', fail_origin = 'plan_rejected'")
+			f.presentation(r, 1, gatePres)
+			f.receipt(r, elig)
+		}, gateWant{runs: 1, n: 1, p50: 1800, planning: store.AnalyticsFlowPlanning{Rejected: 1}, human: 1, notCompleted: 1}},
+
+		{"a failed run with no settlement evidence is failed", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			f.patch(gr(0), "status = 'failed', fail_origin = 'agent_failure'")
+		}, gateWant{runs: 1, planning: store.AnalyticsFlowPlanning{Failed: 1}, notCompleted: 1}},
+
+		{"a cancelled run with no settlement evidence is cancelled", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			f.patch(gr(0), "status = 'cancelled'")
+		}, gateWant{runs: 1, planning: store.AnalyticsFlowPlanning{Cancelled: 1}, notCompleted: 1}},
+
+		{"auto-approve at a replanned revision with no human receipt is unknown, not settled auto", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			f.patch(gr(1), "auto_approve = true, plan_md = 'p'")
+		}, gateWant{runs: 1, planning: store.AnalyticsFlowPlanning{Unknown: 1}, auto: 1}},
+
+		{"a seeded plan with auto-approve at revision 0 is skipped, not settled auto", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			f.patch(gr(0), "auto_approve = true, plan_source = 'seeded', plan_md = 'p'")
+		}, gateWant{runs: 1, planning: store.AnalyticsFlowPlanning{Skipped: 1}, auto: 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -387,8 +424,8 @@ func TestAnalyticsFlowGateEvidenceLiveDB(t *testing.T) {
 			if fn.Disclosure != tc.want.disc {
 				t.Errorf("funnel disclosure = %+v, want %+v", fn.Disclosure, tc.want.disc)
 			}
-			if fn.Outcomes.Completed != tc.want.runs {
-				t.Errorf("funnel completed = %d, want %d", fn.Outcomes.Completed, tc.want.runs)
+			if fn.Outcomes.Completed != tc.want.runs-tc.want.notCompleted {
+				t.Errorf("funnel completed = %d, want %d", fn.Outcomes.Completed, tc.want.runs-tc.want.notCompleted)
 			}
 
 			ap := d.Approval

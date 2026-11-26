@@ -10,8 +10,9 @@ import (
 
 // Issue #4729: typed mirror of the jsonb document that AnalyticsOwnerFlow and
 // AnalyticsAllFlow return. The SQL is the authority for the shape; DecodeAnalyticsFlowDoc
-// rejects unknown keys so a statement change that is not mirrored here fails loudly instead
-// of being silently dropped by the handler's DTO mapping.
+// rejects unknown keys, so a key the statement adds or renames without a mirrored field
+// fails loudly. A key the statement drops is not detected: the missing field decodes as its
+// zero value.
 //
 // Conventions shared by every block below:
 //   - Every block names its time_basis (now, created_at or finished_at) and a population
@@ -156,7 +157,9 @@ type AnalyticsFlowFirstStart struct {
 // same-revision gate presentation's created_at to the applied human input's created_at. N is
 // the number of timed pairs. Every other pair is either Unknown (with a reason) or
 // NotApproved (a presentation with no bound applied approve_plan receipt, disclosed, neither
-// timed nor unknown). Legacy receipts (NULL or unbound gate binding) add one unknown per run.
+// timed nor unknown). A run whose only approve_plan evidence is legacy receipts (NULL or
+// unbound gate binding) adds one unknown; a run that has any presentation row or bound
+// applied receipt is classified by its pairs instead and is never also counted as legacy.
 // Percentiles are null with no_observations when N is 0.
 type AnalyticsFlowPlanResponse struct {
 	TimeBasis   string                  `json:"time_basis"`
@@ -174,7 +177,8 @@ type AnalyticsFlowPlanResponse struct {
 // presentation row), invalid_chronology (a receipt applied before it was created, or a
 // presentation created after the input), excluded_disposition (only superseded, declined or
 // advisory receipts), reconciliation_only (the single eligible receipt has disposition
-// 'applied'), legacy_unbound (a run with a NULL or unbound approve_plan receipt).
+// 'applied'), legacy_unbound (a run with a NULL or unbound approve_plan receipt and no
+// presentation row or bound applied receipt at any revision).
 type AnalyticsFlowUnknown struct {
 	Total   int64                        `json:"total"`
 	Reasons AnalyticsFlowResponseReasons `json:"reasons"`
@@ -250,7 +254,8 @@ type AnalyticsFlowOutcomes struct {
 // AnalyticsFlowFunnelDisclosure counts runs whose approval evidence is incomplete:
 // HistoricalApprovalOnly (an earlier-revision approval and none for the current revision),
 // AmbiguousCurrent (more than one eligible receipt for the current revision) and
-// LegacyEvidence (a NULL or unbound approve_plan receipt).
+// LegacyEvidence (a NULL or unbound approve_plan receipt on a run without current-plan human
+// proof; a run with exactly one eligible current receipt is never counted here).
 type AnalyticsFlowFunnelDisclosure struct {
 	HistoricalApprovalOnly int64 `json:"historical_approval_only"`
 	AmbiguousCurrent       int64 `json:"ambiguous_current"`
@@ -275,7 +280,8 @@ type AnalyticsFlowPRUnitCell struct {
 
 // AnalyticsFlowApproval classifies the plan cohort: funnel-cohort runs with gate_revision > 0,
 // auto_approve set, or any approve_plan receipt. Human is exactly one eligible applied human
-// receipt for the run's current gate revision; it takes precedence over configuration.
+// receipt for the run's current gate revision; it takes precedence over configuration and
+// over legacy evidence.
 // AutoApproveConfigured has no human proof but auto_approve set (configuration, not an
 // observed event). Unknown is the rest, split by reason in order ambiguous (more than one
 // eligible current receipt), legacy_unbound, historical_approval_only, no_evidence.
