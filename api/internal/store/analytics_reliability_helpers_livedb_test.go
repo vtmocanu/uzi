@@ -308,11 +308,13 @@ func (f *spendFixture) outcomeSet(o spendOwner, repo uuid.UUID, other spendOwner
 	f.capture(n5, other.User, "available")
 	n6 := run("failed", "finalize_base_align_conflict", 18, runkind.Issue)
 	f.capture(n6, o.User, "expired")
-	// Recoverable work on runs that are not failed does not count.
-	c4 := run("completed", "", 19, runkind.Issue)
+	// Recoverable work on runs that are not failed does not count, even when the run also
+	// carries a human-landable fail_origin (so only the status guard keeps it out of needs_landing).
+	c4 := run("completed", "push_secret_blocked", 19, runkind.Issue)
 	f.patch(c4)
-	c5 := run("cancelled", "", 19, runkind.Issue)
+	c5 := run("cancelled", "workflow_scope_missing", 19, runkind.Issue)
 	f.patch(c5)
+	f.capture(c5, o.User, "available")
 	// In flight: created, never finished.
 	f.run(spendRun{Owner: o.User, Repo: repo, Status: "running", At: day(20)})
 	return outcomeSet{latestFailure: n6, lastCompleted: c4}

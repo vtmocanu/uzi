@@ -42,7 +42,10 @@ import (
 //
 //	UZI_EVIDENCE_LOG        raw log path (appended); default stdout only
 //	UZI_EVIDENCE_KEEP=1     leave the seed in place (default: TRUNCATE at the end)
-//	UZI_EVIDENCE_RESEED=0   reuse an existing seed (skips the TRUNCATE and the seed)
+//	UZI_EVIDENCE_RESEED=0   reuse an existing seed (skips the TRUNCATE and the seed). The
+//	                        Reliability phase rewrites rows (landable-origin step), so a seed it
+//	                        already ran on fails the run while the Spend phase is enabled: reseed,
+//	                        or set UZI_EVIDENCE_SPEND=0
 //	UZI_EVIDENCE_BASELINE=0 skip the baseline phase
 //	UZI_EVIDENCE_INDEXES=   comma list of candidate numbers 1-4 (default 1,2,3,4; "" or "0" none)
 //	UZI_EVIDENCE_ONLY=      comma list of workload-name substrings
@@ -264,6 +267,16 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 
 	h.seed()
 	spendOn := os.Getenv("UZI_EVIDENCE_SPEND") != "0"
+	if spendOn && os.Getenv("UZI_EVIDENCE_RESEED") == "0" {
+		// The seed carries no human-landable origin, so one means an earlier run's Reliability
+		// landable-origin step already rewrote this retained seed.
+		var rewritten int64
+		h.scalar(`SELECT count(*) FROM runs WHERE fail_origin = ANY(`+evSQLTextArray(workersvc.AllHumanLandableFailOrigins())+`)`, &rewritten)
+		if rewritten > 0 {
+			t.Fatalf("the retained seed already ran the Reliability landable-origin step (%d runs carry a human-landable fail_origin), "+
+				"so the Spend phase would measure rewritten rows; reseed (unset UZI_EVIDENCE_RESEED=0) or set UZI_EVIDENCE_SPEND=0", rewritten)
+		}
+	}
 	var workloads []evWorkload
 	if spendOn {
 		workloads = h.workloads()
@@ -1243,21 +1256,27 @@ func (h *evHarness) timeRequests(phase string, spec evRelSpec, breakdown string)
 	}
 	warm, n := 3, h.runs
 	var totals, auth, hist, cohort, latest []time.Duration
-	timeouts := 0
+	timeouts, warmTimeouts := 0, 0
 	for i := 0; i < warm+n; i++ {
 		d, st, err := h.relRequestOnce(spec, breakdown)
+		timedOut := false
 		if err != nil {
 			if !errors.Is(store.ClassifyAnalyticsErr(err), store.ErrAnalyticsTimeout) {
 				h.t.Fatalf("%s request: %v", name, err)
 			}
-			if i < warm {
-				warm, n = 1, min(n, 5)
-			} else {
-				timeouts++
-			}
+			timedOut = true
 		}
 		if i < warm {
+			// A warm-up is never a sample, timed out or not. A timed-out warm-up ends the warm-up
+			// phase at itself (so the next request is measured) and shortens the measured run.
+			if timedOut {
+				warmTimeouts++
+				warm, n = i+1, min(n, 5)
+			}
 			continue
+		}
+		if timedOut {
+			timeouts++
 		}
 		totals, auth, hist, cohort, latest = append(totals, d), append(auth, st.auth), append(hist, st.hist), append(cohort, st.cohort), append(latest, st.latest)
 	}
@@ -1266,8 +1285,8 @@ func (h *evHarness) timeRequests(phase string, spec evRelSpec, breakdown string)
 	mh, _, _ := evStats(hist)
 	mc, _, _ := evStats(cohort)
 	ml, _, _ := evStats(latest)
-	h.logf("REQUEST %s%s %s n=%d timeouts=%d total median=%.1fms p95=%.1fms max=%.1fms | step medians: auth=%.1fms history=%.1fms cohort+decode=%.1fms latest=%.1fms",
-		os.Getenv("UZI_EVIDENCE_LABEL"), phase, name, len(totals), timeouts, ms(med), ms(p95), ms(mx), ms(ma), ms(mh), ms(mc), ms(ml))
+	h.logf("REQUEST %s%s %s n=%d timeouts=%d warm_timeouts=%d total median=%.1fms p95=%.1fms max=%.1fms | step medians: auth=%.1fms history=%.1fms cohort+decode=%.1fms latest=%.1fms",
+		os.Getenv("UZI_EVIDENCE_LABEL"), phase, name, len(totals), timeouts, warmTimeouts, ms(med), ms(p95), ms(mx), ms(ma), ms(mh), ms(mc), ms(ml))
 }
 
 func (h *evHarness) reliabilityEvidence() {

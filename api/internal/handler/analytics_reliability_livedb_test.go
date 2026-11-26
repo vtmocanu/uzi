@@ -312,6 +312,13 @@ func TestAnalyticsReliabilityOwnerReconcilesLiveDB(t *testing.T) {
 		checkPoints(h.Harness, h.Harness, h.Points)
 	}
 
+	// Envelope rolling flags: the first range starts before the scope's history (clipped, partial),
+	// a middle range is fully covered, and the last range ends at generated_at (today's bucket).
+	if n := len(dto.Rolling); n != 30 || !dto.Rolling[0].Partial || dto.Rolling[n/2].Partial || dto.Rolling[n-2].Partial || !dto.Rolling[n-1].Partial {
+		t.Fatalf("rolling partial flags: first %v middle %v second-to-last %v last %v (of %d), want true false false true",
+			dto.Rolling[0].Partial, dto.Rolling[len(dto.Rolling)/2].Partial, dto.Rolling[len(dto.Rolling)-2].Partial, dto.Rolling[len(dto.Rolling)-1].Partial, len(dto.Rolling))
+	}
+
 	// Breakdown (default primary_model): one row per Primary model, each run in exactly one.
 	if dto.Breakdown.Dimension != "primary_model" {
 		t.Fatalf("breakdown dimension = %q, want primary_model", dto.Breakdown.Dimension)
@@ -486,6 +493,35 @@ func TestAnalyticsReliabilityRepoAndHarnessFiltersLiveDB(t *testing.T) {
 		check(rt.name+" harness=codex", rt.user, rt.base+rt.sep+"harness=codex", want{3, 1, 2, f50, 0})
 		check(rt.name+" repo=r1", rt.user, rt.base+rt.sep+"repo="+r1.String(), want{5, 3, 2, f50, 1})
 		check(rt.name+" repo=r1 harness=codex", rt.user, rt.base+rt.sep+"repo="+r1.String()+"&harness=codex", want{1, 0, 1, f50, 0})
+	}
+}
+
+// A failure created strictly after the request clock is outside every cohort count but is still
+// the latest failure (the statement is unwindowed and takes no clock), whichever breakdown is asked.
+func TestAnalyticsReliabilityFutureFailureIsLatestButNotCountedLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2050)
+	owner := f.user(false)
+	repo, _ := f.repoOwnedBy(owner, "future")
+	f.relRun(relSeed{user: owner, repo: repo, status: "completed", created: f.now.Add(-48 * time.Hour)})
+	past := f.relRun(relSeed{user: owner, repo: repo, status: "failed", origin: "agent_failure", created: f.now.Add(-24 * time.Hour)})
+	future := f.relRun(relSeed{user: owner, repo: repo, status: "failed", origin: "worker_lost", created: f.now.Add(2 * time.Hour)})
+	if past == future {
+		t.Fatal("seed ids collide")
+	}
+	for _, path := range []string{
+		"/api/analytics/reliability",
+		"/api/analytics/reliability?breakdown=harness",
+		"/api/analytics/reliability?breakdown=primary_model",
+	} {
+		dto, _ := f.rel(owner, path)
+		c := dto.Totals.Current
+		if c.Finished != 2 || c.Outcomes.Failed != 1 || c.Outcomes.Completed != 1 || dto.Causes.Failed != 1 {
+			t.Errorf("%s: totals %+v causes %+v, want the future failure outside every count", path, c, dto.Causes)
+		}
+		lf := dto.LatestFailure
+		if lf == nil || lf.RunID != future.String() || lf.Origin != "worker_lost" || lf.CompletedSinceLastFailure != 0 {
+			t.Errorf("%s: latest_failure = %+v, want the future run %s", path, lf, future)
+		}
 	}
 }
 

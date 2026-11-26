@@ -120,6 +120,73 @@ func TestAnalyticsReliabilityParityWithSelfRunOutcomesLiveDB(t *testing.T) {
 	}
 }
 
+// TestAnalyticsReliabilityAllScopeParityWithAdminRunOutcomesLiveDB pins the all-users statement
+// against AdminRunOutcomes (lifetime figures) over the Delivery-only parity population. The admin
+// statement is factory-wide and takes no filter, so its figures are the delta between the calls
+// before and after seeding; the Reliability call is isolated by the seeded repo filter.
+func TestAnalyticsReliabilityAllScopeParityWithAdminRunOutcomesLiveDB(t *testing.T) {
+	f := newRelFixture(t)
+	o, other := f.owner("rel-adm"), f.owner("rel-adm-other")
+	repo, _ := f.repo(o, "rel-adm")
+	landable := workersvc.AllHumanLandableFailOrigins()
+	before, err := f.q.AdminRunOutcomes(f.ctx, landable)
+	if err != nil {
+		t.Fatalf("AdminRunOutcomes before: %v", err)
+	}
+	f.outcomeSet(o, repo, other)
+	after, err := f.q.AdminRunOutcomes(f.ctx, landable)
+	if err != nil {
+		t.Fatalf("AdminRunOutcomes after: %v", err)
+	}
+	delta := func(a, b int64) int64 { return a - b }
+	adm := struct{ finished, completed, cancelled, planRejected, baseDiverged, failed, needs int64 }{
+		delta(after.LifetimeFinished, before.LifetimeFinished), delta(after.LifetimeCompleted, before.LifetimeCompleted),
+		delta(after.LifetimeCancelled, before.LifetimeCancelled), delta(after.LifetimePlanRejected, before.LifetimePlanRejected),
+		delta(after.LifetimeBaseDiverged, before.LifetimeBaseDiverged), delta(after.LifetimeFailed, before.LifetimeFailed),
+		delta(after.LifetimeNeedsLanding, before.LifetimeNeedsLanding),
+	}
+	if adm.finished != 18 || adm.completed != 4 || adm.cancelled != 2 || adm.planRejected != 1 || adm.baseDiverged != 1 || adm.failed != 10 || adm.needs != 2 {
+		t.Fatalf("AdminRunOutcomes delta disagrees with the seed's literal expectation: %+v", adm)
+	}
+	ob, oa := decodeOutcomeOrigins(t, "admin before", before.LifetimeFailOrigins), decodeOutcomeOrigins(t, "admin after", after.LifetimeFailOrigins)
+	origins := map[string]int64{}
+	for k, v := range oa {
+		if d := v - ob[k]; d != 0 {
+			origins[k] = d
+		}
+	}
+
+	d := f.rel(relCall{Now: spendNow, Repo: repo}).Doc
+	b := d.Totals.Current
+	if b.Finished != adm.finished || b.Outcomes.Completed != adm.completed || b.Outcomes.Cancelled != adm.cancelled ||
+		b.Outcomes.PlanRejected != adm.planRejected || b.Outcomes.BaseDiverged != adm.baseDiverged || b.Outcomes.Failed != adm.failed {
+		t.Errorf("all-scope Reliability %+v != AdminRunOutcomes delta %+v", b, adm)
+	}
+	if d.NeedsLanding != adm.needs {
+		t.Errorf("all-scope needs_landing = %d, AdminRunOutcomes delta %d", d.NeedsLanding, adm.needs)
+	}
+	if d.Causes.Failed != adm.failed {
+		t.Errorf("causes.failed = %d, want %d", d.Causes.Failed, adm.failed)
+	}
+	var shown, otherRuns, originTotal int64
+	for _, n := range origins {
+		originTotal += n
+	}
+	for _, c := range d.Causes.Items {
+		if c.IsOther {
+			otherRuns = c.Runs
+			continue
+		}
+		shown += c.Runs
+		if c.Origin == nil || origins[*c.Origin] != c.Runs {
+			t.Errorf("cause %+v does not match the admin origin delta %v", c, origins)
+		}
+	}
+	if shown+otherRuns != originTotal || originTotal != adm.failed {
+		t.Errorf("causes shown %d + Other %d != admin origin total %d (failed %d)", shown, otherRuns, originTotal, adm.failed)
+	}
+}
+
 // TestAnalyticsReliabilityNullOriginAndInFlightLiveDB: a NULL fail_origin groups as unknown in
 // causes; an in-flight run is in no finished figure; plan_rejected and base_diverged are
 // finished but neither failed nor a cause nor the latest failure.
