@@ -308,8 +308,15 @@ never null.
   applied before it was created, or a presentation created after the input),
   `excluded_disposition` (only superseded, declined or advisory receipts),
   `reconciliation_only` (the single eligible receipt has disposition
-  `applied`) and `legacy_unbound`. Percentiles are null with `no_observations`
-  when `n` is 0.
+  `applied`) and `legacy_unbound` (a run with any no-binding or `unbound`
+  `approve_plan` receipt, counted once per run; see
+  [Approval evidence](#approval-evidence)). Percentiles are null with
+  `no_observations` when `n` is 0.
+
+  Plan response covers every kind the selector includes, chat too: when `chat`
+  is selected its runs are probed for gate evidence like any other run. The
+  delivery funnel and the approval classification stay restricted to `issue`
+  and `self_improve`.
 - **`delivery_funnel`** has `applicable`; when the kind selector excludes both
   `issue` and `self_improve` it is false with reason `not_applicable` and every
   count is zero. Otherwise:
@@ -330,7 +337,11 @@ never null.
     `failed`, `cancelled`, `plan_rejected`, `base_diverged` and `in_progress`
     (no outcome yet).
   - `disclosure` counts runs with incomplete approval evidence:
-    `historical_approval_only`, `ambiguous_current` and `legacy_evidence`.
+    `historical_approval_only`, `ambiguous_current` and `legacy_evidence`
+    (any no-binding or `unbound` `approve_plan` receipt, even when the run also
+    has timed pairs or current human proof). These counts are not additive with
+    each other, with `approval.unknown` or with plan response `unknown`: a run
+    can appear in several.
   - `pr_units` counts **distinct PRs**, not runs. A PR is the pair (repo, PR
     number), as in the [merged-PR rules](#ratios); each one is attributed to
     the earliest run of the creation cohort that references it (by
@@ -387,14 +398,19 @@ Plan response, the funnel and the approval classification share these rules:
   revision is `historical_approval_only`. Revisions are never matched across
   runs.
 - **Legacy and unbound.** A receipt written before gate binding (no binding) or
-  recorded as `unbound` never proves an approval. A run with such a receipt and
-  no unique current proof is `legacy_unbound` (unless an earlier reason in the
-  approval precedence applies: human, `auto_approve_configured`, `ambiguous`,
-  then `legacy_unbound`). In plan response a run with a
-  no-binding receipt adds one unknown even when it also has timed pairs; a run
-  with any `unbound` receipt adds one unknown only when it has no pair at
-  all, and with pairs the unbound approval can never have acted on a gate, so
-  the pair stays `not_approved`.
+  recorded as `unbound` never proves an approval. Any run with such an
+  `approve_plan` receipt is counted once in plan response
+  `unknown.legacy_unbound` and in the funnel `disclosure.legacy_evidence`, even
+  when it also has timed pairs or current human proof. An unbound approval can
+  never have acted on a gate, so beside a pair that pair stays `not_approved`.
+- **Approval classification ranks separately.** `approval` places a run by the
+  first reason that applies: human, `auto_approve_configured`, `ambiguous`,
+  then `legacy_unbound`, so a run with current human proof is `human` there
+  while still counted in the disclosure and plan response legacy counts.
+- **Disclosure counts are not additive.** `unknown.legacy_unbound`,
+  `disclosure.legacy_evidence` and `approval.unknown.legacy_unbound` have
+  different populations and precedence, and must not be summed or compared as
+  one total.
 
 ### Null reasons
 

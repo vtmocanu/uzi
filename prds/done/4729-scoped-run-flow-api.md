@@ -90,14 +90,14 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Separate current, creation and finish-time measurements | Each measure identifies its own population. |
 | Require applied revision-matched human evidence | Stale, ACK-only and unmatched records cannot prove an approval. |
 | Publish elapsed cohorts with n and incomplete markers | Unfinished runs and missing durations affect interpretation. |
-| Per-measure populations | Waiting, created, first-start and plan response count chat where the kind selector includes it (chat never publishes a gate, so it adds no plan-response pairs); finished reads `run_outcome_classes` and excludes chat, which has no outcome class; the funnel and approval cover `issue` and `self_improve`, elapsed covers `issue`. Blocks are independent and must not be summed against each other. |
+| Per-measure populations | Waiting, created, first-start and plan response count chat where the kind selector includes it (chat runs are probed for gate evidence in plan response when chat is among the selected kinds; the funnel and approval stay `issue` and `self_improve` only); finished reads `run_outcome_classes` and excludes chat, which has no outcome class; the funnel and approval cover `issue` and `self_improve`, elapsed covers `issue`. Blocks are independent and must not be summed against each other. |
 | No `run_messages` fallback for plan response | `idx_run_messages_plan_seq` scopes by `(run_id,seq)` but a message carries no revision, so no revision match can be proven. Without a retained presentation row the pair is unknown (`no_presentation`), not guessed. No part of the statement reads `run_messages`. |
-| Approval evidence rules | Eligible receipt: `approve_plan`, `gate_binding = 'bound'`, `gate_revision > 0`, `applied_at` set, disposition null or `applied`, `created_at <= applied_at`. Ambiguity counts eligible receipts only (a superseded, declined or advisory row never makes a pair ambiguous). Human proof is exactly one eligible receipt for the run's current `gate_revision`; an earlier-revision approval alone is `historical_approval_only`. Legacy (`NULL` binding) and `unbound` receipts never prove anything. A `NULL`-binding receipt counts one unknown in plan response even beside timed pairs, because it belongs to an untimeable revision-0 gate; an `unbound` receipt adds one only when the run has no pair, and with pairs the pair is `not_approved` since an unbound approve can never act on a gate. Reject treating configuration, ACK-only or superseded `applied_at` rows as proof. |
+| Approval evidence rules | Eligible receipt: `approve_plan`, `gate_binding = 'bound'`, `gate_revision > 0`, `applied_at` set, disposition null or `applied`, `created_at <= applied_at`. Ambiguity counts eligible receipts only (a superseded, declined or advisory row never makes a pair ambiguous). Human proof is exactly one eligible receipt for the run's current `gate_revision`; an earlier-revision approval alone is `historical_approval_only`. Legacy (`NULL` binding) and `unbound` receipts never prove anything. Legacy disclosure follows the frozen contract: any run with a `NULL`-binding or `unbound` `approve_plan` receipt counts once in plan response `unknown.legacy_unbound` and in the funnel `disclosure.legacy_evidence`, even when the run also has timed pairs or current human proof (with a pair, the pair stays `not_approved` since an unbound approve can never act on a gate). Approval classification still ranks human, `auto_approve_configured`, `ambiguous`, then `legacy_unbound`, so a run with human proof is `human` there yet still disclosed as legacy. The disclosure counts are not additive. Reject treating configuration, ACK-only or superseded `applied_at` rows as proof. |
 | Planning-branch precedence | rejected, settled_human, settled_auto, skipped, in_progress, failed, cancelled, unknown, so each run lands in one branch and the branches sum to `stages.created`. `settled_auto` requires `auto_approve`, `gate_revision = 0`, a plan and a non-seeded `plan_source`: the human gate clears `auto_approve`, so a run with `gate_revision > 0` and `auto_approve` set never reached the auto path. `skipped` is a seeded plan at revision 0. A completed run with neither proof is `unknown`, never assumed skipped. |
 | PR units use earliest-run attribution | Distinct `(repo_id, mr_iid)` units are attributed to the earliest creation-cohort run (`created_at`, then `id`) and bucketed by that run's creation bucket, as in #4684. The merge witness is scoped to the response (same user for owner and admin `user=<uuid>`, any user for admin all-users) and ignores the window, harness, kind and repo filters. |
 | Repo masking is vacuous for Flow | The document names no repo id or path, so there is nothing to mask on either route. The only repo shown is the caller's own validated `repo` selector echoed in `filters`. Reject emitting repo-keyed series. |
 | Per-run `LATERAL` receipt aggregate | The first statements joined the funnel to a cohort-wide receipt aggregate; under `plan_cache_mode=force_generic_plan` that became a nested loop re-reading the aggregate per run and went quadratic (owner top all-time 12.8 s). The aggregate is now a `LATERAL` probe of `idx_run_user_inputs_run_id` per run; documents are identical (see section 8). Reject a cohort-wide `GROUP BY` CTE joined per run. |
-| No index added | Candidates (`runs_terminal_end_idx`, `runs (created_at)`, both) moved admin all-users timings under 8%, below the bar, so there is no migration. |
+| No index added | Candidates (`runs_terminal_end_idx`, `runs (created_at)`, both) moved admin all-users custom-plan statement medians under 8%, below the bar, so there is no migration. Generic-mode medians and buffers for the candidates were not retained, and request-path timing was not run with candidate indexes installed (section 8). |
 
 **Verified after implementation.**
 
@@ -106,6 +106,12 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 - Local DST boundaries: `TestAnalyticsFlowLocalDSTBoundariesLiveDB` (`api/internal/store/analytics_flow_livedb_test.go`) runs in `America/New_York` and covers the 23-hour spring-forward day 2033-03-13, the 25-hour fall-back day 2033-11-06 and a week-coarsened `window=all` spanning several transitions. A mutant that passes UTC-computed bucket arrays fails all three subtests.
 - Handler timezone wiring: `TestAnalyticsFlowLocalTimezoneLiveDB` (`api/internal/handler/analytics_flow_livedb_test.go`) requests `tz=America/New_York` through the real router over the 2047-03-10 spring-forward day, asserts `timezone`, the local-midnight bucket starts (including the 23-hour bucket) and that a run created at 23:30 local, already the next UTC day, lands in the local day's created cell. A mutant passing `time.UTC` to `analytics.ComputeBounds` in the Flow handler fails it.
 - Statement-level timings and DB-side request-path timings on the 120k seed are in section 8.
+- Cross-check repair tests (LiveDB, `api/internal/store/analytics_flow_livedb_test.go`, `analytics_flow_scope_livedb_test.go`, `api/internal/handler/analytics_flow_livedb_test.go`):
+  - `TestAnalyticsFlowGateEvidenceLiveDB` includes a revision-0 case with only a `NULL`-binding applied receipt (legacy, never human), and cases where an unbound receipt beside a timed pair or a presentation still discloses legacy evidence.
+  - `TestAnalyticsFlowSelfImproveSettledAutoLiveDB`: a `self_improve` run with `auto_approve` at revision 0 and an agent plan is `settled_auto`.
+  - `TestAnalyticsFlowChatInPlanResponseOnlyLiveDB`: a chat run with a presentation and an applied bound receipt is measured by plan response when chat is selected, and is absent from the funnel and approval.
+  - `TestAnalyticsFlowSelectedUserWitnessLiveDB`: through the real router, another user's merged witness does not mark an admin-selected user's PR merged; the same user's own out-of-window merged run (control) does.
+  - The evidence harness now requires a `run_id`-conditioned index scan on `idx_run_user_inputs_run_id` for every `run_user_inputs` node in every plan, and fails on an empty `UZI_EVIDENCE_ONLY` selection, logging partial selections.
 
 **Still unverified.**
 
@@ -144,7 +150,7 @@ Median-owner workloads ran in 1-15 ms.
 
 **Access paths.** Owner finished-range reads use `runs_user_terminal_end_idx` and creation-range reads use `runs_user_created_idx`. Admin all-users does a parallel Seq Scan of `runs` (about 123-127 ms, not the bottleneck). Presentations are read through `run_gate_presentations_run_id_revision_key` and inputs through `idx_run_user_inputs_run_id`, per run. No plan reads `run_messages` or Seq Scans `run_user_inputs` or `run_gate_presentations` (asserted).
 
-**Candidate indexes** (admin all-users, custom median ms):
+**Candidate indexes** (admin all-users, custom-plan statement medians in ms). These are the only recorded candidate figures. In generic mode the planner picked the terminal-end candidate with no timing change; generic medians and buffers for the candidates were not retained, and request-path timing was not run with candidate indexes installed. No index was committed.
 
 | Candidate | 30d | 90d |
 |---|---|---|
@@ -153,7 +159,7 @@ Median-owner workloads ran in 1-15 ms.
 | `runs (created_at)` | 395 | 563 |
 | both | 371 | 554 |
 
-Every candidate stayed under the 8% bar, so no index migration ships.
+Every candidate stayed under the 8% bar on these custom-plan medians, so no index migration ships.
 
 **Regression guard.** `TestAnalyticsFlowGenericPlanShapeLiveDB` fails on the old SQL (receipt CTE re-read per outer row) and passes on the shipped statement.
 
@@ -168,5 +174,7 @@ Every candidate stayed under the 8% bar, so no index migration ships.
 | admin-user-all | 648.9 | 631.2 / 651.9 | 656.2 | 0 |
 
 Bare-statement timings from the same run match within noise. Scope: the DB-side request path only. HTTP, auth middleware, admission (`deps.admission.Acquire`), in-snapshot authorization (tz-name check, `AnalyticsUserExists` for admin `user=<uuid>`, repo checks), the DTO mapping (`mapAnalyticsFlow`), DTO JSON encoding and network are excluded, and bounds are computed in UTC rather than the caller's zone.
+
+**E2E sweep.** `git grep -F` across `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh` and `e2e/forge-fake/` for `analytics/flow`, `AnalyticsFlow`, `insufficient_observations`, `legacy_unbound` and `plan_response` found no hits (re-run for the cross-check repair, same result), so no e2e update was needed and `task test:e2e-lib` / `task test:forge-fake` were not required. No E2E phase was run in-run: all 58 scripts in `e2e/phases/` were unrun (`00-preflight.sh` through `76-compose-web-dns.sh`; list with `ls e2e/phases`).
 
 **Not measured:** end-to-end production request latency; production table sizes and `run_user_inputs` fan-out; `mr_rework` and `cross_check` mixes; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
