@@ -146,6 +146,9 @@ func flowDocFor(b analytics.Bounds) store.AnalyticsFlowDoc {
 	doc := store.AnalyticsFlowDoc{}
 	for i := range b.Buckets {
 		doc.IssueElapsed.Buckets = append(doc.IssueElapsed.Buckets, store.AnalyticsFlowElapsedCell{Index: i})
+		doc.Activity.Created.Buckets = append(doc.Activity.Created.Buckets, store.AnalyticsFlowCreatedCell{Index: i})
+		doc.Activity.Finished.Buckets = append(doc.Activity.Finished.Buckets, store.AnalyticsFlowFinishedCell{Index: i})
+		doc.DeliveryFunnel.PRUnits.Buckets = append(doc.DeliveryFunnel.PRUnits.Buckets, store.AnalyticsFlowPRUnitCell{Index: i})
 	}
 	return doc
 }
@@ -197,9 +200,9 @@ func TestMapAnalyticsFlowNilListsAreEmptyArrays(t *testing.T) {
 	walk("", tree)
 
 	for name, got := range map[string]int{
-		"waiting_now.states": len(dto.WaitingNow.States), "created.buckets": len(dto.Activity.Created.Buckets),
+		"waiting_now.states":      len(dto.WaitingNow.States),
 		"finished.excluded_kinds": len(dto.Activity.Finished.ExcludedKinds), "first_start.limitations": len(dto.FirstStartDelay.Limitations),
-		"pr_units.buckets": len(dto.DeliveryFunnel.PRUnits.Buckets), "histogram": len(dto.IssueElapsed.Histogram),
+		"histogram": len(dto.IssueElapsed.Histogram),
 	} {
 		if got != 0 {
 			t.Errorf("%s has %d entries from an empty document", name, got)
@@ -247,9 +250,33 @@ func TestMapAnalyticsFlowBucketMismatchIsAnError(t *testing.T) {
 	negative := flowDocFor(b)
 	negative.IssueElapsed.Buckets[0].Index = -1
 	empty := store.AnalyticsFlowDoc{}
+	// Right count, but index 1 is missing and index 0 is repeated: dropped and duplicated buckets.
+	dup := flowDocFor(b)
+	dup.IssueElapsed.Buckets[1].Index = 0
+	createdDup := flowDocFor(b)
+	createdDup.Activity.Created.Buckets[1].Index = 0
+	finishedDup := flowDocFor(b)
+	finishedDup.Activity.Finished.Buckets[1].Index = 0
+	prDup := flowDocFor(b)
+	prDup.DeliveryFunnel.PRUnits.Buckets[1].Index = 0
+	createdOut := flowDocFor(b)
+	createdOut.Activity.Created.Buckets[3].Index = 99
+	finishedOut := flowDocFor(b)
+	finishedOut.Activity.Finished.Buckets[3].Index = 99
+	prOut := flowDocFor(b)
+	prOut.DeliveryFunnel.PRUnits.Buckets[3].Index = -5
+	createdShort := flowDocFor(b)
+	createdShort.Activity.Created.Buckets = createdShort.Activity.Created.Buckets[:3]
+	finishedShort := flowDocFor(b)
+	finishedShort.Activity.Finished.Buckets = finishedShort.Activity.Finished.Buckets[:3]
+	prLong := flowDocFor(b)
+	prLong.DeliveryFunnel.PRUnits.Buckets = append(prLong.DeliveryFunnel.PRUnits.Buckets, store.AnalyticsFlowPRUnitCell{Index: 0})
 
 	for name, doc := range map[string]store.AnalyticsFlowDoc{
 		"fewer cells": short, "more cells": long, "index past the calendar": outOfRange, "negative index": negative, "no cells": empty,
+		"elapsed duplicate index": dup, "created duplicate index": createdDup, "finished duplicate index": finishedDup, "pr_units duplicate index": prDup,
+		"created index out of range": createdOut, "finished index out of range": finishedOut, "pr_units negative index": prOut,
+		"created count mismatch": createdShort, "finished count mismatch": finishedShort, "pr_units count mismatch": prLong,
 	} {
 		if _, err := mapAnalyticsFlow(req, b, doc); err == nil {
 			t.Errorf("%s: mapping succeeded, want an error (a 500, never a silent drop)", name)

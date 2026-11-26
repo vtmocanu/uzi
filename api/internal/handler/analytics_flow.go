@@ -134,6 +134,29 @@ func (m *flowMapper) tsPtr(s *string) *time.Time {
 	return &t
 }
 
+// checkFlowBuckets requires a per-bucket series to cover the calendar exactly once: want
+// cells, every index in [0, want), no index repeated. A violation fails the mapping.
+func checkFlowBuckets[T any](m *flowMapper, series string, cells []T, index func(T) int, want int) bool {
+	if len(cells) != want {
+		m.fail("%s has %d buckets, the calendar has %d", series, len(cells), want)
+		return false
+	}
+	seen := make(map[int]bool, want)
+	for _, c := range cells {
+		i := index(c)
+		if i < 0 || i >= want {
+			m.fail("%s bucket index %d outside the calendar's %d buckets", series, i, want)
+			return false
+		}
+		if seen[i] {
+			m.fail("%s bucket index %d appears more than once", series, i)
+			return false
+		}
+		seen[i] = true
+	}
+	return true
+}
+
 // nonNil returns an empty slice for nil so the wire value is [] and never null.
 func nonNil[T any](s []T) []T {
 	if s == nil {
@@ -281,14 +304,14 @@ func mapAnalyticsFlow(req analyticsRequest, b analytics.Bounds, doc store.Analyt
 			LowerSeconds: h.LowerSeconds, UpperSeconds: h.UpperSeconds, Count: h.Count,
 		})
 	}
-	if len(ie.Buckets) != len(b.Buckets) {
-		m.fail("issue_elapsed has %d buckets, the calendar has %d", len(ie.Buckets), len(b.Buckets))
+	elapsedOK := checkFlowBuckets(m, "issue_elapsed", ie.Buckets, func(c store.AnalyticsFlowElapsedCell) int { return c.Index }, len(b.Buckets))
+	checkFlowBuckets(m, "activity.created", cr.Buckets, func(c store.AnalyticsFlowCreatedCell) int { return c.Index }, len(b.Buckets))
+	checkFlowBuckets(m, "activity.finished", fi.Buckets, func(c store.AnalyticsFlowFinishedCell) int { return c.Index }, len(b.Buckets))
+	checkFlowBuckets(m, "delivery_funnel.pr_units", df.PRUnits.Buckets, func(c store.AnalyticsFlowPRUnitCell) int { return c.Index }, len(b.Buckets))
+	if !elapsedOK {
+		ie.Buckets = nil // the partial flag is looked up by index, so an invalid series maps no cells
 	}
 	for _, c := range ie.Buckets {
-		if c.Index < 0 || c.Index >= len(b.Buckets) {
-			m.fail("issue_elapsed bucket index %d outside the calendar's %d buckets", c.Index, len(b.Buckets))
-			break
-		}
 		out.IssueElapsed.Buckets = append(out.IssueElapsed.Buckets, apitypes.AnalyticsFlowElapsedCellDTO{
 			Index: c.Index, Partial: b.Buckets[c.Index].Partial,
 			N: c.N, Unfinished: c.Unfinished, Invalid: c.Invalid, Incomplete: c.Incomplete,
