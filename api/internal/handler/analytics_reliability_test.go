@@ -154,8 +154,9 @@ func TestAnalyticsReliabilitySupportingOnlyRunsNoStatement(t *testing.T) {
 						t.Fatalf("panels = %+v %+v %+v %+v", dto.RollingFailureRate.Harnesses, dto.Causes, dto.Breakdown, dto.NeedsLanding)
 					}
 					for _, k := range []string{"series", "buckets", "rolling"} {
-						if string(raw[k]) == "null" {
-							t.Fatalf("%s serialized as null, want []", k)
+						v, ok := raw[k]
+						if !ok || !bytes.HasPrefix(bytes.TrimSpace(v), []byte("[")) {
+							t.Fatalf("%s = %q (present %v), want a JSON array", k, v, ok)
 						}
 					}
 					if dto.Breakdown.Dimension != "primary_model" {
