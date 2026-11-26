@@ -71,13 +71,20 @@ const (
 	// custodyHoldsReadBudget bounds owner selection and all hold classifications together.
 	custodyHoldsReadBudget = 4 * time.Second
 
-	// board.drift: a given-up column move counts when its marker crossed the give-up
-	// boundary and is no older than this window.
-	boardDriftWindow = 24 * time.Hour
+	// boardDriftAfter: a column move pending longer than this counts as drift. It mirrors
+	// runlifecycle's fast retry window.
+	boardDriftAfter = 30 * time.Minute
 
-	// boardGiveUp mirrors runlifecycle's give-up boundary: a move pending past this is
-	// "given up". Declared here so board.drift's cutoffs are named, not literal.
-	boardGiveUp = 30 * time.Minute
+	// boardRetryWindow mirrors runlifecycle's give-up: below it a pending move is still
+	// retrying; at or above it the move has been given up.
+	boardRetryWindow = 24 * time.Hour
+
+	// boardDriftWindow is how far back the given-up band looks.
+	boardDriftWindow = 48 * time.Hour
+
+	// boardDriftSampleCap mirrors the SQL LIMIT 100 of ListGaveUpColumnMoves; a band that
+	// returns this many raw rows may be truncated.
+	boardDriftSampleCap = 100
 
 	// defaultHeartbeatStale is the fallback "fresh heartbeat" window when the caller
 	// injects a non-positive one — it mirrors config's WORKER_HEARTBEAT_STALE default so

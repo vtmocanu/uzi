@@ -68,6 +68,9 @@ type fakeStore struct {
 	pauseErr               error
 	gaveUp                 []store.ListGaveUpColumnMovesRow
 	gaveUpErr              error
+	gaveUpByCutoff         func(store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
+	gaveUpCalls            []store.ListGaveUpColumnMovesParams
+	gaveUpMu               sync.Mutex
 	custodyOwners          []uuid.UUID
 	custodyErr             error
 	custodySelect          func(context.Context, store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error)
@@ -140,7 +143,13 @@ func (f *fakeStore) CountUsersPausedWithEnabledSchedules(context.Context, pgtype
 func (f *fakeStore) GetInstanceIntakePause(context.Context) (store.InstanceIntakePause, error) {
 	return f.pause, f.pauseErr
 }
-func (f *fakeStore) ListGaveUpColumnMoves(context.Context, store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
+func (f *fakeStore) ListGaveUpColumnMoves(_ context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
+	f.gaveUpMu.Lock()
+	f.gaveUpCalls = append(f.gaveUpCalls, arg)
+	f.gaveUpMu.Unlock()
+	if f.gaveUpByCutoff != nil {
+		return f.gaveUpByCutoff(arg)
+	}
 	return f.gaveUp, f.gaveUpErr
 }
 func (f *fakeStore) ListOwnersOverCustodyLimit(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
@@ -877,24 +886,190 @@ func TestMaintenanceActive(t *testing.T) {
 
 // ---- board.drift -----------------------------------------------------------
 
+func TestBoardDriftThresholdPins(t *testing.T) {
+	if boardDriftAfter != 30*time.Minute {
+		t.Errorf("boardDriftAfter = %v", boardDriftAfter)
+	}
+	if boardRetryWindow != 24*time.Hour {
+		t.Errorf("boardRetryWindow = %v", boardRetryWindow)
+	}
+	if boardDriftWindow != 48*time.Hour {
+		t.Errorf("boardDriftWindow = %v", boardDriftWindow)
+	}
+	if boardDriftSampleCap != 100 {
+		t.Errorf("boardDriftSampleCap = %d", boardDriftSampleCap)
+	}
+}
+
 func TestBoardDrift(t *testing.T) {
 	withIssue := store.ListGaveUpColumnMovesRow{IssueIid: pgtype.Int8{Int64: 42, Valid: true}}
 	noIssue := store.ListGaveUpColumnMovesRow{IssueIid: pgtype.Int8{Valid: false}}
+	repeat := func(r store.ListGaveUpColumnMovesRow, n int) []store.ListGaveUpColumnMovesRow {
+		out := make([]store.ListGaveUpColumnMovesRow, n)
+		for i := range out {
+			out[i] = r
+		}
+		return out
+	}
+	boom := errors.New("boom")
+	const unavailable = "Unavailable (query failed)"
+	const action = "An automation could not move an issue's card; move it by hand or investigate the board sync. " +
+		"A move still retrying can heal on a later eligible retry once the forge is reachable (batch limits and the existing guards still apply)."
+
+	type band struct {
+		rows []store.ListGaveUpColumnMovesRow
+		err  error
+	}
 	for _, tc := range []struct {
-		name       string
-		rows       []store.ListGaveUpColumnMovesRow
-		wantSev    string
-		wantSubstr string
+		name         string
+		retrying     band
+		gaveUp       band
+		wantSev      string
+		wantSummary  string
+		wantEvidence map[string]string // nil means no evidence expected
 	}{
-		{"ok when none", nil, sevOK, "No column move has been given up"},
-		{"issue-less rows do not count (D12)", []store.ListGaveUpColumnMovesRow{noIssue, noIssue}, sevOK, "No column move has been given up"},
-		{"warn on an issue move", []store.ListGaveUpColumnMovesRow{withIssue, noIssue}, sevWarn, "1 issue column move(s) were given up"},
+		{
+			name:    "none is ok with no evidence",
+			wantSev: sevOK, wantSummary: "No issue column move pending for over 30 minutes was found in the last 48 hours (bounded sample).",
+		},
+		{
+			name:     "issue-less rows only, uncapped, is ok",
+			retrying: band{rows: repeat(noIssue, 2)}, gaveUp: band{rows: repeat(noIssue, 3)},
+			wantSev: sevOK, wantSummary: "No issue column move pending for over 30 minutes was found in the last 48 hours (bounded sample).",
+		},
+		{
+			name:     "retrying only",
+			retrying: band{rows: append(repeat(withIssue, 2), noIssue)},
+			wantSev:  sevWarn, wantSummary: "2 issue column move(s) pending for over 30 minutes (2 still retrying, 0 given up)",
+			wantEvidence: map[string]string{"Still retrying": "2", "Given up": "0"},
+		},
+		{
+			name:    "given up only",
+			gaveUp:  band{rows: repeat(withIssue, 4)},
+			wantSev: sevWarn, wantSummary: "4 issue column move(s) pending for over 30 minutes (0 still retrying, 4 given up)",
+			wantEvidence: map[string]string{"Still retrying": "0", "Given up": "4"},
+		},
+		{
+			name:     "both bands",
+			retrying: band{rows: repeat(withIssue, 1)}, gaveUp: band{rows: repeat(withIssue, 2)},
+			wantSev: sevWarn, wantSummary: "3 issue column move(s) pending for over 30 minutes (1 still retrying, 2 given up)",
+			wantEvidence: map[string]string{"Still retrying": "1", "Given up": "2"},
+		},
+		{
+			name:     "capped given-up band reads at least",
+			retrying: band{rows: repeat(withIssue, 3)}, gaveUp: band{rows: repeat(withIssue, 100)},
+			wantSev: sevWarn, wantSummary: "at least 103 issue column move(s) pending for over 30 minutes (3 still retrying, 100 given up)",
+			wantEvidence: map[string]string{"Still retrying": "3", "Given up": "100 (sample capped at 100)"},
+		},
+		{
+			name:     "capped retrying band reads at least",
+			retrying: band{rows: repeat(withIssue, 100)}, gaveUp: band{rows: repeat(withIssue, 1)},
+			wantSev: sevWarn, wantSummary: "at least 101 issue column move(s) pending for over 30 minutes (100 still retrying, 1 given up)",
+			wantEvidence: map[string]string{"Still retrying": "100 (sample capped at 100)", "Given up": "1"},
+		},
+		{
+			name:     "given-up band fails, capped retrying band reads at least",
+			retrying: band{rows: repeat(withIssue, 100)}, gaveUp: band{err: boom},
+			wantSev: sevWarn, wantSummary: "at least 100 issue column move(s) still retrying for over 30 minutes; the given-up band could not be read",
+			wantEvidence: map[string]string{"Still retrying": "100 (sample capped at 100)", "Given up": unavailable},
+		},
+		{
+			name:     "retrying band fails, capped given-up band reads at least",
+			retrying: band{err: boom}, gaveUp: band{rows: repeat(withIssue, 100)},
+			wantSev: sevWarn, wantSummary: "at least 100 issue column move(s) given up after 24 hours; the still-retrying band could not be read",
+			wantEvidence: map[string]string{"Still retrying": unavailable, "Given up": "100 (sample capped at 100)"},
+		},
+		{
+			name:     "capped issue-less band stays ok but shows the cap",
+			retrying: band{rows: repeat(noIssue, 100)},
+			wantSev:  sevOK, wantSummary: "No issue column move pending for over 30 minutes was found in the last 48 hours (bounded sample).",
+			wantEvidence: map[string]string{"Still retrying": "0 (sample capped at 100)", "Given up": "0"},
+		},
+		{
+			name:     "given-up band fails, retrying has moves",
+			retrying: band{rows: repeat(withIssue, 2)}, gaveUp: band{err: boom},
+			wantSev: sevWarn, wantSummary: "2 issue column move(s) still retrying for over 30 minutes; the given-up band could not be read",
+			wantEvidence: map[string]string{"Still retrying": "2", "Given up": unavailable},
+		},
+		{
+			name:     "retrying band fails, given-up has a move",
+			retrying: band{err: boom}, gaveUp: band{rows: repeat(withIssue, 1)},
+			wantSev: sevWarn, wantSummary: "1 issue column move(s) given up after 24 hours; the still-retrying band could not be read",
+			wantEvidence: map[string]string{"Still retrying": unavailable, "Given up": "1"},
+		},
+		{
+			name:     "given-up fails, retrying empty is unknown",
+			retrying: band{}, gaveUp: band{err: boom},
+			wantSev: sevUnknown,
+		},
+		{
+			name:     "retrying fails, given-up empty is unknown",
+			retrying: band{err: boom}, gaveUp: band{},
+			wantSev: sevUnknown,
+		},
+		{
+			name:     "both fail is unknown",
+			retrying: band{err: boom}, gaveUp: band{err: boom},
+			wantSev: sevUnknown,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := newSvc(&fakeStore{gaveUp: tc.rows}, &fakeSettings{})
+			retryCutoff := fixedNow.Add(-boardDriftAfter)
+			giveUpCutoff := fixedNow.Add(-boardRetryWindow)
+			fs := &fakeStore{gaveUpByCutoff: func(arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error) {
+				switch {
+				case arg.GiveupCutoff.Time.Equal(retryCutoff):
+					return tc.retrying.rows, tc.retrying.err
+				case arg.GiveupCutoff.Time.Equal(giveUpCutoff):
+					return tc.gaveUp.rows, tc.gaveUp.err
+				}
+				return nil, errors.New("unexpected cutoff")
+			}}
+			svc := newSvc(fs, &fakeSettings{})
 			c := svc.checkBoardDrift(context.Background(), fixedNow)
-			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
-				t.Fatalf("got %q / %q", c.Severity, c.Summary)
+
+			if len(fs.gaveUpCalls) != 2 {
+				t.Fatalf("calls = %d, want 2", len(fs.gaveUpCalls))
+			}
+			wantBands := []struct{ giveup, prior time.Time }{
+				{fixedNow.Add(-boardDriftAfter), fixedNow.Add(-boardRetryWindow)},
+				{fixedNow.Add(-boardRetryWindow), fixedNow.Add(-boardDriftWindow)},
+			}
+			for i, w := range wantBands {
+				got := fs.gaveUpCalls[i]
+				if !got.GiveupCutoff.Time.Equal(w.giveup) || !got.PriorCutoff.Time.Equal(w.prior) {
+					t.Errorf("call %d cutoffs = (%v, %v), want (%v, %v)", i, got.GiveupCutoff.Time, got.PriorCutoff.Time, w.giveup, w.prior)
+				}
+			}
+
+			if c.Severity != tc.wantSev {
+				t.Fatalf("severity = %q (%q), want %q", c.Severity, c.Summary, tc.wantSev)
+			}
+			wantSummary := tc.wantSummary
+			if tc.wantSev == sevUnknown {
+				wantSummary = "This signal is temporarily unavailable."
+			}
+			if c.Summary != wantSummary {
+				t.Fatalf("summary = %q, want %q", c.Summary, wantSummary)
+			}
+			if tc.wantEvidence == nil {
+				if len(c.Evidence) != 0 {
+					t.Errorf("evidence = %+v, want none", c.Evidence)
+				}
+			} else {
+				if len(c.Evidence) != 2 || c.Evidence[0].Label != "Still retrying" || c.Evidence[1].Label != "Given up" {
+					t.Fatalf("evidence = %+v", c.Evidence)
+				}
+				for _, e := range c.Evidence {
+					if e.Value != tc.wantEvidence[e.Label] {
+						t.Errorf("evidence %q = %q, want %q", e.Label, e.Value, tc.wantEvidence[e.Label])
+					}
+				}
+			}
+			if tc.wantSev == sevWarn {
+				if c.Action == nil || *c.Action != action {
+					t.Errorf("action = %v", c.Action)
+				}
 			}
 		})
 	}
