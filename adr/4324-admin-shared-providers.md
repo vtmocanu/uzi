@@ -125,7 +125,63 @@ Eight migrations, 00524-00531, all additive and staged (the #4633 migrations 005
 
 Each FK is dropped and re-added under the same name in one `ALTER`, so no window exists without a provider foreign key. Every transactional file sets `lock_timeout = '5s'`.
 
-**Failure model.** Each transactional file is atomic: it either commits with its version row or leaves nothing, across a process crash, a killed connection or a restart, and the next boot re-runs the unrecorded file. This ADR claims no storage- or power-loss durability beyond PostgreSQL's own commit guarantee. 00526 is the exception, because `CREATE INDEX CONCURRENTLY` cannot run in a transaction. Each of its indexes is dropped first and rebuilt, so a re-run after an interrupted build replaces the invalid index instead of keeping it. **00526 must precede 00527 and 00528**: both foreign keys reference the scope key index, and each refuses to apply (`refusing to apply 00527` / `00528`) if it is missing or invalid, so a half-built index can never become a foreign key's parent. Recovery is to roll 00526 back and apply it again. 00524 refuses a nil-UUID user or provider owner and rolls back completely, leaving its version unrecorded. The API is a hard singleton that runs Goose at boot before serving, so no older writer races the migration. The upgrade preserves every personal provider, key, selection and ciphertext.
+**Failure model.** Each transactional file is atomic: it either commits with its version row or leaves nothing, across a migrator interruption while PostgreSQL stays available (see "Failure model (narrowed)" below), and the next boot re-runs the unrecorded file. This ADR claims no storage- or power-loss durability beyond PostgreSQL's own commit guarantee. 00526 is the exception, because `CREATE INDEX CONCURRENTLY` cannot run in a transaction. Each of its indexes is dropped first and rebuilt, so a re-run after an interrupted build replaces the invalid index instead of keeping it. **00526 must precede 00527 and 00528**: both foreign keys reference the scope key index, and each refuses to apply (`refusing to apply 00527` / `00528`) if it is missing, invalid or not unique, so a half-built index can never become a foreign key's parent. users_codex_provider_scope (#4633) carries the same guard. Recovery is the runbook in Scope-index recovery below, not a 00526 rollback. 00524 refuses a nil-UUID user or provider owner and rolls back completely, leaving its version unrecorded. The API is a hard singleton that runs Goose at boot before serving, so no older writer races the migration. The upgrade preserves every personal provider, key, selection and ciphertext.
+
+### Scope-index recovery
+
+The guard in 00527, 00528 and users_codex_provider_scope refuses unless `model_providers_scope_owner_id_key` is a valid, unique index. This is the runbook for that refusal.
+
+**When the text takes effect.** The revised message appears only while an affected migration (00527, 00528 or users_codex_provider_scope) is still pending, including a retry after an earlier refusal: a refusal rolls the file back with no version row (`store.Migrate` runs `goose.UpContext`, `api/internal/store/migrate.go`), so it stays pending. goose skips versions already applied, so installs past these migrations never see it. An operator who sees the old "roll 00526 back and apply it again" message from an older image follows this runbook too; that advice is a dead end once 00527 is applied and shared keys or selections exist, because shared Claude selections block the 00528 Down and shared Claude keys the 00527 Down (see "Migration Downs are out of band" under Rollback hazards); at users_codex_provider_scope the already-applied 00537 and 00536 Downs also refuse while shared Codex keys or definitions exist (Down guard G), and users_codex_provider_scope itself is still pending, so its own Down cannot run. While 00527 is still pending nothing depends on the index yet, but still follow this runbook.
+
+**Preconditions.** API stopped, and this returns zero rows. Run it as a superuser or a role with `pg_read_all_stats`: an ordinary role sees other roles' rows with `relid`, `command` and `phase` NULL, so a relid-only filter could return zero during a build. Any row returned means wait:
+
+```sql
+SELECT pid, command, phase FROM pg_stat_progress_create_index WHERE relid = to_regclass('model_providers') OR relid IS NULL;
+```
+
+**Inspection.** Run from the migration's database, role and search_path. `<schema>` is the schema of `to_regclass('model_providers')`:
+
+```sql
+-- <schema>
+SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass('model_providers');
+-- relation kind (i = index)
+SELECT relkind FROM pg_class WHERE oid = to_regclass('model_providers_scope_owner_id_key');
+-- for an index: parent (must be <schema>.model_providers), flags, definition
+SELECT indrelid = to_regclass('<schema>.model_providers') AS on_model_providers,
+       indisvalid, indisready, indisunique, pg_get_indexdef(indexrelid)
+FROM pg_index WHERE indexrelid = to_regclass('model_providers_scope_owner_id_key');
+-- foreign keys that depend on the index (user_secrets, then users)
+SELECT conrelid::regclass, conname, conindid = to_regclass('model_providers_scope_owner_id_key') AS on_index,
+       pg_get_constraintdef(oid), convalidated
+FROM pg_constraint
+WHERE contype = 'f' AND conrelid IN (to_regclass('user_secrets'), to_regclass('users'))
+  AND conname IN ('user_secrets_provider_fkey', 'users_claude_provider_fkey');
+-- count of foreign keys on the index (any table)
+SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conindid = to_regclass('model_providers_scope_owner_id_key');
+-- migration head
+SELECT max(version_id) FROM goose_db_version WHERE is_applied;
+```
+
+**Exact index definition:** `CREATE UNIQUE INDEX model_providers_scope_owner_id_key ON <schema>.model_providers USING btree (scope_owner_id, id)`.
+
+**Expected foreign keys per stage.** At 00527 the count query above must return 0: the named foreign keys still show their old owner-key forms (`user_secrets_provider_fkey` and `users_claude_provider_fkey` not on the index), which is expected and not "FKs different". At 00528 only `user_secrets_provider_fkey` is on the index (the count is 1); `users_claude_provider_fkey` still shows its owner-key form, `FOREIGN KEY (id, claude_provider_id) REFERENCES model_providers(owner_user_id, id) ON DELETE RESTRICT`. At 00528: `user_secrets_provider_fkey` is `FOREIGN KEY (provider_scope_id, provider_id) REFERENCES model_providers(scope_owner_id, id) ON DELETE CASCADE NOT VALID`, convalidated false. At users_codex_provider_scope: that definition without ` NOT VALID`, plus `users_claude_provider_fkey` = `FOREIGN KEY (claude_provider_scope_id, claude_provider_id) REFERENCES model_providers(scope_owner_id, id) ON DELETE RESTRICT`; both convalidated true, both `conindid` equal to the index oid. The referenced table prints schema-qualified when its schema is off the search_path. The migration head from the last inspection query is the version just below the refusing file (526, 527, or the predecessor of users_codex_provider_scope); any other head means the wrong stage row.
+
+| State | Action |
+|---|---|
+| No relation of that name, refusing file 00527 | Recreate outside any transaction: `CREATE UNIQUE INDEX CONCURRENTLY model_providers_scope_owner_id_key ON <schema>.model_providers (scope_owner_id, id);` then retry |
+| No relation of that name, refusing file 00528 or users_codex_provider_scope | Stop and inspect the FKs: the index was renamed, moved, or dropped with CASCADE, which also removed the FKs; recreating it only defers the failure to 00529 or silently loses the FKs |
+| relkind is not `i` (a table, a view, or a partitioned index `I`) | Stop |
+| An index on another table or schema, or a definition that is not exact | Stop; do not drop it or roll migrations back |
+| The exact definition without UNIQUE (a non-unique index) | Stop (REINDEX cannot add uniqueness) |
+| Exact, unique, invalid, and the stage's FKs as expected (00527: the count query returns 0) | With the API stopped: `REINDEX INDEX <schema>.model_providers_scope_owner_id_key;` then retry. Keeps the index oid, the dependent FKs, selections and keys. Not REINDEX CONCURRENTLY (it gives the index a new oid) |
+| Exact, unique, but the stage's FKs missing or different (valid or invalid) | Stop |
+| Exact, unique, valid, and the stage's FKs as expected (e.g. a recreate whose acknowledgement was lost) | Retry |
+
+After an interrupted or uncertain recreate or REINDEX: re-check the preconditions, re-inspect, and map the state again (an interrupted CONCURRENTLY build can leave no index, an invalid one, or a valid one).
+
+**Failure boundary.** This covers a migrator or operator-session interruption while PostgreSQL stays available; no server-crash, storage or power-loss claim. Each refused file is transactional and leaves no change or version row (pinned by `TestSharedCodexMigrationFailureRollbackLiveDB`, `TestSharedScopeNilUserRollsBack00524LiveDB` and this runbook's tests in `api/internal/store/model_provider_scope_index_recovery_livedb_test.go`). 00526 is the only NO TRANSACTION file in 00524-00541.
+
+**Residual gap.** If the index is dropped with CASCADE and then recreated valid, the unchanged guard passes and no message appears: 00528 then fails at 00529, and at users_codex_provider_scope the Claude-era FKs stay missing silently. Closing it needs a guard change, out of scope for #4710.
 
 ### Rollback hazards
 
@@ -133,7 +189,7 @@ Pinned by `TestSharedScopeImageOnlyRollbackLiveDB` and `TestSharedScopeDownGuard
 
 - **Migration Downs are out of band; shipped images run no Downs.** Each guarded Down locks its table `ACCESS EXCLUSIVE` before checking, and refuses rather than destroy or reassign data: 00528 while any user has a shared Claude source selected, 00527 while any key is attached to a shared definition, 00524 while any NULL-owner definition exists. 00529 and 00530 roll back freely; 00531 drops the evidence table (the data is a cache, and its Down loses it). Nothing clears a source for fallback, reassigns ownership or deletes key custody automatically. Once the references are gone, the full Down restores 00477's and 00479's owner-only FKs under their original names, and the schema matches a 00523 database. A re-upgrade then works.
 - **Image-only rollback (original delivery, 00524-00531 only; for #4633's schema see the amendment, which changes the Codex statement below).** The newer schema stays, and an older API image writes without the scope fields. Provider creation, key attachment and Claude source set and clear fail closed (a NOT NULL or CHECK violation), **including a user clearing a personal source back to vendor**. A user who already has a personal Claude source can still switch between their own personal providers, because the scope pair is unchanged; switching away from a shared selection is refused by the foreign key. On an older post-#4323 image **with only the 00524-00531 schema**, Codex source set and clear still worked, since the Claude scope pair was untouched and the Codex FK was unchanged, but provider creation and key attachment failed for both engines. **With the #4633 schema (00538) that Codex statement no longer holds**: see the amendment. Key disable and delete, provider retirement and the older Test upsert (into the retained legacy table) keep working, as stop levers for rows the older API can address. Shared selections can read as `provider_missing` and shared bindings can go stale. The owner chose to document this rather than add a compatibility trigger. **Pause or cancel affected runs before rolling back.**
-- **Recovery is a re-upgrade.** Re-deploying the new image restores provider writes; there is nothing to repair by hand beyond the 00526 index recovery above.
+- **Recovery is a re-upgrade.** Re-deploying the new image restores provider writes; there is nothing to repair by hand beyond the Scope-index recovery above.
 
 ## Consequences
 
@@ -174,7 +230,7 @@ Draft numbers; they are renumbered at merge, so match by name: 00536 model_provi
 
 **Lock-order caveat.** The guard's order is not exactly the order every application path uses: some paths touch `users` or `user_secrets` before `model_providers`. A Down running against live traffic can therefore deadlock with such a path in a narrow window; PostgreSQL aborts one side and no data is lost. Run Downs with the API stopped. This ADR does not claim the guard's order matches the application's.
 
-**Failure model (narrowed).** The claim covers a migrator interruption while PostgreSQL stays available. Each file is one goose transaction (its statements plus the version row). An interrupted Up rolls back and re-runs at the next boot. An interrupted Down rolls back and keeps that file's version; in a multi-file down, the earlier files stay committed. The operator checks `goose version` and re-runs the down. A lost COMMIT acknowledgement is ambiguous: read `goose_db_version` first to see whether the file committed. No server-crash, storage or power-loss claim is made. This replaces, for 00536-00541, the broader process-crash wording of the failure model above.
+**Failure model (narrowed).** The claim covers a migrator interruption while PostgreSQL stays available. Each file is one goose transaction (its statements plus the version row). An interrupted Up rolls back and re-runs at the next boot. An interrupted Down rolls back and keeps that file's version; in a multi-file down, the earlier files stay committed. The operator checks `goose version` and re-runs the down. A lost COMMIT acknowledgement is ambiguous: read `goose_db_version` first to see whether the file committed. No server-crash, storage or power-loss claim is made. This matches the failure model above.
 
 ### Rollback change (image-only)
 
