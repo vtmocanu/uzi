@@ -148,7 +148,7 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
 	// The fixtures need the head schema (model_providers columns added after 00523), so the database
-	// is migrated to the head; the test then steps the placement function back: the 00537 Down
+	// is migrated to the head; the test then steps the placement function back: the 00543 Down
 	// lands on 00534's definition, then the 00523 Down lands on 00521's definition (00534's own Down
 	// is not exercised here).
 	if err := store.Migrate(ctx, dsn); err != nil {
@@ -180,7 +180,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if !changed {
 		t.Fatal("head definition carries no run_env_v1 block")
 	}
-	for _, stmt := range migrationDownStatements(t, "00537_run_env_placement.sql") {
+	for _, stmt := range migrationDownStatements(t, "00543_run_env_placement.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
 		}
@@ -190,7 +190,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if afterRunEnvDown == head || afterRunEnvDown != latest {
-		t.Fatal("00537 Down did not restore exactly the 00534 definition")
+		t.Fatal("00543 Down did not restore exactly the 00534 definition")
 	}
 	for _, stmt := range migrationDownStatements(t, "00523_codex_runtime_v3.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
@@ -278,7 +278,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if restored != latest {
 		t.Fatal("00534 Up did not restore exact latest definition")
 	}
-	for _, stmt := range migrationUpStatements(t, "00537_run_env_placement.sql") {
+	for _, stmt := range migrationUpStatements(t, "00543_run_env_placement.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
 			t.Fatal(err)
 		}
@@ -287,7 +287,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if restored != head {
-		t.Fatal("00537 Up did not restore the exact live head definition")
+		t.Fatal("00543 Up did not restore the exact live head definition")
 	}
 }
 

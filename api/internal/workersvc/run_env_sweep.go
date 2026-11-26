@@ -18,7 +18,7 @@ import (
 // "run_env_retired_sweep".
 //
 // A retired or pending-deletion secret version stays sealed only while a HELD run holds a secret
-// receipt for it (fn_run_env_run_held, migration 00536: not terminal, terminal for less than 24
+// receipt for it (fn_run_env_run_held, migration 00542: not terminal, terminal for less than 24
 // hours, or holding any recovery custody). Once no held run does, the version is deleted; then
 // the variable identities that no row and no receipt references are deleted too.
 //

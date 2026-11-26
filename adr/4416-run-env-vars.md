@@ -17,7 +17,7 @@ capability, `run_env_v1`.
 
 Variables are delivered to the runs `leadcfg.LeadLane` selects: the kinds `issue`, `ci_fix`,
 `prompt`, `self_improve`, `mr_rework` and `task`, with no review target and no egress profile
-(an isolated-lane run). The SQL function `fn_run_env_lane` (migration `00536_run_env_receipts.sql`)
+(an isolated-lane run). The SQL function `fn_run_env_lane` (migration `00542_run_env_receipts.sql`)
 mirrors `leadcfg.LeadLane`, `workersvc.RunEnvDelivered` calls it, and a LiveDB test pins the two
 to agree for every run kind. The worker applies the same predicate again
 (`agent/src/run-env-lane.ts`) before it hands variables to an executor. Chat, judge, job,
@@ -134,7 +134,7 @@ later rule denies can still be removed.
 - `run_env_v1` (`api/internal/capability`) is required by `ClaimRun` for a lead-lane run whose
   repo has an enabled live variable or that holds a secret receipt, as a standalone clause in
   `api/internal/store/queries/runtime.sql`. The same condition is mirrored in fleet-aware placement
-  (migration `00537_run_env_placement.sql`) and in run health, which reports "no online worker supports
+  (migration `00543_run_env_placement.sql`) and in run health, which reports "no online worker supports
   repo variables (run_env_v1); repo variables need a current two-uid worker (UZI_UID_SPLIT, or
   UZI_WORKER_UID_SPLIT on hosted workers)" while no capable worker is connected. A worker
   advertises `run_env_v1` only under the uid split, so a single-uid worker never counts as capable
