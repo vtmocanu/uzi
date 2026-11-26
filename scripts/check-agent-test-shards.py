@@ -11,6 +11,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 REPORTS = ("shard-1.xml", "shard-2.xml", "shard-3.xml")
+M4_SHARD = 2
+M4_MARKER = f"shard-{M4_SHARD}.codex-m4"
 
 
 def latest_reports(report_dir):
@@ -82,11 +84,11 @@ def check_reports(report_dir, expected):
         present = {name for name, path in paths.items() if path.is_file()}
     if present != set(REPORTS):
         errors.append(f"expected exactly {', '.join(REPORTS)}; found {', '.join(sorted(present)) or '(none)'}")
-    marker = paths[REPORTS[0]].with_suffix(".codex-m4")
+    marker = paths[REPORTS[M4_SHARD - 1]].with_suffix(".codex-m4")
     if not marker.is_file() or marker.read_text().strip() != "passed":
-        errors.append("Codex M4 did not complete in shard 1")
-    for shard, name in enumerate(REPORTS[1:], 2):
-        if paths[name].with_suffix(".codex-m4").exists():
+        errors.append(f"Codex M4 did not complete in shard {M4_SHARD}")
+    for shard, name in enumerate(REPORTS, 1):
+        if shard != M4_SHARD and paths[name].with_suffix(".codex-m4").exists():
             errors.append(f"Codex M4 also ran in shard {shard}")
     for name in REPORTS:
         path = paths[name]
@@ -140,15 +142,15 @@ def self_test():
         write(directory / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
         write(directory / REPORTS[1], ["agent/test/b.test.ts"])
         write(directory / REPORTS[2], ["agent/test/d.test.ts"])
-        (directory / "shard-1.codex-m4").write_text("passed\n")
+        (directory / M4_MARKER).write_text("passed\n")
         errors, _ = check_reports(directory, expected)
         if errors:
             raise RuntimeError(f"self-test failed: valid disjoint union was refused; errors={errors}")
-        (directory / "shard-1.codex-m4").unlink()
+        (directory / M4_MARKER).unlink()
         errors, _ = check_reports(directory, expected)
         require(errors, "did not complete", "missing M4 run went unnoticed")
-        (directory / "shard-1.codex-m4").write_text("passed\n")
-        for extra in ("shard-2.codex-m4", "shard-3.codex-m4"):
+        (directory / M4_MARKER).write_text("passed\n")
+        for extra in ("shard-1.codex-m4", "shard-3.codex-m4"):
             (directory / extra).write_text("passed\n")
             errors, _ = check_reports(directory, expected)
             require(errors, "also ran", f"duplicate M4 run went unnoticed ({extra})")
@@ -179,48 +181,48 @@ def self_test():
             write(directory / REPORTS[index], ["agent/test/b.test.ts"] if index == 1 else ["agent/test/d.test.ts"])
         attempts = directory / "attempts"
         attempts.mkdir()
-        old = attempts / "agent-tests-1-attempt-1"
-        retried = attempts / "agent-tests-1-attempt-2"
-        second = attempts / "agent-tests-2-attempt-1"
+        old = attempts / "agent-tests-2-attempt-1"
+        retried = attempts / "agent-tests-2-attempt-2"
+        second = attempts / "agent-tests-1-attempt-1"
         third = attempts / "agent-tests-3-attempt-1"
         for artifact in (old, retried, second, third):
             artifact.mkdir()
-        write(old / REPORTS[0], ["agent/test/a.test.ts", "agent/test/b.test.ts"])
-        write(retried / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
-        write(second / REPORTS[1], ["agent/test/b.test.ts"])
+        write(old / REPORTS[1], ["agent/test/a.test.ts", "agent/test/b.test.ts"])
+        write(retried / REPORTS[1], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
+        write(second / REPORTS[0], ["agent/test/b.test.ts"])
         write(third / REPORTS[2], ["agent/test/d.test.ts"])
-        (retried / "shard-1.codex-m4").write_text("passed\n")
+        (retried / M4_MARKER).write_text("passed\n")
         errors, _ = check_reports(attempts, expected)
         if errors:
             raise RuntimeError(f"self-test failed: latest reports from different attempts were refused; errors={errors}")
         # A whole-workflow rerun selects every new leg and ignores old payloads.
-        second_retry = attempts / "agent-tests-2-attempt-2"
+        second_retry = attempts / "agent-tests-1-attempt-2"
         second_retry.mkdir()
-        write(second_retry / REPORTS[1], ["agent/test/b.test.ts"])
-        write(second / REPORTS[1], ["agent/test/c.test.ts"])
-        (second / "shard-2.codex-m4").write_text("passed\n")
+        write(second_retry / REPORTS[0], ["agent/test/b.test.ts"])
+        write(second / REPORTS[0], ["agent/test/c.test.ts"])
+        (second / "shard-1.codex-m4").write_text("passed\n")
         errors, _ = check_reports(attempts, expected)
         if errors:
             raise RuntimeError(f"self-test failed: whole-workflow retry selected stale payloads; errors={errors}")
         # An old success cannot fill in a missing marker from the latest attempt.
-        (old / "shard-1.codex-m4").write_text("passed\n")
-        (retried / "shard-1.codex-m4").unlink()
+        (old / M4_MARKER).write_text("passed\n")
+        (retried / M4_MARKER).unlink()
         errors, _ = check_reports(attempts, expected)
         require(errors, "did not complete", "a stale M4 marker satisfied the latest attempt")
         # Attempts sort numerically, not lexically; an aggregator-only rerun needs
         # the most recent AVAILABLE report for each shard, not its own attempt.
-        tenth = attempts / "agent-tests-1-attempt-10"
+        tenth = attempts / "agent-tests-2-attempt-10"
         tenth.mkdir()
-        write(tenth / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
-        (tenth / "shard-1.codex-m4").write_text("passed\n")
+        write(tenth / REPORTS[1], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
+        (tenth / M4_MARKER).write_text("passed\n")
         errors, _ = check_reports(attempts, expected)
         if errors:
             raise RuntimeError(f"self-test failed: numeric latest attempt was refused; errors={errors}")
-        (tenth / REPORTS[0]).unlink()
+        (tenth / REPORTS[1]).unlink()
         errors, _ = check_reports(attempts, expected)
         require(errors, "expected exactly", "a missing latest report fell back to an older report")
         (third / REPORTS[2]).unlink()
-        write(tenth / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
+        write(tenth / REPORTS[1], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
         errors, _ = check_reports(attempts, expected)
         require(errors, "expected exactly", "a missing shard 3 artifact report went unnoticed")
         stray = attempts / "agent-tests-4-attempt-1"

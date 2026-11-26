@@ -755,16 +755,16 @@ jobs:
           UZI_AGENT_TEST_SHARD: ${{ format('{0}/3', matrix.shard) }}
           UZI_AGENT_TEST_JUNIT: shard-${{ matrix.shard }}.xml
         run: task test:agent:shard
-      # Revisit placement only if the slowest agent leg exceeds the next CI job by >60s on main.
-      - name: test:codex-m4 (shard 1 only)
-        if: matrix.shard == 1
+      # Keep the M4 placement in sync with scripts/check-agent-test-shards.py.
+      - name: test:codex-m4 (shard 2 only)
+        if: matrix.shard == 2
         env:
           SHARD_INDEX: ${{ matrix.shard }}
         run: |
           task test:codex-m4
           printf 'passed\n' > "agent/shard-${SHARD_INDEX}.codex-m4"
       # The JUnit file names the files Node ACTUALLY ran. The marker proves M4
-      # completed in one leg; an accidental M4 run in leg 2 or 3 makes its own marker.
+      # completed in one leg; an accidental M4 run in leg 1 or 3 makes its own marker.
       - name: Save executed-file report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
