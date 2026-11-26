@@ -13,7 +13,7 @@ export UZI_CI_SLOTS_MAX=2
 export CALLS="$WORK/calls"
 : > "$CALLS"
 
-jq -cn --arg tip "$TIP" --arg old "$OLD" --arg slot "$SLOT" '
+jq -cn --arg tip "$TIP" --arg old "$OLD" --arg slot "$SLOT" --arg recent "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
   def run($id;$work;$branch;$event;$head;$pr;$message):
     {id:$id,name:(if $work=="CodeQL" then "Dynamic CodeQL display title" else $work end),
      path:(if $work=="CI" then ".github/workflows/ci.yml"
@@ -21,7 +21,7 @@ jq -cn --arg tip "$TIP" --arg old "$OLD" --arg slot "$SLOT" '
            elif $work=="CodeQL" then "dynamic/github-code-scanning/codeql"
            elif $work=="Codex packaged proof" then ".github/workflows/codex-packaged-proof.yml"
            else ".github/workflows/unknown.yml" end),
-     head_branch:$branch,event:$event,head_sha:$head,run_attempt:1,status:"queued",
+     head_branch:$branch,event:$event,head_sha:$head,run_attempt:1,status:"queued",created_at:$recent,
      head_commit:{message:$message},pull_requests:(if $pr==null then [] else [{number:$pr}] end)};
   [
     run(101;"CI";"main";"push";$tip;null;"current"),
@@ -41,8 +41,13 @@ jq -cn --arg tip "$TIP" --arg old "$OLD" --arg slot "$SLOT" '
     run(115;"CodeQL";"main";"dynamic";$tip;null;"current"),
     run(116;"CI";"main";"push";$old;null;"chore(release): v1.2.3-rc.2"),
     run(117;"CI";"main";"unknown";$old;null;"unknown event"),
-    run(118;"CI";"fix/at-threshold";"pull_request";$old;28;"ordinary")
-  ]' > "$WORK/runs"
+    run(118;"CI";"fix/near-done-unslotted";"pull_request";$old;28;"ordinary"),
+    run(119;"CI";"fix/stale";"pull_request";$old;29;"ordinary"),
+    run(120;"E2E";"main";"workflow_dispatch";$old;null;"ordinary"),
+    run(121;"CI";"fix/relied-on";"pull_request";$old;30;"ordinary"),
+    run(122;"CI";"main";"push";$old;null;"ordinary")
+  ] | map(if .id==107 or .id==110 or .id==118 or .id==121 or .id==122 then .status="in_progress"
+          elif .id==114 or .id==119 or .id==120 then .created_at="2020-01-01T00:00:00Z" else . end)' > "$WORK/runs"
 jq -nc --arg head "$TIP" '
   [ {number:31,changedFiles:3,additions:5}, {number:32,changedFiles:1,additions:2},
     {number:33,changedFiles:25,additions:200}, {number:34,changedFiles:7,additions:4},
@@ -52,7 +57,8 @@ jq -nc --arg head "$TIP" '
   [{pr:31,head:$head,blocks:["#4000"]},
    {pr:32,head:$head,blocks:["#4001","#4002"]},
    {pr:34,head:$head,red_main_or_release_fix:true},
-   {pr:35,head:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",red_main_or_release_fix:true}]' > "$WORK/evidence"
+   {pr:35,head:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",red_main_or_release_fix:true},
+   {pr:30,head:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",relied_on:true}]' > "$WORK/evidence"
 
 cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -61,11 +67,17 @@ printf '%s\n' "$*" >> "$CALLS"
 case "$*" in
   'pr list '*) cat "$WORK/prs"; exit ;;
   *'/git/ref/heads/main '*) printf '%s\n' "$TIP"; exit ;;
-  *'/actions/runs?status=queued&per_page=100')
-    if [ "${TORN_LIST:-0}" -eq 1 ]; then echo '[{"total_count":1,"workflow_runs":[]}]'
-    else jq -c '[{total_count:length,workflow_runs:.}]' "$WORK/runs"; fi
+  *'/actions/runs?status='*)
+    endpoint=${!#}
+    run_state=${endpoint#*status=}; run_state=${run_state%%&*}
+    if [ "$run_state" = queued ] && { [ "${TORN_LIST:-0}" = permanent ] ||
+         { [ "${TORN_LIST:-0}" = once ] && [ ! -e "$WORK/torn-once" ]; }; }; then
+      touch "$WORK/torn-once"
+      echo '[{"total_count":1,"workflow_runs":[]}]'
+    else
+      jq -c --arg run_state "$run_state" 'map(select(.status==$run_state)) | [{total_count:length,workflow_runs:.}]' "$WORK/runs"
+    fi
     exit ;;
-  *'/actions/runs?status='*) echo '[{"total_count":0,"workflow_runs":[]}]'; exit ;;
   *'/releases/tags/v1.2.3-rc.1') exit 1 ;;
   *'/releases/tags/v1.2.3-rc.2') echo '{"tag_name":"v1.2.3-rc.2","draft":false,"published_at":"2026-11-26T00:00:00Z"}'; exit ;;
   *"/compare/$OLD...$TIP") jq -cn --arg sha "$OLD" '{status:"ahead",merge_base_commit:{sha:$sha}}'; exit ;;
@@ -75,16 +87,16 @@ case "$*" in
     id=${endpoint#*/actions/runs/}; id=${id%%/*}
     case "$id" in
       104) jq -cn '[{total_count:7,jobs:[range(7)|{id:(. + 1),name:"job",status:(if .<6 then "completed" else "in_progress" end)}]}]' ;;
-      110) echo '[{"total_count":1,"jobs":[{"id":1,"name":"test-codex-refresh-lostreply-e2e","status":"queued"}]}]' ;;
+      107|110|121|122) echo '[{"total_count":1,"jobs":[{"id":1,"name":"test-codex-refresh-lostreply-e2e","status":"queued"}]}]' ;;
       114) exit 1 ;;
-      118) jq -cn '[{total_count:20,jobs:[range(20)|{id:(. + 1),name:"job",status:(if .<17 then "completed" else "in_progress" end)}]}]' ;;
+      118) jq -cn '[{total_count:20,jobs:[range(20)|{id:(. + 1),name:"job",status:(if .<18 then "completed" else "in_progress" end)}]}]' ;;
       *) echo '[{"total_count":0,"jobs":[]}]' ;;
     esac
     exit ;;
   *'/force-cancel')
     endpoint=${!#}
     id=${endpoint#*/actions/runs/}; id=${id%%/*}
-    case "$id" in 102|105|106|116|118) ;; *) exit 99 ;; esac
+    case "$id" in 102|105|106|110|116|118|122) ;; *) exit 99 ;; esac
     [ "${NO_VERIFY:-0}" = 1 ] || touch "$WORK/cancelled-$id"
     : ;;
   *'/actions/runs/'*)
@@ -115,9 +127,10 @@ if "$lane" grant 99 "$TIP" --owner unexpected; then echo 'FAILED: exceeded slot 
 "$lane" plan --json --evidence "$WORK/evidence" > "$WORK/plan"
 jq -e '
   .available_slots==1
-  and ([.runs[]|select(.decision=="CANCEL")|.id] == [102,105,106,116,118])
-  and ([.runs[]|select(.decision=="KEEP")|.id] == [101,103,104,107,108,109,110,115])
+  and ([.runs[]|select(.decision=="CANCEL")|.id] == [102,105,106,110,116,118,122])
+  and ([.runs[]|select(.decision=="KEEP")|.id] == [101,103,104,107,108,109,115,121])
   and ([.runs[]|select(.decision=="UNKNOWN")|.id] == [111,112,113,114,117])
+  and ([.stale_runs[].id]==[119,120])
   and ([.next_slot_candidates[].pr] == [34,32,31,33,35])
   and (.next_slot_candidates[-1].blocks==null)
 ' "$WORK/plan" >/dev/null || { cat "$WORK/plan" >&2; exit 1; }
@@ -125,16 +138,22 @@ jq -e '
 "$lane" plan --evidence "$WORK/evidence" > "$WORK/human"
 grep -Fq 'size: 1/+2; blocks: #4001, #4002' "$WORK/human"
 
-if TORN_LIST=1 "$lane" apply --log "$WORK/torn.log"; then echo 'FAILED: accepted a torn listing' >&2; exit 1; fi
+grep -q '^STALE (queued over 24h' "$WORK/human"
+: > "$CALLS"
+TORN_LIST=once "$lane" plan --json > "$WORK/recovered"
+[ "$(grep -cF 'actions/runs?status=queued&per_page=100' "$CALLS")" = 2 ]
+: > "$CALLS"
+if TORN_LIST=permanent "$lane" apply --log "$WORK/torn.log"; then echo 'FAILED: accepted a torn listing' >&2; exit 1; fi
+[ "$(grep -cF 'actions/runs?status=queued&per_page=100' "$CALLS")" = 4 ]
 ! grep -q -- 'force-cancel' "$CALLS"
-if NO_VERIFY=1 "$lane" apply --log "$WORK/unverified"; then echo 'FAILED: accepted an unverified cancel' >&2; exit 1; fi
+if NO_VERIFY=1 "$lane" apply --evidence "$WORK/evidence" --log "$WORK/unverified"; then echo 'FAILED: accepted an unverified cancel' >&2; exit 1; fi
 [ "$(grep -c -- '/102/force-cancel' "$CALLS")" = 2 ]
 jq -es 'length==1 and .[0].id==102 and .[0].result=="unverified"' "$WORK/unverified" >/dev/null
 
 : > "$CALLS"
-MOVED_ATTEMPT=1 "$lane" apply --log "$WORK/verified" > "$WORK/notify"
+MOVED_ATTEMPT=1 "$lane" apply --evidence "$WORK/evidence" --log "$WORK/verified" > "$WORK/notify"
 ! grep -q -- '/102/force-cancel' "$CALLS"
-[ "$(grep -c -- 'force-cancel' "$CALLS")" = 4 ]
-jq -es 'map(.id)==[105,106,116,118] and all(.[]; .result=="cancelled" and (.at|endswith("Z")))' "$WORK/verified" >/dev/null
+[ "$(grep -c -- 'force-cancel' "$CALLS")" = 6 ]
+jq -es 'map(.id)==[105,106,110,116,118,122] and all(.[]; .result=="cancelled" and (.at|endswith("Z")))' "$WORK/verified" >/dev/null
 grep -qF 'NOTIFY pr=16 branch=fix/wrong-head run=106 owner=session-one' "$WORK/notify"
-echo 'PASS ci-lane: protected runs, supersession, slot cap, priority, retry verification and attempt change'
+echo 'PASS ci-lane: slot protection, stale runs, read retry, force-cancel verification and attempt change'

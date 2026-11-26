@@ -3,7 +3,7 @@
 #        ci-lane.sh release PR | list
 #        ci-lane.sh plan [--json] [--evidence FILE]
 #        ci-lane.sh apply --log FILE [--evidence FILE]
-# Evidence is an array of {pr,head,blocks?,red_main_or_release_fix?,conflict_prone?}.
+# Evidence is an array of {pr,head,blocks?,red_main_or_release_fix?,conflict_prone?,relied_on?}.
 set -uo pipefail
 umask 077
 
@@ -15,6 +15,7 @@ lock="$state/ci-slots.lock"
 command=${1:-}; [ "$#" -eq 0 ] || shift
 slots='[]'
 evidence='[]'
+evidence_file=''
 log_file=''
 json=0
 
@@ -50,6 +51,20 @@ save_slots() {
     rm -f "$tmp"
     return 1
   fi
+}
+
+load_evidence() {
+  [ -n "$evidence_file" ] || return 0
+  evidence=$(jq -cse '
+            if length==1 and (.[0]|type)=="array" then .[0] else error("evidence") end
+            | select(all(.[]; type=="object" and (.pr | type=="number" and .==floor and .>0)
+              and (.head|type=="string" and test("^[0-9a-f]{40}$"))
+              and (.blocks==null or (.blocks|type=="array" and all(.[]; type=="string" and length>0)))
+              and (.red_main_or_release_fix|type|IN("null","boolean"))
+              and (.conflict_prone|type|IN("null","boolean"))
+              and (.relied_on|type|IN("null","boolean")))
+              and (map([.pr,.head])|unique|length)==length)
+            ' < "$evidence_file")
 }
 
 case "$command" in
@@ -107,15 +122,8 @@ case "$command" in
           log_file=$2; shift 2 ;;
         --evidence)
           [ "$#" -ge 2 ] || die 'missing evidence path'
-          evidence=$(jq -cse '
-            if length==1 and (.[0]|type)=="array" then .[0] else error("evidence") end
-            | select(all(.[]; type=="object" and (.pr | type=="number" and .==floor and .>0)
-              and (.head|type=="string" and test("^[0-9a-f]{40}$"))
-              and (.blocks==null or (.blocks|type=="array" and all(.[]; type=="string" and length>0)))
-              and (.red_main_or_release_fix|type|IN("null","boolean"))
-              and (.conflict_prone|type|IN("null","boolean")))
-              and (map([.pr,.head])|unique|length)==length)
-            ' < "$2") || die 'unreadable or duplicate scheduling evidence'
+          evidence_file=$2
+          load_evidence || die 'unreadable or duplicate scheduling evidence'
           shift 2 ;;
         *) die "unknown $command option $1" ;;
       esac
@@ -125,18 +133,45 @@ case "$command" in
   *) die 'usage: ci-lane.sh grant|release|list|plan|apply' ;;
 esac
 
-# An incomplete pagination result is never taken as a zero count.
+# A validated count mismatch is retryable independently of malformed input.
 page_rows() { # endpoint, array field
-  local pages
+  local pages rows
   pages=$(gh api --paginate --slurp "$1" 2>/dev/null) || return 1
-  jq -ce --arg field "$2" '
-    select(length>0 and all(.[]; type=="object"
+  rows=$(jq -cer --arg field "$2" '
+    if length>0 and all(.[]; type=="object"
       and (.total_count|type=="number" and .==floor and .>=0)
-      and (.[$field]|type)=="array"))
+      and (.[$field]|type)=="array") then . else error("page") end
     | .[0].total_count as $count
-    | select(all(.[]; .total_count==$count))
-    | [ .[].[$field][] ] | select(length==$count)
-    ' <<< "$pages" 2>/dev/null
+    | [ .[].[$field][] ] as $rows
+    | if all(.[]; .total_count==$count) and ($rows|length)==$count
+      then $rows else "MISMATCH" end
+    ' <<< "$pages" 2>/dev/null) || return 1
+  [ "$rows" != MISMATCH ] || return 3
+  printf '%s\n' "$rows"
+}
+
+active_rows() { # run status
+  local read rows rc
+  for read in 1 2 3 4; do
+    if rows=$(page_rows "repos/$repo/actions/runs?status=$1&per_page=100" workflow_runs); then
+      printf '%s\n' "$rows"
+      return
+    else
+      rc=$?
+    fi
+    [ "$rc" -eq 3 ] && [ "$read" -lt 4 ] || return 1
+    printf 'ci-lane: %s run count changed while paging; retry %s/3\n' "$1" "$read" >&2
+    sleep "$((2 * read))"
+  done
+}
+
+read_jobs() {
+  local jobs
+  jobs=$(page_rows "repos/$repo/actions/runs/$1/jobs?filter=latest&per_page=100" jobs) || return 1
+  jq -ce 'select(all(.[]; (.name|type=="string" and length>0)
+    and (.id|type=="number" and .>0 and .==floor)
+    and (.status|IN("queued","requested","waiting","pending","in_progress","completed")))
+    and (map(.id)|unique|length)==length)' <<< "$jobs" 2>/dev/null
 }
 
 main_head() {
@@ -159,7 +194,7 @@ release_published() {
 decision() { judgement=$1; reason=$2; }
 
 classify() {
-  local run=$1 tip=$2 id head branch workflow workflow_path event first job_rows related run_state
+  local run=$1 tip=$2 id head branch workflow workflow_path event first job_rows='' related run_state age
   judgement=UNKNOWN; reason='unclassified workflow or missing evidence'; pr=null; owner=null
   id=$(jq -er '.id | select(type=="number" and .>0 and .==floor)' <<< "$run") || return
   head=$(jq -r '.head_sha // empty' <<< "$run")
@@ -176,6 +211,18 @@ classify() {
   run_state=$(jq -r '.status // empty' <<< "$run")
   case "$run_state" in queued|requested|waiting|pending|in_progress) ;; *) return ;; esac
   valid_head "$head" && [ -n "$branch" ] || return
+  if [ "$run_state" = queued ]; then
+    age=$(jq -er '.created_at | now - fromdateiso8601 | select(.>=0)' <<< "$run" 2>/dev/null) ||
+      { decision UNKNOWN 'queued run age unreadable'; return; }
+    if jq -e '. > 86400' <<< "$age" >/dev/null; then
+      job_rows=$(read_jobs "$id") || { decision UNKNOWN 'stale-run job evidence unreadable'; return; }
+      if jq -e 'all(.[]; (.status|IN("queued","requested","waiting","pending"))
+        and ((.started_at // "") == "" or (.started_at|startswith("0001")))
+        and (.steps // []) == [])' <<< "$job_rows" >/dev/null; then
+        decision STALE 'queued over 24h with no started jobs'; return
+      fi
+    fi
+  fi
   if [ "$event" = pull_request ]; then
     pr=$(jq -c '
       .pull_requests
@@ -187,55 +234,44 @@ classify() {
       if jq -e --arg head "$head" '.head==$head' <<< "$related" >/dev/null; then
         decision KEEP 'granted PR head'; return
       fi
+      if jq -e --argjson pr "$pr" --arg head "$head" '
+        any(.[]; .pr==$pr and .head==$head and .relied_on==true)' <<< "$evidence" >/dev/null; then
+        decision KEEP 'owner relies on this PR head'; return
+      fi
     fi
   fi
   case "$workflow" in
     'Codex packaged proof') decision KEEP 'packaged proof'; return ;;
     CodeQL) if [ "$event" = pull_request ] || [ "$branch" != main ]; then decision KEEP 'non-main CodeQL'; return; fi ;;
   esac
-  if [ "$branch" = main ] && [ "$event" != pull_request ]; then
-    case "$workflow" in
-      CI|'KinD Smoke'|CodeQL)
-        if [ "$head" = "$tip" ]; then decision KEEP 'current main head'; return; fi ;;
-    esac
-    first=$(jq -er '.head_commit.message | select(type=="string" and length>0) | split("\n")[0]' <<< "$run") ||
-      { decision UNKNOWN 'main commit subject unreadable'; return; }
-    if [[ "$first" == 'chore(release)'* ]] && ! release_published "$first"; then
-      decision KEEP 'release publication not proven'; return
-    fi
-  fi
-
-  job_rows=$(page_rows "repos/$repo/actions/runs/$id/jobs?filter=latest&per_page=100" jobs) ||
-    { decision UNKNOWN 'jobs unreadable or incomplete'; return; }
-  if ! jq -e 'all(.[]; (.name|type=="string" and length>0) and
-     (.id|type=="number" and .>0 and .==floor)
-     and (.status|IN("queued","requested","waiting","pending","in_progress","completed")))
-     and (map(.id)|unique|length)==length' <<< "$job_rows" >/dev/null; then
-    decision UNKNOWN 'invalid job record'; return
-  fi
-  if jq -e 'any(.[]; .name | test("(^|[^A-Za-z])livedb([^A-Za-z]|$)|^test-codex-refresh-lostreply-e2e$";"i"))' <<< "$job_rows" >/dev/null; then
-    decision KEEP 'LiveDB job present'; return
-  fi
-  if jq -e 'length as $total | ([.[]|select(.status=="completed")]|length)*100 > $total*85' <<< "$job_rows" >/dev/null; then
-    decision KEEP 'more than 85% complete'; return
-  fi
-  if [ "$branch" = main ] && [ "$event" != pull_request ]; then
-    case "$event" in push|schedule|workflow_dispatch|dynamic) ;; *) return ;; esac
-    case "$workflow" in
-      CI|'KinD Smoke'|CodeQL)
-        if gh api "repos/$repo/compare/$head...$tip" 2>/dev/null |
-          jq -e --arg base "$head" '.status=="ahead" and .merge_base_commit.sha==$base' >/dev/null; then
-          decision CANCEL 'superseded by a descendant main push'
-        else
-          decision UNKNOWN 'main ancestry unproven'
-        fi ;;
-    esac
-  elif [ "$event" = pull_request ] && [ "$pr" != null ]; then
+  if [ "$event" = pull_request ] && [ "$pr" != null ]; then
     case "$workflow" in
       CI|'KinD Smoke')
         if [ "$related" = null ]; then decision CANCEL 'PR has no slot'
         else decision CANCEL 'head differs from slot'; fi ;;
     esac
+    return
+  fi
+  [ "$branch" = main ] && [ "$event" != pull_request ] || return
+  case "$event" in push|schedule|workflow_dispatch|dynamic) ;; *) return ;; esac
+  case "$workflow" in CI|'KinD Smoke'|CodeQL) ;; *) return ;; esac
+  if [ "$head" = "$tip" ]; then decision KEEP 'current main head'; return; fi
+  first=$(jq -er '.head_commit.message | select(type=="string" and length>0) | split("\n")[0]' <<< "$run") ||
+    { decision UNKNOWN 'main commit subject unreadable'; return; }
+  if [[ "$first" == 'chore(release)'* ]] && ! release_published "$first"; then
+    decision KEEP 'release publication not proven'; return
+  fi
+  if [ -z "$job_rows" ]; then
+    job_rows=$(read_jobs "$id") || { decision UNKNOWN 'jobs unreadable or incomplete'; return; }
+  fi
+  if jq -e 'length as $total | ([.[]|select(.status=="completed")]|length)*100 > $total*85' <<< "$job_rows" >/dev/null; then
+    decision KEEP 'more than 85% complete'; return
+  fi
+  if gh api "repos/$repo/compare/$head...$tip" 2>/dev/null |
+    jq -e --arg base "$head" '.status=="ahead" and .merge_base_commit.sha==$base' >/dev/null; then
+    decision CANCEL 'superseded by a descendant main push'
+  else
+    decision UNKNOWN 'main ancestry unproven'
   fi
 }
 
@@ -265,7 +301,7 @@ make_plan() {
   load_slots || die 'unreadable slots'
   tip=$(main_head) || die 'cannot pin main'
   for run_state in queued in_progress waiting requested pending; do
-    page=$(page_rows "repos/$repo/actions/runs?status=$run_state&per_page=100" workflow_runs) ||
+    page=$(active_rows "$run_state") ||
       die "incomplete $run_state run listing"
     active+="$page"$'\n'
   done
@@ -289,13 +325,16 @@ make_plan() {
   [ "$end" = "$tip" ] || die 'main moved during planning; retry'
   jq -s --arg main "$tip" --argjson slots "$slots" --argjson max "$slot_max" --argjson next "$proposals" '
     {main:$main,slots:$slots,available_slots:([0,($max-($slots|length))]|max),
-     runs:.,next_slot_candidates:$next}' <<< "$rows"
+     runs:[.[]|select(.decision!="STALE")],stale_runs:[.[]|select(.decision=="STALE")],next_slot_candidates:$next}' <<< "$rows"
 }
 
 if [ "$command" = plan ]; then
   plan=$(make_plan) || exit $?
   if [ "$json" -eq 1 ]; then printf '%s\n' "$plan"; else
     jq -r '.runs[] | [.decision,.id,.workflow,.branch,.head,.reason] | @tsv' <<< "$plan"
+    jq -r 'select(.stale_runs|length>0)
+      | "STALE (queued over 24h, excluded from cancellation and CI occupancy)",
+        (.stale_runs[] | [.id,.workflow,.branch,.head,.reason] | @tsv)' <<< "$plan"
     jq -r '"available slots: \(.available_slots)", (.next_slot_candidates |
       if .==null then "next slots: UNKNOWN" else .[] | "next slot: #\(.pr) \(.head) size: \(.files)/+\(.additions); blocks: \(
         if .blocks==null then "unknown" elif (.blocks|length)==0 then "none" else .blocks|join(", ") end)" end)' <<< "$plan"
@@ -309,6 +348,7 @@ while IFS= read -r candidate; do
   id=$(jq -r .id <<< "$candidate")
   take_lock || die 'state busy or unavailable'
   load_slots || die 'unreadable slots'
+  load_evidence || die 'unreadable scheduling evidence'
   tip=$(main_head) || die 'cannot recheck main'
   live=$(gh api "repos/$repo/actions/runs/$id" 2>/dev/null) || die "cannot refresh run $id"
   if ! jq -e --argjson expected "$candidate" '
@@ -330,6 +370,7 @@ while IFS= read -r candidate; do
   for attempt in 1 2; do
     # The second request still needs a fresh eligible, unretargeted attempt.
     if [ "$attempt" -eq 2 ]; then
+      load_evidence || die 'unreadable scheduling evidence'
       tip=$(main_head) || die 'cannot recheck main'
       live=$(gh api "repos/$repo/actions/runs/$id" 2>/dev/null) || die "cannot refresh run $id"
       if jq -e --argjson expected "$candidate" '

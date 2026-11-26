@@ -113,9 +113,9 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   `gh api -X POST repos/vtmocanu/uzi/actions/runs/<id>/force-cancel` and verify
   `completed cancelled`. Cancel an in-progress run normally. After a slot is granted,
   use `gh run rerun <id>` on the cancelled CI and report its run ID. Leave CodeQL and
-  Codex packaged proof alone. For other capacity cleanup, prefer unstarted queued runs
-  over near-complete ones. Preserve required LiveDB and packaged evidence, including a
-  parent workflow carrying such evidence, and runs another owner relies on.
+  Codex packaged proof alone. LiveDB jobs and near-completion do not protect ungranted
+  PR runs. Keep exact-head grants and PR runs an owner relies on, recorded with
+  `relied_on: true` in the exact-head evidence.
 - **Low-risk main-CI option**: use only on the user's explicit request. Confirm an
   approved, mergeable PR has no migration, trust-boundary change or exact-head CI
   obligation. It needs no PR CI slot. Use `merge.sh ... --expect-head FULL_SHA
@@ -139,9 +139,12 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   use `S/ci-lane.sh plan` to inspect older runs, then `apply --log FILE` to force-cancel
   eligible runs and verify the outcome. The same plan covers ungranted PR runs and
   proposes the next slots. Use `plan --json --evidence FILE` with head-pinned
-  `{pr,head,blocks,red_main_or_release_fix,conflict_prone}` records for the proposal. Keep unpublished `chore(release)` runs, runs more than 85%
-  complete, and runs with LiveDB jobs. Unknowns stay untouched. Preserve the exact or
-  two-hop metadata CI evidence needed to publish a release.
+  `{pr,head,blocks,red_main_or_release_fix,conflict_prone,relied_on}` records for
+  the proposal. Keep unpublished `chore(release)` runs and main runs more than 85%
+  complete. Keep the exact or two-hop metadata CI evidence needed for publication.
+  The planner retries torn run counts and leaves unknowns untouched. Runs queued
+  more than 24 hours with no started jobs appear separately as STALE. Exclude them
+  from cancellation and active CI occupancy.
 - **CI hygiene**: cancel runs for already-merged PRs when they no longer supply evidence.
   Preserve required packaged proof, trust-boundary CI or `e2e.yml`, the exact-head
   LiveDB proofs above, and runs another owner relies on.
