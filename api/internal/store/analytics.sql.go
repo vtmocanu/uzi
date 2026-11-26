@@ -155,6 +155,7 @@ run_fold AS MATERIALIZED (
                          FILTER (WHERE mf.model IS NOT NULL))[1], 'unknown') AS primary_model
         FROM run_usage_model_totals mf
         WHERE mf.run_id = c.id AND $2::text = 'primary_model'
+          AND c.created_at >= $14::timestamptz  -- only current-window rows read primary_model
         OFFSET 0
     ) pm ON true
 ),
@@ -1088,6 +1089,7 @@ run_fold AS MATERIALIZED (
                          FILTER (WHERE mf.model IS NOT NULL))[1], 'unknown') AS primary_model
         FROM run_usage_model_totals mf
         WHERE mf.run_id = c.id AND $2::text = 'primary_model'
+          AND c.created_at >= $16::timestamptz  -- only current-window rows read primary_model
         OFFSET 0
     ) pm ON true
 ),

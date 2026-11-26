@@ -640,6 +640,35 @@ func TestAnalyticsReliabilityRepoMaskingLiveDB(t *testing.T) {
 	}
 }
 
+// TestAnalyticsReliabilityAllScopeRepoRevealLiveDB: the all-scope statement shows every repo with
+// its real key, id and path, including one the owner statement masks.
+func TestAnalyticsReliabilityAllScopeRepoRevealLiveDB(t *testing.T) {
+	f := newRelFixture(t)
+	f.claimYear(2007)
+	now := utcAt(2007, 6, 15, 12, 0, 0)
+	o, p := f.owner("rel-allrepo"), f.owner("rel-allrepo-p")
+	own, ownPath := f.repo(o, "rel-allrepo")
+	foreign, foreignPath := f.repo(p, "rel-allrepo")
+	f.run(fin(o.User, own, "completed", "", utcAt(2007, 6, 3, 9, 0, 0)))
+	f.run(fin(o.User, foreign, "failed", "agent_failure", utcAt(2007, 6, 4, 9, 0, 0)))
+
+	rows := f.rel(relCall{Now: now, Breakdown: "repo"}).Doc.Breakdown.Rows
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want the two real repos", rows)
+	}
+	for key, path := range map[uuid.UUID]string{own: ownPath, foreign: foreignPath} {
+		r := relRowByKey(t, rows, key.String())
+		if r.Label == nil || *r.Label != path || r.ID == nil || *r.ID != key {
+			t.Errorf("all-scope row for %s = %+v, want path %q and its id", key, r, path)
+		}
+	}
+	for _, r := range rows {
+		if r.Key != nil && *r.Key == "inaccessible_repo" {
+			t.Errorf("all-scope statement masked a repo: %+v", r)
+		}
+	}
+}
+
 // TestAnalyticsReliabilityFiltersLiveDB: repo, harness and kinds restrict the cohort, and the
 // totals, buckets and needs_landing all follow it.
 func TestAnalyticsReliabilityFiltersLiveDB(t *testing.T) {

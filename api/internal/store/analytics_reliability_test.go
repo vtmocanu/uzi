@@ -87,7 +87,7 @@ func TestAnalyticsReliabilityStatementsDoNotDrift(t *testing.T) {
 	}
 	for name, b := range map[string]string{"owner": owner, "all": all} {
 		for _, want := range []string{"cohort AS MATERIALIZED", "run_fold AS MATERIALIZED", "run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0",
-			"WHERE mf.run_id = c.id AND @breakdown::text = 'primary_model'\n        OFFSET 0"} {
+			"WHERE mf.run_id = c.id AND @breakdown::text = 'primary_model'\n          AND c.created_at >= sqlc.arg('from')::timestamptz  -- only current-window rows read primary_model\n        OFFSET 0"} {
 			if !strings.Contains(b, want) {
 				t.Errorf("%s statement lacks %q", name, want)
 			}

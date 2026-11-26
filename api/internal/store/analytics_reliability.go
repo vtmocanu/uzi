@@ -12,8 +12,10 @@ import (
 
 // Issue #4685: typed mirror of the jsonb document that AnalyticsOwnerReliability and
 // AnalyticsAllReliability return. The SQL is the authority for the shape;
-// DecodeAnalyticsReliabilityDoc rejects unknown keys so a statement change that is not
-// mirrored here fails loudly instead of being silently dropped by the handler's DTO mapping.
+// DecodeAnalyticsReliabilityDoc rejects unknown keys, trailing data and mistyped values, so a
+// statement change that adds a key or changes a type is not silently dropped by the handler's
+// DTO mapping. It does not enforce that every key is present (as DecodeAnalyticsSpendDoc): a
+// removed key decodes to its zero value.
 // The conventions of analytics_spend.go apply: rates are JSON numbers rounded to six decimals
 // that are null together with a reason, "index" is the zero-based position in the bucket
 // (resp. rolling) arrays the caller passed, and timestamps are UTC RFC 3339 strings.
@@ -129,7 +131,7 @@ type AnalyticsReliabilityGroup struct {
 }
 
 // DecodeAnalyticsReliabilityDoc decodes the document an Analytics*Reliability statement
-// returned, rejecting unknown keys and trailing data.
+// returned, rejecting unknown keys, trailing data and mistyped values; missing keys are not an error.
 func DecodeAnalyticsReliabilityDoc(doc []byte) (AnalyticsReliabilityDoc, error) {
 	var out AnalyticsReliabilityDoc
 	dec := json.NewDecoder(bytes.NewReader(doc))
