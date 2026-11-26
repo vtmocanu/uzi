@@ -433,9 +433,24 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
   // wrapper is synchronous, rethrows the same error and returns the real value unchanged; callers use this.recoveryRemaining,
   // so the instance patch sees them.
   const deadlineThrows = new WeakMap<object, DeadlineThrow>();
-  const previousRemaining = g.recoveryRemaining;
+  const deadlineThrowOf: DeadlineThrowLookup = reason => deadlineThrows.get(reason);
+  // Options objects returned by an attached runner's owedOptions, keyed by identity to the flight they were built for.
+  const optsFlight = new WeakMap<object, unknown>();
+  type GitOwed = Record<"retainCurrentOwedCandidate" | "owedTipRetained", ((...args: any[]) => unknown) | undefined>;
+  const owedNames = ["retainCurrentOwedCandidate", "owedTipRetained"] as const;
+  const owedPatched: Record<string, "patched" | "absent"> = {};
+  const owedPrevious: Partial<Record<(typeof owedNames)[number], ((...args: any[]) => unknown) | undefined>> = {};
+  // The shared-git patches install on the first attach(), inside the fixture's try, so join() always restores them.
+  let sharedInstalled = false;
+  let previousRemaining: typeof g.recoveryRemaining | undefined;
+  let previousRecovery: typeof g.withRecoveryOperation | undefined;
+  const installShared = () => {
+  if (sharedInstalled) return;
+  sharedInstalled = true;
+  const originalRemaining = g.recoveryRemaining;
+  previousRemaining = originalRemaining;
   g.recoveryRemaining = function (this: unknown, operation) {
-    try { return previousRemaining.call(this, operation); }
+    try { return originalRemaining.call(this, operation); }
     catch (error) {
       if (error instanceof RecoveryDeadlineExhaustedError) {
         const at = REAL_DATE_NOW();
@@ -445,8 +460,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       throw error;
     }
   };
-  const deadlineThrowOf: DeadlineThrowLookup = reason => deadlineThrows.get(reason);
-  const previousRecovery = g.withRecoveryOperation;
+  previousRecovery = g.withRecoveryOperation;
   const realRecovery = previousRecovery.bind(git);
   g.withRecoveryOperation = (signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<unknown>,
     ...rest: unknown[]) => {
@@ -504,6 +518,23 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     if (!isThenable(p)) { settle(); return p; }
     p.then(settle, settle);
     return p;
+  };
+  // Direct owner-retention seams on the shared git: synchronous, attributed through the options object the attached
+  // runner's owedOptions produced, and returning the real value unchanged.
+  const gOwed = git as unknown as GitOwed;
+  for (const name of owedNames) {
+    const real = gOwed[name];
+    if (typeof real !== "function") { owedPatched[name] = "absent"; continue; }
+    owedPrevious[name] = real;
+    owedPatched[name] = "patched";
+    gOwed[name] = function (this: unknown, ...args: any[]) {
+      const key = args[1];
+      const known = typeof key === "object" && key !== null && optsFlight.has(key);
+      if (!known) fail(`unattributed owed call ${name}`);
+      else ownerCalls.push({ name, flight: optsFlight.get(key) });
+      return real.apply(this, args);
+    };
+  }
   };
 
   const portRecord = (signal: AbortSignal): PortRecord => {
@@ -570,13 +601,29 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       send: ports.send && { ...ports.send, reason: reasonClassOf(ports.send.reason),
         before: ports.send.before && { ...ports.send.before, reason: reasonClassOf(ports.send.before.reason) } } },
     reachedSites: [...reached], capturedSites: [...captured], uncaptured, foreignWaits,
-    ownerCalls: ownerCalls.map(c => c.name) }) + "]";
+    ownerCalls: ownerCalls.map(c => c.name), owedPatched }) + "]";
 
   return {
     facts,
     invoke<T>(role: InvocationRole, run: () => Promise<T>): Promise<T> { return invocationStore.run(role, run); },
+    /** Attributes the runner's owedOptions results to their flight; the synchronous wrapper returns the identical promise. */
+    attachOwed(runner: RunRunner) {
+      const priv = runner as unknown as Record<string, (...args: any[]) => any>;
+      const real = priv.owedOptions;
+      assert.equal(typeof real, "function", "runner private seam owedOptions exists");
+      const bound = real!.bind(runner);
+      priv.owedOptions = (flight: unknown, ...rest: unknown[]) => {
+        const result = bound(flight, ...rest);
+        if (isThenable(result)) result.then((opts: unknown) => {
+          if (typeof opts === "object" && opts !== null) optsFlight.set(opts, flight);
+        }, () => {});
+        return result;
+      };
+    },
     /** Wraps one runner instance. Must run before that runner's execute. */
     attach(runner: RunRunner, executor: Executor) {
+      installShared();
+      this.attachOwed(runner);
       if ((executor as { safety?: unknown }).safety !== undefined) fail("the fixture executor carries .safety, so a held capture could be authenticated");
       boundaryMs = (runner as unknown as { codexBoundaryDeadlineMs: number }).codexBoundaryDeadlineMs;
       const priv = runner as unknown as Record<string, (...args: any[]) => any>;
@@ -653,7 +700,8 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
         if (typeof wait === "object" && wait !== null) observeWait(wait);
         return real(...args);
       });
-      for (const [name, flightIndex] of [["stopForOwedLimit", 0], ["owedStopReleaseWait", 0], ["retainAcceptedOwnerPause", 1]] as const)
+      for (const [name, flightIndex] of [["stopForOwedLimit", 0], ["owedStopReleaseWait", 0], ["retainAcceptedOwnerPause", 1],
+        ["handlePausePark", 1]] as const)
         wrap(name, real => (...args: any[]) => { ownerCalls.push({ name, flight: args[flightIndex] }); return real(...args); });
     },
     /** Wrap the original executor's capture lane: t0 per held signal, plus the capture-deadline abort record. */
@@ -744,8 +792,12 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
         clock.logging = false;
         // Restore every patch on a shared object (Date.now, git.withRecoveryOperation), reverse of installation order.
         if (Date.now === patchedNow) Date.now = REAL_DATE_NOW;
-        g.withRecoveryOperation = previousRecovery;
-        g.recoveryRemaining = previousRemaining;
+        if (sharedInstalled) {
+          const gOwedNow = git as unknown as GitOwed;
+          for (const name of [...owedNames].reverse()) if (owedPatched[name] === "patched") gOwedNow[name] = owedPrevious[name];
+          g.withRecoveryOperation = previousRecovery!;
+          g.recoveryRemaining = previousRemaining!;
+        }
       }
     },
     /** All assertions; call only after join(). */
@@ -1041,6 +1093,7 @@ test("holdDeadlineCheck: a capture rejecting with the hold's own recoveryRemaini
     const runner = { codexBoundaryDeadlineMs: 5000, startWorkerMemoryPreservation: none, reconcileWorkerMemory: none,
       transferRestorePointToTrustedBare: none, captureRecoveryRestorePointBody: none, captureHoldContext: none, fetchTracking: none,
       refusalGateInAuthority: none, stopForOwedLimit: none, owedStopReleaseWait: none, retainAcceptedOwnerPause: none,
+      handlePausePark: none, owedOptions: none,
       preserveWorkerMemory: (_flight: unknown, hold: { deadline: number }) =>
         git.withRecoveryOperation(new AbortController().signal, hold.deadline, async () =>
           capture(5000, async () => {
@@ -2060,8 +2113,12 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     const log = nullLogger();
     log.child = () => log;
     log.warn = log.error = (message, fields) => { successorLog.push(message + JSON.stringify(fields)); };
-    successorWork = obs.invoke("successor", () => runnerWith(() => ({ executor: nextExecutor }), fakeGitlab().gitlab, undefined, log,
-      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(next));
+    successorWork = obs.invoke("successor", () => {
+      const successorRunner = runnerWith(() => ({ executor: nextExecutor }), fakeGitlab().gitlab, undefined, log,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 });
+      obs.attachOwed(successorRunner);
+      return successorRunner.execute(next);
+    });
     try {
       await until(() => successor !== undefined, 5000);
     } catch {
@@ -2923,8 +2980,8 @@ for (const { scenario, control } of handoffCases) {
       { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
         ...(scenario === "unsettled" || scenario === "expired" ? { memoryHoldDeadlineMs: 200 } : {}) });
     launch?.attach(runner);
-    obs?.attach(runner, executor);
     try {
+      obs?.attach(runner, executor);
       obs?.startClock();
       await (obs ? obs.invoke("original", () => runner.execute(f.claim)) : runner.execute(f.claim));
       // execute() can return while the executor is still joining a long capture; wait for its assertions to finish.
