@@ -107,7 +107,7 @@
 // helper spawn: past it the start is refused and the tree is kept. A helper stuck in uninterruptible
 // I/O is not terminated by SIGKILL until the I/O returns, so neither limit shortens a call that is
 // already blocked; they bound how many helpers start and how long a responsive one runs. A spawn
-// error, a killed sh, a null status, output over the limit, and (for mkdir) any status other than 0
+// error, a killed intermediary, a null status, output over the limit, and (for mkdir) any status other than 0
 // and 1, including those of timeout itself (124, 125, 126, 127, 137), are transient: they refuse
 // this start and move nothing.
 //
@@ -281,7 +281,7 @@ function renameAside(p: string): void {
  *  during the spawn can end the process with node's own uncaught-exception status 1, which
  *  mkdirAsRunner reads as "mkdir ran and failed" (MKDIR_FAILED_STATUS). Only the helper's own
  *  status reaches the exit. */
-const NODE_INTERMEDIARY = [
+export const NODE_INTERMEDIARY = [
   "let code = 127;",
   "try {",
   '  const fs = require("node:fs");',

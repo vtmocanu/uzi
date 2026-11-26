@@ -7,6 +7,7 @@ import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import {
   CLAUDE_GLOBAL_CONFIG_BYTES,
   helperCommand,
+  NODE_INTERMEDIARY,
   prepareClaudeConfigDir,
   runBounded,
   type HelperResult,
@@ -1059,10 +1060,29 @@ describe("the bounded runner helper", () => {
     const start = src.indexOf("export function runBounded");
     assert.ok(start >= 0, "runBounded found");
     const end = src.indexOf("\n}\n", start);
+    assert.ok(end > start, "runBounded end found after its start (the slice is not vacuous)");
     const body = src.slice(start, end);
+    assert.ok(NODE_INTERMEDIARY.includes("shell: false"), "the intermediary sets shell: false");
+    assert.ok(!NODE_INTERMEDIARY.includes("/bin/sh"), "the intermediary does not name /bin/sh");
+    assert.ok(!NODE_INTERMEDIARY.includes("shell: true"), "the intermediary does not set shell: true");
     assert.ok(body.includes("process.execPath"), "runBounded spawns process.execPath");
     assert.ok(!body.includes('"/bin/sh"'), "runBounded does not spawn /bin/sh");
     assert.ok(!/shell:\s*true/.test(body), "runBounded does not set shell: true");
+  });
+
+  // Without the try/catch node exits 1 on the uncaught openSync throw, which mkdirAsRunner would read
+  // as "mkdir ran and failed".
+  it("the intermediary exits 127, not 1, when opening the output file throws", () => {
+    const dir = fs.mkdtempSync(path.join(root, "intermediary-"));
+    const target = path.join(dir, "target");
+    fs.writeFileSync(target, "unchanged");
+    const link = path.join(dir, "link");
+    fs.symlinkSync(target, link);
+    for (const out of [path.join(dir, "missing", "out"), link]) {
+      const r = spawnSync(process.execPath, ["-e", NODE_INTERMEDIARY, "--", out, "/bin/true"], { stdio: "ignore" });
+      assert.strictEqual(r.status, 127, `status for ${out}`);
+    }
+    assert.strictEqual(fs.readFileSync(target, "utf8"), "unchanged", "the symlink target is untouched");
   });
 
   it("a helper killed by a signal reports 128 plus the signal number", () => {
