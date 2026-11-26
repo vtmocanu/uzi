@@ -6802,3 +6802,238 @@ export interface FreshResumeStart {
   sha: string;
   admission_deadline: string;
 }
+
+// ── Scoped usage analytics (issue #4684) ─────────────────────────────────────
+// Mirrors api/internal/apitypes/analytics.go: GET /api/analytics/{options,spend} and
+// GET /api/admin/analytics/{options,spend}. Timestamps are UTC RFC 3339 strings. Dollar
+// amounts are numbers (a recorded-spend figure, not a bill). A rate or ratio that is null
+// always travels with a reason. Slices are never null on the real wire (the handler emits
+// []), even though the recorded zero fixtures carry null for them.
+
+export interface AnalyticsScopeDTO {
+  /** "owner" (the caller's own runs) or "admin". */
+  route: string;
+  /** "all" on an admin response spanning every user, else a user id. */
+  user: string;
+}
+
+export interface AnalyticsBucketDTO {
+  label: string;
+  start: string;
+  end: string;
+  partial: boolean;
+}
+
+export interface AnalyticsRollingDTO {
+  start: string;
+  end: string;
+  partial: boolean;
+}
+
+export interface AnalyticsEnvelopeDTO {
+  scope: AnalyticsScopeDTO;
+  generated_at: string;
+  /** 7d, 30d, 90d or all. */
+  window: string;
+  timezone: string;
+  from: string;
+  to: string;
+  /** Absent for window=all. */
+  previous_from?: string;
+  previous_to?: string;
+  /** Null when the scope has no matching run. */
+  history_start: string | null;
+  /** 1 for day buckets; 7 times the week count for window=all. */
+  bucket_width_days: number;
+  buckets: AnalyticsBucketDTO[];
+  rolling: AnalyticsRollingDTO[];
+}
+
+export interface AnalyticsRepoOptionDTO {
+  id: string;
+  path: string;
+}
+
+export interface AnalyticsRepoOptionsDTO {
+  items: AnalyticsRepoOptionDTO[];
+  truncated: boolean;
+}
+
+export interface AnalyticsUserOptionDTO {
+  id: string;
+  email: string;
+}
+
+export interface AnalyticsUserOptionsDTO {
+  items: AnalyticsUserOptionDTO[];
+  truncated: boolean;
+}
+
+export interface AnalyticsOptionsDTO {
+  scope: AnalyticsScopeDTO;
+  generated_at: string;
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  repos: AnalyticsRepoOptionsDTO;
+  /** Null with users_reason "not_applicable" on the owner route. */
+  users: AnalyticsUserOptionsDTO | null;
+  users_reason: string | null;
+  windows: string[];
+  kinds: string[];
+  harnesses: string[];
+  splits: string[];
+  breakdowns: string[];
+}
+
+export interface AnalyticsDisclosureDTO {
+  metered: number;
+  subscription: number;
+  unreported: number;
+  missing: number;
+  incomplete: boolean;
+}
+
+export interface AnalyticsCoverageDTO {
+  metered: number;
+  applicable: number;
+  /** Null with a reason for an empty population. */
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsSpendBlockDTO {
+  cost_usd: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  runs: number;
+  disclosure: AnalyticsDisclosureDTO;
+  coverage: AnalyticsCoverageDTO;
+}
+
+export interface AnalyticsSpendCellDTO extends AnalyticsSpendBlockDTO {
+  index: number;
+}
+
+export interface AnalyticsSpendTotalsDTO {
+  current: AnalyticsSpendBlockDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsSpendBlockDTO;
+}
+
+export interface AnalyticsSplitGroupDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  label: string | null;
+  id: string | null;
+  totals: AnalyticsSpendBlockDTO;
+  buckets: AnalyticsSpendCellDTO[];
+}
+
+export interface AnalyticsSplitDTO {
+  dimension: string;
+  non_additive: boolean;
+  groups: AnalyticsSplitGroupDTO[];
+}
+
+export interface AnalyticsRatioDTO {
+  numerator_usd: number;
+  denominator: number;
+  value: number | null;
+  reason: string | null;
+  disclosure: AnalyticsDisclosureDTO;
+}
+
+export interface AnalyticsRatioCellDTO extends AnalyticsRatioDTO {
+  index: number;
+}
+
+export interface AnalyticsRatioPanelDTO {
+  current: AnalyticsRatioDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsRatioDTO;
+  buckets: AnalyticsRatioCellDTO[];
+  rolling: AnalyticsRatioCellDTO[];
+}
+
+export interface AnalyticsCacheReadDTO {
+  cache_read_tokens: number;
+  input_tokens: number;
+  cache_creation_tokens: number;
+  denominator: number;
+  value: number | null;
+  reason: string | null;
+  disclosure: AnalyticsDisclosureDTO;
+}
+
+export interface AnalyticsTopRunDTO {
+  run_id: string;
+  kind: string;
+  harness: string;
+  run_status: string;
+  usage_status: string;
+  primary_model: string;
+  created_at: string;
+  cost_usd: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  /** The repo id, "no_repo" or "inaccessible_repo". */
+  repo_key: string;
+  repo_id: string | null;
+  repo_path: string | null;
+  user_id: string;
+  user_email: string;
+}
+
+export interface AnalyticsNullableNumberDTO {
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsOutcomesDTO {
+  completed: number;
+  cancelled: number;
+  plan_rejected: number;
+  base_diverged: number;
+  failed: number;
+}
+
+export interface AnalyticsBreakdownRowDTO extends AnalyticsSpendBlockDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  label: string | null;
+  id: string | null;
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  completion_ratio: AnalyticsNullableNumberDTO;
+  cost_share: AnalyticsNullableNumberDTO;
+  elapsed_p50_seconds: AnalyticsNullableNumberDTO;
+  elapsed_p90_seconds: AnalyticsNullableNumberDTO;
+  merged_prs: number;
+}
+
+export interface AnalyticsBreakdownDTO {
+  dimension: string;
+  rows: AnalyticsBreakdownRowDTO[];
+}
+
+export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  untracked_chat_runs: number;
+  totals: AnalyticsSpendTotalsDTO;
+  /** series[i] is the ungrouped spend of buckets[i]. */
+  series: AnalyticsSpendCellDTO[];
+  split: AnalyticsSplitDTO;
+  cost_per_completed_run: AnalyticsRatioPanelDTO;
+  cost_per_merged_pr: AnalyticsRatioPanelDTO;
+  cache_read: AnalyticsCacheReadDTO;
+  top_runs: AnalyticsTopRunDTO[];
+  breakdown: AnalyticsBreakdownDTO;
+}
