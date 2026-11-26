@@ -5,9 +5,12 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -211,7 +214,7 @@ func flLiteral(t *testing.T, a any) string {
 
 // flowWorkload builds one Flow workload over the owner statement (owner != uuid.Nil) or the
 // all-scope statement, with bounds from analytics.ComputeBounds at the harness's fixed now.
-func (h *evHarness) flowWorkload(name string, owner uuid.UUID, win analytics.Window) evWorkload {
+func (h *evHarness) flowWorkload(name string, owner uuid.UUID, win analytics.Window) flWorkload {
 	h.t.Helper()
 	kinds := runkind.All()
 	var hist pgtype.Timestamptz
@@ -282,13 +285,70 @@ func (h *evHarness) flowWorkload(name string, owner uuid.UUID, win analytics.Win
 	h.scalar(fmt.Sprintf(`SELECT count(*) FILTER (WHERE %[1]screated_at >= '%[2]s' AND created_at < '%[3]s'), count(*) FILTER (WHERE %[1]strue) FROM runs`,
 		scope, b.From.UTC().Format(time.RFC3339Nano), b.Now.UTC().Format(time.RFC3339Nano)), &cohort, &total)
 	h.logf("WORKLOAD %s: window=%s buckets=%d from=%s cohort_runs=%d scope_runs=%d", name, win, len(b.BucketStarts), b.From.Format(time.RFC3339), cohort, total)
-	return w
+	return flWorkload{evWorkload: w, request: h.flowRequest(owner, win)}
 }
 
-func (h *evHarness) flowWorkloads() []evWorkload {
+// flWorkload is a Flow workload plus its request-path run.
+type flWorkload struct {
+	evWorkload
+	request func(ctx context.Context) error
+}
+
+// flowRequest is what one Flow request does on the database side, end to end:
+// store.RunAnalyticsSnapshot (REPEATABLE READ READ ONLY, its real 8 s deadline, statement_timeout
+// = 8s and jit = off) around the history-start query, ComputeBounds, the Flow statement and
+// store.DecodeAnalyticsFlowDoc. It runs on the pool, so pgx's default statement cache applies.
+// It excludes HTTP, auth middleware, JSON encoding of the DTO and the network.
+func (h *evHarness) flowRequest(owner uuid.UUID, win analytics.Window) func(ctx context.Context) error {
+	kinds := runkind.All()
+	return func(ctx context.Context) error {
+		return store.RunAnalyticsSnapshot(ctx, h.pool, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
+			var hist pgtype.Timestamptz
+			var err error
+			if owner != uuid.Nil {
+				hist, err = s.Q.AnalyticsOwnerHistoryStart(ctx, store.AnalyticsOwnerHistoryStartParams{UserID: owner, Kinds: kinds})
+			} else {
+				hist, err = s.Q.AnalyticsAllHistoryStart(ctx, store.AnalyticsAllHistoryStartParams{Kinds: kinds})
+			}
+			if err != nil {
+				return err
+			}
+			var earliest *time.Time
+			if hist.Valid {
+				e := hist.Time
+				earliest = &e
+			}
+			b, err := analytics.ComputeBounds(h.now, time.UTC, win, earliest)
+			if err != nil {
+				return err
+			}
+			var raw []byte
+			if owner != uuid.Nil {
+				raw, err = s.Q.AnalyticsOwnerFlow(ctx, store.AnalyticsOwnerFlowParams{
+					UserID: owner, Now: spendTS(b.Now), From: spendTS(b.From),
+					BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
+					HistogramEdges: store.FlowHistogramEdgesSeconds, MinPercentileN: store.FlowMinPercentileN, Kinds: kinds,
+				})
+			} else {
+				raw, err = s.Q.AnalyticsAllFlow(ctx, store.AnalyticsAllFlowParams{
+					Now: spendTS(b.Now), From: spendTS(b.From),
+					BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
+					HistogramEdges: store.FlowHistogramEdgesSeconds, MinPercentileN: store.FlowMinPercentileN, Kinds: kinds,
+				})
+			}
+			if err != nil {
+				return err
+			}
+			_, err = store.DecodeAnalyticsFlowDoc(raw)
+			return err
+		})
+	}
+}
+
+func (h *evHarness) flowWorkloads() []flWorkload {
 	var median uuid.UUID
 	h.scalar(`SELECT user_id FROM (SELECT user_id, row_number() OVER (ORDER BY count(*) DESC, user_id) rk FROM runs GROUP BY user_id) x WHERE rk = 100`, &median)
-	var all []evWorkload
+	var all []flWorkload
 	for _, o := range []struct {
 		label string
 		id    uuid.UUID
@@ -307,7 +367,7 @@ func (h *evHarness) flowWorkloads() []evWorkload {
 	if only == "" {
 		return all
 	}
-	var out []evWorkload
+	var out []flWorkload
 	for _, w := range all {
 		for _, f := range strings.Split(only, ",") {
 			if f != "" && strings.Contains(w.name, f) {
@@ -324,6 +384,8 @@ type flRecorder struct {
 	h      *evHarness
 	rows   []flRow
 	phases []string
+	// requestRows are the formatted request-path summary rows.
+	requestRows []string
 }
 
 type flRow struct {
@@ -410,7 +472,16 @@ func (r *flRecorder) timing(phase string, w evWorkload, mode string, tm evTiming
 }
 
 func (r *flRecorder) table() {
+	if len(r.requestRows) > 0 {
+		r.h.logf("\n#### SUMMARY [%s]: ms (requests | timeouts | first | median / p95 | max); excludes HTTP, auth middleware, JSON encoding of the DTO and network", flRequestPhase)
+		for _, row := range r.requestRows {
+			r.h.logf("%s", row)
+		}
+	}
 	for _, phase := range r.phases {
+		if phase == flRequestPhase {
+			continue
+		}
 		r.h.logf("\n#### SUMMARY [%s]: median / p95 ms (custom | generic)", phase)
 		type cell struct{ med, p95 float64 }
 		by := map[string]map[string]cell{}
@@ -429,6 +500,50 @@ func (r *flRecorder) table() {
 			c, g := by[n]["custom"], by[n]["generic"]
 			r.h.logf("| %-46s | %9.1f / %9.1f | %9.1f / %9.1f |", n, c.med, c.p95, g.med, g.p95)
 		}
+	}
+}
+
+// flRequestPhase is the phase name of the request-path timings.
+const flRequestPhase = "request-path"
+
+// requestPhase times flowRequest per workload on the pool with pgx's default statement cache.
+// Every request runs from the first one, with no warm-up and no forced plan_cache_mode, so the
+// cache's switch from custom to generic plans (after five executions, when costed cheaper) is
+// inside the sample. Each workload runs max(UZI_EVIDENCE_RUNS, 12) requests. A 57014 or any
+// other timeout is a test failure; the sample is kept either way.
+func (r *flRecorder) requestPhase(workloads []flWorkload) {
+	h := r.h
+	n := max(h.runs, 12)
+	h.logf("\n######## FLOW REQUEST PATH: RunAnalyticsSnapshot (8s statement_timeout, jit=off) + history start + Flow statement + DecodeAnalyticsFlowDoc; pool, default statement cache, %d requests per workload, no warm-up ########", n)
+	h.logf("EXCLUDES: HTTP, auth middleware, JSON encoding of the DTO, network.")
+	for _, w := range workloads {
+		durs := make([]time.Duration, 0, n)
+		timeouts := 0
+		for i := 0; i < n; i++ {
+			start := time.Now()
+			err := w.request(h.ctx)
+			d := time.Since(start)
+			durs = append(durs, d)
+			if err != nil {
+				if errors.Is(store.ClassifyAnalyticsErr(err), store.ErrAnalyticsTimeout) {
+					timeouts++
+					h.t.Errorf("request path %s request %d: 57014 / analytics timeout after %.1fms: %v", w.name, i+1, ms(d), err)
+				} else {
+					h.t.Errorf("request path %s request %d: %v", w.name, i+1, err)
+				}
+			}
+		}
+		first := durs[0]
+		sort.Slice(durs, func(i, j int) bool { return durs[i] < durs[j] })
+		tm := evTiming{n: len(durs), max: durs[len(durs)-1], p95: durs[int(math.Ceil(0.95*float64(len(durs))))-1]}
+		if len(durs)%2 == 1 {
+			tm.median = durs[len(durs)/2]
+		} else {
+			tm.median = (durs[len(durs)/2-1] + durs[len(durs)/2]) / 2
+		}
+		h.logf("TIMING %s %s n=%d timeouts=%d first=%.1fms median=%.1fms p95=%.1fms max=%.1fms", flRequestPhase, w.name, tm.n, timeouts, ms(first), ms(tm.median), ms(tm.p95), ms(tm.max))
+		r.timing(flRequestPhase, w.evWorkload, "request", tm)
+		r.requestRows = append(r.requestRows, fmt.Sprintf("| %-46s | %3d | %2d | %9.1f | %9.1f / %9.1f | %9.1f |", w.name, tm.n, timeouts, ms(first), ms(tm.median), ms(tm.p95), ms(tm.max)))
 	}
 }
 
@@ -462,8 +577,11 @@ func TestAnalyticsFlowPlanEvidenceLiveDB(t *testing.T) {
 	if os.Getenv("UZI_EVIDENCE_BASELINE") != "0" {
 		h.logf("\n######## FLOW BASELINE (no candidate index) ########")
 		for _, w := range workloads {
-			h.measure("baseline", w, h.modes, true)
+			h.measure("baseline", w.evWorkload, h.modes, true)
 		}
+	}
+	if os.Getenv("UZI_EVIDENCE_REQUEST") != "0" {
+		rec.requestPhase(workloads)
 	}
 	// Candidate indexes are optional extras judged on the shipped statements; UZI_EVIDENCE_INDEXES
 	// selects them (default none, "1,2,3" runs every candidate set).
@@ -492,7 +610,7 @@ func TestAnalyticsFlowPlanEvidenceLiveDB(t *testing.T) {
 			h.logf("CREATE INDEX + ANALYZE took %s; %s size %d bytes", time.Since(start).Round(time.Millisecond), nm, size)
 		}
 		for _, w := range workloads {
-			h.measure("idx"+strconv.Itoa(n), w, h.modes, true, names...)
+			h.measure("idx"+strconv.Itoa(n), w.evWorkload, h.modes, true, names...)
 		}
 		dropIndexes(h.simple)
 		h.simple(`ANALYZE runs`)

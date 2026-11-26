@@ -716,6 +716,207 @@ func TestAnalyticsFlowAllTimeCoarseBucketsLiveDB(t *testing.T) {
 	}
 }
 
+// seedDSTRun seeds one completed issue run created at c that started at c and finished at
+// fin, so it lands in the created, finished and issue_elapsed series.
+func seedDSTRun(f *spendFixture, owner, repo uuid.UUID, c, fin time.Time) {
+	id := f.run(spendRun{Owner: owner, Repo: repo, At: c, Finished: fin})
+	f.patch(id, "first_started_at = $2", c)
+}
+
+// TestAnalyticsFlowLocalDSTBoundariesLiveDB pins the Flow created, finished and issue_elapsed
+// series around America/New_York transitions to literal instants and bucket days: the
+// 23-hour 2033-03-13 day (spring forward, 02:00 EST -> 03:00 EDT at 07:00Z) and the 25-hour
+// 2033-11-06 day (fall back, 02:00 EDT -> 01:00 EST at 06:00Z).
+func TestAnalyticsFlowLocalDSTBoundariesLiveDB(t *testing.T) {
+	type seed struct {
+		created, finished time.Time
+		createdDay        int // day of the month of the bucket the run was created in
+		finishedDay       int
+	}
+	cases := []struct {
+		name        string
+		month       time.Month
+		now         time.Time
+		firstDay    int // the day of the first bucket; buckets are consecutive days
+		transition  int // the day with the transition
+		wantStart   time.Time
+		wantEnd     time.Time
+		wantHours   int
+		seeds       []seed
+		createdWant map[int]int64
+		finishWant  map[int]int64
+	}{
+		{
+			name: "spring forward 23-hour day", month: time.March, now: utcAt(2033, time.March, 15, 12, 0, 0),
+			firstDay: 9, transition: 13,
+			wantStart: utcAt(2033, time.March, 13, 5, 0, 0), wantEnd: utcAt(2033, time.March, 14, 4, 0, 0), wantHours: 23,
+			seeds: []seed{
+				// just before and at local midnight starting the transition day (00:00 EST = 05:00Z)
+				{utcAt(2033, time.March, 13, 4, 59, 59), utcAt(2033, time.March, 13, 5, 0, 0), 12, 13},
+				// just before the skipped hour (01:59:59 EST) and its end (03:00:00 EDT)
+				{utcAt(2033, time.March, 13, 5, 0, 0), utcAt(2033, time.March, 13, 6, 59, 59), 13, 13},
+				{utcAt(2033, time.March, 13, 6, 59, 59), utcAt(2033, time.March, 13, 7, 0, 0), 13, 13},
+				// first instant after the skipped hour; finished the last second of the day
+				{utcAt(2033, time.March, 13, 7, 0, 0), utcAt(2033, time.March, 14, 3, 59, 59), 13, 13},
+				// across local midnight ending the transition day (00:00 EDT = 04:00Z)
+				{utcAt(2033, time.March, 14, 3, 59, 59), utcAt(2033, time.March, 14, 4, 0, 0), 13, 14},
+				{utcAt(2033, time.March, 14, 4, 0, 0), utcAt(2033, time.March, 14, 4, 0, 1), 14, 14},
+				// UTC midnights fall on the previous local evening
+				{utcAt(2033, time.March, 13, 0, 0, 0), utcAt(2033, time.March, 14, 0, 0, 0), 12, 13},
+			},
+			createdWant: map[int]int64{12: 2, 13: 4, 14: 1},
+			finishWant:  map[int]int64{13: 5, 14: 2},
+		},
+		{
+			name: "fall back 25-hour day", month: time.November, now: utcAt(2033, time.November, 8, 12, 0, 0),
+			firstDay: 2, transition: 6,
+			wantStart: utcAt(2033, time.November, 6, 4, 0, 0), wantEnd: utcAt(2033, time.November, 7, 5, 0, 0), wantHours: 25,
+			seeds: []seed{
+				// local midnight starting the transition day (00:00 EDT = 04:00Z)
+				{utcAt(2033, time.November, 6, 3, 59, 59), utcAt(2033, time.November, 6, 4, 0, 0), 5, 6},
+				// inside the repeated hour: 01:30 EDT (05:30Z) and 01:30 EST (06:30Z)
+				{utcAt(2033, time.November, 6, 4, 0, 0), utcAt(2033, time.November, 6, 5, 30, 0), 6, 6},
+				{utcAt(2033, time.November, 6, 5, 30, 0), utcAt(2033, time.November, 6, 6, 30, 0), 6, 6},
+				{utcAt(2033, time.November, 6, 6, 30, 0), utcAt(2033, time.November, 7, 4, 59, 59), 6, 6},
+				// across local midnight ending the 25-hour day (00:00 EST = 05:00Z)
+				{utcAt(2033, time.November, 7, 4, 59, 59), utcAt(2033, time.November, 7, 5, 0, 0), 6, 7},
+				{utcAt(2033, time.November, 7, 5, 0, 0), utcAt(2033, time.November, 7, 5, 0, 1), 7, 7},
+				// UTC midnights fall on the previous local evening
+				{utcAt(2033, time.November, 6, 2, 0, 0), utcAt(2033, time.November, 7, 2, 0, 0), 5, 6},
+			},
+			createdWant: map[int]int64{5: 2, 6: 4, 7: 1},
+			finishWant:  map[int]int64{6: 5, 7: 2},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newSpendFixture(t)
+			o := f.owner("flowdst")
+			repo, _ := f.repo(o, "flowdst")
+			for _, s := range c.seeds {
+				seedDSTRun(f, o.User, repo, s.created, s.finished)
+			}
+			res := f.flow(flowCall{Owner: o.User, Now: c.now, Zone: "America/New_York"})
+			bk := res.Bounds.Buckets
+			if len(bk) != 7 {
+				t.Fatalf("bounds buckets = %d, want 7", len(bk))
+			}
+			d := res.Doc
+			if len(d.Activity.Created.Buckets) != len(bk) || len(d.Activity.Finished.Buckets) != len(bk) || len(d.IssueElapsed.Buckets) != len(bk) {
+				t.Fatalf("cells: created %d finished %d elapsed %d, want %d each", len(d.Activity.Created.Buckets),
+					len(d.Activity.Finished.Buckets), len(d.IssueElapsed.Buckets), len(bk))
+			}
+			for i, b := range bk {
+				if want := (analytics.Date{Year: 2033, Month: c.month, Day: c.firstDay + i}); b.Label != want {
+					t.Errorf("bucket %d label = %s, want %s", i, b.Label, want)
+				}
+				if b.Label.Day == c.transition {
+					if !b.Start.Equal(c.wantStart) || !b.End.Equal(c.wantEnd) || b.End.Sub(b.Start) != time.Duration(c.wantHours)*time.Hour {
+						t.Errorf("transition bucket = [%s, %s), want [%s, %s) (%d hours)", b.Start, b.End, c.wantStart, c.wantEnd, c.wantHours)
+					}
+				}
+			}
+			var createdTotal, finishedTotal int64
+			for i := range bk {
+				day := c.firstDay + i
+				wc, wf := c.createdWant[day], c.finishWant[day]
+				createdTotal += wc
+				finishedTotal += wf
+				if cell := d.Activity.Created.Buckets[i]; cell.Index != i || cell.Count != wc {
+					t.Errorf("day %d created = %+v, want %d", day, cell, wc)
+				}
+				if cell := d.Activity.Finished.Buckets[i]; cell.Index != i || cell.Completed != wf || cell.Total != wf {
+					t.Errorf("day %d finished = %+v, want %d completed", day, cell, wf)
+				}
+				if cell := d.IssueElapsed.Buckets[i]; cell.Index != i || cell.N != wc || cell.Unfinished != 0 || cell.Invalid != 0 {
+					t.Errorf("day %d issue_elapsed = %+v, want n %d", day, cell, wc)
+				}
+			}
+			if d.Activity.Created.Total != createdTotal || d.Activity.Finished.Total.Total != finishedTotal || d.IssueElapsed.N != createdTotal {
+				t.Errorf("totals created %d finished %d elapsed %d, want %d / %d / %d", d.Activity.Created.Total,
+					d.Activity.Finished.Total.Total, d.IssueElapsed.N, createdTotal, finishedTotal, createdTotal)
+			}
+		})
+	}
+
+	// window=all: week-coarsened buckets across years of New York transitions. Runs sit on
+	// either side of every bucket edge whose width is not a whole number of 24-hour days.
+	t.Run("window all week-coarsened buckets across transitions", func(t *testing.T) {
+		f := newSpendFixture(t)
+		o := f.owner("flowdstall")
+		repo, _ := f.repo(o, "flowdstall")
+		loc, err := time.LoadLocation("America/New_York")
+		if err != nil {
+			t.Fatal(err)
+		}
+		anchor := utcAt(2031, time.January, 6, 15, 0, 0)
+		f.run(spendRun{Owner: o.User, Repo: repo, Status: "running", At: anchor})
+		b := f.bounds(spendCall{Owner: o.User, Now: flowNow, Zone: "America/New_York", Window: analytics.WindowAll})
+		if b.WidthWeeks < 2 {
+			t.Fatalf("expected coarse buckets, width = %d weeks", b.WidthWeeks)
+		}
+		var odd int
+		for i, bk := range b.Buckets {
+			// Every bucket starts at a local midnight on its Monday label.
+			ls := bk.Start.In(loc)
+			if ls.Hour() != 0 || ls.Minute() != 0 || ls.Second() != 0 || analytics.DateOf(bk.Start, loc) != bk.Label || bk.Label.Weekday() != time.Monday {
+				t.Errorf("bucket %d starts %s (%s), want local Monday midnight of label %s", i, bk.Start, ls, bk.Label)
+			}
+			if i > 0 && !b.Buckets[i-1].End.Equal(bk.Start) {
+				t.Errorf("bucket %d does not start where %d ends", i, i-1)
+			}
+			if bk.End.Sub(bk.Start) != time.Duration(b.WidthWeeks)*7*24*time.Hour {
+				odd++
+			}
+		}
+		if odd < 4 {
+			t.Fatalf("only %d buckets contain a transition", odd)
+		}
+		wantCreated := make([]int64, len(b.Buckets))
+		wantFinished := make([]int64, len(b.Buckets))
+		wantCreated[bucketIndexOf(b, anchor)]++
+		for _, bk := range b.Buckets {
+			if bk.End.Sub(bk.Start) == time.Duration(b.WidthWeeks)*7*24*time.Hour || !bk.End.Before(flowNow) {
+				continue
+			}
+			for _, at := range []time.Time{bk.Start.Add(-time.Second), bk.Start, bk.End.Add(-time.Second)} {
+				ci := bucketIndexOf(b, at)
+				if ci < 0 {
+					continue // before the history start: seeding it would move the history start
+				}
+				fin := at.Add(time.Hour)
+				seedDSTRun(f, o.User, repo, at, fin)
+				wantCreated[ci]++
+				if i := bucketIndexOf(b, fin); i >= 0 {
+					wantFinished[i]++
+				}
+			}
+		}
+		res := f.flow(flowCall{Owner: o.User, Zone: "America/New_York", Window: analytics.WindowAll})
+		d := res.Doc
+		if len(res.Bounds.Buckets) != len(b.Buckets) || len(d.Activity.Created.Buckets) != len(b.Buckets) ||
+			len(d.Activity.Finished.Buckets) != len(b.Buckets) || len(d.IssueElapsed.Buckets) != len(b.Buckets) {
+			t.Fatalf("cells: created %d finished %d elapsed %d, want %d", len(d.Activity.Created.Buckets),
+				len(d.Activity.Finished.Buckets), len(d.IssueElapsed.Buckets), len(b.Buckets))
+		}
+		for i := range b.Buckets {
+			if got := d.Activity.Created.Buckets[i]; got.Index != i || got.Count != wantCreated[i] {
+				t.Errorf("bucket %d (%s) created = %+v, want %d", i, b.Buckets[i].Label, got, wantCreated[i])
+			}
+			if got := d.Activity.Finished.Buckets[i]; got.Index != i || got.Completed != wantFinished[i] {
+				t.Errorf("bucket %d (%s) finished = %+v, want %d", i, b.Buckets[i].Label, got, wantFinished[i])
+			}
+			wantN := wantCreated[i]
+			if i == 0 {
+				wantN-- // the anchor run is unfinished
+			}
+			if got := d.IssueElapsed.Buckets[i]; got.Index != i || got.N != wantN {
+				t.Errorf("bucket %d (%s) elapsed = %+v, want n %d", i, b.Buckets[i].Label, got, wantN)
+			}
+		}
+	})
+}
+
 // TestAnalyticsFlowAllScopeLiveDB: the all-users statement counts every user and a merge
 // witnessed by any user.
 func TestAnalyticsFlowAllScopeLiveDB(t *testing.T) {
