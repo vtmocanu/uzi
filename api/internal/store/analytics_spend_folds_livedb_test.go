@@ -364,6 +364,10 @@ func TestAnalyticsSpendFoldsByteEqualLiveDB(t *testing.T) {
 func TestAnalyticsSpendFoldsRefoldLiveDB(t *testing.T) {
 	fx := seedFoldSpend(t, 2006)
 	fx.materialize(t, fx.eligible)
+	// Non-vacuity: the run must start fresh (stored path), or the stale check below proves nothing.
+	if n := fx.stateRows(t, []uuid.UUID{fx.fresh}, true); n != 1 {
+		t.Fatalf("the run to refold is not fresh after materializing (fresh rows = %d, want 1)", n)
+	}
 	before := fx.docs(t)
 
 	arg := upsertArg(t, fx.fresh, "s-refold", "model-refold", 0, 5000)
