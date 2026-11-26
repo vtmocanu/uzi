@@ -42,7 +42,7 @@ import { chromium } from "playwright";
 import { build } from "vite";
 import { createModuleConfig } from "../examples/ui-module/vite.config.ts";
 import { chromiumLaunchOptions } from "./browser-launch.mjs";
-import { childGroupRows, flushThenExit, launchPhaseProblem } from "./modules-browser-groups.mjs";
+import { childGroupRows, flushThenExit, launchPhaseProblem, waitForLeader } from "./modules-browser-groups.mjs";
 import { federationOnlyFiles, ManifestShapeError, zeroModuleRequestViolations, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
 
 const WEB_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -388,18 +388,13 @@ async function selftestChild() {
     launching.catch(() => {
       launchFailed = true;
     });
-    const end = Date.now() + 10000;
-    let led = false;
-    while (!launchFailed && Date.now() < end) {
-      if (childGroupRowsOrBroken(process.pid).length > 0) {
-        led = true;
-        break;
-      }
-      await sleep(10);
-    }
-    if (launchFailed) await launching;
+    const seen = await waitForLeader({
+      hasLeader: () => childGroupRowsOrBroken(process.pid).length > 0,
+      launchFailed: () => launchFailed,
+    });
+    if (seen === "failed") await launching;
     // Announce only once a browser group leader was actually seen.
-    if (!led) throw new InstrumentError("the browser never appeared as a group-leading child within 10 s of the launch");
+    if (seen !== "leader") throw new InstrumentError("the browser never appeared as a group-leading child within 10 s of the launch");
     console.log(`LAUNCHING ports=${[...ports].join(",")}`);
     await launching;
     // Not signalled: the wrapper reports it; stay alive so it can.

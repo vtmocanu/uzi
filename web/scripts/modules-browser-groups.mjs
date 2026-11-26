@@ -81,3 +81,21 @@ export function flushThenExit(code, { stream = process.stdout, deadlineMs = 2000
     finish();
   }
 }
+
+/**
+ * The launch-phase wait: poll until a group-leading browser child is seen, the launch fails,
+ * or the deadline passes. The launch failure is checked first so a rejection that lands while
+ * the poll sleeps ends it at once.
+ *
+ * @param {{hasLeader: () => boolean, launchFailed: () => boolean, deadlineMs?: number, intervalMs?: number, sleep?: (ms: number) => Promise<void>, now?: () => number}} opts
+ * @returns {Promise<"leader"|"failed"|"timeout">}
+ */
+export async function waitForLeader({ hasLeader, launchFailed, deadlineMs = 10000, intervalMs = 10, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
+  const end = now() + deadlineMs;
+  for (;;) {
+    if (launchFailed()) return "failed";
+    if (hasLeader()) return "leader";
+    if (now() >= end) return "timeout";
+    await sleep(intervalMs);
+  }
+}

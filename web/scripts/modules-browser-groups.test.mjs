@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { childGroupRows, flushThenExit, launchPhaseProblem } from "./modules-browser-groups.mjs";
+import { childGroupRows, flushThenExit, launchPhaseProblem, waitForLeader } from "./modules-browser-groups.mjs";
 
 const ps = (...lines) => () => ({ status: 0, stdout: `${lines.join("\n")}\n`, stderr: "" });
 
@@ -116,5 +116,43 @@ flushThenExit(143);`;
     assert.equal(code, 143);
     assert.ok(out.length >= 1 << 20);
     assert.ok(out.trimEnd().endsWith("MARKER-END"));
+  });
+});
+
+describe("waitForLeader", () => {
+  // A fake clock: each sleep advances it, so the deadline is reached without real waiting.
+  const clock = () => {
+    let t = 0;
+    return { now: () => t, sleep: async (ms) => void (t += ms) };
+  };
+
+  it("returns leader once a group-leading child is seen, not before", async () => {
+    const c = clock();
+    let polls = 0;
+    const r = await waitForLeader({ hasLeader: () => ++polls >= 3, launchFailed: () => false, ...c });
+    assert.equal(r, "leader");
+    assert.equal(polls, 3);
+  });
+
+  it("returns timeout when no leader appears by the deadline (never announces without one)", async () => {
+    const c = clock();
+    const r = await waitForLeader({ hasLeader: () => false, launchFailed: () => false, deadlineMs: 100, intervalMs: 10, ...c });
+    assert.equal(r, "timeout");
+  });
+
+  it("ends the poll as soon as the launch fails mid-poll", async () => {
+    const c = clock();
+    let polls = 0;
+    let failed = false;
+    const r = await waitForLeader({
+      hasLeader: () => {
+        if (++polls === 2) failed = true;
+        return false;
+      },
+      launchFailed: () => failed,
+      ...c,
+    });
+    assert.equal(r, "failed");
+    assert.equal(polls, 2);
   });
 });
