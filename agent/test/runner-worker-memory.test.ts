@@ -1226,8 +1226,8 @@ test("refusal at the observer level: a clean entry after the deadline is accepte
   const { failures, facts, entryAt, deadline } = await probeRefusal(false);
   assert.ok(entryAt >= deadline);
   assert.ok(facts.includes('"class":"expired"'), facts);
-  assert.deepEqual(failures.filter(m => /pre-operation refusal|delayed feedback expected/.test(m)), [], JSON.stringify(failures));
   assert.ok(!failures.includes(MIXED_CUSTODY_MSG), JSON.stringify(failures));
+  assert.deepEqual(failures.filter(m => /pre-operation refusal|delayed feedback expected/.test(m)), [], JSON.stringify(failures));
 });
 
 test("refusal at the observer level: a hold custody operation plus an expired refusal is rejected", async () => {
@@ -1264,7 +1264,7 @@ test("refusal at the observer level: a hold custody operation plus an expired re
   const holds = obs.custodyRecords().filter(c => c.kind === "hold");
   assert.equal(holds.length, 1, "exactly one hold custody record");
   assert.equal(holds[0]!.entered, true);
-  assert.ok(holds[0]!.outcome?.kind !== "abort" && holds[0]!.outcome?.kind !== "rejected-before-action", JSON.stringify(holds[0]!.outcome));
+  assert.equal(holds[0]!.outcome?.kind, "settled-without-abort", JSON.stringify(holds[0]!.outcome));
   const refusals = obs.preOpRefusalRecords();
   assert.equal(refusals.length, 1, "exactly one pre-operation refusal");
   assert.equal(refusals[0]!.clean, true, JSON.stringify(refusals[0]));
@@ -1275,7 +1275,8 @@ test("refusal at the observer level: a hold custody operation plus an expired re
 });
 
 test("refusal at the observer level: a non-deadline predicate set at entry is dirty even after the deadline", async () => {
-  const { failures, facts } = await probeRefusal(false, flight => { flight.steering.getPauseMode = () => "pause"; });
+  const { failures, facts, entryAt, deadline } = await probeRefusal(false, flight => { flight.steering.getPauseMode = () => "pause"; });
+  assert.ok(entryAt >= deadline, `recorded entry ${entryAt} is at or after the deadline ${deadline}`);
   assert.ok(facts.includes('"class":"dirty"'), facts);
   assert.ok(failures.some(m => /non-deadline predicate set at entry.*pause mode/.test(m)), JSON.stringify(failures));
 });
