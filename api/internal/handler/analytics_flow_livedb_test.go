@@ -407,6 +407,53 @@ func TestAnalyticsFlowAdmissionReleasedOnEveryExitLiveDB(t *testing.T) {
 	}
 }
 
+// A valid non-UTC tz reaches the calendar through the Flow handler: the buckets start at local
+// midnights (including the 23h spring-forward day) and a run created at 23:30 local, which is
+// already the next UTC day, lands in the local day's created cell.
+func TestAnalyticsFlowLocalTimezoneLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2047)
+	owner := f.user(false)
+	repo, _ := f.repoOwnedBy(owner, "ftz")
+	// 2047-03-10 is the second Sunday of March: New York springs forward that day.
+	f.now = time.Date(2047, 3, 12, 12, 0, 0, 0, time.UTC)
+	// 03:30Z on Mar 12 is 23:30 EDT on Mar 11: UTC says the 12th, New York the 11th.
+	anSeedFlowRun(t, f.pool, anFlowRun{user: owner, repo: repo, status: "queued", at: time.Date(2047, 3, 12, 3, 30, 0, 0, time.UTC)})
+
+	dto := anDecodeFlow(t, f.cookie(owner, "/api/analytics/flow?window=7d&tz=America/New_York"))
+	if dto.Timezone != "America/New_York" {
+		t.Fatalf("timezone = %q, want America/New_York", dto.Timezone)
+	}
+	wantStarts := []time.Time{
+		time.Date(2047, 3, 6, 5, 0, 0, 0, time.UTC), time.Date(2047, 3, 7, 5, 0, 0, 0, time.UTC),
+		time.Date(2047, 3, 8, 5, 0, 0, 0, time.UTC), time.Date(2047, 3, 9, 5, 0, 0, 0, time.UTC),
+		time.Date(2047, 3, 10, 5, 0, 0, 0, time.UTC), // EST midnight; the day is 23h long
+		time.Date(2047, 3, 11, 4, 0, 0, 0, time.UTC), // EDT midnights from here on
+		time.Date(2047, 3, 12, 4, 0, 0, 0, time.UTC),
+	}
+	if len(dto.Buckets) != len(wantStarts) {
+		t.Fatalf("%d buckets, want %d", len(dto.Buckets), len(wantStarts))
+	}
+	for i, w := range wantStarts {
+		if !dto.Buckets[i].Start.Equal(w) {
+			t.Fatalf("bucket %d starts %s, want %s", i, dto.Buckets[i].Start.UTC(), w)
+		}
+	}
+	if d := dto.Buckets[4].End.Sub(dto.Buckets[4].Start); d != 23*time.Hour {
+		t.Fatalf("transition bucket spans %s, want 23h", d)
+	}
+	if dto.Activity.Created.Total != 1 {
+		t.Fatalf("created total = %d, want 1", dto.Activity.Created.Total)
+	}
+	got := map[int]int64{}
+	for _, c := range dto.Activity.Created.Buckets {
+		got[c.Index] = c.Count
+	}
+	// Index 5 is the local Mar 11 day; the UTC calendar would put the run in index 6.
+	if got[5] != 1 || got[6] != 0 {
+		t.Fatalf("created cells = %v, want the run in index 5 only", got)
+	}
+}
+
 // The snapshot barrier: a run committed on another connection after the first read is not seen
 // by the in-flight response and is seen by the next request.
 func TestAnalyticsFlowSnapshotBarrierLiveDB(t *testing.T) {

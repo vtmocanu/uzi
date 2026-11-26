@@ -294,11 +294,14 @@ type flWorkload struct {
 	request func(ctx context.Context) error
 }
 
-// flowRequest is what one Flow request does on the database side, end to end:
+// flowRequest is what one Flow request does on the database side:
 // store.RunAnalyticsSnapshot (REPEATABLE READ READ ONLY, its real 8 s deadline, statement_timeout
-// = 8s and jit = off) around the history-start query, ComputeBounds, the Flow statement and
-// store.DecodeAnalyticsFlowDoc. It runs on the pool, so pgx's default statement cache applies.
-// It excludes HTTP, auth middleware, JSON encoding of the DTO and the network.
+// = 8s and jit = off) around the history-start query, ComputeBounds (in UTC, not the caller's
+// zone), the Flow statement and store.DecodeAnalyticsFlowDoc. It runs on the pool, so pgx's
+// default statement cache applies. It excludes HTTP, auth middleware, admission
+// (deps.admission.Acquire), in-snapshot authorization (tz-name check, AnalyticsUserExists for an
+// admin user=<uuid>, repo checks), the DTO mapping (mapAnalyticsFlow), JSON encoding of the DTO
+// and the network.
 func (h *evHarness) flowRequest(owner uuid.UUID, win analytics.Window) func(ctx context.Context) error {
 	kinds := runkind.All()
 	return func(ctx context.Context) error {
@@ -473,7 +476,7 @@ func (r *flRecorder) timing(phase string, w evWorkload, mode string, tm evTiming
 
 func (r *flRecorder) table() {
 	if len(r.requestRows) > 0 {
-		r.h.logf("\n#### SUMMARY [%s]: ms (requests | timeouts | first | median / p95 | max); excludes HTTP, auth middleware, JSON encoding of the DTO and network", flRequestPhase)
+		r.h.logf("\n#### SUMMARY [%s]: ms (requests | timeouts | first | median / p95 | max); excludes HTTP, auth middleware, admission, in-snapshot authorization, DTO mapping, JSON encoding of the DTO and network", flRequestPhase)
 		for _, row := range r.requestRows {
 			r.h.logf("%s", row)
 		}
@@ -507,15 +510,17 @@ func (r *flRecorder) table() {
 const flRequestPhase = "request-path"
 
 // requestPhase times flowRequest per workload on the pool with pgx's default statement cache.
-// Every request runs from the first one, with no warm-up and no forced plan_cache_mode, so the
-// cache's switch from custom to generic plans (after five executions, when costed cheaper) is
-// inside the sample. Each workload runs max(UZI_EVIDENCE_RUNS, 12) requests. A 57014 or any
-// other timeout is a test failure; the sample is kept either way.
+// The requests run on a warm pooled connection: by default the baseline phase has already run
+// through the same pool and statement cache, so the prepared statements exist and their plan
+// choice is settled (workloads that share a statement share one prepared statement). No
+// plan_cache_mode is forced, so any generic plan in use is whatever Postgres auto mode chose.
+// Each workload runs max(UZI_EVIDENCE_RUNS, 12) requests. A 57014 or any other timeout is a
+// test failure; the sample is kept either way.
 func (r *flRecorder) requestPhase(workloads []flWorkload) {
 	h := r.h
 	n := max(h.runs, 12)
-	h.logf("\n######## FLOW REQUEST PATH: RunAnalyticsSnapshot (8s statement_timeout, jit=off) + history start + Flow statement + DecodeAnalyticsFlowDoc; pool, default statement cache, %d requests per workload, no warm-up ########", n)
-	h.logf("EXCLUDES: HTTP, auth middleware, JSON encoding of the DTO, network.")
+	h.logf("\n######## FLOW REQUEST PATH: RunAnalyticsSnapshot (8s statement_timeout, jit=off) + history start + Flow statement + DecodeAnalyticsFlowDoc; pool, default statement cache, %d requests per workload ########", n)
+	h.logf("EXCLUDES: HTTP, auth middleware, admission, in-snapshot authorization, DTO mapping, JSON encoding of the DTO, network. Bounds are computed in UTC.")
 	for _, w := range workloads {
 		durs := make([]time.Duration, 0, n)
 		timeouts := 0

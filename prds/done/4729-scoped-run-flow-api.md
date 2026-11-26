@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [x] M1 owner/admin Flow diagnostics (LiveDB store and handler tests ran with 0 skips; the 120k evidence harness ran, including a DB-side request-path phase; HTTP, auth middleware, DTO JSON encoding and network were not measured, see section 8)
+- [x] M1 owner/admin Flow diagnostics (LiveDB store and handler tests ran with 0 skips; the 120k evidence harness ran, including a DB-side request-path phase; HTTP, auth middleware, admission, in-snapshot authorization, the DTO mapping, DTO JSON encoding and network were not measured, see section 8)
 
 ## 1. Problem
 
@@ -104,11 +104,12 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 - The Flow statements are set-based and bounded under both custom and generic plans: no `run_messages` access, and no Seq Scan on `run_user_inputs` or `run_gate_presentations` in any measured plan (the harness asserts no `run_messages` access and no such Seq Scan; `TestAnalyticsFlowGenericPlanShapeLiveDB` asserts only that the receipt CTEs are not re-read per outer row under a generic plan).
 - Owner and admin Flow LiveDB cases in `store` and `handler` ran with 0 skips.
 - Local DST boundaries: `TestAnalyticsFlowLocalDSTBoundariesLiveDB` (`api/internal/store/analytics_flow_livedb_test.go`) runs in `America/New_York` and covers the 23-hour spring-forward day 2033-03-13, the 25-hour fall-back day 2033-11-06 and a week-coarsened `window=all` spanning several transitions. A mutant that passes UTC-computed bucket arrays fails all three subtests.
+- Handler timezone wiring: `TestAnalyticsFlowLocalTimezoneLiveDB` (`api/internal/handler/analytics_flow_livedb_test.go`) requests `tz=America/New_York` through the real router over the 2047-03-10 spring-forward day, asserts `timezone`, the local-midnight bucket starts (including the 23-hour bucket) and that a run created at 23:30 local, already the next UTC day, lands in the local day's created cell. A mutant passing `time.UTC` to `analytics.ComputeBounds` in the Flow handler fails it.
 - Statement-level timings and DB-side request-path timings on the 120k seed are in section 8.
 
 **Still unverified.**
 
-- End-to-end production request latency: the DB-side request path was measured (section 8), but HTTP, auth middleware, DTO JSON encoding and network were excluded.
+- End-to-end production request latency: the DB-side request path was measured (section 8), but HTTP, auth middleware, admission, in-snapshot authorization, the DTO mapping, DTO JSON encoding and network were excluded, and bounds were computed in UTC.
 - Production table sizes and the per-run `run_user_inputs` fan-out: the seed has 3.1 inputs per run (373,446 over 120,000) and 0.45 `approve_plan` receipts per run, which may differ from production.
 - Retained legacy evidence coverage in production (how many real runs have only `unbound` or `NULL`-binding receipts), and the suite and CI job-time impact, which is a landing obligation measured on the PR.
 
@@ -156,7 +157,7 @@ Every candidate stayed under the 8% bar, so no index migration ships.
 
 **Regression guard.** `TestAnalyticsFlowGenericPlanShapeLiveDB` fails on the old SQL (receipt CTE re-read per outer row) and passes on the shipped statement.
 
-**DB-side request path.** A `request-path` phase of the harness times `store.RunAnalyticsSnapshot` (8 s `statement_timeout`, `jit=off`) around the history-start query, `ComputeBounds`, the Flow statement and `DecodeAnalyticsFlowDoc`, on the pool with pgx's default statement cache. There is no warm-up and each workload makes 20 requests, so the switch to a generic plan falls inside the sample, and a timeout fails the test. Seed as above. Set `UZI_EVIDENCE_REQUEST=0` to skip the phase.
+**DB-side request path.** A `request-path` phase of the harness times `store.RunAnalyticsSnapshot` (8 s `statement_timeout`, `jit=off`) around the history-start query, `ComputeBounds`, the Flow statement and `DecodeAnalyticsFlowDoc`, on the pool with pgx's default statement cache. The requests run on a warm pooled connection whose plan choice the baseline phase (enabled, running first through the same pool and statement cache) had already settled, and workloads that share a statement share one prepared statement; any generic plan in use is whatever Postgres auto mode chose. The table came from a filtered run of these 5 workloads with the default of 20 requests each (`UZI_EVIDENCE_RUNS` unset) and the baseline phase enabled. A timeout fails the test. Seed as above. Set `UZI_EVIDENCE_REQUEST=0` to skip the phase.
 
 | Workload | First (ms) | Median / p95 (ms) | Max (ms) | Timeouts |
 |---|---|---|---|---|
@@ -166,6 +167,6 @@ Every candidate stayed under the 8% bar, so no index migration ships.
 | admin-all-90d | 573.7 | 589.1 / 597.9 | 601.1 | 0 |
 | admin-user-all | 648.9 | 631.2 / 651.9 | 656.2 | 0 |
 
-Bare-statement timings from the same run match within noise. Scope: the DB-side request path only; HTTP, auth middleware, DTO JSON encoding and network are excluded.
+Bare-statement timings from the same run match within noise. Scope: the DB-side request path only. HTTP, auth middleware, admission (`deps.admission.Acquire`), in-snapshot authorization (tz-name check, `AnalyticsUserExists` for admin `user=<uuid>`, repo checks), the DTO mapping (`mapAnalyticsFlow`), DTO JSON encoding and network are excluded, and bounds are computed in UTC rather than the caller's zone.
 
 **Not measured:** end-to-end production request latency; production table sizes and `run_user_inputs` fan-out; `mr_rework` and `cross_check` mixes; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).

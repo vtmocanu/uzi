@@ -427,9 +427,15 @@ and network are excluded.
 | Admin `user=<uuid>` `window=all` | about 0.64 s | about 0.65 s |
 
 The DB-side request path (`store.RunAnalyticsSnapshot` with an 8 s statement
-timeout around the history-start query, bounds, the Flow statement and
-decoding, no warm-up, 20 requests per workload, default pgx statement cache)
-measured the same on that seed, with no timeouts. Medians in ms: owner `30d`
+timeout around the history-start query, bounds computed in UTC rather than the
+caller's zone, the Flow statement and decoding; 20 requests per workload on a
+warm pooled connection with the default pgx statement cache) measured the same
+on that seed, with no timeouts. The baseline phase had already run through the
+same pool, so the prepared statements were warm and their plan choice settled;
+any generic plan in use was whatever Postgres auto mode chose. It excludes HTTP,
+auth middleware, admission, in-snapshot authorization (tz-name check, user
+lookup for an admin `user=<uuid>`, repo checks), the DTO mapping, JSON encoding
+and the network. Medians in ms: owner `30d`
 81.5, owner `window=all` 641.4, admin all-users `30d` 410.5, admin all-users
 `90d` 589.1, admin `user=<uuid>` `window=all` 631.2; the slowest request of any
 workload was 656.2 ms.
