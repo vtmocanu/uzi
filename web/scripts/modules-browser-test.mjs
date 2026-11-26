@@ -42,6 +42,7 @@ import { chromium } from "playwright";
 import { build } from "vite";
 import { createModuleConfig } from "../examples/ui-module/vite.config.ts";
 import { chromiumLaunchOptions } from "./browser-launch.mjs";
+import { childGroupRows, flushThenExit, launchPhaseProblem } from "./modules-browser-groups.mjs";
 import { federationOnlyFiles, ManifestShapeError, zeroModuleRequestViolations, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
 
 const WEB_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -139,24 +140,22 @@ function acceptsConnection(port) {
 // ---------------------------------------------------------------------------------------
 
 function groupMembers(pgid) {
-  const r = spawnSync("ps", ["-o", "pid=,pgid=,stat=", "-e"], { encoding: "utf8" });
+  const r = spawnSync("ps", ["-o", "pid=,pgid=,stat=,comm=", "-e"], { encoding: "utf8" });
   if (r.status !== 0) throw new InstrumentError(`ps failed: ${r.stderr}`);
   return r.stdout
     .split("\n")
     .map((l) => l.trim().split(/\s+/))
     .filter((c) => c.length >= 3 && Number(c[1]) === pgid)
-    .map((c) => ({ pid: Number(c[0]), stat: c[2] }));
+    .map((c) => ({ pid: Number(c[0]), stat: c[2], comm: c.slice(3).join(" ") }));
 }
 
-/** Process groups of the DIRECT children of `ppid` (the browser is the harness's only child). */
-function childGroups(ppid) {
-  const r = spawnSync("ps", ["-o", "pid=,ppid=,pgid=", "-e"], { encoding: "utf8" });
-  if (r.status !== 0) throw new InstrumentError(`ps failed: ${r.stderr}`);
-  return r.stdout
-    .split("\n")
-    .map((l) => l.trim().split(/\s+/).map(Number))
-    .filter((c) => c.length >= 3 && c[1] === ppid)
-    .map((c) => c[2]);
+/** childGroupRows with a ps failure reported as an instrument error. */
+function childGroupRowsOrBroken(ppid) {
+  try {
+    return childGroupRows(ppid);
+  } catch (e) {
+    throw new InstrumentError(e.message);
+  }
 }
 
 /**
@@ -177,7 +176,7 @@ async function waitGroupGone(pgid, deadlineMs = 5000) {
     if (alive.length === 0) {
       return { problem: null, branch: members.length > 0 ? `zombies-only (${members.length} unreaped: ${members.map((m) => m.pid).join(",")})` : "no members listed" };
     }
-    last = alive.map((m) => `${m.pid}(${m.stat})`).join(",");
+    last = alive.map((m) => `${m.pid}(${m.stat} ${m.comm})`).join(",");
     if (Date.now() > end) return { problem: `process group ${pgid} still has live members: ${last}`, branch: "none" };
     await sleep(100);
   }
@@ -227,6 +226,7 @@ let browserServer = null;
 let browser = null;
 let browserPgid = 0;
 let launchPromise = null; // the pending (or settled) chromium.launchServer, kept so shutdown can await it
+let launchSettled = false; // set when launchPromise's continuation ran or it rejected
 let shuttingDown = false;
 let shutdownPromise = null;
 const LAUNCH_WAIT_MS = 10000;
@@ -255,15 +255,22 @@ async function startBrowser() {
         handleSIGTERM: false,
         handleSIGHUP: false,
       })
-      .then(async (server) => {
-        if (hookDelay > 0) await sleep(hookDelay);
-        browserServer = server;
-        browserPgid = server.process().pid;
-        if (MODE === "selftest-child") console.log(`BROWSER pgid=${browserPgid}`);
-        // A launch that resolved after shutdown gave up waiting for it: kill it now.
-        if (shuttingDown) killBrowserGroup();
-        return server;
-      });
+      .then(
+        async (server) => {
+          if (hookDelay > 0) await sleep(hookDelay);
+          browserServer = server;
+          browserPgid = server.process().pid;
+          launchSettled = true;
+          if (MODE === "selftest-child") console.log(`BROWSER pgid=${browserPgid}`);
+          // A launch that resolved after shutdown gave up waiting for it: kill it now.
+          if (shuttingDown) killBrowserGroup();
+          return server;
+        },
+        (e) => {
+          launchSettled = true;
+          throw e;
+        },
+      );
     await launchPromise;
     // Shutdown began while launching: its signal handler (or the crash handler) ends the
     // process after cleanup, so park here instead of reporting a spurious instrument error.
@@ -325,18 +332,24 @@ async function cleanupProblems() {
 
 const shutdownAll = () => Promise.allSettled([shutdown(), killSelfChild()]);
 
+// Whether the first signal arrived while the launch was still pending (null: no signal yet).
+let signalLaunchPending = null;
+
 function installSignalHandlers() {
   for (const [sig, code] of [
     ["SIGINT", 130],
     ["SIGTERM", 143],
   ]) {
     process.on(sig, () => {
-      void shutdownAll().finally(() => process.exit(code));
+      const first = signalLaunchPending === null;
+      if (first) signalLaunchPending = launchPromise !== null && !launchSettled;
+      if (first && MODE === "selftest-child") console.log(`SIGNAL launch-pending=${signalLaunchPending}`);
+      void shutdownAll().finally(() => flushThenExit(code));
     });
   }
   const crash = (e) => {
     console.error("harness: unhandled error", e);
-    void shutdownAll().finally(() => process.exit(1));
+    void shutdownAll().finally(() => flushThenExit(1));
   };
   process.on("uncaughtException", crash);
   process.on("unhandledRejection", crash);
@@ -366,7 +379,7 @@ async function selftestChild() {
     // arrives in this window.
     const launching = startBrowser();
     const end = Date.now() + 10000;
-    while (childGroups(process.pid).length === 0 && Date.now() < end) await sleep(10);
+    while (childGroupRowsOrBroken(process.pid).length === 0 && Date.now() < end) await sleep(10);
     console.log(`LAUNCHING ports=${[...ports].join(",")}`);
     await launching;
     // Not signalled: the wrapper reports it; stay alive so it can.
@@ -420,12 +433,12 @@ async function selftestInterrupt(phase) {
     await killSelfChild();
     throw new InstrumentError(`interrupt self-test (${phase}) child never became ready: ${out.trim()}`);
   }
-  const seen = new Set();
+  const seen = new Map(); // pgid -> first sampled row
   let polling = true;
   const poll = (async () => {
     while (polling) {
       try {
-        for (const g of childGroups(child.pid)) seen.add(g);
+        for (const row of childGroupRows(child.pid)) if (!seen.has(row.pgid)) seen.set(row.pgid, row);
       } catch {
         // ps unavailable: the BROWSER line is then the only source
       }
@@ -443,14 +456,24 @@ async function selftestInterrupt(phase) {
     await killSelfChild();
     problems.push("the child did not exit within 15 s of SIGTERM");
   }
-  const groups = new Set(seen);
+  if (phase === "launch") {
+    const lp = launchPhaseProblem(out);
+    if (lp) problems.push(lp);
+  }
+  const groups = new Set(seen.keys());
   const reported = /(?:BROWSER|READY) pgid=(\d+)/.exec(out);
   if (reported) groups.add(Number(reported[1]));
   if (groups.size === 0) throw new InstrumentError(`interrupt self-test (${phase}): no browser group was identified, so cleanup cannot be asserted: ${out.trim()}`);
   // The harness's own shutdown must have killed and verified the group (see shutdown, 2b):
   // Playwright's exit handler would otherwise make this pass without it.
   for (const pgid of groups) {
-    if (!out.includes(`SHUTDOWN group ${pgid} gone`)) problems.push(`the harness's shutdown never reported group ${pgid} gone (cleanup relied on something else)`);
+    if (!out.includes(`SHUTDOWN group ${pgid} gone`)) {
+      const r = seen.get(pgid);
+      const origin = r
+        ? ` (sampled as pid ${r.pid} ppid ${r.ppid} pgid ${r.pgid}; the child reported pgid ${reported ? reported[1] : "none"})`
+        : "";
+      problems.push(`the harness's shutdown never reported group ${pgid} gone (cleanup relied on something else)${origin}`);
+    }
   }
   const via = [];
   for (const pgid of groups) {
@@ -1664,6 +1687,6 @@ main().then(
   },
   (e) => {
     console.error(e instanceof InstrumentError ? `BROKEN: ${e.message}` : e);
-    void shutdownAll().finally(() => process.exit(e instanceof InstrumentError ? 2 : 1));
+    void shutdownAll().finally(() => flushThenExit(e instanceof InstrumentError ? 2 : 1));
   },
 );
