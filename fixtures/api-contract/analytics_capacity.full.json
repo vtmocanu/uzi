@@ -1,0 +1,193 @@
+{
+  "scope": {
+    "route": "x",
+    "user": "x"
+  },
+  "generated_at": "2020-01-02T03:04:05Z",
+  "window": "x",
+  "timezone": "x",
+  "from": "2020-01-02T03:04:05Z",
+  "to": "2020-01-02T03:04:05Z",
+  "previous_from": "2020-01-02T03:04:05Z",
+  "previous_to": "2020-01-02T03:04:05Z",
+  "history_start": "2020-01-02T03:04:05Z",
+  "bucket_width_days": 1,
+  "buckets": [
+    {
+      "label": "x",
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "rolling": [
+    {
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "selected_user": "x",
+  "filters": {
+    "repo": "x",
+    "harness": "x",
+    "kinds": [
+      "x"
+    ]
+  },
+  "excluded_kind_selected": "x",
+  "occupancy": {
+    "time_basis": "x",
+    "unit": "x",
+    "population": {
+      "candidates": 1,
+      "with_interval": 1,
+      "without_start": 1,
+      "invalid_interval": 1,
+      "end_from_status_since": 1,
+      "ongoing": 1,
+      "cross_check_kind_included": 1
+    },
+    "limitations": [
+      {
+        "code": "x",
+        "runs": 1
+      }
+    ],
+    "window": {
+      "run_seconds": 1.5,
+      "duration_seconds": 1.5,
+      "average_concurrent_runs": 1.5,
+      "reason": "x"
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "run_seconds": 1.5,
+        "duration_seconds": 1.5,
+        "average_concurrent_runs": 1.5,
+        "reason": "x"
+      }
+    ]
+  },
+  "usage_wait": {
+    "time_basis": "x",
+    "cohort": "x",
+    "basis": "x",
+    "current": {
+      "count": 1,
+      "n": 1,
+      "share": 1.5,
+      "reason": "x"
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "count": 1,
+        "n": 1,
+        "share": 1.5,
+        "reason": "x"
+      }
+    ]
+  },
+  "not_tracked": [
+    {
+      "measure": "x",
+      "value": 1.5,
+      "reason": "x"
+    }
+  ],
+  "gauges": {
+    "anthropic": {
+      "provider": "x",
+      "status": "x",
+      "reason": "x",
+      "time_basis": "x",
+      "effective_scope": {
+        "user": "x",
+        "provider": "x",
+        "unattributed_selectors": [
+          "x"
+        ],
+        "reason": "x"
+      },
+      "truncated": true,
+      "set_state": "x",
+      "identities": [
+        {
+          "secret_id": "x",
+          "label": "x",
+          "is_default": true,
+          "user_id": "x",
+          "email": "x",
+          "limits": {
+            "status": "x",
+            "five_hour": {
+              "pct": 1,
+              "resets_at": 1
+            },
+            "seven_day": {
+              "pct": 1,
+              "resets_at": 1
+            },
+            "source": "x",
+            "synced_at": "x",
+            "stale": true
+          }
+        }
+      ]
+    },
+    "codex": {
+      "provider": "x",
+      "status": "x",
+      "reason": "x",
+      "time_basis": "x",
+      "effective_scope": {
+        "user": "x",
+        "provider": "x",
+        "unattributed_selectors": [
+          "x"
+        ],
+        "reason": "x"
+      },
+      "truncated": true,
+      "set_state": "x",
+      "vault_state_basis": "x",
+      "identities": [
+        {
+          "account_id": "x",
+          "aliases": [
+            "x"
+          ],
+          "is_default": true,
+          "status": "x",
+          "reason": "x",
+          "last_success_at": "x",
+          "stale": true,
+          "buckets": [
+            {
+              "id": "x",
+              "display_name": "x",
+              "allowed": true,
+              "limit_reached": true,
+              "primary": {
+                "used_percent": 1.5,
+                "limit_window_seconds": 1,
+                "reset_after_seconds": 1,
+                "reset_at": 1
+              },
+              "secondary": {
+                "used_percent": 1.5,
+                "limit_window_seconds": 1,
+                "reset_after_seconds": 1,
+                "reset_at": 1
+              }
+            }
+          ],
+          "user_id": "x",
+          "email": "x"
+        }
+      ]
+    }
+  }
+}

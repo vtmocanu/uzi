@@ -1,7 +1,7 @@
 # PRD #4731: Scoped run diagnostics API: Capacity
 
 **Issue:** #4731.
-**Status:** Ready (#4684 merged).
+**Status:** Implemented (2026-11-26). Owner decisions on plan review: a gauge timeout or the snapshot deadline fails the whole request with 503; the admin vault observation is non-blocking.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** Read-only API, DTO contracts, docs and specs. Additive indexes only when supported by plans. No lifecycle, tracking, interface or CLI changes. Implementation and validation leave `.github/workflows/**` untouched.
@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [ ] M1 owner/admin Capacity diagnostics
+- [x] M1 owner/admin Capacity diagnostics
 
 ## 1. Problem
 
@@ -81,5 +81,16 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Sweep retained intervals without a denominator | A single interval is approximate and current slots cannot describe historical capacity. |
 | Separate current readings by owner and provider | Shared quotas cannot be attributed to an individual repo or run kind. |
 | Count runs with a usage-wait counter | Retained counters show entry into wait but cannot place individual episodes in time. |
+| A gauge statement timeout (57014) or the snapshot deadline fails the whole Capacity request with 503, like any analytics timeout (owner decision on plan review); only non-timeout gauge errors with a live snapshot leave occupancy intact. | Retrying a 503 is the same contract as every other analytics timeout; a savepoint keeps occupancy only for ordinary gauge errors. |
+| The admin vault observation is non-blocking (`TryLock`) with a 2 s budget checked between and after lookups (reads run under the budget's context, so they are cancelled when it expires; a step that does not honour cancellation can still finish after it, so this is not a hard 2 s cap) and the owner route uses `RequiresUnlock` (owner decision on plan review). | A user's lifecycle operation must not stall an instance-wide read; contention, a read error or the budget gives `vault_status_unavailable` on the admin routes only, while the owner route fails closed (`vault_locked`). |
+| No index added. | No demonstrated gap within the 8 s budget (evidence below). A terminal-end index cut admin 7d to 35 ms but barely moved 90d. |
 
-**Unverified before implementation**. Query plans, endpoint/identity cardinality impact and suite runtime.
+**Measured (Nov 2026).** #4684's 120k-run seed, fresh `ANALYZE`, top owner 20.1% of runs. Statement times, custom / generic plan: owner 30d 27 / 26 ms; owner all-time 206 / 225 ms; admin all-users 7d 110 / 60 ms, 30d 232 / 131 ms, 90d 270 / 177 ms; admin 30d with `repo` 3.9 / 48.8 ms; admin all-time 1127 ms with a 42 MB disk sort (refused by the API, so not reachable). Owner paths use per-user indexes only: `runs_user_terminal_end_idx`, `runs_user_nonterminal_idx` and `runs_user_created_idx` (usage-wait scan) at 30d; `runs_user_terminal_end_idx`, `runs_user_nonterminal_idx` and `idx_runs_user` all-time (custom plan; the generic plan scans `runs_user_created_idx` for usage wait instead). The admin all-users custom plans at 30d, 90d and all-time sequentially scan `runs` twice. "Scales linearly with total runs, about 0.19 s per 100k runs at 30d" is inferred from this single 120k seed, not from a size sweep. Gauge statements took 1.2-30 ms at the 201-row capped fetch (604 enabled Anthropic and 443 enabled Codex identities seeded, so the cap was hit).
+
+**Selectivity and sweep sizes (Nov 2026).** Same seed. "Candidates" is the statement's candidate set (`pop`: terminal runs ending after `from` plus every nonterminal run created before `now`, per scope and selectors) over all runs of the scope; "events" is an upper bound on the sorted endpoint rows (two per interval plus two per bucket, from `with_interval` and the bucket count), not a measured row count, because endpoints outside the window may not be emitted. Owner (24,162 runs) 30d: 2,743 candidates (11.35%), at most 4,778 events; owner all-time: 23,672 candidates (97.97%), at most 46,734. Admin all-users (120,000 runs) 7d: 4,412 candidates (3.68%), at most 5,306; 30d: 13,368 (11.14%), at most 23,264; 90d: 19,292 (16.08%), at most 35,232; 30d with `repo`: 25 (0.02%), at most 104; all-time: 117,550 (97.96%), at most 231,726 (the case the API refuses). The log lines are `CAPACITY SELECTIVITY` in the evidence run; the harness now labels the event figure `sweep_events_upper_bound`.
+
+**Request timings (Nov 2026).** The same seed rebuilt in a private database, `TestAnalyticsCapacityRequestEvidenceLiveDB` (build tag `analyticsevidence`, `UZI_ANALYTICS_PLAN_EVIDENCE=1`): full requests through the mounted router with a real pool and vault, the seed's clock, one warm-up then 20 requests each, every response 200, one client on a local Postgres container. Median / p90: owner Capacity 30d (top owner) 58.8 / 62.6 ms; admin all-users Capacity 7d 123 / 174 ms, 30d 197 / 200 ms, 90d 245 / 251 ms; admin all-users Spend with comparison 30d 1.54 / 1.58 s, 90d 2.56 / 2.60 s. Capacity at 90d is therefore about a tenth of the Spend request it sits beside. These include the gauge reads and the Codex vault observation.
+
+**LiveDB suite time.** From the gate logs: the 14 handler Capacity tests that existed then (three more were added later and are not in this figure) took 20.0 s of a 67.8 s handler package run (at 5436bdc75), and the 32 store tests (Capacity, savepoint, plan guard and unit tests) 28.3 s of a 40.5 s store package run (at d738e4eea), 48.3 s together; the final repair commit added three handler LiveDB tests (about 5.3 s locally) and changed some handler and store tests, and these figures were not re-measured after it; the two plan-guard tests are 10.5 s of that. The `TryStatus` tests are plain unit tests in the vault package and are not in those logs.
+
+**Not measured:** CI job time on the pipeline runner (a landing obligation, read from the exact-head run), concurrent load or admission contention, a size sweep, and a contended or locked vault.

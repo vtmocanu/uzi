@@ -14,6 +14,7 @@ const (
 	SectionOptions     = "options"
 	SectionSpend       = "spend"
 	SectionReliability = "reliability"
+	SectionCapacity    = "capacity"
 )
 
 // ErrBusy is returned by Acquire when the (caller, section) key is already

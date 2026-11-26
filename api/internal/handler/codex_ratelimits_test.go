@@ -151,7 +151,7 @@ func TestCodexAccountDTOReason(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := &Handler{cfg: config.Config{CodexUsagePollInterval: tc.interval}}
-			dto := h.codexAccountDTO(uuid.New(), []string{"a"}, false, tc.reauth, tc.reason, nil, validTS(now), validTS(now), tc.vaultLocked)
+			dto := h.codexAccountDTO(uuid.New(), []string{"a"}, false, tc.reauth, tc.reason, nil, validTS(now), validTS(now), tc.vaultLocked, now)
 			if dto.Status != tc.wantStatus {
 				t.Fatalf("status = %q, want %q", dto.Status, tc.wantStatus)
 			}
