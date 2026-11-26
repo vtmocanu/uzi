@@ -336,6 +336,7 @@ const EXPECTED_HELD_SITES: Record<string, readonly string[]> = {
 };
 
 const REAL_DATE_NOW = Date.now;
+const MIXED_CUSTODY_MSG = "delayed feedback saw both a hold custody operation and a pre-operation refusal";
 const PRESSURE_PARK_NONCE = "original-memory-registration";
 const isThenable = (value: unknown): value is PromiseLike<unknown> =>
   (typeof value === "object" || typeof value === "function") && value !== null && typeof (value as { then?: unknown }).then === "function";
@@ -770,6 +771,8 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       return wrapped as unknown as NonNullable<Executor["withCredentialFreeCapture"]>;
     },
     captureRecords: (): readonly CaptureRecord[] => captures,
+    custodyRecords: (): readonly CustodyRecord[] => custody,
+    preOpRefusalRecords: (): readonly PreOpRefusal[] => preOpRefusals,
     deadlineThrowOf,
     startClock() {
       clock.log.length = 0; clock.logging = true;
@@ -888,6 +891,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           if (refusalClasses[i] === "dirty")
             failures.push(`a pre-operation refusal had a non-deadline predicate set at entry: ${JSON.stringify(r.dirty)}`);
         });
+        if (holdOps.length > 0 && preOpRefusals.length > 0) failures.push(MIXED_CUSTODY_MSG);
         const expiredRefusal = holdOps.length === 0 && preOpRefusals.length === 1 && refusalClasses[0] === "expired";
         if (expiredRefusal) { /* accepted: no custody operation started */ }
         else if (holdOps.length !== 1)
@@ -1171,7 +1175,7 @@ async function probeHoldThrow(makeOperation: (holdDeadline: number) => { signal:
 async function probeRefusal(entryBeforeDeadline: boolean, tweak: (flight: any) => void = () => {}) {
   const f = await setup();
   const obs = observeCustody(f, "delayedFeedback", "delayedFeedback");
-  let failures: string[] = [], facts = "", warnAt = NaN, deadline = NaN, entryAt = NaN;
+  let failures: string[] = [], facts = "", warnAt = NaN, deadline = NaN;
   try {
     const signal = new AbortController().signal;
     const flight: any = { claimGeneration: 7, workerMemory: { ended: false, incarnation: 1, hold: undefined },
@@ -1194,19 +1198,28 @@ async function probeRefusal(entryBeforeDeadline: boolean, tweak: (flight: any) =
     deadline = entryBeforeDeadline ? Date.now() + 60 : Date.now() - 5;
     const hold = { deadline, context: { flight, claim_generation: 7 } };
     flight.workerMemory.hold = hold;
-    entryAt = Date.now();
     await (runner as unknown as { preserveWorkerMemory(...a: unknown[]): Promise<unknown> }).preserveWorkerMemory(flight, hold);
   } finally { try { await f.memory.stop(); } finally { await obs.join(); } }
   facts = obs.facts();
   try { obs.assertAll(); } catch (error) { failures = ((error as { actual?: unknown }).actual as string[] | undefined) ?? [String(error)]; }
-  return { failures, facts, warnAt, deadline, entryAt };
+  const recorded = obs.preOpRefusalRecords();
+  assert.equal(recorded.length, 1, "exactly one pre-operation refusal was recorded");
+  // The wrapper's own entry sample and deadline, not the probe's.
+  return { failures, facts, warnAt, deadline: recorded[0]!.deadline, entryAt: recorded[0]!.entryAt };
 }
 
 test("refusal at the observer level: an entry before the deadline is a straddle even though the refusal settled after it", async () => {
-  const { failures, facts, warnAt, deadline, entryAt } = await probeRefusal(true);
-  assert.ok(entryAt < deadline && warnAt > deadline, "entry before the deadline, late warn after it");
-  assert.ok(failures.some(m => /entered before the hold deadline/.test(m)), JSON.stringify(failures) + facts);
-  assert.ok(facts.includes('"class":"straddle"'), facts);
+  const entries: string[] = [];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { failures, facts, warnAt, deadline, entryAt } = await probeRefusal(true);
+    // Retry only when the recorded entry missed the 60 ms margin (a stalled process), never because of the class.
+    if (entryAt >= deadline) { entries.push(`${entryAt}>=${deadline}`); continue; }
+    assert.ok(warnAt > deadline, "late warn after the deadline");
+    assert.ok(failures.some(m => /entered before the hold deadline/.test(m)), JSON.stringify(failures) + facts);
+    assert.ok(facts.includes('"class":"straddle"'), facts);
+    return;
+  }
+  assert.fail(`straddle precondition not reached in 5 attempts (recorded entries ${entries.join(", ")})`);
 });
 
 test("refusal at the observer level: a clean entry after the deadline is accepted as expiry", async () => {
@@ -1214,6 +1227,51 @@ test("refusal at the observer level: a clean entry after the deadline is accepte
   assert.ok(entryAt >= deadline);
   assert.ok(facts.includes('"class":"expired"'), facts);
   assert.deepEqual(failures.filter(m => /pre-operation refusal|delayed feedback expected/.test(m)), [], JSON.stringify(failures));
+  assert.ok(!failures.includes(MIXED_CUSTODY_MSG), JSON.stringify(failures));
+});
+
+test("refusal at the observer level: a hold custody operation plus an expired refusal is rejected", async () => {
+  const f = await setup();
+  const obs = observeCustody(f, "delayedFeedback", "delayedFeedback");
+  try {
+    const signal = new AbortController().signal;
+    const flight: any = { claimGeneration: 7, workerMemory: { ended: false, incarnation: 1, hold: undefined },
+      steering: { claimFence: () => undefined, isCancelled: () => false, terminalLifecycleSignal: () => signal,
+        pendingCredentialSwitch: () => undefined, getPauseMode: () => null } };
+    try { f.memory.begin({ flight, claim_generation: 7 } as never, {} as never); } catch { /* expected: invalid sinks */ }
+    const none = () => undefined;
+    let calls = 0;
+    const runner = { codexBoundaryDeadlineMs: 5000, shuttingDownGlobal: false, shutdownSignal: { signal }, client: { memoryIncarnation: 1 },
+      startWorkerMemoryPreservation: none, reconcileWorkerMemory: none, transferRestorePointToTrustedBare: none,
+      captureRecoveryRestorePointBody: none, captureHoldContext: none, fetchTracking: none, refusalGateInAuthority: none,
+      stopForOwedLimit: none, owedStopReleaseWait: none, retainAcceptedOwnerPause: none, handlePausePark: none, owedOptions: none,
+      preserveWorkerMemory: (_flight: unknown, hold: { deadline: number }) => {
+        calls++;
+        if (calls > 1) return Promise.resolve("refused");
+        // Synchronously, before any await: the hold custody operation with exactly the hold's deadline.
+        return git.withRecoveryOperation(new AbortController().signal, hold.deadline, async () => "ok");
+      } } as unknown as RunRunner;
+    obs.attach(runner, {} as Executor);
+    const hold = { deadline: Date.now() + 150, context: { flight, claim_generation: 7 } };
+    flight.workerMemory.hold = hold;
+    const preserve = (runner as unknown as { preserveWorkerMemory(...a: unknown[]): Promise<unknown> }).preserveWorkerMemory.bind(runner);
+    assert.equal(await preserve(flight, hold), "ok");
+    const giveUp = Date.now() + 10_000;
+    while (Date.now() <= hold.deadline && Date.now() < giveUp) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(Date.now() > hold.deadline, "the real clock passed the hold deadline");
+    assert.equal(await preserve(flight, hold), "refused");
+  } finally { try { await f.memory.stop(); } finally { await obs.join(); } }
+  const holds = obs.custodyRecords().filter(c => c.kind === "hold");
+  assert.equal(holds.length, 1, "exactly one hold custody record");
+  assert.equal(holds[0]!.entered, true);
+  assert.ok(holds[0]!.outcome?.kind !== "abort" && holds[0]!.outcome?.kind !== "rejected-before-action", JSON.stringify(holds[0]!.outcome));
+  const refusals = obs.preOpRefusalRecords();
+  assert.equal(refusals.length, 1, "exactly one pre-operation refusal");
+  assert.equal(refusals[0]!.clean, true, JSON.stringify(refusals[0]));
+  assert.ok(obs.facts().includes('"class":"expired"'), obs.facts());
+  let failures: string[] = [];
+  try { obs.assertAll(); } catch (error) { failures = ((error as { actual?: unknown }).actual as string[] | undefined) ?? [String(error)]; }
+  assert.ok(failures.includes(MIXED_CUSTODY_MSG), JSON.stringify(failures));
 });
 
 test("refusal at the observer level: a non-deadline predicate set at entry is dirty even after the deadline", async () => {
@@ -2134,6 +2192,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   let original: MemoryFlightProof | undefined;
   let successor: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
   let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined, liveAtSend: boolean | undefined;
+  let parkAtWorkSettle: boolean | string | undefined;
   let successorWork: Promise<void> | undefined;
   let started: number | undefined, rescue: ReturnType<typeof setTimeout> | undefined;
   const report = client.reportState.bind(client);
@@ -2190,13 +2249,16 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   let hold: ReturnType<typeof holdFirstPost> | undefined;
   let work!: Promise<void>;
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-  // The try starts before the first patch so an early throw still reaches the finally that joins the observer.
+  // Attach runs inside the try so a throwing attach still reaches the finally that stops the monitor and joins the observer.
   try {
     launch?.attach(runner);
     obs.attach(runner, executor);
     hold = slow ? holdFirstPost("/state", "worker_memory_pressure") : undefined;
     obs.startClock();
     work = obs.invoke("original", () => runner.execute(f.claim));
+    // Pins the park signal state at the first reaction registered on work.
+    const rec = () => { parkAtWorkSettle = parkSignal === undefined ? "no-park-signal" : parkSignal.aborted; };
+    work.then(rec, rec);
     await until(() => nativeAck !== undefined, 3000 + (launch ? LAUNCH_GATE_CAP_MS : 0), launch?.facts);
     assert.equal(liveAtSend, true, "original park send starts before its owner deadline");
     if (hold) assert.equal(hold.held(), 1, "control: first park POST response was held");
@@ -2224,6 +2286,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.notEqual(original!.workerMemory!.settled, true, "original work has not settled");
     assert.equal(runner.isExecuting(f.claim.run_id), true, "execution tail owns the pending original capture");
     assert.equal(parkSignal!.aborted, true);
+    assert.equal(parkAtWorkSettle, true, "park signal aborted when original work settled");
     assert.notEqual(original!.parked, true, "native acceptance alone cannot mark an expired flight parked");
     assert.equal(original!.retainedLocalCustody, true);
     assert.equal(fs.readFileSync(homeDir + "/session-proof", "utf8"), "original session");
@@ -2447,7 +2510,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
   let hold: ReturnType<typeof holdFirstPost> | undefined;
   let work!: Promise<void>;
-  // The try starts before the first patch so an early throw still reaches the finally that joins the observer.
+  // Attach runs inside the try so a throwing attach still reaches the finally that stops the monitor and joins the observer.
   try {
     launch?.attach(runner);
     obs.attach(runner, executor);
@@ -3129,8 +3192,8 @@ for (const { scenario, control } of handoffCases) {
     runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, launch?.logger,
       { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
         ...(scenario === "unsettled" || scenario === "expired" ? { memoryHoldDeadlineMs: 200 } : {}) });
-    launch?.attach(runner);
     try {
+      launch?.attach(runner);
       obs?.attach(runner, executor);
       obs?.startClock();
       await (obs ? obs.invoke("original", () => runner.execute(f.claim)) : runner.execute(f.claim));
