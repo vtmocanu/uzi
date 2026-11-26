@@ -147,7 +147,7 @@ export function makeUziToolHandlers(deps: UziToolsDeps): UziToolHandlers {
         // Send repo_path (what the read tools expose); the server resolves it to the
         // user's repo id. repo_id is forwarded only as a back-compat fallback.
         const proposal = await client.createProposal(runId, {
-          ...(args.repo_path ? { repo_path: args.repo_path } : { repo_id: args.repo_id }),
+          ...(args.repo_path ? { repo_path: redact(args.repo_path) } : { repo_id: redact(args.repo_id ?? "") }),
           title: redact(args.title),
           description: redact(args.description ?? ""),
           labels: (args.labels ?? []).map(redact),

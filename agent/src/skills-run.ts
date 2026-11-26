@@ -64,7 +64,7 @@ export async function prepareSkillPlugin(ctx: SkillRunInput, caps: SkillCaps): P
   const repoKept: ClaimSkill[] = [];
   if (ctx.repoSkillsEnabled) {
     const repo = await collectRepoSkills(ctx.worktreePath, caps.maxBytes);
-    drops.push(...repo.dropped);
+    for (const d of repo.dropped) drops.push(d);
     const seen = new Set(deliveredSkills.map((s) => s.name));
     for (const rs of repo.skills) {
       if (seen.has(rs.name)) {
@@ -79,7 +79,7 @@ export async function prepareSkillPlugin(ctx: SkillRunInput, caps: SkillCaps): P
   // Delivered first (higher precedence), repo last so the per-run cap evicts repo
   // skills first (the server already capped the delivered set).
   const { kept: runSkills, dropped: capDrops } = enforceSkillCaps([...deliveredSkills, ...repoKept], caps);
-  drops.push(...capDrops);
+  for (const d of capDrops) drops.push(d);
 
   const pluginPath = skillsPluginDir(ctx.worktreePath);
   await materializeSkillsPlugin(pluginPath, runSkills);

@@ -169,4 +169,4 @@ above (the history stays as written):
   default and rendered only when set) wins and locks the field. The chart guards
   against setting the key in `api.config` or `api.secretEnv` are unchanged.
 
-See [PRD #4212](../prds/4212-admin-workers-tab.md).
+See [PRD #4212](../prds/done/4212-admin-workers-tab.md).

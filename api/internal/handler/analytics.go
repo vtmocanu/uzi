@@ -28,13 +28,14 @@ import (
 
 // Issue #4684: the scoped usage analytics API.
 //
-//	GET /api/analytics/{options,spend}        the caller's own runs (requireUser)
-//	GET /api/admin/analytics/{options,spend}  admin read group (RequireAdminRO)
+//	GET /api/analytics/{options,spend,reliability}        the caller's own runs (requireUser)
+//	GET /api/admin/analytics/{options,spend,reliability}  admin read group (RequireAdminRO)
 //
 // Request order: (1) syntax validation with no database access, (2) single-flight admission
 // that never blocks, (3) one REPEATABLE READ READ ONLY snapshot holding the timezone check,
-// the selected-user and repo authority checks and, for spend only, the history-start read and
-// the statement; options reads no history start.
+// the selected-user and repo authority checks and, for spend and reliability, the history-start
+// read and the statements (reliability: cohort, then latest failure; analytics_reliability.go);
+// options reads no history start.
 
 const (
 	analyticsRouteOwner = "owner"
@@ -56,6 +57,9 @@ type analyticsDeps struct {
 	// afterFirstRead, when non-nil, runs inside the snapshot right after the history-start
 	// read. Tests use it to commit a competing write once the snapshot is fixed.
 	afterFirstRead func(ctx context.Context)
+	// afterCohortRead, when non-nil, runs inside the Reliability snapshot right after the
+	// cohort statement and before the latest-failure read (issue #4685).
+	afterCohortRead func(ctx context.Context)
 
 	// tzSet caches pg_timezone_names after the first successful read (never on failure).
 	tzMu  sync.Mutex
@@ -139,8 +143,12 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	req := analyticsRequest{admin: admin, section: section, scopeUser: caller}
 
 	allowed := []string{"window", "tz", "repo", "harness", "kind"}
-	if section == analytics.SectionSpend {
+	switch section {
+	case analytics.SectionSpend:
 		allowed = append(allowed, "split", "breakdown")
+	case analytics.SectionReliability:
+		// Reliability has a breakdown but no split.
+		allowed = append(allowed, "breakdown")
 	}
 	if admin {
 		allowed = append(allowed, "user")
@@ -148,7 +156,8 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	// Sorted so that, with several bad parameters, the first error is always the same one.
 	for _, key := range slices.Sorted(maps.Keys(q)) {
 		if !slices.Contains(allowed, key) {
-			// split and breakdown on /options, and user on the owner route, get a message that names them.
+			// split and breakdown on /options (split also on /reliability), and user on the owner
+			// route, get a message that names them.
 			switch key {
 			case "user":
 				return req, "user not allowed"
@@ -221,14 +230,17 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	}
 
 	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
-	// per-run totals for finished runs. Options still accepts and ignores window, so the
-	// check is spend-only.
-	if section == analytics.SectionSpend && !slices.Contains(req.windowChoices(), string(req.window)) {
+	// per-run totals for finished runs, and Reliability follows the same window choices.
+	// Options still accepts and ignores window, so the check is skipped for it.
+	if section != analytics.SectionOptions && !slices.Contains(req.windowChoices(), string(req.window)) {
 		return req, msgAnalyticsWindowAllAllUsers
 	}
 
 	splits, breakdowns := req.splitChoices(), req.breakdownChoices()
 	req.split, req.breakdown = "usage_model", "repo"
+	if section == analytics.SectionReliability {
+		req.breakdown = "primary_model"
+	}
 	if v := q.Get("split"); v != "" {
 		if !slices.Contains(splits, v) {
 			return req, "invalid split"
@@ -313,6 +325,16 @@ func (h *Handler) AdminAnalyticsSpend(w http.ResponseWriter, r *http.Request) {
 	h.serveAnalytics(w, r, true, analytics.SectionSpend)
 }
 
+// AnalyticsReliability serves GET /api/analytics/reliability for the caller's own scope.
+func (h *Handler) AnalyticsReliability(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, false, analytics.SectionReliability)
+}
+
+// AdminAnalyticsReliability serves GET /api/admin/analytics/reliability.
+func (h *Handler) AdminAnalyticsReliability(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, true, analytics.SectionReliability)
+}
+
 func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin bool, section string) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -351,9 +373,12 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 	var body any
 	err = store.RunAnalyticsSnapshot(r.Context(), deps.begin, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
 		var ferr error
-		if section == analytics.SectionOptions {
+		switch section {
+		case analytics.SectionOptions:
 			body, ferr = deps.options(ctx, s, req, now)
-		} else {
+		case analytics.SectionReliability:
+			body, ferr = deps.reliability(ctx, s, req, now)
+		default:
 			body, ferr = deps.spend(ctx, s, req, now)
 		}
 		return ferr
@@ -387,7 +412,7 @@ func analyticsFail(w http.ResponseWriter, r *http.Request, err error) {
 	httpx.Error(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorize runs the in-snapshot checks shared by Options and Spend: the timezone, the selected
+// authorize runs the in-snapshot checks shared by Options, Spend and Reliability: the timezone, the selected
 // user's existence and the repo filter's authority. A repo that does not exist and one the scope
 // cannot see produce the identical 400.
 func (d *analyticsDeps) authorize(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest) (*time.Location, error) {
@@ -705,12 +730,11 @@ func (m *spendMapper) createdAt(s string) time.Time {
 	return t.UTC()
 }
 
-// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all spend request.
+// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all Spend or Reliability request.
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
-// mapAnalyticsSpend builds the response from the calendar and the store document.
-func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {
-	m := &spendMapper{}
+// analyticsEnvelope builds the calendar envelope every analytics response is indexed against.
+func analyticsEnvelope(req analyticsRequest, b analytics.Bounds) apitypes.AnalyticsEnvelopeDTO {
 	env := apitypes.AnalyticsEnvelopeDTO{
 		Scope:           req.scope(),
 		GeneratedAt:     b.Now.UTC(),
@@ -741,9 +765,14 @@ func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.Analy
 	for _, rp := range b.Rolling {
 		env.Rolling = append(env.Rolling, apitypes.AnalyticsRollingDTO{Start: rp.Start.UTC(), End: rp.End.UTC(), Partial: rp.Partial})
 	}
+	return env
+}
 
+// mapAnalyticsSpend builds the response from the calendar and the store document.
+func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {
+	m := &spendMapper{}
 	out := apitypes.AnalyticsSpendDTO{
-		AnalyticsEnvelopeDTO: env,
+		AnalyticsEnvelopeDTO: analyticsEnvelope(req, b),
 		SelectedUser:         req.scope().User,
 		UntrackedChatRuns:    doc.UntrackedChatRuns,
 		Series:               m.cells(doc.Buckets),

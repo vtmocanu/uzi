@@ -12,6 +12,7 @@ import type { PositiveOwedCandidateContext, PublicationCandidate } from "../src/
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 
 installHarness();
 
@@ -85,7 +86,7 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
     const { logger, lines } = recordingLogger();
     const recoveryClient = new FakeRecoveryClient();
     const recoveryOptions = { client: recoveryClient, git, log: nullLogger(),
-      recoveryRoot: git.recoveryRoot, workerToken: "publication-retry-worker-fixture" };
+      recoveryRoot: git.recoveryRoot, workerToken: "publication-retry-worker-fixture", ...NO_SCAN_NEEDLES };
     const recovery = new RecoveryCoordinator(recoveryOptions);
     const marker = path.join(homeDir, "session-marker");
     fs.writeFileSync(marker, "retained session");
@@ -302,7 +303,7 @@ for (const kind of ["mr_rework", "ci_fix", "issue"] as const) {
       return upload(runId, captureId, manifest, Readable.from([bytes]));
     };
     const recoveryOptions = { client: recoveryClient, git, log: nullLogger(),
-      recoveryRoot: git.recoveryRoot, workerToken: "publication-proof-worker-fixture" };
+      recoveryRoot: git.recoveryRoot, workerToken: "publication-proof-worker-fixture", ...NO_SCAN_NEEDLES };
     const recovery = new RecoveryCoordinator(recoveryOptions);
     if (captureFailure) {
       git.produceRecoveryBundle = async () => { throw new Error("injected bundle production failure"); };

@@ -643,7 +643,7 @@ export class ClaudeCommandLane {
           notes.push(`The spill file is truncated at ${sizeLabel(this.spillCapBytes)}; it is bounded and not the full output.`);
         }
       }
-      notes.push(...extraNotes);
+      for (const note of extraNotes) notes.push(note);
       if (!eofSeen) {
         notes.push("Output may be incomplete: a background process kept the output open after the command ended and was stopped.");
       }

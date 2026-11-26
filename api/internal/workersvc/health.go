@@ -235,6 +235,11 @@ const (
 	// whose owner has no online worker self-reporting 'issue_key_v1': ClaimRun's standalone
 	// issue_key clause can never be satisfied until a worker that renders references by
 	// issue_key (and never closes #<iid>) comes online.
+	// reasonNoRunEnvCapableWorker (PRD #4416 M2) is emitted for a queued lead-lane run that
+	// receives repo variables (an enabled live variable, or a secret delivery receipt) whose
+	// owner has no online worker self-reporting 'run_env_v1': ClaimRun's standalone run_env
+	// clause can never be satisfied until a worker that injects the variables comes online.
+	reasonNoRunEnvCapableWorker             = "no online worker supports repo variables (run_env_v1); repo variables need a current two-uid worker (UZI_UID_SPLIT, or UZI_WORKER_UID_SPLIT on hosted workers)"
 	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
@@ -1653,6 +1658,22 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				slog.Error("health: check issue_key_v1 workers for linked repo", "run_id", r.ID, "error", merr)
 			} else if missing {
 				return reasonNoIssueKeyCapableWorker
+			}
+		}
+	}
+	// PRD #4416 M2: a lead-lane run that receives repo variables with no online run_env_v1 worker
+	// is unplaceable. The lane is decided in SQL from the run row (the review-target half is not
+	// on the health row), so the Go pre-gate only skips the lookup for kinds that never receive
+	// variables; a failed read falls through like the rungs above.
+	if r.RepoID.Valid && RunEnvDelivered(r.Kind, false, r.EgressProfileID.Valid) {
+		if q, ok := s.q.(interface {
+			RunEnvWorkerMissingForRun(context.Context, store.RunEnvWorkerMissingForRunParams) (bool, error)
+		}); ok {
+			missing, merr := q.RunEnvWorkerMissingForRun(ctx, store.RunEnvWorkerMissingForRunParams{RunID: r.ID, UserID: r.UserID})
+			if merr != nil {
+				slog.Error("health: check run_env_v1 workers for run", "run_id", r.ID, "error", merr)
+			} else if missing {
+				return reasonNoRunEnvCapableWorker
 			}
 		}
 	}

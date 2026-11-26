@@ -33,6 +33,325 @@ func (q *Queries) AnalyticsAllHistoryStart(ctx context.Context, arg AnalyticsAll
 	return history_start, err
 }
 
+const analyticsAllLatestFailure = `-- name: AnalyticsAllLatestFailure :one
+WITH last_failure AS MATERIALIZED (
+    SELECT id, user_id, COALESCE(finished_at, status_since) AS ended_at,
+           COALESCE(fail_origin, 'unknown') AS origin
+    FROM runs
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
+      AND fn_outcome_kind(kind)
+      AND ($1::uuid IS NULL OR repo_id = $1::uuid)
+      AND ($2::text IS NULL OR harness = $2::text)
+      AND kind = ANY($3::text[])
+    ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
+)
+SELECT
+    EXISTS (SELECT 1 FROM last_failure)::boolean AS found,
+    (SELECT f.ended_at FROM last_failure f)::timestamptz AS failed_at,
+    COALESCE((SELECT f.origin FROM last_failure f), '')::text AS origin,
+    COALESCE((SELECT f.id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS run_id,
+    COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS failed_user_id,
+    COALESCE((SELECT count(*)::bigint
+       FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
+       WHERE r3.status = 'completed' AND fn_outcome_kind(r3.kind)
+         AND ($1::uuid IS NULL OR r3.repo_id = $1::uuid)
+         AND ($2::text IS NULL OR r3.harness = $2::text)
+         AND r3.kind = ANY($3::text[])), 0)::bigint AS completed_since_last_failure
+`
+
+type AnalyticsAllLatestFailureParams struct {
+	RepoID  pgtype.UUID `json:"repo_id"`
+	Harness pgtype.Text `json:"harness"`
+	Kinds   []string    `json:"kinds"`
+}
+
+type AnalyticsAllLatestFailureRow struct {
+	Found                     bool               `json:"found"`
+	FailedAt                  pgtype.Timestamptz `json:"failed_at"`
+	Origin                    string             `json:"origin"`
+	RunID                     uuid.UUID          `json:"run_id"`
+	FailedUserID              uuid.UUID          `json:"failed_user_id"`
+	CompletedSinceLastFailure int64              `json:"completed_since_last_failure"`
+}
+
+// Issue #4685: the lifetime latest failure of the scope (no created_at cutoff, no window): the
+// SelfRunOutcomes last_failure predicate verbatim, restricted by the request's repo, harness
+// and Delivery kinds. completed_since_last_failure counts completed outcome-kind runs of the
+// same scope strictly after the failure's terminal timestamp. found is false when there is no
+// failure (the other columns then carry zero values). The owner and all-scope statements are
+// textually identical except the lines tagged owner-only.
+func (q *Queries) AnalyticsAllLatestFailure(ctx context.Context, arg AnalyticsAllLatestFailureParams) (AnalyticsAllLatestFailureRow, error) {
+	row := q.db.QueryRow(ctx, analyticsAllLatestFailure, arg.RepoID, arg.Harness, arg.Kinds)
+	var i AnalyticsAllLatestFailureRow
+	err := row.Scan(
+		&i.Found,
+		&i.FailedAt,
+		&i.Origin,
+		&i.RunID,
+		&i.FailedUserID,
+		&i.CompletedSinceLastFailure,
+	)
+	return i, err
+}
+
+const analyticsAllReliability = `-- name: AnalyticsAllReliability :one
+WITH
+prm AS (SELECT $3::timestamptz AS now_ts),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest($4::timestamptz[]), unnest($5::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+rp AS (
+    SELECT t.ord::int AS idx, t.s AS r_start, t.e AS r_end
+    FROM ROWS FROM (unnest($6::timestamptz[]), unnest($7::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+bnd AS (
+    SELECT COALESCE(array_agg(d.x ORDER BY d.x), '{}'::timestamptz[]) AS arr
+    FROM (SELECT r_start AS x FROM rp UNION SELECT r_end FROM rp) d
+),
+roll_series AS (
+    SELECT NULL::text AS hs, 0 AS ord
+    UNION ALL
+    SELECT t.h, t.ord::int FROM unnest($8::text[]) WITH ORDINALITY AS t(h, ord)
+),
+cohort AS MATERIALIZED (
+    SELECT r.id, r.user_id, u.email, r.repo_id, rpo.path_with_namespace AS repo_path,
+           true AS repo_shown,  -- all-only
+           r.kind, r.harness, r.fail_origin, (r.requeue_count > 0) AS requeued, r.created_at,
+           CASE WHEN r.status = 'failed' AND r.fail_origin = ANY($9::text[])
+                THEN (EXISTS (SELECT 1 FROM recovery_captures rc
+                              WHERE rc.run_id = r.id AND rc.user_id = r.user_id AND rc.state = 'available')
+                      OR r.preserved_patch IS NOT NULL)
+                ELSE false END AS needs_landing
+    FROM runs r
+    JOIN users u ON u.id = r.user_id
+    LEFT JOIN repos rpo ON rpo.id = r.repo_id
+    WHERE r.created_at >= $10::timestamptz AND r.created_at < $3::timestamptz
+      AND ($11::uuid IS NULL OR r.repo_id = $11::uuid)
+      AND ($12::text IS NULL OR r.harness = $12::text)
+      AND r.kind = ANY($13::text[])
+),
+run_fold AS MATERIALIZED (
+    SELECT c.id AS run_id, c.user_id, c.email, c.repo_id, c.kind, c.harness, c.fail_origin, c.requeued,
+           c.needs_landing, c.created_at,
+           CASE WHEN c.repo_id IS NULL THEN 'no_repo'
+                WHEN c.repo_shown THEN c.repo_id::text
+                ELSE 'inaccessible_repo' END AS repo_key,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_id END AS repo_id_out,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_path END AS repo_path_out,
+           CASE WHEN c.created_at >= $14::timestamptz THEN 'cur'
+                WHEN $1::timestamptz IS NOT NULL AND c.created_at >= $1::timestamptz AND c.created_at < $14::timestamptz THEN 'prev'
+           END AS win,
+           o.outcome,
+           pm.primary_model,
+           width_bucket(c.created_at, $4::timestamptz[]) AS wb
+    FROM cohort c
+    LEFT JOIN LATERAL (
+        SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0
+    ) o ON true
+    LEFT JOIN LATERAL (
+        SELECT
+               COALESCE((array_agg(mf.model ORDER BY mf.output_tokens DESC, mf.model COLLATE "C" ASC)
+                         FILTER (WHERE mf.model IS NOT NULL))[1], 'unknown') AS primary_model
+        FROM run_usage_model_totals mf
+        WHERE mf.run_id = c.id AND $2::text = 'primary_model'
+          AND c.created_at >= $14::timestamptz  -- only current-window rows read primary_model
+        OFFSET 0
+    ) pm ON true
+),
+rfb AS MATERIALIZED (
+    SELECT rf.run_id, rf.user_id, rf.email, rf.repo_id, rf.kind, rf.harness, rf.fail_origin, rf.requeued, rf.needs_landing, rf.created_at, rf.repo_key, rf.repo_id_out, rf.repo_path_out, rf.win, rf.outcome, rf.primary_model, rf.wb,
+           CASE WHEN rf.win = 'cur' AND rf.wb >= 1 AND rf.created_at < ($5::timestamptz[])[rf.wb] THEN rf.wb END AS bidx
+    FROM run_fold rf
+),
+bd_items AS MATERIALIZED (
+    SELECT x.run_id, x.user_id, x.email, x.repo_id, x.kind, x.harness, x.fail_origin, x.requeued, x.needs_landing, x.created_at, x.repo_key, x.repo_id_out, x.repo_path_out, x.win, x.outcome, x.primary_model, x.wb, x.bidx,
+           CASE $2::text
+                WHEN 'user' THEN x.user_id::text
+                WHEN 'harness' THEN x.harness
+                WHEN 'repo' THEN x.repo_key
+                WHEN 'kind' THEN x.kind
+                WHEN 'primary_model' THEN x.primary_model
+            END AS gkey,
+           CASE $2::text
+                WHEN 'user' THEN x.email
+                WHEN 'repo' THEN x.repo_path_out
+            END AS glabel,
+           CASE $2::text
+                WHEN 'user' THEN x.user_id
+                WHEN 'repo' THEN x.repo_id_out
+            END AS gid
+    FROM rfb x
+    WHERE x.win = 'cur'
+),
+bd_ranked AS (
+    SELECT y.run_id, y.user_id, y.email, y.repo_id, y.kind, y.harness, y.fail_origin, y.requeued, y.needs_landing, y.created_at, y.repo_key, y.repo_id_out, y.repo_path_out, y.win, y.outcome, y.primary_model, y.wb, y.bidx, y.gkey, y.glabel, y.gid, y.gfin, dense_rank() OVER (ORDER BY y.gfin DESC, y.gkey COLLATE "C")::int AS rnk
+    FROM (SELECT i.run_id, i.user_id, i.email, i.repo_id, i.kind, i.harness, i.fail_origin, i.requeued, i.needs_landing, i.created_at, i.repo_key, i.repo_id_out, i.repo_path_out, i.win, i.outcome, i.primary_model, i.wb, i.bidx, i.gkey, i.glabel, i.gid, count(*) FILTER (WHERE i.outcome IS NOT NULL) OVER (PARTITION BY i.gkey) AS gfin FROM bd_items i) y
+),
+bd_groups AS MATERIALIZED (
+    SELECT r.gkey, min(r.glabel COLLATE "C") AS glabel, (array_agg(r.gid ORDER BY r.gid))[1] AS gid, min(r.rnk) AS rnk
+    FROM bd_ranked r
+    GROUP BY r.gkey
+),
+fan AS (
+    SELECT 'tot_cur'::text AS kind, 0 AS idx, x.outcome, x.requeued FROM rfb x WHERE x.win = 'cur'
+    UNION ALL SELECT 'tot_prev', 0, x.outcome, x.requeued FROM rfb x WHERE x.win = 'prev'
+    UNION ALL SELECT 'bucket', x.bidx, x.outcome, x.requeued FROM rfb x WHERE x.bidx IS NOT NULL
+    UNION ALL SELECT 'bd', LEAST(x.rnk, 51), x.outcome, x.requeued FROM bd_ranked x
+    UNION ALL SELECT 'tot_cur', 0, NULL::text, false
+    UNION ALL SELECT 'tot_prev', 0, NULL::text, false
+    UNION ALL SELECT 'bucket', bk.idx, NULL::text, false FROM bk
+),
+cnt AS (
+    SELECT f.kind, f.idx,
+           (CASE WHEN f.kind = 'bd' THEN 5 ELSE 1 END) AS min_n,
+           count(*) FILTER (WHERE f.outcome IS NOT NULL) AS fin,
+           count(*) FILTER (WHERE f.outcome = 'completed') AS n_completed,
+           count(*) FILTER (WHERE f.outcome = 'cancelled') AS n_cancelled,
+           count(*) FILTER (WHERE f.outcome = 'plan_rejected') AS n_plan_rejected,
+           count(*) FILTER (WHERE f.outcome = 'base_diverged') AS n_base_diverged,
+           count(*) FILTER (WHERE f.outcome = 'failed') AS n_failed,
+           count(*) FILTER (WHERE f.requeued) AS n_requeued
+    FROM fan f
+    GROUP BY f.kind, f.idx
+),
+cnt_j AS (
+    SELECT c.kind, c.idx, c.fin, c.n_requeued,
+           jsonb_build_object('completed', c.n_completed, 'cancelled', c.n_cancelled, 'plan_rejected', c.n_plan_rejected,
+                              'base_diverged', c.n_base_diverged, 'failed', c.n_failed) AS outcomes,
+           jsonb_build_object('value', CASE WHEN c.fin < c.min_n THEN NULL ELSE round(c.n_failed::numeric / c.fin, 6) END,
+                              'reason', CASE WHEN c.fin >= c.min_n THEN NULL
+                                             WHEN c.kind = 'bd' THEN 'insufficient_runs'
+                                             ELSE 'no_finished_runs' END) AS rate
+    FROM cnt c
+),
+cause_g AS (
+    SELECT COALESCE(x.fail_origin, 'unknown') AS origin, count(*) AS n
+    FROM rfb x
+    WHERE x.win = 'cur' AND x.outcome = 'failed'
+    GROUP BY 1
+),
+cause_r AS (
+    SELECT g.origin, g.n, row_number() OVER (ORDER BY g.n DESC, g.origin COLLATE "C")::int AS rnk
+    FROM cause_g g
+),
+cause_s AS (
+    SELECT LEAST(r.rnk, 6) AS slot, sum(r.n)::bigint AS n, (array_agg(r.origin ORDER BY r.rnk) FILTER (WHERE r.rnk <= 5))[1] AS origin
+    FROM cause_r r
+    GROUP BY LEAST(r.rnk, 6)
+),
+ev_seg AS (
+    SELECT NULL::text AS hs, width_bucket(x.created_at, (SELECT arr FROM bnd)) AS seg,
+           count(*) FILTER (WHERE x.outcome IS NOT NULL) AS fin, count(*) FILTER (WHERE x.outcome = 'failed') AS failed
+    FROM run_fold x
+    GROUP BY width_bucket(x.created_at, (SELECT arr FROM bnd))
+    UNION ALL
+    SELECT x.harness, width_bucket(x.created_at, (SELECT arr FROM bnd)),
+           count(*) FILTER (WHERE x.outcome IS NOT NULL), count(*) FILTER (WHERE x.outcome = 'failed')
+    FROM run_fold x
+    GROUP BY x.harness, width_bucket(x.created_at, (SELECT arr FROM bnd))
+),
+roll_pts AS (
+    SELECT s.hs, s.ord, rp.idx, COALESCE(sum(g.fin), 0)::bigint AS fin, COALESCE(sum(g.failed), 0)::bigint AS failed
+    FROM roll_series s
+    CROSS JOIN rp
+    LEFT JOIN ev_seg g ON g.hs IS NOT DISTINCT FROM s.hs
+        AND (SELECT arr[g.seg] FROM bnd) >= rp.r_start
+        AND (SELECT arr[g.seg] FROM bnd) < rp.r_end
+    GROUP BY s.hs, s.ord, rp.idx
+),
+roll_j AS (
+    SELECT p.hs, p.idx,
+           jsonb_build_object('index', p.idx - 1, 'finished', p.fin, 'failed', p.failed,
+                              'value', CASE WHEN p.fin < 5 THEN NULL ELSE round(p.failed::numeric / p.fin, 6) END,
+                              'reason', CASE WHEN p.fin < 5 THEN 'insufficient_runs' END) AS j
+    FROM roll_pts p
+)
+SELECT jsonb_build_object(
+    'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
+    'totals', jsonb_build_object('current', (SELECT jsonb_build_object('finished', c.fin, 'outcomes', c.outcomes, 'failure_rate', c.rate, 'requeued_runs', c.n_requeued) FROM cnt_j c WHERE c.kind = 'tot_cur'))
+        || CASE WHEN $1::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT jsonb_build_object('finished', c.fin, 'outcomes', c.outcomes, 'failure_rate', c.rate, 'requeued_runs', c.n_requeued) FROM cnt_j c WHERE c.kind = 'tot_prev')) END,
+    'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1, 'finished', c.fin, 'outcomes', c.outcomes) ORDER BY c.idx) FROM cnt_j c WHERE c.kind = 'bucket'), '[]'::jsonb),
+    'causes', jsonb_build_object(
+        'failed', (SELECT COALESCE(sum(g.n), 0)::bigint FROM cause_g g),
+        'items', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('rank', s.slot, 'is_other', s.slot = 6, 'origin', s.origin, 'runs', s.n,
+                                                'share', round(s.n::numeric / (SELECT sum(g.n) FROM cause_g g), 6)) ORDER BY s.slot)
+            FROM cause_s s), '[]'::jsonb)),
+    'rolling', jsonb_build_object(
+        'overall', COALESCE((SELECT jsonb_agg(r.j ORDER BY r.idx) FROM roll_j r WHERE r.hs IS NULL), '[]'::jsonb),
+        'harnesses', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('harness', s.hs,
+                                                'points', COALESCE((SELECT jsonb_agg(r.j ORDER BY r.idx) FROM roll_j r WHERE r.hs = s.hs), '[]'::jsonb))
+                             ORDER BY s.ord)
+            FROM roll_series s WHERE s.hs IS NOT NULL), '[]'::jsonb)),
+    'breakdown', jsonb_build_object(
+        'dimension', $2::text,
+        'rows', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'rank', c.idx,
+                    'is_other', c.idx = 51,
+                    'key', g.gkey, 'label', g.glabel, 'id', g.gid,
+                    'n', c.fin, 'outcomes', c.outcomes, 'failure_rate', c.rate, 'requeued_runs', c.n_requeued)
+                ORDER BY c.idx)
+            FROM cnt_j c
+            LEFT JOIN bd_groups g ON g.rnk = c.idx AND c.idx < 51
+            WHERE c.kind = 'bd'), '[]'::jsonb)),
+    'needs_landing', (SELECT count(*) FROM rfb x WHERE x.win = 'cur' AND x.needs_landing)
+)::jsonb AS doc
+`
+
+type AnalyticsAllReliabilityParams struct {
+	PreviousFrom    pgtype.Timestamptz   `json:"previous_from"`
+	Breakdown       string               `json:"breakdown"`
+	Now             pgtype.Timestamptz   `json:"now"`
+	BucketStarts    []pgtype.Timestamptz `json:"bucket_starts"`
+	BucketEnds      []pgtype.Timestamptz `json:"bucket_ends"`
+	RollStarts      []pgtype.Timestamptz `json:"roll_starts"`
+	RollEnds        []pgtype.Timestamptz `json:"roll_ends"`
+	RollHarnesses   []string             `json:"roll_harnesses"`
+	LandableOrigins []string             `json:"landable_origins"`
+	FoldFrom        pgtype.Timestamptz   `json:"fold_from"`
+	RepoID          pgtype.UUID          `json:"repo_id"`
+	Harness         pgtype.Text          `json:"harness"`
+	Kinds           []string             `json:"kinds"`
+	From            pgtype.Timestamptz   `json:"from"`
+}
+
+// Issue #4685: the Reliability document, one jsonb value built over ONE materialized cohort and
+// ONE per-run fold (exactly one row per run, so every count is a plain count(*)). Reuses the
+// Spend statements' window, bucket, rolling-segment, masking and Primary-model rules.
+// The owner and all-scope statements are kept textually identical except the scope lines, each
+// tagged with a trailing marker comment (a Go test drops them and fails on any other drift).
+// The caller passes the effective Delivery kinds in @kinds (chat, judge and cross_check never
+// reach this statement). Every range comes from the parameters (half-open); no calendar
+// arithmetic here. Outcome classes come from run_outcome_classes; needs_landing mirrors
+// SelfRunOutcomes (the Go-owned @landable_origins plus an owner-scoped available capture or a
+// preserved patch).
+func (q *Queries) AnalyticsAllReliability(ctx context.Context, arg AnalyticsAllReliabilityParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, analyticsAllReliability,
+		arg.PreviousFrom,
+		arg.Breakdown,
+		arg.Now,
+		arg.BucketStarts,
+		arg.BucketEnds,
+		arg.RollStarts,
+		arg.RollEnds,
+		arg.RollHarnesses,
+		arg.LandableOrigins,
+		arg.FoldFrom,
+		arg.RepoID,
+		arg.Harness,
+		arg.Kinds,
+		arg.From,
+	)
+	var doc []byte
+	err := row.Scan(&doc)
+	return doc, err
+}
+
 const analyticsAllRepoOptions = `-- name: AnalyticsAllRepoOptions :many
 SELECT r.id, r.path_with_namespace
 FROM repos r
@@ -636,6 +955,339 @@ func (q *Queries) AnalyticsOwnerHistoryStart(ctx context.Context, arg AnalyticsO
 	var history_start pgtype.Timestamptz
 	err := row.Scan(&history_start)
 	return history_start, err
+}
+
+const analyticsOwnerLatestFailure = `-- name: AnalyticsOwnerLatestFailure :one
+WITH last_failure AS MATERIALIZED (
+    SELECT id, user_id, COALESCE(finished_at, status_since) AS ended_at,
+           COALESCE(fail_origin, 'unknown') AS origin
+    FROM runs
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
+      AND fn_outcome_kind(kind)
+      AND user_id = $1::uuid  -- owner-only
+      AND ($2::uuid IS NULL OR repo_id = $2::uuid)
+      AND ($3::text IS NULL OR harness = $3::text)
+      AND kind = ANY($4::text[])
+    ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
+)
+SELECT
+    EXISTS (SELECT 1 FROM last_failure)::boolean AS found,
+    (SELECT f.ended_at FROM last_failure f)::timestamptz AS failed_at,
+    COALESCE((SELECT f.origin FROM last_failure f), '')::text AS origin,
+    COALESCE((SELECT f.id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS run_id,
+    COALESCE((SELECT f.user_id FROM last_failure f), '00000000-0000-0000-0000-000000000000'::uuid)::uuid AS failed_user_id,
+    COALESCE((SELECT count(*)::bigint
+       FROM last_failure f JOIN runs r3 ON COALESCE(r3.finished_at, r3.status_since) > f.ended_at
+       WHERE r3.status = 'completed' AND fn_outcome_kind(r3.kind)
+         AND r3.user_id = $1::uuid  -- owner-only
+         AND ($2::uuid IS NULL OR r3.repo_id = $2::uuid)
+         AND ($3::text IS NULL OR r3.harness = $3::text)
+         AND r3.kind = ANY($4::text[])), 0)::bigint AS completed_since_last_failure
+`
+
+type AnalyticsOwnerLatestFailureParams struct {
+	UserID  uuid.UUID   `json:"user_id"`
+	RepoID  pgtype.UUID `json:"repo_id"`
+	Harness pgtype.Text `json:"harness"`
+	Kinds   []string    `json:"kinds"`
+}
+
+type AnalyticsOwnerLatestFailureRow struct {
+	Found                     bool               `json:"found"`
+	FailedAt                  pgtype.Timestamptz `json:"failed_at"`
+	Origin                    string             `json:"origin"`
+	RunID                     uuid.UUID          `json:"run_id"`
+	FailedUserID              uuid.UUID          `json:"failed_user_id"`
+	CompletedSinceLastFailure int64              `json:"completed_since_last_failure"`
+}
+
+// Issue #4685: the lifetime latest failure of the scope (no created_at cutoff, no window): the
+// SelfRunOutcomes last_failure predicate verbatim, restricted by the request's repo, harness
+// and Delivery kinds. completed_since_last_failure counts completed outcome-kind runs of the
+// same scope strictly after the failure's terminal timestamp. found is false when there is no
+// failure (the other columns then carry zero values). The owner and all-scope statements are
+// textually identical except the lines tagged owner-only.
+func (q *Queries) AnalyticsOwnerLatestFailure(ctx context.Context, arg AnalyticsOwnerLatestFailureParams) (AnalyticsOwnerLatestFailureRow, error) {
+	row := q.db.QueryRow(ctx, analyticsOwnerLatestFailure,
+		arg.UserID,
+		arg.RepoID,
+		arg.Harness,
+		arg.Kinds,
+	)
+	var i AnalyticsOwnerLatestFailureRow
+	err := row.Scan(
+		&i.Found,
+		&i.FailedAt,
+		&i.Origin,
+		&i.RunID,
+		&i.FailedUserID,
+		&i.CompletedSinceLastFailure,
+	)
+	return i, err
+}
+
+const analyticsOwnerReliability = `-- name: AnalyticsOwnerReliability :one
+WITH
+prm AS (SELECT $3::timestamptz AS now_ts),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest($4::timestamptz[]), unnest($5::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+rp AS (
+    SELECT t.ord::int AS idx, t.s AS r_start, t.e AS r_end
+    FROM ROWS FROM (unnest($6::timestamptz[]), unnest($7::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+bnd AS (
+    SELECT COALESCE(array_agg(d.x ORDER BY d.x), '{}'::timestamptz[]) AS arr
+    FROM (SELECT r_start AS x FROM rp UNION SELECT r_end FROM rp) d
+),
+roll_series AS (
+    SELECT NULL::text AS hs, 0 AS ord
+    UNION ALL
+    SELECT t.h, t.ord::int FROM unnest($8::text[]) WITH ORDINALITY AS t(h, ord)
+),
+cohort AS MATERIALIZED (
+    SELECT r.id, r.user_id, u.email, r.repo_id, rpo.path_with_namespace AS repo_path,
+           ($9::boolean IS TRUE OR fc.id IS NOT NULL) AS repo_shown,  -- owner-only
+           r.kind, r.harness, r.fail_origin, (r.requeue_count > 0) AS requeued, r.created_at,
+           CASE WHEN r.status = 'failed' AND r.fail_origin = ANY($10::text[])
+                THEN (EXISTS (SELECT 1 FROM recovery_captures rc
+                              WHERE rc.run_id = r.id AND rc.user_id = r.user_id AND rc.state = 'available')
+                      OR r.preserved_patch IS NOT NULL)
+                ELSE false END AS needs_landing
+    FROM runs r
+    JOIN users u ON u.id = r.user_id
+    LEFT JOIN repos rpo ON rpo.id = r.repo_id
+    LEFT JOIN forge_connections fc ON fc.id = rpo.connection_id AND fc.user_id = $11::uuid  -- owner-only
+    WHERE r.created_at >= $12::timestamptz AND r.created_at < $3::timestamptz
+      AND r.user_id = $11::uuid  -- owner-only
+      AND ($13::uuid IS NULL OR r.repo_id = $13::uuid)
+      AND ($14::text IS NULL OR r.harness = $14::text)
+      AND r.kind = ANY($15::text[])
+),
+run_fold AS MATERIALIZED (
+    SELECT c.id AS run_id, c.user_id, c.email, c.repo_id, c.kind, c.harness, c.fail_origin, c.requeued,
+           c.needs_landing, c.created_at,
+           CASE WHEN c.repo_id IS NULL THEN 'no_repo'
+                WHEN c.repo_shown THEN c.repo_id::text
+                ELSE 'inaccessible_repo' END AS repo_key,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_id END AS repo_id_out,
+           CASE WHEN c.repo_id IS NOT NULL AND c.repo_shown THEN c.repo_path END AS repo_path_out,
+           CASE WHEN c.created_at >= $16::timestamptz THEN 'cur'
+                WHEN $1::timestamptz IS NOT NULL AND c.created_at >= $1::timestamptz AND c.created_at < $16::timestamptz THEN 'prev'
+           END AS win,
+           o.outcome,
+           pm.primary_model,
+           width_bucket(c.created_at, $4::timestamptz[]) AS wb
+    FROM cohort c
+    LEFT JOIN LATERAL (
+        SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0
+    ) o ON true
+    LEFT JOIN LATERAL (
+        SELECT
+               COALESCE((array_agg(mf.model ORDER BY mf.output_tokens DESC, mf.model COLLATE "C" ASC)
+                         FILTER (WHERE mf.model IS NOT NULL))[1], 'unknown') AS primary_model
+        FROM run_usage_model_totals mf
+        WHERE mf.run_id = c.id AND $2::text = 'primary_model'
+          AND c.created_at >= $16::timestamptz  -- only current-window rows read primary_model
+        OFFSET 0
+    ) pm ON true
+),
+rfb AS MATERIALIZED (
+    SELECT rf.run_id, rf.user_id, rf.email, rf.repo_id, rf.kind, rf.harness, rf.fail_origin, rf.requeued, rf.needs_landing, rf.created_at, rf.repo_key, rf.repo_id_out, rf.repo_path_out, rf.win, rf.outcome, rf.primary_model, rf.wb,
+           CASE WHEN rf.win = 'cur' AND rf.wb >= 1 AND rf.created_at < ($5::timestamptz[])[rf.wb] THEN rf.wb END AS bidx
+    FROM run_fold rf
+),
+bd_items AS MATERIALIZED (
+    SELECT x.run_id, x.user_id, x.email, x.repo_id, x.kind, x.harness, x.fail_origin, x.requeued, x.needs_landing, x.created_at, x.repo_key, x.repo_id_out, x.repo_path_out, x.win, x.outcome, x.primary_model, x.wb, x.bidx,
+           CASE $2::text
+                WHEN 'user' THEN x.user_id::text
+                WHEN 'harness' THEN x.harness
+                WHEN 'repo' THEN x.repo_key
+                WHEN 'kind' THEN x.kind
+                WHEN 'primary_model' THEN x.primary_model
+            END AS gkey,
+           CASE $2::text
+                WHEN 'user' THEN x.email
+                WHEN 'repo' THEN x.repo_path_out
+            END AS glabel,
+           CASE $2::text
+                WHEN 'user' THEN x.user_id
+                WHEN 'repo' THEN x.repo_id_out
+            END AS gid
+    FROM rfb x
+    WHERE x.win = 'cur'
+),
+bd_ranked AS (
+    SELECT y.run_id, y.user_id, y.email, y.repo_id, y.kind, y.harness, y.fail_origin, y.requeued, y.needs_landing, y.created_at, y.repo_key, y.repo_id_out, y.repo_path_out, y.win, y.outcome, y.primary_model, y.wb, y.bidx, y.gkey, y.glabel, y.gid, y.gfin, dense_rank() OVER (ORDER BY y.gfin DESC, y.gkey COLLATE "C")::int AS rnk
+    FROM (SELECT i.run_id, i.user_id, i.email, i.repo_id, i.kind, i.harness, i.fail_origin, i.requeued, i.needs_landing, i.created_at, i.repo_key, i.repo_id_out, i.repo_path_out, i.win, i.outcome, i.primary_model, i.wb, i.bidx, i.gkey, i.glabel, i.gid, count(*) FILTER (WHERE i.outcome IS NOT NULL) OVER (PARTITION BY i.gkey) AS gfin FROM bd_items i) y
+),
+bd_groups AS MATERIALIZED (
+    SELECT r.gkey, min(r.glabel COLLATE "C") AS glabel, (array_agg(r.gid ORDER BY r.gid))[1] AS gid, min(r.rnk) AS rnk
+    FROM bd_ranked r
+    GROUP BY r.gkey
+),
+fan AS (
+    SELECT 'tot_cur'::text AS kind, 0 AS idx, x.outcome, x.requeued FROM rfb x WHERE x.win = 'cur'
+    UNION ALL SELECT 'tot_prev', 0, x.outcome, x.requeued FROM rfb x WHERE x.win = 'prev'
+    UNION ALL SELECT 'bucket', x.bidx, x.outcome, x.requeued FROM rfb x WHERE x.bidx IS NOT NULL
+    UNION ALL SELECT 'bd', LEAST(x.rnk, 51), x.outcome, x.requeued FROM bd_ranked x
+    UNION ALL SELECT 'tot_cur', 0, NULL::text, false
+    UNION ALL SELECT 'tot_prev', 0, NULL::text, false
+    UNION ALL SELECT 'bucket', bk.idx, NULL::text, false FROM bk
+),
+cnt AS (
+    SELECT f.kind, f.idx,
+           (CASE WHEN f.kind = 'bd' THEN 5 ELSE 1 END) AS min_n,
+           count(*) FILTER (WHERE f.outcome IS NOT NULL) AS fin,
+           count(*) FILTER (WHERE f.outcome = 'completed') AS n_completed,
+           count(*) FILTER (WHERE f.outcome = 'cancelled') AS n_cancelled,
+           count(*) FILTER (WHERE f.outcome = 'plan_rejected') AS n_plan_rejected,
+           count(*) FILTER (WHERE f.outcome = 'base_diverged') AS n_base_diverged,
+           count(*) FILTER (WHERE f.outcome = 'failed') AS n_failed,
+           count(*) FILTER (WHERE f.requeued) AS n_requeued
+    FROM fan f
+    GROUP BY f.kind, f.idx
+),
+cnt_j AS (
+    SELECT c.kind, c.idx, c.fin, c.n_requeued,
+           jsonb_build_object('completed', c.n_completed, 'cancelled', c.n_cancelled, 'plan_rejected', c.n_plan_rejected,
+                              'base_diverged', c.n_base_diverged, 'failed', c.n_failed) AS outcomes,
+           jsonb_build_object('value', CASE WHEN c.fin < c.min_n THEN NULL ELSE round(c.n_failed::numeric / c.fin, 6) END,
+                              'reason', CASE WHEN c.fin >= c.min_n THEN NULL
+                                             WHEN c.kind = 'bd' THEN 'insufficient_runs'
+                                             ELSE 'no_finished_runs' END) AS rate
+    FROM cnt c
+),
+cause_g AS (
+    SELECT COALESCE(x.fail_origin, 'unknown') AS origin, count(*) AS n
+    FROM rfb x
+    WHERE x.win = 'cur' AND x.outcome = 'failed'
+    GROUP BY 1
+),
+cause_r AS (
+    SELECT g.origin, g.n, row_number() OVER (ORDER BY g.n DESC, g.origin COLLATE "C")::int AS rnk
+    FROM cause_g g
+),
+cause_s AS (
+    SELECT LEAST(r.rnk, 6) AS slot, sum(r.n)::bigint AS n, (array_agg(r.origin ORDER BY r.rnk) FILTER (WHERE r.rnk <= 5))[1] AS origin
+    FROM cause_r r
+    GROUP BY LEAST(r.rnk, 6)
+),
+ev_seg AS (
+    SELECT NULL::text AS hs, width_bucket(x.created_at, (SELECT arr FROM bnd)) AS seg,
+           count(*) FILTER (WHERE x.outcome IS NOT NULL) AS fin, count(*) FILTER (WHERE x.outcome = 'failed') AS failed
+    FROM run_fold x
+    GROUP BY width_bucket(x.created_at, (SELECT arr FROM bnd))
+    UNION ALL
+    SELECT x.harness, width_bucket(x.created_at, (SELECT arr FROM bnd)),
+           count(*) FILTER (WHERE x.outcome IS NOT NULL), count(*) FILTER (WHERE x.outcome = 'failed')
+    FROM run_fold x
+    GROUP BY x.harness, width_bucket(x.created_at, (SELECT arr FROM bnd))
+),
+roll_pts AS (
+    SELECT s.hs, s.ord, rp.idx, COALESCE(sum(g.fin), 0)::bigint AS fin, COALESCE(sum(g.failed), 0)::bigint AS failed
+    FROM roll_series s
+    CROSS JOIN rp
+    LEFT JOIN ev_seg g ON g.hs IS NOT DISTINCT FROM s.hs
+        AND (SELECT arr[g.seg] FROM bnd) >= rp.r_start
+        AND (SELECT arr[g.seg] FROM bnd) < rp.r_end
+    GROUP BY s.hs, s.ord, rp.idx
+),
+roll_j AS (
+    SELECT p.hs, p.idx,
+           jsonb_build_object('index', p.idx - 1, 'finished', p.fin, 'failed', p.failed,
+                              'value', CASE WHEN p.fin < 5 THEN NULL ELSE round(p.failed::numeric / p.fin, 6) END,
+                              'reason', CASE WHEN p.fin < 5 THEN 'insufficient_runs' END) AS j
+    FROM roll_pts p
+)
+SELECT jsonb_build_object(
+    'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
+    'totals', jsonb_build_object('current', (SELECT jsonb_build_object('finished', c.fin, 'outcomes', c.outcomes, 'failure_rate', c.rate, 'requeued_runs', c.n_requeued) FROM cnt_j c WHERE c.kind = 'tot_cur'))
+        || CASE WHEN $1::timestamptz IS NULL THEN '{}'::jsonb
+                ELSE jsonb_build_object('previous', (SELECT jsonb_build_object('finished', c.fin, 'outcomes', c.outcomes, 'failure_rate', c.rate, 'requeued_runs', c.n_requeued) FROM cnt_j c WHERE c.kind = 'tot_prev')) END,
+    'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1, 'finished', c.fin, 'outcomes', c.outcomes) ORDER BY c.idx) FROM cnt_j c WHERE c.kind = 'bucket'), '[]'::jsonb),
+    'causes', jsonb_build_object(
+        'failed', (SELECT COALESCE(sum(g.n), 0)::bigint FROM cause_g g),
+        'items', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('rank', s.slot, 'is_other', s.slot = 6, 'origin', s.origin, 'runs', s.n,
+                                                'share', round(s.n::numeric / (SELECT sum(g.n) FROM cause_g g), 6)) ORDER BY s.slot)
+            FROM cause_s s), '[]'::jsonb)),
+    'rolling', jsonb_build_object(
+        'overall', COALESCE((SELECT jsonb_agg(r.j ORDER BY r.idx) FROM roll_j r WHERE r.hs IS NULL), '[]'::jsonb),
+        'harnesses', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('harness', s.hs,
+                                                'points', COALESCE((SELECT jsonb_agg(r.j ORDER BY r.idx) FROM roll_j r WHERE r.hs = s.hs), '[]'::jsonb))
+                             ORDER BY s.ord)
+            FROM roll_series s WHERE s.hs IS NOT NULL), '[]'::jsonb)),
+    'breakdown', jsonb_build_object(
+        'dimension', $2::text,
+        'rows', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'rank', c.idx,
+                    'is_other', c.idx = 51,
+                    'key', g.gkey, 'label', g.glabel, 'id', g.gid,
+                    'n', c.fin, 'outcomes', c.outcomes, 'failure_rate', c.rate, 'requeued_runs', c.n_requeued)
+                ORDER BY c.idx)
+            FROM cnt_j c
+            LEFT JOIN bd_groups g ON g.rnk = c.idx AND c.idx < 51
+            WHERE c.kind = 'bd'), '[]'::jsonb)),
+    'needs_landing', (SELECT count(*) FROM rfb x WHERE x.win = 'cur' AND x.needs_landing)
+)::jsonb AS doc
+`
+
+type AnalyticsOwnerReliabilityParams struct {
+	PreviousFrom    pgtype.Timestamptz   `json:"previous_from"`
+	Breakdown       string               `json:"breakdown"`
+	Now             pgtype.Timestamptz   `json:"now"`
+	BucketStarts    []pgtype.Timestamptz `json:"bucket_starts"`
+	BucketEnds      []pgtype.Timestamptz `json:"bucket_ends"`
+	RollStarts      []pgtype.Timestamptz `json:"roll_starts"`
+	RollEnds        []pgtype.Timestamptz `json:"roll_ends"`
+	RollHarnesses   []string             `json:"roll_harnesses"`
+	RevealRepos     bool                 `json:"reveal_repos"`
+	LandableOrigins []string             `json:"landable_origins"`
+	UserID          uuid.UUID            `json:"user_id"`
+	FoldFrom        pgtype.Timestamptz   `json:"fold_from"`
+	RepoID          pgtype.UUID          `json:"repo_id"`
+	Harness         pgtype.Text          `json:"harness"`
+	Kinds           []string             `json:"kinds"`
+	From            pgtype.Timestamptz   `json:"from"`
+}
+
+// Issue #4685: the Reliability document, one jsonb value built over ONE materialized cohort and
+// ONE per-run fold (exactly one row per run, so every count is a plain count(*)). Reuses the
+// Spend statements' window, bucket, rolling-segment, masking and Primary-model rules.
+// The owner and all-scope statements are kept textually identical except the scope lines, each
+// tagged with a trailing marker comment (a Go test drops them and fails on any other drift).
+// The caller passes the effective Delivery kinds in @kinds (chat, judge and cross_check never
+// reach this statement). Every range comes from the parameters (half-open); no calendar
+// arithmetic here. Outcome classes come from run_outcome_classes; needs_landing mirrors
+// SelfRunOutcomes (the Go-owned @landable_origins plus an owner-scoped available capture or a
+// preserved patch).
+func (q *Queries) AnalyticsOwnerReliability(ctx context.Context, arg AnalyticsOwnerReliabilityParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, analyticsOwnerReliability,
+		arg.PreviousFrom,
+		arg.Breakdown,
+		arg.Now,
+		arg.BucketStarts,
+		arg.BucketEnds,
+		arg.RollStarts,
+		arg.RollEnds,
+		arg.RollHarnesses,
+		arg.RevealRepos,
+		arg.LandableOrigins,
+		arg.UserID,
+		arg.FoldFrom,
+		arg.RepoID,
+		arg.Harness,
+		arg.Kinds,
+		arg.From,
+	)
+	var doc []byte
+	err := row.Scan(&doc)
+	return doc, err
 }
 
 const analyticsOwnerRepoAccessible = `-- name: AnalyticsOwnerRepoAccessible :one

@@ -1,6 +1,6 @@
 # PRD #4212: Admin → Workers tab with worker capacity settings
 
-**Status**: Implemented; hosted acceptance pending
+**Status**: Done (2026-11-26): implemented in PR #4421; hosted acceptance is tracked in #4424.
 **Priority**: Normal
 **Umbrella**: #2415
 **Blocks**: #4213 (admin-defined hosted worker sizes renders inside this tab)

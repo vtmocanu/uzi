@@ -1047,6 +1047,15 @@ func run() error {
 			Name: "terminal_preservation",
 			Run:  wsvc.SweepTerminalPreservations,
 		},
+		// Run environment retired versions (PRD #4416 M2): deletes retired and pending-deletion
+		// secret versions no held run holds a receipt for, then the variable identities nothing
+		// references. ALWAYS registered and effect-inert when there is nothing to sweep: one
+		// bounded owner scan. It locks only the owner's users row (FOR SHARE NOWAIT, a busy owner
+		// is skipped) and never a run or a custody row.
+		sweeper.Pass{
+			Name: "run_env_retired_sweep",
+			Run:  wsvc.SweepRunEnvRetired,
+		},
 		// Prerequisite closure always advances existing rows, regardless of admission knobs.
 		// Its extra share before run liveness is at most a 10s pass plus a 5s in-flight
 		// durable outcome tail (15s), independent of WorkerHeartbeatStale and RunTimeout.

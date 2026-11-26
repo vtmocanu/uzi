@@ -14,6 +14,12 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 - Fresh compatible task claims freeze validated root work-branch and own-run checkpoint-key coordinates with `task_checkpoint_coordinates_v1`; issue/self-improvement keys stay exact, active legacy tasks are not converted, invalid lineage stays unsupported and old workers receive no descriptor. Authorization markers do not prove durability: known no-write may continue on the inherited branch; unavailable/mismatched confirmed anchors or unresolved writes without verified evidence retain custody and fail closed. Ordinary checkpoints are committed-only; WIP requires verified capture overlay. Read-only review, task MR behavior, custody/generation/CAS and issue-only milestone policy remain unchanged. Old API rollback can stall queue-head claims or reject whole mixed readoption batches; roll forward compatible API. Schema Down refuses enrolled rows; capability overrides cannot bypass compatibility. See [ADR-3343](../adr/3343-task-checkpoint-coordinates.md). (AI-synced 2026-10-24)
 
+## Feature #4416 — Run environment variables
+
+PRD at `prds/4416-repo-env-vars.md` (M1 shipped; M2 implemented, pending landing; M3 and M4 pending).
+
+- A repo's variables reach lead-lane runs only (`issue`, `ci_fix`, `prompt`, `self_improve`, `mr_rework`, `task`, no review target, no egress profile), at the lowest precedence in the agent command environment on both harnesses; chat, judge, job, task-review and cross-check runs get none. Secret values are redacted from run output and every publish (checkpoint, final push on every forge, held and terminal packs, recovery uploads, preserved patch) is exact-value scanned and fails closed. A lead-lane run whose repo has an enabled variable, or that holds a secret receipt, is claimed only by a worker reporting `run_env_v1`. (AI-synced 2026-11-21)
+
 ## Project
 
 - Name: "Uzinele Întunecate" (uzi) — an AI dark factory.
@@ -459,6 +465,7 @@ Tracked as GitLab issue vtmocanu/uzi#40; PRD at `prds/done/40-token-usage-report
 - Superseded by the next line; on a 120,000-run seed an admin all-users `window=all` request takes about 10 s and would exceed the 8 s budget; 30d takes about 1.3 s for an admin and 0.25 s for an owner. (AI-synced 2026-11-25, #4684)
 - Admin all-users `window=all` is not offered: Options lists only `7d`, `30d`, `90d` for that scope (`user` omitted or `user=all`) and Spend answers 400 `window all not available for all users` before any analytics database work (authentication runs first). Owner and admin `user=<uuid>` all-time are unchanged. All-time for admin all-users is deferred to a follow-up that adds per-run totals for finished runs (owner decision at landing). An empty-scope `window=all` response reports `bucket_width_days` 7 with no buckets. (AI-synced 2026-11-25, #4684)
 - The merge witness uses the owner scope (owner routes and admin `user=<uuid>` use that user's runs; admin all-users uses any run) and ignores the harness, kind, repo and window filters, so a same-owner `mr_rework` or other-harness run can prove a PR merged without adding its cost to the filtered cohort. (AI-synced 2026-11-25, #4684)
+- Reliability analytics routes exist (API only): `/api/analytics/reliability` and `/api/admin/analytics/reliability` cover delivery kinds only, by creation cohort; a kind filter selecting only supporting kinds answers `applicable: false` (`supporting_kinds_only`), and the admin all-users `window=all` 400 now applies to Reliability too. `latest_failure` is lifetime (unwindowed) with a strictly-after completed count, and `needs_landing` is a recoverable-work figure whose work may already have landed. (AI-synced 2026-11-26, #4685)
 
 ## Feature — Run retrospective (LLM judge) & self-improvement job
 
@@ -2060,7 +2067,7 @@ PRD at `prds/done/3263-settings-models-tab.md`.
 
 ## Feature #4123 — Weekly limit warning and switch reason
 
-PRD at `prds/4123-weekly-limit-warning.md`.
+PRD at `prds/done/4123-weekly-limit-warning.md`.
 
 - A vendor-subscription run parked on the overall 7-day window, or paused by the weekly usage reserve, says why its next claim will or will not move to another credential (pinned, not auto, can switch, selection unchanged, headroom outside the pool, pool exhausted, no alternative, switch pending, Codex account-bound, unknown), what happens next without promising a resume that will not happen, and the existing owner action that would change it. Shown to the owner only on the run page, `uzi run get`, the TUI and the Slack park message; one server computation feeds every surface. Nothing switches automatically; 5-hour and per-model parks, API keys and custom providers are unchanged. (AI-synced 2026-11-22)
 - An early warning appears for any non-terminal vendor-subscription run whose credential is within the per-user margin (`weekly_warning_margin_pts`, default 15, 0..50; 0 disables early warnings but not park explanations) of its effective weekly limit (the weekly reserve when set, else 100%), on the run page, the Overview "Needs your decision" card (grouped per credential; a run is never listed twice), `uzi run get` and the TUI. Set via Run defaults, `uzi settings warning-margin` or `PUT /api/me/weekly-warning-margin`. (AI-synced 2026-11-22)

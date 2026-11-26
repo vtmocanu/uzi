@@ -267,7 +267,10 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 					id := uuid.UUID(row.RepoID.Bytes)
 					scope, repoID = runenv.ScopeRepo, &id
 				}
-				kind := runenv.AADKind(scope, repoID, row.Secret, row.Name)
+				kind, err := runenv.AADFor(row.AadVersion, userID, scope, repoID, row.Secret, row.Name, row.VarID, row.Rev)
+				if err != nil {
+					return err
+				}
 				ciphertext, marker, err := v.convertCipher(userID, kind, row.Ciphertext, row.SealedWith, source, sourceBox, targetMode, targetEpoch, private, lazy)
 				if err != nil {
 					return err

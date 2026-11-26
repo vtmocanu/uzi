@@ -274,7 +274,10 @@ export class SettlementJournal {
       return [];
     }
     const out: SettlementRecord[] = [];
-    for (const runId of runs.sort()) out.push(...(await this.listRun(runId)));
+    for (const runId of runs.sort()) {
+      const listed = await this.listRun(runId);
+      for (const record of listed) out.push(record);
+    }
     return out;
   }
 

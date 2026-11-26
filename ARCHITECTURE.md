@@ -2235,12 +2235,22 @@ defense-in-depth *on top of* this, not instead of it):
    whose values are readable on argv in the process table). The PAT is never
    written to on-disk git config and never enters the agent subprocess's
    environment.
-3. **The agent subprocess** (the Claude Agent SDK's own process) gets *only*
-   `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH` — none of the worker's own env
-   (join token, PAT) is inherited; `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
-   are explicitly unset so they can't outrank the OAuth token. The agent only
-   edits files and makes local commits; when it signals done, the worker
-   performs the push and MR.
+3. **The agent subprocess** (the Claude Agent SDK's own process) gets a
+   replacement environment built by `buildSdkEnv`: the worker-set keys
+   (`CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH`, …) plus, on a lead-lane run,
+   the repo's run environment variables ([ADR-4416](adr/4416-run-env-vars.md)).
+   None of the worker's own env (join token, PAT) is inherited;
+   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are explicitly unset so they
+   can't outrank the OAuth token. Repo variables are folded in at the lowest
+   precedence. Existing keys, protected git-config carriers and names denied by
+   the pinned rules (`fixtures/run-env/name-rules.json`) are dropped. The rules
+   reserve worker credentials and harness controls; allowed application-setting
+   overlaps are recorded in ADR-4416. The agent can read every value it is
+   given. Output redaction and publication checks cover the registered secret
+   forms; an incomplete publication scan withholds the publish. Exact-match and
+   multiline limitations are recorded in ADR-4416. The agent only edits
+   files and makes local commits; when it signals done, the worker performs the
+   push and MR.
 
 This means "worker disk/agent env contain no PAT" (a Success Criterion) holds
 structurally, not by policy — the agent has no credential to push with in the

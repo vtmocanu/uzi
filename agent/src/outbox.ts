@@ -2043,8 +2043,12 @@ export class Outbox {
   depthFor(runId: string): OutboxDepth | undefined {
     const rs = this.runs.get(runId);
     const scopes = [...this.policyInspections.values()].filter(scope => scope.held && scope.runId.toLowerCase() === runId.toLowerCase());
-    if (!rs) return scopes.length ? { runId, pendingMessages: 0, pendingTerminal: scopes.length,
-      staleRetired: 0, since: Math.min(...scopes.map(scope => scope.since)) } : undefined;
+    if (!rs) {
+      let earliest = Infinity;
+      for (const scope of scopes) earliest = Math.min(earliest, scope.since);
+      return scopes.length ? { runId, pendingMessages: 0, pendingTerminal: scopes.length,
+        staleRetired: 0, since: earliest } : undefined;
+    }
     const m = rs.manifest;
     let pendingMessages = 0;
     for (const r of m.records) if (r.lastSeq > m.cursor) pendingMessages += seqCount(r);

@@ -678,7 +678,9 @@ export class SteeringChannel {
     const anchors: number[] = [];
     if (this.held && this.held.phase !== "ack" && this.held.routedAt !== undefined) anchors.push(this.held.routedAt);
     if (this.ready) anchors.push(this.ready.readyAt);
-    const since = anchors.length > 0 ? Math.min(...anchors) : this.now();
+    let earliest = Infinity;
+    for (const anchor of anchors) earliest = Math.min(earliest, anchor);
+    const since = anchors.length > 0 ? earliest : this.now();
     return Math.max(0, this.receiptDeadlineMs - (this.now() - since));
   }
 
@@ -712,7 +714,7 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) {
       if (w.switchOutcome) own.push(w); else w.reject(new CredentialSwitchSignal());
     }
-    this.receiptWaiters.push(...own);
+    for (const w of own) this.receiptWaiters.push(w);
   }
 
   private releaseHeld(): void {
@@ -855,7 +857,7 @@ export class SteeringChannel {
     const fresh = ids.filter((id) => !(this.ready?.ids.includes(id) ?? false));
     for (const id of fresh) this.awaitingGateIds.delete(id);
     if (fresh.length === 0) return;
-    if (this.ready) this.ready.ids.push(...fresh);
+    if (this.ready) { for (const id of fresh) this.ready.ids.push(id); }
     else this.ready = { ids: fresh, readyAt: this.now() };
     this.kickReady();
   }
@@ -2365,7 +2367,7 @@ export class SteeringChannel {
       seeded.push({ id: input.id, body });
     }
     for (const f of seeded) this.seededFollowUpIds.add(f.id);
-    this.receivedFollowUps.unshift(...seeded);
+    for (let i = seeded.length - 1; i >= 0; i--) this.receivedFollowUps.unshift(seeded[i]!);
   }
 
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. The id travels with the body

@@ -4058,6 +4058,13 @@ export interface HarnessDecision {
   other_weekly_reset_at: string | null;
 }
 
+/** PRD #4416 M2: one variable delivered to a run's current claim; never a value. */
+export interface RunInjectedEnvVar {
+  name: string;
+  scope: string;
+  secret: boolean;
+}
+
 /** PRD #4123: one allowlisted action in a weekly-limit block (Go WeeklyLimitFixDTO). `command`
  *  is rendered once by the server, the same string on every surface; it is absent with
  *  command_unavailable "label" when the target label is not command-safe, and absent for a
@@ -4104,6 +4111,8 @@ export interface WeeklyLimitSummary {
 }
 
 export interface Run {
+  /** PRD #4416 M2: the variables the current claim delivered (names only, owner-only). */
+  injected_env?: RunInjectedEnvVar[];
   /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on its weekly
    *  limit (and, from M2, near it). */
   weekly_limit?: WeeklyLimit;
@@ -5283,7 +5292,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch" | "injected_env"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
@@ -7036,4 +7045,115 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   cache_read: AnalyticsCacheReadDTO;
   top_runs: AnalyticsTopRunDTO[];
   breakdown: AnalyticsBreakdownDTO;
+}
+
+// ── Reliability analytics (issue #4685) ──────────────────────────────────────
+// Mirrors the Reliability types of api/internal/apitypes/analytics.go: GET
+// /api/analytics/reliability and GET /api/admin/analytics/reliability. It reuses the envelope,
+// outcome classes and nullable number above. A failure rate is failed / finished; a breakdown
+// row or rolling point over fewer than five finished runs is null with insufficient_runs and
+// keeps its raw counts.
+
+export interface AnalyticsReliabilityBlockDTO {
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  requeued_runs: number;
+}
+
+export interface AnalyticsReliabilityTotalsDTO {
+  current: AnalyticsReliabilityBlockDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsReliabilityBlockDTO;
+}
+
+export interface AnalyticsReliabilityCellDTO {
+  /** Zero-based position in the response's buckets array. */
+  index: number;
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+}
+
+export interface AnalyticsReliabilityCauseDTO {
+  rank: number;
+  is_other: boolean;
+  /** Null for the Other row. */
+  origin: string | null;
+  runs: number;
+  share: number;
+}
+
+export interface AnalyticsReliabilityCausesDTO {
+  failed: number;
+  items: AnalyticsReliabilityCauseDTO[];
+}
+
+export interface AnalyticsReliabilityPointDTO {
+  /** Zero-based position in the response's rolling array. */
+  index: number;
+  finished: number;
+  failed: number;
+  /** Null with a reason: insufficient_runs below five finished runs, or not_applicable. */
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsReliabilityHarnessSeriesDTO {
+  harness: string;
+  points: AnalyticsReliabilityPointDTO[];
+}
+
+export interface AnalyticsReliabilityRollingDTO {
+  overall: AnalyticsReliabilityPointDTO[];
+  harnesses: AnalyticsReliabilityHarnessSeriesDTO[];
+}
+
+export interface AnalyticsReliabilityRowDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  /** User email or repo path; null otherwise and for a repo the caller may not see. */
+  label: string | null;
+  id: string | null;
+  /** The row's finished runs. */
+  n: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  requeued_runs: number;
+}
+
+export interface AnalyticsReliabilityBreakdownDTO {
+  dimension: string;
+  rows: AnalyticsReliabilityRowDTO[];
+}
+
+export interface AnalyticsReliabilityLatestFailureDTO {
+  failed_at: string;
+  origin: string;
+  run_id: string;
+  user_id: string;
+  completed_since_last_failure: number;
+}
+
+export interface AnalyticsReliabilityNeedsLandingDTO {
+  runs: number;
+  /** Always "work_may_already_have_landed". */
+  caveat: string;
+}
+
+export interface AnalyticsReliabilityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  /** False, with reason "supporting_kinds_only", when the kind filter selects no delivery kind. */
+  applicable: boolean;
+  reason: string | null;
+  totals: AnalyticsReliabilityTotalsDTO;
+  /** series[i] is the outcome cell of buckets[i]. */
+  series: AnalyticsReliabilityCellDTO[];
+  causes: AnalyticsReliabilityCausesDTO;
+  rolling_failure_rate: AnalyticsReliabilityRollingDTO;
+  breakdown: AnalyticsReliabilityBreakdownDTO;
+  /** Null when the scope has no failure. */
+  latest_failure: AnalyticsReliabilityLatestFailureDTO | null;
+  needs_landing: AnalyticsReliabilityNeedsLandingDTO;
 }

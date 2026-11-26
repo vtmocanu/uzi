@@ -1488,6 +1488,10 @@ WITH checker_template_pins AS MATERIALIZED (
       -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
       -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
       AND ('issue_key_v1' = ANY($29::text[]) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+      -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+      -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+      -- fn_worker_can_claim and @capability_aware.
+      AND ('run_env_v1' = ANY($29::text[]) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
       AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY($29::text[]))
       AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY($29::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY($29::text[]))
@@ -1814,6 +1818,10 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
                 -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
                 AND ('issue_key_v1' = ANY(p.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+                -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+                -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+                -- fn_worker_can_claim and @capability_aware.
+                AND ('run_env_v1' = ANY(p.protocol_capabilities) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
                 AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
                 AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
@@ -3233,6 +3241,10 @@ WHERE run.id = $1
   -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
   -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
   AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = run.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+  -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+  -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+  -- fn_worker_can_claim and @capability_aware.
+  AND ('run_env_v1' = ANY(w.protocol_capabilities) OR NOT (fn_run_env_lane(run.kind, run.review_target_run_id, run.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = run.user_id AND re.repo_id = run.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = run.id AND rr.secret))))
   AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
   AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -16344,6 +16356,10 @@ WHERE r.status = 'queued'
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
         AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+        -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+        -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+        -- fn_worker_can_claim and @capability_aware.
+        AND ('run_env_v1' = ANY(w.protocol_capabilities) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -16461,6 +16477,10 @@ WHERE r.status = 'queued'
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
         AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+        -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+        -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+        -- fn_worker_can_claim and @capability_aware.
+        AND ('run_env_v1' = ANY(w.protocol_capabilities) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -16788,10 +16808,12 @@ WHERE r.status = 'queued'
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   -- PRD #4173: a run on a LINKED repo is demand too: with no worker reporting issue_key_v1 online,
   -- only a freshly provisioned worker can claim it.
+  -- PRD #4416 M2: a lead-lane run with enabled live variables or a secret receipt is demand too: with no
+  -- worker reporting run_env_v1 online, only a freshly provisioned worker can claim it.
   -- PRD #4320 / #4505: a provider-bound run (model_provider_key_mode set) is demand too. Provider
   -- execution is activated, so a fresh ephemeral worker can claim it; fn_placement_admitting_workers'
   -- provider clause (migration 00486) lets an online capable idle worker suppress it below.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[])
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[])
       -- PRD #3252: a lead-lane run whose owner has a planning value set is demand too: with no
       -- worker reporting its harness phase capability online, only a freshly provisioned worker can claim it
       -- (required_capabilities stays '{}' for it). The same predicate text as every claim site.
@@ -25683,10 +25705,13 @@ WITH candidates AS MATERIALIZED (
   -- PRD #3250: a pending Fresh grant blocks the ordinary resume EXCEPT on a run_override_unavailable
   -- hold whose episode is resolved: that park (ParkRunOverrideUnavailableRun) restored a grant its
   -- undelivered claim consumed, so the owner's resume may requeue it and the next claim consumes it.
+  -- PRD #4416: the same holds for a run_env_history_unavailable hold (ParkRunEnvHistoryUnavailableRun
+  -- restores the same undelivered-claim grant); an unresolved episode stays refused by the last clause.
   AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold'
            OR (runs.policy_pending_fresh
-               AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
-                        AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL)))
+               AND NOT ((runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
+                         AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL))
+                        OR runs.hold_reason IS NOT DISTINCT FROM 'run_env_history_unavailable'))
            OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
@@ -25790,10 +25815,13 @@ WHERE runs.id = $6 AND runs.user_id = $7
   -- PRD #3250: a pending Fresh grant blocks the ordinary resume EXCEPT on a run_override_unavailable
   -- hold whose episode is resolved: that park (ParkRunOverrideUnavailableRun) restored a grant its
   -- undelivered claim consumed, so the owner's resume may requeue it and the next claim consumes it.
+  -- PRD #4416: the same holds for a run_env_history_unavailable hold (ParkRunEnvHistoryUnavailableRun
+  -- restores the same undelivered-claim grant); an unresolved episode stays refused by the last clause.
   AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold'
            OR (runs.policy_pending_fresh
-               AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
-                        AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL)))
+               AND NOT ((runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
+                         AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL))
+                        OR runs.hold_reason IS NOT DISTINCT FROM 'run_env_history_unavailable'))
            OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
@@ -26083,6 +26111,41 @@ func (q *Queries) ResumeWorkerRecoveryEpisode(ctx context.Context, arg ResumeWor
 	var i ResumeWorkerRecoveryEpisodeRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err
+}
+
+const runEnvWorkerMissingForRun = `-- name: RunEnvWorkerMissingForRun :one
+SELECT COALESCE((EXISTS (
+  SELECT 1 FROM runs r
+  WHERE r.id = $1
+    AND fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id)
+    AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL)
+         OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))
+) AND NOT EXISTS (
+  SELECT 1 FROM workers w
+  WHERE w.user_id = $2
+    AND w.status = 'online'
+    AND fn_worker_accepts_new_intake(w)
+    AND NOT w.ephemeral
+    AND NOT w.isolated_lane
+    AND 'run_env_v1' = ANY(w.protocol_capabilities)
+)), false)::boolean AS missing
+`
+
+type RunEnvWorkerMissingForRunParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #4416 M2: true when the run receives repo variables (a lead-lane run whose repo has an
+// enabled live variable, or that holds a secret delivery receipt: the same predicate as ClaimRun's
+// standalone run_env_v1 clause) and none of the user's ONLINE, intake-accepting, non-ephemeral,
+// non-lane workers self-reports 'run_env_v1'. Drives the queued-reason resolver's run_env rung.
+// Mirrors IssueKeyWorkerMissingForRepo's worker filters.
+func (q *Queries) RunEnvWorkerMissingForRun(ctx context.Context, arg RunEnvWorkerMissingForRunParams) (bool, error) {
+	row := q.db.QueryRow(ctx, runEnvWorkerMissingForRun, arg.RunID, arg.UserID)
+	var missing bool
+	err := row.Scan(&missing)
+	return missing, err
 }
 
 const runGatePresentationExists = `-- name: RunGatePresentationExists :one

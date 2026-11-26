@@ -1,0 +1,8 @@
+{
+  "max_run_env_entries": 50,
+  "max_value_bytes": 65536,
+  "max_run_env_total_bytes": 262144,
+  "max_redact_entries": 300,
+  "max_redact_total_bytes": 2621440,
+  "min_secret_len": 8
+}

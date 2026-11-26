@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 // Issue #2545 M5: shared fixture for the runner-held-publication*.test.ts files. A guarded
 // "api" for one run (holds, ownership, archive capture, held publication, FINAL) installed on the
 // harness client, an executor that leaves a realistic failed workspace, and the custody-retention
@@ -183,7 +184,7 @@ export const pinRef = (claim: { run_id: string; claim_generation?: number }): st
 
 /** A coordinator over the harness stores, to read the journal the runner wrote. */
 export function journal(): RecoveryCoordinator {
-  return new RecoveryCoordinator({ client, git, log: nullLog(), recoveryRoot: git.recoveryRoot, workerToken: JOIN_TOKEN });
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLog(), recoveryRoot: git.recoveryRoot, workerToken: JOIN_TOKEN });
 }
 function nullLog() {
   const self: import("../src/log.js").Logger = {

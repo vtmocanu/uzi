@@ -28,6 +28,7 @@
 // renderer imports its aliases, root-only sets, canonicalizer and recognition predicate
 // directly so a broker-side vocabulary change cannot silently grant or strip authority.
 
+import { sanitizeName } from "../diagnostic-name.js";
 import type {
   AdviceRequest,
   HarnessAgent,
@@ -379,51 +380,14 @@ function resolveRoleModel(
  *  command-lifetime guidance, and the worker-owned safety block last. Only that STATIC block:
  *  the run's operator constraints (follow-ups) are attached per dispatch by the Claude Agent
  *  guard (guardrails.ts buildAgentGuardHook) and do NOT reach Codex subagents yet (#1660). */
-function renderSubagentPrompt(agent: HarnessAgent, childTurnBudgetMs?: number): string {
+function renderSubagentPrompt(agent: HarnessAgent, childTurnBudgetMs?: number, runEnvAppend = ""): string {
+  const runEnv = runEnvAppend === "" ? "" : `${runEnvAppend}\n\n`;
   const budget = childTurnBudgetMs === undefined ? "" : `${codexChildBudgetAppend(childTurnBudgetMs)}\n\n`;
-  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${budget}${SUBAGENT_SAFETY_APPEND}`;
+  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${runEnv}${budget}${SUBAGENT_SAFETY_APPEND}`;
 }
 
-/** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's
- *  MAX_DIAGNOSTIC_CHARS. An over-long name is truncated with an ellipsis. */
-const MAX_DIAGNOSTIC_NAME_CHARS = 120;
-
-/** True for a code point that must not survive in a human-facing diagnostic `name`:
- *  a C0 control (0x00-0x1F, incl. TAB/LF/CR/ESC), DEL (0x7F), a C1 control
- *  (0x80-0x9F), or a Unicode bidi/format control (zero-width, line/paragraph
- *  separators, bidi embeddings/overrides/isolates, word joiner, BOM). MIRRORS
- *  broker.ts `isUnsafeIdentifierChar`. A code-point scan on purpose: oxlint's
- *  `no-control-regex` is denied, so a control-char regex is not an option. */
-function isUnsafeNameChar(cp: number): boolean {
-  if (cp <= 0x1f) return true; // C0 controls incl. TAB/LF/CR/ESC
-  if (cp === 0x7f) return true; // DEL
-  if (cp >= 0x80 && cp <= 0x9f) return true; // C1 controls
-  if (cp >= 0x200b && cp <= 0x200f) return true; // ZWSP..RLM
-  if (cp === 0x2028 || cp === 0x2029) return true; // line / paragraph separators
-  if (cp >= 0x202a && cp <= 0x202e) return true; // bidi embeddings / overrides
-  if (cp >= 0x2060 && cp <= 0x2064) return true; // word joiner..invisible separator
-  if (cp >= 0x2066 && cp <= 0x206f) return true; // bidi isolates + deprecated format
-  return cp === 0xfeff; // BOM / ZWNBSP
-}
-
-/** Sanitize an untrusted, user-authored diagnostic `name` (an unknown tool/skill/
- *  effort/model identifier) so a control/newline/ANSI/bidi sequence can never forge
- *  or terminal-rewrite a downstream log/report line, whichever future consumer renders
- *  the diagnostic. Replaces every control and bidi/format code point (see
- *  {@link isUnsafeNameChar}) with the visible replacement char U+FFFD, then bounds the
- *  length. MIRRORS broker.ts `safeId`; pure and allocation-bounded (one code-point pass
- *  + one slice). Only the human `name` is routed through this — never the machine-facing
- *  `kind`/`role` shape or the tool canonicalization. */
-export function sanitizeName(s: string): string {
-  let out = "";
-  for (const ch of s) {
-    const cp = ch.codePointAt(0) ?? 0;
-    out += isUnsafeNameChar(cp) ? "�" : ch;
-  }
-  return out.length > MAX_DIAGNOSTIC_NAME_CHARS
-    ? `${out.slice(0, MAX_DIAGNOSTIC_NAME_CHARS)}…`
-    : out;
-}
+// sanitizeName / isUnsafeNameChar live in ../diagnostic-name.ts; sanitizeName is re-exported here.
+export { sanitizeName };
 
 /** Code-unit comparator (UTF-16), IDENTICAL to what `sortedSet`'s default `.sort()`
  *  applies. Locale-independent, so the ordering is byte-identical across environments. */
@@ -509,7 +473,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
       allowedSkills: buildAllowedSkills(agent.skills, role, diagnostics),
       isRoot: false,
     });
-    perRolePrompts.set(role, renderSubagentPrompt(agent, request.childTurnBudgetMs));
+    perRolePrompts.set(role, renderSubagentPrompt(agent, request.childTurnBudgetMs, request.runEnvAppend));
   }
 
   return {

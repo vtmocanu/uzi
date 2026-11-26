@@ -403,8 +403,10 @@ export class RecoveryMaintenance {
       let cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === key);
       if (!cycle) {
         if (lineage.length) {
-          const version = Math.max(...lineage.map(c => c.config.verifierVersion));
-          const cap = Math.max(...lineage.filter(c => c.config.verifierVersion === version).map(c => c.config.decodedCap));
+          let version = -Infinity;
+          for (const c of lineage) version = Math.max(version, c.config.verifierVersion);
+          let cap = -Infinity;
+          for (const c of lineage) if (c.config.verifierVersion === version) cap = Math.max(cap, c.config.decodedCap);
           if (input.config.verifierVersion < version ||
             (input.config.verifierVersion === version && input.config.decodedCap <= cap))
             return deny("maintenance_config_changed");

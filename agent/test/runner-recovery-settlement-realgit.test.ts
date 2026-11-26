@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -106,7 +107,7 @@ interface Stores {
 /** The worker's durable stores over the harness dataDir (the SAME paths a restart re-opens). */
 function stores(gitCache: GitCache, now?: () => number): Stores {
   const recoveryClient = new FakeRecoveryClient();
-  const coord = new RecoveryCoordinator({
+  const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client: recoveryClient,
     git: gitCache, // the REAL GitCache produces the gen1 bundle
     log: nullLogger(),

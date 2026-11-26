@@ -70,6 +70,7 @@ it.each([
   ["credential_disabled", "Current: waiting: credential disabled", false],
   ["credentials_reset", "Current: waiting: credentials were reset", false],
   ["run_override_unavailable", "Current: model choice unavailable: owner hold", true],
+  ["run_env_history_unavailable", "Current: variable history unavailable: owner hold", true],
   ["phase_switch_unavailable", "Current: planning switch unavailable: owner hold", true],
 ] as const)("LastRun owner-actions link for hold %s is %s", async (hold, current, linked) => {
   vi.mocked(api.getRun).mockResolvedValueOnce({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: hold } });

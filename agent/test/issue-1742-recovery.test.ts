@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -60,7 +61,7 @@ describe("issue #1742 D4(b): crash before fetch-back and the finalization pin", 
     }).execute(claim);
 
     const makeCoordinator = (client: RecoveryArchiveClient) =>
-      new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
+      new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
     try {
       await Promise.race([at, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("fetch-back cut not reached")), 10_000))]);
 
@@ -127,7 +128,7 @@ describe("issue #1742 D4(a): the runner's finalization pin", () => {
     try {
       await Promise.race([at, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("post-pin cut not reached")), 10_000))]);
       const client = new FakeRecoveryClient();
-      const coord = new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
+      const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
       const records = await coord.inspect(claim.run_id);
       assert.equal(records.length, 1, "the finalization pin reused the early record");
       const rec = records[0]!;
@@ -188,7 +189,7 @@ describe("issue #2886: the finalization pin for a long origin", () => {
     try {
       await Promise.race([at, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("post-pin cut not reached")), 10_000))]);
       const client = new FakeRecoveryClient();
-      const coord = new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
+      const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
       const records = await coord.inspect(claim.run_id);
       assert.equal(records.length, 1);
       const rec = records[0]!;

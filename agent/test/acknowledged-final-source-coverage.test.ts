@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -40,7 +41,7 @@ for (const [covered, earlierSynthetic, name] of [
         try {cmd(['merge-base','--is-ancestor',a,b]);return 'ancestor';} catch {return 'divergent';}
       },
     };
-    const recovery = new RecoveryCoordinator({ client, git, log:nullLogger(), recoveryRoot:path.join(root,'recovery'), workerToken:'buddy-test-key' });
+    const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log:nullLogger(), recoveryRoot:path.join(root,'recovery'), workerToken:'buddy-test-key' });
     const common:any = {version:1,runId,generation,inventoryGuarded:true,kind:'issue',branch:ctx.branch,createdAt:Date.now(),bareDir:'repo.git',defaultBranch:'main',coverageContext:ctx,coverageDigest:digest,originalSourceSha:base,inventoryCurrentSha:base,originalRoots:[]};
     const archive = {...common,captureId:archiveId,sourceSha:base,state:'uploaded',serverCaptureId:archiveId,checksum,byteSize:1,finalAcknowledged:true,finalRequest:{disposition:{kind:'archive',capture_id:archiveId,source_sha:base,coverage_digest:digest}}};
     const pending = {...common,captureId:'33333333-3333-4333-8333-333333333333',sourceSha:covered ? base : uncovered,state:'needs_action',reason:'inventory_source_not_quiescent:execution_tail_present',finalRequest:{disposition:{kind:'settled',coverage_digest:digest},evidence:'publication'}};

@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -70,7 +71,7 @@ it("#3031 runner terminal route replays a saved FINAL without a boot or live pas
   // journaled under the worker key, then left unsent (its holder stopped before the release).
   const bare = await git.ensureClone(claim.repo.clone_url);
   const main = command(bare, "rev-parse", "refs/remotes/origin/main");
-  const seeder = new RecoveryCoordinator({ client, git, log: recordingLogger().logger,
+  const seeder = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: recordingLogger().logger,
     recoveryRoot: git.recoveryRoot, workerToken: token });
   const saved = await seeder.freezeInventory({
     context: { runId: claim.run_id, generation: 1, kind: "issue", branch: "agent/issue-3031", barePath: bare,
@@ -348,7 +349,7 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
         }
       });
     }
-    const inspect = new RecoveryCoordinator({ client, git, workerToken: token, recoveryRoot: git.recoveryRoot,
+    const inspect = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, workerToken: token, recoveryRoot: git.recoveryRoot,
       log: log.logger });
     const running = runner.execute(claim);
     try {

@@ -1207,6 +1207,19 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
   });
 
+  it("advertises run_env_v1 only under the uid split", async () => {
+    const prior = process.env.UZI_UID_SPLIT;
+    try {
+      process.env.UZI_UID_SPLIT = "1";
+      assert.ok((await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "advertised with the split active");
+      delete process.env.UZI_UID_SPLIT;
+      assert.ok(!(await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "not advertised without the split");
+    } finally {
+      if (prior === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = prior;
+    }
+  });
+
   it("advertises codex_refresh_recovery_v1 without API protocol_features or Codex availability requirements", async () => {
     for (const advertise of [true, false]) {
       const caps = await advertisedCapabilities(

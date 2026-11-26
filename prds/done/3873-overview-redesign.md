@@ -1,6 +1,6 @@
 # Overview redesign: design brief (epic #3873)
 
-**Status**: Parked (`Later`). This is the epic's shared design brief, not a PRD: it has no milestones. Each child PRD implements one slice and cites the sections below; where a child PRD and this brief disagree, the child PRD wins for its own scope.
+**Status**: Done (2026-11-26): epic #3873 closed 2026-11-20 with every child PRD delivered. This is the epic's shared design brief, not a PRD: it has no milestones. Each child PRD implements one slice and cites the sections below; where a child PRD and this brief disagree, the child PRD wins for its own scope.
 
 **Design mock**: `prds/mockups/3873-overview-redesign-mock.html` (the design to build). Reference only: `prds/mockups/3873-overview-redesign-exploration-mock.html`.
 

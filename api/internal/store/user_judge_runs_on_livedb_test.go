@@ -13,10 +13,7 @@ import (
 // TestUserJudgeRunsOnCheckLiveDB pins users_judge_runs_on_check (PRD #3257): NULL, claude
 // and codex are accepted and any other value is rejected with SQLSTATE 23514.
 func TestUserJudgeRunsOnCheckLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "user_judge_runs_on_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatal(err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "user_judge_runs_on_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

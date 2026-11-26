@@ -478,7 +478,11 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     if (verdict === "ambiguous") api.overrideStateStatus(f.claim.run_id, "running");
     try {
       await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
-        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: verdict === "deadline" ? 200 : 5000 }).execute(f.claim);
+        { memoryRuntime: f.memory,
+          // Only the owner/memory hold deadline is narrowed: launch remediation rounds keep the generous boundary budget,
+          // so a loaded host cannot stop the run before the first trusted accessor.
+          codexBoundaryDeadlineMs: 5000,
+          ...(verdict === "deadline" ? { memoryHoldDeadlineMs: 200 } : {}) }).execute(f.claim);
       if (executorError) throw executorError;
       assert.equal(proof, true, "actual RunRunner executor reached the first trusted accessor");
       assert.ok(started !== undefined, "elapsed clock anchored at the first trusted accessor");

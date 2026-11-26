@@ -217,7 +217,7 @@ func TestAnalyticsUnknownSectionIs404LiveDB(t *testing.T) {
 	f := newAnFixture(t, 2031)
 	admin := f.user(true)
 	jwt := cliMintJWT(t, f.pool, admin)
-	for _, path := range []string{"/api/analytics/reliability", "/api/admin/analytics/reliability", "/api/analytics/", "/api/admin/analytics"} {
+	for _, path := range []string{"/api/analytics/trends", "/api/admin/analytics/trends", "/api/analytics/", "/api/admin/analytics"} {
 		if rec := cookieReq(t, f.router, http.MethodGet, path, jwt, ""); rec.Code != http.StatusNotFound {
 			t.Fatalf("%s = %d, want 404", path, rec.Code)
 		}

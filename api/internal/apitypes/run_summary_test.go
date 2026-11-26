@@ -29,6 +29,7 @@ var summaryOmitted = map[string]bool{
 	"effort":                   true, // PRD #3250: the start-time choice is shown on the run page and the list, not the polling shape.
 	"model_source":             true, // PRD #3250: same; the summary shows no run-start choice.
 	"effort_source":            true, // PRD #3250: same.
+	"injected_env":             true, // PRD #4416: GetRun-only owner overlay; never on a list or summary.
 }
 
 // TestRunSummaryItemDTOKeys pins the summary key set to the list item's key set minus
@@ -80,6 +81,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.Effort = nil
 	want.ModelSource = nil
 	want.EffortSource = nil
+	want.InjectedEnv = nil
 	// The summary keeps only tier, credential_key and credential_label of the weekly-limit block.
 	want.WeeklyLimit = &WeeklyLimitDTO{
 		Tier: full.WeeklyLimit.Tier, CredentialKey: full.WeeklyLimit.CredentialKey, CredentialLabel: full.WeeklyLimit.CredentialLabel,

@@ -12,10 +12,7 @@ import (
 )
 
 func TestBaseDivergedOutcomesAndBoardLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "base_diverged_outcomes_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatal(err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "base_diverged_outcomes_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

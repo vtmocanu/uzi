@@ -5,10 +5,12 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/analytics"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Issue #4684 (m5): plan and runtime evidence for the Spend statements and the options reads.
@@ -39,12 +42,18 @@ import (
 //
 //	UZI_EVIDENCE_LOG        raw log path (appended); default stdout only
 //	UZI_EVIDENCE_KEEP=1     leave the seed in place (default: TRUNCATE at the end)
-//	UZI_EVIDENCE_RESEED=0   reuse an existing seed (skips the TRUNCATE and the seed)
+//	UZI_EVIDENCE_RESEED=0   reuse an existing seed (skips the TRUNCATE and the seed). The
+//	                        Reliability phase rewrites rows (landable-origin step), so a seed it
+//	                        already ran on fails the run while the Spend phase is enabled: reseed,
+//	                        or set UZI_EVIDENCE_SPEND=0
 //	UZI_EVIDENCE_BASELINE=0 skip the baseline phase
 //	UZI_EVIDENCE_INDEXES=   comma list of candidate numbers 1-4 (default 1,2,3,4; "" or "0" none)
 //	UZI_EVIDENCE_ONLY=      comma list of workload-name substrings
 //	UZI_EVIDENCE_RUNS=20    measured executions per workload and mode
 //	UZI_EVIDENCE_MODES=     custom,generic (timing modes for the baseline)
+//	UZI_EVIDENCE_SPEND=0    skip the Spend/options phase (and its candidate indexes)
+//	UZI_EVIDENCE_RELIABILITY=0  skip the Reliability phase (issue #4685 m3)
+//	UZI_EVIDENCE_REL_INDEX=0    skip the runs_terminal_end_idx before/after step
 
 const (
 	evNowRFC = "2026-11-20T12:00:00Z"
@@ -157,6 +166,11 @@ type evWorkload struct {
 	stmts []evStmt
 	run   func(ctx context.Context, q *store.Queries) error
 	spend bool
+	// rawRun, when set, replaces run: it executes a standalone SQL text on the timed connection
+	// (the latest-failure row lookup and count parts, which have no sqlc method of their own).
+	rawRun func(ctx context.Context, c *pgxpool.Conn) error
+	// idx marks the workloads re-measured with the runs_terminal_end_idx candidate.
+	idx bool
 }
 
 type evHarness struct {
@@ -170,6 +184,9 @@ type evHarness struct {
 	topOwner uuid.UUID
 	runs     int
 	modes    []string
+	// jitOff mirrors the production snapshot (store.RunAnalyticsSnapshot sets jit = off) for the
+	// Reliability phase; the Spend phase keeps the server default so its figures stay comparable.
+	jitOff bool
 }
 
 func (h *evHarness) logf(format string, a ...any) {
@@ -243,14 +260,29 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 			for _, ix := range evIndexes {
 				_, _ = pool.Exec(context.Background(), "DROP INDEX IF EXISTS "+ix.name)
 			}
+			_, _ = pool.Exec(context.Background(), "DROP INDEX IF EXISTS "+evTerminalIdxName)
 			_, _ = pool.Exec(context.Background(), `TRUNCATE users CASCADE`)
 		})
 	}
 
 	h.seed()
-	workloads := h.workloads()
+	spendOn := os.Getenv("UZI_EVIDENCE_SPEND") != "0"
+	if spendOn && os.Getenv("UZI_EVIDENCE_RESEED") == "0" {
+		// The seed carries no human-landable origin, so one means an earlier run's Reliability
+		// landable-origin step already rewrote this retained seed.
+		var rewritten int64
+		h.scalar(`SELECT count(*) FROM runs WHERE fail_origin = ANY(`+evSQLTextArray(workersvc.AllHumanLandableFailOrigins())+`)`, &rewritten)
+		if rewritten > 0 {
+			t.Fatalf("the retained seed already ran the Reliability landable-origin step (%d runs carry a human-landable fail_origin), "+
+				"so the Spend phase would measure rewritten rows; reseed (unset UZI_EVIDENCE_RESEED=0) or set UZI_EVIDENCE_SPEND=0", rewritten)
+		}
+	}
+	var workloads []evWorkload
+	if spendOn {
+		workloads = h.workloads()
+	}
 
-	if os.Getenv("UZI_EVIDENCE_BASELINE") != "0" {
+	if spendOn && os.Getenv("UZI_EVIDENCE_BASELINE") != "0" {
 		h.logf("\n######## BASELINE (no candidate index) ########")
 		h.logDisk("baseline")
 		for _, w := range workloads {
@@ -260,6 +292,9 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 	list := "1,2,3,4"
 	if v, ok := os.LookupEnv("UZI_EVIDENCE_INDEXES"); ok {
 		list = v
+	}
+	if !spendOn {
+		list = ""
 	}
 	for _, s := range strings.Split(list, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(s))
@@ -280,6 +315,12 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 		}
 		h.simple("DROP INDEX " + ix.name)
 		h.simple(`ANALYZE runs`)
+	}
+
+	// Issue #4685 (m3): the Reliability evidence runs AFTER every Spend workload, because the
+	// landable-origin step rewrites rows the Spend measurements must see untouched.
+	if os.Getenv("UZI_EVIDENCE_RELIABILITY") != "0" {
+		h.reliabilityEvidence()
 	}
 }
 
@@ -496,20 +537,35 @@ func (h *evHarness) workloads() []evWorkload {
 			evSpendOpts{harness: "claude", kinds: []string{runkind.Issue}, revealRepos: true}),
 	}
 	all = append(all, h.optionWorkloads()...)
+	return evOnly(all)
+}
+
+// evOnly applies UZI_EVIDENCE_ONLY (comma list of workload-name substrings).
+func evOnly(all []evWorkload) []evWorkload {
 	only := os.Getenv("UZI_EVIDENCE_ONLY")
 	if only == "" {
 		return all
 	}
 	var out []evWorkload
 	for _, w := range all {
-		for _, f := range strings.Split(only, ",") {
-			if f != "" && strings.Contains(w.name, f) {
-				out = append(out, w)
-				break
-			}
+		if evNameSelected(w.name) {
+			out = append(out, w)
 		}
 	}
 	return out
+}
+
+func evNameSelected(name string) bool {
+	only := os.Getenv("UZI_EVIDENCE_ONLY")
+	if only == "" {
+		return true
+	}
+	for _, f := range strings.Split(only, ",") {
+		if f != "" && strings.Contains(name, f) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- measurement ----
@@ -565,6 +621,9 @@ func (h *evHarness) timeWorkload(w evWorkload, mode string) evTiming {
 	}
 	defer c.Release()
 	stmts := []string{`SET statement_timeout = 0`, fmt.Sprintf("SET plan_cache_mode = force_%s_plan", mode)}
+	if h.jitOff {
+		stmts = append(stmts, `SET jit = off`)
+	}
 	for _, s := range stmts {
 		if _, err := c.Exec(h.ctx, s, pgx.QueryExecModeSimpleProtocol); err != nil {
 			h.t.Fatalf("%s: %v", s, err)
@@ -574,11 +633,15 @@ func (h *evHarness) timeWorkload(w evWorkload, mode string) evTiming {
 	// (it leaves pgx's client-side statement cache valid, unlike DISCARD ALL).
 	defer func() { _, _ = c.Exec(context.Background(), `RESET ALL`, pgx.QueryExecModeSimpleProtocol) }()
 	q := store.New(c)
+	run := w.run
+	if w.rawRun != nil {
+		run = func(ctx context.Context, _ *store.Queries) error { return w.rawRun(ctx, c) }
+	}
 	warm, n := 3, h.runs
 	tm := evTiming{}
 	for i := 0; i < warm; i++ {
 		start := time.Now()
-		if err := w.run(h.ctx, q); err != nil {
+		if err := run(h.ctx, q); err != nil {
 			h.t.Fatalf("%s warm-up: %v", w.name, err)
 		}
 		// A statement that already takes more than 8 s (the request budget) is measured with one
@@ -590,7 +653,7 @@ func (h *evHarness) timeWorkload(w evWorkload, mode string) evTiming {
 	durs := make([]time.Duration, 0, n)
 	for i := 0; i < n; i++ {
 		start := time.Now()
-		if err := w.run(h.ctx, q); err != nil {
+		if err := run(h.ctx, q); err != nil {
 			h.t.Fatalf("%s: %v", w.name, err)
 		}
 		durs = append(durs, time.Since(start))
@@ -776,4 +839,517 @@ func (p *evPlan) walk(n map[string]any, depth int) {
 	for _, k := range kids {
 		p.walk(k, depth+1)
 	}
+}
+
+// ---- Issue #4685 (m3): Reliability and latest-failure evidence ----
+
+const (
+	evTerminalIdxName = "runs_terminal_end_idx"
+	evTerminalIdxDDL  = `CREATE INDEX runs_terminal_end_idx ON runs ((COALESCE(finished_at, status_since)), id) WHERE status IN ('completed', 'failed', 'cancelled')`
+	// evLandablePct is the share (percent) of Delivery agent_failure runs rewritten to a
+	// human-landable fail_origin. The seed's origins are not landable, so without the rewrite
+	// the needs_landing branch of the cohort statement never fires.
+	evLandablePct = 35
+)
+
+func evSQLTextArray(vals []string) string {
+	return "ARRAY['" + strings.Join(vals, "', '") + "']::text[]"
+}
+
+func evHash(col, salt string) string {
+	return "(hashtext(" + col + "::text || '" + salt + "')::bigint & 2147483647)"
+}
+
+// evLandableStmts is the landable-origin step. Every selection is a function of the run id, so
+// the step is idempotent under UZI_EVIDENCE_RESEED=0. Shares: evLandablePct of Delivery
+// agent_failure runs get a landable origin; of those, 30% an available recovery capture, 10% an
+// expired capture (a decoy the statement must not count), 25% a preserved patch (independent
+// hash), the rest neither. 5% of Delivery runs carry a requeue count.
+func evLandableStmts() []string {
+	origins := evSQLTextArray(workersvc.AllHumanLandableFailOrigins())
+	deliv := evSQLTextArray(runkind.Delivery())
+	n := strconv.Itoa(len(workersvc.AllHumanLandableFailOrigins()))
+	return []string{
+		`UPDATE runs SET fail_origin = (` + origins + `)[1 + ((` + evHash("id", "o") + ` / 100) % ` + n + `)::int]
+		 WHERE status = 'failed' AND fail_origin = 'agent_failure' AND kind = ANY(` + deliv + `)
+		   AND ` + evHash("id", "o") + ` % 100 < ` + strconv.Itoa(evLandablePct),
+		// ~3.2 KB of incompressible text: stored out of line, so it widens nothing in the heap.
+		`UPDATE runs SET preserved_patch = (SELECT string_agg(md5(runs.id::text || g::text), '') FROM generate_series(1, 100) g)
+		 WHERE status = 'failed' AND fail_origin = ANY(` + origins + `) AND ` + evHash("id", "p") + ` % 100 < 25`,
+		`UPDATE runs SET requeue_count = 1 + ((` + evHash("id", "q") + ` / 100) % 3)::int
+		 WHERE kind = ANY(` + deliv + `) AND requeue_count = 0 AND ` + evHash("id", "q") + ` % 100 < 5`,
+		`INSERT INTO recovery_custody_holds (id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, released_at)
+		 SELECT gen_random_uuid(), r.user_id, r.repo_id, r.id, 1, 'released', gen_random_uuid(), 'ev-worker', now()
+		 FROM runs r
+		 WHERE r.status = 'failed' AND r.fail_origin = ANY(` + origins + `) AND ` + evHash("r.id", "c") + ` % 100 < 40
+		   AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id)`,
+		`INSERT INTO recovery_captures (id, hold_id, run_id, user_id, original_worker_identity, source_sha, idempotency_key, state, manifest_bound, expires_at)
+		 SELECT gen_random_uuid(), h.id, h.run_id, h.user_id, 'ev-worker', md5(h.run_id::text), 'ev-' || h.run_id::text,
+		        CASE WHEN ` + evHash("h.run_id", "c") + ` % 100 < 30 THEN 'available' ELSE 'expired' END, true, now() + interval '7 days'
+		 FROM recovery_custody_holds h
+		 WHERE h.original_worker_identity = 'ev-worker'
+		   AND NOT EXISTS (SELECT 1 FROM recovery_captures c WHERE c.hold_id = h.id)`,
+		`ANALYZE runs`, `ANALYZE recovery_custody_holds`, `ANALYZE recovery_captures`,
+	}
+}
+
+func (h *evHarness) landableStep() {
+	h.t.Helper()
+	h.logf("\n######## RELIABILITY: landable-origin step (%d%% of Delivery agent_failure runs) ########", evLandablePct)
+	start := time.Now()
+	for _, s := range evLandableStmts() {
+		h.simple(s)
+	}
+	h.logf("landable step took %s", time.Since(start).Round(time.Millisecond))
+	land := "status = 'failed' AND fail_origin = ANY(" + evSQLTextArray(workersvc.AllHumanLandableFailOrigins()) + ")"
+	capOK := "EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = runs.id AND c.user_id = runs.user_id AND c.state = 'available')"
+	for _, q := range []string{
+		`SELECT 'landable-origin failed runs', count(*) FROM runs WHERE ` + land,
+		`SELECT '  with available capture only', count(*) FROM runs WHERE ` + land + ` AND ` + capOK + ` AND preserved_patch IS NULL`,
+		`SELECT '  with preserved_patch only', count(*) FROM runs WHERE ` + land + ` AND NOT ` + capOK + ` AND preserved_patch IS NOT NULL`,
+		`SELECT '  with both', count(*) FROM runs WHERE ` + land + ` AND ` + capOK + ` AND preserved_patch IS NOT NULL`,
+		`SELECT '  with neither (not needs_landing)', count(*) FROM runs WHERE ` + land + ` AND NOT ` + capOK + ` AND preserved_patch IS NULL`,
+		`SELECT '  expired-capture decoys without patch', count(*) FROM runs WHERE ` + land + ` AND NOT ` + capOK + ` AND preserved_patch IS NULL AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = runs.id AND c.state = 'expired')`,
+		`SELECT 'recovery_captures available/expired', (SELECT count(*) FILTER (WHERE state = 'available') FROM recovery_captures) || '/' || (SELECT count(*) FILTER (WHERE state = 'expired') FROM recovery_captures)`,
+		`SELECT 'failed origins', string_agg(coalesce(fail_origin, 'NULL') || '=' || c, ' ' ORDER BY fail_origin) FROM (SELECT fail_origin, count(*) c FROM runs WHERE status = 'failed' GROUP BY 1) x`,
+		`SELECT 'requeued runs', count(*) FROM runs WHERE requeue_count > 0`,
+	} {
+		h.logf("%s", h.shape(q))
+	}
+}
+
+// evRelSpec is one request shape: the scope (owner-shaped or all-users statement), the window
+// and the cohort filters. breakdowns lists the Breakdown values the shape is measured with.
+type evRelSpec struct {
+	name       string
+	owner      uuid.UUID // uuid.Nil: the all-users statements
+	window     analytics.Window
+	repo       uuid.UUID
+	reveal     bool // the admin route with user=<uuid>: owner-shaped statement, repo names revealed
+	breakdowns []string
+	idx        bool // re-measured with the runs_terminal_end_idx candidate
+}
+
+func evRepoArg(id uuid.UUID) pgtype.UUID {
+	if id == uuid.Nil {
+		return pgtype.UUID{}
+	}
+	return pgtype.UUID{Bytes: id, Valid: true}
+}
+
+func evRelHistory(ctx context.Context, q *store.Queries, spec evRelSpec) (*time.Time, error) {
+	var hist pgtype.Timestamptz
+	var err error
+	if spec.owner != uuid.Nil {
+		hist, err = q.AnalyticsOwnerHistoryStart(ctx, store.AnalyticsOwnerHistoryStartParams{UserID: spec.owner, RepoID: evRepoArg(spec.repo), Kinds: runkind.Delivery()})
+	} else {
+		hist, err = q.AnalyticsAllHistoryStart(ctx, store.AnalyticsAllHistoryStartParams{RepoID: evRepoArg(spec.repo), Kinds: runkind.Delivery()})
+	}
+	if err != nil || !hist.Valid {
+		return nil, err
+	}
+	e := hist.Time
+	return &e, nil
+}
+
+func evRelOwnerParams(spec evRelSpec, breakdown string, b analytics.Bounds) store.AnalyticsOwnerReliabilityParams {
+	var prev pgtype.Timestamptz
+	if b.PreviousFrom != nil {
+		prev = spendTS(*b.PreviousFrom)
+	}
+	return store.AnalyticsOwnerReliabilityParams{
+		From: spendTS(b.From), PreviousFrom: prev, Breakdown: breakdown, Now: spendTS(b.Now), FoldFrom: spendTS(b.FoldFrom),
+		BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
+		RollStarts: spendTSs(b.RollStarts), RollEnds: spendTSs(b.RollEnds),
+		RollHarnesses: []string{"claude", "codex"}, LandableOrigins: workersvc.AllHumanLandableFailOrigins(),
+		RevealRepos: spec.reveal, UserID: spec.owner, RepoID: evRepoArg(spec.repo), Kinds: runkind.Delivery(),
+	}
+}
+
+func evRelAllParams(spec evRelSpec, breakdown string, b analytics.Bounds) store.AnalyticsAllReliabilityParams {
+	var prev pgtype.Timestamptz
+	if b.PreviousFrom != nil {
+		prev = spendTS(*b.PreviousFrom)
+	}
+	return store.AnalyticsAllReliabilityParams{
+		From: spendTS(b.From), PreviousFrom: prev, Breakdown: breakdown, Now: spendTS(b.Now), FoldFrom: spendTS(b.FoldFrom),
+		BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
+		RollStarts: spendTSs(b.RollStarts), RollEnds: spendTSs(b.RollEnds),
+		RollHarnesses: []string{"claude", "codex"}, LandableOrigins: workersvc.AllHumanLandableFailOrigins(),
+		RepoID: evRepoArg(spec.repo), Kinds: runkind.Delivery(),
+	}
+}
+
+func (h *evHarness) relCohortWorkload(spec evRelSpec, breakdown string) evWorkload {
+	h.t.Helper()
+	earliest, err := evRelHistory(h.ctx, h.q, spec)
+	if err != nil {
+		h.t.Fatalf("history start: %v", err)
+	}
+	b, err := analytics.ComputeBounds(h.now, time.UTC, spec.window, earliest)
+	if err != nil {
+		h.t.Fatalf("ComputeBounds: %v", err)
+	}
+	capture := &capturingDBTX{}
+	cq := store.New(capture)
+	w := evWorkload{name: "rel-" + spec.name + "-" + breakdown, idx: spec.idx}
+	if spec.owner != uuid.Nil {
+		p := evRelOwnerParams(spec, breakdown, b)
+		_, _ = cq.AnalyticsOwnerReliability(h.ctx, p)
+		w.stmts = []evStmt{{name: "AnalyticsOwnerReliability", sql: store.AnalyticsOwnerReliabilitySQL}}
+		w.run = func(ctx context.Context, q *store.Queries) error {
+			_, err := q.AnalyticsOwnerReliability(ctx, p)
+			return err
+		}
+	} else {
+		p := evRelAllParams(spec, breakdown, b)
+		_, _ = cq.AnalyticsAllReliability(h.ctx, p)
+		w.stmts = []evStmt{{name: "AnalyticsAllReliability", sql: store.AnalyticsAllReliabilitySQL}}
+		w.run = func(ctx context.Context, q *store.Queries) error {
+			_, err := q.AnalyticsAllReliability(ctx, p)
+			return err
+		}
+	}
+	lits := make([]string, len(capture.args))
+	for i, a := range capture.args {
+		lits[i] = sqlLiteral(h.t, a)
+	}
+	w.stmts[0].args = strings.Join(lits, ", ")
+	h.logf("WORKLOAD %s: window=%s buckets=%d rolling=%d from=%s fold_from=%s reveal=%v repo=%s",
+		w.name, spec.window, len(b.BucketStarts), len(b.RollStarts), b.From.Format(time.RFC3339), b.FoldFrom.Format(time.RFC3339), spec.reveal, spec.repo)
+	return w
+}
+
+// evLatestSpec is one latest-failure scope: owner uuid.Nil is the all-users statement.
+type evLatestSpec struct {
+	name        string
+	owner, repo uuid.UUID
+	idx         bool
+}
+
+// evLatestPartsSQL returns the two parts of the latest-failure statement as standalone texts:
+// the row lookup (the last_failure CTE) and the strict-after completed count with the failure's
+// terminal timestamp as a parameter. The parameter order is $1 repo, $2 harness, $3 kinds, then
+// the owner id (owner statement only), then the timestamp (count only).
+func evLatestPartsSQL(owner bool) (row, count string) {
+	userRow, userCnt, ended := "", "", "$4"
+	if owner {
+		userRow, userCnt, ended = " AND user_id = $4::uuid", " AND r3.user_id = $4::uuid", "$5"
+	}
+	row = `SELECT id, user_id, COALESCE(finished_at, status_since) AS ended_at, COALESCE(fail_origin, 'unknown') AS origin
+		FROM runs
+		WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
+		  AND fn_outcome_kind(kind)` + userRow + `
+		  AND ($1::uuid IS NULL OR repo_id = $1::uuid) AND ($2::text IS NULL OR harness = $2::text) AND kind = ANY($3::text[])
+		ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1`
+	count = `SELECT count(*)::bigint FROM runs r3
+		WHERE COALESCE(r3.finished_at, r3.status_since) > ` + ended + `::timestamptz
+		  AND r3.status = 'completed' AND fn_outcome_kind(r3.kind)` + userCnt + `
+		  AND ($1::uuid IS NULL OR r3.repo_id = $1::uuid) AND ($2::text IS NULL OR r3.harness = $2::text) AND r3.kind = ANY($3::text[])`
+	return row, count
+}
+
+func evDrain(ctx context.Context, c *pgxpool.Conn, sql string, args []any) error {
+	rows, err := c.Query(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+	}
+	return rows.Err()
+}
+
+// latestWorkloads returns three workloads for one scope: the full sqlc statement, and its row
+// lookup and strict-after count as standalone equivalent queries (the count's timestamp is the
+// failure's real terminal timestamp), so the two parts are reported separately.
+func (h *evHarness) latestWorkloads(sp evLatestSpec) []evWorkload {
+	h.t.Helper()
+	kinds := runkind.Delivery()
+	repo := evRepoArg(sp.repo)
+	ownerScope := sp.owner != uuid.Nil
+	capture := &capturingDBTX{}
+	cq := store.New(capture)
+	full := evWorkload{name: "latest-" + sp.name + "-full", idx: sp.idx}
+	var res store.AnalyticsAllLatestFailureRow
+	var err error
+	if ownerScope {
+		p := store.AnalyticsOwnerLatestFailureParams{UserID: sp.owner, RepoID: repo, Kinds: kinds}
+		var r store.AnalyticsOwnerLatestFailureRow
+		r, err = h.q.AnalyticsOwnerLatestFailure(h.ctx, p)
+		res = store.AnalyticsAllLatestFailureRow(r)
+		_, _ = cq.AnalyticsOwnerLatestFailure(h.ctx, p)
+		full.stmts = []evStmt{{name: "AnalyticsOwnerLatestFailure", sql: store.AnalyticsOwnerLatestFailureSQL}}
+		full.run = func(ctx context.Context, q *store.Queries) error {
+			_, err := q.AnalyticsOwnerLatestFailure(ctx, p)
+			return err
+		}
+	} else {
+		p := store.AnalyticsAllLatestFailureParams{RepoID: repo, Kinds: kinds}
+		res, err = h.q.AnalyticsAllLatestFailure(h.ctx, p)
+		_, _ = cq.AnalyticsAllLatestFailure(h.ctx, p)
+		full.stmts = []evStmt{{name: "AnalyticsAllLatestFailure", sql: store.AnalyticsAllLatestFailureSQL}}
+		full.run = func(ctx context.Context, q *store.Queries) error {
+			_, err := q.AnalyticsAllLatestFailure(ctx, p)
+			return err
+		}
+	}
+	if err != nil {
+		h.t.Fatalf("latest failure: %v", err)
+	}
+	lits := make([]string, len(capture.args))
+	for i, a := range capture.args {
+		lits[i] = sqlLiteral(h.t, a)
+	}
+	full.stmts[0].args = strings.Join(lits, ", ")
+	h.logf("LATEST %s: found=%v failed_at=%s origin=%s completed_since=%d repo=%s",
+		sp.name, res.Found, res.FailedAt.Time.Format(time.RFC3339), res.Origin, res.CompletedSinceLastFailure, sp.repo)
+
+	rowSQL, cntSQL := evLatestPartsSQL(ownerScope)
+	rowArgs := []any{repo, pgtype.Text{}, kinds}
+	if ownerScope {
+		rowArgs = append(rowArgs, sp.owner)
+	}
+	cntArgs := append(slices.Clone(rowArgs), res.FailedAt)
+	lit := func(args []any) string {
+		out := make([]string, len(args))
+		for i, a := range args {
+			out[i] = sqlLiteral(h.t, a)
+		}
+		return strings.Join(out, ", ")
+	}
+	rowW := evWorkload{name: "latest-" + sp.name + "-row", idx: sp.idx,
+		stmts:  []evStmt{{name: "latest-row-lookup", sql: rowSQL, args: lit(rowArgs)}},
+		rawRun: func(ctx context.Context, c *pgxpool.Conn) error { return evDrain(ctx, c, rowSQL, rowArgs) }}
+	cntW := evWorkload{name: "latest-" + sp.name + "-count", idx: sp.idx,
+		stmts:  []evStmt{{name: "latest-strict-after-count", sql: cntSQL, args: lit(cntArgs)}},
+		rawRun: func(ctx context.Context, c *pgxpool.Conn) error { return evDrain(ctx, c, cntSQL, cntArgs) }}
+	return []evWorkload{full, rowW, cntW}
+}
+
+func (h *evHarness) busiestRepo(owner uuid.UUID) uuid.UUID {
+	h.t.Helper()
+	where := ""
+	if owner != uuid.Nil {
+		where = " AND user_id = '" + owner.String() + "'"
+	}
+	var id uuid.UUID
+	var n int64
+	h.scalar(`SELECT repo_id, count(*) FROM runs WHERE repo_id IS NOT NULL AND kind = ANY(`+evSQLTextArray(runkind.Delivery())+`)`+where+
+		` GROUP BY repo_id ORDER BY count(*) DESC, repo_id LIMIT 1`, &id, &n)
+	h.logf("busiest repo (owner=%s): %s with %d Delivery runs", owner, id, n)
+	return id
+}
+
+func (h *evHarness) relSpecs() ([]evRelSpec, []evLatestSpec) {
+	h.t.Helper()
+	ownRepo, allRepo := h.busiestRepo(h.topOwner), h.busiestRepo(uuid.Nil)
+	pmH := []string{"primary_model", "harness"}
+	specs := []evRelSpec{
+		{name: "owner-30d", owner: h.topOwner, window: analytics.Window30d, breakdowns: pmH},
+		{name: "owner-all", owner: h.topOwner, window: analytics.WindowAll, breakdowns: pmH},
+		{name: "admin-all-30d", window: analytics.Window30d, breakdowns: []string{"primary_model", "harness", "user"}, idx: true},
+		{name: "admin-all-90d", window: analytics.Window90d, breakdowns: pmH, idx: true},
+		{name: "admin-user-all", owner: h.topOwner, window: analytics.WindowAll, reveal: true, breakdowns: pmH},
+		{name: "owner-30d-repo", owner: h.topOwner, window: analytics.Window30d, repo: ownRepo, breakdowns: pmH},
+		{name: "admin-all-30d-repo", window: analytics.Window30d, repo: allRepo, breakdowns: pmH, idx: true},
+	}
+	latest := []evLatestSpec{
+		{name: "owner", owner: h.topOwner},
+		{name: "owner-repo", owner: h.topOwner, repo: ownRepo},
+		{name: "all", idx: true},
+		{name: "all-repo", repo: allRepo, idx: true},
+	}
+	return specs, latest
+}
+
+type evReqStep struct{ auth, hist, cohort, latest time.Duration }
+
+// relRequestOnce runs the production request sequence through store.RunAnalyticsSnapshot (8 s
+// deadline, statement_timeout '8s', jit off): the authorize-equivalent reads, the history start,
+// the cohort statement plus its document decode, and the latest-failure statement.
+func (h *evHarness) relRequestOnce(spec evRelSpec, breakdown string) (time.Duration, evReqStep, error) {
+	var st evReqStep
+	kinds := runkind.Delivery()
+	start := time.Now()
+	err := store.RunAnalyticsSnapshot(h.ctx, h.pool, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
+		t0 := time.Now()
+		if _, err := s.Q.AnalyticsTimezoneNames(ctx); err != nil {
+			return err
+		}
+		if spec.reveal {
+			if _, err := s.Q.AnalyticsUserExists(ctx, spec.owner); err != nil {
+				return err
+			}
+		}
+		if spec.repo != uuid.Nil {
+			var err error
+			if spec.owner == uuid.Nil {
+				_, err = s.Q.AnalyticsRepoExists(ctx, spec.repo)
+			} else {
+				_, err = s.Q.AnalyticsOwnerRepoAccessible(ctx, store.AnalyticsOwnerRepoAccessibleParams{RepoID: spec.repo, UserID: spec.owner})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		st.auth = time.Since(t0)
+		t0 = time.Now()
+		earliest, err := evRelHistory(ctx, s.Q, spec)
+		if err != nil {
+			return err
+		}
+		st.hist = time.Since(t0)
+		b, err := analytics.ComputeBounds(h.now, time.UTC, spec.window, earliest)
+		if err != nil {
+			return err
+		}
+		t0 = time.Now()
+		var raw []byte
+		if spec.owner != uuid.Nil {
+			raw, err = s.Q.AnalyticsOwnerReliability(ctx, evRelOwnerParams(spec, breakdown, b))
+		} else {
+			raw, err = s.Q.AnalyticsAllReliability(ctx, evRelAllParams(spec, breakdown, b))
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := store.DecodeAnalyticsReliabilityDoc(raw); err != nil {
+			return err
+		}
+		st.cohort = time.Since(t0)
+		t0 = time.Now()
+		if spec.owner != uuid.Nil {
+			_, err = s.Q.AnalyticsOwnerLatestFailure(ctx, store.AnalyticsOwnerLatestFailureParams{UserID: spec.owner, RepoID: evRepoArg(spec.repo), Kinds: kinds})
+		} else {
+			_, err = s.Q.AnalyticsAllLatestFailure(ctx, store.AnalyticsAllLatestFailureParams{RepoID: evRepoArg(spec.repo), Kinds: kinds})
+		}
+		st.latest = time.Since(t0)
+		return err
+	})
+	return time.Since(start), st, err
+}
+
+func evStats(d []time.Duration) (median, p95, maxD time.Duration) {
+	if len(d) == 0 {
+		return 0, 0, 0
+	}
+	s := slices.Clone(d)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	n := len(s)
+	if n%2 == 1 {
+		median = s[n/2]
+	} else {
+		median = (s[n/2-1] + s[n/2]) / 2
+	}
+	return median, s[int(math.Ceil(0.95*float64(n)))-1], s[n-1]
+}
+
+// timeRequests measures the request sequence on the production pool (default plan_cache_mode).
+// A request that hits the 8 s deadline or statement_timeout is counted as a timeout and its
+// elapsed time kept; any other error fails the harness.
+func (h *evHarness) timeRequests(phase string, spec evRelSpec, breakdown string) {
+	h.t.Helper()
+	name := "rel-" + spec.name + "-" + breakdown
+	if !evNameSelected(name) {
+		return
+	}
+	warm, n := 3, h.runs
+	var totals, auth, hist, cohort, latest []time.Duration
+	timeouts, warmTimeouts := 0, 0
+	for i := 0; i < warm+n; i++ {
+		d, st, err := h.relRequestOnce(spec, breakdown)
+		timedOut := false
+		if err != nil {
+			if !errors.Is(store.ClassifyAnalyticsErr(err), store.ErrAnalyticsTimeout) {
+				h.t.Fatalf("%s request: %v", name, err)
+			}
+			timedOut = true
+		}
+		if i < warm {
+			// A warm-up is never a sample, timed out or not. A timed-out warm-up ends the warm-up
+			// phase at itself (so the next request is measured) and shortens the measured run.
+			if timedOut {
+				warmTimeouts++
+				warm, n = i+1, min(n, 5)
+			}
+			continue
+		}
+		if timedOut {
+			timeouts++
+		}
+		totals, auth, hist, cohort, latest = append(totals, d), append(auth, st.auth), append(hist, st.hist), append(cohort, st.cohort), append(latest, st.latest)
+	}
+	med, p95, mx := evStats(totals)
+	ma, _, _ := evStats(auth)
+	mh, _, _ := evStats(hist)
+	mc, _, _ := evStats(cohort)
+	ml, _, _ := evStats(latest)
+	h.logf("REQUEST %s%s %s n=%d timeouts=%d warm_timeouts=%d total median=%.1fms p95=%.1fms max=%.1fms | step medians: auth=%.1fms history=%.1fms cohort+decode=%.1fms latest=%.1fms",
+		os.Getenv("UZI_EVIDENCE_LABEL"), phase, name, len(totals), timeouts, warmTimeouts, ms(med), ms(p95), ms(mx), ms(ma), ms(mh), ms(mc), ms(ml))
+}
+
+func (h *evHarness) reliabilityEvidence() {
+	h.t.Helper()
+	h.landableStep()
+	h.jitOff = true
+	h.simple(`SET jit = off`)
+	h.logf("Reliability phase runs with jit = off, as store.RunAnalyticsSnapshot does")
+	h.simple("DROP INDEX IF EXISTS " + evTerminalIdxName)
+	h.simple(`ANALYZE runs`)
+	var idxList string
+	h.scalar(`SELECT string_agg(indexname || '=' || pg_relation_size(indexname::regclass), ' ' ORDER BY indexname) FROM pg_indexes WHERE tablename = 'runs'`, &idxList)
+	h.logf("runs indexes (bytes): %s", idxList)
+	h.logDisk("reliability baseline")
+
+	specs, latest := h.relSpecs()
+	var ws []evWorkload
+	for _, sp := range specs {
+		for _, bd := range sp.breakdowns {
+			ws = append(ws, h.relCohortWorkload(sp, bd))
+		}
+	}
+	for _, ls := range latest {
+		ws = append(ws, h.latestWorkloads(ls)...)
+	}
+	ws = evOnly(ws)
+
+	h.logf("\n######## RELIABILITY BASELINE (no %s) ########", evTerminalIdxName)
+	for _, w := range ws {
+		h.measure("rel-base", w, h.modes, true)
+	}
+	h.logf("\n######## RELIABILITY REQUEST-LEVEL (baseline) ########")
+	for _, sp := range specs {
+		for _, bd := range sp.breakdowns {
+			h.timeRequests("rel-base", sp, bd)
+		}
+	}
+	if os.Getenv("UZI_EVIDENCE_REL_INDEX") == "0" {
+		return
+	}
+
+	h.logf("\n######## CANDIDATE: %s ########", evTerminalIdxDDL)
+	start := time.Now()
+	h.simple(evTerminalIdxDDL)
+	h.simple(`ANALYZE runs`)
+	var size int64
+	h.scalar(fmt.Sprintf("SELECT pg_relation_size('%s')", evTerminalIdxName), &size)
+	h.logf("CREATE INDEX + ANALYZE took %s; index size %d bytes", time.Since(start).Round(time.Millisecond), size)
+	h.logDisk("with " + evTerminalIdxName)
+	for _, w := range ws {
+		if w.idx {
+			h.measure("rel-idx", w, h.modes, true, evTerminalIdxName)
+		}
+	}
+	h.logf("\n######## RELIABILITY REQUEST-LEVEL (with %s) ########", evTerminalIdxName)
+	for _, sp := range specs {
+		if !sp.idx {
+			continue
+		}
+		for _, bd := range sp.breakdowns {
+			h.timeRequests("rel-idx", sp, bd)
+		}
+	}
+	h.simple("DROP INDEX " + evTerminalIdxName)
+	h.simple(`ANALYZE runs`)
 }

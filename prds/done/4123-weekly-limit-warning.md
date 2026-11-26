@@ -1,7 +1,7 @@
 # PRD #4123: Weekly limit warning and switch reason
 
 **Issue**: #4123
-**Status**: Implemented M1–M3 on branch `agent/issue-4123` (2026-11-22); owner acceptance pending (live Slack DM and hosted rendering)
+**Status**: Done (2026-11-26). M1–M3 shipped in v0.87.0-rc.23 (#4623). Owner acceptance: live Slack DM verified on the hosted instance; hosted banner and Overview rendering waived by the maintainer.
 **Priority**: Normal
 
 ## Problem

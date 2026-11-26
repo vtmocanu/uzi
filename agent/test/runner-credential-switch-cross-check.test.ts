@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 // Issue #3953 m3: a credential switch that arrives while the plan cross-check holds its candidate
 // transport reservation is LATCHED (SteeringChannel.holdCredentialSwitch), never tripped into the
 // reservation. It is serviced only after the reservation is verifiably released (S1 approve, S2
@@ -1164,7 +1165,7 @@ describe("issue #3953 m3: recovery custody across a held switch's release", () =
       listRecoveryHolds: async (id) => ({ run_id: id, holds: [{ hold_id: `hold-g${generation.current}`,
         generation: generation.current, inventory_guarded: true, has_available_capture: false }] }),
     };
-    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+    const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git, log: nullLogger(),
       recoveryRoot: path.join(root, "recovery"), workerToken: "custody-worker-fixture" });
     try {
       const d = await drive({ capture: "release", switchRounds: [1], runnerOpts: { recovery },
@@ -1363,7 +1364,7 @@ describe("issue #3953 m3: boundaries keep their dispositions; the latch is never
       releaseRecoveryCustody: async (id) => ({ run_id: id, released: true, holds_released: 1 }),
       listRecoveryHolds: async (id) => ({ run_id: id, holds: [] }),
     };
-    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+    const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git, log: nullLogger(),
       recoveryRoot: path.join(root, "recovery"), workerToken: "preparation-worker-fixture" });
     const tl: Timeline = { events: [], callsAt: {}, counter: { calls: 0 } };
     const original = MessageBatcher.prototype.reserveCandidateTransport;
@@ -2306,7 +2307,7 @@ describe("issue #3974: recovery custody parity with an ordinary delivered cancel
       listRecoveryHolds: async (id) => { calls.push("holds"); return { run_id: id, holds: [{ hold_id: "hold-g1", generation: 1,
         inventory_guarded: true, has_available_capture: false }] }; },
     };
-    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+    const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git, log: nullLogger(),
       recoveryRoot: path.join(root, "recovery"), workerToken: "custody-parity-fixture" });
     try {
       const d = mode === "withheld"
