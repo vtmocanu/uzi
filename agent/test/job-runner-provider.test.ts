@@ -302,8 +302,11 @@ describe("provider job: gateway limit settlement reads the raw frame", () => {
   });
 
   it("a key equal to a result member value cannot hide an error result", async () => {
-    const states = await settle([INIT_OK, { type: "result", subtype: "error_during_execution", is_error: true }], "error_during_execution");
+    // The key equals the error flag's member name, so only the raw frame still says is_error; the
+    // reason distinguishes the error-result settlement from the no-result path.
+    const states = await settle([INIT_OK, { type: "result", subtype: "success", is_error: true }], "is_error");
     assert.equal(states.at(-1)!.status, "failed");
+    assert.equal(states.at(-1)!.failure_reason, "the job session ended with an error result");
     assert.equal(states.at(-1)!.rate_limit_type, undefined);
   });
 
@@ -510,6 +513,21 @@ describe("provider job: output publication end to end", { skip: LINUX_ONLY }, ()
     assert.deepEqual(calls.results[0]!.refused_outputs, [{ display_name: "***REDACTED***.txt", reason: "worker_unreadable" }]);
     assert.equal(calls.states.at(-1)!.status, "completed");
     assertNoKey(STATUS_KEY, everywhere(calls), "published");
+  });
+
+  it("a name withheld for an uppercase spelling of the key is reported under a placeholder, never its own spelling", async () => {
+    const { client, calls } = fakeClient();
+    const upper = STATUS_KEY.toUpperCase();
+    const qf = session({ [`outputs/${upper}.txt`]: "named by the key", [`outputs/${STATUS_KEY}.md`]: "x", "outputs/clean.txt": "ok" }, [`outputs/${upper}.txt`, `outputs/${STATUS_KEY}.md`, "outputs/clean.txt"]);
+    await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim(STATUS_KEY));
+    assert.deepEqual(calls.uploads.map((u) => u.meta.display_name), ["clean.txt"]);
+    assert.deepEqual(calls.results[0]!.refused_outputs, [
+      { display_name: "withheld-output-1", reason: "worker_unreadable" },
+      { display_name: "***REDACTED***.md", reason: "worker_unreadable" },
+    ]);
+    assert.equal(calls.states.at(-1)!.status, "completed");
+    const text = everywhere(calls);
+    assert.ok(!text.toLowerCase().includes(STATUS_KEY), "no case variant of the key is published");
   });
 
   it("a vendor job is untouched: no capture, same-handle upload, key-free claim carries no provider", async () => {
