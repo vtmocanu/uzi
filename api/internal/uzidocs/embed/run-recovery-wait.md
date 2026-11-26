@@ -831,11 +831,11 @@ other diagnostic (both observed from GitHub; reasons undocumented, and whether
 they are transient is unproven). The third is GitHub's server error:
 `! [remote rejected] <src> -> <dst> (Internal Server Error)` together with its
 complete banner, the three lines `remote: Internal Server Error`,
-`remote: Request ID <id>` and `remote: Time <UTC timestamp>`, each exactly
+`remote: Request ID <uppercase hex groups joined by colons>` and `remote: Time <UTC timestamp>`, each exactly
 once. An `(Internal Server Error)` line without that banner, a partial or
 repeated banner, a second ref line or any other `remote:` line stays
-permanent, and the banner never makes `(failed)` or
-`(missing necessary objects)` retryable. Each retried refusal is treated as
+permanent, and a banner beside a `(failed)` or
+`(missing necessary objects)` line keeps that push permanent. Each retried refusal is treated as
 transient and the same non-forced push is retried on the same schedule, with
 the full publication proof on every attempt. If it keeps failing, it is
 classified `publication_forge_unreachable` like any other exhausted push. Any

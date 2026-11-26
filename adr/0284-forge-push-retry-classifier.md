@@ -160,7 +160,7 @@ once. Whether that refusal was transient is unproven; this amendment treats
 the shape as transient by decision, not because its cause is known.
 
 **Decision.** `classifyGitStderrText` (`agent/src/git.ts`, called by
-`classifyGitStderr`) now classifies a push as transient when, and only when,
+`classifyGitStderr`; since #4716 both delegate to the private `classifyPushStderr`) now classifies a push as transient when, and only when,
 all of these hold:
 
 1. at least one ref-status line is `! [remote rejected] <src> -> <dst> (failed)`
@@ -183,7 +183,8 @@ cannot turn a deterministic refusal transient.
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.
 Everything else is unchanged and permanent: any other reason (other than
-`missing necessary objects`, #4438; including `failed to update ref` and
+`missing necessary objects`, #4438, and `Internal Server Error` with its complete
+banner, #4716; including `failed to update ref` and
 `failed to lock`), authentication failures, protected-branch and
 pre-receive-hook refusals, workflow scope, `GH013`, and non-fast-forward or
 `[rejected]`.
@@ -293,7 +294,7 @@ To <url>
 error: failed to push some refs to '<url>'
 ```
 
-The banner and the request-id lines carry git's sideband padding (trailing
+The `Internal Server Error` and `Request ID` banner lines carry git's sideband padding (trailing
 spaces). No numeric HTTP status is printed. `remote rejected` is in
 `PERMANENT_PATTERNS`, and the `remote:` banner lines are not framing under the
 #3929 rule, so the run failed at its last step without a retry. GitHub's
