@@ -28,8 +28,9 @@ import (
 //
 // Statement timeout (SQLSTATE 57014): the unit test
 // TestAnalyticsQualityStatementTimeoutIs503WithRetryAfterAndReleases pins the 503 mapping and
-// the slot release through the handler; there is no LiveDB timeout pattern for Spend either, so
-// none is added here.
+// the slot release through the handler. The shared snapshot's real 57014 is covered at store level
+// by TestAnalyticsSnapshotStatementTimeoutLiveDB (#4684); like Spend, no handler-level LiveDB
+// timeout case is added here.
 
 func anDecodeQuality(t *testing.T, rec *httptest.ResponseRecorder) apitypes.AnalyticsQualityDTO {
 	t.Helper()

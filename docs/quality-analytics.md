@@ -202,7 +202,7 @@ inert and never exposed. Raw findings and prompts are never returned.
   `decided_at`, however old their lead run. Replaced and interrupted attempts
   are decided attempts too and appear in `classes.replaced`, except a plan
   attempt whose verdict (`approve`, `revise` or `block`, with `reason_class`
-  `verdict`) was recorded before the interruption (`decided_at <=
+  equal to that verdict) was recorded before the interruption (`decided_at <=
   interrupted_at`): it keeps its class (`passed` or `raised_issues`).
 - **`classes`** classify each decided attempt the way the cross-check history
   does: `passed`, `raised_issues`, `didnt_finish`, `replaced`, `unclassified`.
