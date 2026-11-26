@@ -84,8 +84,8 @@ export function flushThenExit(code, { stream = process.stdout, deadlineMs = 2000
 
 /**
  * The launch-phase wait: poll until a group-leading browser child is seen, the launch fails,
- * or the deadline passes. The launch failure is checked first so a rejection that lands while
- * the poll sleeps ends it at once.
+ * or the deadline passes. The failure is checked before the leader so a launch that already
+ * failed is never announced, even when its browser is visible.
  *
  * @param {{hasLeader: () => boolean, launchFailed: () => boolean, deadlineMs?: number, intervalMs?: number, sleep?: (ms: number) => Promise<void>, now?: () => number}} opts
  * @returns {Promise<"leader"|"failed"|"timeout">}
@@ -98,4 +98,25 @@ export async function waitForLeader({ hasLeader, launchFailed, deadlineMs = 1000
     if (now() >= end) return "timeout";
     await sleep(intervalMs);
   }
+}
+
+/**
+ * Records that a signal or crash has begun its cleanup, after which no new self-test child may
+ * be spawned: that cleanup's killSelfChild has already run and could not cover it.
+ * `beforeSpawn()` resolves while the gate is open and never resolves once it is closed (the
+ * caller parks; the signal or crash handler ends the process).
+ */
+export function createTerminationGate() {
+  let closed = false;
+  return {
+    close() {
+      closed = true;
+    },
+    get closed() {
+      return closed;
+    },
+    beforeSpawn() {
+      return closed ? new Promise(() => {}) : Promise.resolve();
+    },
+  };
 }

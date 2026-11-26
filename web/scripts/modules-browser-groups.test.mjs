@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { childGroupRows, flushThenExit, launchPhaseProblem, waitForLeader } from "./modules-browser-groups.mjs";
+import { childGroupRows, createTerminationGate, flushThenExit, launchPhaseProblem, waitForLeader } from "./modules-browser-groups.mjs";
 
 const ps = (...lines) => () => ({ status: 0, stdout: `${lines.join("\n")}\n`, stderr: "" });
 
@@ -140,6 +140,11 @@ describe("waitForLeader", () => {
     assert.equal(r, "timeout");
   });
 
+  it("reports failed, not leader, when the launch failed although a leader is visible", async () => {
+    const r = await waitForLeader({ hasLeader: () => true, launchFailed: () => true, ...clock() });
+    assert.equal(r, "failed");
+  });
+
   it("ends the poll as soon as the launch fails mid-poll", async () => {
     const c = clock();
     let polls = 0;
@@ -154,5 +159,22 @@ describe("waitForLeader", () => {
     });
     assert.equal(r, "failed");
     assert.equal(polls, 2);
+  });
+});
+
+describe("createTerminationGate", () => {
+  const settlesWithin = (p, ms) => Promise.race([p.then(() => true), new Promise((r) => setTimeout(() => r(false), ms))]);
+
+  it("lets a spawn through while open", async () => {
+    const g = createTerminationGate();
+    assert.equal(g.closed, false);
+    assert.equal(await settlesWithin(g.beforeSpawn(), 50), true);
+  });
+
+  it("parks a spawn after a signal or crash closed it", async () => {
+    const g = createTerminationGate();
+    g.close();
+    assert.equal(g.closed, true);
+    assert.equal(await settlesWithin(g.beforeSpawn(), 50), false);
   });
 });

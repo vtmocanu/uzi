@@ -42,7 +42,7 @@ import { chromium } from "playwright";
 import { build } from "vite";
 import { createModuleConfig } from "../examples/ui-module/vite.config.ts";
 import { chromiumLaunchOptions } from "./browser-launch.mjs";
-import { childGroupRows, flushThenExit, launchPhaseProblem, waitForLeader } from "./modules-browser-groups.mjs";
+import { childGroupRows, createTerminationGate, flushThenExit, launchPhaseProblem, waitForLeader } from "./modules-browser-groups.mjs";
 import { federationOnlyFiles, ManifestShapeError, zeroModuleRequestViolations, zeroModuleViolations } from "./modules-manifest-traversal.mjs";
 
 const WEB_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -334,8 +334,8 @@ const shutdownAll = () => Promise.allSettled([shutdown(), killSelfChild()]);
 
 // Whether the first signal arrived while the launch was still pending (null: no signal yet).
 let signalLaunchPending = null;
-// Set by a signal or crash before its cleanup starts; selftestInterrupt refuses to spawn after it.
-let terminating = false;
+// Closed by a signal or crash before its cleanup starts; selftestInterrupt refuses to spawn after it.
+const termination = createTerminationGate();
 
 function installSignalHandlers() {
   for (const [sig, code] of [
@@ -345,13 +345,13 @@ function installSignalHandlers() {
     process.on(sig, () => {
       const first = signalLaunchPending === null;
       if (first) signalLaunchPending = launchPromise !== null && !launchSettled;
-      terminating = true;
+      termination.close();
       if (first && MODE === "selftest-child") console.log(`SIGNAL launch-pending=${signalLaunchPending}`);
       void shutdownAll().finally(() => flushThenExit(code));
     });
   }
   const crash = (e) => {
-    terminating = true;
+    termination.close();
     console.error("harness: unhandled error", e);
     void shutdownAll().finally(() => flushThenExit(1));
   };
@@ -391,6 +391,7 @@ async function selftestChild() {
     const seen = await waitForLeader({
       hasLeader: () => childGroupRowsOrBroken(process.pid).length > 0,
       launchFailed: () => launchFailed,
+      deadlineMs: 10000,
     });
     if (seen === "failed") await launching;
     // Announce only once a browser group leader was actually seen.
@@ -425,7 +426,7 @@ async function selftestInterrupt(phase) {
   // its exit waits on the stdout flush: never spawn a child it can no longer cover. Park; that
   // handler ends the process. (Not `shuttingDown`: the full run calls shutdown() before the
   // self-tests on purpose.)
-  if (terminating) await new Promise(() => {});
+  await termination.beforeSpawn();
   const env = { ...process.env, ...(phase === "launch" ? { MODULES_SELFTEST_LAUNCH_DELAY_MS: "1500" } : {}) };
   const args = [SELF, "--selftest-child", ...(phase === "launch" ? ["--selftest-launch"] : [])];
   const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "inherit"], env });
