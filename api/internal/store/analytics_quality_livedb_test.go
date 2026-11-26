@@ -3,6 +3,7 @@ package store_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,6 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/analytics"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Issue #4730: LiveDB tests of the Quality statements. They call the generated store methods
@@ -618,23 +618,31 @@ func TestQualityCalendarAllTimeLiveDB(t *testing.T) {
 	}
 }
 
-// qualityTSArray renders timestamps as a text-array literal for an EXECUTE argument.
-func qualityTSArray(ts []time.Time) string {
-	parts := make([]string, len(ts))
-	for i, v := range ts {
-		parts[i] = `"` + v.UTC().Format(time.RFC3339Nano) + `"`
-	}
-	return "'{" + strings.Join(parts, ",") + "}'::timestamptz[]"
-}
-
-func qualityTextArray(v []string) string {
-	return "'{" + strings.Join(v, ",") + "}'::text[]"
-}
+// qualityOldWitnessBlock is the rw_pr CTE as it was before the witness fold became a GROUP BY
+// over a UNION ALL: the merge-witness lookup is a correlated scalar subquery over rw_witness,
+// an unhashed per-row SubPlan whatever the witness set's size. It is the negative control of
+// the plan-shape test below, written against the generated statement's $1 (bucket_starts) and
+// $2 (bucket_ends) parameters.
+const qualityOldWitnessBlock = `rw_pr AS MATERIALIZED (
+    SELECT p.repo_id, p.mr_iid, p.witnessed,
+           CASE WHEN p.wb >= 1 AND p.first_at < ($2::timestamptz[])[p.wb] THEN p.wb END AS bidx
+    FROM (
+        SELECT s.repo_id, s.mr_iid, s.first_at,
+               ((SELECT count(*) FROM rw_witness w WHERE w.repo_id = s.repo_id AND w.mr_iid = s.mr_iid) > 0) AS witnessed,
+               width_bucket(s.first_at, $1::timestamptz[]) AS wb
+        FROM rw_seed s
+    ) p
+),
+`
 
 // TestQualityGenericPlanShapeLiveDB pins the plan shape the statements get once pgx's cached
-// prepared statement switches to a generic plan (CTEs estimated at one row): the merge-witness
-// lookup is a hashed SubPlan and no rework/PR join falls back to a nested loop with a
-// Join Filter on the (repo_id, mr_iid) pair. Both statements are checked.
+// prepared statement switches to a generic plan (CTEs estimated at one row): no unhashed
+// SubPlan reads any CTE (a per-row SubPlan over a CTE degrades quadratically once the CTE
+// outgrows hash_mem), the merge witness (rw_witness) is folded in by a plain scan, the
+// rework-link membership (rw_sel) is a hashed SubPlan, and no rework/PR join falls back to a
+// nested loop with a Join Filter on the (repo_id, mr_iid) pair. Both statements are checked,
+// and a negative control (the old per-row witness lookup swapped back in) proves the check can
+// fail.
 func TestQualityGenericPlanShapeLiveDB(t *testing.T) {
 	f := newQualityFixture(t)
 	o := f.owner("plan")
@@ -644,81 +652,71 @@ func TestQualityGenericPlanShapeLiveDB(t *testing.T) {
 		f.rework(o, repo, 500+i, seed, "mr_rework", qualDay(10, 9))
 	}
 	b := f.bounds(spendCall{Owner: o.User, Now: qualNow})
-	ownerArgs := func() string {
-		a := []string{
-			qualityTSArray(b.BucketStarts), qualityTSArray(b.BucketEnds),
-			"'" + b.From.UTC().Format(time.RFC3339Nano) + "'::timestamptz",
-			"'" + b.Now.UTC().Format(time.RFC3339Nano) + "'::timestamptz",
-			"'" + o.User.String() + "'::uuid", "NULL::uuid", "NULL::text",
-			qualityTextArray(runkind.All()), qualityTextArray(runkind.Delivery()),
+	ownerArgs := qualityExecuteArgs(t, f.ctx, o.User, b)
+	allArgs := qualityExecuteArgs(t, f.ctx, uuid.Nil, b)
+
+	explain := func(t *testing.T, name, sql, args string) *planNode {
+		t.Helper()
+		conn, err := f.pool.Acquire(f.ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
-		always, prestart := workersvc.JudgeSkipFailOrigins()
-		a = append(a, qualityTextArray(always), qualityTextArray(prestart))
-		var judge []string
-		for _, k := range runkind.All() {
-			if runkind.JudgeEligible(k) {
-				judge = append(judge, k)
-			}
+		defer conn.Release()
+		stmt := "qual_plan_" + name
+		defer func() { _, _ = conn.Exec(context.Background(), "DEALLOCATE "+stmt) }()
+		tx, err := conn.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
-		a = append(a, qualityTextArray(judge))
-		return strings.Join(a, ", ")
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if _, err := tx.Exec(f.ctx, "SET LOCAL plan_cache_mode = force_generic_plan"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(f.ctx, "PREPARE "+stmt+" AS "+sql); err != nil {
+			t.Fatalf("prepare: %v", err)
+		}
+		var raw []byte
+		if err := tx.QueryRow(f.ctx, "EXPLAIN (VERBOSE, FORMAT JSON) EXECUTE "+stmt+"("+args+")").Scan(&raw); err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		var doc []struct {
+			Plan planNode `json:"Plan"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil || len(doc) != 1 {
+			t.Fatalf("decode EXPLAIN JSON (%d docs): %v", len(doc), err)
+		}
+		return &doc[0].Plan
 	}
+
 	for _, tc := range []struct {
-		name, sql string
-		owner     bool
+		name, sql, args string
 	}{
-		{"owner", store.AnalyticsOwnerQualitySQL, true},
-		{"all", store.AnalyticsAllQualitySQL, false},
+		{"owner", store.AnalyticsOwnerQualitySQL, ownerArgs},
+		{"all", store.AnalyticsAllQualitySQL, allArgs},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, err := f.pool.Acquire(f.ctx)
-			if err != nil {
-				t.Fatal(err)
+			root := explain(t, tc.name, tc.sql, tc.args)
+			for _, p := range qualityShapeProblems(root) {
+				t.Errorf("%s\n%s", p, renderPlan(root, 0))
 			}
-			defer conn.Release()
-			stmt := "qual_plan_" + tc.name
-			defer func() { _, _ = conn.Exec(context.Background(), "DEALLOCATE "+stmt) }()
-			tx, err := conn.Begin(f.ctx)
-			if err != nil {
-				t.Fatal(err)
+		})
+		t.Run(tc.name+" negative control", func(t *testing.T) {
+			start := strings.Index(tc.sql, "rw_pr AS MATERIALIZED (")
+			end := strings.Index(tc.sql, "rw_sel AS MATERIALIZED (")
+			if start < 0 || end < start {
+				t.Fatalf("the %s statement no longer has the rw_pr block this control replaces", tc.name)
 			}
-			defer func() { _ = tx.Rollback(context.Background()) }()
-			if _, err := tx.Exec(f.ctx, "SET LOCAL plan_cache_mode = force_generic_plan"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := tx.Exec(f.ctx, "PREPARE "+stmt+" AS "+tc.sql); err != nil {
-				t.Fatalf("prepare: %v", err)
-			}
-			a := ownerArgs()
-			if !tc.owner {
-				// The all-scope statement has no user_id parameter.
-				parts := strings.Split(a, ", ")
-				a = strings.Join(append(append([]string{}, parts[:4]...), parts[5:]...), ", ")
-			}
-			rows, err := tx.Query(f.ctx, "EXPLAIN (VERBOSE, FORMAT TEXT) EXECUTE "+stmt+"("+a+")")
-			if err != nil {
-				t.Fatalf("explain: %v", err)
-			}
-			defer rows.Close()
-			var plan []string
-			for rows.Next() {
-				var line string
-				if err := rows.Scan(&line); err != nil {
-					t.Fatal(err)
+			control := tc.sql[:start] + qualityOldWitnessBlock + tc.sql[end:]
+			root := explain(t, tc.name+"_ctl", control, tc.args)
+			var found bool
+			for _, p := range qualityShapeProblems(root) {
+				if strings.Contains(p, "un-hashed") && strings.Contains(p, "rw_witness") {
+					found = true
 				}
-				plan = append(plan, line)
 			}
-			if err := rows.Err(); err != nil {
-				t.Fatal(err)
-			}
-			text := strings.Join(plan, "\n")
-			if !strings.Contains(text, "hashed SubPlan") {
-				t.Errorf("the merge-witness lookup is not a hashed SubPlan:\n%s", text)
-			}
-			for _, line := range plan {
-				if strings.Contains(line, "Join Filter") && strings.Contains(line, "mr_iid") {
-					t.Errorf("a PR/rework join is a nested loop on the (repo_id, mr_iid) pair: %s\n%s", strings.TrimSpace(line), text)
-				}
+			if !found {
+				t.Fatalf("the per-row witness lookup did not trip the un-hashed SubPlan check (problems: %v); the plan-shape check cannot fail\n%s",
+					qualityShapeProblems(root), renderPlan(root, 0))
 			}
 		})
 	}

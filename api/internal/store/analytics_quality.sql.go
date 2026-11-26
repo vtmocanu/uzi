@@ -38,10 +38,15 @@ rw_pr AS MATERIALIZED (
     SELECT p.repo_id, p.mr_iid, p.witnessed,
            CASE WHEN p.wb >= 1 AND p.first_at < ($2::timestamptz[])[p.wb] THEN p.wb END AS bidx
     FROM (
-        SELECT s.repo_id, s.mr_iid, s.first_at,
-               ((s.repo_id, s.mr_iid) IN (SELECT w.repo_id, w.mr_iid FROM rw_witness w)) AS witnessed,
-               width_bucket(s.first_at, $1::timestamptz[]) AS wb
-        FROM rw_seed s
+        SELECT u.repo_id, u.mr_iid, min(u.first_at) AS first_at, bool_or(u.w) AS witnessed,
+               width_bucket(min(u.first_at), $1::timestamptz[]) AS wb
+        FROM (
+            SELECT s.repo_id, s.mr_iid, s.first_at, false AS w FROM rw_seed s
+            UNION ALL
+            SELECT w.repo_id, w.mr_iid, NULL::timestamptz, true FROM rw_witness w
+        ) u
+        GROUP BY u.repo_id, u.mr_iid
+        HAVING bool_or(NOT u.w)
     ) p
 ),
 rw_sel AS MATERIALIZED (
@@ -314,6 +319,10 @@ type AnalyticsAllQualityParams struct {
 // key list, and an absent class is zero.
 // Rework: seed PRs (creation cohort collapsed to one row per PR BEFORE any join), the scoped
 // merge witness, the retained mr_rework runs on the selected PRs and their verified links.
+// The witness is folded in by one GROUP BY over a UNION ALL of the seed and the witness keys
+// (a PR is witnessed when any witness row carries its key; HAVING keeps only seeded PRs). A
+// membership subquery here would become an unhashed per-row SubPlan once the witness set
+// outgrew hash_mem.
 // CI fix: runs created in the window, their outcome class from run_outcome_classes.
 // Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
 // lead-time restriction. Stage selects the stored result field: plan reads verdict, code reads
@@ -367,10 +376,15 @@ rw_pr AS MATERIALIZED (
     SELECT p.repo_id, p.mr_iid, p.witnessed,
            CASE WHEN p.wb >= 1 AND p.first_at < ($2::timestamptz[])[p.wb] THEN p.wb END AS bidx
     FROM (
-        SELECT s.repo_id, s.mr_iid, s.first_at,
-               ((s.repo_id, s.mr_iid) IN (SELECT w.repo_id, w.mr_iid FROM rw_witness w)) AS witnessed,
-               width_bucket(s.first_at, $1::timestamptz[]) AS wb
-        FROM rw_seed s
+        SELECT u.repo_id, u.mr_iid, min(u.first_at) AS first_at, bool_or(u.w) AS witnessed,
+               width_bucket(min(u.first_at), $1::timestamptz[]) AS wb
+        FROM (
+            SELECT s.repo_id, s.mr_iid, s.first_at, false AS w FROM rw_seed s
+            UNION ALL
+            SELECT w.repo_id, w.mr_iid, NULL::timestamptz, true FROM rw_witness w
+        ) u
+        GROUP BY u.repo_id, u.mr_iid
+        HAVING bool_or(NOT u.w)
     ) p
 ),
 rw_sel AS MATERIALIZED (
@@ -649,6 +663,10 @@ type AnalyticsOwnerQualityParams struct {
 // key list, and an absent class is zero.
 // Rework: seed PRs (creation cohort collapsed to one row per PR BEFORE any join), the scoped
 // merge witness, the retained mr_rework runs on the selected PRs and their verified links.
+// The witness is folded in by one GROUP BY over a UNION ALL of the seed and the witness keys
+// (a PR is witnessed when any witness row carries its key; HAVING keeps only seeded PRs). A
+// membership subquery here would become an unhashed per-row SubPlan once the witness set
+// outgrew hash_mem.
 // CI fix: runs created in the window, their outcome class from run_outcome_classes.
 // Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
 // lead-time restriction. Stage selects the stored result field: plan reads verdict, code reads
