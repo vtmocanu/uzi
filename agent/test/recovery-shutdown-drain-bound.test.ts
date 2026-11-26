@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -83,7 +84,7 @@ it("#3031 shutdown aborts a boot pass blocked in a real archive upload to a sile
     checksum: createHash("sha256").update(body).digest("hex"), chunkCount: 1, prerequisiteShas: [],
     selfContained: true, serverCaptureId: "server-capture",
   });
-  const coordinator = new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: token });
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: token });
   const pass = coordinator.resumePending();
   await within(entered, CEILING_MS, "upload request");
   const elapsed = await timedShutdown(coordinator);

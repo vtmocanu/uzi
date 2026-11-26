@@ -45,6 +45,21 @@ func All() []string {
 	return []string{Issue, CIFix, Chat, Judge, SelfImprove, Prompt, Task, MRRework, Job, CrossCheck}
 }
 
+// Delivery returns the run kinds that deliver work (issue #4684): issue, mr_rework,
+// ci_fix, prompt, self_improve, task and job. Spend analytics uses it for the
+// "delivery" kind filter and for the completed-run and merged-PR ratios. Together
+// with Supporting it partitions All(). Each call returns a fresh slice.
+func Delivery() []string {
+	return []string{Issue, MRRework, CIFix, Prompt, SelfImprove, Task, Job}
+}
+
+// Supporting returns the run kinds that support delivery rather than deliver it
+// (issue #4684): judge, cross_check and chat. Together with Delivery it partitions
+// All(). Each call returns a fresh slice.
+func Supporting() []string {
+	return []string{Judge, CrossCheck, Chat}
+}
+
 // CodeCrossCheckable reports which lead kinds snapshot owner code consent.
 // Auto-approval and seeded plans do not affect code consent.
 func CodeCrossCheckable(kind string) bool {

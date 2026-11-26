@@ -2,7 +2,7 @@
 
 **Status**: Done (2026-11-06). Child of epic #3873. Built on #3878 (PR #3952) and #3880 (PR #3971). Both milestones delivered; screenshots in `prds/mockups/3879/`.
 
-**Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
+**Design brief**: `prds/done/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
 **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`, the "Issue work" card. The brief's mock contract applies: implement the mock, small consistency tweaks are fine, larger deviations go under `Mock deviations` in the PR body with a reason, and the PR carries side-by-side screenshots.
 

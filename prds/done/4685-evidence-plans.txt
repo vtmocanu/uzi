@@ -1,0 +1,449 @@
+Reliability plan evidence for PRD #4685 (prds/done/4685-scoped-outcomes-reliability-api.md, section 8).
+Extracted verbatim from the run's plan-evidence harness output (api/internal/store/analytics_evidence_livedb_test.go,
+build tag analyticsevidence). Seed: 120,000 runs, 846,668 run_usage rows, 1,250 repos, 200 users; PostgreSQL 17; jit off;
+warm cache; single client. Each block is the harness's text plan summary for one workload in custom and generic plan mode,
+except the last (candidate index), which has the generic plan only with both timing lines.
+Source line ranges refer to the harness log (not committed).
+
+##### 1. owner 30d, breakdown=primary_model, custom + generic (baseline, no candidate index); harness log lines 3087-3255
+-- EXPLAIN AnalyticsOwnerReliability plan_cache_mode=custom (generic_plans=0 custom_plans=1): exec=136.1ms planning=4.2ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=27671 shared_read=4005
+   runs_pkey probes (loops): 2495
+   scans:
+     Bitmap Heap Scan on run_usage                                          loops=1944 rows=13608 time=33.0ms
+     Bitmap Heap Scan on runs                                               loops=1 rows=2495 time=4.4ms
+     Bitmap Index Scan using run_usage_pkey                                 loops=1944 rows=13608 time=11.7ms
+     Bitmap Index Scan using runs_user_created_idx                          loops=1 rows=3274 time=0.3ms
+     Index Scan using runs_pkey on runs                                     loops=2495 rows=2495 time=10.0ms
+     Seq Scan on forge_connections                                          loops=1 rows=1 time=0.0ms
+     Seq Scan on recovery_captures [SubPlan 5]                              loops=1 rows=791 time=0.2ms
+     Seq Scan on repos                                                      loops=1 rows=1250 time=0.2ms
+     Seq Scan on users                                                      loops=1 rows=1 time=0.0ms
+   NL Nested Loop [CTE run_fold]: outer=Nested Loop (rows 2495) inner=Aggregate (loops 2495, rows/loop 1.0) total_rows=2495 time=104.3ms
+   NL Nested Loop: outer=CTE Scan cohort (rows 2495) inner=Index Scan using runs_pkey on runs (loops 2495, rows/loop 1.0) total_rows=2495 time=19.7ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=135.4ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+       Nested Loop [CTE cohort] rows=2495 loops=1 time=7.8ms
+         Hash Join (Left) rows=2495 loops=1 time=6.2ms
+           Nested Loop rows=2495 loops=1 time=4.9ms
+             Seq Scan on users rows=1 loops=1 time=0.0ms
+             Bitmap Heap Scan on runs rows=2495 loops=1 time=4.4ms
+               Bitmap Index Scan using runs_user_created_idx rows=3274 loops=1 time=0.3ms
+             Seq Scan on repos rows=1250 loops=1 time=0.2ms
+           Seq Scan on forge_connections rows=1 loops=1 time=0.0ms
+         Seq Scan on recovery_captures [SubPlan 5] rows=791 loops=1 time=0.2ms
+       Nested Loop [CTE run_fold] rows=2495 loops=1 time=104.3ms
+         Nested Loop rows=2495 loops=1 time=19.7ms
+           CTE Scan cohort rows=2495 loops=1 time=9.6ms
+           Index Scan using runs_pkey on runs rows=2495 loops=2495 time=10.0ms
+         Aggregate rows=2495 loops=2495 time=82.3ms
+           Sort rows=2495 loops=2495 time=79.8ms sort=quicksort/Memory
+             Result rows=2495 loops=2495 time=74.8ms
+               Aggregate rows=3888 loops=1944 time=73.9ms
+                 Aggregate rows=3888 loops=1944 time=70.0ms
+                   WindowAgg rows=7776 loops=1944 time=64.2ms
+                     Incremental Sort rows=7776 loops=1944 time=54.4ms
+                       Subquery Scan rows=7776 loops=1944 time=50.5ms
+                         Aggregate rows=7776 loops=1944 time=50.5ms
+                           Sort rows=13608 loops=1944 time=42.8ms sort=quicksort/Memory
+                             Bitmap Heap Scan on run_usage rows=13608 loops=1944 time=33.0ms
+                               Bitmap Index Scan using run_usage_pkey rows=13608 loops=1944 time=11.7ms
+       CTE Scan run_fold [CTE rfb] rows=2495 loops=1 time=107.4ms
+       CTE Scan rfb [CTE bd_items] rows=1944 loops=1 time=0.7ms
+       WindowAgg [CTE bd_ranked] rows=1944 loops=1 time=8.1ms
+         Sort rows=1944 loops=1 time=6.8ms sort=quicksort/Memory
+             WindowAgg rows=1944 loops=1 time=5.3ms
+                 CTE Scan bd_items rows=1944 loops=1 time=2.7ms
+           CTE Scan bd_ranked rows=1944 loops=1 time=0.4ms
+       Subquery Scan [CTE cnt_j] rows=38 loops=1 time=124.9ms
+         Aggregate rows=38 loops=1 time=124.7ms
+           Append rows=6415 loops=1 time=122.1ms
+             CTE Scan rfb rows=1944 loops=1 time=110.0ms
+             CTE Scan rfb rows=551 loops=1 time=0.5ms
+             CTE Scan rfb rows=1944 loops=1 time=0.5ms
+             CTE Scan bd_ranked rows=1944 loops=1 time=10.4ms
+           CTE Scan rfb rows=265 loops=1 time=0.5ms
+       Subquery Scan [CTE roll_j] rows=90 loops=1 time=7.3ms
+         Aggregate rows=90 loops=1 time=6.9ms
+             Nested Loop rows=630 loops=1 time=6.4ms
+               Nested Loop rows=90 loops=1 time=0.1ms
+                 CTE Scan roll_series rows=3 loops=1 time=0.0ms
+                 CTE Scan rp rows=90 loops=3 time=0.0ms
+                       CTE Scan bnd [InitPlan 16] rows=1 loops=1 time=0.1ms
+                       CTE Scan run_fold rows=2495 loops=1 time=0.7ms
+                       CTE Scan bnd [InitPlan 17] rows=1 loops=1 time=0.0ms
+                       CTE Scan run_fold rows=2495 loops=1 time=0.6ms
+               CTE Scan bnd [SubPlan 14] rows=3330 loops=3330 time=0.0ms
+               CTE Scan bnd [SubPlan 15] rows=1935 loops=1935 time=0.0ms
+       CTE Scan cnt_j [InitPlan 20] rows=1 loops=1 time=124.9ms
+       CTE Scan cnt_j [InitPlan 21] rows=1 loops=1 time=0.0ms
+           CTE Scan cnt_j rows=30 loops=1 time=0.0ms
+         CTE Scan cause_g rows=6 loops=1 time=0.6ms
+           CTE Scan cause_g rows=6 loops=1 time=0.0ms
+               WindowAgg rows=6 loops=1 time=0.0ms
+                   CTE Scan cause_g rows=6 loops=1 time=0.0ms
+       Aggregate [InitPlan 26] rows=1 loops=1 time=7.4ms
+         Sort rows=30 loops=1 time=7.3ms sort=quicksort/Memory
+           CTE Scan roll_j rows=30 loops=1 time=7.3ms
+           CTE Scan roll_series rows=2 loops=1 time=0.0ms
+             CTE Scan roll_j rows=60 loops=2 time=0.0ms
+           Hash Join (Right) rows=6 loops=1 time=1.4ms
+             CTE Scan bd_groups rows=6 loops=1 time=1.3ms
+               CTE Scan cnt_j rows=6 loops=1 time=0.0ms
+         CTE Scan rfb rows=29 loops=1 time=0.3ms
+-- EXPLAIN AnalyticsOwnerReliability plan_cache_mode=generic (generic_plans=1 custom_plans=0): exec=165.4ms planning=3.8ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=55293 shared_read=208
+   runs_pkey probes (loops): 2495
+   scans:
+     Bitmap Heap Scan on run_usage                                          loops=1944 rows=13608 time=23.3ms
+     Bitmap Index Scan using run_usage_pkey                                 loops=1944 rows=13608 time=7.8ms
+     Index Scan using forge_connections_pkey on forge_connections           loops=2406 rows=2406 time=2.4ms
+     Index Scan using idx_recovery_captures_run_owner on recovery_captures [SubPlan 4] loops=67 rows=0 time=0.2ms
+     Index Scan using repos_pkey on repos                                   loops=2495 rows=2495 time=5.0ms
+     Index Scan using runs_pkey on runs                                     loops=2495 rows=2495 time=7.5ms
+     Index Scan using runs_user_created_idx on runs                         loops=1 rows=2495 time=5.1ms
+     Seq Scan on users                                                      loops=2495 rows=2495 time=32.4ms
+   NL Nested Loop: outer=Index Scan using runs_user_created_idx on runs (rows 2495) inner=Nested Loop (loops 2495, rows/loop 1.0) total_rows=2495 time=13.1ms
+   NL Nested Loop: outer=Index Scan using repos_pkey on repos (rows 2495) inner=Index Scan using forge_connections_pkey on forge_connections (loops 2406, rows/loop 1.0) total_rows=2495 time=7.5ms
+   NL Nested Loop [CTE run_fold]: outer=Nested Loop (rows 2495) inner=Aggregate (loops 2495, rows/loop 1.0) total_rows=2495 time=134.4ms
+   NL Nested Loop: outer=CTE Scan cohort (rows 2495) inner=Index Scan using runs_pkey on runs (loops 2495, rows/loop 1.0) total_rows=2495 time=60.4ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=164.8ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+       Nested Loop [CTE cohort] rows=2495 loops=1 time=49.2ms
+         Nested Loop rows=2495 loops=1 time=13.1ms
+           Index Scan using runs_user_created_idx on runs rows=2495 loops=1 time=5.1ms
+           Nested Loop rows=2495 loops=2495 time=7.5ms
+             Index Scan using repos_pkey on repos rows=2495 loops=2495 time=5.0ms
+             Index Scan using forge_connections_pkey on forge_connections rows=2406 loops=2406 time=2.4ms
+         Seq Scan on users rows=2495 loops=2495 time=32.4ms
+         Index Scan using idx_recovery_captures_run_owner on recovery_captures [SubPlan 4] rows=0 loops=67 time=0.2ms
+       Nested Loop [CTE run_fold] rows=2495 loops=1 time=134.4ms
+         Nested Loop rows=2495 loops=1 time=60.4ms
+           CTE Scan cohort rows=2495 loops=1 time=51.1ms
+           Index Scan using runs_pkey on runs rows=2495 loops=2495 time=7.5ms
+         Aggregate rows=2495 loops=2495 time=72.4ms
+           Sort rows=2495 loops=2495 time=69.9ms sort=quicksort/Memory
+             Result rows=2495 loops=2495 time=64.9ms
+               Aggregate rows=3888 loops=1944 time=62.2ms
+                 Aggregate rows=3888 loops=1944 time=58.3ms
+                   WindowAgg rows=7776 loops=1944 time=54.4ms
+                     Incremental Sort rows=7776 loops=1944 time=44.7ms
+                       Subquery Scan rows=7776 loops=1944 time=40.8ms
+                         Aggregate rows=7776 loops=1944 time=40.8ms
+                           Sort rows=13608 loops=1944 time=33.0ms sort=quicksort/Memory
+                             Bitmap Heap Scan on run_usage rows=13608 loops=1944 time=23.3ms
+                               Bitmap Index Scan using run_usage_pkey rows=13608 loops=1944 time=7.8ms
+       CTE Scan run_fold [CTE rfb] rows=2495 loops=1 time=137.4ms
+       CTE Scan rfb [CTE bd_items] rows=1944 loops=1 time=1.0ms
+       WindowAgg [CTE bd_ranked] rows=1944 loops=1 time=8.2ms
+             WindowAgg rows=1944 loops=1 time=5.5ms
+                 CTE Scan bd_items rows=1944 loops=1 time=3.0ms
+           CTE Scan bd_ranked rows=1944 loops=1 time=0.4ms
+       Subquery Scan [CTE cnt_j] rows=38 loops=1 time=154.7ms
+         Aggregate rows=38 loops=1 time=154.6ms
+           Append rows=6415 loops=1 time=152.1ms
+             CTE Scan rfb rows=1944 loops=1 time=140.0ms
+             CTE Scan rfb rows=551 loops=1 time=0.5ms
+             CTE Scan rfb rows=1944 loops=1 time=0.5ms
+             CTE Scan bd_ranked rows=1944 loops=1 time=10.5ms
+         CTE Scan rfb rows=265 loops=1 time=0.4ms
+           Nested Loop rows=630 loops=1 time=6.3ms
+             Nested Loop rows=90 loops=1 time=0.1ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+               CTE Scan roll_series rows=90 loops=30 time=0.0ms
+                     CTE Scan bnd [InitPlan 16] rows=1 loops=1 time=0.1ms
+                     CTE Scan run_fold rows=2495 loops=1 time=0.7ms
+                     CTE Scan bnd [InitPlan 17] rows=1 loops=1 time=0.0ms
+                     CTE Scan run_fold rows=2495 loops=1 time=0.6ms
+             CTE Scan bnd [SubPlan 14] rows=3330 loops=3330 time=0.0ms
+             CTE Scan bnd [SubPlan 15] rows=1935 loops=1935 time=0.0ms
+       CTE Scan cnt_j [InitPlan 20] rows=1 loops=1 time=154.8ms
+       CTE Scan cnt_j [InitPlan 21] rows=1 loops=1 time=0.0ms
+           CTE Scan cnt_j rows=30 loops=1 time=0.0ms
+         CTE Scan cause_g rows=6 loops=1 time=0.5ms
+           CTE Scan cause_g rows=6 loops=1 time=0.0ms
+               WindowAgg rows=6 loops=1 time=0.0ms
+                   CTE Scan cause_g rows=6 loops=1 time=0.0ms
+           CTE Scan roll_j rows=30 loops=1 time=6.8ms
+           CTE Scan roll_series rows=2 loops=1 time=0.0ms
+             CTE Scan roll_j rows=60 loops=2 time=0.0ms
+           Nested Loop rows=6 loops=1 time=1.3ms
+             CTE Scan cnt_j rows=6 loops=1 time=0.0ms
+             CTE Scan bd_groups rows=36 loops=6 time=1.3ms
+         CTE Scan rfb rows=29 loops=1 time=0.3ms
+TIMING rel-base rel-owner-30d-primary_model mode=custom n=20 reduced=false median=105.0ms p95=106.3ms max=106.4ms
+TIMING rel-base rel-owner-30d-primary_model mode=generic n=20 reduced=false median=144.3ms p95=145.8ms max=146.3ms
+
+##### 2. admin all-users 30d, breakdown=primary_model, custom + generic (baseline); harness log lines 3786-3941
+-- EXPLAIN AnalyticsAllReliability plan_cache_mode=custom (generic_plans=0 custom_plans=1): exec=642.4ms planning=6.5ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=135429 shared_read=21362
+   runs_pkey probes (loops): 12281
+   scans:
+     Bitmap Heap Scan on run_usage                                          loops=9675 rows=67725 time=154.8ms
+     Bitmap Index Scan using run_usage_pkey                                 loops=9675 rows=67725 time=38.7ms
+     Index Scan using runs_pkey on runs                                     loops=12281 rows=12281 time=49.1ms
+     Seq Scan on recovery_captures [SubPlan 5]                              loops=1 rows=791 time=0.3ms
+     Seq Scan on repos                                                      loops=1 rows=1250 time=0.2ms
+     Seq Scan on runs                                                       loops=1 rows=12281 time=42.8ms
+     Seq Scan on users                                                      loops=1 rows=200 time=0.0ms
+   NL Nested Loop [CTE run_fold]: outer=Nested Loop (rows 12281) inner=Aggregate (loops 12281, rows/loop 1.0) total_rows=12281 time=509.1ms
+   NL Nested Loop: outer=CTE Scan cohort (rows 12281) inner=Index Scan using runs_pkey on runs (loops 12281, rows/loop 1.0) total_rows=12281 time=112.6ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=640.9ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+       Hash Join (Left) [CTE cohort] rows=12281 loops=1 time=52.1ms
+         Hash Join (Inner) rows=12281 loops=1 time=46.4ms
+           Seq Scan on runs rows=12281 loops=1 time=42.8ms
+             Seq Scan on users rows=200 loops=1 time=0.0ms
+           Seq Scan on repos rows=1250 loops=1 time=0.2ms
+         Seq Scan on recovery_captures [SubPlan 5] rows=791 loops=1 time=0.3ms
+       Nested Loop [CTE run_fold] rows=12281 loops=1 time=509.1ms
+         Nested Loop rows=12281 loops=1 time=112.6ms
+           CTE Scan cohort rows=12281 loops=1 time=61.1ms
+           Index Scan using runs_pkey on runs rows=12281 loops=12281 time=49.1ms
+         Aggregate rows=12281 loops=12281 time=380.7ms
+           Sort rows=12281 loops=12281 time=368.4ms sort=quicksort/Memory
+             Result rows=12281 loops=12281 time=343.9ms
+               Aggregate rows=19350 loops=9675 time=338.6ms
+                 Aggregate rows=19350 loops=9675 time=319.3ms
+                   WindowAgg rows=38700 loops=9675 time=299.9ms
+                     Incremental Sort rows=38700 loops=9675 time=261.2ms
+                       Subquery Scan rows=38700 loops=9675 time=241.9ms
+                         Aggregate rows=38700 loops=9675 time=232.2ms
+                           Sort rows=67725 loops=9675 time=203.2ms sort=quicksort/Memory
+                             Bitmap Heap Scan on run_usage rows=67725 loops=9675 time=154.8ms
+                               Bitmap Index Scan using run_usage_pkey rows=67725 loops=9675 time=38.7ms
+       CTE Scan run_fold [CTE rfb] rows=12281 loops=1 time=524.6ms
+       CTE Scan rfb [CTE bd_items] rows=9675 loops=1 time=3.4ms
+       WindowAgg [CTE bd_ranked] rows=9675 loops=1 time=41.3ms
+         Sort rows=9675 loops=1 time=35.3ms sort=quicksort/Memory
+             WindowAgg rows=9675 loops=1 time=26.9ms
+                 CTE Scan bd_items rows=9675 loops=1 time=13.8ms
+           CTE Scan bd_ranked rows=9675 loops=1 time=2.0ms
+       Subquery Scan [CTE cnt_j] rows=38 loops=1 time=611.8ms
+         Aggregate rows=38 loops=1 time=611.6ms
+           Append rows=31663 loops=1 time=599.5ms
+             CTE Scan rfb rows=9675 loops=1 time=538.2ms
+             CTE Scan rfb rows=2606 loops=1 time=2.3ms
+             CTE Scan rfb rows=9675 loops=1 time=2.7ms
+             CTE Scan bd_ranked rows=9675 loops=1 time=53.1ms
+           CTE Scan rfb rows=1291 loops=1 time=2.4ms
+             Nested Loop rows=630 loops=1 time=15.9ms
+               Nested Loop rows=90 loops=1 time=0.1ms
+                 CTE Scan roll_series rows=3 loops=1 time=0.0ms
+                 CTE Scan rp rows=90 loops=3 time=0.0ms
+                       CTE Scan bnd [InitPlan 16] rows=1 loops=1 time=0.1ms
+                       CTE Scan run_fold rows=12281 loops=1 time=3.5ms
+                       CTE Scan bnd [InitPlan 17] rows=1 loops=1 time=0.0ms
+                       CTE Scan run_fold rows=12281 loops=1 time=3.4ms
+               CTE Scan bnd [SubPlan 14] rows=3330 loops=3330 time=0.0ms
+               CTE Scan bnd [SubPlan 15] rows=1935 loops=1935 time=0.0ms
+       CTE Scan cnt_j [InitPlan 20] rows=1 loops=1 time=611.8ms
+       CTE Scan cnt_j [InitPlan 21] rows=1 loops=1 time=0.0ms
+           CTE Scan cnt_j rows=30 loops=1 time=0.0ms
+         CTE Scan cause_g rows=6 loops=1 time=2.7ms
+           CTE Scan cause_g rows=6 loops=1 time=0.0ms
+               WindowAgg rows=6 loops=1 time=0.0ms
+                   CTE Scan cause_g rows=6 loops=1 time=0.0ms
+           CTE Scan roll_j rows=30 loops=1 time=16.8ms
+           CTE Scan roll_series rows=2 loops=1 time=0.0ms
+             CTE Scan roll_j rows=60 loops=2 time=0.0ms
+           Hash Join (Right) rows=6 loops=1 time=6.9ms
+             CTE Scan bd_groups rows=6 loops=1 time=6.9ms
+               CTE Scan cnt_j rows=6 loops=1 time=0.0ms
+         CTE Scan rfb rows=119 loops=1 time=1.7ms
+-- EXPLAIN AnalyticsAllReliability plan_cache_mode=generic (generic_plans=1 custom_plans=0): exec=668.7ms planning=3.9ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=174592 shared_read=26508
+   runs_pkey probes (loops): 12281
+   scans:
+     Bitmap Heap Scan on run_usage                                          loops=9675 rows=67725 time=164.5ms
+     Bitmap Index Scan using run_usage_pkey                                 loops=9675 rows=67725 time=48.4ms
+     Index Scan using idx_recovery_captures_run_owner on recovery_captures [SubPlan 4] loops=316 rows=0 time=0.9ms
+     Index Scan using repos_pkey on repos                                   loops=12281 rows=12281 time=12.3ms
+     Index Scan using runs_pkey on runs                                     loops=12281 rows=12281 time=36.8ms
+     Index Scan using runs_user_created_idx on runs                         loops=200 rows=12200 time=42.4ms
+     Seq Scan on users                                                      loops=1 rows=200 time=0.1ms
+   NL Nested Loop [CTE run_fold]: outer=Nested Loop (rows 12281) inner=Aggregate (loops 12281, rows/loop 1.0) total_rows=12281 time=534.0ms
+   NL Nested Loop: outer=CTE Scan cohort (rows 12281) inner=Index Scan using runs_pkey on runs (loops 12281, rows/loop 1.0) total_rows=12281 time=125.0ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=667.0ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+       Nested Loop [CTE cohort] rows=12281 loops=1 time=69.3ms
+         Nested Loop rows=12281 loops=1 time=44.7ms
+           Seq Scan on users rows=200 loops=1 time=0.1ms
+           Index Scan using runs_user_created_idx on runs rows=12200 loops=200 time=42.4ms
+         Index Scan using repos_pkey on repos rows=12281 loops=12281 time=12.3ms
+         Index Scan using idx_recovery_captures_run_owner on recovery_captures [SubPlan 4] rows=0 loops=316 time=0.9ms
+       Nested Loop [CTE run_fold] rows=12281 loops=1 time=534.0ms
+         Nested Loop rows=12281 loops=1 time=125.0ms
+           CTE Scan cohort rows=12281 loops=1 time=78.7ms
+           Index Scan using runs_pkey on runs rows=12281 loops=12281 time=36.8ms
+         Aggregate rows=12281 loops=12281 time=393.0ms
+           Sort rows=12281 loops=12281 time=380.7ms sort=quicksort/Memory
+             Result rows=12281 loops=12281 time=356.1ms
+               Aggregate rows=19350 loops=9675 time=348.3ms
+                 Aggregate rows=19350 loops=9675 time=329.0ms
+                   WindowAgg rows=38700 loops=9675 time=309.6ms
+                     Incremental Sort rows=38700 loops=9675 time=270.9ms
+                       Subquery Scan rows=38700 loops=9675 time=251.5ms
+                         Aggregate rows=38700 loops=9675 time=241.9ms
+                           Sort rows=67725 loops=9675 time=212.8ms sort=quicksort/Memory
+                             Bitmap Heap Scan on run_usage rows=67725 loops=9675 time=164.5ms
+                               Bitmap Index Scan using run_usage_pkey rows=67725 loops=9675 time=48.4ms
+       CTE Scan run_fold [CTE rfb] rows=12281 loops=1 time=549.6ms
+       CTE Scan rfb [CTE bd_items] rows=9675 loops=1 time=5.0ms
+       WindowAgg [CTE bd_ranked] rows=9675 loops=1 time=42.7ms
+         Sort rows=9675 loops=1 time=36.5ms sort=quicksort/Memory
+             WindowAgg rows=9675 loops=1 time=28.3ms
+                 CTE Scan bd_items rows=9675 loops=1 time=15.4ms
+           CTE Scan bd_ranked rows=9675 loops=1 time=2.1ms
+       Subquery Scan [CTE cnt_j] rows=38 loops=1 time=638.7ms
+         Aggregate rows=38 loops=1 time=638.5ms
+           Append rows=31663 loops=1 time=626.2ms
+             CTE Scan rfb rows=9675 loops=1 time=563.4ms
+             CTE Scan rfb rows=2606 loops=1 time=2.2ms
+             CTE Scan rfb rows=9675 loops=1 time=2.7ms
+             CTE Scan bd_ranked rows=9675 loops=1 time=54.7ms
+         CTE Scan rfb rows=1291 loops=1 time=2.3ms
+           Nested Loop rows=630 loops=1 time=15.2ms
+             Nested Loop rows=90 loops=1 time=0.1ms
+               CTE Scan rp rows=30 loops=1 time=0.0ms
+               CTE Scan roll_series rows=90 loops=30 time=0.0ms
+                     CTE Scan bnd [InitPlan 16] rows=1 loops=1 time=0.1ms
+                     CTE Scan run_fold rows=12281 loops=1 time=3.2ms
+                     CTE Scan bnd [InitPlan 17] rows=1 loops=1 time=0.0ms
+                     CTE Scan run_fold rows=12281 loops=1 time=3.1ms
+             CTE Scan bnd [SubPlan 14] rows=3330 loops=3330 time=0.0ms
+             CTE Scan bnd [SubPlan 15] rows=1935 loops=1935 time=0.0ms
+       CTE Scan cnt_j [InitPlan 20] rows=1 loops=1 time=638.7ms
+       CTE Scan cnt_j [InitPlan 21] rows=1 loops=1 time=0.0ms
+           CTE Scan cnt_j rows=30 loops=1 time=0.0ms
+         CTE Scan cause_g rows=6 loops=1 time=2.5ms
+           CTE Scan cause_g rows=6 loops=1 time=0.0ms
+               WindowAgg rows=6 loops=1 time=0.0ms
+                   CTE Scan cause_g rows=6 loops=1 time=0.0ms
+           CTE Scan roll_j rows=30 loops=1 time=15.8ms
+           CTE Scan roll_series rows=2 loops=1 time=0.0ms
+             CTE Scan roll_j rows=60 loops=2 time=0.0ms
+           Nested Loop rows=6 loops=1 time=7.2ms
+             CTE Scan cnt_j rows=6 loops=1 time=0.0ms
+             CTE Scan bd_groups rows=36 loops=6 time=7.2ms
+         CTE Scan rfb rows=119 loops=1 time=1.7ms
+TIMING rel-base rel-admin-all-30d-primary_model mode=custom n=20 reduced=false median=562.6ms p95=583.3ms max=584.2ms
+TIMING rel-base rel-admin-all-30d-primary_model mode=generic n=20 reduced=false median=574.3ms p95=582.5ms max=583.5ms
+
+##### 3. owner latest failure (full statement), custom + generic (baseline); harness log lines 5572-5615
+-- EXPLAIN AnalyticsOwnerLatestFailure plan_cache_mode=custom (generic_plans=0 custom_plans=1): exec=0.1ms planning=1.4ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=34 shared_read=3
+   runs_pkey probes (loops): 0
+   scans:
+     Bitmap Heap Scan on runs                                               loops=1 rows=4 time=0.0ms
+     Bitmap Index Scan using runs_user_terminal_end_idx                     loops=1 rows=5 time=0.0ms
+     Index Scan using runs_user_terminal_end_idx on runs                    loops=1 rows=2 time=0.1ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=0.1ms
+       Limit [CTE last_failure] rows=1 loops=1 time=0.1ms
+         Incremental Sort rows=1 loops=1 time=0.1ms
+           Index Scan using runs_user_terminal_end_idx on runs rows=2 loops=1 time=0.1ms
+       CTE Scan last_failure [InitPlan 2] rows=1 loops=1 time=0.1ms
+       CTE Scan last_failure [InitPlan 3] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 4] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 5] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 6] rows=1 loops=1 time=0.0ms
+       Aggregate [InitPlan 7] rows=1 loops=1 time=0.0ms
+         Nested Loop rows=4 loops=1 time=0.0ms
+           CTE Scan last_failure rows=1 loops=1 time=0.0ms
+           Bitmap Heap Scan on runs rows=4 loops=1 time=0.0ms
+             Bitmap Index Scan using runs_user_terminal_end_idx rows=5 loops=1 time=0.0ms
+-- EXPLAIN AnalyticsOwnerLatestFailure plan_cache_mode=generic (generic_plans=1 custom_plans=0): exec=5.6ms planning=1.1ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=1422 shared_read=40
+   runs_pkey probes (loops): 0
+   scans:
+     Bitmap Heap Scan on runs                                               loops=2 rows=2657 time=5.0ms
+     Bitmap Index Scan using idx_runs_claimable                             loops=1 rows=5294 time=0.5ms
+     Bitmap Index Scan using runs_user_terminal_end_idx                     loops=1 rows=5 time=0.0ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=5.6ms
+       Limit [CTE last_failure] rows=1 loops=1 time=5.6ms
+         Sort rows=1 loops=1 time=5.6ms sort=top-N heapsort/Memory
+           Bitmap Heap Scan on runs rows=2653 loops=1 time=5.0ms
+             Bitmap Index Scan using idx_runs_claimable rows=5294 loops=1 time=0.5ms
+       CTE Scan last_failure [InitPlan 2] rows=1 loops=1 time=5.6ms
+       CTE Scan last_failure [InitPlan 3] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 4] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 5] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 6] rows=1 loops=1 time=0.0ms
+         Nested Loop rows=4 loops=1 time=0.0ms
+           CTE Scan last_failure rows=1 loops=1 time=0.0ms
+           Bitmap Heap Scan on runs rows=4 loops=1 time=0.0ms
+             Bitmap Index Scan using runs_user_terminal_end_idx rows=5 loops=1 time=0.0ms
+TIMING rel-base latest-owner-full mode=custom n=20 reduced=false median=1.3ms p95=1.3ms max=1.3ms
+TIMING rel-base latest-owner-full mode=generic n=20 reduced=false median=4.8ms p95=5.0ms max=5.5ms
+
+##### 4. all-users latest failure (full statement), custom + generic (baseline); harness log lines 5767-5807
+-- EXPLAIN AnalyticsAllLatestFailure plan_cache_mode=custom (generic_plans=0 custom_plans=1): exec=94.4ms planning=1.3ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=13366 shared_read=1142
+   runs_pkey probes (loops): 0
+   scans:
+     Seq Scan on runs                                                       loops=4 rows=81236 time=111.3ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=94.3ms
+       Limit [CTE last_failure] rows=1 loops=1 time=34.1ms
+         Gather Merge rows=1 loops=1 time=34.1ms
+           Sort rows=3 loops=3 time=58.4ms sort=top-N heapsort/Memory
+             Seq Scan on runs rows=13209 loops=3 time=55.5ms
+       CTE Scan last_failure [InitPlan 2] rows=1 loops=1 time=34.0ms
+       CTE Scan last_failure [InitPlan 3] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 4] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 5] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 6] rows=1 loops=1 time=0.0ms
+       Aggregate [InitPlan 7] rows=1 loops=1 time=60.2ms
+         Nested Loop rows=9 loops=1 time=60.2ms
+           CTE Scan last_failure rows=1 loops=1 time=0.0ms
+           Seq Scan on runs rows=68027 loops=1 time=55.9ms
+-- EXPLAIN AnalyticsAllLatestFailure plan_cache_mode=generic (generic_plans=1 custom_plans=0): exec=90.4ms planning=3.3ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=13632 shared_read=882
+   runs_pkey probes (loops): 0
+   scans:
+     Seq Scan on runs                                                       loops=6 rows=81237 time=157.3ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=90.3ms
+       Limit [CTE last_failure] rows=1 loops=1 time=40.2ms
+         Gather Merge rows=1 loops=1 time=40.2ms
+           Sort rows=3 loops=3 time=79.9ms sort=top-N heapsort/Memory
+             Seq Scan on runs rows=13209 loops=3 time=76.8ms
+       CTE Scan last_failure [InitPlan 2] rows=1 loops=1 time=40.2ms
+       CTE Scan last_failure [InitPlan 3] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 4] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 5] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 6] rows=1 loops=1 time=0.0ms
+       Aggregate [InitPlan 7] rows=1 loops=1 time=50.0ms
+         Nested Loop rows=9 loops=1 time=50.0ms
+           CTE Scan last_failure rows=1 loops=1 time=0.0ms
+           Gather rows=68027 loops=1 time=45.3ms
+             Seq Scan on runs rows=68028 loops=3 time=80.4ms
+TIMING rel-base latest-all-full mode=custom n=20 reduced=false median=86.1ms p95=88.0ms max=88.5ms
+TIMING rel-base latest-all-full mode=generic n=20 reduced=false median=85.0ms p95=86.8ms max=89.1ms
+
+##### 5. all-users latest failure with candidate index runs_terminal_end_idx, generic (custom timing line included); harness log lines 7110-7132
+-- EXPLAIN AnalyticsAllLatestFailure plan_cache_mode=generic (generic_plans=1 custom_plans=0): exec=0.1ms planning=2.7ms temp_written_blocks=0 temp_read_blocks=0 disk_sorts=0 jit_ms=0.0 jit_funcs=0 shared_hit=29 shared_read=0
+   uses runs_terminal_end_idx: true
+   runs_pkey probes (loops): 0
+   scans:
+     Bitmap Heap Scan on runs                                               loops=1 rows=9 time=0.0ms
+     Bitmap Index Scan using runs_terminal_end_idx                          loops=1 rows=11 time=0.0ms
+     Index Scan using runs_terminal_end_idx on runs                         loops=1 rows=1 time=0.0ms
+   plan (interesting nodes):
+     Result rows=1 loops=1 time=0.1ms
+       Limit [CTE last_failure] rows=1 loops=1 time=0.0ms
+         Index Scan using runs_terminal_end_idx on runs rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 2] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 3] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 4] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 5] rows=1 loops=1 time=0.0ms
+       CTE Scan last_failure [InitPlan 6] rows=1 loops=1 time=0.0ms
+       Aggregate [InitPlan 7] rows=1 loops=1 time=0.0ms
+         Nested Loop rows=9 loops=1 time=0.0ms
+           CTE Scan last_failure rows=1 loops=1 time=0.0ms
+           Bitmap Heap Scan on runs rows=9 loops=1 time=0.0ms
+             Bitmap Index Scan using runs_terminal_end_idx rows=11 loops=1 time=0.0ms
+TIMING rel-idx latest-all-full mode=custom n=20 reduced=false median=1.1ms p95=1.2ms max=1.5ms
+TIMING rel-idx latest-all-full mode=generic n=20 reduced=false median=0.2ms p95=0.3ms max=0.3ms

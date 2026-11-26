@@ -1,0 +1,100 @@
+{
+  "scope": {
+    "route": "",
+    "user": ""
+  },
+  "generated_at": "0001-01-01T00:00:00Z",
+  "window": "",
+  "timezone": "",
+  "from": "0001-01-01T00:00:00Z",
+  "to": "0001-01-01T00:00:00Z",
+  "history_start": null,
+  "bucket_width_days": 0,
+  "buckets": null,
+  "rolling": null,
+  "selected_user": "",
+  "untracked_chat_runs": 0,
+  "totals": {
+    "current": {
+      "cost_usd": 0,
+      "input_tokens": 0,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 0,
+      "runs": 0,
+      "disclosure": {
+        "metered": 0,
+        "subscription": 0,
+        "unreported": 0,
+        "missing": 0,
+        "incomplete": false
+      },
+      "coverage": {
+        "metered": 0,
+        "applicable": 0,
+        "value": null,
+        "reason": null
+      }
+    }
+  },
+  "series": null,
+  "split": {
+    "dimension": "",
+    "non_additive": false,
+    "groups": null
+  },
+  "cost_per_completed_run": {
+    "current": {
+      "numerator_usd": 0,
+      "denominator": 0,
+      "value": null,
+      "reason": null,
+      "disclosure": {
+        "metered": 0,
+        "subscription": 0,
+        "unreported": 0,
+        "missing": 0,
+        "incomplete": false
+      }
+    },
+    "buckets": null,
+    "rolling": null
+  },
+  "cost_per_merged_pr": {
+    "current": {
+      "numerator_usd": 0,
+      "denominator": 0,
+      "value": null,
+      "reason": null,
+      "disclosure": {
+        "metered": 0,
+        "subscription": 0,
+        "unreported": 0,
+        "missing": 0,
+        "incomplete": false
+      }
+    },
+    "buckets": null,
+    "rolling": null
+  },
+  "cache_read": {
+    "cache_read_tokens": 0,
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "denominator": 0,
+    "value": null,
+    "reason": null,
+    "disclosure": {
+      "metered": 0,
+      "subscription": 0,
+      "unreported": 0,
+      "missing": 0,
+      "incomplete": false
+    }
+  },
+  "top_runs": null,
+  "breakdown": {
+    "dimension": "",
+    "rows": null
+  }
+}

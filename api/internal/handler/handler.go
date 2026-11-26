@@ -92,7 +92,7 @@ type Handler struct {
 	secretBeginTx func(ctx context.Context) (pgx.Tx, error)
 	// runEnvHasReceipt, when non-nil, replaces store.RunEnvVersionHasReceipt as the answer to
 	// "does any run hold a delivery receipt for this variable version" (PRD #4416), so a
-	// test can reach the retire and pending-deletion paths before M2 adds receipts. nil in
+	// test can reach the retire and pending-deletion paths without a run. nil in
 	// production.
 	runEnvHasReceipt func(ctx context.Context, varID uuid.UUID, rev int32) (bool, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset
@@ -164,6 +164,7 @@ type Handler struct {
 	weeklyLimit          weeklyLimitSource // owner-only weekly-limit block (PRD #4123); nil = no block
 	heldSvc              heldPublisher     // test seam for WorkerRunHeldPublication; nil = wsvc
 	terminalSvc          terminalPublisher // test seam for WorkerRunTerminalPreservation; nil = wsvc
+	runEnvRedactSvc      runEnvRedactor    // test seam for WorkerRunEnvRedact; nil = wsvc
 	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
 	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
 	catalogDefaults codexCatalogReader
@@ -268,6 +269,9 @@ type Handler struct {
 	// in the classification path would make the graces testable only by sleeping.
 	now       func() time.Time
 	startedAt time.Time
+	// analyticsDeps serves the scoped usage analytics routes (issue #4684). New builds it only
+	// when there is a pool; nil answers every analytics request with the sanitized 500.
+	analyticsDeps *analyticsDeps
 	// scheduler is the PRD #241 scheduled-runs actor, constructed in New from deps the
 	// handler already holds. M4 uses it ONLY for run-now (POST
 	// /api/schedules/{id}/run-now), which fires a schedule once through the same seam a
@@ -694,7 +698,11 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 		scheduler.SetIssueSources(svc)
 	}
 	scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
+	hd := &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
+	if pool != nil {
+		hd.analyticsDeps = newAnalyticsDeps(pool)
+	}
+	return hd
 }
 
 // SetVersion stamps the server build version served at GET /api/version. Called
@@ -1033,7 +1041,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountAdminRoutes(r, forgeLimiter, authLimiter)
 		h.mountForgeRoutes(r, forgeLimiter)
 		h.mountIssueTrackerRoutes(r, forgeLimiter)
-		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
+		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter, authLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
 		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
 		// only) and a per-user limit; read mountV1Routes before adding anything here.
@@ -1243,6 +1251,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		h.mountChatRoutes(r, chatLimiter, forgeLimiter)
+		h.mountAnalyticsRoutes(r)
 
 		h.mountWorkerRoutes(r, proposalLimiter)
 		h.mountControllerRoutes(r)
@@ -1442,6 +1451,11 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// the route refuses unsupported, with no write, for a worker without
 		// recovery_terminal_preservation_v1.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/terminal-preservation", h.WorkerRunTerminalPreservation)
+
+		// Run environment redact maintenance (PRD #4416 M2): the secret versions a run was ever
+		// delivered, opened for its owner, so the worker that holds or last held the run can mask
+		// its output. The answer carries plaintext secrets and is never cacheable.
+		r.With(h.refuseJobRuns).Get("/runs/{id}/run-env-redact", h.WorkerRunEnvRedact)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences

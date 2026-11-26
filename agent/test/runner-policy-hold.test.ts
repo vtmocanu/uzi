@@ -4,6 +4,7 @@ import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Outbox } from "../src/outbox.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { PolicyHoldRequest } from "../src/protocol.js";
@@ -175,6 +176,40 @@ describe("policy admission on every production claim", () => {
     assert.equal(models, 0, "existing terminal running-ACK guard still refuses a stale claim");
     assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 1))?.body, original);
     assert.equal(outbox.listPendingTerminals()[0]?.server_settled, true);
+  });
+
+  it("an over-budget claim holding a policy admission settles it, then reports run_env_forms_over_budget", async () => {
+    const outbox = await pendingOutbox();
+    const lines = (seed: string): string => {
+      let text = "";
+      for (let i = 0; text.length < 65536; i++) text += createHash("sha512").update(`${seed}-${i}`).digest("base64").replace(/=+$/, "") + "\r\n";
+      return text;
+    };
+    const secrets = {
+      forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan",
+      run_env_redact: Array.from({ length: 40 }, (_, i) =>
+        ({ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: i + 1, name: `OLD_${i % 5}`, value: lines(`policy-over-${i}`) })),
+    };
+    const claim = gitlabClaim(3708, { claim_generation: 3, secrets: secrets as never });
+    await outbox.journalPolicyHold(claim.run_id, original);
+    // The original stays pending at its own generation; the rehold at this claim's generation settles it while the
+    // run keeps running, and the claim then fails on its forms.
+    const modes: string[] = [];
+    client.reportPolicyHold = async (_id, body) => {
+      if (body.claim_generation === 1) return { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 };
+      modes.push(body.continuation_mode);
+      return { disposition: "already_applied", outcome_id: body.outcome_id, source_generation: 1, observed_status: "running", observed_generation: 3 };
+    };
+    client.getRunOwnership = async () => ({ status: "running", claim_generation: 3, claim_released: false }) as never;
+    let models = 0;
+    // An attempt-paths runner: the mode comes from the runner's own paths.
+    await runnerWith(() => ({ executor: { run: async () => { models++; throw new Error("unexpected model"); } } }),
+      fakeGitlab().gitlab, undefined, nullLogger(), { outbox, dockerHost: "unix:///fixture" }).execute(claim);
+    assert.equal(models, 0);
+    assert.deepEqual(modes, ["fresh_from_saved_work"]);
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    assert.ok(failed, "the over-budget failure is reported, not dropped by the admission early return");
+    assert.match(String(failed.failure_reason), /run_env_forms_over_budget/);
   });
 
   it("resolved authenticated policy history alone does not constrain a later ordinary claim", async () => {

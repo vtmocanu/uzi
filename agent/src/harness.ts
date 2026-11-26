@@ -409,6 +409,9 @@ export interface RunTurnRequest {
   /** Codex-only: the effective per-child turn budget (ms), rendered into each subagent's
    *  developer instructions. The Claude harness ignores it. */
   childTurnBudgetMs?: number;
+  /** PRD #4416 M2: the run-variables prompt block, appended to every subagent's prompt on both phases
+   *  (the lead's own prompt carries it separately). Absent or empty leaves every prompt unchanged. */
+  runEnvAppend?: string;
   resumeSessionId?: string;
   /** Policy-held (preserve-only) conversation: this root lead turn may continue `resumeSessionId` but must
    *  never start a fresh provider thread. Set by the executor on every root lead request of such a claim. */

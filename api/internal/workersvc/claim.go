@@ -492,6 +492,17 @@ type ClaimPayload struct {
 	// never a Codex block (isolateClaim). omitempty keeps every other claim byte-identical
 	// to today's wire. Never logged: Credential is a live bearer secret.
 	IsolatedFetch *ClaimIsolatedFetch `json:"isolated_fetch,omitempty"`
+
+	// runEnv is the (var_id, rev) snapshot of the run environment lists assembleClaim delivered
+	// (PRD #4416 M2). Unexported on purpose: encoding/json never serializes it, so it reaches
+	// neither the wire nor any outbox. finishRunClaimTx recomputes both lists under the owner's
+	// users-row lock and compares them with this snapshot.
+	runEnv *runEnvSnapshot
+	// redactEpoch is the vault epoch a cross-check child's RunEnvRedact versions were opened at
+	// (valid only when redactEpochSet). Unexported like runEnv; the finish compares it with the
+	// epoch read under the users-row lock and requeues on a mismatch.
+	redactEpoch    int64
+	redactEpochSet bool
 }
 
 // ClaimIsolatedFetch is the per-run fetch grant: Credential is the plaintext uzf_ token
@@ -572,6 +583,45 @@ type ClaimSecrets struct {
 	// key, not null, not empty; snapshot-tested). Only a worker advertising claude_provider_v1 is
 	// offered such a claim. Never logged: it carries the usable gateway key.
 	Provider *ClaimProviderBinding `json:"provider,omitempty"`
+	// RunEnv are the run-scoped environment variables (PRD #4416 M2) the worker injects into the
+	// commands the agent runs. omitempty is load-bearing: a claim with no variables emits NO
+	// `run_env` key, so its JSON is byte-identical to today's wire. Only a worker advertising
+	// run_env_v1 is sent it. Secret values are plaintext here: never logged, never persisted.
+	RunEnv []ClaimRunEnvVar `json:"run_env,omitempty"`
+	// RunEnvRedact are the secret versions this run holds a receipt for that are not in RunEnv
+	// (older versions of a rotated secret, disabled secrets, secrets pending deletion): the worker
+	// registers their values with its redactor. A (var_id, rev) is never in both lists. Same
+	// omitempty and never-logged, never-persisted rules as RunEnv.
+	RunEnvRedact []ClaimRunEnvRedact `json:"run_env_redact,omitempty"`
+}
+
+// ClaimRunEnvVar is one resolved run environment variable on a claim. Value is plaintext and is
+// never logged or persisted by the worker beyond the run.
+type ClaimRunEnvVar struct {
+	VarID       string `json:"var_id"`
+	Scope       string `json:"scope"`
+	Rev         int32  `json:"rev"`
+	Name        string `json:"name"`
+	Value       string `json:"value"`
+	Secret      bool   `json:"secret"`
+	Description string `json:"description"`
+}
+
+// ClaimRunEnvRedact is one secret value version for redaction only. Entries are always secrets,
+// so there is no secret flag and no description. Never logged, never persisted.
+type ClaimRunEnvRedact struct {
+	VarID string `json:"var_id"`
+	Scope string `json:"scope"`
+	Rev   int32  `json:"rev"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// RunEnvRedactResponse is the body of the run-env redact maintenance endpoint. When Protected is
+// false there are no Versions. Versions carry plaintext secrets: never logged, never persisted.
+type RunEnvRedactResponse struct {
+	Protected bool                `json:"protected"`
+	Versions  []ClaimRunEnvRedact `json:"versions,omitempty"`
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run

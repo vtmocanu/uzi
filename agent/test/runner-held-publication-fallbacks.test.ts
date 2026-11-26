@@ -524,7 +524,7 @@ describe("the held decision follows the durable first winner", () => {
       iterationParkState: "none" as const,
       runId: claim.run_id, claimGeneration: 53, batcher: { currentSeq: () => 0 },
       steering: { claimFence: () => undefined }, runLog: { info() {}, warn() {}, error() {} },
-      completionSendAttempted: false, terminalResolved: false,
+      completionSendAttempted: false, terminalResolved: false, redactText: (s: string) => s,
       prepareTerminalInventory: async (pending: unknown) => { prepared.push(pending); },
     };
     const journalAndSend = r["journalAndSendTerminal"] as (f: unknown, phase: string, body: unknown, send: unknown) => Promise<void>;

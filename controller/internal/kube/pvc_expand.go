@@ -59,6 +59,7 @@ func claimObservationOf(ns, workerID string, p *corev1.PersistentVolumeClaim) re
 		WorkerID:         workerID,
 		Phase:            string(p.Status.Phase),
 		Terminating:      p.DeletionTimestamp != nil,
+		CreatedAt:        p.CreationTimestamp.Time,
 		Requested:        p.Spec.Resources.Requests[corev1.ResourceStorage].DeepCopy(),
 		RollAnnotation:   p.Annotations[annotationRoll],
 		ResizeConditions: []string{},
@@ -73,6 +74,7 @@ func claimObservationOf(ns, workerID string, p *corev1.PersistentVolumeClaim) re
 	}
 	_, o.RollAnnotationPresent = p.Annotations[annotationRoll]
 	o.PlacementNew = p.Annotations[AnnotationPlacement] == placementNew
+	o.CodexExtraCA = p.Annotations[AnnotationCodexExtraCA] == codexExtraCAWritten
 	for _, c := range p.Status.Conditions {
 		if c.Status == corev1.ConditionTrue {
 			o.ResizeConditions = append(o.ResizeConditions, string(c.Type))

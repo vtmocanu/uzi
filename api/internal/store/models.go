@@ -1523,6 +1523,19 @@ type RunDecisionMemo struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunEnvReceipt struct {
+	RunID                uuid.UUID          `json:"run_id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	VarID                uuid.UUID          `json:"var_id"`
+	Rev                  int32              `json:"rev"`
+	Scope                string             `json:"scope"`
+	Name                 string             `json:"name"`
+	Secret               bool               `json:"secret"`
+	FirstClaimGeneration int64              `json:"first_claim_generation"`
+	LastClaimGeneration  int64              `json:"last_claim_generation"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
 type RunEnvVar struct {
 	ID              uuid.UUID          `json:"id"`
 	VarID           uuid.UUID          `json:"var_id"`
@@ -1540,6 +1553,15 @@ type RunEnvVar struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
+}
+
+type RunEnvVarID struct {
+	VarID  uuid.UUID   `json:"var_id"`
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+	Scope  string      `json:"scope"`
+	Name   string      `json:"name"`
 }
 
 type RunFetch struct {
@@ -1710,6 +1732,11 @@ type RunMilestoneReconciliation struct {
 	AppliedInputID   int64              `json:"applied_input_id"`
 	StopCutoff       int64              `json:"stop_cutoff"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunOutcomeClass struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Outcome string    `json:"outcome"`
 }
 
 type RunPublicationResume struct {
@@ -1903,6 +1930,17 @@ type RunUsageMessage struct {
 	Conflict                   bool               `json:"conflict"`
 	ClaimGeneration            pgtype.Int8        `json:"claim_generation"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunUsageModelTotal struct {
+	RunID               uuid.UUID      `json:"run_id"`
+	Model               string         `json:"model"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+	CostStatus          string         `json:"cost_status"`
 }
 
 type RunUsageTailState struct {

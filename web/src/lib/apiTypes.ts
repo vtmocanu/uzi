@@ -4058,6 +4058,13 @@ export interface HarnessDecision {
   other_weekly_reset_at: string | null;
 }
 
+/** PRD #4416 M2: one variable delivered to a run's current claim; never a value. */
+export interface RunInjectedEnvVar {
+  name: string;
+  scope: string;
+  secret: boolean;
+}
+
 /** PRD #4123: one allowlisted action in a weekly-limit block (Go WeeklyLimitFixDTO). `command`
  *  is rendered once by the server, the same string on every surface; it is absent with
  *  command_unavailable "label" when the target label is not command-safe, and absent for a
@@ -4104,6 +4111,8 @@ export interface WeeklyLimitSummary {
 }
 
 export interface Run {
+  /** PRD #4416 M2: the variables the current claim delivered (names only, owner-only). */
+  injected_env?: RunInjectedEnvVar[];
   /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on its weekly
    *  limit (and, from M2, near it). */
   weekly_limit?: WeeklyLimit;
@@ -5283,7 +5292,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch" | "injected_env"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
@@ -6801,4 +6810,350 @@ export interface FreshResumeStart {
   checkpoint_ref?: string;
   sha: string;
   admission_deadline: string;
+}
+
+// ── Scoped usage analytics (issue #4684) ─────────────────────────────────────
+// Mirrors api/internal/apitypes/analytics.go: GET /api/analytics/{options,spend} and
+// GET /api/admin/analytics/{options,spend}. Timestamps are UTC RFC 3339 strings. Dollar
+// amounts are numbers (a recorded-spend figure, not a bill). A rate or ratio that is null
+// always travels with a reason. Slices are never null on the real wire (the handler emits
+// []), even though the recorded zero fixtures carry null for them.
+
+export interface AnalyticsScopeDTO {
+  /** "owner" (the caller's own runs) or "admin". */
+  route: string;
+  /** "all" on an admin response spanning every user, else a user id. */
+  user: string;
+}
+
+export interface AnalyticsBucketDTO {
+  label: string;
+  start: string;
+  end: string;
+  partial: boolean;
+}
+
+export interface AnalyticsRollingDTO {
+  start: string;
+  end: string;
+  partial: boolean;
+}
+
+export interface AnalyticsEnvelopeDTO {
+  scope: AnalyticsScopeDTO;
+  generated_at: string;
+  /** 7d, 30d, 90d or all. */
+  window: string;
+  timezone: string;
+  from: string;
+  to: string;
+  /** Absent for window=all. */
+  previous_from?: string;
+  previous_to?: string;
+  /** Null when the scope has no matching run. */
+  history_start: string | null;
+  /** 1 for day buckets; 7 times the week count for window=all. */
+  bucket_width_days: number;
+  buckets: AnalyticsBucketDTO[];
+  rolling: AnalyticsRollingDTO[];
+}
+
+export interface AnalyticsRepoOptionDTO {
+  id: string;
+  path: string;
+}
+
+export interface AnalyticsRepoOptionsDTO {
+  items: AnalyticsRepoOptionDTO[];
+  truncated: boolean;
+}
+
+export interface AnalyticsUserOptionDTO {
+  id: string;
+  email: string;
+}
+
+export interface AnalyticsUserOptionsDTO {
+  items: AnalyticsUserOptionDTO[];
+  truncated: boolean;
+}
+
+export interface AnalyticsOptionsDTO {
+  scope: AnalyticsScopeDTO;
+  generated_at: string;
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  repos: AnalyticsRepoOptionsDTO;
+  /** Null with users_reason "not_applicable" on the owner route. */
+  users: AnalyticsUserOptionsDTO | null;
+  users_reason: string | null;
+  windows: string[];
+  kinds: string[];
+  harnesses: string[];
+  splits: string[];
+  breakdowns: string[];
+}
+
+export interface AnalyticsDisclosureDTO {
+  metered: number;
+  subscription: number;
+  unreported: number;
+  missing: number;
+  incomplete: boolean;
+}
+
+export interface AnalyticsCoverageDTO {
+  metered: number;
+  applicable: number;
+  /** Null with a reason for an empty population. */
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsSpendBlockDTO {
+  cost_usd: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  runs: number;
+  disclosure: AnalyticsDisclosureDTO;
+  coverage: AnalyticsCoverageDTO;
+}
+
+export interface AnalyticsSpendCellDTO extends AnalyticsSpendBlockDTO {
+  index: number;
+}
+
+export interface AnalyticsSpendTotalsDTO {
+  current: AnalyticsSpendBlockDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsSpendBlockDTO;
+}
+
+export interface AnalyticsSplitGroupDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  label: string | null;
+  id: string | null;
+  totals: AnalyticsSpendBlockDTO;
+  buckets: AnalyticsSpendCellDTO[];
+}
+
+export interface AnalyticsSplitDTO {
+  dimension: string;
+  non_additive: boolean;
+  groups: AnalyticsSplitGroupDTO[];
+}
+
+export interface AnalyticsRatioDTO {
+  numerator_usd: number;
+  denominator: number;
+  value: number | null;
+  reason: string | null;
+  disclosure: AnalyticsDisclosureDTO;
+}
+
+export interface AnalyticsRatioCellDTO extends AnalyticsRatioDTO {
+  index: number;
+}
+
+export interface AnalyticsRatioPanelDTO {
+  current: AnalyticsRatioDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsRatioDTO;
+  buckets: AnalyticsRatioCellDTO[];
+  rolling: AnalyticsRatioCellDTO[];
+}
+
+export interface AnalyticsCacheReadDTO {
+  cache_read_tokens: number;
+  input_tokens: number;
+  cache_creation_tokens: number;
+  denominator: number;
+  value: number | null;
+  reason: string | null;
+  disclosure: AnalyticsDisclosureDTO;
+}
+
+export interface AnalyticsTopRunDTO {
+  run_id: string;
+  kind: string;
+  harness: string;
+  run_status: string;
+  usage_status: string;
+  primary_model: string;
+  created_at: string;
+  cost_usd: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  output_tokens: number;
+  /** The repo id, "no_repo" or "inaccessible_repo". */
+  repo_key: string;
+  repo_id: string | null;
+  repo_path: string | null;
+  user_id: string;
+  user_email: string;
+}
+
+export interface AnalyticsNullableNumberDTO {
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsOutcomesDTO {
+  completed: number;
+  cancelled: number;
+  plan_rejected: number;
+  base_diverged: number;
+  failed: number;
+}
+
+export interface AnalyticsBreakdownRowDTO extends AnalyticsSpendBlockDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  label: string | null;
+  id: string | null;
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  completion_ratio: AnalyticsNullableNumberDTO;
+  cost_share: AnalyticsNullableNumberDTO;
+  elapsed_p50_seconds: AnalyticsNullableNumberDTO;
+  elapsed_p90_seconds: AnalyticsNullableNumberDTO;
+  merged_prs: number;
+}
+
+export interface AnalyticsBreakdownDTO {
+  dimension: string;
+  rows: AnalyticsBreakdownRowDTO[];
+}
+
+export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  untracked_chat_runs: number;
+  totals: AnalyticsSpendTotalsDTO;
+  /** series[i] is the ungrouped spend of buckets[i]. */
+  series: AnalyticsSpendCellDTO[];
+  split: AnalyticsSplitDTO;
+  cost_per_completed_run: AnalyticsRatioPanelDTO;
+  cost_per_merged_pr: AnalyticsRatioPanelDTO;
+  cache_read: AnalyticsCacheReadDTO;
+  top_runs: AnalyticsTopRunDTO[];
+  breakdown: AnalyticsBreakdownDTO;
+}
+
+// ── Reliability analytics (issue #4685) ──────────────────────────────────────
+// Mirrors the Reliability types of api/internal/apitypes/analytics.go: GET
+// /api/analytics/reliability and GET /api/admin/analytics/reliability. It reuses the envelope,
+// outcome classes and nullable number above. A failure rate is failed / finished; a breakdown
+// row or rolling point over fewer than five finished runs is null with insufficient_runs and
+// keeps its raw counts.
+
+export interface AnalyticsReliabilityBlockDTO {
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  requeued_runs: number;
+}
+
+export interface AnalyticsReliabilityTotalsDTO {
+  current: AnalyticsReliabilityBlockDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsReliabilityBlockDTO;
+}
+
+export interface AnalyticsReliabilityCellDTO {
+  /** Zero-based position in the response's buckets array. */
+  index: number;
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+}
+
+export interface AnalyticsReliabilityCauseDTO {
+  rank: number;
+  is_other: boolean;
+  /** Null for the Other row. */
+  origin: string | null;
+  runs: number;
+  share: number;
+}
+
+export interface AnalyticsReliabilityCausesDTO {
+  failed: number;
+  items: AnalyticsReliabilityCauseDTO[];
+}
+
+export interface AnalyticsReliabilityPointDTO {
+  /** Zero-based position in the response's rolling array. */
+  index: number;
+  finished: number;
+  failed: number;
+  /** Null with a reason: insufficient_runs below five finished runs, or not_applicable. */
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsReliabilityHarnessSeriesDTO {
+  harness: string;
+  points: AnalyticsReliabilityPointDTO[];
+}
+
+export interface AnalyticsReliabilityRollingDTO {
+  overall: AnalyticsReliabilityPointDTO[];
+  harnesses: AnalyticsReliabilityHarnessSeriesDTO[];
+}
+
+export interface AnalyticsReliabilityRowDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  /** User email or repo path; null otherwise and for a repo the caller may not see. */
+  label: string | null;
+  id: string | null;
+  /** The row's finished runs. */
+  n: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  requeued_runs: number;
+}
+
+export interface AnalyticsReliabilityBreakdownDTO {
+  dimension: string;
+  rows: AnalyticsReliabilityRowDTO[];
+}
+
+export interface AnalyticsReliabilityLatestFailureDTO {
+  failed_at: string;
+  origin: string;
+  run_id: string;
+  user_id: string;
+  completed_since_last_failure: number;
+}
+
+export interface AnalyticsReliabilityNeedsLandingDTO {
+  runs: number;
+  /** Always "work_may_already_have_landed". */
+  caveat: string;
+}
+
+export interface AnalyticsReliabilityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  /** False, with reason "supporting_kinds_only", when the kind filter selects no delivery kind. */
+  applicable: boolean;
+  reason: string | null;
+  totals: AnalyticsReliabilityTotalsDTO;
+  /** series[i] is the outcome cell of buckets[i]. */
+  series: AnalyticsReliabilityCellDTO[];
+  causes: AnalyticsReliabilityCausesDTO;
+  rolling_failure_rate: AnalyticsReliabilityRollingDTO;
+  breakdown: AnalyticsReliabilityBreakdownDTO;
+  /** Null when the scope has no failure. */
+  latest_failure: AnalyticsReliabilityLatestFailureDTO | null;
+  needs_landing: AnalyticsReliabilityNeedsLandingDTO;
 }

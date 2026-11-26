@@ -15,6 +15,7 @@ import type { Executor } from "../src/executor.js";
 import type { CompletedPublicationReceipt } from "../src/protocol.js";
 import type { CompletionSource, RecoveryCoordinator, RecoveryRecord } from "../src/recovery.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { nullLogger } from "./helpers.js";
 import { client, fakeGitlab, fx, git, gitlabClaim, runnerWith } from "./runner-harness.js";
@@ -127,7 +128,7 @@ export async function rig(_t: TestContext, options: { codex: boolean; cohort?: n
     captureIds.push(extra.captureId);
   }
   captureIds.sort();
-  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", []);
+  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   Object.assign(flight, { barePath: bare, worktreePath: cloneInfo.path, branch: BRANCH, runnerClone: cloneInfo });
   await p.bindCompletionSource(flight);
   const bound = flight.completionSourceBound as CompletionSource | undefined;

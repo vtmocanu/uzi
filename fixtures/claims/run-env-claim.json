@@ -1,0 +1,31 @@
+{
+  "run_env": [
+    {
+      "var_id": "6f1c1f0e-3a55-4c1e-9d0b-2a7e5b8c4d11",
+      "scope": "repo",
+      "rev": 3,
+      "name": "PAYMENTS_SANDBOX_URL",
+      "value": "https://sandbox.example.com",
+      "secret": false,
+      "description": "Sandbox endpoint of the payments service"
+    },
+    {
+      "var_id": "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44",
+      "scope": "user",
+      "rev": 2,
+      "name": "PAYMENTS_SANDBOX_PASSWORD",
+      "value": "correct-horse-battery-staple",
+      "secret": true,
+      "description": ""
+    }
+  ],
+  "run_env_redact": [
+    {
+      "var_id": "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44",
+      "scope": "user",
+      "rev": 1,
+      "name": "PAYMENTS_SANDBOX_PASSWORD",
+      "value": "correct-horse-battery"
+    }
+  ]
+}

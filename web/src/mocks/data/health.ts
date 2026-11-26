@@ -67,7 +67,7 @@ const OK_SUMMARY: Record<string, string> = {
   "slack.socket": "Slack socket is connected.",
   "schedules.paused": "No user has paused schedules while owning enabled ones.",
   "maintenance.active": "uzi is not in maintenance mode.",
-  "board.drift": "No column move has been given up in the last 24 hours.",
+  "board.drift": "No issue column move pending for over 30 minutes was found in the last 48 hours (bounded sample).",
   "custody.holds": "No owner is at the custody-hold admission limit.",
   "recovery.storage": "0 captures currently marked quota-refused.",
   "release.check": "This instance is on a recent release.",

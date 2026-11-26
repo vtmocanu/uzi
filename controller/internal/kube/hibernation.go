@@ -205,11 +205,13 @@ func allTerminated(specNames []string, statuses []corev1.ContainerStatus) bool {
 // deploymentPlacementBlocked reports that a Deployment must not be created yet: a nix
 // PVC EXISTS but is not LIVE at the desired size (Terminating, or mid-recycle), or a
 // /data or DinD claim is Terminating. Never place a Deployment over a doomed or
-// undersized volume. False when a claim is absent (first provision and re-mint still
-// create in one tick) or live (steady state).
-func deploymentPlacementBlocked(w protocol.DesiredWorker, obs reconcile.ObservedWorker, spec preset.Spec) bool {
+// undersized volume. False when a claim is absent or live (steady state); first provision
+// and re-mint reach the create in one tick unless that pass wrote the Codex CA evidence,
+// when reconcileWorker defers the Deployment one tick (codexCAWriteDeferred).
+func deploymentPlacementBlocked(w protocol.DesiredWorker, obs reconcile.ObservedWorker, spec preset.Spec, ns string) bool {
 	nixLiveAtSize := obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) >= 0
-	dataBlocking := obs.HasDataPVC && !obs.DataPVCLive // present but Terminating
+	ownHas, ownLive := ownDataPresence(w, obs, ns)
+	dataBlocking := ownHas && !ownLive // present but Terminating
 	dindBlocking := w.Docker && obs.HasDinDDataPVC && !obs.DinDPVCLive
 	return (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking || dindBlocking
 }
@@ -255,7 +257,7 @@ func (m *Materializer) reconcileHibernation(ctx context.Context, w protocol.Desi
 // given replicas. A fresh create is safe without a precondition: AlreadyExists means
 // something else won, and the next tick re-reads.
 func (m *Materializer) createHibernationDeployment(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec, replicas int32) error {
-	if deploymentPlacementBlocked(w, obs, spec) {
+	if deploymentPlacementBlocked(w, obs, spec, ns) {
 		return nil
 	}
 	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
@@ -697,7 +699,9 @@ func wakeRollAdmitted(ctx context.Context, id string) bool {
 // wakeAnnotationPermitted reports whether an unadmitted wake may still write its op
 // annotation. It keeps wakeRollAdmitted's uncertainty and migration fences, adds the
 // entry-block, snapshot-complete and retained-history-retirement guards, and drops only
-// e.admitted. Some terms repeat the pass-2 caller's
+// e.admitted. An entry block refuses it unless planPool marked the entry
+// duplicateWakeSettle (the waking current canary of a pool held for unresolved duplicate
+// canaries; see duplicateWakeSettleCandidates). Some terms repeat the pass-2 caller's
 // filters and are kept for direct-call safety. historyRetireUnknown is set only by
 // retireHibernationHistory, which skips non-preparing workers, so for a waking entry it
 // is defensive only. A pool-level hold (blocker or poolReason with e.blocked == "")
@@ -707,7 +711,7 @@ func wakeRollAdmitted(ctx context.Context, id string) bool {
 func wakeAnnotationPermitted(ctx context.Context, id string) bool {
 	e := rollFrom(ctx, id)
 	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
-	return e != nil && tick != nil && !e.hibernation && e.blocked == "" && !e.snapshotIncomplete &&
+	return e != nil && tick != nil && !e.hibernation && (e.blocked == "" || e.duplicateWakeSettle) && !e.snapshotIncomplete &&
 		!e.historyRetireUnknown && !tick.uncertain[coverageKey(e.coverage)] && !migrationLaneFenced(tick, e.coverage)
 }
 

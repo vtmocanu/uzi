@@ -35,7 +35,8 @@ import (
 var freshResumeRefuse = map[string]string{ //nolint:gosec // G101: the keys are sqlc query names, not credentials.
 	"SetRunBaseAttestationHold": "single run", "FailCodexAccountWaitRun": "single run", "SetCodexSwitchStopped": "single run",
 	"ParkCredentialDisabledRun": "assembly arm: RefuseFreshResumeInTx in m2", "ParkRunOverrideUnavailableRun": "assembly arm",
-	"ParkCredentialDisabledChatRun": "chat", "PromoteCredentialDisabledRun": "single run", "ReassignCredentialDisabledRun": "single run",
+	"ParkRunEnvHistoryUnavailableRun": "assembly arm: refuseFreshAtAssembly returns before the run-env park (PRD #4416)",
+	"ParkCredentialDisabledChatRun":   "chat", "PromoteCredentialDisabledRun": "single run", "ReassignCredentialDisabledRun": "single run",
 	"FailJobRunWithoutResult": "job", "ResumeMemoryEpisode": "single run", "SetRunPhaseSwitchHold": "single run",
 	"ApplyPolicyHold": "single run", "ResumePolicyHold": "single run", "ParkRunPublicationForgeUnreachable": "single run",
 	"ResumePublicationForgeHold": "single run", "SetRunRepoAgentSourceHold": "single run", "SetRunAwaitingApproval": "single run",

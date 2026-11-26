@@ -215,7 +215,15 @@ Planned, Later) rather than a hardcoded column, so a backlog placement is
 never lost. A manual drag always wins — move a card by hand after a run has
 started and automation leaves it alone from then on. Moves are best-effort
 against the forge: one that fails (e.g. GitLab briefly unreachable) is
-retried in the background for up to 30 minutes, without blocking the run.
+retried in the background, without blocking the run, every 30 seconds for the
+first 30 minutes and then every 10 minutes (batch-limited, oldest first).
+Retries stop once the move has been pending for 24 hours, so a forge that
+recovers late in that window may not be reached before the give-up; move the
+card by hand then (admin health's `board.drift` counts such moves until
+48 hours after the move first failed). Whenever an older run's move is
+attempted (immediately or on a retry) and a newer run for the same issue
+already exists, the move is skipped and its marker cleared, so it does not
+move the newer run's card; a newer run created during that attempt is not seen.
 
 Closing a completed run's merge request without merging it is treated as
 "rework needed": on the next poll its card moves from **Human Review** back

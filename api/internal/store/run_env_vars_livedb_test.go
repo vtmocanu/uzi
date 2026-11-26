@@ -150,7 +150,7 @@ func TestRunEnvVarsCascadeLiveDB(t *testing.T) {
 
 func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_receipts"))
 	q := New(pool)
 	user, foreign := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
@@ -330,13 +330,13 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 
 func TestRunEnvVarWriteQueriesLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_receipts"))
 	q := New(pool)
 	user, foreign := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	s := seedEnvRepo(t, pool, user)
 	repo := pgtype.UUID{Bytes: s.repo, Valid: true}
 	ins, err := q.InsertRunEnvVar(ctx, InsertRunEnvVarParams{VarID: uuid.New(), UserID: user, RepoID: repo, Name: "TOKEN_X", Secret: true,
-		Description: "first", Ciphertext: []byte("c"), SealedWith: "master_aad", ValueBytes: 9, Rev: 1})
+		Description: "first", Ciphertext: []byte("c"), SealedWith: "master_aad", ValueBytes: 9, Rev: 1, AadVersion: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -275,6 +275,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if len(r.RequiredTools) > 0 {
 		rows = append(rows, []string{"REQUIRED_TOOLS", sanitizeTTY(strings.Join(r.RequiredTools, ","))})
 	}
+	if len(r.InjectedEnv) > 0 {
+		rows = append(rows, []string{"INJECTED_ENV", injectedEnvCell(r.InjectedEnv)})
+	}
 	if r.SizeClass != "" {
 		rows = append(rows, []string{"SIZE_CLASS", sanitizeTTY(r.SizeClass)})
 	}
@@ -611,7 +614,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
 		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) ||
 		(*r.HoldReason == holdRunOverrideUnavailable && !isRunOverrideHold(r)) ||
-		(*r.HoldReason == holdPhaseSwitchUnavailable && !isPhaseSwitchHold(r)) {
+		(*r.HoldReason == holdPhaseSwitchUnavailable && !isPhaseSwitchHold(r)) ||
+		(*r.HoldReason == holdRunEnvHistoryUnavailable && !isRunEnvHistoryHold(r)) {
 		return nil
 	}
 	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
@@ -644,6 +648,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, repoAgentSourceAction(r))
 	case holdRunOverrideUnavailable:
 		clauses = append(clauses, runOverrideAction(r))
+	case holdRunEnvHistoryUnavailable:
+		clauses = append(clauses, runEnvHistoryAction(r))
 	case holdPhaseSwitchUnavailable:
 		clauses = append(clauses, phaseSwitchAction(r))
 	case holdWeeklyReserve:
@@ -680,6 +686,8 @@ func holdReasonLabel(reason string) string {
 		return "repo agents unreadable"
 	case holdRunOverrideUnavailable:
 		return "model choice unavailable"
+	case holdRunEnvHistoryUnavailable:
+		return "variable history unavailable"
 	case holdPhaseSwitchUnavailable:
 		return "planning switch unavailable"
 	case holdWeeklyReserve:
@@ -708,6 +716,34 @@ func isRunOverrideHold(r apitypes.RunDTO) bool {
 func runOverrideAction(r apitypes.RunDTO) string {
 	id := cellText(r.ID)
 	return "the run's chosen model or effort cannot run on its harness; Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice; Resume: uzi run resume " +
+		id + "; Cancel: uzi run cancel " + id
+}
+
+// injectedEnvCell renders the INJECTED_ENV row of `uzi run get` (PRD #4416 M2): "NAME (scope[, secret])"
+// per variable, comma-joined. Names only; the DTO carries no value. Names and scopes come from the
+// server, so each goes through cellText.
+func injectedEnvCell(vars []apitypes.InjectedEnvVarDTO) string {
+	parts := make([]string, 0, len(vars))
+	for _, v := range vars {
+		detail := cellText(v.Scope)
+		if v.Secret {
+			detail += ", secret"
+		}
+		parts = append(parts, cellText(v.Name)+" ("+detail+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
+// isRunEnvHistoryHold reports whether r is paused on a run_env_history_unavailable hold. Resume
+// keeps the marker through queued/claimed until the claim succeeds, so only paused is an owner hold.
+func isRunEnvHistoryHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdRunEnvHistoryUnavailable
+}
+
+// runEnvHistoryAction is the owner's next step for a run_env_history_unavailable hold (PRD #4416 M2).
+func runEnvHistoryAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	return "a secret variable version the run was given can no longer be read, so its output cannot be masked; Resume retries once the variable history is restored, otherwise Cancel the run; Resume: uzi run resume " +
 		id + "; Cancel: uzi run cancel " + id
 }
 
@@ -833,6 +869,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
 	case holdRunOverrideUnavailable:
 		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
+	case holdRunEnvHistoryUnavailable:
+		return "held, " + holdReasonLabel(reason) + "; " + runEnvHistoryAction(r)
 	case holdPhaseSwitchUnavailable:
 		return "held, " + holdReasonLabel(reason) + "; " + phaseSwitchAction(r)
 	case holdWeeklyReserve:

@@ -14,6 +14,8 @@ import (
 const (
 	codexProviderJudgeOldArm = "OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))"
 	codexProviderJudgeNewArm = "OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))"
+	// The run_env_v1 claim clause 00544 added; the Codex migration must keep it.
+	runEnvKeptClause = "'run_env_v1' = ANY("
 	// The Claude judge clause 00534 added; the Codex migration must keep it byte for byte.
 	claudeProviderJudgeKeptArm = "OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))"
 )
@@ -53,7 +55,7 @@ func codexProviderJudgeMigrationDB(t *testing.T) (*pgxpool.Pool, string, int64, 
 }
 
 // Up adds only the Codex judge clause to the Codex provider arm and keeps the Claude judge clause;
-// Down restores the predecessor (00534 body, Claude judge clause kept) function byte for byte; a
+// Down restores the predecessor (00544 body: Claude judge and run_env_v1 clauses kept) function byte for byte; a
 // retried Up lands the same definition; Goose records each step.
 func TestPlacementCodexProviderJudgeMigrationRoundTripLiveDB(t *testing.T) {
 	pool, dsn, p, v := codexProviderJudgeMigrationDB(t)
@@ -66,6 +68,9 @@ func TestPlacementCodexProviderJudgeMigrationRoundTripLiveDB(t *testing.T) {
 	if strings.Count(before, claudeProviderJudgeKeptArm) != 1 {
 		t.Fatal("predecessor definition lacks the Claude judge clause")
 	}
+	if !strings.Contains(before, runEnvKeptClause) {
+		t.Fatal("predecessor definition lacks the 00544 run_env_v1 clause")
+	}
 	runtimeV3AssertVersion(t, pool, p)
 	if err := MigrateTo(ctx, dsn, v); err != nil {
 		t.Fatal(err)
@@ -76,6 +81,9 @@ func TestPlacementCodexProviderJudgeMigrationRoundTripLiveDB(t *testing.T) {
 	}
 	if strings.Count(after, claudeProviderJudgeKeptArm) != 1 {
 		t.Fatal("committed Up lost the Claude judge clause")
+	}
+	if !strings.Contains(after, runEnvKeptClause) {
+		t.Fatal("committed Up lost the 00544 run_env_v1 clause")
 	}
 	if strings.Replace(after, codexProviderJudgeNewArm, codexProviderJudgeOldArm, 1) != before {
 		t.Fatal("Up changed more than the Codex provider arm")

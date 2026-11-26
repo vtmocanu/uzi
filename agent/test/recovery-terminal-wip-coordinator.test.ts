@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -106,7 +107,7 @@ async function fixture(t: test.TestContext, mode: string, options: {
     worktreeHead: async () => { headCalls++; assert.equal(MaintenanceResources.discoveryActive(), false); return sourceHead; },
   };
   const log = recordingLogger();
-  const make = (): RecoveryCoordinator => new RecoveryCoordinator({
+  const make = (): RecoveryCoordinator => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot, workerToken, client, git: git as never, log: log.logger, isExecuting: () => executing,
     writerExclusion: passingExclusion(),
     terminalSettlementConfirmed: () => true,

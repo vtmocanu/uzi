@@ -140,6 +140,8 @@ log() { printf '%s [land-prep #%s] %s\n' "$(date +%H:%M:%S)" "$PR" "$*"; }
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 3
 # shellcheck source=lib/ci-fix.sh
 . "$HERE/lib/ci-fix.sh"
+# shellcheck source=lib/migrations.sh
+. "$HERE/lib/migrations.sh"
 # shellcheck source=lib/net-retry.sh
 . "$HERE/lib/net-retry.sh"
 net_retry_install
@@ -507,26 +509,20 @@ else
 fi
 
 # ---- migrations -----------------------------------------------------------------------------
-# Read each listing into a variable first and fail CLOSED on a git error. Piping
-# `git ls-tree | xargs basename | grep -q` under pipefail made an early grep match SIGPIPE
-# xargs, so the pipeline reported failure on a real collision and the renumber was skipped.
-if ! added_paths=$(git diff --name-only --diff-filter=A "origin/$BASE...HEAD" -- api/internal/store/migrations/); then
+# Use the same version <= base-head rule as merge.sh, including unused historical gaps.
+migration_dir=api/internal/store/migrations
+if ! migration_files=$(git diff --no-renames --name-only --diff-filter=A -z "$BASE_SHA...HEAD" -- "$migration_dir/" |
+  jq -Rsc 'split("\u0000") | map(select(length > 0) | {filename: ., status: "added"})'); then
   echo "cannot list the branch's added migrations" >&2; exit 3
 fi
-if [ -n "$added_paths" ]; then
-  if ! base_paths=$(git ls-tree --name-only "origin/$BASE" -- api/internal/store/migrations/); then
-    echo "cannot list origin/$BASE migrations" >&2; exit 3
+if [ "$migration_files" != '[]' ]; then
+  if ! migration_base=$(git ls-tree -r --name-only -z "$BASE_SHA" -- "$migration_dir/" |
+    jq -Rsc 'split("\u0000") | map(split("/") | select(length == 5) | {name: last})') ||
+    ! migration_info=$(migration_report "$migration_files" "$migration_base"); then
+    echo "cannot compare branch migrations with the pinned base" >&2; exit 3
   fi
-  base_names=$(printf '%s\n' "$base_paths" | sed 's|.*/||')
-  collide=0
-  while IFS= read -r m; do
-    [ -z "$m" ] && continue
-    pfx=$(printf '%s' "${m##*/}" | grep -oE '^[0-9]+' || true)
-    [ -n "$pfx" ] || continue
-    if printf '%s\n' "$base_names" | grep -E "^${pfx}_" >/dev/null; then collide=1; fi
-  done <<< "$added_paths"
-  if [ "$collide" -eq 1 ]; then
-    log "migration number collision with origin/$BASE — running task migration:renumber"
+  if [ "$(jq '.collisions | length' <<< "$migration_info")" -gt 0 ]; then
+    log "migration version at or below origin/$BASE head: running task migration:renumber"
     if ! out=$(task migration:renumber 2>&1); then
       printf '%s\n' "$out"; echo "RESULT=renumber_refused WORKTREE=$WT"; exit 6
     fi

@@ -92,7 +92,8 @@ type Store interface {
 	// maintenance.active: the instance intake-pause singleton (pgx.ErrNoRows when the row was
 	// deleted, which fn_instance_intake_paused reads as paused).
 	GetInstanceIntakePause(ctx context.Context) (store.InstanceIntakePause, error)
-	// board.drift: given-up column moves in a cutoff window (issue_iid filtered in Go, D12).
+	// board.drift: pending column moves read in two cutoff bands (still retrying, given up);
+	// issue_iid is filtered in Go (D12).
 	ListGaveUpColumnMoves(ctx context.Context, arg store.ListGaveUpColumnMovesParams) ([]store.ListGaveUpColumnMovesRow, error)
 	// custody.holds: owners at/over the custody admission limit.
 	ListOwnersOverCustodyLimit(ctx context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error)

@@ -3,7 +3,7 @@
 # admin-merge past the ruleset, then CONFIRM it merged and print the merge SHA for the
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
-# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--expect-closes N[,N...]|none] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
+# Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--expect-closes N[,N...]|none] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--main-ci-gate] [--confirm-only]
 # OWNER/REPO also accepts a github.com/ or https://github.com/ prefix.
 #   --expect-head   reviewed full SHA or unique hex prefix (7+); resolve prefixes on the forge
 #                   before comparing; a different current head refuses (exit 8)
@@ -19,6 +19,11 @@
 #                   Unreadable or an incomplete commit list refuses (exit 2). Without the
 #                   flag, CLOSES= is printed only.
 #   --no-rework-check  skip helper guards (ONLY for a repo that is not on uzi).
+#   --main-ci-gate  user-authorized low-risk fast merge into vtmocanu/uzi main only.
+#                   Require the reviewed full --expect-head. Waive missing/pending/cancelled
+#                   PR CI and gate the batch on main CI. Refuse known failed checks,
+#                   migration files, and recognized trust-boundary or exact-head CI markers.
+#                   The caller must verify eligibility. Every other merge guard still runs.
 #   --confirm-only  do NOT merge: the PR was already merged OUT OF BAND (e.g. the harness
 #                   classifier refused the in-script `gh pr merge --admin` and the user ran it
 #                   via a `!` line, so merge.sh's own confirm/trail block never executed).
@@ -110,7 +115,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/ci-fix.sh
 . "$HERE/lib/ci-fix.sh"
 
-REPO=""; PR=""; EXPECT=""; EXPECT_CLOSES=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0
+REPO=""; PR=""; EXPECT=""; EXPECT_CLOSES=""; METHOD="squash"; ADMIN=1; DELETE=1; REWORK_CHECK=1; CONFIRM_ONLY=0; MAIN_CI_GATE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect-head) EXPECT="${2:?}"; shift 2;;
@@ -120,8 +125,9 @@ while [ $# -gt 0 ]; do
     --no-admin) ADMIN=0; shift;;
     --no-delete-branch) DELETE=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
+    --main-ci-gate) MAIN_CI_GATE=1; shift;;
     --confirm-only) CONFIRM_ONLY=1; shift;;
-    -h|--help) sed -n '2,29p' "$0"; exit 2;;
+    -h|--help) awk 'NR>1 && /^# Coordination:/ {exit} NR>1' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -142,6 +148,14 @@ pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,headRefName,mergeSt
 state=$(printf '%s' "$pj" | jq -r .state); head=$(printf '%s' "$pj" | jq -r .headRefOid)
 ms=$(printf '%s' "$pj" | jq -r .mergeStateStatus); mg=$(printf '%s' "$pj" | jq -r .mergeable)
 base=$(printf '%s' "$pj" | jq -r 'if (.baseRefName|type) == "string" then .baseRefName else empty end')
+
+if [ "$MAIN_CI_GATE" -eq 1 ]; then
+  if [ "$REPO" != vtmocanu/uzi ] || [ "$base" != main ] || [ "$REWORK_CHECK" -ne 1 ] ||
+     [ "$CONFIRM_ONLY" -ne 0 ] || ! [[ "$EXPECT" =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo 'MAIN_CI_GATE_REFUSED: require vtmocanu/uzi main, a full --expect-head and the writer guard; not merging'
+    exit 2
+  fi
+fi
 
 # The terminal evidence contract, from the ONE place that knows the true merge SHA: print
 # MERGED + MERGE_SHA, append the trail's merge line (trail.sh dedupes an identical last line),
@@ -317,39 +331,41 @@ if [ "$mg" = "CONFLICTING" ]; then
   exit 3
 fi
 
-# Required checks on the head — FAIL CLOSED: unreadable JSON is "not merging", an EMPTY list
-# is "not merging" (a head with no check runs — CI skipped, a missed dispatch — would
-# otherwise merge ungated), a cancelled required check is not green (supersession), pending
-# is not green. gh exits non-zero while still printing the array when a check is failing or
-# pending, so its status only matters when no array came back.
-cj_rc=0
-req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
-[ -n "$req" ] || { echo "cannot read the required checks of ${base:-the base branch}; not merging"; exit 2; }
-ci_scope=required; [ "$req" = '[]' ] && ci_scope=all
-cj=$(pr_ci_checks "$REPO" "$PR" "$req" "$head" "$base" 2>/dev/null) || cj_rc=$?
-if ! ci_checks_valid "$cj"; then
-  echo "cannot read the required checks for #$PR (gh exit $cj_rc); not merging"; exit 2
-fi
-if [ "$(printf '%s' "$cj" | jq 'length')" -eq 0 ]; then
-  echo "no $ci_scope checks reported on ${head:0:8}; not merging"; exit 2
-fi
-f=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
-p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
-c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
-[ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
-[ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
-# A required context that has not registered yet is pending too (lib/required-checks.sh).
-miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required checks on ${head:0:8}; not merging"; exit 2; }
-[ "$miss" -gt 0 ] && { echo "$miss required check(s) not yet reported on ${head:0:8}; not merging"; exit 2; }
-[ "$c" -gt 0 ] && { echo "a required check on ${head:0:8} was cancelled (superseded?); not merging"; exit 2; }
-# A non-zero gh exit that no failing or pending check explains is a partial read (an API
-# failure mid-listing), not a verdict. And at least one required check must have PASSED:
-# `skipping` alone means no required gate ran; path-filtered checks that skip next to a
-# passing one are fine.
-[ "$cj_rc" -ne 0 ] && { echo "gh pr checks exited $cj_rc with no failing or pending check on ${head:0:8} (partial read?); not merging"; exit 2; }
-ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
-if [ "$req" != '[]' ] && [ "$ok" -eq 0 ]; then
-  echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2
+if [ "$MAIN_CI_GATE" -eq 0 ]; then
+  # Required checks on the head — FAIL CLOSED: unreadable JSON is "not merging", an EMPTY list
+  # is "not merging" (a head with no check runs — CI skipped, a missed dispatch — would
+  # otherwise merge ungated), a cancelled required check is not green (supersession), pending
+  # is not green. gh exits non-zero while still printing the array when a check is failing or
+  # pending, so its status only matters when no array came back.
+  cj_rc=0
+  req=""; [ -n "$base" ] && req=$(required_contexts "$REPO" "$base")
+  [ -n "$req" ] || { echo "cannot read the required checks of ${base:-the base branch}; not merging"; exit 2; }
+  ci_scope=required; [ "$req" = '[]' ] && ci_scope=all
+  cj=$(pr_ci_checks "$REPO" "$PR" "$req" "$head" "$base" 2>/dev/null) || cj_rc=$?
+  if ! ci_checks_valid "$cj"; then
+    echo "cannot read the required checks for #$PR (gh exit $cj_rc); not merging"; exit 2
+  fi
+  if [ "$(printf '%s' "$cj" | jq 'length')" -eq 0 ]; then
+    echo "no $ci_scope checks reported on ${head:0:8}; not merging"; exit 2
+  fi
+  f=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="fail")]|length')
+  p=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pending")]|length')
+  c=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="cancel")]|length')
+  [ "$f" -gt 0 ] && { echo "required check failing on ${head:0:8}; not merging"; exit 1; }
+  [ "$p" -gt 0 ] && { echo "required checks still pending on ${head:0:8}; not merging"; exit 2; }
+  # A required context that has not registered yet is pending too (lib/required-checks.sh).
+  miss=$(missing_required "$req" "$cj") || { echo "cannot compare the required checks on ${head:0:8}; not merging"; exit 2; }
+  [ "$miss" -gt 0 ] && { echo "$miss required check(s) not yet reported on ${head:0:8}; not merging"; exit 2; }
+  [ "$c" -gt 0 ] && { echo "a required check on ${head:0:8} was cancelled (superseded?); not merging"; exit 2; }
+  # A non-zero gh exit that no failing or pending check explains is a partial read (an API
+  # failure mid-listing), not a verdict. And at least one required check must have PASSED:
+  # `skipping` alone means no required gate ran; path-filtered checks that skip next to a
+  # passing one are fine.
+  [ "$cj_rc" -ne 0 ] && { echo "gh pr checks exited $cj_rc with no failing or pending check on ${head:0:8} (partial read?); not merging"; exit 2; }
+  ok=$(printf '%s' "$cj" | jq '[.[]|select(.bucket=="pass")]|length')
+  if [ "$req" != '[]' ] && [ "$ok" -eq 0 ]; then
+    echo "no required check passed on ${head:0:8} (only: $(printf '%s' "$cj" | jq -r '[.[].bucket]|unique|join(",")')); not merging"; exit 2
+  fi
 fi
 
 # ---- every-author blockers, last moment — FAIL CLOSED ---------------------------------------
@@ -649,6 +665,22 @@ fi
 # Out-of-band base moves after this snapshot remain a race; GitHub pins only the head.
 migration_files=$(migration_pr_files "$REPO" "$PR") \
   || { echo 'cannot read PR files for migration check; not merging'; exit 2; }
+if [ "$MAIN_CI_GATE" -eq 1 ]; then
+  # Check both paths, so a deleted, modified or renamed-away migration is also ineligible.
+  if ! jq -e '
+    length>0 and all(.[]; (.filename|length)>0 and
+      (if (.status=="renamed" or .status=="copied") then
+        (.previous_filename|type)=="string" and (.previous_filename|length)>0
+      else true end))
+    and all(.[] | .filename, (.previous_filename // "");
+      startswith("api/internal/store/migrations/") | not)
+    and all(.[] | .filename, (.previous_filename // "");
+      test("^(api/internal/(vault|secretbox)/|agent/src/(guardrails|runner-uid|claude-global-config|redact)\\.ts$)") | not)
+    ' <<< "$migration_files" >/dev/null; then
+    echo 'MAIN_CI_GATE_REFUSED: migration, trust-boundary path or incomplete file evidence; not merging'
+    exit 2
+  fi
+fi
 migration_info=$(migration_report "$migration_files" '[]') \
   || { echo 'cannot read introduced migration versions; not merging'; exit 2; }
 if [ "$(printf '%s' "$migration_info" | jq '.added | length')" -gt 0 ]; then
@@ -666,9 +698,48 @@ if [ "$(printf '%s' "$migration_info" | jq '.added | length')" -gt 0 ]; then
   fi
 fi
 
-# --match-head-commit makes GitHub itself refuse the merge if the head moved after the
-# preflight above (a push in the window), so --expect-head is enforced server-side too.
+if [ "$MAIN_CI_GATE" -eq 1 ]; then
+  # A head-pinned rollup distinguishes no checks yet ([]) from an unreadable lookup.
+  # Wait-related states may pass this opt-in; a recorded red cannot.
+  snapshot=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,baseRefName,mergeable,labels,statusCheckRollup 2>/dev/null) ||
+    { echo 'MAIN_CI_GATE_REFUSED: cannot read PR eligibility; not merging'; exit 2; }
+  eligibility=$(jq -ser --arg head "$head" '
+    def blocked_label:
+      ascii_downcase | test("^(security|area::security|trust[-_ ]boundary|exact[-_ ]head[-_ ]ci)$");
+    if length!=1 then error("documents") else .[0] end
+    | if .state!="OPEN" or .headRefOid!=$head or .baseRefName!="main" or .mergeable!="MERGEABLE"
+         or (.labels|type)!="array" or (.statusCheckRollup|type)!="array"
+         or any(.labels[]; (.name|type)!="string")
+         or any(.statusCheckRollup[];
+           if .__typename=="CheckRun" then
+             (.status | IN("QUEUED","IN_PROGRESS","COMPLETED","WAITING","REQUESTED","PENDING") | not)
+             or (.conclusion | IN("","ACTION_REQUIRED","CANCELLED","FAILURE","NEUTRAL","SKIPPED",
+                                   "STALE","STARTUP_FAILURE","SUCCESS","TIMED_OUT") | not)
+             or (.status=="COMPLETED" and .conclusion=="")
+           elif .__typename=="StatusContext" then
+             (.state | IN("EXPECTED","ERROR","FAILURE","PENDING","SUCCESS") | not)
+           else true end)
+      then error("eligibility") else . end
+    | if any(.labels[]; .name|blocked_label) then "marked"
+      elif any(.statusCheckRollup[];
+           if .__typename=="CheckRun" then
+             .conclusion | IN("FAILURE","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED")
+           else .state | IN("FAILURE","ERROR") end) then "red"
+      else "allowed" end' <<< "$snapshot" 2>/dev/null) ||
+    { echo 'MAIN_CI_GATE_REFUSED: PR evidence unreadable, moved or not mergeable; not merging'; exit 2; }
+  case "$eligibility" in
+    marked) echo 'MAIN_CI_GATE_REFUSED: trust-boundary or exact-head CI marker; not merging'; exit 2 ;;
+    red) echo 'MAIN_CI_GATE_REFUSED: a PR check failed; not merging'; exit 1 ;;
+    allowed) : ;;
+    *) echo 'MAIN_CI_GATE_REFUSED: unknown eligibility; not merging'; exit 2 ;;
+  esac
+fi
+# --match-head-commit makes GitHub itself refuse a push after preflight. Keep the writer
+# recheck last so the optional eligibility reads add no delay between it and the merge.
 helper_guard || exit "$?"
+if [ "$MAIN_CI_GATE" -eq 1 ]; then
+  printf 'MAIN_CI_GATE: PR #%s at %s will use batch main CI; PR CI wait waived by user approval\n' "$PR" "$head"
+fi
 cmd=(gh pr merge "$PR" --repo "$REPO" "--$METHOD" --match-head-commit "$head")
 [ "$DELETE" -eq 1 ] && cmd+=(--delete-branch)
 [ "$ADMIN" -eq 1 ] && cmd+=(--admin)

@@ -89,6 +89,7 @@ import {
   literalMatcher,
   parseGitleaksReport,
   PROVIDER_KEY_RULE_ID,
+  RUN_ENV_RULE_ID,
   scanIsTrustworthy,
   stripAnsiSgr,
   type SecretFinding,
@@ -582,8 +583,10 @@ export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
  *  or `agent/issue-404` decide the verdict. A failure without retained stderr is permanent. */
 export function classifyGitStderr(error: unknown): "transient" | "permanent" {
   const retained = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
-  const stderr = retained?.stderr.trim();
-  return stderr ? classifyGitStderrText(stderr) : "permanent";
+  const raw = retained?.stderr ?? "";
+  // The #4716 shape check reads the untrimmed text so a malformed first banner line is never
+  // erased; the legacy rule keeps reading the trimmed text exactly as before.
+  return classifyPushStderr(raw, raw.trim());
 }
 
 const BARE_REMOTE_REJECTED_RETRYABLE = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\((?:failed|missing necessary objects)\)\s*$/;
@@ -606,9 +609,44 @@ const PUSH_FRAMING_LINES: RegExp[] = [
  * Any other line, a `remote:` diagnostic included, may state a reason and keeps today's classification.
  * Framing lines carry the branch and URL, so they are matched whole (`agent/issue-404` must not decide);
  * nothing inside any other line is masked.
+ * A third, separate exception (#4716) accepts GitHub's `(Internal Server Error)` refusal only together
+ * with its complete `remote:` banner; see {@link isGitHubIseRefusal}.
  */
 export function classifyGitStderrText(stderr: string): "transient" | "permanent" {
-  if (!stderr.trim()) return "permanent";
+  return classifyPushStderr(stderr, stderr);
+}
+
+// #4716: GitHub's server-error refusal, observed as a three-line `remote:` banner plus one
+// `(Internal Server Error)` ref-status line. Each line is matched whole and case-sensitively,
+// with only trailing spaces or tabs (git's sideband padding) allowed.
+const ISE_STATUS = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\(Internal Server Error\)[ \t]*$/;
+const ISE_BANNER: RegExp[] = [
+  /^remote: Internal Server Error[ \t]*$/,
+  /^remote: Request ID [0-9A-F]+(?::[0-9A-F]+)+[ \t]*$/,
+  /^remote: Time \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z[ \t]*$/,
+];
+const ISE_BASE_FRAMING = PUSH_FRAMING_LINES.filter((re) => re !== BARE_REMOTE_REJECTED_RETRYABLE);
+
+/**
+ * True only for the exact GitHub-observed server-error shape (#4716, ADR-0284 amendment): exactly one
+ * `! [remote rejected] <src> -> <dst> (Internal Server Error)` line, each of the three banner lines
+ * (`remote: Internal Server Error`, `remote: Request ID <HEX>(:<HEX>)+`, `remote: Time
+ * YYYY-MM-DDTHH:MM:SSZ`) exactly once, and otherwise only the ref-status-free framing lines. Any other
+ * line, a second ref-status line of any kind or a repeated or missing banner line keeps today's
+ * classification. The banner never widens the `(failed)` / `(missing necessary objects)` rule.
+ */
+function isGitHubIseRefusal(raw: string): boolean {
+  const lines = raw.split(/\r?\n|\r/);
+  const count = (re: RegExp) => lines.filter((l) => re.test(l)).length;
+  if (count(ISE_STATUS) !== 1 || ISE_BANNER.some((re) => count(re) !== 1)) return false;
+  return lines.every((l) => ISE_STATUS.test(l) || ISE_BANNER.some((re) => re.test(l)) || ISE_BASE_FRAMING.some((re) => re.test(l)));
+}
+
+/** `raw` feeds only the #4716 shape check; `legacy` is exactly the input the pre-#4716 rule read. */
+function classifyPushStderr(raw: string, legacy: string): "transient" | "permanent" {
+  if (!legacy.trim()) return "permanent";
+  if (isGitHubIseRefusal(raw)) return "transient";
+  const stderr = legacy;
   const lines = stderr.split(/\r?\n|\r/);
   // Every other line, any other `remote rejected` reason or a `[rejected]` line included, is not framing.
   // Both retryable reasons (`failed`, `missing necessary objects`) are a policy exception (#3929, #4438).
@@ -1239,6 +1277,10 @@ export interface GitCacheOptions {
   /** issue #4263 — test-only: LOWER (never raise) the foreign-bare scan limits of compactAttemptLedger, and replace its clock
    *  (milliseconds) so a deadline can be exercised. A value above the production limit is ignored. Production never passes it. */
   compactForeignScanForTest?: { maxBares?: number; maxConfigBytes?: number; maxRecords?: number; deadlineMs?: number; now?: () => number };
+  /** issue #4416 — test-only: the clock of the object scan (scanObjectsGrouped, and through it the path pass), and an optional
+   *  hook called as the scan reaches each stage (`path_stream`: each chunk the path pass reads), immediately before that stage's deadline check, so a test can move the
+   *  clock at an exact point instead of racing the real one. Production never passes it. */
+  objectScanClockForTest?: { now: () => number; atStage?: (stage: "before_path_pass" | "path_pass" | "path_stream" | "object_pass") => void };
   /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
    *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
    *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
@@ -1325,6 +1367,14 @@ interface WipMarkerOptions {
 const CHECKPOINT_SCAN_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 /** Most distinct blob oids (old + new side) the scanned commits may touch. */
 const CHECKPOINT_SCAN_MAX_OBJECTS = 100_000;
+/** Most paths (one per name emitted by the commit-diff path pass of scanObjectsGrouped, tree entries included). */
+const CHECKPOINT_SCAN_MAX_PATHS = 1_000_000;
+/** Most path bytes the commit-diff path pass reads (streamed, never buffered whole). */
+const CHECKPOINT_SCAN_MAX_PATH_BYTES = 256 * 1024 * 1024;
+/** Longest single path the path pass accepts; a longer token is garbled framing, not a path. */
+const CHECKPOINT_SCAN_MAX_PATH_TOKEN_BYTES = 1024 * 1024;
+/** The only file name a path-pass finding carries: the path itself may be the secret. */
+const PATH_WITHHELD = "[path withheld]";
 /** Most merge commits whose own contribution is scanned separately (see scanMergeContribution). */
 const CHECKPOINT_SCAN_MAX_MERGES = 32;
 /** A gitleaks run that lasted to within this margin of the scan deadline is classed `deadline`. */
@@ -1342,7 +1392,9 @@ export type CheckpointScanUntrustedReason =
   | "merge_diff_too_large"
   | "scan_untrusted"
   /** The exact-key scan ({@link GitCache.scanObjectsForLiterals}) could not prove the range free of the run's provider key. */
-  | "provider_key_scan_untrusted";
+  | "provider_key_scan_untrusted"
+  /** The exact-value scan of the run's secret variables ({@link GitCache.scanObjectsForRunEnv}) could not prove the range free of them. */
+  | "variable_scan_untrusted";
 
 /** issue #1597 M2: the result of {@link GitCache.secretScanCheckpointRange}. */
 export interface CheckpointScanResult {
@@ -1397,6 +1449,15 @@ const RUNNER_CLONE_BUSY_MARKERS = [
 // diff is truncated at this size with a marker. 512 KiB is generous for a task-run diff
 // while staying an order of magnitude under runGit's 64 MiB maxBuffer.
 const REVIEW_DIFF_MAX_BYTES = 512 * 1024;
+
+/** `diff` capped at REVIEW_DIFF_MAX_BYTES with a truncation marker, cut on a byte boundary (a cut through a
+ *  multi-byte rune yields at most one U+FFFD). Text within the cap is returned as is. */
+export function capReviewDiff(diff: string): string {
+  const buf = Buffer.from(diff, "utf8");
+  if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return diff;
+  const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
+  return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+}
 
 // PRD #1296 M3 (D4/D5) — durable-recovery bundle limits.
 // The maximum COMPLETE bundle byte size the worker will produce before it declares the
@@ -4745,6 +4806,9 @@ export class GitCache {
    *  inside it: it is not custody (nothing reads it to release or retire anything), and the
    *  recovery restart sweep treats every entry under `recovery/` as a runId. */
   readonly recoveryArchiveRoot: string;
+  /** The per-run markers recording that a run was handed variables on this worker. A
+   *  SIBLING of `recovery/`, never inside it: the recovery restart sweep treats every entry under it as a runId. */
+  readonly runEnvSeenRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
   /** The current holder of each `locks` key, keyed the same way: an identity token whose `since`
@@ -5064,8 +5128,11 @@ export class GitCache {
       const cwd = args[gitPosition] === "-C" ? args[gitPosition + 1] : undefined;
       const present = new Set(args.flatMap((arg, i) => arg === "-c" ? [args[i + 1]!] : []));
       const attr = `--attr-source=${EPOCH_EMPTY_TREE_OID}`;
-      args.splice(position, 0, ...(state.attrSource === true && !versionOnly && !args.includes(attr) ? [attr] : []),
-        ...this.epochNativePins(cwd, state).filter(pin => !present.has(pin)).flatMap(pin => ["-c", pin]));
+      // Array-literal rebuild, not a splice with an argument spread: the pin count is data-derived.
+      args = [...args.slice(0, position),
+        ...(state.attrSource === true && !versionOnly && !args.includes(attr) ? [attr] : []),
+        ...this.epochNativePins(cwd, state).filter(pin => !present.has(pin)).flatMap(pin => ["-c", pin]),
+        ...args.slice(position)];
       this.requireEpochNativePins(args, gitPosition, state, versionOnly);
       args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
         "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
@@ -6404,6 +6471,7 @@ export class GitCache {
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
   /** See {@link GitCacheOptions.retireBindingStep}; undefined in production. */
   private readonly retireBindingStepSeam: GitCacheOptions["retireBindingStep"];
+  private readonly objectScanClock: GitCacheOptions["objectScanClockForTest"];
   /** The foreign-bare scan limits of compactAttemptLedger: the production constants, lowered only by the test seam. */
   private readonly compactForeignLimits: { maxBares: number; maxConfigBytes: number; maxRecords: number; deadlineMs: number };
   private readonly compactForeignNow: () => number;
@@ -6472,6 +6540,7 @@ export class GitCache {
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.retireBindingStepSeam = opts.retireBindingStep;
+    this.objectScanClock = opts.objectScanClockForTest;
     const lowered = (production: number, requested: number | undefined): number =>
       typeof requested === "number" && requested >= 0 ? Math.min(production, requested) : production;
     const foreignSeam = opts.compactForeignScanForTest;
@@ -6501,6 +6570,7 @@ export class GitCache {
     this.recoveryMaintenanceRoot = path.join(dataDir, "recovery-maintenance");
     this.recoverySettlementRoot = path.join(dataDir, "recovery-settlement");
     this.recoveryArchiveRoot = path.join(dataDir, "recovery-archive");
+    this.runEnvSeenRoot = path.join(dataDir, "run-variables-seen");
   }
 
   private authorityRefusal(op: string): Error {
@@ -11664,7 +11734,7 @@ export class GitCache {
           const sourceKey = shape?.key ?? path.basename(journal.clonePath);
           await this.attributedRecovery(barePath, branch, sourceKey, journal, journal, false, snapshot);
         }
-        relevant.push(...protectedRecords.map(r => r.journal));
+        for (const r of protectedRecords) relevant.push(r.journal);
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
           fail("identity", "restriction record branch mismatch");
         return { activeRaw, protectedRaw, relevant, activeSource };
@@ -13397,7 +13467,7 @@ export class GitCache {
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
           if (++lookalikes > MAX_AGGREGATES) return fail("wrapper_lookalike_bound", true);
-          queue.push(...commit.parents);
+          for (const parent of commit.parents) queue.push(parent);
           continue;
         }
         leaves.add(sha);
@@ -13405,7 +13475,7 @@ export class GitCache {
       }
       aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
       if (aggregates.length > MAX_AGGREGATES) return fail("wrapper_aggregate_bound", true);
-      queue.push(...commit.parents);
+      for (const parent of commit.parents) queue.push(parent);
     }
     if (leaves.size > MAX_LEAVES) return fail("wrapper_leaf_bound", true);
     const markerLeaves = new Set<string>();
@@ -20828,7 +20898,12 @@ export class GitCache {
     range: CheckpointRange,
     /** `literals` is REQUIRED: the encoded forms of the run's bound provider key, `[]` for a vendor run
      *  (no extra git work). A caller that has no claim passes `[]` only under a policy that fails closed. */
-    opts: { deadlineMs?: number; literals: readonly string[] },
+    opts: {
+      deadlineMs?: number; literals: readonly string[];
+      /** PRD 4416 M2: the registered forms of the run's secret variables, one entry per variable name. A hit is a
+       *  trusted `uzi-run-env` finding; any failure is untrusted. Omitted or empty: no extra git work. */
+      needles?: ReadonlyArray<{ name: string; forms: readonly string[] }>; maxBytes?: number;
+    },
   ): Promise<CheckpointScanResult> {
     const label = "checkpoint secret scan";
     const untrusted = (reason: CheckpointScanUntrustedReason, fields: Record<string, unknown> = {}): CheckpointScanResult => {
@@ -20859,6 +20934,15 @@ export class GitCache {
       );
       if (!key.trusted) return untrusted("provider_key_scan_untrusted", { why: key.reason });
       if (key.findings.length > 0) return { trusted: true, findings: key.findings };
+    }
+    // 0b. The same listing for the run's secret variables (PRD 4416 M2), fail closed like the key scan.
+    if (opts.needles && opts.needles.length > 0) {
+      const vars = await this.scanObjectsForRunEnv(
+        barePath, { tip: range.tipSha, excludes: range.packExcludeShas ?? [range.excludeSha] }, opts.needles,
+        { deadlineMs: remaining(), ...(opts.maxBytes === undefined ? {} : { maxBytes: opts.maxBytes }) },
+      );
+      if (!vars.trusted) return untrusted("variable_scan_untrusted", { why: vars.reason });
+      if (vars.findings.length > 0) return { trusted: true, findings: vars.findings };
     }
 
     // 1. Size pre-check (bounded buffers; any failure is untrusted).
@@ -20902,7 +20986,7 @@ export class GitCache {
         if (run.kind === "deadline") return untrusted("deadline", { mode: "git" });
         if (run.kind === "unreadable") return untrusted("scan_untrusted", { mode: "git", why: run.why });
         const scannedCommits = commitsScannedFromStderr(run.stderr);
-        findings.push(...run.findings);
+        for (const finding of run.findings) findings.push(finding);
         if (!scanIsTrustworthy({ stderr: run.stderr, scannedCommits, expectedCommits, execOk: run.execOk }) || /\bskipp/i.test(run.stderr)) {
           if (findings.length > 0) return { trusted: false, findings, reason: "scan_untrusted" };
           return untrusted("scan_untrusted", { mode: "git", expectedCommits, scannedCommits, execOk: run.execOk });
@@ -20915,7 +20999,7 @@ export class GitCache {
           if (findings.length > 0) return { trusted: false, findings, reason: res.reason };
           return untrusted(res.reason, { merge });
         }
-        findings.push(...res.findings);
+        for (const finding of res.findings) findings.push(finding);
       }
       this.log.debug(`${label} complete`, { barePath, expectedCommits, merges: merges.length, findings: findings.length });
       return { trusted: true, findings };
@@ -20929,9 +21013,11 @@ export class GitCache {
   /**
    * Exact-literal scan of every object a publication of `range.tip` would carry: the objects of
    * `rev-list --objects tip --not excludes` (plus, with `excludeRemoteTracking`, everything reachable
-   * from `refs/remotes/origin/*`), read whole (commits, trees and blobs, so messages, filenames,
-   * binary files and merge results are all covered) and searched for any of `literals` (the encoded
-   * forms of the run's bound provider key; gitleaks cannot detect a prefixless key).
+   * from `refs/remotes/origin/*`), read whole (commits, trees and blobs, so messages, single path
+   * components, binary files and merge results are covered) and searched for any of `literals` (the
+   * encoded forms of the run's bound provider key; gitleaks cannot detect a prefixless key). A tree
+   * object stores one path component, so a value containing "/" is not in any single object: a second,
+   * path pass searches the FULL path of every entry each outgoing commit adds (see scanObjectsGrouped).
    *
    * Empty `literals` is clean and spawns NO git child. Otherwise: the listing (capped at
    * CHECKPOINT_SCAN_MAX_OBJECTS), a `cat-file --batch-check` size total (capped at
@@ -20946,24 +21032,133 @@ export class GitCache {
     barePath: string,
     range: { tip: string; excludes: readonly string[]; excludeRemoteTracking?: boolean },
     literals: readonly string[],
-    opts: { deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number } } = {},
+    opts: { deadlineMs?: number; caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number } } = {},
   ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
-    const usable = literals.filter((l) => l.length > 0);
-    if (usable.length === 0) return { trusted: true, findings: [] };
-    const untrusted = (reason: string): { trusted: false; reason: string } => {
-      this.log.warn("provider key scan: untrusted, not publishing", { barePath, reason });
+    return this.scanObjectsGrouped(barePath, range, [{ forms: literals }], opts, PROVIDER_KEY_RULE_ID, "provider key scan");
+  }
+
+  /**
+   * PRD 4416 M2: the exact-value scan of a run's secret variables over the same object listing as
+   * {@link scanObjectsForLiterals}. `needles` carries one entry per variable name with every registered
+   * form of its values; a finding names the variable (never the value) under `uzi-run-env`. Fails closed:
+   * a deadline, a git error, an unresolved revision, a cap or `maxBytes` (counted over the streamed bytes)
+   * is `trusted: false`. `tips` lets one scan walk several heads (a bundle's refs). The scan also
+   * searches the full path of every entry each outgoing commit adds (a value containing "/" can be
+   * published as a path, which no single tree object holds); a path hit is a finding whose file is
+   * "[path withheld]", and an incomplete path pass is `trusted: false, reason: "path_scan_incomplete"`.
+   */
+  async scanObjectsForRunEnv(
+    barePath: string,
+    range: { tip: string; tips?: readonly string[]; excludes: readonly string[]; excludeRemoteTracking?: boolean },
+    needles: ReadonlyArray<{ name: string; forms: readonly string[] }>,
+    opts: { deadlineMs?: number; maxBytes?: number; caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number } } = {},
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
+    return this.scanObjectsGrouped(barePath, range,
+      needles.map((n) => ({ label: n.name, forms: n.forms })), opts, RUN_ENV_RULE_ID, "run variable scan");
+  }
+
+  /**
+   * PRD 4416 M2: the exact-value scan of a recovery bundle FILE's objects (the bytes that will be uploaded).
+   * The bundle is unpacked into a scratch bare repo whose alternates are the worker's bare caches, so a thin
+   * pack resolves its public prerequisites; its objects (`sourceSha` not the header's prerequisites) are then
+   * scanned like {@link scanObjectsForRunEnv}. A bundle that does not unpack, a header that does not match
+   * `sourceSha`, a prerequisite no cache holds, or any scan failure is `trusted: false`. No needles: clean,
+   * with no git work. The caller binds the verdict to the bundle's journaled checksum.
+   */
+  async scanBundleForRunEnv(
+    bundlePath: string,
+    sourceSha: string,
+    needles: ReadonlyArray<{ name: string; forms: readonly string[] }>,
+    opts: { deadlineMs?: number; maxBytes?: number } = {},
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
+    if (!needles.some((n) => n.forms.some((f) => f.length > 0))) return { trusted: true, findings: [] };
+    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const bad = (reason: string): { trusted: false; reason: string } => {
+      this.log.warn("run variable scan of a bundle: untrusted, not uploading", { reason });
       return { trusted: false, reason };
     };
-    if (!SHA40_RE.test(range.tip) || range.excludes.some((x) => !SHA40_RE.test(x))) return untrusted("range_invalid");
+    if (!SHA40_RE.test(sourceSha)) return bad("range_invalid");
+    let scratch: string | undefined;
+    try {
+      const header = await readRecoveryBundleHeader(bundlePath, sourceSha);
+      scratch = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-bundle-scan-"));
+      const repo = path.join(scratch, "r.git");
+      await this.execScoped("git", ["init", "--bare", "-q", repo], { env: gitEnv(), timeout: Math.max(1, deadlineAt - Date.now()) });
+      const alternates: string[] = [];
+      for (const entry of (await fs.readdir(this.reposRoot).catch(() => [] as string[])).slice(0, 256)) {
+        const objects = path.join(this.reposRoot, entry, "objects");
+        if (await fs.stat(objects).then((s) => s.isDirectory(), () => false)) alternates.push(objects);
+      }
+      await fs.mkdir(path.join(repo, "objects", "info"), { recursive: true });
+      await fs.writeFile(path.join(repo, "objects", "info", "alternates"), alternates.join("\n") + "\n", "utf8");
+      await this.execScoped("git", withDir(repo, ["bundle", "unbundle", bundlePath]), {
+        env: gitEnv(), timeout: Math.max(1, deadlineAt - Date.now()), maxBuffer: 1024 * 1024,
+      });
+      return await this.scanObjectsForRunEnv(repo, { tip: sourceSha, excludes: header.prerequisiteShas }, needles,
+        { deadlineMs: Math.max(1, deadlineAt - Date.now()), ...(opts.maxBytes === undefined ? {} : { maxBytes: opts.maxBytes }) });
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
+      return bad("bundle_unreadable");
+    } finally {
+      if (scratch) await this.removeBestEffort(scratch, "scan-scratch");
+    }
+  }
+
+  private async scanObjectsGrouped(
+    barePath: string,
+    range: { tip: string; tips?: readonly string[]; excludes: readonly string[]; excludeRemoteTracking?: boolean },
+    groups: ReadonlyArray<{ label?: string; forms: readonly string[] }>,
+    opts: { deadlineMs?: number; maxBytes?: number; caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number } },
+    ruleId: string,
+    what: string,
+  ): Promise<{ trusted: true; findings: SecretFinding[] } | { trusted: false; reason: string }> {
+    const active = groups
+      .map((g) => ({ label: g.label, forms: [...new Set(g.forms)].filter((l) => l.length > 0) }))
+      .filter((g) => g.forms.length > 0);
+    if (active.length === 0) return { trusted: true, findings: [] };
+    const untrusted = (reason: string): { trusted: false; reason: string } => {
+      this.log.warn(`${what}: untrusted, not publishing`, { barePath, reason });
+      return { trusted: false, reason };
+    };
+    const tips = range.tips ?? [range.tip];
+    if (tips.length === 0 || tips.some((t) => !SHA40_RE.test(t)) || !SHA40_RE.test(range.tip) ||
+        range.excludes.some((x) => !SHA40_RE.test(x))) return untrusted("range_invalid");
     const maxObjects = opts.caps?.maxObjects ?? CHECKPOINT_SCAN_MAX_OBJECTS;
-    const maxTotal = opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES;
-    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
-    const remaining = (): number => deadlineAt - Date.now();
-    const hasKeyForm = (s: string): boolean => usable.some((l) => s.includes(l));
+    const maxTotal = opts.caps?.maxTotalBytes ?? opts.maxBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES;
+    const seam = this.objectScanClock;
+    const now = seam?.now ?? Date.now;
+    const deadlineAt = now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => deadlineAt - now();
+    const hasKeyForm = (s: string): boolean => active.some((g) => g.forms.some((l) => s.includes(l)));
     let producer: { stdout: Readable; exited: Promise<number>; cancel: () => void } | undefined;
     try {
       this.checkCheckpointCooperation();
-      const revs = [range.tip, "--not", ...range.excludes, ...(range.excludeRemoteTracking ? ["--remotes=origin"] : []), "--"];
+      const revs = [...tips, "--not", ...range.excludes, ...(range.excludeRemoteTracking ? ["--remotes=origin"] : []), "--"];
+      // PATH PASS (runs first, over exactly the revisions of the object pass below). A tree object stores one
+      // path COMPONENT, so a secret containing "/" published as a path ("dirA/dirB/file") is in no single
+      // object the object pass reads. Completeness: every full path in an outgoing commit C is either present
+      // in a parent of C (an excluded parent is already public; an in-range parent is itself scanned) or is
+      // listed by C's own diff. A root commit diffs against the empty tree; `-t` lists tree entries (empty
+      // trees and gitlinks included); for a merge `-c` lists every path that differs from EVERY parent, a
+      // superset of the paths absent from all parents. Each such path is searched whole.
+      // A deadline spent before the path pass is "deadline", inside it "path_scan_incomplete", before the object pass "deadline".
+      seam?.atStage?.("before_path_pass");
+      if (remaining() <= 0) return untrusted("deadline");
+      seam?.atStage?.("path_pass");
+      const pathPass = await this.scanPathsForGroups(barePath, revs, active, {
+        maxPaths: opts.caps?.maxPaths ?? CHECKPOINT_SCAN_MAX_PATHS,
+        maxPathBytes: opts.caps?.maxPathBytes ?? CHECKPOINT_SCAN_MAX_PATH_BYTES,
+        maxCommits: maxObjects,
+      }, remaining);
+      if (!pathPass.complete) return untrusted("path_scan_incomplete");
+      const pathFindings: SecretFinding[] = pathPass.hits.map((h) => ({
+        file: PATH_WITHHELD, startLine: 0, commit: h.commit, ruleId, ...(h.label === undefined ? {} : { variable: h.label }),
+      }));
+      this.checkCheckpointCooperation();
+      seam?.atStage?.("object_pass");
+      if (remaining() <= 0) return untrusted("deadline");
       const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--objects", ...revs]), {
         env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (maxObjects + 1) * 4096,
       });
@@ -20976,7 +21171,7 @@ export class GitCache {
         if (m[2]) paths.set(m[1]!, m[2]);
       }
       if (oids.length > maxObjects) return untrusted("too_many_objects");
-      if (oids.length === 0) return { trusted: true, findings: [] };
+      if (oids.length === 0) return { trusted: true, findings: pathFindings };
       const input = oids.join("\n") + "\n";
 
       this.checkCheckpointCooperation();
@@ -20998,18 +21193,25 @@ export class GitCache {
         timeoutMs: Math.max(1, remaining()), stdoutCategory: "artifactBytes", stderrMaxBytes: 4096, cancelOnAbandon: true,
       });
       producer = spawned;
-      const matcher = literalMatcher(usable);
-      const hits: Array<{ oid: string; type: string }> = [];
+      const matchers = active.map((g) => ({ label: g.label, matcher: literalMatcher(g.forms) }));
+      const hits: Array<{ oid: string; type: string; labels: Array<string | undefined> }> = [];
       // Frame parser for `cat-file --batch`: "<oid> <type> <size>\n" + <size> bytes + "\n", per object.
       let mode: "header" | "body" | "lf" = "header";
       let header = Buffer.alloc(0);
-      let pending: { oid: string; type: string; left: number; hit: boolean } | undefined;
+      let pending: { oid: string; type: string; left: number; hit: Array<string | undefined> } | undefined;
       let sawObjects = 0;
       let garbled = false;
+      let streamed = 0;
       scan: for await (const raw of spawned.stdout) {
         this.checkCheckpointCooperation();
         if (remaining() <= 0) { producer.cancel(); producer.stdout.destroy(); await producer.exited; return untrusted("deadline"); }
         let chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+        // The streamed bytes are counted too: the sizes read above can lie about what the child actually sends.
+        streamed += chunk.length;
+        if (streamed > maxTotal + oids.length * 256) {
+          producer.cancel(); producer.stdout.destroy(); await producer.exited;
+          return untrusted("scan_too_large");
+        }
         while (chunk.length > 0) {
           if (mode === "header") {
             const nl = chunk.indexOf(0x0a);
@@ -21023,20 +21225,23 @@ export class GitCache {
             const m = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(header.toString("latin1"));
             header = Buffer.alloc(0);
             if (!m || m[1] !== oids[sawObjects]) { garbled = true; break scan; }
-            pending = { oid: m[1]!, type: m[2]!, left: Number(m[3]), hit: false };
-            matcher.reset();
+            pending = { oid: m[1]!, type: m[2]!, left: Number(m[3]), hit: [] };
+            for (const g of matchers) g.matcher.reset();
             sawObjects++;
             mode = pending.left > 0 ? "body" : "lf";
           } else if (mode === "body") {
             const body = chunk.subarray(0, Math.min(pending!.left, chunk.length));
-            if (!pending!.hit && matcher.push(body)) pending!.hit = true;
+            for (const g of matchers) {
+              if (pending!.hit.includes(g.label)) continue;
+              if (g.matcher.push(body)) pending!.hit.push(g.label);
+            }
             pending!.left -= body.length;
             chunk = chunk.subarray(body.length);
             if (pending!.left === 0) mode = "lf";
           } else {
             if (chunk[0] !== 0x0a) { garbled = true; break scan; }
             chunk = chunk.subarray(1);
-            if (pending!.hit) hits.push({ oid: pending!.oid, type: pending!.type });
+            if (pending!.hit.length > 0) hits.push({ oid: pending!.oid, type: pending!.type, labels: pending!.hit });
             pending = undefined;
             mode = "header";
           }
@@ -21051,7 +21256,7 @@ export class GitCache {
           return untrusted("read_failed");
         }
       }
-      if (hits.length === 0) return { trusted: true, findings: [] };
+      if (hits.length === 0) return { trusted: true, findings: pathFindings };
 
       const findings: SecretFinding[] = [];
       for (const hit of hits) {
@@ -21071,17 +21276,148 @@ export class GitCache {
           }
         }
         const path = paths.get(hit.oid) ?? "";
-        findings.push({
-          file: hasKeyForm(path) ? "[path withheld]" : path, startLine: 0, commit, ruleId: PROVIDER_KEY_RULE_ID,
-        });
+        // Padded as the path pass is: a form with a leading or trailing "/" (rev-list paths never start with one) still withholds.
+        const file = hasKeyForm(`/${path}/`) ? "[path withheld]" : path;
+        // One finding per hit object, or per variable it carries when the scan is labelled.
+        const labels = hit.labels.filter((l): l is string => l !== undefined);
+        if (labels.length === 0) findings.push({ file, startLine: 0, commit, ruleId });
+        else for (const variable of labels) findings.push({ file, startLine: 0, commit, ruleId, variable });
       }
-      return { trusted: true, findings };
+      return { trusted: true, findings: [...findings, ...pathFindings] };
     } catch (err) {
       if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited.catch(() => -1); }
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
       if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
       return untrusted(`scan_failed`);
+    }
+  }
+
+  /**
+   * The path pass of {@link scanObjectsGrouped}: the full path of every entry each commit of `revs` adds
+   * (see the completeness argument there), searched for the groups' forms. Two git children at most, no
+   * child per commit: `rev-list --parents` (commit ids; a commit with two or more parents is a merge),
+   * then `diff-tree --stdin --root -r -t --no-renames --name-only -z` over the non-merges and
+   * `diff-tree --stdin -c -r -t --name-only -z` over the merges, each with `--ignore-submodules=none`
+   * (defence in depth: diff-tree plumbing lists gitlinks regardless of a repository's diff.ignoreSubmodules) and `--no-replace-objects`.
+   *
+   * Framing of the `-z` output: "<commit id>\0" then "<path>\0" per entry, the next commit's id following
+   * directly; a commit with no diff prints nothing in the plain pass, while a merge whose combined diff is
+   * empty prints its id with no paths in the -c pass. Paths are raw bytes (-z, so core.quotePath is moot).
+   * A token that is a listed commit id starts that commit's paths; every token, such an id included, is
+   * searched as a path, so the attribution can never hide a path. The stream is parsed incrementally and
+   * never buffered whole. A path is searched as "/" + path + "/", which contains the path, "/" + path and
+   * path + "/" and so matches a form with a leading or trailing "/" against a root directory or tree entry.
+   *
+   * Incomplete (a path or byte cap, the deadline, a git error, garbled framing) is `complete: false`: the
+   * caller fails closed. Only a boundary abort propagates. At most 16 hits are collected.
+   */
+  private async scanPathsForGroups(
+    barePath: string,
+    revs: readonly string[],
+    active: ReadonlyArray<{ label: string | undefined; forms: readonly string[] }>,
+    caps: { maxPaths: number; maxPathBytes: number; maxCommits: number },
+    remaining: () => number,
+  ): Promise<{ complete: true; hits: Array<{ label: string | undefined; commit: string }> } | { complete: false }> {
+    const incomplete = { complete: false } as const;
+    // A deadline already spent on entry is incomplete before any git work (a zero-commit range never checks the deadline otherwise).
+    if (remaining() <= 0) return incomplete;
+    const matchers = active.map((g) => ({ label: g.label, matcher: literalMatcher(g.forms) }));
+    const hits: Array<{ label: string | undefined; commit: string }> = [];
+    const seen = new Set<string>();
+    let paths = 0;
+    let pathBytes = 0;
+    let producer: { stdout: Readable; exited: Promise<number>; cancel: () => void } | undefined;
+    try {
+      this.checkCheckpointCooperation();
+      const listing = await this.execScoped("git", withDir(barePath, ["--no-replace-objects", "rev-list", "--parents", ...revs]), {
+        env: gitEnv(), timeout: Math.max(1, remaining()), maxBuffer: (caps.maxCommits + 1) * 4096,
+      });
+      const plain: string[] = [];
+      const merges: string[] = [];
+      for (const line of listing.stdout.split("\n")) {
+        if (line === "") continue;
+        const ids = line.split(" ");
+        if (ids.some((id) => !SHA40_RE.test(id))) return incomplete;
+        (ids.length > 2 ? merges : plain).push(ids[0]!);
+      }
+      if (plain.length + merges.length > caps.maxCommits) return incomplete;
+      const passes: Array<{ ids: string[]; args: string[] }> = [
+        { ids: plain, args: ["--root", "-r", "-t", "--no-renames"] },
+        { ids: merges, args: ["-c", "-r", "-t"] },
+      ];
+      for (const pass of passes) {
+        if (pass.ids.length === 0) continue;
+        this.checkCheckpointCooperation();
+        const known = new Set(pass.ids);
+        const spawned = await this.spawnGit(barePath, [
+          "--no-replace-objects", "diff-tree", "--stdin", ...pass.args, "--ignore-submodules=none", "--name-only", "-z",
+        ], pass.ids.join("\n") + "\n", {
+          timeoutMs: Math.max(1, remaining()), stdoutCategory: "artifactBytes", stderrMaxBytes: 4096, cancelOnAbandon: true,
+        });
+        producer = spawned;
+        let carry: Buffer = Buffer.alloc(0);
+        let current: string | undefined;
+        let garbled = false;
+        const take = (token: Buffer): boolean => {
+          paths++;
+          pathBytes += token.length;
+          if (paths > caps.maxPaths || pathBytes > caps.maxPathBytes) return false;
+          if (token.length === 40) {
+            const id = token.toString("latin1");
+            if (known.has(id)) current = id;
+          }
+          if (current === undefined) { garbled = true; return false; }
+          const padded = Buffer.concat([Buffer.from("/"), token, Buffer.from("/")]);
+          for (const g of matchers) {
+            g.matcher.reset();
+            if (!g.matcher.push(padded)) continue;
+            const key = `${current}\0${g.label ?? ""}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            hits.push({ label: g.label, commit: current });
+          }
+          return true;
+        };
+        let stop = false;
+        for await (const raw of spawned.stdout) {
+          this.checkCheckpointCooperation();
+          this.objectScanClock?.atStage?.("path_stream");
+          if (remaining() <= 0) { stop = true; break; }
+          let chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+          while (chunk.length > 0) {
+            const nul = chunk.indexOf(0);
+            if (nul < 0) {
+              carry = Buffer.concat([carry, chunk]);
+              if (carry.length > CHECKPOINT_SCAN_MAX_PATH_TOKEN_BYTES) stop = true;
+              break;
+            }
+            const token = carry.length > 0 ? Buffer.concat([carry, chunk.subarray(0, nul)]) : chunk.subarray(0, nul);
+            carry = Buffer.alloc(0);
+            chunk = chunk.subarray(nul + 1);
+            if (!take(token)) { stop = true; break; }
+          }
+          if (stop || hits.length >= 16) break;
+        }
+        if (stop || garbled) {
+          producer.cancel(); producer.stdout.destroy(); await producer.exited;
+          return incomplete;
+        }
+        if (hits.length >= 16) {
+          producer.cancel(); producer.stdout.destroy(); await producer.exited;
+          return { complete: true, hits };
+        }
+        const code = await producer.exited;
+        producer = undefined;
+        if (code !== 0 || carry.length > 0) return incomplete;
+      }
+      return { complete: true, hits };
+    } catch (err) {
+      if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited.catch(() => -1); }
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      if (err instanceof CheckpointSoftDeadlineError || err instanceof GitBoundaryAbortError) throw err;
+      return incomplete;
     }
   }
 
@@ -25533,12 +25869,7 @@ try {
     const baseRef = (await this.refExists(barePath, remoteBaseRef)) ? remoteBaseRef : base;
     const branchRef = `refs/remotes/origin/${branch}`;
     const out = await this.runGit(barePath, ["diff", "--no-color", "--no-ext-diff", `${baseRef}...${branchRef}`]);
-    const buf = Buffer.from(out, "utf8");
-    if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
-    const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
-    // Slice on a byte boundary so a giant diff cannot balloon the string we keep. A cut
-    // through a multi-byte rune yields at most one U+FFFD; harmless for review text.
-    return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
+    return capReviewDiff(out);
   }
 
   /**
@@ -25730,25 +26061,21 @@ try {
    * disable it explicitly. `changedFiles` sidesteps it via `--name-only`. `--no-color` keeps
    * the text plain.
    *
-   * The result is CAPPED at REVIEW_DIFF_MAX_BYTES with a truncation marker, sliced on a byte
-   * boundary (a cut through a multi-byte rune yields at most one U+FFFD). It is secret-scrubbed
-   * by the CALLER (redactText) before it leaves the worker — this method does not scrub. Returns
-   * `null` on ANY failure (try/catch), so the caller can still report the failed outcome without
-   * a patch rather than turning a diff-computation error into a second failure.
+   * The result is NOT capped: the caller secret-scrubs it (redactText) and then caps it
+   * ({@link capReviewDiff}) before it leaves the worker.
+   * This method does not scrub. Returns `null` on ANY failure (try/catch), so the caller can still
+   * report the failed outcome without a patch rather than turning a diff-computation error into a
+   * second failure.
    */
   async workflowScopeDiff(barePath: string, trackingRef: string): Promise<string | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const out = await this.runGit(barePath, [
+      return await this.runGit(barePath, [
         "diff",
         "--no-color",
         "--no-ext-diff",
         `${baseRef}...${trackingRef}`,
       ]);
-      const buf = Buffer.from(out, "utf8");
-      if (buf.byteLength <= REVIEW_DIFF_MAX_BYTES) return out;
-      const marker = `\n… diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes (${buf.byteLength} total) …\n`;
-      return buf.subarray(0, REVIEW_DIFF_MAX_BYTES).toString("utf8") + marker;
     } catch {
       return null;
     }
@@ -31597,7 +31924,10 @@ try {
         const after = await read(() => fs.lstat(dir));
         if (st.dev !== after.dev || st.ino !== after.ino || st.mtimeMs !== after.mtimeMs ||
             st.ctimeMs !== after.ctimeMs) throw new Error("owed directory changed");
-      } else names.push(...await fs.readdir(dir));
+      } else {
+        const entries = await fs.readdir(dir);
+        for (const entry of entries) names.push(entry);
+      }
       for (const name of names) {
         if (!/^(?:context-[0-9a-f]{64}|candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-[0-9a-f]{64}|(?:governed|receipt)-[0-9a-f]{64})\.json$/.test(name) &&
             !/^\.tmp-[0-9a-f-]{36}$/.test(name)) throw new Error("unknown owed metadata entry");
@@ -32360,7 +32690,7 @@ try {
           if (commit.tree !== tree) return undefined;
           aggregates.push({ round: Number(m[1]), batch: Number(m[2]), body: commit.body });
           if (aggregates.length > MAX_AGGREGATES) return undefined;
-          queue.push(...commit.parents);
+          for (const parent of commit.parents) queue.push(parent);
         }
         if (!aggregates.length || [...leaves].sort().join(",") !== heads.join(",")) return undefined;
         const current = await readCommit(currentSha);

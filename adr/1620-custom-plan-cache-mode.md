@@ -391,3 +391,64 @@ treated as pre-approved.
 `ClaimRun` per poll. Whether production pays per-call planning, and why, is not established,
 so the precheck removes the idle-queue cost but is not shown to remove the production
 symptom in general.
+
+## Addendum (#4684, 2026-11-25): the per-model consumer, the reveal flag and JIT
+
+Issue #4684 adds the scoped Spend API. Four decisions belong with this rule; the PRD is
+[prds/done/4684-scoped-usage-spend-api.md](../prds/done/4684-scoped-usage-spend-api.md).
+
+**1. A multi-row consumer of `run_usage_model_totals`, kept bounded by a lateral with
+`OFFSET 0`.** The Spend statements read the new view `run_usage_model_totals`, which yields
+one row per `(run_id, model)`, so the `LIMIT 1` fence of `SelfUsage` would drop models. They
+read it through a per-run `LEFT JOIN LATERAL (... WHERE t.run_id = c.id OFFSET 0)` over the
+materialized cohort: `OFFSET 0` stops the planner flattening the subquery, the `LEFT JOIN`
+keeps every run without usage, and no row is dropped. Both `AnalyticsOwnerSpend` and
+`AnalyticsAllSpend` have cases in `TestRunUsageGenericPlanLiveDB` (the Spend cases), which
+asserts the bound under a forced generic plan.
+
+**2. Shape (b), `run_id = ANY(ARRAY(SELECT ...))`, was measured and rejected.** One fold
+filtered by the cohort's ids is 5-10% faster under a custom plan, but under a generic plan,
+which PostgreSQL may choose from the sixth execution of a prepared statement (it compares the
+generic plan against the earlier custom plans, so a forced generic plan measures the case where
+it is chosen, not which plan production will settle on), the planner no longer pushes
+the ids into the view and folds all of `run_usage`. On the 120,000-run seed (845,988 legs),
+medians:
+
+| workload | lateral (kept), custom | shape (b), custom | shape (b), generic |
+|---|---|---|---|
+| owner 30d | 250 ms | 239 ms | 9185 ms |
+| owner 90d | 425 ms | 408 ms | 29409 ms |
+| admin all-users 30d | 1283 ms | 1152 ms | 214873 ms |
+
+That is 30x to 170x worse and far past the 8 s budget. The lateral stays bounded under both
+plan types, and it is the only shape tried that does.
+
+**3. `@reveal_repos` on the owner-shaped statement: a deliberate, bounded exception to the
+spirit of ADR-1184 D1.** `AnalyticsOwnerSpend` takes a boolean that makes repo ids and paths
+visible even for repos outside the user's connections. D1's letter holds: the
+`r.user_id = @user_id` predicate stays unconditional, so the flag can never widen the cohort.
+It only reveals identifiers of repos already inside it, which the admin routes need when
+`user=<uuid>` selects a user whose run references a foreign repo. The route sets it and a
+query parameter never can (the owner handler passes false, a test pins that), and a single
+projection, `(@reveal_repos::boolean IS TRUE OR fc.id IS NOT NULL) AS repo_shown`, gates every
+repo identifier, so false or NULL masks (fails closed). The alternative was a second, duplicated, very large jsonb statement for
+the selected-user case, which invites the two copies to drift. The admin all-users statement
+stays separate and has no gate at all.
+
+**4. `SET LOCAL jit = off` in the analytics snapshot.** The custom plan of the admin all-users
+Spend statement is costed above `jit_above_cost`, so PostgreSQL compiled about 446 functions,
+6.4-7.3 s per call. Medians (custom plan, 120,000 runs):
+
+| workload | JIT on | JIT off |
+|---|---|---|
+| admin all-users 30d | 8193 ms | 1283 ms |
+| owner 30d | 710 ms | 250 ms |
+| owner 90d | 908 ms | 425 ms |
+| admin all-users `all` | 15678 ms | 9599 ms |
+
+The measured generic plans were not JIT-compiled (costed below `jit_above_cost`) and are unchanged. The setting is transaction-local, so
+the pool and every other statement keep the server default. `window=all` for the admin
+all-users scope still exceeds the 8 s budget with JIT off, so the API does not offer it: Spend
+answers 400 `window all not available for all users` before any analytics database work (authentication runs first) (owner decision at
+landing, 2026-11-25), and all-time for that scope is deferred to a follow-up that adds per-run
+totals for finished runs. This addendum does not fix the latency.

@@ -101,6 +101,19 @@ type rollEntry struct {
 	podsObserved       int
 	replicaSetsPending int
 	absenceOwners      replicaSetOwners
+	// independentBlock is e.blocked as it stood before the unresolved-duplicate hold
+	// overwrote it; empty when the entry had no block of its own. Set only by planPool's
+	// duplicate branch, together with duplicateHeld.
+	independentBlock string
+	// duplicateHeld marks an entry whose pool was held with "duplicate canary
+	// reservations unresolved; explicit recovery required". Production does not read it:
+	// it records the hold for tests and diagnostics.
+	duplicateHeld bool
+	// duplicateWakeSettle marks each waking current canary of such a held pool whose
+	// unadmitted wake may bind its op annotation and settle (wakeAnnotationPermitted, the
+	// pass-2 hibernateWake call) although e.blocked is set. It never authorizes a replica
+	// or template write: hibernateWake still requires wakeRollAdmitted for those.
+	duplicateWakeSettle bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -782,6 +795,10 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			if m.cancelAbsentDuplicateCanary(ctx, t, pool, canaries) {
 				return
 			}
+			for _, e := range pool {
+				e.independentBlock, e.duplicateHeld = e.blocked, true
+			}
+			duplicateWakeSettleCandidates(t, pool)
 			for _, e := range pool {
 				e.blocked = "duplicate canary reservations unresolved; explicit recovery required"
 				t.outcomes[e.w.ID].BlockingReason = pacingText(e.blocked)

@@ -1,0 +1,374 @@
+{
+  "scope": {
+    "route": "x",
+    "user": "x"
+  },
+  "generated_at": "2020-01-02T03:04:05Z",
+  "window": "x",
+  "timezone": "x",
+  "from": "2020-01-02T03:04:05Z",
+  "to": "2020-01-02T03:04:05Z",
+  "previous_from": "2020-01-02T03:04:05Z",
+  "previous_to": "2020-01-02T03:04:05Z",
+  "history_start": "2020-01-02T03:04:05Z",
+  "bucket_width_days": 1,
+  "buckets": [
+    {
+      "label": "x",
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "rolling": [
+    {
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "selected_user": "x",
+  "untracked_chat_runs": 1,
+  "totals": {
+    "current": {
+      "cost_usd": 1.5,
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "runs": 1,
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      },
+      "coverage": {
+        "metered": 1,
+        "applicable": 1,
+        "value": 1.5,
+        "reason": "x"
+      }
+    },
+    "previous": {
+      "cost_usd": 1.5,
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "runs": 1,
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      },
+      "coverage": {
+        "metered": 1,
+        "applicable": 1,
+        "value": 1.5,
+        "reason": "x"
+      }
+    }
+  },
+  "series": [
+    {
+      "index": 1,
+      "cost_usd": 1.5,
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "runs": 1,
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      },
+      "coverage": {
+        "metered": 1,
+        "applicable": 1,
+        "value": 1.5,
+        "reason": "x"
+      }
+    }
+  ],
+  "split": {
+    "dimension": "x",
+    "non_additive": true,
+    "groups": [
+      {
+        "rank": 1,
+        "is_other": true,
+        "key": "x",
+        "label": "x",
+        "id": "x",
+        "totals": {
+          "cost_usd": 1.5,
+          "input_tokens": 1,
+          "cache_read_tokens": 1,
+          "cache_creation_tokens": 1,
+          "output_tokens": 1,
+          "runs": 1,
+          "disclosure": {
+            "metered": 1,
+            "subscription": 1,
+            "unreported": 1,
+            "missing": 1,
+            "incomplete": true
+          },
+          "coverage": {
+            "metered": 1,
+            "applicable": 1,
+            "value": 1.5,
+            "reason": "x"
+          }
+        },
+        "buckets": [
+          {
+            "index": 1,
+            "cost_usd": 1.5,
+            "input_tokens": 1,
+            "cache_read_tokens": 1,
+            "cache_creation_tokens": 1,
+            "output_tokens": 1,
+            "runs": 1,
+            "disclosure": {
+              "metered": 1,
+              "subscription": 1,
+              "unreported": 1,
+              "missing": 1,
+              "incomplete": true
+            },
+            "coverage": {
+              "metered": 1,
+              "applicable": 1,
+              "value": 1.5,
+              "reason": "x"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "cost_per_completed_run": {
+    "current": {
+      "numerator_usd": 1.5,
+      "denominator": 1,
+      "value": 1.5,
+      "reason": "x",
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      }
+    },
+    "previous": {
+      "numerator_usd": 1.5,
+      "denominator": 1,
+      "value": 1.5,
+      "reason": "x",
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      }
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "numerator_usd": 1.5,
+        "denominator": 1,
+        "value": 1.5,
+        "reason": "x",
+        "disclosure": {
+          "metered": 1,
+          "subscription": 1,
+          "unreported": 1,
+          "missing": 1,
+          "incomplete": true
+        }
+      }
+    ],
+    "rolling": [
+      {
+        "index": 1,
+        "numerator_usd": 1.5,
+        "denominator": 1,
+        "value": 1.5,
+        "reason": "x",
+        "disclosure": {
+          "metered": 1,
+          "subscription": 1,
+          "unreported": 1,
+          "missing": 1,
+          "incomplete": true
+        }
+      }
+    ]
+  },
+  "cost_per_merged_pr": {
+    "current": {
+      "numerator_usd": 1.5,
+      "denominator": 1,
+      "value": 1.5,
+      "reason": "x",
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      }
+    },
+    "previous": {
+      "numerator_usd": 1.5,
+      "denominator": 1,
+      "value": 1.5,
+      "reason": "x",
+      "disclosure": {
+        "metered": 1,
+        "subscription": 1,
+        "unreported": 1,
+        "missing": 1,
+        "incomplete": true
+      }
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "numerator_usd": 1.5,
+        "denominator": 1,
+        "value": 1.5,
+        "reason": "x",
+        "disclosure": {
+          "metered": 1,
+          "subscription": 1,
+          "unreported": 1,
+          "missing": 1,
+          "incomplete": true
+        }
+      }
+    ],
+    "rolling": [
+      {
+        "index": 1,
+        "numerator_usd": 1.5,
+        "denominator": 1,
+        "value": 1.5,
+        "reason": "x",
+        "disclosure": {
+          "metered": 1,
+          "subscription": 1,
+          "unreported": 1,
+          "missing": 1,
+          "incomplete": true
+        }
+      }
+    ]
+  },
+  "cache_read": {
+    "cache_read_tokens": 1,
+    "input_tokens": 1,
+    "cache_creation_tokens": 1,
+    "denominator": 1,
+    "value": 1.5,
+    "reason": "x",
+    "disclosure": {
+      "metered": 1,
+      "subscription": 1,
+      "unreported": 1,
+      "missing": 1,
+      "incomplete": true
+    }
+  },
+  "top_runs": [
+    {
+      "run_id": "x",
+      "kind": "x",
+      "harness": "x",
+      "run_status": "x",
+      "usage_status": "x",
+      "primary_model": "x",
+      "created_at": "2020-01-02T03:04:05Z",
+      "cost_usd": 1.5,
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "repo_key": "x",
+      "repo_id": "x",
+      "repo_path": "x",
+      "user_id": "x",
+      "user_email": "x"
+    }
+  ],
+  "breakdown": {
+    "dimension": "x",
+    "rows": [
+      {
+        "rank": 1,
+        "is_other": true,
+        "key": "x",
+        "label": "x",
+        "id": "x",
+        "cost_usd": 1.5,
+        "input_tokens": 1,
+        "cache_read_tokens": 1,
+        "cache_creation_tokens": 1,
+        "output_tokens": 1,
+        "runs": 1,
+        "disclosure": {
+          "metered": 1,
+          "subscription": 1,
+          "unreported": 1,
+          "missing": 1,
+          "incomplete": true
+        },
+        "coverage": {
+          "metered": 1,
+          "applicable": 1,
+          "value": 1.5,
+          "reason": "x"
+        },
+        "finished": 1,
+        "outcomes": {
+          "completed": 1,
+          "cancelled": 1,
+          "plan_rejected": 1,
+          "base_diverged": 1,
+          "failed": 1
+        },
+        "failure_rate": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "completion_ratio": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "cost_share": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "elapsed_p50_seconds": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "elapsed_p90_seconds": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "merged_prs": 1
+      }
+    ]
+  }
+}

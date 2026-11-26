@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -247,7 +248,7 @@ function guardedRecovery(holds: "open" | "released"): { coordinator: RecoveryCoo
   recoveryClient.holds = holds === "open"
     ? [{ hold_id: OPEN_HOLD, generation: 2, inventory_guarded: true, has_available_capture: false } as never]
     : [];
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client: recoveryClient, git, log: nullLogger(), recoveryRoot: git.recoveryRoot,
     workerToken: "stopped-source-worker-join-token-0123456789",
   });

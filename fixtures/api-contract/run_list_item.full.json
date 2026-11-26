@@ -308,6 +308,13 @@
     "max": 1,
     "remaining": 1
   },
+  "injected_env": [
+    {
+      "name": "x",
+      "scope": "x",
+      "secret": true
+    }
+  ],
   "weekly_limit": {
     "credential_label": "x",
     "credential_key": "x",

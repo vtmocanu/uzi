@@ -249,6 +249,16 @@ WT="$WORK/wt-406"
 git -C "$WT" log -1 --format=%s | grep -q '^chore: renumber migrations' || fail "F: the renumber was not committed"
 [ "$(git -C "$WT" rev-parse HEAD^^2)" = "$(origin_ref main)" ] || fail "F: the renumber does not sit on the merge"
 
+# F0. An unused historical number at or below main's head also needs renumbering.
+merge_branch mf0
+branch_commit mf0 "$MIG/00005_gap.sql" '-- branch\n' 'branch migration in an unused gap'
+main_commit "$MIG/00006_main.sql" '-- main\n' 'main advances past the gap'
+: > "$TASK_LOG"
+RENUMBER_FROM="$MIG/00005_gap.sql" RENUMBER_TO="$MIG/00007_gap.sql" run mf0 420 --no-push
+[ "$rc" -eq 0 ] || fail "F0: renumber after merge failed, rc=$rc: $(out 420)"
+grep -qx 'migration:renumber' "$TASK_LOG" || fail "F0: unused number below the head was not renumbered"
+[ -f "$WORK/wt-420/$MIG/00007_gap.sql" ] || fail "F0: renamed file missing"
+
 # F2. a renumber that reports unresolved references stops for a hand fix, uncommitted.
 merge_branch mf2
 branch_commit mf2 "$MIG/00002_branch.sql" '-- branch\n' 'branch migration'
@@ -333,3 +343,7 @@ grep -q 'worktree back at' "$WORK/out.411" && fail "I: claimed the worktree was 
 git -C "$WT" merge --abort
 
 echo "PASS land-prep-merge: auto merge mode with a fast-forward push, CHANGELOG union under merge, refused union keeps git's conflict, other conflicts stop mid-merge, removal guard, renumber after merge, recorded forced modes, concurrent remote advance rejected, base-move merge and restore"
+
+# The same CI target verifies the read-only batch preparation report.
+"$HERE/fast-batch.test.sh"
+"$HERE/ci-lane.test.sh"

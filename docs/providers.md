@@ -416,8 +416,10 @@ details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 
 ## Gateways behind a private CA
 
-For a Codex provider, the worker's existing extra-CA bundle is delivered to the Codex runtime with
-TLS verification left on, so a private-CA gateway works there. A stalled connection fails with a
+For a Codex provider, the worker's extra-CA bundle is delivered to the Codex runtime with
+TLS verification left on, so a private-CA gateway works there, but only on workers the controller recorded as
+created with it (see the `workers.extraCA` upgrade note in [Configuration](./configuration.md)); a worker without
+that record fails TLS until it is reprovisioned. A stalled connection fails with a
 typed timeout (setup through the first model response is bounded at 10 seconds per runtime
 root); it is reported as a certificate error only when the runtime reports one. This page does not
 separately document the `workers.uidSplit` case for Codex; the paragraph below describes Claude.

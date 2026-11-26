@@ -265,6 +265,16 @@ func contractCases() []contractCase {
 		// refusal_totals are non-omitempty (the zero.json carries nulls the handler
 		// normalizes to []/{}).
 		newContractCase[AdminWorkerSizesDTO]("admin_worker_sizes"),
+		// Issue #4684: the scoped usage analytics responses. The options lists, the envelope
+		// buckets/rolling and every Spend panel slice are non-omitempty (the zero.json carries
+		// nulls the handler normalizes to []); users/users_reason and history_start are
+		// present-as-null by design.
+		newContractCase[AnalyticsOptionsDTO]("analytics_options"),
+		newContractCase[AnalyticsSpendDTO]("analytics_spend"),
+		// Issue #4685: the Reliability response. Its envelope and panel slices are non-omitempty
+		// (the zero.json carries nulls the handler normalizes to []); reason and latest_failure
+		// are present-as-null by design and totals.previous is omitempty.
+		newContractCase[AnalyticsReliabilityDTO]("analytics_reliability"),
 	}
 }
 

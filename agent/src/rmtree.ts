@@ -125,8 +125,10 @@ export async function restoreTreeWritability(target: string): Promise<void> {
  *
  * The HOME root is created by the worker (uid `worker`), but everything the agent
  * writes inside it is owned by `runner`: the SDK CLI runs as `runner`, so the Go
- * module cache (`0555` dirs) and the SDK's private `0700` `.claude/projects` are
- * runner-owned. The worker cannot `chmod` a directory it does not own and cannot even
+ * module cache (`0555` dirs) and the private `0700` `.claude`, `.claude/projects` and
+ * `.claude/tasks` (created as the runner by claude-global-config.ts, or by the CLI) are
+ * runner-owned. The worker-owned `.uzi-claude-config` (0555 with one uid) is removed by the
+ * worker's own pass. The worker cannot `chmod` a directory it does not own and cannot even
  * `scandir` a runner-private one, so {@link rmTreeForce} fails EACCES and the HOME
  * leaks on the data volume (measured: 0.3-1.6 GB per run, a 20 GB volume filled).
  *
@@ -273,7 +275,7 @@ async function purgeChildrenAsAgents(target: string): Promise<void> {
  * relative to that HOME. Each is refilled on demand by its tool (`go build` refills the
  * build cache, `go` re-downloads modules, `npm` refills its content cache), so dropping
  * one costs a resumed run time, never state. Nothing outside this list is ever deleted
- * by {@link rmHomeSubtree}: the session transcript, `.claude.json`, `go/bin` and every
+ * by {@link rmHomeSubtree}: the session transcript, `.uzi-claude-config`, `go/bin` and every
  * unknown file stay. Adding an entry needs code evidence that it is rebuildable.
  *
  * The one other name {@link rmHomeSubtree} accepts is not a cache: the park-only managed Go
