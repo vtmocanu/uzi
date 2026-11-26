@@ -8,7 +8,8 @@ SET LOCAL lock_timeout = '5s';
 -- enablement_rev are untouched.
 --
 -- The foreign key below references model_providers_scope_owner_id_key (00526). Refuse an invalid
--- index explicitly rather than rely on the planner's own refusal.
+-- index explicitly rather than rely on the planner's own refusal. The message names the recovery for a
+-- missing, invalid or non-unique index (ADR 4324, Scope-index recovery), not a 00526 rollback.
 -- +goose StatementBegin
 DO $$
 BEGIN
@@ -17,7 +18,7 @@ BEGIN
         WHERE i.indexrelid = to_regclass('model_providers_scope_owner_id_key')
           AND i.indisvalid AND i.indisunique
     ) THEN
-        RAISE EXCEPTION 'refusing to apply 00527: model_providers_scope_owner_id_key is missing or invalid; roll 00526 back and apply it again';
+        RAISE EXCEPTION 'refusing to apply 00527: model_providers_scope_owner_id_key is missing, invalid or not unique. If it is missing, recreate it as 00526 does and retry; if it is invalid with the exact 00526 definition, rebuild it with REINDEX per the runbook and retry; otherwise stop and investigate. See Scope-index recovery in ADR 4324 (adr/4324-admin-shared-providers.md).';
     END IF;
 END
 $$;

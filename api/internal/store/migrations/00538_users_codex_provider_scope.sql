@@ -12,6 +12,8 @@ SET LOCAL lock_timeout = '5s';
 -- writes users, and the two deadlock.
 LOCK TABLE model_providers, users IN ACCESS EXCLUSIVE MODE;
 
+-- The guard below refuses a missing, invalid or non-unique model_providers_scope_owner_id_key and names the
+-- recovery (ADR 4324, Scope-index recovery).
 -- +goose StatementBegin
 DO $$
 BEGIN
@@ -20,7 +22,7 @@ BEGIN
         WHERE i.indexrelid = to_regclass('model_providers_scope_owner_id_key')
           AND i.indisvalid AND i.indisunique
     ) THEN
-        RAISE EXCEPTION 'refusing to apply users_codex_provider_scope: model_providers_scope_owner_id_key is missing or invalid; roll 00526 back and apply it again';
+        RAISE EXCEPTION 'refusing to apply users_codex_provider_scope: model_providers_scope_owner_id_key is missing, invalid or not unique. If it is missing, stop and inspect the prerequisite foreign keys user_secrets_provider_fkey and users_claude_provider_fkey, since recreating the index alone does not restore them; if it is invalid with the exact 00526 definition, first confirm those foreign keys still reference it, then rebuild it with REINDEX per the runbook and retry; otherwise stop and investigate. See Scope-index recovery in ADR 4324 (adr/4324-admin-shared-providers.md).';
     END IF;
 END
 $$;
