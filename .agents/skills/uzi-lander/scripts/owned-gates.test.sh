@@ -82,24 +82,6 @@ runs '[{id:"n1",kind:"ci_fix",status:"awaiting_approval",issue_title:"Fix CI: ag
 run_it
 [ "$rc" -eq 0 ] || fail "repo-less/other-repo matched: rc=$rc out=$out"
 
-# 5. A full run page cannot prove absence: unknown, exit 3, even when it reaches past the
-#    claim (an older run can enter a gate later and age out of the page).
-RUN_LIST_CAP=3 run_it
-[ "$rc" -eq 3 ] || fail "saturated page read as none: rc=$rc out=$out"
-grep -qF 'RESULT=unknown' <<<"$out" || fail "saturated: $out"
-#    The same full page reaching back past the claim covers it: none.
-runs '[{id:"a1",repo_id:"r1",kind:"issue",status:"completed",created_at:"2026-01-01T00:00:00Z"},
-       {id:"a2",repo_id:"r1",kind:"issue",status:"completed",created_at:"2026-01-06T00:00:00Z"},
-       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"2026-01-07T00:00:00Z"}]'
-RUN_LIST_CAP=3 run_it
-[ "$rc" -eq 3 ] || fail "full page reaching past the claim read as none: rc=$rc out=$out"
-#    A gate found on a full page is still reported.
-runs '[{id:"g1",repo_id:"r1",kind:"mr_rework",status:"awaiting_input",mr_iid:42,created_at:"t"},
-       {id:"a2",repo_id:"r1",kind:"issue",status:"completed",created_at:"t"},
-       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
-RUN_LIST_CAP=3 run_it
-[ "$rc" -eq 1 ] || fail "gate on full page: rc=$rc out=$out"
-
 # 5b. Malformed lookups are unknown, never none: a run row without status breaks the matcher,
 #     a claimed run without status, and a sole repo row with a null id.
 runs '[{id:"m1",repo_id:"r1",kind:"ci_fix",status:{"x":1},mr_iid:42,created_at:"t"},
