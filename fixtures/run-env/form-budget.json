@@ -1,0 +1,4 @@
+{
+  "form_chars_max": 40000000,
+  "form_chars_per_secret_byte": 342
+}

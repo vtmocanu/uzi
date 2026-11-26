@@ -572,7 +572,7 @@ describe("protected CLI roots and executor seams", () => {
     const { queryFn } = fakeTurns(planAndDone());
     const { capture } = fakeCapture();
     const executor = new SdkExecutor(nullLogger(), homeDir, { queryFn, killCliGroup: () => true, kill: () => true,
-      runProcesses: { reap: async () => ({ killed: [], left: [], complete: true }), scan: async () => ({ procs: [], complete: true }) } as never });
+      runProcesses: { reap: async () => ({ killed: [], left: [], complete: true }), scan: async () => ({ pids: [], complete: true }) } as never });
     assert.deepEqual(await executor.settleWorkerCommands(10), { confirmed: true }, "no lane: nothing to settle");
     await executor.run(makeCtx({ capturedMemory: capture }));
     const lane = (executor as unknown as { guardLane: ClaudeCommandLane }).guardLane;

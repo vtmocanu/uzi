@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { makeScratchRoot } from "./fixture-repo.js";
 import { it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -174,7 +175,7 @@ for (const latestJournal of [false, true]) {
           return { run_id: context.runId, generation: 7, released: true, holds_released: 1 };
         },
       };
-      const make = (git: GitCache) => new RecoveryCoordinator({
+      const make = (git: GitCache) => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
         recoveryRoot: path.join(data, "recovery"), workerToken: "fixture-worker",
         git, client: client as never, log: nullLogger(),
       });

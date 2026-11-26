@@ -58,7 +58,7 @@ interface ScanOpts {
   literals?: readonly string[];
   excludeRemoteTracking?: boolean;
   deadlineMs?: number;
-  caps?: { maxObjects?: number; maxTotalBytes?: number };
+  caps?: { maxObjects?: number; maxTotalBytes?: number; maxPaths?: number; maxPathBytes?: number };
 }
 const scan = (tip: string, excludes: string[], o: ScanOpts = {}) =>
   cache.scanObjectsForLiterals(
@@ -87,6 +87,19 @@ describe("scanObjectsForLiterals", () => {
       assertNoKeyBytes(res);
     });
   }
+
+  it("finds a key published only as a nested PATH (no object holds it whole), naming the commit and withholding the path", async () => {
+    const pathKey = ["Zq9xLm", "tR7kQ2w8", "vNp4"].join("/");
+    const introducing = commitFile(work, pathKey, "harmless\n");
+    const after = commitFile(work, "later.txt", "later\n");
+    syncFeature();
+    const res = await scan(after, [base], { literals: [pathKey] });
+    assert.ok(res.trusted && res.findings.length === 1, JSON.stringify(res));
+    if (!res.trusted) return;
+    assert.deepEqual(res.findings[0], { file: "[path withheld]", startLine: 0, commit: introducing, ruleId: "uzi-provider-key" });
+    assert.ok(!JSON.stringify(res).includes(pathKey));
+    assert.deepEqual(await scan(after, [base], { literals: [pathKey], caps: { maxPaths: 1 } }), { trusted: false, reason: "path_scan_incomplete" });
+  });
 
   it("finds the key in an EMPTY commit's message (no hunk for gitleaks to count)", async () => {
     git(work, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", `note ${RAW} tail`);

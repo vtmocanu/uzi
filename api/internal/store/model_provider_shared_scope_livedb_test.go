@@ -619,7 +619,8 @@ func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 
 // TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB: the scope key index is the parent of the 00527
 // and 00528 foreign keys. An invalid one (an interrupted concurrent build) makes 00527 refuse with no
-// partial change, and re-running the index migration rebuilds it VALID so the rest completes.
+// partial change, and the documented REINDEX (ADR 4324, Scope-index recovery) rebuilds it VALID so the
+// rest completes. The runbook cases live in model_provider_scope_index_recovery_livedb_test.go.
 func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 	invalidate := func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 		t.Helper()
@@ -632,25 +633,18 @@ func TestSharedScopeInvalidIndexRefusesThenRecoversLiveDB(t *testing.T) {
 	t.Run("00527 refuses an invalid parent index", func(t *testing.T) {
 		ctx, dsn, pool := sharedDB(t, "shared_scope_inv_a_", 526)
 		invalidate(ctx, t, pool)
-		err := store.Migrate(ctx, dsn)
-		if err == nil || !strings.Contains(err.Error(), "refusing to apply 00527") {
-			t.Fatalf("Migrate over an invalid index = %v, want the 00527 refusal", err)
-		}
-		if v := appliedVersion(ctx, t, pool); v != 526 {
-			t.Errorf("version after the refusal = %d, want 526", v)
-		}
+		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00527, 526)
 		if scalar[bool](ctx, t, pool, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'user_secrets' AND column_name = 'provider_scope_id')`) {
 			t.Errorf("00527 left provider_scope_id behind after refusing")
 		}
 		if scalar[string](ctx, t, pool, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'user_secrets_provider_fkey'`) != "FOREIGN KEY (user_id, provider_id) REFERENCES model_providers(owner_user_id, id) ON DELETE CASCADE" {
 			t.Errorf("00527 left the provider foreign key changed after refusing")
 		}
-		// Recovery: roll the index migration back and apply it again, which drops and rebuilds the index.
-		if err := store.MigrateDownTo(ctx, dsn, 525); err != nil {
-			t.Fatal(err)
-		}
+		// Recovery: the documented REINDEX, which keeps the index oid and its dependents.
+		wantRunbook(ctx, t, pool, stage00527, "reindex")
+		reindexScopeIndex(ctx, t, pool)
 		if err := store.Migrate(ctx, dsn); err != nil {
-			t.Fatalf("Migrate after rolling 00526 back: %v", err)
+			t.Fatalf("Migrate after REINDEX: %v", err)
 		}
 		if !scalar[bool](ctx, t, pool, `SELECT indisvalid AND indisunique FROM pg_index WHERE indexrelid = 'model_providers_scope_owner_id_key'::regclass`) {
 			t.Errorf("the index is not valid after recovery")

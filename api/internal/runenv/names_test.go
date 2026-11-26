@@ -11,14 +11,21 @@ import (
 
 const nameRulesFixture = "../../../fixtures/run-env/name-rules.json"
 
+type fixtureRule struct {
+	Value     string `json:"value"`
+	Invariant string `json:"invariant"`
+	Note      string `json:"note"`
+}
+
 type nameRulesFile struct {
 	HarnessVersions struct {
 		ClaudeAgentSDK string `json:"claude_agent_sdk"`
 		Codex          string `json:"codex"`
 	} `json:"harness_versions"`
-	DeniedNames    []string `json:"denied_names"`
-	DeniedPrefixes []string `json:"denied_prefixes"`
-	DeniedSuffixes []string `json:"denied_suffixes"`
+	Invariants     []string      `json:"invariants"`
+	DeniedNames    []fixtureRule `json:"denied_names"`
+	DeniedPrefixes []fixtureRule `json:"denied_prefixes"`
+	DeniedSuffixes []fixtureRule `json:"denied_suffixes"`
 	Overlaps       []struct {
 		Name     string `json:"name"`
 		Harness  string `json:"harness"`
@@ -47,15 +54,42 @@ func loadNameRules(t *testing.T) nameRulesFile {
 func TestGoNameRulesEqualSharedFixture(t *testing.T) {
 	fx := loadNameRules(t)
 	for _, c := range []struct {
-		what      string
-		got, want []string
+		what string
+		got  []deniedRule
+		want []fixtureRule
 	}{
 		{"denied names", deniedNames, fx.DeniedNames},
 		{"denied prefixes", deniedPrefixes, fx.DeniedPrefixes},
 		{"denied suffixes", deniedSuffixes, fx.DeniedSuffixes},
 	} {
-		if !slices.Equal(c.got, c.want) {
-			t.Errorf("%s differ from fixtures/run-env/name-rules.json:\n go:      %v\n fixture: %v", c.what, c.got, c.want)
+		if len(c.got) != len(c.want) {
+			t.Errorf("%s: go has %d entries, fixture %d", c.what, len(c.got), len(c.want))
+			continue
+		}
+		for i := range c.got {
+			g := fixtureRule{Value: c.got[i].Value, Invariant: c.got[i].Invariant, Note: c.got[i].Note}
+			if g != c.want[i] {
+				t.Errorf("%s differ from fixtures/run-env/name-rules.json at index %d:\n go:      %+v\n fixture: %+v", c.what, i, g, c.want[i])
+				break
+			}
+		}
+	}
+}
+
+// Every entry names an invariant from the fixture's closed enum and says why.
+func TestFixtureRulesCarryInvariantAndNote(t *testing.T) {
+	fx := loadNameRules(t)
+	if len(fx.Invariants) != 8 {
+		t.Fatalf("invariants = %v, want the eight enum values", fx.Invariants)
+	}
+	for _, list := range [][]fixtureRule{fx.DeniedNames, fx.DeniedPrefixes, fx.DeniedSuffixes} {
+		for _, r := range list {
+			if !slices.Contains(fx.Invariants, r.Invariant) {
+				t.Errorf("%q has invariant %q outside the enum", r.Value, r.Invariant)
+			}
+			if strings.TrimSpace(r.Note) == "" {
+				t.Errorf("%q has no note", r.Value)
+			}
 		}
 	}
 }
@@ -93,7 +127,8 @@ func TestFixtureHarnessVersionsMatchPins(t *testing.T) {
 
 func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 	fx := loadNameRules(t)
-	for _, n := range fx.DeniedNames {
+	for _, r := range fx.DeniedNames {
+		n := r.Value
 		if deniedBy(n) == "" {
 			t.Errorf("denied name %q is not denied by the lists", n)
 		}
@@ -106,13 +141,15 @@ func TestFixtureNamesAreDeniedByTheLists(t *testing.T) {
 			t.Errorf("ValidateName(%q) = %v, want the exact denied-name rule", n, err)
 		}
 	}
-	for _, p := range fx.DeniedPrefixes {
+	for _, r := range fx.DeniedPrefixes {
+		p := r.Value
 		n := p + "SOMETHING"
 		if err := ValidateName(n); err == nil || !strings.Contains(err.Error(), "denied prefix "+p) {
 			t.Errorf("ValidateName(%q) = %v, want the denied prefix %q rule", n, err, p)
 		}
 	}
-	for _, s := range fx.DeniedSuffixes {
+	for _, r := range fx.DeniedSuffixes {
+		s := r.Value
 		n := "SOMETHING" + s
 		if err := ValidateName(n); err == nil {
 			t.Errorf("ValidateName(%q) accepted a name with denied suffix %q", n, s)
@@ -203,9 +240,24 @@ func TestValidateNameTable(t *testing.T) {
 		{"AWS_SECRET_ACCESS_KEY", ""},
 		{"NPM_TOKEN", ""},
 		{"GRADLE_OPTS", ""},
+		{"ANT_OPTS", ""},
+		{"ANT_HOME", ""},
 		{"ORG_GRADLE_PROJECT_X", ""},
 		{"TESTCONTAINERS_HOST_OVERRIDE", ""},
 		{"DOCKER_AUTH_CONFIG", ""},
+		{"NPM_CONFIG_REGISTRY", ""},
+		{"PIP_INDEX_URL", ""},
+		{"MAVEN_OPTS", ""},
+		{"TESTCONTAINERS_X", ""},
+		{"NODE_ENV", ""},
+		{"NODE_AUTH_TOKEN", ""},
+		{"UV_INDEX_URL", ""},
+		{"TZ", ""},
+		{"AWS_REGION", ""},
+		{"GOOGLE_APPLICATION_CREDENTIALS", ""},
+		{"BUN_CONFIG_VERBOSE_FETCH", "denied prefix BUN_"},
+		{"SSLKEYLOGFILE", "SSLKEYLOGFILE is set or reserved"},
+		{"NODE_USE_ENV_PROXY", "NODE_USE_ENV_PROXY is set or reserved"},
 		{"_UNDERSCORE_FIRST", ""},
 		{"A", ""},
 		{strings.Repeat("A", 128), ""},
@@ -229,6 +281,50 @@ func TestValidateNameTable(t *testing.T) {
 		{"MAX_MCP_OUTPUT_TOKENS", "MAX_MCP_OUTPUT_TOKENS is set or reserved"},
 		{"DOCKER_HOST", "DOCKER_HOST is set or reserved"},
 		{"UZI_ANYTHING", "denied prefix UZI_"},
+		{"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "(denied name)"},
+		{"USE_STAGING_OAUTH", "USE_STAGING_OAUTH is set or reserved"},
+		{"USE_LOCAL_OAUTH", "USE_LOCAL_OAUTH is set or reserved"},
+		{"AGENT_PROXY_URL", "AGENT_PROXY_URL is set or reserved"},
+		{"AGENT_PROXY_AUTH_TOKEN", "AGENT_PROXY_AUTH_TOKEN is set or reserved"},
+		{"VITALS_EMITTER_BIN", "VITALS_EMITTER_BIN is set or reserved"},
+		{"ANTHROPIC_CUSTOM_HEADERS", "denied prefix ANTHROPIC_"},
+		{"ANT_OTEL_EXPORTER_OTLP_ENDPOINT", "denied prefix ANT_OTEL_"},
+		{"ANT_CLAUDE_CODE_METRICS_ENDPOINT", "denied prefix ANT_CLAUDE_"},
+		{"OTEL_LOG_USER_PROMPTS", "denied prefix OTEL_LOG_"},
+		{"OTEL_LOG_RAW_API_BODIES", "denied prefix OTEL_LOG_"},
+		{"OTEL_EXPORTER_OTLP_ENDPOINT", "denied prefix OTEL_EXPORTER_OTLP_"},
+		{"OTEL_EXPORTER_OTLP_HEADERS", "denied prefix OTEL_EXPORTER_OTLP_"},
+		{"GCE_METADATA_HOST", "denied prefix GCE_METADATA_"},
+		{"AWS_ENDPOINT_URL_BEDROCK", "denied prefix AWS_ENDPOINT_URL_BEDROCK"},
+		{"AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "denied prefix AWS_ENDPOINT_URL_BEDROCK"},
+		{"NODE", "NODE is set or reserved"},
+		{"NODE_NO_WARNINGS", "NODE_NO_WARNINGS is set or reserved"},
+		{"NODE_SKIP_PLATFORM_CHECK", "NODE_SKIP_PLATFORM_CHECK is set or reserved"},
+		{"NODE_PENDING_PIPE_INSTANCES", "NODE_PENDING_PIPE_INSTANCES is set or reserved"},
+		{"UV_USE_IO_URING", "UV_USE_IO_URING is set or reserved"},
+		{"AWS_EC2_METADATA_SERVICE_ENDPOINT", "AWS_EC2_METADATA_SERVICE_ENDPOINT is set or reserved"},
+		{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL is set or reserved"},
+		{"NODE_ENV", ""},
+		{"NODE_AUTH_TOKEN", ""},
+		{"AWS_ENDPOINT_URL_STS", "AWS_ENDPOINT_URL_STS is set or reserved"},
+		{"AWS_ENDPOINT_URL_SSO", "AWS_ENDPOINT_URL_SSO is set or reserved"},
+		{"AWS_ENDPOINT_URL_SSO_OIDC", "AWS_ENDPOINT_URL_SSO_OIDC is set or reserved"},
+		{"AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE", ""},
+		{"OTEL_SERVICE_NAME", ""},
+		{"OTEL_EXPORTER_PROMETHEUS_PORT", ""},
+		{"LC_ALL", "denied prefix LC_"},
+		{"LC_CTYPE", "denied prefix LC_"},
+		{"CDPATH", "CDPATH is set or reserved"},
+		{"ZDOTDIR", "ZDOTDIR is set or reserved"},
+		{"HISTFILE", "HISTFILE is set or reserved"},
+		{"DEBUG", "DEBUG is set or reserved"},
+		{"DEBUG_SDK", "DEBUG_SDK is set or reserved"},
+		{"DEBUG_CLAUDE_AGENT_SDK", "DEBUG_CLAUDE_AGENT_SDK is set or reserved"},
+		{"ENABLE_PROMPT_CACHING_1H", "ENABLE_PROMPT_CACHING_1H is set or reserved"},
+		{"ENABLE_FEATURE_X", ""},
+		{"CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN is set or reserved"},
+		{"AWS_BEARER_TOKEN_BEDROCK", "AWS_BEARER_TOKEN_BEDROCK is set or reserved"},
+		{"GCM_CREDENTIAL_STORE", "denied prefix GCM_"},
 	}
 	for _, tc := range tests {
 		err := ValidateName(tc.name)

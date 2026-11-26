@@ -160,7 +160,9 @@ describe("Repos environment variables panel", () => {
     expect(within(panel).getByText("Sandbox base URL")).toBeTruthy();
     expect(within(panel).getByText("Pending deletion")).toBeTruthy();
     expect(panel.textContent).toContain("The agent can read every value, secret or not.");
-    expect(panel.textContent).toContain("Variables are not yet injected into runs.");
+    expect(panel.textContent).toContain("Variables are set in the environment of every command a repo’s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge, job and cross-check runs do not receive them.");
+    expect(panel.textContent).toContain("Secret values are redacted from run output and checked before anything is pushed.");
+    expect(panel.textContent).not.toContain("not yet injected");
     expect(panel.textContent).toContain("does not revoke the credential; revoke it at the provider");
   });
 
@@ -429,6 +431,35 @@ describe("Repos environment variables panel", () => {
     fireEvent.change(within(panel).getByLabelText("Value"), { target: { value: "x" } });
     fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
     expect(await within(panel).findByText("value: a secret must be at least 8 characters")).toBeTruthy();
+  });
+
+  it("names the holding runs as links on a 409 env_history_full save", async () => {
+    // PRD #4416 M2: a full secret-version history names the runs holding versions as links.
+    mockApi.putRepoEnv.mockRejectedValue(
+      new ApiError(409, "secret version history is full", { code: "env_history_full", held_by_runs: ["run-a", "run-b"] }),
+    );
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "TOKEN" } });
+    fireEvent.change(within(panel).getByLabelText("Value"), { target: { value: SECRET_VALUE } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    expect(await within(panel).findByText("secret version history is full")).toBeTruthy();
+    expect(within(panel).getByRole("link", { name: "run-a" }).getAttribute("href")).toBe("/runs/run-a");
+    expect(within(panel).getByRole("link", { name: "run-b" }).getAttribute("href")).toBe("/runs/run-b");
+    expect(panel.textContent).toContain("kept while the runs holding them are active, for at least 24 hours after they end, and longer while their retained work is kept. You can still Disable or Delete a variable.");
+    expect(panel.textContent).not.toContain("Finish or cancel them");
+  });
+
+  it("shows no run links when env_history_full names none", async () => {
+    mockApi.putRepoEnv.mockRejectedValue(new ApiError(409, "secret version history is full", { code: "env_history_full" }));
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "TOKEN" } });
+    fireEvent.change(within(panel).getByLabelText("Value"), { target: { value: SECRET_VALUE } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    expect(await within(panel).findByText("secret version history is full")).toBeTruthy();
+    expect(within(panel).queryByRole("link")).toBeNull();
+    expect(panel.textContent).toContain("You can still Disable or Delete a variable");
   });
 
   it("shows the vault-locked message on a 409 vault_locked save", async () => {

@@ -376,7 +376,10 @@ export function selfImproveMrSection(guardHits: readonly string[] | null, checks
   const lines: KindSectionLine[] = [{ fixed: "---" }, { fixed: "### Self-improvement run" }];
 
   const guardWarning = guardCriticalWarningLines(guardHits);
-  if (guardWarning.length > 0) lines.push({ fixed: "" }, ...guardWarning);
+  if (guardWarning.length > 0) {
+    lines.push({ fixed: "" });
+    for (const line of guardWarning) lines.push(line);
+  }
 
   if (checks.length > 0) {
     lines.push({ fixed: "" }, { fixed: "**Test evidence** (run by the worker before the push; the PR's own CI is separate):" }, { fixed: "" });

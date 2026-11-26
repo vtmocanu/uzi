@@ -47,8 +47,9 @@ hits the `.git` deny.
 
 - **Relocate spills into `.uzi/scratch/`.** The CLI builds the spill directory
   only from `CLAUDE_CONFIG_DIR` or `$HOME/.claude` (plus `CLAUDE_CODE_PROJECT_DIR_NAME`
-  only when `CLAUDE_CONFIG_DIR` is set). Setting `CLAUDE_CONFIG_DIR` would move
-  credentials and config into the worktree.
+  only when `CLAUDE_CONFIG_DIR` is set). Pointing `CLAUDE_CONFIG_DIR` into the worktree
+  would move credentials and config there. (The worker does set it, to a directory under
+  HOME, for a different reason; see the Consequences.)
 - **A PostToolUse hook recording `persistedOutputPath`.** It is Bash-only; the
   generic spill path (other tools, MCP) is written after the PostToolUse loop.
 
@@ -61,6 +62,10 @@ hits the `.git` deny.
   already read; under the worker/runner uid split OS permissions remain the boundary.
 - Nested spill subdirectories (for example PDF page extraction `pdf-<id>/`) are
   not readable. This is a limit, not a hole.
-- Transcript paths outside the expected `<HOME>/.claude/projects/<P>/<session_id>.jsonl`
-  layout fail closed. A `CLAUDE_CONFIG_DIR` override that changes that layout
-  receives no allowance. No Unicode normalization policy is enforced.
+- Transcript paths outside the expected layout fail closed. Two lexical forms are accepted:
+  `<HOME>/.claude/projects/<P>/<session_id>.jsonl` and, since the worker starts every Claude
+  CLI with `CLAUDE_CONFIG_DIR=<HOME>/.uzi-claude-config` (PRD #4416), the same path under
+  `<HOME>/.uzi-claude-config/projects`, which is a symlink to `<HOME>/.claude/projects`. The
+  real root stays `realpath(HOME)/.claude/projects`, so a retargeted `projects` link resolves
+  outside it and receives no allowance. Any other `CLAUDE_CONFIG_DIR` layout receives no
+  allowance. No Unicode normalization policy is enforced.

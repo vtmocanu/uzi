@@ -854,10 +854,12 @@ async function classifyScratch(deps: HibernationCensusDeps, dataDir: string, tre
   }
   const census: CensusEntry[] = leaves.map((leaf) => {
     const below = tree.descendants(leaf.rel);
+    let maxCtimeMs = leaf.ctimeMs;
+    for (const n of below) maxCtimeMs = Math.max(maxCtimeMs, n.ctimeMs);
     return {
       name: lastSegment(leaf.rel), type: leaf.type === "dir" ? "dir" : "other", devIno: `0:${leaf.rel}`, uid: leaf.uid,
       fsDiffers: false, foreignUid: below.some(n => n.uid !== leafRoot.uid), bytes: below.reduce((s, n) => s + n.size, leaf.size),
-      sharedBytes: 0, maxCtimeMs: Math.max(leaf.ctimeMs, ...below.map(n => n.ctimeMs)), incomplete: false,
+      sharedBytes: 0, maxCtimeMs, incomplete: false,
     };
   });
   const names = census.map(c => c.name);

@@ -77,7 +77,7 @@ func (h *Handler) SelfCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		accounts = append(accounts, h.codexAccountDTO(
 			row.ProviderAccountID, row.Aliases, row.IsDefault, row.ReauthRequired, row.ReauthReason,
-			row.Buckets, row.LastSuccessAt, row.LastAttemptAt, vaultLocked,
+			row.Buckets, row.LastSuccessAt, row.LastAttemptAt, vaultLocked, time.Now(),
 		))
 	}
 	// A meter reading is per-user private state; never let a shared cache serve one
@@ -128,7 +128,7 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 		grp := &users[len(users)-1]
 		grp.Accounts = append(grp.Accounts, h.codexAccountDTO(
 			row.ProviderAccountID, row.Aliases, row.IsDefault, row.ReauthRequired, row.ReauthReason,
-			row.Buckets, row.LastSuccessAt, row.LastAttemptAt, grp.VaultLocked,
+			row.Buckets, row.LastSuccessAt, row.LastAttemptAt, grp.VaultLocked, time.Now(),
 		))
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
@@ -138,7 +138,7 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 // codexAccountDTO maps one store row's shared fields onto a CodexAccountRateLimitDTO,
 // deriving the status and normalizing the two collection fields to non-nil slices (the
 // contract keeps aliases and buckets PRESENT, never null). Both store reads carry these
-// same fields, so the two handlers share this one builder. reauthReason becomes the DTO's
+// same fields, so the handlers share this one builder; staleness is judged at now. reauthReason becomes the DTO's
 // reason only for the closed-set value, only when the account is flagged reauth_required,
 // and under any derived status except vault_locked (issue #1594). polling_disabled is
 // included so a disabled poller does not hide a provider-rejected login from its owner or
@@ -146,8 +146,8 @@ func (h *Handler) AdminCodexRateLimits(w http.ResponseWriter, r *http.Request) {
 // is unlocking, and after unlock the status becomes credential_action_required and the
 // reason shows. Because polling_disabled outranks vault_locked in codexRateLimitStatus, a
 // locked vault with the poller off still shows the reason.
-func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefault, reauthRequired bool, reauthReason pgtype.Text, buckets []byte, lastSuccessAt, lastAttemptAt pgtype.Timestamptz, vaultLocked bool) apitypes.CodexAccountRateLimitDTO {
-	status := codexRateLimitStatus(h.cfg.CodexUsagePollInterval, vaultLocked, reauthRequired, lastSuccessAt, lastAttemptAt, time.Now())
+func (h *Handler) codexAccountDTO(accountID uuid.UUID, aliases []string, isDefault, reauthRequired bool, reauthReason pgtype.Text, buckets []byte, lastSuccessAt, lastAttemptAt pgtype.Timestamptz, vaultLocked bool, now time.Time) apitypes.CodexAccountRateLimitDTO {
+	status := codexRateLimitStatus(h.cfg.CodexUsagePollInterval, vaultLocked, reauthRequired, lastSuccessAt, lastAttemptAt, now)
 
 	// Aliases and buckets are contract fields with no omitempty, so a nil slice would
 	// serialize as null; force an empty (non-nil) slice instead.

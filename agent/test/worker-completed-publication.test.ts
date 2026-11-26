@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -76,7 +77,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
   await client.claimRun();
   await client.listRecoveryHolds(receipt.run_id);
   const git = { recoveryRoot: path.join(root, "recovery"), pinRecoverySource: async () => {} } as unknown as GitCache;
-  const recovery = new RecoveryCoordinator({ recoveryRoot: git.recoveryRoot, git, client,
+  const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: git.recoveryRoot, git, client,
     workerToken: "completion-worker-fixture", log: nullLogger() });
   const record = await recovery.pin({ runId: receipt.run_id, generation: 1, sourceSha: "b".repeat(40),
     inventoryGuarded: guarded, branch, kind });
@@ -691,7 +692,7 @@ it("persistence failure blocks finalize retirement as well as terminal retiremen
 it("missing key and missing exact generation cannot silently persist or create receipt records", async () => {
   const f = await fixture();
   try {
-    const disabled = new RecoveryCoordinator({ recoveryRoot: f.root, client: f.client, git: {} as GitCache, log: nullLogger() });
+    const disabled = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: f.root, client: f.client, git: {} as GitCache, log: nullLogger() });
     assert.equal(await disabled.persistCompletionReceipt(f.receipt), false);
     assert.equal(await f.recovery.persistCompletionReceipt({ ...f.receipt, generation: 2 }), false);
     assert.equal((await f.recovery.inspect(f.receipt.run_id)).length, 1);

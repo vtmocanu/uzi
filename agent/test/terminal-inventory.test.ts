@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -50,7 +51,7 @@ class Rig {
   constructor() {
     roots.push(this.root);
     this.cache = new GitCache(this.data, nullLogger(), undefined, testGitCacheOptions());
-    this.coordinator = new RecoveryCoordinator({
+    this.coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       recoveryRoot: path.join(this.data, "recovery"), workerToken: "fixture-worker",
       git: this.cache, client: { hasFeature: () => true, getRunOwnership: async () => ({ status: "running", claim_generation: 1, inventory_guarded: true }),
         listRecoveryHolds: async () => ({ run_id: RUN, holds: [{ hold_id: "hold", generation: 1, inventory_guarded: true, has_available_capture: false }] }) } as never, log: nullLogger(),

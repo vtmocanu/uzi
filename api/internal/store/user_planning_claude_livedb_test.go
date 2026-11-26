@@ -11,10 +11,7 @@ import (
 )
 
 func TestPlanningClaudeQueriesLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "planning_claude_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatal(err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "planning_claude_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

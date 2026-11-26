@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 // PRD #1349 M2 / #1531 / #1539 — the REAL Codex pre-settle-reap boundary fixture, shared between
 // runner-recovery-generation.test.ts (the M1/M2 reap-before-report cases) and
 // runner-terminal-journal.test.ts (the M3 permanent-failure end-to-end case). It builds a genuine
@@ -159,7 +160,7 @@ export function makeRecoveryCoordinator(client: RecoveryArchiveClient, git: Reco
   root: string;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m2-recov-"));
-  const coord = new RecoveryCoordinator({
+  const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client,
     git,
     log: nullLogger(),

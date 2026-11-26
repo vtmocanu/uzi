@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 /**
  * #4007 slice B M6-V: the guarded replay of a frozen OPEN held record runs the terminal-preservation operation before
  * any held FINAL can be minted, and only inside the inventory source boundary. Production-dark: every case that turns
@@ -102,7 +103,7 @@ async function rig(opts: { gate: boolean; boundary?: "pass" | "refuse"; heldBind
     commitTreeOid: async (_b: string, sha: string) => sha[0]!.repeat(40),
     worktreeStatus: async () => s.dirty,
   };
-  const make = (gate = opts.gate) => new RecoveryCoordinator({
+  const make = (gate = opts.gate) => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture", log: nullLogger(),
     client: client as never, git: git as never, now: () => 1000,
     ...(gate ? { terminalPreservationTestOverride: {} } : {}),

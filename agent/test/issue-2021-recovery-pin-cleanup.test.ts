@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { makeScratchRoot } from "./fixture-repo.js";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
@@ -60,7 +61,7 @@ let warnings: Array<{ message: string; fields: unknown }>;
 function coord(producer: RecoveryBundleProducer = cache) {
   const log = nullLogger();
   log.warn = (message, fields) => { warnings.push({ message, fields }); };
-  return new RecoveryCoordinator({ client: archive, git: producer, log, recoveryRoot: cache.recoveryRoot,
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git: producer, log, recoveryRoot: cache.recoveryRoot,
     workerToken: TOKEN, now: () => now });
 }
 function file(record: RecoveryRecord) { return path.join(cache.recoveryRoot, RUN, `${record.captureId}.json`); }

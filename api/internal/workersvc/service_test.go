@@ -44,6 +44,8 @@ func (f *fakeStore) LatestRunMilestoneReconciliationSession(context.Context, uui
 }
 
 type fakeStore struct {
+	// runEnv stages the run environment reads and records the finish-time writes (PRD #4416).
+	runEnv fakeRunEnv
 	// pendingRemovals records the pending-only ledger removals (no run created).
 	pendingRemovals    []store.RemoveMRReworkPendingKeysParams
 	pendingRemovalErr  error

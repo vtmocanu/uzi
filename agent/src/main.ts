@@ -796,7 +796,8 @@ async function mainBody(): Promise<void> {
   // executor — so SdkExecutor.spawnedPids and killAgentTree are private to the run,
   // never shared across two concurrent runs (the B1 pre-push reap) — and gets its
   // OWN HOME `agent-home/<runId>` so the SDK's process-global $HOME/.claude state
-  // (history/todos/shell-snapshots/~/.claude.json) can't race or leak between runs.
+  // (history, todos and shell-snapshots live under HOME/.claude; the worker-prepared CLI config dir
+  // is HOME/.uzi-claude-config) can't race or leak between runs.
   // The runner removes it on terminal.
   //
   // This comment used to end "the runId keeps it stable across resume (a requeue keeps

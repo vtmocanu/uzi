@@ -67,6 +67,18 @@ printf '%s\n' "$*" >> "$CALLS"
 case "$*" in
   'pr list '*) cat "$WORK/prs"; exit ;;
   *'/git/ref/heads/main '*) printf '%s\n' "$TIP"; exit ;;
+  *"/actions/runs?branch=main&head_sha=$TIP&per_page=100")
+    mode=${TIP_RUNS:-normal}
+    if [ "$mode" = lost-on-apply ] && grep -q '/actions/runs/102$' "$CALLS"; then
+      mode=cancelled-ci
+    fi
+    jq -c --arg head "$TIP" --arg mode "$mode" '
+      map(select(.head_sha==$head))
+      | if $mode=="no-ci" then map(select(.id!=101))
+        elif $mode=="cancelled-ci" then map(if .id==101 then .status="completed"|.conclusion="cancelled" else . end)
+        else . end
+      | [{total_count:length,workflow_runs:.}]' "$WORK/runs"
+    exit ;;
   *'/actions/runs?status='*)
     endpoint=${!#}
     run_state=${endpoint#*status=}; run_state=${run_state%%&*}
@@ -75,7 +87,9 @@ case "$*" in
       touch "$WORK/torn-once"
       echo '[{"total_count":1,"workflow_runs":[]}]'
     else
-      jq -c --arg run_state "$run_state" 'map(select(.status==$run_state)) | [{total_count:length,workflow_runs:.}]' "$WORK/runs"
+      jq -c --arg run_state "$run_state" --arg mode "${TIP_RUNS:-normal}" '
+        map(select(.status==$run_state and ($mode!="lost-on-apply" or .id==102)))
+        | [{total_count:length,workflow_runs:.}]' "$WORK/runs"
     fi
     exit ;;
   *'/releases/tags/v1.2.3-rc.1') exit 1 ;;
@@ -135,6 +149,18 @@ jq -e '
   and (.next_slot_candidates[-1].blocks==null)
 ' "$WORK/plan" >/dev/null || { cat "$WORK/plan" >&2; exit 1; }
 ! grep -q -- 'force-cancel' "$CALLS"
+
+for mode in no-ci cancelled-ci; do
+  TIP_RUNS=$mode "$lane" plan --json > "$WORK/tip-plan"
+  jq -e '[.runs[] | select(.id==102) | .decision] == ["KEEP"]' "$WORK/tip-plan" >/dev/null ||
+    { echo "FAILED: main CI cancelled with tip fixture $mode" >&2; exit 1; }
+done
+
+: > "$CALLS"
+TIP_RUNS=lost-on-apply "$lane" apply --log "$WORK/lost-replacement" > "$WORK/lost-replacement.out"
+grep -qF 'SKIP run 102: KEEP' "$WORK/lost-replacement.out"
+! grep -q -- 'force-cancel' "$CALLS"
+
 "$lane" plan --evidence "$WORK/evidence" > "$WORK/human"
 grep -Fq 'size: 1/+2; blocks: #4001, #4002' "$WORK/human"
 
@@ -156,4 +182,4 @@ MOVED_ATTEMPT=1 "$lane" apply --evidence "$WORK/evidence" --log "$WORK/verified"
 [ "$(grep -c -- 'force-cancel' "$CALLS")" = 6 ]
 jq -es 'map(.id)==[105,106,110,116,118,122] and all(.[]; .result=="cancelled" and (.at|endswith("Z")))' "$WORK/verified" >/dev/null
 grep -qF 'NOTIFY pr=16 branch=fix/wrong-head run=106 owner=session-one' "$WORK/notify"
-echo 'PASS ci-lane: slot protection, stale runs, read retry, force-cancel verification and attempt change'
+echo 'PASS ci-lane: slot protection, stale runs, main replacements, read retry, force-cancel verification and attempt change'

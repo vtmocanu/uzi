@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -576,7 +577,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, { skip: mode.startsWit
     }
     assert.ok(api.states.some(s => s.body.status === "failed"));
     assert.ok(terminalAcks > 0, "actual FAILED ACK was received before fixture faults");
-    const records = await new RecoveryCoordinator({
+    const records = await new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client, git, log: log.logger, recoveryRoot: git.recoveryRoot, workerToken: "fixture-journal-key",
     }).snapshotBootRecords();
     if (originMode) assert.equal(JSON.stringify(records).includes(".maintenance-transfer-"), false,

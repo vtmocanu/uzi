@@ -2,7 +2,7 @@
 
 **Status**: Done (delivered on branch agent/issue-3875, 2026-11-10). Child of epic #3873. Its blockers have landed: #3878 (the Overview header that hosts the Search button, and the decisions selector) and #3880 (which completes that selector with held-work decisions). Shortcut scope confirmed by the maintainer (Decision Log).
 
-**Design brief**: `prds/3873-overview-redesign.md` (constraints, mock contract). This PRD wins where it is more specific.
+**Design brief**: `prds/done/3873-overview-redesign.md` (constraints, mock contract). This PRD wins where it is more specific.
 
 **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`: press Cmd K or Ctrl K, or click Search in the page header. The brief's mock contract applies: implement the mock, small consistency tweaks are fine, larger deviations go under `Mock deviations` in the PR body with a reason, and the PR carries screenshots.
 
