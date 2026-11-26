@@ -255,9 +255,10 @@ required`. The controller binds its own op through the existing metadata-only
 op-annotation write, preconditioned on the observed UID and resourceVersion, and
 reports `ready` from a fresh observation on a later tick; several waking current
 canaries each bind only their own op. The pool stays held until an operator or a
-later roll resolves the duplicate. The wake waits a tick when any pool entry made
-a roll write that tick (confirmed or not), and a claim mirror on the canary's
-data claim, even a matching one, still holds it. A custody-held canary is allowed.
+later roll resolves the duplicate. The wake is refused on any tick in which a pool
+entry makes a roll write (confirmed or not), so a write that keeps failing keeps it
+waiting, and a claim mirror on the canary's data claim, even a matching one, still
+holds it. A custody-held canary is allowed.
 Duplicate recovery itself is described under
 [Draining and cordoned](#draining-and-cordoned).
 
