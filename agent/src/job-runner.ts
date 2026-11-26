@@ -74,7 +74,7 @@ import {
   writeJobInputs,
   type JobWorkspace,
 } from "./job-workspace.js";
-import { OUTPUT_FILES_MAX, outputDisplayName, resolveOutputFile, uploadJobOutputs, uploadPhaseDeadline, validateOutputFilePaths } from "./job-outputs.js";
+import { OUTPUT_FILES_MAX, outputDisplayName, partitionOutputFiles, resolveOutputFile, uploadJobOutputs, uploadPhaseDeadline, validateOutputFilePaths } from "./job-outputs.js";
 import { classifyLimitFailure, describeLimit, LimitReachedError, RateLimitObserver } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { Outbox } from "./outbox.js";
@@ -89,9 +89,17 @@ import type {
   JobRefusedOutput,
   JobResultRequest,
 } from "./protocol.js";
-import { makeRedactor, makeTextRedactor, providerKeyForms, type TextRedactor } from "./redact.js";
-import { buildSdkEnv } from "./sdk-env.js";
-import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms, redactStrings, type TextRedactor } from "./redact.js";
+import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import {
+  isGatewayLimitStatus,
+  PROVIDER_GATEWAY_LIMIT,
+  PROVIDER_LANE_UNSUPPORTED,
+  ProviderModelUnmappedError,
+  resolveProviderModel,
+  sdkCredentialFromBinding,
+  stripProviderCost,
+} from "./provider-binding.js";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { SdkQueryFn } from "./sdk-executor.js";
@@ -216,44 +224,62 @@ const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
  *  posted body. */
 export function validateJobResult(
   raw: unknown,
-): { ok: true; value: JobResultBody; outputFiles: string[] } | { ok: false; error: string } {
+  /** PRD #4322 M1b: set only on a claim carrying provider key forms. Every model-authored string is
+   *  scrubbed BEFORE it is validated or stored, a `status` the scrub would change is refused with a
+   *  constant message, and `output_files` is partitioned by {@link partitionOutputFiles}. */
+  scrub?: TextRedactor,
+): { ok: true; value: JobResultBody; outputFiles: string[]; keyedOutputs: string[] } | { ok: false; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "the result must be an object" };
   const r = raw as Record<string, unknown>;
   if (typeof r.status !== "string" || !RESULT_STATUS_RE.test(r.status)) {
     return { ok: false, error: "status must match ^[a-z][a-z0-9_-]{0,31}$ (a short lowercase token such as completed)" };
   }
+  if (scrub && scrub(r.status) !== r.status) {
+    return { ok: false, error: "status must be a short lowercase token such as completed; this value was refused" };
+  }
   if (typeof r.report_md !== "string") return { ok: false, error: "report_md must be a string" };
-  if (byteLen(r.report_md) > REPORT_MAX_BYTES) return { ok: false, error: `report_md exceeds ${REPORT_MAX_BYTES} bytes` };
+  const reportMd = scrub ? scrub(r.report_md) : r.report_md;
+  if (byteLen(reportMd) > REPORT_MAX_BYTES) return { ok: false, error: `report_md exceeds ${REPORT_MAX_BYTES} bytes` };
   const rawFindings = r.findings === undefined || r.findings === null ? [] : r.findings;
   if (!Array.isArray(rawFindings)) return { ok: false, error: "findings must be an array" };
   if (rawFindings.length > MAX_FINDINGS) return { ok: false, error: `at most ${MAX_FINDINGS} findings` };
   const findings: JobFindingBody[] = [];
   for (const [i, f] of rawFindings.entries()) {
-    const checked = validateFinding(f);
+    const checked = validateFinding(f, scrub);
     if (!checked.ok) return { ok: false, error: `findings[${i}]: ${checked.error}` };
     findings.push(checked.value);
   }
   // output_files is NOT part of the result the api decodes (it refuses unknown fields): it names
   // the workspace files the runner uploads before the post (job-outputs.ts).
-  const outputFiles = validateOutputFilePaths(r.output_files);
+  let listed: unknown = r.output_files;
+  let keyedOutputs: string[] = [];
+  if (scrub) {
+    const part = partitionOutputFiles(r.output_files, scrub);
+    if (!part.ok) return { ok: false, error: part.error };
+    listed = part.clean;
+    keyedOutputs = part.keyed;
+  }
+  const outputFiles = validateOutputFilePaths(listed);
   if (!outputFiles.ok) return { ok: false, error: outputFiles.error };
-  return { ok: true, value: { status: r.status, report_md: r.report_md, findings }, outputFiles: outputFiles.value };
+  return { ok: true, value: { status: r.status, report_md: reportMd, findings }, outputFiles: outputFiles.value, keyedOutputs };
 }
 
-function validateFinding(raw: unknown): { ok: true; value: JobFindingBody } | { ok: false; error: string } {
+function validateFinding(raw: unknown, scrub?: TextRedactor): { ok: true; value: JobFindingBody } | { ok: false; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "must be an object" };
   const f = raw as Record<string, unknown>;
   if (typeof f.severity !== "string" || !FINDING_SEVERITIES.has(f.severity)) {
     return { ok: false, error: "severity must be one of info|warning|error" };
   }
   if (typeof f.message_md !== "string" || f.message_md.trim() === "") return { ok: false, error: "message_md must be a non-empty string" };
-  if (byteLen(f.message_md) > FINDING_MESSAGE_MAX_BYTES) return { ok: false, error: `message_md exceeds ${FINDING_MESSAGE_MAX_BYTES} bytes` };
-  const url = f.url === null ? undefined : f.url;
-  const file = f.file === null ? undefined : f.file;
+  const message = scrub ? scrub(f.message_md) : f.message_md;
+  if (byteLen(message) > FINDING_MESSAGE_MAX_BYTES) return { ok: false, error: `message_md exceeds ${FINDING_MESSAGE_MAX_BYTES} bytes` };
+  const scrubField = (v: unknown): unknown => (scrub && typeof v === "string" ? scrub(v) : v);
+  const url = f.url === null ? undefined : scrubField(f.url);
+  const file = f.file === null ? undefined : scrubField(f.file);
   const line = f.line === null ? undefined : f.line;
   if (url !== undefined && file !== undefined) return { ok: false, error: "a finding names a url or a file, not both" };
   if (line !== undefined && file === undefined) return { ok: false, error: "line requires file" };
-  const out: JobFindingBody = { severity: f.severity as JobFindingBody["severity"], message_md: f.message_md };
+  const out: JobFindingBody = { severity: f.severity as JobFindingBody["severity"], message_md: message };
   if (url !== undefined) {
     if (typeof url !== "string" || url === "") return { ok: false, error: "url must be a non-empty string" };
     if (byteLen(url) > FINDING_URL_MAX_BYTES) return { ok: false, error: `url exceeds ${FINDING_URL_MAX_BYTES} bytes` };
@@ -302,6 +328,9 @@ interface JobResultStore {
   result?: JobResultBody;
   /** The workspace-relative files the model listed to upload as outputs (PRD #1909 M4). */
   outputFiles?: string[];
+  /** PRD #4322 M1b: listed outputs withheld because their path or name carried provider key
+   *  material. Never opened or uploaded; finish() reports each under its scrubbed display name. */
+  keyedOutputs?: string[];
 }
 
 /** The in-process MCP server carrying `submit_job_result`, bound to one job's result store.
@@ -314,16 +343,22 @@ export function buildJobResultServer(
      *  the model can still fix it. The runner checks again at upload time. */
     workDir?: string;
     secretPaths?: readonly string[];
+    /** PRD #4322 M1b: set only for a claim carrying provider key forms. The result is validated
+     *  with it (validateJobResult), and every diagnostic is scrubbed AFTER it is rendered and BEFORE
+     *  it is length-limited, so no key form reaches the model's tool response. */
+    redactText?: TextRedactor;
   } = {},
 ): {
   server: ReturnType<typeof createSdkMcpServer>;
   toolNames: string[];
   submit: (args: unknown) => { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 } {
+  const scrub = opts.redactText;
+  const render = (text: string): string => (scrub ? scrub(text) : text);
   const submit = (args: unknown): { content: Array<{ type: "text"; text: string }>; isError?: boolean } => {
-    const checked = validateJobResult(args);
+    const checked = validateJobResult(args, scrub);
     if (!checked.ok) {
-      return { isError: true, content: [{ type: "text", text: `Result rejected, nothing was stored: ${checked.error}. Fix it and call ${SUBMIT_TOOL} again.` }] };
+      return { isError: true, content: [{ type: "text", text: render(`Result rejected, nothing was stored: ${checked.error}. Fix it and call ${SUBMIT_TOOL} again.`) }] };
     }
     if (opts.workDir) {
       const problems: string[] = [];
@@ -332,14 +367,17 @@ export function buildJobResultServer(
         if (!r.ok) problems.push(r.error);
       }
       if (problems.length) {
+        // Scrub the RENDERED diagnostic first, then cut it: a cut first could leave a key prefix.
+        const shown = render(problems.join("; ")).slice(0, 1000);
         return {
           isError: true,
-          content: [{ type: "text", text: `Result rejected, nothing was stored: output_files: ${problems.join("; ").slice(0, 1000)}. Fix it and call ${SUBMIT_TOOL} again.` }],
+          content: [{ type: "text", text: `Result rejected, nothing was stored: output_files: ${shown}. Fix it and call ${SUBMIT_TOOL} again.` }],
         };
       }
     }
     store.result = checked.value;
     store.outputFiles = checked.outputFiles;
+    store.keyedOutputs = checked.keyedOutputs;
     const files = checked.outputFiles.length ? ` and ${checked.outputFiles.length} output files` : "";
     return { content: [{ type: "text", text: `Result stored (${checked.value.findings.length} findings${files}). You may finish now.` }] };
   };
@@ -753,19 +791,25 @@ export class JobRunner {
     // moment the grant validates; one list builds the batcher's redactors AND the text redactor
     // finish() and the failure reports use.
     const providerKeys = claim.secrets?.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    const provider = claim.secrets?.provider;
+    // PRD #4322 M1b: every key form is registered with the worker log for the WHOLE claim, before any
+    // report, and removed in the finally below. A refusal, a failure and the terminal outbox replay
+    // are all scrubbed of it.
+    for (const k of providerKeys) this.log.addSecret(k);
     let secrets: Array<string | undefined> = [token, ...providerKeys, this.joinToken];
     let redactText: TextRedactor = makeTextRedactor(secrets);
     let laneCredential: string | undefined;
     try {
-      // PRD #4320: the job lane cannot serve a provider until PRD #4322; the server refuses it first
-      // (a job fails terminally), this is the worker's second layer.
-      if (claim.secrets?.provider) {
-        for (const k of providerKeys) this.log.addSecret(k);
+      // A provider-bound job runs only as an ordinary (non-isolated) Claude job: a site-list job stays
+      // refused until M3 (the lane branch below rebuilds the secrets list), and a non-Claude binding
+      // is not served here. The server refuses both first; this is the worker's second layer. The
+      // reason is the constant, never a value from the claim.
+      if (provider && ((claim.isolated_fetch !== undefined && claim.isolated_fetch !== null) || provider.engine !== "claude")) {
         await this.fail(runId, generation, PROVIDER_LANE_UNSUPPORTED);
         return;
       }
       const job = claim.job;
-      if (!job || !token) {
+      if (!job || (!token && !provider)) {
         await this.fail(runId, generation, !job ? "job claim carried no job block" : "job claim carried no Anthropic credential");
         return;
       }
@@ -776,6 +820,21 @@ export class JobRunner {
         runLog.error("job claim carried no claim generation; the api will refuse the failed report, the server sweep is the backstop");
         await this.fail(runId, generation, "job claim carried no claim generation");
         return;
+      }
+
+      let model = claim.config?.default_model;
+      if (provider) {
+        // The server sends one canonical model (never "inherit"); the bound map resolves it. An
+        // unmapped model is a typed refusal: the constant reason, never the model text.
+        try {
+          model = resolveProviderModel(model, provider.model_map);
+        } catch (err) {
+          if (err instanceof ProviderModelUnmappedError) {
+            await this.fail(runId, generation, err.reason);
+            return;
+          }
+          throw err;
+        }
       }
 
       // Lane mode (PRD #1976): a claim carrying `isolated_fetch` is a profile-bound job. It needs a
@@ -791,7 +850,7 @@ export class JobRunner {
         }
         laneCredential = grant.credential;
         this.log.addSecret(laneCredential);
-        secrets = [token, this.joinToken, laneCredential];
+        secrets = [token, ...providerKeys, this.joinToken, laneCredential];
         redactText = makeTextRedactor(secrets);
       }
 
@@ -898,16 +957,21 @@ export class JobRunner {
             signal: session.signal,
           }).server
         : undefined;
-      const resultTool = buildJobResultServer(store, { workDir: ws.work, secretPaths: this.secretPaths });
+      const resultTool = buildJobResultServer(store, {
+        workDir: ws.work,
+        secretPaths: this.secretPaths,
+        ...(providerKeys.length ? { redactText } : {}),
+      });
+      const credential: SdkCredential = provider ? sdkCredentialFromBinding(provider) : { kind: "oauth", token: token! };
       const options = buildJobSdkOptions({
-        env: (lane ? isolateSdkEnv(buildSdkEnv({ kind: "oauth", token }, ws.home)) : buildSdkEnv({ kind: "oauth", token }, ws.home)) as unknown as Record<string, string | undefined>,
+        env: (lane ? isolateSdkEnv(buildSdkEnv(credential, ws.home)) : buildSdkEnv(credential, ws.home)) as unknown as Record<string, string | undefined>,
         systemPrompt: (lane ? LANE_JOB_SYSTEM_PROMPT : JOB_SYSTEM_PROMPT) + (productSkills ? JOB_SKILLS_PROMPT_SUFFIX : ""),
         workDir: ws.work,
         log: runLog,
         secretPaths: this.secretPaths,
         resultServer: resultTool.server,
         toolNames: resultTool.toolNames,
-        model: claim.config?.default_model,
+        model,
         effort: claim.config?.default_effort,
         ...(productSkills ? { productSkills } : {}),
         ...(lane && fetchServer ? { lane: { ...lane, fetchServer } } : {}),
@@ -925,12 +989,18 @@ export class JobRunner {
         batcher,
         log: runLog,
         transportReason: () => transportReason,
+        redactText,
+        provider: provider !== undefined,
       });
 
       // The session is over: flush the messages (usage frames fold into run_usage) before any report.
       await batcher.close().catch((err) => runLog.warn("job message flush failed", { error: errMessage(err) }));
       const through = batcher.currentSeq();
-      await this.finish(claim, outcome, store, through, runLog, redactText, budgetSeconds, { workDir: ws.work, deadlineAt: uploadPhaseDeadline(startedAt + budgetMs) });
+      await this.finish(claim, outcome, store, through, runLog, redactText, budgetSeconds, {
+        workDir: ws.work,
+        deadlineAt: uploadPhaseDeadline(startedAt + budgetMs),
+        ...(providerKeys.length ? { capture: { root: ws.root, forms: providerKeys } } : {}),
+      });
     } catch (err) {
       if (err instanceof JobAlreadyTerminal) {
         if (batcher) await batcher.close().catch(() => undefined);
@@ -1100,6 +1170,11 @@ export class JobRunner {
     batcher: MessageBatcher;
     log: Logger;
     transportReason: () => string | undefined;
+    /** The claim's text redactor (every secret, provider key forms included). */
+    redactText: TextRedactor;
+    /** A provider-bound claim (PRD #4322 M1b): frames are scrubbed, cost is stripped and a gateway
+     *  429/529 settles as the provider gateway limit. */
+    provider: boolean;
   }): Promise<SessionOutcome> {
     const { runId, generation, session, batcher, log } = args;
     let cancelled = false;
@@ -1140,6 +1215,10 @@ export class JobRunner {
     let resultFrame: unknown;
     let sawResult = false;
     let iterationError: unknown;
+    // Provider path: the settlement facts, read from the RAW frame by its original member names before
+    // the frame is scrubbed (a key colliding with a member name must not turn a limit into a success).
+    // Settlement reads only this record on the provider path, never the scrubbed frame.
+    const facts = { isError: false, status: null as number | null };
     try {
       // issue #2213: the last statement before the credential-bearing provider spawn.
       assertResidueQuarantineOpen("provider_turn");
@@ -1155,18 +1234,26 @@ export class JobRunner {
             break;
           }
         }
+        // The tool policy reads the ORIGINAL frame: scrubbing could rename a tool and flip the decision.
         const extra = args.lane ? [] : disallowedEffectiveTools(msg, { skills: args.skills });
         if (extra.length) {
-          policyReason = `the job session exposed tools outside the job policy: ${extra.join(", ").slice(0, 200)}`;
-          log.error("job effective tool list violates the policy; aborting", { tools: extra });
+          const shown = extra.map(args.redactText);
+          policyReason = `the job session exposed tools outside the job policy: ${shown.join(", ").slice(0, 200)}`;
+          log.error("job effective tool list violates the policy; aborting", { tools: shown });
           session.abort();
           reap();
           break;
         }
-        rateLimits.observe(msg);
-        for (const em of mapSdkMessage(msg) as EmittedMessage[]) batcher.emit(em);
+        if (isResult(msg) && !sawResult) {
+          facts.isError = isErrorResult(msg);
+          const status = (msg as Record<string, unknown>)["api_error_status"];
+          facts.status = typeof status === "number" ? status : null;
+        }
+        const frame = args.provider ? redactStrings(msg, args.redactText) : msg;
+        rateLimits.observe(frame);
+        for (const em of mapSdkMessage(frame) as EmittedMessage[]) batcher.emit(args.provider ? stripProviderCost(em) : em);
         if (isResult(msg)) {
-          resultFrame = msg;
+          resultFrame = frame;
           sawResult = true;
           // End of the session: abort so a lingering background op cannot pin the iterator.
           session.abort();
@@ -1191,7 +1278,14 @@ export class JobRunner {
     if (args.lane && !args.lane.gate.passed) {
       return { kind: "policy", reason: "the isolated job session never reported a verified tool set (no init frame)" };
     }
-    if (sawResult && isErrorResult(resultFrame)) {
+    if (args.provider) {
+      // Provider settlement reads the raw facts only. A gateway 429/529 is the provider gateway limit
+      // (typed, no reset, never classified as a vendor limit); any other error result is a plain error.
+      if (sawResult && facts.isError) {
+        if (isGatewayLimitStatus(facts.status)) return { kind: "limit", error: new LimitReachedError({ rateLimitType: PROVIDER_GATEWAY_LIMIT }) };
+        return { kind: "error", reason: "the job session ended with an error result" };
+      }
+    } else if (sawResult && isErrorResult(resultFrame)) {
       const limit = classifyLimitFailure(resultFrame, rateLimits.latest, Date.now());
       if (limit) return { kind: "limit", error: new LimitReachedError(limit) };
       const subtype = (resultFrame as { subtype?: unknown }).subtype;
@@ -1245,7 +1339,7 @@ export class JobRunner {
     log: Logger,
     redactText: TextRedactor,
     budgetSeconds: number,
-    outputs: { workDir: string; deadlineAt: number },
+    outputs: { workDir: string; deadlineAt: number; capture?: { root: string; forms: readonly string[] } },
   ): Promise<void> {
     const runId = claim.run_id;
     const generation = claim.claim_generation;
@@ -1291,14 +1385,22 @@ export class JobRunner {
     });
     // An output file whose own name carries a secret is never uploaded (its display name rides the
     // upload request and the caller reads it): it is dropped and reported under the scrubbed name.
-    // The CONTENTS of output files are outside this redaction's coverage: keeping the fetch
-    // credential out of the prompt and env does not prove an echoed credential can never reach a file.
+    // The CONTENTS of output files are outside this redaction's coverage, except that a claim carrying
+    // provider key forms stages and scans each file for them (job-outputs.ts captureAndHash): keeping
+    // the fetch credential out of the prompt and env does not prove an echoed credential can never
+    // reach a file.
     const unsafeNames: JobRefusedOutput[] = [];
     const outputFiles = (store.outputFiles ?? []).filter((rel) => {
       if (redactText(rel) === rel && redactText(outputDisplayName(rel)) === outputDisplayName(rel)) return true;
       unsafeNames.push({ display_name: redactText(outputDisplayName(rel)), reason: "worker_unreadable" });
       return false;
     });
+    // PRD #4322 M1b: outputs the result tool withheld because their path or name carried provider key
+    // material (store.keyedOutputs). Never opened and never uploaded; reported once per scrubbed name.
+    for (const rel of store.keyedOutputs ?? []) {
+      const display_name = redactText(outputDisplayName(rel));
+      if (!unsafeNames.some((u) => u.display_name === display_name)) unsafeNames.push({ display_name, reason: "worker_unreadable" });
+    }
     let uploaded: Awaited<ReturnType<typeof uploadJobOutputs>>;
     try {
       uploaded = await uploadJobOutputs({
@@ -1311,6 +1413,7 @@ export class JobRunner {
         outputFiles,
         deadlineAt: outputs.deadlineAt,
         signal: uploadAbort.signal,
+        ...(outputs.capture ? { capture: outputs.capture } : {}),
         ...(this.outputRetryDelaysMs ? { retryDelaysMs: this.outputRetryDelaysMs } : {}),
       });
     } finally {

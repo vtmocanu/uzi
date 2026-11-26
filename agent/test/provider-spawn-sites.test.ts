@@ -438,8 +438,11 @@ describe("JudgeRunner in provider mode (no longer a refused lane)", () => {
 
 describe("lanes the server refuses reject a provider claim with provider_lane_unsupported", () => {
   const secrets = { forge_pat: "", anthropic_oauth_token: "", provider: binding() };
+  // PRD #4322 M1b: an ordinary Claude provider job runs; only a site-list job (isolated_fetch next to
+  // the provider) stays refused until M3.
+  const siteList = { profile: "p", hosts: ["a.example.test"], credential: "fetch-credential-do-not-scan-0001" };
 
-  it("job: fails terminally with the typed reason before any workspace or model work", async () => {
+  it("site-list job: fails terminally with the typed reason before any workspace or model work", async () => {
     const { client, states } = recordingClient();
     let modelCalls = 0;
     const queryFn = (() => { modelCalls++; return (async function* () { /* none */ })(); }) as unknown as SdkQueryFn;
@@ -447,7 +450,7 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     const { logger, added, removed } = secretRecordingLogger();
     await new JobRunner(client, logger, { queryFn, jobsRoot, batchMs: 5, cancelPollMs: 10 }).execute({
       run_id: "job-1", kind: "job", issue_iid: null, issue_title: "", issue_description: "", repo: undefined, secrets: secrets as never, last_seq: 0, agents: [],
-      claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {},
+      claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {}, isolated_fetch: siteList,
     } as unknown as ClaimResponse);
     assert.equal(modelCalls, 0);
     assert.ok(!fs.existsSync(jobsRoot) || fs.readdirSync(jobsRoot).length === 0, "no workspace was created");
@@ -458,14 +461,14 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     assert.ok(removed.includes(KEY), "and evicted again when the job ended");
   });
 
-  it("job: a sibling holder of the same key keeps it scrubbed after the refusal (add/remove are symmetric)", async () => {
+  it("site-list job: a sibling holder of the same key keeps it scrubbed after the refusal (add/remove are symmetric)", async () => {
     const { client } = recordingClient();
     const logger = createLogger("error");
     logger.addSecret(KEY); // a concurrent run on the shared logger holds the same key
     await new JobRunner(client, logger, { queryFn: (() => (async function* () { /* none */ })()) as unknown as SdkQueryFn,
       jobsRoot: path.join(homeDir, "jobs"), batchMs: 5, cancelPollMs: 10 }).execute({
       run_id: "job-2", kind: "job", issue_iid: null, issue_title: "", issue_description: "", repo: undefined, secrets: secrets as never, last_seq: 0, agents: [],
-      claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {},
+      claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {}, isolated_fetch: siteList,
     } as unknown as ClaimResponse);
     assert.ok(!logger.redactDiagnostic!(`leak ${KEY} here`).includes(KEY), "the holder's registration survives the refusal");
     logger.removeSecret(KEY);

@@ -5,7 +5,7 @@ import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "../src/provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "../src/provider-binding.js";
 
 // PRD #4320 / #4505: the pinned Claude CLI follows gateway redirects (see the PRD Decision Log), and
 // that risk was accepted on 2026-11-19 (ADR-4320), so the worker advertises claude_provider_v1 on
@@ -50,6 +50,16 @@ it("the worker advertises claude_provider_judge_v1 on registration", async () =>
     const caps = await registeredCaps(advertise);
     assert.equal(caps.includes(CLAUDE_PROVIDER_JUDGE_CAPABILITY), true);
     assert.equal(caps.includes("claude_provider_judge_v1"), true);
+  }
+});
+
+// PRD #4322 M1b: the Claude provider job path ships in this image; the api places a provider job only
+// on a worker advertising claude_provider_job_v1, with or without the Codex harness.
+it("the worker advertises claude_provider_job_v1 on registration", async () => {
+  for (const advertise of [false, true]) {
+    const caps = await registeredCaps(advertise);
+    assert.equal(caps.includes(CLAUDE_PROVIDER_JOB_CAPABILITY), true);
+    assert.equal(caps.includes("claude_provider_job_v1"), true);
   }
 });
 
