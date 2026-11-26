@@ -305,7 +305,7 @@ minutes (it lists up to 10 workers); see [Admin health](admin-health.md).
 
 Status shows in `uzi worker list` and `uzi admin workers`; see
 [CLI](./cli.md#hibernated-workers). The design is in
-[PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
+[PRD #4205](../prds/done/4205-worker-hibernation-sleep-wake.md).
 
 ### Automatic hibernation
 

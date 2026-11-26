@@ -1,6 +1,6 @@
 # PRD #4205: Worker hibernation: sleep and wake a persistent hosted worker
 
-**Epic**: #4204. **Status**: Implemented (M1, M2); live hosted-k8s acceptance pending. **Blocked by**: none.
+**Epic**: #4204. **Status**: Done (2026-11-26): M1 and M2 shipped in PR #4260; live hosted-k8s acceptance is tracked in #4308. **Blocked by**: none.
 
 ## Problem
 
