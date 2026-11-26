@@ -158,12 +158,15 @@ func (m *Materializer) syncRetainedCodexCARecord(ctx context.Context, ns string,
 // requires a confirmed response before returning the updated pass-local observation.
 //
 // With no own claim observed there is nothing to patch: the carry stays and the ensurePVCs
-// create path stamps the claim. An already stamped claim needs no patch. The snapshot is
-// the roll entry's claim (refreshed by earlier writes this tick) when there is one, else
-// the observation. Any disagreement between the two, a failed precondition, or a patch
-// that is not confirmed clears the carry and returns an error so the pass stops before it
-// touches anything else and the next tick decides from a fresh observation. Nothing here
-// logs more than the worker id and namespace.
+// create path stamps the claim. The same holds when the chosen snapshot and the
+// observation agree the own claim is Terminating: no patch, the carry is kept and the
+// pass continues, so the replacement claim is stamped through the create path. An already
+// stamped claim needs no patch. The snapshot is the roll entry's claim (refreshed by
+// earlier writes this tick) when there is one, else the observation. Any disagreement
+// between the two (a Terminating roll claim against a live observation, or another UID), a
+// failed precondition, or a patch that is not confirmed clears the carry and returns an
+// error so the pass stops before it touches anything else and the next tick decides from
+// a fresh observation. Nothing here logs more than the worker id and namespace.
 func (m *Materializer) stampCodexCAClaim(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) (reconcile.ObservedWorker, error) {
 	own := ownDataClaim(w, obs, ns)
 	if own == nil {
@@ -204,7 +207,13 @@ func (m *Materializer) stampCodexCAClaim(ctx context.Context, w protocol.Desired
 	if stamped {
 		return obs, nil
 	}
-	if uid == "" || rv == "" || terminating {
+	if terminating {
+		// The snapshot and the observation agree the claim is being deleted: like the
+		// no-own-claim case there is nothing to patch, the carry stays and the replacement
+		// claim is stamped by the ensurePVCs create path.
+		return obs, nil
+	}
+	if uid == "" || rv == "" {
 		return unconfirmed()
 	}
 

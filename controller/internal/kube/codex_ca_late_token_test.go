@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -226,8 +227,9 @@ func TestCodexCALateTokenStampThenSamePassRetainedRecycle(t *testing.T) {
 	}
 }
 
-// R4: an earlier step of the tick refreshed the claim (its resourceVersion moved after the
-// observation). The stamp fences on the roll entry's newer claim and succeeds.
+// R4: the claim's resourceVersion moved before the roll snapshot re-listed it, so the roll
+// entry's claim is newer than the observation. The stamp fences on the roll entry's newer
+// claim and succeeds.
 func TestCodexCALateTokenStampUsesTheRollEntrysNewerClaim(t *testing.T) {
 	m, c, workers, _ := matrixFixture(t, 3)
 	m.cfg.UIDSplit, m.cfg.APICAPEM, m.cfg.ExtraCAPEM = true, []byte("api-ca"), []byte("extra-ca-A")
@@ -422,8 +424,9 @@ func TestCodexCAPreexistingSecretOnAnUnstampedClaimIsNotStamped(t *testing.T) {
 	}
 }
 
-// N2: the roll entry's claim is Terminating while the observation says live (same UID, newer
-// resourceVersion): the two disagree, so no patch is sent and the tick reports it.
+// N2 (regression test for the unconfirmed error on disagreement): the roll entry's claim is
+// Terminating while the observation says live (same UID, newer resourceVersion): the two
+// disagree, so no patch is sent, the carry is cleared and the tick reports the error.
 func TestCodexCALateTokenStampRefusesADisagreeingRollClaim(t *testing.T) {
 	m, c, workers, _ := matrixFixture(t, 3)
 	m.cfg.UIDSplit, m.cfg.APICAPEM, m.cfg.ExtraCAPEM = true, []byte("api-ca"), []byte("extra-ca-A")
@@ -453,7 +456,8 @@ func TestCodexCALateTokenStampRefusesADisagreeingRollClaim(t *testing.T) {
 	}
 }
 
-// N3: an observation without a UID or without a resourceVersion cannot be fenced: no patch.
+// N3 (regression test for the unconfirmed error on an unfenced claim): an observation
+// without a UID or without a resourceVersion cannot be fenced: no patch, and the error.
 func TestCodexCALateTokenStampRefusesAnUnfencedObservation(t *testing.T) {
 	for _, field := range []string{"uid", "resourceVersion"} {
 		t.Run(field, func(t *testing.T) {
@@ -489,10 +493,17 @@ func TestCodexCALateTokenStampRefusesAnUnfencedObservation(t *testing.T) {
 }
 
 // The stamp body is exactly the fenced annotation: no labels or other metadata ride along.
+// Operator deployment labels and annotations are configured so a body that carried
+// withOperatorMetadata would fail.
 func TestCodexCALateTokenStampPatchBodyIsMinimal(t *testing.T) {
 	m, c, w := caLateStart(t, true)
+	m.cfg.DeploymentLabels = map[string]string{"team": "platform"}
+	m.cfg.DeploymentAnnotations = map[string]string{"policy.example.com/skip-probes": "true"}
 	c.ClearActions()
 	caMustTick(t, m, w)
+	if n := caStampPatchCount(c, "w1"); n != 1 {
+		t.Fatalf("stamp patches = %d, want exactly 1", n)
+	}
 	for _, a := range c.Actions() {
 		if !caIsStampPatch(a) {
 			continue
@@ -509,5 +520,286 @@ func TestCodexCALateTokenStampPatchBodyIsMinimal(t *testing.T) {
 		if p.GetPatchType() != types.MergePatchType {
 			t.Errorf("patch type = %s", p.GetPatchType())
 		}
+	}
+}
+
+// caStampFx drives stampCodexCAClaim directly: the claims exist unstamped in the fake
+// apiserver, obs is a real observation of them (with DataClaim set to the own claim), the
+// carry is set as a confirmed Secret write would, and e is the roll entry in ctx when one
+// was asked for (its claim is the apiserver's claim at that point).
+type caStampFx struct {
+	m   *Materializer
+	c   *fake.Clientset
+	w   protocol.DesiredWorker
+	ns  string
+	ctx context.Context
+	e   *rollEntry
+	obs reconcile.ObservedWorker
+}
+
+func caStampFixture(t *testing.T, withEntry bool, seed func(*corev1.PersistentVolumeClaim)) *caStampFx {
+	t.Helper()
+	m, c, w := caLateStart(t, true)
+	ns := m.cfg.Namespace
+	if seed != nil {
+		caSetClaim(t, c, ns, dataPVCName("w1"), seed)
+	}
+	obs := caObserve(t, m, "w1")
+	own := obs.DataClaimsByNamespace[ns]
+	cp := own
+	obs.DataClaim = &cp
+	fx := &caStampFx{m: m, c: c, w: w, ns: ns, ctx: context.Background(), obs: obs}
+	if withEntry {
+		fx.e = &rollEntry{claim: caClaim(t, c, ns, dataPVCName("w1"))}
+		fx.ctx = context.WithValue(fx.ctx, rollTickKey{}, &rollTick{entries: map[string]*rollEntry{"w1": fx.e}})
+	}
+	m.setCodexCACarry("w1", ns)
+	c.ClearActions()
+	return fx
+}
+
+func (fx *caStampFx) stamp() (reconcile.ObservedWorker, error) {
+	return fx.m.stampCodexCAClaim(fx.ctx, fx.w, fx.obs, fx.ns)
+}
+
+// caSeedRollAnnotations gives the claim a roll and a placement annotation, so a stamp
+// response that changes them can be told from one that keeps them.
+func caSeedRollAnnotations(p *corev1.PersistentVolumeClaim) {
+	p.Annotations = map[string]string{AnnotationPlacement: placementNew, annotationRoll: "keep-roll"}
+}
+
+// Intent: a Terminating own claim that the snapshot and the observation agree on (no roll
+// entry) needs no patch and no error; the carry is kept, so the pass goes on and the
+// replacement claim is created stamped. Kills "clear the carry or error on an agreed
+// Terminating claim" and "patch anyway".
+func TestCodexCALateTokenStampSkipsAnAgreedTerminatingClaim(t *testing.T) {
+	fx := caStampFixture(t, false, func(p *corev1.PersistentVolumeClaim) {
+		now := metav1.NewTime(m5Now)
+		p.DeletionTimestamp = &now
+	})
+	if !fx.obs.DataClaimsByNamespace[fx.ns].Terminating {
+		t.Fatal("fixture: the observation does not say Terminating")
+	}
+	got, err := fx.stamp()
+	if err != nil {
+		t.Fatalf("stamp error = %v, want none", err)
+	}
+	if n := caStampPatchCount(fx.c, "w1"); n != 0 {
+		t.Errorf("stamp patches = %d, want none", n)
+	}
+	if !fx.m.codexCACarried("w1", fx.ns) {
+		t.Error("the carry was cleared")
+	}
+	if !reflect.DeepEqual(got, fx.obs) {
+		t.Error("the observation changed")
+	}
+}
+
+// Intent: end to end, a Terminating own claim at the token tick does not stop the pass; once
+// it is gone a later tick creates the replacement stamped (through the kept carry) and the
+// env renders.
+func TestCodexCALateTokenTerminatingClaimCarriesToTheStampedReplacement(t *testing.T) {
+	m, c, w := caLateStart(t, true)
+	ns := m.cfg.Namespace
+	caTerminateClaim(t, c, ns, dataPVCName("w1"))
+	c.ClearActions()
+	caMustTick(t, m, w)
+	if n := caStampPatchCount(c, "w1"); n != 0 {
+		t.Fatalf("stamp patches = %d, want none", n)
+	}
+	if !m.codexCACarried("w1", ns) {
+		t.Fatal("the carry was cleared on a Terminating claim")
+	}
+	if err := c.Tracker().Delete(pvcRes, ns, dataPVCName("w1")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && !caHasEnv(caDep(t, c, ns, "w1")); i++ {
+		caMustTick(t, m, w)
+	}
+	if !caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
+		t.Error("the replacement claim is not stamped")
+	}
+	if d := caDep(t, c, ns, "w1"); d == nil || !caHasEnv(d) {
+		t.Errorf("deployment = %v, want the env", d)
+	}
+}
+
+// Intent: the roll entry's UID differs from the observation's: no patch, the unconfirmed
+// error, the carry cleared.
+func TestCodexCALateTokenStampRefusesAUIDDisagreement(t *testing.T) {
+	fx := caStampFixture(t, true, nil)
+	fx.e.claim = fx.e.claim.DeepCopy()
+	fx.e.claim.UID = "another-uid"
+	_, err := fx.stamp()
+	if err == nil || !strings.Contains(err.Error(), "codex CA claim stamp unconfirmed") {
+		t.Fatalf("error = %v, want the unconfirmed stamp error", err)
+	}
+	if n := caStampPatchCount(fx.c, "w1"); n != 0 {
+		t.Errorf("stamp patches = %d, want none", n)
+	}
+	if fx.m.codexCACarried("w1", fx.ns) {
+		t.Error("the carry survived")
+	}
+}
+
+// Intent: the snapshot must be the worker's own claim in ns (namespace and name checked
+// against the call): a snapshot of anything else sends no patch.
+func TestCodexCALateTokenStampRefusesAForeignSnapshot(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry bool
+		edit  func(fx *caStampFx)
+	}{
+		{"observation-namespace", false, func(fx *caStampFx) {
+			own := fx.obs.DataClaimsByNamespace[fx.ns]
+			own.Namespace = "elsewhere"
+			fx.obs.DataClaimsByNamespace = map[string]reconcile.ClaimObservation{fx.ns: own}
+		}},
+		{"roll-claim-namespace", true, func(fx *caStampFx) {
+			fx.e.claim = fx.e.claim.DeepCopy()
+			fx.e.claim.Namespace = "elsewhere"
+		}},
+		{"roll-claim-name", true, func(fx *caStampFx) {
+			fx.e.claim = fx.e.claim.DeepCopy()
+			fx.e.claim.Name = "other-claim"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := caStampFixture(t, tc.entry, nil)
+			tc.edit(fx)
+			if _, err := fx.stamp(); err == nil {
+				t.Error("want the unconfirmed stamp error")
+			}
+			if n := caStampPatchCount(fx.c, "w1"); n != 0 {
+				t.Errorf("stamp patches = %d, want none", n)
+			}
+		})
+	}
+}
+
+// Intent: every response that is not exactly the stamped claim yields the unconfirmed error,
+// clears the carry and leaves the pass-local view untouched. The roll-entry branch (a
+// pooled worker) and the observation branch (no roll entry) each check their own
+// annotations.
+func TestCodexCALateTokenStampUnconfirmedAckVariants(t *testing.T) {
+	type alter = func(p *corev1.PersistentVolumeClaim)
+	cases := []struct {
+		name  string
+		entry bool
+		seed  bool // the claim carries the roll and placement annotations
+		edit  alter
+	}{
+		{"uid-entry", true, false, func(p *corev1.PersistentVolumeClaim) { p.UID = "other" }},
+		{"uid-observation", false, false, func(p *corev1.PersistentVolumeClaim) { p.UID = "other" }},
+		{"deletion-timestamp-entry", true, false, func(p *corev1.PersistentVolumeClaim) {
+			now := metav1.NewTime(m5Now)
+			p.DeletionTimestamp = &now
+		}},
+		{"deletion-timestamp-observation", false, false, func(p *corev1.PersistentVolumeClaim) {
+			now := metav1.NewTime(m5Now)
+			p.DeletionTimestamp = &now
+		}},
+		{"stamp-missing-entry", true, false, func(p *corev1.PersistentVolumeClaim) { delete(p.Annotations, AnnotationCodexExtraCA) }},
+		{"stamp-different-observation", false, false, func(p *corev1.PersistentVolumeClaim) { p.Annotations[AnnotationCodexExtraCA] = "other" }},
+		{"roll-changed-entry", true, true, func(p *corev1.PersistentVolumeClaim) { p.Annotations[annotationRoll] = "changed" }},
+		{"roll-stripped-entry", true, true, func(p *corev1.PersistentVolumeClaim) { delete(p.Annotations, annotationRoll) }},
+		{"placement-changed-entry", true, true, func(p *corev1.PersistentVolumeClaim) { p.Annotations[AnnotationPlacement] = "other" }},
+		{"roll-changed-observation", false, true, func(p *corev1.PersistentVolumeClaim) { p.Annotations[annotationRoll] = "changed" }},
+		{"placement-flipped-observation", false, true, func(p *corev1.PersistentVolumeClaim) { delete(p.Annotations, AnnotationPlacement) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var seed alter
+			if tc.seed {
+				seed = caSeedRollAnnotations
+			}
+			fx := caStampFixture(t, tc.entry, seed)
+			caIntercept(fx.c, "patch", "persistentvolumeclaims", caIsStampPatch, func(next func() (runtime.Object, error)) (runtime.Object, error) {
+				o, err := next()
+				if err != nil {
+					return nil, err
+				}
+				p := o.(*corev1.PersistentVolumeClaim).DeepCopy()
+				if p.Annotations == nil {
+					p.Annotations = map[string]string{}
+				}
+				tc.edit(p)
+				return p, nil
+			})
+			before := fx.e
+			var beforeClaim *corev1.PersistentVolumeClaim
+			if before != nil {
+				beforeClaim = before.claim
+			}
+			got, err := fx.stamp()
+			if err == nil || !strings.Contains(err.Error(), "codex CA claim stamp unconfirmed") {
+				t.Fatalf("error = %v, want the unconfirmed stamp error", err)
+			}
+			if n := caStampPatchCount(fx.c, "w1"); n != 1 {
+				t.Errorf("stamp patches = %d, want the one attempt", n)
+			}
+			if fx.m.codexCACarried("w1", fx.ns) {
+				t.Error("the carry survived")
+			}
+			if !reflect.DeepEqual(got, fx.obs) {
+				t.Error("the observation was updated by an unconfirmed ack")
+			}
+			if fx.e != nil && fx.e.claim != beforeClaim {
+				t.Error("the roll entry's claim was refreshed by an unconfirmed ack")
+			}
+		})
+	}
+}
+
+// Intent: after a confirmed stamp with a roll entry present, the entry's claim is the
+// patched object (new resourceVersion, the stamp) and the entry is marked mutated.
+func TestCodexCALateTokenStampRefreshesTheRollEntryClaim(t *testing.T) {
+	fx := caStampFixture(t, true, caSeedRollAnnotations)
+	oldRV := fx.e.claim.ResourceVersion
+	if _, err := fx.stamp(); err != nil {
+		t.Fatal(err)
+	}
+	stored := caClaim(t, fx.c, fx.ns, dataPVCName("w1"))
+	if fx.e.claim.ResourceVersion == oldRV || fx.e.claim.ResourceVersion != stored.ResourceVersion {
+		t.Errorf("roll claim resourceVersion = %q, want the patched %q (was %q)", fx.e.claim.ResourceVersion, stored.ResourceVersion, oldRV)
+	}
+	if !caStamped(fx.e.claim) || fx.e.claim.Annotations[annotationRoll] != "keep-roll" {
+		t.Errorf("roll claim annotations = %v, want the stamp and the kept roll annotation", fx.e.claim.Annotations)
+	}
+	if !fx.e.mutated {
+		t.Error("the roll entry is not marked mutated")
+	}
+}
+
+// Intent: the returned pass-local view carries the stamp in the namespace map and in the
+// own DataClaim, while the original observation's map and claim stay as they were (no
+// shared-map mutation).
+func TestCodexCALateTokenStampViewIsPassLocal(t *testing.T) {
+	for _, entry := range []bool{false, true} {
+		name := "observation"
+		if entry {
+			name = "roll-entry"
+		}
+		t.Run(name, func(t *testing.T) {
+			fx := caStampFixture(t, entry, nil)
+			orig := fx.obs
+			got, err := fx.stamp()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.DataClaimsByNamespace[fx.ns].CodexExtraCA {
+				t.Error("the returned namespace map is not stamped")
+			}
+			if got.DataClaim == nil || !got.DataClaim.CodexExtraCA {
+				t.Errorf("the returned DataClaim = %v, want stamped", got.DataClaim)
+			}
+			if orig.DataClaimsByNamespace[fx.ns].CodexExtraCA {
+				t.Error("the original observation's map was mutated")
+			}
+			if orig.DataClaim.CodexExtraCA {
+				t.Error("the original observation's DataClaim was mutated")
+			}
+		})
 	}
 }
