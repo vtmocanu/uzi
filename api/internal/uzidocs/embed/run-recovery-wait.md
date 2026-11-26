@@ -833,8 +833,8 @@ they are transient is unproven). The third is GitHub's server error:
 complete banner, the three lines `remote: Internal Server Error`,
 `remote: Request ID <uppercase hex groups joined by colons>` and `remote: Time <UTC timestamp>`, each exactly
 once. An `(Internal Server Error)` line without that banner, a partial or
-repeated banner, a second ref line or any other `remote:` line stays
-permanent, and a banner beside a `(failed)` or
+repeated banner, a second ref line or any other non-empty `remote:` line
+(an empty `remote:` line is ordinary framing) stays permanent, and a banner beside a `(failed)` or
 `(missing necessary objects)` line keeps that push permanent. Each retried refusal is treated as
 transient and the same non-forced push is retried on the same schedule, with
 the full publication proof on every attempt. If it keeps failing, it is
