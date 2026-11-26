@@ -80,6 +80,7 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 	}
 	var passVar, folderVar string
 	var sweeperNewArgs []string
+	sweeperLast := ""
 	waited := map[string]bool{}
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch x := n.(type) {
@@ -106,6 +107,9 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 				return true
 			}
 			if recv.Name == "sweeper" && sel.Sel.Name == "New" {
+				if id, ok := x.Args[len(x.Args)-1].(*ast.Ident); ok {
+					sweeperLast = id.Name
+				}
 				for _, a := range x.Args {
 					if id, ok := a.(*ast.Ident); ok {
 						sweeperNewArgs = append(sweeperNewArgs, id.Name)
@@ -127,6 +131,9 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("the pass returned by wireUsageFolder (%s) is not an argument of sweeper.New (args: %v)", passVar, sweeperNewArgs)
+	}
+	if sweeperLast != passVar {
+		t.Errorf("the usage-fold pass (%s) must be the LAST sweeper.New argument so its slow lanes never delay the liveness passes; last is %q", passVar, sweeperLast)
 	}
 	if !waited[folderVar] {
 		t.Errorf("%s.Wait is never called in main.go: in-flight usage-fold kicks would not be drained at shutdown", folderVar)

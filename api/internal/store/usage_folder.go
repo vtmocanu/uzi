@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -27,6 +29,12 @@ const (
 	// query carries). When it is full of unexpired entries the soonest-to-expire one is
 	// evicted; an evicted run is merely retried earlier than its TTL.
 	usageFolderMaxSkip = 1000
+	// usageFolderMissingWindow is the number of eligible runs one missing-lane query inspects. It
+	// MUST equal the LIMIT literal in ListMissingRunUsageFoldRuns (queries/run_usage_folds.sql):
+	// a window shorter than this means the traversal reached the end.
+	usageFolderMissingWindow int32 = 2000
+	// usageFolderRollbackTimeout bounds the cleanup rollback of a lane query's transaction.
+	usageFolderRollbackTimeout = 2 * time.Second
 )
 
 // UsageFolderDB is what the folder needs from the pool: transactions for the materializer
@@ -45,6 +53,8 @@ type UsageFolderOptions struct {
 	OnFolded func(runID uuid.UUID, n int64, err error)
 	// Now replaces time.Now for the skip TTL and the missing-lane backoff.
 	Now func() time.Time
+	// OnLane is called with "stale" or "missing" as each lane of a Pass starts. Test hook.
+	OnLane func(lane string)
 
 	ParentTimeout  time.Duration // whole-Pass deadline (default 5s)
 	LaneTimeout    time.Duration // per-lane cap, itself bounded by what is left of the parent (2.5s)
@@ -68,7 +78,7 @@ type UsageFolderOptions struct {
 // serialises its own calls.
 type UsageFolder struct {
 	opt UsageFolderOptions
-	q   *Queries
+	db  UsageFolderDB
 	mat chan struct{} // capacity 1: serialises every Materialize call
 
 	baseCtx    context.Context
@@ -86,6 +96,10 @@ type UsageFolder struct {
 	missingCID     uuid.UUID
 	missingFound   bool
 	missingBackoff time.Time
+	// retryStale / retryMissing hold the ids of a batch that failed because the lane deadline
+	// expired. The next Pass retries them run by run, before taking new work (guarded by passMu).
+	retryStale   []uuid.UUID
+	retryMissing []uuid.UUID
 
 	skipMu sync.Mutex
 	skip   map[uuid.UUID]time.Time
@@ -118,10 +132,7 @@ func NewUsageFolder(db UsageFolderDB, opts UsageFolderOptions) *UsageFolder {
 	if opts.MaxKicks <= 0 {
 		opts.MaxKicks = usageFolderMaxKicks
 	}
-	f := &UsageFolder{opt: opts, mat: make(chan struct{}, 1), skip: map[uuid.UUID]time.Time{}}
-	if db != nil {
-		f.q = New(db)
-	}
+	f := &UsageFolder{opt: opts, db: db, mat: make(chan struct{}, 1), skip: map[uuid.UUID]time.Time{}}
 	if opts.Materialize == nil {
 		f.opt.Materialize = func(ctx context.Context, ids []uuid.UUID) (int64, error) {
 			return MaterializeRunUsageFolds(ctx, db, ids)
@@ -147,10 +158,67 @@ func (f *UsageFolder) materialize(ctx context.Context, ids []uuid.UUID) (int64, 
 	select {
 	case f.mat <- struct{}{}:
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, &materializerBusyError{err: ctx.Err()}
 	}
 	defer func() { <-f.mat }()
 	return f.opt.Materialize(ctx, ids)
+}
+
+// materializerBusyError means ctx ended while the call was still waiting for the folder-wide
+// semaphore (a kick held it): the run itself was never attempted, so it must not be skipped.
+type materializerBusyError struct{ err error }
+
+func (e *materializerBusyError) Error() string {
+	return "waiting for the materializer: " + e.err.Error()
+}
+func (e *materializerBusyError) Unwrap() error { return e.err }
+
+// fullBudget reports whether ctx still has at least half a lane budget, i.e. an attempt that
+// runs out of time did so on its own and not because the parent deadline cut the lane short.
+func (f *UsageFolder) fullBudget(ctx context.Context) bool {
+	dl, ok := ctx.Deadline()
+	return !ok || time.Until(dl) >= f.opt.LaneTimeout/2
+}
+
+// readTx runs fn in a short read-only transaction with a server-side statement_timeout of one
+// lane budget. pgx closes the socket when ctx ends without cancelling the backend, so without
+// this bound a slow lane query would keep running on the server after the lane gave up.
+func (f *UsageFolder) readTx(ctx context.Context, fn func(q *Queries) error) error {
+	tx, err := f.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), usageFolderRollbackTimeout)
+		defer rcancel()
+		if rerr := tx.Rollback(rctx); rerr != nil && !errors.Is(rerr, pgx.ErrTxClosed) {
+			slog.Debug("usage fold lane query rollback failed", "error", rerr)
+		}
+	}()
+	ms := f.opt.LaneTimeout.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", ms)); err != nil {
+		return err
+	}
+	return fn(New(tx))
+}
+
+// routineLaneDeadline reports whether err is a lane running out of its budget (the lane
+// context's deadline or the server-side statement_timeout), which is routine under load and
+// retried on the next tick, as opposed to a real failure.
+func routineLaneDeadline(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "57014" && !isCanceledByUser(pgErr)
+}
+
+// isCanceledByUser tells a statement_timeout apart from a cancel request (both are 57014).
+func isCanceledByUser(pgErr *pgconn.PgError) bool {
+	return pgErr.Message == "canceling statement due to user request"
 }
 
 // Notify satisfies workersvc.RunLifecycle. For a terminal status it starts a bounded
@@ -230,10 +298,22 @@ func (f *UsageFolder) Pass(ctx context.Context) (int64, error) {
 
 	var total int64
 	var errs []error
+	// laneErr records a lane's failure. Running out of budget is routine under load: it is
+	// logged at Warn and not reported, so the sweeper does not log an error every tick.
+	laneErr := func(name string, err error) {
+		if routineLaneDeadline(err) {
+			slog.Warn("usage fold lane ran out of budget", "lane", name, "error", err)
+			return
+		}
+		errs = append(errs, fmt.Errorf("usage fold %s lane: %w", name, err))
+	}
 	for _, l := range lanes {
 		if err := pctx.Err(); err != nil {
-			errs = append(errs, fmt.Errorf("usage fold %s lane: %w", l.name, err))
+			laneErr(l.name, err)
 			continue
+		}
+		if h := f.opt.OnLane; h != nil {
+			h(l.name)
 		}
 		// WithTimeout under pctx yields min(what is left of the parent, LaneTimeout).
 		lctx, lcancel := context.WithTimeout(pctx, f.opt.LaneTimeout)
@@ -241,7 +321,7 @@ func (f *UsageFolder) Pass(ctx context.Context) (int64, error) {
 		lcancel()
 		total += n
 		if err != nil {
-			errs = append(errs, fmt.Errorf("usage fold %s lane: %w", l.name, err))
+			laneErr(l.name, err)
 		}
 	}
 	return total, errors.Join(errs...)
@@ -249,11 +329,21 @@ func (f *UsageFolder) Pass(ctx context.Context) (int64, error) {
 
 func (f *UsageFolder) staleLane(ctx context.Context) (int64, error) {
 	limit := f.opt.LaneLimit
-	ids, err := f.q.ListStaleRunUsageFoldRuns(ctx, ListStaleRunUsageFoldRunsParams{
-		After: f.staleCursor, Skip: f.skipList(), Lim: limit,
+	n0, err := f.retryPending(ctx, &f.retryStale)
+	if err != nil {
+		return n0, err
+	}
+	var ids []uuid.UUID
+	err = f.readTx(ctx, func(q *Queries) error {
+		var qerr error
+		ids, qerr = q.ListStaleRunUsageFoldRuns(ctx, ListStaleRunUsageFoldRunsParams{
+			After: f.staleCursor, Skip: f.skipList(), Lim: limit,
+		})
+		return qerr
 	})
 	if err != nil {
-		return 0, err
+		// The cursor stays where it was; the next tick (one sweeper interval away) retries.
+		return n0, err
 	}
 	// Advance even when the fold below fails or times out: the unfolded runs stay stale and
 	// come back on the wrap, so one stuck batch cannot starve the lane.
@@ -262,58 +352,132 @@ func (f *UsageFolder) staleLane(ctx context.Context) (int64, error) {
 	} else {
 		f.staleCursor = ids[len(ids)-1]
 	}
-	return f.fold(ctx, ids)
+	n1, err := f.fold(ctx, ids, &f.retryStale)
+	return n0 + n1, err
 }
 
+// missingLane walks the eligible runs that have no state row, newest first, one window of
+// usageFolderMissingWindow runs per call (see ListMissingRunUsageFoldRuns). A traversal ends
+// when a window is shorter than the full window; it backs off MissingBackoff only when the
+// whole traversal found no candidate. A failed query (including the lane deadline or the
+// server-side statement_timeout) also backs off, so a scan slower than the lane budget is
+// retried every MissingBackoff, not every tick.
 func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 	now := f.opt.Now()
 	if now.Before(f.missingBackoff) {
 		return 0, nil
 	}
 	limit := f.opt.LaneLimit
-	rows, err := f.q.ListMissingRunUsageFoldRuns(ctx, ListMissingRunUsageFoldRunsParams{
-		C:    pgtype.Timestamptz{Time: f.missingC, Valid: true},
-		Cid:  f.missingCID,
-		Skip: f.skipList(),
-		Lim:  limit,
+	n0, err := f.retryPending(ctx, &f.retryMissing)
+	if err != nil {
+		return n0, err
+	}
+	var rows []ListMissingRunUsageFoldRunsRow
+	err = f.readTx(ctx, func(q *Queries) error {
+		var qerr error
+		rows, qerr = q.ListMissingRunUsageFoldRuns(ctx, ListMissingRunUsageFoldRunsParams{
+			C:    pgtype.Timestamptz{Time: f.missingC, Valid: true},
+			Cid:  f.missingCID,
+			Skip: f.skipList(),
+			Lim:  limit,
+		})
+		return qerr
 	})
 	if err != nil {
-		return 0, err
+		f.missingBackoff = now.Add(f.opt.MissingBackoff)
+		return n0, err
 	}
-	ids := make([]uuid.UUID, len(rows))
-	for i, r := range rows {
-		ids[i] = r.ID
+	var ids []uuid.UUID
+	var oldest, end *ListMissingRunUsageFoldRunsRow
+	for i := range rows {
+		r := &rows[i]
+		if r.WindowEnd {
+			end = r
+			continue
+		}
+		ids = append(ids, r.ID)
+		if oldest == nil || r.CreatedAt.Time.Before(oldest.CreatedAt.Time) ||
+			(r.CreatedAt.Time.Equal(oldest.CreatedAt.Time) && r.ID.String() < oldest.ID.String()) {
+			oldest = r
+		}
 	}
-	if len(rows) > 0 {
+	if len(ids) > 0 {
 		f.missingFound = true
-		last := rows[len(rows)-1]
-		f.missingC, f.missingCID = last.CreatedAt.Time, last.ID
 	}
-	if len(rows) < int(limit) {
-		// The traversal reached the end. One that found nothing at all backs off; either way
-		// the next one starts from the newest run again.
+	switch {
+	case len(ids) >= int(limit):
+		// More candidates may remain in this window: continue after the last one taken.
+		f.missingC, f.missingCID = oldest.CreatedAt.Time, oldest.ID
+	case end != nil && end.WindowRows >= usageFolderMissingWindow:
+		// The whole window was scanned; the next one starts after its oldest run.
+		f.missingC, f.missingCID = end.CreatedAt.Time, end.ID
+	default:
+		// A short (or empty) window: the traversal reached the end. One that found nothing at
+		// all backs off; either way the next one starts from the newest run again.
 		if !f.missingFound {
 			f.missingBackoff = now.Add(f.opt.MissingBackoff)
 		}
 		f.missingFound = false
 		f.resetMissingCursor()
 	}
-	return f.fold(ctx, ids)
+	n1, err := f.fold(ctx, ids, &f.retryMissing)
+	return n0 + n1, err
 }
 
-// fold materializes ids as one batch; when the batch fails (and the lane deadline is not the
-// cause) it retries run by run, and a run that fails on its own is skipped for the TTL so one
-// poison run cannot stall the lane. The error is returned only for a failure the lane itself
-// suffers (deadline), never for a run that was individually skipped.
-func (f *UsageFolder) fold(ctx context.Context, ids []uuid.UUID) (int64, error) {
+// retryPending retries, run by run, the ids of a batch that failed on the lane deadline in an
+// earlier tick. Progress persists in *pending: an id leaves it once it folded, or once it was
+// skipped for the TTL because it ran out of time ALONE with a full lane budget. An id that ran
+// out of time with a short budget (or while waiting for the materializer) stays for the next
+// tick, where it goes first.
+func (f *UsageFolder) retryPending(ctx context.Context, pending *[]uuid.UUID) (int64, error) {
+	var total int64
+	for len(*pending) > 0 {
+		id := (*pending)[0]
+		full := f.fullBudget(ctx)
+		n, err := f.materialize(ctx, []uuid.UUID{id})
+		if err == nil {
+			total += n
+			*pending = (*pending)[1:]
+			continue
+		}
+		if ctx.Err() != nil {
+			var busy *materializerBusyError
+			if full && !errors.As(err, &busy) {
+				f.skipRun(id, err)
+				*pending = (*pending)[1:]
+			}
+			return total, fmt.Errorf("retry of a deadline-failed batch: %w", err)
+		}
+		f.skipRun(id, err)
+		*pending = (*pending)[1:]
+	}
+	return total, nil
+}
+
+// fold materializes ids as one batch. When the batch fails on its own it retries run by run, and
+// a run that fails on its own is skipped for the TTL so one poison run cannot stall the lane.
+// When the batch fails because the lane deadline expired, the ids are remembered in *retry and
+// retried run by run first on the next tick, so a run whose fold outlasts the lane budget cannot
+// block its neighbours forever; a run that times out alone is skipped. The error is returned only
+// for a failure the lane itself suffers (deadline), never for a run that was individually skipped.
+func (f *UsageFolder) fold(ctx context.Context, ids []uuid.UUID, retry *[]uuid.UUID) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	full := f.fullBudget(ctx)
 	n, err := f.materialize(ctx, ids)
 	if err == nil {
 		return n, nil
 	}
 	if cerr := ctx.Err(); cerr != nil {
+		var busy *materializerBusyError
+		if len(ids) == 1 {
+			if full && !errors.As(err, &busy) {
+				f.skipRun(ids[0], err)
+			}
+		} else {
+			*retry = append([]uuid.UUID(nil), ids...)
+		}
 		return 0, fmt.Errorf("batch of %d: %w", len(ids), err)
 	}
 	if len(ids) == 1 {
@@ -322,13 +486,15 @@ func (f *UsageFolder) fold(ctx context.Context, ids []uuid.UUID) (int64, error) 
 	}
 	slog.Warn("usage fold batch failed, retrying run by run", "runs", len(ids), "error", err)
 	var total int64
-	for _, id := range ids {
+	for i, id := range ids {
 		n1, err1 := f.materialize(ctx, []uuid.UUID{id})
 		if err1 == nil {
 			total += n1
 			continue
 		}
 		if cerr := ctx.Err(); cerr != nil {
+			// Out of time part way: the rest, this run included, go first on the next tick.
+			*retry = append([]uuid.UUID(nil), ids[i:]...)
 			return total, fmt.Errorf("run-by-run retry: %w", err1)
 		}
 		f.skipRun(id, err1)

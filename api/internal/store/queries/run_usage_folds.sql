@@ -24,19 +24,26 @@ LIMIT @lim::int;
 
 -- name: ListMissingRunUsageFoldRuns :many
 -- Missing lane: eligible runs with no state row, newest first, by a keyset cursor over
--- (created_at DESC, id DESC): the next page is the rows strictly before (@c, @cid). runs has no
--- plain created_at index, so each call is a filtered scan plus top-N sort of the eligible set;
--- the folder bounds that with the lane deadline and a 5 minute backoff after an empty
--- traversal.
-SELECT r.id, r.created_at FROM runs r
-WHERE (r.created_at, r.id) < (@c::timestamptz, @cid::uuid)
-  AND NOT (r.id = ANY(@skip::uuid[]))
-  AND r.status IN ('completed', 'failed', 'cancelled')
-  AND r.kind <> 'chat'
-  AND r.usage_refolded
-  AND NOT EXISTS (SELECT 1 FROM run_usage_fold_state s WHERE s.run_id = r.id)
-ORDER BY r.created_at DESC, r.id DESC
-LIMIT @lim::int;
+-- (created_at DESC, id DESC): the next page is the rows strictly before (@c, @cid). The query
+-- looks at one WINDOW of the 2000 eligible runs after the cursor (an index range scan of
+-- idx_runs_usage_fold_missing, migration 00544) and returns up to @lim candidates from it
+-- (window_end = false), plus one extra row (window_end = true) that is the OLDEST run of the
+-- window and carries the window's size in window_rows. The folder moves its cursor to the last
+-- candidate when @lim came back, else to the window_end row, and a window smaller than 2000
+-- means the traversal reached the end. The 2000 MUST stay a SQL literal: as a parameter the
+-- generic plan flips to a sequential scan (TestUsageFolderMissingQueryPlanLiveDB pins it).
+WITH w AS MATERIALIZED (
+  SELECT r.id, r.created_at FROM runs r
+  WHERE (r.created_at, r.id) < (@c::timestamptz, @cid::uuid)
+    AND r.status IN ('completed', 'failed', 'cancelled') AND r.kind <> 'chat' AND r.usage_refolded
+  ORDER BY r.created_at DESC, r.id DESC LIMIT 2000)
+(SELECT w.id, w.created_at, false AS window_end, 0::int AS window_rows FROM w
+   WHERE NOT (w.id = ANY(@skip::uuid[]))
+     AND NOT EXISTS (SELECT 1 FROM run_usage_fold_state s WHERE s.run_id = w.id)
+   ORDER BY w.created_at DESC, w.id DESC LIMIT @lim::int)
+UNION ALL
+(SELECT w.id, w.created_at, true, (SELECT count(*) FROM w)::int FROM w
+   ORDER BY w.created_at, w.id LIMIT 1);
 
 -- name: LockRunForUsageRefold :one
 -- First statement of RefoldRunUsage's transaction: takes the runs row FOR UPDATE (not FOR NO
