@@ -802,14 +802,14 @@ func newCjFix(t *testing.T) *cjFix {
 	c.provider, c.key = seedCodexProviderKeyFor(t, env, userID)
 	c.selectSource(c.provider)
 	t.Cleanup(func() {
-		_, _ = env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id = NULL WHERE id = $1`, userID)
+		_, _ = env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, userID)
 	})
 	return c
 }
 
 func (c *cjFix) selectSource(provider uuid.UUID) {
 	c.t.Helper()
-	c.env.exec(`UPDATE users SET codex_provider_id = $2 WHERE id = $1`, c.userID, provider)
+	c.env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = (SELECT scope_owner_id FROM model_providers WHERE id = $2) WHERE id = $1`, c.userID, provider)
 }
 
 // seedCodexProviderWithMap seeds a Codex provider (revision 1) with the given model map and an
@@ -910,7 +910,7 @@ func TestCodexProviderJudgeCreateLiveDB(t *testing.T) {
 	})
 	t.Run("unset source is the vendor codex judge", func(t *testing.T) {
 		c := newCjFix(t)
-		c.env.exec(`UPDATE users SET codex_provider_id = NULL WHERE id = $1`, c.userID)
+		c.env.exec(`UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, c.userID)
 		target := c.newTarget("codex")
 		c.auto(target)
 		r := c.mustJudge(target)

@@ -384,9 +384,9 @@ func newPJCFix(t *testing.T) *pjcFix {
 		t.Fatalf("insert codex key: %v", err)
 	}
 	c.cProvider, c.cKey = prov.ID, key.ID
-	p.env.exec(`UPDATE users SET codex_provider_id = $2, judge_runs_on = 'codex' WHERE id = $1`, p.userID, c.cProvider)
+	p.env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = (SELECT scope_owner_id FROM model_providers WHERE id = $2), judge_runs_on = 'codex' WHERE id = $1`, p.userID, c.cProvider)
 	t.Cleanup(func() {
-		_, _ = p.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id = NULL WHERE id = $1`, p.userID)
+		_, _ = p.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, p.userID)
 	})
 	p.setCaps(pjCodexJudgeCaps())
 	return c
