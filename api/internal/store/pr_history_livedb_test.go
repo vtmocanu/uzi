@@ -342,8 +342,17 @@ func TestPRHistoryBasicsLiveDB(t *testing.T) {
 					t.Fatalf("round %d observer %d: rows=%d err=%v", round, i, rows[i], errs[i])
 				}
 			}
-			if hs := fx.heads(round); len(hs) != 1 {
+			hs := fx.heads(round)
+			if len(hs) != 1 {
 				t.Fatalf("round %d: %d heads, want 1", round, len(hs))
+			}
+			// The head keeps the newest observation whichever writer won the insert.
+			wantObs := obsA
+			if obsB.After(wantObs) {
+				wantObs = obsB
+			}
+			if hs[0].State != "merged" || !hs[0].ObservedAt.Equal(wantObs) {
+				t.Fatalf("round %d: head = %+v, want merged observed at %s", round, hs[0], wantObs)
 			}
 			var firstMerge int
 			if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM pr_history_events WHERE repo_id=$1 AND mr_iid=$2 AND first_merge`,
@@ -353,8 +362,13 @@ func TestPRHistoryBasicsLiveDB(t *testing.T) {
 			if firstMerge != 1 {
 				t.Fatalf("round %d: %d first_merge events, want 1", round, firstMerge)
 			}
-			if es := fx.events(round); len(es) != 1 {
+			es := fx.events(round)
+			if len(es) != 1 {
 				t.Fatalf("round %d: %d events, want 1: %+v", round, len(es), es)
+			}
+			// The event's observed_at depends on which writer inserted first, so it is not pinned.
+			if e := es[0]; e.From != nil || e.To != "merged" || e.TimeSource != "observation_fallback" || !e.Bootstrap || !e.FirstMerge {
+				t.Fatalf("round %d: event = %+v, want nil -> merged, observation_fallback, bootstrap, first_merge", round, e)
 			}
 			fx.assertMRState(a, "merged")
 			fx.assertMRState(b, "merged")
