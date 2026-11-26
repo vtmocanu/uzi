@@ -431,8 +431,10 @@ timeout around the history-start query, bounds computed in UTC rather than the
 caller's zone, the Flow statement and decoding; 20 requests per workload on a
 warm pooled connection with the default pgx statement cache) measured the same
 on that seed, with no timeouts. The baseline phase had already run through the
-same pool, so the prepared statements were warm and their plan choice settled;
-any generic plan in use was whatever Postgres auto mode chose. It excludes HTTP,
+same pool, so the Flow statement was already prepared and its plan choice
+settled; the cheaper history-start query had run fewer than five times, so its
+plan could still switch inside the sample. Any generic plan in use was whatever
+Postgres auto mode chose. It excludes HTTP,
 auth middleware, admission, in-snapshot authorization (tz-name check, user
 lookup for an admin `user=<uuid>`, repo checks), the DTO mapping, JSON encoding
 and the network. Medians in ms: owner `30d`

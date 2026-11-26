@@ -511,8 +511,10 @@ const flRequestPhase = "request-path"
 
 // requestPhase times flowRequest per workload on the pool with pgx's default statement cache.
 // The requests run on a warm pooled connection: by default the baseline phase has already run
-// through the same pool and statement cache, so the prepared statements exist and their plan
-// choice is settled (workloads that share a statement share one prepared statement). No
+// through the same pool and statement cache, so the Flow statement is already prepared and its
+// plan choice settled (workloads that share a statement share one prepared statement). The
+// history-start statements ran fewer than five times there, so their plan may still switch
+// inside the sample. No
 // plan_cache_mode is forced, so any generic plan in use is whatever Postgres auto mode chose.
 // Each workload runs max(UZI_EVIDENCE_RUNS, 12) requests. A 57014 or any other timeout is a
 // test failure; the sample is kept either way.
