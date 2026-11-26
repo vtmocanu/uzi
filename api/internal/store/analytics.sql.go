@@ -12,6 +12,460 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const analyticsAllFlow = `-- name: AnalyticsAllFlow :one
+WITH
+prm AS (SELECT $3::timestamptz AS now_ts),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest($4::timestamptz[]), unnest($5::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+scoped AS MATERIALIZED (
+    SELECT r.id, r.kind, r.status, r.created_at, r.finished_at, r.status_since, r.first_started_at,
+           r.auto_approve, (r.plan_md IS NOT NULL) AS has_plan, r.plan_source, r.gate_revision,
+           r.repo_id, r.mr_iid,
+           (r.created_at >= $6::timestamptz AND r.created_at < $3::timestamptz) AS in_cohort
+    FROM runs r
+    WHERE r.kind = ANY($1::text[])
+      AND ($7::uuid IS NULL OR r.repo_id = $7::uuid)
+      AND ($8::text IS NULL OR r.harness = $8::text)
+      AND ((r.created_at >= $6::timestamptz AND r.created_at < $3::timestamptz)
+           OR r.status IN ('queued', 'awaiting_approval', 'awaiting_input', 'awaiting_followup', 'paused', 'limit_wait', 'pool_wait', 'recovery_wait')
+           OR (r.status IN ('completed', 'failed', 'cancelled')
+               AND COALESCE(r.finished_at, r.status_since) >= $6::timestamptz
+               AND COALESCE(r.finished_at, r.status_since) < $3::timestamptz))
+),
+cc AS MATERIALIZED (
+    SELECT c.id, c.kind, c.status, c.created_at, c.finished_at, c.status_since, c.first_started_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision, c.repo_id, c.mr_iid, c.in_cohort, c.wb,
+           CASE WHEN c.wb >= 1 AND c.created_at < ($5::timestamptz[])[c.wb] THEN c.wb END AS bidx
+    FROM (SELECT s.id, s.kind, s.status, s.created_at, s.finished_at, s.status_since, s.first_started_at, s.auto_approve, s.has_plan, s.plan_source, s.gate_revision, s.repo_id, s.mr_iid, s.in_cohort, width_bucket(s.created_at, $4::timestamptz[]) AS wb FROM scoped s WHERE s.in_cohort) c
+),
+fin AS MATERIALIZED (
+    SELECT c.id, o.outcome,
+           CASE WHEN c.wb >= 1 AND c.end_at < ($5::timestamptz[])[c.wb] THEN c.wb END AS bidx
+    FROM (SELECT s.id, COALESCE(s.finished_at, s.status_since) AS end_at,
+                 width_bucket(COALESCE(s.finished_at, s.status_since), $4::timestamptz[]) AS wb
+          FROM scoped s
+          WHERE s.status IN ('completed', 'failed', 'cancelled')
+            AND COALESCE(s.finished_at, s.status_since) >= $6::timestamptz
+            AND COALESCE(s.finished_at, s.status_since) < $3::timestamptz) c
+    JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
+    WHERE o.outcome IS NOT NULL
+),
+merged_witness AS MATERIALIZED (
+    SELECT DISTINCT w.repo_id, w.mr_iid
+    FROM runs w
+    WHERE w.mr_state = 'merged' AND w.mr_iid IS NOT NULL AND w.repo_id IS NOT NULL
+),
+wstates AS (
+    SELECT t.s AS state, t.ord::int AS ord
+    FROM unnest(ARRAY['queued', 'awaiting_approval', 'awaiting_input', 'awaiting_followup', 'paused', 'limit_wait', 'pool_wait', 'recovery_wait']::text[]) WITH ORDINALITY AS t(s, ord)
+),
+waiting AS (
+    SELECT w.ord, w.state, count(c.id) AS n, min(c.status_since) AS oldest
+    FROM wstates w
+    LEFT JOIN scoped c ON c.status = w.state
+    GROUP BY w.ord, w.state
+),
+created_cells AS (
+    SELECT bk.idx, count(c.id) AS n
+    FROM bk LEFT JOIN cc c ON c.bidx = bk.idx
+    GROUP BY bk.idx
+),
+fin_cells AS (
+    SELECT bk.idx,
+           count(f.id) FILTER (WHERE f.outcome = 'completed') AS completed,
+           count(f.id) FILTER (WHERE f.outcome = 'cancelled') AS cancelled,
+           count(f.id) FILTER (WHERE f.outcome = 'plan_rejected') AS plan_rejected,
+           count(f.id) FILTER (WHERE f.outcome = 'base_diverged') AS base_diverged,
+           count(f.id) FILTER (WHERE f.outcome = 'failed') AS failed,
+           count(f.id) AS total
+    FROM bk LEFT JOIN fin f ON f.bidx = bk.idx
+    GROUP BY bk.idx
+),
+fin_total AS (
+    SELECT jsonb_build_object(
+               'completed', count(*) FILTER (WHERE f.outcome = 'completed'),
+               'cancelled', count(*) FILTER (WHERE f.outcome = 'cancelled'),
+               'plan_rejected', count(*) FILTER (WHERE f.outcome = 'plan_rejected'),
+               'base_diverged', count(*) FILTER (WHERE f.outcome = 'base_diverged'),
+               'failed', count(*) FILTER (WHERE f.outcome = 'failed'),
+               'total', count(*)) AS j
+    FROM fin f
+),
+start_delay AS (
+    SELECT count(*) FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at >= c.created_at) AS observed,
+           count(*) FILTER (WHERE c.first_started_at IS NULL) AS not_started,
+           count(*) FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at < c.created_at) AS invalid,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (c.first_started_at - c.created_at)))
+               FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at >= c.created_at) AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (c.first_started_at - c.created_at)))
+               FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at >= c.created_at) AS p90
+    FROM cc c
+),
+gate_runs AS MATERIALIZED (
+    -- Chat runs never publish a plan gate, so they are not probed for receipts.
+    SELECT c.id, c.gate_revision FROM cc c WHERE c.kind <> 'chat'
+),
+rcpt AS MATERIALIZED (
+    SELECT g.id AS run_id, g.gate_revision AS run_rev, i.gate_binding, i.gate_revision AS rev,
+           i.created_at AS in_at, i.applied_at, i.disposition
+    FROM gate_runs g
+    JOIN LATERAL (
+        SELECT x.gate_binding, x.gate_revision, x.created_at, x.applied_at, x.disposition
+        FROM run_user_inputs x
+        WHERE x.run_id = g.id AND x.kind = 'approve_plan'
+        OFFSET 0
+    ) i ON true
+),
+rcpt_c AS MATERIALIZED (
+    SELECT r.run_id, r.run_rev, r.gate_binding, r.rev, r.in_at, r.applied_at, r.disposition,
+           COALESCE(r.gate_binding = 'bound' AND r.rev > 0 AND r.applied_at IS NOT NULL, false) AS applied_bound,
+           (r.disposition IS NULL OR r.disposition = 'applied') AS disp_ok,
+           COALESCE(r.in_at <= r.applied_at, false) AS chron_ok
+    FROM rcpt r
+),
+rcpt_pair AS (
+    SELECT x.run_id, x.rev,
+           count(*) FILTER (WHERE x.disp_ok AND x.chron_ok) AS n_elig,
+           count(*) FILTER (WHERE x.disp_ok AND x.chron_ok AND x.disposition = 'applied') AS n_elig_applied,
+           count(*) FILTER (WHERE x.disp_ok AND NOT x.chron_ok) AS n_chron,
+           count(*) FILTER (WHERE NOT x.disp_ok) AS n_excl,
+           min(x.in_at) FILTER (WHERE x.disp_ok AND x.chron_ok) AS in_at
+    FROM rcpt_c x
+    WHERE x.applied_bound
+    GROUP BY x.run_id, x.rev
+),
+pres AS MATERIALIZED (
+    SELECT g.id AS run_id, p.revision AS rev, p.created_at AS pres_at
+    FROM gate_runs g
+    JOIN LATERAL (
+        SELECT x.revision, x.created_at
+        FROM run_gate_presentations x
+        WHERE x.run_id = g.id
+        OFFSET 0
+    ) p ON true
+),
+pair_class AS (
+    SELECT q.run_id, q.rev, q.pres_at, q.n_elig, q.n_elig_applied, q.n_chron, q.n_excl, q.in_at,
+           CASE WHEN q.n_elig > 1 THEN 'ambiguous'
+                WHEN q.n_elig = 1 AND q.n_elig_applied = 1 THEN 'reconciliation_only'
+                WHEN q.n_elig = 1 AND q.pres_at IS NULL THEN 'no_presentation'
+                WHEN q.n_elig = 1 AND q.pres_at > q.in_at THEN 'invalid_chronology'
+                WHEN q.n_elig = 1 THEN 'timed'
+                WHEN q.n_chron > 0 THEN 'invalid_chronology'
+                WHEN q.n_excl > 0 THEN 'excluded_disposition'
+                ELSE 'not_approved' END AS cls
+    FROM (SELECT COALESCE(p.run_id, a.run_id) AS run_id, COALESCE(p.rev, a.rev) AS rev, p.pres_at,
+                 COALESCE(a.n_elig, 0) AS n_elig, COALESCE(a.n_elig_applied, 0) AS n_elig_applied,
+                 COALESCE(a.n_chron, 0) AS n_chron, COALESCE(a.n_excl, 0) AS n_excl, a.in_at
+          FROM pres p
+          FULL OUTER JOIN rcpt_pair a ON a.run_id = p.run_id AND a.rev = p.rev) q
+),
+plan_resp AS (
+    SELECT count(*) FILTER (WHERE pc.cls = 'timed') AS n,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (pc.in_at - pc.pres_at))) FILTER (WHERE pc.cls = 'timed') AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (pc.in_at - pc.pres_at))) FILTER (WHERE pc.cls = 'timed') AS p90,
+           count(*) FILTER (WHERE pc.cls = 'ambiguous') AS ambiguous,
+           count(*) FILTER (WHERE pc.cls = 'no_presentation') AS no_presentation,
+           count(*) FILTER (WHERE pc.cls = 'invalid_chronology') AS invalid_chronology,
+           count(*) FILTER (WHERE pc.cls = 'excluded_disposition') AS excluded_disposition,
+           count(*) FILTER (WHERE pc.cls = 'reconciliation_only') AS reconciliation_only,
+           count(*) FILTER (WHERE pc.cls = 'not_approved') AS not_approved
+    FROM pair_class pc
+),
+plan_legacy AS (
+    SELECT count(*) AS n FROM (SELECT x.run_id FROM rcpt_c x GROUP BY x.run_id HAVING bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')) l
+),
+run_ev AS (
+    SELECT x.run_id,
+           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev = x.run_rev) AS cur_n,
+           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev < x.run_rev) AS hist_n,
+           bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound') AS legacy,
+           count(*) AS any_receipt
+    FROM rcpt_c x
+    GROUP BY x.run_id
+),
+fr AS MATERIALIZED (
+    SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
+           c.repo_id, c.mr_iid, c.bidx, o.outcome,
+           COALESCE(e.cur_n, 0) AS cur_n, COALESCE(e.hist_n, 0) AS hist_n,
+           COALESCE(e.legacy, false) AS legacy, COALESCE(e.any_receipt, 0) AS any_receipt,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL) AS pr_present,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL
+                AND (c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)) AS witnessed
+    FROM cc c
+    LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
+    LEFT JOIN run_ev e ON e.run_id = c.id
+    WHERE c.kind IN ('issue', 'self_improve')
+),
+fr_class AS (
+    SELECT f.id, f.kind, f.status, f.created_at, f.auto_approve, f.has_plan, f.plan_source, f.gate_revision, f.repo_id, f.mr_iid, f.bidx, f.outcome, f.cur_n, f.hist_n, f.legacy, f.any_receipt, f.pr_present, f.witnessed,
+           CASE WHEN f.outcome = 'plan_rejected' THEN 'rejected'
+                WHEN f.cur_n = 1 THEN 'settled_human'
+                WHEN f.auto_approve AND f.gate_revision = 0 AND f.has_plan AND f.plan_source <> 'seeded' THEN 'settled_auto'
+                WHEN f.plan_source = 'seeded' AND f.gate_revision = 0 THEN 'skipped'
+                WHEN f.status NOT IN ('completed', 'failed', 'cancelled') THEN 'in_progress'
+                WHEN f.status = 'failed' THEN 'failed'
+                WHEN f.status = 'cancelled' THEN 'cancelled'
+                ELSE 'unknown' END AS planning,
+           (f.gate_revision > 0 OR f.auto_approve OR f.any_receipt > 0) AS in_plan_cohort,
+           CASE WHEN f.cur_n = 1 THEN 'human'
+                WHEN f.auto_approve THEN 'auto_approve_configured'
+                WHEN f.cur_n > 1 THEN 'ambiguous'
+                WHEN f.legacy THEN 'legacy_unbound'
+                WHEN f.hist_n > 0 THEN 'historical_approval_only'
+                ELSE 'no_evidence' END AS approval
+    FROM fr f
+),
+pr_units AS (
+    SELECT DISTINCT ON (f.repo_id, f.mr_iid) f.repo_id, f.mr_iid, f.bidx, f.witnessed
+    FROM fr f
+    WHERE f.pr_present
+    ORDER BY f.repo_id, f.mr_iid, f.created_at, f.id
+),
+pr_cells AS (
+    SELECT bk.idx, count(u.mr_iid) AS present, count(u.mr_iid) FILTER (WHERE u.witnessed) AS merged
+    FROM bk LEFT JOIN pr_units u ON u.bidx = bk.idx
+    GROUP BY bk.idx
+),
+funnel_applicable AS (
+    SELECT EXISTS (SELECT 1 FROM unnest($1::text[]) k WHERE k IN ('issue', 'self_improve')) AS ok
+),
+funnel AS (
+    SELECT count(*) AS created,
+           count(*) FILTER (WHERE f.planning IN ('settled_human', 'settled_auto')) AS plan_settled,
+           count(*) FILTER (WHERE f.outcome = 'completed') AS completed,
+           count(*) FILTER (WHERE f.pr_present) AS pr_present,
+           count(*) FILTER (WHERE f.witnessed) AS merged,
+           count(*) FILTER (WHERE f.planning = 'settled_human') AS p_human,
+           count(*) FILTER (WHERE f.planning = 'settled_auto') AS p_auto,
+           count(*) FILTER (WHERE f.planning = 'skipped') AS p_skipped,
+           count(*) FILTER (WHERE f.planning = 'rejected') AS p_rejected,
+           count(*) FILTER (WHERE f.planning = 'in_progress') AS p_in_progress,
+           count(*) FILTER (WHERE f.planning = 'failed') AS p_failed,
+           count(*) FILTER (WHERE f.planning = 'cancelled') AS p_cancelled,
+           count(*) FILTER (WHERE f.planning = 'unknown') AS p_unknown,
+           count(*) FILTER (WHERE f.outcome = 'failed') AS o_failed,
+           count(*) FILTER (WHERE f.outcome = 'cancelled') AS o_cancelled,
+           count(*) FILTER (WHERE f.outcome = 'plan_rejected') AS o_plan_rejected,
+           count(*) FILTER (WHERE f.outcome = 'base_diverged') AS o_base_diverged,
+           count(*) FILTER (WHERE f.outcome IS NULL) AS o_in_progress,
+           count(*) FILTER (WHERE f.cur_n = 0 AND f.hist_n > 0) AS d_historical,
+           count(*) FILTER (WHERE f.cur_n > 1) AS d_ambiguous,
+           count(*) FILTER (WHERE f.legacy) AS d_legacy,
+           count(*) FILTER (WHERE f.in_plan_cohort) AS a_total,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'human') AS a_human,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'auto_approve_configured') AS a_auto,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval NOT IN ('human', 'auto_approve_configured')) AS a_unknown,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'ambiguous') AS a_ambiguous,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'legacy_unbound') AS a_legacy,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'historical_approval_only') AS a_historical,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'no_evidence') AS a_none
+    FROM fr_class f
+),
+pr_unit_totals AS (
+    SELECT count(*) AS present, count(*) FILTER (WHERE u.witnessed) AS merged FROM pr_units u
+),
+el AS MATERIALIZED (
+    SELECT t.id, t.bidx, t.terminal,
+           CASE WHEN t.terminal AND t.first_started_at IS NOT NULL
+                     AND COALESCE(t.finished_at, t.status_since) >= t.first_started_at
+                THEN extract(epoch FROM (COALESCE(t.finished_at, t.status_since) - t.first_started_at))::float8 END AS dur
+    FROM (SELECT c.id, c.bidx, c.first_started_at, c.finished_at, c.status_since,
+                 (c.status IN ('completed', 'failed', 'cancelled')) AS terminal
+          FROM cc c WHERE c.kind = 'issue') t
+),
+el_cells AS (
+    SELECT bk.idx,
+           count(e.dur) AS n,
+           count(e.id) FILTER (WHERE NOT e.terminal) AS unfinished,
+           count(e.id) FILTER (WHERE e.terminal AND e.dur IS NULL) AS invalid,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY e.dur) AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY e.dur) AS p90
+    FROM bk LEFT JOIN el e ON e.bidx = bk.idx
+    GROUP BY bk.idx
+),
+el_total AS (
+    SELECT count(e.dur) AS n,
+           count(e.id) FILTER (WHERE NOT e.terminal) AS unfinished,
+           count(e.id) FILTER (WHERE e.terminal AND e.dur IS NULL) AS invalid,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY e.dur) AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY e.dur) AS p90
+    FROM el e
+),
+hist_edges AS (
+    SELECT t.e AS lower_s, t.ord::int AS ord, lead(t.e) OVER (ORDER BY t.ord) AS upper_s
+    FROM unnest($9::float8[]) WITH ORDINALITY AS t(e, ord)
+),
+hist AS (
+    SELECT h.ord, h.lower_s, h.upper_s, count(e.dur) AS n
+    FROM hist_edges h
+    LEFT JOIN el e ON e.dur IS NOT NULL AND GREATEST(width_bucket(e.dur, $9::float8[]), 1) = h.ord
+    GROUP BY h.ord, h.lower_s, h.upper_s
+)
+SELECT jsonb_build_object(
+    'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
+    'waiting_now', jsonb_build_object(
+        'time_basis', 'now',
+        'population', 'current_runs',
+        'states', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                'state', w.state,
+                'count', w.n,
+                'oldest_status_since', to_char(w.oldest AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                'oldest_age_seconds', CASE WHEN w.oldest IS NULL THEN NULL
+                                           ELSE GREATEST(extract(epoch FROM ((SELECT p.now_ts FROM prm p) - w.oldest)), 0)::float8 END)
+                ORDER BY w.ord)
+            FROM waiting w), '[]'::jsonb),
+        'total', (SELECT COALESCE(sum(w.n), 0)::bigint FROM waiting w)),
+    'activity', jsonb_build_object(
+        'created', jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window',
+            'total', (SELECT count(*) FROM cc),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1, 'count', c.n) ORDER BY c.idx) FROM created_cells c), '[]'::jsonb)),
+        'finished', jsonb_build_object(
+            'time_basis', 'finished_at',
+            'population', 'finished_in_window',
+            'excluded_kinds', jsonb_build_array('chat'),
+            'total', (SELECT j FROM fin_total),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                    'index', c.idx - 1, 'completed', c.completed, 'cancelled', c.cancelled,
+                    'plan_rejected', c.plan_rejected, 'base_diverged', c.base_diverged,
+                    'failed', c.failed, 'total', c.total) ORDER BY c.idx) FROM fin_cells c), '[]'::jsonb))),
+    'first_start_delay', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window',
+            'approximate', true,
+            'limitations', jsonb_build_array('first_started_at_legacy_backfill'),
+            'observed', d.observed,
+            'not_started', d.not_started,
+            'invalid', d.invalid,
+            'p50_seconds', jsonb_build_object('value', d.p50, 'reason', CASE WHEN d.observed = 0 THEN 'no_observations' END),
+            'p90_seconds', jsonb_build_object('value', d.p90, 'reason', CASE WHEN d.observed = 0 THEN 'no_observations' END))
+        FROM start_delay d),
+    'plan_response', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_gate_pairs',
+            'approximate', true,
+            'n', p.n,
+            'p50_seconds', jsonb_build_object('value', p.p50, 'reason', CASE WHEN p.n = 0 THEN 'no_observations' END),
+            'p90_seconds', jsonb_build_object('value', p.p90, 'reason', CASE WHEN p.n = 0 THEN 'no_observations' END),
+            'unknown', jsonb_build_object(
+                'total', p.ambiguous + p.no_presentation + p.invalid_chronology + p.excluded_disposition + p.reconciliation_only + (SELECT l.n FROM plan_legacy l),
+                'reasons', jsonb_build_object(
+                    'ambiguous', p.ambiguous,
+                    'no_presentation', p.no_presentation,
+                    'invalid_chronology', p.invalid_chronology,
+                    'excluded_disposition', p.excluded_disposition,
+                    'reconciliation_only', p.reconciliation_only,
+                    'legacy_unbound', (SELECT l.n FROM plan_legacy l))),
+            'not_approved', p.not_approved)
+        FROM plan_resp p),
+    'delivery_funnel', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_delivery_kinds',
+            'applicable', a.ok,
+            'reason', CASE WHEN a.ok THEN NULL ELSE 'not_applicable' END,
+            'stages', jsonb_build_object('created', f.created, 'plan_settled', f.plan_settled, 'completed', f.completed,
+                                         'pr_present', f.pr_present, 'merged', f.merged),
+            'planning', jsonb_build_object('settled_human', f.p_human, 'settled_auto', f.p_auto, 'skipped', f.p_skipped,
+                                           'rejected', f.p_rejected, 'in_progress', f.p_in_progress, 'failed', f.p_failed,
+                                           'cancelled', f.p_cancelled, 'unknown', f.p_unknown),
+            'outcomes', jsonb_build_object('completed', f.completed, 'failed', f.o_failed, 'cancelled', f.o_cancelled,
+                                           'plan_rejected', f.o_plan_rejected, 'base_diverged', f.o_base_diverged,
+                                           'in_progress', f.o_in_progress),
+            'disclosure', jsonb_build_object('historical_approval_only', f.d_historical, 'ambiguous_current', f.d_ambiguous,
+                                             'legacy_evidence', f.d_legacy),
+            'pr_units', jsonb_build_object(
+                'present', (SELECT t.present FROM pr_unit_totals t),
+                'merged', (SELECT t.merged FROM pr_unit_totals t),
+                'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1, 'present', c.present, 'merged', c.merged) ORDER BY c.idx) FROM pr_cells c), '[]'::jsonb)))
+        FROM funnel f, funnel_applicable a),
+    'approval', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_plan_cohort',
+            'applicable', a.ok,
+            'reason', CASE WHEN a.ok THEN NULL ELSE 'not_applicable' END,
+            'total', f.a_total,
+            'human', f.a_human,
+            'auto_approve_configured', f.a_auto,
+            'unknown', jsonb_build_object(
+                'total', f.a_unknown,
+                'reasons', jsonb_build_object('ambiguous', f.a_ambiguous, 'legacy_unbound', f.a_legacy,
+                                              'historical_approval_only', f.a_historical, 'no_evidence', f.a_none)))
+        FROM funnel f, funnel_applicable a),
+    'issue_elapsed', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_issue_runs',
+            'applicable', (SELECT 'issue' = ANY($1::text[])),
+            'reason', CASE WHEN 'issue' = ANY($1::text[]) THEN NULL ELSE 'not_applicable' END,
+            'n', t.n,
+            'unfinished', t.unfinished,
+            'invalid', t.invalid,
+            'incomplete', t.unfinished > 0,
+            'p50_seconds', jsonb_build_object('value', t.p50, 'reason', CASE WHEN t.n = 0 THEN 'no_observations' END),
+            'p90_seconds', jsonb_build_object('value', t.p90, 'reason', CASE WHEN t.n = 0 THEN 'no_observations' END),
+            'histogram', COALESCE((SELECT jsonb_agg(jsonb_build_object('lower_seconds', h.lower_s, 'upper_seconds', h.upper_s, 'count', h.n) ORDER BY h.ord) FROM hist h), '[]'::jsonb),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                    'index', c.idx - 1, 'n', c.n, 'unfinished', c.unfinished, 'invalid', c.invalid,
+                    'incomplete', c.unfinished > 0,
+                    'p50_seconds', jsonb_build_object(
+                        'value', CASE WHEN c.n >= $2::int THEN c.p50 END,
+                        'reason', CASE WHEN c.n = 0 THEN 'no_observations' WHEN c.n < $2::int THEN 'insufficient_observations' END),
+                    'p90_seconds', jsonb_build_object(
+                        'value', CASE WHEN c.n >= $2::int THEN c.p90 END,
+                        'reason', CASE WHEN c.n = 0 THEN 'no_observations' WHEN c.n < $2::int THEN 'insufficient_observations' END))
+                    ORDER BY c.idx) FROM el_cells c), '[]'::jsonb))
+        FROM el_total t)
+)::jsonb AS doc
+`
+
+type AnalyticsAllFlowParams struct {
+	Kinds          []string             `json:"kinds"`
+	MinPercentileN int32                `json:"min_percentile_n"`
+	Now            pgtype.Timestamptz   `json:"now"`
+	BucketStarts   []pgtype.Timestamptz `json:"bucket_starts"`
+	BucketEnds     []pgtype.Timestamptz `json:"bucket_ends"`
+	From           pgtype.Timestamptz   `json:"from"`
+	RepoID         pgtype.UUID          `json:"repo_id"`
+	Harness        pgtype.Text          `json:"harness"`
+	HistogramEdges []float64            `json:"histogram_edges"`
+}
+
+// Issue #4729: the Flow document, one jsonb value built over ONE materialized scoped set.
+// The owner and all-scope statements are kept textually identical except the scope lines, each
+// tagged with a trailing marker comment (a Go test drops them and fails on any other drift).
+// Every range comes from the parameters (half-open: start <= ts < end); there is no calendar
+// arithmetic or clock read here. Timestamps are UTC strings so the document does not depend on
+// the session TimeZone. The document names no repo id or path, so repo masking is vacuous.
+// Populations (each measure names its own): waiting = current status; created = created_at in
+// [from, now); finished = COALESCE(finished_at, status_since) in [from, now), independent of
+// created_at; every other block is the created_at cohort.
+// Approval evidence is one receipt per run_user_inputs row fetched through a per-run lookup on
+// idx_run_user_inputs_run_id; it never scans run_user_inputs globally and never reads the run message log.
+func (q *Queries) AnalyticsAllFlow(ctx context.Context, arg AnalyticsAllFlowParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, analyticsAllFlow,
+		arg.Kinds,
+		arg.MinPercentileN,
+		arg.Now,
+		arg.BucketStarts,
+		arg.BucketEnds,
+		arg.From,
+		arg.RepoID,
+		arg.Harness,
+		arg.HistogramEdges,
+	)
+	var doc []byte
+	err := row.Scan(&doc)
+	return doc, err
+}
+
 const analyticsAllHistoryStart = `-- name: AnalyticsAllHistoryStart :one
 SELECT MIN(r.created_at)::timestamptz AS history_start
 FROM runs r
@@ -603,6 +1057,464 @@ func (q *Queries) AnalyticsAllSpend(ctx context.Context, arg AnalyticsAllSpendPa
 		arg.Harness,
 		arg.Kinds,
 		arg.DeliveryKinds,
+	)
+	var doc []byte
+	err := row.Scan(&doc)
+	return doc, err
+}
+
+const analyticsOwnerFlow = `-- name: AnalyticsOwnerFlow :one
+WITH
+prm AS (SELECT $3::timestamptz AS now_ts),
+bk AS (
+    SELECT t.ord::int AS idx, t.s AS b_start, t.e AS b_end
+    FROM ROWS FROM (unnest($4::timestamptz[]), unnest($5::timestamptz[])) WITH ORDINALITY AS t(s, e, ord)
+),
+scoped AS MATERIALIZED (
+    SELECT r.id, r.kind, r.status, r.created_at, r.finished_at, r.status_since, r.first_started_at,
+           r.auto_approve, (r.plan_md IS NOT NULL) AS has_plan, r.plan_source, r.gate_revision,
+           r.repo_id, r.mr_iid,
+           (r.created_at >= $6::timestamptz AND r.created_at < $3::timestamptz) AS in_cohort
+    FROM runs r
+    WHERE r.kind = ANY($1::text[])
+      AND r.user_id = $7::uuid  -- owner-only
+      AND ($8::uuid IS NULL OR r.repo_id = $8::uuid)
+      AND ($9::text IS NULL OR r.harness = $9::text)
+      AND ((r.created_at >= $6::timestamptz AND r.created_at < $3::timestamptz)
+           OR r.status IN ('queued', 'awaiting_approval', 'awaiting_input', 'awaiting_followup', 'paused', 'limit_wait', 'pool_wait', 'recovery_wait')
+           OR (r.status IN ('completed', 'failed', 'cancelled')
+               AND COALESCE(r.finished_at, r.status_since) >= $6::timestamptz
+               AND COALESCE(r.finished_at, r.status_since) < $3::timestamptz))
+),
+cc AS MATERIALIZED (
+    SELECT c.id, c.kind, c.status, c.created_at, c.finished_at, c.status_since, c.first_started_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision, c.repo_id, c.mr_iid, c.in_cohort, c.wb,
+           CASE WHEN c.wb >= 1 AND c.created_at < ($5::timestamptz[])[c.wb] THEN c.wb END AS bidx
+    FROM (SELECT s.id, s.kind, s.status, s.created_at, s.finished_at, s.status_since, s.first_started_at, s.auto_approve, s.has_plan, s.plan_source, s.gate_revision, s.repo_id, s.mr_iid, s.in_cohort, width_bucket(s.created_at, $4::timestamptz[]) AS wb FROM scoped s WHERE s.in_cohort) c
+),
+fin AS MATERIALIZED (
+    SELECT c.id, o.outcome,
+           CASE WHEN c.wb >= 1 AND c.end_at < ($5::timestamptz[])[c.wb] THEN c.wb END AS bidx
+    FROM (SELECT s.id, COALESCE(s.finished_at, s.status_since) AS end_at,
+                 width_bucket(COALESCE(s.finished_at, s.status_since), $4::timestamptz[]) AS wb
+          FROM scoped s
+          WHERE s.status IN ('completed', 'failed', 'cancelled')
+            AND COALESCE(s.finished_at, s.status_since) >= $6::timestamptz
+            AND COALESCE(s.finished_at, s.status_since) < $3::timestamptz) c
+    JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
+    WHERE o.outcome IS NOT NULL
+),
+merged_witness AS MATERIALIZED (
+    SELECT DISTINCT w.repo_id, w.mr_iid
+    FROM runs w
+    WHERE w.mr_state = 'merged' AND w.mr_iid IS NOT NULL AND w.repo_id IS NOT NULL
+      AND w.user_id = $7::uuid  -- owner-only
+),
+wstates AS (
+    SELECT t.s AS state, t.ord::int AS ord
+    FROM unnest(ARRAY['queued', 'awaiting_approval', 'awaiting_input', 'awaiting_followup', 'paused', 'limit_wait', 'pool_wait', 'recovery_wait']::text[]) WITH ORDINALITY AS t(s, ord)
+),
+waiting AS (
+    SELECT w.ord, w.state, count(c.id) AS n, min(c.status_since) AS oldest
+    FROM wstates w
+    LEFT JOIN scoped c ON c.status = w.state
+    GROUP BY w.ord, w.state
+),
+created_cells AS (
+    SELECT bk.idx, count(c.id) AS n
+    FROM bk LEFT JOIN cc c ON c.bidx = bk.idx
+    GROUP BY bk.idx
+),
+fin_cells AS (
+    SELECT bk.idx,
+           count(f.id) FILTER (WHERE f.outcome = 'completed') AS completed,
+           count(f.id) FILTER (WHERE f.outcome = 'cancelled') AS cancelled,
+           count(f.id) FILTER (WHERE f.outcome = 'plan_rejected') AS plan_rejected,
+           count(f.id) FILTER (WHERE f.outcome = 'base_diverged') AS base_diverged,
+           count(f.id) FILTER (WHERE f.outcome = 'failed') AS failed,
+           count(f.id) AS total
+    FROM bk LEFT JOIN fin f ON f.bidx = bk.idx
+    GROUP BY bk.idx
+),
+fin_total AS (
+    SELECT jsonb_build_object(
+               'completed', count(*) FILTER (WHERE f.outcome = 'completed'),
+               'cancelled', count(*) FILTER (WHERE f.outcome = 'cancelled'),
+               'plan_rejected', count(*) FILTER (WHERE f.outcome = 'plan_rejected'),
+               'base_diverged', count(*) FILTER (WHERE f.outcome = 'base_diverged'),
+               'failed', count(*) FILTER (WHERE f.outcome = 'failed'),
+               'total', count(*)) AS j
+    FROM fin f
+),
+start_delay AS (
+    SELECT count(*) FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at >= c.created_at) AS observed,
+           count(*) FILTER (WHERE c.first_started_at IS NULL) AS not_started,
+           count(*) FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at < c.created_at) AS invalid,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (c.first_started_at - c.created_at)))
+               FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at >= c.created_at) AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (c.first_started_at - c.created_at)))
+               FILTER (WHERE c.first_started_at IS NOT NULL AND c.first_started_at >= c.created_at) AS p90
+    FROM cc c
+),
+gate_runs AS MATERIALIZED (
+    -- Chat runs never publish a plan gate, so they are not probed for receipts.
+    SELECT c.id, c.gate_revision FROM cc c WHERE c.kind <> 'chat'
+),
+rcpt AS MATERIALIZED (
+    SELECT g.id AS run_id, g.gate_revision AS run_rev, i.gate_binding, i.gate_revision AS rev,
+           i.created_at AS in_at, i.applied_at, i.disposition
+    FROM gate_runs g
+    JOIN LATERAL (
+        SELECT x.gate_binding, x.gate_revision, x.created_at, x.applied_at, x.disposition
+        FROM run_user_inputs x
+        WHERE x.run_id = g.id AND x.kind = 'approve_plan'
+        OFFSET 0
+    ) i ON true
+),
+rcpt_c AS MATERIALIZED (
+    SELECT r.run_id, r.run_rev, r.gate_binding, r.rev, r.in_at, r.applied_at, r.disposition,
+           COALESCE(r.gate_binding = 'bound' AND r.rev > 0 AND r.applied_at IS NOT NULL, false) AS applied_bound,
+           (r.disposition IS NULL OR r.disposition = 'applied') AS disp_ok,
+           COALESCE(r.in_at <= r.applied_at, false) AS chron_ok
+    FROM rcpt r
+),
+rcpt_pair AS (
+    SELECT x.run_id, x.rev,
+           count(*) FILTER (WHERE x.disp_ok AND x.chron_ok) AS n_elig,
+           count(*) FILTER (WHERE x.disp_ok AND x.chron_ok AND x.disposition = 'applied') AS n_elig_applied,
+           count(*) FILTER (WHERE x.disp_ok AND NOT x.chron_ok) AS n_chron,
+           count(*) FILTER (WHERE NOT x.disp_ok) AS n_excl,
+           min(x.in_at) FILTER (WHERE x.disp_ok AND x.chron_ok) AS in_at
+    FROM rcpt_c x
+    WHERE x.applied_bound
+    GROUP BY x.run_id, x.rev
+),
+pres AS MATERIALIZED (
+    SELECT g.id AS run_id, p.revision AS rev, p.created_at AS pres_at
+    FROM gate_runs g
+    JOIN LATERAL (
+        SELECT x.revision, x.created_at
+        FROM run_gate_presentations x
+        WHERE x.run_id = g.id
+        OFFSET 0
+    ) p ON true
+),
+pair_class AS (
+    SELECT q.run_id, q.rev, q.pres_at, q.n_elig, q.n_elig_applied, q.n_chron, q.n_excl, q.in_at,
+           CASE WHEN q.n_elig > 1 THEN 'ambiguous'
+                WHEN q.n_elig = 1 AND q.n_elig_applied = 1 THEN 'reconciliation_only'
+                WHEN q.n_elig = 1 AND q.pres_at IS NULL THEN 'no_presentation'
+                WHEN q.n_elig = 1 AND q.pres_at > q.in_at THEN 'invalid_chronology'
+                WHEN q.n_elig = 1 THEN 'timed'
+                WHEN q.n_chron > 0 THEN 'invalid_chronology'
+                WHEN q.n_excl > 0 THEN 'excluded_disposition'
+                ELSE 'not_approved' END AS cls
+    FROM (SELECT COALESCE(p.run_id, a.run_id) AS run_id, COALESCE(p.rev, a.rev) AS rev, p.pres_at,
+                 COALESCE(a.n_elig, 0) AS n_elig, COALESCE(a.n_elig_applied, 0) AS n_elig_applied,
+                 COALESCE(a.n_chron, 0) AS n_chron, COALESCE(a.n_excl, 0) AS n_excl, a.in_at
+          FROM pres p
+          FULL OUTER JOIN rcpt_pair a ON a.run_id = p.run_id AND a.rev = p.rev) q
+),
+plan_resp AS (
+    SELECT count(*) FILTER (WHERE pc.cls = 'timed') AS n,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM (pc.in_at - pc.pres_at))) FILTER (WHERE pc.cls = 'timed') AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM (pc.in_at - pc.pres_at))) FILTER (WHERE pc.cls = 'timed') AS p90,
+           count(*) FILTER (WHERE pc.cls = 'ambiguous') AS ambiguous,
+           count(*) FILTER (WHERE pc.cls = 'no_presentation') AS no_presentation,
+           count(*) FILTER (WHERE pc.cls = 'invalid_chronology') AS invalid_chronology,
+           count(*) FILTER (WHERE pc.cls = 'excluded_disposition') AS excluded_disposition,
+           count(*) FILTER (WHERE pc.cls = 'reconciliation_only') AS reconciliation_only,
+           count(*) FILTER (WHERE pc.cls = 'not_approved') AS not_approved
+    FROM pair_class pc
+),
+plan_legacy AS (
+    SELECT count(*) AS n FROM (SELECT x.run_id FROM rcpt_c x GROUP BY x.run_id HAVING bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')) l
+),
+run_ev AS (
+    SELECT x.run_id,
+           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev = x.run_rev) AS cur_n,
+           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev < x.run_rev) AS hist_n,
+           bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound') AS legacy,
+           count(*) AS any_receipt
+    FROM rcpt_c x
+    GROUP BY x.run_id
+),
+fr AS MATERIALIZED (
+    SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
+           c.repo_id, c.mr_iid, c.bidx, o.outcome,
+           COALESCE(e.cur_n, 0) AS cur_n, COALESCE(e.hist_n, 0) AS hist_n,
+           COALESCE(e.legacy, false) AS legacy, COALESCE(e.any_receipt, 0) AS any_receipt,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL) AS pr_present,
+           (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL
+                AND (c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)) AS witnessed
+    FROM cc c
+    LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
+    LEFT JOIN run_ev e ON e.run_id = c.id
+    WHERE c.kind IN ('issue', 'self_improve')
+),
+fr_class AS (
+    SELECT f.id, f.kind, f.status, f.created_at, f.auto_approve, f.has_plan, f.plan_source, f.gate_revision, f.repo_id, f.mr_iid, f.bidx, f.outcome, f.cur_n, f.hist_n, f.legacy, f.any_receipt, f.pr_present, f.witnessed,
+           CASE WHEN f.outcome = 'plan_rejected' THEN 'rejected'
+                WHEN f.cur_n = 1 THEN 'settled_human'
+                WHEN f.auto_approve AND f.gate_revision = 0 AND f.has_plan AND f.plan_source <> 'seeded' THEN 'settled_auto'
+                WHEN f.plan_source = 'seeded' AND f.gate_revision = 0 THEN 'skipped'
+                WHEN f.status NOT IN ('completed', 'failed', 'cancelled') THEN 'in_progress'
+                WHEN f.status = 'failed' THEN 'failed'
+                WHEN f.status = 'cancelled' THEN 'cancelled'
+                ELSE 'unknown' END AS planning,
+           (f.gate_revision > 0 OR f.auto_approve OR f.any_receipt > 0) AS in_plan_cohort,
+           CASE WHEN f.cur_n = 1 THEN 'human'
+                WHEN f.auto_approve THEN 'auto_approve_configured'
+                WHEN f.cur_n > 1 THEN 'ambiguous'
+                WHEN f.legacy THEN 'legacy_unbound'
+                WHEN f.hist_n > 0 THEN 'historical_approval_only'
+                ELSE 'no_evidence' END AS approval
+    FROM fr f
+),
+pr_units AS (
+    SELECT DISTINCT ON (f.repo_id, f.mr_iid) f.repo_id, f.mr_iid, f.bidx, f.witnessed
+    FROM fr f
+    WHERE f.pr_present
+    ORDER BY f.repo_id, f.mr_iid, f.created_at, f.id
+),
+pr_cells AS (
+    SELECT bk.idx, count(u.mr_iid) AS present, count(u.mr_iid) FILTER (WHERE u.witnessed) AS merged
+    FROM bk LEFT JOIN pr_units u ON u.bidx = bk.idx
+    GROUP BY bk.idx
+),
+funnel_applicable AS (
+    SELECT EXISTS (SELECT 1 FROM unnest($1::text[]) k WHERE k IN ('issue', 'self_improve')) AS ok
+),
+funnel AS (
+    SELECT count(*) AS created,
+           count(*) FILTER (WHERE f.planning IN ('settled_human', 'settled_auto')) AS plan_settled,
+           count(*) FILTER (WHERE f.outcome = 'completed') AS completed,
+           count(*) FILTER (WHERE f.pr_present) AS pr_present,
+           count(*) FILTER (WHERE f.witnessed) AS merged,
+           count(*) FILTER (WHERE f.planning = 'settled_human') AS p_human,
+           count(*) FILTER (WHERE f.planning = 'settled_auto') AS p_auto,
+           count(*) FILTER (WHERE f.planning = 'skipped') AS p_skipped,
+           count(*) FILTER (WHERE f.planning = 'rejected') AS p_rejected,
+           count(*) FILTER (WHERE f.planning = 'in_progress') AS p_in_progress,
+           count(*) FILTER (WHERE f.planning = 'failed') AS p_failed,
+           count(*) FILTER (WHERE f.planning = 'cancelled') AS p_cancelled,
+           count(*) FILTER (WHERE f.planning = 'unknown') AS p_unknown,
+           count(*) FILTER (WHERE f.outcome = 'failed') AS o_failed,
+           count(*) FILTER (WHERE f.outcome = 'cancelled') AS o_cancelled,
+           count(*) FILTER (WHERE f.outcome = 'plan_rejected') AS o_plan_rejected,
+           count(*) FILTER (WHERE f.outcome = 'base_diverged') AS o_base_diverged,
+           count(*) FILTER (WHERE f.outcome IS NULL) AS o_in_progress,
+           count(*) FILTER (WHERE f.cur_n = 0 AND f.hist_n > 0) AS d_historical,
+           count(*) FILTER (WHERE f.cur_n > 1) AS d_ambiguous,
+           count(*) FILTER (WHERE f.legacy) AS d_legacy,
+           count(*) FILTER (WHERE f.in_plan_cohort) AS a_total,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'human') AS a_human,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'auto_approve_configured') AS a_auto,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval NOT IN ('human', 'auto_approve_configured')) AS a_unknown,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'ambiguous') AS a_ambiguous,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'legacy_unbound') AS a_legacy,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'historical_approval_only') AS a_historical,
+           count(*) FILTER (WHERE f.in_plan_cohort AND f.approval = 'no_evidence') AS a_none
+    FROM fr_class f
+),
+pr_unit_totals AS (
+    SELECT count(*) AS present, count(*) FILTER (WHERE u.witnessed) AS merged FROM pr_units u
+),
+el AS MATERIALIZED (
+    SELECT t.id, t.bidx, t.terminal,
+           CASE WHEN t.terminal AND t.first_started_at IS NOT NULL
+                     AND COALESCE(t.finished_at, t.status_since) >= t.first_started_at
+                THEN extract(epoch FROM (COALESCE(t.finished_at, t.status_since) - t.first_started_at))::float8 END AS dur
+    FROM (SELECT c.id, c.bidx, c.first_started_at, c.finished_at, c.status_since,
+                 (c.status IN ('completed', 'failed', 'cancelled')) AS terminal
+          FROM cc c WHERE c.kind = 'issue') t
+),
+el_cells AS (
+    SELECT bk.idx,
+           count(e.dur) AS n,
+           count(e.id) FILTER (WHERE NOT e.terminal) AS unfinished,
+           count(e.id) FILTER (WHERE e.terminal AND e.dur IS NULL) AS invalid,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY e.dur) AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY e.dur) AS p90
+    FROM bk LEFT JOIN el e ON e.bidx = bk.idx
+    GROUP BY bk.idx
+),
+el_total AS (
+    SELECT count(e.dur) AS n,
+           count(e.id) FILTER (WHERE NOT e.terminal) AS unfinished,
+           count(e.id) FILTER (WHERE e.terminal AND e.dur IS NULL) AS invalid,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY e.dur) AS p50,
+           percentile_cont(0.9) WITHIN GROUP (ORDER BY e.dur) AS p90
+    FROM el e
+),
+hist_edges AS (
+    SELECT t.e AS lower_s, t.ord::int AS ord, lead(t.e) OVER (ORDER BY t.ord) AS upper_s
+    FROM unnest($10::float8[]) WITH ORDINALITY AS t(e, ord)
+),
+hist AS (
+    SELECT h.ord, h.lower_s, h.upper_s, count(e.dur) AS n
+    FROM hist_edges h
+    LEFT JOIN el e ON e.dur IS NOT NULL AND GREATEST(width_bucket(e.dur, $10::float8[]), 1) = h.ord
+    GROUP BY h.ord, h.lower_s, h.upper_s
+)
+SELECT jsonb_build_object(
+    'generated_at', (SELECT to_char(prm.now_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM prm),
+    'waiting_now', jsonb_build_object(
+        'time_basis', 'now',
+        'population', 'current_runs',
+        'states', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                'state', w.state,
+                'count', w.n,
+                'oldest_status_since', to_char(w.oldest AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                'oldest_age_seconds', CASE WHEN w.oldest IS NULL THEN NULL
+                                           ELSE GREATEST(extract(epoch FROM ((SELECT p.now_ts FROM prm p) - w.oldest)), 0)::float8 END)
+                ORDER BY w.ord)
+            FROM waiting w), '[]'::jsonb),
+        'total', (SELECT COALESCE(sum(w.n), 0)::bigint FROM waiting w)),
+    'activity', jsonb_build_object(
+        'created', jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window',
+            'total', (SELECT count(*) FROM cc),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1, 'count', c.n) ORDER BY c.idx) FROM created_cells c), '[]'::jsonb)),
+        'finished', jsonb_build_object(
+            'time_basis', 'finished_at',
+            'population', 'finished_in_window',
+            'excluded_kinds', jsonb_build_array('chat'),
+            'total', (SELECT j FROM fin_total),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                    'index', c.idx - 1, 'completed', c.completed, 'cancelled', c.cancelled,
+                    'plan_rejected', c.plan_rejected, 'base_diverged', c.base_diverged,
+                    'failed', c.failed, 'total', c.total) ORDER BY c.idx) FROM fin_cells c), '[]'::jsonb))),
+    'first_start_delay', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window',
+            'approximate', true,
+            'limitations', jsonb_build_array('first_started_at_legacy_backfill'),
+            'observed', d.observed,
+            'not_started', d.not_started,
+            'invalid', d.invalid,
+            'p50_seconds', jsonb_build_object('value', d.p50, 'reason', CASE WHEN d.observed = 0 THEN 'no_observations' END),
+            'p90_seconds', jsonb_build_object('value', d.p90, 'reason', CASE WHEN d.observed = 0 THEN 'no_observations' END))
+        FROM start_delay d),
+    'plan_response', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_gate_pairs',
+            'approximate', true,
+            'n', p.n,
+            'p50_seconds', jsonb_build_object('value', p.p50, 'reason', CASE WHEN p.n = 0 THEN 'no_observations' END),
+            'p90_seconds', jsonb_build_object('value', p.p90, 'reason', CASE WHEN p.n = 0 THEN 'no_observations' END),
+            'unknown', jsonb_build_object(
+                'total', p.ambiguous + p.no_presentation + p.invalid_chronology + p.excluded_disposition + p.reconciliation_only + (SELECT l.n FROM plan_legacy l),
+                'reasons', jsonb_build_object(
+                    'ambiguous', p.ambiguous,
+                    'no_presentation', p.no_presentation,
+                    'invalid_chronology', p.invalid_chronology,
+                    'excluded_disposition', p.excluded_disposition,
+                    'reconciliation_only', p.reconciliation_only,
+                    'legacy_unbound', (SELECT l.n FROM plan_legacy l))),
+            'not_approved', p.not_approved)
+        FROM plan_resp p),
+    'delivery_funnel', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_delivery_kinds',
+            'applicable', a.ok,
+            'reason', CASE WHEN a.ok THEN NULL ELSE 'not_applicable' END,
+            'stages', jsonb_build_object('created', f.created, 'plan_settled', f.plan_settled, 'completed', f.completed,
+                                         'pr_present', f.pr_present, 'merged', f.merged),
+            'planning', jsonb_build_object('settled_human', f.p_human, 'settled_auto', f.p_auto, 'skipped', f.p_skipped,
+                                           'rejected', f.p_rejected, 'in_progress', f.p_in_progress, 'failed', f.p_failed,
+                                           'cancelled', f.p_cancelled, 'unknown', f.p_unknown),
+            'outcomes', jsonb_build_object('completed', f.completed, 'failed', f.o_failed, 'cancelled', f.o_cancelled,
+                                           'plan_rejected', f.o_plan_rejected, 'base_diverged', f.o_base_diverged,
+                                           'in_progress', f.o_in_progress),
+            'disclosure', jsonb_build_object('historical_approval_only', f.d_historical, 'ambiguous_current', f.d_ambiguous,
+                                             'legacy_evidence', f.d_legacy),
+            'pr_units', jsonb_build_object(
+                'present', (SELECT t.present FROM pr_unit_totals t),
+                'merged', (SELECT t.merged FROM pr_unit_totals t),
+                'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object('index', c.idx - 1, 'present', c.present, 'merged', c.merged) ORDER BY c.idx) FROM pr_cells c), '[]'::jsonb)))
+        FROM funnel f, funnel_applicable a),
+    'approval', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_plan_cohort',
+            'applicable', a.ok,
+            'reason', CASE WHEN a.ok THEN NULL ELSE 'not_applicable' END,
+            'total', f.a_total,
+            'human', f.a_human,
+            'auto_approve_configured', f.a_auto,
+            'unknown', jsonb_build_object(
+                'total', f.a_unknown,
+                'reasons', jsonb_build_object('ambiguous', f.a_ambiguous, 'legacy_unbound', f.a_legacy,
+                                              'historical_approval_only', f.a_historical, 'no_evidence', f.a_none)))
+        FROM funnel f, funnel_applicable a),
+    'issue_elapsed', (
+        SELECT jsonb_build_object(
+            'time_basis', 'created_at',
+            'population', 'created_in_window_issue_runs',
+            'applicable', (SELECT 'issue' = ANY($1::text[])),
+            'reason', CASE WHEN 'issue' = ANY($1::text[]) THEN NULL ELSE 'not_applicable' END,
+            'n', t.n,
+            'unfinished', t.unfinished,
+            'invalid', t.invalid,
+            'incomplete', t.unfinished > 0,
+            'p50_seconds', jsonb_build_object('value', t.p50, 'reason', CASE WHEN t.n = 0 THEN 'no_observations' END),
+            'p90_seconds', jsonb_build_object('value', t.p90, 'reason', CASE WHEN t.n = 0 THEN 'no_observations' END),
+            'histogram', COALESCE((SELECT jsonb_agg(jsonb_build_object('lower_seconds', h.lower_s, 'upper_seconds', h.upper_s, 'count', h.n) ORDER BY h.ord) FROM hist h), '[]'::jsonb),
+            'buckets', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                    'index', c.idx - 1, 'n', c.n, 'unfinished', c.unfinished, 'invalid', c.invalid,
+                    'incomplete', c.unfinished > 0,
+                    'p50_seconds', jsonb_build_object(
+                        'value', CASE WHEN c.n >= $2::int THEN c.p50 END,
+                        'reason', CASE WHEN c.n = 0 THEN 'no_observations' WHEN c.n < $2::int THEN 'insufficient_observations' END),
+                    'p90_seconds', jsonb_build_object(
+                        'value', CASE WHEN c.n >= $2::int THEN c.p90 END,
+                        'reason', CASE WHEN c.n = 0 THEN 'no_observations' WHEN c.n < $2::int THEN 'insufficient_observations' END))
+                    ORDER BY c.idx) FROM el_cells c), '[]'::jsonb))
+        FROM el_total t)
+)::jsonb AS doc
+`
+
+type AnalyticsOwnerFlowParams struct {
+	Kinds          []string             `json:"kinds"`
+	MinPercentileN int32                `json:"min_percentile_n"`
+	Now            pgtype.Timestamptz   `json:"now"`
+	BucketStarts   []pgtype.Timestamptz `json:"bucket_starts"`
+	BucketEnds     []pgtype.Timestamptz `json:"bucket_ends"`
+	From           pgtype.Timestamptz   `json:"from"`
+	UserID         uuid.UUID            `json:"user_id"`
+	RepoID         pgtype.UUID          `json:"repo_id"`
+	Harness        pgtype.Text          `json:"harness"`
+	HistogramEdges []float64            `json:"histogram_edges"`
+}
+
+// Issue #4729: the Flow document, one jsonb value built over ONE materialized scoped set.
+// The owner and all-scope statements are kept textually identical except the scope lines, each
+// tagged with a trailing marker comment (a Go test drops them and fails on any other drift).
+// Every range comes from the parameters (half-open: start <= ts < end); there is no calendar
+// arithmetic or clock read here. Timestamps are UTC strings so the document does not depend on
+// the session TimeZone. The document names no repo id or path, so repo masking is vacuous.
+// Populations (each measure names its own): waiting = current status; created = created_at in
+// [from, now); finished = COALESCE(finished_at, status_since) in [from, now), independent of
+// created_at; every other block is the created_at cohort.
+// Approval evidence is one receipt per run_user_inputs row fetched through a per-run lookup on
+// idx_run_user_inputs_run_id; it never scans run_user_inputs globally and never reads the run message log.
+func (q *Queries) AnalyticsOwnerFlow(ctx context.Context, arg AnalyticsOwnerFlowParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, analyticsOwnerFlow,
+		arg.Kinds,
+		arg.MinPercentileN,
+		arg.Now,
+		arg.BucketStarts,
+		arg.BucketEnds,
+		arg.From,
+		arg.UserID,
+		arg.RepoID,
+		arg.Harness,
+		arg.HistogramEdges,
 	)
 	var doc []byte
 	err := row.Scan(&doc)
