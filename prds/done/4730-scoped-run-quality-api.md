@@ -76,51 +76,78 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Separate plan, code and judge populations | The sources answer different questions and have different retention and eligibility rules. |
 | Use retained latest judge review | The store keeps one review per target, so historical versions cannot be reconstructed. |
 | Fold the merge-witness lookup into one GROUP BY over a UNION ALL of the seed and witness keys | A per-row `IN (SELECT ...)` over the witness CTE becomes an unhashed SubPlan once the witness set outgrows `hash_mem`; the fold is independent of it (6.3 s vs 1.15 s at `work_mem` 64kB, section 8). A generic-plan guard test pins the shape. |
-| Add no index | The bar was a 20% p95 gain on a Quality workload or removal of the 8 s timeout risk. The rework index gained at most 7.2% p95, the `decided_at` index was never chosen and the worst timing is 2.4 s. |
+| Add no index | The bar was a 20% p95 gain on a Quality workload or removal of the 8 s timeout risk. With JIT on, the rework index appeared to cut all-users 30d custom p95 by 23.5%, but that was the JIT cost: the JIT-off, production-like check in both plan modes puts it within -6.1% to +5.6% on every workload (all-users 30d custom 688 to 688 ms). The `decided_at` index was never chosen, and the worst observed statement timing is about 2.2 s (section 8). |
 | Pending cross-checks have no time cutoff | Pending is a live count of undecided, uninterrupted attempts of any age, disclosed with `effective_filters` and `window: not_applied`. |
+| `cc_base` has no creation-time cutoff; every non-pending attempt that is not dated is undated | A `created_at < now` cutoff silently dropped rows with malformed time evidence (non-finite `created_at` including `+infinity`, a far-future `created_at`, `decided_at` before `created_at`, missing or non-finite `decided_at`). They are now counted as `undated` and disclosed. The dated series is bounded by `decided_at` in `[from, now)`. |
+| Cross-check population is per stage | `cc_base` keeps plan attempts only for plan-cross-checkable lead kinds and code attempts only for code-cross-checkable lead kinds (`runkind.PlanCrossCheckable`, `runkind.CodeCrossCheckable`), so counts agree with `applicable` (kind=task: plan not applicable with zero counts; retained plan attempts on other lead kinds are not counted). |
 | Decide cross-check applicability per stage | Plan and code use their own cross-checkable kinds (`runkind.PlanCrossCheckable`, `runkind.CodeCrossCheckable`), and pending applies when either does. |
-| Cover the SQLSTATE 57014 mapping with a unit test through `analyticsFail`, as #4684 does | #4684 has a store-level LiveDB timeout test of the shared snapshot (`TestAnalyticsSnapshotStatementTimeoutLiveDB`) but no handler-level one; Quality uses the same snapshot and `analyticsFail` path. |
-| Known follow-up: narrow `cc_base` | `cc_base` carries `findings` for every cross-check (about 109 MB temp spill at 4 MB `work_mem`, about 40% of the all-users time). A candidate fix computes `findings_count` only for in-window decisions. Not done here. |
+| Cover the SQLSTATE 57014 mapping at three levels: unit test through `analyticsFail`, store-level snapshot test, and a handler LiveDB test through the router | `TestAnalyticsQualityStatementTimeoutIs503WithRetryAfterAndReleases` pins the mapping and slot release through the handler. `TestAnalyticsSnapshotStatementTimeoutLiveDB` (#4684) covers the shared snapshot. `TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB` holds an `ACCESS EXCLUSIVE` lock on `runs` so the real 8 s statement timeout fires through the live router, and asserts 503, `Retry-After`, the timed-out body text and that the next request returns 200 (slot released). |
+| Known follow-up: narrow `cc_base` | `cc_base` carries `findings` for every cross-check, and the `cc_*` CTEs write about 100 MB of temp (12,993 blocks at 4 MB `work_mem`, all-users 30d custom plan). A candidate fix computes `findings_count` only for in-window decisions. Not done here. |
 
 ## 8. Performance evidence
 
-Summary of the M1 evidence run (seed 0.4730, PostgreSQL 17 (postgres:17 image), 4 vCPU, warm cache, `work_mem` 4MB).
+Re-run of the M1 evidence at commit `0d4a4919da868f5e7e6fe294d68d631698308d1a` (seed 0.4730, fresh full reseed), replacing the earlier figures. Environment: PostgreSQL 17.12 (Debian 17.12-1.pgdg13+1, `postgres:17` image, `--shm-size=1g`, recorded by `SELECT version()` in the run), `work_mem` 4MB, `jit` on by default, 4 processors (`GOMAXPROCS=4`), warm cache. Raw logs were kept outside the tree (scratch evidence directories of the run).
 
-**Seed.** #4684's base seed (200 owners, largest owner 20.0% of runs, top 10 owners 59.3%) plus a Quality extension: 140,018 runs (20,018 `mr_rework`), 845,032 usage legs, 1,250 repos, 92,420 cross-checks (59,724 plan, 32,696 code), 35,722 reviews over 59,553 judge-eligible runs (60.0%, 15% of reviews failed). Fan-out: 1.60 plan attempts per lead that has any plan check (0.64 across all 93,520 delivery leads), and at most one review per eligible target (60% coverage). Statistics were fresh: the seed runs `ANALYZE` on `cross_checks`, `run_reviews`, `judge_skips` and `runs` after loading (`analytics_evidence_livedb_test.go`). 30d range selectivity is 9.94% of runs (largest owner 10.02%). 24,935 PRs, 69.0% with a merge witness; reworks per PR 0/1/2/3+ are 13,725 / 6,243 / 3,051 / 1,916.
+**Harness runs and flags.** All use `-tags analyticsevidence -count=1 -v -p 1` against a LiveDB PostgreSQL 17 (`UZI_TEST_DATABASE_URL`).
 
-**Store timings** (ms, n=20, custom plan unless noted, statement timeout off, **JIT on**):
+- Store (510.6 s, exit 0, PASS): `UZI_ANALYTICS_PLAN_EVIDENCE=1 UZI_EVIDENCE_KEEP=1 UZI_EVIDENCE_ONLY=quality UZI_EVIDENCE_INDEXES=5,6 UZI_EVIDENCE_LOG=<file>`, `-run TestAnalyticsPlanEvidenceLiveDB ./internal/store/`. Fresh seed (`UZI_EVIDENCE_RESEED` unset), baseline on (`UZI_EVIDENCE_BASELINE` unset), `UZI_EVIDENCE_RUNS` default 20 (n=20). Baseline measured in custom and generic plan modes; candidates in custom mode only. Statement timeout off, **JIT on** (PostgreSQL default).
+- HTTP (exit 0, PASS): `UZI_ANALYTICS_PLAN_EVIDENCE=1 UZI_EVIDENCE_LOG=<file>`, `-run TestQualityHTTPEvidenceLiveDB ./internal/handler/`, reusing the kept seed (`UZI_EVIDENCE_KEEP=1` from the store run). Production router and snapshot path (8 s statement timeout, **JIT off** as in production's analytics snapshot).
+- JIT-off index check (exit 0, PASS): `UZI_ANALYTICS_PLAN_EVIDENCE=1 UZI_EVIDENCE_ONLY=quality UZI_EVIDENCE_INDEXES=5 UZI_EVIDENCE_LOG=<file>`, `-run TestAnalyticsPlanEvidenceLiveDB ./internal/store/`, no `UZI_EVIDENCE_KEEP` (the seed was truncated at the end). It ran from a scratch copy of the commit whose only change set `jit = off` (the harness session, the timing statements and the `EXPLAIN` statements) and measured the candidate in both plan modes (custom and generic) instead of custom only. All 20 EXPLAINs reported JIT 0.
+
+**Seed.** #4684's base seed plus a Quality extension: 140,169 runs (20,169 `mr_rework`), 848,520 usage legs, 1,250 repos, 200 users, 92,547 cross-checks (59,560 plan, 32,987 code), 35,818 reviews over 59,553 judge-eligible runs (60.1%; 5,391 failed reviews), 2,988 judge skips. Table sizes: runs 114 MB, `cross_checks` 956 MB (878 MB TOAST), `run_reviews` 7,152 kB. Owner skew: the largest owner holds 27,891 runs (19.9%), the top 10 owners 59.3%. Kind mix: chat 2,450, ci_fix 8,212, issue 60,035, job 3,563, judge 20,467, mr_rework 20,169, prompt 6,096, self_improve 7,249, task 11,928. Statistics were fresh: the seed runs `ANALYZE` on `cross_checks`, `run_reviews`, `judge_skips` and `runs` after loading (`analytics_evidence_livedb_test.go`).
+
+**30d window** (from `analytics.ComputeBounds` with the harness clock 2026-11-20T12:00:00Z): from 2026-10-22T00:00:00Z (day-truncated) to the 12:00 clock, 30 buckets; `window=all` starts 2023-11-06T00:00:00Z with 80 buckets. Selectivity: 9.85% of 140,169 runs overall (13,801 in window) and 9.93% of the largest owner's 27,891 (2,770). Rework cohort in the 30d window: 2,810 PRs from 4,619 delivery runs overall; 559 PRs from 903 delivery runs for the largest owner. Cross-check decisions in the window: plan 5,915, code 3,349, of which 243 belong to leads created before the window (the harness prints one total for both stages).
+
+**Fan-out.**
+
+- PRs: 24,935 distinct (repo, PR), 68.9% with a merge witness (17,189 witnessed). Reworks per PR 0/1/2/3+: 13,697 / 6,265 / 3,013 / 1,960. Of the retained reworks, 25.2% are manual, 91.1% were created before the 30d window and 6.9% have an unverified link.
+- Plan attempts per lead that has any plan check (1/2/3 rounds): 20,630 / 11,098 / 5,578, so 37,306 leads out of 93,520 delivery leads (39.9%). Final plan verdicts: approve 22,390, revise 29,693, block 3,594, failed 3,738, pending 145 (the totals count attempts, not leads).
+- Code attempts per lead: at most 1; outcomes completed 26,340, failed 6,577, pending 70.
+- Reviews per eligible target: at most 1 (59,553 eligible, 35,818 reviewed, 60.1%).
+
+**Store timings** (ms, n=20, statement timeout off, **JIT on**):
 
 | Workload | Custom median / p95 | Generic median / p95 |
 |---|---|---|
-| Owner 30d (largest owner) | 193.5 / 196.9 | 207.0 / 211.0 |
-| Owner `window=all` | 702.0 / 712.4 | 560.6 / 574.9 |
-| Admin user 30d (largest owner) | 200.9 / 203.7 | 211.9 / 215.4 |
-| Admin all-users 30d | 1168.3 / 1181.4 | 631.5 / 636.5 |
-| Admin all-users `window=all` | 2320.7 / 2361.9 | 2196.5 / 2224.8 |
+| Owner 30d (largest owner) | 182.3 / 185.6 | 199.3 / 202.1 |
+| Owner `window=all` | 679.7 / 701.4 | 526.7 / 533.4 |
+| Admin user 30d (largest owner) | 178.6 / 183.1 | 195.0 / 198.6 |
+| Admin all-users 30d | 1140.3 / 1170.0 | 588.7 / 599.4 |
+| Admin all-users `window=all` | 2154.8 / 2179.5 | 2069.5 / 2097.2 |
 
-**Request impact** (production router, cookie session, analytics pool of 20, JIT off as in production's analytics snapshot, sequential, N=25 after 2 warm-ups, all 200):
+**Request impact** (HTTP run: production router, cookie session, analytics pool of 20, admission capacity 5, JIT off, sequential, N=25 after 2 excluded warm-ups, every response 200, no 503 timeout or busy; largest owner 27,891 runs):
 
 | Request | p50 ms | p95 ms | max ms |
 |---|---|---|---|
-| `GET /api/analytics/quality?window=30d` (largest owner) | 205.8 | 209.1 | 209.7 |
-| `GET /api/analytics/quality?window=all` (largest owner) | 541.7 | 554.9 | 555.9 |
-| `GET /api/admin/analytics/quality?window=30d` (all users) | 625.2 | 646.8 | 682.8 |
-| `GET /api/admin/analytics/quality?user=<largest owner>&window=30d` | 205.7 | 216.1 | 216.4 |
+| `GET /api/analytics/quality?window=30d` (largest owner) | 198.6 | 208.5 | 215.0 |
+| `GET /api/analytics/quality?window=all` (largest owner) | 532.6 | 539.4 | 540.5 |
+| `GET /api/admin/analytics/quality?window=30d` (all users) | 602.8 | 741.1 | 746.0 |
+| `GET /api/admin/analytics/quality?user=<largest owner>&window=30d` | 194.8 | 202.3 | 202.9 |
 
-**Plan nodes and buffers** (`EXPLAIN (ANALYZE, BUFFERS)`, custom plan, 30d):
+Warm-ups (ms, two per scope): owner 30d 225.6 / 185.1, owner all 526.0 / 526.0, all-users 30d 753.2 / 742.3, admin user 198.4 / 187.7. First-200 response sizes: 24,836 / 62,802 / 25,273 / 24,836 bytes. Inside one snapshot (`deps.quality`, 10 runs, excluding HTTP and admission), p50 / p95: owner 30d 190.4 / 205.3, owner all 499.7 / 507.5, all-users 30d 591.2 / 614.5, admin user 30d 189.8 / 206.1.
 
-- Owner 30d (largest owner, 2,811 runs): shared hit 13.6k / read 6.1k blocks, temp written 2,154 blocks; the same CTE structure as all-users, with Bitmap Heap Scans in place of Seq Scans.
-- Admin all-users 30d: shared hit 43,679 / read 23,179, temp written 14,000 blocks (about 109 MB). The dominant cost is `cc_base` (Seq Scan of 92,420 `cross_checks` hash-joined to a Seq Scan of 140,018 `runs`, 251 ms) and the `cc_dec`/`cc_win`/`cc_cls` materialisation (341 to 494 ms, 13,998 temp blocks); the rework CTEs total about 200 ms (custom; about 150 ms generic).
+**Plan nodes and buffers** (baseline, one `EXPLAIN (ANALYZE, BUFFERS)` each; JIT on):
 
-**Corrections and caveats.**
+| | Owner 30d custom | Owner 30d generic | All-users 30d custom | All-users 30d generic |
+|---|---|---|---|---|
+| execution / planning ms | 186.8 / 8.3 | 216.3 / 6.2 | 1152.1 / 8.0 | 626.5 / 6.3 |
+| shared hit / read blocks | 12,346 / 7,223 | 117,945 / 2,724 | 60,091 / 7,045 | 559,905 / 18,375 |
+| temp written / read blocks | 1,966 / 2,950 | 1,966 / 2,950 | 12,993 / 17,876 | 9,758 / 14,641 |
+| JIT ms (functions) | 0 | 0 | 449.4 (566) | 0 |
 
-- The store timings ran with the PostgreSQL default JIT on. JIT fired on three custom-plan workloads (221 to 471 ms inside execution); production's analytics snapshot sets JIT off and the HTTP table ran through that path. Most of the all-users 30d gap between generic and custom plans is JIT, but with JIT time subtracted the custom plan is still slower (738 vs 657, 683 vs 609 and 758 vs 654 ms across the baseline and two candidate-index states, one EXPLAIN each; temp written 14,000 vs 10,805 blocks), so the generic plan is about 10 to 15% cheaper there. For all-users `window=all` the gap is JIT.
+Custom-plan node times: `cc_base` (hash join of `cross_checks` and `runs`) 79.7 ms for the largest owner (17,256 rows; Seq Scan of `cross_checks` 43.4 ms) and 250.3 ms all-users (85,126 rows; Seq Scan 53.2 ms, hash of 140,169 runs, 3,235 temp blocks written). `cc_dec` / `cc_win` (cumulative as the harness prints them): 96.9 / 122.5 ms owner, 334.2 / 463.1 ms all-users (8,109 / 12,991 temp blocks written). Rework CTEs `rw_sel + rw_link + rw_cnt + rw_key`: 38.8 ms owner, 250.4 ms all-users (`rw_sel` includes `rw_pr` / `rw_seed`: 16.1 / 128.2 ms; the `rework` CTE scan itself adds 8.3 / 42.1 ms). The owner plan reads `runs` through `runs_user_created_idx` / `idx_runs_user` bitmap scans; the all-users plan Seq Scans `runs` (11 loops, 411.6 ms). JIT fired on three baseline custom plans: owner `window=all` 234.4 ms (337 functions), all-users 30d 449.4 ms (566) and all-users `window=all` 236.3 ms (327); it was 0 on every generic plan, owner 30d and admin user 30d.
+
+**What the JIT-off run shows.** Without JIT, all-users 30d is 688 ms p95 in custom mode against 580 ms in generic mode, so the generic plan is about 16% faster there for a reason other than JIT, and the JIT-on custom figure (1170 ms) overstated the gap. Owner `window=all` (437 custom against 485 generic) and all-users `window=all` (1840 against 2019) are faster in custom mode without JIT, so generic is not faster across the board. Production sets JIT off, so the JIT-off figures describe the request path and the JIT-on store table describes the harness.
+
+**Caveats.**
+
+- The store timings ran with the PostgreSQL default JIT on and the statement timeout disabled; the HTTP table ran through the production path (JIT off, 8 s snapshot).
+- The all-users `window=all` timing (about 2.2 s median, 2.18 s custom p95) is an observed statement timing on one synthetic seed with the statement timeout disabled. It is not a bound on smaller all-users windows or on HTTP latency, and that scope is refused by the API. No workload approached the 8 s statement timeout.
 - The `cross_checks` immutability and write-once triggers (migrations 00312, 00325, 00360) are BEFORE INSERT OR UPDATE, not UPDATE-only. The seed inserts rows in their final state, which pass them.
 - The seed has no `cross_check` child runs, so its runs table is about 40% light for its cross-check volume, and it measures a single volume point.
-- Admin all-users `window=all` is refused by the API, so its 2.4 s timing is an upper bound for the all-users windows a request can reach. No workload approached the 8 s statement timeout.
-- Sequential requests cannot trigger the per-caller admission 503; busy is covered by unit tests.
+- Sequential requests cannot trigger the per-caller admission 503; busy is covered by unit tests. The statement timeout through the router is covered by a LiveDB test (Decision Log).
 
-**Witness lookup hardening** (EXPLAIN ANALYZE, all-users scope, 2,805-PR window, about 17k witness keys; old per-row `IN` vs the fold):
+**Witness lookup hardening** (measured earlier on the m3 evidence seed, not re-run in the v2 pass; EXPLAIN ANALYZE, all-users scope, 2,805-PR window, about 17k witness keys; old per-row `IN` vs the fold):
 
 | `work_mem` | Old, custom / generic ms | New, custom / generic ms |
 |---|---|---|
@@ -130,18 +157,30 @@ Summary of the M1 evidence run (seed 0.4730, PostgreSQL 17 (postgres:17 image), 
 
 At 64kB the old plan runs the witness CTE as an unhashed SubPlan (loops=2805, about 11k rows each; 5.33 s of 6.34 s). The owner scope was unaffected (190 to 234 ms either way). `TestQualityGenericPlanShapeLiveDB` asserts from `EXPLAIN (VERBOSE, FORMAT JSON)` under `force_generic_plan` that no CTE Scan sits in an unhashed SubPlan, no Nested Loop filters on `mr_iid`, and the witness is read by a plain scan; its negative control swaps in a deliberately unhashed stand-in for the old `IN` lookup (the real old SQL cannot be forced unhashed at small test scale, because the planner hashes by estimated size), and the real old SQL at 64kB is the timing table above.
 
-**Index decision** (custom-plan p95, positive is faster):
+**Index decision.** Candidate 5 is `runs (repo_id, mr_iid) WHERE kind = 'mr_rework'` (589,824 bytes) and candidate 6 is `cross_checks (decided_at)` (2,088,960 bytes), both harness-only. The bar is a 20% p95 gain on a Quality workload.
 
-| Workload | Baseline ms | `runs(repo_id, mr_iid) WHERE kind = 'mr_rework'` | `cross_checks(decided_at)` |
+With JIT on (store run, custom plan, p95, negative is faster):
+
+| Workload | Baseline ms | Candidate 5 | Candidate 6 |
 |---|---|---|---|
-| Owner 30d | 196.9 | -1.0% | -4.2% |
-| Owner `window=all` | 712.4 | -2.8% | -1.9% |
-| Admin user 30d | 203.7 | +7.2% | +1.6% |
-| Admin all-users 30d | 1181.4 | +1.5% | +0.8% |
-| Admin all-users `window=all` | 2361.9 | +3.7% | +2.8% |
+| Owner 30d | 185.6 | 177.5 (-4.4%) | 189.0 (+1.8%) |
+| Owner `window=all` | 701.4 | 709.9 (+1.2%) | 671.3 (-4.3%) |
+| Admin user 30d | 183.1 | 178.1 (-2.7%) | 186.1 (+1.6%) |
+| Admin all-users 30d | 1170.0 | 894.7 (-23.5%) | 1129.7 (-3.4%) |
+| Admin all-users `window=all` | 2179.5 | 1993.3 (-8.5%) | 2179.1 (0.0%) |
 
-The rework index was chosen by the planner and gained at most 7.2%; the `decided_at` index was never chosen, because `cc_base` reads the whole table through a materialized CTE with no `decided_at` predicate. No migration was added.
+Candidate 6 was never used in any plan, so its deltas are noise. Candidate 5 was used in every plan, and its all-users 30d gain coincided with a different custom plan shape. Because production's analytics snapshot runs JIT off and the baseline plan carried about 449 ms of JIT, the candidate was re-measured with JIT off in both plan modes (p95 ms, n=20, one run):
+
+| Workload | Base custom | Cand. 5 custom | Delta | Base generic | Cand. 5 generic | Delta |
+|---|---|---|---|---|---|---|
+| Owner 30d | 183.6 | 174.6 | -4.9% | 191.6 | 195.7 | +2.1% |
+| Owner `window=all` | 436.9 | 412.7 | -5.5% | 484.8 | 512.1 | +5.6% |
+| Admin all-users 30d | 688.3 | 688.3 | 0.0% | 579.5 | 543.9 | -6.1% |
+| Admin user 30d | 182.6 | 172.0 | -5.8% | 189.4 | 189.1 | -0.2% |
+| Admin all-users `window=all` | 1839.9 | 1799.3 | -2.2% | 2019.0 | 2014.2 | -0.2% |
+
+Candidate 5 was used in every plan and the `EXPLAIN` summaries show no plan-shape change (temp blocks identical to baseline in every row). With JIT off the all-users 30d custom p95 is 688 ms either way, so the earlier -23.5% was the JIT cost and not the index. Every JIT-off delta is within -6.1% to +5.6%, so the 20% bar is not met on any workload. No migration was added.
 
 **Flake observed on a shared database.** `TestRunUsageGenericPlanLiveDB`'s Spend all-scope check was observed failing on an accumulated shared database at a0a259b79, where that test file and the Spend SQL were still identical to the base commit (Quality seed rows were added to it later, in this branch's m3); it passes on a fresh database. A base-commit reproduction was not recorded.
 
-**Verified and still unverified.** Verified: the owner and admin plans, generic-plan behavior, witness and link association under the ownership boundary, cross-check stage fields, judge eligibility rules, request impact at the seed above, and that no index is warranted. Still unverified: legacy rework association completeness (the seed stamps every rework link, so it cannot show how many legacy rework runs lack one; counts are lower bounds), and behavior at other volumes or with cross-check child runs in the seed. Passing tests do not establish retention completeness.
+**Verified and still unverified.** Verified: the owner and admin plans, generic-plan behavior, witness and link association under the ownership boundary (any user's witness and every user's connections on admin all-users; the scoped user's only on owner and admin-selected-user), per-stage cross-check population and undated disclosure, cross-check stage fields, judge eligibility rules, the 57014 mapping through the router, request impact at the seed above, and that no index is warranted. Still unverified: legacy rework association completeness (the seed stamps every rework link, so it cannot show how many legacy rework runs lack one; retained totals are lower bounds, but deleting a rework or review can raise a class count such as `zero` or `unreviewed`), and behavior at other volumes or with cross-check child runs in the seed. The index check is one JIT-off run at n=20. Passing tests do not establish retention completeness.

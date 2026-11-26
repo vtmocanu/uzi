@@ -19,8 +19,11 @@ admission, calendar and filter options. Read that page for the shared rules;
 this page covers what is specific to Quality.
 
 Quality reports **retained** evidence. A run, review or cross-check that was
-deleted is not counted, so a count is a lower bound and a zero is a zero of
-what is still stored, not proof that nothing happened.
+deleted is not counted, so a zero is a zero of what is still stored, not proof
+that nothing happened. Only totals of retained rows (runs, attempts, targets)
+are lower bounds. Class counts are not: deleting a rework run can move its PR
+into the `zero` group, and deleting a review moves a target from `complete` to
+`unreviewed`, which raises that count.
 
 ## Routes and authorization
 
@@ -151,9 +154,10 @@ Merged PRs grouped by how many retained `mr_rework` runs they have.
   counted once however many runs it has.
 - **Merged.** A PR counts only when a merge witness exists: any run of the
   scoped user with that identity and state `merged`, even one outside the
-  window or the harness, kind and repo filters. A witness from another user
-  never establishes a merge. Cohort PRs without a witness are not in the
-  groups: they are `unwitnessed_prs`. `applicable_prs` is the witnessed cohort
+  window or the harness, kind and repo filters. On the owner route and an
+  admin-selected `user=<uuid>`, a witness from another user never establishes a
+  merge. Admin all-users accepts any user's witness. Cohort PRs without a
+  witness are not in the groups: they are `unwitnessed_prs`. `applicable_prs` is the witnessed cohort
   and is the total of `groups`.
 - **Groups.** `zero`, `one`, `two`, `three_plus`: the number of distinct
   retained `mr_rework` runs associated with the PR through its identity and a
@@ -165,15 +169,20 @@ Merged PRs grouped by how many retained `mr_rework` runs they have.
   missing, deleted or does not match. They are in no group.
 - **`shared_external_prs`.** Selected PRs whose external identity (forge type,
   connection base URL, project, PR number) is shared by two or more selected
-  PRs, which means one external PR connected more than once. The count is
-  within the scoped user's own connections. `shared_detection_unavailable` is
-  the selected PRs whose connection is missing or not the scoped user's, so
-  they were left out of that detection.
+  PRs, which means one external PR connected more than once. On the owner route
+  and an admin-selected user, detection uses only the scoped user's own
+  connections, and `shared_detection_unavailable` is the selected PRs whose
+  connection is missing or not the scoped user's, so they were left out of it.
+  Admin all-users uses every user's connections, so there
+  `shared_detection_unavailable` is the selected PRs whose repo has no
+  connection.
 - **`buckets`.** The witnessed PRs per earliest-cohort-run bucket, with the
   same four groups.
-- **`retention`** is always `retained_runs_only`: a deleted rework run is a
-  lower count and not a zero-rework proof. The association is only as complete
-  as the retained links; legacy rework runs that lack them are not counted.
+- **`retention`** is always `retained_runs_only`: a deleted rework run lowers
+  its PR's group (a PR can fall into `zero`) and is not a zero-rework proof, and
+  a deleted witness run can move a PR into `unwitnessed_prs`. The association is
+  only as complete as the retained links; legacy rework runs that lack them are
+  not counted.
 - **`merge_day_activity` and `run_end_to_merge_seconds`** are always null with
   reason `not_tracked`. The merge state is the last one uzi saw, and the merge
   moment itself is not recorded.
@@ -191,7 +200,16 @@ in-flight run has none.
 Attempts are selected through their **lead run**: the lead's repo, harness and
 kind (any kind except `cross_check`) decide whether an attempt is in scope.
 The checker's harness is separate metadata, reported as `checker_harness`
-(`claude`, `codex`, `unknown`). There is no time restriction on the lead run.
+(`claude`, `codex`, `unknown`). There is no time restriction on the lead run,
+and none on the attempt's creation time: time evidence is classified as dated
+or undated, never dropped.
+
+The population is per stage, so counts always agree with `applicable`: a plan
+attempt counts only when its lead kind is plan cross-checkable, and a code
+attempt only when its lead kind is code cross-checkable (the kinds in
+[Applicability](#applicability)). For `kind=task`, plan is
+`applicable: false` with zero counts, and plan attempts retained on other lead
+kinds are not counted.
 
 Plan and code are separate measures with separate stored fields. Plan reports
 the stored verdict (`approve`, `revise`, `block`, `failed`). Code reports the
@@ -209,10 +227,13 @@ inert and never exposed. Raw findings and prompts are never returned.
   For code, a `completed` attempt is `raised_issues` when it has findings and
   `passed` when it has none; findings that cannot be counted are
   `unclassified`.
-- **`undated`** counts decided attempts with no usable decision time (missing,
-  non-finite, or earlier than the attempt's creation) or a non-finite creation
-  time (for example a `-infinity` `created_at`). They are in no bucket
-  and the window is not applied to them (`window: "not_applied"`).
+- **`undated`** counts every non-pending attempt that is not dated. An attempt
+  is dated when `decided_at` is present and finite, `created_at` is finite
+  (`-infinity` and `+infinity` are not), and `decided_at` is not earlier than
+  `created_at` (so a far-future `created_at` makes it undated). Undated
+  attempts are in no bucket and the window is not applied to them
+  (`window: "not_applied"`); they have no creation-time cutoff. The dated
+  series is bounded by `decided_at` in `[from, now)`.
 - **`pending`** is a live count of attempts that are undecided and not
   interrupted, of any age, split into `plan` and `code`. The window is not
   applied and there is no `now` bound. It discloses the filters it applied in
@@ -259,9 +280,10 @@ evidence. This covers every source, not only the starting cohort:
 - the judge reviews (a review counts only for its target's owner).
 
 Admin all-users applies no scope-user filter, so it reads every user's
-evidence, but the same-owner checks still apply: a review counts only if its
-user is the target's owner, and a rework link is verified only when the target
-and the rework share the owner.
+evidence: any user's merge witness and every user's forge connections count
+there. The same-owner checks still apply: a review counts only if its user is
+the target's owner, and a rework link is verified only when the target and the
+rework share the owner.
 
 ## Repo visibility
 
@@ -277,30 +299,34 @@ scope may see it. Which repos a scope may filter by is the same as for Spend.
   [Judge coverage](#judge-coverage)).
 - Judge verdicts are the retained latest review. A rejudge changes the verdict
   of the cohort the target was created in.
-- Rework counts retained runs only. Deleted runs and missing links lower the
-  counts; an unverified link is reported and not counted.
+- Rework counts retained runs only. Deleted rework runs and missing links
+  lower a PR's group (a PR can fall into `zero`); an unverified link is
+  reported and not counted.
 - Merge-day activity and run-end-to-merge duration are not tracked (null with
   `not_tracked`).
-- Shared external PR detection covers the scoped user's own connections only.
+- Shared external PR detection covers the scoped user's own connections on the
+  owner route and an admin-selected user, and every user's on admin all-users.
 - Pending is a live count of any age and is not tied to the window.
 
 ## Performance limit
 
-Measured on a synthetic seed of 140,018 runs (120,000 base plus 20,018 rework
-runs; 200 owners with skew, the largest owner 20% of runs), 92,420 cross-checks
-and 35,722 reviews, PostgreSQL 17, default settings. The request times below
-ran through the production router with JIT off and warm caches (sequential
-requests, so they do not exercise admission):
+Measured on a synthetic seed of 140,169 runs (120,000 base plus 20,169 rework
+runs; 200 owners with skew, the largest owner 19.9% of runs), 92,547
+cross-checks and 35,818 reviews, PostgreSQL 17.12 with `work_mem` 4MB. The
+request times below ran through the production router with JIT off and warm
+caches (sequential requests, so they do not exercise admission):
 
 | Request | p50 | p95 |
 |---|---|---|
-| Owner `30d` (largest owner) | about 0.21 s | about 0.21 s |
-| Owner `window=all` (largest owner) | about 0.54 s | about 0.55 s |
-| Admin all-users `30d` | about 0.63 s | about 0.65 s |
-| Admin `user=<uuid>` `30d` (largest owner) | about 0.21 s | about 0.22 s |
+| Owner `30d` (largest owner) | about 0.20 s | about 0.21 s |
+| Owner `window=all` (largest owner) | about 0.53 s | about 0.54 s |
+| Admin all-users `30d` | about 0.60 s | about 0.74 s |
+| Admin `user=<uuid>` `30d` (largest owner) | about 0.19 s | about 0.20 s |
 
-The all-users all-time scope was measured only at the statement level
-(about 2.4 s); it is not offered, so that figure is an upper bound for the
-windows a request can reach. No index was added: the candidates changed the p95
-by at most 7%. The evidence and the seed's limits are in the PRD
+The all-users all-time scope was measured only at the statement level, with
+the statement timeout disabled and JIT on: about 2.2 s median on one synthetic
+seed. It is not offered, and that timing is an observation on this seed, not a
+bound on smaller windows or on HTTP latency. No index was added: with JIT off,
+the best candidate changed the p95 by between -6.1% and +5.6% on every
+workload. The evidence and the seed's limits are in the PRD
 (`prds/done/4730-scoped-run-quality-api.md`, section 8).
