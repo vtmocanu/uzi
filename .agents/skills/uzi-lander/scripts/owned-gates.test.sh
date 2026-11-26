@@ -82,8 +82,8 @@ runs '[{id:"n1",kind:"ci_fix",status:"awaiting_approval",issue_title:"Fix CI: ag
 run_it
 [ "$rc" -eq 0 ] || fail "repo-less/other-repo matched: rc=$rc out=$out"
 
-# 5. A full run page whose oldest run is newer than the PR claim cannot prove absence:
-#    unknown, exit 3 (the case-4 runs carry created_at "t", which sorts after any date).
+# 5. A full run page cannot prove absence: unknown, exit 3, even when it reaches past the
+#    claim (an older run can enter a gate later and age out of the page).
 RUN_LIST_CAP=3 run_it
 [ "$rc" -eq 3 ] || fail "saturated page read as none: rc=$rc out=$out"
 grep -qF 'RESULT=unknown' <<<"$out" || fail "saturated: $out"
@@ -92,7 +92,28 @@ runs '[{id:"a1",repo_id:"r1",kind:"issue",status:"completed",created_at:"2026-01
        {id:"a2",repo_id:"r1",kind:"issue",status:"completed",created_at:"2026-01-06T00:00:00Z"},
        {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"2026-01-07T00:00:00Z"}]'
 RUN_LIST_CAP=3 run_it
-[ "$rc" -eq 0 ] || fail "covered full page: rc=$rc out=$out"
+[ "$rc" -eq 3 ] || fail "full page reaching past the claim read as none: rc=$rc out=$out"
+#    A gate found on a full page is still reported.
+runs '[{id:"g1",repo_id:"r1",kind:"mr_rework",status:"awaiting_input",mr_iid:42,created_at:"t"},
+       {id:"a2",repo_id:"r1",kind:"issue",status:"completed",created_at:"t"},
+       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
+RUN_LIST_CAP=3 run_it
+[ "$rc" -eq 1 ] || fail "gate on full page: rc=$rc out=$out"
+
+# 5b. Malformed lookups are unknown, never none: a run row without status breaks the matcher,
+#     a claimed run without status, and a sole repo row with a null id.
+runs '[{id:"m1",repo_id:"r1",kind:"ci_fix",status:{"x":1},mr_iid:42,created_at:"t"},
+       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
+run_it
+[ "$rc" -eq 3 ] || fail "malformed row: rc=$rc out=$out"
+runs '[{id:"r9",repo_id:"r1",kind:"issue",created_at:"t"}]'
+run_it
+[ "$rc" -eq 3 ] || fail "run claim without status: rc=$rc out=$out"
+echo '[{"id":null,"path_with_namespace":"test/repo"}]' > "$WORK/repos.json"
+runs '[{id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
+run_it
+[ "$rc" -eq 3 ] || fail "null repo id: rc=$rc out=$out"
+echo '[{"id":"r1","path_with_namespace":"test/repo"}]' > "$WORK/repos.json"
 
 # 6. An ambiguous repo lookup fails closed.
 echo '[{"id":"r1","path_with_namespace":"test/repo"},{"id":"r3","path_with_namespace":"test/repo"}]' > "$WORK/repos.json"

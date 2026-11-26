@@ -14,10 +14,9 @@
 #   #<PR> claim     -> runs in `uzi run list` with this repo's exact repo_id whose mr_iid is the
 #                      PR, whose branch is the PR's head branch, or a ci_fix whose issue_title
 #                      is "Fix CI: <head branch> pipeline ..."
-# `uzi run list` returns only the newest RUN_LIST_CAP (200) runs. A full page still covers a PR
-# claim when its oldest run predates the earliest PR claim (runs started after you claimed are
-# all visible; earlier ones were in takeover.sh's snapshot). Otherwise, with no PR-claim gate
-# found, absence is not established: RESULT=unknown, exit 3.
+# `uzi run list` returns only the newest RUN_LIST_CAP (200) runs and the API has no paging, so
+# a full page cannot prove absence: with no PR-claim gate found it is RESULT=unknown, exit 3
+# (gates it does find are still reported, exit 1). Check older runs on the board by hand.
 # Prints one line per gate:
 #   GATE key=<claim> run=<id> kind=<kind> status=<status> since=<created_at> title=<title>
 # then RESULT=none|gates|unknown COUNT=<n>.
@@ -45,8 +44,6 @@ mine="$(jq -c --arg me "$me" --arg repo "$repo" \
   '[.[] | select(.owner_uuid == $me and ((.repo // $repo) == $repo))]' <<<"$claims")" \
   || broken "claims list is not JSON"
 keys="$(jq -r '.[].key' <<<"$mine")"
-# Earliest PR claim; a claim without claimed_at gives "" and never counts as covered.
-horizon="$(jq -r '[.[] | select(.key | startswith("#")) | (.claimed_at // "")] | if length == 0 then "" elif any(. == "") then "" else min end' <<<"$mine")"
 [ -n "$keys" ] || { echo "RESULT=none COUNT=0"; exit 0; }
 
 lines=()
@@ -56,8 +53,10 @@ while IFS= read -r key; do
   case "$key" in
     run-*)
       run="$(uzi run get "${key#run-}" --json 2>/dev/null)" || broken "uzi run get ${key#run-} failed"
-      jq -e --argjson g "$GATES" '.status as $s | $g | index($s) != null' >/dev/null <<<"$run" \
-        && lines+=("$(gate_line "$key" <<<"$run")") ;;
+      is_gate="$(jq -r --argjson g "$GATES" \
+        'if (.id | type) == "string" and (.status | type) == "string" then (.status as $s | $g | index($s) != null) else error("run without id/status") end' \
+        <<<"$run" 2>/dev/null)" || broken "uzi run get ${key#run-}: no id/status"
+      [ "$is_gate" = true ] && lines+=("$(gate_line "$key" <<<"$run")") ;;
     '#'*)
       pr="${key#\#}"
       head="$(gh pr view "$pr" --repo "$repo" --json headRefName --jq .headRefName 2>/dev/null)" \
@@ -68,32 +67,31 @@ done <<<"$keys"
 
 saturated=0
 if [ "$(jq length <<<"$targets")" -gt 0 ]; then
-  ids="$(uzi repo list --json 2>/dev/null | jq -r --arg r "$repo" '[.[] | select(.path_with_namespace == $r) | .id] | if length == 1 then .[0] else empty end' 2>/dev/null)"
-  [ -n "$ids" ] || broken "repo $repo is missing or ambiguous in uzi repo list"
+  repos="$(uzi repo list --json 2>/dev/null)" || broken "uzi repo list failed"
+  ids="$(jq -r --arg r "$repo" '[.[] | select(.path_with_namespace == $r) | .id] | if length == 1 and (.[0] | type) == "string" and .[0] != "" then .[0] else empty end' <<<"$repos" 2>/dev/null)"
+  [ -n "$ids" ] || broken "repo $repo is missing, ambiguous or id-less in uzi repo list"
   runs="$(uzi run list --json 2>/dev/null)" || broken "uzi run list failed"
   n_runs="$(jq 'if type == "array" then length else error("not an array") end' <<<"$runs" 2>/dev/null)" \
     || broken "uzi run list is not a JSON array"
-  if [ "$n_runs" -ge "$CAP" ]; then
-    oldest="$(jq -r '[.[].created_at // empty] | min // ""' <<<"$runs")"
-    # ISO-8601 UTC strings compare lexically.
-    if [ -z "$horizon" ] || [ -z "$oldest" ] || [[ "$oldest" > "$horizon" ]]; then saturated=1; fi
-  fi
-  while IFS= read -r l; do [ -n "$l" ] && lines+=("$l"); done < <(jq -r --argjson t "$targets" --arg rid "$ids" --argjson g "$GATES" '
-    [ .[] | select(.repo_id == $rid) | . as $r | select($g | index($r.status) != null)
+  [ "$n_runs" -ge "$CAP" ] && saturated=1
+  matched="$(jq -r --argjson t "$targets" --arg rid "$ids" --argjson g "$GATES" '
+    if all(.[]; (.id | type) == "string" and (.status | type) == "string") then . else error("run row without id/status") end
+    | [ .[] | select(.repo_id == $rid) | . as $r | select($g | index($r.status) != null)
       | ($t[] | . as $c | select(
             ($r.mr_iid // -1) == $c.pr
          or ($c.head != "" and (($r.branch // "") == $c.head
               or ($r.kind == "ci_fix" and (($r.issue_title // "") | startswith("Fix CI: " + $c.head + " "))))))
         ) as $m
       | "GATE key=\($m.key) run=\($r.id) kind=\($r.kind) status=\($r.status) since=\($r.created_at) title=\(($r.issue_title // "") | gsub("[\\r\\n\\t]"; " "))"
-    ] | unique | .[]' <<<"$runs") || broken "match failed"
+    ] | unique | .[]' <<<"$runs" 2>/dev/null)" || broken "match failed (malformed run rows)"
+  while IFS= read -r l; do [ -n "$l" ] && lines+=("$l"); done <<<"$matched"
 fi
 
 n=${#lines[@]}
 [ "$n" -gt 0 ] && printf '%s\n' "${lines[@]}"
 if [ "$n" -gt 0 ]; then echo "RESULT=gates COUNT=$n"; exit 1; fi
 if [ "$saturated" -eq 1 ]; then
-  echo "owned-gates: uzi run list returned $CAP runs (its cap) and its oldest run is newer than the earliest PR claim; older runs are not visible" >&2
+  echo "owned-gates: uzi run list returned $CAP runs (its cap); older runs are not visible" >&2
   echo "RESULT=unknown COUNT=0"; exit 3
 fi
 echo "RESULT=none COUNT=0"
