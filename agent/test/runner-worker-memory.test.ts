@@ -302,7 +302,9 @@ const EXPECTED_HELD_SITES: Record<string, readonly string[]> = {
 
 const REAL_DATE_NOW = Date.now;
 const PRESSURE_PARK_NONCE = "original-memory-registration";
-const isDeadlineReason = (reason: unknown) => reason instanceof RecoveryDeadlineExhaustedError;
+const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+  (typeof value === "object" || typeof value === "function") && value !== null && typeof (value as { then?: unknown }).then === "function";
+const isDeadlineReason =(reason: unknown) => reason instanceof RecoveryDeadlineExhaustedError;
 const isAbortErrorReason = (reason: unknown) => reason instanceof DOMException && reason.name === "AbortError";
 const reasonClassOf = (reason: unknown) => isDeadlineReason(reason) ? "RecoveryDeadlineExhaustedError"
   : (reason as { constructor?: { name?: string } } | undefined)?.constructor?.name ?? typeof reason;
@@ -323,9 +325,15 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
   const preOpRefusals: { expired: boolean }[] = [];
   const captures: { signal: AbortSignal; deadlineAt: number; caller: AbortSignal | undefined; abortedAt?: number; returnedAt?: number;
     /** The abort was seen while the capture's action had not yet returned. */
-    abortedWhilePending?: boolean; /** The capture was opened under the original flight's preserve call. */ originalFlight?: boolean }[] = [];
+    abortedWhilePending?: boolean; /** The capture was opened under the original flight's preserve call. */ originalFlight?: boolean;
+    /** The capture action's return value settled (or it threw synchronously). */ settled?: boolean;
+    /** The maintenance-budget signal visible where the capture was requested. */ budgetSignal?: AbortSignal;
+    seq0?: number }[] = [];
   const capturePromises: Promise<unknown>[] = [];
   const t0BySignal = new Map<AbortSignal, number>();
+  const seq0BySignal = new Map<AbortSignal, number>();
+  /** Exact f(v) witnesses are searched in assertAll so observeWait does no work proportional to the clock log. */
+  const pendingWitnesses: { site: string; timeoutMs: number; t0: number; t1: number; seq0: number; seq1: number; deadlineAt: number }[] = [];
   const waits = new WeakMap<object, { timeoutMs: unknown; signal: unknown; site: string }>();
   const reached = new Map<string, number>();
   const captured = new Map<string, number>();
@@ -385,7 +393,9 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       if (!record.outcome) record.settleAtDate = REAL_DATE_NOW();
       record.outcome ??= record.entered ? { kind: "settled-without-abort" } : { kind: "rejected-before-action" };
     };
-    const wrapped = async (combined: AbortSignal) => {
+    // Non-perturbing: handlers attached below only mark the production promises as handled; production awaits them all,
+    // and the exact production promise/value is returned.
+    const wrapped = (combined: AbortSignal) => {
       record.entered = true;
       const onAbort = () => {
         if (record.outcome) return;
@@ -399,10 +409,16 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           deadlineClass: source === "own" || (source === "parent" && isDeadlineReason(reason)) };
       };
       if (combined.aborted) onAbort(); else combined.addEventListener("abort", onAbort, { once: true });
-      try { return await action(combined); } finally { combined.removeEventListener("abort", onAbort); }
+      const cleanup = () => combined.removeEventListener("abort", onAbort);
+      let result: unknown;
+      try { result = action(combined); } catch (error) { cleanup(); throw error; }
+      if (isThenable(result)) result.then(cleanup, cleanup); else cleanup();
+      return result;
     };
-    return realRecovery(signal, deadline, wrapped, ...rest).then(
-      value => { settle(); return value; }, error => { settle(); throw error; });
+    const p = realRecovery(signal, deadline, wrapped as never, ...rest);
+    if (!isThenable(p)) { settle(); return p; }
+    p.then(settle, settle);
+    return p;
   };
 
   const portRecord = (signal: AbortSignal): PortRecord => {
@@ -439,8 +455,8 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     if (!(model(t1) <= timeoutMs && timeoutMs <= model(t0)))
       fail(`${tag.site}: timeoutMs ${timeoutMs} outside [f(t1)=${model(t1)}, f(t0)=${model(t0)}]`);
     if (!(timeoutMs >= 1 && timeoutMs <= boundaryMs)) fail(`${tag.site}: timeoutMs ${timeoutMs} violates floor 1 / clamp ${boundaryMs}`);
-    if (!clock.log.some(entry => entry.value >= t0 && entry.value <= t1 && model(entry.value) === timeoutMs))
-      fail(`${tag.site}: timeoutMs ${timeoutMs} equals f(v) for no recorded Date.now value in [${t0}, ${t1}]`);
+    pendingWitnesses.push({ site: tag.site, timeoutMs, t0, t1, seq0: seq0BySignal.get(wait.signal!) ?? 0, seq1: clock.log.length,
+      deadlineAt: tag.held.deadlineAt });
     captured.set(tag.site, (captured.get(tag.site) ?? 0) + 1);
   };
 
@@ -528,16 +544,27 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     wrapCapture(inner: NonNullable<Executor["withCredentialFreeCapture"]>): NonNullable<Executor["withCredentialFreeCapture"]> {
       const wrapped = (deadlineMs: number, action: (context: CredentialFreeCaptureContext) => Promise<unknown>,
         purpose?: "capture" | "cancel", signal?: AbortSignal, attempt?: unknown) => {
-        const run = inner(deadlineMs, async context => {
+        // The record exists in wrapper scope: the run is created before the callback runs (queue wait).
+        const record = { caller: signal, abortedWhilePending: false, budgetSignal: MaintenanceBudget.signal() } as (typeof captures)[number];
+        // Non-perturbing: the callback is synchronous and returns the exact production value; handlers attached to it only
+        // mark it handled, and production awaits it.
+        const run = inner(deadlineMs, context => {
           t0BySignal.set(context.signal, REAL_DATE_NOW());
-          const record: (typeof captures)[number] = { signal: context.signal, deadlineAt: context.deadlineAt, caller: signal,
-            abortedWhilePending: false, originalFlight: original !== undefined && flightStore.getStore()?.flight === original };
-          let returned = false;
-          const note = () => { record.abortedAt ??= REAL_DATE_NOW(); if (!returned) record.abortedWhilePending = true; };
+          record.signal = context.signal;
+          record.deadlineAt = context.deadlineAt;
+          record.originalFlight = original !== undefined && flightStore.getStore()?.flight === original;
+          record.seq0 = clock.log.length;
+          seq0BySignal.set(context.signal, record.seq0);
+          captures.push(record);
+          const note = () => { record.abortedAt ??= REAL_DATE_NOW(); if (!record.settled) record.abortedWhilePending = true; };
           if (context.signal.aborted) note();
           else context.signal.addEventListener("abort", note, { once: true });
-          captures.push(record);
-          try { return await action(context); } finally { returned = true; record.returnedAt = REAL_DATE_NOW(); }
+          // returnedAt stays until the form (c) oracle stops reading it.
+          const mark = () => { record.settled = true; record.returnedAt = REAL_DATE_NOW(); };
+          let result: Promise<unknown>;
+          try { result = action(context); } catch (error) { record.settled = true; throw error; }
+          if (isThenable(result)) result.then(mark, mark); else mark();
+          return result;
         }, purpose, signal, attempt as never);
         capturePromises.push(run);
         return run;
@@ -585,6 +612,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           ...f.memory.sinkReceipts.filter(receipt => receipt.context.flight === original).map(receipt => receipt.completion)]);
       } finally {
         clock.logging = false;
+        // Restore every patch on a shared object (Date.now, git.withRecoveryOperation), reverse of installation order.
         if (Date.now === patchedNow) Date.now = REAL_DATE_NOW;
         g.withRecoveryOperation = previousRecovery;
       }
@@ -592,6 +620,15 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     /** All assertions; call only after join(). */
     assertAll() {
       const failures = [...violations];
+      for (const w of pendingWitnesses) {
+        const model = (t: number) => Math.max(1, Math.min(boundaryMs, w.deadlineAt - t));
+        let found = false;
+        for (let i = w.seq0; i < w.seq1 && i < clock.log.length; i++) {
+          const entry = clock.log[i]!;
+          if (entry.value >= w.t0 && entry.value <= w.t1 && model(entry.value) === w.timeoutMs) { found = true; break; }
+        }
+        if (!found) failures.push(`${w.site}: timeoutMs ${w.timeoutMs} equals f(v) for no recorded Date.now value in [${w.t0}, ${w.t1}]`);
+      }
       const memory = original?.workerMemory;
       if (!original) failures.push("no original flight was begun");
       const firsts = starts.filter(s => s.flight === original && s.firstCall);
@@ -1587,13 +1624,16 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   };
   const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
-  launch?.attach(runner);
-  obs.attach(runner, executor);
-  const hold = slow ? holdFirstPost("/state", "worker_memory_pressure") : undefined;
-  obs.startClock();
-  const work = obs.invoke("original", () => runner.execute(f.claim));
+  let hold: ReturnType<typeof holdFirstPost> | undefined;
+  let work!: Promise<void>;
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  // The try starts before the first patch so an early throw still reaches the finally that joins the observer.
   try {
+    launch?.attach(runner);
+    obs.attach(runner, executor);
+    hold = slow ? holdFirstPost("/state", "worker_memory_pressure") : undefined;
+    obs.startClock();
+    work = obs.invoke("original", () => runner.execute(f.claim));
     await until(() => nativeAck !== undefined, 3000 + (launch ? LAUNCH_GATE_CAP_MS : 0), launch?.facts);
     assert.equal(liveAtSend, true, "original park send starts before its owner deadline");
     if (hold) assert.equal(hold.held(), 1, "control: first park POST response was held");
@@ -1838,13 +1878,15 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
   } };
   const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, launch?.logger,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000, memoryHoldDeadlineMs: 200 });
-  launch?.attach(runner);
-  obs.attach(runner, executor);
-  // Installed only after everything that can throw, directly before the try that restores it.
-  const hold = slow ? holdFirstPost("/messages", "worker_memory_pressure") : undefined;
-  obs.startClock();
-  const work = obs.invoke("original", () => runner.execute(f.claim));
+  let hold: ReturnType<typeof holdFirstPost> | undefined;
+  let work!: Promise<void>;
+  // The try starts before the first patch so an early throw still reaches the finally that joins the observer.
   try {
+    launch?.attach(runner);
+    obs.attach(runner, executor);
+    hold = slow ? holdFirstPost("/messages", "worker_memory_pressure") : undefined;
+    obs.startClock();
+    work = obs.invoke("original", () => runner.execute(f.claim));
     await until(() => sending, 3000 + (launch ? LAUNCH_GATE_CAP_MS : 0), launch?.facts);
     assert.equal(liveAtSend, true, "original feedback send starts before its owner deadline");
     const receipt = f.memory.sinkReceipts.find(r => r.kind === "feedback" && r.context.flight === original);
