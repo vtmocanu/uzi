@@ -175,7 +175,8 @@ Merged PRs grouped by how many retained `mr_rework` runs they have.
   connection is missing or not the scoped user's, so they were left out of it.
   Admin all-users uses every user's connections, so there
   `shared_detection_unavailable` is the selected PRs whose repo has no
-  connection.
+  connection. In practice it is always 0 there, because `repos.connection_id`
+  is `NOT NULL` and cascades on connection deletion.
 - **`buckets`.** The witnessed PRs per earliest-cohort-run bucket, with the
   same four groups.
 - **`retention`** is always `retained_runs_only`: a deleted rework run lowers
@@ -202,14 +203,18 @@ kind (any kind except `cross_check`) decide whether an attempt is in scope.
 The checker's harness is separate metadata, reported as `checker_harness`
 (`claude`, `codex`, `unknown`). There is no time restriction on the lead run,
 and none on the attempt's creation time: time evidence is classified as dated
-or undated, never dropped.
+or undated. Two kinds of attempt are still counted nowhere, and neither is
+disclosed in the response: a dated attempt whose `decided_at` falls outside
+`[from, now)` (see `undated` below), and an attempt whose stage cannot apply to
+its lead kind (see the population rule below).
 
 The population is per stage, so counts always agree with `applicable`: a plan
 attempt counts only when its lead kind is plan cross-checkable, and a code
 attempt only when its lead kind is code cross-checkable (the kinds in
 [Applicability](#applicability)). For `kind=task`, plan is
 `applicable: false` with zero counts, and plan attempts retained on other lead
-kinds are not counted.
+kinds are not counted. Plan attempts on task leads, and any attempt on a chat,
+judge or job lead, are excluded under every filter and are not disclosed.
 
 Plan and code are separate measures with separate stored fields. Plan reports
 the stored verdict (`approve`, `revise`, `block`, `failed`). Code reports the
@@ -230,10 +235,14 @@ inert and never exposed. Raw findings and prompts are never returned.
 - **`undated`** counts every non-pending attempt that is not dated. An attempt
   is dated when `decided_at` is present and finite, `created_at` is finite
   (`-infinity` and `+infinity` are not), and `decided_at` is not earlier than
-  `created_at` (so a far-future `created_at` makes it undated). Undated
-  attempts are in no bucket and the window is not applied to them
-  (`window: "not_applied"`); they have no creation-time cutoff. The dated
-  series is bounded by `decided_at` in `[from, now)`.
+  `created_at`. A far-future `created_at` makes an attempt undated only when
+  `decided_at` is earlier than it; with `decided_at >= created_at` the attempt
+  is dated. Undated attempts are in no bucket and the window is not applied to
+  them (`window: "not_applied"`); they have no creation-time cutoff. The dated
+  series is bounded by `decided_at` in `[from, now)`. The dated rule has no
+  upper bound, so a non-pending attempt with a finite future `decided_at` (or a
+  far-future `created_at` with `decided_at >= created_at`) is dated but outside
+  `[from, now)`, and it is counted nowhere: not in a bucket, not in `undated`.
 - **`pending`** is a live count of attempts that are undecided and not
   interrupted, of any age, split into `plan` and `code`. The window is not
   applied and there is no `now` bound. It discloses the filters it applied in
@@ -325,8 +334,12 @@ caches (sequential requests, so they do not exercise admission):
 
 The all-users all-time scope was measured only at the statement level, with
 the statement timeout disabled and JIT on: about 2.2 s median on one synthetic
-seed. It is not offered, and that timing is an observation on this seed, not a
-bound on smaller windows or on HTTP latency. No index was added: with JIT off,
-the best candidate changed the p95 by between -6.1% and +5.6% on every
-workload. The evidence and the seed's limits are in the PRD
+seed (the `EXPLAIN ANALYZE` runs reached about 2.3 s). It is not offered, and that timing is an observation on this seed, not a
+bound on smaller windows or on HTTP latency. No index was added. With JIT on,
+a candidate index appeared to cut all-users 30d custom p95 by 23.5%; the cause
+is undetermined (an index-driven plan change or a different statistics
+sample). The decision rests on a production-like JIT-off check, where the best
+candidate changed the p95 by between -6.1% and +5.6% in both plan modes, so
+the 20% bar is not met. That check is one run at n=20 on a fresh reseed whose
+counts differ slightly from the main run (140,113 runs against 140,169). The evidence and the seed's limits are in the PRD
 (`prds/done/4730-scoped-run-quality-api.md`, section 8).

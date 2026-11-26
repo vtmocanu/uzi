@@ -326,9 +326,12 @@ type AnalyticsAllQualityParams struct {
 // membership subquery here would become an unhashed per-row SubPlan once the witness set
 // outgrew hash_mem.
 // CI fix: runs created in the window, their outcome class from run_outcome_classes.
-// Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
-// must be one whose stage can run a cross-check), with no creation-time restriction: time
-// evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
+// Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
+// creation-time restriction. Attempts whose stage cannot apply to the lead kind (plan_lead_kinds /
+// code_lead_kinds) are excluded under every filter. Each remaining non-pending attempt is either
+// dated (decided_at and created_at finite, decided_at >= created_at) or undated; a dated attempt
+// decided outside [from, now), including a future decided_at, is outside the window and not
+// counted. Stage selects the stored result field: plan reads verdict, code reads
 // outcome (the legacy code verdict column is inert).
 // Judge: the target cohort by creation time, the stable skip rules by failure origin, and the
 // retained review (one row per target; a rejudge overwrites it in place).
@@ -675,9 +678,12 @@ type AnalyticsOwnerQualityParams struct {
 // membership subquery here would become an unhashed per-row SubPlan once the witness set
 // outgrew hash_mem.
 // CI fix: runs created in the window, their outcome class from run_outcome_classes.
-// Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
-// must be one whose stage can run a cross-check), with no creation-time restriction: time
-// evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
+// Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
+// creation-time restriction. Attempts whose stage cannot apply to the lead kind (plan_lead_kinds /
+// code_lead_kinds) are excluded under every filter. Each remaining non-pending attempt is either
+// dated (decided_at and created_at finite, decided_at >= created_at) or undated; a dated attempt
+// decided outside [from, now), including a future decided_at, is outside the window and not
+// counted. Stage selects the stored result field: plan reads verdict, code reads
 // outcome (the legacy code verdict column is inert).
 // Judge: the target cohort by creation time, the stable skip rules by failure origin, and the
 // retained review (one row per target; a rejudge overwrites it in place).

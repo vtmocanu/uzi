@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,12 +27,14 @@ import (
 // per-test calendar-year isolation come from analytics_livedb_test.go (years 2040-2044 are
 // claimed here).
 //
-// Statement timeout (SQLSTATE 57014): the unit test
-// TestAnalyticsQualityStatementTimeoutIs503WithRetryAfterAndReleases pins the 503 mapping and
-// the slot release through the handler, and TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB
-// below drives a real 57014 through the live router (about 8 s, the snapshot's statement_timeout).
-// The shared snapshot's own 57014 is also covered at store level by
-// TestAnalyticsSnapshotStatementTimeoutLiveDB (#4684).
+// Query timeout: the unit test TestAnalyticsQualityStatementTimeoutIs503WithRetryAfterAndReleases
+// pins the 503 mapping and the slot release through the handler, and
+// TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB below drives a real query timeout
+// through the live router (about 8 s). Under its ACCESS EXCLUSIVE lock the snapshot's 8 s Go
+// context deadline (started before BEGIN in RunAnalyticsSnapshot) normally fires before the
+// server-side statement_timeout, so that test pins the timeout, 503 plus Retry-After and slot
+// release path, not SQLSTATE 57014 specifically. Server-side 57014 classification is pinned at
+// store level by TestAnalyticsSnapshotStatementTimeoutLiveDB (#4684).
 
 func anDecodeQuality(t *testing.T, rec *httptest.ResponseRecorder) apitypes.AnalyticsQualityDTO {
 	t.Helper()
@@ -251,9 +254,11 @@ func TestAnalyticsQualityPlanApplicabilityMatchesPopulationLiveDB(t *testing.T) 
 	}
 }
 
-// A real statement timeout through the live router: while another connection holds an ACCESS
-// EXCLUSIVE lock on runs the snapshot's first read waits until its 8 s statement_timeout, the
-// response is a 503 with Retry-After, and the admission slot is released for the next request.
+// A real query timeout through the live router: while another connection holds an ACCESS
+// EXCLUSIVE lock on runs the snapshot's first read blocks until the snapshot's 8 s Go context
+// deadline (normally before the server-side statement_timeout), the response is a 503 with
+// Retry-After, and the admission slot is released for the next request. A watchdog releases the
+// lock after 30 s so a regression fails instead of hanging.
 func TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB(t *testing.T) {
 	f := newAnFixture(t, 2042)
 	u := f.user(false)
@@ -264,20 +269,26 @@ func TestAnalyticsQualityStatementTimeoutThroughRouterLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	released := false
-	release := func() {
-		if !released {
-			released = true
-			_ = tx.Rollback(lockCtx)
-		}
-	}
+	var once sync.Once
+	release := func() { once.Do(func() { _ = tx.Rollback(lockCtx) }) }
 	t.Cleanup(release)
+	if _, err := tx.Exec(lockCtx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(lockCtx, `LOCK TABLE runs IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
+	watchdog := time.AfterFunc(30*time.Second, release)
+	defer watchdog.Stop()
 
+	start := time.Now()
 	rec := cookieReq(t, f.router, http.MethodGet, "/api/analytics/quality", jwt, "")
+	elapsed := time.Since(start)
 	release()
+	t.Logf("timeout request took %s", elapsed)
+	if elapsed < 7*time.Second || elapsed > 20*time.Second {
+		t.Errorf("request took %s, want between 7s and 20s", elapsed)
+	}
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("locked status = %d %s, want 503", rec.Code, rec.Body.String())
 	}

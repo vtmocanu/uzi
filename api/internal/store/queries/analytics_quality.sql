@@ -134,9 +134,12 @@ cf_cells AS (
     FROM bk LEFT JOIN cfb x ON x.bidx = bk.idx
     GROUP BY bk.idx
 ),
--- Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
--- must be one whose stage can run a cross-check), with no creation-time restriction: time
--- evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
+-- Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
+-- creation-time restriction. Attempts whose stage cannot apply to the lead kind (plan_lead_kinds /
+-- code_lead_kinds) are excluded under every filter. Each remaining non-pending attempt is either
+-- dated (decided_at and created_at finite, decided_at >= created_at) or undated; a dated attempt
+-- decided outside [from, now), including a future decided_at, is outside the window and not
+-- counted. Stage selects the stored result field: plan reads verdict, code reads
 -- outcome (the legacy code verdict column is inert).
 cc_base AS MATERIALIZED (
     SELECT cc.id, cc.stage,
@@ -439,9 +442,12 @@ cf_cells AS (
     FROM bk LEFT JOIN cfb x ON x.bidx = bk.idx
     GROUP BY bk.idx
 ),
--- Cross-check: attempts selected through the lead run (lead repo, harness and kind; the kind
--- must be one whose stage can run a cross-check), with no creation-time restriction: time
--- evidence is classified by the dated rule below, never dropped. Stage selects the stored result field: plan reads verdict, code reads
+-- Cross-check: attempts selected through the lead run (lead repo, harness and kind), with no
+-- creation-time restriction. Attempts whose stage cannot apply to the lead kind (plan_lead_kinds /
+-- code_lead_kinds) are excluded under every filter. Each remaining non-pending attempt is either
+-- dated (decided_at and created_at finite, decided_at >= created_at) or undated; a dated attempt
+-- decided outside [from, now), including a future decided_at, is outside the window and not
+-- counted. Stage selects the stored result field: plan reads verdict, code reads
 -- outcome (the legacy code verdict column is inert).
 cc_base AS MATERIALIZED (
     SELECT cc.id, cc.stage,
