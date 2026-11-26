@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
@@ -46,6 +48,7 @@ func TestDuplicateWakeAuthorizationFlags(t *testing.T) {
 	}
 	cases := []struct {
 		name     string
+		mutate   func(*appsv1.Deployment)
 		setup    func(wc *wakeCanary)
 		w1Block  string
 		w1Settle bool
@@ -66,10 +69,51 @@ func TestDuplicateWakeAuthorizationFlags(t *testing.T) {
 			}
 			return string(raw)
 		})},
+		// Planner-level refusals of the behavioural controls. Each row is refused by
+		// duplicateWakeSettle itself (settle false), not only at the wake write site.
+		{name: "a stale waking canary", setup: func(wc *wakeCanary) {
+			wc.at("w1").Hibernation = nil
+			wc.edit(t, "w2", func(d *appsv1.Deployment) { d.Annotations[annotationHibernationOp] = wakeCanaryOldOp })
+			wc.at("w2").Hibernation = &protocol.Hibernation{State: protocol.HibernationWaking, OpID: wakeCanaryOp}
+		}, w1Shape: true},
+		{name: "c1 template drift", mutate: func(d *appsv1.Deployment) { d.Spec.Template.Annotations[AnnotationSpecHash] = "stale-hash" }},
+		// c2 is refused by the planner: the rendered template generation no longer matches
+		// the Deployment's, which the generation term of the authorization reads. The wake
+		// write site would also refuse it through obs.Generation != w.Generation.
+		{name: "c2 observe generation drift", setup: func(wc *wakeCanary) { wc.at("w1").Generation++ }, w1Shape: true},
+		{name: "d replicas zero", mutate: func(d *appsv1.Deployment) { z := int32(0); d.Spec.Replicas = &z }},
+		{name: "h stuck", setup: func(wc *wakeCanary) {
+			pod, err := wc.c.CoreV1().Pods(wc.m.cfg.Namespace).Get(context.Background(), "pod-w1", metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name:  "worker",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			}}
+			if err := wc.c.Tracker().Update(corev1.SchemeGroupVersion.WithResource("pods"), pod, pod.Namespace); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "i reservation mismatch", setup: func(wc *wakeCanary) {
+			mk := wc.marker(t, "w1")
+			mk.TargetVersion = "9.9.9"
+			raw, err := json.Marshal(mk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wc.edit(t, "w1", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = string(raw) })
+		}},
+		{name: "k bound with independent block", mutate: func(d *appsv1.Deployment) { d.Annotations[annotationHibernationOp] = wakeCanaryOp },
+			setup: invalid, w1Block: "retained reservation invalid; explicit recovery required"},
+		// f2 tick 1: the sibling's mirror cleanup succeeds and marks w2 mutated, so the
+		// pool-wide mutated term refuses w1 in that tick.
+		{name: "f2 sibling mirror cleanup tick", setup: func(wc *wakeCanary) { mirrorSibling(t, wc) }, w1Shape: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			wc := newDupWake(t, nil)
+			wc := newDupWake(t, tc.mutate)
 			if tc.setup != nil {
 				tc.setup(wc)
 			}
@@ -139,5 +183,27 @@ func TestDuplicateWakeAuthorizationIsolation(t *testing.T) {
 				t.Fatal("a non-waking sibling was authorized")
 			}
 		})
+	}
+}
+
+// (j) Only the Deployment's template generation annotation moves between Observe and
+// planRoll. The planner refuses it through the generation term; hibernateWake's own
+// observed-generation check would still pass on the stale observation.
+func TestDuplicateWakeAuthorizationGenerationEditedBetweenObserveAndPlan(t *testing.T) {
+	wc := newDupWake(t, nil)
+	ctx := context.Background()
+	obs, err := wc.m.Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc.edit(t, "w1", func(d *appsv1.Deployment) { d.Spec.Template.Annotations[AnnotationGeneration] = "9999" })
+	byID := map[string]reconcile.ObservedWorker{}
+	for _, o := range obs {
+		byID[o.ID] = o
+	}
+	tick, _ := wc.m.planRoll(ctx, wc.workers, byID)
+	w1 := tick.entries["w1"]
+	if !w1.duplicateHeld || w1.duplicateWakeSettle {
+		t.Fatalf("duplicateHeld = %t, duplicateWakeSettle = %t, want true / false", w1.duplicateHeld, w1.duplicateWakeSettle)
 	}
 }

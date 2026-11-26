@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -279,6 +280,7 @@ func TestDuplicateCanaryWakeControlsStayUnwritten(t *testing.T) {
 func TestDuplicateCanaryWakeConflictWritesNothing(t *testing.T) {
 	wc := newDupWake(t, nil)
 	before := wc.dep(t, "w1").DeepCopy()
+	res := wc.dupReservations(t)
 	attempts := 0
 	wc.c.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		p := a.(k8stesting.PatchAction)
@@ -295,10 +297,11 @@ func TestDuplicateCanaryWakeConflictWritesNothing(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("attempts = %d", attempts)
 	}
-	after := wc.dep(t, "w1")
-	if after.ResourceVersion != before.ResourceVersion || after.Annotations[annotationHibernationOp] != wakeCanaryOldOp {
-		t.Fatal("w1 Deployment changed after a Conflict")
+	wc.requirePatchCount(t, "w2", 0)
+	if after := wc.dep(t, "w1"); !reflect.DeepEqual(after, before) {
+		t.Fatalf("w1 Deployment changed after a Conflict:\n got %+v\nwant %+v", after, before)
 	}
+	wc.requireReservations(t, res, "conflict")
 	if n := len(wc.readyCalls()); n != 0 {
 		t.Fatalf("ready reported: %d", n)
 	}

@@ -267,24 +267,27 @@ func staleDuplicate(t *testing.T, o *orphanCohort, older bool) {
 	})
 }
 
-// isOpOnlyWakeBinding reports a patch body that is exactly the top-level metadata key
-// holding only uid, resourceVersion and an annotations map with the single key
-// annotationHibernationOp.
-func isOpOnlyWakeBinding(body []byte) bool {
+// isWakeBindingPatch reports a patch body that is exactly the top-level metadata key
+// holding only the given uid, the given resourceVersion and an annotations map whose one
+// entry binds op through annotationHibernationOp.
+func isWakeBindingPatch(body []byte, uid, rv, op string) bool {
 	var top map[string]json.RawMessage
 	if json.Unmarshal(body, &top) != nil || len(top) != 1 || top["metadata"] == nil {
 		return false
 	}
 	var md map[string]json.RawMessage
-	if json.Unmarshal(top["metadata"], &md) != nil || len(md) != 3 || md["uid"] == nil || md["resourceVersion"] == nil {
+	if json.Unmarshal(top["metadata"], &md) != nil || len(md) != 3 {
 		return false
 	}
-	var ann map[string]json.RawMessage
-	if json.Unmarshal(md["annotations"], &ann) != nil || len(ann) != 1 {
+	var got struct {
+		UID             string            `json:"uid"`
+		ResourceVersion string            `json:"resourceVersion"`
+		Annotations     map[string]string `json:"annotations"`
+	}
+	if json.Unmarshal(top["metadata"], &got) != nil || got.UID != uid || got.ResourceVersion != rv {
 		return false
 	}
-	_, ok := ann[annotationHibernationOp]
-	return ok
+	return len(got.Annotations) == 1 && got.Annotations[annotationHibernationOp] == op
 }
 
 // w2Cancellations lists patches that cleared w2's reservation annotation.
@@ -441,8 +444,11 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		reasons [2]string
 		// noCancel additionally requires that w2's reservation is never cancelled.
 		noCancel bool
-		wantErr  bool
-		mutate   func(t *testing.T, o *orphanCohort)
+		// wakeBindID names the one worker whose exact op-only wake binding patch is exempt
+		// from the no-metadata-patch rule; every other row exempts nothing.
+		wakeBindID string
+		wantErr    bool
+		mutate     func(t *testing.T, o *orphanCohort)
 	}{
 		{name: "D replicas 1", mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w2", func(d *appsv1.Deployment) { d.Spec.Replicas = &one })
@@ -642,7 +648,7 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		}},
 		{name: "out-of-pool canary", mutate: func(t *testing.T, o *orphanCohort) { o.outsider(t, true, false) }},
 		{name: "out-of-pool open reservation", mutate: func(t *testing.T, o *orphanCohort) { o.outsider(t, false, false) }},
-		{name: "waking pool member with a reservation", noCancel: true, mutate: func(t *testing.T, o *orphanCohort) {
+		{name: "waking pool member with a reservation", noCancel: true, wakeBindID: "w1", mutate: func(t *testing.T, o *orphanCohort) {
 			o.at("w1").Hibernation = &protocol.Hibernation{State: protocol.HibernationWaking, OpID: orphanWakeOp}
 		}},
 		{name: "both canaries absent", mutate: func(t *testing.T, o *orphanCohort) {
@@ -741,6 +747,11 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 					reservations[id] = raw
 				}
 			}
+			var bindUID, bindRV string
+			if tc.wakeBindID != "" {
+				d := o.dep(t, tc.wakeBindID)
+				bindUID, bindRV = string(d.UID), d.ResourceVersion
+			}
 			o.c.ClearActions()
 			err := o.tick(t)
 			if (err != nil) != tc.wantErr {
@@ -748,7 +759,11 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			}
 			for _, a := range o.c.Actions() {
 				p, ok := a.(k8stesting.PatchAction)
-				if !ok || a.GetResource().Resource != "deployments" || isOpOnlyWakeBinding(p.GetPatch()) {
+				if !ok || a.GetResource().Resource != "deployments" {
+					continue
+				}
+				if tc.wakeBindID != "" && p.GetName() == deploymentName(tc.wakeBindID) &&
+					isWakeBindingPatch(p.GetPatch(), bindUID, bindRV, orphanWakeOp) {
 					continue
 				}
 				for id := range reservations {
