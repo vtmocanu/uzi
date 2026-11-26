@@ -235,6 +235,40 @@ type GuardInput struct {
 type GuardResult struct {
 	Blocked  bool
 	Findings []Finding
+	// ForgeRetryClass is the scrubbed class of the forge read failure behind a
+	// protection_unreadable block; empty when there was none. Use
+	// TransientForgeCause rather than reading it directly.
+	ForgeRetryClass forge.ErrorClass
+}
+
+// TransientForgeCause reports the transient forge class when the only reason for
+// the block is an unreadable forge that may recover: blocked, a retryable class
+// (timeout, server_error, rate_limited, network) and exactly one blocking finding,
+// protection_unreadable. Any other blocker means a retry cannot clear the guard.
+func (r GuardResult) TransientForgeCause() (forge.ErrorClass, bool) {
+	if !r.Blocked {
+		return "", false
+	}
+	switch r.ForgeRetryClass {
+	case forge.ErrorClassTimeout, forge.ErrorClassServerError,
+		forge.ErrorClassRateLimited, forge.ErrorClassNetwork:
+	default:
+		return "", false
+	}
+	blocking := 0
+	for _, f := range r.Findings {
+		if f.Severity != SeverityBlock {
+			continue
+		}
+		if f.Code != CodeProtectionUnreadable {
+			return "", false
+		}
+		blocking++
+	}
+	if blocking != 1 {
+		return "", false
+	}
+	return r.ForgeRetryClass, true
 }
 
 // GuardRepo is the shared, fail-closed live guard (PRD #66 M2, D3/D8). It answers
@@ -251,6 +285,12 @@ type GuardResult struct {
 // protection_unreadable is not a waivable code, a forge blip refuses even an
 // allowed repo.
 //
+// The result also carries ForgeRetryClass, the scrubbed class of a forge read
+// failure behind the block (VerifyToken or DefaultBranchProtection error, or a
+// GitHub ruleset read failure), cleared when ctx is done or the class is other.
+// It never changes the findings or the verdict; GuardResult.TransientForgeCause
+// exposes it to callers that may retry. A client-build failure carries no class.
+//
 // Callers: the repo-enable gate (handler.SetRepoEnabled, M4). The run-create
 // service inserts and the claim backstop wire in at M5/M6.
 func (s *Service) GuardRepo(ctx context.Context, in GuardInput) GuardResult {
@@ -265,7 +305,9 @@ func (s *Service) GuardRepo(ctx context.Context, in GuardInput) GuardResult {
 	identity, err := f.VerifyToken(ctx)
 	if err != nil {
 		// Cannot identify the bot ⇒ cannot clear it. Fail closed, generic message.
-		return blockedResult(newFinding(CodeProtectionUnreadable, "could not verify the bot token against the forge"))
+		res := blockedResult(newFinding(CodeProtectionUnreadable, "could not verify the bot token against the forge"))
+		res.ForgeRetryClass = guardRetryClass(ctx, forge.Class(err))
+		return res
 	}
 
 	role, member, roleErr := f.ProjectRole(ctx, in.Repo.ForgeProjectID, identity.ForgeUserID)
@@ -293,7 +335,30 @@ func (s *Service) GuardRepo(ctx context.Context, in GuardInput) GuardResult {
 	// six waivable codes are downgraded on an allowed repo — protection_unreadable
 	// never is (R8).
 	findings := DowngradeOverridden(rr.Findings, in.Overridden)
-	return GuardResult{Blocked: RepoReport{Findings: findings}.Blocks(), Findings: findings}
+	var retryClass forge.ErrorClass
+	switch {
+	case bpErr != nil:
+		retryClass = forge.Class(bpErr)
+	case bp.ProtectionUnverified:
+		retryClass = bp.UnverifiedReadClass
+	}
+	return GuardResult{
+		Blocked:         RepoReport{Findings: findings}.Blocks(),
+		Findings:        findings,
+		ForgeRetryClass: guardRetryClass(ctx, retryClass),
+	}
+}
+
+// guardRetryClass drops the class when the caller's context is done: a
+// cancellation or deadline of the guard's own call is not a forge outage.
+func guardRetryClass(ctx context.Context, class forge.ErrorClass) forge.ErrorClass {
+	if ctx.Err() != nil {
+		return ""
+	}
+	if class == forge.ErrorClassOther {
+		return ""
+	}
+	return class
 }
 
 // blockedResult wraps a single fail-closed finding as a blocked verdict. Used only

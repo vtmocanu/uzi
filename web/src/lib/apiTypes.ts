@@ -4645,7 +4645,7 @@ export interface Run {
   /** PRD #1392 M1: the TYPED cause of a `recovery_wait` park. Null is the LEGACY/untyped
    *  park — the empty-turn park (#1197) writes null, so render null as the generic
    *  "waiting to recover" wording, NOT as any particular cause. Known non-null values:
-   *  "forge_unreachable" (the forge stayed unreachable at clone), "codex_account_unavailable"
+   *  "forge_unreachable" (the forge could not be reached: at clone or fetch, during publication, or, for a started run, by the api's guardrail read at claim, issue #4689), "codex_account_unavailable"
    *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: a Codex
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`

@@ -385,6 +385,33 @@ func (q *Queries) ListOwnerRunPublicationIntents(ctx context.Context, arg ListOw
 	return items, nil
 }
 
+const markPublicationClaimParked = `-- name: MarkPublicationClaimParked :execrows
+UPDATE run_publication_resume SET
+    wait_started_at = COALESCE(wait_started_at, $1::timestamptz),
+    first_wait_at   = COALESCE(first_wait_at, $1::timestamptz),
+    park_total      = park_total + 1,
+    hold_reason     = $2::text
+WHERE run_id = $3 AND state = 'active'
+`
+
+type MarkPublicationClaimParkedParams struct {
+	Now        pgtype.Timestamptz `json:"now"`
+	HoldReason pgtype.Text        `json:"hold_reason"`
+	RunID      uuid.UUID          `json:"run_id"`
+}
+
+// Issue #4689: the side-row half of a claim-time forge park of an enrolled run (ParkClaimForgeUnreachable).
+// Same clock and counter semantics as MarkPublicationParked (the wait clock starts at the first park and
+// is never reset, park_total grows, hold_reason is set only on an owner hold), but no flight ran, so it
+// never touches the custodian (worker_id), the handoff, the episode or the intent. @now comes from Go.
+func (q *Queries) MarkPublicationClaimParked(ctx context.Context, arg MarkPublicationClaimParkedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPublicationClaimParked, arg.Now, arg.HoldReason, arg.RunID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const markPublicationParked = `-- name: MarkPublicationParked :one
 UPDATE run_publication_resume SET
     wait_started_at = COALESCE(wait_started_at, $1::timestamptz),
