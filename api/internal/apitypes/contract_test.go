@@ -271,6 +271,9 @@ func contractCases() []contractCase {
 		// present-as-null by design.
 		newContractCase[AnalyticsOptionsDTO]("analytics_options"),
 		newContractCase[AnalyticsSpendDTO]("analytics_spend"),
+		// Issue #4731: the Capacity response; every slice is non-omitempty and the nullable
+		// measures are present-as-null.
+		newContractCase[AnalyticsCapacityDTO]("analytics_capacity"),
 	}
 }
 

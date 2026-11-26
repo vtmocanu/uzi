@@ -108,6 +108,13 @@ func TestAnalyticsCapacityLanesLiveDB(t *testing.T) {
 	wantPopulation(t, "chat only", chat.Doc.Population, store.AnalyticsCapacityPopulation{})
 	wantOcc(t, "chat only window", chat.Doc.Occupancy.Window, 0, 561600, f6(0), "")
 	wantWait(t, "chat only wait", chat.Doc.UsageWait.Window, 0, 0, nil, store.AnalyticsReasonNoApplicableRuns)
+
+	// kind=cross_check alone: the lane-false run is included and disclosed, the lane run is not.
+	cc := f.capacity(capCall{Owner: o.User, Now: now, Kinds: []string{runkind.CrossCheck}})
+	wantPopulation(t, "cross_check only", cc.Doc.Population, store.AnalyticsCapacityPopulation{
+		Candidates: 1, WithInterval: 1, CrossCheckKindIncluded: 1,
+	})
+	wantOcc(t, "cross_check only window", cc.Doc.Occupancy.Window, 21600, 561600, f6(0.038462), "")
 }
 
 func TestAnalyticsCapacityMidnightZeroDurationBucketLiveDB(t *testing.T) {

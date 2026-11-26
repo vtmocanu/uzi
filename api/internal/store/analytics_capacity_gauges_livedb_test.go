@@ -444,7 +444,9 @@ func TestAnalyticsSavepointGaugeErrorKeepsSnapshotLiveDB(t *testing.T) {
 	err := store.RunAnalyticsSnapshot(f.ctx, f.pool, func(dctx context.Context, s *store.AnalyticsSnapshot) error {
 		first := hist(dctx, s.Q) // fixes the snapshot
 		// A second connection commits a newer reading after the snapshot was taken.
-		fencedUpsert(f.ctx, t, f.q, o.User, tok, 0, 99)
+		if n := fencedUpsert(f.ctx, t, f.q, o.User, tok, 0, 99); n != 1 {
+			t.Fatalf("competing reading affected %d rows, want exactly 1 (a no-op would make the isolation check vacuous)", n)
+		}
 
 		gaugeErr, err := s.Savepoint(dctx, func(gctx context.Context, q *store.Queries, db store.DBTX) error {
 			_, e := db.Exec(gctx, "SELECT 1/0")

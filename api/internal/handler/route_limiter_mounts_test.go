@@ -433,6 +433,7 @@ var wantRouteMounts = []routeMount{
 	// snapshot deadline (no forge call, no token spend) → noLimiter, like /usage beside them.
 	{"GET", "/api/admin/analytics/options", noLimiter},
 	{"GET", "/api/admin/analytics/spend", noLimiter},
+	{"GET", "/api/admin/analytics/capacity", noLimiter},
 	{"GET", "/api/admin/users", noLimiter},
 	{"GET", "/api/admin/vault-migration", noLimiter},
 	{"GET", "/api/admin/workers", noLimiter},
@@ -611,6 +612,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/usage", noLimiter},
 	{"GET", "/api/analytics/options", noLimiter},
 	{"GET", "/api/analytics/spend", noLimiter},
+	{"GET", "/api/analytics/capacity", noLimiter},
 	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter (v1Limiter
 	// since PRD #1908 D-B) is mounted on the whole /api/v1 subtree after RequireV1Caller
 	// (routes_v1.go), so it keys on the caller's user, not the token: minting more tokens

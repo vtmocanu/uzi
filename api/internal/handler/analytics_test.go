@@ -61,6 +61,10 @@ type analyticsRoute struct {
 
 func (h *Handler) analyticsServe(rt analyticsRoute, rec http.ResponseWriter, req *http.Request) {
 	switch {
+	case !rt.admin && rt.section == analytics.SectionCapacity:
+		h.AnalyticsCapacity(rec, req)
+	case rt.admin && rt.section == analytics.SectionCapacity:
+		h.AdminAnalyticsCapacity(rec, req)
 	case !rt.admin && rt.section == analytics.SectionOptions:
 		h.AnalyticsOptions(rec, req)
 	case !rt.admin:
@@ -77,6 +81,9 @@ var analyticsRoutes = []analyticsRoute{
 	{"owner spend", "/api/analytics/spend", false, analytics.SectionSpend},
 	{"admin options", "/api/admin/analytics/options", true, analytics.SectionOptions},
 	{"admin spend", "/api/admin/analytics/spend", true, analytics.SectionSpend},
+	// Issue #4731. Appended, so the indexes above keep their meaning.
+	{"owner capacity", "/api/analytics/capacity", false, analytics.SectionCapacity},
+	{"admin capacity", "/api/admin/analytics/capacity", true, analytics.SectionCapacity},
 }
 
 func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
@@ -124,6 +131,18 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"admin empty user", analyticsRoutes[3], "user=", "invalid user"},
 		{"semicolon pair", analyticsRoutes[1], "window=7d;x=1", "invalid query"},
 		{"bad percent-encoding", analyticsRoutes[1], "window=%zz", "invalid query"},
+		{"capacity owner user", analyticsRoutes[4], "user=" + someUUID, "user not allowed"},
+		{"capacity owner split", analyticsRoutes[4], "split=repo", "invalid split"},
+		{"capacity admin split", analyticsRoutes[5], "split=repo", "invalid split"},
+		{"capacity owner breakdown", analyticsRoutes[4], "breakdown=repo", "invalid breakdown"},
+		{"capacity owner foo", analyticsRoutes[4], "foo=1", "unknown parameter"},
+		{"capacity admin foo", analyticsRoutes[5], "foo=1", "unknown parameter"},
+		{"capacity admin window=all omitted user", analyticsRoutes[5], "window=all", msgAnalyticsWindowAllAllUsers},
+		{"capacity admin window=all user=all", analyticsRoutes[5], "window=all&user=all", msgAnalyticsWindowAllAllUsers},
+		{"capacity bad harness", analyticsRoutes[4], "harness=gemini", "invalid harness"},
+		{"capacity bad kind", analyticsRoutes[5], "kind=reliability", "invalid kind"},
+		{"capacity bad repo", analyticsRoutes[4], "repo=nope", "invalid repo"},
+		{"capacity bad tz", analyticsRoutes[4], "tz=Local", "invalid tz"},
 		{"admin options bad user", analyticsRoutes[2], "user=nobody", "invalid user"},
 	}
 	for _, tc := range cases {
@@ -169,7 +188,13 @@ func TestAnalyticsFirstBadParameterIsDeterministic(t *testing.T) {
 
 // The all-users window=all refusal is the same response whether user is omitted or user=all.
 func TestAnalyticsAdminAllUsersWindowAllRefusalIsIdentical(t *testing.T) {
-	rt := analyticsRoutes[3]
+	for _, rt := range []analyticsRoute{analyticsRoutes[3], analyticsRoutes[5]} {
+		t.Run(rt.name, func(t *testing.T) { checkWindowAllRefusalIsIdentical(t, rt) })
+	}
+}
+
+func checkWindowAllRefusalIsIdentical(t *testing.T, rt analyticsRoute) {
+	t.Helper()
 	var bodies []string
 	for _, q := range []string{"window=all", "window=all&user=all"} {
 		b := &countingBeginner{err: errors.New("must not begin")}
@@ -223,6 +248,10 @@ func TestAnalyticsAcceptedQueriesReachTheSnapshot(t *testing.T) {
 		{analyticsRoutes[3], "window=7d&user=all"},
 		{analyticsRoutes[3], "window=30d&user=all"},
 		{analyticsRoutes[3], "window=90d&user=all"},
+		{analyticsRoutes[4], ""},
+		{analyticsRoutes[4], "window=all&tz=America/New_York&harness=codex&kind=chat&repo=" + someUUID},
+		{analyticsRoutes[5], "window=7d&user=all"},
+		{analyticsRoutes[5], "window=all&user=" + someUUID},
 	}
 	for _, tc := range cases {
 		b := &countingBeginner{err: errors.New("stop here")}

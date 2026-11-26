@@ -93,7 +93,8 @@ func ClassifyAnalyticsErr(err error) error {
 // a gauge that fails with an ordinary error does not poison the snapshot for the statements
 // that follow (issue #4731). ctx is the snapshot context RunAnalyticsSnapshot handed to its
 // callback. fn receives New(gtx) and the savepoint transaction itself, so raw statements can run
-// on it too.
+// on it too. fn must not SET LOCAL on a path that returns nil: RELEASE keeps the setting for the
+// rest of the snapshot (a SET LOCAL is rolled back only when fn fails and the savepoint rolls back).
 //
 // Failure model, two results:
 //   - gaugeErr: fn failed with an ordinary error (not a timeout) while the snapshot context was
