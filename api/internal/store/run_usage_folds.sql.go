@@ -89,7 +89,8 @@ type ListMissingRunUsageFoldRunsRow struct {
 // window and carries the window's size in window_rows. The folder moves its cursor to the last
 // candidate when @lim came back, else to the window_end row, and a window smaller than 2000
 // means the traversal reached the end. The 2000 MUST stay a SQL literal: as a parameter the
-// generic plan flips to a sequential scan (TestUsageFolderMissingQueryPlanLiveDB pins it).
+// generic plan flips to a hash anti join that sequentially scans run_usage_fold_state
+// (TestUsageFolderMissingQueryPlanLiveDB asserts the literal text).
 func (q *Queries) ListMissingRunUsageFoldRuns(ctx context.Context, arg ListMissingRunUsageFoldRunsParams) ([]ListMissingRunUsageFoldRunsRow, error) {
 	rows, err := q.db.Query(ctx, listMissingRunUsageFoldRuns,
 		arg.C,

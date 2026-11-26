@@ -190,7 +190,7 @@ func containsID(ids []uuid.UUID, set ...uuid.UUID) bool {
 
 // A terminal write that never kicked the folder (status set in plain SQL, no Notify) is
 // folded by the Pass, through the missing lane (no state yet) and the stale lane (stale).
-func TestUsageFolderPassFoldsNonKickingTerminalWrite(t *testing.T) {
+func TestUsageFolderPassFoldsNonKickingTerminalWriteLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{})
 
@@ -208,7 +208,7 @@ func TestUsageFolderPassFoldsNonKickingTerminalWrite(t *testing.T) {
 }
 
 // A Pass never folds what is not eligible: non-terminal and chat runs stay unfolded.
-func TestUsageFolderPassSkipsIneligibleRuns(t *testing.T) {
+func TestUsageFolderPassSkipsIneligibleRunsLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{})
 	running := e.run(t, "running")
@@ -222,7 +222,7 @@ func TestUsageFolderPassSkipsIneligibleRuns(t *testing.T) {
 
 // More eligible runs than the per-tick limit: successive Passes fold all of them, and a run
 // the materializer skipped (its state row held locked) is reselected after the cursor wraps.
-func TestUsageFolderCursorProgressAndWrap(t *testing.T) {
+func TestUsageFolderCursorProgressAndWrapLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{LaneLimit: 2})
 
@@ -248,7 +248,7 @@ func TestUsageFolderCursorProgressAndWrap(t *testing.T) {
 // cursor: with LaneLimit 1 the other stale runs are folded within a few Passes while it is
 // locked (a cursor that never advanced would reselect the lowest id forever), and once the lock
 // is released the cursor wraps back to it.
-func TestUsageFolderStaleCursorAdvancesPastSkippedRun(t *testing.T) {
+func TestUsageFolderStaleCursorAdvancesPastSkippedRunLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	low := lowRunID()
 	mustExec(e.ctx, t, e.pool,
@@ -262,7 +262,7 @@ func TestUsageFolderStaleCursorAdvancesPastSkippedRun(t *testing.T) {
 
 	one := store.NewUsageFolder(e.pool, store.UsageFolderOptions{LaneLimit: 1})
 	release := e.lockRow(t, `SELECT run_id FROM run_usage_fold_state WHERE run_id = $1 FOR UPDATE`, low)
-	passUntil(t, one, 12, func() bool {
+	passUntil(t, one, e.passBound(t), func() bool {
 		for _, r := range others {
 			if !e.isFresh(t, r) {
 				return false
@@ -272,20 +272,20 @@ func TestUsageFolderStaleCursorAdvancesPastSkippedRun(t *testing.T) {
 	})
 	e.wantState(t, "low while locked", low, true, true)
 	release()
-	passUntil(t, one, 12, func() bool { return e.isFresh(t, low) })
+	passUntil(t, one, e.passBound(t), func() bool { return e.isFresh(t, low) })
 }
 
 // The missing lane likewise walks past a head-of-traversal run it cannot fold (its runs row is
 // held locked, so the materializer skips it and never creates its state): the older missing runs
 // are folded within a few Passes. A cursor that always reset would reselect the stuck newest run
 // forever.
-func TestUsageFolderMissingCursorAdvancesPastSkippedRun(t *testing.T) {
+func TestUsageFolderMissingCursorAdvancesPastSkippedRunLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	others := []uuid.UUID{e.missingRun(t), e.missingRun(t), e.missingRun(t)}
 	stuck := e.missingRun(t) // newest: the first candidate of every traversal
 	one := store.NewUsageFolder(e.pool, store.UsageFolderOptions{LaneLimit: 1})
 	release := e.lockRow(t, `SELECT id FROM runs WHERE id = $1 FOR UPDATE`, stuck)
-	passUntil(t, one, 12, func() bool {
+	passUntil(t, one, e.passBound(t), func() bool {
 		for _, r := range others {
 			if !e.isFresh(t, r) {
 				return false
@@ -295,11 +295,11 @@ func TestUsageFolderMissingCursorAdvancesPastSkippedRun(t *testing.T) {
 	})
 	e.wantState(t, "stuck while locked", stuck, false, false)
 	release()
-	passUntil(t, one, 12, func() bool { return e.isFresh(t, stuck) })
+	passUntil(t, one, e.passBound(t), func() bool { return e.isFresh(t, stuck) })
 }
 
 // One lane failing or running out of budget does not stop the other, in either order.
-func TestUsageFolderLaneIsolation(t *testing.T) {
+func TestUsageFolderLaneIsolationLiveDB(t *testing.T) {
 	for _, blockStale := range []bool{true, false} {
 		name := "missing lane blocked"
 		if blockStale {
@@ -370,7 +370,7 @@ func TestUsageFolderLaneIsolation(t *testing.T) {
 
 // The parent deadline bounds the whole Pass even when the per-lane budget is larger: both
 // lanes block, and Pass still returns within the parent bound.
-func TestUsageFolderParentDeadlineBoundsPass(t *testing.T) {
+func TestUsageFolderParentDeadlineBoundsPassLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{
 		ParentTimeout: 300 * time.Millisecond,
@@ -396,7 +396,7 @@ func TestUsageFolderParentDeadlineBoundsPass(t *testing.T) {
 // A run that fails on its own is retried alone, skipped for the TTL, and picked up again once
 // the (injected) clock passes it; the rest of its batch still folds. A missing lane that found
 // nothing backs off before looking again.
-func TestUsageFolderPoisonRunSkipTTLAndBackoff(t *testing.T) {
+func TestUsageFolderPoisonRunSkipTTLAndBackoffLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	var mu sync.Mutex
 	var poison uuid.UUID
@@ -480,7 +480,7 @@ func TestUsageFolderPoisonRunSkipTTLAndBackoff(t *testing.T) {
 }
 
 // Kicks and Passes share one materializer lane: they never run Materialize concurrently.
-func TestUsageFolderSerialisesMaterializerCalls(t *testing.T) {
+func TestUsageFolderSerialisesMaterializerCallsLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	var active, maxActive atomic.Int32
 	folded := make(chan struct{}, 8)
@@ -519,7 +519,7 @@ func TestUsageFolderSerialisesMaterializerCalls(t *testing.T) {
 }
 
 // A kick folds its run on a real database through Notify, synchronised on onFolded.
-func TestUsageFolderNotifyFoldsRealRun(t *testing.T) {
+func TestUsageFolderNotifyFoldsRealRunLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	got := make(chan foldCall, 1)
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{
@@ -540,7 +540,7 @@ func TestUsageFolderNotifyFoldsRealRun(t *testing.T) {
 // A batch that failed because the lane deadline expired is remembered and retried run by run on
 // the next tick, so the run whose fold outlasts the lane budget cannot block its neighbours
 // forever; that run, timing out alone, is skipped for the TTL.
-func TestUsageFolderDeadlineBatchRetriedRunByRun(t *testing.T) {
+func TestUsageFolderDeadlineBatchRetriedRunByRunLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	var slow uuid.UUID
 	var slowCalls atomic.Int32
@@ -614,7 +614,7 @@ func (t *recordingTx) Exec(ctx context.Context, sql string, args ...any) (pgconn
 	return t.Tx.Exec(ctx, sql, args...)
 }
 
-func TestUsageFolderLaneQueriesAreBoundedAndLanesAlternate(t *testing.T) {
+func TestUsageFolderLaneQueriesAreBoundedAndLanesAlternateLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	db := &recordingDB{UsageFolderDB: e.pool}
 	var mu sync.Mutex
@@ -623,6 +623,7 @@ func TestUsageFolderLaneQueriesAreBoundedAndLanesAlternate(t *testing.T) {
 	// suppresses the next Pass's missing query.
 	var clock atomic.Int64
 	f := store.NewUsageFolder(db, store.UsageFolderOptions{
+		Materialize: e.realMaterialize, // only the lane transactions go through recordingDB
 		LaneTimeout: 1500 * time.Millisecond,
 		Now:         func() time.Time { return time.Unix(0, 0).Add(time.Duration(clock.Add(1)) * time.Hour) },
 		OnLane:      func(l string) { mu.Lock(); order = append(order, l); mu.Unlock() },
@@ -657,13 +658,14 @@ func TestUsageFolderLaneQueriesAreBoundedAndLanesAlternate(t *testing.T) {
 
 // A failing lane query must not spin: the missing lane backs off MissingBackoff, and the stale
 // lane keeps its cursor and simply tries again on the next tick. Real failures are returned.
-func TestUsageFolderLaneQueryErrorBacksOffMissingLane(t *testing.T) {
+func TestUsageFolderLaneQueryErrorBacksOffMissingLaneLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	db := &recordingDB{UsageFolderDB: e.pool}
 	var cmu sync.Mutex
 	clock := time.Now()
 	f := store.NewUsageFolder(db, store.UsageFolderOptions{
-		Now: func() time.Time { cmu.Lock(); defer cmu.Unlock(); return clock },
+		Materialize: e.realMaterialize,
+		Now:         func() time.Time { cmu.Lock(); defer cmu.Unlock(); return clock },
 	})
 	db.failTx.Store(true)
 	if _, err := f.Pass(context.Background()); err == nil {
@@ -698,10 +700,13 @@ func TestUsageFolderLaneQueryErrorBacksOffMissingLane(t *testing.T) {
 	passUntil(t, f, 6, func() bool { return e.isFresh(t, r) })
 }
 
-// The missing-lane query is served by idx_runs_usage_fold_missing (migration 00544): with the
-// generic plan forced (what a prepared statement may settle on) and every other planner setting
-// at its default, it shows no sequential scan of runs. The window size MUST stay a SQL literal;
-// as a parameter the generic plan reads the whole table.
+// What this proves: with sequential scans disabled and the generic plan forced, the missing-lane
+// query's window over runs is planned through idx_runs_usage_fold_missing (migration 00544), i.e.
+// the index exists and the query's predicate implies the partial index. It does NOT prove the
+// default planner picks that plan: at this fixture's scale a sequential scan is legitimately
+// cheaper. The window size MUST stay a SQL literal (asserted below as text): as a parameter the
+// generic plan flips to a hash anti join that seq-scans run_usage_fold_state at steady state
+// (measured 145ms against 11-18ms).
 func TestUsageFolderMissingQueryPlanLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	const rows = 6000
@@ -723,8 +728,13 @@ func TestUsageFolderMissingQueryPlanLiveDB(t *testing.T) {
 	}
 	mustExecTx(e.ctx, t, tx, `ANALYZE runs`)
 	mustExecTx(e.ctx, t, tx, `SET LOCAL plan_cache_mode = force_generic_plan`)
-	mustExecTx(e.ctx, t, tx, "PREPARE fold_missing AS "+store.ListMissingRunUsageFoldRunsSQL)
-	prows, err := tx.Query(e.ctx, `EXPLAIN EXECUTE fold_missing('9999-12-31 00:00:00+00', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '{}', 100)`, pgx.QueryExecModeSimpleProtocol)
+	mustExecTx(e.ctx, t, tx, `SET LOCAL enable_seqscan = off`)
+	// PREPARE is session state and survives the rollback on a pooled connection: use a name unique
+	// to this run and deallocate it before the rollback (defers run last-in first-out).
+	stmt := "fold_missing_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	mustExecTx(e.ctx, t, tx, "PREPARE "+stmt+" AS "+store.ListMissingRunUsageFoldRunsSQL)
+	defer func() { _, _ = tx.Exec(context.Background(), "DEALLOCATE "+stmt) }()
+	prows, err := tx.Query(e.ctx, `EXPLAIN EXECUTE `+stmt+`('9999-12-31 00:00:00+00', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '{}', 100)`, pgx.QueryExecModeSimpleProtocol)
 	if err != nil {
 		t.Fatalf("explain: %v", err)
 	}

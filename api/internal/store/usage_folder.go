@@ -181,8 +181,9 @@ func (f *UsageFolder) fullBudget(ctx context.Context) bool {
 }
 
 // readTx runs fn in a short read-only transaction with a server-side statement_timeout of one
-// lane budget. pgx closes the socket when ctx ends without cancelling the backend, so without
-// this bound a slow lane query would keep running on the server after the lane gave up.
+// lane budget. pgx v5 sends a best-effort CancelRequest when ctx ends (pgconn asyncClose), but
+// it is not guaranteed to arrive, so the server-side bound is the backstop that stops a slow
+// lane query from running on after the lane gave up.
 func (f *UsageFolder) readTx(ctx context.Context, fn func(q *Queries) error) error {
 	tx, err := f.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -361,7 +362,8 @@ func (f *UsageFolder) staleLane(ctx context.Context) (int64, error) {
 // when a window is shorter than the full window; it backs off MissingBackoff only when the
 // whole traversal found no candidate. A failed query (including the lane deadline or the
 // server-side statement_timeout) also backs off, so a scan slower than the lane budget is
-// retried every MissingBackoff, not every tick.
+// retried every MissingBackoff, not every tick, but only when the query had a full lane budget:
+// a deadline caused by retryPending having consumed the budget says nothing about the query.
 func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 	now := f.opt.Now()
 	if now.Before(f.missingBackoff) {
@@ -373,6 +375,7 @@ func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 		return n0, err
 	}
 	var rows []ListMissingRunUsageFoldRunsRow
+	fullQuery := f.fullBudget(ctx)
 	err = f.readTx(ctx, func(q *Queries) error {
 		var qerr error
 		rows, qerr = q.ListMissingRunUsageFoldRuns(ctx, ListMissingRunUsageFoldRunsParams{
@@ -384,7 +387,9 @@ func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 		return qerr
 	})
 	if err != nil {
-		f.missingBackoff = now.Add(f.opt.MissingBackoff)
+		if fullQuery {
+			f.missingBackoff = now.Add(f.opt.MissingBackoff)
+		}
 		return n0, err
 	}
 	var ids []uuid.UUID
