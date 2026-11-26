@@ -2,8 +2,10 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -38,6 +40,19 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	qtx := q.WithTx(tx)
+
+	// Issue #4700: the runs row is the master lock of the run_usage fold-freshness protocol
+	// (migration 00543). Take it FOR UPDATE before the first run_usage write: that waits out
+	// every in-flight writer (each holds the row FOR KEY SHARE) before DeleteRunUsage's
+	// statement snapshot is taken, so the delete sees every row they committed, and it
+	// serialises this refold against a concurrent run delete and other refolds. No row means
+	// the run was deleted while the refold waited: nothing to refold or mark, and not a failure.
+	if _, err := qtx.LockRunForUsageRefold(ctx, run.ID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("refold usage (run %s): lock run: %w", run.ID, err)
+	}
 
 	if err := qtx.DeleteRunUsage(ctx, run.ID); err != nil {
 		return fmt.Errorf("refold usage (run %s): delete old rows: %w", run.ID, err)

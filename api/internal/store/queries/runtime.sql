@@ -9931,13 +9931,22 @@ LIMIT @lim;
 -- different generation), while a first frame whose existing value is NULL adopts the incoming one.
 -- Legacy NULL frames leave the column NULL. run_usage.claim_generation is DERIVED OUTPUT of the fold,
 -- never its evidence — the frame stamp on run_messages is the evidence.
+--
+-- Issue #4700 (fold freshness): the lk CTE calls fn_run_usage_fold_lock (migration 00543)
+-- BEFORE the insert can run. It takes FOR KEY SHARE on the runs row (raising 23503 for a
+-- missing run, exactly the FK violation the insert would raise) and marks the run's
+-- run_usage_fold_state row stale, holding that row's lock until this transaction ends so a
+-- concurrent materializer can never mark a fold that predates this write fresh. The INSERT
+-- reads FROM lk WHERE lk.ok so the CTE is evaluated and ordered first.
+WITH lk AS (SELECT fn_run_usage_fold_lock(@run_id) AS ok)
 INSERT INTO run_usage (
     run_id, session_id, model, lineage_epoch,
     input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, harness, cost_status, usage_basis, lineage_index, claim_generation, credential_epoch_ordinal, updated_at
-) VALUES (
+)
+SELECT
     @run_id, @session_id, @model, @lineage_epoch,
     @input_tokens, @cache_read_tokens, @cache_creation_tokens, @output_tokens, @cost_usd, @harness, @cost_status, @usage_basis, @lineage_index, sqlc.narg('claim_generation')::bigint, sqlc.narg('credential_epoch_ordinal')::int, now()
-)
+FROM lk WHERE lk.ok
 ON CONFLICT (run_id, session_id, model, lineage_epoch) DO UPDATE SET
     input_tokens          = GREATEST(run_usage.input_tokens,          EXCLUDED.input_tokens),
     cache_read_tokens     = GREATEST(run_usage.cache_read_tokens,     EXCLUDED.cache_read_tokens),
@@ -10554,7 +10563,12 @@ UPDATE runs SET usage_refolded = true WHERE id = @id;
 -- Clears a run's run_usage rows so RefoldRunUsage can re-fold from the frame history
 -- without the old collapsed rows lingering. Runs in the same transaction as the fold;
 -- a refold of a run with no result frames simply leaves zero rows behind.
-DELETE FROM run_usage WHERE run_id = @run_id;
+-- Issue #4700: the lk CTE marks the run's fold state stale (fn_run_usage_fold_lock,
+-- migration 00543) in the same statement. The EXISTS (... FROM lk) conjunct is a constant
+-- InitPlan: under a generic plan it surfaces as a One-Time Filter, so the delete never
+-- scans run_usage when the lock function returned false.
+WITH lk AS (SELECT fn_run_usage_fold_lock(@run_id) AS ok)
+DELETE FROM run_usage WHERE run_id = @run_id AND EXISTS (SELECT 1 FROM lk WHERE lk.ok);
 
 -- Worker chat read surface (PRD #39 M3, Decision 7) --------------------------
 -- The chat agent investigates its OWNER'S runs (both kinds) via the worker. These
