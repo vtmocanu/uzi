@@ -236,25 +236,45 @@ func TestAnalyticsCapacityUsageWaitLiveDB(t *testing.T) {
 	f.capRun(capRun{Owner: o.User, Repo: repo, Created: capDay(18, 23), Waits: 1})
 	// A second repo of the same owner, to prove the repo selector.
 	f.capRun(capRun{Owner: o.User, Repo: repo2, Created: capDay(23, 10), Waits: 1})
+	// A started ordinary run that is parked in a limit wait right now (non-terminal limit_wait):
+	// it has waited once, so it counts exactly once in usage_wait, and its retained interval runs
+	// from first_started_at to now (Nov 24 07:00 to Nov 25 12:00 = 29h).
+	f.capRun(capRun{Owner: o.User, Repo: repo, Status: "limit_wait", Created: capDay(24, 6), Started: capDay(24, 7), Waits: 1})
 
 	all := f.capacity(capCall{Owner: o.User, Now: now})
-	wantWait(t, "unfiltered", all.Doc.UsageWait.Window, 3, 5, f6(0.6), "")
-
-	scoped := f.capacity(capCall{Owner: o.User, Now: now, Repo: repo})
-	wantWait(t, "repo", scoped.Doc.UsageWait.Window, 2, 4, f6(0.5), "")
-	// Per bucket (Nov 19 = bucket 0): Nov 20 1/1, Nov 21 1/2, Nov 22 0/1, the rest empty.
+	wantWait(t, "unfiltered", all.Doc.UsageWait.Window, 4, 6, f6(0.666667), "")
+	// Unfiltered per bucket (Nov 19 = bucket 0): Nov 20 1/1, Nov 21 1/2, Nov 22 0/1, Nov 23 1/1
+	// (the second repo's run), Nov 24 1/1 (the parked run), the rest empty.
 	for i, c := range []struct {
 		count, n int64
 		share    *float64
-	}{{0, 0, nil}, {1, 1, f6(1)}, {1, 2, f6(0.5)}, {0, 1, f6(0)}, {0, 0, nil}, {0, 0, nil}, {0, 0, nil}} {
+	}{{0, 0, nil}, {1, 1, f6(1)}, {1, 2, f6(0.5)}, {0, 1, f6(0)}, {1, 1, f6(1)}, {1, 1, f6(1)}, {0, 0, nil}} {
+		wantWait(t, "unfiltered bucket", all.Doc.UsageWait.Buckets[i], c.count, c.n, c.share, store.AnalyticsReasonNoApplicableRuns)
+	}
+	// The parked run's occupancy: 17h in Nov 24, 12h in Nov 25 (now), 29h in the window; it is the
+	// only retained interval in this scope and the only ongoing run.
+	wantOccSecs(t, "parked Nov 24", all.Doc.Occupancy.Buckets[5], 17*3600, 86400)
+	wantOccSecs(t, "parked Nov 25", all.Doc.Occupancy.Buckets[6], 12*3600, 43200)
+	wantOccSecs(t, "parked window", all.Doc.Occupancy.Window, 29*3600, 561600)
+	if all.Doc.Population.Ongoing != 1 || all.Doc.Population.WithInterval != 1 {
+		t.Errorf("population = %+v, want exactly the parked run as ongoing with an interval", all.Doc.Population)
+	}
+
+	scoped := f.capacity(capCall{Owner: o.User, Now: now, Repo: repo})
+	wantWait(t, "repo", scoped.Doc.UsageWait.Window, 3, 5, f6(0.6), "")
+	// Per bucket: Nov 20 1/1, Nov 21 1/2, Nov 22 0/1, Nov 24 1/1, the rest empty.
+	for i, c := range []struct {
+		count, n int64
+		share    *float64
+	}{{0, 0, nil}, {1, 1, f6(1)}, {1, 2, f6(0.5)}, {0, 1, f6(0)}, {0, 0, nil}, {1, 1, f6(1)}, {0, 0, nil}} {
 		wantWait(t, "repo bucket", scoped.Doc.UsageWait.Buckets[i], c.count, c.n, c.share, store.AnalyticsReasonNoApplicableRuns)
 	}
 	claude := f.capacity(capCall{Owner: o.User, Now: now, Repo: repo, Harness: "claude"})
-	wantWait(t, "claude", claude.Doc.UsageWait.Window, 1, 2, f6(0.5), "")
+	wantWait(t, "claude", claude.Doc.UsageWait.Window, 2, 3, f6(0.666667), "")
 	codex := f.capacity(capCall{Owner: o.User, Now: now, Repo: repo, Harness: "codex"})
 	wantWait(t, "codex", codex.Doc.UsageWait.Window, 1, 2, f6(0.5), "")
 	issue := f.capacity(capCall{Owner: o.User, Now: now, Repo: repo, Kinds: []string{runkind.Issue}})
-	wantWait(t, "issue", issue.Doc.UsageWait.Window, 2, 3, f6(0.666667), "")
+	wantWait(t, "issue", issue.Doc.UsageWait.Window, 3, 4, f6(0.75), "")
 	chat := f.capacity(capCall{Owner: o.User, Now: now, Kinds: []string{runkind.Chat}})
 	wantWait(t, "chat", chat.Doc.UsageWait.Window, 0, 0, nil, store.AnalyticsReasonNoApplicableRuns)
 }

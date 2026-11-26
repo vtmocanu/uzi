@@ -14,7 +14,45 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
+
+// requireEvidenceDatabase checks, on one plain pgx connection and with read-only statements only,
+// that UZI_TEST_DATABASE_URL names a throwaway database (the uzi_test_harness.database_marker row
+// seeded by e2e/test-database-marker.sql, as the store evidence harness requires) and that the
+// store evidence seed is present. It returns the top owner and the run count.
+func requireEvidenceDatabase(t *testing.T) (uuid.UUID, int64) {
+	t.Helper()
+	ctx := context.Background()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Fatal("UZI_TEST_DATABASE_URL not set; the evidence harness needs a throwaway database")
+	}
+	c, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("marker check connect: %v", err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	var n int
+	if err := c.QueryRow(ctx, `SELECT count(*)::int FROM uzi_test_harness.database_marker WHERE marker = 'recovery-reset-v1'`).Scan(&n); err != nil {
+		t.Fatalf("refusing to run: uzi_test_harness.database_marker unreadable: %v; initialise a throwaway database with e2e/test-database-marker.sql", err)
+	}
+	if n != 1 {
+		t.Fatalf("refusing to run: uzi_test_harness.database_marker lacks recovery-reset-v1 (count %d)", n)
+	}
+	var top uuid.UUID
+	if err := c.QueryRow(ctx, `SELECT id FROM users WHERE email = 'evid-0001@e2e'`).Scan(&top); err != nil {
+		t.Fatalf("the store evidence seed is missing (top owner evid-0001@e2e): %v", err)
+	}
+	var nRuns int64
+	if err := c.QueryRow(ctx, `SELECT count(*) FROM runs`).Scan(&nRuns); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if nRuns < 100000 {
+		t.Fatalf("database holds %d runs, want the >= 100000 seed", nRuns)
+	}
+	return top, nRuns
+}
 
 // Issue #4731 (U4): router-level request timings for Capacity and the Spend comparison, against a
 // database the store harness already seeded. It is a measurement harness, not a gate: it is
@@ -54,19 +92,12 @@ func TestAnalyticsCapacityRequestEvidenceLiveDB(t *testing.T) {
 		}
 	}
 
+	// Verify the throwaway marker and the store evidence seed with read-only queries on a plain
+	// connection BEFORE newCapFixture migrates the database and deletes rows. Either missing
+	// fails (never skips): the operator asked for a harness that mutates the database.
+	top, nRuns := requireEvidenceDatabase(t)
 	f := newCapFixture(t, 2026, false)
 	f.now = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
-	var top uuid.UUID
-	if err := f.pool.QueryRow(context.Background(), `SELECT id FROM users WHERE email = 'evid-0001@e2e'`).Scan(&top); err != nil {
-		t.Fatalf("the store evidence seed is missing (top owner evid-0001@e2e): %v", err)
-	}
-	var nRuns int64
-	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM runs`).Scan(&nRuns); err != nil {
-		t.Fatal(err)
-	}
-	if nRuns < 100000 {
-		t.Fatalf("database holds %d runs, want the >= 100000 seed", nRuns)
-	}
 	admin := f.user(true)
 	logf("REQUEST EVIDENCE database runs=%d clock=%s measured=%d (plus 1 warm-up) through the mounted router", nRuns, f.now.Format(time.RFC3339), runs)
 

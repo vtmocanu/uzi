@@ -351,9 +351,10 @@ raw provider identifiers or poll-error text.
   `GET /api/me/codex-rate-limits` and fails closed: a locked or unreadable vault
   reports `vault_locked` per identity (`polling_disabled` instead when Codex
   polling is turned off). The admin routes read each distinct owner without
-  waiting for any user's vault lifecycle, within a 2 second budget, so they add
-  at most 2 seconds. If a state is contended, fails to read or the budget runs
-  out, the Codex gauge is `unavailable` with reason `vault_status_unavailable`
+  waiting for any user's vault lifecycle, under a 2 second budget that is
+  checked between and after the lookups (a single in-flight read is bounded by
+  its own context, not by the budget). If a state is contended, fails to read or
+  the budget runs out, the Codex gauge is `unavailable` with reason `vault_status_unavailable`
   and occupancy is kept. This reason appears on the admin routes only.
 
 ## Performance limit

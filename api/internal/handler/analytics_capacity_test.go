@@ -369,6 +369,26 @@ func TestCapacityAdminVaultObservation(t *testing.T) {
 			t.Fatalf("observation ran %v, the injected 30ms budget did not bound it", elapsed)
 		}
 	})
+	t.Run("a lookup that succeeds after the budget expired is not accepted", func(t *testing.T) {
+		m := newMemVaultQ()
+		m.states[a] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected}
+		h := capacityHandler(time.Minute)
+		h.vault = vault.New(newHandlerTestBox(t), &lateSuccessStateReader{memVaultQ: m}, m.transaction)
+		d := &analyticsDeps{vaultBudget: 30 * time.Millisecond}
+		locked, observed := h.observeCodexVault(context.Background(), d, req, rows[:1])
+		if observed || locked != nil {
+			t.Fatalf("observe = %v, %v: a state returned after the budget expired must leave the state unobserved", locked, observed)
+		}
+		g := h.codexGauge(req, capacityCodexSet{selected: true, rows: rows[:1]}, locked, observed, time.Now())
+		if g.Status != "unavailable" || *g.Reason != "vault_status_unavailable" {
+			t.Fatalf("gauge = %+v, want unavailable / vault_status_unavailable", g)
+		}
+		// Control: the same double inside a generous budget is accepted, so the refusal above is
+		// the post-lookup budget check and not the double failing.
+		if locked, observed := h.observeCodexVault(context.Background(), &analyticsDeps{vaultBudget: time.Minute}, req, rows[:1]); !observed || locked[a] {
+			t.Fatalf("control observe = %v, %v, want a observed unlocked", locked, observed)
+		}
+	})
 	t.Run("nil vault keeps the conservative fallback", func(t *testing.T) {
 		h := capacityHandler(time.Minute)
 		locked, observed := h.observeCodexVault(context.Background(), &analyticsDeps{}, req, rows)
@@ -376,6 +396,16 @@ func TestCapacityAdminVaultObservation(t *testing.T) {
 			t.Fatalf("nil-vault fallback = %v %v, want a (unprotected) open and b (protected) locked", locked, observed)
 		}
 	})
+}
+
+// lateSuccessStateReader makes the lookup's last context-sensitive step (the policy read that
+// follows the state read) take 200ms and succeed regardless of the context: the whole lookup
+// succeeds, but only after a short budget has expired, and nothing inside it reports that.
+type lateSuccessStateReader struct{ *memVaultQ }
+
+func (q *lateSuccessStateReader) GetVaultPolicy(ctx context.Context) (string, error) {
+	time.Sleep(200 * time.Millisecond)
+	return q.memVaultQ.GetVaultPolicy(context.WithoutCancel(ctx))
 }
 
 type blockingStateReader struct{ *memVaultQ }

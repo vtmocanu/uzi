@@ -42,6 +42,7 @@ import (
 // capPlanNode is one node of an EXPLAIN (FORMAT JSON) plan.
 type capPlanNode struct {
 	NodeType     string        `json:"Node Type"`
+	ParentRel    string        `json:"Parent Relationship"`
 	JoinType     string        `json:"Join Type"`
 	RelationName string        `json:"Relation Name"`
 	IndexName    string        `json:"Index Name"`
@@ -105,10 +106,25 @@ func capPlanViolations(n capPlanNode, path string) []string {
 	var out []string
 	label := path + "/" + n.NodeType
 	isJoin := strings.HasSuffix(n.NodeType, "Join") || n.NodeType == "Nested Loop"
-	if isJoin && len(n.Plans) == 2 {
+	if isJoin {
+		// A join's two inputs are its Outer and Inner children; InitPlan and SubPlan children
+		// attached to the same node are not inputs, so a join carrying one is still checked.
 		l, r := map[string]bool{}, map[string]bool{}
-		n.Plans[0].sources(l)
-		n.Plans[1].sources(r)
+		sides := 0
+		for _, c := range n.Plans {
+			switch c.ParentRel {
+			case "Outer":
+				c.sources(l)
+				sides++
+			case "Inner":
+				c.sources(r)
+				sides++
+			}
+		}
+		if sides != 2 {
+			// Never pass a join whose inputs cannot be identified.
+			out = append(out, label+": join without exactly one Outer and one Inner child")
+		}
 		lInt, rInt := capHasAny(l, capIntervalSources), capHasAny(r, capIntervalSources)
 		if n.NodeType == "Nested Loop" && ((capHasAny(l, capBucketSources) && rInt) || (capHasAny(r, capBucketSources) && lInt)) {
 			out = append(out, label+": Nested Loop joins the interval/event set with the bucket set")
@@ -291,4 +307,33 @@ func TestAnalyticsCapacityPlanGuardNegativeControlLiveDB(t *testing.T) {
 	if v := capPlanViolations(self, ""); len(v) == 0 {
 		t.Error("interval self-join was not reported")
 	}
+	// A join that also carries an InitPlan child (the join is the top node, so the uncorrelated
+	// subquery in its condition attaches to it) has three children; it must still be checked by
+	// its Outer and Inner inputs, not skipped because it does not have exactly two.
+	withInit := explain(`WITH bk AS MATERIALIZED (SELECT g AS idx, now() + g * interval '1 day' AS s FROM generate_series(1, 30) g),
+	    iv AS MATERIALIZED (SELECT now() + g * interval '1 hour' AS cs FROM generate_series(1, 500) g)
+	SELECT bk.idx FROM bk JOIN iv ON iv.cs >= bk.s + (SELECT interval '0' FROM generate_series(1, 1) LIMIT 1)`)
+	if !capJoinCarriesSubplan(withInit) {
+		t.Fatalf("calibration: the control plan has no join with an InitPlan or SubPlan child; the shape this test needs did not materialize")
+	}
+	if v := capPlanViolations(withInit, ""); len(v) == 0 {
+		t.Error("interval x bucket Nested Loop carrying an InitPlan child was not reported")
+	}
+}
+
+// capJoinCarriesSubplan reports whether some join node has an InitPlan or SubPlan child.
+func capJoinCarriesSubplan(n capPlanNode) bool {
+	if strings.HasSuffix(n.NodeType, "Join") || n.NodeType == "Nested Loop" {
+		for _, c := range n.Plans {
+			if c.ParentRel == "InitPlan" || c.ParentRel == "SubPlan" {
+				return true
+			}
+		}
+	}
+	for _, c := range n.Plans {
+		if capJoinCarriesSubplan(c) {
+			return true
+		}
+	}
+	return false
 }

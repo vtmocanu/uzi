@@ -11,6 +11,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
@@ -469,6 +471,8 @@ func TestAnalyticsCapacitySnapshotBarrierLiveDB(t *testing.T) {
 	repo, _ := f.repoOwnedBy(u, "barrier")
 	f.capRun(u, repo, "issue", "claude", f.now.Add(-3*time.Hour), f.now.Add(-2*time.Hour), 0)
 	tok := f.anthropicToken(u, "tok", true, 10, f.now.Add(-time.Hour))
+	oldCodex, newCodex := f.now.Add(-time.Hour), f.now.Add(-time.Minute)
+	acct := f.codexAccount(u, "sub", true, oldCodex)
 
 	var fired atomic.Int32
 	var busy *httptest.ResponseRecorder
@@ -478,6 +482,7 @@ func TestAnalyticsCapacitySnapshotBarrierLiveDB(t *testing.T) {
 		}
 		f.capRun(u, repo, "issue", "claude", f.now.Add(-90*time.Minute), f.now.Add(-30*time.Minute), 0)
 		cliMustExec(t, f.pool, `UPDATE anthropic_rate_limits SET five_hour_pct = 99, seven_day_pct = 99, synced_at = $2 WHERE user_secret_id = $1`, tok, f.now.Add(-time.Minute))
+		cliMustExec(t, f.pool, `UPDATE codex_account_rate_limits SET last_success_at = $2, last_attempt_at = $2 WHERE provider_account_id = $1`, acct, newCodex)
 		busy = f.cookie(u, "/api/analytics/capacity")
 	}
 	first := f.capOwner(u, "")
@@ -495,6 +500,10 @@ func TestAnalyticsCapacitySnapshotBarrierLiveDB(t *testing.T) {
 	if id.Limits.FiveHour == nil || id.Limits.FiveHour.Pct != 10 {
 		t.Fatalf("in-flight reading = %+v, want the pre-commit 10%%", id.Limits)
 	}
+	cx, ok := capCodexByAccount(first.Gauges.Codex, acct)
+	if !ok || cx.LastSuccessAt != oldCodex.UTC().Format(time.RFC3339) || cx.Status != "stale" {
+		t.Fatalf("in-flight codex reading = %+v (found %v), want last_success_at %s and stale (the pre-commit reading)", cx, ok, oldCodex.UTC().Format(time.RFC3339))
+	}
 	second := f.capOwner(u, "")
 	if second.Occupancy.Population.Candidates != 2 {
 		t.Fatalf("fresh candidates = %d, want 2", second.Occupancy.Population.Candidates)
@@ -502,6 +511,10 @@ func TestAnalyticsCapacitySnapshotBarrierLiveDB(t *testing.T) {
 	id, _ = capAnthropicBySecret(second.Gauges.Anthropic, tok)
 	if id.Limits.FiveHour == nil || id.Limits.FiveHour.Pct != 99 {
 		t.Fatalf("fresh reading = %+v, want 99%%", id.Limits)
+	}
+	cx, ok = capCodexByAccount(second.Gauges.Codex, acct)
+	if !ok || cx.LastSuccessAt != newCodex.UTC().Format(time.RFC3339) || cx.Status != "fresh" {
+		t.Fatalf("fresh codex reading = %+v (found %v), want last_success_at %s and fresh", cx, ok, newCodex.UTC().Format(time.RFC3339))
 	}
 }
 
@@ -573,8 +586,10 @@ func TestAnalyticsCapacityGaugeErrorKeepsOccupancyLiveDB(t *testing.T) {
 		}
 		return nil
 	}
-	got := f.capOwner(u, "")
+	// Keep the recorder of THIS request (the one that hits SELECT 1/0) for the sanitization check.
+	failing := f.cookie(u, "/api/analytics/capacity")
 	f.h.analyticsDeps.beforeGauge = nil
+	got := f.capDecode(failing)
 	if !slices.Equal(calls, []string{"anthropic", "codex"}) {
 		t.Fatalf("gauge order = %v, want anthropic then codex", calls)
 	}
@@ -591,8 +606,8 @@ func TestAnalyticsCapacityGaugeErrorKeepsOccupancyLiveDB(t *testing.T) {
 	if !reflect.DeepEqual(got.Occupancy, control.Occupancy) || !reflect.DeepEqual(got.UsageWait, control.UsageWait) {
 		t.Fatal("occupancy or usage_wait changed because a gauge failed")
 	}
-	if body := f.cookie(u, "/api/analytics/capacity").Body.String(); strings.Contains(body, "division") {
-		t.Fatalf("response leaks a database error: %s", body)
+	if body := failing.Body.String(); strings.Contains(body, "division") || strings.Contains(body, "22012") || !strings.Contains(body, "gauge_unavailable") {
+		t.Fatalf("failing request's response leaks a database error or lacks the sanitized reason: %s", body)
 	}
 }
 
@@ -619,6 +634,173 @@ func TestAnalyticsCapacityGaugeTimeoutIs503LiveDB(t *testing.T) {
 		t.Fatalf("timeout body = %s", rec.Body.String())
 	}
 	f.capOwner(u, "") // admission was released and the snapshot connection was returned
+}
+
+// A Codex account whose only alias was disabled and re-enabled hides its pre-disable reading: the
+// response status is exactly "pending" (polling on, vault unlocked, no reauth) in both shapes.
+func TestAnalyticsCapacityCodexReenableIsPendingLiveDB(t *testing.T) {
+	f := newCapFixture(t, 2054, true)
+	admin, u := f.user(true), f.user(false)
+	acct := f.codexAccount(u, "sub", true, f.now.Add(-time.Minute))
+	owner := f.capOwner(u, "")
+	if id, ok := capCodexByAccount(owner.Gauges.Codex, acct); !ok || id.Status != "fresh" {
+		t.Fatalf("control: owner codex identity = %+v (found %v), want fresh", id, ok)
+	}
+	var secret uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `SELECT id FROM user_secrets WHERE user_id = $1 AND kind = $2 AND label = 'sub'`, u, store.KindCodexAuth).Scan(&secret); err != nil {
+		t.Fatalf("find the alias secret: %v", err)
+	}
+	q := store.New(f.pool)
+	for _, enabled := range []bool{false, true} {
+		if _, err := q.SetSecretEnablement(context.Background(), store.SetSecretEnablementParams{ID: secret, UserID: u, Enabled: enabled}); err != nil {
+			t.Fatalf("set enabled=%v: %v", enabled, err)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		dto  apitypes.AnalyticsCapacityDTO
+	}{
+		{"owner", f.capOwner(u, "")},
+		{"admin all-users", f.capAdmin(admin, "")},
+	} {
+		id, ok := capCodexByAccount(c.dto.Gauges.Codex, acct)
+		if c.dto.Gauges.Codex.Status != "available" || !ok || id.Status != "pending" || id.LastSuccessAt != "" || len(id.Buckets) != 0 {
+			t.Fatalf("%s: re-enabled codex identity = %+v (found %v, gauge %q), want exactly pending with no reading", c.name, id, ok, c.dto.Gauges.Codex.Status)
+		}
+	}
+}
+
+// More than 200 identities per provider on the admin all-users route: exactly the first 200 in the
+// documented order (owner email, owner id, then default-first label for Claude tokens or account
+// id for Codex) come back, flagged truncated with set_state "truncated" for both providers.
+func TestAnalyticsCapacityGaugeTruncationLiveDB(t *testing.T) {
+	f := newCapFixture(t, 2055, true)
+	admin := f.user(true)
+	type owner struct {
+		id    uuid.UUID
+		email string
+	}
+	owners := make([]owner, 3)
+	for i := range owners {
+		owners[i].id = f.user(false)
+		if err := f.pool.QueryRow(context.Background(), `SELECT email FROM users WHERE id = $1`, owners[i].id).Scan(&owners[i].email); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slices.SortFunc(owners, func(a, b owner) int {
+		if c := strings.Compare(a.email, b.email); c != 0 {
+			return c
+		}
+		return strings.Compare(a.id.String(), b.id.String())
+	})
+	// Per owner: 80 Claude tokens (the first is the default, labels ascend) and 80 Codex accounts.
+	var wantTokens, wantAccounts []string
+	for oi, o := range owners {
+		for i := 0; i < 80; i++ {
+			wantTokens = append(wantTokens, f.anthropicToken(o.id, "t"+strconv.Itoa(1000+i), i == 0, 10, f.now.Add(-time.Minute)).String())
+		}
+		var accts []string
+		for i := 0; i < 80; i++ {
+			accts = append(accts, f.codexAccount(o.id, "c"+strconv.Itoa(oi*1000+i), i == 0, f.now.Add(-time.Minute)).String())
+		}
+		slices.Sort(accts)
+		wantAccounts = append(wantAccounts, accts...)
+	}
+	got := f.capAdmin(admin, "")
+	an, cx := got.Gauges.Anthropic, got.Gauges.Codex
+	if an.Status != "available" || cx.Status != "available" {
+		t.Fatalf("gauges = %q / %q, want both available", an.Status, cx.Status)
+	}
+	if !an.Truncated || an.SetState == nil || *an.SetState != "truncated" || len(an.Identities) != 200 {
+		t.Fatalf("anthropic: truncated=%v set_state=%v n=%d, want true / truncated / 200", an.Truncated, an.SetState, len(an.Identities))
+	}
+	if !cx.Truncated || cx.SetState == nil || *cx.SetState != "truncated" || len(cx.Identities) != 200 {
+		t.Fatalf("codex: truncated=%v set_state=%v n=%d, want true / truncated / 200", cx.Truncated, cx.SetState, len(cx.Identities))
+	}
+	for i, id := range an.Identities {
+		if id.SecretID != wantTokens[i] {
+			t.Fatalf("anthropic identity %d = %s, want %s (the ordered 200-prefix)", i, id.SecretID, wantTokens[i])
+		}
+	}
+	for i, id := range cx.Identities {
+		if id.AccountID != wantAccounts[i] {
+			t.Fatalf("codex identity %d = %s, want %s (the ordered 200-prefix)", i, id.AccountID, wantAccounts[i])
+		}
+	}
+}
+
+// timeoutCapacityTx runs everything on the real transaction except the Capacity historical
+// statements, which fail the way a statement_timeout does (SQLSTATE 57014).
+type timeoutCapacityTx struct {
+	pgx.Tx
+	hits *atomic.Int32
+}
+
+type erroringRow struct{ err error }
+
+func (r erroringRow) Scan(...any) error { return r.err }
+
+func (t *timeoutCapacityTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	// Only the two historical statements build the occupancy document; the gauges, the options
+	// and the timezone reads never mention it.
+	if strings.Contains(sql, "'average_concurrent_runs'") {
+		t.hits.Add(1)
+		return erroringRow{&pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"}}
+	}
+	return t.Tx.QueryRow(ctx, sql, args...)
+}
+
+type timeoutCapacityBeginner struct {
+	inner store.AnalyticsBeginner
+	hits  *atomic.Int32
+}
+
+func (b *timeoutCapacityBeginner) BeginTx(ctx context.Context, o pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := b.inner.BeginTx(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	return &timeoutCapacityTx{Tx: tx, hits: b.hits}, nil
+}
+
+// The historical statement itself timing out (not the gauges, not BeginTx) is a 503 with
+// Retry-After, leaks nothing, and releases admission and the snapshot connection.
+func TestAnalyticsCapacityHistoricalStatementTimeoutIs503LiveDB(t *testing.T) {
+	f := newCapFixture(t, 2053, false)
+	admin, u := f.user(true), f.user(false)
+	real := f.h.analyticsDeps.begin
+	for _, c := range []struct {
+		name, path string
+		viewer     uuid.UUID
+	}{
+		{"owner", "/api/analytics/capacity", u},
+		{"admin all-users", "/api/admin/analytics/capacity", admin},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var hits atomic.Int32
+			f.h.analyticsDeps.begin = &timeoutCapacityBeginner{inner: real, hits: &hits}
+			rec := f.cookie(c.viewer, c.path)
+			f.h.analyticsDeps.begin = real
+			if hits.Load() != 1 {
+				t.Fatalf("the historical statement ran %d times through the failing transaction, want 1", hits.Load())
+			}
+			if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
+				t.Fatalf("historical statement timeout = %d Retry-After %q %s, want 503 and 1", rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "57014") || strings.Contains(rec.Body.String(), "statement timeout") {
+				t.Fatalf("timeout body leaks the database error: %s", rec.Body.String())
+			}
+			// Admission was released and the snapshot connection returned: the next request is admitted and served.
+			if c.viewer == admin {
+				f.capAdmin(admin, "")
+			} else {
+				f.capOwner(u, "")
+			}
+			if n := f.pool.Stat().AcquiredConns(); n != 0 {
+				t.Fatalf("%d connections still acquired", n)
+			}
+		})
+	}
 }
 
 // A deadline error that reaches the handler as the gauge's own error with a live snapshot context

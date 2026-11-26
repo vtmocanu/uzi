@@ -200,7 +200,9 @@ func (h *evHarness) capacityWorkload(name string, owner uuid.UUID, win analytics
 }
 
 // logCapacitySelectivity runs the statement once and logs how much of the scope's runs the
-// statement's candidate set selects, and how many sweep events it sorts.
+// statement's candidate set selects, and an upper bound on the sweep events it sorts (two interval
+// endpoints per interval plus two per bucket; endpoint rows outside the window may not be emitted,
+// so the figure is not a measured row count).
 func (h *evHarness) logCapacitySelectivity(name string, win analytics.Window, scope string, b analytics.Bounds, run func() ([]byte, error)) {
 	h.t.Helper()
 	raw, err := run()
@@ -223,7 +225,7 @@ func (h *evHarness) logCapacitySelectivity(name string, win analytics.Window, sc
 	h.scalar("SELECT count(*) FROM runs "+scope, &total)
 	cand, withIv := doc.Population["candidates"], doc.Population["with_interval"]
 	events := 2*withIv + 2*int64(len(b.BucketStarts))
-	h.logf("CAPACITY SELECTIVITY %s: window=%s from=%s buckets=%d scope_runs=%d candidates=%d (%.2f%% of scope) with_interval=%d without_start=%d invalid=%d ongoing=%d end_from_status_since=%d sweep_events=%d usage_wait_n=%d usage_wait_count=%d",
+	h.logf("CAPACITY SELECTIVITY %s: window=%s from=%s buckets=%d scope_runs=%d candidates=%d (%.2f%% of scope) with_interval=%d without_start=%d invalid=%d ongoing=%d end_from_status_since=%d sweep_events_upper_bound=%d usage_wait_n=%d usage_wait_count=%d",
 		name, win, b.From.Format(time.RFC3339), len(b.BucketStarts), total, cand, 100*float64(cand)/float64(max(total, 1)),
 		withIv, doc.Population["without_start"], doc.Population["invalid_interval"], doc.Population["ongoing"],
 		doc.Population["end_from_status_since"], events, doc.UsageWait.Window.N, doc.UsageWait.Window.Count)

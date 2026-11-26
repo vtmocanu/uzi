@@ -32,8 +32,9 @@ const (
 	// capacityIdentityCap is the number of identities returned per provider gauge; the gauge
 	// statements fetch one more to detect truncation.
 	capacityIdentityCap = 200
-	// capacityVaultObserveBudget bounds the admin route's serial vault observation. It is a
-	// deadline on synchronous reads, not a timer around a lock wait: TryStatus never waits.
+	// capacityVaultObserveBudget is the admin route's serial vault observation budget. It is
+	// checked between and after the lookups; a single in-flight read is bounded only by its own
+	// context, and TryStatus never waits for a lifecycle lock.
 	capacityVaultObserveBudget = 2 * time.Second
 
 	capacityTimeBasisOccupancy   = "interval_overlap"
@@ -376,6 +377,11 @@ func (h *Handler) observeCodexVault(ctx context.Context, d *analyticsDeps, req a
 			continue
 		}
 		_, isLocked, ok, err := h.adminRateVaultTrySnapshot(bctx, row.userID, row.vaultMode)
+		// A lookup that returns success after the budget ran out is not accepted: the budget is
+		// checked after each lookup as well as before the next one.
+		if err == nil && ok && bctx.Err() != nil {
+			ok = false
+		}
 		if err != nil || !ok {
 			if err != nil {
 				slog.Warn("analytics capacity: vault status unavailable", "user", row.userID, "error", err)
