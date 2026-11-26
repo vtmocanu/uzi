@@ -767,7 +767,12 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 					continue
 				}
 				for id := range reservations {
-					if p.GetName() == deploymentName(id) && strings.Contains(string(p.GetPatch()), `"metadata"`) {
+					// Same rule as actionTrace: any patch without a top-level "spec" (including
+					// a JSON Patch array, which does not decode as an object) counts as a
+					// metadata write. Only the row-scoped wake binding above is exempt.
+					var body map[string]json.RawMessage
+					_ = json.Unmarshal(p.GetPatch(), &body)
+					if _, spec := body["spec"]; p.GetName() == deploymentName(id) && !spec {
 						t.Fatalf("a canary reservation was written: %v", actionTrace(o.c))
 					}
 				}
