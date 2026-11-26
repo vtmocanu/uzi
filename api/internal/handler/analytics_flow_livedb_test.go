@@ -454,6 +454,37 @@ func TestAnalyticsFlowLocalTimezoneLiveDB(t *testing.T) {
 	}
 }
 
+// Admin selected-user scope: a merged run of another user on the same (repo, mr_iid) is not a
+// merge witness for the selected user, while the selected user's own out-of-window merged run
+// on that PR is.
+func TestAnalyticsFlowSelectedUserWitnessLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2048)
+	admin, a, b := f.user(true), f.user(false), f.user(false)
+	repo, _ := f.repoOwnedBy(a, "fwit")
+	const mrIID = 4_729_001
+	seedPR := func(user uuid.UUID, state string, at time.Time) {
+		id := anSeedFlowRun(t, f.pool, anFlowRun{user: user, repo: repo, status: "completed", at: at, finished: at.Add(time.Hour)})
+		cliMustExec(t, f.pool, `UPDATE runs SET mr_iid = $2, mr_state = $3 WHERE id = $1`, id, mrIID, state)
+	}
+	seedPR(a, "opened", f.now.Add(-2*time.Hour))
+	seedPR(b, "merged", f.now.Add(-time.Hour))
+
+	path := "/api/admin/analytics/flow?user=" + a.String()
+	dto := anDecodeFlow(t, f.cookie(admin, path))
+	if dto.DeliveryFunnel.PRUnits.Present != 1 || dto.DeliveryFunnel.PRUnits.Merged != 0 || dto.DeliveryFunnel.Stages.Merged != 0 {
+		t.Fatalf("B's merged run witnessed A's PR: pr_units present %d merged %d, merged stage %d, want 1 / 0 / 0",
+			dto.DeliveryFunnel.PRUnits.Present, dto.DeliveryFunnel.PRUnits.Merged, dto.DeliveryFunnel.Stages.Merged)
+	}
+
+	// Control: A's own merged run on the same PR, outside the 30d window, is a witness.
+	seedPR(a, "merged", f.now.Add(-60*24*time.Hour))
+	dto = anDecodeFlow(t, f.cookie(admin, path))
+	if dto.DeliveryFunnel.PRUnits.Present != 1 || dto.DeliveryFunnel.PRUnits.Merged != 1 || dto.DeliveryFunnel.Stages.Merged != 1 {
+		t.Fatalf("A's own out-of-window merged run: pr_units present %d merged %d, merged stage %d, want 1 / 1 / 1",
+			dto.DeliveryFunnel.PRUnits.Present, dto.DeliveryFunnel.PRUnits.Merged, dto.DeliveryFunnel.Stages.Merged)
+	}
+}
+
 // The snapshot barrier: a run committed on another connection after the first read is not seen
 // by the in-flight response and is seen by the next request.
 func TestAnalyticsFlowSnapshotBarrierLiveDB(t *testing.T) {
