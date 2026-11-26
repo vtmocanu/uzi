@@ -56,7 +56,7 @@ wall seconds to load at the CI concurrency, then place heavy tests longest
 first on the lightest shard. Keep unmeasured files hashed with unknown costs.
 Compare the resulting load estimates and run focused selector/launcher tests.
 Run all three `task test:agent:shard` legs with matching JUnit destinations and M4
-once in the shard-1 composition, then run `task check:agent-shards` over the
+once in the shard-2 composition, then run `task check:agent-shards` over the
 actual reports and success marker. This independently proves the tracked-file
 union and disjointness before accepting new pins. See [ADR-3121](../adr/3121-stable-agent-test-shards.md)
 for the initial timing provenance and decision.

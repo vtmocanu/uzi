@@ -46,8 +46,8 @@ load assessment. The branch's new unit-test-shards regression has unknown CI
 cost and remains hashed; no absent measurement is assigned zero cost or copied
 from another file. Matching file counts alone do not establish inventory identity.
 
-Allocation initially seeds both shards with the measured load of their hashed
-remainder, then adds the estimated M4 overhead to shard 1 in concurrency-equivalent
+The initial two-shard allocation seeded both shards with the measured load of their hashed
+remainder and added the estimated M4 overhead to shard 1 in concurrency-equivalent
 load units. Heavy tests are assigned longest first to the lighter shard, with
 path order breaking weight ties and shard 1 breaking equal estimated-load ties.
 The refreshed assessment uses only matching measurements from the complete new
@@ -75,8 +75,8 @@ the existing hermetic-proc-default proof through the launcher.
 The agent suite now runs in three shards, 1/3, 2/3 and 3/3. Unpinned paths use
 the first SHA-256 digest byte modulo three. The pin file has exactly those three
 sorted arrays, and check:agent-shards requires three disjoint JUnit reports whose
-union is every tracked file, with M4 once, in shard 1. Concurrency, the test
-timeout and M4 placement are unchanged.
+union is every tracked file. That change kept M4 in shard 1, with concurrency
+and test timeouts unchanged.
 
 The change moves most memberships once. After it, the membership contract above
 holds unchanged: adding or deleting an unpinned path moves no other path.
@@ -89,10 +89,22 @@ each, above the LiveDB job.
 Pin provenance: per-file wall durations (duration_ms in each shard's
 progress.json, which includes process lifetime) from the attempt-1 artifacts of
 six green main runs, 43291940611 through 43367001027, taking the median per
-file. Every tracked file had a measurement. Allocation seeds every shard with
-its hashed remainder, adds M4's 45 wall seconds times concurrency three to
-shard 1, then moves the heaviest file that fits from the heaviest to the
+file. Every tracked file had a measurement. The allocation seeded every shard with
+its hashed remainder, added M4's 45 wall seconds times concurrency three to
+shard 1, then moved the heaviest file that fits from the heaviest to the
 lightest shard until the spread is within 2% of the mean shard load. Pins that
 equal the hash assignment are dropped, leaving seven. The estimated loads are
 6575, 6576 and 6706 load seconds, about 2200 wall seconds per shard at
 concurrency three. These are estimates; verify against measured main runs.
+
+## Amendment: Codex M4 moves to shard 2 (#4722, 2026-11-26)
+
+Five successful main CI runs measured M4 at 9.3 to 13.1 minutes. Moving it to
+shard 2, with job starts and other work fixed, reduced the projected median
+workflow tail by 5.7 minutes. One sample projected a longer tail. The
+aggregate checker now requires the M4 marker from shard 2 and rejects it
+on the other shards. The wrapper self-tests still run on shard 1.
+
+Existing test-file pins stay fixed. The launcher and checker validate
+membership and coverage. There is no checked-in timing-based pin generator.
+When re-pinning from fresh CI measurements, account for M4 on shard 2.

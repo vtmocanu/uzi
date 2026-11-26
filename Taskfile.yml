@@ -3286,8 +3286,8 @@ tasks:
       # Issue #2240: with no caller override or denied-procfs cap, the wrapper floors
       # availableParallelism()==2 at two files, leaves one CPU untouched, and prints
       # runtime/quota/concurrency diagnostics plus the unit-stage duration.
-      # This self-test validates the wrapper used by both legs. Run it once in
-      # shard 1 with M4, and once in the unsharded local composition.
+      # These self-tests validate the shared wrapper. Run them once in
+      # shard 1 and once in the unsharded local composition.
       # tmpdir-leak-guard.test.sh (issue #2020) is the same kind of self-test: it proves a
       # leftover is reported with its ledger evidence and the exit codes are unchanged.
       - |
