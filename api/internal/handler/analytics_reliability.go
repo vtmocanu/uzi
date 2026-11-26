@@ -68,7 +68,8 @@ func (d *analyticsDeps) reliability(ctx context.Context, s *store.AnalyticsSnaps
 
 	kinds := reliabilityKinds(req.kinds)
 	if len(kinds) == 0 {
-		// No delivery kind selected: nothing is read, and the response says so instead of
+		// No delivery kind selected: authorize has run, but no history, cohort or latest-failure
+		// statement runs, and the response says so instead of
 		// reporting a zero failure rate.
 		bounds, err := analytics.ComputeBounds(now, loc, req.window, nil)
 		if err != nil {
