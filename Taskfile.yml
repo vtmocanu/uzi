@@ -1411,6 +1411,7 @@ tasks:
       - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
       - ./.agents/skills/uzi-lander/scripts/wait-mrrework.test.sh
+      - ./.agents/skills/uzi-lander/scripts/owned-gates.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/claims-atomic-lock.test.py
       - ./.agents/skills/uzi-lander/scripts/claims-registry-fetch.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
@@ -2667,6 +2668,7 @@ tasks:
       # OTHER module, above its own root -
       # internal/protocol -> ../../../api/internal/hostedsvc/testdata/controller_poll_wire.json
       # internal/preset   -> ../../../api/internal/hostedsvc/testdata/{hosted_sizes,hosted_templates}.json
+      # internal/apiclient -> ../../../api/internal/hostedsvc/testdata/controller_poll_limits.json
       # Those cross-reads ARE the gate on the wire format, so a `(cached)` run
       # silently retires the only check on it.
       #

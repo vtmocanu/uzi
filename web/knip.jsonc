@@ -63,7 +63,8 @@
   //
   // `scripts/modules-browser-test.mjs` is the runtime-modules harness (`npm run
   // test:modules-browser`); knip reaches it through that package.json script, and it imports
-  // browser-launch.mjs and modules-manifest-traversal.mjs, so those need no line.
+  // browser-launch.mjs, modules-browser-groups.mjs and modules-manifest-traversal.mjs, so
+  // those need no line.
   // `scripts/modules-compose-check.mjs` (PRD #4686) is the browser step of the opt-in compose
   // acceptance (`task test:web-modules-compose`): scripts/web-modules-compose-acceptance.sh
   // copies it into a Playwright container and runs it with node, so no package.json script
