@@ -1255,16 +1255,6 @@ plan_legacy AS (
                                    OR (bool_or(x.gate_binding = 'unbound')
                                        AND NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id))) l
 ),
-run_ev AS (
-    SELECT x.run_id,
-           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev = x.run_rev) AS cur_n,
-           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev < x.run_rev) AS hist_n,
-           (bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')
-                AND count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev = x.run_rev) <> 1) AS legacy,
-           count(*) AS any_receipt
-    FROM rcpt_c x
-    GROUP BY x.run_id
-),
 fr AS MATERIALIZED (
     SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
            c.repo_id, c.mr_iid, c.bidx, o.outcome,
@@ -1275,7 +1265,20 @@ fr AS MATERIALIZED (
                 AND (c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)) AS witnessed
     FROM cc c
     LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
-    LEFT JOIN run_ev e ON e.run_id = c.id
+    -- Per-run receipt aggregate as a probe of idx_run_user_inputs_run_id: a join against a cohort-wide
+    -- GROUP BY CTE is re-read once per run under a generic plan.
+    LEFT JOIN LATERAL (
+        SELECT count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) AS cur_n,
+               count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev < c.gate_revision) AS hist_n,
+               (bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound')
+                    AND count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) <> 1) AS legacy,
+               count(*) AS any_receipt
+        FROM (SELECT x.gate_binding, x.gate_revision AS rev,
+                     COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
+                     (x.disposition IS NULL OR x.disposition = 'applied') AS dok,
+                     COALESCE(x.created_at <= x.applied_at, false) AS cok
+              FROM run_user_inputs x WHERE x.run_id = c.id AND x.kind = 'approve_plan' OFFSET 0) y
+    ) e ON true
     WHERE c.kind IN ('issue', 'self_improve')
 ),
 fr_class AS (
@@ -1684,16 +1687,6 @@ plan_legacy AS (
                                    OR (bool_or(x.gate_binding = 'unbound')
                                        AND NOT EXISTS (SELECT 1 FROM pair_class pc WHERE pc.run_id = x.run_id))) l
 ),
-run_ev AS (
-    SELECT x.run_id,
-           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev = x.run_rev) AS cur_n,
-           count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev < x.run_rev) AS hist_n,
-           (bool_or(x.gate_binding IS NULL OR x.gate_binding = 'unbound')
-                AND count(*) FILTER (WHERE x.applied_bound AND x.disp_ok AND x.chron_ok AND x.rev = x.run_rev) <> 1) AS legacy,
-           count(*) AS any_receipt
-    FROM rcpt_c x
-    GROUP BY x.run_id
-),
 fr AS MATERIALIZED (
     SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
            c.repo_id, c.mr_iid, c.bidx, o.outcome,
@@ -1704,7 +1697,20 @@ fr AS MATERIALIZED (
                 AND (c.repo_id, c.mr_iid) IN (SELECT mw.repo_id, mw.mr_iid FROM merged_witness mw)) AS witnessed
     FROM cc c
     LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
-    LEFT JOIN run_ev e ON e.run_id = c.id
+    -- Per-run receipt aggregate as a probe of idx_run_user_inputs_run_id: a join against a cohort-wide
+    -- GROUP BY CTE is re-read once per run under a generic plan.
+    LEFT JOIN LATERAL (
+        SELECT count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) AS cur_n,
+               count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev < c.gate_revision) AS hist_n,
+               (bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound')
+                    AND count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) <> 1) AS legacy,
+               count(*) AS any_receipt
+        FROM (SELECT x.gate_binding, x.gate_revision AS rev,
+                     COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
+                     (x.disposition IS NULL OR x.disposition = 'applied') AS dok,
+                     COALESCE(x.created_at <= x.applied_at, false) AS cok
+              FROM run_user_inputs x WHERE x.run_id = c.id AND x.kind = 'approve_plan' OFFSET 0) y
+    ) e ON true
     WHERE c.kind IN ('issue', 'self_improve')
 ),
 fr_class AS (
