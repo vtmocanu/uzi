@@ -121,8 +121,9 @@ type genericPlanCase struct {
 	scoped    bool
 	spend     bool
 	ownLegs   int64
-	// quality marks the #4730 Quality statements: they read no run_usage, so only the
-	// join/subplan offender classes of qualityOffenders apply.
+	// quality marks the #4730 Quality statements: they read no run_usage, so qualityOffenders
+	// applies instead (the looped-work class limited to CTE Scans and runs, no join-discard
+	// class, plus qualityShapeProblems).
 	quality bool
 }
 

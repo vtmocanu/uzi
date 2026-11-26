@@ -619,10 +619,13 @@ func TestQualityCalendarAllTimeLiveDB(t *testing.T) {
 }
 
 // qualityOldWitnessBlock is the rw_pr CTE as it was before the witness fold became a GROUP BY
-// over a UNION ALL: the merge-witness lookup is a correlated scalar subquery over rw_witness,
-// an unhashed per-row SubPlan whatever the witness set's size. It is the negative control of
-// the plan-shape test below, written against the generated statement's $1 (bucket_starts) and
-// $2 (bucket_ends) parameters.
+// over a UNION ALL. The old lookup was a membership IN over rw_witness, which the planner
+// hashes at test scale; this control is a deliberately unhashed stand-in for it (a correlated
+// scalar subquery over rw_witness, an unhashed per-row SubPlan whatever the witness set's
+// size), so the unhashed-SubPlan check has something to catch. The real old IN form is caught
+// by the "rw_witness is read under a hashed SubPlan" branch of qualityShapeProblems. It is the
+// negative control of the plan-shape test below, written against the generated statement's $1
+// (bucket_starts) and $2 (bucket_ends) parameters.
 const qualityOldWitnessBlock = `rw_pr AS MATERIALIZED (
     SELECT p.repo_id, p.mr_iid, p.witnessed,
            CASE WHEN p.wb >= 1 AND p.first_at < ($2::timestamptz[])[p.wb] THEN p.wb END AS bidx
@@ -641,8 +644,8 @@ const qualityOldWitnessBlock = `rw_pr AS MATERIALIZED (
 // outgrows hash_mem), the merge witness (rw_witness) is folded in by a plain scan, the
 // rework-link membership (rw_sel) is a hashed SubPlan, and no rework/PR join falls back to a
 // nested loop with a Join Filter on the (repo_id, mr_iid) pair. Both statements are checked,
-// and a negative control (the old per-row witness lookup swapped back in) proves the check can
-// fail.
+// and a negative control (a deliberately unhashed stand-in for the old IN witness lookup,
+// swapped back in) proves the check can fail.
 func TestQualityGenericPlanShapeLiveDB(t *testing.T) {
 	f := newQualityFixture(t)
 	o := f.owner("plan")
