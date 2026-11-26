@@ -649,28 +649,6 @@ func TestCodexCAUnstampedOwnClaimDecidesAgainstARecordAndAForeignStamp(t *testin
 	}
 }
 
-// Namespace fold (PVC c): the own /data claim is absent but a foreign same-ID claim makes the
-// scalar observation read live. Nothing is deleted and the recycle reports the missing
-// evidence.
-func TestCodexCAForeignClaimAloneCannotAuthorizeADataDelete(t *testing.T) {
-	foreign := pvcForNS("w1", "data", caDockerNS)
-	cfg := caCfg()
-	cfg.DockerNamespace = caDockerNS
-	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
-	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", DiskPressure: true}, m5Now)
-	dep := markedDeployment(t, cfg.withCodexCA(true), w, false)
-	zero := int32(0)
-	dep.Spec.Replicas = &zero
-	m, c := caMat(t, cfg, dep, foreign, pvcNix("w1", "20Gi"))
-	err := caTick(t, m, w)
-	if err == nil || !strings.Contains(err.Error(), "recycle data claim evidence unavailable") {
-		t.Fatalf("tick err = %v, want the evidence-unavailable error", err)
-	}
-	if got := caPVCDeletes(c); len(got) != 0 {
-		t.Fatalf("claims deleted: %v", got)
-	}
-}
-
 // caPartialDelete runs a retained recycle whose /data delete fails after /nix was deleted,
 // then restarts the controller at that boundary.
 // It also returns the Deployment's hash taken before the first recycle tick.

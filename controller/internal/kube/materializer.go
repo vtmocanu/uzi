@@ -990,6 +990,16 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	}
 	if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
 		retained = true
+		// A retained /data recycle needs the own claim's UID and liveness. Refuse before
+		// the scale-down (and so before any delete, /nix included) when the own claim
+		// exists but is Terminating or has no UID.
+		if vols.Data {
+			if has, live := ownDataPresence(w, obs, ns); has {
+				if c := ownDataClaim(w, obs, ns); !live || (c != nil && c.UID == "") {
+					return fmt.Errorf("recycle data claim evidence unavailable; re-poll required")
+				}
+			}
+		}
 		if e.dep == nil || e.dep.DeletionTimestamp != nil {
 			return fmt.Errorf("recycle reservation deployment unavailable")
 		}
@@ -1032,8 +1042,10 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// one is already being reaped, so re-deleting it is a redundant call (matching the nix
 	// arm's NixPVCSize != nil liveness gate above; /data has no size, so DataPVCLive is its
 	// proxy).
-	if vols.Data && obs.HasDataPVC && obs.DataPVCLive {
-		names = append(names, dataPVCName(w.ID))
+	if vols.Data {
+		if _, live := ownDataPresence(w, obs, ns); live {
+			names = append(names, dataPVCName(w.ID))
+		}
 	}
 	// rollSnapshot scans every namespace pod, including terminating and unmanaged
 	// pods. Unknown snapshot evidence or any selected mount defers this tick.
@@ -1115,13 +1127,14 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 // it). A confirmed stamp retires the carry.
 func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec, stampCodexCA bool) (deferred, codexStamped bool, err error) {
 	placementSet := m.cfg.NewPlacementSet()
+	ownHas, _ := ownDataPresence(w, obs, ns)
 	stamp := false
 	if placementSet {
 		for _, c := range []struct {
 			has   bool
 			claim *reconcile.ClaimObservation
 		}{
-			{obs.HasDataPVC, obs.DataClaim},
+			{ownHas, ownDataClaim(w, obs, ns)},
 			{obs.HasNixPVC, obs.NixClaim},
 			{obs.HasDinDDataPVC, obs.DinDClaim},
 		} {
@@ -1138,7 +1151,7 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 		isData := false
 		switch pvc.Name {
 		case dataPVCName(w.ID):
-			if obs.HasDataPVC {
+			if ownHas {
 				continue
 			}
 			isData = true
@@ -1194,9 +1207,9 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 // older would let a genuinely-old sibling volume defeat the cooldown and thrash. A nil
 // timestamp everywhere (no live PVC observed) allows the recycle — there is nothing to
 // prove a recent one.
-func (m *Materializer) withinRecycleCooldown(obs reconcile.ObservedWorker) bool {
+func (m *Materializer) withinRecycleCooldown(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) bool {
 	var youngest *time.Time
-	for _, t := range []*time.Time{obs.NixPVCCreatedAt, obs.DataPVCCreatedAt} {
+	for _, t := range []*time.Time{obs.NixPVCCreatedAt, ownDataCreatedAt(w, obs, ns)} {
 		if t != nil && (youngest == nil || t.After(*youngest)) {
 			youngest = t
 		}
@@ -1354,17 +1367,18 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// discard it. It falls through to normal reconcile (like the cooldown case) with a fixed
 	// deferral token, rather than recycling. recycleWorkerVolumes itself also refuses to drop
 	// a held /data volume, so this arm is doubly guarded.
-	if legacy && m.recycle.Enabled && w.DiskPressure && !w.Ephemeral && obs.HasNixPVC && obs.HasDataPVC {
+	ownHasData, _ := ownDataPresence(w, obs, ns)
+	if legacy && m.recycle.Enabled && w.DiskPressure && !w.Ephemeral && obs.HasNixPVC && ownHasData {
 		switch {
 		case w.CustodyHeld:
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-custody worker=%s", w.ID))
 			// custody protects unpublished work: fall through to normal reconcile; do NOT recycle.
 		case dockerDataPressure:
 			// The durable-data deferral was already logged before DinD handling.
-		case m.withinRecycleCooldown(obs):
+		case m.withinRecycleCooldown(w, obs, ns):
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
 			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
-		case m.pressureRecycleEligible(w, obs):
+		case m.pressureRecycleEligible(w, obs, ns):
 			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: !w.Docker, Pressure: true})
 		}
 	}
@@ -1436,7 +1450,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// suppresses the recreate — /data has no size, so its liveness is the gate. dataBlocking
 		// is false when /data is ABSENT (first-provision) or LIVE (steady state), so neither is
 		// affected; it fires only for a present-but-Terminating /data volume.
-		if deploymentPlacementBlocked(w, obs, spec) {
+		if deploymentPlacementBlocked(w, obs, spec, ns) {
 			return nil
 		}
 		_, err := m.client.AppsV1().Deployments(ns).Create(ctx, dep, metav1.CreateOptions{})
@@ -1451,7 +1465,8 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	paused := false
 	if e := rollFrom(ctx, w.ID); e != nil && e.dep != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 {
 		paused = true
-		if len(e.pods) != 0 || !obs.HasNixPVC || obs.NixPVCSize == nil || obs.NixPVCSize.Cmp(spec.NixSize) < 0 || !obs.HasDataPVC || !obs.DataPVCLive || (w.Docker && (!obs.HasDinDDataPVC || !obs.DinDPVCLive)) {
+		pausedOwnHas, pausedOwnLive := ownDataPresence(w, obs, ns)
+		if len(e.pods) != 0 || !obs.HasNixPVC || obs.NixPVCSize == nil || obs.NixPVCSize.Cmp(spec.NixSize) < 0 || !pausedOwnHas || !pausedOwnLive || (w.Docker && (!obs.HasDinDDataPVC || !obs.DinDPVCLive)) {
 			return nil
 		}
 	}

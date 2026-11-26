@@ -59,6 +59,7 @@ func claimObservationOf(ns, workerID string, p *corev1.PersistentVolumeClaim) re
 		WorkerID:         workerID,
 		Phase:            string(p.Status.Phase),
 		Terminating:      p.DeletionTimestamp != nil,
+		CreatedAt:        p.CreationTimestamp.Time,
 		Requested:        p.Spec.Resources.Requests[corev1.ResourceStorage].DeepCopy(),
 		RollAnnotation:   p.Annotations[annotationRoll],
 		ResizeConditions: []string{},

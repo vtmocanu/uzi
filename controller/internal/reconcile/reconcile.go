@@ -43,6 +43,8 @@ type ClaimObservation struct {
 	WorkerID    string
 	Phase       string
 	Terminating bool
+	// CreatedAt is the claim's metadata.creationTimestamp.
+	CreatedAt time.Time
 	// Requested is spec.resources.requests[storage].
 	Requested resource.Quantity
 	// Capacity is status.capacity[storage]; nil while absent (not yet provisioned).

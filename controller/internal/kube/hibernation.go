@@ -208,9 +208,10 @@ func allTerminated(specNames []string, statuses []corev1.ContainerStatus) bool {
 // undersized volume. False when a claim is absent or live (steady state); first provision
 // and re-mint reach the create in one tick unless that pass wrote the Codex CA evidence,
 // when reconcileWorker defers the Deployment one tick (codexCAWriteDeferred).
-func deploymentPlacementBlocked(w protocol.DesiredWorker, obs reconcile.ObservedWorker, spec preset.Spec) bool {
+func deploymentPlacementBlocked(w protocol.DesiredWorker, obs reconcile.ObservedWorker, spec preset.Spec, ns string) bool {
 	nixLiveAtSize := obs.NixPVCSize != nil && obs.NixPVCSize.Cmp(spec.NixSize) >= 0
-	dataBlocking := obs.HasDataPVC && !obs.DataPVCLive // present but Terminating
+	ownHas, ownLive := ownDataPresence(w, obs, ns)
+	dataBlocking := ownHas && !ownLive // present but Terminating
 	dindBlocking := w.Docker && obs.HasDinDDataPVC && !obs.DinDPVCLive
 	return (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking || dindBlocking
 }
@@ -256,7 +257,7 @@ func (m *Materializer) reconcileHibernation(ctx context.Context, w protocol.Desi
 // given replicas. A fresh create is safe without a precondition: AlreadyExists means
 // something else won, and the next tick re-reads.
 func (m *Materializer) createHibernationDeployment(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec, replicas int32) error {
-	if deploymentPlacementBlocked(w, obs, spec) {
+	if deploymentPlacementBlocked(w, obs, spec, ns) {
 		return nil
 	}
 	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)

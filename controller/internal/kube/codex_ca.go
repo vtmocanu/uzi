@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -163,6 +164,32 @@ func ownDataClaim(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns str
 		return c
 	}
 	return nil
+}
+
+// ownDataPresence reports whether w's own /data claim exists in ns (has) and is live (not
+// Terminating). Same-ID claims in other namespaces never count.
+func ownDataPresence(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) (has, live bool) {
+	if obs.DataClaimsByNamespace != nil {
+		if c, ok := obs.DataClaimsByNamespace[ns]; ok && c.Name == dataPVCName(w.ID) {
+			return true, !c.Terminating
+		}
+		return false, false
+	}
+	// The fallback is looser than ownDataClaim's (which checks the namespace), and only
+	// literal-observation tests reach it, because Observe always fills the map.
+	return obs.HasDataPVC, obs.DataPVCLive
+}
+
+// ownDataCreatedAt returns the creation time of w's own LIVE /data claim in ns, else nil.
+func ownDataCreatedAt(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) *time.Time {
+	if obs.DataClaimsByNamespace != nil {
+		if c, ok := obs.DataClaimsByNamespace[ns]; ok && c.Name == dataPVCName(w.ID) && !c.Terminating {
+			t := c.CreatedAt
+			return &t
+		}
+		return nil
+	}
+	return obs.DataPVCCreatedAt
 }
 
 // deriveCodexCA applies the evidence rules with no side effects: the own-namespace /data
