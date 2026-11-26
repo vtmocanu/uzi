@@ -297,17 +297,27 @@ function assertIdenticalNonForcedPushes(argvs: string[][], branch: string): void
 
 const completed = (runId: string) => api.states.some(s => s.runId === runId && s.body.status === "completed");
 
-// #4438: GitHub also refused with `(missing necessary objects)`; both bare reasons share every retry behaviour.
-const RETRYABLE_REASONS = ["failed", "missing necessary objects"] as const;
+// #4438: GitHub also refused with `(missing necessary objects)`; #4716: and with `(Internal Server Error)`
+// after its three-line `remote:` banner, printed before `To <url>` as observed. A banner-less ISE line
+// stays permanent, so that case must carry the banner. All three share every retry behaviour.
+const GITHUB_ISE_BANNER =
+  "remote: Internal Server Error        \n" +
+  "remote: Request ID 0000:1111:2222222:3333333:44444444        \n" +
+  "remote: Time 2026-11-25T16:15:24Z\n";
+const RETRYABLE_CASES: ReadonlyArray<{ reason: string; stderr: (branch: string) => string }> = [
+  { reason: "failed", stderr: b => framed(bareStatus(b, "failed")) },
+  { reason: "missing necessary objects", stderr: b => framed(bareStatus(b, "missing necessary objects")) },
+  { reason: "Internal Server Error", stderr: b => GITHUB_ISE_BANNER + framed(bareStatus(b, "Internal Server Error")) },
+];
 
-RETRYABLE_REASONS.forEach((reason, idx) => {
+RETRYABLE_CASES.forEach(({ reason, stderr }, idx) => {
   // Distinct issue iids per reason so branches and runs never collide.
   const off = idx * 30;
 
-  it(`a bare (${reason}) push rejection on the plain arm retries the whole schedule and is typed git/push`, async t => {
+  it(`a (${reason}) push rejection on the plain arm retries the whole schedule and is typed git/push`, async t => {
     const claim = gitlabClaim(4301 + off);
     const branch = `agent/issue-${4301 + off}`;
-    const argvs = recordPushes(framed(bareStatus(branch, reason)));
+    const argvs = recordPushes(stderr(branch));
     const preflights = countPreflights();
     const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
     instantRetries(r);
@@ -320,10 +330,10 @@ RETRYABLE_REASONS.forEach((reason, idx) => {
     assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
   });
 
-  it(`a bare (${reason}) push rejection on branch agent/issue-404 is still retried (plain arm)`, async t => {
+  it(`a (${reason}) push rejection on branch agent/issue-404 is still retried (plain arm)`, async t => {
     const claim = gitlabClaim(404);
     const branch = "agent/issue-404";
-    const argvs = recordPushes(framed(bareStatus(branch, reason)));
+    const argvs = recordPushes(stderr(branch));
     const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
     instantRetries(r);
     const seen = hookRecorder(t, r);
@@ -334,10 +344,10 @@ RETRYABLE_REASONS.forEach((reason, idx) => {
     assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
   });
 
-  it(`one bare (${reason}) push rejection followed by a real push completes the run`, async t => {
+  it(`one (${reason}) push rejection followed by a real push completes the run`, async t => {
     const claim = gitlabClaim(4302 + off);
     const branch = `agent/issue-${4302 + off}`;
-    const argvs = recordPushes(framed(bareStatus(branch, reason)), { failFirstOnly: true });
+    const argvs = recordPushes(stderr(branch), { failFirstOnly: true });
     const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
     instantRetries(r);
     const seen = hookRecorder(t, r);
@@ -351,7 +361,7 @@ RETRYABLE_REASONS.forEach((reason, idx) => {
   it(`a (${reason}) rejection thrown AFTER the push really landed is recognised on retry and the run completes`, async t => {
     const claim = gitlabClaim(4303 + off);
     const branch = `agent/issue-${4303 + off}`;
-    const argvs = recordPushes(framed(bareStatus(branch, reason)), { performRealPush: true, failFirstOnly: true });
+    const argvs = recordPushes(stderr(branch), { performRealPush: true, failFirstOnly: true });
     const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
     instantRetries(r);
     const seen = hookRecorder(t, r);
@@ -439,13 +449,13 @@ function githubOverlayRunner(iid: number): { claim: ReturnType<typeof gitlabClai
   return { claim, r, strategies };
 }
 
-RETRYABLE_REASONS.forEach((reason, idx) => {
+RETRYABLE_CASES.forEach(({ reason, stderr }, idx) => {
   const off = idx * 30;
 
-  it(`a bare (${reason}) push rejection on the GitHub overlay arm retries the overlay candidate and is typed git/push`, async t => {
+  it(`a (${reason}) push rejection on the GitHub overlay arm retries the overlay candidate and is typed git/push`, async t => {
     const { claim, r, strategies } = githubOverlayRunner(4304 + off);
     const branch = `agent/issue-${4304 + off}`;
-    const argvs = recordPushes(framed(bareStatus(branch, reason)));
+    const argvs = recordPushes(stderr(branch));
     const preflights = countPreflights();
     const seen = hookRecorder(t, r);
     await r.execute(claim);
@@ -463,12 +473,12 @@ RETRYABLE_REASONS.forEach((reason, idx) => {
 
 // #4438: a permanent scratch-publication refusal on a later attempt ends the retry loop; the earlier
 // rejection must not turn the run into publication_forge_unreachable.
-RETRYABLE_REASONS.forEach((reason, idx) => {
+RETRYABLE_CASES.forEach(({ reason, stderr }, idx) => {
   it(`(${reason}) rejection then a permanent proof refusal on a later attempt stops after one push`, async t => {
     const iid = 4341 + idx;
     const claim = gitlabClaim(iid);
     const branch = `agent/issue-${iid}`;
-    const argvs = recordPushes(framed(bareStatus(branch, reason)));
+    const argvs = recordPushes(stderr(branch));
     let calls = 0;
     const preflight = git.scratchPublicationPreflight.bind(git);
     git.scratchPublicationPreflight = (async (...args: Parameters<typeof git.scratchPublicationPreflight>) => {

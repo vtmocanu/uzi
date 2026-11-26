@@ -148,6 +148,8 @@ describe("classifyGitStderrText", () => {
     ["Time with fractional seconds", ise({ b3: "remote: Time 2026-11-25T16:15:24.123Z\n" })],
     ["Time with an offset", ise({ b3: "remote: Time 2026-11-25T16:15:24+00:00\n" })],
     ["Time with a date only", ise({ b3: "remote: Time 2026-11-25\n" })],
+    ["Time with trailing text", ise({ b3: "remote: Time 2026-11-25T16:15:24Z extra\n" })],
+    ["lowercase time banner", ise({ b3: "remote: time 2026-11-25t16:15:24z\n" })],
     ["(Internal Server Error) with trailing text", ise({ statusLine: ` ! [remote rejected]     ${SHA} -> agent/issue-4416 (Internal Server Error) x\n` })],
     ["lowercase (internal server error)", ise({ statusLine: iseStatus("internal server error") })],
     ["(Internal Server Errors)", ise({ statusLine: iseStatus("Internal Server Errors") })],
