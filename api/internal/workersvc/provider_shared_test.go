@@ -34,7 +34,7 @@ func TestSelectionOfAnInvisibleDefinitionIsMissing(t *testing.T) {
 	}
 }
 
-// A shared definition is Claude only: a row whose provider engine is not the requested engine is
+// A row whose provider engine is not the requested engine is
 // invalid (a shared Claude definition read as a Codex source, or a Codex definition read as Claude).
 func TestSharedDefinitionOfTheWrongEngineIsInvalid(t *testing.T) {
 	pid := uuid.New()

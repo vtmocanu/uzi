@@ -24,29 +24,37 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
 // Every test name ends LiveDB so the store-IT sweep selects it.
 
-// seedSharedProvider inserts a shared definition (revision 1 at pvBase) and registers its cleanup:
-// every selection is cleared first (users_claude_provider_fkey is RESTRICT), then the row is deleted
-// (its keys and evidence cascade).
-func seedSharedProvider(t *testing.T, env codexTestEnv, modelMap string) (id uuid.UUID, name string) {
+// seedSharedProvider inserts a shared definition of the given engine (revision 1 at pvBase; a Codex
+// revision is openai_responses with bearer auth) and registers its cleanup: every selection of either
+// engine is cleared first (users_claude_provider_fkey and users_codex_provider_fkey are RESTRICT), then
+// the row is deleted (its keys and evidence cascade).
+func seedSharedProvider(t *testing.T, env codexTestEnv, engine, modelMap string) (id uuid.UUID, name string) {
 	t.Helper()
-	p, err := env.q.InsertSharedModelProvider(env.ctx, "shared-"+uuid.NewString()[:8])
+	p, err := env.q.InsertSharedModelProvider(env.ctx, store.InsertSharedModelProviderParams{Name: "shared-" + uuid.NewString()[:8], Engine: engine})
 	if err != nil {
 		t.Fatalf("insert shared provider: %v", err)
-	}
-	if err := env.q.InsertModelProviderRevision(env.ctx, store.InsertModelProviderRevisionParams{
-		ProviderID: p.ID, Revision: 1, Protocol: "anthropic_messages", BaseUrl: pvBase, AuthStyle: "bearer", ModelMap: []byte(modelMap),
-	}); err != nil {
-		t.Fatalf("insert shared revision: %v", err)
 	}
 	t.Cleanup(func() {
 		ctx := context.Background()
 		if _, err := env.pool.Exec(ctx, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE claude_provider_id = $1`, p.ID); err != nil {
-			t.Errorf("clear shared selections in cleanup: %v", err)
+			t.Errorf("clear shared Claude selections in cleanup: %v", err)
+		}
+		if _, err := env.pool.Exec(ctx, `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE codex_provider_id = $1`, p.ID); err != nil {
+			t.Errorf("clear shared Codex selections in cleanup: %v", err)
 		}
 		if _, err := env.pool.Exec(ctx, `DELETE FROM model_providers WHERE id = $1`, p.ID); err != nil {
 			t.Errorf("delete shared provider in cleanup: %v", err)
 		}
 	})
+	protocol := "anthropic_messages"
+	if engine == "codex" {
+		protocol = "openai_responses"
+	}
+	if err := env.q.InsertModelProviderRevision(env.ctx, store.InsertModelProviderRevisionParams{
+		ProviderID: p.ID, Revision: 1, Protocol: protocol, BaseUrl: pvBase, AuthStyle: "bearer", ModelMap: []byte(modelMap),
+	}); err != nil {
+		t.Fatalf("insert shared revision: %v", err)
+	}
 	return p.ID, p.Name
 }
 
@@ -97,7 +105,7 @@ func selectClaudeSource(t *testing.T, env codexTestEnv, userID, providerID uuid.
 // useShared points the fixture at a fresh shared definition with B's own sealed key, selected.
 func (pf *provFix) useShared(plain string) (name string) {
 	pf.t.Helper()
-	pf.provider, name = seedSharedProvider(pf.t, pf.env, pvDefaultMap)
+	pf.provider, name = seedSharedProvider(pf.t, pf.env, "claude", pvDefaultMap)
 	pf.key = seedSealedKey(pf.t, pf.env, pf.userID, pf.provider, plain)
 	selectClaudeSource(pf.t, pf.env, pf.userID, pf.provider)
 	return name
@@ -354,7 +362,7 @@ func TestSharedProviderChatBindsTheSharedRevisionAndKeyLiveDB(t *testing.T) {
 func newSharedPCFix(t *testing.T) *pcFix {
 	t.Helper()
 	pf := newPCFix(t)
-	provider, _ := seedSharedProvider(t, pf.env, pvDefaultMap)
+	provider, _ := seedSharedProvider(t, pf.env, "claude", pvDefaultMap)
 	pf.provider = provider
 	pf.key = seedSealedKey(t, pf.env, pf.userID, provider, pf.plain)
 	selectClaudeSource(t, pf.env, pf.userID, provider)
@@ -588,9 +596,10 @@ func TestSharedBindingToAnotherRecipientsKeyIsStaleLiveDB(t *testing.T) {
 	}
 }
 
-// TestSharedClaudeDefinitionNeverServesACodexRunLiveDB: a shared definition is Claude only. A
-// codex-harness run bound to it (with B's Claude key) is a corrupt reference and refuses stale on the
-// claim and the finisher's re-check, never decrypting the key.
+// TestSharedClaudeDefinitionNeverServesACodexRunLiveDB: cross-engine, a shared definition of one engine
+// never serves a run of the other. A codex-harness run bound to a shared CLAUDE definition (with B's
+// Claude key) is a corrupt reference and refuses stale on the claim and the finisher's re-check, never
+// decrypting the key, and that definition is never selectable as the Codex source.
 func TestSharedClaudeDefinitionNeverServesACodexRunLiveDB(t *testing.T) {
 	pf := newSharedPCFix(t)
 	spy := &keyOpenSpy{Store: pf.svc.q, rd: pf.svc.q.(providerClaimReader)}
@@ -626,7 +635,7 @@ func TestSharedClaudeDefinitionNeverServesACodexRunLiveDB(t *testing.T) {
 	if c := spy.ciphertextReads.Load(); c != 0 {
 		t.Fatalf("%d ciphertext read(s) for a codex run on a shared Claude definition", c)
 	}
-	// A shared definition is never a Codex source.
+	// A shared Claude definition is never a Codex source (the cross-engine guard).
 	if _, err := pf.env.q.SetUserProviderSource(pf.env.ctx, store.SetUserProviderSourceParams{ID: pf.userID, Engine: "codex", ProviderID: pgtype.UUID{Bytes: pf.provider, Valid: true}}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("select a shared definition as the Codex source err = %v, want no rows", err)
 	}

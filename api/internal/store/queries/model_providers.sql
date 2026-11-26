@@ -88,8 +88,8 @@ UPDATE model_providers SET retired_at = COALESCE(retired_at, now()) WHERE id = @
 
 -- name: DeleteModelProvider :execrows
 -- Owner-scoped. Cascades to the provider's revisions, probe results and key. Refused with a
--- foreign-key violation (users_claude_provider_fkey, ON DELETE RESTRICT) while any user has the
--- provider selected as their source; the handler maps that to provider_in_use_as_source.
+-- foreign-key violation (users_claude_provider_fkey / users_codex_provider_fkey, ON DELETE RESTRICT)
+-- while any user has the provider selected as their source; the handler maps that to provider_in_use_as_source.
 DELETE FROM model_providers WHERE id = @id AND owner_user_id = @owner_user_id::uuid;
 
 -- name: ListModelProvidersForOwner :many
@@ -151,14 +151,14 @@ SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, prob
 -- Stores the CALLER's gateway key for a definition visible to them (their own, or a shared per-user-key
 -- one); derives its kind from the definition's engine. The key is always the caller's, never the
 -- admin's: user_id is the caller and provider_scope_id is the definition's scope (the caller's own id,
--- or the nil UUID for a shared Claude definition).
+-- or the nil UUID for a shared definition of either engine).
 -- Deliberately NOT InsertUserSecret: that statement forces the first secret of a kind to be the
 -- default and the first anthropic_token into the auto-select pool, and a provider key must be
 -- neither (is_default=false, auto_eligible=false), so it never enters a default slot, the poller,
 -- the weekly reserve or pool selection. provider_id and provider_scope_id are written here and by no
 -- UPDATE. The composite foreign key (provider_scope_id, provider_id) keeps the key under a scope the
--- caller may use, and user_secrets_provider_scope_check pins that scope to the caller's id or, for a
--- Claude key, the shared scope; the unique index user_secrets_one_provider_key allows one key per
+-- caller may use, and user_secrets_provider_scope_check pins that scope to the caller's id or the
+-- shared scope; the unique index user_secrets_one_provider_key allows one key per
 -- (user, provider). The label is the provider id.
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id, provider_scope_id)
 SELECT @user_id::uuid, CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END,
@@ -230,9 +230,9 @@ FOR KEY SHARE OF r;
 
 -- name: GetUserProviderSource :one
 -- The caller's selected source for one engine with everything run creation needs to judge it usable
--- in ONE read: the setting, the provider, its CURRENT revision and the CALLER's key row for it. The
--- Claude arm resolves the caller's own definition or a shared per-user-key one; the Codex arm stays
--- owner-only (a shared definition is never a Codex source). The key join is always the caller's own
+-- in ONE read: the setting, the provider, its CURRENT revision and the CALLER's key row for it. Each
+-- engine arm resolves the caller's own definition or a shared per-user-key one of that engine
+-- (p.engine = @engine). The key join is always the caller's own
 -- (k.user_id = u.id), so a shared definition never resolves another user's key. A NULL setting
 -- returns a row whose provider columns are all NULL (no rows only for an unknown user). Plain read:
 -- the freeze takes LockSecretMutationShared and then LockModelProviderForShare around its own re-read.
@@ -254,7 +254,8 @@ SELECT u.codex_provider_id AS provider_id,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
 FROM users u
-LEFT JOIN model_providers p ON p.id = u.codex_provider_id AND p.owner_user_id = u.id AND p.engine = @engine
+LEFT JOIN model_providers p ON p.id = u.codex_provider_id
+ AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = @engine
 LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
 WHERE u.id = @id AND @engine::text = 'codex';
@@ -273,8 +274,10 @@ SELECT judge_anthropic_bind_mode, judge_anthropic_secret_id, claude_provider_id,
 -- Sets or clears (NULL) the caller's source for one engine; a NULL provider_id CLEARS the setting and
 -- the engine must be named. The Claude branch accepts a definition visible to the caller (their own
 -- or a shared per-user-key one) and writes claude_provider_scope_id from that definition in the same
--- statement (NULL when clearing); the Codex branch accepts only the caller's own Codex definition and
--- never touches the Claude scope. The composite foreign keys (users_claude_provider_fkey,
+-- statement (NULL when clearing); the Codex branch likewise writes codex_provider_scope_id from the
+-- definition and never touches the Claude scope. Each branch accepts a definition of its own engine
+-- that is the caller's own or a shared per-user-key one, so a shared definition of the other engine is
+-- refused (no row). The composite foreign keys (users_claude_provider_fkey,
 -- users_codex_provider_fkey) independently reject a definition the caller may not use. Usability is
 -- checked by the caller, which holds the user's secret-mutation lock.
 UPDATE users u
@@ -282,7 +285,10 @@ SET claude_provider_id = CASE WHEN @engine::text = 'claude' THEN sqlc.narg('prov
     claude_provider_scope_id = CASE WHEN @engine::text = 'claude'
         THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = sqlc.narg('provider_id')::uuid)
         ELSE claude_provider_scope_id END,
-    codex_provider_id = CASE WHEN @engine::text = 'codex' THEN sqlc.narg('provider_id')::uuid ELSE codex_provider_id END
+    codex_provider_id = CASE WHEN @engine::text = 'codex' THEN sqlc.narg('provider_id')::uuid ELSE codex_provider_id END,
+    codex_provider_scope_id = CASE WHEN @engine::text = 'codex'
+        THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = sqlc.narg('provider_id')::uuid)
+        ELSE codex_provider_scope_id END
 WHERE u.id = @id AND @engine::text IN ('claude', 'codex')
   AND (sqlc.narg('provider_id')::uuid IS NULL
        OR (@engine::text = 'claude' AND EXISTS (
@@ -291,12 +297,13 @@ WHERE u.id = @id AND @engine::text IN ('claude', 'codex')
               AND p.engine = 'claude'))
        OR (@engine::text = 'codex' AND EXISTS (
             SELECT 1 FROM model_providers p WHERE p.id = sqlc.narg('provider_id')::uuid
-              AND p.owner_user_id = u.id AND p.engine = 'codex')))
+              AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+              AND p.engine = 'codex')))
 RETURNING claude_provider_id, codex_provider_id;
 
 -- name: ListVisibleProviders :many
 -- Every definition visible to the CALLER: their own (either engine) and the shared per-user-key
--- catalogue (Claude only). The key and the Test evidence are always the CALLER's: the key join is
+-- catalogue (either engine). The key and the Test evidence are always the CALLER's: the key join is
 -- (caller, definition, the engine's key kind) and the evidence joins only while its provider revision,
 -- key identity and key enablement revision are all current, so a rotated or edited definition reads as
 -- not tested and another user's key or result never appears. owner_user_id is NULL on a shared row.
@@ -398,11 +405,12 @@ SELECT pg_advisory_xact_lock(
 SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode = 'per_user_key';
 
 -- name: InsertSharedModelProvider :one
--- A shared definition: NULL owner, per-user-key mode, the nil shared scope, Claude only. The CHECKs
+-- A shared definition of the named engine (claude or codex): NULL owner, per-user-key mode, the nil
+-- shared scope. The handler validates the engine; the CHECKs
 -- (model_providers_shared_mode_check, _shared_engine_check, _scope_owner_check) enforce the same shape.
 -- Authorized caller: the admin create path.
 INSERT INTO model_providers (owner_user_id, name, engine, current_revision, credential_mode, scope_owner_id)
-VALUES (NULL, @name, 'claude', 1, 'per_user_key', '00000000-0000-0000-0000-000000000000'::uuid)
+VALUES (NULL, @name, @engine, 1, 'per_user_key', '00000000-0000-0000-0000-000000000000'::uuid)
 RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id;
 
 -- name: LockSharedModelProviderForEdit :one
@@ -410,7 +418,7 @@ RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created
 -- the bump and the rename would, so the order is fixed up front and a concurrent run-create share lock
 -- (LockModelProviderForShare) waits for the edit. No per-user lock is involved. A retired definition is
 -- returned so the handler can refuse it with the right error. Authorized caller: admin edit.
-SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at FROM model_providers p
 WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
 FOR NO KEY UPDATE OF p;
 
@@ -460,7 +468,7 @@ WHERE rev.provider_id = @id
 -- name: DeleteSharedProviderKeys :many
 -- Deletes every user's key attached to one shared definition and returns the ids, so the delete's
 -- warning and audit record the exact count under the same provider lock. The shared scope is the nil
--- UUID, which only a Claude gateway key may carry. The cascading foreign keys then remove their Test
+-- UUID, which only a shared definition's key (either engine) may carry. The cascading foreign keys then remove their Test
 -- evidence. Authorized caller: admin delete, after LockSharedModelProviderForDelete and a zero
 -- CountSharedProviderSelections.
 DELETE FROM user_secrets
@@ -468,11 +476,12 @@ WHERE provider_id = @id::uuid AND provider_scope_id = '00000000-0000-0000-0000-0
 RETURNING id;
 
 -- name: CountSharedProviderSelections :one
--- How many users have this shared definition selected as their Claude source. A delete is refused
--- while it is above zero (users_claude_provider_fkey is ON DELETE RESTRICT as the structural backstop).
--- Authorized caller: admin delete.
+-- How many users have this shared definition selected as their source, in either engine's lane. A
+-- delete is refused while it is above zero (users_claude_provider_fkey and users_codex_provider_fkey are
+-- ON DELETE RESTRICT as the structural backstop). Authorized caller: admin delete.
 SELECT count(*) FROM users
-WHERE claude_provider_id = @id::uuid AND claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid;
+WHERE (claude_provider_id = @id::uuid AND claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid)
+   OR (codex_provider_id = @id::uuid AND codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid);
 
 -- name: DeleteSharedModelProvider :execrows
 -- Cascades to the definition's revisions and legacy probe rows. Refused with a foreign-key violation
@@ -488,9 +497,13 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        COALESCE(ak.n, 0)::bigint AS attached_key_count
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
-LEFT JOIN (SELECT claude_provider_id AS pid, count(*) AS n FROM users
-            WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
-            GROUP BY claude_provider_id) su ON su.pid = p.id
+LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
+              SELECT id AS uid, claude_provider_id AS pid FROM users
+               WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
+               WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
+            GROUP BY sel.pid) su ON su.pid = p.id
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
@@ -505,9 +518,13 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        COALESCE(ak.n, 0)::bigint AS attached_key_count
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
-LEFT JOIN (SELECT claude_provider_id AS pid, count(*) AS n FROM users
-            WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
-            GROUP BY claude_provider_id) su ON su.pid = p.id
+LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
+              SELECT id AS uid, claude_provider_id AS pid FROM users
+               WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
+               WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
+            GROUP BY sel.pid) su ON su.pid = p.id
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id

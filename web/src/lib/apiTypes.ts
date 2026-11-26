@@ -185,10 +185,10 @@ export interface ProviderDTO {
 export interface AdminSharedProvider {
   id: string;
   name: string;
-  engine: "claude";
+  engine: ProviderDTO["engine"];
   retired: boolean;
   current_revision: number;
-  protocol: "anthropic_messages";
+  protocol: ProviderDTO["protocol"];
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
@@ -201,8 +201,11 @@ export interface AdminSharedProviderList {
   providers: AdminSharedProvider[];
 }
 
-/** POST /api/admin/providers body: keyless, Claude only. */
+/** POST /api/admin/providers body: keyless (each user attaches their own key). The client
+ *  derives the protocol from the engine: Claude speaks Anthropic Messages, Codex speaks
+ *  OpenAI Responses and is bearer-only with a required `default` slot. */
 export interface AdminSharedProviderCreateInput {
+  engine: ProviderDTO["engine"];
   name: string;
   base_url: string;
   auth_style: ProviderAuthStyle;

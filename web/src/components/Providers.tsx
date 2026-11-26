@@ -9,8 +9,9 @@
 // Admin-shared definitions (PRD #4324, credential_mode "per_user_key") appear in the same
 // list. The admin owns their endpoint, auth style and model map; the user owns only their
 // own key. Such a row therefore offers key actions, Test and select/clear only (the server
-// answers 404 to the owner routes), and both attaching a key and selecting it as the Claude
-// source first show SharedProviderDisclosure: who controls what, and where the key goes.
+// answers 404 to the owner routes), and both attaching a key and selecting it as the Claude or
+// Codex source (the definition's own engine) first show SharedProviderDisclosure: who
+// controls what, and where the key goes.
 
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type Ref } from "react";
 import {
@@ -161,11 +162,20 @@ function SharedProviderDisclosure({
           </p>
         </div>
       </div>
-      <p className="text-muted">
-        Your key is sent to that endpoint on every request. If the gateway redirects, it can resend your prompts and
-        code to another host, and your key to another path on the same host.
-      </p>
-      {p.auth_style === "x_api_key" && (
+      {p.engine === "codex" ? (
+        <p className="text-muted" data-testid={`shared-disclosure-redirect-${p.id}`}>
+          Your key is sent to that endpoint on every request. Codex runtime redirects may forward request bodies and
+          authentication headers, so a redirecting gateway can resend your prompts, code and key to another host.
+          Allowlist admission is not confinement to that host.
+        </p>
+      ) : (
+        <p className="text-muted" data-testid={`shared-disclosure-redirect-${p.id}`}>
+          Your key is sent to that endpoint on every request. If the gateway redirects, it can resend your prompts and
+          code to another host, and your key to another path on the same host.
+        </p>
+      )}
+      {/* Codex definitions are bearer-only, so the x-api-key warning is Claude's alone. */}
+      {p.engine === "claude" && p.auth_style === "x_api_key" && (
         <p className="text-warn" data-testid={`shared-disclosure-xapikey-${p.id}`}>
           With x-api-key auth, a redirect can also forward the key itself to another host. Bearer auth limits this.
         </p>

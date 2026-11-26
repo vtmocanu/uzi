@@ -39,7 +39,7 @@ func newCodexActualClaimFix(t *testing.T) (*pcFix, uuid.UUID) {
 		t.Fatal(err)
 	}
 	pf.provider, pf.key = p.ID, key.ID
-	pf.env.exec(`UPDATE users SET codex_provider_id=$2,default_harness='codex' WHERE id=$1`, pf.userID, pf.provider)
+	pf.env.exec(`UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1,default_harness='codex' WHERE id=$1`, pf.userID, pf.provider)
 	pf.env.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, pf.workerID,
 		[]string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexProviderV1, capability.RepoAgentSourceV1})
 	// A usable native credential remains available throughout every provider refusal.
@@ -67,7 +67,7 @@ func newCodexActualClaimFix(t *testing.T) (*pcFix, uuid.UUID) {
 		t.Fatal("creation did not commit provider A")
 	}
 	t.Cleanup(func() {
-		_, _ = pf.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL WHERE id=$1`, pf.userID)
+		_, _ = pf.env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, pf.userID)
 	})
 	return pf, id
 }
@@ -132,9 +132,9 @@ func TestCodexProviderActualClaimAndReclaimLiveDB(t *testing.T) {
 			if _, err := pf.env.q.InsertProviderKeySecret(pf.env.ctx, store.InsertProviderKeySecretParams{UserID: pf.userID, Label: b.ID.String(), Ciphertext: sealed, SealedWith: "master", ProviderID: pgtype.UUID{Bytes: b.ID, Valid: true}}); err != nil {
 				t.Fatal(err)
 			}
-			pf.env.exec(`UPDATE users SET codex_provider_id=$2 WHERE id=$1`, pf.userID, b.ID)
+			pf.env.exec(`UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1 WHERE id=$1`, pf.userID, b.ID)
 			if mutation != "intact" {
-				pf.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, pf.userID)
+				pf.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, pf.userID)
 			}
 			restartCodexActualClaimService(pf)
 			first := wantCodexActualProviderClaim(t, pf, id)
@@ -197,7 +197,7 @@ func TestCodexProviderActualClaimNativeVendorControlLiveDB(t *testing.T) {
 	pf, _ := newCodexActualClaimFix(t)
 	// Remove the queued provider candidate from admission without claiming it.
 	pf.env.exec(`UPDATE runs SET status='completed' WHERE user_id=$1`, pf.userID)
-	pf.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, pf.userID)
+	pf.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, pf.userID)
 	alias := pf.env.seedStaticAPIKey(t, pf.userID, "native-"+uuid.NewString(), "inert-native-api-key")
 	id := pf.queuedRun(t, "issue")
 	if err := pf.svc.FreezeCodexBinding(pf.env.ctx, pf.userID, id, alias, codexAuthModeAPIKey); err != nil {

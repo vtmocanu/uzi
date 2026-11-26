@@ -231,7 +231,7 @@ func TestCodexProviderWakeReadinessActualClaimLiveDB(t *testing.T) {
 			}
 			p.env.exec(`UPDATE user_secrets SET ciphertext=$2 WHERE id=$1`, b.key, sealedB)
 			if change != "source_B" {
-				p.env.exec(`UPDATE users SET codex_provider_id=NULL WHERE id=$1`, p.userID)
+				p.env.exec(`UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, p.userID)
 			}
 			settleCodexWakeReplacement(t, f, w)
 			if term := f.row(w).LastManualWakeSettledAt; !term.Valid || !term.Time.Equal(lease) {

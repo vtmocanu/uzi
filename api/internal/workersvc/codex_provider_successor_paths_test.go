@@ -35,7 +35,7 @@ func TestCodexProviderFreshConstructorPathsLiveDB(t *testing.T) {
 					}
 					switch change {
 					case "cleared":
-						fx.env.exec("UPDATE users SET codex_provider_id=NULL WHERE id=$1", fx.userID)
+						fx.env.exec("UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1", fx.userID)
 					case "disabled":
 						fx.env.exec("UPDATE user_secrets SET disabled_at=now() WHERE id=$1", fx.key)
 					}
@@ -107,7 +107,7 @@ func TestCodexProviderReliableSuccessorPathsLiveDB(t *testing.T) {
 			fx.cancelRun(source.ID)
 			seedCodexSource(t, fx)
 			if change == "cleared" {
-				fx.env.exec("UPDATE users SET codex_provider_id=NULL WHERE id=$1", fx.userID)
+				fx.env.exec("UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1", fx.userID)
 			}
 			constructors := []struct {
 				name   string

@@ -100,7 +100,8 @@ func writeSharedProviderError(w http.ResponseWriter, err error) bool {
 		httpx.ErrorReason(w, http.StatusConflict,
 			"shared provider limit reached (50 definitions, retired ones included)", reasonProviderLimit)
 	case errors.Is(err, errSharedProviderInUse),
-		isPGForeignKeyViolation(err, "users_claude_provider_fkey"):
+		isPGForeignKeyViolation(err, "users_claude_provider_fkey"),
+		isPGForeignKeyViolation(err, "users_codex_provider_fkey"):
 		httpx.ErrorReason(w, http.StatusConflict,
 			"the provider is selected as a source by at least one user; they must choose another source before it can be deleted",
 			reasonProviderInUseAsSource)
@@ -152,7 +153,8 @@ func (h *Handler) AdminGetSharedProvider(w http.ResponseWriter, r *http.Request)
 }
 
 // AdminCreateSharedProvider is POST /api/admin/providers: a keyless shared definition with revision 1.
-// The engine is Claude only (codex is a 400 and writes no row).
+// The engine is claude (the default when omitted) or codex; any other engine is a 400 and writes no
+// row. An omitted protocol defaults per engine (anthropic_messages, openai_responses).
 func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Request) {
 	actor, ok := egressProfileAdmin(w, r)
 	if !ok {
@@ -177,12 +179,15 @@ func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Reque
 	if req.Engine == "" {
 		req.Engine = providers.EngineClaude
 	}
-	if req.Engine != providers.EngineClaude {
-		httpx.Error(w, http.StatusBadRequest, "a shared provider supports the claude engine only")
+	if req.Engine != providers.EngineClaude && req.Engine != providers.EngineCodex {
+		httpx.Error(w, http.StatusBadRequest, "a shared provider supports the claude and codex engines only")
 		return
 	}
 	if req.Protocol == "" {
 		req.Protocol = providers.ProtocolAnth
+		if req.Engine == providers.EngineCodex {
+			req.Protocol = providers.ProtocolResponses
+		}
 	}
 	if err := providers.ValidateProfile(req.Engine, req.Protocol, req.AuthStyle, req.ModelMap); err != nil {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
@@ -210,7 +215,7 @@ func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Reque
 		if n >= maxSharedProviders {
 			return errSharedProviderCap
 		}
-		p, err := q.InsertSharedModelProvider(r.Context(), name)
+		p, err := q.InsertSharedModelProvider(r.Context(), store.InsertSharedModelProviderParams{Name: name, Engine: req.Engine})
 		if err != nil {
 			return err
 		}
@@ -274,7 +279,17 @@ func (h *Handler) AdminPatchSharedProvider(w http.ResponseWriter, r *http.Reques
 	}
 	var newMap []byte
 	if req.ModelMap != nil {
-		if err := providers.ValidateModelMapForEngine(providers.EngineClaude, *req.ModelMap); err != nil {
+		// The definition's engine decides the model-map shape. An unknown id validates as claude so the
+		// invalid-map 400 keeps its precedence over the 404; the transaction re-validates against the
+		// locked row's engine.
+		engine := providers.EngineClaude
+		if cur, err := h.q.GetSharedModelProviderAdmin(r.Context(), id); err == nil {
+			engine = cur.Engine
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			internalProviderError(w, "get shared model provider", err)
+			return
+		}
+		if err := providers.ValidateModelMapForEngine(engine, *req.ModelMap); err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -294,6 +309,12 @@ func (h *Handler) AdminPatchSharedProvider(w http.ResponseWriter, r *http.Reques
 		}
 		if err != nil {
 			return err
+		}
+		if req.ModelMap != nil {
+			// Defensive: the engine never changes, but the validation above ran before the lock.
+			if err := providers.ValidateModelMapForEngine(cur.Engine, *req.ModelMap); err != nil {
+				return &providerProfileError{err}
+			}
 		}
 		if cur.RetiredAt.Valid {
 			return errProviderRetired

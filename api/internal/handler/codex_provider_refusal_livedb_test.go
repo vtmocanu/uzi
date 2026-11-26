@@ -298,9 +298,9 @@ func TestWorkerCodexProviderRoutesRefuseLiveDB(t *testing.T) {
 		t.Fatal("native control is not frozen to the Codex harness")
 	}
 	// Edit only the current source, then exercise the very same native capability.
-	mustExecT(ctx, t, f.pool, `UPDATE users SET codex_provider_id=$2 WHERE id=$1`, f.owner, p.ID)
+	mustExecT(ctx, t, f.pool, `UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1 WHERE id=$1`, f.owner, p.ID)
 	t.Cleanup(func() {
-		if _, err := f.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL WHERE id=$1`, f.owner); err != nil {
+		if _, err := f.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1`, f.owner); err != nil {
 			t.Errorf("clear owned source: %v", err)
 		}
 	})

@@ -15,3 +15,22 @@ it("sends Codex engine, Responses protocol and all mappings over the real transp
   expect(fetchMock.mock.calls[1][0]).toBe("/api/me/providers/codex-source");
   expect(JSON.parse((fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body as string)).toEqual({ provider_id: "code" });
 });
+it("sends a shared Codex definition's engine with the Responses protocol", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ provider: {} }), { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const model_map = { default: { model: "gateway-default" } };
+  await api.adminCreateSharedProvider({ engine: "codex", name: "shared-code", base_url: "https://gateway.example/v1", auth_style: "bearer", model_map });
+  expect(fetchMock.mock.calls[0][0]).toBe("/api/admin/providers");
+  expect(JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)).toEqual({
+    engine: "codex", protocol: "openai_responses", name: "shared-code", base_url: "https://gateway.example/v1", auth_style: "bearer", model_map,
+  });
+});
+it("sends a shared Claude definition's engine with the Messages protocol", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ provider: {} }), { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const model_map = { haiku: { model: "gateway-haiku" } };
+  await api.adminCreateSharedProvider({ engine: "claude", name: "shared-gw", base_url: "https://gateway.example", auth_style: "x_api_key", model_map });
+  expect(JSON.parse((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body as string)).toEqual({
+    engine: "claude", protocol: "anthropic_messages", name: "shared-gw", base_url: "https://gateway.example", auth_style: "x_api_key", model_map,
+  });
+});

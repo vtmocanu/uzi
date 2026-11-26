@@ -69,15 +69,16 @@ function adminView(p: ProviderDTO): AdminSharedProvider {
   return {
     id: p.id,
     name: p.name,
-    engine: "claude",
+    engine: p.engine,
     retired: p.retired,
     current_revision: p.current_revision,
-    protocol: "anthropic_messages",
+    protocol: p.protocol,
     base_url: p.base_url,
     auth_style: p.auth_style,
     model_map: p.model_map,
     credential_mode: "per_user_key",
-    selected_user_count: others.selected + (claudeProviderId === p.id ? 1 : 0),
+    // The demo user counts once whichever engine slot holds it (a definition has one engine).
+    selected_user_count: others.selected + (claudeProviderId === p.id || codexProviderId === p.id ? 1 : 0),
     attached_key_count: others.keys + (p.has_key ? 1 : 0),
   };
 }
@@ -281,7 +282,8 @@ export const providersApi = {
   adminCreateSharedProvider: async (input: AdminSharedProviderCreateInput) => {
     requireAdmin();
     checkUrl(input.base_url);
-    validate("claude", input.auth_style, input.model_map);
+    const engine = input.engine ?? "claude";
+    validate(engine, input.auth_style, input.model_map);
     if (sharedNameTaken(input.name)) fail(409, "provider_name_taken", "a shared provider with that name already exists");
     if (providers.filter(isShared).length >= SHARED_CAP) {
       fail(409, "provider_limit_reached", "shared provider limit reached (50 definitions, retired ones included)");
@@ -289,10 +291,10 @@ export const providersApi = {
     const created: ProviderDTO = {
       id: `prov-shared-mock-${nextId++}`,
       name: input.name.trim(),
-      engine: "claude",
+      engine,
       retired: false,
       current_revision: 1,
-      protocol: "anthropic_messages",
+      protocol: engine === "codex" ? "openai_responses" : "anthropic_messages",
       base_url: input.base_url,
       auth_style: input.auth_style,
       model_map: input.model_map,
@@ -308,7 +310,7 @@ export const providersApi = {
     requireAdmin();
     const p = shared(id);
     if (p.retired) fail(409, "provider_retired", "provider is retired");
-    if (body.model_map) validate("claude", p.auth_style, body.model_map);
+    if (body.model_map) validate(p.engine, p.auth_style, body.model_map);
     if (body.name !== undefined && sharedNameTaken(body.name, id)) {
       fail(409, "provider_name_taken", "a shared provider with that name already exists");
     }
