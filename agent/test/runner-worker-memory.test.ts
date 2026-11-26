@@ -6,7 +6,7 @@ import path from "node:path";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryDeadlineExhaustedError } from "../src/git.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
-import type { CredentialFreeCaptureContext } from "../src/harness.js";
+import { captureFailureOf, type CredentialFreeCaptureContext } from "../src/harness.js";
 import { performance } from "node:perf_hooks";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
@@ -280,8 +280,43 @@ type CustodyOutcome =
 interface CustodyRecord {
   kind: "hold" | "close"; invocation: InvocationRole | undefined; requested: number;
   parentDeadline: number | undefined; hasBudget: boolean; hasPending: boolean; effectiveDeadline: number;
-  entered: boolean; outcome?: CustodyOutcome; settleAtDate?: number;
+  entered: boolean; outcome?: CustodyOutcome;
+  /** The recoveryOperations frame the hold's action runs in (read inside the wrapped action), by identity. */
+  frame?: unknown;
 }
+/** One RecoveryDeadlineExhaustedError thrown by GitCache.recoveryRemaining, keyed by the error object. */
+interface DeadlineThrow { frame: unknown; deadline: number; at: number; budgetLimited: boolean }
+type DeadlineThrowLookup = (reason: object) => DeadlineThrow | undefined;
+/** Who aborted a capture's signal, classified synchronously during abort dispatch. */
+type CaptureOrigin = "caller" | "maintenance" | "lane" | "unknown";
+interface CaptureRecord {
+  signal: AbortSignal; deadlineAt: number; caller: AbortSignal | undefined; seq0?: number;
+  /** The maintenance-budget signal visible where the capture was requested. */
+  budgetSignal?: AbortSignal;
+  /** The capture was opened under the original flight's preserve call. */
+  originalFlight?: boolean;
+  /** The hold operation active where the capture was requested (wrapper scope, inside that operation's action). */
+  custody?: CustodyRecord;
+  /** The capture action's return value settled (or it threw synchronously). */
+  settled?: boolean;
+  /** The typed provenance of the lane's rejection, when it recorded one. */
+  failure?: ReturnType<typeof captureFailureOf>;
+  abortedAt?: number; reason?: unknown;
+  /** The action had not yet returned when the abort was dispatched. */
+  pendingAtAbort?: boolean; origin?: CaptureOrigin;
+  /** What the capture action rejected with (or threw synchronously), by identity. */
+  actionReason?: unknown;
+}
+interface HoldOpEvidence { outcome?: CustodyOutcome; effectiveDeadline: number }
+interface CaptureEvidence {
+  originalFlight?: boolean; custody?: { kind: string; frame?: unknown; effectiveDeadline?: number };
+  failure?: { deadlineExpired: boolean };
+  pendingAtAbort?: boolean; abortedAt?: number; deadlineAt: number; origin?: CaptureOrigin;
+  actionReason?: unknown;
+}
+/** A preserveWorkerMemory call refused before any custody operation started. */
+interface PreOpRefusal { entryAt: number; deadline: number; clean: boolean; dirty: string[] }
+type RefusalClass = "expired" | "straddle" | "dirty";
 interface PortRecord { aborted: boolean; reason: unknown; before?: { aborted: boolean; reason: unknown } }
 interface HeldLike { context?: unknown; signal?: AbortSignal; deadlineAt: number }
 interface SiteTag { site: string; held: HeldLike | undefined; flight: unknown }
@@ -306,6 +341,42 @@ const isThenable = (value: unknown): value is PromiseLike<unknown> =>
   (typeof value === "object" || typeof value === "function") && value !== null && typeof (value as { then?: unknown }).then === "function";
 const isDeadlineReason =(reason: unknown) => reason instanceof RecoveryDeadlineExhaustedError;
 const isAbortErrorReason = (reason: unknown) => reason instanceof DOMException && reason.name === "AbortError";
+const abortOriginOf = (reason: unknown, caller: AbortSignal | undefined, budgetSignal: AbortSignal | undefined): CaptureOrigin =>
+  caller?.aborted && reason === caller.reason ? "caller"
+  : budgetSignal?.aborted && reason === budgetSignal.reason ? "maintenance"
+  : isAbortErrorReason(reason) ? "lane" : "unknown";
+const isDeadlineAbort = (op: HoldOpEvidence) => op.outcome?.kind === "abort" && op.outcome.deadlineClass &&
+  op.outcome.atDate >= op.effectiveDeadline - 1;
+/** A typed lane capture-deadline abort: the lane's own expiry, while the action was pending, inside a hold operation. */
+const isCaptureAbort = (c: CaptureEvidence) => c.originalFlight === true && c.custody?.kind === "hold" &&
+  c.failure?.deadlineExpired === true && c.pendingAtAbort === true &&
+  c.abortedAt !== undefined && c.abortedAt >= c.deadlineAt - 1 && c.origin === "lane";
+/**
+ * The hold's own deadline check: the capture action rejected with the very error object GitCache.recoveryRemaining threw
+ * inside that hold's recoveryOperations frame, on the hold's effective deadline, not budget-limited, at or past that
+ * deadline. Bound by object identity (the throw record is looked up by the error), not by any settle timestamp.
+ */
+const isHoldDeadlineCheck = (c: CaptureEvidence, lookup: DeadlineThrowLookup) => {
+  if (c.originalFlight !== true || c.custody?.kind !== "hold") return false;
+  const reason = c.actionReason;
+  if (typeof reason !== "object" || reason === null) return false;
+  const rec = lookup(reason);
+  return rec !== undefined && rec.frame !== undefined && rec.frame === c.custody.frame &&
+    c.custody.effectiveDeadline !== undefined && rec.deadline === c.custody.effectiveDeadline &&
+    rec.budgetLimited === false && rec.at >= c.custody.effectiveDeadline;
+};
+/** The accepted evidence for an exhausted-deadline run, naming the disjunct that carried it. */
+function exhaustedDeadlineEvidence(holdOps: readonly HoldOpEvidence[], captures: readonly CaptureEvidence[],
+  lookup: DeadlineThrowLookup = () => undefined): "deadlineAbort" | "captureAbort" | "holdDeadlineCheck" | undefined {
+  if (holdOps.some(isDeadlineAbort)) return "deadlineAbort";
+  if (captures.some(isCaptureAbort)) return "captureAbort";
+  if (captures.some(c => isHoldDeadlineCheck(c, lookup))) return "holdDeadlineCheck";
+  return undefined;
+}
+/** Accepted only when no non-deadline predicate was already true at entry and the entry itself was at or past the deadline. */
+function classifyPreOpRefusal(r: { entryAt: number; deadline: number; clean: boolean }): RefusalClass {
+  return !r.clean ? "dirty" : r.entryAt >= r.deadline ? "expired" : "straddle";
+}
 const reasonClassOf = (reason: unknown) => isDeadlineReason(reason) ? "RecoveryDeadlineExhaustedError"
   : (reason as { constructor?: { name?: string } } | undefined)?.constructor?.name ?? typeof reason;
 
@@ -322,13 +393,8 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
   const starts: { flight: unknown; caller: string; firstCall: boolean; operationSet: boolean }[] = [];
   const preserves: { flight: unknown; promise: Promise<unknown>; store: { custody?: CustodyRecord } }[] = [];
   const custody: CustodyRecord[] = [];
-  const preOpRefusals: { expired: boolean }[] = [];
-  const captures: { signal: AbortSignal; deadlineAt: number; caller: AbortSignal | undefined; abortedAt?: number; returnedAt?: number;
-    /** The abort was seen while the capture's action had not yet returned. */
-    abortedWhilePending?: boolean; /** The capture was opened under the original flight's preserve call. */ originalFlight?: boolean;
-    /** The capture action's return value settled (or it threw synchronously). */ settled?: boolean;
-    /** The maintenance-budget signal visible where the capture was requested. */ budgetSignal?: AbortSignal;
-    seq0?: number }[] = [];
+  const preOpRefusals: PreOpRefusal[] = [];
+  const captures: CaptureRecord[] = [];
   const capturePromises: Promise<unknown>[] = [];
   const t0BySignal = new Map<AbortSignal, number>();
   const seq0BySignal = new Map<AbortSignal, number>();
@@ -361,7 +427,25 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
   const g = git as unknown as {
     withRecoveryOperation: (...args: any[]) => Promise<unknown>;
     recoveryOperations: AsyncLocalStorage<{ signal: AbortSignal; deadline: number; budget?: MaintenanceBudget }>;
+    recoveryRemaining: (operation: { signal: AbortSignal; deadline: number; budget?: MaintenanceBudget }) => number;
   };
+  // Records every RecoveryDeadlineExhaustedError that GitCache.recoveryRemaining throws, keyed by the error object. The
+  // wrapper is synchronous, rethrows the same error and returns the real value unchanged; callers use this.recoveryRemaining,
+  // so the instance patch sees them.
+  const deadlineThrows = new WeakMap<object, DeadlineThrow>();
+  const previousRemaining = g.recoveryRemaining;
+  g.recoveryRemaining = function (this: unknown, operation) {
+    try { return previousRemaining.call(this, operation); }
+    catch (error) {
+      if (error instanceof RecoveryDeadlineExhaustedError) {
+        const at = REAL_DATE_NOW();
+        deadlineThrows.set(error, { frame: g.recoveryOperations.getStore(), deadline: operation.deadline, at,
+          budgetLimited: (operation.budget?.remainingMs() ?? Infinity) < operation.deadline - at });
+      }
+      throw error;
+    }
+  };
+  const deadlineThrowOf: DeadlineThrowLookup = reason => deadlineThrows.get(reason);
   const previousRecovery = g.withRecoveryOperation;
   const realRecovery = previousRecovery.bind(git);
   g.withRecoveryOperation = (signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<unknown>,
@@ -390,13 +474,14 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     custody.push(record);
     if (store) store.custody = record;
     const settle = () => {
-      if (!record.outcome) record.settleAtDate = REAL_DATE_NOW();
       record.outcome ??= record.entered ? { kind: "settled-without-abort" } : { kind: "rejected-before-action" };
     };
     // Non-perturbing: handlers attached below only mark the production promises as handled; production awaits them all,
     // and the exact production promise/value is returned.
     const wrapped = (combined: AbortSignal) => {
       record.entered = true;
+      // withRecoveryOperation runs this action inside recoveryOperations.run(frame, ...), so this is the hold's own frame.
+      record.frame = g.recoveryOperations.getStore();
       const onAbort = () => {
         if (record.outcome) return;
         const reason = combined.reason;
@@ -460,13 +545,26 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     captured.set(tag.site, (captured.get(tag.site) ?? 0) + 1);
   };
 
+  const disjunctOf = () => fixture === "exhausted" && scenario === "deadline"
+    ? exhaustedDeadlineEvidence(custody.filter(c => c.kind === "hold"), captures, deadlineThrowOf) : undefined;
+  /** The recorded recoveryRemaining throw behind a capture's action rejection, with frame equality as a boolean. */
+  const throwFacts = (c: CaptureRecord) => {
+    const rec = typeof c.actionReason === "object" && c.actionReason !== null ? deadlineThrowOf(c.actionReason) : undefined;
+    return rec && { frameMatchesHold: rec.frame !== undefined && rec.frame === c.custody?.frame, deadline: rec.deadline, at: rec.at,
+      budgetLimited: rec.budgetLimited };
+  };
   const facts = () => " [custody observer facts: " + JSON.stringify({
     fixture, scenario, violations,
     starts: starts.map(s => ({ original: s.flight === original, caller: s.caller, firstCall: s.firstCall, operationSet: s.operationSet })),
-    custody: custody.map(c => ({ ...c, outcome: c.outcome ?? "none" })),
+    custody: custody.map(({ frame, ...c }) => ({ ...c, hasFrame: frame !== undefined, outcome: c.outcome ?? "none" })),
     captures: captures.map(c => ({ deadlineAt: c.deadlineAt, abortedAt: c.abortedAt, aborted: c.signal.aborted,
-      abortedWhilePending: c.abortedWhilePending, originalFlight: c.originalFlight })),
-    preOpRefusals,
+      origin: c.origin, pendingAtAbort: c.pendingAtAbort, reason: c.reason === undefined ? undefined : reasonClassOf(c.reason),
+      failure: c.failure, custodyKind: c.custody?.kind, originalFlight: c.originalFlight,
+      actionReason: c.actionReason === undefined ? undefined : reasonClassOf(c.actionReason),
+      actionReasonIsRecordedThrow: typeof c.actionReason === "object" && c.actionReason !== null && deadlineThrowOf(c.actionReason) !== undefined,
+      deadlineThrow: throwFacts(c) })),
+    preOpRefusals: preOpRefusals.map(r => ({ ...r, class: classifyPreOpRefusal(r) })),
+    disjunct: disjunctOf(),
     ports: { park: ports.park && { ...ports.park, reason: reasonClassOf(ports.park.reason),
         before: ports.park.before && { ...ports.park.before, reason: reasonClassOf(ports.park.before.reason) } },
       send: ports.send && { ...ports.send, reason: reasonClassOf(ports.send.reason),
@@ -497,15 +595,33 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       wrap("reconcileWorkerMemory", real => (flight: unknown) => callerStore.run("reconcile", () => real(flight)));
       wrap("preserveWorkerMemory", real => (flight: MemoryFlightProof, hold: unknown) => {
         const store: { flight: MemoryFlightProof; custody?: CustodyRecord } = { flight };
+        // Same synchronous turn as the call: the entry time and every non-deadline predicate of the runner's pre-operation
+        // identity() / retainedTerminalGuard, all side-effect-free reads.
+        const entryAt = REAL_DATE_NOW();
+        const dirty: string[] = [];
+        const deadline = (hold as { deadline?: number } | undefined)?.deadline;
+        if (flight === original) {
+          const f2 = flight as any, r2 = runner as any, mem = f2.workerMemory, ctx = (hold as any)?.context;
+          const read = (name: string, test: () => boolean) => { try { if (test()) dirty.push(name); } catch (error) { dirty.push(`${name} threw ${String(error)}`); } };
+          if (typeof deadline !== "number") dirty.push("hold carries no numeric deadline");
+          read("flight shuttingDown", () => f2.active?.shuttingDown === true);
+          read("global shutdown", () => r2.shuttingDownGlobal === true);
+          read("shutdown signal", () => r2.shutdownSignal.signal.aborted === true);
+          read("claim fence", () => f2.steering.claimFence() !== undefined);
+          read("cancelled", () => f2.steering.isCancelled() === true);
+          read("terminal lifecycle", () => f2.steering.terminalLifecycleSignal().aborted === true);
+          read("memory ended", () => mem?.ended === true);
+          read("memory incarnation", () => r2.client.memoryIncarnation !== mem?.incarnation);
+          read("context flight", () => ctx?.flight !== flight);
+          read("claim generation", () => ctx?.claim_generation !== f2.claimGeneration);
+          read("pending credential switch", () => f2.steering.pendingCredentialSwitch() !== undefined);
+          read("pause mode", () => f2.steering.getPauseMode() !== null);
+        }
         const promise = flightStore.run(store, () => real(flight, hold)) as Promise<unknown>;
         preserves.push({ flight, promise, store });
-        // A refusal by the pre-operation identity() check settles the call with no custody operation recorded.
-        const noteSettled = () => {
-          if (flight !== original || store.custody) return;
-          const deadline = (hold as { deadline?: number } | undefined)?.deadline;
-          preOpRefusals.push({ expired: typeof deadline === "number" && REAL_DATE_NOW() >= deadline });
-        };
-        promise.then(noteSettled, noteSettled);
+        // The async function ran synchronously through identity(): no custody operation means a pre-operation refusal.
+        if (flight === original && !store.custody)
+          preOpRefusals.push({ entryAt, deadline: typeof deadline === "number" ? deadline : NaN, clean: dirty.length === 0, dirty });
         return promise;
       });
       const sites: [string, (args: any[]) => { flight: unknown; held: HeldLike | undefined; authenticated: unknown }][] = [
@@ -544,8 +660,11 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     wrapCapture(inner: NonNullable<Executor["withCredentialFreeCapture"]>): NonNullable<Executor["withCredentialFreeCapture"]> {
       const wrapped = (deadlineMs: number, action: (context: CredentialFreeCaptureContext) => Promise<unknown>,
         purpose?: "capture" | "cancel", signal?: AbortSignal, attempt?: unknown) => {
-        // The record exists in wrapper scope: the run is created before the callback runs (queue wait).
-        const record = { caller: signal, abortedWhilePending: false, budgetSignal: MaintenanceBudget.signal() } as (typeof captures)[number];
+        // The record exists in wrapper scope: the run is created before the callback runs (queue wait). The capture is requested
+        // synchronously from inside the hold operation's action, so the flight store's custody read here is that operation
+        // (a callback-time read could see a later operation on the same flight).
+        const record = { caller: signal, budgetSignal: MaintenanceBudget.signal(),
+          custody: flightStore.getStore()?.custody } as CaptureRecord;
         // Non-perturbing: the callback is synchronous and returns the exact production value; handlers attached to it only
         // mark it handled, and production awaits it.
         const run = inner(deadlineMs, context => {
@@ -556,21 +675,32 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           record.seq0 = clock.log.length;
           seq0BySignal.set(context.signal, record.seq0);
           captures.push(record);
-          const note = () => { record.abortedAt ??= REAL_DATE_NOW(); if (!record.settled) record.abortedWhilePending = true; };
+          // Synchronous during abort dispatch: nothing here awaits.
+          const note = () => {
+            record.abortedAt ??= REAL_DATE_NOW();
+            record.reason = context.signal.reason;
+            record.pendingAtAbort = !record.settled;
+            record.origin = abortOriginOf(record.reason, record.caller, record.budgetSignal);
+          };
           if (context.signal.aborted) note();
           else context.signal.addEventListener("abort", note, { once: true });
-          // returnedAt stays until the form (c) oracle stops reading it.
-          const mark = () => { record.settled = true; record.returnedAt = REAL_DATE_NOW(); };
+          const mark = () => { record.settled = true; };
+          const markRejected = (error: unknown) => { record.actionReason = error; mark(); };
           let result: Promise<unknown>;
-          try { result = action(context); } catch (error) { record.settled = true; throw error; }
-          if (isThenable(result)) result.then(mark, mark); else mark();
+          try { result = action(context); } catch (error) { record.actionReason = error; record.settled = true; throw error; }
+          if (isThenable(result)) result.then(mark, markRejected); else mark();
           return result;
         }, purpose, signal, attempt as never);
+        // Records the typed failure without changing what is returned.
+        if (isThenable(run)) void run.then(undefined, error => { record.failure = captureFailureOf(error); });
         capturePromises.push(run);
         return run;
       };
       return wrapped as unknown as NonNullable<Executor["withCredentialFreeCapture"]>;
     },
+    captureRecords: (): readonly CaptureRecord[] => captures,
+    custodyRecords: (): readonly CustodyRecord[] => custody,
+    deadlineThrowOf,
     startClock() { clock.log.length = 0; clock.logging = true; Date.now = patchedNow; },
     /** Fixture-port abort records: plain listeners, attached on the first correlated call only, no clock reads. */
     observePark(args: Parameters<WorkerClient["reportState"]>) {
@@ -615,6 +745,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
         // Restore every patch on a shared object (Date.now, git.withRecoveryOperation), reverse of installation order.
         if (Date.now === patchedNow) Date.now = REAL_DATE_NOW;
         g.withRecoveryOperation = previousRecovery;
+        g.recoveryRemaining = previousRemaining;
       }
     },
     /** All assertions; call only after join(). */
@@ -655,8 +786,6 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       // Close work is classified only by its closingDeadline, so its deadline is not separately asserted here; no
       // fixture observed a close operation reach withRecoveryOperation (the close path runs through the batcher).
       for (const op of custody) if (op.outcome === undefined) failures.push("a custody operation recorded no outcome");
-      const deadlineAbort = (op: CustodyRecord) => op.outcome?.kind === "abort" && op.outcome.deadlineClass &&
-        op.outcome.atDate >= op.effectiveDeadline - 1;
       const heldCase = fixture === "lateAck" || fixture === "delayedFeedback" || (fixture === "exhausted" && scenario === "deadline");
       if (heldCase) for (const op of holdOps) {
         if (op.outcome?.kind === "abort" && !op.outcome.deadlineClass)
@@ -667,15 +796,21 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       // No upper bound is placed on a custody operation.
       for (const op of holdOps) {
         const required = fixture === "lateAck" || (fixture === "delayedFeedback" && op.outcome?.kind === "abort");
-        if (required && !deadlineAbort(op))
+        if (required && !isDeadlineAbort(op))
           failures.push(`a custody operation has no deadline-class abort at or after its effective deadline (${JSON.stringify(op.outcome)})`);
       }
       if (fixture === "lateAck" && holdOps.length === 0) failures.push("late-ACK recorded no hold custody operation");
+      const refusalClasses = preOpRefusals.map(classifyPreOpRefusal);
       if (fixture === "delayedFeedback") {
-        // Either exactly one started hold operation, or exactly one recorded expired pre-operation refusal (reconcile
-        // reached preserveWorkerMemory after the hold expired). An unexpired pre-operation settle is never accepted.
-        const expiredRefusal = holdOps.length === 0 && preOpRefusals.length === 1 && preOpRefusals[0]!.expired;
-        if (preOpRefusals.some(r => !r.expired)) failures.push("a pre-operation refusal settled before the hold deadline");
+        // Either exactly one started hold operation, or exactly one pre-operation refusal that was clean and entered at or
+        // after the hold deadline (reconcile reached preserveWorkerMemory after the hold expired).
+        preOpRefusals.forEach((r, i) => {
+          if (refusalClasses[i] === "straddle")
+            failures.push(`a pre-operation refusal was entered before the hold deadline (entry ${r.entryAt} < deadline ${r.deadline})`);
+          if (refusalClasses[i] === "dirty")
+            failures.push(`a pre-operation refusal had a non-deadline predicate set at entry: ${JSON.stringify(r.dirty)}`);
+        });
+        const expiredRefusal = holdOps.length === 0 && preOpRefusals.length === 1 && refusalClasses[0] === "expired";
         if (expiredRefusal) { /* accepted: no custody operation started */ }
         else if (holdOps.length !== 1)
           failures.push(`delayed feedback expected exactly one hold custody operation or one expired pre-operation refusal, saw ${holdOps.length} operation(s) and ${JSON.stringify(preOpRefusals)}`);
@@ -684,27 +819,252 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           if (op.outcome?.kind === "rejected-before-action") failures.push("the delayed-feedback hold custody operation was rejected before action");
         }
       }
-      if (fixture === "exhausted" && scenario === "deadline") {
-        const captureAbort = captures.some(c => c.signal.aborted && !(c.caller?.aborted && c.signal.reason === c.caller.reason) &&
-          c.abortedWhilePending === true && c.originalFlight === true &&
-          c.abortedAt !== undefined && c.abortedAt >= c.deadlineAt - 1);
-        // (c) the hold operation settled without an abort at or after its deadline, and the original-flight capture's action
-        // itself ran until the capture deadline (its return time, not the unconditional teardown abort, is the evidence).
-        const settledAtDeadline = holdOps.some(op => op.outcome?.kind === "settled-without-abort" &&
-          op.settleAtDate !== undefined && op.settleAtDate >= op.effectiveDeadline - 1) &&
-          captures.some(c => c.originalFlight === true && c.returnedAt !== undefined && c.returnedAt >= c.deadlineAt - 1);
-        if (!holdOps.some(deadlineAbort) && !captureAbort && !settledAtDeadline)
-          failures.push("no deadline-class custody abort, pending capture-deadline abort or at-deadline hold settle was recorded");
+      if (heldCase) for (const c of captures) {
+        if (c.originalFlight === true && c.pendingAtAbort === true && (c.origin === "maintenance" || c.origin === "unknown"))
+          failures.push(`an original-flight capture was aborted while pending by ${c.origin} (${reasonClassOf(c.reason)}), not by its lane deadline`);
       }
+      // Settle-before-teardown through the real adapter: an abort of a capture with no typed failure is the lane's teardown
+      // after the action settled, so it can never be a pending abort.
+      if (fixture === "exhausted" && (scenario === "accepted" || scenario === "ambiguous")) for (const c of captures) {
+        if (c.failure === undefined && c.signal.aborted && c.pendingAtAbort !== false)
+          failures.push(`a capture with no typed failure was aborted while its action was pending (${c.origin}, ${reasonClassOf(c.reason)})`);
+      }
+      const disjunct = disjunctOf();
+      if (fixture === "exhausted" && scenario === "deadline" && disjunct === undefined)
+        failures.push("no deadline-class custody abort, typed lane capture-deadline abort or hold deadline check was recorded");
       const accepted = (reason: unknown) => isDeadlineReason(reason) || isAbortErrorReason(reason);
       if (ports.park && !accepted(ports.park.before?.reason)) failures.push(`park signal aborted with ${reasonClassOf(ports.park.before?.reason)}`);
       if (ports.send && !accepted(ports.send.before?.reason)) failures.push(`send signal aborted with ${reasonClassOf(ports.send.before?.reason)}`);
       const expected = EXPECTED_HELD_SITES[`${fixture}:${scenario}`] ?? [];
       for (const site of expected) if (!captured.has(site)) failures.push(`expected held fetch site ${site} was not captured`);
       assert.deepEqual(failures, [], "custody observer" + facts());
+      console.log("custody-witness " + JSON.stringify({ fixture, scenario, disjunct: disjunct ?? null,
+        captures: captures.map(c => ({ origin: c.origin ?? null, pendingAtAbort: c.pendingAtAbort ?? null,
+          deadlineExpired: c.failure?.deadlineExpired ?? null, originalFlight: c.originalFlight === true,
+          actionReasonIsRecordedThrow: typeof c.actionReason === "object" && c.actionReason !== null && deadlineThrowOf(c.actionReason) !== undefined,
+          deadlineThrow: throwFacts(c) ?? null })),
+        refusal: refusalClasses[0] ?? null, holdOps: holdOps.length }));
     },
   };
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Probes of the custody oracles. Small synthetic inputs: each pins one accept or reject decision.
+// ---------------------------------------------------------------------------------------------------------------------
+const probeHold = (outcome: CustodyOutcome, extra: object = {}) => ({ kind: "hold" as const, effectiveDeadline: 100, outcome, ...extra });
+const probeCapture = (extra: object = {}) => ({ originalFlight: true, custody: { kind: "hold" }, failure: { deadlineExpired: true },
+  pendingAtAbort: true, abortedAt: 100, deadlineAt: 100, origin: "lane" as CaptureOrigin, ...extra });
+
+test("custody oracle rejects an action that rejected early with a late continuation and no abort", () => {
+  // Owner repro: the action rejected at t=0 and its continuation ran at t=200; nothing aborted, no typed failure.
+  const hold = probeHold({ kind: "settled-without-abort" }, );
+  const capture = probeCapture({ failure: undefined, pendingAtAbort: false, abortedAt: undefined, origin: undefined,
+    settled: true });
+  assert.equal(exhaustedDeadlineEvidence([hold], [capture]), undefined);
+});
+
+test("custody oracle accepts a typed lane capture-deadline abort alone", () => {
+  assert.equal(exhaustedDeadlineEvidence([probeHold({ kind: "settled-without-abort" })], [probeCapture()]), "captureAbort");
+});
+
+test("custody oracle accepts a deadline-class hold abort alone", () => {
+  const hold = probeHold({ kind: "abort", atDate: 100, reasonClass: "RecoveryDeadlineExhaustedError", source: "own", deadlineClass: true });
+  assert.equal(exhaustedDeadlineEvidence([hold], []), "deadlineAbort");
+});
+
+test("custody oracle rejects every near-miss capture abort", () => {
+  const hold = probeHold({ kind: "settled-without-abort" });
+  const cases: [string, object][] = [
+    ["maintenance origin", { origin: "maintenance" }],
+    ["caller abort with a typed failure", { origin: "caller" }],
+    ["unknown origin", { origin: "unknown" }],
+    ["deadlineExpired with pendingAtAbort false", { pendingAtAbort: false }],
+    ["non-hold custody record", { custody: { kind: "close" } }],
+    ["no custody record", { custody: undefined }],
+    ["failure not deadline-expired", { failure: { deadlineExpired: false } }],
+    ["no typed failure", { failure: undefined }],
+    ["abort before the capture deadline", { abortedAt: 98 }],
+    ["not the original flight", { originalFlight: false }],
+  ];
+  for (const [label, extra] of cases)
+    assert.equal(exhaustedDeadlineEvidence([hold], [probeCapture(extra)]), undefined, label);
+});
+
+// holdDeadlineCheck: the hold's own recoveryRemaining throw, bound to the capture's rejection by object identity.
+const HOLD_FRAME = { frame: "hold" };
+const holdCheckRig = (throwExtra: Partial<DeadlineThrow> = {}, captureExtra: object = {}, record = true) => {
+  const reason = new RecoveryDeadlineExhaustedError();
+  const rec: DeadlineThrow = { frame: HOLD_FRAME, deadline: 100, at: 100, budgetLimited: false, ...throwExtra };
+  const lookup: DeadlineThrowLookup = r => (record && r === reason ? rec : undefined);
+  const capture = { originalFlight: true, custody: { kind: "hold", frame: HOLD_FRAME, effectiveDeadline: 100 }, deadlineAt: 100,
+    actionReason: reason, ...captureExtra };
+  return { hold: probeHold({ kind: "settled-without-abort" }), capture, lookup };
+};
+
+test("custody oracle accepts the hold's own deadline check bound by identity", () => {
+  const { hold, capture, lookup } = holdCheckRig();
+  assert.equal(exhaustedDeadlineEvidence([hold], [capture], lookup), "holdDeadlineCheck");
+  const later = holdCheckRig({ at: 250 });
+  assert.equal(exhaustedDeadlineEvidence([later.hold], [later.capture], later.lookup), "holdDeadlineCheck");
+});
+
+test("custody oracle rejects every near-miss hold deadline check", () => {
+  const cases: [string, Partial<DeadlineThrow>, object, boolean][] = [
+    ["RDEE from a foreign frame", { frame: { frame: "other" } }, {}, true],
+    ["throw without a frame", { frame: undefined }, { custody: { kind: "hold", frame: undefined, effectiveDeadline: 100 } }, true],
+    ["budget-limited throw", { budgetLimited: true }, {}, true],
+    ["RDEE never seen by recoveryRemaining", {}, {}, false],
+    ["correct identity but thrown before the effective deadline", { at: 99 }, {}, true],
+    ["throw deadline differs from the effective deadline", { deadline: 90 }, {}, true],
+    ["not the original flight", {}, { originalFlight: false }, true],
+    ["non-hold custody", {}, { custody: { kind: "close", frame: HOLD_FRAME, effectiveDeadline: 100 } }, true],
+    ["a non-object rejection", {}, { actionReason: "x" }, true],
+  ];
+  for (const [label, throwExtra, captureExtra, record] of cases) {
+    const { hold, capture, lookup } = holdCheckRig(throwExtra, captureExtra, record);
+    assert.equal(exhaustedDeadlineEvidence([hold], [capture], lookup), undefined, label);
+  }
+});
+
+test("pre-operation refusal: an entry before the deadline that settled after it is a straddle, not expiry", () => {
+  assert.equal(classifyPreOpRefusal({ entryAt: 950, deadline: 1000, clean: true }), "straddle");
+});
+
+test("pre-operation refusal: a straddle is never expiry whichever later timestamp is available", () => {
+  for (const entryAt of [999, 990, 500])
+    assert.equal(classifyPreOpRefusal({ entryAt, deadline: 1000, clean: true }), "straddle", `entry ${entryAt}`);
+});
+
+test("pre-operation refusal: a clean entry at or after the deadline is expiry", () => {
+  for (const entryAt of [1000, 1001, 5000]) assert.equal(classifyPreOpRefusal({ entryAt, deadline: 1000, clean: true }), "expired");
+});
+
+test("pre-operation refusal: a non-deadline predicate set at entry is dirty even after the deadline", () => {
+  // e.g. pause mode set before the entry, with the deadline already passed: the deadline did not cause the refusal.
+  assert.equal(classifyPreOpRefusal({ entryAt: 1500, deadline: 1000, clean: false }), "dirty");
+});
+
+// The real wrapCapture, fed a scripted lane: the lane owns its own controller, calls the callback and aborts as scripted.
+type ProbeAction = (context: CredentialFreeCaptureContext) => Promise<unknown>;
+const pendingUntilAbort: ProbeAction = context => new Promise<never>((_, reject) => {
+  context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true });
+});
+/** `script` runs after the lane called the callback and may abort the lane's controller (or an outer signal). */
+async function probeWrapCapture(action: ProbeAction, script: (ctl: AbortController) => void,
+  scope: (call: () => Promise<unknown>) => Promise<unknown> = call => call(), caller?: AbortSignal) {
+  const f = await setup();
+  const obs = observeCustody(f, "exhausted", "probe");
+  try {
+    const lane = async (deadlineMs: number, cb: ProbeAction, _purpose?: string, signal?: AbortSignal) => {
+      const ctl = new AbortController();
+      const outer = [signal, MaintenanceBudget.signal()].filter((x): x is AbortSignal => x !== undefined);
+      if (outer.length) {
+        const any = AbortSignal.any(outer);
+        const forward = () => ctl.abort(any.reason);
+        if (any.aborted) forward(); else any.addEventListener("abort", forward, { once: true });
+      }
+      try {
+        const running = cb({ signal: ctl.signal, deadlineAt: Date.now() + deadlineMs } as CredentialFreeCaptureContext);
+        script(ctl);
+        return await running;
+      } finally { ctl.abort(); }
+    };
+    const wrapped = obs.wrapCapture(lane as never);
+    await scope(() => wrapped(100, action, "capture", caller).then(() => undefined, () => undefined));
+    return obs.captureRecords();
+  } finally { try { await f.memory.stop(); } finally { await obs.join(); } }
+}
+
+test("wrapCapture records pendingAtAbort false when the action threw synchronously before the teardown abort", async () => {
+  const [record, ...rest] = await probeWrapCapture(() => { throw new Error("sync"); }, () => {});
+  assert.equal(rest.length, 0);
+  assert.equal(record!.pendingAtAbort, false);
+  assert.equal(record!.origin, "lane");
+});
+
+test("wrapCapture records pendingAtAbort false when the action rejected early before the teardown abort", async () => {
+  const [record] = await probeWrapCapture(async () => { throw new Error("early"); }, () => {});
+  assert.equal(record!.pendingAtAbort, false);
+});
+
+test("wrapCapture classifies a pending action aborted by the lane's own controller as lane origin", async () => {
+  const [record] = await probeWrapCapture(pendingUntilAbort, ctl => { ctl.abort(); });
+  assert.equal(record!.pendingAtAbort, true);
+  assert.equal(record!.origin, "lane");
+});
+
+test("wrapCapture classifies an abort carrying the caller signal's reason as caller origin", async () => {
+  const caller = new AbortController();
+  const [record] = await probeWrapCapture(pendingUntilAbort, () => { caller.abort(new Error("caller reason")); },
+    call => call(), caller.signal);
+  assert.equal(record!.pendingAtAbort, true);
+  assert.equal(record!.origin, "caller");
+});
+
+test("wrapCapture classifies an abort carrying the maintenance budget's reason as maintenance origin", async () => {
+  const budget = new MaintenanceBudget(5000);
+  try {
+    const [record] = await probeWrapCapture(pendingUntilAbort,
+      () => { (budget as unknown as { expire(): void }).expire(); },
+      call => MaintenanceBudget.run(budget, call));
+    assert.equal(record!.pendingAtAbort, true);
+    assert.equal(record!.origin, "maintenance");
+  } finally { budget.dispose(); }
+});
+
+test("wrapCapture classifies an abort with a foreign reason as unknown origin", async () => {
+  const caller = new AbortController();
+  const [record] = await probeWrapCapture(pendingUntilAbort, ctl => { ctl.abort(new Error("foreign")); },
+    call => call(), caller.signal);
+  assert.equal(record!.origin, "unknown");
+});
+
+test("wrapCapture records no typed failure for a plain rejection and no custody outside a hold operation", async () => {
+  const [record] = await probeWrapCapture(async () => { throw new Error("plain"); }, () => {});
+  assert.equal(record!.failure, undefined, "an untyped rejection records no failure");
+  assert.equal(record!.custody, undefined, "no hold operation was active");
+});
+
+test("holdDeadlineCheck: a capture rejecting with the hold's own recoveryRemaining throw is bound by identity through the real seams", async () => {
+  const f = await setup();
+  const obs = observeCustody(f, "exhausted", "probe");
+  try {
+    const holdDeadline = Date.now() + 40;
+    const flight = { workerMemory: { hold: { deadline: holdDeadline } } };
+    // The observer tags the original flight at begin; the real begin rejects this synthetic input before doing any work.
+    try { f.memory.begin({ flight, claim_generation: 7 } as never, {} as never); } catch { /* expected: invalid sinks */ }
+    const lane = (_deadlineMs: number, cb: ProbeAction) =>
+      cb({ signal: new AbortController().signal, deadlineAt: holdDeadline } as CredentialFreeCaptureContext);
+    const capture = obs.wrapCapture(lane as never);
+    // A runner double carrying only the seams attach wraps; preserveWorkerMemory opens the real hold operation.
+    const none = () => undefined;
+    const runner = { codexBoundaryDeadlineMs: 5000, startWorkerMemoryPreservation: none, reconcileWorkerMemory: none,
+      transferRestorePointToTrustedBare: none, captureRecoveryRestorePointBody: none, captureHoldContext: none, fetchTracking: none,
+      refusalGateInAuthority: none, stopForOwedLimit: none, owedStopReleaseWait: none, retainAcceptedOwnerPause: none,
+      preserveWorkerMemory: (_flight: unknown, hold: { deadline: number }) =>
+        git.withRecoveryOperation(new AbortController().signal, hold.deadline, async () =>
+          capture(5000, async () => {
+            await new Promise(resolve => setTimeout(resolve, Math.max(0, holdDeadline - Date.now()) + 25));
+            // The hold's own deadline check, run inside the hold's frame; a fresh signal keeps the abort-signal check out of it.
+            (git as unknown as { recoveryRemaining(op: object): number })
+              .recoveryRemaining({ signal: new AbortController().signal, deadline: holdDeadline });
+            return "unreachable";
+          }, "capture")) } as unknown as RunRunner;
+    obs.attach(runner, {} as Executor);
+    await assert.rejects((runner as unknown as { preserveWorkerMemory(...a: unknown[]): Promise<unknown> })
+      .preserveWorkerMemory(flight, { deadline: holdDeadline }), RecoveryDeadlineExhaustedError);
+    const [record, ...rest] = obs.captureRecords();
+    assert.equal(rest.length, 0);
+    assert.equal(record!.originalFlight, true, obs.facts());
+    assert.equal(record!.custody?.kind, "hold", obs.facts());
+    assert.notEqual(record!.custody?.frame, undefined, "the wrapper recorded the hold's frame");
+    const thrown = obs.deadlineThrowOf(record!.actionReason as object);
+    assert.ok(thrown, "recoveryRemaining recorded the very error object the action rejected with" + obs.facts());
+    assert.equal(thrown.frame, record!.custody?.frame, "the throw happened in the hold's own frame");
+    assert.equal(thrown.budgetLimited, false);
+    assert.equal(exhaustedDeadlineEvidence([], obs.captureRecords(), obs.deadlineThrowOf), "holdDeadlineCheck", obs.facts());
+  } finally { try { await f.memory.stop(); } finally { await obs.join(); } }
+});
 
 test("runner pressure joins the original tool/feed, refuses retries, rearms at sustained low Q and carries allowance across approval/input", async () => {
   const f = await setup();
