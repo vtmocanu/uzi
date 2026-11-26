@@ -19,7 +19,10 @@ import (
 //   - "index" in a bucket cell is the zero-based position in the bucket_starts / bucket_ends
 //     arrays the caller passed; every bucket is present, including empty ones.
 //   - Whether a measure applies (a kind filter that excludes the measure's kinds) is decided by
-//     the caller; with empty kind arrays the statement returns zeros.
+//     the caller. Every measure is gated by the kinds array (rework and judge targets must
+//     also be in it; CI fix and cross-check leads are selected by it), and each by its own
+//     array too (delivery kinds for rework, judge kinds for judge), so an empty array for
+//     any of them zeroes that measure.
 
 // AnalyticsQualityDoc is the whole Quality document.
 type AnalyticsQualityDoc struct {

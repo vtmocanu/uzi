@@ -39,7 +39,7 @@ rw_pr AS MATERIALIZED (
            CASE WHEN p.wb >= 1 AND p.first_at < ($2::timestamptz[])[p.wb] THEN p.wb END AS bidx
     FROM (
         SELECT s.repo_id, s.mr_iid, s.first_at,
-               (EXISTS (SELECT 1 FROM rw_witness w WHERE w.repo_id = s.repo_id AND w.mr_iid = s.mr_iid)) AS witnessed,
+               ((s.repo_id, s.mr_iid) IN (SELECT w.repo_id, w.mr_iid FROM rw_witness w)) AS witnessed,
                width_bucket(s.first_at, $1::timestamptz[]) AS wb
         FROM rw_seed s
     ) p
@@ -53,21 +53,25 @@ rework AS MATERIALIZED (
     WHERE kind = 'mr_rework' AND created_at < $4::timestamptz
 ),
 rw_link AS MATERIALIZED (
-    SELECT s.repo_id, s.mr_iid, rw.id AS rework_id,
+    SELECT rw.repo_id, rw.mr_iid, rw.id AS rework_id,
            (t.repo_id = rw.repo_id AND t.mr_iid = rw.mr_iid AND t.user_id = rw.user_id) IS TRUE AS verified
-    FROM rw_sel s
-    JOIN rework rw ON rw.repo_id = s.repo_id AND rw.mr_iid = s.mr_iid
+    FROM rework rw
     LEFT JOIN runs t ON t.id = rw.target_run_id
+    -- IS TRUE keeps a hashed SubPlan (no pulled-up semi-join, so no nested loop in a generic plan).
+    WHERE ((rw.repo_id, rw.mr_iid) IN (SELECT q.repo_id, q.mr_iid FROM rw_sel q)) IS TRUE
 ),
 rw_cnt AS MATERIALIZED (
-    SELECT s.repo_id, s.mr_iid, s.bidx,
-           CASE WHEN count(DISTINCT l.rework_id) FILTER (WHERE l.verified) = 0 THEN 'zero'
-                WHEN count(DISTINCT l.rework_id) FILTER (WHERE l.verified) = 1 THEN 'one'
-                WHEN count(DISTINCT l.rework_id) FILTER (WHERE l.verified) = 2 THEN 'two'
+    SELECT u.repo_id, u.mr_iid, max(u.bidx) AS bidx,
+           CASE WHEN sum(u.v) = 0 THEN 'zero'
+                WHEN sum(u.v) = 1 THEN 'one'
+                WHEN sum(u.v) = 2 THEN 'two'
                 ELSE 'three_plus' END AS grp
-    FROM rw_sel s
-    LEFT JOIN rw_link l ON l.repo_id = s.repo_id AND l.mr_iid = s.mr_iid
-    GROUP BY s.repo_id, s.mr_iid, s.bidx
+    FROM (
+        SELECT repo_id, mr_iid, bidx, 0 AS v FROM rw_sel
+        UNION ALL
+        SELECT repo_id, mr_iid, NULL::int, CASE WHEN verified THEN 1 ELSE 0 END FROM rw_link
+    ) u
+    GROUP BY u.repo_id, u.mr_iid
 ),
 rw_key AS MATERIALIZED (
     SELECT s.repo_id, s.mr_iid, (fc.id IS NOT NULL) AS detectable,
@@ -229,6 +233,7 @@ jd AS MATERIALIZED (
       AND ($5::uuid IS NULL OR r.repo_id = $5::uuid)
       AND ($6::text IS NULL OR r.harness = $6::text)
       AND r.kind = ANY($11::text[])
+      AND r.kind = ANY($7::text[])
 ),
 jd2 AS MATERIALIZED (
     SELECT j.id, j.status, j.created_at, j.skip_expr, j.rv_id, j.rv_status, j.rv_verdict, j.skipped, j.wb,
@@ -362,7 +367,7 @@ rw_pr AS MATERIALIZED (
            CASE WHEN p.wb >= 1 AND p.first_at < ($2::timestamptz[])[p.wb] THEN p.wb END AS bidx
     FROM (
         SELECT s.repo_id, s.mr_iid, s.first_at,
-               (EXISTS (SELECT 1 FROM rw_witness w WHERE w.repo_id = s.repo_id AND w.mr_iid = s.mr_iid)) AS witnessed,
+               ((s.repo_id, s.mr_iid) IN (SELECT w.repo_id, w.mr_iid FROM rw_witness w)) AS witnessed,
                width_bucket(s.first_at, $1::timestamptz[]) AS wb
         FROM rw_seed s
     ) p
@@ -377,21 +382,25 @@ rework AS MATERIALIZED (
       AND user_id = $5::uuid  -- owner-only
 ),
 rw_link AS MATERIALIZED (
-    SELECT s.repo_id, s.mr_iid, rw.id AS rework_id,
+    SELECT rw.repo_id, rw.mr_iid, rw.id AS rework_id,
            (t.repo_id = rw.repo_id AND t.mr_iid = rw.mr_iid AND t.user_id = rw.user_id) IS TRUE AS verified
-    FROM rw_sel s
-    JOIN rework rw ON rw.repo_id = s.repo_id AND rw.mr_iid = s.mr_iid
+    FROM rework rw
     LEFT JOIN runs t ON t.id = rw.target_run_id
+    -- IS TRUE keeps a hashed SubPlan (no pulled-up semi-join, so no nested loop in a generic plan).
+    WHERE ((rw.repo_id, rw.mr_iid) IN (SELECT q.repo_id, q.mr_iid FROM rw_sel q)) IS TRUE
 ),
 rw_cnt AS MATERIALIZED (
-    SELECT s.repo_id, s.mr_iid, s.bidx,
-           CASE WHEN count(DISTINCT l.rework_id) FILTER (WHERE l.verified) = 0 THEN 'zero'
-                WHEN count(DISTINCT l.rework_id) FILTER (WHERE l.verified) = 1 THEN 'one'
-                WHEN count(DISTINCT l.rework_id) FILTER (WHERE l.verified) = 2 THEN 'two'
+    SELECT u.repo_id, u.mr_iid, max(u.bidx) AS bidx,
+           CASE WHEN sum(u.v) = 0 THEN 'zero'
+                WHEN sum(u.v) = 1 THEN 'one'
+                WHEN sum(u.v) = 2 THEN 'two'
                 ELSE 'three_plus' END AS grp
-    FROM rw_sel s
-    LEFT JOIN rw_link l ON l.repo_id = s.repo_id AND l.mr_iid = s.mr_iid
-    GROUP BY s.repo_id, s.mr_iid, s.bidx
+    FROM (
+        SELECT repo_id, mr_iid, bidx, 0 AS v FROM rw_sel
+        UNION ALL
+        SELECT repo_id, mr_iid, NULL::int, CASE WHEN verified THEN 1 ELSE 0 END FROM rw_link
+    ) u
+    GROUP BY u.repo_id, u.mr_iid
 ),
 rw_key AS MATERIALIZED (
     SELECT s.repo_id, s.mr_iid, (fc.id IS NOT NULL) AS detectable,
@@ -557,6 +566,7 @@ jd AS MATERIALIZED (
       AND ($6::uuid IS NULL OR r.repo_id = $6::uuid)
       AND ($7::text IS NULL OR r.harness = $7::text)
       AND r.kind = ANY($12::text[])
+      AND r.kind = ANY($8::text[])
 ),
 jd2 AS MATERIALIZED (
     SELECT j.id, j.status, j.created_at, j.skip_expr, j.rv_id, j.rv_status, j.rv_verdict, j.skipped, j.wb,

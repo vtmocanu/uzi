@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"bytes"
+	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/analytics"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Issue #4730: LiveDB tests of the Quality statements. They call the generated store methods
@@ -451,6 +454,20 @@ func TestQualityJudgeLiveDB(t *testing.T) {
 	wantEq(t, "no judge kinds candidates", empty.Candidates.Total, 0)
 }
 
+// The kind filter applies to judge targets too: a judge-eligible kind outside the requested
+// kinds is not a candidate.
+func TestQualityJudgeKindFilterLiveDB(t *testing.T) {
+	f := newQualityFixture(t)
+	o := f.owner("jd-kind")
+	repo, _ := f.repo(o, "jd-kind")
+	f.run(spendRun{Owner: o.User, Repo: repo, Kind: runkind.CIFix, Status: "completed", At: qualDay(3, 9), Finished: qualDay(3, 10)})
+	all := f.quality(qualityCall{Owner: o.User, Now: qualNow}).Doc.Judge
+	wantEq(t, "ci_fix eligible by default", all.Eligible.Total, 1)
+	issueOnly := f.quality(qualityCall{Owner: o.User, Now: qualNow, Kinds: []string{runkind.Issue}}).Doc.Judge
+	wantEq(t, "ci_fix with kinds=[issue] eligible", issueOnly.Eligible.Total, 0)
+	wantEq(t, "ci_fix with kinds=[issue] candidates", issueOnly.Candidates.Total, 0)
+}
+
 func TestQualityOwnershipLiveDB(t *testing.T) {
 	f := newQualityFixture(t)
 	u, v := f.owner("own-u"), f.owner("own-v")
@@ -551,6 +568,8 @@ func TestQualityCalendarLiveDB(t *testing.T) {
 		}
 	}
 	// A run on the window's exclusive end (Now) is outside; one at From is inside.
+	f.run(spendRun{Owner: o.User, Repo: repo, Kind: runkind.CIFix, At: res.Bounds.Now})
+	res = f.quality(call)
 	wantEq(t, "total runs", res.Doc.CIFix.Runs, 60)
 
 	// The session TimeZone changes nothing.
@@ -589,5 +608,111 @@ func TestQualityCalendarAllTimeLiveDB(t *testing.T) {
 		if got[i].Runs != 2 {
 			t.Errorf("weekly bucket %d (%s) holds %d runs, want 2", i, b.BucketStarts[i], got[i].Runs)
 		}
+	}
+}
+
+// qualityTSArray renders timestamps as a text-array literal for an EXECUTE argument.
+func qualityTSArray(ts []time.Time) string {
+	parts := make([]string, len(ts))
+	for i, v := range ts {
+		parts[i] = `"` + v.UTC().Format(time.RFC3339Nano) + `"`
+	}
+	return "'{" + strings.Join(parts, ",") + "}'::timestamptz[]"
+}
+
+func qualityTextArray(v []string) string {
+	return "'{" + strings.Join(v, ",") + "}'::text[]"
+}
+
+// TestQualityGenericPlanShapeLiveDB pins the plan shape the statements get once pgx's cached
+// prepared statement switches to a generic plan (CTEs estimated at one row): the merge-witness
+// lookup is a hashed SubPlan and no rework/PR join falls back to a nested loop with a
+// Join Filter on the (repo_id, mr_iid) pair. Both statements are checked.
+func TestQualityGenericPlanShapeLiveDB(t *testing.T) {
+	f := newQualityFixture(t)
+	o := f.owner("plan")
+	repo, _ := f.repo(o, "plan")
+	for i := int64(0); i < 12; i++ {
+		seed := f.pr(o, repo, 500+i, "merged", qualDay(3+int(i%5), 9))
+		f.rework(o, repo, 500+i, seed, "mr_rework", qualDay(10, 9))
+	}
+	b := f.bounds(spendCall{Owner: o.User, Now: qualNow})
+	ownerArgs := func() string {
+		a := []string{
+			qualityTSArray(b.BucketStarts), qualityTSArray(b.BucketEnds),
+			"'" + b.From.UTC().Format(time.RFC3339Nano) + "'::timestamptz",
+			"'" + b.Now.UTC().Format(time.RFC3339Nano) + "'::timestamptz",
+			"'" + o.User.String() + "'::uuid", "NULL::uuid", "NULL::text",
+			qualityTextArray(runkind.All()), qualityTextArray(runkind.Delivery()),
+		}
+		always, prestart := workersvc.JudgeSkipFailOrigins()
+		a = append(a, qualityTextArray(always), qualityTextArray(prestart))
+		var judge []string
+		for _, k := range runkind.All() {
+			if runkind.JudgeEligible(k) {
+				judge = append(judge, k)
+			}
+		}
+		a = append(a, qualityTextArray(judge))
+		return strings.Join(a, ", ")
+	}
+	for _, tc := range []struct {
+		name, sql string
+		owner     bool
+	}{
+		{"owner", store.AnalyticsOwnerQualitySQL, true},
+		{"all", store.AnalyticsAllQualitySQL, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := f.pool.Acquire(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Release()
+			stmt := "qual_plan_" + tc.name
+			defer func() { _, _ = conn.Exec(context.Background(), "DEALLOCATE "+stmt) }()
+			tx, err := conn.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			if _, err := tx.Exec(f.ctx, "SET LOCAL plan_cache_mode = force_generic_plan"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(f.ctx, "PREPARE "+stmt+" AS "+tc.sql); err != nil {
+				t.Fatalf("prepare: %v", err)
+			}
+			a := ownerArgs()
+			if !tc.owner {
+				// The all-scope statement has no user_id parameter.
+				parts := strings.Split(a, ", ")
+				a = strings.Join(append(append([]string{}, parts[:4]...), parts[5:]...), ", ")
+			}
+			rows, err := tx.Query(f.ctx, "EXPLAIN (VERBOSE, FORMAT TEXT) EXECUTE "+stmt+"("+a+")")
+			if err != nil {
+				t.Fatalf("explain: %v", err)
+			}
+			defer rows.Close()
+			var plan []string
+			for rows.Next() {
+				var line string
+				if err := rows.Scan(&line); err != nil {
+					t.Fatal(err)
+				}
+				plan = append(plan, line)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			text := strings.Join(plan, "\n")
+			if !strings.Contains(text, "hashed SubPlan") {
+				t.Errorf("the merge-witness lookup is not a hashed SubPlan:\n%s", text)
+			}
+			for _, line := range plan {
+				if strings.Contains(line, "Join Filter") && strings.Contains(line, "mr_iid") {
+					t.Errorf("a PR/rework join is a nested loop on the (repo_id, mr_iid) pair: %s\n%s", strings.TrimSpace(line), text)
+				}
+			}
+		})
 	}
 }
