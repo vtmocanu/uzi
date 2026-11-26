@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,11 +29,14 @@ import (
 //	  go test -tags analyticsevidence -count=1 -v -timeout 50m \
 //	  -run TestAnalyticsFlowPlanEvidenceLiveDB ./internal/store
 //
-// UZI_EVIDENCE_INDEXES here selects Flow candidates (flIndexes, default "1,2,3"; "" or "0" none).
+// UZI_EVIDENCE_INDEXES here selects Flow candidates (flIndexes); it defaults to none, and
+// "1,2,3" runs every candidate set.
 //
 // The run FAILS (t.Errorf, evidence still logged) when any Flow plan, custom or generic,
-// contains a node on run_messages, a Seq Scan on run_user_inputs or run_gate_presentations, or
-// reaches run_user_inputs other than through idx_run_user_inputs_run_id.
+// contains a node on run_messages, a Seq Scan on run_user_inputs or run_gate_presentations,
+// reaches run_user_inputs other than through idx_run_user_inputs_run_id, or reads a receipt CTE
+// under a node that ran more than once (the per-run rescan), and when any workload's p95 or max
+// reaches the 8 s statement_timeout.
 
 // flSeed runs after evSeed on the same connection. It adds what the Flow statements read:
 // realistic statuses (waiting states only among recent runs), first_started_at, plan gate
@@ -352,6 +356,22 @@ func (r *flRecorder) plan(w evWorkload, mode string, st evStmt, p *evPlan) {
 	if touchesInputs && !p.indexNames["idx_run_user_inputs_run_id"] {
 		h.t.Errorf("%s: run_user_inputs is not reached through idx_run_user_inputs_run_id", ctx)
 	}
+	if blob, err := json.Marshal(p.root); err != nil {
+		h.t.Errorf("%s: re-encode plan: %v", ctx, err)
+	} else {
+		var root planNode
+		if err := json.Unmarshal(blob, &root); err != nil {
+			h.t.Errorf("%s: decode plan: %v", ctx, err)
+		} else {
+			rescans, scans := flowRescans(&root, "")
+			if scans == 0 {
+				h.t.Errorf("%s: no CTE Scan of a receipt CTE in the plan; the rescan check is vacuous", ctx)
+			}
+			for _, r := range rescans {
+				h.t.Errorf("%s: receipt CTE re-read per outer row: %s", ctx, r)
+			}
+		}
+	}
 	h.logf("ACCESS PATH [%s]", ctx)
 	h.logf("   finished-time range / terminal idx: runs_user_terminal_end_idx=%v evid_runs_terminal_end_idx=%v",
 		p.indexNames["runs_user_terminal_end_idx"], p.indexNames["evid_runs_terminal_end_idx"])
@@ -382,6 +402,7 @@ func (r *flRecorder) timing(phase string, w evWorkload, mode string, tm evTiming
 	}
 	switch {
 	case tm.p95 >= 8*time.Second || tm.max >= 8*time.Second:
+		r.h.t.Errorf("OVER the 8s statement_timeout: [%s] %s mode=%s p95=%.1fms max=%.1fms", phase, w.name, mode, ms(tm.p95), ms(tm.max))
 		r.h.logf("!!!! OVER the 8s statement_timeout: [%s] %s mode=%s p95=%.1fms max=%.1fms", phase, w.name, mode, ms(tm.p95), ms(tm.max))
 	case tm.p95 >= 4*time.Second:
 		r.h.logf("!!!! NEAR the 8s statement_timeout: [%s] %s mode=%s p95=%.1fms max=%.1fms", phase, w.name, mode, ms(tm.p95), ms(tm.max))

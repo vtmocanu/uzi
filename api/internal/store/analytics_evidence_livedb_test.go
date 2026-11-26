@@ -642,6 +642,7 @@ type evPlan struct {
 	indexNames            map[string]bool
 	sortDisk              int
 	totalMs               float64
+	root                  map[string]any // the EXPLAIN plan root, for checks that need the tree
 }
 
 func (p *evPlan) loopsOf(label string) float64 {
@@ -701,6 +702,7 @@ func (h *evHarness) explain(mode string, st evStmt) *evPlan {
 	}
 	root, _ := doc[0]["Plan"].(map[string]any)
 	p.totalMs = p.execMs
+	p.root = root
 	p.sharedHit, p.sharedRead = int64(evNum(root, "Shared Hit Blocks")), int64(evNum(root, "Shared Read Blocks"))
 	p.walk(root, 0)
 	return p
