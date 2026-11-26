@@ -24,15 +24,24 @@ func placementClaimChanged(before, after *reconcile.ClaimObservation) bool {
 // newPlacementStamped reports whether a worker renders the new placement: newPlacement is
 // configured and every observed PVC (Terminating included) carries the stamp. A worker with
 // no PVCs counts as stamped, because every PVC it creates this tick is stamped.
-func newPlacementStamped(cfg RenderConfig, obs reconcile.ObservedWorker) bool {
+func newPlacementStamped(cfg RenderConfig, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) bool {
 	if !cfg.NewPlacementSet() {
 		return false
+	}
+	// The /data row reads the worker's own claim in ns, so a same-ID foreign claim's
+	// stamp (or lack of one) never decides this worker's placement. Without the
+	// namespace-keyed map (literal test observations only; Observe always fills it when
+	// any /data claim exists) the folded fields stay, matching ownDataPresence's fallback.
+	dataHas, dataClaim := obs.HasDataPVC, obs.DataClaim
+	if obs.DataClaimsByNamespace != nil {
+		dataHas, _ = ownDataPresence(w, obs, ns)
+		dataClaim = ownDataClaim(w, obs, ns)
 	}
 	for _, c := range []struct {
 		has   bool
 		claim *reconcile.ClaimObservation
 	}{
-		{obs.HasDataPVC, obs.DataClaim},
+		{dataHas, dataClaim},
 		{obs.HasNixPVC, obs.NixClaim},
 		{obs.HasDinDDataPVC, obs.DinDClaim},
 	} {
@@ -54,7 +63,12 @@ func newPlacementStamped(cfg RenderConfig, obs reconcile.ObservedWorker) bool {
 func (m *Materializer) placementDecisions(desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) map[string]bool {
 	p := make(map[string]bool, len(desired))
 	for _, w := range desired {
-		p[w.ID] = newPlacementStamped(m.cfg, observed[w.ID])
+		ns, err := m.cfg.Placement(w)
+		if err != nil {
+			p[w.ID] = false // not rendered anyway
+			continue
+		}
+		p[w.ID] = newPlacementStamped(m.cfg, w, observed[w.ID], ns)
 	}
 	return p
 }
@@ -67,11 +81,15 @@ func (m *Materializer) placementStampedFor(ctx context.Context, w protocol.Desir
 			return v
 		}
 	}
-	return newPlacementStamped(m.cfg, obs)
+	ns, err := m.cfg.Placement(w)
+	if err != nil {
+		return false
+	}
+	return newPlacementStamped(m.cfg, w, obs, ns)
 }
 
 // renderCfgFor is the config every render of w's Deployment uses, so all hash consumers
-// agree on the placement.
+// agree on the placement and on whether the worker's Secret carries the Codex CA key.
 func (m *Materializer) renderCfgFor(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) RenderConfig {
-	return m.cfg.withPlacement(m.placementStampedFor(ctx, w, obs))
+	return m.cfg.withPlacement(m.placementStampedFor(ctx, w, obs)).withCodexCA(m.codexCAInSecretFor(ctx, w, obs))
 }

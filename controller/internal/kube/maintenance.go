@@ -63,7 +63,7 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		if o.HasDeployment && !o.DeploymentTerminating && o.DeploymentUID != "" && o.DinDPVCLive && o.DinDPVCUID != "" {
 			_, err = c.TransitionDinD(ctx, w.ID, protocol.DindMaintenance{Phase: "requested", DeploymentUID: o.DeploymentUID, PVCUID: o.DinDPVCUID})
 			if err == nil {
-				return !m.legacyRecycleDue(w, o, spec), nil
+				return !m.legacyRecycleDue(w, o, spec, ns), nil
 			}
 			// Explicit refusal proves no request was accepted. Ambiguous transport
 			// failures defer legacy until the next authoritative poll.
@@ -127,7 +127,7 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			w.DiskPressure = false
 			return true, m.reconcileReplacement(ctx, w, o)
 		}
-		if m.legacyRecycleDue(w, o, spec) {
+		if m.legacyRecycleDue(w, o, spec, ns) {
 			return false, nil
 		}
 		if w.Busy || w.CustodyHeld || !o.DinDPVCLive || o.DeploymentTerminating {
@@ -255,15 +255,16 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 
 // pressureRecycleEligible is shared by legacy scheduling and execution. Docker's
 // /data is durable: only explicit nix pressure permits a legacy pressure recycle.
-func (m *Materializer) pressureRecycleEligible(w protocol.DesiredWorker, o reconcile.ObservedWorker) bool {
+func (m *Materializer) pressureRecycleEligible(w protocol.DesiredWorker, o reconcile.ObservedWorker, ns string) bool {
+	ownHas, _ := ownDataPresence(w, o, ns)
 	return m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld && w.DiskPressure &&
-		o.HasNixPVC && o.HasDataPVC && (!w.Docker || slices.Contains(w.DiskPressureVolumes, "nix")) &&
-		!m.withinRecycleCooldown(o)
+		o.HasNixPVC && ownHas && (!w.Docker || slices.Contains(w.DiskPressureVolumes, "nix")) &&
+		!m.withinRecycleCooldown(w, o, ns)
 }
 
-func (m *Materializer) legacyRecycleDue(w protocol.DesiredWorker, o reconcile.ObservedWorker, spec preset.Spec) bool {
+func (m *Materializer) legacyRecycleDue(w protocol.DesiredWorker, o reconcile.ObservedWorker, spec preset.Spec, ns string) bool {
 	return (m.recycle.Enabled && !w.Ephemeral && o.HasNixPVC && o.NixPVCSize != nil && o.NixPVCSize.Cmp(spec.NixSize) < 0) ||
-		m.pressureRecycleEligible(w, o)
+		m.pressureRecycleEligible(w, o, ns)
 }
 
 func (m *Materializer) reconcileReplacement(ctx context.Context, w protocol.DesiredWorker, o reconcile.ObservedWorker) error {
