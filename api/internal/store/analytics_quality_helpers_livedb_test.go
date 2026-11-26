@@ -94,16 +94,28 @@ func (f *qualityFixture) lead(o spendOwner, repo uuid.UUID, harness string, at t
 // ccPlan inserts one plan cross-check attempt.
 func (f *qualityFixture) ccPlan(lead uuid.UUID, verdict string, reason any, created time.Time, decided, interrupted pgtype.Timestamptz, checker any) {
 	f.t.Helper()
+	f.ccPlanTS(lead, verdict, reason, qualTS(created), decided, interrupted, checker)
+}
+
+// ccPlanTS is ccPlan with a created_at that may be infinite; the deadline is created_at plus an hour.
+func (f *qualityFixture) ccPlanTS(lead uuid.UUID, verdict string, reason any, created, decided, interrupted pgtype.Timestamptz, checker any) {
+	f.t.Helper()
 	mustExec(f.ctx, f.t, f.pool,
 		`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, size_class,
 		     base_commit, candidate_digest, verdict, reason_class, decided_at, deadline_at, created_at, interrupted_at, checker_harness)
-		 VALUES ($1, 'plan', 1, 0, 'p', '[]'::jsonb, 'S', 'base', '\x01'::bytea, $2, $3, $4, $5, $6, $7, $8)`,
-		lead, verdict, reason, decided, created.Add(time.Hour), created, interrupted, checker)
+		 VALUES ($1, 'plan', 1, 0, 'p', '[]'::jsonb, 'S', 'base', '\x01'::bytea, $2, $3, $4, $5::timestamptz + interval '1 hour', $5, $6, $7)`,
+		lead, verdict, reason, decided, created, interrupted, checker)
 }
 
 // ccCode inserts one code cross-check attempt. The legacy verdict column is 'failed' on every
 // code row (cross_checks_code_shape), which is what makes reading it a bug.
 func (f *qualityFixture) ccCode(lead uuid.UUID, outcome string, reason any, findings any, created time.Time, decided, interrupted pgtype.Timestamptz, checker any) {
+	f.t.Helper()
+	f.ccCodeTS(lead, outcome, reason, findings, qualTS(created), decided, interrupted, checker)
+}
+
+// ccCodeTS is ccCode with a created_at that may be infinite; the deadline is created_at plus an hour.
+func (f *qualityFixture) ccCodeTS(lead uuid.UUID, outcome string, reason any, findings any, created, decided, interrupted pgtype.Timestamptz, checker any) {
 	f.t.Helper()
 	mustExec(f.ctx, f.t, f.pool,
 		`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, base_commit, head_commit, candidate_digest,
@@ -111,9 +123,9 @@ func (f *qualityFixture) ccCode(lead uuid.UUID, outcome string, reason any, find
 		     code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled,
 		     repo_instructions_text, repo_instructions_digest)
 		 VALUES ($1, 'code', 1, 0, repeat('a', 40), repeat('b', 40), '\x01'::bytea,
-		     'failed', $2, $3, $4::jsonb, $5, $6, $7, $8, $9,
+		     'failed', $2, $3, $4::jsonb, $5, $6::timestamptz + interval '1 hour', $6, $7, $8,
 		     '{}'::jsonb, '', '', sha256(convert_to('', 'UTF8')), false, '', sha256(convert_to('', 'UTF8')))`,
-		lead, outcome, reason, findings, decided, created.Add(time.Hour), created, interrupted, checker)
+		lead, outcome, reason, findings, decided, created, interrupted, checker)
 }
 
 // checkerRun seeds a running cross_check child run for a lead and returns its id.

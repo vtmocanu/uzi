@@ -288,8 +288,13 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	f.ccPlan(lead("claude", at(4)), "revise", "revise", at(4), qualInf, qualNull, "claude")
 	f.ccPlan(lead("claude", at(4)), "block", "block", at(4), qualNegInf, qualNull, "claude")
 	f.ccPlan(lead("claude", at(20)), "approve", "approve", at(20), qualTS(at(19)), qualNull, "claude")
+	// Undated: created_at is -infinity with a finite decision time inside the window.
+	negLead := lead("claude", at(14))
+	f.ccPlanTS(negLead, "approve", "approve", qualNegInf, qualTS(at(14)), qualNull, "claude")
 	// Pending plan on an old lead.
 	f.ccPlan(lead("claude", old), "pending", nil, old, qualNull, qualNull, "claude")
+	// Pending created after the request's Now: live pending has no time predicate.
+	f.ccPlan(lead("claude", old), "pending", nil, qualNow.Add(time.Hour), qualNull, qualNull, "claude")
 
 	// Code attempts. The legacy verdict column is 'failed' on every row.
 	code("claude", 5, "completed", nil, `[]`, false, "codex")                                               // passed
@@ -301,6 +306,8 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	f.ccCode(lead("claude", at(4)), "completed", nil, `[]`, at(4), qualNull, qualNull, "codex")             // undated
 	f.ccCode(lead("claude", at(20)), "failed", "timed_out", nil, at(20), qualTS(at(19)), qualNull, "codex") // undated
 	f.ccCode(lead("claude", old), "pending", nil, `[]`, old, qualNull, qualNull, "codex")                   // pending, old
+	negCode := lead("claude", at(14))
+	f.ccCodeTS(negCode, "completed", nil, `[]`, qualNegInf, qualTS(at(14)), qualNull, "codex") // undated: -infinity created_at
 
 	res := f.quality(qualityCall{Owner: o.User, Now: qualNow})
 	cc := res.Doc.CrossCheck
@@ -310,8 +317,8 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	wantEq(t, "plan stored", p.StoredResult, store.AnalyticsQualityPlanResults{Approve: 4, Revise: 1, Block: 1, Failed: 3})
 	wantEq(t, "plan classes", p.Classes, store.AnalyticsQualityClasses{Passed: 4, RaisedIssues: 2, DidntFinish: 1, Replaced: 2})
 	wantEq(t, "plan checker harness", p.CheckerHarness, store.AnalyticsQualityCheckerHarness{Claude: 5, Codex: 1, Unknown: 3})
-	wantEq(t, "plan undated", p.Undated, store.AnalyticsQualityPlanUndated{Count: 4,
-		StoredResult: store.AnalyticsQualityPlanResults{Approve: 2, Revise: 1, Block: 1}})
+	wantEq(t, "plan undated", p.Undated, store.AnalyticsQualityPlanUndated{Count: 5,
+		StoredResult: store.AnalyticsQualityPlanResults{Approve: 3, Revise: 1, Block: 1}})
 
 	c := cc.Code
 	wantEq(t, "code decided", c.DecidedInWindow, 6)
@@ -320,10 +327,10 @@ func TestQualityCrossCheckLiveDB(t *testing.T) {
 	wantEq(t, "code stored", c.StoredResult, store.AnalyticsQualityCodeResults{Completed: 5, Failed: 1})
 	wantEq(t, "code classes", c.Classes, store.AnalyticsQualityClasses{Passed: 2, RaisedIssues: 1, DidntFinish: 1, Replaced: 1, Unclassified: 1})
 	wantEq(t, "code checker harness", c.CheckerHarness, store.AnalyticsQualityCheckerHarness{Claude: 1, Codex: 4, Unknown: 1})
-	wantEq(t, "code undated", c.Undated, store.AnalyticsQualityCodeUndated{Count: 2,
-		StoredResult: store.AnalyticsQualityCodeResults{Completed: 1, Failed: 1}})
+	wantEq(t, "code undated", c.Undated, store.AnalyticsQualityCodeUndated{Count: 3,
+		StoredResult: store.AnalyticsQualityCodeResults{Completed: 2, Failed: 1}})
 
-	wantEq(t, "pending", cc.Pending, store.AnalyticsQualityPending{Total: 2, Plan: 1, Code: 1})
+	wantEq(t, "pending", cc.Pending, store.AnalyticsQualityPending{Total: 3, Plan: 2, Code: 1})
 
 	// Reconciliation: decided in window = stored results = classes = checker harness = buckets.
 	for name, s := range map[string]struct {

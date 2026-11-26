@@ -134,7 +134,8 @@ cc_base AS MATERIALIZED (
     WHERE ($5::uuid IS NULL OR lead.repo_id = $5::uuid)
       AND ($6::text IS NULL OR lead.harness = $6::text)
       AND lead.kind = ANY($7::text[]) AND lead.kind <> 'cross_check'
-      AND cc.created_at < $4::timestamptz
+      AND ((((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending'))
+             AND cc.interrupted_at IS NULL) OR cc.created_at < $4::timestamptz)
 ),
 cc_dec AS MATERIALIZED (
     SELECT b.id, b.stage, b.result, b.reason_class, b.interrupted_at, b.decided_at, b.created_at, b.findings, b.checker, b.is_pending,
@@ -466,7 +467,8 @@ cc_base AS MATERIALIZED (
       AND lead.user_id = $5::uuid  -- owner-only
       AND ($7::text IS NULL OR lead.harness = $7::text)
       AND lead.kind = ANY($8::text[]) AND lead.kind <> 'cross_check'
-      AND cc.created_at < $4::timestamptz
+      AND ((((cc.stage = 'plan' AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending'))
+             AND cc.interrupted_at IS NULL) OR cc.created_at < $4::timestamptz)
 ),
 cc_dec AS MATERIALIZED (
     SELECT b.id, b.stage, b.result, b.reason_class, b.interrupted_at, b.decided_at, b.created_at, b.findings, b.checker, b.is_pending,

@@ -109,7 +109,7 @@ func TestAnalyticsQualityStatementsDoNotDrift(t *testing.T) {
 				t.Errorf("%s statement lacks %q", name, want)
 			}
 		}
-		// Live pending has no time predicate other than the snapshot instant.
+		// Live pending has no time predicate at all: the snapshot instant bounds only decided and undated rows.
 		pend := b[strings.Index(b, "cc_base AS MATERIALIZED"):strings.Index(b, "cc_dec AS MATERIALIZED")]
 		if strings.Contains(pend, "@from") || strings.Contains(pend, "sqlc.arg('from')") {
 			t.Errorf("%s statement restricts cross-check attempts by the window start", name)
