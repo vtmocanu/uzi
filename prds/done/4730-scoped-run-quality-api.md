@@ -1,7 +1,7 @@
 # PRD #4730: Scoped run diagnostics API: Quality
 
 **Issue:** #4730.
-**Status:** Ready (#4684 merged).
+**Status:** Done (#4730).
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** Read-only API, DTO contracts, docs and specs. Additive indexes only when supported by plans. No lifecycle, tracking, interface or CLI changes. Implementation and validation leave `.github/workflows/**` untouched.
@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [ ] M1 owner/admin Quality evidence
+- [x] M1 owner/admin Quality evidence
 
 ## 1. Problem
 
@@ -75,5 +75,68 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Attribute PRs once and count retained matching rework | Manual activity belongs in the measure and the automatic ledger alone is incomplete. |
 | Separate plan, code and judge populations | The sources answer different questions and have different retention and eligibility rules. |
 | Use retained latest judge review | The store keeps one review per target, so historical versions cannot be reconstructed. |
+| Fold the merge-witness lookup into one GROUP BY over a UNION ALL of the seed and witness keys | A per-row `IN (SELECT ...)` over the witness CTE becomes an unhashed SubPlan once the witness set outgrows `hash_mem`; the fold is independent of it (6.3 s vs 1.15 s at `work_mem` 64kB, section 8). A generic-plan guard test pins the shape. |
+| Add no index | The bar was a 20% p95 gain on a Quality workload or removal of the 8 s timeout risk. The rework index gained at most 7.2% p95, the `decided_at` index was never chosen and the worst timing is 2.4 s. |
+| Pending cross-checks have no time cutoff | Pending is a live count of undecided, uninterrupted attempts of any age, disclosed with `effective_filters` and `window: not_applied`. |
+| Decide cross-check applicability per stage | Plan and code use their own cross-checkable kinds (`runkind.PlanCrossCheckable`, `runkind.CodeCrossCheckable`), and pending applies when either does. |
+| Cover the SQLSTATE 57014 mapping with a unit test through `analyticsFail`, as #4684 does | No LiveDB statement-timeout pattern exists to reuse. |
+| Known follow-up: narrow `cc_base` | `cc_base` carries `findings` for every cross-check (about 109 MB temp spill at 4 MB `work_mem`, about 40% of the all-users time). A candidate fix computes `findings_count` only for in-window decisions. Not done here. |
 
-**Unverified before implementation**. Legacy rework association completeness, plans and latency. Passing tests do not establish retention completeness.
+## 8. Performance evidence
+
+Summary of the M1 evidence run (seed 0.4730, PostgreSQL 17.12, 4 vCPU, warm cache, `work_mem` 4MB).
+
+**Seed.** #4684's base seed (200 owners, largest owner 20.0% of runs, top 10 owners 59.3%) plus a Quality extension: 140,018 runs (20,018 `mr_rework`), 845,032 usage legs, 1,250 repos, 92,420 cross-checks (59,724 plan, 32,696 code), 35,722 reviews over 59,553 judge-eligible runs (60.0%, 15% of reviews failed). 30d range selectivity is 9.94% of runs (largest owner 10.02%). 24,935 PRs, 69.0% with a merge witness; reworks per PR 0/1/2/3+ are 13,725 / 6,243 / 3,051 / 1,916.
+
+**Store timings** (ms, n=20, custom plan unless noted, statement timeout off, **JIT on**):
+
+| Workload | Custom median / p95 | Generic median / p95 |
+|---|---|---|
+| Owner 30d (largest owner) | 193.5 / 196.9 | 207.0 / 211.0 |
+| Owner `window=all` | 702.0 / 712.4 | 560.6 / 574.9 |
+| Admin user 30d (largest owner) | 200.9 / 203.7 | 211.9 / 215.4 |
+| Admin all-users 30d | 1168.3 / 1181.4 | 631.5 / 636.5 |
+| Admin all-users `window=all` | 2320.7 / 2361.9 | 2196.5 / 2224.8 |
+
+**Request impact** (production router, cookie session, analytics pool of 20, JIT off as in production's analytics snapshot, sequential, N=25 after 2 warm-ups, all 200):
+
+| Request | p50 ms | p95 ms | max ms |
+|---|---|---|---|
+| `GET /api/analytics/quality?window=30d` (largest owner) | 205.8 | 209.1 | 209.7 |
+| `GET /api/analytics/quality?window=all` (largest owner) | 541.7 | 554.9 | 555.9 |
+| `GET /api/admin/analytics/quality?window=30d` (all users) | 625.2 | 646.8 | 682.8 |
+| `GET /api/admin/analytics/quality?user=<largest owner>&window=30d` | 205.7 | 216.1 | 216.4 |
+
+**Corrections and caveats.**
+
+- The store timings ran with the PostgreSQL default JIT on. JIT fired on three custom-plan workloads (221 to 471 ms inside execution); production's analytics snapshot sets JIT off and the HTTP table ran through that path. The observation that generic plans are faster than custom on the all-users scopes is a JIT artifact, not a better plan.
+- The `cross_checks` immutability and write-once triggers (migrations 00312, 00325, 00360) are BEFORE INSERT OR UPDATE, not UPDATE-only. The seed inserts rows in their final state, which pass them.
+- The seed has no `cross_check` child runs, so its runs table is about 40% light for its cross-check volume, and it measures a single volume point.
+- Admin all-users `window=all` is refused by the API, so its 2.4 s timing is an upper bound for the all-users windows a request can reach. No workload approached the 8 s statement timeout.
+- Sequential requests cannot trigger the per-caller admission 503; busy is covered by unit tests.
+
+**Witness lookup hardening** (EXPLAIN ANALYZE, all-users scope, 2,805-PR window, about 17k witness keys; old per-row `IN` vs the fold):
+
+| `work_mem` | Old, custom / generic ms | New, custom / generic ms |
+|---|---|---|
+| 4MB | 956 / 686 | 936 / 657 |
+| 256kB | 1005 / 679 | 1023 / 693 |
+| 64kB | 6341 / 5983 | 1148 / 711 |
+
+At 64kB the old plan runs the witness CTE as an unhashed SubPlan (loops=2805, about 11k rows each; 5.33 s of 6.34 s). The owner scope was unaffected (190 to 234 ms either way). `TestQualityGenericPlanShapeLiveDB` asserts from `EXPLAIN (VERBOSE, FORMAT JSON)` under `force_generic_plan` that no CTE Scan sits in an unhashed SubPlan, no Nested Loop filters on `mr_iid`, and the witness is read by a plain scan; its negative control swaps in a deliberately unhashed stand-in for the old `IN` lookup (the real old SQL cannot be forced unhashed at small test scale, because the planner hashes by estimated size), and the real old SQL at 64kB is the timing table above.
+
+**Index decision** (custom-plan p95, positive is faster):
+
+| Workload | Baseline ms | `runs(repo_id, mr_iid) WHERE kind = 'mr_rework'` | `cross_checks(decided_at)` |
+|---|---|---|---|
+| Owner 30d | 196.9 | -1.0% | -4.2% |
+| Owner `window=all` | 712.4 | -2.8% | -1.9% |
+| Admin user 30d | 203.7 | +7.2% | +1.6% |
+| Admin all-users 30d | 1181.4 | +1.5% | +0.8% |
+| Admin all-users `window=all` | 2361.9 | +3.7% | +2.8% |
+
+The rework index was chosen by the planner and gained at most 7.2%; the `decided_at` index was never chosen, because `cc_base` reads the whole table through a materialized CTE with no `decided_at` predicate. No migration was added.
+
+**Pre-existing flake (not from this change).** `TestRunUsageGenericPlanLiveDB`'s Spend all-scope check fails on HEAD once the shared test database has accumulated rows from earlier LiveDB runs, and passes on a freshly truncated database.
+
+**Verified and unverified before implementation.** Verified: the owner and admin plans, generic-plan behavior, witness and link association under the ownership boundary, cross-check stage fields, judge eligibility rules, request impact at the seed above, and that no index is warranted. Still unverified: legacy rework association completeness (the seed stamps every rework link, so it cannot show how many legacy rework runs lack one; counts are lower bounds), and behavior at other volumes or with cross-check child runs in the seed. Passing tests do not establish retention completeness.

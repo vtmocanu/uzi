@@ -19,8 +19,9 @@ import (
 
 // Issue #4730: the Quality read. It reuses the analytics boundary of analytics.go (parsing,
 // admission, snapshot, authority checks, calendar) and adds one statement, its decoder and the
-// DTO mapping below. Quality has no previous window and no rolling series; it never reveals
-// repo ids or paths, on either route.
+// DTO mapping below. Quality has no previous window and no rolling series. The only repo id it
+// returns is the caller's own repo filter, echoed in effective_filters after authorize has
+// confirmed access; it emits no per-repo rows or paths.
 
 // Time bases and fixed strings of the Quality DTO.
 const (

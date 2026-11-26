@@ -13,6 +13,13 @@ computed on the server from one database snapshot. It is API only: there is no
 web page or `uzi` command for it yet, and `GET /api/usage` and
 `GET /api/admin/usage` are unchanged.
 
+Options and Spend share this boundary with a third section, Quality (retained
+rework, CI-fix, cross-check and judge coverage), at
+`/api/analytics/quality` and `/api/admin/analytics/quality`. It is documented
+in [Quality analytics API](quality-analytics.md); the parameters, errors,
+admission and calendar below apply to it too, except where that page says
+otherwise.
+
 Every dollar figure is recorded spend (an estimate for comparison), not a
 bill.
 
@@ -20,8 +27,8 @@ bill.
 
 | Scope | Routes | Who |
 |---|---|---|
-| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
-| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend` | An admin session, or a Bearer token with the `admin_ro` scope. |
+| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend`, `GET /api/analytics/quality` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
+| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend`, `GET /api/admin/analytics/quality` | An admin session, or a Bearer token with the `admin_ro` scope. |
 
 - The owner route never reads a user from the query. An admin calling it sees
   only their own runs, and a `user` parameter there is a 400.
@@ -29,6 +36,7 @@ bill.
   is an admin (403).
 - The paths are literal. Any other `/api/analytics/...` path, such as a section
   that does not exist yet, is a 404.
+- Spend is the only section with `split` and `breakdown`; Quality rejects both.
 
 ## Parameters and errors
 

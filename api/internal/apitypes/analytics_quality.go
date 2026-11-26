@@ -13,8 +13,9 @@ package apitypes
 //   - "index" in a bucket is the zero-based position in the response's buckets array. Every
 //     calendar bucket is present, including empty ones. The envelope carries no previous
 //     window and an empty rolling array.
-//   - Repo ids and paths are never part of a Quality response, so the owner route's repo
-//     masking has nothing to hide here.
+//   - No repo ids or paths appear beyond the caller's own validated repo filter, echoed in
+//     cross_check.pending.effective_filters.repo after the route's repo authority check. A
+//     change that adds repo-keyed rows must apply the owner route's repo masking.
 
 // AnalyticsQualitySectionDTO is the applicability header of one Quality measure. TimeBasis names
 // the timestamp the measure's window and buckets are cut on.

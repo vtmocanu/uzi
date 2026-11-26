@@ -713,7 +713,8 @@ func (m *spendMapper) createdAt(s string) time.Time {
 	return t.UTC()
 }
 
-// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all spend request.
+// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all request on
+// any section except options (Spend and Quality).
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
 // mapAnalyticsSpend builds the response from the calendar and the store document.
