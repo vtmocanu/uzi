@@ -61,7 +61,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   (`claims.sh`), so other landers see who holds what and message you instead of
   double-driving it. A PR another live session holds stops you at `NEXT=claimed_by_other`:
   talk to them (SendMessage), do not take it. Each pass over parked claims, run
-  `S/owned-gates.sh OWNER/REPO`: exit 1 lists uzi runs gated on them; 3 is unknown.
+  `S/owned-gates.sh OWNER/REPO` (1: runs gated on them; 3: unknown).
 - **Never in the `main` worktree.** Every local edit happens in a sibling worktree
   (`land-prep.sh` makes one); auto-clean worktrees you created once the PR merges.
 - **Run the scripts from your own fresh `origin/main` worktree**, not the long-lived
