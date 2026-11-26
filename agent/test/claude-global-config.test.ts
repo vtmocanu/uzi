@@ -647,6 +647,18 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
       assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0);
     });
 
+    it("mkdir failing with a runner-owned 0300 .claude (writable and searchable) refuses and leaves it in place", { skip: process.getuid?.() === 0 ? "root can always write and search, so the mode is not distinguishing" : false }, () => {
+      fs.chmodSync(claude(), 0o300);
+      try {
+        const h = helpers({ mkdir: () => 1 });
+        assert.throws(() => prepareClaudeConfigDir(envOf(), { runAsRunner: h.run }), /did not complete/);
+        assert.strictEqual(fs.readdirSync(home).filter((f) => f.startsWith(".claude.stale-")).length, 0);
+        assert.ok(fs.lstatSync(claude()).isDirectory());
+      } finally {
+        fs.chmodSync(claude(), 0o700);
+      }
+    });
+
     it("mkdir failing with an owner-unwritable .claude moves it aside once and the start proceeds", () => {
       fs.chmodSync(claude(), 0o500);
       const h = helpers({ mkdir: (_a, n) => (n === 1 ? 1 : undefined) });
@@ -1021,9 +1033,12 @@ describe("the bounded runner helper", () => {
   });
 
   it("a TMPDIR with spaces and shell metacharacters is used as a plain path", () => {
-    const marker = path.join(root, "injected-tmp");
+    // A single path component (no slash) so mkdirSync works; a shell evaluating it would create
+    // `injected-tmp` relative to its cwd, which is the cwd of this process (and so of the helper).
+    const marker = "injected-tmp";
     const priv = path.join(root, `tmp dir $(touch ${marker}); "q" 'r'`);
     fs.mkdirSync(priv);
+    const probes = [path.resolve(marker), path.join(root, marker), path.join(priv, marker)];
     const savedTmp = process.env.TMPDIR;
     process.env.TMPDIR = priv;
     try {
@@ -1034,8 +1049,20 @@ describe("the bounded runner helper", () => {
       if (savedTmp === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = savedTmp;
     }
-    assert.ok(!fs.existsSync(marker), "no metacharacter in the directory name was evaluated");
+    for (const p of probes) assert.ok(!fs.existsSync(p), `no metacharacter in the directory name was evaluated (${p})`);
     assert.deepStrictEqual(fs.readdirSync(priv), [], "the output directory is removed");
+  });
+
+  // CodeQL alert 229 guard: runBounded must start the intermediary directly, never through a shell.
+  it("runBounded spawns process.execPath and no shell (source guard)", () => {
+    const src = fs.readFileSync(new URL("../src/claude-global-config.ts", import.meta.url), "utf8");
+    const start = src.indexOf("export function runBounded");
+    assert.ok(start >= 0, "runBounded found");
+    const end = src.indexOf("\n}\n", start);
+    const body = src.slice(start, end);
+    assert.ok(body.includes("process.execPath"), "runBounded spawns process.execPath");
+    assert.ok(!body.includes('"/bin/sh"'), "runBounded does not spawn /bin/sh");
+    assert.ok(!/shell:\s*true/.test(body), "runBounded does not set shell: true");
   });
 
   it("a helper killed by a signal reports 128 plus the signal number", () => {

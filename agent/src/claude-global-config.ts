@@ -96,7 +96,8 @@
 // under the split (the binary itself with one uid), started by a worker-uid Node intermediary
 // (NODE_INTERMEDIARY, `process.execPath -e`, no shell) that opens a file in a worker-private mkdtemp
 // directory without following a symlink, runs the helper with it as stdout and exits with the
-// helper's status (127 if it could not start, 128 + signal number if a signal ended it). spawnSync
+// helper's status (127 if it could not start or the intermediary itself threw anywhere before or
+// during the spawn, 128 + signal number if a signal ended it; never node's uncaught status 1). spawnSync
 // waits only on that intermediary, with a 4 s timeout and SIGKILL: it runs as the worker uid, so
 // that kill always lands, and all of spawnSync's stdio is ignored, so no pipe is held
 // open by a helper that outlives it. The worker uid cannot signal the runner-uid helper (no
@@ -275,17 +276,27 @@ function renameAside(p: string): void {
 /** The constant CommonJS script of the worker-uid Node intermediary (`node -e`): argv is the output
  *  file, then the helper command and its arguments. It opens the file without following a symlink,
  *  runs the helper with that file as stdout and no shell, and exits with the helper's status
- *  (127 when it could not start, 128 + signal number when a signal ended it). */
+ *  (127 when it could not start, 128 + signal number when a signal ended it). Everything, from the
+ *  require calls to the spawn, sits in one try whose catch exits 127, so no exception before or
+ *  during the spawn can end the process with node's own uncaught-exception status 1, which
+ *  mkdirAsRunner reads as "mkdir ran and failed" (MKDIR_FAILED_STATUS). Only the helper's own
+ *  status reaches the exit. */
 const NODE_INTERMEDIARY = [
-  'const fs = require("node:fs");',
-  'const os = require("node:os");',
-  'const cp = require("node:child_process");',
-  "const [out, command, ...args] = process.argv.slice(1);",
-  "const fd = fs.openSync(out, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);",
-  'const r = cp.spawnSync(command, args, { stdio: ["ignore", fd, "ignore"], shell: false });',
-  "if (r.error) process.exit(127);",
-  "if (r.signal) process.exit(128 + (os.constants.signals[r.signal] || 0));",
-  "process.exit(r.status === null ? 127 : r.status);",
+  "let code = 127;",
+  "try {",
+  '  const fs = require("node:fs");',
+  '  const os = require("node:os");',
+  '  const cp = require("node:child_process");',
+  "  const [out, command, ...args] = process.argv.slice(1);",
+  "  const fd = fs.openSync(out, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);",
+  '  const r = cp.spawnSync(command, args, { stdio: ["ignore", fd, "ignore"], shell: false });',
+  "  if (r.error) code = 127;",
+  "  else if (r.signal) code = 128 + (os.constants.signals[r.signal] || 0);",
+  "  else code = r.status === null ? 127 : r.status;",
+  "} catch (e) {",
+  "  code = 127;",
+  "}",
+  "process.exit(code);",
 ].join("\n");
 
 /** Read at most HELPER_MAX_BUFFER bytes of the helper's output file; more than that refuses. */
@@ -306,7 +317,8 @@ function readHelperOutput(file: string): string {
  *  for it. spawnSync waits only on that intermediary, with a timeout (default 4 s) and SIGKILL, which
  *  the worker uid can always deliver; all of spawnSync's stdio is ignored, so no pipe is held by a
  *  helper that outlives it. The helper's exit status is the intermediary's (a helper ended by a signal
- *  reports 128 + the signal number, one that could not start 127). A spawn error, a timeout or a
+ *  reports 128 + the signal number; one that could not start, or any exception in the intermediary
+ *  before or during the spawn, 127; never node's uncaught-exception 1). A spawn error, a timeout or a
  *  signal on the intermediary, or output over 64 KiB, throws a refusal. */
 export function runBounded(command: string, args: readonly string[], timeoutMs: number = HELPER_SPAWN_TIMEOUT_MS): HelperResult {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-helper-"));
