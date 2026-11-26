@@ -403,6 +403,10 @@ func TestAnalyticsQualitySnapshotBarrierLiveDB(t *testing.T) {
 // released on success, on an in-snapshot error and on cancellation.
 func TestAnalyticsQualityAdmissionLiveDB(t *testing.T) {
 	f := newAnFixture(t, 2044)
+	// The pool-derived capacity is MaxConns/4, which is 1 on a 4-CPU runner (pgxpool's default
+	// MaxConns is max(4, NumCPU)), and then the held Quality key alone fills it. Pin capacity 2 so
+	// the cross-section check below tests the per-key rule, not the machine's CPU count.
+	f.h.analyticsDeps.admission = analytics.NewAdmission(8)
 	owner := f.user(false)
 	repo, _ := f.repoOwnedBy(owner, "admission")
 	f.run(owner, repo, f.now.Add(-time.Hour), "1.000000")
