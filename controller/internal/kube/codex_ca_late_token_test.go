@@ -151,6 +151,28 @@ func TestCodexCALateTokenOnAPooledWorkerRendersTheEnvAfterTheStamp(t *testing.T)
 	if replicaPatches(c) != 0 {
 		t.Error("token tick patched replicas")
 	}
+	// The only Deployment write on the token tick is the roll reservation: one patch that
+	// carries metadata alone (the fenced uid and resourceVersion plus the roll annotation).
+	// No other Deployment verb and no spec of any kind.
+	if got := caDeploymentWrites(c); !reflect.DeepEqual(got, []string{"patch"}) {
+		t.Errorf("token tick deployment writes = %v, want the single reservation patch", got)
+	}
+	for _, b := range deploymentPatchBodies(c) {
+		if len(b) != 1 || b["metadata"] == nil {
+			t.Errorf("deployment patch keys = %v, want metadata only (no spec.template, no spec.replicas)", b)
+			continue
+		}
+		md, _ := b["metadata"].(map[string]any)
+		ann, _ := md["annotations"].(map[string]any)
+		if len(ann) != 1 || ann[annotationRoll] == nil {
+			t.Errorf("deployment patch annotations = %v, want only %s", ann, annotationRoll)
+		}
+		for k := range md {
+			if k != "annotations" && k != "uid" && k != "resourceVersion" {
+				t.Errorf("deployment patch metadata carries %q", k)
+			}
+		}
+	}
 	if d := caDep(t, c, ns, "w1"); caHasEnv(d) {
 		t.Fatal("token tick already rendered the env")
 	}
@@ -400,6 +422,29 @@ func TestCodexCALateTokenRejectedStampThenClaimTerminating(t *testing.T) {
 	}
 	caTerminateClaim(t, c, ns, dataPVCName("w1"))
 	caNoEnvAfter(t, m, c, w, 3)
+
+	// Once the Terminating claim finalizes, the replacement is created unstamped and the
+	// env stays off: the failed stamp left no carry behind.
+	if err := c.Tracker().Delete(pvcRes, ns, dataPVCName("w1")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4 && caClaim(t, c, ns, dataPVCName("w1")) == nil; i++ {
+		caMustTick(t, m, w)
+	}
+	repl := caClaim(t, c, ns, dataPVCName("w1"))
+	if repl == nil {
+		t.Fatal("the replacement claim was not created")
+	}
+	if caStamped(repl) {
+		t.Error("the replacement claim is stamped")
+	}
+	caMustTick(t, m, w)
+	if d := caDep(t, c, ns, "w1"); d == nil || caHasEnv(d) {
+		t.Errorf("deployment = %v, want present without the env", d)
+	}
+	if caStamped(caClaim(t, c, ns, dataPVCName("w1"))) {
+		t.Error("the replacement claim was stamped by a later tick")
+	}
 }
 
 // N1: a Secret that already exists proves nothing about its contents: no stamp, no env.

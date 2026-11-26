@@ -323,10 +323,18 @@ func TestCodexCARecycleWithoutOwnDataClaimWritesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recycle: %v", err)
 	}
+	var nixDeleted bool
 	for _, name := range caPVCDeletes(c) {
 		if name == dataPVCName("w1") {
 			t.Fatal("a data claim was deleted")
 		}
+		if name == nixPVCName("w1") {
+			nixDeleted = true
+		}
+	}
+	// The missing /data claim must not stop the rest of the recycle: the own /nix goes.
+	if !nixDeleted {
+		t.Fatalf("the own nix claim was not deleted: %v", caPVCDeletes(c))
 	}
 	if n := caRecordPatches(c); n != 0 {
 		t.Fatalf("record patches = %d, want 0", n)
