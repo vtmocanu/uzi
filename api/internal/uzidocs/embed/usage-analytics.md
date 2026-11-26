@@ -236,7 +236,8 @@ read group) answer where work is waiting now, how much finished over time and
 where delay shows up in a creation cohort. Routes, authorization, parameters,
 errors, admission, the snapshot and the [Calendar](#calendar) are the same as
 for Spend, with the differences below. Flow has no `split` or `breakdown`, no
-previous period and no cost figures. The response is the shared envelope, then:
+previous-period figures and no cost figures (the shared envelope still carries
+`previous_from` and `previous_to` for bounded windows). The response is the shared envelope, then:
 
 - `selected_user`: `all` for an admin all-users response, else the user id.
 - `filters`: the echoed `repo` and `harness` (null when not given) and the
@@ -387,9 +388,11 @@ Plan response, the funnel and the approval classification share these rules:
   runs.
 - **Legacy and unbound.** A receipt written before gate binding (no binding) or
   recorded as `unbound` never proves an approval. A run with such a receipt and
-  no unique current proof is `legacy_unbound`. In plan response a run with a
+  no unique current proof is `legacy_unbound` (unless an earlier reason in the
+  approval precedence applies: human, `auto_approve_configured`, `ambiguous`,
+  then `legacy_unbound`). In plan response a run with a
   no-binding receipt adds one unknown even when it also has timed pairs; a run
-  with only `unbound` receipts adds one unknown only when it has no pair at
+  with any `unbound` receipt adds one unknown only when it has no pair at
   all, and with pairs the unbound approval can never have acted on a gate, so
   the pair stays `not_approved`.
 
@@ -411,8 +414,9 @@ echoed in `filters.repo`. For the scoped PR counts, see `pr_units` above.
 
 Measured on a synthetic 120,000-run seed (200 owners with skew, 1,250 repos,
 373,446 run inputs, 71,336 gate presentations, 2.46 million messages),
-PostgreSQL 17, JIT off. These are statement-level medians; end-to-end request
-latency was not measured.
+PostgreSQL 17, JIT off. These are statement-level medians. End-to-end
+production latency was not measured; HTTP, auth middleware, DTO JSON encoding
+and network are excluded.
 
 | Request | Custom plan | Generic plan |
 |---|---|---|
@@ -421,6 +425,14 @@ latency was not measured.
 | Admin all-users `30d` | about 0.40 s | about 0.39 s |
 | Admin all-users `90d` | about 0.56 s | about 0.58 s |
 | Admin `user=<uuid>` `window=all` | about 0.64 s | about 0.65 s |
+
+The DB-side request path (`store.RunAnalyticsSnapshot` with an 8 s statement
+timeout around the history-start query, bounds, the Flow statement and
+decoding, no warm-up, 20 requests per workload, default pgx statement cache)
+measured the same on that seed, with no timeouts. Medians in ms: owner `30d`
+81.5, owner `window=all` 641.4, admin all-users `30d` 410.5, admin all-users
+`90d` 589.1, admin `user=<uuid>` `window=all` 631.2; the slowest request of any
+workload was 656.2 ms.
 
 A median owner takes 1-15 ms. The statement reads approval evidence per run
 through an index and never reads the run message log. No index was added for

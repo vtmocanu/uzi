@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [x] M1 owner/admin Flow diagnostics (LiveDB store and handler tests ran with 0 skips; the 120k evidence harness ran, see section 8)
+- [x] M1 owner/admin Flow diagnostics (LiveDB store and handler tests ran with 0 skips; the 120k evidence harness ran, including a DB-side request-path phase; HTTP, auth middleware, DTO JSON encoding and network were not measured, see section 8)
 
 ## 1. Problem
 
@@ -101,19 +101,20 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 
 **Verified after implementation.**
 
-- The Flow statements are set-based and bounded under both custom and generic plans: no `run_messages` access, and no Seq Scan on `run_user_inputs` or `run_gate_presentations` in any measured plan (asserted by the harness and by `TestAnalyticsFlowGenericPlanShapeLiveDB`).
+- The Flow statements are set-based and bounded under both custom and generic plans: no `run_messages` access, and no Seq Scan on `run_user_inputs` or `run_gate_presentations` in any measured plan (the harness asserts no `run_messages` access and no such Seq Scan; `TestAnalyticsFlowGenericPlanShapeLiveDB` asserts only that the receipt CTEs are not re-read per outer row under a generic plan).
 - Owner and admin Flow LiveDB cases in `store` and `handler` ran with 0 skips.
-- Statement-level timings on the 120k seed are in section 8.
+- Local DST boundaries: `TestAnalyticsFlowLocalDSTBoundariesLiveDB` (`api/internal/store/analytics_flow_livedb_test.go`) runs in `America/New_York` and covers the 23-hour spring-forward day 2033-03-13, the 25-hour fall-back day 2033-11-06 and a week-coarsened `window=all` spanning several transitions. A mutant that passes UTC-computed bucket arrays fails all three subtests.
+- Statement-level timings and DB-side request-path timings on the 120k seed are in section 8.
 
 **Still unverified.**
 
-- End-to-end request time (HTTP, JSON encoding, pool wait, the 8 s request budget): only statement-level time was measured.
+- End-to-end production request latency: the DB-side request path was measured (section 8), but HTTP, auth middleware, DTO JSON encoding and network were excluded.
 - Production table sizes and the per-run `run_user_inputs` fan-out: the seed has 3.1 inputs per run (373,446 over 120,000) and 0.45 `approve_plan` receipts per run, which may differ from production.
 - Retained legacy evidence coverage in production (how many real runs have only `unbound` or `NULL`-binding receipts), and the suite and CI job-time impact, which is a landing obligation measured on the PR.
 
 ## 8. Measurement evidence
 
-Method: throwaway PostgreSQL 17, `jit=off`, the exact sqlc statement text prepared on one connection, `now` fixed. Harness: `analytics_flow_evidence_livedb_test.go` under the `analyticsevidence` build tag with `UZI_ANALYTICS_PLAN_EVIDENCE=1`, committed as an opt-in harness (build tag plus env var), not a gate. Figures are statement-level; end-to-end request time was not measured. Raw logs were not kept in the repository.
+Method: throwaway PostgreSQL 17, `jit=off`, the exact sqlc statement text prepared on one connection, `now` fixed. Harness: `analytics_flow_evidence_livedb_test.go` under the `analyticsevidence` build tag with `UZI_ANALYTICS_PLAN_EVIDENCE=1`, committed as an opt-in harness (build tag plus env var), not a gate. Figures in the tables below are statement-level; the request-path phase is described after them. Raw logs were not kept in the repository.
 
 **Seed:** 120,000 runs, 200 owners (largest 20.1% = 24,162 runs, top 10 = 59.8%), 1,250 repos; 2.41% / 10.2% / 15.2% of runs in the last 7 / 30 / 90 days. `gate_revision` for issue and `self_improve` runs: 0 for 19,769, 1 for 29,175, 2 for 12,859, 3 for 5,481. `run_user_inputs`: 373,446 rows, of which `approve_plan` 53,851 (applied 33,306; applied with NULL disposition 5,647; superseded 9,444; ACK-only 2,259; legacy 1,866; unbound 1,329). `run_gate_presentations`: 71,336. `run_messages`: 2,462,718 (20.5 per run). `ANALYZE` run.
 
@@ -155,4 +156,16 @@ Every candidate stayed under the 8% bar, so no index migration ships.
 
 **Regression guard.** `TestAnalyticsFlowGenericPlanShapeLiveDB` fails on the old SQL (receipt CTE re-read per outer row) and passes on the shipped statement.
 
-**Not measured:** end-to-end request time; production table sizes and `run_user_inputs` fan-out; `mr_rework` and `cross_check` mixes; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
+**DB-side request path.** A `request-path` phase of the harness times `store.RunAnalyticsSnapshot` (8 s `statement_timeout`, `jit=off`) around the history-start query, `ComputeBounds`, the Flow statement and `DecodeAnalyticsFlowDoc`, on the pool with pgx's default statement cache. There is no warm-up and each workload makes 20 requests, so the switch to a generic plan falls inside the sample, and a timeout fails the test. Seed as above. Set `UZI_EVIDENCE_REQUEST=0` to skip the phase.
+
+| Workload | First (ms) | Median / p95 (ms) | Max (ms) | Timeouts |
+|---|---|---|---|---|
+| owner-top-30d | 81.6 | 81.5 / 84.3 | 84.8 | 0 |
+| owner-top-all | 647.6 | 641.4 / 652.4 | 655.0 | 0 |
+| admin-all-30d | 410.5 | 410.5 / 419.9 | 430.1 | 0 |
+| admin-all-90d | 573.7 | 589.1 / 597.9 | 601.1 | 0 |
+| admin-user-all | 648.9 | 631.2 / 651.9 | 656.2 | 0 |
+
+Bare-statement timings from the same run match within noise. Scope: the DB-side request path only; HTTP, auth middleware, DTO JSON encoding and network are excluded.
+
+**Not measured:** end-to-end production request latency; production table sizes and `run_user_inputs` fan-out; `mr_rework` and `cross_check` mixes; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
