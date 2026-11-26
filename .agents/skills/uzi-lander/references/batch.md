@@ -132,9 +132,13 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
 - **After each batch**: one `main` CI run; the next batch may merge while it runs. Red: rerun a
   known flake, or fix forward / revert the culprit in parallel. A second unresolved red pauses merges.
 - **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
-- **CI hygiene**: cancel runs that no longer decide anything: exact-head runs of PRs already merged
-  under this mode, and an older `main` run once a newer descendant `main` run covers it. Never cancel
-  a required packaged proof, trust-boundary CI or `e2e.yml`, a LiveDB job above, or a run another owner relies on.
+- **Main CI**: keep only the newest run. After a newer main push, force-cancel older
+  main CI runs except those for a `chore(release)` commit whose tag is unpublished
+  or runs more than about 85% complete. Preserve the exact or two-hop metadata CI
+  evidence needed to publish a release.
+- **CI hygiene**: cancel runs for already-merged PRs when they no longer supply evidence.
+  Preserve required packaged proof, trust-boundary CI or `e2e.yml`, the exact-head
+  LiveDB proofs above, and runs another owner relies on.
 
 ## 5. Report-only runs whose issue could now be closed
 
