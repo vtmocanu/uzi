@@ -13,8 +13,9 @@ mkdir -p "$WORK/bin"
 cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-  "repo list --json") echo '[{"id":"r1","path_with_namespace":"test/repo"}]' ;;
+  "repo list --json") cat "$WORK/repos.json" ;;
   "run list --json") [ -f "$WORK/uzi-down" ] && exit 1; cat "$WORK/runs.json" ;;
+  "run get "*" --json") id="${3}"; jq -e --arg id "$id" '.[] | select(.id == $id)' "$WORK/runs.json" || { echo '{"error":"not found"}'; exit 4; } ;;
   *) echo "unexpected uzi call: $*" >&2; exit 99 ;;
 esac
 STUB
@@ -36,9 +37,10 @@ esac
 STUB
 chmod +x "$WORK/bin/uzi" "$WORK/bin/gh" "$WORK/claims"
 export PATH="$WORK/bin:$PATH" WORK OWNED_GATES_CLAIMS="$WORK/claims"
+echo '[{"id":"r1","path_with_namespace":"test/repo"},{"id":"r2","path_with_namespace":"test/other"}]' > "$WORK/repos.json"
 
 jq -n '[
-  {key:"#42", repo:"test/repo", owner_uuid:"u-me"},
+  {key:"#42", repo:"test/repo", owner_uuid:"u-me", claimed_at:"2026-01-05T00:00:00Z"},
   {key:"run-r9", repo:"test/repo", owner_uuid:"u-me"},
   {key:"#43", repo:"test/repo", owner_uuid:"u-other"}]' > "$WORK/claims.json"
 
@@ -47,7 +49,8 @@ run_it() { set +e; out="$("$SCRIPT" test/repo 2>&1)"; rc=$?; set -e; }
 
 # 1. The incident: a ci_fix linked only by its title, parked at a plan gate on claimed #42.
 runs '[{id:"cf1",repo_id:"r1",kind:"ci_fix",status:"awaiting_approval",branch:null,mr_iid:null,
-        issue_title:"Fix CI: agent/issue-7 pipeline #123",created_at:"2026-01-01T00:00:00Z"}]'
+        issue_title:"Fix CI: agent/issue-7 pipeline #123",created_at:"2026-01-01T00:00:00Z"},
+       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
 run_it
 [ "$rc" -eq 1 ] || fail "ci_fix gate: rc=$rc out=$out"
 grep -qF 'GATE key=#42 run=cf1 kind=ci_fix status=awaiting_approval' <<<"$out" || fail "ci_fix gate line missing: $out"
@@ -65,12 +68,47 @@ grep -qF 'key=run-r9 run=r9' <<<"$out" || fail "run key missing: $out"
 grep -qF 'COUNT=2' <<<"$out" || fail "count: $out"
 
 # 3. A prefix branch must not match (agent/issue-7 vs agent/issue-70).
-runs '[{id:"p1",repo_id:"r1",kind:"ci_fix",status:"awaiting_approval",issue_title:"Fix CI: agent/issue-70 pipeline #9",created_at:"t"}]'
+runs '[{id:"p1",repo_id:"r1",kind:"ci_fix",status:"awaiting_approval",issue_title:"Fix CI: agent/issue-70 pipeline #9",created_at:"t"},
+       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
 run_it
 [ "$rc" -eq 0 ] || fail "prefix branch matched: rc=$rc out=$out"
 grep -qF 'RESULT=none' <<<"$out" || fail "none: $out"
 
-# 4. A failed lookup is exit 3, never "none".
+# 4. Inferred PR matches require this repo's exact id: a repo-less or other-repo run on the
+#    same branch name is not ours.
+runs '[{id:"n1",kind:"ci_fix",status:"awaiting_approval",issue_title:"Fix CI: agent/issue-7 pipeline #3",created_at:"t"},
+       {id:"o1",repo_id:"r2",kind:"mr_rework",status:"awaiting_input",mr_iid:42,created_at:"t"},
+       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"t"}]'
+run_it
+[ "$rc" -eq 0 ] || fail "repo-less/other-repo matched: rc=$rc out=$out"
+
+# 5. A full run page whose oldest run is newer than the PR claim cannot prove absence:
+#    unknown, exit 3 (the case-4 runs carry created_at "t", which sorts after any date).
+RUN_LIST_CAP=3 run_it
+[ "$rc" -eq 3 ] || fail "saturated page read as none: rc=$rc out=$out"
+grep -qF 'RESULT=unknown' <<<"$out" || fail "saturated: $out"
+#    The same full page reaching back past the claim covers it: none.
+runs '[{id:"a1",repo_id:"r1",kind:"issue",status:"completed",created_at:"2026-01-01T00:00:00Z"},
+       {id:"a2",repo_id:"r1",kind:"issue",status:"completed",created_at:"2026-01-06T00:00:00Z"},
+       {id:"r9",repo_id:"r1",kind:"issue",status:"running",created_at:"2026-01-07T00:00:00Z"}]'
+RUN_LIST_CAP=3 run_it
+[ "$rc" -eq 0 ] || fail "covered full page: rc=$rc out=$out"
+
+# 6. An ambiguous repo lookup fails closed.
+echo '[{"id":"r1","path_with_namespace":"test/repo"},{"id":"r3","path_with_namespace":"test/repo"}]' > "$WORK/repos.json"
+run_it
+[ "$rc" -eq 3 ] || fail "ambiguous repo: rc=$rc out=$out"
+echo '[{"id":"r1","path_with_namespace":"test/repo"}]' > "$WORK/repos.json"
+
+# 7. No claims for this repo: none, without touching uzi.
+jq -n '[{key:"#43", repo:"test/repo", owner_uuid:"u-other"}]' > "$WORK/claims.json"
+touch "$WORK/uzi-down"
+run_it
+{ [ "$rc" -eq 0 ] && grep -qF 'RESULT=none' <<<"$out"; } || fail "no claims: rc=$rc out=$out"
+rm -f "$WORK/uzi-down"
+jq -n '[{key:"#42", repo:"test/repo", owner_uuid:"u-me", claimed_at:"2026-01-05T00:00:00Z"},{key:"run-r9", repo:"test/repo", owner_uuid:"u-me"}]' > "$WORK/claims.json"
+
+# 8. A failed lookup is exit 3, never "none".
 touch "$WORK/uzi-down"
 run_it
 [ "$rc" -eq 3 ] || fail "uzi down: rc=$rc out=$out"
