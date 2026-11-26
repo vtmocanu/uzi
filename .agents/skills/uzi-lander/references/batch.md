@@ -104,14 +104,15 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   with `--peak-jobs N`. Treat the result as an estimate against the 20-job cap. Include
   pending demand when planning the push wave. A missing proof stays unknown.
 - **CI slots**: let the lane owner grant at most two concurrent PR CI runs alongside
-  main CI. Prioritize a red-main or release fix, then the migration-chain head, then
-  ready PRs with exact-head obligations, then the rest. Size grants in jobs using the
-  readiness report, including queued demand and companion workflows. A push without a
-  slot is allowed. Cancel its new head's CI and KinD Smoke runs at once, then use
-  `gh run rerun <id>` on the cancelled CI when the slot is granted and report the run ID.
-  Keep CodeQL and Codex packaged proof. For other capacity cleanup, prefer unstarted
-  queued runs over near-complete ones. Preserve required LiveDB and packaged evidence,
-  including a parent workflow carrying such evidence, and runs another owner relies on.
+  main CI. Size grants in jobs using the readiness report, including queued demand and
+  companion workflows. A push without a slot is allowed. Identify the CI and KinD Smoke
+  runs created for its exact head. For a queued run, use
+  `gh api -X POST repos/vtmocanu/uzi/actions/runs/<id>/force-cancel` and verify
+  `completed cancelled`. Cancel an in-progress run normally. After a slot is granted,
+  use `gh run rerun <id>` on the cancelled CI and report its run ID. Leave CodeQL and
+  Codex packaged proof alone. For other capacity cleanup, prefer unstarted queued runs
+  over near-complete ones. Preserve required LiveDB and packaged evidence, including a
+  parent workflow carrying such evidence, and runs another owner relies on.
 - **Low-risk main-CI option**: use only on the user's explicit request. Confirm an
   approved, mergeable PR has no migration, trust-boundary change or exact-head CI
   obligation. It needs no PR CI slot. Use `merge.sh ... --expect-head FULL_SHA
@@ -122,10 +123,12 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   bounded window. Run `merge.sh` per PR and report each merge SHA. Return to the owner if
   a head or the order changes, a hold arrives, or the grant expires. The report alone
   grants no merge authority.
-- **Order**: PRs without infra deltas before PRs with one (an infra delta re-runs the others' CI).
-  Within each group, large or conflict-prone PRs first: rebasing a small PR onto a large one is
-  cheap, the reverse re-conflicts the large one per merge. Give a large PR at most one separable
-  small companion so a red stays attributable.
+- **Order for merges and CI slots**: take red-main or release fixes first, then PRs
+  that unblock other PRs or runs (most dependents first), then large or conflict-prone
+  PRs, then the rest. Use non-infra changes first as a tie-breaker. Give a large PR at
+  most one separable small companion so a red stays attributable. Include this line in
+  every `MERGE?` or slot request:
+  `size: <files/+lines>; blocks: <PRs/runs/issues waiting on this merge>; obligation: <exact-head CI yes/no>`.
 - **After each batch**: one `main` CI run; the next batch may merge while it runs. Red: rerun a
   known flake, or fix forward / revert the culprit in parallel. A second unresolved red pauses merges.
 - **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
