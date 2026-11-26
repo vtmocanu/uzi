@@ -37,8 +37,8 @@ const (
 )
 
 // errProviderLaneClaimRefused is the claim-assembly refusal of a provider-bound run on a lane that
-// has no provider support yet (Codex judge until #4574, job, cross-check, isolated; a Claude judge is
-// supported since PRD #4322 M1a), or on a worker lacking the lane's capability. It wraps
+// has no provider support yet (job, cross-check, isolated, Codex chat; Claude and Codex judges are
+// supported since PRD #4322 M1a and #4574 M1), or on a worker lacking the lane's capability. It wraps
 // errCredentialUnavailable, so finishRunClaim fails the claim terminally exactly as it does for the
 // other refused-lane shapes (errIsolatedClaimRefused), never delivering anything.
 var errProviderLaneClaimRefused = fmt.Errorf("%w: %w", errCredentialUnavailable, ErrProviderLaneUnsupported)
@@ -297,7 +297,8 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 
 // workerSupportsProvider checks only the advertised protocol for the frozen engine.
 // Wake admission and claim assembly share this conjunction without reading credentials. A Claude
-// judge additionally needs claude_provider_judge_v1 (PRD #4322 M1a), mirroring the SQL claim clause.
+// judge additionally needs claude_provider_judge_v1 (PRD #4322 M1a) and a Codex judge
+// codex_provider_judge_v1 (PRD #4574 M1), mirroring the SQL claim clause.
 func workerSupportsProvider(w store.Worker, engine, kind string) bool {
 	switch engine {
 	case harnessClaude:
@@ -307,7 +308,8 @@ func workerSupportsProvider(w store.Worker, engine, kind string) bool {
 		return slices.Contains(w.ProtocolCapabilities, capability.CodexProviderV1) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV2) &&
-			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV3)
+			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV3) &&
+			(kind != runkind.Judge || slices.Contains(w.ProtocolCapabilities, capability.CodexProviderJudgeV1))
 	default:
 		return false
 	}

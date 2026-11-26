@@ -472,8 +472,8 @@ type PendingJudgeDTO struct {
 // could not serve it. Harness is "claude" or "codex"; Reason is the closed set
 // "no_usable_credential" | "credential_disabled" | "codex_pool_unavailable" |
 // "provider_lane_unsupported" | "provider_source_unusable" | "provider_model_unmapped"
-// (workersvc.JudgeSkipReasons). provider_lane_unsupported is now recorded only for a Codex judge
-// whose owner has a Codex source; older Claude rows with it are historical. At is when it was
+// (workersvc.JudgeSkipReasons). provider_lane_unsupported is no longer recorded; older Claude and
+// Codex rows with it are historical. At is when it was
 // recorded. Like PendingJudgeDTO it is a
 // SIBLING key on the review response ({"review": ..., "pending_judge": ..., "skip": ...}),
 // always present and null when nothing was skipped. It is non-null only for an unjudged run

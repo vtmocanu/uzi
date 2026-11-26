@@ -148,9 +148,9 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
 	// The fixtures need the head schema (model_providers columns added after 00523), so the database
-	// is migrated to the head; the test then steps the placement function back: the 00544 Down
-	// lands on 00534's definition, then the 00523 Down lands on 00521's definition (00534's own Down
-	// is not exercised here).
+	// is migrated to the head; the test then steps the placement function back: the 00545 Down
+	// lands on 00544's definition, the 00544 Down on 00534's, then the 00523 Down lands on 00521's
+	// definition (00534's own Down is not exercised here).
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
@@ -175,10 +175,28 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&head); err != nil {
 		t.Fatal(err)
 	}
-	// latest is the 00534 definition: the head definition minus the run-env block.
-	latest, changed := stripRunEnvBlock(head)
+	// runEnvHead is the 00544 definition: the head minus 00545's Codex judge clause.
+	const codexJudgeClause = " AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))"
+	runEnvHead := strings.Replace(head, codexJudgeClause, "", 1)
+	if runEnvHead == head {
+		t.Fatal("head definition carries no codex_provider_judge_v1 clause")
+	}
+	for _, stmt := range migrationDownStatements(t, "00545_placement_codex_provider_judge_capability.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var afterCodexDown string
+	if err := tx.QueryRow(ctx, definition).Scan(&afterCodexDown); err != nil {
+		t.Fatal(err)
+	}
+	if afterCodexDown != runEnvHead {
+		t.Fatal("00545 Down did not restore exactly the 00544 definition")
+	}
+	// latest is the 00534 definition: the 00544 definition minus the run-env block.
+	latest, changed := stripRunEnvBlock(runEnvHead)
 	if !changed {
-		t.Fatal("head definition carries no run_env_v1 block")
+		t.Fatal("00544 definition carries no run_env_v1 block")
 	}
 	for _, stmt := range migrationDownStatements(t, "00544_run_env_placement.sql") {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
@@ -189,7 +207,7 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&afterRunEnvDown); err != nil {
 		t.Fatal(err)
 	}
-	if afterRunEnvDown == head || afterRunEnvDown != latest {
+	if afterRunEnvDown == runEnvHead || afterRunEnvDown != latest {
 		t.Fatal("00544 Down did not restore exactly the 00534 definition")
 	}
 	for _, stmt := range migrationDownStatements(t, "00523_codex_runtime_v3.sql") {
@@ -286,8 +304,19 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
 		t.Fatal(err)
 	}
+	if restored != runEnvHead {
+		t.Fatal("00544 Up did not restore the exact 00544 definition")
+	}
+	for _, stmt := range migrationUpStatements(t, "00545_placement_codex_provider_judge_capability.sql") {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
+		t.Fatal(err)
+	}
 	if restored != head {
-		t.Fatal("00544 Up did not restore the exact live head definition")
+		t.Fatal("00545 Up did not restore the exact live head definition")
 	}
 }
 

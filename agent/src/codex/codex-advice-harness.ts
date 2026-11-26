@@ -93,6 +93,13 @@ export class CodexAdviceError extends Error {
   }
 }
 
+/**
+ * Issue #4574: the harness wall-clock timer's rejection. Its message is byte-identical to the plain
+ * Error it replaced and `name` stays "Error" (never set), so String(err) and errMessage consumers
+ * are unchanged; the provider judge's settlement recognizes it by `instanceof` only.
+ */
+export class AdviceCallTimeoutError extends Error {}
+
 // --- construction inputs / seams ---------------------------------------------
 
 /** The spec the harness hands to {@link LaunchAdviceRootSeam}. It carries ONLY trusted,
@@ -321,7 +328,7 @@ export class CodexAdviceHarness implements AdviceHarness {
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         internalAbort.abort();
-        reject(new Error(`${request.label} model call exceeded ${request.timeoutMs}ms`));
+        reject(new AdviceCallTimeoutError(`${request.label} model call exceeded ${request.timeoutMs}ms`));
       }, request.timeoutMs);
     });
 
@@ -769,6 +776,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       errors,
       usage,
       metrics: { cost: { kind: "unreported" } },
+      ...(classification !== undefined ? { codexClassification: classification } : {}),
       failure: {
         // Deferred, invoked only at the owner's classification point. The category now comes
         // from the CLOSED classification MAP (never invented from a raw provider status), and

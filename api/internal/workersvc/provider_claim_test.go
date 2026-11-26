@@ -64,7 +64,7 @@ func providerBoundRow(kind string) store.Run {
 // provider_lane_unsupported before anything is opened: the store is a nil-embedding fake, so any
 // credential read would panic. The judge row is refused here too, but only because the zero Worker
 // lacks claude_provider_v1 / claude_provider_judge_v1 (a Claude judge is provider-bound since PRD
-// #4322 M1a); a Codex-bound judge is the one refused as an unsupported lane.
+// #4322 M1a); a Codex-bound judge is likewise refused only for a missing capability (PRD #4574 M1).
 func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 	svc := New(&fakeStore{}, newBox(t), testParams())
 	for _, kind := range []string{runkind.Judge, runkind.Job, runkind.CrossCheck} {
@@ -87,6 +87,46 @@ func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 	}
 	if singleFamilyCheckerCustody(string(HarnessClaude), &ClaimPayload{Secrets: ClaimSecrets{AnthropicOAuthToken: "t", Provider: &ClaimProviderBinding{}}}) {
 		t.Error("a checker child holding a provider binding passed the custody rule")
+	}
+}
+
+// A Codex provider judge needs codex_provider_judge_v1 on top of the Codex provider trio and
+// codex_provider_v1 (PRD #4574 M1); an ordinary Codex provider run does not.
+func TestWorkerSupportsProviderCodexJudge(t *testing.T) {
+	base := []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}
+	withJudge := append(append([]string{}, base...), capability.CodexProviderJudgeV1)
+	onlyJudge := []string{capability.CodexProviderJudgeV1}
+	for _, tc := range []struct {
+		name string
+		caps []string
+		kind string
+		want bool
+	}{
+		{"full trio without the judge capability, judge", base, runkind.Judge, false},
+		{"full trio without the judge capability, issue", base, runkind.Issue, true},
+		{"full trio with the judge capability, judge", withJudge, runkind.Judge, true},
+		{"full trio with the judge capability, issue", withJudge, runkind.Issue, true},
+		{"judge capability alone, judge", onlyJudge, runkind.Judge, false},
+		{"no capabilities, judge", nil, runkind.Judge, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workerSupportsProvider(store.Worker{ProtocolCapabilities: tc.caps}, harnessCodex, tc.kind); got != tc.want {
+				t.Fatalf("workerSupportsProvider(codex, %s) = %t, want %t", tc.kind, got, tc.want)
+			}
+		})
+	}
+}
+
+// The Go backstop in assembleClaim: a provider-bound Codex judge reaches the capability check (no
+// longer refused by kind) and a worker without codex_provider_judge_v1 is refused terminally
+// before any credential read (the store is a nil-embedding fake, so a read would panic).
+func TestProviderBoundCodexJudgeRefusedWithoutJudgeCapability(t *testing.T) {
+	svc := New(&fakeStore{}, newBox(t), testParams())
+	run := providerBoundRow(runkind.Judge)
+	run.Harness = harnessCodex
+	wkr := store.Worker{ProtocolCapabilities: []string{capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3}}
+	if _, err := svc.assembleClaim(context.Background(), wkr, run); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Fatalf("err = %v, want terminal provider_lane_unsupported", err)
 	}
 }
 

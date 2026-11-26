@@ -179,13 +179,56 @@ Anthropic token.
 - **Cost is unknown.** Usage shows as unknown, as for any [provider run](./providers.md#usage-and-cost).
 - **The provider key is redacted** from the judge's output, review, usage and failure text.
 - **Codex.** A Codex judge for an owner who has only a Claude source runs on its usual Codex credential
-  and ignores the Claude source. A Codex judge for an owner whose **Codex source** is a provider is still
-  refused (`provider_lane_unsupported`) until [#4574](https://github.com/vtmocanu/uzi/issues/4574). Neither
-  harness ever falls back to the other.
+  and ignores the Claude source. Neither harness ever falls back to the other. A Codex judge for an owner
+  whose **Codex source** is a model provider (their own, or an admin-shared Codex definition with their own
+  key) runs on that provider the same way, see [A Codex judge on a model provider](#a-codex-judge-on-a-model-provider).
 
 When the judge cannot be created on your provider, the automatic judge is [skipped](#a-skipped-judge) and
 **Run judge** is refused, with the same reasons (see [A skipped judge](#a-skipped-judge)); nothing falls
 back to an Anthropic token.
+
+### A Codex judge on a model provider
+
+A Codex judge for an owner whose **Codex source** is a model provider runs on that provider, with your
+provider key and no vendor Codex credential. The provider and its revision are frozen onto the judge when it
+is created; a later change to your source affects new judges only. If your source changes between the
+decision and the freeze (both inside creation), nothing is created: a source that was cleared or became
+unusable fails with `provider_source_unusable`, and a source switched to another usable provider fails
+with `judge_policy_changed` (retry-safe). It never falls back to a vendor Codex credential.
+
+- **No pin keeps it a vendor judge.** Unlike Claude, there is no judge pin that keeps a Codex judge on the
+  vendor: a selected Codex source always wins. The Anthropic token pin does not apply to the Codex lane. An
+  owner with no Codex source keeps the vendor Codex judge.
+- **The model resolves through the provider's map.** The judge model is resolved as for any Codex judge
+  ([Which model it runs on](#which-model-it-runs-on)); the worker then looks it up in the provider's model
+  map: an exact key, else the map's required `default` slot. So a map with only `default` serves any
+  curated Codex judge model. A Codex map without `default`, or one that is otherwise invalid, is an unusable
+  source: the automatic judge is skipped as `provider_source_unusable` and **Run judge** is refused with a
+  409 of the same type. It is never `provider_model_unmapped`, and never a vendor fallback.
+- **Gateway limits fail the judge.** A gateway 429 or overloaded (529) answer ends the judge as failed with
+  `rate_limit_type` `provider_gateway_limit`, no review and no vendor cooldown. It never parks.
+- **A revoked binding fails the judge.** If the key was revoked, rotated or disabled by the time the judge is
+  claimed, it ends failed with `credential_unavailable`, never parked.
+- **Other failures.** A timeout, an abort, a failure while the advice harness shuts down its session
+  (closing the app-server transport or its auth admission), or an error the worker cannot classify fails
+  the judge with no review. A failed disposal of the judge's temporary home is only logged and does not
+  change the outcome. Any other classified model error (a bad request, an unauthorized answer, a
+  server error that carries a status) produces the deterministic fallback review, scrubbed of the key,
+  as do a prompt that cannot be built (the model is never called) and model output that cannot be parsed.
+- **The provider key is redacted** in its raw, escaped and invisible-separated forms from the review, model
+  name, usage, failure reasons, logs and the terminal journal. A worker may later re-send an already
+  journaled terminal log through its own logger; that body is key-free.
+- **Capability and rollout.** The judge needs a worker advertising `codex_provider_judge_v1` (advertised
+  by workers that run the Codex harness). Without one, the judge stays queued and health shows "no worker that
+  supports Codex provider judges (codex_provider_judge_v1) is online". The shipped chart runs the API as a
+  single replica with a `Recreate` rollout, so during an upgrade a Codex provider judge waits for an upgraded,
+  capable worker rather than failing. Only a deployment that runs old and new API replicas side by side (outside
+  the shipped topology) can have a new replica create a Codex provider judge that an old replica selects and
+  refuses terminally (`credential_unavailable`, no review, no automatic retry); a manual **Run judge** after
+  that rollout succeeds.
+- **Trace destination.** The judged trace goes to your Codex gateway and any redirect it issues, including
+  the trace of a run that itself used a vendor credential, under the risk accepted for custom providers
+  ([Where the judged trace goes](#where-the-judged-trace-goes)).
 
 ### Where the judged trace goes
 
@@ -193,6 +236,8 @@ A judge reads the reviewed run's trace, so the trace reaches whichever evaluator
 
 - **A provider judge sends the trace to your gateway**, including the trace of a run that itself used an
   Anthropic token (the judge follows your Claude source by default or auto-select).
+- **A Codex provider judge sends the trace to your Codex gateway**, including the trace of a run that used
+  a vendor credential, and to any redirect the gateway issues.
 - **A pinned vendor judge sends a provider run's trace to Anthropic.**
 - **Redirects.** The Claude CLI follows gateway redirects (see the
   [providers redirect warning](./providers.md)), so judged trace bodies can reach a redirect
@@ -487,11 +532,12 @@ or `null`. It is non-null only when the run has no review and no pending judge,
 so it never appears next to either of them; `reason` is one of
 `no_usable_credential`, `credential_disabled`, `codex_pool_unavailable`,
 `provider_lane_unsupported`, `provider_source_unusable` or
-`provider_model_unmapped`. `provider_lane_unsupported` is now recorded only for
-a Codex judge whose owner has a Codex source (a model provider), which stays
-unsupported until #4574. Older rows with that reason and `"harness": "claude"` are
-historical, from before a Claude source could bind a judge, and are shown in the
-past tense. `provider_source_unusable` means your Claude source could not serve
+`provider_model_unmapped`. `provider_lane_unsupported` is no longer recorded for a judge;
+rows with that reason are historical: a `"harness": "claude"` row predates a
+Claude source binding a judge, and a `"harness": "codex"` row predates a Codex
+source binding one. Both are shown in the past tense (for Codex, "the selected
+Codex source is a model provider, which the Codex judge did not support at the
+time"); **Run judge** on such a row now creates the judge. `provider_source_unusable` means your Claude or Codex source could not serve
 the judge (retired, off the operator allowlist, or without your enabled
 key), and `provider_model_unmapped` means the provider's model map does not map the
 judge's model. Without
@@ -548,8 +594,7 @@ stays live and reads **Run judge** (or **Re-run judge**).
 When the automatic judge is skipped because the judge's harness has no usable
 credential, the run page says so instead of showing an empty panel: it names
 the reason (no usable credential for the harness, the credential is disabled,
-no pooled Codex account was available, your Codex source is a model provider the
-judge does not support yet, your Claude source could not serve the judge, or the
+no pooled Codex account was available, your Claude or Codex source could not serve the judge, or the
 provider did not map the judge's model), links to **Models**, where
 [Judge runs on](#judge-runs-on) is chosen (the Claude judge token is chosen in Run defaults; Codex
 accounts are linked and pooled in Settings), and offers **Run judge**. The skip is recorded only after every other check has passed, so
@@ -562,9 +607,8 @@ It shows only while the run has no review and no judge in flight. Clicking
 **Run judge** while the credential is still missing is refused with a message
 naming what is missing (an Anthropic token, a usable credential for the judge's
 harness, or a pooled Codex account), shown inline in the panel, and the skip stays.
-A provider refusal is a typed 409 instead: `provider_source_unusable`,
-`provider_model_unmapped` or `provider_lane_unsupported` (a Codex judge with a Codex
-source). A fourth, `judge_policy_changed`, means your judge settings changed while the judge was
+A provider refusal is a typed 409 instead: `provider_source_unusable` or
+`provider_model_unmapped`. A third, `judge_policy_changed`, means your judge settings changed while the judge was
 being created; nothing was created and nothing fell back to an Anthropic token, so try again.
 
 ## Filing an issue from a recommendation
