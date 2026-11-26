@@ -96,7 +96,9 @@ const (
 	placementNew = "new"
 
 	// AnnotationCodexExtraCA is set at create time on a worker's /data PVC, and only
-	// when the worker's Secret was just written with the codexExtraCACertKey entry. The
+	// when the worker's Secret was just written with the codexExtraCACertKey entry. It
+	// can also be added to an existing claim by stampCodexCAClaim's confirmed patch right
+	// after a confirmed Secret write. The
 	// Secret is write-once and the controller cannot read it back, so this claim stamp is
 	// the durable evidence that the key exists; the pod template renders UZI_CODEX_CA_FILE
 	// only on that evidence (RenderConfig.withCodexCA).

@@ -18,7 +18,9 @@ import (
 // carries codexExtraCACertKey is known only from evidence recorded when it was written:
 //
 //   - durable: AnnotationCodexExtraCA on the worker's /data claim, stamped at claim create
-//     (ensurePVCs) in the same pass that wrote the Secret;
+//     (ensurePVCs) in the same pass that wrote the Secret, or added to an already existing
+//     claim by stampCodexCAClaim's confirmed patch right after a confirmed Secret write
+//     (a worker whose token arrived after its claims were created);
 //   - durable, retained recycle only: the same annotation on the retained worker Deployment
 //     (held at zero replicas under a reservation). recycleWorkerVolumes syncs it to the
 //     own claim's stamp (set when stamped, cleared when not) with a confirmed patch
@@ -146,6 +148,115 @@ func (m *Materializer) syncRetainedCodexCARecord(ctx context.Context, ns string,
 	e.dep = got
 	e.o.DeploymentUID, e.o.DeploymentResourceVersion = string(got.UID), got.ResourceVersion
 	return nil
+}
+
+// stampCodexCAClaim is called only after THIS pass's Secret create was confirmed to carry
+// the Codex CA key (secretWritten). A worker whose /data claim already exists unstamped
+// (its token arrived after its PVCs were created) would otherwise never get the durable
+// stamp: the next tick would see a live unstamped claim and retire the carry. It adds the
+// stamp with one UID- and resourceVersion-fenced merge patch of the own claim only, and
+// requires a confirmed response before returning the updated pass-local observation.
+//
+// With no own claim observed there is nothing to patch: the carry stays and the ensurePVCs
+// create path stamps the claim. An already stamped claim needs no patch. The snapshot is
+// the roll entry's claim (refreshed by earlier writes this tick) when there is one, else
+// the observation. Any disagreement between the two, a failed precondition, or a patch
+// that is not confirmed clears the carry and returns an error so the pass stops before it
+// touches anything else and the next tick decides from a fresh observation. Nothing here
+// logs more than the worker id and namespace.
+func (m *Materializer) stampCodexCAClaim(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) (reconcile.ObservedWorker, error) {
+	own := ownDataClaim(w, obs, ns)
+	if own == nil {
+		return obs, nil
+	}
+	name := dataPVCName(w.ID)
+	e := rollFrom(ctx, w.ID)
+	unconfirmed := func() (reconcile.ObservedWorker, error) {
+		m.clearCodexCACarry(w.ID, ns)
+		m.log.Warn("codex CA claim stamp unconfirmed; re-poll required", "worker_id", w.ID, "namespace", ns)
+		return obs, fmt.Errorf("codex CA claim stamp unconfirmed; re-poll required")
+	}
+
+	var (
+		uid, rv, cNS, cName  string
+		terminating, stamped bool
+		rollVal, placeVal    string
+		rollHas, placeHas    bool
+	)
+	if e != nil && e.claim != nil {
+		c := e.claim
+		if string(c.UID) != own.UID || (c.DeletionTimestamp != nil && !own.Terminating) {
+			return unconfirmed()
+		}
+		uid, rv, cNS, cName = string(c.UID), c.ResourceVersion, c.Namespace, c.Name
+		terminating = c.DeletionTimestamp != nil
+		stamped = c.Annotations[AnnotationCodexExtraCA] == codexExtraCAWritten
+		rollVal, rollHas = c.Annotations[annotationRoll]
+		placeVal, placeHas = c.Annotations[AnnotationPlacement]
+	} else {
+		uid, rv, cNS, cName = own.UID, own.ResourceVersion, own.Namespace, own.Name
+		terminating = own.Terminating
+		stamped = own.CodexExtraCA
+	}
+	if cNS != ns || cName != name {
+		return unconfirmed()
+	}
+	if stamped {
+		return obs, nil
+	}
+	if uid == "" || rv == "" || terminating {
+		return unconfirmed()
+	}
+
+	body, err := json.Marshal(map[string]any{"metadata": map[string]any{
+		"uid":             uid,
+		"resourceVersion": rv,
+		"annotations":     map[string]any{AnnotationCodexExtraCA: codexExtraCAWritten},
+	}})
+	if err != nil {
+		return unconfirmed()
+	}
+	if e != nil {
+		e.mutated = true
+	}
+	got, err := m.client.CoreV1().PersistentVolumeClaims(ns).Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
+	if err != nil || got == nil || string(got.UID) != uid || got.Name != name || got.Namespace != ns ||
+		got.ResourceVersion == "" || got.ResourceVersion == rv || got.DeletionTimestamp != nil ||
+		got.Annotations[AnnotationCodexExtraCA] != codexExtraCAWritten {
+		return unconfirmed()
+	}
+	if e != nil && e.claim != nil {
+		gotRoll, gotRollHas := got.Annotations[annotationRoll]
+		gotPlace, gotPlaceHas := got.Annotations[AnnotationPlacement]
+		if gotRollHas != rollHas || gotRoll != rollVal || gotPlaceHas != placeHas || gotPlace != placeVal {
+			return unconfirmed()
+		}
+	} else {
+		gotRoll, gotRollHas := got.Annotations[annotationRoll]
+		if gotRollHas != own.RollAnnotationPresent || gotRoll != own.RollAnnotation ||
+			(got.Annotations[AnnotationPlacement] == placementNew) != own.PlacementNew {
+			return unconfirmed()
+		}
+	}
+
+	// Confirmed. Later writes this tick fence on the refreshed identity, and every later
+	// step of the pass (a same-pass recycle's record sync included) sees the stamp.
+	if e != nil {
+		e.claim = got
+	}
+	fresh := claimObservationOf(ns, w.ID, got)
+	if obs.DataClaimsByNamespace != nil {
+		clone := make(map[string]reconcile.ClaimObservation, len(obs.DataClaimsByNamespace)+1)
+		for k, v := range obs.DataClaimsByNamespace {
+			clone[k] = v
+		}
+		clone[ns] = fresh
+		obs.DataClaimsByNamespace = clone
+	}
+	if c := obs.DataClaim; c != nil && c.Namespace == ns && c.Name == name {
+		obs.DataClaim = &fresh
+	}
+	return obs, nil
 }
 
 // ownDataClaim returns obs's /data claim when it is w's own claim in ns. When the

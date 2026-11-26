@@ -1305,6 +1305,16 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 			secretWritten = true
 		}
 	}
+	if secretWritten {
+		// A claim that already exists unstamped (the token arrived after the PVCs were
+		// created) gets the stamp by a confirmed patch now, or the next tick retires the
+		// carry and the env is never rendered. An unconfirmed stamp stops the pass here,
+		// before hibernation, DinD, the recycle arms and ensurePVCs.
+		obs, err = m.stampCodexCAClaim(ctx, w, obs, ns)
+		if err != nil {
+			return err
+		}
+	}
 
 	// Hibernation (PRD #4205) owns the worker entirely while its desired state is set:
 	// it must run before DinD maintenance and both recycle arms below, none of which

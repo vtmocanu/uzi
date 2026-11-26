@@ -393,12 +393,24 @@ func TestCodexCAForeignDataClaimRetainedRecycleRestart(t *testing.T) {
 func TestCodexCAOwnDataAbsentDoesNotEnterThePressureArm(t *testing.T) {
 	const prefix = "disk-recycle-skipped-"
 	t.Run("own-absent-live-foreign", func(t *testing.T) {
-		m, _, w, _ := caRetainedNoOwnData(t, true)
+		m, c, w, cfg := caRetainedNoOwnData(t, true)
+		// Precondition: the young /nix keeps the cooldown active, which is what holds a
+		// pressure recycle back if the arm were entered.
+		if !m.withinRecycleCooldown(w, caObserve(t, m, "w1"), cfg.Namespace) {
+			t.Fatal("fixture: the recycle cooldown is not active")
+		}
 		var buf bytes.Buffer
 		m.log = slog.New(slog.NewTextHandler(&buf, nil))
+		c.ClearActions()
 		caMustTick(t, m, w) // the tick that creates the own claim; it was absent when observed
 		if strings.Contains(buf.String(), prefix) {
 			t.Fatalf("pressure arm entered with no own /data claim; logs:\n%s", buf.String())
+		}
+		if got := caPVCDeletes(c); len(got) != 0 {
+			t.Errorf("claims deleted: %v", got)
+		}
+		if n := replicaPatches(c); n != 0 {
+			t.Errorf("replica patches = %d, want no scale-down", n)
 		}
 	})
 	t.Run("own-present-control", func(t *testing.T) {
