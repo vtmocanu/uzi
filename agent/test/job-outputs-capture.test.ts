@@ -127,8 +127,11 @@ describe("staged output capture (provider key forms)", { skip: LINUX_ONLY }, () 
       return fh;
     });
     mock.method(fsp, "unlink", async (p: string) => {
-      if (String(p).includes(".capture-")) steps.push("unlink");
-      return origUnlink(p);
+      try {
+        return await origUnlink(p);
+      } finally {
+        if (String(p).includes(".capture-")) steps.push("unlink");
+      }
     });
     mock.method(proto, "write", async function (this: FileHandle, ...args: unknown[]) {
       if (capHandles.has(this)) steps.push("write");
@@ -421,6 +424,23 @@ describe("staged output capture (provider key forms)", { skip: LINUX_ONLY }, () 
     assert.deepEqual((await fsp.readdir(ws.root)).filter((n) => n.startsWith(".capture-")), []);
   });
 
+  it("an upload failure echoing the key across the log clip boundary leaves no key fragment in any log line", async () => {
+    const ws = await workspace({ "outputs/a.txt": "abc" });
+    const lines: string[] = [];
+    const base = nullLogger();
+    const push = (msg: string, f?: Record<string, unknown>): void => { lines.push(JSON.stringify([msg, f ?? {}])); };
+    const log = { ...base, debug: push, info: push, warn: push, error: push, child: () => log } as typeof base;
+    // 290 filler characters, then the key: a 300-character clip lands inside it.
+    const { client } = recordingClient(() => { throw new Error(`${"x".repeat(290)}${KEY}`); });
+    await uploadJobOutputs({
+      client, log, runId: "r", generation: 3, workDir: ws.work, secretPaths: [], outputFiles: ["outputs/a.txt"],
+      deadlineAt: Date.now() + 60_000, retryDelaysMs: [1, 1], capture: { root: ws.root, forms: FORMS },
+    });
+    const text = lines.join("\n");
+    assert.ok(lines.some((l) => l.includes("job output upload failed")), "the failed upload was logged");
+    for (let i = 0; i + 8 <= KEY.length; i++) assert.ok(!text.includes(KEY.slice(i, i + 8)), `a key fragment reached a log line: ${KEY.slice(i, i + 8)}`);
+  });
+
   it("the stale-workspace reaper removes a workspace that still holds a capture directory", async () => {
     const jobsRoot = path.join(await tmp(), "jobs");
     const ws = await createJobWorkspace(jobsRoot, "22222222-2222-4222-8222-222222222222");
@@ -445,4 +465,3 @@ describe("staged output capture (provider key forms)", { skip: LINUX_ONLY }, () 
     console.log(`staged ${size} bytes in ${ms} ms`);
   });
 });
-

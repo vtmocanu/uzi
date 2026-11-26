@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
 
-import type { WorkerClient } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import { buildJobResultServer, JobRunner } from "../src/job-runner.js";
 import type { Logger } from "../src/log.js";
 import { Outbox } from "../src/outbox.js";
@@ -239,6 +239,40 @@ describe("provider job: lane refusals (constant reason, before the first report)
   }
 });
 
+describe("provider job: a late terminal replay", () => {
+  it("a failed late replay of a provider job terminal logs no key, whatever the error response body echoes", async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "uzi-jobprov-replay-"));
+    roots.push(root);
+    const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(), runMaxBytes: 1e6, maxBytes: 1e6, retentionMs: 86_400_000 });
+    await outbox.init();
+    const { client } = fakeClient({
+      reportState: (b) => {
+        if (b.status === "failed" || b.status === "completed") throw new Error("connect ECONNRESET: api unreachable");
+        return { applied: true, status: b.status };
+      },
+    });
+    // A refused lane fails the job before any workspace (so this runs on every platform) and journals the terminal.
+    const qf = scripted(async function* () { yield INIT_OK; });
+    const claim = providerJobClaim(KEY, { isolated_fetch: { profile: "p", hosts: ["a.example.test"], credential: "fetch-credential-do-not-scan-0001", fetcher: "x" } } as never);
+    await runner(client, path.join(root, "jobs"), qf, nullLogger(), { outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 }).execute(claim);
+    const mine = outbox.listPendingTerminals().find((p) => p.run_id === claim.run_id && p.claim_generation === GEN);
+    assert.ok(mine, "the job's terminal is journaled and pending");
+    // The late replay runs on the plain worker logger (no per-run redactor): the error response echoes
+    // every form of the bound key.
+    const echo = providerKeyForms(KEY).join(" | ");
+    const replay = recordingLogger();
+    const deps = makeTerminalOutboxDeps(outbox, client, { gapFillMax: 100, terminalMaxBytes: 1 << 20, log: replay.logger })!;
+    await resolvePendingTerminal(deps, {
+      runId: mine.run_id, claimGeneration: mine.claim_generation,
+      send: async () => { throw new RequestError("POST", "/state", 502, `gateway said ${echo}`); },
+    });
+    const lines = JSON.stringify(replay.lines);
+    assert.ok(replay.lines.length > 0, "the failed replay was logged");
+    assertNoKey(KEY, lines, "replay log");
+    assert.ok(lines.includes("POST /state returned 502"), "the bounded diagnostic names the request and status");
+  });
+});
+
 describe("provider job: key registration for the whole claim", () => {
   function registryLogger(events: string[]): { logger: Logger; added: string[]; removed: string[] } {
     const added: string[] = [];
@@ -258,7 +292,8 @@ describe("provider job: key registration for the whole claim", () => {
     const forms = providerKeyForms(KEY);
     assert.deepEqual([...reg.added].sort(), [...forms].sort());
     assert.deepEqual([...reg.removed].sort(), [...forms].sort());
-    assert.ok(events.indexOf("add") < events.findIndex((e) => e.startsWith("state:")), "registered before the first report");
+    const firstReport = events.findIndex((e) => e.startsWith("state:"));
+    assert.equal(events.slice(0, firstReport).filter((e) => e === "add").length, forms.length, "every form was registered before the first report");
   });
 
   it("a refused claim still registers and removes the forms (the refusal text is scrubbed too)", async () => {

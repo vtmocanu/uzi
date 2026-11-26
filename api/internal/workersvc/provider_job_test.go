@@ -342,6 +342,21 @@ func TestProviderJobClaimModelPrecedence(t *testing.T) {
 	}
 }
 
+// TestProviderJobClaimUnmappedModelRefusalNamesNoModel: the owner's default model is any single-token
+// string, so a pasted credential must never reach the refusal text (it becomes failure_reason).
+func TestProviderJobClaimUnmappedModelRefusalNamesNoModel(t *testing.T) {
+	secretShaped := strings.Join([]string{"sk", "proj", "abcdefghijklmnopqrstuvwxyz0123456789"}, "-")
+	fx := newProviderJobFixture(t, pvDefaultMap)
+	fx.store.defaultModel = txt(secretShaped)
+	_, err := fx.svc.assembleJobClaim(fx.ctx, fx.worker, fx.run)
+	if !errors.Is(err, ErrProviderModelUnmapped) {
+		t.Fatalf("err = %v, want provider_model_unmapped", err)
+	}
+	if strings.Contains(err.Error(), secretShaped) || strings.Contains(err.Error(), secretShaped[:12]) {
+		t.Fatalf("the refusal text %q carries the model value", err.Error())
+	}
+}
+
 // TestProviderJobClaimModelReadFailure: a transient database error while reading the model settings
 // leaves the claim for the never-started sweep (no settlement, no payload), while any other error is the
 // terminal credential_unavailable with a FIXED sentence that carries none of the raw error.

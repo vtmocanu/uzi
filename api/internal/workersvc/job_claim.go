@@ -180,7 +180,7 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		return nil, fmt.Errorf("%w: the job's model settings could not be read", errCredentialUnavailable)
 	}
 	if providerJob && !modelMapped(secrets.Provider.ModelMap, *defaultModel) {
-		return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: fmt.Sprintf("model %q (job) is not mapped by the provider", *defaultModel)}
+		return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: "the job's model is not mapped by the provider"}
 	}
 	defaultEffort, eerr := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if eerr != nil {

@@ -13,12 +13,14 @@ import {
   logSafe,
   OUTPUT_FILES_MAX,
   outputDisplayName,
+  partitionOutputFiles,
   resolveOutputFile,
   uploadJobOutputs,
   uploadPhaseDeadline,
   validateOutputFilePaths,
 } from "../src/job-outputs.js";
 import type { JobFileUploadMeta } from "../src/protocol.js";
+import { providerKeyForms, makeTextRedactor } from "../src/redact.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
 // PRD #1909 M4: the lexical and filesystem checks on the files a job may hand back.
@@ -169,6 +171,19 @@ describe("outputDisplayName", () => {
   });
 });
 
+
+describe("partitionOutputFiles: case variants of a provider key in a long name", () => {
+  // The key is assembled at runtime (no provider-token-shaped literal); it has no slash, so it can sit in a basename.
+  const KEY = ["gw", "secretkey", "4242", "abcdefgh"].join("-");
+  const redact = makeTextRedactor(providerKeyForms(KEY));
+  it("withholds an uppercased key that the 100-character display cut would split", () => {
+    const name = `outputs/${"A".repeat(80)}${KEY.toUpperCase()}.txt`;
+    const cut = outputDisplayName(name);
+    assert.ok(!cut.toLowerCase().includes(KEY), "the display cut splits the variant, so a check of the capped name alone misses it");
+    const r = partitionOutputFiles([name, "outputs/fine.txt"], redact);
+    assert.deepEqual(r, { ok: true, clean: ["outputs/fine.txt"], keyed: [name] });
+  });
+});
 
 describe("uploadJobOutputs (PRD #1909 M4 rework)", { skip: process.platform !== "linux" ? "requires Linux descriptor-relative output opens" : false }, () => {
   const sha = (b: string | Buffer): string => createHash("sha256").update(b).digest("hex");

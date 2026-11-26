@@ -84,6 +84,19 @@ export function logSafe(s: string, max = 300): string {
     });
 }
 
+/** A bounded log diagnostic for an upload or read failure that never carries free-form error text:
+ *  that text (a response body, a message) can echo a credential, and clipping it before a redactor
+ *  runs can leave a prefix of a key straddling the cut. Names the request and status, or the
+ *  error class and system code. */
+function failureDiagnostic(err: unknown): string {
+  if (err instanceof RequestError) return logSafe(`${err.method} ${err.path} returned ${err.status}`, 200);
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return logSafe(`${err.name}${typeof code === "string" ? ` ${code}` : ""}`, 100);
+  }
+  return "failed";
+}
+
 const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
 
 /** The lexical (no filesystem) check of the `output_files` a model submits: an array of at most
@@ -155,11 +168,21 @@ export function partitionOutputFiles(raw: unknown, redactText: TextRedactor): Ou
   const clean: string[] = [];
   const keyed: string[] = [];
   for (const p of raw as string[]) {
-    const display = outputDisplayName(p);
-    if (redactText(p) !== p || redactText(display) !== display || redactText(display.toLowerCase()) !== display.toLowerCase()) keyed.push(p);
+    if (outputNameCarriesKey(p, redactText)) keyed.push(p);
     else clean.push(p);
   }
   return { ok: true, clean, keyed };
+}
+
+/** True when the raw path, its UNCAPPED basename, or the capped display name (each also lowercased)
+ *  is changed by `redactText`. The uncapped basename is checked before the display cut: a case
+ *  variant of a key near the end of a long name can be cut in two by the display cap, which no
+ *  check of the capped name alone would see; the capped name is still checked because the cut can
+ *  also join text that was separate in the original. */
+export function outputNameCarriesKey(rel: string, redactText: TextRedactor): boolean {
+  const base = rel.slice(rel.lastIndexOf("/") + 1).replace(/[\p{C}\p{Zl}\p{Zp}]/gu, "").trim();
+  const display = outputDisplayName(rel);
+  return [rel, base, display].some((t) => redactText(t) !== t || redactText(t.toLowerCase()) !== t.toLowerCase());
 }
 
 /** A workspace file resolved for upload. */
@@ -556,7 +579,7 @@ export async function uploadJobOutputs(args: UploadJobOutputsArgs): Promise<Uplo
         }
         // A local read failure (the file vanished, unreadable): this file only.
         drop(c.displayName, "worker_unreadable");
-        log.warn("job output file could not be read; skipped", { file: logSafe(c.displayName), error: logSafe(errMessage(err)) });
+        log.warn("job output file could not be read; skipped", { file: logSafe(c.displayName), error: failureDiagnostic(err) });
       } finally {
         await opened?.fh.close().catch(() => undefined);
       }
@@ -622,7 +645,7 @@ async function uploadWithRetry(
           retryAfterMs = err.retryAfterHeaderMs;
         }
       }
-      log.warn("job output upload failed", { file: logSafe(meta.display_name), attempt: attempt + 1, error: logSafe(errMessage(err)) });
+      log.warn("job output upload failed", { file: logSafe(meta.display_name), attempt: attempt + 1, error: failureDiagnostic(err) });
       if (attempt + 1 >= OUTPUT_UPLOAD_ATTEMPTS) break;
       const wait = retryAfterMs ?? delays[attempt] ?? delays[delays.length - 1] ?? 0;
       const left = Math.max(0, args.deadlineAt - Date.now());

@@ -74,7 +74,7 @@ import {
   writeJobInputs,
   type JobWorkspace,
 } from "./job-workspace.js";
-import { OUTPUT_FILES_MAX, outputDisplayName, partitionOutputFiles, resolveOutputFile, uploadJobOutputs, uploadPhaseDeadline, validateOutputFilePaths } from "./job-outputs.js";
+import { OUTPUT_FILES_MAX, outputDisplayName, outputNameCarriesKey, partitionOutputFiles, resolveOutputFile, uploadJobOutputs, uploadPhaseDeadline, validateOutputFilePaths } from "./job-outputs.js";
 import { classifyLimitFailure, describeLimit, LimitReachedError, RateLimitObserver } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { Outbox } from "./outbox.js";
@@ -1216,7 +1216,7 @@ export class JobRunner {
         if (err instanceof JobInputError) {
           throw new JobFileFailure(`job input file "${shown}" was refused: ${err.message}`, err);
         }
-        throw new JobFileFailure(`could not download job input file "${shown}": ${errMessage(err).slice(0, 200)}`, err);
+        throw new JobFileFailure(`could not download job input file "${shown}": ${errMessage(err)}`, err);
       }
     }
   }
@@ -1466,7 +1466,7 @@ export class JobRunner {
       return clean(full) && clean(name) ? name : null;
     };
     const outputFiles = (store.outputFiles ?? []).filter((rel) => {
-      if (redactText(rel) === rel && redactText(outputDisplayName(rel)) === outputDisplayName(rel)) return true;
+      if (!outputNameCarriesKey(rel, redactText)) return true;
       const display_name = withheldName(rel) ?? `withheld-output-${unsafeNames.length + 1}`;
       if (!unsafeNames.some((u) => u.display_name === display_name)) unsafeNames.push({ display_name, reason: "worker_unreadable" });
       return false;
