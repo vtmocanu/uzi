@@ -2,6 +2,42 @@
 -- driver is MaterializeRunUsageFolds (run_usage_folds.go); these statements are its steps
 -- and are deliberately SEPARATE statements, see the invariants documented there.
 
+-- Issue #4700 M2: the UsageFolder lanes (usage_folder.go). Both join runs and apply the same
+-- eligibility predicate as the materializer, so a TRUNCATE orphan (a state row whose run is
+-- gone) never matches. Neither takes a lock: they only pick candidates; the materializer
+-- decides under its own locks.
+
+-- name: ListStaleRunUsageFoldRuns :many
+-- Stale lane: eligible runs whose state row is stale, by ascending run_id after a wrapping
+-- cursor. Served by idx_run_usage_fold_state_stale (run_id) WHERE stale. @skip is the folder's
+-- bounded poison/skip set.
+SELECT s.run_id FROM run_usage_fold_state s
+JOIN runs r ON r.id = s.run_id
+WHERE s.stale
+  AND s.run_id > @after::uuid
+  AND NOT (s.run_id = ANY(@skip::uuid[]))
+  AND r.status IN ('completed', 'failed', 'cancelled')
+  AND r.kind <> 'chat'
+  AND r.usage_refolded
+ORDER BY s.run_id
+LIMIT @lim::int;
+
+-- name: ListMissingRunUsageFoldRuns :many
+-- Missing lane: eligible runs with no state row, newest first, by a keyset cursor over
+-- (created_at DESC, id DESC): the next page is the rows strictly before (@c, @cid). runs has no
+-- plain created_at index, so each call is a filtered scan plus top-N sort of the eligible set;
+-- the folder bounds that with the lane deadline and a 5 minute backoff after an empty
+-- traversal.
+SELECT r.id, r.created_at FROM runs r
+WHERE (r.created_at, r.id) < (@c::timestamptz, @cid::uuid)
+  AND NOT (r.id = ANY(@skip::uuid[]))
+  AND r.status IN ('completed', 'failed', 'cancelled')
+  AND r.kind <> 'chat'
+  AND r.usage_refolded
+  AND NOT EXISTS (SELECT 1 FROM run_usage_fold_state s WHERE s.run_id = r.id)
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT @lim::int;
+
 -- name: LockRunForUsageRefold :one
 -- First statement of RefoldRunUsage's transaction: takes the runs row FOR UPDATE (not FOR NO
 -- KEY UPDATE) before the refold touches run_usage. Every run_usage writer holds the runs row

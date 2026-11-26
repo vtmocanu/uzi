@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteRunUsageModelFolds = `-- name: DeleteRunUsageModelFolds :exec
@@ -51,14 +52,115 @@ func (q *Queries) InsertRunUsageModelFolds(ctx context.Context, l []uuid.UUID) (
 	return result.RowsAffected(), nil
 }
 
-const lockRunForUsageRefold = `-- name: LockRunForUsageRefold :one
-
-SELECT id FROM runs WHERE id = $1 FOR UPDATE
+const listMissingRunUsageFoldRuns = `-- name: ListMissingRunUsageFoldRuns :many
+SELECT r.id, r.created_at FROM runs r
+WHERE (r.created_at, r.id) < ($1::timestamptz, $2::uuid)
+  AND NOT (r.id = ANY($3::uuid[]))
+  AND r.status IN ('completed', 'failed', 'cancelled')
+  AND r.kind <> 'chat'
+  AND r.usage_refolded
+  AND NOT EXISTS (SELECT 1 FROM run_usage_fold_state s WHERE s.run_id = r.id)
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT $4::int
 `
+
+type ListMissingRunUsageFoldRunsParams struct {
+	C    pgtype.Timestamptz `json:"c"`
+	Cid  uuid.UUID          `json:"cid"`
+	Skip []uuid.UUID        `json:"skip"`
+	Lim  int32              `json:"lim"`
+}
+
+type ListMissingRunUsageFoldRunsRow struct {
+	ID        uuid.UUID          `json:"id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Missing lane: eligible runs with no state row, newest first, by a keyset cursor over
+// (created_at DESC, id DESC): the next page is the rows strictly before (@c, @cid). runs has no
+// plain created_at index, so each call is a filtered scan plus top-N sort of the eligible set;
+// the folder bounds that with the lane deadline and a 5 minute backoff after an empty
+// traversal.
+func (q *Queries) ListMissingRunUsageFoldRuns(ctx context.Context, arg ListMissingRunUsageFoldRunsParams) ([]ListMissingRunUsageFoldRunsRow, error) {
+	rows, err := q.db.Query(ctx, listMissingRunUsageFoldRuns,
+		arg.C,
+		arg.Cid,
+		arg.Skip,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMissingRunUsageFoldRunsRow{}
+	for rows.Next() {
+		var i ListMissingRunUsageFoldRunsRow
+		if err := rows.Scan(&i.ID, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStaleRunUsageFoldRuns = `-- name: ListStaleRunUsageFoldRuns :many
+
+
+SELECT s.run_id FROM run_usage_fold_state s
+JOIN runs r ON r.id = s.run_id
+WHERE s.stale
+  AND s.run_id > $1::uuid
+  AND NOT (s.run_id = ANY($2::uuid[]))
+  AND r.status IN ('completed', 'failed', 'cancelled')
+  AND r.kind <> 'chat'
+  AND r.usage_refolded
+ORDER BY s.run_id
+LIMIT $3::int
+`
+
+type ListStaleRunUsageFoldRunsParams struct {
+	After uuid.UUID   `json:"after"`
+	Skip  []uuid.UUID `json:"skip"`
+	Lim   int32       `json:"lim"`
+}
 
 // Issue #4700: run_usage fold materializer and refold lock (migration 00543). The Go
 // driver is MaterializeRunUsageFolds (run_usage_folds.go); these statements are its steps
 // and are deliberately SEPARATE statements, see the invariants documented there.
+// Issue #4700 M2: the UsageFolder lanes (usage_folder.go). Both join runs and apply the same
+// eligibility predicate as the materializer, so a TRUNCATE orphan (a state row whose run is
+// gone) never matches. Neither takes a lock: they only pick candidates; the materializer
+// decides under its own locks.
+// Stale lane: eligible runs whose state row is stale, by ascending run_id after a wrapping
+// cursor. Served by idx_run_usage_fold_state_stale (run_id) WHERE stale. @skip is the folder's
+// bounded poison/skip set.
+func (q *Queries) ListStaleRunUsageFoldRuns(ctx context.Context, arg ListStaleRunUsageFoldRunsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listStaleRunUsageFoldRuns, arg.After, arg.Skip, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var run_id uuid.UUID
+		if err := rows.Scan(&run_id); err != nil {
+			return nil, err
+		}
+		items = append(items, run_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockRunForUsageRefold = `-- name: LockRunForUsageRefold :one
+SELECT id FROM runs WHERE id = $1 FOR UPDATE
+`
+
 // First statement of RefoldRunUsage's transaction: takes the runs row FOR UPDATE (not FOR NO
 // KEY UPDATE) before the refold touches run_usage. Every run_usage writer holds the runs row
 // FOR KEY SHARE until its transaction ends (fn_run_usage_fold_lock, migration 00543), and FOR

@@ -773,7 +773,10 @@ func run() error {
 	// Project a successful uzi-originated column move onto a linked GitHub Projects
 	// v2 Status (PRD #364 M5), best-effort. The same service backs the drag handler.
 	lifecycle.SetProjector(projectSync)
-	wsvc.SetLifecycle(lifecycle)
+	// Usage fold (#4700 M2): the lifecycle also kicks a per-run materialization on a terminal
+	// status; the returned sweeper pass is the safety net registered with sweeper.New below.
+	usageFolder := store.NewUsageFolder(pool, store.UsageFolderOptions{})
+	usageFoldPass := wireUsageFolder(wsvc, lifecycle, usageFolder)
 	// Admin-health loop-beat: the run-lifecycle reconciler is one of the four loops (M2).
 	lifecycle.SetBeat(func() { healthBeats.Beat("lifecycle") })
 	healthBeats.Register("lifecycle", lifecycle.Interval())
@@ -873,6 +876,7 @@ func run() error {
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
+		usageFoldPass,
 		sweeper.Pass{
 			Name: "vault_browser_slots_expired",
 			Run: func(ctx context.Context) (int64, error) {
@@ -1799,10 +1803,21 @@ func run() error {
 	// any in-flight ones to finish before the deferred pool.Close so they don't
 	// race a closing pool.
 	lifecycle.Wait()
+	// Same for the usage-fold kicks: bounded, so a stuck materialization cannot hang shutdown
+	// (a kick cut short leaves its run for the sweeper pass of the next process).
+	foldWaitCtx, foldWaitCancel := context.WithTimeout(context.Background(), usageFolderShutdownBudget)
+	if err := usageFolder.Wait(foldWaitCtx); err != nil {
+		slog.Warn("shutdown: usage fold kicks still in flight at the drain deadline", "error", err)
+	}
+	foldWaitCancel()
 	return runErr
 }
 
 const prerequisiteShutdownBudget = 5 * time.Second
+
+// usageFolderShutdownBudget bounds the wait for in-flight usage-fold kicks at shutdown,
+// matching the sibling drain budget above.
+const usageFolderShutdownBudget = 5 * time.Second
 
 // drainShutdownWork joins the prerequisite drain alongside the existing generated-output
 // drain. Call after HTTP shutdown and before pool.Close. Each callback owns its bounded
