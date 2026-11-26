@@ -464,7 +464,7 @@ var evIndexes = []struct{ name, ddl string }{
 	{"evid_runs_user_repo_mr_merged_idx", `CREATE INDEX evid_runs_user_repo_mr_merged_idx ON runs (user_id, repo_id, mr_iid) WHERE mr_state = 'merged'`},
 	// #4731 candidate: the terminal-end arm of the admin all-users Capacity statement (no user prefix).
 	{"evid_runs_terminal_end_idx", `CREATE INDEX evid_runs_terminal_end_idx ON runs ((COALESCE(finished_at, status_since))) WHERE status IN ('completed', 'failed', 'cancelled')`},
-	// Issue #4730 candidates (5 and 6): the rework join and the cross-check decision window.
+	// Issue #4730 candidates (6 and 7): the rework join and the cross-check decision window.
 	{"evid_runs_rework_repo_mr_idx", `CREATE INDEX evid_runs_rework_repo_mr_idx ON runs (repo_id, mr_iid) WHERE kind = 'mr_rework'`},
 	{"evid_cc_decided_idx", `CREATE INDEX evid_cc_decided_idx ON cross_checks (decided_at)`},
 }
