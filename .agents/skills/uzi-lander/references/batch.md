@@ -137,8 +137,11 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
 - **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
 - **Main CI**: keep the newest main CI, KinD and CodeQL runs. After a newer main push,
   use `S/ci-lane.sh plan` to inspect older runs, then `apply --log FILE` to force-cancel
-  eligible runs and verify the outcome. The same plan covers ungranted PR runs and
-  proposes the next slots. Use `plan --json --evidence FILE` with head-pinned
+  eligible runs and verify the outcome. An older main run is eligible only if
+  the descendant at the current tip has a replacement for the same workflow
+  that is active or completed with success, failure, or a timeout. A skip-CI
+  push can leave the older run as the latest check. The same plan covers
+  ungranted PR runs and proposes the next slots. Use `plan --json --evidence FILE` with head-pinned
   `{pr,head,blocks,red_main_or_release_fix,conflict_prone,relied_on}` records for
   the proposal. Keep unpublished `chore(release)` runs and main runs more than 85%
   complete. Keep the exact or two-hop metadata CI evidence needed for publication.
