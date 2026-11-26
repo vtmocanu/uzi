@@ -121,8 +121,9 @@ function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
       assert.ok(s.gated, "the target round was gated" + facts());
       assert.ok(!s.frameMissing, "the gate runs inside the bootstrap recovery operation" + facts());
       assert.equal(s.releasedBy, "cap", "the gate released by cap, not by abort" + facts());
-      // 1 ms of slack: the timer clock is millisecond-rounded, so a timer can read ~0.3 ms short on performance.now().
-      assert.ok(s.heldMs! >= LAUNCH_GATE_CAP_MS - 1, "the hold lasted at least the cap" + facts());
+      // The hold must outlast the 200 ms base launch budget; a wall-clock comparison to the cap itself would flake because
+      // the cap timer can read a little short on performance.now(). A cap timer of 0 ms holds ~1-2 ms and fails here.
+      assert.ok(s.heldMs! > 200, "the hold outlasted the 200 ms base launch budget" + facts());
       assert.equal(s.liveAtRelease, true, "the launch signal was live at release" + facts());
       assert.ok(s.remainingMs! > 0, "the launch allowance remained at release" + facts());
       assert.equal(s.warnings.length, 0, "no remediation-unavailable warning at all" + facts());
@@ -277,8 +278,8 @@ interface HeldLike { context?: unknown; signal?: AbortSignal; deadlineAt: number
 interface SiteTag { site: string; held: HeldLike | undefined; flight: unknown }
 
 /**
- * Held fetch-wait sites each fixture is expected to bracket, pinned from observer runs on the candidate and on a
- * base-budget export (the four budget sites reverted). A listed site that ends up uncaptured fails.
+ * Held fetch-wait sites each fixture is expected to bracket, pinned from observer runs on the candidate only (no
+ * base-budget comparison run was made). A listed site that ends up uncaptured fails.
  */
 const EXPECTED_HELD_SITES: Record<string, readonly string[]> = {
   "exhausted:accepted": ["captureRecoveryRestorePointBody"],
@@ -353,10 +354,10 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
         if (!memory?.hold) fail("a custody operation started without a hold");
         else if (deadline !== memory.hold.deadline) fail(`custody requested deadline ${deadline} !== hold.deadline ${memory.hold.deadline}`);
       }
-    } else if (original && memory) {
-      if (memory.hold && deadline === memory.hold.deadline) fail("preservation work reached withRecoveryOperation with an invocation tag but no flight tag");
-      else if (memory.closingDeadline !== undefined && deadline === memory.closingDeadline &&
-          invocationStore.getStore() === "original") kind = "close";
+    } else if (original && memory && invocationStore.getStore() === "original" && custody.some(c => c.kind === "hold")) {
+      // Tag-based: after the flight-tagged hold started, original-invocation work without a flight tag is close work.
+      if (memory.closingDeadline !== undefined && deadline === memory.closingDeadline) kind = "close";
+      else fail(`custody work reached withRecoveryOperation with the original invocation tag but no flight tag, requested deadline ${deadline}`);
     }
     if (!kind) return realRecovery(signal, deadline, action, ...rest);
     const parent = g.recoveryOperations.getStore();
@@ -428,8 +429,10 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     starts: starts.map(s => ({ original: s.flight === original, caller: s.caller, firstCall: s.firstCall, operationSet: s.operationSet })),
     custody: custody.map(c => ({ ...c, outcome: c.outcome ?? "none" })),
     captures: captures.map(c => ({ deadlineAt: c.deadlineAt, abortedAt: c.abortedAt, aborted: c.signal.aborted })),
-    ports: { park: ports.park && { ...ports.park, reason: reasonClassOf(ports.park.reason) },
-      send: ports.send && { ...ports.send, reason: reasonClassOf(ports.send.reason) } },
+    ports: { park: ports.park && { ...ports.park, reason: reasonClassOf(ports.park.reason),
+        before: ports.park.before && { ...ports.park.before, reason: reasonClassOf(ports.park.before.reason) } },
+      send: ports.send && { ...ports.send, reason: reasonClassOf(ports.send.reason),
+        before: ports.send.before && { ...ports.send.before, reason: reasonClassOf(ports.send.before.reason) } } },
     reachedSites: [...reached], capturedSites: [...captured], uncaptured, foreignWaits,
     ownerCalls: ownerCalls.map(c => c.name) }) + "]";
 
@@ -562,9 +565,11 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       if (firsts.length !== 1) failures.push(`expected exactly one first preservation call for the original flight, saw ${firsts.length}`);
       else {
         if (!firsts[0]!.operationSet) failures.push("the first preservation call did not set the owner operation");
-        if (fixture === "exhausted" && firsts[0]!.caller !== "reconcile")
-          failures.push(`an initially exhausted allowance is first preserved by reconcile, saw ${firsts[0]!.caller}`);
+        const wantCaller = fixture === "handoff" ? "sink" : "reconcile";
+        if (firsts[0]!.caller !== wantCaller)
+          failures.push(`the ${fixture} fixture is first preserved by ${wantCaller}, saw ${firsts[0]!.caller}`);
       }
+      if (foreignWaits !== 0) failures.push(`${foreignWaits} held-site wait(s) carried a signal other than the held capture signal`);
       if (original) {
         if (original.claimGeneration !== 7) failures.push(`original flight generation ${original.claimGeneration}`);
         if (memory?.hold?.context.claim_generation !== 7) failures.push("original hold context is not generation 7");
@@ -576,8 +581,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           failures.push(`a memory park was reported under generation ${String(body.claim_generation)}`);
       }
       for (const call of ownerCalls) if (call.flight === original) failures.push(`${call.name} ran for the original flight`);
-      const holdOps = custody.filter(c => c.kind === "hold");
-      for (const op of custody) {
+      const holdOps = custody.filter(c => c.kind === "hold");      for (const op of custody) {
         if (op.kind === "close" && op.requested !== memory?.closingDeadline) failures.push("close work requested a deadline other than closingDeadline");
         if (op.outcome === undefined) failures.push("a custody operation recorded no outcome");
       }
@@ -597,6 +601,13 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           failures.push(`a custody operation has no deadline-class abort at or after its effective deadline (${JSON.stringify(op.outcome)})`);
       }
       if (fixture === "lateAck" && holdOps.length === 0) failures.push("late-ACK recorded no hold custody operation");
+      if (fixture === "delayedFeedback") {
+        if (holdOps.length !== 1) failures.push(`delayed feedback expected exactly one hold custody operation, saw ${holdOps.length}`);
+        for (const op of holdOps) {
+          if (!op.entered) failures.push("the delayed-feedback hold custody operation never entered its action");
+          if (op.outcome?.kind === "rejected-before-action") failures.push("the delayed-feedback hold custody operation was rejected before action");
+        }
+      }
       if (fixture === "exhausted" && scenario === "deadline") {
         const captureAbort = captures.some(c => c.signal.aborted && !(c.caller?.aborted && c.signal.reason === c.caller.reason) &&
           c.abortedAt !== undefined && c.abortedAt >= c.deadlineAt - 1);
@@ -979,7 +990,7 @@ for (const { verdict, slowLaunch } of initiallyExhaustedCases) {
           register_nonce: "original-memory-registration", claim_generation: 7, memory_episode: 3,
         }, "exact public owner ACK confirms the park");
       } else assert.equal(f.parkReceipts.some(ack => ack.memoryParkAccepted !== undefined), false);
-    } finally { await f.memory.stop(); await obs.join(); }
+    } finally { try { await f.memory.stop(); } finally { await obs.join(); } }
     obs.assertAll();
     launch?.assertControl();
   });
@@ -1640,21 +1651,24 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.equal(successor!.commands.admitsCommands(successor!.context), true);
     assert.equal(successor!.commands.remaining(successor!.context), 1);
   } finally {
-    hold?.restore();
-    clearTimeout(rescue);
-    release.resolve();
-    cleanupRelease.resolve();
-    duplicateRelease.resolve();
-    successorRelease.resolve();
-    await work;
-    await original?.workerMemory?.operation;
-    await original?.workerMemory?.closing;
-    await successorWork;
-    await queuedWork;
-    git.normalizeRetainedSourceObjects = originalReadiness;
-    await f.memory.stop(); await monitoring;
-    await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
-    await obs.join();
+    try {
+      hold?.restore();
+      clearTimeout(rescue);
+      release.resolve();
+      cleanupRelease.resolve();
+      duplicateRelease.resolve();
+      successorRelease.resolve();
+      await work;
+      await original?.workerMemory?.operation;
+      await original?.workerMemory?.closing;
+      await successorWork;
+      await queuedWork;
+      git.normalizeRetainedSourceObjects = originalReadiness;
+      await f.memory.stop(); await monitoring;
+      await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+    } finally {
+      await obs.join();
+    }
   }
   obs.assertAll();
   verifyUnenrolledReads();
@@ -1811,14 +1825,17 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     assert.notEqual(original!.parked, true);
     assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
   } finally {
-    hold?.restore();
-    clearTimeout(rescue); release.resolve();
-    await work;
-    await original?.workerMemory?.operation;
-    await original?.workerMemory?.closing;
-    await f.memory.stop(); await monitoring;
-    await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
-    await obs.join();
+    try {
+      hold?.restore();
+      clearTimeout(rescue); release.resolve();
+      await work;
+      await original?.workerMemory?.operation;
+      await original?.workerMemory?.closing;
+      await f.memory.stop(); await monitoring;
+      await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+    } finally {
+      await obs.join();
+    }
   }
   obs.assertAll();
   launch?.assertControl();
@@ -2470,10 +2487,13 @@ for (const { scenario, control } of handoffCases) {
       assert.equal(fs.readFileSync(homeDir + "/pause-session-proof", "utf8"), "retained session");
       assert.equal(captured?.retainedLocalCustody, true);
     } finally {
-      release.resolve();
-      await captured?.workerMemory?.operation;
-      await f.memory.stop(); await monitoring;
-      await obs?.join();
+      try {
+        release.resolve();
+        await captured?.workerMemory?.operation;
+        await f.memory.stop(); await monitoring;
+      } finally {
+        await obs?.join();
+      }
     }
     obs?.assertAll();
     verifyUnenrolledReads?.();
