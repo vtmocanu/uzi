@@ -2,8 +2,8 @@ package apitypes
 
 import "time"
 
-// Issue #4684: wire DTOs of the scoped usage analytics API
-// (GET /api/analytics/{options,spend} and GET /api/admin/analytics/{options,spend}).
+// Issues #4684 and #4731: wire DTOs of the scoped usage analytics API
+// (GET /api/analytics/{options,spend,capacity} and GET /api/admin/analytics/{options,spend,capacity}).
 //
 // Conventions shared by every type below:
 //   - Dollar amounts (cost_usd, numerator_usd and ratio values) are float64 converted from the
@@ -12,8 +12,8 @@ import "time"
 //   - A nullable measure, rate or ratio that is null travels with a reason (for example
 //     no_completed_delivery_runs, no_merged_prs, no_applicable_runs, no_input_tokens,
 //     no_finished_runs, not_applicable). Nullable metadata fields are null without a reason and
-//     say so on the field: limitations[].runs, filters.repo and filters.harness,
-//     excluded_kind_selected, identity user_id and email, and set_state.
+//     say so on the field, for example history_start, limitations[].runs, filters.repo and
+//     filters.harness, excluded_kind_selected, identity user_id and email, and set_state.
 //   - "index" in a cell is the zero-based position in the response's buckets (or rolling) array.
 //   - Timestamps are UTC RFC 3339.
 

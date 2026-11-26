@@ -430,7 +430,8 @@ func TestAnalyticsCapacitySelectorAttributionLiveDB(t *testing.T) {
 
 // Staleness is judged at the request's captured clock (h.now), not the wall clock. The fixture year
 // is in the past, so a reading synced a minute before the pinned now would read stale (and a Codex
-// account stale) if either gauge call site used time.Now instead.
+// account stale) if any gauge call site (owner and admin all-users Anthropic, Codex) used
+// time.Now instead.
 func TestAnalyticsCapacityGaugeStalenessUsesRequestClockLiveDB(t *testing.T) {
 	f := newCapFixture(t, 2020, true)
 	u := f.user(false)
@@ -445,6 +446,17 @@ func TestAnalyticsCapacityGaugeStalenessUsesRequestClockLiveDB(t *testing.T) {
 	c, ok := capCodexByAccount(dto.Gauges.Codex, acct)
 	if !ok || c.Status != "fresh" {
 		t.Fatalf("codex identity = %+v (found %v), want status fresh at the request clock", c, ok)
+	}
+
+	// The admin all-users route maps its own store rows through a separate call site.
+	all := f.capAdmin(f.user(true), "")
+	a, ok = capAnthropicBySecret(all.Gauges.Anthropic, tok)
+	if !ok || a.Limits.Status != "ok" || a.Limits.Stale == nil || *a.Limits.Stale {
+		t.Fatalf("admin all-users anthropic identity = %+v (found %v), want a fresh reading at the request clock", a, ok)
+	}
+	c, ok = capCodexByAccount(all.Gauges.Codex, acct)
+	if !ok || c.Status != "fresh" {
+		t.Fatalf("admin all-users codex identity = %+v (found %v), want status fresh at the request clock", c, ok)
 	}
 }
 
