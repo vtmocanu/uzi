@@ -742,11 +742,18 @@ func TestUsageFolderLaneQueryErrorAfterRetryDoesNotBackOffLiveDB(t *testing.T) {
 	// budget and succeeds, then the lane query fails with less than half a budget left.
 	retryPhase.Store(true)
 	db.failTx.Store(true)
+	before2 := db.begins.Load()
 	if _, err := f.Pass(context.Background()); err == nil {
 		t.Fatal("Pass 2 with failing lane queries returned nil, want the query error")
 	}
 	if !slept.Load() {
 		t.Fatal("the run-by-run retry never ran: the deadline batch was not remembered")
+	}
+	// Non-vacuity: the missing lane must actually have reached its (failing) query with the short
+	// budget left after the retry; if the retry overran the lane deadline instead, Pass 3 below
+	// would see 2 begins on fixed and reverted code alike.
+	if got := db.begins.Load() - before2; got != 2 {
+		t.Fatalf("lane queries begun by Pass 2 = %d, want 2 (the missing lane did not reach its query after the retry)", got)
 	}
 	retryPhase.Store(false)
 
