@@ -178,7 +178,7 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   `/api/v1/jobs` for an owner whose Claude source is a provider runs on that provider, frozen when
   the job is created, with your provider key and no Anthropic token. A job that names a site list
   (`egress_profile`) is still refused with `provider_lane_unsupported`, and site-list jobs on a
-  provider are not shipped yet. A job never parks: revocation or a gateway rate limit fails it. The
+  provider are not shipped yet. A job never parks: revocation (a removed allowlist entry or a replaced, disabled or deleted key) or a gateway rate limit fails it. The
   same redirect risk applies, and the job's agent can see your provider key in its environment. The
   worker scrubs the key from what the job publishes and withholds output files that carry it, but
   matching covers only the key's raw, JSON-escaped, `\/`, `\u`-escaped and percent-encoded forms (other
@@ -208,10 +208,11 @@ use your current source. Editing a provider's model map creates a new revision f
 and older ones keep theirs.
 
 Revocation takes effect at the run's **next claim**, not mid-claim, and cancelling is the
-immediate stop. If the operator removes the URL from the allowlist, the run pauses as
-`provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the
+immediate stop. If the operator removes the URL from the allowlist, the run (a job excepted, below)
+pauses as `provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the
 key was replaced, disabled or deleted, the run pauses as `provider_binding_stale`: it cannot
-continue, so cancel it and start a new run, which uses the current key.
+continue, so cancel it and start a new run, which uses the current key. A job never pauses: a
+removed allowlist entry, or a replaced, disabled or deleted key, fails it with the same reason.
 
 ### Gateway rate limits
 

@@ -512,10 +512,20 @@ func TestProviderJobCreateRaceWriterFirstLiveDB(t *testing.T) {
 				err error
 			}
 			done := make(chan result, 1)
+			// A failure below must not leave the create racing the fixture cleanup: cancel it, release the
+			// writer and join the goroutine first (this cleanup was registered after the fixture's, so it runs before it).
+			gctx, cancelCreate := context.WithCancel(ctx)
+			joined := make(chan struct{})
 			go func() {
-				v, err := p.svc.CreateJobRun(ctx, req)
+				defer close(joined)
+				v, err := p.svc.CreateJobRun(gctx, req)
 				done <- result{v, err}
 			}()
+			t.Cleanup(func() {
+				cancelCreate()
+				_ = tx.Rollback(ctx)
+				<-joined
+			})
 			deadline := time.Now().Add(10 * time.Second)
 			for p.waiters() < 1 {
 				select {
@@ -602,6 +612,13 @@ func TestProviderJobCreateVisibilityLiveDB(t *testing.T) {
 		}
 		if r, in, o, a := counts(p, v.ID, f.ID); r != 1 || in != 1 || o != 1 || a != 1 {
 			t.Fatalf("after commit runs=%d inputs=%d origins=%d attached=%d, want all 1", r, in, o, a)
+		}
+		var inName, inContent string
+		if err := p.aux.QueryRow(p.env.ctx, `SELECT name, content_md FROM job_inputs WHERE run_id = $1`, v.ID).Scan(&inName, &inContent); err != nil {
+			t.Fatalf("read the persisted input: %v", err)
+		}
+		if inName != "notes.md" || inContent != "alpha" {
+			t.Fatalf("persisted input = (%q, %q), want (notes.md, alpha)", inName, inContent)
 		}
 	})
 	t.Run("(ii) a commit-seam failure leaves nothing", func(t *testing.T) {
@@ -816,8 +833,14 @@ func TestProviderJobClaimFinalRecheckLiveDB(t *testing.T) {
 	t.Run("a stale finisher settles nothing", func(t *testing.T) {
 		p := newPJobFix(t)
 		r := p.mustCreate()
+		var genAtHook int64
+		assembled := false
 		p.svc.claimHooks = &claimTestHooks{
-			afterAssembly: func(context.Context, store.Run, *ClaimPayload, error) {
+			afterAssembly: func(_ context.Context, run store.Run, payload *ClaimPayload, err error) {
+				if run.ID == r.ID && err == nil && payload != nil && payload.Secrets.Provider != nil {
+					assembled = true
+				}
+				genAtHook = mustRun(t, p.env, r.ID).ClaimGeneration
 				p.env.exec(`UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, p.key)
 				p.env.exec(`UPDATE runs SET claim_generation = claim_generation + 1 WHERE id = $1`, r.ID)
 			},
@@ -827,8 +850,15 @@ func TestProviderJobClaimFinalRecheckLiveDB(t *testing.T) {
 		if err != nil || payload != nil {
 			t.Fatalf("Claim = (%v, %v), want idle", payload != nil, err)
 		}
-		if got := mustRun(t, p.env, r.ID); got.Status != "claimed" || got.FailOrigin.Valid || got.HoldReason.Valid {
+		if !assembled {
+			t.Fatal("assembly did not succeed before the newer claim generation, so the stale finisher race was not reached")
+		}
+		got := mustRun(t, p.env, r.ID)
+		if got.Status != "claimed" || got.FailOrigin.Valid || got.HoldReason.Valid {
 			t.Fatalf("stale finisher settled the run: status=%s origin=%v hold=%v", got.Status, got.FailOrigin, got.HoldReason)
+		}
+		if got.ClaimGeneration != genAtHook+1 {
+			t.Fatalf("claim_generation = %d, want %d: the stale finisher changed the advanced generation", got.ClaimGeneration, genAtHook+1)
 		}
 	})
 }

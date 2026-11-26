@@ -75,15 +75,24 @@ func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 			t.Errorf("%s: err = %v, want terminal provider_lane_unsupported", kind, err)
 		}
 	}
-	// A Codex-bound job is refused whatever the worker advertises (the job lane is Claude-only); a
-	// Codex-bound judge is refused here only because this worker advertises no Codex capability.
+	// A Codex-bound job is refused as an unsupported lane whatever the worker advertises: the worker
+	// below advertises every Claude and Codex capability, so the capability check cannot be what
+	// refuses it (were the lane restriction removed, the claim would proceed to the nil store and panic).
+	allCaps := store.Worker{ProtocolCapabilities: []string{
+		capability.ClaudeProviderV1, capability.ClaudeProviderJudgeV1, capability.ClaudeProviderJobV1,
+		capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexProviderJudgeV1,
+	}}
+	codexJob := providerBoundRow(runkind.Job)
+	codexJob.Harness = harnessCodex
+	if _, err := svc.assembleClaim(context.Background(), allCaps, codexJob); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Errorf("codex-bound job: err = %v, want terminal provider_lane_unsupported", err)
+	}
+	// A Codex-bound judge is supported; this worker advertises no Codex capability, so that alone refuses it.
 	allClaude := store.Worker{ProtocolCapabilities: []string{capability.ClaudeProviderV1, capability.ClaudeProviderJudgeV1, capability.ClaudeProviderJobV1}}
-	for _, kind := range []string{runkind.Judge, runkind.Job} {
-		row := providerBoundRow(kind)
-		row.Harness = harnessCodex
-		if _, err := svc.assembleClaim(context.Background(), allClaude, row); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
-			t.Errorf("codex-bound %s: err = %v, want terminal provider_lane_unsupported", kind, err)
-		}
+	codexJudge := providerBoundRow(runkind.Judge)
+	codexJudge.Harness = harnessCodex
+	if _, err := svc.assembleClaim(context.Background(), allClaude, codexJudge); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Errorf("codex-bound judge: err = %v, want terminal provider_lane_unsupported", err)
 	}
 	iso := providerBoundRow(runkind.Issue)
 	iso.EgressProfileID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
@@ -112,8 +121,6 @@ func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 			t.Errorf("assembleJobClaim caps %v: err = %v, want terminal provider_lane_unsupported", caps, err)
 		}
 	}
-	codexJob := providerBoundRow(runkind.Job)
-	codexJob.Harness = harnessCodex
 	if _, err := jobSvc.assembleJobClaim(context.Background(), allClaude, codexJob); !errors.Is(err, errCredentialUnavailable) {
 		t.Errorf("assembleJobClaim codex: err = %v, want errCredentialUnavailable", err)
 	}
