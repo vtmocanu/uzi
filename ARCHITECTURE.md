@@ -537,8 +537,14 @@ vendor fallback. A provider run's claim carries one `provider` object and no
 `anthropic_oauth_token`; the worker maps it onto the SDK env in `buildSdkEnv`. Issue runs wait out
 a gateway 429 or overload as `limit_wait` (`provider_gateway_limit`) on a 1, 5, 15 minute
 schedule and then for the owner; chat ends the turn instead. Usage is recorded with
-`cost_status='unreported'`. The job, cross-check and isolated lanes refuse provider-sourced
-owners (`provider_lane_unsupported`). The judge no longer does for Claude (PRD #4322 M1a): its
+`cost_status='unreported'`. The cross-check and isolated lanes refuse provider-sourced
+owners (`provider_lane_unsupported`), as does a site-list job. An ordinary job (no `egress_profile`) no
+longer does (PRD #4322 M1b): `CreateJobRun` freezes the owner's Claude source under the secret-mutation lock
+and validates one canonical job model, its claim carries only the provider binding (no Anthropic token or
+run credential epoch) and needs `claude_provider_job_v1` plus `claude_provider_v1` on a non-Docker worker,
+a provider refusal fails it as `credential_unavailable` and a gateway limit fails it (jobs never park),
+and the worker scrubs the bound key from results and scans every output file for its bytes (byte-exact only;
+accidental-publication protection, not a defence against the job's own agent). The judge no longer refuses for Claude (PRD #4322 M1a): its
 lane decision (`decideJudgeLane`, taken under the shared secret-mutation lock in `createRunAtomic`)
 freezes the owner's Claude source onto the judge in the creation transaction, unless the owner pinned
 a vendor Anthropic token (`judgeLaneDecision.Vendor` from `decideJudgeLane`, which sends the provider run's trace to Anthropic). A provider

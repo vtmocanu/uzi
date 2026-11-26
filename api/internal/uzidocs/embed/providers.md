@@ -174,7 +174,13 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   [A judge on a model provider](./judge.md#a-judge-on-a-model-provider). Before PRD #4322 M1a, this
   lane refused every owner whose Claude source was set with `provider_lane_unsupported`, so older
   runs can still show that skip.
-- **Other lanes that cannot use a provider refuse.** The jobs and cross-check lanes refuse an
+- **Jobs run on your provider.** A [job](./jobs.md#jobs-on-a-model-provider) created through
+  `/api/v1/jobs` for an owner whose Claude source is a provider runs on that provider, frozen when
+  the job is created, with your provider key and no Anthropic token. A job that names a site list
+  (`egress_profile`) is still refused with `provider_lane_unsupported`, and site-list jobs on a
+  provider are not shipped yet. A job never parks: revocation or a gateway rate limit fails it. The
+  same redirect risk and output-publication limits apply; see the linked section.
+- **Other lanes that cannot use a provider refuse.** The cross-check lane refuses an
   owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
   that use an Anthropic token. A plan cross-check whose
   checker would be refused sends the plan to the human plan gate instead; for a Codex lead that
@@ -296,9 +302,9 @@ Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit
   Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker
   refused and waits for you to approve the plan. The code stage records the checker as
   unavailable with no verdict.
-- **Jobs and chat** are Claude-only and unchanged by a Codex source. A job refuses with
-  `provider_lane_unsupported` while your **Claude** source is set; a Codex source does not
-  affect them.
+- **Jobs and chat** are Claude-only and unchanged by a Codex source. A Codex source does not
+  affect them. A job follows your **Claude** source (see
+  [Use a provider as your Claude source](#use-a-provider-as-your-claude-source)).
 
 Codex providers on the judge and cross-check lanes are tracked in #4574.
 
