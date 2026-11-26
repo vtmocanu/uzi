@@ -1,7 +1,7 @@
 # PRD #4685: Scoped run outcomes API: Reliability
 
 **Issue:** #4685.
-**Status:** Ready once #4684 merges.
+**Status:** Done (M1 delivered by the #4685 run; exact-head PR CI pending as a landing obligation).
 **Priority:** Normal.
 **Blocked by:** #4684 (scoped run usage API: filter options and Spend).
 **Scope:** API, DTO contracts, docs and specs. Additive index migrations only if measured plans demonstrate a gap. No user-interface or command implementation. No changes under `.github/workflows/**`, including validation.
@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [ ] M1 owner/admin Reliability and lifetime recency
+- [x] M1 owner/admin Reliability and lifetime recency (routes, DTOs and recorded fixtures, creation-cohort outcomes, causes, rolling rates, breakdowns, unwindowed latest failure, recoverable-work figure, docs/specs, LiveDB and generic-plan tests, plan evidence in §8)
 
 ## 1. Problem
 
@@ -95,5 +95,38 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Reuse the existing outcome classification, incl. `base_diverged` | One definition across endpoints; reject a second failure taxonomy. |
 | Unwindowed latest failure | It answers "how long since the last failure", which a window would hide. |
 | Own query-plan evidence | New reads, new plans; reject assuming #4684's plans cover them. |
+| Admin all-users `window=all` is refused (400) on Reliability too | One window contract with Options and Spend (#4684 owner decision); reject a section-specific window set. |
+| Primary-model fold gated by `breakdown=primary_model` and the current window | Other breakdowns and previous-window rows never read the model; reject paying the run_usage fold for them (measured: about half the cohort time). |
+| Latest failure is lifetime with no creation cutoff, read in the same snapshot as the cohort | Preserves the existing `SelfRunOutcomes` strict-after semantics; a run created after the cohort's `now` may appear there but not in the counts, by design. |
+| Latest failure also returns `user_id` | Owner route: always the caller; admin: an id the admin already sees via `breakdown=user`. Additive, not a leak. |
+| No `runs_terminal_end_idx` migration | §8: it saves about 90 ms of an 8 s budget on the all-users latest-failure lookup and regresses the repo-filtered all-users lookup (2 ms to 20 ms); reject indexing without a measured bottleneck. |
 
-**UNVERIFIED before implementation:** latency and query plans of the new reads. These require the stated offline measurements; no external lookup is left to the implementation worker.
+## 8. Measurement evidence
+
+Harness: `api/internal/store/analytics_evidence_livedb_test.go` (build tag `analyticsevidence`, `UZI_ANALYTICS_PLAN_EVIDENCE=1`), PostgreSQL 17.12, #4684's seed: 120,000 runs, 846,668 run_usage rows, 1,250 repos, 200 users. A Reliability step then rewrites 35% of delivery `agent_failure` runs to human-landable origins: 2,712 landable failures (569 with an available capture only, 474 with a preserved patch only, 222 with both, 1,447 with neither), 791 available and 269 expired captures, 4,686 requeued runs. 20 measured executions per workload; Reliability measured with `jit = off` as in production; warm cache.
+
+Cohort statement, median ms (custom / generic plan), and full request through `RunAnalyticsSnapshot` (authorize reads, history start, cohort, latest failure; 8 s deadline), median / p95 ms:
+
+| Workload | Breakdown | SQL custom / generic | Request median / p95 |
+|---|---|---|---|
+| owner 30d | primary_model | 105 / 144 | 156 / 164 |
+| owner 30d | harness | 45 / 85 | 98 / 102 |
+| owner all-time | primary_model | 937 / 1316 | 1282 / 1319 |
+| owner all-time | harness | 354 / 708 | 736 / 753 |
+| admin all-users 30d | primary_model | 563 / 574 | 734 / 776 |
+| admin all-users 30d | harness | 196 / 206 | 347 / 358 |
+| admin all-users 30d | user | 214 / 228 | 375 / 420 |
+| admin all-users 90d | primary_model | 886 / 936 | 1063 / 1088 |
+| admin all-users 90d | harness | 348 / 378 | 529 / 541 |
+| admin user=<uuid> all-time | primary_model | 897 / 1294 | 1294 / 1322 |
+| admin user=<uuid> all-time | harness | 350 / 686 | 719 / 726 |
+| owner 30d, repo filter | primary_model | 7.5 / 7.2 | 31 / 32 |
+| admin all-users 30d, repo filter | primary_model | 7.8 / 18.6 | 37 / 38 |
+
+Latest failure, median ms (custom / generic): owner full 1.3 / 4.8 (row lookup 0.6 / 4.7, strict-after count 0.7 / 0.1, via `runs_user_terminal_end_idx`); all-users full 86 / 85 (row lookup 37 / 42, count 35 / 38; sequential scans of runs).
+
+Index candidate `runs_terminal_end_idx ON runs ((COALESCE(finished_at, status_since)), id) WHERE status IN ('completed','failed','cancelled')`: all-users latest failure 86 to 1.1 ms; admin 30d request 734 to 625 ms; no cohort plan uses it; the repo-filtered all-users latest step in the request path regresses 2.1 to 20.4 ms (generic plan choice). Not added (Decision Log).
+
+Worst case: admin `user=<uuid>` all-time primary_model, 1338 ms max, about 6.7 s headroom; no Reliability workload timed out. Owner all-time shapes spill sorts to temp (about 3.4k blocks). The harness also showed #4684 Spend admin shapes above 8 s when measured with the server-default JIT; production disables JIT in the snapshot, so that is not a Reliability finding. Generic-plan guards: `TestAnalyticsReliabilityGenericPlanLiveDB` and `TestAnalyticsLatestFailureGenericPlanLiveDB`.
+
+**UNVERIFIED:** production-sized latency beyond this seed (the all-users latest-failure scan grows linearly with `runs`), and CI job-time impact (landing obligation).
