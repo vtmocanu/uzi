@@ -180,8 +180,8 @@ Anthropic token.
 - **The provider key is redacted** from the judge's output, review, usage and failure text.
 - **Codex.** A Codex judge for an owner who has only a Claude source runs on its usual Codex credential
   and ignores the Claude source. Neither harness ever falls back to the other. A Codex judge for an owner
-  whose **Codex source** is a model provider (their own; shared Codex definitions are #4633) runs on
-  that provider the same way, see [A Codex judge on a model provider](#a-codex-judge-on-a-model-provider).
+  whose **Codex source** is a model provider (their own, or an admin-shared Codex definition with their own
+  key) runs on that provider the same way, see [A Codex judge on a model provider](#a-codex-judge-on-a-model-provider).
 
 When the judge cannot be created on your provider, the automatic judge is [skipped](#a-skipped-judge) and
 **Run judge** is refused, with the same reasons (see [A skipped judge](#a-skipped-judge)); nothing falls
@@ -220,10 +220,12 @@ with `judge_policy_changed` (retry-safe). It never falls back to a vendor Codex 
   journaled terminal log through its own logger; that body is key-free.
 - **Capability and rollout.** The judge needs a worker advertising `codex_provider_judge_v1` (advertised
   by workers that run the Codex harness). Without one, the judge stays queued and health shows "no worker that
-  supports Codex provider judges (codex_provider_judge_v1) is online". During a rolling API deploy, a new replica can
-  create a Codex provider judge that an old replica selects and refuses terminally (`credential_unavailable`,
-  no review, no automatic retry); a manual **Run judge** after the rollout succeeds. Finish the API and
-  worker rollout before relying on it.
+  supports Codex provider judges (codex_provider_judge_v1) is online". The shipped chart runs the API as a
+  single replica with a `Recreate` rollout, so during an upgrade a Codex provider judge waits for an upgraded,
+  capable worker rather than failing. Only a deployment that runs old and new API replicas side by side (outside
+  the shipped topology) can have a new replica create a Codex provider judge that an old replica selects and
+  refuses terminally (`credential_unavailable`, no review, no automatic retry); a manual **Run judge** after
+  that rollout succeeds.
 - **Trace destination.** The judged trace goes to your Codex gateway and any redirect it issues, including
   the trace of a run that itself used a vendor credential, under the risk accepted for custom providers
   ([Where the judged trace goes](#where-the-judged-trace-goes)).
