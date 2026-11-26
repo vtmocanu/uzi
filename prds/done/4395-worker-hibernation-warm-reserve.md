@@ -1,6 +1,6 @@
 # PRD #4395: Worker hibernation: keep one warm worker per pool, hibernate the surplus
 
-**Epic**: #4204 (step 5, "capability-aware warm coverage"). **Status**: Implemented on the branch (M1 and M2), pending exact-head PR CI and hosted owner acceptance, 2026-11-17. **Blocked by**: none open; builds on PRD #4205 (sleep/wake), PRD #4206 (cache cleanup) and PRD #4207 (automatic hibernation), all merged.
+**Epic**: #4204 (step 5, "capability-aware warm coverage"). **Status**: Done (2026-11-26): M1 and M2 merged in PR #4430; hosted owner acceptance is tracked in #4443. **Blocked by**: none open; builds on PRD #4205 (sleep/wake), PRD #4206 (cache cleanup) and PRD #4207 (automatic hibernation), all merged.
 
 ## Problem
 

@@ -1,7 +1,7 @@
 # PRD #2755: Compress terminal runs' messages into chunked archives (lossless, off by default)
 
 **Issues:** [#2755](https://github.com/vtmocanu/uzi/issues/2755) (part of [#80](https://github.com/vtmocanu/uzi/issues/80)).
-**Status:** Parked after M0: the pass criteria fixed before measuring are not all met; awaiting the owner's go/no-go decision (see M0 results).
+**Status:** Closed, not planned (2026-11-26). M0 failed its fixed pass criteria (see M0 results); growth of `run_messages` is handled by the S3 cold tier (#4662, epic #4660).
 **Execution:** M0 delivered by the #2755 run; M1–M4 run as a separate gated run after an owner go decision.
 
 ## Progress
