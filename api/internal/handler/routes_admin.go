@@ -88,6 +88,7 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// group only; reveal-repos comes from this mount, never from the query.
 			r.Get("/analytics/options", h.AdminAnalyticsOptions)
 			r.Get("/analytics/spend", h.AdminAnalyticsSpend)
+			r.Get("/analytics/reliability", h.AdminAnalyticsReliability)
 			r.Get("/analytics/capacity", h.AdminAnalyticsCapacity)
 			// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
 			// /usage: admin-only via this group, per-user rows incl. no_token.

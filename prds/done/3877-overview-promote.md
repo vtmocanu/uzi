@@ -2,7 +2,7 @@
 
 **Status**: Done. Verdict recorded 2026-11-14 on #3873: **promote, with a soak**. M1 shipped in PR #4338. M2 shipped (issue #3877 run): `/overview/classic` redirects to `/dashboard` with query and hash preserved, and the old page, its tests and its only-used components are deleted. Child of epic #3873. #3875 and #3876 were not blockers.
 
-**Design brief**: `prds/3873-overview-redesign.md`. **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`; the promoted page must still match it (brief mock contract).
+**Design brief**: `prds/done/3873-overview-redesign.md`. **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`; the promoted page must still match it (brief mock contract).
 
 ## Problem
 

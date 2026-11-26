@@ -2,8 +2,8 @@ package apitypes
 
 import "time"
 
-// Issues #4684 and #4731: wire DTOs of the scoped usage analytics API
-// (GET /api/analytics/{options,spend,capacity} and GET /api/admin/analytics/{options,spend,capacity}).
+// Issues #4684, #4685 and #4731: wire DTOs of the scoped usage analytics API
+// (GET /api/analytics/{options,spend,reliability,capacity} and GET /api/admin/analytics/{options,spend,reliability,capacity}).
 //
 // Conventions shared by every type below:
 //   - Dollar amounts (cost_usd, numerator_usd and ratio values) are float64 converted from the
@@ -272,6 +272,139 @@ type AnalyticsBreakdownRowDTO struct {
 type AnalyticsBreakdownDTO struct {
 	Dimension string                     `json:"dimension"`
 	Rows      []AnalyticsBreakdownRowDTO `json:"rows"`
+}
+
+// Issue #4685: the Reliability response (GET /api/analytics/reliability and
+// GET /api/admin/analytics/reliability). It reuses the envelope, outcome classes and nullable
+// number above. A failure rate is failed / finished and is never suppressed for a small sample
+// (null with no_finished_runs only when nothing finished); a breakdown row or rolling point over
+// fewer than five finished runs carries null with insufficient_runs and keeps its raw counts.
+
+// AnalyticsReliabilityBlockDTO is the outcome aggregate of one population. Finished is
+// completed + cancelled + plan_rejected + base_diverged + failed; in-flight runs are in no
+// finished figure. RequeuedRuns counts runs whose retained requeue count is above zero.
+type AnalyticsReliabilityBlockDTO struct {
+	Finished     int64                      `json:"finished"`
+	Outcomes     AnalyticsOutcomesDTO       `json:"outcomes"`
+	FailureRate  AnalyticsNullableNumberDTO `json:"failure_rate"`
+	RequeuedRuns int64                      `json:"requeued_runs"`
+}
+
+// AnalyticsReliabilityTotalsDTO holds the current window and, for bounded windows only, the previous one.
+type AnalyticsReliabilityTotalsDTO struct {
+	Current  AnalyticsReliabilityBlockDTO  `json:"current"`
+	Previous *AnalyticsReliabilityBlockDTO `json:"previous,omitempty"`
+}
+
+// AnalyticsReliabilityCellDTO is one bucket's finished count and outcome classes.
+type AnalyticsReliabilityCellDTO struct {
+	Index    int                  `json:"index"`
+	Finished int64                `json:"finished"`
+	Outcomes AnalyticsOutcomesDTO `json:"outcomes"`
+}
+
+// AnalyticsReliabilityCauseDTO is one ranked failure origin: ranks 1..5, then Other (is_other,
+// no origin). Share is runs / the window's failed runs.
+type AnalyticsReliabilityCauseDTO struct {
+	Rank    int     `json:"rank"`
+	IsOther bool    `json:"is_other"`
+	Origin  *string `json:"origin"`
+	Runs    int64   `json:"runs"`
+	Share   float64 `json:"share"`
+}
+
+// AnalyticsReliabilityCausesDTO groups the window's failed runs by failure origin; the item
+// runs sum to Failed. Failed excludes plan_rejected and base_diverged, which are their own classes.
+type AnalyticsReliabilityCausesDTO struct {
+	Failed int64                          `json:"failed"`
+	Items  []AnalyticsReliabilityCauseDTO `json:"items"`
+}
+
+// AnalyticsReliabilityPointDTO is one seven-day rolling range: the real finished and failed
+// counts and a rate that is null with a reason (insufficient_runs below five finished runs,
+// not_applicable when the filters select no delivery kind).
+type AnalyticsReliabilityPointDTO struct {
+	Index    int      `json:"index"`
+	Finished int64    `json:"finished"`
+	Failed   int64    `json:"failed"`
+	Value    *float64 `json:"value"`
+	Reason   *string  `json:"reason"`
+}
+
+// AnalyticsReliabilityHarnessSeriesDTO is one harness's rolling points, one per rolling range.
+type AnalyticsReliabilityHarnessSeriesDTO struct {
+	Harness string                         `json:"harness"`
+	Points  []AnalyticsReliabilityPointDTO `json:"points"`
+}
+
+// AnalyticsReliabilityRollingDTO is the overall rolling failure rate and one series per harness.
+type AnalyticsReliabilityRollingDTO struct {
+	Overall   []AnalyticsReliabilityPointDTO         `json:"overall"`
+	Harnesses []AnalyticsReliabilityHarnessSeriesDTO `json:"harnesses"`
+}
+
+// AnalyticsReliabilityRowDTO is one ranked breakdown row (ranks 1..50 by finished runs, then
+// Other with no key). Each run is counted once in exactly one row. N is the row's finished
+// runs. Label and ID are the user email and id, or the repo path and id; null otherwise, and
+// for a repo the caller may not see (key "inaccessible_repo").
+type AnalyticsReliabilityRowDTO struct {
+	Rank         int                        `json:"rank"`
+	IsOther      bool                       `json:"is_other"`
+	Key          *string                    `json:"key"`
+	Label        *string                    `json:"label"`
+	ID           *string                    `json:"id"`
+	N            int64                      `json:"n"`
+	Outcomes     AnalyticsOutcomesDTO       `json:"outcomes"`
+	FailureRate  AnalyticsNullableNumberDTO `json:"failure_rate"`
+	RequeuedRuns int64                      `json:"requeued_runs"`
+}
+
+// AnalyticsReliabilityBreakdownDTO is the ranked breakdown table.
+type AnalyticsReliabilityBreakdownDTO struct {
+	Dimension string                       `json:"dimension"`
+	Rows      []AnalyticsReliabilityRowDTO `json:"rows"`
+}
+
+// AnalyticsReliabilityLatestFailureDTO is the scope's most recent failure over its lifetime
+// (not bounded by the window), restricted by the repo, harness and delivery-kind filters.
+// CompletedSinceLastFailure counts completed runs of the same scope after FailedAt.
+type AnalyticsReliabilityLatestFailureDTO struct {
+	FailedAt                  time.Time `json:"failed_at"`
+	Origin                    string    `json:"origin"`
+	RunID                     string    `json:"run_id"`
+	UserID                    string    `json:"user_id"`
+	CompletedSinceLastFailure int64     `json:"completed_since_last_failure"`
+}
+
+// AnalyticsReliabilityNeedsLandingDTO counts the window's failed runs that left recoverable
+// work (a human-landable failure origin plus an available capture or a preserved patch). Caveat
+// is always "work_may_already_have_landed": the work may have been landed by other means.
+type AnalyticsReliabilityNeedsLandingDTO struct {
+	Runs   int64  `json:"runs"`
+	Caveat string `json:"caveat"`
+}
+
+// AnalyticsReliabilityDTO is the Reliability response: the calendar envelope plus every panel.
+// Applicable is false, with Reason "supporting_kinds_only", when the kind filter selects no
+// delivery kind: every count is then zero and every rate null with reason "not_applicable",
+// which is not a zero failure rate.
+type AnalyticsReliabilityDTO struct {
+	AnalyticsEnvelopeDTO
+	// SelectedUser matches the options response: "all" for an admin response spanning every
+	// user, else the user id (the caller on the owner route).
+	SelectedUser string                        `json:"selected_user"`
+	Applicable   bool                          `json:"applicable"`
+	Reason       *string                       `json:"reason"`
+	Totals       AnalyticsReliabilityTotalsDTO `json:"totals"`
+	// Series is the outcome count per bucket: series[i] is the cell of buckets[i].
+	Series []AnalyticsReliabilityCellDTO `json:"series"`
+	Causes AnalyticsReliabilityCausesDTO `json:"causes"`
+	// RollingFailureRate points are aligned with the envelope's rolling ranges.
+	RollingFailureRate AnalyticsReliabilityRollingDTO   `json:"rolling_failure_rate"`
+	Breakdown          AnalyticsReliabilityBreakdownDTO `json:"breakdown"`
+	// LatestFailure is null when the scope has no failure (never a zero timestamp).
+	LatestFailure *AnalyticsReliabilityLatestFailureDTO `json:"latest_failure"`
+	NeedsLanding  AnalyticsReliabilityNeedsLandingDTO   `json:"needs_landing"`
 }
 
 // AnalyticsSpendDTO is the Spend response: the calendar envelope plus every panel. Chat runs

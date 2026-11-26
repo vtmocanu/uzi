@@ -6,14 +6,15 @@ audience: user
 
 # Usage analytics API
 
-A read-only API for spend and capacity over time: filter options, a Spend
-document with daily (or weekly) buckets, ranked splits, two cost ratios, a
-cache-read ratio, the ten most expensive runs and a per-group breakdown, and a
-[Capacity](#capacity) document with approximate concurrent-run occupancy, a
-usage-wait share and current provider gauges. The historical figures are
-computed on the server from one database snapshot. It is API only: there is no
-web page or `uzi` command for it yet, and `GET /api/usage` and
-`GET /api/admin/usage` are unchanged.
+A read-only API for spend, reliability and capacity over time: filter options,
+a Spend document with daily (or weekly) buckets, ranked splits, two cost
+ratios, a cache-read ratio, the ten most expensive runs and a per-group
+breakdown, a Reliability document with run outcomes, failure causes, a rolling
+failure rate and a ranked breakdown, and a [Capacity](#capacity) document with
+approximate concurrent-run occupancy, a usage-wait share and current provider
+gauges. The historical figures are computed on the server from one database
+snapshot. It is API only: there is no web page or `uzi` command for it yet, and
+`GET /api/usage` and `GET /api/admin/usage` are unchanged.
 
 Every dollar figure is recorded spend (an estimate for comparison), not a
 bill. Capacity reports no dollars.
@@ -22,8 +23,8 @@ bill. Capacity reports no dollars.
 
 | Scope | Routes | Who |
 |---|---|---|
-| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend`, `GET /api/analytics/capacity` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
-| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend`, `GET /api/admin/analytics/capacity` | An admin session, or a Bearer token with the `admin_ro` scope. |
+| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend`, `GET /api/analytics/reliability`, `GET /api/analytics/capacity` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
+| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend`, `GET /api/admin/analytics/reliability`, `GET /api/admin/analytics/capacity` | An admin session, or a Bearer token with the `admin_ro` scope. |
 
 - The owner route never reads a user from the query. An admin calling it sees
   only their own runs, and a `user` parameter there is a 400.
@@ -36,26 +37,27 @@ bill. Capacity reports no dollars.
 
 | Parameter | Values | Default | Notes |
 |---|---|---|---|
-| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend and Capacity reject `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
+| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend, Reliability and Capacity reject `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
-| `kind` | a run kind, `delivery` or `supporting` | all kinds | `chat` is accepted. On Spend it only feeds `untracked_chat_runs`; on Capacity it gives empty measures and `excluded_kind_selected` `chat`. |
-| `split` (spend only) | `usage_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `usage_model` | Top 5 groups plus Other. |
-| `breakdown` (spend only) | `primary_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `repo` | Top 50 rows plus Other. |
+| `kind` | a run kind, `delivery` or `supporting` | all kinds | `chat` is accepted but only feeds `untracked_chat_runs`; on Capacity it gives empty measures and `excluded_kind_selected` `chat`. Reliability uses only the delivery kinds of the selection, see [Reliability](#reliability). |
+| `split` (spend) | `usage_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `usage_model` | Top 5 groups plus Other. |
+| `breakdown` (spend, reliability) | `primary_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `repo` on Spend, `primary_model` on Reliability | Top 50 rows plus Other. |
 | `user` (admin only) | `all` or a user UUID | `all` | Omitting it is byte-identical to `user=all`. |
 
 - Every invalid value is a 400 naming its parameter (`invalid window`,
   `invalid tz`, ...). The message never echoes the value, SQL or other
   sensitive text.
-- Spend and Capacity on the admin all-users scope with `window=all` are a 400,
+- Spend, Reliability and Capacity on the admin all-users scope with `window=all` are a 400,
   `window all not available for all users`. It is answered before any
   analytics database work (authentication runs first) and is not a 503.
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
   silently replaced by defaults.
-- `split` or `breakdown` on `/options` or `/capacity`, and `split=user` or `breakdown=user`
+- `split` or `breakdown` on `/options` or `/capacity`, `split` on `/reliability`
+  (it has a breakdown but no split), and `split=user` or `breakdown=user`
   anywhere but an admin all-users response, is `invalid split` or
   `invalid breakdown`.
 - A `repo` that does not exist and a `repo` the scope cannot see give the
@@ -70,7 +72,7 @@ bill. Capacity reports no dollars.
 
 - Capacity is a quarter of the database pool (`max(1, MaxConns / 4)`; the
   default pool of 20 gives 5). One request per caller per section (`options`,
-  `spend` or `capacity`) may be in flight, and the owner and admin variants share that
+  `spend`, `reliability` or `capacity`) may be in flight, and the owner and admin variants share that
   slot. Nothing queues.
 - A request that finds no slot answers 503 with `Retry-After: 1` before any
   analytics database work. Authentication runs earlier (bearer and cookie
@@ -80,7 +82,8 @@ bill. Capacity reports no dollars.
   and `SET LOCAL statement_timeout = '8s'`. Hitting it also answers 503 with
   `Retry-After: 1`. Other database failures are a plain 500 with no detail.
 - All analytics reads of one request, after authentication (user and repo
-  checks, history start, the statement, and the timezone list on its first,
+  checks, history start, the statement (Reliability: the cohort statement, then
+  the latest-failure statement), and the timezone list on its first,
   cached load), run in a single `REPEATABLE READ` read-only transaction, so
   they agree with each other. JIT is off inside it. Authentication reads happen
   before it, and a warmed timezone cache comes from an earlier request, not
@@ -171,7 +174,11 @@ Delivery kinds are issue, mr_rework, ci_fix, prompt, self_improve, task and
 job. Supporting kinds are judge, cross_check and chat.
 
 Null reasons are a closed set: `no_completed_delivery_runs`, `no_merged_prs`,
-`no_applicable_runs`, `no_input_tokens`, `no_finished_runs`, `not_applicable`.
+`no_applicable_runs`, `no_input_tokens`, `no_finished_runs`, `not_applicable`
+and `insufficient_runs`. `insufficient_runs` appears only on Reliability: on a
+rolling point or a breakdown row over fewer than five finished runs. The
+top-level Reliability `reason` is a separate field: `supporting_kinds_only` (or
+null), see [Reliability](#reliability).
 
 Merged-PR rules:
 
@@ -214,6 +221,85 @@ Other measures:
   + failed, the same classes as the usage outcomes; `failed` excludes the
   other four.
 
+## Reliability
+
+`GET /api/analytics/reliability` (the caller's own runs) and
+`GET /api/admin/analytics/reliability` (admin read group) answer how often
+finished work fails, why, and where. It takes `window`, `tz`, `repo`,
+`harness`, `kind` and `breakdown` (plus `user` on the admin route). It has no
+`split`: sending one is a 400 `invalid split`. The response carries the same
+calendar envelope as Spend (`scope`, `generated_at`, `window`, `timezone`,
+`from`, `to`, `previous_from`, `previous_to`, `history_start`,
+`bucket_width_days`, `buckets`, `rolling`, `selected_user`), so
+[Calendar](#calendar) applies unchanged. The admin all-users scope has no
+`window=all` here either (400 `window all not available for all users`, as
+for Spend).
+
+- **Cohort.** Runs are chosen by **creation time**, like Spend: a run belongs
+  to the window its `created_at` falls in, whenever it finished. Only delivery
+  kinds count; `chat`, `judge` and `cross_check` are in no figure. A run that
+  has not finished (in flight) is in no finished figure.
+- **Not applicable.** When the `kind` filter selects only supporting kinds
+  (`kind=supporting`, `kind=judge`, `kind=chat`, ...), no history, cohort or
+  latest-failure statement runs (the user and repo checks still run, so an
+  unknown `repo` is still a 400 `invalid repo`) and the response has `applicable: false` with `reason: "supporting_kinds_only"`. Every
+  count is zero and every rate is null with reason `not_applicable`, which is
+  not a zero failure rate. With `kind=delivery` or any delivery kind,
+  `applicable` is true and `reason` is null.
+- **Outcome classes.** `completed`, `cancelled`, `plan_rejected`,
+  `base_diverged` and `failed`; `finished` is their sum. `failed` excludes
+  `plan_rejected` and `base_diverged`, the same classes as the usage outcomes.
+  A failed run with no recorded origin is `unknown` in the causes.
+- **`totals`.** `current` and `previous` (omitted when the window has no
+  previous period, as for `all`) each hold `finished`, `outcomes`,
+  `failure_rate` and `requeued_runs`. `failure_rate` is failed over finished,
+  never suppressed for a small sample; it is null with `no_finished_runs` only
+  when nothing finished.
+- **`series`.** One cell per bucket (`series[i]` is `buckets[i]`) with
+  `finished` and the outcome counts, plus its own `index` (`series[].index`).
+- **`causes`.** The window's failed runs by failure origin: the top five origins
+  by runs, then Other. `causes.failed` is the window's failed count and
+  `causes.items` (each with `rank`, `is_other`, `origin`, `runs` and `share`; no
+  `origin` on Other) sum to it. `share` is runs over `failed`.
+- **`rolling_failure_rate`.** `overall` (a list of points) and `harnesses`
+  (`[{harness, points}]`, one entry for `claude` and one for `codex`), with one
+  point per rolling range (same index as `rolling`). A point
+  keeps its real `finished` and `failed` counts; `value` is null with
+  `insufficient_runs` below five finished runs. A point is `partial` as in
+  [Calendar](#calendar) (see the envelope's `rolling`).
+- **`breakdown`.** Ranked by finished runs: ranks 1 to 50, then Other.
+  `dimension` echoes the choice, `primary_model` by default; `harness`, `repo`
+  and `kind` are the others, and `user` only on an admin all-users response.
+  Each run is counted once, in exactly one row (under `primary_model`, the run's
+  [primary model](#cost-fold-and-disclosure)). The rows are `breakdown.rows`,
+  each with `rank`, `is_other`, `key`, `label`, `id`, `n`, `outcomes`,
+  `failure_rate` and `requeued_runs`. `n` is the row's finished runs
+  and `failure_rate` is null with `insufficient_runs` below five. On the owner
+  route a repo outside the caller's connections is masked as in
+  [Repo visibility](#repo-visibility): its row has key `inaccessible_repo` and
+  null `id` and `label`, as do the other rows without one. A group whose runs
+  are all still in flight appears with `n` = 0.
+- **`requeued_runs`.** Runs whose retained requeue count is above zero. It is a
+  count of runs, not of timestamped requeue events, and it counts cohort runs
+  whether or not they finished, so it can exceed `finished`.
+- **`needs_landing`.** `needs_landing.runs` counts the window's failed runs that left
+  recoverable work: a failure origin a human can land, plus an available owner
+  recovery capture or a preserved patch. `needs_landing.caveat` is always
+  `work_may_already_have_landed`: the work may have landed by other means, so it
+  is a recoverable-work figure, not a guaranteed landing backlog.
+- **`latest_failure`.** The scope's most recent failure over its **lifetime**,
+  not bounded by the window, restricted by the scope and the `repo`, `harness`
+  and `kind` filters (delivery kinds only). It ignores `breakdown`, which never
+  narrows it. It holds `failed_at` (finish time, else the last status time),
+  `origin`, `run_id`, `user_id` and `completed_since_last_failure`, the
+  completed runs of the same scope strictly after `failed_at`. It is `null` when
+  the scope has no failure. Because it is unwindowed it can be a run created
+  after the cohort's boundary at `generated_at`.
+- **One snapshot.** The cohort and the latest-failure statements run in the
+  same `REPEATABLE READ` transaction, so the whole response describes one
+  database state. Admission is one request per caller for the `reliability`
+  section, as described in [Admission and timeouts](#admission-and-timeouts).
+
 ## Options
 
 `/options` returns the repos you can filter by, the users an admin can select
@@ -225,7 +311,7 @@ On the owner route `users` is null with reason `not_applicable`.
   accepted as a filter.
 - It reads no usage and no history start, so it is cheap.
 - Admin `user=<uuid>` narrows the repo list to that user's connections and
-  echoes `selected_user`. The Spend response carries the same `selected_user`
+  echoes `selected_user`. The Spend and Reliability responses carry the same `selected_user`
   (`all` or the user id; the caller's id on the owner route).
 
 ## Capacity
@@ -372,10 +458,18 @@ about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 | Admin all-users `window=all` (measured, not offered) | about 10 s |
 
 **Decision:** admin all-users `window=all` is not offered. Options does not
-list `all` for that scope and Spend answers 400 `window all not available for
-all users` before any analytics database work (authentication runs first). The measured 10 s is over the 8 second
+list `all` for that scope, and Spend and Reliability answer 400 `window all not
+available for all users` before any analytics database work (authentication runs first). The measured 10 s is over the 8 second
 budget, so the request would otherwise have been a 503. All-time stays
 available for the owner route and for admin `user=<uuid>`; owner `all` Spend
 measured about 1.8 s (statement-level median, custom plan) on the same seed, and
 end-to-end request latency was not measured. Admin all-users all-time is deferred to a follow-up that adds per-run
 totals for finished runs (owner decision at landing).
+
+**Reliability.** Measured on the same seed generator (120,000 runs, 846,668
+usage legs, 200 owners, 1,250 repos; the #4685 re-seed, not byte-identical to
+the Spend seed), PostgreSQL 17, JIT off as in production, warm cache, one client
+and no concurrent load. The worst request, admin `user=<uuid>` all-time by
+primary model, took about 1.3 s median, and no workload timed out against the
+8 second budget. The per-workload tables and plans are in
+[PRD #4685](../prds/done/4685-scoped-outcomes-reliability-api.md) section 8.

@@ -520,7 +520,7 @@ unreferenced old-image create was proved. One observed build cancellation is
 not universal quiescence. Rootless/overlay/containerd equivalence, hosted behavior
 and net physical reclamation remain unrun. The accepted-create residual in
 [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md) remains.
-[PRD-1860 M0](../prds/1860-pod-epoch-writer-exclusion.md) complete / conditional-go
+[PRD-1860 M0](../prds/done/1860-pod-epoch-writer-exclusion.md) complete / conditional-go
 is historical context, not newly shipped universal proof; current
 [main.ts](../agent/src/main.ts) also invokes the GET-only pod-epoch shadow reader.
 

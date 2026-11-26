@@ -191,10 +191,27 @@ release_published() {
     jq -e --arg tag "$tag" '.tag_name==$tag and .draft==false and (.published_at|type=="string" and length>0)' >/dev/null
 }
 
+# A descendant without its own workflow run cannot replace the running main check.
+# Query the pinned tip for both plan and apply so a cancelled replacement is rechecked.
+main_tip_has_replacement() {
+  local tip=$1 workflow_path=$2 workflow=$3 runs
+  runs=$(page_rows "repos/$repo/actions/runs?branch=main&head_sha=$tip&per_page=100" workflow_runs) || return 1
+  jq -c --arg tip "$tip" --arg path "$workflow_path" --arg workflow "$workflow" '
+    any(.[]; (.id|type=="number" and .>0 and .==floor)
+      and .head_sha==$tip and .head_branch=="main"
+      and (if $workflow=="CodeQL" then
+             (.path|IN("dynamic/github-code-scanning/codeql",".github/workflows/codeql.yml"))
+           else .path==$path end)
+      and (.event=="push" or ($workflow=="CodeQL" and .event=="dynamic"))
+      and (if .status=="completed" then (.conclusion|IN("success","failure","timed_out"))
+           else .conclusion==null and (.status|IN("queued","requested","waiting","pending","in_progress")) end))
+    ' <<< "$runs" 2>/dev/null
+}
+
 decision() { judgement=$1; reason=$2; }
 
 classify() {
-  local run=$1 tip=$2 id head branch workflow workflow_path event first job_rows='' related run_state age
+  local run=$1 tip=$2 id head branch workflow workflow_path event first job_rows='' related run_state age replacement
   judgement=UNKNOWN; reason='unclassified workflow or missing evidence'; pr=null; owner=null
   id=$(jq -er '.id | select(type=="number" and .>0 and .==floor)' <<< "$run") || return
   head=$(jq -r '.head_sha // empty' <<< "$run")
@@ -269,7 +286,13 @@ classify() {
   fi
   if gh api "repos/$repo/compare/$head...$tip" 2>/dev/null |
     jq -e --arg base "$head" '.status=="ahead" and .merge_base_commit.sha==$base' >/dev/null; then
-    decision CANCEL 'superseded by a descendant main push'
+    replacement=$(main_tip_has_replacement "$tip" "$workflow_path" "$workflow") ||
+      { decision UNKNOWN 'descendant main workflow listing unreadable'; return; }
+    if [ "$replacement" = true ]; then
+      decision CANCEL 'superseded by a descendant main push'
+    else
+      decision KEEP 'descendant main has no replacement workflow run'
+    fi
   else
     decision UNKNOWN 'main ancestry unproven'
   fi
