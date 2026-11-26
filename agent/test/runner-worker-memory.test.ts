@@ -105,7 +105,7 @@ function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
       const heldFrom = performance.now();
       await new Promise<void>(resolve => {
         const done = (by: "abort" | "cap") => {
-          clearTimeout(timer); s.releasedBy ??= by; if (by === "abort") s.abortAtDate ??= Date.now(); resolve();
+          clearTimeout(timer); s.releasedBy ??= by; if (by === "abort") s.abortAtDate ??= REAL_DATE_NOW(); resolve();
         };
         const timer = setTimeout(() => done("cap"), LAUNCH_GATE_CAP_MS);
         if (frame.signal.aborted) done("abort");
@@ -287,9 +287,8 @@ interface HeldLike { context?: unknown; signal?: AbortSignal; deadlineAt: number
 interface SiteTag { site: string; held: HeldLike | undefined; flight: unknown }
 
 /**
- * Held fetch-wait sites each fixture is expected to bracket, pinned from candidate runs and confirmed against a
- * base-budget run (the four budget sites reverted) that captured the same sites. A listed site that ends up
- * uncaptured fails.
+ * Held fetch-wait sites each fixture is expected to bracket, pinned from candidate runs; the listed sites were confirmed
+ * against a base-budget run (the four budget sites reverted). A listed site that ends up uncaptured fails.
  */
 const EXPECTED_HELD_SITES: Record<string, readonly string[]> = {
   "exhausted:accepted": ["captureRecoveryRestorePointBody"],
@@ -322,7 +321,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
   const preserves: { flight: unknown; promise: Promise<unknown>; store: { custody?: CustodyRecord } }[] = [];
   const custody: CustodyRecord[] = [];
   const preOpRefusals: { expired: boolean }[] = [];
-  const captures: { signal: AbortSignal; deadlineAt: number; caller: AbortSignal | undefined; abortedAt?: number;
+  const captures: { signal: AbortSignal; deadlineAt: number; caller: AbortSignal | undefined; abortedAt?: number; returnedAt?: number;
     /** The abort was seen while the capture's action had not yet returned. */
     abortedWhilePending?: boolean; /** The capture was opened under the original flight's preserve call. */ originalFlight?: boolean }[] = [];
   const capturePromises: Promise<unknown>[] = [];
@@ -538,7 +537,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           if (context.signal.aborted) note();
           else context.signal.addEventListener("abort", note, { once: true });
           captures.push(record);
-          try { return await action(context); } finally { returned = true; }
+          try { return await action(context); } finally { returned = true; record.returnedAt = REAL_DATE_NOW(); }
         }, purpose, signal, attempt as never);
         capturePromises.push(run);
         return run;
@@ -652,11 +651,11 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
         const captureAbort = captures.some(c => c.signal.aborted && !(c.caller?.aborted && c.signal.reason === c.caller.reason) &&
           c.abortedWhilePending === true && c.originalFlight === true &&
           c.abortedAt !== undefined && c.abortedAt >= c.deadlineAt - 1);
-        // (c) the hold operation ran to its deadline and settled without an abort, plus an original-flight capture abort at or
-        // after the capture deadline (a post-action abort counts): the deadline proof is the hold settle time.
+        // (c) the hold operation settled without an abort at or after its deadline, and the original-flight capture's action
+        // itself ran until the capture deadline (its return time, not the unconditional teardown abort, is the evidence).
         const settledAtDeadline = holdOps.some(op => op.outcome?.kind === "settled-without-abort" &&
           op.settleAtDate !== undefined && op.settleAtDate >= op.effectiveDeadline - 1) &&
-          captures.some(c => c.originalFlight === true && c.abortedAt !== undefined && c.abortedAt >= c.deadlineAt - 1);
+          captures.some(c => c.originalFlight === true && c.returnedAt !== undefined && c.returnedAt >= c.deadlineAt - 1);
         if (!holdOps.some(deadlineAbort) && !captureAbort && !settledAtDeadline)
           failures.push("no deadline-class custody abort, pending capture-deadline abort or at-deadline hold settle was recorded");
       }
