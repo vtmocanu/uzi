@@ -405,8 +405,10 @@ Plan response, the funnel and the approval classification share these rules:
   cohort, chat included when selected). It is also counted once in the funnel
   `disclosure.legacy_evidence`, which covers only `issue` and `self_improve`
   runs (the funnel cohort). Both apply even when the run also has timed pairs
-  or current human proof. An unbound receipt never approves a pair; a pair with
-  no eligible bound receipt is `not_approved`.
+  or current human proof. An unbound receipt never approves a pair. A pair with
+  no bound, applied receipt at all is `not_approved`; one whose bound, applied
+  receipts all fail eligibility is `invalid_chronology` or
+  `excluded_disposition`.
 - **Approval classification ranks separately.** `approval` places a run by the
   first reason that applies: human, `auto_approve_configured`, `ambiguous`,
   then `legacy_unbound`, so a run with current human proof is `human` there
