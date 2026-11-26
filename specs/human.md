@@ -2066,6 +2066,12 @@ PRD at `prds/4123-weekly-limit-warning.md`.
 - With a linked Slack account, the owner gets at most one best-effort DM per credential per observed anchored weekly period when a credential with non-terminal runs is near or at its effective weekly limit (margin > 0, a usable reset); it lists the affected runs with reason and fix. Never durable or replayed; a lost DM is accepted because the banner is the guaranteed surface (D11, D15, D16). (AI-synced 2026-11-22)
 - Fix commands put every flag before `--` and then the shell-quoted label, always name `--kind` for `uzi token pool`, and are omitted (with a rename hint) for grandfathered labels that are not command-safe. (AI-synced 2026-11-22)
 
+## Feature #4686 — Runtime web modules
+
+PRD at `prds/done/4686-runtime-web-modules.md`.
+
+- Operators can enable trusted runtime web modules through deployment config (chart `web.modules[]`, or the compose generator and override), served same-origin under `/modules/<id>/` with no web image rebuild and an unchanged CSP. A module failing to load, render or match the host contract is contained to its own page. (AI-synced 2026-11-25)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

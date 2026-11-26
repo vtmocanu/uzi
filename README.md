@@ -267,7 +267,7 @@ Full docs live in [docs/](docs/), and the same golden-path pages are browsable i
 
 **Using uzi:** [Board](docs/board.md) · [CLI](docs/cli.md) · [Autopilot](docs/autopilot.md) · [Chat](docs/chat.md) · [Slack](docs/slack.md) · [Handoff](docs/handoff.md) · [Judge](docs/judge.md) · [Findings](docs/findings.md) · [Scheduling](docs/scheduling.md) · [Memory](docs/memory.md) · [Agent templates](docs/agent-templates.md)
 
-**Operating:** [Hosted workers](docs/hosted-workers.md) · [Worker model](docs/worker-model.md) / [tools](docs/worker-tools.md) / [Docker](docs/worker-docker.md) · [Rate limits](docs/rate-limits.md) · [OIDC](docs/oidc.md) · [Updates](docs/updates.md) · [Admin settings](docs/admin-settings.md)
+**Operating:** [Hosted workers](docs/hosted-workers.md) · [Worker model](docs/worker-model.md) / [tools](docs/worker-tools.md) / [Docker](docs/worker-docker.md) · [Rate limits](docs/rate-limits.md) · [OIDC](docs/oidc.md) · [Updates](docs/updates.md) · [Admin settings](docs/admin-settings.md) · [Web modules](docs/web-modules.md) ([developing one](docs/web-modules-dev.md))
 
 **Design:** [Auth design](docs/auth-design.md) · [Proc hardening](docs/proc-hardening.md) · [Security gate](docs/security-gate.md) · [Vault threat model](docs/vault-threat-model.md) · [Why a hosted run costs less](docs/run-cost.md) · [Developer conventions](docs/dev-conventions.md)
 

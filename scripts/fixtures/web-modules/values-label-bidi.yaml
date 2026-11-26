@@ -1,0 +1,12 @@
+# Fixture for scripts/assert-web-modules-render.sh: a label with a right-to-left override (U+202E)
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: bad
+      version: "1.0.0"
+      page: Page
+      label: "Ba\u202Ed"
+      icon: package
+      navGroup: modules
+      upstream: svc:80

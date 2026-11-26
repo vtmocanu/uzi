@@ -1,0 +1,5 @@
+# Fixture for scripts/assert-web-modules-render.sh: zero modules (the default)
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules: []

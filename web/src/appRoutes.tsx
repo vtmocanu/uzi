@@ -1,6 +1,7 @@
 import { isRouteErrorResponse, useRouteError, type RouteObject } from "react-router-dom";
 import App from "./App";
 import { AuthProvider } from "./auth/AuthContext";
+import { ModulesProvider } from "./modules/registry";
 
 // The data router's root error element (PRD #3263): what renders if the app tree throws while
 // rendering, instead of the router's developer fallback. Deliberately self-contained (no auth,
@@ -39,7 +40,9 @@ export const appRoutes: RouteObject[] = [
     path: "*",
     element: (
       <AuthProvider>
-        <App />
+        <ModulesProvider>
+          <App />
+        </ModulesProvider>
       </AuthProvider>
     ),
     errorElement: <AppErrorElement />,

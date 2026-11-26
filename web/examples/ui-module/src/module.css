@@ -1,0 +1,18 @@
+/* Scoped under .uzi-mod-example: a module's CSS must not leak into the host. It reads the
+   host's theme variables (space-separated RGB triplets), so it follows a live theme switch. */
+.uzi-mod-example {
+  background: rgb(var(--surface));
+  color: rgb(var(--fg));
+  border-left: 4px solid rgb(var(--brand));
+  padding: 1rem 1.25rem;
+  border-radius: 0.5rem;
+}
+.uzi-mod-example nav {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+.uzi-mod-example a {
+  color: rgb(var(--brand));
+  text-decoration: underline;
+}

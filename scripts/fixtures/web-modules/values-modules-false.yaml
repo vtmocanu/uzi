@@ -1,0 +1,5 @@
+# Fixture for scripts/assert-web-modules-render.sh: web.modules is false, not a list (must fail the render)
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules: false

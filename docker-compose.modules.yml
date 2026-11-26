@@ -1,0 +1,42 @@
+# Runtime web modules on the compose stack (PRD #4686): an override for docker-compose.yml.
+#
+#   1. Describe the modules (see deploy/compose/web-modules.example.json) and generate the files
+#      the web nginx reads. The directory must exist and be readable by the web container
+#      (the generator makes it 0755, its files 0644):
+#
+#        scripts/web-modules-gen.py deploy/compose/web-modules.example.json .web-modules
+#
+#   2. Start the stack with this override and (re)create web after every successful generation:
+#
+#        docker compose -f docker-compose.yml -f docker-compose.modules.yml \
+#          up -d --force-recreate web example-module
+#
+# Rules (the generator's --help has the full text): run one generator invocation at a time,
+# recreate web only after it exited successfully, and rerun it first after an interruption.
+# The directory is bind-mounted, so a running web serves a new modules.json at once while its
+# nginx keeps the old locations until the recreate: a module you just added shows its error
+# card until then.
+#
+# UZI_WEB_MODULES_DIR picks another directory (default ./.web-modules, git-ignored). The mount
+# is read-only and `create_host_path: false` makes a missing directory an error instead of an
+# empty root-owned one.
+#
+# example-module is the example module of web/examples/ui-module as its own container. It is
+# an acceptance fixture and is not shipped: it publishes no port, is reached only through the
+# web nginx at /modules/example/ (the `example` entry of the example list names it as
+# example-module:8080), and uses the default network like every other service.
+
+services:
+  web:
+    volumes:
+      - type: bind
+        source: ${UZI_WEB_MODULES_DIR:-./.web-modules}
+        target: /etc/nginx/uzi-modules
+        read_only: true
+        bind:
+          create_host_path: false
+
+  example-module:
+    build:
+      context: .
+      dockerfile: web/examples/ui-module/Dockerfile

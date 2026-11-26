@@ -129,7 +129,9 @@
 # cache - 51.6s, the pipeline's cold long pole. So there is still a FETCH but no
 # compile (~1-2s to download+verify, not 51.6s), and it still writes nothing to
 # either go.mod. "Installs nothing" remains false as stated: it fetches a binary.
-# Everything else still holds: no `npm ci`, no `go mod download`.
+# Everything else still holds: no `npm ci`, no `go mod download`. The one other exception:
+# `test:web-browser:in-container*` may run `npm ci --ignore-scripts` INSIDE its throwaway
+# container, and only when the copied node_modules cannot load in that image (a musl host).
 # CI does that in .github/workflows/ci.yml's setup steps (`npm ci`); locally your `node_modules`
 # is expected to exist. `cd agent && npm ci` in particular has a documented
 # host-wide side effect (it rewrites `/opt/homebrew/bin/agent-browser`), so this
@@ -341,6 +343,11 @@ tasks:
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
       - task: test:web-nginx-cleanup
+      # Hermetic contract of the compose web-modules generator (scripts/web-modules-gen.py, PRD
+      # #4686): the upstream list and the chart values fixtures it shares with the chart's
+      # render driver, no-write-on-invalid, modes, rename order and the projection. Needs
+      # python3, jq and yq (the same tools test:refresh-role-manifest already needs here).
+      - task: test:web-modules-gen
       # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
       # fake `go install` failing then succeeding, no real gitleaks and no network,
       # proving a transient proxy failure is retried while a broken scan is not.
@@ -1119,6 +1126,11 @@ tasks:
     cmds:
       - ./scripts/assert-web-nginx.test.sh
 
+  test:web-modules-gen:
+    desc: hermetic contract of scripts/web-modules-gen.py, the compose web-modules generator (no docker, no network)
+    cmds:
+      - ./scripts/web-modules-gen.test.sh
+
   test:sqlc-drift-gate:
     desc: hermetic sqlc release acquisition and drift-gate contracts (fixture archives, no network)
     cmds:
@@ -1398,6 +1410,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
+      - ./.agents/skills/uzi-lander/scripts/wait-mrrework.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/claims-atomic-lock.test.py
       - ./.agents/skills/uzi-lander/scripts/claims-registry-fetch.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
@@ -1738,6 +1751,18 @@ tasks:
       # / runCacheCapFraction relayed verbatim as strings, typed values refused, compose
       # passthrough), same no-workflow-edit wiring.
       - ./scripts/assert-run-cache-cap-render.sh
+      # Also runs the runtime web modules render check (PRD #4686: web.modules[] validation, the
+      # public modules.json projection, the per-module nginx locations against the shared
+      # fixture, and the subPath mounts), same no-workflow-edit wiring.
+      - ./scripts/assert-web-modules-render.sh
+
+  render:web-modules-check:
+    desc: assert the chart renders web.modules[] (modules.json projection, nginx locations, subPath mounts, checksum) and refuses invalid modules
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-web-modules-render.sh
 
   render:run-cache-cap-check:
     desc: assert the chart relays workers.runCacheCapMaxBytes/runCacheCapFraction verbatim as strings to the controller and refuses typed values
@@ -2911,9 +2936,13 @@ tasks:
       # cache is, and the same fixture mutation reddens it with no flag at all.
       # The two halves of this repo are NOT symmetric here.
       - npm test
+      # node --test over web/scripts/*.test.mjs (CSP scan, sdk transform pin, manifest
+      # traversal): pure node, so it belongs in the ordinary web test lane. It is not repeated
+      # in test:web-modules-browser; the in-container script runs it itself.
+      - npm run test:scripts
 
   test:web-browser:
-    desc: web layout tests in real Chromium (vitest browser mode, *.browser.test.tsx)
+    desc: web layout tests (vitest browser mode, *.browser.test.tsx) plus the runtime-modules built-mode harness, in real Chromium
     dir: web
     env:
       TZ: UTC
@@ -2927,6 +2956,38 @@ tasks:
       # Playwright's image, which ships it. UZI_WEB_BROWSER_CHROMIUM=<path> runs any other
       # Chromium instead.
       - npm run test:browser
+      # Then the built-mode harness for runtime web modules (PRD #4686): it builds the host
+      # and the example module, so it needs the same Chromium and no more.
+      - task: test:web-modules-browser
+
+  test:web-modules-browser:
+    desc: web runtime-modules harness - builds the host and example module, drives real Chromium (PRD 4686)
+    dir: web
+    env:
+      TZ: UTC
+    cmds:
+      # test:modules-browser is the harness itself (scripts/modules-browser-test.mjs:
+      # in-process builds and servers, the scenarios, the process-group cleanup assertions and
+      # the SIGTERM self-test). The node script tests (test:scripts) run in test:web.
+      - npm run test:modules-browser
+
+  test:web-browser:in-container:
+    desc: Opt-in run test:web-browser's tests in the pinned CI Playwright image (docker) against HEAD plus uncommitted changes
+    # For a host whose Chromium cannot start (a worker: the profile socket path is too long
+    # under .uzi/scratch). Exports the candidate to .uzi/scratch/snap-<slot> (SLOT, default
+    # inrun), copies it and web/node_modules into a `docker create --init` container, runs the
+    # browser tests there and removes the container. Not wired into any gate. Exit 2 = the
+    # instrument is broken; the details are in scripts/web-browser-in-container.sh.
+    cmds:
+      - ./scripts/web-browser-in-container.sh
+
+  test:web-browser:in-container-noinit:
+    desc: Same as test:web-browser:in-container but the container has no init (PID 1 does not reap, as in CI), to exercise the zombie-tolerant cleanup path
+    # A static env value (no variable is spliced into a command line).
+    env:
+      NO_INIT: "1"
+    cmds:
+      - ./scripts/web-browser-in-container.sh
 
   # ----------------------------------------------------------- agent (npm) ----
   test:stale-worker-cancel-e2e:
@@ -3417,6 +3478,17 @@ tasks:
     # task reports either failure as 201.
     cmds:
       - ./scripts/assert-web-nginx.sh
+
+  test:web-modules-compose:
+    desc: Opt-in live compose acceptance of runtime web modules (PRD 4686, m5); builds the stack from source
+    # Runs scripts/web-modules-compose-acceptance.sh: a throwaway project mh-4686-<pid>-<nonce> rendered
+    # to a literal file with `env -i`, built once, started with no modules and then with the
+    # example module, driven by a Playwright container. Needs a docker daemon with compose,
+    # jq, yq and python3; the api image builds from source, so it takes many minutes. NOT wired
+    # into gate, gate:repo or gate:web. Exit 2 means the instrument is broken, 1 means a check
+    # failed, and task reports either failure as 201.
+    cmds:
+      - ./scripts/web-modules-compose-acceptance.sh
 
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)

@@ -1,0 +1,12 @@
+# Fixture for scripts/assert-web-modules-render.sh: an id with an uppercase letter
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: Bad
+      version: "1.0.0"
+      page: Page
+      label: Bad
+      icon: package
+      navGroup: modules
+      upstream: svc:80

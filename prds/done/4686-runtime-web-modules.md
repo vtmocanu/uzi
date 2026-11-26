@@ -1,7 +1,7 @@
 # PRD #4686: Runtime web modules
 
 **Issue:** #4686.
-**Status:** Ready.
+**Status:** Implementation complete (2026-11-25); Kubernetes owner acceptance pending.
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** web SPA, web nginx configs and images, Helm chart, compose, docs, specs and tests. No api, store, worker or CLI behaviour change (the generated `api/internal/uzidocs/embed` changes from `task docs:sync` are expected). No changes under `.github/workflows/**`, including validation.
@@ -9,8 +9,8 @@
 
 ## Progress
 
-- [ ] M1 host runtime
-- [ ] M2 delivery (nginx, chart, compose)
+- [x] M1 host runtime
+- [x] M2 delivery (nginx, chart, compose)
 
 ## 1. Problem
 
@@ -23,7 +23,7 @@ An operator lists trusted web modules in deployment configuration. Each module i
 Acceptance examples:
 
 1. An operator adds the example module to deployment configuration. Without rebuilding the web image, a signed-in user sees its nav entry and command-menu entry, opens `/m/example`, and the page renders with uzi's theme; its link navigates uzi's router.
-2. The example module's server is stopped, or accepts connections but never answers. Every uzi page works; `/m/example` shows a "module unavailable" card with Retry within the load timeout; after the server returns, Retry renders the page without a document reload.
+2. The example module's server is stopped, or accepts connections but never answers. Every uzi page works; `/m/example` shows a "module unavailable" card with Retry within the load timeout; after the server returns, Retry renders the page without a document reload. If the Retry fails again (the module is still failing, or the browser keeps a failed module file for the page), the card also offers "Reload page", which recovers once the module is back (Retry, then Reload page, recovers).
 3. A module declares a different host contract major, or was built requiring an incompatible React major. The host refuses to render it and never renders a second React tree. An admin sees the refusal reason (contract or shared-version mismatch, module id and version); any other user sees a generic "this module is not compatible with this version of uzi" message. Neither gets Retry.
 4. No module is configured. No module code or nav entry appears, and the only added request is one small no-cache `/modules.json` fetch.
 5. A module is redeployed from v1 to v2 while a tab holds v1. When the tab next needs a v1 chunk that is no longer served, the page shows the error card with a "Reload page" action; after the rollout completes, that reload renders v2.
@@ -50,7 +50,7 @@ The web tier serves the list at `GET /modules.json` (no auth, `Cache-Control: no
 | `id` | Required. `^[a-z][a-z0-9-]{0,31}$`, unique. Names the route `/m/<id>`, the asset prefix `/modules/<id>/` and the federation remote name |
 | `version` | Required. Shown to admins in error details and diagnostics only; it is not part of any URL and does no cache busting (§ Same-origin delivery) |
 | `page` | Required expose name rendered at `/m/<id>/*` |
-| `label`, `icon`, `navGroup` | Required. `label` 1 to 40 characters; `icon` from a fixed host icon-name list; `navGroup` is `work`, `factory` or `modules` (mapping to the existing `"Work"` and `"Factory"` `NavGroupName`s, or a new `"Modules"` group rendered last and only when non-empty) |
+| `label`, `icon`, `navGroup` | Required. `label` 1 to 40 characters; `icon` from a fixed host icon-name list; `navGroup` is `work`, `factory` or `modules` (mapping to the existing `"Work"` and `"Factory"` `NavGroupName`s, or a new `"Modules"` group rendered only when non-empty; as built it sits after Factory and before the unlabelled Settings/Admin/Docs cluster, see the Decision Log) |
 | `adminOnly` | Optional boolean, default false. Nav and command-menu entries hidden from non-admins, route behind `AdminRoute`. Presentation only: the API still authorizes every call |
 
 The upstream address of a module is nginx configuration only and never appears in `/modules.json`. Ignore unknown fields, so a later contract can add one additively.
@@ -84,14 +84,14 @@ For each module the web nginx gets a `location /modules/<id>/` proxying to that 
 
 - All three configs (`web/nginx.conf`, `web/nginx.mock.conf`, the chart's `web-configmap.yaml`) gain an `include` of a modules directory inside the server block and a `location = /modules.json`.
 - Both images (`web/Dockerfile`, `web/Dockerfile.mock`) ship an empty `[]` and an empty include directory, so with no modules the only behaviour change is that file.
-- The chart renders the include and the file from `web.modules[]` (the fields above plus `upstream`) into the web ConfigMap. `web-deployment.yaml` today mounts only `default.conf` from that ConfigMap, so add explicit read-only mounts for the include directory and `/modules.json`, keeping the existing config-checksum rollout so a list change rolls the web pods.
+- The chart renders the include and the file from `web.modules[]` (the fields above plus `upstream`) into the web ConfigMap. `web-deployment.yaml` today mounts only `default.conf` from that ConfigMap, so add explicit read-only mounts for the include and `/modules.json`, keeping the existing config-checksum rollout so a list change rolls the web pods. As built these are two `subPath` file mounts, not directory mounts (see the Decision Log).
 - Compose takes the same list from a modules override file through a small generator script (`scripts/`), which validates as the chart does and writes the include and `modules.json` that an override compose file mounts.
 
 ### Loader
 
 - Add `@module-federation/vite` and `@module-federation/runtime` (declared directly) to `web`. Host federation config: no build-time remotes, `shareStrategy: "loaded-first"`, shared singletons `react`, `react-dom`, `react-router-dom` with `requiredVersion` from `web/package.json` and `strictVersion: true`.
 - On app start the SPA fetches `/modules.json` once (failure means "no modules", logged). It registers each valid entry with `registerRemotes(..., { force: true })`, `type: "module"`, entry `/modules/<id>/remoteEntry.js`. No remote entry is fetched until a module route renders.
-- Loading uses the runtime's `loadRemote`, never `React.lazy`: a rejected lazy promise is cached, which defeats Retry. Retry is for transient failures before a module ever loaded in this document (upstream down, timeout): it re-registers the remote with `force` and loads again. The spike showed this recovering in Chromium; M1 proves it in the browser test. Retry is not an update mechanism (§ Updates during a rollout).
+- Loading uses the runtime's `loadRemote`, never `React.lazy`: a rejected lazy promise is cached, which defeats Retry. Retry is for transient failures before a module ever loaded in this document (upstream down, timeout): it re-registers the remote with `force` and loads again; after a Retry that fails again, the card also offers Reload page. The spike showed this recovering in Chromium; M1 proves it in the browser test. Retry is not an update mechanism (§ Updates during a rollout).
 - Each load is bounded by a 15 s timeout (one constant, a test hook overrides it). On expiry the page shows the error card; a late arrival is discarded.
 - Measure and report the host bundle and first-load delta the federation runtime adds with zero modules.
 
@@ -127,7 +127,7 @@ Each renders an error card in the module's page. Admins see the reason, the modu
 
 | Class | Card action |
 |---|---|
-| Transient failure before the module ever loaded in this document (network or HTTP error, timeout) | Retry |
+| Transient failure before the module ever loaded in this document (network or HTTP error, timeout) | Retry; after a Retry that fails again, also Reload page |
 | A chunk load fails after the module already loaded in this document (stale chunk during a rollout) | Reload page |
 | Contract major or shared-version refusal, missing expose | None; an incompatibility message (Retry cannot fix it) |
 | Render or lifecycle error | Retry: resets the page's error boundary and remounts the already-loaded component; no re-registration or `loadRemote` |
@@ -207,6 +207,25 @@ Acceptance (in-run): example 1 holds under compose with no web image rebuild bet
 | Pages only, no slots | Smallest useful contract; slots inside existing pages can be added additively later. |
 | Example module inside `web/` with no own `package.json` | CI's existing `npm ci` covers it; no network install in a gate. |
 | No browser SRI | Dynamic ES module imports cannot carry integrity without an inline import map, which needs a CSP hash or nonce. Provenance comes from pinning module images by digest. |
+| Runtime-only host | `@module-federation/runtime@2.9.3` (`init`, `registerRemotes`, `loadRemote`), lazy-imported only when the list is non-empty; the plugin is used only for remotes. Reject the host plugin (eager runtime, build-time remote config). |
+| CSP amendment: literal artifact scan plus runtime enforcement | "No eval/new Function" is verified by a literal artifact scan (`web/scripts/csp-build-scan.mjs`) with hit and no-hit controls, plus runtime enforcement: the exact CSP header asserted on the host document, a deliberate-violation control page that the listener must report, and zero violations in every other scenario. Literal hits in the pinned MF sdk are removed at build time by a `define` plus a version-pinned transform that fails the build on drift. Reject an AST scanner (owner simplification) and adding `'unsafe-eval'`. |
+| nginx layout | `/etc/nginx/uzi-modules/{modules.json,locations.conf}` outside `conf.d`; one flat `location ^~ /modules/<id>/` per module, identical text from chart and generator; a `/modules/` catch-all 404 `no-store` with full security headers; one `map "$status:$uri" $uzi_modcc`, named to avoid colliding with a module id `cc`. Reject per-config copies and a shared `$cc` variable. |
+| Strip every X-Accel-* by njs | An njs header filter deletes every `x-accel-*` response header (image main `nginx.conf` = the pinned image's file + `load_module` + `js_import`, with a drift guard). Reject a fixed list (cannot cover unknown names). |
+| Expanded hidden-header and cleared-request-header lists | From the delivery (PRD M2) nginx security review: `Service-Worker-Allowed`, HSTS, `Clear-Site-Data` and others hidden; `Proxy-Authorization` and `X-CSRF-Token` cleared. Reject the narrower list in the first draft. |
+| Shared upstream grammar and fixtures | Chart and generator validate against the same fixtures so they cannot drift; dotless-host expansion is in the chart only (compose resolves a service name as is). Reject separate grammars. |
+| Chart `subPath` mounts, rollout via `checksum/nginx` | Each pod stays consistent with its own nginx; mid-rollout generation skew is accepted and documented. Reject directory mounts (kubelet updates files under a running nginx). |
+| Simple compose generator | Validate, encode before write, temp file + rename, `locations.conf` first; no lock or crash-recovery protocol and no crash-safety claim; operator rules are documented. Reject a locking/recovery protocol (owner simplification). |
+| Compose acceptance deviates from `stack.md`'s literal `env -i` start (owner-approved) | Render with `env -i` into a literal file, then build/up/down from that file under a unique per-invocation `-p mh-4686-<pid>-<nonce>` project with a ports override, a pre-start round-trip comparison, env and mount checks, image-id equality as the no-rebuild proof, and `down -v` only after verifying volume prefixes (unnamed volumes of the invocation's own containers are allowed, owner-approved at landing). Accepted residual: CLI config, proxies and build settings can affect pulls and builds. |
+| Example module image is a fixture only | `web/examples/ui-module/Dockerfile` is a test and acceptance fixture, shipped in no uzi image and published by no workflow. Reject shipping it as a sample image. |
+| Modules nav group placement | A "Modules" group after Factory and before Settings/Admin/Docs; `work` and `factory` entries append in manifest order; sidebar sections are keyed by stable ids. Reject a group at the end. |
+| Manifest validation in the SPA | Invalid entries are skipped with one `console.error` each; a later duplicate id is skipped (first valid wins); an unknown `navGroup` falls back to `modules`. Reject failing the whole list. |
+| Reload page after a failed Retry | Offered next to Retry once a Retry fails transient, per module per document (a success clears it). Chunk URLs are not rewritten across the import graph, so a child chunk keeps its URL; pinned Chromium (Playwright 1.64.1) was observed to re-fetch a failed child chunk on Retry, so the harness pins both the Chromium recovery and the card path. Owner-approved at landing (MR review, 2026-11-25). |
+| Stale vs transient errors | After a module's first successful load, dynamic-import and MF chunk failures under its prefix are stale and show "Reload page"; others remount with Retry and a forced re-registration. Reject Retry for stale chunks (the browser's module map keeps v1). |
+| Measurement (PRD M1) | One local environment, 5 cold `/dashboard` loads per subject, zero modules, hooks-off builds; noisy, report only. First run: base transferred 2,160,102 B / JS 2,110,074 B / 36 requests / loadEventEnd 389 ms / LCP 560 ms, gzip bundle JS 2,137,382 B, all 2,158,024 B; candidate then 2,196,877 B / 2,146,321 B / 38 requests / 443 ms / 584 ms, gzip bundle JS 2,195,972 B, all 2,216,654 B; `/m/example` cold load 2,248,988 B transferred, 35 requests, loadEventEnd 411 ms. The two extra requests were `/modules.json` and a bundler runtime chunk (`rolldown-runtime`) preloaded by the entry, split out because the lazy federation chunk imported React and the router from the entry; that broke example 4 and was fixed (shared libs handed to the federation chunk at call time), and the harness now refuses any preload or unexpected asset in a zero-module load. After the fix: candidate 2,204,654 B / 2,155,188 B / 36 requests / 348 ms / 476 ms, gzip bundle JS 2,203,786 B, all 2,224,435 B; `/m/example` 2,254,861 B, 33 requests, 338 ms (no base rerun in that run, so no like-for-like delta). Harness wall time 43 to 54 s locally; hosted CI time is a landing obligation. |
+| Example 4 by logical asset roles | The harness builds with a Vite manifest, takes S = static closure of `index.html` and F = static closure of `src/modules/federation.ts`, and with zero modules asserts one `/modules.json` request, no `/modules/` request, no request for or preload of an F \ S chunk, and no preload or unexpected asset at all. Reject hashed file names as the check (they change every build). |
+| Guard before load | `/m/:id/*` is a protected route; `adminOnly` entries render inside `AdminRoute`; `ModuleLoader` is the only caller of `loadRemote`, in a post-mount effect, so signed-out and non-admin visits fetch nothing under `/modules/`. Reject loading first and hiding after. |
+| Theme subscription | `sdk.theme.mode` is the polarity (`light` or `dark`) of the validated `data-theme` stamp; `subscribe` uses a `MutationObserver` on `<html data-theme>` and fires only when the polarity changes. Reject exposing theme names (palettes are host-internal). |
+| Vendorable contract file | `web/src/modules/sdk-contract.ts` imports only `react` types and carries `HostSdkV1` plus the nine `ui` prop types; the host assigns its real components to `HostSdkV1["ui"]` so prop drift fails the host type-check. Reject vendoring `sdk.ts` (it imports host runtime values). |
 
 ## 8. Spike evidence (local throwaway spike, built mode)
 
@@ -214,4 +233,9 @@ Acceptance (in-run): example 1 holds under compose with no web image rebuild bet
 
 Not covered by the spike and required in §5: cache headers, a redeploy with an open tab, a separately deployed second remote, incompatible shared versions, a stalled upstream, and the host build's own `eval` scan. Live list refresh is out of scope (§3).
 
-**UNVERIFIED before implementation:** the bundle-size and first-load delta of the federation runtime with zero modules; the CI time of the built-mode browser test; `strictVersion` behaviour on a React major mismatch; whether the federation runtime's `loadRemote` honours an abort or must be raced against the timeout.
+**Measured during implementation** (replacing the earlier UNVERIFIED line):
+
+- Bundle and first-load delta with zero modules, the gzip bundle size and the `/m/example` load cost: see the "Measurement (PRD M1)" Decision Log row (report only, one local environment).
+- Built-mode browser harness: 21/21 scenarios (two interrupt self-test phases, ready and launch), 43 to 54 s wall time locally across runs. The hosted CI time is a landing obligation, not measured here.
+- `strictVersion` on a React major mismatch: the module is refused, never double-loaded (#RUNTIME-015, verified).
+- `loadRemote` is raced against the 15 s timeout (the runtime is not relied on to honour an abort).

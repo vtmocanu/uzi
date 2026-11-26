@@ -28,6 +28,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 import { appRoutes } from "../appRoutes";
 import { mockApi } from "../mocks/mockApi";
 import { failNextMockModelSettingsWrite } from "../mocks/mockApi/settings";
+import { resetModuleListForTests } from "../modules/registry";
 
 const DIALOG = "You have unsaved model changes";
 const RESET = {
@@ -69,6 +70,9 @@ async function openModels(path?: string) {
 let routerErrors: string[] = [];
 beforeEach(async () => {
   localStorage.clear();
+  // appRoutes mounts ModulesProvider, which fetches /modules.json once per document (PRD
+  // #4686): serve "no modules" instead of letting the request leave the test.
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
   await mockApi.login("vlad@uzi.local", "x");
   await mockApi.putMyModelSettings(RESET);
   dialogSeen = false;
@@ -91,6 +95,8 @@ afterEach(() => {
   routerErrors = [];
   observer?.disconnect();
   cleanup();
+  vi.unstubAllGlobals();
+  resetModuleListForTests();
   failNextMockModelSettingsWrite(null);
   vi.restoreAllMocks();
   expect(errors).toEqual([]);

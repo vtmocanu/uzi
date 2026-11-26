@@ -1,0 +1,58 @@
+# Shared upstream accept/reject list (PRD #4686 decision 5), read by
+# scripts/assert-web-modules-render.sh and scripts/web-modules-gen.test.sh.
+# One case per line: `accept <VALUE>` or `reject <VALUE>`, where VALUE is wrapped in angle
+# brackets so leading and trailing spaces are visible: everything between the first `<` and the
+# last `>` on the line is the value, verbatim. Lines starting with `#` and blank lines are skipped.
+# The grammar: the whole value is [http://]HOST:PORT. HOST is a strict IPv4 address (a host of
+# only digits and dots must be valid IPv4) or a lowercase DNS-1123 name; PORT is 1-65535.
+accept <svc:80>
+accept <http://svc.ns:8080>
+accept <10.0.0.1:8080>
+accept <my-svc.my-ns.svc.cluster.local:65535>
+accept <http://10.255.255.255:1>
+accept <a1-b2.c3:443>
+# A 253-character host (the DNS maximum) of valid labels is accepted, 254 is not.
+accept <aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:80>
+reject <svc>
+reject <svc:>
+reject <:80>
+reject <svc:0>
+reject <svc:08>
+reject <svc:65536>
+reject <svc:123456>
+reject <svc:80/>
+reject <svc:80/path>
+reject <svc:80?x>
+reject <svc:80#x>
+reject <https://svc:80>
+reject <http://http://svc:80>
+reject <ftp://svc:80>
+reject <SVC:80>
+reject <Svc.Ns:80>
+reject <[::1]:80>
+reject <::1>
+reject <user@svc:80>
+reject <svc:80;>
+reject <svc:80 >
+reject < svc:80>
+reject <svc;x:80>
+reject <svc{:80>
+reject <svc}:80>
+reject <$svc:80>
+reject <999.1.1.1:80>
+reject <256.0.0.1:80>
+reject <01.2.3.4:80>
+reject <1.2.3:80>
+reject <1.2.3.4.5:80>
+reject <123:80>
+reject <svc\x:80>
+reject <"svc":80>
+reject <'svc':80>
+reject <-svc:80>
+reject <svc-:80>
+reject <svc..ns:80>
+reject <svc.:80>
+reject <svc_x:80>
+reject <svc:80:80>
+reject <http:svc:80>
+reject <aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:80>

@@ -46,6 +46,12 @@ case "$1" in
     exit 0 ;;
   cp)
     case "$2" in
+      *:/etc/nginx/nginx.conf)
+        # The drift guard's base: the "image" nginx.conf is the shipped main conf minus its two
+        # added lines (a copy INTO a container has the container as its destination, not $2).
+        grep -vxF -e 'load_module modules/ngx_http_js_module.so;' \
+          -e '    js_import uzi_modules from /etc/nginx/uzi-modules.js;' "$FAKE_ROOT/web/nginx-main.conf" > "$3"
+        exit 0 ;;
       *:/var/log/nginx/.)
         if [ "${FAKE_LEAK_SOURCE:-}" = file ]; then
           leak_cookie > "$3/access.log"
@@ -107,7 +113,8 @@ run() {
   FAKE_CREATE_FAIL=$2
   FAKE_LOG="$TMP/$case_name.log"
   FAKE_IDS="$TMP/$case_name.ids"
-  export FAKE_CREATE_FAIL FAKE_LOG FAKE_IDS
+  FAKE_ROOT=${3:-$ROOT}
+  export FAKE_CREATE_FAIL FAKE_LOG FAKE_IDS FAKE_ROOT
   : > "$FAKE_LOG"
   mkdir -p "$TMP/$case_name.tmp"
   rc=0
@@ -127,7 +134,8 @@ run_pull() {
   FAKE_CREATE_FAIL='no-such-container'
   FAKE_LOG="$TMP/$case_name.log"
   FAKE_IDS="$TMP/$case_name.ids"
-  export FAKE_PULL_OK FAKE_INSPECT_MISS FAKE_CREATE_FAIL FAKE_LOG FAKE_IDS
+  FAKE_ROOT=$ROOT
+  export FAKE_PULL_OK FAKE_INSPECT_MISS FAKE_CREATE_FAIL FAKE_LOG FAKE_IDS FAKE_ROOT
   : > "$FAKE_LOG"
   mkdir -p "$TMP/$case_name.tmp"
   pull_rc=0
@@ -138,9 +146,9 @@ run_pull() {
 # creates_end_with <case> <ref>: exactly 4 docker create lines, each ending in " <ref>".
 creates_end_with() {
   n=$(grep -c '^docker create ' "$TMP/$1.log" || true)
-  [ "$n" = 4 ] || fail "$1: want 4 docker create lines, got $n"
+  [ "$n" = 8 ] || fail "$1: want 8 docker create lines, got $n"
   m=$(grep '^docker create ' "$TMP/$1.log" | grep -cF " $2" || true)
-  [ "$m" = 4 ] || fail "$1: want all 4 creates to end with ' $2', got $m"
+  [ "$m" = 8 ] || fail "$1: want all 8 creates to end with ' $2', got $m"
   grep '^docker create ' "$TMP/$1.log" | grep -qvF -- " $2" \
     && fail "$1: a docker create does not end with ' $2'"
   return 0
@@ -159,7 +167,12 @@ expect_net_rm() {
 # mktemp and reaches Docker without relying on this harness's scratch parent.
 fresh="$TMP/fresh-checkout"
 mkdir -p "$fresh/web" "$fresh/deploy"
-cp "$ROOT/web/Dockerfile" "$ROOT/web/nginx.conf" "$ROOT/web/nginx.mock.conf" "$fresh/web/"
+cp "$ROOT/web/Dockerfile" "$ROOT/web/Dockerfile.mock" "$ROOT/web/nginx.conf" "$ROOT/web/nginx.mock.conf" "$fresh/web/"
+cp "$ROOT/web/nginx-main.conf" "$ROOT/web/nginx-modules.js" "$fresh/web/"
+cp -R "$ROOT/web/nginx-modules-default" "$fresh/web/"
+mkdir -p "$fresh/scripts/fixtures/web-modules"
+cp "$ROOT/scripts/fixtures/web-modules/location.example.conf" "$fresh/scripts/fixtures/web-modules/"
+cp "$ROOT/scripts/web-modules-gen.py" "$fresh/scripts/"
 cp -R "$ROOT/deploy/chart" "$fresh/deploy/chart"
 [ ! -d "$fresh/.uzi" ] || fail "fresh: fixture already has scratch"
 run fresh '*-up' "$fresh"
@@ -225,7 +238,7 @@ for source in stdout stderr file; do
     || fail "leak-$source: chart cookie log assertion did not detect leak"
   ! grep -qF 'wnginx-request-' "$TMP/leak-$source.out" \
     || fail "leak-$source: sentinel printed in script output"
-  [ "$(rms "leak-$source" | wc -l | tr -d ' ')" = 4 ] \
+  [ "$(rms "leak-$source" | wc -l | tr -d ' ')" = 8 ] \
     || fail "leak-$source: owned containers not cleaned"
 done
 unset FAKE_LEAK_SOURCE
