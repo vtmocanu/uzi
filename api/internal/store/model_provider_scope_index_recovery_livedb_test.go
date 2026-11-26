@@ -289,7 +289,7 @@ func scopeSnapshot(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s scop
 	oid := scalar[string](ctx, t, pool, `SELECT to_regclass('model_providers_scope_owner_id_key')::oid::text`)
 	qualified := scalar[string](ctx, t, pool, `SELECT to_regclass($1 || '.model_providers_scope_owner_id_key')::oid::text`, schemaOfModelProviders(ctx, t, pool))
 	// Whole rows (to_jsonb): no migration from the predecessor to head adds, drops or retypes a column of
-	// model_providers, model_provider_revisions or user_secrets (00538 alters users; 00539 and 00540 only
+	// model_providers, model_provider_revisions or user_secrets (00538 alters users; 00539, 00540 and 00541 only
 	// validate constraints).
 	providers := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(p)::text, E'\n' ORDER BY p.id), '') FROM model_providers p WHERE p.id IN ($1, $2)`, s.shared, s.personal)
 	revisions := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(r)::text, E'\n' ORDER BY r.provider_id, r.revision), '') FROM model_provider_revisions r WHERE r.provider_id IN ($1, $2)`, s.shared, s.personal)
@@ -387,6 +387,22 @@ func TestScopeIndexRecoveryStopRowsLiveDB(t *testing.T) {
 		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00527, 526)
 		wantRunbook(ctx, t, pool, stage00527, "stop-fks")
 	})
+	t.Run("00528 with a second foreign key on the index", func(t *testing.T) {
+		ctx, dsn, pool := sharedDB(t, "scope_idx_fk528_two_", 527)
+		// The real user_secrets foreign key stays; a second one from another table makes the count 2.
+		mustExec(ctx, t, pool, `CREATE TABLE scope_decoy (s uuid, p uuid)`)
+		mustExec(ctx, t, pool, `ALTER TABLE scope_decoy ADD CONSTRAINT scope_decoy_fkey FOREIGN KEY (s, p) REFERENCES model_providers (scope_owner_id, id) NOT VALID`)
+		invalidateScopeIndex(ctx, t, pool)
+		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00528, 527)
+		wantRunbook(ctx, t, pool, stage00528, "stop-fks")
+	})
+	t.Run("00528 with the Claude foreign key missing", func(t *testing.T) {
+		ctx, dsn, pool := sharedDB(t, "scope_idx_fk528_claude_", 527)
+		mustExec(ctx, t, pool, `ALTER TABLE users DROP CONSTRAINT users_claude_provider_fkey`)
+		invalidateScopeIndex(ctx, t, pool)
+		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00528, 527)
+		wantRunbook(ctx, t, pool, stage00528, "stop-fks")
+	})
 	t.Run("users_codex_provider_scope with a missing Claude foreign key", func(t *testing.T) {
 		pred := sharedCodexPredecessor(t, resolveSharedCodexVersions(t).userScope)
 		ctx, dsn, pool := sharedDB(t, "scope_idx_codex_fks_", pred)
@@ -400,8 +416,9 @@ func TestScopeIndexRecoveryStopRowsLiveDB(t *testing.T) {
 		ctx, _, pool := sharedDB(t, "scope_idx_codex_recreated_", pred)
 		mustExec(ctx, t, pool, `DROP INDEX `+scopeIndex+` CASCADE`)
 		recreateScopeIndex(ctx, t, pool)
-		// No Migrate here: the unchanged guard would pass on this valid index and the Claude-era foreign
-		// keys would stay missing. That is the residual gap the runbook itself must catch.
+		// No Migrate here: the unchanged guard still passes on this valid index (ADR Residual gap). If an
+		// operator reaches the runbook in this state (e.g. after an interrupted repair), the valid row
+		// must still stop on the missing foreign keys.
 		wantRunbook(ctx, t, pool, stageCodex, "stop-fks")
 	})
 }
