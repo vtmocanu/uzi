@@ -90,7 +90,7 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
         modelMap: { opus: { model: "o", context_window: 200_000 }, sonnet: { model: "s" }, haiku: { model: "h" }, fable: { model: "f" } },
       }), HOME_DIR);
       const expected = new Set([
-        "HOME", "PATH", "AGENT_BROWSER_ARGS", "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH",
+        "HOME", "CLAUDE_CONFIG_DIR", "PATH", "AGENT_BROWSER_ARGS", "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH",
         "ANTHROPIC_BASE_URL", authStyle === "bearer" ? "ANTHROPIC_AUTH_TOKEN" : "ANTHROPIC_API_KEY",
         "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
@@ -157,7 +157,8 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
 
   it("the sdk-env protected set and the Codex command-env mirror agree (the documented differences are pinned)", () => {
     for (const k of PROTECTED_ENV_KEYS) {
-      if (k === "NODE_EXTRA_CA_CERTS") continue; // sdk-only: the CLI's CA bundle; the Codex command env has no CLI
+      // sdk-only: the CLI's CA bundle and its config directory (PRD #4416); the Codex command env has no CLI
+      if (k === "NODE_EXTRA_CA_CERTS" || k === "CLAUDE_CONFIG_DIR") continue;
       assert.ok(COMMAND_ENV_PROTECTED_KEYS.has(k), `${k} is protected in sdk-env but missing from the Codex mirror`);
     }
     const codexOnly = [...COMMAND_ENV_PROTECTED_KEYS].filter((k) => !PROTECTED_ENV_KEYS.has(k)).sort();

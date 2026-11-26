@@ -375,6 +375,7 @@ it.each([
   ["credential_switch_settling", "credential switch_settling"],
   ["credential_switch_unsettled", "credential switch_unsettled"],
   ["run_override_unavailable", "model choice unavailable: owner hold"],
+  ["run_env_history_unavailable", "variable history unavailable: owner hold"],
 ] as const)("history label for a paused run held on %s", async (hold, label) => {
   setAuth();
   mockApi.getIssue.mockResolvedValue({ issue: anIssue() });

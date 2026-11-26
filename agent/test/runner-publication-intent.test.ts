@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -745,7 +746,7 @@ it("records no closing reference for an owner-partial delivery or a scope-capped
 /** A runner whose recovery coordinator is ENABLED (a worker token), as on a real worker. */
 const recoveryRunner = (executor: Executor, outbox: Outbox): RunRunner =>
   build(executor, { github: fakeGitHub().github }, outbox, nullLogger(), {
-    recovery: new RecoveryCoordinator({ client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "publication-intent-worker-fixture" }),
+    recovery: new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "publication-intent-worker-fixture" }),
   });
 
 type PinSpy = { calls: Array<{ attemptedHeadSha?: string }>; results: Array<{ attemptedHeadShas?: string[]; attemptedHeadSha?: string } | undefined> };

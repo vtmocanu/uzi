@@ -13,6 +13,7 @@ import { ExecutorLifetime, type ExecutorTerminalSeal } from "../src/codex/execut
 import type { Executor } from "../src/executor.js";
 import { legacyCompletionCore, type CompletionSource, type PublicationFsOps, type RecoveryCoordinator } from "../src/recovery.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { validCompletionSource as baseValidCompletionSource } from "./fixtures/base-valid-completion-source.js";
 import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";
@@ -125,7 +126,7 @@ async function rig(t: TestContext, options: { codex: boolean; cohort?: number; u
   }
   captureIds.sort();
 
-  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", []);
+  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   Object.assign(flight, { barePath: bare, worktreePath: cloneInfo.path, branch: BRANCH, runnerClone: cloneInfo });
   await p.bindCompletionSource(flight);
   const bound = flight.completionSourceBound as CompletionSource | undefined;

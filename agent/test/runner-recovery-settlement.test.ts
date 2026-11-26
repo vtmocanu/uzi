@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { establishTrackingOwnership } from "./publication-fixture.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -109,7 +110,7 @@ function rig(seededFrom?: RunnerClone["seededFrom"], events?: string[]): Rig {
   const recoveryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-rec-"));
   const settlementRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-set-"));
   const recoveryClient = new FakeRecoveryClient();
-  const coord = new RecoveryCoordinator({
+  const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client: recoveryClient,
     git: new FakeRecoveryGit(),
     log: nullLogger(),

@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -34,7 +35,7 @@ test("exact release hints follow metadata locks; bad terminals and unknown sibli
     });
     const hints: number[] = [];
     const followups: Promise<void>[] = [];
-    const coord = new RecoveryCoordinator({
+    const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client: exactClient, git: new FakeRecoveryGit(), log, recoveryRoot: path.join(root, "recovery"), workerToken: "unit-key",
       terminalRecordProtection: (id) => box.hasPhysicalTerminalProtection(id),
       onAuthoritativeGenerationReleased: (id, gen) => {
@@ -71,7 +72,7 @@ test("exact release hints follow metadata locks; bad terminals and unknown sibli
     assert.deepEqual(hints, [3], "no hints for ambiguous, retained, noop, or feature-absent releases");
     await coord.forgetGeneration(run, 3);
     assert.deepEqual(hints, [3], "metadata forgetting is not release authority");
-    const failClosed = new RecoveryCoordinator({ client, git: new FakeRecoveryGit(), log, recoveryRoot: path.join(root, "recovery"), workerToken: "unit-key",
+    const failClosed = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git: new FakeRecoveryGit(), log, recoveryRoot: path.join(root, "recovery"), workerToken: "unit-key",
       terminalRecordProtection: async () => { throw new Error("inventory unavailable"); } });
     await failClosed.release(run);
     assert.ok(await fs.stat(unknown));

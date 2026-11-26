@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { RecoveryCoordinator } from "../src/recovery.js";
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { PublicationContextRequest } from "../src/protocol.js";
@@ -207,7 +208,7 @@ describe("#4616 M4 refresh publication: target_terminal context refusal", () => 
         const f = forgeFor(rig.h.original);
         const push = t.mock.method(git, "pushBranch");
         const archiveClient = new FakeRecoveryClient();
-        const options = { client: archiveClient, git, log: nullLogger(),
+        const options = { ...NO_SCAN_NEEDLES, client: archiveClient, git, log: nullLogger(),
           recoveryRoot: git.recoveryRoot, workerToken: "refresh-recovery-worker-fixture" };
         const recovery = new RecoveryCoordinator(options);
         if (captureFailure) t.mock.method(git, "produceRecoveryBundle", async () => {
@@ -300,7 +301,7 @@ describe("#4616 M4 refresh publication: target_terminal context refusal", () => 
         // captures and uploads, and the release FINAL cannot be sent from inside the flight.
         const server = heldServer(claim, ["recovery_inventory_v1"]);
         const push = t.mock.method(git, "pushBranch");
-        const recovery = new RecoveryCoordinator({ client, git, log: nullLogger(),
+        const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(),
           recoveryRoot: git.recoveryRoot, workerToken: JOIN_TOKEN });
         const probe = candidateExecutor(h.candidate);
         await runner(probe.executor, f.gl.gitlab, JOIN_TOKEN, { github: f.gh.github, recovery }).execute(claim);

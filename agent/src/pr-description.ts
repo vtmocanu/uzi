@@ -1053,7 +1053,10 @@ function deterministicRegion(input: RegionInput): string {
   const size = sizeLineOf(input);
   const prov = provenanceOf(input);
   if (size) parts.push(size);
-  if (prov) parts.push(...(parts.length ? [""] : []), prov);
+  if (prov) {
+    if (parts.length) parts.push("");
+    parts.push(prov);
+  }
   return wrapRegion(parts);
 }
 
@@ -1071,11 +1074,9 @@ function verificationLines(fields: SanitizedPrDescriptionFields, input: RegionIn
   for (const g of groups.values()) {
     const head = input.headSha?.trim();
     const differs = head !== undefined && head !== "" && !sameSha(g.sha, head);
-    out.push(
-      ...(out.length ? [""] : []),
-      `Reported by the agent at ${shortSha(g.sha)}${differs ? ` (the PR head is ${shortSha(head)})` : ""}:`,
-      ...g.lines,
-    );
+    if (out.length) out.push("");
+    out.push(`Reported by the agent at ${shortSha(g.sha)}${differs ? ` (the PR head is ${shortSha(head)})` : ""}:`);
+    for (const line of g.lines) out.push(line);
   }
   return out;
 }
@@ -1446,7 +1447,7 @@ function pendingBlock(pending: CompletionPending, deferredMilestones: readonly s
       ...c.verification_steps.map((x) => `>   - Verify: ${escapeInline(x)}`),
     ];
     const size = lines.reduce((n, l) => n + l.length + 1, 0);
-    if (brief.length === 0 && used + size <= PENDING_ITEM_CHAR_BUDGET) { full.push(...lines); used += size; }
+    if (brief.length === 0 && used + size <= PENDING_ITEM_CHAR_BUDGET) { for (const line of lines) full.push(line); used += size; }
     else brief.push(`> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)})`);
   }
   return [
@@ -1518,16 +1519,23 @@ function issueArm(input: CompletionBlockInput): string[] {
       `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
     lines.push("", `> **Issue remains open.** ${reason}`);
   }
-  if (pending) lines.push("", ...pendingBlock(pending, deferred.map((d) => d.milestone_id), !!input.scopeCapped));
+  if (pending) {
+    const block = pendingBlock(pending, deferred.map((d) => d.milestone_id), !!input.scopeCapped);
+    lines.push("");
+    for (const line of block) lines.push(line);
+  }
   const drift = input.semanticDrift ? driftBlock(input.semanticDrift) : [];
-  if (drift.length > 0) lines.push("", ...drift);
+  if (drift.length > 0) {
+    lines.push("");
+    for (const line of drift) lines.push(line);
+  }
   if (accepted.length > 0) {
     lines.push(
       "",
       "> ⚠️ **Accepted unmet criteria — owner decision (PRD #1227).** The owner accepted the following",
       "> unmet criteria as-is with the reason given; they are NOT met by this merge request:",
-      ...accepted.map((a) => `> - ${codeSpan(a.id)} — ${escapeInline(a.text)}: ${escapeInline(a.reason)}`),
     );
+    for (const a of accepted) lines.push(`> - ${codeSpan(a.id)} — ${escapeInline(a.text)}: ${escapeInline(a.reason)}`);
   }
   const gates = gatesUnverifiedSection(input.gatesUnverified, input.gatesDiscoveryTruncated);
   if (gates) lines.push("", gates);

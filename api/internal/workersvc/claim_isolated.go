@@ -161,4 +161,10 @@ func stripForIsolation(p *ClaimPayload) {
 	p.KnownImproveUziTargets = nil
 	p.ReviewComments = nil
 	p.Pipeline = nil
+	// PRD #4416: an isolated run never receives run environment variables, and nothing about
+	// them is recorded for it.
+	p.Secrets.RunEnv = nil
+	p.Secrets.RunEnvRedact = nil
+	p.runEnv = nil
+	p.redactEpochSet = false
 }

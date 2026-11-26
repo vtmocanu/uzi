@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -55,7 +56,7 @@ function reworkWorker(outbox: Outbox, ownership: () => Promise<unknown>,
 }
 // Match runner-inventory-cleanup: authenticated journal predates generation tracking.
 async function realRecoveryCoordinator(root: string) {
-  const recovery = new RecoveryCoordinator({ recoveryRoot: root + "/legacy-recovery",
+  const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: root + "/legacy-recovery",
     workerToken: TOKEN, client: recoveryClient, git, log: nullLogger() });
   assert.ok(await recovery.pin({ runId: RUN, kind: "issue", branch: "task", sourceSha: "a".repeat(40) }));
   recoveryClient.clearFeatures();

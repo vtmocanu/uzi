@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1964,7 +1965,7 @@ it(`handoff receipt pacing preserves the uploaded task identity with cleanup bac
     f.state.finalError = undefined;
     f.state.candidates = [];
     const timing = fast ? buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }) : undefined;
-    const live = new RecoveryCoordinator({ recoveryRoot: path.join(f.root, "journal"),
+    const live = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: path.join(f.root, "journal"),
       workerToken: "local-worker-fixture", client: f.client as never, git: f.git as never,
       log: f.log, now: () => f.state.now, ...timing });
     const snapshot = live.snapshotBootRecords.bind(live);
@@ -2855,6 +2856,8 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   }>();
   const client = {
     hasFeature: () => state.feature,
+    // PRD 4416 M2: the runner-built coordinator resolves scan needles through this route; the fixture run holds no secret variables.
+    getRunEnvRedact: async () => ({ protected: false as const }),
     getRunOwnership: async () => {
       if (state.ownershipError) throw state.ownershipError;
       return { status: state.status, claim_generation: state.ownGeneration, inventory_guarded: state.ownGuarded };
@@ -3003,7 +3006,7 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     timing: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs" | "liveMaxPerPass" | "isExecuting"> = {}) => {
     let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
       action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
-    const coordinator = new RecoveryCoordinator({
+    const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
     log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased, testHooks, ...timing,
     withInventorySourceBoundary: sourceBoundary === "runner" ? async (context, action) => {
@@ -4300,7 +4303,7 @@ it("real aggregate bundle imports H and exact disposition H2 with current tree a
     assert.equal((await cache.updateTrackingRef(bare, producer.branch, h, { context: producer })).kind, "updated");
     assert.equal((await cache.committedTrackingOwnership(bare, producer.branch, producer.runId, h, 1)).kind, "owned");
     const context = { ...producer, generation: 7, branch: "current" };
-    const coordinator = new RecoveryCoordinator({
+    const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       recoveryRoot: path.join(data, "recovery"), workerToken: "local-worker-fixture", log: nullLogger(),
       git: cache,
       client: {
@@ -4384,7 +4387,7 @@ it("restart from persisted divergent owed refs without a journal uploads an impo
     const serverId = "00000000-0000-4000-8000-000000001945";
     let manifest: { checksum: string; byte_size: number } | undefined;
     let uploaded = Buffer.alloc(0);
-    const coordinator = new RecoveryCoordinator({
+    const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       recoveryRoot, workerToken: "local-worker-fixture", log: nullLogger(), git: restartedCache,
       client: {
         hasFeature: (name: string) => name === "recovery_inventory_v1",
@@ -4473,7 +4476,7 @@ it("a guarded journal never uses the legacy release RPC after feature loss", asy
   const root = makeScratchRoot("inventory-");
   const calls: unknown[] = [];
   let feature = true;
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: root, workerToken: "local-worker-fixture", log: nullLogger(),
     client: {
       hasFeature: () => feature,

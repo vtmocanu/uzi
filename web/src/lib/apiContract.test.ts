@@ -25,12 +25,47 @@ import type {
   AnalyticsBreakdownRowDTO,
   AnalyticsBreakdownDTO,
   AnalyticsSpendDTO,
+  AnalyticsReliabilityBlockDTO,
+  AnalyticsReliabilityTotalsDTO,
+  AnalyticsReliabilityCellDTO,
+  AnalyticsReliabilityCauseDTO,
+  AnalyticsReliabilityCausesDTO,
+  AnalyticsReliabilityPointDTO,
+  AnalyticsReliabilityHarnessSeriesDTO,
+  AnalyticsReliabilityRollingDTO,
+  AnalyticsReliabilityRowDTO,
+  AnalyticsReliabilityBreakdownDTO,
+  AnalyticsReliabilityLatestFailureDTO,
+  AnalyticsReliabilityNeedsLandingDTO,
+  AnalyticsReliabilityDTO,
+  AnalyticsCapacityDTO,
+  AnalyticsCapacityFiltersDTO,
+  AnalyticsCapacityPopulationDTO,
+  AnalyticsCapacityLimitationDTO,
+  AnalyticsCapacityOccupancyCellDTO,
+  AnalyticsCapacityOccupancyBucketDTO,
+  AnalyticsCapacityOccupancyDTO,
+  AnalyticsCapacityUsageWaitCellDTO,
+  AnalyticsCapacityUsageWaitBucketDTO,
+  AnalyticsCapacityUsageWaitDTO,
+  AnalyticsCapacityNotTrackedDTO,
+  AnalyticsCapacityEffectiveScopeDTO,
+  AnalyticsCapacityGaugeBaseDTO,
+  AnalyticsCapacityAnthropicIdentityDTO,
+  AnalyticsCapacityAnthropicGaugeDTO,
+  AnalyticsCapacityCodexIdentityDTO,
+  AnalyticsCapacityCodexGaugeDTO,
+  AnalyticsCapacityGaugesDTO,
   AnalyticsQualityDTO,
 } from "./apiTypes";
+import analyticsReliabilityFull from "../../../fixtures/api-contract/analytics_reliability.full.json";
+import analyticsReliabilityZero from "../../../fixtures/api-contract/analytics_reliability.zero.json";
 import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
 import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
 import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
 import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
+import analyticsCapacityFull from "../../../fixtures/api-contract/analytics_capacity.full.json";
+import analyticsCapacityZero from "../../../fixtures/api-contract/analytics_capacity.zero.json";
 import analyticsQualityFull from "../../../fixtures/api-contract/analytics_quality.full.json";
 import analyticsQualityZero from "../../../fixtures/api-contract/analytics_quality.zero.json";
 import type { CrossCheckHistoryDTO, CrossCheckHistoryAvailabilityDTO, FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
@@ -2580,6 +2615,81 @@ describe("analytics spend contract (issue #4684)", () => {
   });
 });
 
+describe("analytics capacity contract (issue #4731)", () => {
+  // Fixed-string fields are literal unions in the TS type but "x" or "" in the recorded
+  // fixtures, so the fixtures are checked after Widen (strings stay strings, shape and
+  // nullability stay exact). NullSlices then lets every array slot accept the zero null.
+  type Full = typeof analyticsCapacityFull;
+  const _top: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityDTO, Full>;
+  const _filters: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityDTO["filters"], Full["filters"]>;
+  const _occ: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityDTO["occupancy"], Full["occupancy"]>;
+  const _pop: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityPopulationDTO, Full["occupancy"]["population"]>;
+  const _lim: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityLimitationDTO, Full["occupancy"]["limitations"][number]>;
+  const _occCell: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityOccupancyCellDTO, Full["occupancy"]["window"]>;
+  const _occBucket: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityOccupancyBucketDTO, Full["occupancy"]["buckets"][number]>;
+  const _wait: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityUsageWaitDTO, Full["usage_wait"]>;
+  const _waitCell: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityUsageWaitCellDTO, Full["usage_wait"]["current"]>;
+  const _waitBucket: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityUsageWaitBucketDTO, Full["usage_wait"]["buckets"][number]>;
+  const _nt: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityNotTrackedDTO, Full["not_tracked"][number]>;
+  const _gauges: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityGaugesDTO, Full["gauges"]>;
+  const _anth: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityAnthropicGaugeDTO, Full["gauges"]["anthropic"]>;
+  const _codex: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityCodexGaugeDTO, Full["gauges"]["codex"]>;
+  const _scope: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityEffectiveScopeDTO, Full["gauges"]["codex"]["effective_scope"]>;
+  const _anthId: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityAnthropicIdentityDTO, Full["gauges"]["anthropic"]["identities"][number]>;
+  const _codexId: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityCodexIdentityDTO, Full["gauges"]["codex"]["identities"][number]>;
+  type GaugeBase = AnalyticsCapacityGaugeBaseDTO;
+  const _base: never = null as unknown as Exclude<keyof GaugeBase, keyof Full["gauges"]["anthropic"]>;
+  void [
+    _top, _filters, _occ, _pop, _lim, _occCell, _occBucket, _wait, _waitCell, _waitBucket, _nt, _gauges, _anth,
+    _codex, _scope, _anthId, _codexId, _base,
+  ];
+
+  it("accepts the full fixture", () => {
+    const full: Widen<AnalyticsCapacityDTO> = analyticsCapacityFull;
+    expect(full.selected_user).toBe("x");
+    expect(full.filters).toEqual({ repo: "x", harness: "x", kinds: ["x"] });
+    expect(full.excluded_kind_selected).toBe("x");
+    expect(full.occupancy.population.cross_check_kind_included).toBe(1);
+    expect(full.occupancy.limitations[0]).toEqual({ code: "x", runs: 1 });
+    expect(full.occupancy.window.average_concurrent_runs).toBe(1.5);
+    expect(full.occupancy.buckets[0].index).toBe(1);
+    expect(full.usage_wait.current).toEqual({ count: 1, n: 1, share: 1.5, reason: "x" });
+    expect(full.usage_wait.buckets[0].index).toBe(1);
+    expect(full.not_tracked[0].value).toBe(1.5);
+    expect(full.gauges.anthropic.identities[0].limits.status).toBe("x");
+    expect(full.gauges.anthropic.identities[0].user_id).toBe("x");
+    expect(full.gauges.codex.vault_state_basis).toBe("x");
+    expect(full.gauges.codex.identities[0].account_id).toBe("x");
+    expect(full.gauges.codex.identities[0].email).toBe("x");
+    expect(full.gauges.codex.set_state).toBe("x");
+  });
+
+  it("accepts the zero fixture: pointers and slices null, scalars zero", () => {
+    const zero: NullSlices<Widen<AnalyticsCapacityDTO>> = analyticsCapacityZero;
+    expect("previous_from" in zero).toBe(false);
+    expect(zero.history_start).toBeNull();
+    expect(zero.filters.repo).toBeNull();
+    expect(zero.filters.harness).toBeNull();
+    expect(zero.filters.kinds).toBeNull();
+    expect(zero.excluded_kind_selected).toBeNull();
+    expect(zero.occupancy.limitations).toBeNull();
+    expect(zero.occupancy.buckets).toBeNull();
+    expect(zero.occupancy.window.average_concurrent_runs).toBeNull();
+    expect(zero.occupancy.window.reason).toBeNull();
+    expect(zero.occupancy.window.run_seconds).toBe(0);
+    expect(zero.usage_wait.current.share).toBeNull();
+    expect(zero.usage_wait.buckets).toBeNull();
+    expect(zero.not_tracked).toBeNull();
+    expect(zero.gauges.anthropic.reason).toBeNull();
+    expect(zero.gauges.anthropic.set_state).toBeNull();
+    expect(zero.gauges.anthropic.identities).toBeNull();
+    expect(zero.gauges.anthropic.effective_scope.unattributed_selectors).toBeNull();
+    expect(zero.gauges.codex.identities).toBeNull();
+    expect(zero.gauges.codex.truncated).toBe(false);
+    expect(zero.occupancy.time_basis).toBe("");
+  });
+});
+
 describe("analytics quality contract (issue #4730)", () => {
   type Full = typeof analyticsQualityFull;
   type Q = AnalyticsQualityDTO;
@@ -2691,12 +2801,176 @@ describe("analytics DTO exact nullability (issue #4684)", () => {
   const _row: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownRowDTO>, "key" | "label" | "id">;
   const _breakdown: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownDTO>, never>;
   const _spend: never = null as unknown as UnionDiff<NullKeys<AnalyticsSpendDTO>, "history_start">;
+  const _capFilters: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityFiltersDTO>, "repo" | "harness">;
+  const _capPopulation: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityPopulationDTO>, never>;
+  const _capLimitation: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityLimitationDTO>, "runs">;
+  const _capOccCell: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityOccupancyCellDTO>, "average_concurrent_runs" | "reason">;
+  const _capOccBucket: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityOccupancyBucketDTO>, "average_concurrent_runs" | "reason">;
+  const _capOccupancy: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityOccupancyDTO>, never>;
+  const _capWaitCell: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityUsageWaitCellDTO>, "share" | "reason">;
+  const _capWaitBucket: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityUsageWaitBucketDTO>, "share" | "reason">;
+  const _capWait: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityUsageWaitDTO>, never>;
+  const _capNotTracked: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityNotTrackedDTO>, "value">;
+  const _capScope: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityEffectiveScopeDTO>, "reason">;
+  const _capGaugeBase: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityGaugeBaseDTO>, "reason" | "set_state">;
+  const _capAnthropicId: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityAnthropicIdentityDTO>, "user_id" | "email">;
+  const _capAnthropicGauge: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityAnthropicGaugeDTO>, "reason" | "set_state">;
+  const _capCodexId: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityCodexIdentityDTO>, "user_id" | "email">;
+  const _capCodexGauge: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityCodexGaugeDTO>, "reason" | "set_state">;
+  const _capGauges: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityGaugesDTO>, never>;
+  const _capacity: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityDTO>, "history_start" | "excluded_kind_selected">;
   it("pins every analytics DTO's nullable fields", () => {
     void [
+      _capFilters, _capPopulation, _capLimitation, _capOccCell, _capOccBucket, _capOccupancy, _capWaitCell,
+      _capWaitBucket, _capWait, _capNotTracked, _capScope, _capGaugeBase, _capAnthropicId, _capAnthropicGauge,
+      _capCodexId, _capCodexGauge, _capGauges, _capacity,
       _scope, _bucket, _rolling, _envelope, _repoOption, _repoOptions, _userOption, _userOptions, _options,
       _disclosure, _coverage, _block, _cell, _totals, _group, _split, _ratio, _ratioCell, _panel, _cache,
       _topRun, _nullableNumber, _outcomes, _row, _breakdown, _spend,
     ];
+    expect(true).toBe(true);
+  });
+});
+
+describe("analytics reliability contract (issue #4685)", () => {
+  type Full = typeof analyticsReliabilityFull;
+  type Block = AnalyticsReliabilityBlockDTO;
+  type Row = AnalyticsReliabilityRowDTO;
+  type Point = AnalyticsReliabilityPointDTO;
+  const _top: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityDTO, Full>;
+  const _scope: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityDTO["scope"], Full["scope"]>;
+  const _bucket: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityDTO["buckets"][number], Full["buckets"][number]>;
+  const _rolling: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityDTO["rolling"][number], Full["rolling"][number]>;
+  const _totals: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityTotalsDTO, Full["totals"]>;
+  const _current: never = null as unknown as AnalyticsKeyDiff<Block, Full["totals"]["current"]>;
+  const _previous: never = null as unknown as AnalyticsKeyDiff<Block, Full["totals"]["previous"]>;
+  const _outcomes: never = null as unknown as AnalyticsKeyDiff<Block["outcomes"], Full["totals"]["current"]["outcomes"]>;
+  const _rate: never = null as unknown as AnalyticsKeyDiff<Block["failure_rate"], Full["totals"]["current"]["failure_rate"]>;
+  const _cell: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityCellDTO, Full["series"][number]>;
+  const _cellOutcomes: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityCellDTO["outcomes"], Full["series"][number]["outcomes"]>;
+  const _causes: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityCausesDTO, Full["causes"]>;
+  const _cause: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityCauseDTO, Full["causes"]["items"][number]>;
+  const _rollingRate: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityRollingDTO, Full["rolling_failure_rate"]>;
+  const _harness: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityHarnessSeriesDTO, Full["rolling_failure_rate"]["harnesses"][number]>;
+  const _overall: never = null as unknown as AnalyticsKeyDiff<Point, Full["rolling_failure_rate"]["overall"][number]>;
+  const _harnessPoint: never = null as unknown as AnalyticsKeyDiff<Point, Full["rolling_failure_rate"]["harnesses"][number]["points"][number]>;
+  const _breakdown: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityBreakdownDTO, Full["breakdown"]>;
+  const _row: never = null as unknown as AnalyticsKeyDiff<Row, Full["breakdown"]["rows"][number]>;
+  const _rowOutcomes: never = null as unknown as AnalyticsKeyDiff<Row["outcomes"], Full["breakdown"]["rows"][number]["outcomes"]>;
+  const _rowRate: never = null as unknown as AnalyticsKeyDiff<Row["failure_rate"], Full["breakdown"]["rows"][number]["failure_rate"]>;
+  const _latest: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityLatestFailureDTO, NonNullable<Full["latest_failure"]>>;
+  const _landing: never = null as unknown as AnalyticsKeyDiff<AnalyticsReliabilityNeedsLandingDTO, Full["needs_landing"]>;
+  void [
+    _top, _scope, _bucket, _rolling, _totals, _current, _previous, _outcomes, _rate, _cell, _cellOutcomes, _causes,
+    _cause, _rollingRate, _harness, _overall, _harnessPoint, _breakdown, _row, _rowOutcomes, _rowRate, _latest, _landing,
+  ];
+
+  // Nullability of the exported type itself: what the wire may carry as null...
+  const _reasonNullable: IsNullable<AnalyticsReliabilityDTO["reason"]> extends true ? true : never = true;
+  const _latestNullable: IsNullable<AnalyticsReliabilityDTO["latest_failure"]> extends true ? true : never = true;
+  const _historyNullable: IsNullable<AnalyticsReliabilityDTO["history_start"]> extends true ? true : never = true;
+  const _rateValueNullable: IsNullable<Block["failure_rate"]["value"]> extends true ? true : never = true;
+  const _rateReasonNullable: IsNullable<Block["failure_rate"]["reason"]> extends true ? true : never = true;
+  const _causeOriginNullable: IsNullable<AnalyticsReliabilityCauseDTO["origin"]> extends true ? true : never = true;
+  const _pointValueNullable: IsNullable<Point["value"]> extends true ? true : never = true;
+  const _pointReasonNullable: IsNullable<Point["reason"]> extends true ? true : never = true;
+  const _rowKeyNullable: IsNullable<Row["key"]> extends true ? true : never = true;
+  const _rowLabelNullable: IsNullable<Row["label"]> extends true ? true : never = true;
+  const _rowIdNullable: IsNullable<Row["id"]> extends true ? true : never = true;
+  const _rowRateValueNullable: IsNullable<Row["failure_rate"]["value"]> extends true ? true : never = true;
+  const _rowRateReasonNullable: IsNullable<Row["failure_rate"]["reason"]> extends true ? true : never = true;
+  // ...and what it never carries as null: scalars, slices and the omitempty fields (absent, not null).
+  const _applicableNotNull: IsNullable<AnalyticsReliabilityDTO["applicable"]> extends false ? true : never = true;
+  const _seriesNotNull: IsNullable<AnalyticsReliabilityDTO["series"]> extends false ? true : never = true;
+  const _itemsNotNull: IsNullable<AnalyticsReliabilityCausesDTO["items"]> extends false ? true : never = true;
+  const _overallNotNull: IsNullable<AnalyticsReliabilityRollingDTO["overall"]> extends false ? true : never = true;
+  const _harnessesNotNull: IsNullable<AnalyticsReliabilityRollingDTO["harnesses"]> extends false ? true : never = true;
+  const _pointsNotNull: IsNullable<AnalyticsReliabilityHarnessSeriesDTO["points"]> extends false ? true : never = true;
+  const _rowsNotNull: IsNullable<AnalyticsReliabilityBreakdownDTO["rows"]> extends false ? true : never = true;
+  const _landingNotNull: IsNullable<AnalyticsReliabilityDTO["needs_landing"]> extends false ? true : never = true;
+  const _caveatNotNull: IsNullable<AnalyticsReliabilityNeedsLandingDTO["caveat"]> extends false ? true : never = true;
+  const _failedAtNotNull: IsNullable<AnalyticsReliabilityLatestFailureDTO["failed_at"]> extends false ? true : never = true;
+  const _previousNotNull: IsNullable<AnalyticsReliabilityTotalsDTO["previous"]> extends false ? true : never = true;
+  const _previousOptional: Record<never, never> extends Pick<AnalyticsReliabilityTotalsDTO, "previous"> ? true : never = true;
+  const _previousFromOptional: Record<never, never> extends Pick<AnalyticsReliabilityDTO, "previous_from"> ? true : never = true;
+  void [
+    _reasonNullable, _latestNullable, _historyNullable, _rateValueNullable, _rateReasonNullable, _causeOriginNullable,
+    _pointValueNullable, _pointReasonNullable, _rowKeyNullable, _rowLabelNullable, _rowIdNullable, _rowRateValueNullable,
+    _rowRateReasonNullable, _applicableNotNull, _seriesNotNull, _itemsNotNull, _overallNotNull, _harnessesNotNull,
+    _pointsNotNull, _rowsNotNull, _landingNotNull, _caveatNotNull, _failedAtNotNull, _previousNotNull, _previousOptional,
+    _previousFromOptional,
+  ];
+
+  it("accepts the full fixture", () => {
+    const full: AnalyticsReliabilityDTO = analyticsReliabilityFull;
+    expect(full.scope).toEqual({ route: "x", user: "x" });
+    expect(full.selected_user).toBe("x");
+    expect(full.applicable).toBe(true);
+    expect(full.reason).toBe("x");
+    expect(full.previous_from).toBe("2020-01-02T03:04:05Z");
+    expect(full.totals.current.outcomes.plan_rejected).toBe(1);
+    expect(full.totals.current.failure_rate).toEqual({ value: 1.5, reason: "x" });
+    expect(full.totals.current.requeued_runs).toBe(1);
+    expect(full.totals.previous?.finished).toBe(1);
+    expect(full.series[0].index).toBe(1);
+    expect(full.series[0].outcomes.failed).toBe(1);
+    expect(full.causes.failed).toBe(1);
+    expect(full.causes.items[0]).toEqual({ rank: 1, is_other: true, origin: "x", runs: 1, share: 1.5 });
+    expect(full.rolling_failure_rate.overall[0]).toEqual({ index: 1, finished: 1, failed: 1, value: 1.5, reason: "x" });
+    expect(full.rolling_failure_rate.harnesses[0].harness).toBe("x");
+    expect(full.rolling_failure_rate.harnesses[0].points[0].failed).toBe(1);
+    expect(full.breakdown.dimension).toBe("x");
+    expect(full.breakdown.rows[0]).toMatchObject({ rank: 1, is_other: true, key: "x", label: "x", id: "x", n: 1, requeued_runs: 1 });
+    expect(full.latest_failure).toEqual({
+      failed_at: "2020-01-02T03:04:05Z", origin: "x", run_id: "x", user_id: "x", completed_since_last_failure: 1,
+    });
+    expect(full.needs_landing).toEqual({ runs: 1, caveat: "x" });
+  });
+
+  it("accepts the zero fixture: omitted keys absent, nulls null", () => {
+    const zero: NullSlices<AnalyticsReliabilityDTO> = analyticsReliabilityZero;
+    // omitempty fields are absent, not null.
+    expect("previous" in zero.totals).toBe(false);
+    expect("previous_from" in zero).toBe(false);
+    expect("previous_to" in zero).toBe(false);
+    // pointers and slices serialize as null.
+    expect(zero.reason).toBeNull();
+    expect(zero.latest_failure).toBeNull();
+    expect(zero.history_start).toBeNull();
+    for (const k of ["buckets", "rolling", "series"] as const) expect(zero[k]).toBeNull();
+    expect(zero.causes.items).toBeNull();
+    expect(zero.rolling_failure_rate.overall).toBeNull();
+    expect(zero.rolling_failure_rate.harnesses).toBeNull();
+    expect(zero.breakdown.rows).toBeNull();
+    expect(zero.totals.current.failure_rate.value).toBeNull();
+    expect(zero.totals.current.failure_rate.reason).toBeNull();
+    // scalars are zero values, never null.
+    expect(zero.applicable).toBe(false);
+    expect(zero.totals.current.finished).toBe(0);
+    expect(zero.needs_landing).toEqual({ runs: 0, caveat: "" });
+  });
+});
+
+// Exact nullability of every Reliability DTO, in the style of the #4684 pin above: each
+// assertion names the fields of one DTO whose type admits null, mirroring the Go *T fields.
+describe("analytics reliability DTO exact nullability (issue #4685)", () => {
+  type NullKeys<T> = { [K in keyof T]-?: null extends T[K] ? K : never }[keyof T];
+  type UnionDiff<A, B> = Exclude<A, B> | Exclude<B, A>;
+  const _block: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityBlockDTO>, never>;
+  const _totals: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityTotalsDTO>, never>;
+  const _cell: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityCellDTO>, never>;
+  const _cause: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityCauseDTO>, "origin">;
+  const _causes: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityCausesDTO>, never>;
+  const _point: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityPointDTO>, "value" | "reason">;
+  const _harness: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityHarnessSeriesDTO>, never>;
+  const _rolling: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityRollingDTO>, never>;
+  const _row: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityRowDTO>, "key" | "label" | "id">;
+  const _breakdown: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityBreakdownDTO>, never>;
+  const _latest: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityLatestFailureDTO>, never>;
+  const _landing: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityNeedsLandingDTO>, never>;
+  const _reliability: never = null as unknown as UnionDiff<NullKeys<AnalyticsReliabilityDTO>, "history_start" | "reason" | "latest_failure">;
+  it("pins every reliability DTO's nullable fields", () => {
+    void [_block, _totals, _cell, _cause, _causes, _point, _harness, _rolling, _row, _breakdown, _latest, _landing, _reliability];
     expect(true).toBe(true);
   });
 });

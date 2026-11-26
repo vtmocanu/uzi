@@ -28,13 +28,16 @@ import (
 
 // Issue #4684: the scoped usage analytics API.
 //
-//	GET /api/analytics/{options,spend,quality}        the caller's own runs (requireUser)
-//	GET /api/admin/analytics/{options,spend,quality}  admin read group (RequireAdminRO)
+//	GET /api/analytics/{options,spend,reliability,capacity,quality}        the caller's own runs (requireUser)
+//	GET /api/admin/analytics/{options,spend,reliability,capacity,quality}  admin read group (RequireAdminRO)
 //
 // Request order: (1) syntax validation with no database access, (2) single-flight admission
 // that never blocks, (3) one REPEATABLE READ READ ONLY snapshot holding the timezone check,
-// the selected-user and repo authority checks and, for spend and quality (#4730), the
-// history-start read and the statement; options reads no history start.
+// the selected-user and repo authority checks and, for spend, reliability, capacity and quality
+// (#4730), the history-start read and the statements (reliability: cohort, then latest failure;
+// analytics_reliability.go); options reads no history start. Capacity (issue #4731) also reads
+// the current provider gauges inside the snapshot, each in a savepoint, and observes Codex
+// vault state live after it (analytics_capacity.go).
 
 const (
 	analyticsRouteOwner = "owner"
@@ -56,6 +59,17 @@ type analyticsDeps struct {
 	// afterFirstRead, when non-nil, runs inside the snapshot right after the history-start
 	// read. Tests use it to commit a competing write once the snapshot is fixed.
 	afterFirstRead func(ctx context.Context)
+	// afterCohortRead, when non-nil, runs inside the Reliability snapshot right after the
+	// cohort statement and before the latest-failure read (issue #4685).
+	afterCohortRead func(ctx context.Context)
+
+	// beforeGauge, when non-nil, runs inside each selected provider's gauge savepoint, before
+	// that provider's statement. db is the savepoint transaction, so a test can run raw SQL on
+	// it; a returned error is handled as that gauge read's error. Nil in production.
+	beforeGauge func(ctx context.Context, db store.DBTX, provider string) error
+
+	// vaultBudget overrides capacityVaultObserveBudget when positive (tests only).
+	vaultBudget time.Duration
 
 	// qualityBeforeSnapshotRead, when non-nil, runs at the very start of the Quality statement
 	// function, before the snapshot's first query. Tests use it to commit a write that the
@@ -127,6 +141,10 @@ type analyticsRequest struct {
 	repo    uuid.UUID // uuid.Nil: no repo filter
 	harness string
 	kinds   []string
+	// kindName is the raw kind parameter ("" when absent). The capacity filters echo the effective
+	// kinds (req.kinds), not this name; kindName feeds only the effective-scope selectors the
+	// gauges cannot attribute and excluded_kind_selected.
+	kindName string
 
 	split     string
 	breakdown string
@@ -144,8 +162,12 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	req := analyticsRequest{admin: admin, section: section, scopeUser: caller}
 
 	allowed := []string{"window", "tz", "repo", "harness", "kind"}
-	if section == analytics.SectionSpend {
+	switch section { // capacity takes no grouping controls
+	case analytics.SectionSpend:
 		allowed = append(allowed, "split", "breakdown")
+	case analytics.SectionReliability:
+		// Reliability has a breakdown but no split.
+		allowed = append(allowed, "breakdown")
 	}
 	if admin {
 		allowed = append(allowed, "user")
@@ -153,7 +175,8 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	// Sorted so that, with several bad parameters, the first error is always the same one.
 	for _, key := range slices.Sorted(maps.Keys(q)) {
 		if !slices.Contains(allowed, key) {
-			// split and breakdown on /options, and user on the owner route, get a message that names them.
+			// split and breakdown on /options (split also on /reliability), and user on the owner
+			// route, get a message that names them.
 			switch key {
 			case "user":
 				return req, "user not allowed"
@@ -201,6 +224,7 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 
 	req.kinds = runkind.All()
 	if v := q.Get("kind"); v != "" {
+		req.kindName = v
 		switch {
 		case v == "delivery":
 			req.kinds = runkind.Delivery()
@@ -226,14 +250,18 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	}
 
 	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
-	// per-run totals for finished runs, and Quality (#4730) follows it. Options still accepts
-	// and ignores window, so only the other sections refuse.
+	// per-run totals for finished runs; Reliability, Capacity (issue #4731) and Quality (#4730)
+	// follow the same window choices. Options still accepts and ignores window, so the check is
+	// skipped for it.
 	if section != analytics.SectionOptions && !slices.Contains(req.windowChoices(), string(req.window)) {
 		return req, msgAnalyticsWindowAllAllUsers
 	}
 
 	splits, breakdowns := req.splitChoices(), req.breakdownChoices()
 	req.split, req.breakdown = "usage_model", "repo"
+	if section == analytics.SectionReliability {
+		req.breakdown = "primary_model"
+	}
 	if v := q.Get("split"); v != "" {
 		if !slices.Contains(splits, v) {
 			return req, "invalid split"
@@ -318,11 +346,35 @@ func (h *Handler) AdminAnalyticsSpend(w http.ResponseWriter, r *http.Request) {
 	h.serveAnalytics(w, r, true, analytics.SectionSpend)
 }
 
+// AnalyticsReliability serves GET /api/analytics/reliability for the caller's own scope.
+func (h *Handler) AnalyticsReliability(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, false, analytics.SectionReliability)
+}
+
+// AdminAnalyticsReliability serves GET /api/admin/analytics/reliability.
+func (h *Handler) AdminAnalyticsReliability(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, true, analytics.SectionReliability)
+}
+
+// AnalyticsCapacity serves GET /api/analytics/capacity for the caller's own scope.
+func (h *Handler) AnalyticsCapacity(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, false, analytics.SectionCapacity)
+}
+
+// AdminAnalyticsCapacity serves GET /api/admin/analytics/capacity.
+func (h *Handler) AdminAnalyticsCapacity(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, true, analytics.SectionCapacity)
+}
+
 func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin bool, section string) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
+	}
+	if section == analytics.SectionCapacity {
+		// Provider gauges and per-owner identities are private, current state.
+		w.Header().Set("Cache-Control", "private, no-store")
 	}
 	deps := h.analyticsDeps
 	if !deps.ready() {
@@ -354,11 +406,16 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 	defer release()
 
 	var body any
+	var capacity *capacityResult
 	err = store.RunAnalyticsSnapshot(r.Context(), deps.begin, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
 		var ferr error
 		switch section {
 		case analytics.SectionOptions:
 			body, ferr = deps.options(ctx, s, req, now)
+		case analytics.SectionReliability:
+			body, ferr = deps.reliability(ctx, s, req, now)
+		case analytics.SectionCapacity:
+			capacity, ferr = h.capacity(ctx, deps, s, req, now)
 		case analytics.SectionQuality:
 			body, ferr = deps.quality(ctx, s, req, now)
 		default:
@@ -368,6 +425,10 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 	})
 	if err != nil {
 		analyticsFail(w, r, err)
+		return
+	}
+	if section == analytics.SectionCapacity {
+		h.finishCapacity(w, r, deps, req, capacity, now)
 		return
 	}
 	httpx.JSON(w, http.StatusOK, body)
@@ -395,7 +456,7 @@ func analyticsFail(w http.ResponseWriter, r *http.Request, err error) {
 	httpx.Error(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorize runs the in-snapshot checks shared by Options, Spend and Quality: the timezone, the selected
+// authorize runs the in-snapshot checks shared by Options, Spend, Reliability, Capacity and Quality: the timezone, the selected
 // user's existence and the repo filter's authority. A repo that does not exist and one the scope
 // cannot see produce the identical 400.
 func (d *analyticsDeps) authorize(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest) (*time.Location, error) {
@@ -506,30 +567,9 @@ func (d *analyticsDeps) spend(ctx context.Context, s *store.AnalyticsSnapshot, r
 		return apitypes.AnalyticsSpendDTO{}, err
 	}
 
-	var repo pgtype.UUID
-	if req.repo != uuid.Nil {
-		repo = pgtype.UUID{Bytes: req.repo, Valid: true}
-	}
-	var harness pgtype.Text
-	if req.harness != "" {
-		harness = pgtype.Text{String: req.harness, Valid: true}
-	}
-	var hist pgtype.Timestamptz
-	if req.allUsers {
-		hist, err = s.Q.AnalyticsAllHistoryStart(ctx, store.AnalyticsAllHistoryStartParams{RepoID: repo, Harness: harness, Kinds: req.kinds})
-	} else {
-		hist, err = s.Q.AnalyticsOwnerHistoryStart(ctx, store.AnalyticsOwnerHistoryStartParams{UserID: req.scopeUser, RepoID: repo, Harness: harness, Kinds: req.kinds})
-	}
+	earliest, err := d.historyStart(ctx, s, req)
 	if err != nil {
 		return apitypes.AnalyticsSpendDTO{}, err
-	}
-	if d.afterFirstRead != nil {
-		d.afterFirstRead(ctx)
-	}
-	var earliest *time.Time
-	if hist.Valid {
-		e := hist.Time
-		earliest = &e
 	}
 	bounds, err := analytics.ComputeBounds(now, loc, req.window, earliest)
 	if err != nil {
@@ -551,6 +591,37 @@ func (d *analyticsDeps) spend(ctx context.Context, s *store.AnalyticsSnapshot, r
 		return apitypes.AnalyticsSpendDTO{}, err
 	}
 	return mapAnalyticsSpend(req, bounds, doc)
+}
+
+// historyStart reads the scope's earliest matching run creation instant (nil for an empty scope)
+// and then runs the afterFirstRead test hook, the point where the snapshot is fixed.
+func (d *analyticsDeps) historyStart(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest) (*time.Time, error) {
+	var repo pgtype.UUID
+	if req.repo != uuid.Nil {
+		repo = pgtype.UUID{Bytes: req.repo, Valid: true}
+	}
+	var harness pgtype.Text
+	if req.harness != "" {
+		harness = pgtype.Text{String: req.harness, Valid: true}
+	}
+	var hist pgtype.Timestamptz
+	var err error
+	if req.allUsers {
+		hist, err = s.Q.AnalyticsAllHistoryStart(ctx, store.AnalyticsAllHistoryStartParams{RepoID: repo, Harness: harness, Kinds: req.kinds})
+	} else {
+		hist, err = s.Q.AnalyticsOwnerHistoryStart(ctx, store.AnalyticsOwnerHistoryStartParams{UserID: req.scopeUser, RepoID: repo, Harness: harness, Kinds: req.kinds})
+	}
+	if err != nil {
+		return nil, err
+	}
+	if d.afterFirstRead != nil {
+		d.afterFirstRead(ctx)
+	}
+	if !hist.Valid {
+		return nil, nil
+	}
+	e := hist.Time
+	return &e, nil
 }
 
 // analyticsSpendStatement is the one Spend statement a request runs: owner-shaped (always
@@ -714,12 +785,11 @@ func (m *spendMapper) createdAt(s string) time.Time {
 }
 
 // msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all request on
-// any section except options (Spend and Quality).
+// any section except options (Spend, Reliability, Capacity and Quality).
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
-// mapAnalyticsSpend builds the response from the calendar and the store document.
-func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {
-	m := &spendMapper{}
+// analyticsEnvelope builds the calendar envelope every analytics response is indexed against.
+func analyticsEnvelope(req analyticsRequest, b analytics.Bounds) apitypes.AnalyticsEnvelopeDTO {
 	env := apitypes.AnalyticsEnvelopeDTO{
 		Scope:           req.scope(),
 		GeneratedAt:     b.Now.UTC(),
@@ -750,9 +820,14 @@ func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.Analy
 	for _, rp := range b.Rolling {
 		env.Rolling = append(env.Rolling, apitypes.AnalyticsRollingDTO{Start: rp.Start.UTC(), End: rp.End.UTC(), Partial: rp.Partial})
 	}
+	return env
+}
 
+// mapAnalyticsSpend builds the response from the calendar and the store document.
+func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.AnalyticsSpendDoc) (apitypes.AnalyticsSpendDTO, error) {
+	m := &spendMapper{}
 	out := apitypes.AnalyticsSpendDTO{
-		AnalyticsEnvelopeDTO: env,
+		AnalyticsEnvelopeDTO: analyticsEnvelope(req, b),
 		SelectedUser:         req.scope().User,
 		UntrackedChatRuns:    doc.UntrackedChatRuns,
 		Series:               m.cells(doc.Buckets),

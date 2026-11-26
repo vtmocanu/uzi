@@ -13,23 +13,33 @@ import { COMMAND_ENV_PROTECTED_KEYS } from "../src/codex/codex-executor.js";
 
 // PRD 4416 "Name rules (shared fixture)": the agent copy of the run-env name rules must
 // equal fixtures/run-env/name-rules.json, which the api copy is also tested against.
+type Rule = { value: string; invariant: string; note: string };
 const fixture = JSON.parse(
   fs.readFileSync(new URL("../../fixtures/run-env/name-rules.json", import.meta.url), "utf8"),
 ) as {
   harness_versions: { claude_agent_sdk: string; codex: string };
-  denied_names: string[];
-  denied_prefixes: string[];
-  denied_suffixes: string[];
+  invariants: string[];
+  denied_names: Rule[];
+  denied_prefixes: Rule[];
+  denied_suffixes: Rule[];
   overlaps: { name: string; harness: string; decision: "allowed" | "denied"; reason: string }[];
 };
 
 const NAME_GRAMMAR = /^[A-Z_][A-Z0-9_]{0,127}$/;
 
 describe("run-env name rules match the shared fixture", () => {
-  it("denied names, prefixes and suffixes are identical, in order", () => {
+  it("denied names, prefixes and suffixes are identical, in order, with invariant and note", () => {
     assert.deepEqual([...RUN_ENV_DENIED_NAMES], fixture.denied_names);
     assert.deepEqual([...RUN_ENV_DENIED_PREFIXES], fixture.denied_prefixes);
     assert.deepEqual([...RUN_ENV_DENIED_SUFFIXES], fixture.denied_suffixes);
+  });
+
+  it("every entry names an invariant from the enum and carries a note", () => {
+    assert.equal(fixture.invariants.length, 8);
+    for (const r of [...fixture.denied_names, ...fixture.denied_prefixes, ...fixture.denied_suffixes]) {
+      assert.ok(fixture.invariants.includes(r.invariant), `${r.value}: invariant ${r.invariant}`);
+      assert.ok(r.note.trim().length > 0, `${r.value}: empty note`);
+    }
   });
 
   it("recorded harness versions are identical", () => {
@@ -56,7 +66,7 @@ describe("recorded harness versions track the pinned harnesses", () => {
 });
 
 describe("runEnvNameViolation", () => {
-  for (const name of fixture.denied_names) {
+  for (const { value: name } of fixture.denied_names) {
     // npm_config_cache fails the name grammar, which rejects it before any list is consulted.
     if (!NAME_GRAMMAR.test(name)) continue;
     it(`denies name ${name} by the exact-name rule`, () => {
@@ -82,13 +92,13 @@ describe("runEnvNameViolation", () => {
       assert.equal(runEnvNameViolation(name), null);
     });
   }
-  for (const prefix of fixture.denied_prefixes) {
+  for (const { value: prefix } of fixture.denied_prefixes) {
     it(`denies prefix ${prefix}`, () => {
       const v = runEnvNameViolation(`${prefix}SOMETHING`);
       assert.ok(v !== null && v.includes(`denied prefix ${prefix}`), String(v));
     });
   }
-  for (const suffix of fixture.denied_suffixes) {
+  for (const { value: suffix } of fixture.denied_suffixes) {
     it(`denies suffix ${suffix}`, () => {
       const v = runEnvNameViolation(`SOMETHING${suffix}`);
       assert.ok(v !== null && v.includes(`denied suffix ${suffix}`), String(v));
@@ -102,14 +112,59 @@ describe("runEnvNameViolation", () => {
     "AWS_REGION",
     "NPM_TOKEN",
     "GRADLE_OPTS",
+    "ANT_OPTS",
+    "ANT_HOME",
+    "NPM_CONFIG_REGISTRY",
+    "PIP_INDEX_URL",
+    "MAVEN_OPTS",
+    "ORG_GRADLE_PROJECT_X",
+    "TESTCONTAINERS_X",
+    "NODE_ENV",
+    "NODE_AUTH_TOKEN",
+    "UV_INDEX_URL",
+    "TZ",
+    "GOOGLE_APPLICATION_CREDENTIALS",
     "DOCKER_AUTH_CONFIG",
     "TESTCONTAINERS_HOST_OVERRIDE",
     "_LEADING_UNDERSCORE",
     "A",
     "A".repeat(128),
+    "OTEL_SERVICE_NAME",
+    "OTEL_EXPORTER_PROMETHEUS_PORT",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+    "ENABLE_FEATURE_X",
   ]) {
     it(`allows ${name.length > 20 ? `${name.length}-char name` : name}`, () => {
       assert.equal(runEnvNameViolation(name), null);
+    });
+  }
+
+  for (const name of [
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+    "ANT_OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "GCE_METADATA_HOST",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_STS",
+    "AWS_ENDPOINT_URL_SSO",
+    "AWS_ENDPOINT_URL_SSO_OIDC",
+    "AWS_ENDPOINT_URL_BEDROCK",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    "NODE",
+    "NODE_NO_WARNINGS",
+    "NODE_SKIP_PLATFORM_CHECK",
+    "NODE_PENDING_PIPE_INSTANCES",
+    "UV_USE_IO_URING",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+    "OTEL_LOG_USER_PROMPTS",
+    "DEBUG",
+    "LC_ALL",
+    "LC_CTYPE",
+  ]) {
+    it(`denies registry name ${name}`, () => {
+      assert.notEqual(runEnvNameViolation(name), null);
     });
   }
 

@@ -11,9 +11,11 @@ import (
 // Section names used as the second half of the admission key. The owner and
 // admin variants of one section share a key (#4684 plan, admission.go).
 const (
-	SectionOptions = "options"
-	SectionSpend   = "spend"
-	SectionQuality = "quality"
+	SectionOptions     = "options"
+	SectionSpend       = "spend"
+	SectionReliability = "reliability"
+	SectionCapacity    = "capacity"
+	SectionQuality     = "quality"
 )
 
 // ErrBusy is returned by Acquire when the (caller, section) key is already

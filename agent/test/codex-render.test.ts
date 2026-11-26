@@ -808,7 +808,7 @@ describe("renderCodexRun — diagnostic name sanitization", () => {
   const REPLACEMENT = "�"; // U+FFFD, the visible replacement char sanitizeName emits.
 
   /** A code-point scan asserting no control/DEL/C1/bidi/zero-width byte survives —
-   *  the reader-side mirror of render.ts's isUnsafeNameChar (NOT a control-char regex;
+   *  the reader-side mirror of diagnostic-name.ts's isUnsafeNameChar (NOT a control-char regex;
    *  oxlint no-control-regex is denied). */
   function assertNoUnsafeChars(s: string): void {
     for (const ch of s) {

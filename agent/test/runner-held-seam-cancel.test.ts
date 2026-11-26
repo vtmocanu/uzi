@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { after, afterEach, before, describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -181,7 +182,7 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
     current.retireSink(earlier);
   }
   const recovery = o.recoveryEnabled
-    ? new RecoveryCoordinator({
+    ? new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       ...(current ? { authority: current } : {}),
       client: new FakeRecoveryClient(), git: restartedGit, log: nullLogger(),
       recoveryRoot: restartedGit.recoveryRoot, workerToken: TOKEN,

@@ -191,11 +191,44 @@ func staleDuplicateEligible(e *rollEntry) bool {
 }
 
 // currentSurvivor reports an incomplete canary reservation that matches the rendered
-// and deployed target exactly, on a live one-replica Deployment that is not absent.
-// It is not the negation of the stale predicate.
+// and deployed target exactly, on a live one-replica Deployment that is not absent and
+// not under custody. It is not the negation of the stale predicate.
 func currentSurvivor(t *rollTick, e *rollEntry) bool {
+	return !e.w.CustodyHeld && currentCanaryShape(t, e)
+}
+
+// duplicateWakeSettleCandidates sets duplicateWakeSettle on each waking current canary of a pool held
+// for unresolved duplicate canaries (called with every entry's independentBlock already
+// recorded, before the hold text overwrites e.blocked) that has no other obstacle. Two
+// such canaries are both authorized: each binds only its own op and reports its own ready. The pool-wide terms refuse any in-flight mutation, any
+// unconfirmed sibling write and any uncertain coverage; the entry terms refuse every
+// other block, admitted or hibernation-lane state, and a rendered generation the
+// Deployment does not carry (rollSnapshot refreshes the hash and op but not e.o.Generation).
+func duplicateWakeSettleCandidates(t *rollTick, pool []*rollEntry) {
+	if len(pool) == 0 || t.uncertain[coverageKey(pool[0].coverage)] {
+		return
+	}
+	for _, e := range pool {
+		if e.mutated || strings.Contains(e.independentBlock, "unconfirmed") {
+			return
+		}
+	}
+	for _, e := range pool {
+		h := e.w.Hibernation
+		e.duplicateWakeSettle = e.independentBlock == "" && h != nil && h.State == protocol.HibernationWaking &&
+			!e.hibernation && !e.admitted && !e.mutated && !e.snapshotIncomplete && !e.historyRetireUnknown &&
+			!e.identityAmbiguous && !e.strayReservation && !t.unavailable[e.w.ID] &&
+			currentCanaryShape(t, e) && e.dep != nil && e.target != nil &&
+			e.dep.Spec.Template.Annotations[AnnotationGeneration] == e.target.Spec.Template.Annotations[AnnotationGeneration]
+	}
+}
+
+// currentCanaryShape is currentSurvivor without the custody term: the reservation
+// matches the rendered and deployed target exactly, on a live one-replica Deployment
+// that is not absent, with no stuck phase or claim mirror.
+func currentCanaryShape(t *rollTick, e *rollEntry) bool {
 	r := e.marker
-	if r == nil || !r.Canary || r.Completed || e.w.CustodyHeld || e.rawReservation || !liveRollDeployment(e) || physicallyAbsent(e) ||
+	if r == nil || !r.Canary || r.Completed || e.rawReservation || !liveRollDeployment(e) || physicallyAbsent(e) ||
 		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 || e.o.Roll.Phase == protocol.PhaseStuck ||
 		(e.claim != nil && e.claim.Annotations[annotationRoll] != "") {
 		return false

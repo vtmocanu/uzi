@@ -23,7 +23,7 @@ import { asWriter } from "./hibernation-inventory.js";
  *      sweep confirms it (home-reclaim.ts: every kind of not-knowing skips);
  *  (b) the rebuildable caches (D2, `dropRunCaches`) of a run PARKED WITH ITS PROCESS ENDED:
  *      api status `limit_wait`, `recovery_wait` or `paused`. Everything else in that HOME
- *      (the transcript, `.claude.json`, unknown files) stays for the resume. A gate status
+ *      (the transcript, `.uzi-claude-config`, unknown files) stays for the resume. A gate status
  *      (`awaiting_approval`, `awaiting_input`, `awaiting_followup`) keeps a live executor
  *      and is never eligible; nor is `queued`, `claimed` or `running`;
  *  (c) a model-pass HOME (`uzi-judge-*`, `uzi-review-*`, `uzi-summary-*`) whose pass is
@@ -93,7 +93,9 @@ const MODEL_PASS_AGE_MARGIN_MS = 15 * 60_000;
  *    every writer stopped. Removal remains descriptor-pinned even after the age guard.
  */
 export function modelPassMinAgeMs(timeoutsMs: readonly number[]): number {
-  return Math.max(0, ...timeoutsMs) + MODEL_PASS_AGE_MARGIN_MS;
+  let longest = 0;
+  for (const timeoutMs of timeoutsMs) longest = Math.max(longest, timeoutMs);
+  return longest + MODEL_PASS_AGE_MARGIN_MS;
 }
 
 /** The bound with the built-in timeouts (judge and review 5 min, summary 60 s), for tests. */

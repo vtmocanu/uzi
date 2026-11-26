@@ -226,8 +226,10 @@ var limiterNames = [...]string{
 // len(wantRouteMounts) is 414 (the earlier figures above were not re-tallied).
 // PRD #4208 adds the two noLimiter inventory/exclusion-final routes, making 416 rows.
 // PRD #4416 M1 adds the five per-repo environment variable routes (GET /api/repos/{id}/env,
-// PUT and DELETE /api/repos/{id}/env/{name}, POST .../disable and .../enable; all noLimiter,
-// local DB reads and writes with no forge call), making 421 rows; re-tallied at that change.
+// PUT and DELETE /api/repos/{id}/env/{name}, POST .../disable and .../enable; local DB reads and
+// writes with no forge call), making 421 rows; re-tallied at that change. M2 puts the four writes
+// under authLimiter (the per-user secret-write budget) and adds the noLimiter worker route
+// GET /api/worker/runs/{id}/run-env-redact (422 rows).
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -360,7 +362,7 @@ var wantRouteMounts = []routeMount{
 	// Explicit per-repo remove (PRD #357): owner-scoped DB delete, no forge call →
 	// noLimiter, like the schedule/connection deletes it sits beside.
 	{"DELETE", "/api/repos/{id}", noLimiter},
-	{"DELETE", "/api/repos/{id}/env/{name}", noLimiter},
+	{"DELETE", "/api/repos/{id}/env/{name}", limAuth},
 	// GitHub Projects v2 sync disable (issue #534, PRD #364 follow-up): relocated
 	// from /admin to the owner-or-admin /repos group (D4). Owner preflight + DB
 	// teardown, no user-spammable forge proxying → noLimiter, like the admin write
@@ -433,6 +435,8 @@ var wantRouteMounts = []routeMount{
 	// snapshot deadline (no forge call, no token spend) → noLimiter, like /usage beside them.
 	{"GET", "/api/admin/analytics/options", noLimiter},
 	{"GET", "/api/admin/analytics/spend", noLimiter},
+	{"GET", "/api/admin/analytics/capacity", noLimiter},
+	{"GET", "/api/admin/analytics/reliability", noLimiter},
 	{"GET", "/api/admin/analytics/quality", noLimiter},
 	{"GET", "/api/admin/users", noLimiter},
 	{"GET", "/api/admin/vault-migration", noLimiter},
@@ -612,6 +616,8 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/usage", noLimiter},
 	{"GET", "/api/analytics/options", noLimiter},
 	{"GET", "/api/analytics/spend", noLimiter},
+	{"GET", "/api/analytics/capacity", noLimiter},
+	{"GET", "/api/analytics/reliability", noLimiter},
 	{"GET", "/api/analytics/quality", noLimiter},
 	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter (v1Limiter
 	// since PRD #1908 D-B) is mounted on the whole /api/v1 subtree after RequireV1Caller
@@ -835,8 +841,8 @@ var wantRouteMounts = []routeMount{
 	// follow-up): relocated from /admin to owner-or-admin /repos (D4). Adopt/provision
 	// make forge calls but are infrequent manual actions, not user-spammable proxying,
 	// so they wear no per-user limiter → noLimiter, as in the admin write group they left.
-	{"POST", "/api/repos/{id}/env/{name}/disable", noLimiter},
-	{"POST", "/api/repos/{id}/env/{name}/enable", noLimiter},
+	{"POST", "/api/repos/{id}/env/{name}/disable", limAuth},
+	{"POST", "/api/repos/{id}/env/{name}/enable", limAuth},
 	{"POST", "/api/repos/{id}/github-project-sync", noLimiter},
 	{"POST", "/api/repos/{id}/github-project-sync/provision", noLimiter},
 	// PRD #576 M3 Resync: re-seed an already-linked board; infrequent manual action in
@@ -1018,6 +1024,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/held-publication", noLimiter},
 	// Issue #4007: the terminal-preservation upload, worker-authenticated and unlimited like the held-work upload above.
 	{"POST", "/api/worker/runs/{id}/terminal-preservation", noLimiter},
+	// PRD #4416 M2: the run-env redact maintenance read. Worker-authenticated, no per-user limiter.
+	{"GET", "/api/worker/runs/{id}/run-env-redact", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.
@@ -1178,7 +1186,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/issue-tracker-link/states", limForge},
 	{"PUT", "/api/repos/{id}/issue-tracker-link/states", limForge},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
-	{"PUT", "/api/repos/{id}/env/{name}", noLimiter},
+	{"PUT", "/api/repos/{id}/env/{name}", limAuth},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,
 	// and it cannot even change the run's status. Contrast /runs/{id}/rejudge above,

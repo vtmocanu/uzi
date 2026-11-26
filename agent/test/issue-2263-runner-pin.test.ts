@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -69,7 +70,7 @@ function setup(producer: RecoveryBundleProducer, runnerRef: { current?: RunRunne
   const retained: string[] = [];
   log.warn = (message, fields) => { if (message === "recovery: uploaded record pin retained") retained.push((fields as { reason: string }).reason); };
   log.info = (message, fields) => { if (message === "recovery: uploaded record pin retained") retained.push((fields as { reason: string }).reason); };
-  const coord = new RecoveryCoordinator({
+  const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git: producer, log, recoveryRoot: root, workerToken: WORKER_TOKEN, now: () => 1_700_000_000_000,
     // The real wiring: a run is executing while the runner still holds it.
     isExecuting: (runId) => runnerRef.current?.isExecuting(runId) ?? false,

@@ -70,7 +70,8 @@ export class CodexRateLimitObserver {
     let selected = windows.filter(w => w.used >= 100);
     if (selected.length === 0) {
       if (snapshot.reached !== "rate_limit_reached") return undefined;
-      const highest = Math.max(...windows.map(w => w.used));
+      let highest = -Infinity;
+      for (const w of windows) highest = Math.max(highest, w.used);
       selected = windows.filter(w => w.used === highest);
     }
     // At most two selected windows. Missing resets suppress the reset entirely;

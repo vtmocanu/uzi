@@ -19,10 +19,7 @@ import (
 // Keep these regressions independent of the migration round trip: the query test
 // must return ErrNoRows even on the preceding schema, rather than rely on a trigger error.
 func TestMarkCaptureReadyRequiresUploadingLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "ready_state_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatal(err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "ready_state_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -65,10 +62,7 @@ func TestMarkCaptureReadyRequiresUploadingLiveDB(t *testing.T) {
 }
 
 func TestRecoveryAvailableTransitionGuardLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "available_guard_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatal(err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "available_guard_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

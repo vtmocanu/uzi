@@ -10583,6 +10583,26 @@ describe("CodexExecutor: Docker wiring", () => {
   });
 });
 
+// PRD 4416 M2: the Codex prompts list the variables the command env builder actually injected.
+describe("CodexExecutor prompts: the listed run variables are the injected ones", () => {
+  const rv = (name: string, value: string) =>
+    ({ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: 1, name, value, secret: false, description: "" });
+
+  it("omits a variable the tool profile already set, and lists a normal one", async () => {
+    const rig = makeRig();
+    rig.deps = { ...rig.deps, provisionRunTools: async () => ({ toolEnv: { NPM_TOKEN: "x" } }) };
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(
+      makeCtx({ runEnv: [rv("NPM_TOKEN", "run-value"), rv("REGION", "eu-west")] }).ctx), 3000, "run");
+    assert.equal(rig.fileopSpawns[0]!.env.NPM_TOKEN, "x", "the tool profile wins");
+    assert.equal(rig.fileopSpawns[0]!.env.REGION, "eu-west");
+    const sent = JSON.stringify(rig.transport.requests);
+    assert.match(sent, /<run_env_[0-9a-f]+>/);
+    assert.match(sent, /- REGION \(repo scope\)/);
+    assert.doesNotMatch(sent, /- NPM_TOKEN/);
+  });
+});
+
 describe("CodexExecutor: credential-free command env (item 6)", () => {
   const FIXED_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -32994,7 +33014,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: JSON.stringify({ summary: `Plan summary built with ${(params.binding as CodexBinding).capability}`, deltas: [] }),
+            return { text: JSON.stringify({ summary: `Plan summary built by ${(params.binding as CodexBinding).capability === next.capability ? "flight B" : "another flight"}`, deltas: [] }),
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
@@ -33018,7 +33038,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
             request.usageObserver?.(planUsageSnapshot as never);
-            return { text: `Intent summary built with ${(params.binding as CodexBinding).capability}`,
+            return { text: `Intent summary built by ${(params.binding as CodexBinding).capability === next.capability ? "flight B" : "another flight"}`,
               end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
           } };
         }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
@@ -36113,7 +36133,7 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(bInputsAtFinish, 0, "retired A plan callback never builds or posts with B");
               assert.equal(planInputs.filter(input => input.capability === next.capability).length, 1,
                 "only B's own retried gate summarises, with B's credential");
-              assert.deepEqual(planPostRequests, [{ runId: claim.run_id, summary: `Plan summary built with ${next.capability}` }],
+              assert.deepEqual(planPostRequests, [{ runId: claim.run_id, summary: "Plan summary built by flight B" }],
                 "exactly one B plan summary post for this run before cancellation");
             } else {
               // Preconditions, recorded when the executor suspension was entered and when the barrier was released.
@@ -36440,7 +36460,7 @@ describe("M2 actualRunner credential replacement", () => {
               const followInputs = intentInputs.slice(inputsBefore), followBuilds = summaryBuilds.slice(buildsBefore);
               assert.equal(followInputs.length, 1, "B intent summary uses B's credential");
               assert.deepEqual(followInputs[0], { capability: next.capability, authMode: next.auth_mode }, "B intent summary uses B's credential");
-              assert.deepEqual(intentPosts, [`Intent summary built with ${next.capability}`], "exactly one B intent summary post");
+              assert.deepEqual(intentPosts, ["Intent summary built by flight B"], "exactly one B intent summary post");
               assert.equal(followBuilds.length, 1, "exactly one B intent build");
               assert.deepEqual([followBuilds[0]?.capability, followBuilds[0]?.authMode], [next.capability, next.auth_mode], "exactly one B intent build");
               const followFeed = api.messages(claim.run_id).slice(switchedFeedLength);
@@ -37558,6 +37578,41 @@ describe("Codex repeated actualRunner switching", () => {
     }
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
+});
+
+// PRD 4416 M2: the Codex lead prompts carry the run-variables block (names, descriptions, plain
+// values; never a secret value). Dummy values only.
+describe("CodexExecutor prompts: run variables", () => {
+  const SECRET = "dummy-secret-run-value-000000";
+  const ESC = String.fromCharCode(0x1b);
+  const runEnv = [
+    { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: 1, name: "REGION", value: "eu west", secret: false, description: `zone${ESC}[31m\r\nx‮y⁦z​w` },
+    { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo" as const, rev: 1, name: "DB_PASSWORD", value: SECRET, secret: true, description: "login" },
+  ];
+  const exec = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+  const builders = exec as unknown as {
+    planPrompt(c: RunContext): string;
+    implementPrompt(c: RunContext, gatedPlan?: string): string;
+  };
+  const norm = (p: string) => p.replace(/_[0-9a-f]{16}>/g, "_N>").replace(/issue_context_[0-9a-f]+/g, "issue_context_NONCE");
+
+  for (const phase of ["planPrompt", "implementPrompt"] as const) {
+    it(`${phase} lists the variables and never a secret value`, () => {
+      const prompt = builders[phase](makeCtx({ runEnv, injectedRunEnv: runEnv }).ctx);
+      assert.match(prompt, /<run_env_[0-9a-f]+>/);
+      assert.ok(prompt.includes("DB_PASSWORD") && prompt.includes("login"));
+      assert.ok(!prompt.includes(SECRET));
+      assert.ok(prompt.includes('"eu west"'));
+      const block = prompt.slice(prompt.indexOf("<run_env_"), prompt.indexOf("</run_env_"));
+      for (const bad of [ESC, "\r", "‮", "⁦", "​", "[31m"]) assert.ok(!block.includes(bad), JSON.stringify(bad));
+    });
+
+    it(`${phase} is unchanged without variables`, () => {
+      const fresh = makeCtx().ctx;
+      assert.ok(!builders[phase](fresh).includes("run_env_"));
+      assert.equal(norm(builders[phase]({ ...fresh, runEnv: [], injectedRunEnv: [] })), norm(builders[phase](fresh)));
+    });
+  }
 });
 
 describe("M2 provider executor composition", () => {

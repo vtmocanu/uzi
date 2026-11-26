@@ -827,9 +827,12 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				// waits; no replica or template mutation is.
 				if ns, err := m.cfg.Placement(w); err == nil {
 					if spec, err := m.resolveWorker(w); err == nil {
-						if e.blocked == "" {
+						waking := w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking
+						// duplicateWakeSettle lets only the op binding and ready report
+						// through a duplicate-canary hold; reconcileDinD still needs no block.
+						if e.blocked == "" || (waking && e.duplicateWakeSettle) {
 							var err error
-							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
+							if waking {
 								// Template and replica mutations of the wake still require
 								// e.admitted. The one unadmitted write is the annotation-only
 								// op binding (patchWakeOpAnnotation); a bound participant

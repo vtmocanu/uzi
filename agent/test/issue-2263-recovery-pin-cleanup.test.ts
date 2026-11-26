@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -62,7 +63,7 @@ function coord(producer: RecoveryBundleProducer = cache, isExecuting: (runId: st
   const log = nullLogger();
   log.warn = (message, fields) => { warnings.push({ message, fields }); };
   log.info = (message, fields) => { infos.push({ message, fields }); };
-  return new RecoveryCoordinator({ client: archive, git: producer, log, recoveryRoot: cache.recoveryRoot,
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: archive, git: producer, log, recoveryRoot: cache.recoveryRoot,
     workerToken: TOKEN, now: () => now, isExecuting, ...extra });
 }
 /** A producer with no archived-pin cleanup capability: uploads succeed and the pin survives. */

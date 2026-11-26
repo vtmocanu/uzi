@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { GitCache, OVERLAY_COMMIT_PREFIX, ScratchPublicationError, type GitCacheOptions } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 import { RunRunner } from "../src/runner.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import { WorkerClient } from "../src/client.js";
 
 const scratch = path.resolve("../.uzi/scratch");
@@ -199,7 +200,7 @@ for (const name of ["開発/custom\u00a0", " 開発/custom "]) {
       const runner = new RunRunner(client, f.cache, () => ({ executor: { run: async () => ({ branch: f.branch }) } }),
         nullLogger(), 1);
       const claim = { repo: { default_branch: name }, secrets: {}, last_seq: 0, kind: "issue" } as Parameters<RunRunner["buildFlight"]>[0];
-      const flight = runner["buildFlight"](claim, "test", { run: async () => ({ branch: f.branch }) }, undefined, "", []);
+      const flight = runner["buildFlight"](claim, "test", { run: async () => ({ branch: f.branch }) }, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
       const owner = supervised(f);
       const packed = await f.cache.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
         () => f.cache.checkpointPack(f.bare, f.branch, undefined, undefined, undefined, undefined,

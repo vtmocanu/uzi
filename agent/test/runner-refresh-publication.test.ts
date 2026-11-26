@@ -16,6 +16,7 @@ import { StubExecutor, type ExecutorResult, type RunContext } from "../src/execu
 import type { PublicationContextRequest } from "../src/protocol.js";
 import { REGION_END, REGION_START } from "../src/pr-description.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { followSuccessfulPush, sourcePublicationContext } from "./publication-fixture.js";
 import {
   api, client, fx, git, gitlabClaim, installHarness, runner,
@@ -499,7 +500,7 @@ describe("M2 refresh publication — real runner, scanner and push", () => {
           return upload(runId, captureId, manifest, Readable.from([bytes]));
         });
         const options = { client: archiveClient, git, log: nullLogger(),
-          recoveryRoot: git.recoveryRoot, workerToken: "refresh-recovery-worker-fixture" };
+          recoveryRoot: git.recoveryRoot, workerToken: "refresh-recovery-worker-fixture", ...NO_SCAN_NEEDLES };
         const recovery = new RecoveryCoordinator(options);
         if (captureFailure) t.mock.method(git, "produceRecoveryBundle", async () => {
           throw new Error("injected bundle production failure");

@@ -33,6 +33,8 @@ import { linkedIssueKey } from "./linked-issue.js";
 import { SEEDED_PLAN_RULES } from "./seeded-plan.js";
 import { clampUtf8Bytes, DECISIONS_MEMO_MAX_BYTES } from "./decisions-memo.js";
 import type { EnvFacts } from "./env-probe.js";
+import type { ClaimRunEnvVar } from "./protocol.js";
+import { buildRunEnvBlock } from "./run-env-prompt.js";
 
 /** Captured issue fields are evidence, fenced together with a fresh per-prompt nonce. */
 export function buildIssueContext(title: string, description: string, iid?: number | null, issueKey?: string): string {
@@ -1614,8 +1616,14 @@ export function depsProvisionImplementNote(
     if (shown !== d.dir) lossy.push(i + 1);
     (d.ok ? installed : failed).push(`${i + 1}. ${shown}`);
   });
-  if (installed.length > 0) rows.push("installed:", ...installed);
-  if (failed.length > 0) rows.push("failed:", ...failed);
+  if (installed.length > 0) {
+    rows.push("installed:");
+    for (const row of installed) rows.push(row);
+  }
+  if (failed.length > 0) {
+    rows.push("failed:");
+    for (const row of failed) rows.push(row);
+  }
 
   const lines = [
     "The worker attempted to provision this repo's JS dependencies. Between the tags below, the",
@@ -1769,6 +1777,10 @@ export interface PlanPromptInput {
    *  buildEnvironmentFactsBlock; absent, or nothing limited and Docker wired ⇒ no block,
    *  byte-identical to before. */
   environmentFacts?: EnvFacts;
+  /** PRD #4416 M2: the run's user environment variables (lead lane). Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty ⇒ no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
 }
 
 /**
@@ -1810,6 +1822,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
   );
   // issue #1866: measured environment limits, beside the deps note. "" ⇒ nothing added.
   const envFactsBlock = buildEnvironmentFactsBlock(input.environmentFacts);
+  const runEnvBlock = buildRunEnvBlock(input.runEnv);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
@@ -1826,6 +1839,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     "",
     depsProvisionPlanNote(),
     ...(envFactsBlock ? ["", envFactsBlock] : []),
+    ...(runEnvBlock ? ["", runEnvBlock] : []),
     "",
     // PRD #88 M4: the pre-run clarification framing. Placed with the plan
     // instruction rather than in the system append because the TIMING is what is
@@ -2027,6 +2041,10 @@ export interface ImplementPromptInput {
   /** issue #1866: the run-start environment probe's facts. FIRST TURN ONLY, like `deps`.
    *  Absent, or nothing limited and Docker wired ⇒ no block. See buildEnvironmentFactsBlock. */
   environmentFacts?: EnvFacts;
+  /** PRD #4416 M2: the run's user environment variables (lead lane). FIRST TURN ONLY. Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty ⇒ no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
 }
 
 /** Repeat on ordinary and answered rework turns on both harnesses. */
@@ -2104,7 +2122,8 @@ export function renderFollowUpBatch(bodies: readonly string[]): string[] {
     `The user sent ${n} follow-ups, oldest first; each is in its own fenced block below.`,
   ];
   bodies.forEach((body, i) => {
-    lines.push("", `Follow-up ${i + 1} of ${n}:`, ...renderFollowUpBlock(body));
+    lines.push("", `Follow-up ${i + 1} of ${n}:`);
+    for (const line of renderFollowUpBlock(body)) lines.push(line);
   });
   lines.push("", FOLLOW_UP_TRAILER);
   return lines;
@@ -2173,7 +2192,8 @@ export function renderPriorOwnerHistory(bodies: readonly string[]): string[] {
     "server-reported scope and progress, take precedence.",
   ];
   bodies.forEach((body, i) => {
-    lines.push("", `Earlier follow-up ${i + 1} of ${n}:`, ...renderPriorOwnerHistoryBlock(body));
+    lines.push("", `Earlier follow-up ${i + 1} of ${n}:`);
+    for (const line of renderPriorOwnerHistoryBlock(body)) lines.push(line);
   });
   lines.push("", PRIOR_OWNER_HISTORY_TRAILER);
   return lines;
@@ -2264,6 +2284,8 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // issue #1866: measured environment limits, first turn only, beside the deps facts.
   const envFactsBlock = input.first ? buildEnvironmentFactsBlock(input.environmentFacts) : "";
   if (envFactsBlock) lines.push("", envFactsBlock);
+  const runEnvBlock = input.first ? buildRunEnvBlock(input.runEnv) : "";
+  if (runEnvBlock) lines.push("", runEnvBlock);
   // issue #222: the reseed warning, first turn only. Placed BEFORE baseNote so the two read
   // together — "the tree was rebuilt at the start of this attempt" then "your branch was
   // created at <base>". A follow-up queued before the loop (issue #1800: pulled at the
@@ -2316,9 +2338,14 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     );
   }
   // Issue #3149: earlier owner follow-ups read BEFORE any live follow-up, so a live correction wins.
-  if (input.priorOwnerFollowUps?.length) lines.push(...renderPriorOwnerHistory(input.priorOwnerFollowUps));
-  if (input.followUp) lines.push(...renderFollowUpBlock(input.followUp));
-  else if (input.ownerFollowUps?.length) lines.push(...renderFollowUpBatch(input.ownerFollowUps));
+  if (input.priorOwnerFollowUps?.length) {
+    for (const line of renderPriorOwnerHistory(input.priorOwnerFollowUps)) lines.push(line);
+  }
+  if (input.followUp) {
+    for (const line of renderFollowUpBlock(input.followUp)) lines.push(line);
+  } else if (input.ownerFollowUps?.length) {
+    for (const line of renderFollowUpBatch(input.ownerFollowUps)) lines.push(line);
+  }
   if (input.completionRework) lines.push("", input.completionRework.text);
   if (input.ownerDecisionEligible && !input.completionRework) lines.push("", COMPLETION_CONTRACT_GUIDANCE);
   lines.push(
@@ -2686,6 +2713,10 @@ function openSelfImproveMRsFrame(openTag: string, closeTag: string): string {
 }
 
 export interface SelfImprovePlanPromptInput {
+  /** PRD #4416 M2: the run's user environment variables (lead lane). Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty => no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
   branch: string;
   /** The accumulated improve_uzi backlog (untrusted), carried as issue_description. */
   recommendations: string;
@@ -2754,6 +2785,7 @@ export function buildSelfImprovePlanPrompt(
   // PRD #90: inert, nonce-fenced cross-run memory (its own fence, distinct from the
   // recommendations fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
+  const runEnvBlock = buildRunEnvBlock(input.runEnv);
   const priorNote = priorWorkNote(input.priorWork, input.interruptedSnapshot);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
@@ -2870,6 +2902,7 @@ export function buildSelfImprovePlanPrompt(
     ...(inflightBlock ? ["", inflightBlock] : []),
     ...(openMRsBlock ? ["", openMRsBlock] : []),
     ...(memoryBlock ? ["", memoryBlock] : []),
+    ...(runEnvBlock ? ["", runEnvBlock] : []),
     "",
     delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
@@ -2939,6 +2972,10 @@ export function fenceNonce(): string {
 }
 
 export interface CIFixPlanPromptInput {
+  /** PRD #4416 M2: the run's user environment variables (lead lane). Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty => no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
   ref: string;
   branch: string;
   pipelineWebURL: string;
@@ -3037,6 +3074,8 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   // job-log fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   if (memoryBlock) lines.push(memoryBlock, "");
+  const runEnvBlock = buildRunEnvBlock(input.runEnv);
+  if (runEnvBlock) lines.push(runEnvBlock, "");
   lines.push(
     delegatesLine(input.subagentNames, input.subagentCanWrite),
     "Diagnose the failure. You may re-run the failing commands locally (tests,",
