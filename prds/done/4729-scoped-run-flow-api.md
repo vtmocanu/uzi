@@ -1,7 +1,7 @@
 # PRD #4729: Scoped run diagnostics API: Flow
 
 **Issue:** #4729.
-**Status:** Ready (#4684 merged).
+**Status:** Done (#4729).
 **Priority:** Normal.
 **Blocked by:** none.
 **Scope:** Read-only API, DTO contracts, docs and specs. Additive indexes only when supported by plans. No lifecycle, tracking, interface or CLI changes. Implementation and validation leave `.github/workflows/**` untouched.
@@ -9,7 +9,7 @@
 
 ## Progress
 
-- [ ] M1 owner/admin Flow diagnostics
+- [x] M1 owner/admin Flow diagnostics (LiveDB store and handler tests ran with 0 skips; the 120k evidence harness ran, see section 8)
 
 ## 1. Problem
 
@@ -90,5 +90,69 @@ Before merge, the exact PR head must pass full `test:api`, `gate:repo`, `scan:se
 | Separate current, creation and finish-time measurements | Each measure identifies its own population. |
 | Require applied revision-matched human evidence | Stale, ACK-only and unmatched records cannot prove an approval. |
 | Publish elapsed cohorts with n and incomplete markers | Unfinished runs and missing durations affect interpretation. |
+| Per-measure populations | Waiting, created, first-start and plan response count chat where the kind selector includes it (chat never publishes a gate, so it adds no plan-response pairs); finished reads `run_outcome_classes` and excludes chat, which has no outcome class; the funnel and approval cover `issue` and `self_improve`, elapsed covers `issue`. Blocks are independent and must not be summed against each other. |
+| No `run_messages` fallback for plan response | `idx_run_messages_plan_seq` scopes by `(run_id,seq)` but a message carries no revision, so no revision match can be proven. Without a retained presentation row the pair is unknown (`no_presentation`), not guessed. No part of the statement reads `run_messages`. |
+| Approval evidence rules | Eligible receipt: `approve_plan`, `gate_binding = 'bound'`, `gate_revision > 0`, `applied_at` set, disposition null or `applied`, `created_at <= applied_at`. Ambiguity counts eligible receipts only (a superseded, declined or advisory row never makes a pair ambiguous). Human proof is exactly one eligible receipt for the run's current `gate_revision`; an earlier-revision approval alone is `historical_approval_only`. Legacy (`NULL` binding) and `unbound` receipts never prove anything. A `NULL`-binding receipt counts one unknown in plan response even beside timed pairs, because it belongs to an untimeable revision-0 gate; an `unbound` receipt adds one only when the run has no pair, and with pairs the pair is `not_approved` since an unbound approve can never act on a gate. Reject treating configuration, ACK-only or superseded `applied_at` rows as proof. |
+| Planning-branch precedence | rejected, settled_human, settled_auto, skipped, in_progress, failed, cancelled, unknown, so each run lands in one branch and the branches sum to `stages.created`. `settled_auto` requires `auto_approve`, `gate_revision = 0`, a plan and a non-seeded `plan_source`: the human gate clears `auto_approve`, so a run with `gate_revision > 0` and `auto_approve` set never reached the auto path. `skipped` is a seeded plan at revision 0. A completed run with neither proof is `unknown`, never assumed skipped. |
+| PR units use earliest-run attribution | Distinct `(repo_id, mr_iid)` units are attributed to the earliest creation-cohort run (`created_at`, then `id`) and bucketed by that run's creation bucket, as in #4684. The merge witness is scoped to the response (same user for owner and admin `user=<uuid>`, any user for admin all-users) and ignores the window, harness, kind and repo filters. |
+| Repo masking is vacuous for Flow | The document names no repo id or path, so there is nothing to mask on either route. The only repo shown is the caller's own validated `repo` selector echoed in `filters`. Reject emitting repo-keyed series. |
+| Per-run `LATERAL` receipt aggregate | The first statements joined the funnel to a cohort-wide receipt aggregate; under `plan_cache_mode=force_generic_plan` that became a nested loop re-reading the aggregate per run and went quadratic (owner top all-time 12.8 s). The aggregate is now a `LATERAL` probe of `idx_run_user_inputs_run_id` per run; documents are identical (see section 8). Reject a cohort-wide `GROUP BY` CTE joined per run. |
+| No index added | Candidates (`runs_terminal_end_idx`, `runs (created_at)`, both) moved admin all-users timings under 8%, below the bar, so there is no migration. |
 
-**Unverified before implementation**. Retained legacy evidence coverage, plans, latency and suite impact.
+**Verified after implementation.**
+
+- The Flow statements are set-based and bounded under both custom and generic plans: no `run_messages` access, and no Seq Scan on `run_user_inputs` or `run_gate_presentations` in any measured plan (asserted by the harness and by `TestAnalyticsFlowGenericPlanShapeLiveDB`).
+- Owner and admin Flow LiveDB cases in `store` and `handler` ran with 0 skips.
+- Statement-level timings on the 120k seed are in section 8.
+
+**Still unverified.**
+
+- End-to-end request time (HTTP, JSON encoding, pool wait, the 8 s request budget): only statement-level time was measured.
+- Production table sizes and the per-run `run_user_inputs` fan-out: the seed has 3.1 inputs per run (373,446 over 120,000) and 0.45 `approve_plan` receipts per run, which may differ from production.
+- Retained legacy evidence coverage in production (how many real runs have only `unbound` or `NULL`-binding receipts), and the suite and CI job-time impact, which is a landing obligation measured on the PR.
+
+## 8. Measurement evidence
+
+Method: throwaway PostgreSQL 17, `jit=off`, the exact sqlc statement text prepared on one connection, `now` fixed. Harness: `analytics_flow_evidence_livedb_test.go` under the `analyticsevidence` build tag with `UZI_ANALYTICS_PLAN_EVIDENCE=1`, committed as an opt-in harness (build tag plus env var), not a gate. Figures are statement-level; end-to-end request time was not measured. Raw logs were not kept in the repository.
+
+**Seed:** 120,000 runs, 200 owners (largest 20.1% = 24,162 runs, top 10 = 59.8%), 1,250 repos; 2.41% / 10.2% / 15.2% of runs in the last 7 / 30 / 90 days. `gate_revision` for issue and `self_improve` runs: 0 for 19,769, 1 for 29,175, 2 for 12,859, 3 for 5,481. `run_user_inputs`: 373,446 rows, of which `approve_plan` 53,851 (applied 33,306; applied with NULL disposition 5,647; superseded 9,444; ACK-only 2,259; legacy 1,866; unbound 1,329). `run_gate_presentations`: 71,336. `run_messages`: 2,462,718 (20.5 per run). `ANALYZE` run.
+
+**Finding: generic plans went quadratic.** The first Flow statements joined the funnel (`fr`) to a receipt aggregate with a `LEFT JOIN`; under `plan_cache_mode=force_generic_plan` the planner chose a nested loop that re-read the aggregate once per run. Custom plans stayed under 700 ms, but generic plans (the steady state for prepared statements) did not:
+
+| Workload | Generic median / p95 (ms) |
+|---|---|
+| Owner (top), all-time | 12,776 / 13,078 (over the 8 s `statement_timeout`) |
+| Admin selected-user, all-time | 12,585 / 12,655 |
+| Admin all-users 90d | 7,517 / 7,610 |
+| Admin all-users 30d | 3,243 (median) |
+
+**Fix:** a per-run `LATERAL` aggregate over `run_user_inputs`, probing `idx_run_user_inputs_run_id` once per cohort run. The documents are identical: custom-mode `md5` of the document matched on 11 workloads, and a temp-table `EXCEPT ALL` comparison over 20,000 runs and 60,000 inputs found 0 differences.
+
+**Final timings** (10 runs, median / p95 ms):
+
+| Workload | Custom | Generic |
+|---|---|---|
+| Owner (top) 30d | 85.0 / 86.6 | 81.8 / 84.9 |
+| Owner (top) all-time | 665.3 / 678.1 | 665.3 / 694.0 |
+| Admin all-users 30d | 398.6 / 407.2 | 388.3 / 415.3 |
+| Admin all-users 90d | 560.6 / 574.0 | 577.2 / 592.5 |
+| Admin selected-user all-time | 641.8 / 667.2 | 654.7 / 660.8 |
+
+Median-owner workloads ran in 1-15 ms.
+
+**Access paths.** Owner finished-range reads use `runs_user_terminal_end_idx` and creation-range reads use `runs_user_created_idx`. Admin all-users does a parallel Seq Scan of `runs` (about 123-127 ms, not the bottleneck). Presentations are read through `run_gate_presentations_run_id_revision_key` and inputs through `idx_run_user_inputs_run_id`, per run. No plan reads `run_messages` or Seq Scans `run_user_inputs` or `run_gate_presentations` (asserted).
+
+**Candidate indexes** (admin all-users, custom median ms):
+
+| Candidate | 30d | 90d |
+|---|---|---|
+| none | 388 | 555 |
+| `runs_terminal_end_idx` | 392 | 563 |
+| `runs (created_at)` | 395 | 563 |
+| both | 371 | 554 |
+
+Every candidate stayed under the 8% bar, so no index migration ships.
+
+**Regression guard.** `TestAnalyticsFlowGenericPlanShapeLiveDB` fails on the old SQL (receipt CTE re-read per outer row) and passes on the shipped statement.
+
+**Not measured:** end-to-end request time; production table sizes and `run_user_inputs` fan-out; `mr_rework` and `cross_check` mixes; suite-runtime and CI job-time impact (a landing obligation, measured on the PR).
