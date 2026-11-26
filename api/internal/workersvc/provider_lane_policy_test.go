@@ -108,6 +108,43 @@ func TestProviderLaneFakeCreationAdmission(t *testing.T) {
 }
 func laneHarness(h Harness) *Harness { return &h }
 
+// TestProviderLaneFakeCreationAdmissionJobLane is the JobLane twin of the table above (PRD #4322 M1b):
+// without a transaction (the fake store) a vendor job proceeds, but a selected Claude source can never
+// be frozen, so it fails closed with errProviderCreateRequiresTx before any insert, and a site-list job
+// keeps its provider_lane_unsupported refusal (never an insert either way).
+func TestProviderLaneFakeCreationAdmissionJobLane(t *testing.T) {
+	claudeSet := store.GetUserProviderLaneSourcesRow{ClaudeProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}
+	codexSet := store.GetUserProviderLaneSourcesRow{CodexProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}
+	for _, tc := range []struct {
+		name             string
+		explicit         *Harness
+		siteList         bool
+		row              store.GetUserProviderLaneSourcesRow
+		want             error
+		queries, inserts int
+	}{
+		{name: "missing explicit", want: ErrProviderLaneUnsupported},
+		{name: "unknown explicit", explicit: laneHarness("unknown"), want: ErrProviderLaneUnsupported},
+		{name: "claude selected fails closed without a transaction", explicit: laneHarness(HarnessClaude), row: claudeSet, want: errProviderCreateRequiresTx, queries: 1},
+		{name: "claude selected with a site list", explicit: laneHarness(HarnessClaude), siteList: true, row: claudeSet, want: ErrProviderLaneUnsupported, queries: 1},
+		{name: "codex selected claude allowed", explicit: laneHarness(HarnessClaude), row: codexSet, queries: 1, inserts: 1},
+		{name: "codex selected codex refused", explicit: laneHarness(HarnessCodex), row: codexSet, want: ErrProviderLaneUnsupported, queries: 1},
+		{name: "neither claude allowed", explicit: laneHarness(HarnessClaude), queries: 1, inserts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &laneCreationStore{lanePresenceReader: lanePresenceReader{row: tc.row}}
+			inserts := 0
+			_, err := (&Service{q: f}).createRunResolved(context.Background(), uuid.New(), tc.explicit, func(Store, resolvedHarness) (store.Run, error) {
+				inserts++
+				return store.Run{}, nil
+			}, harnessCreationOrigin{JobLane: true, JobSiteList: tc.siteList})
+			if !errors.Is(err, tc.want) || f.calls != tc.queries || inserts != tc.inserts {
+				t.Fatalf("err=%v want=%v queries=%d inserts=%d, want %d/%d", err, tc.want, f.calls, inserts, tc.queries, tc.inserts)
+			}
+		})
+	}
+}
+
 func TestProviderLaneSettingsSelectionBeforeCredentials(t *testing.T) {
 	for _, row := range []store.GetUserProviderLaneSourcesRow{
 		{ClaudeProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}},

@@ -222,8 +222,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// Provider claims support ordinary engine-aware lanes only; refuse unsupported
 	// shapes before context or credential reads, without entering a vendor ladder. A Claude judge
-	// is supported (PRD #4322 M1a); a provider-bound Codex judge stays refused here until #4574.
-	if providerBoundRun(run) && ((run.Kind == runkind.Judge && run.Harness != harnessClaude) || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
+	// is supported (PRD #4322 M1a); a provider-bound Codex judge stays refused here until #4574. A
+	// Claude job is supported (PRD #4322 M1b); a provider-bound Codex job (a data error) stays refused,
+	// and a profile-bound (isolated) provider job is refused by the isolated term.
+	if providerBoundRun(run) && ((run.Kind == runkind.Judge && run.Harness != harnessClaude) || (run.Kind == runkind.Job && run.Harness != harnessClaude) || run.Kind == runkind.CrossCheck ||
 		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
 		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
 		return nil, errProviderLaneClaimRefused

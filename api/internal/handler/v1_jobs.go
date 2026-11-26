@@ -136,8 +136,8 @@ func writeV1JobError(w http.ResponseWriter, op string, err error) {
 	case errors.Is(err, workersvc.ErrJobTerminal):
 		httpx.ErrorReason(w, http.StatusConflict, "the job has already finished", v1ReasonJobTerminal)
 	case writeProviderCreateRefusal(w, err):
-		// Issue #4541: the typed provider refusals of run creation (a provider-sourced owner is
-		// provider_lane_unsupported until PRD #4322), answered by the shared helper, not copied.
+		// Issue #4541: the typed provider refusals of run creation (PRD #4322 M1b: an unusable source,
+		// an unmapped job model, or a site-list job under a Claude source), answered by the shared helper.
 	default:
 		slog.Error("v1 jobs: "+op, "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

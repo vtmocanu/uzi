@@ -60,7 +60,8 @@ func TestProviderJudgeCapabilityClauseFormsPinned(t *testing.T) {
 
 	// The health count takes the run kind as its own parameter ($3 after user and engine).
 	count := constant(runtime, "countOnlineWorkersSatisfyingProvider")
-	if form := "($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))"; !strings.Contains(count, form) {
+	// PRD #4322 M1b appends the job clause on the same kind parameter.
+	if form := "($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)) AND ($3::text <> 'job' OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))"; !strings.Contains(count, form) {
 		t.Errorf("CountOnlineWorkersSatisfyingProvider lacks %q", form)
 	}
 

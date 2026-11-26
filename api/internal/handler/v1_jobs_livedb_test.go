@@ -385,12 +385,14 @@ func TestV1JobsCreateLiveDB(t *testing.T) {
 		e.exec(`UPDATE products SET allowed_job_types = '{research}' WHERE id = $1`, product)
 	})
 
-	t.Run("a provider-sourced owner is refused with the typed 409 and nothing is created", func(t *testing.T) {
-		// Issue #4541: jobs refuse a provider-sourced owner (provider_lane_unsupported until PRD
-		// #4322); before the fix the refusal surfaced as a logged 500.
+	t.Run("an owner whose provider source cannot serve a run is refused with the typed 409 and nothing is created", func(t *testing.T) {
+		// Issue #4541 and PRD #4322 M1b: a job under a provider source is provider-bound when the
+		// source is usable (TestV1JobsProviderSourceLiveDB); a source that cannot serve a run (a bare
+		// provider row has no revision) is the typed provider_source_unusable 409, never a logged 500
+		// and never a silent vendor fallback.
 		provUser, provTok := e.user()
 		e.selectProvider(provUser)
-		e.want(e.call(http.MethodPost, "/api/v1/jobs", provTok, v1MinimalJob), http.StatusConflict, "provider_lane_unsupported")
+		e.want(e.call(http.MethodPost, "/api/v1/jobs", provTok, v1MinimalJob), http.StatusConflict, "provider_source_unusable")
 		if n := e.jobCount(provTok); n != 0 {
 			t.Fatalf("job runs = %d, want 0", n)
 		}

@@ -1611,6 +1611,10 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (r.kind <> 'job'
            OR (NOT $11::boolean AND 'job_runner_v1' = ANY($29::text[])
                AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($29::text[]))
+               -- PRD #4322 M1b (the claude_provider_job_v1 ROLLOUT GATE): a provider-bound job (every one
+               -- stamps model_provider_key_mode) additionally needs 'claude_provider_job_v1'; the generic
+               -- provider clause above already requires 'claude_provider_v1'. Vendor jobs are unchanged.
+               AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY($29::text[]))
                -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
                -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
                -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
@@ -1903,6 +1907,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (r.kind <> 'job'
                      OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)
                          AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
+                         -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+                         AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(p.protocol_capabilities))
                          -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
                          AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
                 AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
@@ -3314,6 +3320,8 @@ WHERE run.id = $1
   AND (run.kind <> 'job'
        OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+           -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+           AND (run.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   AND (run.released_worker_id IS NULL
@@ -3717,11 +3725,16 @@ WHERE w.user_id = $1
   -- PRD #1909 M1: a job stamped with runs.job_protocol (@requires_job_files) also needs the
   -- 'job_files_v1' protocol capability; the caller passes runs.job_protocol IS NOT NULL.
   AND (NOT $2::boolean OR 'job_files_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4322 M1b: a provider-bound job (@requires_provider_job: runs.model_provider_key_mode IS NOT
+  -- NULL) also needs 'claude_provider_v1' AND 'claude_provider_job_v1' (the claim clauses' conjunction).
+  AND (NOT $3::boolean
+       OR ('claude_provider_v1' = ANY(w.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
 `
 
 type CountOnlineWorkersSatisfyingJobRunnerParams struct {
-	UserID           uuid.UUID `json:"user_id"`
-	RequiresJobFiles bool      `json:"requires_job_files"`
+	UserID              uuid.UUID `json:"user_id"`
+	RequiresJobFiles    bool      `json:"requires_job_files"`
+	RequiresProviderJob bool      `json:"requires_provider_job"`
 }
 
 // PRD #1908 (D-A): how many of a user's ONLINE, non-draining, non-ephemeral, NON-docker workers
@@ -3731,7 +3744,7 @@ type CountOnlineWorkersSatisfyingJobRunnerParams struct {
 // job-runner clause can never be satisfied). Reads workers.protocol_capabilities DIRECTLY and
 // excludes docker workers, exactly the set ClaimRun's clause admits.
 func (q *Queries) CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, arg CountOnlineWorkersSatisfyingJobRunnerParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles)
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles, arg.RequiresProviderJob)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3818,7 +3831,7 @@ WHERE w.user_id = $1
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND (
-    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
+    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)) AND ($3::text <> 'job' OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
     OR ($2::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
@@ -16407,6 +16420,7 @@ WHERE r.status = 'queued'
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   )
   AND NOT EXISTS (
@@ -16521,6 +16535,7 @@ WHERE r.status = 'queued'
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
         AND (r.kind = 'cross_check' OR w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
@@ -16762,6 +16777,11 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
+  -- PRD #4322 M1b: the generic arm never decides a job. A provider-bound job would satisfy this
+  -- arm's model_provider_key_mode demand disjunct, so the job arm below (which carries the
+  -- job-runner and provider-job capabilities) is the only decider for kind 'job'. The conjunct
+  -- sits INSIDE this first AND chain, before the OR, so it cannot gate the job arm.
+  AND r.kind <> 'job'
   -- Orphan PLAN children retain the legacy capability-gap provisioning path;
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
@@ -16816,6 +16836,9 @@ WHERE r.status = 'queued'
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
         -- PRD #1909 M1: and 'job_files_v1' for a stamped job (runs.job_protocol).
         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(wj.protocol_capabilities))
+        -- PRD #4322 M1b: and both provider capabilities for a provider-bound job.
+        AND (r.model_provider_key_mode IS NULL
+             OR ('claude_provider_v1' = ANY(wj.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(wj.protocol_capabilities)))
         -- PRD #1976 M1: and 'isolated_job_v1' for a profile-bound job (runs.egress_profile_id).
         AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(wj.protocol_capabilities))
   ))

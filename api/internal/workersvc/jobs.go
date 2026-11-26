@@ -400,6 +400,12 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		return JobView{}, err
 	}
 
+	return s.createJobRun(ctx, p, v, maxActive, harnessCreationOrigin{JobLane: true, JobSiteList: p.EgressProfile != ""})
+}
+
+// createJobRun is CreateJobRun's body after validation, with the creation origin as a parameter so a
+// LiveDB test can drive the closure's own backstops (an origin the wrapper never builds).
+func (s *Service) createJobRun(ctx context.Context, p CreateJobParams, v validatedJob, maxActive int, origin harnessCreationOrigin) (JobView, error) {
 	explicit := HarnessClaude
 	runID := uuid.New()
 	var originCreatedAt pgtype.Timestamptz
@@ -451,6 +457,17 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 			}
 			profileID = pgtype.UUID{Bytes: prof.ID, Valid: true}
 		}
+		// Backstop of the lane decision above: a provider-bound job is never profile-bound. createRunAtomic
+		// refuses a site-list job under a selected Claude source before this closure runs, so reaching
+		// this with both set means the origin and the parameters disagree; refuse rather than insert a
+		// row an isolated worker could never serve with its provider binding.
+		if resolved.ProviderSource != nil && profileID.Valid {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		// Lock order of a job create (PRD #4322 M1b): the secret-mutation lock (shared; taken by the
+		// job lane and again by freezeProviderSource), then the provider row FOR SHARE (the freeze),
+		// then the job-create key below, then the stored-files keys. Every secret or provider writer
+		// takes the secret-mutation lock first, so none of them waits on a lock this create holds.
 		if err := qq.LockJobCreate(ctx, p.Caller.UserID); err != nil {
 			return store.Run{}, err
 		}
@@ -483,6 +500,12 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 			// The rollout stamp: only a worker advertising capability.JobFilesV1 may claim this job.
 			JobProtocol:     pgtype.Int2{Int16: capability.JobProtocolFiles, Valid: true},
 			EgressProfileID: profileID,
+
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
 		if err != nil {
 			return store.Run{}, err
@@ -505,7 +528,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		}
 		originCreatedAt, err = qq.CreateJobOrigin(ctx, origin)
 		return run, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true}) // Jobs retain the fixed Claude lane and its legacy Claude-source refusal.
+	}, origin) // PRD #4322 M1b: the job lane decides vendor or provider-bound under the shared secret-mutation lock.
 	if err != nil {
 		return JobView{}, err
 	}

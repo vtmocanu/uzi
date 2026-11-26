@@ -777,7 +777,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			// A provider binding's re-check and insert need one transaction: fail closed.
 			return store.Run{}, resolvedHarness{}, errProviderCreateRequiresTx
 		}
-		if (origin.RefuseProviderOwner || origin.JudgeLane) && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
+		if (origin.RefuseProviderOwner || origin.JudgeLane || origin.JobLane) && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
 			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
 		}
 		rq, ok := s.harnessStore()
@@ -789,12 +789,17 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
+		if origin.JobLane {
+			if err := s.jobLaneNonAtomic(ctx, rq, userID, *explicit, origin.JobSiteList); err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+		}
 		if origin.JudgeLane {
 			if err := s.judgeLaneNonAtomic(ctx, userID, *explicit); err != nil {
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
-		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane)
+		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane || origin.JobLane)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
@@ -887,6 +892,39 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		}
 	}
 	providerJudge := origin.JudgeLane && !judgeDec.Vendor
+	// A job decides its lane under the same shared lock (PRD #4322 M1b), taken BEFORE the source read
+	// and held to commit: every writer of the sources takes it exclusively, so the read below is ordered
+	// before such a write (the create commits with the binding it read, and the writer then proceeds) or
+	// after its commit (the create reflects it). jobProvider is true when the owner selected a Claude
+	// source, which this create then freezes; false is the vendor job, resolved exactly as before. A Codex
+	// job is a data error and keeps the legacy refusal for a selected source.
+	jobProvider := false
+	if origin.JobLane {
+		if explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex) {
+			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+		}
+		if err := store.LockSecretMutationShared(ctx, tx, userID); err != nil {
+			return store.Run{}, resolvedHarness{}, fmt.Errorf("job lane: secret lock: %w", err)
+		}
+		sources, err := qtx.GetUserProviderLaneSources(ctx, userID)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		if s.jobDecidedHook != nil {
+			s.jobDecidedHook(ctx)
+		}
+		switch {
+		case *explicit == HarnessCodex:
+			if sources.ClaudeProviderID.Valid || sources.CodexProviderID.Valid {
+				return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+			}
+		case sources.ClaudeProviderID.Valid:
+			if origin.JobSiteList {
+				return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+			}
+			jobProvider = true
+		}
+	}
 	if inheritedProvider {
 		// A successor of a provider-bound run uses the SOURCE RUN's binding and never consults the
 		// owner's current source (PRD #4320 inheritance).
@@ -904,14 +942,18 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
 	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
-	// A guarded vendor lane (job, cross-check) does the same: the guard above allowed its source
+	// A guarded vendor lane (cross-check) does the same: the guard above allowed its source
 	// snapshot, and a vendor lane insert stamps no binding, so a second source read here could only
 	// see a source selected in between and then fail the binding assertion as an internal mismatch.
+	// A vendor job (no Claude source under the shared lock the job lane takes) is vendorOnly too; the
+	// lock, not a snapshot, is what makes that read final.
 	// A vendor judge needs vendorOnly for a different reason: its pin policy can choose vendor while
 	// a Claude source IS selected (pinned with a credential), so the resolver must not consult the
 	// source. A provider judge never reaches resolve(): it stamps all five binding columns from the
-	// source frozen under the shared lock (freezeProviderJudge).
-	vendorOnly := inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane
+	// source frozen under the shared lock (freezeProviderJudge). A provider JOB is the one guarded lane
+	// that does consult the source: it resolves it (usable, or typed ErrProviderSourceUnusable) and
+	// freezes it below, while a vendor job (no Claude source under the shared lock) is vendorOnly.
+	vendorOnly := inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane || (origin.JobLane && !jobProvider)
 	resolve := func() (resolvedHarness, error) {
 		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)
 	}
@@ -930,6 +972,11 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		res, err = resolve()
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
+		}
+		if jobProvider && res.ProviderSource == nil {
+			// The lane read saw a Claude source but the resolution carries none: never fall through to a
+			// vendor job under a selected source.
+			return store.Run{}, resolvedHarness{}, &ProviderSourceUnusableError{Reason: SourceUnusableProviderMissing}
 		}
 	}
 
@@ -1146,6 +1193,10 @@ func (s *Service) verifyRunBinding(ctx context.Context, q *store.Queries, run st
 		// A judge runs one model, not a lead plus templates: validate it strictly (PRD #4322 M1a).
 		return s.checkProviderJudgeModel(ctx, q, run, *res.ProviderSource)
 	}
+	if run.Kind == runkind.Job {
+		// A job runs one model, not a lead plus templates: validate it strictly (PRD #4322 M1b).
+		return s.checkProviderJobModel(ctx, q, run, *res.ProviderSource)
+	}
 	return s.checkProviderModels(ctx, q, run, *res.ProviderSource)
 }
 
@@ -1166,6 +1217,31 @@ func (s *Service) refuseProviderLane(ctx context.Context, q providerLaneSourceRe
 	}
 	if sources.ClaudeProviderID.Valid || (lane == HarnessCodex && sources.CodexProviderID.Valid) {
 		return ErrProviderLaneUnsupported
+	}
+	return nil
+}
+
+// jobLaneNonAtomic is the job lane check for the creation paths that have no transaction (no beginner
+// wired, or the in-memory fake store), so no secret-mutation lock: it can refuse and can admit a vendor
+// job, but it cannot freeze a provider binding, so a selected Claude source fails closed with
+// errProviderCreateRequiresTx (ErrProviderLaneUnsupported for a site-list job, as in the transaction).
+// A Codex job keeps the legacy refusal of any selected source.
+func (s *Service) jobLaneNonAtomic(ctx context.Context, q providerLaneSourceReader, userID uuid.UUID, lane Harness, siteList bool) error {
+	if lane == HarnessCodex {
+		return s.refuseProviderLane(ctx, q, userID, lane)
+	}
+	if lane != HarnessClaude {
+		return ErrProviderLaneUnsupported
+	}
+	sources, err := q.GetUserProviderLaneSources(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if sources.ClaudeProviderID.Valid {
+		if siteList {
+			return ErrProviderLaneUnsupported
+		}
+		return errProviderCreateRequiresTx
 	}
 	return nil
 }
