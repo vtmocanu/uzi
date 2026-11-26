@@ -127,6 +127,8 @@ type genericPlanEnv struct {
 	userID, targetID uuid.UUID
 	// The Spend-only owner (and its runs), seeded after the five usage cases' data.
 	spendOwnerID uuid.UUID
+	// Issue #4685: the latest-failure seed (see seedGenericPlanLatestFailure).
+	latest genericPlanLatest
 
 	// denominator, ownLegs, bound and scopedBound serve the five original cases and exclude
 	// the Spend owner's legs; the spend* fields serve the Spend cases.
@@ -268,13 +270,14 @@ func newGenericPlanEnv(t *testing.T) *genericPlanEnv {
 		 WHERE r.user_id = $1`, spendOwnerID)
 	mustExec(ctx, t, pool, `ANALYZE runs`)
 	mustExec(ctx, t, pool, `ANALYZE run_usage`)
+	latest := seedGenericPlanLatestFailure(ctx, t, pool)
 
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	t.Cleanup(conn.Release)
-	e := &genericPlanEnv{ctx: ctx, pool: pool, q: q, conn: conn, userID: userID, targetID: targetID, spendOwnerID: spendOwnerID}
+	e := &genericPlanEnv{ctx: ctx, pool: pool, q: q, conn: conn, userID: userID, targetID: targetID, spendOwnerID: spendOwnerID, latest: latest}
 	// Simple protocol throughout: these are session/utility statements, and the plan under
 	// test is the one the server-side PREPARE produces, not a pgx-cached one.
 	e.exec(t, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
@@ -652,6 +655,7 @@ func TestAnalyticsSpendWitnessNegativeControlLiveDB(t *testing.T) {
 type planNode struct {
 	NodeType            string     `json:"Node Type"`
 	RelationName        string     `json:"Relation Name"`
+	Alias               string     `json:"Alias"`
 	IndexName           string     `json:"Index Name"`
 	ActualRows          float64    `json:"Actual Rows"`
 	ActualLoops         float64    `json:"Actual Loops"`
@@ -808,4 +812,303 @@ func renderPlan(n *planNode, depth int) string {
 		b.WriteString(renderPlan(&n.Plans[i], depth+1))
 	}
 	return b.String()
+}
+
+// genericPlanLatest is the latest-failure seed of issue #4685: per scope one eligible failure
+// with completed runs before it, exactly at its terminal instant, and after it.
+type genericPlanLatest struct {
+	ownerID                    uuid.UUID
+	ownerRun, allRun, allOwner uuid.UUID
+	ownerSince, allSince       int64
+	ownerFailedAt, allFailedAt time.Time
+}
+
+// seedGenericPlanLatestFailure seeds two users in the year 2098, which no other test uses, after
+// deleting what an earlier call left (they are matched by the genericplan-lf email prefix):
+//
+//	owner L: completed at 08:00 and exactly at the failure's instant (neither counts), a failed
+//	         run at 2098-01-01 10:00, then completed at 11:00 and 12:00 (both count): since 2;
+//	user M:  a newer failure at 2098-01-02 10:00 (the instance-wide latest), completed exactly at
+//	         that instant (not counted) and at 11:00, 12:00, 13:00 (counted); L's runs all end
+//	         before it: since 3.
+func seedGenericPlanLatestFailure(ctx context.Context, t *testing.T, pool *pgxpool.Pool) genericPlanLatest {
+	t.Helper()
+	del := func() {
+		for _, q := range []string{
+			`DELETE FROM runs WHERE user_id IN (SELECT id FROM users WHERE email LIKE 'genericplan-lf-%@e2e')`,
+			`DELETE FROM users WHERE email LIKE 'genericplan-lf-%@e2e'`,
+		} {
+			if _, err := pool.Exec(context.Background(), q); err != nil {
+				t.Fatalf("clear latest-failure seed: %v", err)
+			}
+		}
+	}
+	del()
+	t.Cleanup(del)
+	mkUser := func(tag string) (user, repo uuid.UUID) {
+		user, conn, repo := uuid.New(), uuid.New(), uuid.New()
+		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, user, fmt.Sprintf("genericplan-lf-%s-%s@e2e", tag, user))
+		mustExec(ctx, t, pool,
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, conn, user, []byte{0x1})
+		mustExec(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+			 VALUES ($1, $2, 1, $3, 'https://forge.e2e/g/lf', 'main', true)`, repo, conn, fmt.Sprintf("g/genericplan-lf-%s", repo))
+		return user, repo
+	}
+	var iid int64 = 5_000_000
+	ins := func(user, repo uuid.UUID, status, origin string, finished time.Time) uuid.UUID {
+		iid++
+		id := uuid.New()
+		var fo any
+		if origin != "" {
+			fo = origin
+		}
+		mustExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, created_at, finished_at, status_since, fail_origin)
+			 VALUES ($1, $2, $3, $4, 't', 'd', $5, 'issue', $6, $6, $6, $7)`, id, user, repo, iid, status, finished, fo)
+		return id
+	}
+	day := func(d, h int) time.Time { return time.Date(2098, 1, d, h, 0, 0, 0, time.UTC) }
+	var l genericPlanLatest
+	owner, ownerRepo := mkUser("owner")
+	ins(owner, ownerRepo, "completed", "", day(1, 8))
+	l.ownerRun = ins(owner, ownerRepo, "failed", "agent_failure", day(1, 10))
+	ins(owner, ownerRepo, "completed", "", day(1, 10))
+	ins(owner, ownerRepo, "completed", "", day(1, 11))
+	ins(owner, ownerRepo, "completed", "", day(1, 12))
+	m, mRepo := mkUser("other")
+	l.allRun = ins(m, mRepo, "failed", "run_timeout", day(2, 10))
+	ins(m, mRepo, "completed", "", day(2, 10))
+	ins(m, mRepo, "completed", "", day(2, 11))
+	ins(m, mRepo, "completed", "", day(2, 12))
+	ins(m, mRepo, "completed", "", day(2, 13))
+	l.ownerID, l.allOwner = owner, m
+	l.ownerSince, l.allSince = 2, 3
+	l.ownerFailedAt, l.allFailedAt = day(1, 10), day(2, 10)
+	mustExec(ctx, t, pool, `ANALYZE runs`)
+	return l
+}
+
+// reliabilityArgs renders the EXECUTE arguments of a Reliability statement for a 30d window
+// ending at the transaction's now(). The argument order is read from what the generated Go
+// method actually passes (a capturing DBTX), never assumed.
+func (e *genericPlanEnv) reliabilityArgs(t *testing.T, owner uuid.UUID, breakdown string) string {
+	t.Helper()
+	var now time.Time
+	if err := e.conn.QueryRow(e.ctx, `SELECT now()`, pgx.QueryExecModeSimpleProtocol).Scan(&now); err != nil {
+		t.Fatalf("select now(): %v", err)
+	}
+	b, err := analytics.ComputeBounds(now, time.UTC, analytics.Window30d, nil)
+	if err != nil {
+		t.Fatalf("ComputeBounds: %v", err)
+	}
+	ts := func(v time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: v, Valid: true} }
+	tss := func(vs []time.Time) []pgtype.Timestamptz {
+		out := make([]pgtype.Timestamptz, len(vs))
+		for i, v := range vs {
+			out[i] = ts(v)
+		}
+		return out
+	}
+	var prev pgtype.Timestamptz
+	if b.PreviousFrom != nil {
+		prev = ts(*b.PreviousFrom)
+	}
+	capture := &capturingDBTX{}
+	cq := store.New(capture)
+	landable := []string{"workflow_scope_missing", "push_secret_blocked"}
+	if owner != uuid.Nil {
+		_, _ = cq.AnalyticsOwnerReliability(e.ctx, store.AnalyticsOwnerReliabilityParams{
+			UserID: owner, Now: ts(b.Now), From: ts(b.From), PreviousFrom: prev, FoldFrom: ts(b.FoldFrom),
+			BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds), RollStarts: tss(b.RollStarts), RollEnds: tss(b.RollEnds),
+			RollHarnesses: []string{"claude", "codex"}, LandableOrigins: landable,
+			Kinds: runkind.Delivery(), Breakdown: breakdown,
+		})
+	} else {
+		_, _ = cq.AnalyticsAllReliability(e.ctx, store.AnalyticsAllReliabilityParams{
+			Now: ts(b.Now), From: ts(b.From), PreviousFrom: prev, FoldFrom: ts(b.FoldFrom),
+			BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds), RollStarts: tss(b.RollStarts), RollEnds: tss(b.RollEnds),
+			RollHarnesses: []string{"claude", "codex"}, LandableOrigins: landable,
+			Kinds: runkind.Delivery(), Breakdown: breakdown,
+		})
+	}
+	lits := make([]string, len(capture.args))
+	for i, a := range capture.args {
+		lits[i] = sqlLiteral(t, a)
+	}
+	return strings.Join(lits, ", ")
+}
+
+// TestAnalyticsReliabilityGenericPlanLiveDB is the issue #1620 plan-shape check applied to the
+// Reliability statements: under force_generic_plan ONE prepared statement per scope is executed
+// with breakdown=primary_model (the Primary-model fold reads run_usage: positive work, inside
+// the global 4 x count(run_usage) bound and, for the owner, inside the owner's own legs) and
+// then with breakdown=harness (zero executed run_usage scans: the parameter gate must keep the
+// fold out of the plan). The seed holds usage legs of other users, so an unscoped fold shows.
+func TestAnalyticsReliabilityGenericPlanLiveDB(t *testing.T) {
+	e := newGenericPlanEnv(t)
+	if e.spendOwnLegs >= e.spendDenominator {
+		t.Fatalf("foreign usage missing: owner legs %d, table %d", e.spendOwnLegs, e.spendDenominator)
+	}
+	cases := []struct {
+		name   string
+		sql    string
+		owner  uuid.UUID
+		scoped bool
+	}{
+		{"AnalyticsOwnerReliability", store.AnalyticsOwnerReliabilitySQL, e.spendOwnerID, true},
+		{"AnalyticsAllReliability", store.AnalyticsAllReliabilitySQL, uuid.Nil, false},
+	}
+	for i, c := range cases {
+		stmt := fmt.Sprintf("reliability_plan_%d", i)
+		e.exec(t, fmt.Sprintf("PREPARE %s AS %s", stmt, c.sql))
+		pc := genericPlanCase{name: c.name, sql: c.sql, scoped: c.scoped, spend: true, ownLegs: e.spendOwnLegs}
+
+		doc := e.explain(t, c.name+"[primary_model]", stmt, e.reliabilityArgs(t, c.owner, "primary_model"))
+		t.Logf("%s[primary_model] generic plan:\n%s", c.name, renderPlan(doc, 0))
+		if offenders := e.planOffenders(pc, doc); len(offenders) > 0 {
+			t.Errorf("%s[primary_model]: run_usage work exceeds its bound (4 x %d, own legs %d):\n  %s", c.name, e.spendDenominator, e.spendOwnLegs, strings.Join(offenders, "\n  "))
+		}
+		var usageWork, usageSum, slack float64
+		for _, n := range collectScans(doc, "run_usage") {
+			total, rounded := nodeWork(n)
+			usageWork += n.ActualRows * n.ActualLoops
+			usageSum += total
+			slack += rounded * n.ActualLoops / 2
+		}
+		if usageWork == 0 {
+			t.Errorf("%s[primary_model]: no run_usage row was read; the seed or the window is empty and the bounds prove nothing", c.name)
+		}
+		if !c.scoped && usageSum > float64(e.spendDenominator)+slack {
+			t.Errorf("%s[primary_model]: run_usage scans did %.0f rows of work, more than one fold of the table (%d, slack %.0f)", c.name, usageSum, e.spendDenominator, slack)
+		}
+		e.reliabilityLoopOffenders(t, c.name+"[primary_model]", doc)
+
+		doc = e.explain(t, c.name+"[harness]", stmt, e.reliabilityArgs(t, c.owner, "harness"))
+		t.Logf("%s[harness] generic plan:\n%s", c.name, renderPlan(doc, 0))
+		for _, n := range collectScans(doc, "run_usage") {
+			if n.ActualLoops > 0 {
+				t.Errorf("%s[harness]: %s on run_usage executed (loops %.0f, rows %.0f): the usage fold must not run when the breakdown is not primary_model", c.name, n.NodeType, n.ActualLoops, n.ActualRows)
+			}
+		}
+		e.reliabilityLoopOffenders(t, c.name+"[harness]", doc)
+		e.exec(t, "DEALLOCATE "+stmt)
+	}
+}
+
+// reliabilityLoopOffenders reports a per-cohort-row re-scan: a scan of runs or run_usage, or a
+// CTE scan of a run-derived CTE (cohort, run_fold, rfb, the breakdown and count CTEs), that
+// looped more than once for more than 4 x count(runs) rows of work. The rolling-range join
+// (series x ranges x segments, a few thousand rows whatever the data) reads only the segment
+// CTE, so it is deliberately not a run-derived scan.
+func (e *genericPlanEnv) reliabilityLoopOffenders(t *testing.T, name string, root *planNode) {
+	t.Helper()
+	limit := 4 * float64(e.runsTotal)
+	runDerived := map[string]bool{"cohort": true, "run_fold": true, "rfb": true, "bd_items": true, "bd_ranked": true, "fan": true, "cnt": true}
+	var visit func(n *planNode)
+	visit = func(n *planNode) {
+		derived := n.RelationName == "runs" || n.RelationName == "run_usage" || runDerived[n.CTEName]
+		if work := (n.ActualRows + n.RowsRemovedByFilter) * n.ActualLoops; derived && n.ActualLoops > 1 && work > limit {
+			t.Errorf("%s: %s %s%s looped %.0f times for %.0f rows of work (> 4 x count(runs) = %.0f): a per-row re-scan", name, n.NodeType, n.CTEName, n.RelationName, n.ActualLoops, work, limit)
+		}
+		for i := range n.Plans {
+			visit(&n.Plans[i])
+		}
+	}
+	visit(root)
+}
+
+// collectScans returns every plan node that scans the named relation.
+func collectScans(root *planNode, relation string) []*planNode {
+	var out []*planNode
+	var visit func(n *planNode)
+	visit = func(n *planNode) {
+		if n.RelationName == relation {
+			out = append(out, n)
+		}
+		for i := range n.Plans {
+			visit(&n.Plans[i])
+		}
+	}
+	visit(root)
+	return out
+}
+
+// TestAnalyticsLatestFailureGenericPlanLiveDB runs the two latest-failure statements as
+// generic prepared plans against a seed with an earlier and a later matching completion per
+// scope: the statement must return the exact run and the exact positive completed-since count,
+// and the plan must have executed the count's scan of runs (alias r3), not skipped it.
+func TestAnalyticsLatestFailureGenericPlanLiveDB(t *testing.T) {
+	e := newGenericPlanEnv(t)
+	l := e.latest
+	cases := []struct {
+		name      string
+		sql       string
+		args      func(t *testing.T) string
+		run, user uuid.UUID
+		failedAt  time.Time
+		since     int64
+	}{
+		{"AnalyticsOwnerLatestFailure", store.AnalyticsOwnerLatestFailureSQL, func(t *testing.T) string {
+			return e.latestArgs(t, l.ownerID)
+		}, l.ownerRun, l.ownerID, l.ownerFailedAt, l.ownerSince},
+		{"AnalyticsAllLatestFailure", store.AnalyticsAllLatestFailureSQL, func(t *testing.T) string {
+			return e.latestArgs(t, uuid.Nil)
+		}, l.allRun, l.allOwner, l.allFailedAt, l.allSince},
+	}
+	for i, c := range cases {
+		stmt := fmt.Sprintf("latest_failure_plan_%d", i)
+		e.exec(t, fmt.Sprintf("PREPARE %s AS %s", stmt, c.sql))
+		args := c.args(t)
+
+		var found bool
+		var failedAt time.Time
+		var origin string
+		var runID, userID uuid.UUID
+		var since int64
+		if err := e.conn.QueryRow(e.ctx, fmt.Sprintf("EXECUTE %s(%s)", stmt, args), pgx.QueryExecModeSimpleProtocol).
+			Scan(&found, &failedAt, &origin, &runID, &userID, &since); err != nil {
+			t.Fatalf("%s: EXECUTE: %v", c.name, err)
+		}
+		if !found || runID != c.run || userID != c.user || !failedAt.Equal(c.failedAt) || since != c.since || since <= 0 {
+			t.Errorf("%s: got found=%v run=%s user=%s at=%s since=%d, want run %s user %s at %s since %d",
+				c.name, found, runID, userID, failedAt, since, c.run, c.user, c.failedAt, c.since)
+		}
+		doc := e.explain(t, c.name, stmt, args)
+		t.Logf("%s generic plan:\n%s", c.name, renderPlan(doc, 0))
+		var executed bool
+		var visit func(n *planNode)
+		visit = func(n *planNode) {
+			if n.RelationName == "runs" && n.Alias == "r3" && n.ActualLoops >= 1 {
+				executed = true
+			}
+			for i := range n.Plans {
+				visit(&n.Plans[i])
+			}
+		}
+		visit(doc)
+		if !executed {
+			t.Errorf("%s: the completed-since count's scan of runs (alias r3) did not execute under the generic plan", c.name)
+		}
+		e.exec(t, "DEALLOCATE "+stmt)
+	}
+}
+
+// latestArgs renders the EXECUTE arguments of a latest-failure statement (no repo or harness
+// filter, the Delivery kinds), reading the argument order from the generated method.
+func (e *genericPlanEnv) latestArgs(t *testing.T, owner uuid.UUID) string {
+	t.Helper()
+	capture := &capturingDBTX{}
+	cq := store.New(capture)
+	if owner != uuid.Nil {
+		_, _ = cq.AnalyticsOwnerLatestFailure(e.ctx, store.AnalyticsOwnerLatestFailureParams{UserID: owner, Kinds: runkind.Delivery()})
+	} else {
+		_, _ = cq.AnalyticsAllLatestFailure(e.ctx, store.AnalyticsAllLatestFailureParams{Kinds: runkind.Delivery()})
+	}
+	lits := make([]string, len(capture.args))
+	for i, a := range capture.args {
+		lits[i] = sqlLiteral(t, a)
+	}
+	return strings.Join(lits, ", ")
 }
