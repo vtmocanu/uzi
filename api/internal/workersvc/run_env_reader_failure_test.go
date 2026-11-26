@@ -87,10 +87,19 @@ type scriptedStateVaultStore struct {
 	okReads int
 	invalid bool
 	reads   int
+
+	// script, when set, is consulted first with the 1-based read number; a true third result
+	// means the scripted answer is served (handled) and okReads/invalid are ignored for that read.
+	script func(n int) (store.GetUserVaultStateRow, bool, error)
 }
 
 func (s *scriptedStateVaultStore) GetUserVaultState(ctx context.Context, id uuid.UUID) (store.GetUserVaultStateRow, error) {
 	s.reads++
+	if s.script != nil {
+		if row, handled, err := s.script(s.reads); handled {
+			return row, err
+		}
+	}
 	if s.reads <= s.okReads {
 		return s.memVaultStore.GetUserVaultState(ctx, id)
 	}
@@ -103,6 +112,14 @@ func (s *scriptedStateVaultStore) GetUserVaultState(ctx context.Context, id uuid
 // openableRedactFixture is a RunEnvRedact fixture whose one receipted version opens (master
 // AAD sealed, unprotected vault, epoch 0) and whose owner's vault state read is scripted.
 func openableRedactFixture(t *testing.T, okReads int, invalid bool) (*Service, *receiptRowsStore, store.Worker, uuid.UUID) {
+	t.Helper()
+	s, q, wkr, lead, _ := openableRedactFixtureScripted(t, okReads, invalid)
+	return s, q, wkr, lead
+}
+
+// openableRedactFixtureScripted is openableRedactFixture that also returns the scripted store,
+// so a test can set its per-read script.
+func openableRedactFixtureScripted(t *testing.T, okReads int, invalid bool) (*Service, *receiptRowsStore, store.Worker, uuid.UUID, *scriptedStateVaultStore) {
 	t.Helper()
 	owner, lead := uuid.New(), uuid.New()
 	box, err := secretbox.New(make([]byte, secretbox.KeySize))
@@ -133,7 +150,85 @@ func openableRedactFixture(t *testing.T, okReads int, invalid bool) (*Service, *
 	wkr := store.Worker{ID: uuid.New(), UserID: owner}
 	q.run = store.Run{ID: lead, UserID: owner, Kind: runkind.Issue, WorkerID: pgconv.UUID(wkr.ID)}
 	scripted := &scriptedStateVaultStore{memVaultStore: m, okReads: okReads, invalid: invalid}
-	return &Service{q: q, box: box, vlt: vault.New(box, scripted, m.transaction)}, q, wkr, lead
+	return &Service{q: q, box: box, vlt: vault.New(box, scripted, m.transaction)}, q, wkr, lead, scripted
+}
+
+// postOpenStateScript serves the real state to every read before RunEnvRedact's post-open
+// phase and, from the post-open authority read (the second GetRunByIDForUser call, which
+// precedes the post-open state read) on, the rows in order, repeating the last. postReads
+// counts the state reads served in the post-open phase.
+func postOpenStateScript(q *receiptRowsStore, s *scriptedStateVaultStore, rows ...store.GetUserVaultStateRow) (postReads *int) {
+	postReads = new(int)
+	s.script = func(int) (store.GetUserVaultStateRow, bool, error) {
+		if q.runCalls < 2 {
+			return store.GetUserVaultStateRow{}, false, nil
+		}
+		i := *postReads
+		*postReads++
+		if i >= len(rows) {
+			i = len(rows) - 1
+		}
+		return rows[i], true, nil
+	}
+	return postReads
+}
+
+// The fixture's opens run in an unprotected vault at epoch 0.
+const redactOpenedEpoch = int64(0)
+
+// Regression (PRD #4416 round 8): the post-open check used to read the state, then call
+// RequiresUnlock, which reads it again. A state that changes BETWEEN those two reads (here a
+// protected user at the opened epoch with no cached key on the first read, an unprotected one on
+// the next) delivered versions on the old code: State saw epoch == opened, and RequiresUnlock's
+// own read saw unprotected and returned false. One state read decides both now, so the first
+// read (protected, no key) must be refused as locked.
+func TestRunEnvRedactEpochAndUnlockFromOneStateRead(t *testing.T) {
+	s, q, wkr, lead, scripted := openableRedactFixtureScripted(t, 100, false)
+	reads := postOpenStateScript(q, scripted,
+		store.GetUserVaultStateRow{VaultMode: store.VaultModeProtected, VaultEpoch: redactOpenedEpoch},
+		store.GetUserVaultStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: redactOpenedEpoch})
+	res, err := s.RunEnvRedact(context.Background(), wkr, lead)
+	if !errors.Is(err, ErrRunEnvVaultLocked) || len(res.Versions) != 0 || res.Protected {
+		t.Fatalf("RunEnvRedact = %+v, %v; want ErrRunEnvVaultLocked and no version", res, err)
+	}
+	if *reads != 1 {
+		t.Fatalf("post-open state reads = %d, want exactly 1", *reads)
+	}
+}
+
+func TestRunEnvRedactPostOpenStateControls(t *testing.T) {
+	cases := []struct {
+		name    string
+		row     store.GetUserVaultStateRow
+		want    error
+		wantVer int
+	}{
+		{name: "unprotected at the opened epoch delivers",
+			row: store.GetUserVaultStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: redactOpenedEpoch}, wantVer: 1},
+		{name: "epoch changed is locked",
+			row:  store.GetUserVaultStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: redactOpenedEpoch + 1},
+			want: ErrRunEnvVaultLocked},
+		// A protected state whose key is cached at the epoch delivers; that needs a real
+		// Enable/Unlock to populate the vault cache, which this fixture cannot do. The cached-key
+		// answer itself is pinned by the vault package's TestUsableAtState.
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, q, wkr, lead, scripted := openableRedactFixtureScripted(t, 100, false)
+			reads := postOpenStateScript(q, scripted, c.row)
+			res, err := s.RunEnvRedact(context.Background(), wkr, lead)
+			if c.want != nil {
+				if !errors.Is(err, c.want) || len(res.Versions) != 0 {
+					t.Fatalf("RunEnvRedact = %+v, %v; want %v and no version", res, err, c.want)
+				}
+			} else if err != nil || len(res.Versions) != c.wantVer {
+				t.Fatalf("RunEnvRedact = %+v, %v; want %d version(s)", res, err, c.wantVer)
+			}
+			if *reads != 1 {
+				t.Fatalf("post-open state reads = %d, want exactly 1", *reads)
+			}
+		})
+	}
 }
 
 func TestRunEnvRedactPostOpenFailures(t *testing.T) {

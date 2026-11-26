@@ -368,8 +368,10 @@ var (
 // else is ErrRunNotOwned. When versions would be returned, the requested run must still be open
 // (RunEnvRedactOpen), else ErrRunEnvRedactClosed. The route is read-only, so there is no
 // generation or repo check. After the opens, the ownership and openness checks run again and
-// the owner's vault epoch must still equal the one the versions were opened at with the vault
-// not requiring unlock; a failure there returns the same typed refusal and no version. A vault
+// the owner's vault epoch and unlock state are checked from one state read: the epoch must still
+// equal the one the versions were opened at and, only when the vault is protected, that epoch's
+// key must be cached (vault.UsableAtState, no second read); a failure there returns the same
+// typed refusal and no version. A vault
 // state read that fails with an invalid state or no vault is ErrRunEnvHistoryUnavailable (as on
 // the open path); any other failure of the state read, the authority read or the openness read is
 // a reader failure. Authority, openness and the owner's epoch and lock state are checked after
@@ -425,7 +427,7 @@ func (s *Service) RunEnvRedact(ctx context.Context, wkr store.Worker, runID uuid
 	if err != nil {
 		return RunEnvRedactResponse{}, fmt.Errorf("%w: run env redact vault state: %w", secretopen.ErrReaderFailure, err)
 	}
-	if state.VaultEpoch != epoch || s.vlt.RequiresUnlock(ctx, run.UserID) {
+	if state.VaultEpoch != epoch || !s.vlt.UsableAtState(run.UserID, state) {
 		return RunEnvRedactResponse{}, ErrRunEnvVaultLocked
 	}
 	return RunEnvRedactResponse{Protected: true, Versions: versions}, nil
