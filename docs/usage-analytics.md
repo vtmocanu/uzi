@@ -171,7 +171,11 @@ Delivery kinds are issue, mr_rework, ci_fix, prompt, self_improve, task and
 job. Supporting kinds are judge, cross_check and chat.
 
 Null reasons are a closed set: `no_completed_delivery_runs`, `no_merged_prs`,
-`no_applicable_runs`, `no_input_tokens`, `no_finished_runs`, `not_applicable`.
+`no_applicable_runs`, `no_input_tokens`, `no_finished_runs`, `not_applicable`
+and `insufficient_runs`. `insufficient_runs` appears only on Reliability: on a
+rolling point or a breakdown row over fewer than five finished runs. The
+top-level Reliability `reason` is a separate field: `supporting_kinds_only` (or
+null), see [Reliability](#reliability).
 
 Merged-PR rules:
 
@@ -233,8 +237,9 @@ for Spend).
   kinds count; `chat`, `judge` and `cross_check` are in no figure. A run that
   has not finished (in flight) is in no finished figure.
 - **Not applicable.** When the `kind` filter selects only supporting kinds
-  (`kind=supporting`, `kind=judge`, `kind=chat`, ...), nothing is read and the
-  response has `applicable: false` with `reason: "supporting_kinds_only"`. Every
+  (`kind=supporting`, `kind=judge`, `kind=chat`, ...), no history, cohort or
+  latest-failure statement runs (the user and repo checks still run, so an
+  unknown `repo` is still a 400 `invalid repo`) and the response has `applicable: false` with `reason: "supporting_kinds_only"`. Every
   count is zero and every rate is null with reason `not_applicable`, which is
   not a zero failure rate. With `kind=delivery` or any delivery kind,
   `applicable` is true and `reason` is null.
@@ -248,12 +253,14 @@ for Spend).
   never suppressed for a small sample; it is null with `no_finished_runs` only
   when nothing finished.
 - **`series`.** One cell per bucket (`series[i]` is `buckets[i]`) with
-  `finished` and the outcome counts.
+  `finished` and the outcome counts, plus its own `index` (`series[].index`).
 - **`causes`.** The window's failed runs by failure origin: the top five origins
-  by runs, then Other (`is_other`, no origin). `failed` is the window's failed
-  count and the item `runs` sum to it. `share` is runs over `failed`.
-- **`rolling_failure_rate`.** `overall`, plus one series for `claude` and one for
-  `codex`, with one point per rolling range (same index as `rolling`). A point
+  by runs, then Other. `causes.failed` is the window's failed count and
+  `causes.items` (each with `rank`, `is_other`, `origin`, `runs` and `share`; no
+  `origin` on Other) sum to it. `share` is runs over `failed`.
+- **`rolling_failure_rate`.** `overall` (a list of points) and `harnesses`
+  (`[{harness, points}]`, one entry for `claude` and one for `codex`), with one
+  point per rolling range (same index as `rolling`). A point
   keeps its real `finished` and `failed` counts; `value` is null with
   `insufficient_runs` below five finished runs. A point is `partial` as in
   [Calendar](#calendar) (see the envelope's `rolling`).
@@ -261,16 +268,20 @@ for Spend).
   `dimension` echoes the choice, `primary_model` by default; `harness`, `repo`
   and `kind` are the others, and `user` only on an admin all-users response.
   Each run is counted once, in exactly one row (under `primary_model`, the run's
-  [primary model](#cost-fold-and-disclosure)). `n` is the row's finished runs
+  [primary model](#cost-fold-and-disclosure)). The rows are `breakdown.rows`,
+  each with `rank`, `is_other`, `key`, `label`, `id`, `n`, `outcomes`,
+  `failure_rate` and `requeued_runs`. `n` is the row's finished runs
   and `failure_rate` is null with `insufficient_runs` below five. On the owner
   route a repo outside the caller's connections is masked as in
-  [Repo visibility](#repo-visibility); a row's `id` and `label` are null for it
-  and for the other rows without one.
+  [Repo visibility](#repo-visibility): its row has key `inaccessible_repo` and
+  null `id` and `label`, as do the other rows without one. A group whose runs
+  are all still in flight appears with `n` = 0.
 - **`requeued_runs`.** Runs whose retained requeue count is above zero. It is a
-  count of runs, not of timestamped requeue events.
-- **`needs_landing`.** `runs` counts the window's failed runs that left
+  count of runs, not of timestamped requeue events, and it counts cohort runs
+  whether or not they finished, so it can exceed `finished`.
+- **`needs_landing`.** `needs_landing.runs` counts the window's failed runs that left
   recoverable work: a failure origin a human can land, plus an available owner
-  recovery capture or a preserved patch. It always carries the caveat
+  recovery capture or a preserved patch. `needs_landing.caveat` is always
   `work_may_already_have_landed`: the work may have landed by other means, so it
   is a recoverable-work figure, not a guaranteed landing backlog.
 - **`latest_failure`.** The scope's most recent failure over its **lifetime**,
@@ -297,7 +308,7 @@ On the owner route `users` is null with reason `not_applicable`.
   accepted as a filter.
 - It reads no usage and no history start, so it is cheap.
 - Admin `user=<uuid>` narrows the repo list to that user's connections and
-  echoes `selected_user`. The Spend response carries the same `selected_user`
+  echoes `selected_user`. The Spend and Reliability responses carry the same `selected_user`
   (`all` or the user id; the caller's id on the owner route).
 
 ## Performance limit
@@ -315,10 +326,18 @@ about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 | Admin all-users `window=all` (measured, not offered) | about 10 s |
 
 **Decision:** admin all-users `window=all` is not offered. Options does not
-list `all` for that scope and Spend answers 400 `window all not available for
-all users` before any analytics database work (authentication runs first). The measured 10 s is over the 8 second
+list `all` for that scope, and Spend and Reliability answer 400 `window all not
+available for all users` before any analytics database work (authentication runs first). The measured 10 s is over the 8 second
 budget, so the request would otherwise have been a 503. All-time stays
 available for the owner route and for admin `user=<uuid>`; owner `all` Spend
 measured about 1.8 s (statement-level median, custom plan) on the same seed, and
 end-to-end request latency was not measured. Admin all-users all-time is deferred to a follow-up that adds per-run
 totals for finished runs (owner decision at landing).
+
+**Reliability.** Measured on the same seed generator (120,000 runs, 846,668
+usage legs, 200 owners, 1,250 repos; the #4685 re-seed, not byte-identical to
+the Spend seed), PostgreSQL 17, JIT off as in production, warm cache, one client
+and no concurrent load. The worst request, admin `user=<uuid>` all-time by
+primary model, took about 1.3 s median, and no workload timed out against the
+8 second budget. The per-workload tables and plans are in
+[PRD #4685](../prds/done/4685-scoped-outcomes-reliability-api.md) section 8.
