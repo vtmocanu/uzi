@@ -79,6 +79,14 @@ func readRunbookFK(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table,
 // and foreign key catalogs the remaining inspection queries show.
 func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runbookStage) string {
 	t.Helper()
+	// The documented goose head query must sit just below the refusing file the caller claims.
+	wantHead := map[runbookStage]int64{stage00527: 526, stage00528: 527}[stage]
+	if stage == stageCodex {
+		wantHead = sharedCodexPredecessor(t, resolveSharedCodexVersions(t).userScope)
+	}
+	if head := scalar[int64](ctx, t, pool, `SELECT max(version_id) FROM goose_db_version WHERE is_applied`); head != wantHead {
+		t.Fatalf("migration head = %d, want %d for stage %d (the pending file is the next version above the head)", head, wantHead, stage)
+	}
 	// Preconditions: no index build in progress on model_providers (any row means wait).
 	if n := scalar[int](ctx, t, pool, `SELECT count(*) FROM pg_stat_progress_create_index WHERE relid = to_regclass('model_providers') OR relid IS NULL`); n != 0 {
 		return "stop-build-in-progress"
@@ -119,11 +127,7 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 	default:
 		return "stop-wrong-definition"
 	}
-	if valid && ready {
-		return "retry"
-	}
-
-	// Exact, unique, not valid: REINDEX only when the stage's foreign keys are as expected.
+	// Exact and unique: the stage's foreign keys must be as expected before either retry or REINDEX.
 	ref := "model_providers"
 	if scalar[bool](ctx, t, pool, `SELECT NOT pg_table_is_visible(to_regclass('model_providers'))`) {
 		ref = schema + ".model_providers"
@@ -132,6 +136,8 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 	claude := readRunbookFK(ctx, t, pool, "users", "users_claude_provider_fkey", idx)
 	secretsDef := "FOREIGN KEY (provider_scope_id, provider_id) REFERENCES " + ref + "(scope_owner_id, id) ON DELETE CASCADE"
 	claudeDef := "FOREIGN KEY (claude_provider_scope_id, claude_provider_id) REFERENCES " + ref + "(scope_owner_id, id) ON DELETE RESTRICT"
+	// The 00477/00479-era form the Claude foreign key keeps until users_codex_provider_scope.
+	claudeOwnerDef := "FOREIGN KEY (id, claude_provider_id) REFERENCES " + ref + "(owner_user_id, id) ON DELETE RESTRICT"
 	switch stage {
 	case stage00527:
 		// No foreign key depends on the index yet: the documented count query must return 0.
@@ -139,7 +145,13 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 			return "stop-fks"
 		}
 	case stage00528:
-		if !secrets.found || !secrets.onIndex || secrets.validated || secrets.def != secretsDef+" NOT VALID" {
+		// The documented count query must return 1 (only user_secrets_provider_fkey is on the index) and
+		// the Claude foreign key must still show its owner-key form.
+		if n := scalar[int](ctx, t, pool, `SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conindid = to_regclass('model_providers_scope_owner_id_key')`); n != 1 {
+			return "stop-fks"
+		}
+		if !secrets.found || !secrets.onIndex || secrets.validated || secrets.def != secretsDef+" NOT VALID" ||
+			!claude.found || claude.onIndex || claude.def != claudeOwnerDef {
 			return "stop-fks"
 		}
 	case stageCodex:
@@ -147,6 +159,9 @@ func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runboo
 			!claude.found || !claude.onIndex || !claude.validated || claude.def != claudeDef {
 			return "stop-fks"
 		}
+	}
+	if valid && ready {
+		return "retry"
 	}
 	return "reindex"
 }
@@ -273,11 +288,15 @@ func scopeSnapshot(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s scop
         FROM pg_constraint WHERE contype = 'f' AND conname IN ('user_secrets_provider_fkey', 'users_claude_provider_fkey')`)
 	oid := scalar[string](ctx, t, pool, `SELECT to_regclass('model_providers_scope_owner_id_key')::oid::text`)
 	qualified := scalar[string](ctx, t, pool, `SELECT to_regclass($1 || '.model_providers_scope_owner_id_key')::oid::text`, schemaOfModelProviders(ctx, t, pool))
-	secrets := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(concat_ws('|', id::text, user_id::text, kind, provider_id::text, provider_scope_id::text, encode(ciphertext, 'hex')), E'\n' ORDER BY id), '')
-        FROM user_secrets WHERE user_id IN ($1, $2)`, s.sharedUser, s.personalUser)
+	// Whole rows (to_jsonb): no migration from the predecessor to head adds, drops or retypes a column of
+	// model_providers, model_provider_revisions or user_secrets (00538 alters users; 00539 and 00540 only
+	// validate constraints).
+	providers := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(p)::text, E'\n' ORDER BY p.id), '') FROM model_providers p WHERE p.id IN ($1, $2)`, s.shared, s.personal)
+	revisions := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(r)::text, E'\n' ORDER BY r.provider_id, r.revision), '') FROM model_provider_revisions r WHERE r.provider_id IN ($1, $2)`, s.shared, s.personal)
+	secrets := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(u)::text, E'\n' ORDER BY u.id), '') FROM user_secrets u WHERE u.user_id IN ($1, $2)`, s.sharedUser, s.personalUser)
 	users := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(concat_ws('|', id::text, claude_provider_id::text, claude_provider_scope_id::text), E'\n' ORDER BY id), '')
         FROM users WHERE id IN ($1, $2)`, s.sharedUser, s.personalUser)
-	return fmt.Sprintf("fks:\n%s\nindex oid: %s (qualified %s)\nsecrets:\n%s\nusers:\n%s", fks, oid, qualified, secrets, users)
+	return fmt.Sprintf("fks:\n%s\nindex oid: %s (qualified %s)\nproviders:\n%s\nrevisions:\n%s\nsecrets:\n%s\nusers (claude fields):\n%s", fks, oid, qualified, providers, revisions, secrets, users)
 }
 
 func TestScopeIndexRecoveryInvalidAtCodexScopeLiveDB(t *testing.T) {
@@ -374,6 +393,15 @@ func TestScopeIndexRecoveryStopRowsLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, `ALTER TABLE users DROP CONSTRAINT users_claude_provider_fkey`)
 		invalidateScopeIndex(ctx, t, pool)
 		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusalCodex, pred)
+		wantRunbook(ctx, t, pool, stageCodex, "stop-fks")
+	})
+	t.Run("users_codex_provider_scope with the index dropped with CASCADE and recreated valid", func(t *testing.T) {
+		pred := sharedCodexPredecessor(t, resolveSharedCodexVersions(t).userScope)
+		ctx, _, pool := sharedDB(t, "scope_idx_codex_recreated_", pred)
+		mustExec(ctx, t, pool, `DROP INDEX `+scopeIndex+` CASCADE`)
+		recreateScopeIndex(ctx, t, pool)
+		// No Migrate here: the unchanged guard would pass on this valid index and the Claude-era foreign
+		// keys would stay missing. That is the residual gap the runbook itself must catch.
 		wantRunbook(ctx, t, pool, stageCodex, "stop-fks")
 	})
 }
