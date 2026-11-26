@@ -432,7 +432,9 @@ every Claude CLI start in every lane, the worker:
    groups 10002 or 10004, else other bits) lack write or search. A foreign owner or a missing read
    whose bits still grant write and search is not an obstruction: that start is refused
    transiently and `.claude` stays. The evidence is mode bits, so ACL entries are not seen: an ACL
-   granting access to a foreign-owned `.claude` could still read as an obstruction, and an ACL
+   granting access to a foreign-owned `.claude` (set by the directory's owner or a privileged
+   process) could still read as an obstruction, but only after the mkdir has already failed for
+   another reason, since the stat probe runs only after a failed mkdir; and an ACL
    mask can hide a deny, which fails closed as a refusal. Only on a positive obstruction is `.claude` renamed aside once and retried (transcripts stay in the aside
    copy, so a resume of that session finds none); a second obstruction refuses the start. Any
    other failure (spawn error, signal, timeout, an exit status other than 0 and 1, or exit 1
@@ -665,7 +667,7 @@ preparation, a full disk included, is reported as this refusal, not as a disk pa
 
 - each runner helper runs behind a constant worker-uid Node intermediary (`process.execPath -e`,
   argv only, no shell) that `spawnSync` kills with SIGKILL after 4 s (the worker uid can always
-  deliver it). The intermediary exits 127 if it cannot start the helper and 128+n when the helper
+  deliver it). The intermediary exits 127 on any failure before or during the helper's spawn (including its own exceptions) and 128+n when the helper
   dies on signal n; the output limit stays 64 KiB. Dropping the shell closes CodeQL
   `js/shell-command-injection-from-environment` alert 229, pending the PR's CodeQL re-scan. Node's
   cold start per helper is unmeasured;

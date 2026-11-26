@@ -266,10 +266,12 @@ the rename fails (for example a read-only data volume), the home directory or
 one of its parent directories fails the worker's ownership and mode checks (a
 symlink, an owner other than root or the worker, world-writable without the
 sticky bit, or group-writable by a runner group without it), preparing the
-transcript directories fails (the worker moves `.claude` aside only when a
-check shows a planted file, a wrong owner or an unusable mode, and only once;
-any other failure, a full disk included, refuses that start and keeps
-`.claude`), the preparation passes its 10 second limit, or the directory keeps
+transcript directories fails (the worker moves `.claude` aside only when it
+proves an obstruction, and only once: a non-directory planted at `.claude` or at
+a target, or a `.claude` the runner cannot write and search by its mode bits;
+any other failure, a full disk or a foreign-owned `.claude` whose bits still
+let the runner write and search included, refuses that start and keeps
+`.claude` and its transcripts), the preparation passes its 10 second limit, or the directory keeps
 changing while the worker prepares it. Every preparation error is reported as
 this refusal, not as a disk park. The preparation blocks the worker for up to
 about 14 seconds in the worst case; a helper stuck in uninterruptible I/O is not
