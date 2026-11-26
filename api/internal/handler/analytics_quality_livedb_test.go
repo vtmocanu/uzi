@@ -255,7 +255,7 @@ func TestAnalyticsQualityPlanApplicabilityMatchesPopulationLiveDB(t *testing.T) 
 }
 
 // A real query timeout through the live router: while another connection holds an ACCESS
-// EXCLUSIVE lock on runs the snapshot's first read blocks until the snapshot's 8 s Go context
+// EXCLUSIVE lock on runs the snapshot's first read of runs blocks until the snapshot's 8 s Go context
 // deadline (normally before the server-side statement_timeout), the response is a 503 with
 // Retry-After, and the admission slot is released for the next request. A watchdog releases the
 // lock after 30 s so a regression fails instead of hanging.

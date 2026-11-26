@@ -204,8 +204,9 @@ The checker's harness is separate metadata, reported as `checker_harness`
 (`claude`, `codex`, `unknown`). There is no time restriction on the lead run,
 and none on the attempt's creation time: time evidence is classified as dated
 or undated. Two kinds of attempt are still counted nowhere, and neither is
-disclosed in the response: a dated attempt whose `decided_at` falls outside
-`[from, now)` (see `undated` below), and an attempt whose stage cannot apply to
+disclosed in the response: a dated attempt with a future `decided_at` (one
+decided before `from` is simply outside the window; see `undated` below), and
+an attempt whose stage cannot apply to
 its lead kind (see the population rule below).
 
 The population is per stage, so counts always agree with `applicable`: a plan
