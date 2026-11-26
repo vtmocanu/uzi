@@ -432,9 +432,11 @@ caller's zone, the Flow statement and decoding; 20 requests per workload on a
 warm pooled connection with the default pgx statement cache) measured the same
 on that seed, with no timeouts. The baseline phase had already run through the
 same pool, so the Flow statement was already prepared and its plan choice
-settled; the two history-start statements (owner and all-users) had run fewer
-than five times each, so their plans could still switch inside the sample. Any generic plan in use was whatever
-Postgres auto mode chose. It excludes HTTP,
+settled. The history-start statements run once per built workload (all eleven
+are built before the workload filter): nine owner and two all-users executions
+over the pool. The all-users plan could still switch inside the sample, and the
+owner plan's state on the request connection was not checked. Any generic plan
+in use was whatever Postgres auto mode chose. It excludes HTTP,
 auth middleware, admission, in-snapshot authorization (tz-name check, user
 lookup for an admin `user=<uuid>`, repo checks), the DTO mapping, JSON encoding
 and the network. Medians in ms: owner `30d`
