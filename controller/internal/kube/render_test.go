@@ -1086,6 +1086,13 @@ func TestCodexExtraCASecretAndStartupEnv(t *testing.T) {
 						if string(secret.Data["worker_token"]) != "uzw_test-token" {
 							t.Error("join token changed")
 						}
+						// Without durable evidence the Secret carries the key, the pod never
+						// references it.
+						noEvidence := envMap(RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0])
+						if v, present := noEvidence["UZI_CODEX_CA_FILE"]; present {
+							t.Errorf("no evidence: UZI_CODEX_CA_FILE = %q, want unset", v)
+						}
+						cfg = cfg.withCodexCA(true)
 						pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
 						env := envMap(pod.Containers[0])
 						wantPath := ""

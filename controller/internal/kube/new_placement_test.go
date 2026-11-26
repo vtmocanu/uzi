@@ -585,7 +585,7 @@ func TestNewPlacementTickDecisionIsFrozen(t *testing.T) {
 			// The observation reads the opposite of the map; the nix claim is missing.
 			obs := npObserved("w1", !mapStamped, "")
 			obs.HasNixPVC, obs.NixClaim = false, nil
-			if newPlacementStamped(cfg, obs) == mapStamped {
+			if newPlacementStamped(cfg, w, obs, ns) == mapStamped {
 				t.Fatal("observation does not imply the opposite decision")
 			}
 			m, client := npMat(t, cfg)
@@ -596,7 +596,7 @@ func TestNewPlacementTickDecisionIsFrozen(t *testing.T) {
 				t.Errorf("render placement = %s, want %s (the map)", got, want)
 			}
 
-			deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec)
+			deferred, _, err := m.ensurePVCs(ctx, w, obs, ns, spec, false)
 			if err != nil || deferred {
 				t.Fatalf("ensurePVCs deferred=%v err=%v", deferred, err)
 			}
@@ -815,7 +815,7 @@ func TestNewPlacementTerminatingGateDefersStaleClaimPointer(t *testing.T) {
 		DataClaim: claim(dataPVCName("w1"), false), NixClaim: claim(nixPVCName("w1"), false),
 		DinDClaim: claim(dindDataPVCName("w1"), true), // stale: gone in the refreshed flags
 	}
-	deferred, err := m.ensurePVCs(context.Background(), w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size))
+	deferred, _, err := m.ensurePVCs(context.Background(), w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size), false)
 	if err != nil || !deferred {
 		t.Fatalf("ensurePVCs = %v, %v", deferred, err)
 	}
@@ -918,7 +918,8 @@ func TestNewPlacementUnsetTerminatingClaimDoesNotGate(t *testing.T) {
 
 // A claim flagged present but with no observation is not proof of a stamp.
 func TestNewPlacementStampedNeedsReadableClaim(t *testing.T) {
-	if newPlacementStamped(placementConfig(), reconcile.ObservedWorker{ID: "w1", HasDataPVC: true}) {
+	cfg := placementConfig()
+	if newPlacementStamped(cfg, protocol.DesiredWorker{ID: "w1"}, reconcile.ObservedWorker{ID: "w1", HasDataPVC: true}, cfg.Namespace) {
 		t.Error("present claim with nil observation counted as stamped")
 	}
 }

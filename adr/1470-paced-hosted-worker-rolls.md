@@ -215,7 +215,8 @@ The pool stays in the existing hold (`duplicate canary reservations unresolved;
 explicit recovery required`) when any absence proof is not met; when the absent
 duplicate is already on the target template (not drifted), because cancelling it
 can leave a markerless worker held as "target template has no reservation
-proof"; when the pool has a waking hibernation member; when the survivor is
+proof"; when the pool has a waking hibernation member (a waking current
+canary still settles its own wake under the hold, #4723); when the survivor is
 physically absent, terminating, stuck or otherwise not current; and with three or
 more canaries. Two live canaries cannot use this fallback, but the existing
 old-incarnation duplicate proof may still cancel their reservations. When the

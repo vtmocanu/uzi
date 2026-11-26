@@ -160,18 +160,20 @@ once. Whether that refusal was transient is unproven; this amendment treats
 the shape as transient by decision, not because its cause is known.
 
 **Decision.** `classifyGitStderrText` (`agent/src/git.ts`, called by
-`classifyGitStderr`) now classifies a push as transient when, and only when,
+`classifyGitStderr`; since #4716 both delegate to the private `classifyPushStderr`) now classifies a push as transient when, and only when,
 all of these hold:
 
 1. at least one ref-status line is `! [remote rejected] <src> -> <dst> (failed)`
    with the reason exactly `failed` (`missing necessary objects` was added as a
-   second reason by the #4438 amendment below);
+   second reason by the #4438 amendment below; a separate, banner-bound
+   `Internal Server Error` exception was added by the #4716 amendment below);
 2. every line is a whole git framing line in an anchored complete format:
    `To <url>`, such a ref-status line, `error: failed to push some refs to
    '<url>'` with nothing after it, or an empty (or empty `remote:`) line.
 
 Any other line keeps today's classification, so another `remote rejected`
-reason (other than `missing necessary objects`, added by #4438), a
+reason (other than `missing necessary objects`, added by #4438, and
+`Internal Server Error` with its complete banner, #4716), a
 `[rejected]` line and every `remote:` diagnostic (a stated reason, marked or
 not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope refusal, or
 free text such as a repository-policy notice) stay permanent. This is narrower
@@ -181,7 +183,8 @@ cannot turn a deterministic refusal transient.
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.
 Everything else is unchanged and permanent: any other reason (other than
-`missing necessary objects`, #4438; including `failed to update ref` and
+`missing necessary objects`, #4438, and `Internal Server Error` with its complete
+banner, #4716; including `failed to update ref` and
 `failed to lock`), authentication failures, protected-branch and
 pre-receive-hook refusals, workflow scope, `GH013`, and non-fast-forward or
 `[rejected]`.
@@ -275,3 +278,101 @@ overall recovery time; parking and its duration policy are unchanged.
 
 **Scope.** Worker-only, as for #3929: older workers keep the old behaviour,
 and there is no API or schema change.
+
+## Amendment (2026-11-26, #4716): GitHub (Internal Server Error) remote rejection with its banner is classified transient
+
+**Observed.** An `mr_rework` run's finalize push, an ordinary non-forced push
+of one ref from the canonical bare, was refused by GitHub with a server-error
+banner followed by the usual framing:
+
+```
+remote: Internal Server Error
+remote: Request ID <HEX>:<HEX>:...
+remote: Time YYYY-MM-DDTHH:MM:SSZ
+To <url>
+ ! [remote rejected] <src> -> <dst> (Internal Server Error)
+error: failed to push some refs to '<url>'
+```
+
+The `Internal Server Error` and `Request ID` banner lines carry git's sideband padding (trailing
+spaces). No numeric HTTP status is printed. `remote rejected` is in
+`PERMANENT_PATTERNS`, and the `remote:` banner lines are not framing under the
+#3929 rule, so the run failed at its last step without a retry. GitHub's
+activity log showed that the attempt did not move the ref; the commit reached
+the branch through a later push. That does not prove a worker retry would have
+succeeded.
+
+**Decision.** A third, separate format-based exception in
+`classifyGitStderrText` / `classifyGitStderr` (`agent/src/git.ts`,
+`isGitHubIseRefusal`), with no forge identity in the classifier. The stderr is
+transient when, and only when, all of these hold:
+
+1. exactly one line is `! [remote rejected] <src> -> <dst> (Internal Server
+   Error)`, with the reason matched exactly and case-sensitively;
+2. each of the three banner lines appears exactly once, matched whole and
+   case-sensitively, with git's `remote: ` prefix (one space) and only trailing
+   spaces or tabs: `remote: Internal Server Error`, `remote: Request ID
+   <HEX>(:<HEX>)+` (uppercase hex groups), and `remote: Time
+   YYYY-MM-DDTHH:MM:SSZ` (whole seconds, literal `Z`);
+3. every other line is ref-status-free framing: `To <url>`,
+   `error: failed to push some refs to '<url>'`, an empty `remote:` line or a
+   blank line.
+
+The check reads the untrimmed retained stderr, so leading whitespace before the
+first banner line is not erased. The #3929/#4438 rule keeps reading exactly the
+input it read before: the trimmed retained stderr through `classifyGitStderr`,
+and the string passed in through `classifyGitStderrText`. The banner lines
+never widen that rule: `(failed)` and `(missing necessary objects)` stay
+banner-free. `/remote rejected/i` and `\b50[023]\b` in `forge-retry.ts`, the
+retry schedule and the exhaustion disposition are unchanged.
+
+**Callers.** The finalize push (`runner.ts`, both `classifyGitStderr` uses on
+the push step) gets the new verdict. The floor refresh's `ls-remote`/fetch
+(`git.ts`, `if (classifyGitStderr(cause) !== "transient") throw cause;`) shares
+the classifier but never prints a ref-status line, so it is unaffected.
+
+**Why retrying is safe.** Each retry pushes the same single-ref candidate,
+non-forced, and reruns the whole publication proof chain first. GitHub's banner
+and its ref status both name a server error. If an attempt did update the ref,
+the next attempt's floor refresh finds the remote already at the candidate and
+the non-forced re-push is a no-op (pinned by the runner case "rejection thrown
+AFTER the push really landed is recognised on retry").
+
+**Lookalikes stay permanent.** A bare `(Internal Server Error)` status line with
+no banner; a missing or repeated banner line; the banner with a second
+ref-status line of any kind; the banner with a `(failed)` or `(missing
+necessary objects)` status line; any other `remote:` line (`GHnnn`, push
+protection, `remote: error:`, `remote: fatal:`, free text); `remote: Internal
+Server Error <extra>`, a lowercase banner or `remote: error: Internal Server
+Error`; a `Request ID` with trailing text or a non-hex or lowercase token; a
+`Time` with fractional seconds, an offset, a date only or trailing text;
+`(Internal Server Error) x`, a lowercase reason or `(Internal Server Errors)`;
+and `[rejected]` or non-fast-forward lines. Other 5xx wordings (`Service
+Unavailable`, `Bad Gateway`, `Gateway Timeout`) are not covered; each is added
+only when a run shows it.
+
+**Accepted leniencies.** The rule checks line sets, not order: banner lines in
+another order, a missing `To` or trailer line, repeated framing lines or extra
+blank lines are still accepted, and the `Time` fields are not range-checked.
+The leading-whitespace allowance on the ref-status line follows the #3929
+pattern. None of these can admit a line that states another reason.
+
+**Residual (unchanged behaviour).** A banner with no ref-status line at all is
+not matched by this exception and goes to `classifyForgeError` as before, where
+a request-id group of exactly `500`, `502` or `503` matches the transient
+`\b50[023]\b`. That predates this amendment and is out of scope.
+
+**Accepted risk.** A persistent server error exhausts the retries and is
+labelled `publication_forge_unreachable` ("unreachable"). A run that is not
+enrolled pays about 31 s of backoff plus per-attempt push and proof time, then
+fails with the typed reason; an enrolled run re-parks until the hold threshold,
+which is checked only at park time. The exhausted publication park also feeds
+the worker-origin cooldown (#1324 D9), which can delay other work by the same
+owner on the same worker and Git origin, as well as this run's next retry.
+Parking and its duration policy are unchanged. This mirrors #3929 and #4438
+(related: #3585).
+
+**Scope.** Worker-only: older workers keep the old behaviour, and there is no
+API or schema change. Out of scope, as before: checkpoint publication through
+the api push broker, merge-request creation (classified by HTTP status, where a
+500 is already transient) and the CLI `uzi handoff` push.

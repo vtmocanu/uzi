@@ -346,3 +346,4 @@ echo "PASS land-prep-merge: auto merge mode with a fast-forward push, CHANGELOG 
 
 # The same CI target verifies the read-only batch preparation report.
 "$HERE/fast-batch.test.sh"
+"$HERE/ci-lane.test.sh"

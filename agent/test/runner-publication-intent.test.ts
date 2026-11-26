@@ -452,22 +452,31 @@ it("a non-enrolled run keeps the existing typed failure for the same outage", as
 });
 
 // #3929, #4438: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` and its `(missing necessary objects)`
-// sibling are classified transient (cause unproven). Distinct iids per reason.
-const RETRYABLE_REASONS = ["failed", "missing necessary objects"] as const;
+// sibling are classified transient (cause unproven); #4716 adds `(Internal Server Error)`, transient only with
+// GitHub's three-line `remote:` banner, printed before `To <url>` as observed. Distinct iids per case.
 const bareRejectedStderr = (iid: number, reason: string) =>
   `To https://github.com/org/repo.git\n ! [remote rejected] 0123456789abcdef0123456789abcdef01234567 -> agent/issue-${iid} (${reason})\n` +
   "error: failed to push some refs to 'https://github.com/org/repo.git'\n";
+const GITHUB_ISE_BANNER =
+  "remote: Internal Server Error        \n" +
+  "remote: Request ID 0000:1111:2222222:3333333:44444444        \n" +
+  "remote: Time 2026-11-25T16:15:24Z\n";
+const RETRYABLE_CASES: ReadonlyArray<{ reason: string; stderr: (iid: number) => string }> = [
+  { reason: "failed", stderr: iid => bareRejectedStderr(iid, "failed") },
+  { reason: "missing necessary objects", stderr: iid => bareRejectedStderr(iid, "missing necessary objects") },
+  { reason: "Internal Server Error", stderr: iid => GITHUB_ISE_BANNER + bareRejectedStderr(iid, "Internal Server Error") },
+];
 
-RETRYABLE_REASONS.forEach((reason, idx) => {
+RETRYABLE_CASES.forEach(({ reason, stderr }, idx) => {
   const enrolledIid = 5113 + idx * 100;
   const plainIid = 5114 + idx * 100;
 
-  it(`a sustained bare remote-rejected (${reason}) push on an enrolled run parks on the git surface`, async () => {
+  it(`a sustained remote-rejected (${reason}) push on an enrolled run parks on the git surface`, async () => {
     client.protocolFeatures = FEATURES;
     const outbox = await mkOutbox();
     ackIntents([]);
     let pushes = 0;
-    failGit("push", bareRejectedStderr(enrolledIid, reason), () => { pushes++; });
+    failGit("push", stderr(enrolledIid), () => { pushes++; });
     const claim = claimFor(enrolledIid);
     const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
     await r.execute(claim);
@@ -478,10 +487,10 @@ RETRYABLE_REASONS.forEach((reason, idx) => {
     assert.equal(failed(claim.run_id).length, 0);
   });
 
-  it(`a sustained bare remote-rejected (${reason}) push on a non-enrolled run fails typed publication_forge_unreachable: push`, async () => {
+  it(`a sustained remote-rejected (${reason}) push on a non-enrolled run fails typed publication_forge_unreachable: push`, async () => {
     client.protocolFeatures = ["recovery_park_cause"];
     let pushes = 0;
-    failGit("push", bareRejectedStderr(plainIid, reason), () => { pushes++; });
+    failGit("push", stderr(plainIid), () => { pushes++; });
     const claim = claimFor(plainIid);
     const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
     await r.execute(claim);

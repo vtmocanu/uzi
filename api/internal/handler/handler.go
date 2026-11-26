@@ -269,6 +269,9 @@ type Handler struct {
 	// in the classification path would make the graces testable only by sleeping.
 	now       func() time.Time
 	startedAt time.Time
+	// analyticsDeps serves the scoped usage analytics routes (issue #4684). New builds it only
+	// when there is a pool; nil answers every analytics request with the sanitized 500.
+	analyticsDeps *analyticsDeps
 	// scheduler is the PRD #241 scheduled-runs actor, constructed in New from deps the
 	// handler already holds. M4 uses it ONLY for run-now (POST
 	// /api/schedules/{id}/run-now), which fires a schedule once through the same seam a
@@ -695,7 +698,11 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 		scheduler.SetIssueSources(svc)
 	}
 	scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
-	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
+	hd := &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
+	if pool != nil {
+		hd.analyticsDeps = newAnalyticsDeps(pool)
+	}
+	return hd
 }
 
 // SetVersion stamps the server build version served at GET /api/version. Called
@@ -1244,6 +1251,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		})
 
 		h.mountChatRoutes(r, chatLimiter, forgeLimiter)
+		h.mountAnalyticsRoutes(r)
 
 		h.mountWorkerRoutes(r, proposalLimiter)
 		h.mountControllerRoutes(r)

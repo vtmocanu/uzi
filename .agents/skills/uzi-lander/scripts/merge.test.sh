@@ -224,6 +224,34 @@ seed_state() {  # a live claim + a pre-merge trail for #42, so the terminal side
 # 1. Already MERGED out of band → --confirm-only emits the owed terminal evidence (MERGED, the
 #    true MERGE_SHA, the trail's admin-merged line) THEN releases the claim but preserves the
 #    trail until the post-merge result is appended, printed and explicitly purged.
+cat > "$WORK/bin/uzi" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+case "$*" in
+  'repo list --json') jq -cn --arg repo "${HELPER_REPO:-test/repo}" '[{id:"repo",path_with_namespace:$repo}]' ;;
+  'run list --json')
+    n=0; [ ! -f "$HELPER_CALLS" ] || n=$(cat "$HELPER_CALLS")
+    n=$((n+1)); echo "$n" > "$HELPER_CALLS"
+    [ "${HELPER_RUNS_RC:-0}" -eq 0 ] || exit "$HELPER_RUNS_RC"
+    if [ "${HELPER_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '[]'
+    else printf '%s\n' "$HELPER_RUNS"; fi ;;
+  # cobra prints the parent help (rc 0) for any subcommand; the verb line exists only on a new CLI.
+  'admin --help')
+    printf 'Admin commands\n\nUsage:\n  uzi admin [command]\n\nAvailable Commands:\n  review      Review backlog\n'
+    [ -z "${ADMIN_RW:-}" ] || printf '  run-writers List active ci_fix and mr_rework writers\n'
+    printf '\nFlags:\n  -h, --help   help for admin\n' ;;
+  'admin run-writers '*)
+    echo "$*" >> "$WRITERS_ARGS"
+    n=0; [ ! -f "$WRITERS_CALLS" ] || n=$(cat "$WRITERS_CALLS")
+    n=$((n+1)); echo "$n" > "$WRITERS_CALLS"
+    if [ "${WRITERS_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '{"writers":[],"complete":true}'; exit 0; fi
+    [ "${WRITERS_RC:-0}" -eq 0 ] || { echo "HTTP ${WRITERS_HTTP:-500}" >&2; exit "$WRITERS_RC"; }
+    printf '%s\n' "$WRITERS_OUT" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$WORK/bin/uzi"
+
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" != 1 ]; then
 MERGE_STATE=MERGED; export MERGE_STATE
 seed_state
@@ -406,33 +434,6 @@ merge_run green
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "a green required-checks list did not reach the merge: $(cat "$WORK/m.green")"
 # A green head is still owned by an active helper. The second lookup models a
 # helper appearing while the other merge preflights run; no real factory is used.
-cat > "$WORK/bin/uzi" <<'STUB'
-#!/usr/bin/env bash
-set -eu
-case "$*" in
-  'repo list --json') echo '[{"id":"repo","path_with_namespace":"test/repo"}]' ;;
-  'run list --json')
-    n=0; [ ! -f "$HELPER_CALLS" ] || n=$(cat "$HELPER_CALLS")
-    n=$((n+1)); echo "$n" > "$HELPER_CALLS"
-    [ "${HELPER_RUNS_RC:-0}" -eq 0 ] || exit "$HELPER_RUNS_RC"
-    if [ "${HELPER_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '[]'
-    else printf '%s\n' "$HELPER_RUNS"; fi ;;
-  # cobra prints the parent help (rc 0) for any subcommand; the verb line exists only on a new CLI.
-  'admin --help')
-    printf 'Admin commands\n\nUsage:\n  uzi admin [command]\n\nAvailable Commands:\n  review      Review backlog\n'
-    [ -z "${ADMIN_RW:-}" ] || printf '  run-writers List active ci_fix and mr_rework writers\n'
-    printf '\nFlags:\n  -h, --help   help for admin\n' ;;
-  'admin run-writers '*)
-    echo "$*" >> "$WRITERS_ARGS"
-    n=0; [ ! -f "$WRITERS_CALLS" ] || n=$(cat "$WRITERS_CALLS")
-    n=$((n+1)); echo "$n" > "$WRITERS_CALLS"
-    if [ "${WRITERS_LATE:-0}" = 1 ] && [ "$n" -eq 1 ]; then echo '{"writers":[],"complete":true}'; exit 0; fi
-    [ "${WRITERS_RC:-0}" -eq 0 ] || { echo "HTTP ${WRITERS_HTTP:-500}" >&2; exit "$WRITERS_RC"; }
-    printf '%s\n' "$WRITERS_OUT" ;;
-  *) exit 1 ;;
-esac
-STUB
-chmod +x "$WORK/bin/uzi"
 export HELPER_CALLS="$WORK/helper.calls" WRITERS_CALLS="$WORK/writers.calls" WRITERS_ARGS="$WORK/writers.args" CONFIRM_AFTER_MERGE=1
 helper_merge() {
   rm -f "$WORK/merge.log" "$HELPER_CALLS" "$WRITERS_CALLS" "$WRITERS_ARGS"
@@ -1063,7 +1064,11 @@ for a in "$@"; do
 done
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ] && [[ "$*" == *headRefOid* ]]; then
   "$POLICY_BASE_GH" "${args[@]}" | jq --arg h "$POLICY_HEAD" --argjson b "${POLICY_BASE_JSON:-null}" --arg r "${POLICY_BASE_REF:-}" \
-    '.headRefOid=$h | if $b != null then .baseRefName=$b elif $r != "" then .baseRefName=$r else . end'
+    '.headRefOid=$h | if $b != null then .baseRefName=$b elif $r != "" then .baseRefName=$r else . end' |
+    if [[ "$*" == *statusCheckRollup* ]]; then
+      jq --argjson labels "${POLICY_LABELS:-[]}" --argjson checks "${POLICY_ROLLUP:-[]}" \
+        --arg head "${ELIGIBILITY_HEAD:-$POLICY_HEAD}" '. + {headRefOid:$head,labels:$labels,statusCheckRollup:$checks}'
+    else cat; fi
 else
   exec "$POLICY_BASE_GH" "${args[@]}"
 fi
@@ -1086,7 +1091,11 @@ policy_run() {
   if [ "$#" -gt 0 ]; then shift; fi
   rm -f "$WORK/merge.log"
   set +e
-  bash "$SCRIPT" "$repo" 42 --expect-head "$POLICY_HEAD" --no-rework-check "$@" > "$WORK/policy.out" 2>&1
+  if [ "${POLICY_REWORK:-0}" = 1 ]; then
+    bash "$SCRIPT" "$repo" 42 --expect-head "$POLICY_HEAD" "$@" > "$WORK/policy.out" 2>&1
+  else
+    bash "$SCRIPT" "$repo" 42 --expect-head "$POLICY_HEAD" --no-rework-check "$@" > "$WORK/policy.out" 2>&1
+  fi
   rc=$?
   set -e
 }
@@ -1371,6 +1380,47 @@ rm -f "$CLOSES_SEQ_FILE"
 policy_run vtmocanu/uzi --expect-closes none; pol_want 'single closing read' 15 0
 [ "$(cat "$CLOSES_SEQ_FILE")" = 1 ] || fail "closing metadata read $(cat "$CLOSES_SEQ_FILE") times, want 1"
 pol_reset
+# Fast main CI is an opt-in for the reviewed full head and low-risk files.
+pol_reset; pol_pr main-ci-gate
+export POLICY_REWORK=1 HELPER_REPO=vtmocanu/uzi ADMIN_RW=1
+export HELPER_CALLS="$WORK/helper.calls" WRITERS_CALLS="$WORK/writers.calls" WRITERS_ARGS="$WORK/writers.args"
+export WRITERS_OUT='{"writers":[],"complete":true}'
+export PR_FILES_JSON='[{"filename":".agents/skills/uzi-lander/references/batch.md","status":"modified"}]'
+CHECKS_JSON='[]' policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate on unregistered checks' 0 1
+grep -qF "MAIN_CI_GATE: PR #42 at $POLICY_HEAD" "$WORK/policy.out" || fail 'main CI waiver not logged'
+for status in added removed modified; do
+  PR_FILES_JSON="[{\"filename\":\"api/internal/store/migrations/00003_new.sql\",\"status\":\"$status\"}]" \
+    policy_run vtmocanu/uzi --main-ci-gate
+  pol_want "main CI gate refuses a $status migration" 2 0
+  grep -qF 'MAIN_CI_GATE_REFUSED: migration' "$WORK/policy.out" || fail 'migration was refused for another reason'
+done
+PR_FILES_JSON='[{"filename":"tmp/archive.sql","status":"renamed","previous_filename":"api/internal/store/migrations/00003_new.sql"}]' \
+  policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses a renamed-away migration' 2 0
+PR_FILES_JSON='[{"filename":"agent/src/guardrails.ts","status":"modified"}]' policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses a trust-boundary path' 2 0
+POLICY_LABELS='[{"name":"area::security"}]' policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses a trust-boundary marker' 2 0
+POLICY_ROLLUP='[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]' \
+  policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses a known red' 1 0
+POLICY_ROLLUP='null' policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses unreadable checks' 2 0
+ELIGIBILITY_HEAD="$HEAD" policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses a head that moved during preflight' 2 0
+policy_run vtmocanu/uzi --main-ci-gate --expect-head deadbee
+pol_want 'main CI gate refuses a short SHA' 2 0
+policy_run vtmocanu/uzi --main-ci-gate --no-rework-check
+pol_want 'main CI gate refuses a writer-check bypass' 2 0
+rm -f "$WRITERS_CALLS"
+WRITERS_LATE=1 WRITERS_OUT='{"writers":[{"run_id":"late-fix","kind":"ci_fix","status":"queued","pipeline_ref":"agent/issue-42"}],"complete":true}' \
+  policy_run vtmocanu/uzi --main-ci-gate
+pol_want 'main CI gate refuses a pending writer at the final recheck' 14 0
+[ "$(cat "$WRITERS_CALLS")" = 2 ] || fail 'main CI gate skipped the final writer read'
+unset POLICY_REWORK HELPER_REPO ADMIN_RW HELPER_CALLS WRITERS_CALLS WRITERS_ARGS WRITERS_OUT PR_FILES_JSON
+echo 'PASS main-ci-gate: exact-head waiver does not bypass migration, trust, known red or writer refusal'
+
 echo 'PASS merge-policy: six changes/admin modes/repo spellings refuse stale policy; rebase/unrelated-main/own-policy-edit/remote-head accept; Git errors refuse; optional lock still checks; confirm-only skips; fragment guard refuses uncited multi-fragment PRs (15) and incomplete metadata (2), counting only added <uuid>.md fragments'
 if [ "${UZI_MERGE_POLICY_ONLY:-0}" = 1 ]; then exit 0; fi
 

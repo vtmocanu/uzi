@@ -1734,6 +1734,11 @@ type RunMilestoneReconciliation struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
+type RunOutcomeClass struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Outcome string    `json:"outcome"`
+}
+
 type RunPublicationResume struct {
 	RunID           uuid.UUID          `json:"run_id"`
 	EnrollmentSeq   int32              `json:"enrollment_seq"`
@@ -1925,6 +1930,17 @@ type RunUsageMessage struct {
 	Conflict                   bool               `json:"conflict"`
 	ClaimGeneration            pgtype.Int8        `json:"claim_generation"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunUsageModelTotal struct {
+	RunID               uuid.UUID      `json:"run_id"`
+	Model               string         `json:"model"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+	CostStatus          string         `json:"cost_status"`
 }
 
 type RunUsageTailState struct {

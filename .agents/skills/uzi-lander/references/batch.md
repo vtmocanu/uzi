@@ -103,20 +103,51 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   `--active-jobs N` and a conservative incremental peak, including companion workflows,
   with `--peak-jobs N`. Treat the result as an estimate against the 20-job cap. Include
   pending demand when planning the push wave. A missing proof stays unknown.
-- **Batch grant**: have the lane owner authorize the ordered PR and full-SHA list for a
+- **CI slots**: let the lane owner (tower) grant at most two concurrent PR CI runs
+  alongside main CI with `S/ci-lane.sh grant PR FULL_SHA --owner NAME`, then
+  `S/ci-lane.sh release PR` after the slot is no longer needed. Use `list` to see grants.
+  Keep the local slot state outside the checkout.
+  Size grants in jobs using the readiness report, including queued demand and
+  companion workflows. A push without a slot is allowed. Identify the CI and KinD Smoke
+  runs created for its exact head. For a queued run, use
+  `gh api -X POST repos/vtmocanu/uzi/actions/runs/<id>/force-cancel` and verify
+  `completed cancelled`. Cancel an in-progress run normally. After a slot is granted,
+  use `gh run rerun <id>` on the cancelled CI and report its run ID. Leave CodeQL and
+  Codex packaged proof alone. LiveDB jobs and near-completion do not protect ungranted
+  PR runs. Keep exact-head grants and PR runs an owner relies on, recorded with
+  `relied_on: true` in the exact-head evidence.
+- **Low-risk main-CI option**: use only on the user's explicit request. Confirm an
+  approved, mergeable PR has no migration, trust-boundary change or exact-head CI
+  obligation. It needs no PR CI slot. Use `merge.sh ... --expect-head FULL_SHA
+  --main-ci-gate`. The flag refuses detected migration and trust markers or known red
+  checks. All other guards run. Gate the batch on main CI and retain exact-tip release
+  coverage.
+- **Batch grant**: have the lane owner (tower) authorize the ordered PR and full-SHA list for a
   bounded window. Run `merge.sh` per PR and report each merge SHA. Return to the owner if
   a head or the order changes, a hold arrives, or the grant expires. The report alone
   grants no merge authority.
-- **Order**: PRs without infra deltas before PRs with one (an infra delta re-runs the others' CI).
-  Within each group, large or conflict-prone PRs first: rebasing a small PR onto a large one is
-  cheap, the reverse re-conflicts the large one per merge. Give a large PR at most one separable
-  small companion so a red stays attributable.
+- **Order for merges and CI slots**: take red-main or release fixes first, then PRs
+  that unblock other PRs or runs (most dependents first), then large or conflict-prone
+  PRs, then the rest. Use non-infra changes first as a tie-breaker. Give a large PR at
+  most one separable small companion so a red stays attributable. Include this line in
+  every `MERGE?` or slot request:
+  `size: <files/+lines>; blocks: <PRs/runs/issues waiting on this merge>; obligation: <exact-head CI yes/no>`.
 - **After each batch**: one `main` CI run; the next batch may merge while it runs. Red: rerun a
   known flake, or fix forward / revert the culprit in parallel. A second unresolved red pauses merges.
 - **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
-- **CI hygiene**: cancel runs that no longer decide anything: exact-head runs of PRs already merged
-  under this mode, and an older `main` run once a newer descendant `main` run covers it. Never cancel
-  a required packaged proof, trust-boundary CI or `e2e.yml`, a LiveDB job above, or a run another owner relies on.
+- **Main CI**: keep the newest main CI, KinD and CodeQL runs. After a newer main push,
+  use `S/ci-lane.sh plan` to inspect older runs, then `apply --log FILE` to force-cancel
+  eligible runs and verify the outcome. The same plan covers ungranted PR runs and
+  proposes the next slots. Use `plan --json --evidence FILE` with head-pinned
+  `{pr,head,blocks,red_main_or_release_fix,conflict_prone,relied_on}` records for
+  the proposal. Keep unpublished `chore(release)` runs and main runs more than 85%
+  complete. Keep the exact or two-hop metadata CI evidence needed for publication.
+  The planner retries torn run counts and leaves unknowns untouched. Runs queued
+  more than 24 hours with no started jobs appear separately as STALE. Exclude them
+  from cancellation and active CI occupancy.
+- **CI hygiene**: cancel runs for already-merged PRs when they no longer supply evidence.
+  Preserve required packaged proof, trust-boundary CI or `e2e.yml`, the exact-head
+  LiveDB proofs above, and runs another owner relies on.
 
 ## 5. Report-only runs whose issue could now be closed
 
