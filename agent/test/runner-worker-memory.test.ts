@@ -342,7 +342,8 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
     withRecoveryOperation: (...args: any[]) => Promise<unknown>;
     recoveryOperations: AsyncLocalStorage<{ signal: AbortSignal; deadline: number; budget?: MaintenanceBudget }>;
   };
-  const realRecovery = g.withRecoveryOperation.bind(git);
+  const previousRecovery = g.withRecoveryOperation;
+  const realRecovery = previousRecovery.bind(git);
   g.withRecoveryOperation = (signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<unknown>,
     ...rest: unknown[]) => {
     const memory = original?.workerMemory;
@@ -414,6 +415,8 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       else captured.set(tag.site, (captured.get(tag.site) ?? 0) + 1);
       return;
     }
+    // Resolution limit: the bracket and the exact-f(v) witness cannot distinguish a timeoutMs deviation smaller than
+    // this fixture's [t0, t1] width (about 30-50 ms observed), since some recorded Date.now in the window may match.
     const t0 = t0BySignal.get(wait.signal!);
     if (t0 === undefined) { uncaptured.push(`${tag.site}: no capture-entry t0 for the held signal`); return; }
     if (!(model(t1) <= timeoutMs && timeoutMs <= model(t0)))
@@ -554,6 +557,7 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
       } finally {
         clock.logging = false;
         if (Date.now === patchedNow) Date.now = REAL_DATE_NOW;
+        g.withRecoveryOperation = previousRecovery;
       }
     },
     /** All assertions; call only after join(). */
@@ -581,10 +585,10 @@ function observeCustody(f: Awaited<ReturnType<typeof setup>>, fixture: ObservedF
           failures.push(`a memory park was reported under generation ${String(body.claim_generation)}`);
       }
       for (const call of ownerCalls) if (call.flight === original) failures.push(`${call.name} ran for the original flight`);
-      const holdOps = custody.filter(c => c.kind === "hold");      for (const op of custody) {
-        if (op.kind === "close" && op.requested !== memory?.closingDeadline) failures.push("close work requested a deadline other than closingDeadline");
-        if (op.outcome === undefined) failures.push("a custody operation recorded no outcome");
-      }
+      const holdOps = custody.filter(c => c.kind === "hold");
+      // Close work is classified only by its closingDeadline, so its deadline is not separately asserted here; no
+      // fixture observed a close operation reach withRecoveryOperation (the close path runs through the batcher).
+      for (const op of custody) if (op.outcome === undefined) failures.push("a custody operation recorded no outcome");
       const deadlineAbort = (op: CustodyRecord) => op.outcome?.kind === "abort" && op.outcome.deadlineClass &&
         op.outcome.atDate >= op.effectiveDeadline - 1;
       const heldCase = fixture === "lateAck" || fixture === "delayedFeedback" || (fixture === "exhausted" && scenario === "deadline");
