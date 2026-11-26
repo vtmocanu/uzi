@@ -49,9 +49,10 @@ func runUsageFoldStepDone(ctx context.Context, step string) {
 // anything else is skipped and left exactly as it was. A run whose EXISTING state row a
 // concurrent writer or deleter holds locked is skipped too (it stays stale and a later call
 // picks it up). A run for which an open writer transaction has CREATED the state row (the
-// run had none) is not skipped: step (a) waits on that uncommitted row, and after the 2s
-// lock_timeout the WHOLE batch fails with SQLSTATE 55P03, nothing is folded, and the caller
-// retries. At most MaxRunUsageFoldBatch ids are accepted per call.
+// run had none), or for which a concurrent materializer is creating it, is not skipped:
+// step (a) waits on that uncommitted row, and after the 2s lock_timeout the WHOLE batch fails
+// with SQLSTATE 55P03, nothing is folded, and the caller retries. Production writers hold the
+// runs row FOR UPDATE, which makes (a0) skip the run instead. At most MaxRunUsageFoldBatch ids are accepted per call.
 //
 // Everything runs in ONE explicit READ COMMITTED transaction, and every step is its own
 // statement (see the migration 00543 header for the lock protocol). Invariants this code

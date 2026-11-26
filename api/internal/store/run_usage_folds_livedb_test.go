@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Issue #4700, migration 00543: the materialized per-(run, model) usage fold, its freshness
@@ -376,8 +377,8 @@ func TestRunUsageFoldMissingRunLiveDB(t *testing.T) {
 		t.Fatalf("UpsertRunUsage for a missing run = %v, want SQLSTATE 23503", err)
 	}
 	e.wantState(t, "missing run upsert", ghost, false, false)
-	if err := e.q.DeleteRunUsage(e.ctx, ghost); err == nil {
-		t.Fatal("DeleteRunUsage for a missing run succeeded; want the lock function's 23503")
+	if err := e.q.DeleteRunUsage(e.ctx, ghost); !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Fatalf("DeleteRunUsage for a missing run = %v, want SQLSTATE 23503", err)
 	}
 	e.wantState(t, "missing run delete", ghost, false, false)
 }
@@ -538,12 +539,11 @@ func TestRunUsageFoldMaterializerSeesWriteAfterFirstStatementLiveDB(t *testing.T
 		t.Fatal(err)
 	}
 	release()
-	if r := mat.wait(t); r.err != nil {
-		t.Fatalf("materializer: %v", r.err)
+	if r := mat.wait(t); r.err != nil || r.n != 1 {
+		t.Fatalf("materializer = %d, %v; want 1, nil", r.n, r.err)
 	}
-	got := e.foldRows(t, e.pool, run)
-	_, stale := e.state(t, run)
-	if !stale && (len(got) != 1 || !strings.HasPrefix(got[0], "model-a:5000:")) {
+	e.wantState(t, "after the materializer", run, true, false)
+	if got := e.foldRows(t, e.pool, run); len(got) != 1 || !strings.HasPrefix(got[0], "model-a:5000:") {
 		t.Fatalf("run marked fresh with fold %v, want the write committed after (a0) (5000)", got)
 	}
 }
@@ -577,6 +577,149 @@ func TestRunUsageFoldMaterializerHoldsLockWriterWaitsLiveDB(t *testing.T) {
 	e.materialize(t, run)
 	if got := e.foldRows(t, e.pool, run); len(got) != 1 || !strings.HasPrefix(got[0], "model-a:5000:") {
 		t.Fatalf("re-fold = %v", got)
+	}
+}
+
+// waitQueryBlocked polls until some backend of this database waits on a Lock while running a
+// statement containing like. Used when the blocked statement runs on a connection the test did
+// not acquire (RefoldRunUsage opens its own transaction from the pool).
+func (e *foldEnv) waitQueryBlocked(t *testing.T, like string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1`, like).Scan(&n); err != nil {
+			t.Fatalf("pg_stat_activity: %v", err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no backend blocked on a lock in a statement like %q", like)
+}
+
+// The other two run_usage invalidating writers, DeleteRunUsage and workersvc.RefoldRunUsage,
+// against the real materializer in both orders (UpsertRunUsage has its own tests above).
+//
+// Writer first: the writer transaction stays open, the materializer skips the run (no error, n
+// is 0, still fresh), and once the writer commits the run is stale with run_usage emptied.
+// RefoldRunUsage opens and commits its own transaction, so it cannot be held open mid-way: the
+// writer-first side replays its first two statements (the runs-row lock, then DeleteRunUsage)
+// on a held transaction, the same way the workersvc races do. Materializer first: the real
+// materializer is paused after step (b); the writer (the real RefoldRunUsage for that case)
+// blocks on the state row, the materializer commits its fold, then the writer completes and the
+// run ends stale with the pre-delete fold rows still in place until the next materialization.
+func TestRunUsageFoldDeleteAndRefoldVsMaterializerLiveDB(t *testing.T) {
+	type writer struct {
+		name string
+		hold func(ctx context.Context, e *foldEnv, tx pgx.Tx, run uuid.UUID) error
+		run  func(ctx context.Context, e *foldEnv, run uuid.UUID) error
+	}
+	writers := []writer{
+		{"DeleteRunUsage",
+			func(ctx context.Context, e *foldEnv, tx pgx.Tx, run uuid.UUID) error {
+				return e.q.WithTx(tx).DeleteRunUsage(ctx, run)
+			},
+			func(ctx context.Context, e *foldEnv, run uuid.UUID) error {
+				return e.q.DeleteRunUsage(ctx, run)
+			}},
+		{"RefoldRunUsage",
+			func(ctx context.Context, e *foldEnv, tx pgx.Tx, run uuid.UUID) error {
+				qtx := e.q.WithTx(tx)
+				if _, err := qtx.LockRunForUsageRefold(ctx, run); err != nil {
+					return err
+				}
+				return qtx.DeleteRunUsage(ctx, run)
+			},
+			func(ctx context.Context, e *foldEnv, run uuid.UUID) error {
+				return workersvc.RefoldRunUsage(ctx, e.pool, e.q, store.Run{ID: run})
+			}},
+	}
+	// freshRun is a completed run with one run_usage row, folded and fresh.
+	freshRun := func(t *testing.T, e *foldEnv) uuid.UUID {
+		run := e.run(t, "completed")
+		if err := e.upsert(t, e.q, run, "s1", "model-a", 0, 1000); err != nil {
+			t.Fatal(err)
+		}
+		if n := e.materialize(t, run); n != 1 {
+			t.Fatalf("setup materialized %d, want 1", n)
+		}
+		e.wantState(t, "setup", run, true, false)
+		return run
+	}
+	usageRows := func(t *testing.T, e *foldEnv, run uuid.UUID) int {
+		t.Helper()
+		var n int
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM run_usage WHERE run_id = $1`, run).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// settled checks the sequential outcome both orders share: run_usage emptied, the run
+	// stale with the previous fold rows kept, and one more materialization yields the empty fold.
+	settled := func(t *testing.T, e *foldEnv, run uuid.UUID) {
+		t.Helper()
+		e.wantState(t, "after the race", run, true, true)
+		if got := usageRows(t, e, run); got != 0 {
+			t.Fatalf("run_usage rows after the delete = %d, want 0", got)
+		}
+		if got := e.foldRows(t, e.pool, run); len(got) != 1 || !strings.HasPrefix(got[0], "model-a:1000:") {
+			t.Fatalf("committed fold = %v, want the pre-delete 1000 row (stale)", got)
+		}
+		if n := e.materialize(t, run); n != 1 {
+			t.Fatalf("final materialize = %d, want 1", n)
+		}
+		e.wantState(t, "after the final materialize", run, true, false)
+		if got := e.foldRows(t, e.pool, run); len(got) != 0 {
+			t.Fatalf("final fold = %v, want empty", got)
+		}
+	}
+
+	for _, w := range writers {
+		t.Run(w.name+"/writer holds the lock first", func(t *testing.T) {
+			e := newFoldEnv(t)
+			run := freshRun(t, e)
+			tx, err := e.pool.Begin(e.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			if err := w.hold(e.ctx, e, tx, run); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := store.MaterializeRunUsageFolds(e.ctx, e.pool, []uuid.UUID{run}); err != nil || n != 0 {
+				t.Fatalf("materializer while the writer is open = %d, %v; want 0, nil", n, err)
+			}
+			e.wantState(t, "during the writer", run, true, false)
+			if err := tx.Commit(e.ctx); err != nil {
+				t.Fatal(err)
+			}
+			settled(t, e, run)
+		})
+
+		t.Run(w.name+"/materializer holds the lock first", func(t *testing.T) {
+			e := newFoldEnv(t)
+			run := freshRun(t, e)
+			// A fresh state would still be locked and re-folded; make it stale so the
+			// materializer has work, as it does after any earlier write.
+			mustExec(e.ctx, t, e.pool, `UPDATE run_usage_fold_state SET stale = true WHERE run_id = $1`, run)
+			reached, release := pauseAt(t, "b")
+			mat := e.matBG(t, run)
+			mustReach(t, reached)
+			wop := &bgOp{done: make(chan opResult, 1)}
+			go func() { wop.done <- opResult{err: w.run(e.ctx, e, run)} }()
+			e.waitQueryBlocked(t, "%fn_run_usage_fold_lock%")
+			release()
+			if r := mat.wait(t); r.err != nil || r.n != 1 {
+				t.Fatalf("materializer = %d, %v; want 1, nil", r.n, r.err)
+			}
+			if r := wop.wait(t); r.err != nil {
+				t.Fatalf("%s: %v", w.name, r.err)
+			}
+			settled(t, e, run)
+		})
 	}
 }
 
@@ -682,7 +825,9 @@ func TestRunUsageFoldMaterializerVsRunDeleteLiveDB(t *testing.T) {
 		})
 		del.waitBlocked(t, e)
 		release()
-		mat.wait(t)
+		if r := mat.wait(t); r.err != nil || r.n != int64(len(ids)) {
+			t.Fatalf("materializer = %d, %v; want %d, nil", r.n, r.err, len(ids))
+		}
 		if r := del.wait(t); r.err != nil || r.n != 1 {
 			t.Fatalf("repo delete = %d, %v", r.n, r.err)
 		}

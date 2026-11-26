@@ -6005,8 +6005,11 @@ DELETE FROM run_usage WHERE run_id = $1 AND EXISTS (SELECT 1 FROM lk WHERE lk.ok
 // Issue #4700: the lk CTE marks the run's fold state stale (fn_run_usage_fold_lock,
 // migration 00543) in the same statement. The lock function returns true or raises (it never
 // returns false): a missing run now raises SQLSTATE 23503. Its only caller, RefoldRunUsage,
-// pre-locks the run row first, so that cannot happen there. The EXISTS (... FROM lk) conjunct
-// is a constant InitPlan that keeps the CTE evaluated before the delete reads run_usage.
+// pre-locks the run row first, so that cannot happen there. Visibility of concurrent writers'
+// committed rows comes from that pre-lock (RefoldRunUsage's runs FOR UPDATE waits out every
+// in-flight writer before this statement's snapshot is taken); the snapshot is taken before the
+// CTE runs, so the lock function itself does not refresh it. The EXISTS (... FROM lk) conjunct
+// only forces the lock function to be evaluated (a constant InitPlan) before the delete runs.
 func (q *Queries) DeleteRunUsage(ctx context.Context, runID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteRunUsage, runID)
 	return err
