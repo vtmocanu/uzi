@@ -567,11 +567,34 @@ func TestWakeAnnotationPermittedGuards(t *testing.T) {
 	if wakeAnnotationPermitted(build(nil), "other") {
 		t.Fatal("nil entry was permitted")
 	}
+	// An entry block alone refuses; the duplicate-canary wake authorization lifts only
+	// that term.
+	if !wakeAnnotationPermitted(build(func(e *rollEntry, _ *rollTick) { e.blocked, e.duplicateWakeSettle = "held", true }), "w") {
+		t.Fatal("a blocked entry with duplicateWakeSettle was refused")
+	}
 	for name, mut := range map[string]func(e *rollEntry, tick *rollTick){
-		"hibernation":          func(e *rollEntry, _ *rollTick) { e.hibernation = true },
-		"blocked":              func(e *rollEntry, _ *rollTick) { e.blocked = "held" },
-		"snapshotIncomplete":   func(e *rollEntry, _ *rollTick) { e.snapshotIncomplete = true },
-		"historyRetireUnknown": func(e *rollEntry, _ *rollTick) { e.historyRetireUnknown = true },
+		"settle: hibernation": func(e *rollEntry, _ *rollTick) {
+			e.blocked, e.duplicateWakeSettle, e.hibernation = "held", true, true
+		},
+		"settle: snapshotIncomplete": func(e *rollEntry, _ *rollTick) {
+			e.blocked, e.duplicateWakeSettle, e.snapshotIncomplete = "held", true, true
+		},
+		"settle: historyRetireUnknown": func(e *rollEntry, _ *rollTick) {
+			e.blocked, e.duplicateWakeSettle, e.historyRetireUnknown = "held", true, true
+		},
+		"settle: uncertain": func(e *rollEntry, tick *rollTick) {
+			e.blocked, e.duplicateWakeSettle = "held", true
+			tick.uncertain[coverageKey(e.coverage)] = true
+		},
+		"settle: migration fenced": func(e *rollEntry, tick *rollTick) {
+			e.blocked, e.duplicateWakeSettle = "held", true
+			tick.migrationFences[migrationLane(e.coverage)] = true
+		},
+		"blocked without settle": func(e *rollEntry, _ *rollTick) { e.blocked = "held" },
+		"hibernation":            func(e *rollEntry, _ *rollTick) { e.hibernation = true },
+		"blocked":                func(e *rollEntry, _ *rollTick) { e.blocked = "held" },
+		"snapshotIncomplete":     func(e *rollEntry, _ *rollTick) { e.snapshotIncomplete = true },
+		"historyRetireUnknown":   func(e *rollEntry, _ *rollTick) { e.historyRetireUnknown = true },
 		"uncertain": func(e *rollEntry, tick *rollTick) {
 			tick.uncertain[coverageKey(e.coverage)] = true
 		},

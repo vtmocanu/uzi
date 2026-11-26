@@ -267,6 +267,26 @@ func staleDuplicate(t *testing.T, o *orphanCohort, older bool) {
 	})
 }
 
+// isOpOnlyWakeBinding reports a patch body that is exactly the top-level metadata key
+// holding only uid, resourceVersion and an annotations map with the single key
+// annotationHibernationOp.
+func isOpOnlyWakeBinding(body []byte) bool {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil || len(top) != 1 || top["metadata"] == nil {
+		return false
+	}
+	var md map[string]json.RawMessage
+	if json.Unmarshal(top["metadata"], &md) != nil || len(md) != 3 || md["uid"] == nil || md["resourceVersion"] == nil {
+		return false
+	}
+	var ann map[string]json.RawMessage
+	if json.Unmarshal(md["annotations"], &ann) != nil || len(ann) != 1 {
+		return false
+	}
+	_, ok := ann[annotationHibernationOp]
+	return ok
+}
+
 // w2Cancellations lists patches that cleared w2's reservation annotation.
 func w2Cancellations(c interface{ Actions() []k8stesting.Action }) int {
 	n := 0
@@ -724,12 +744,19 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("tick error = %v, want error: %v", err, tc.wantErr)
 			}
-			for _, line := range actionTrace(o.c) {
+			for _, a := range o.c.Actions() {
+				p, ok := a.(k8stesting.PatchAction)
+				if !ok || a.GetResource().Resource != "deployments" || isOpOnlyWakeBinding(p.GetPatch()) {
+					continue
+				}
 				for id := range reservations {
-					if line == "patch deployments "+deploymentName(id)+" metadata" {
+					if p.GetName() == deploymentName(id) && strings.Contains(string(p.GetPatch()), `"metadata"`) {
 						t.Fatalf("a canary reservation was written: %v", actionTrace(o.c))
 					}
 				}
+			}
+			if tc.name == "waking pool member with a reservation" && w2Cancellations(o.c) != 0 {
+				t.Fatalf("w2 was cancelled while w1 wakes: %v", actionTrace(o.c))
 			}
 			for id, raw := range reservations {
 				if got := o.dep(t, id).Annotations[annotationRoll]; got != raw {

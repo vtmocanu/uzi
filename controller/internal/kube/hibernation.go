@@ -697,7 +697,9 @@ func wakeRollAdmitted(ctx context.Context, id string) bool {
 // wakeAnnotationPermitted reports whether an unadmitted wake may still write its op
 // annotation. It keeps wakeRollAdmitted's uncertainty and migration fences, adds the
 // entry-block, snapshot-complete and retained-history-retirement guards, and drops only
-// e.admitted. Some terms repeat the pass-2 caller's
+// e.admitted. An entry block refuses it unless planPool marked the entry
+// duplicateWakeSettle (the waking current canary of a pool held for unresolved duplicate
+// canaries; see duplicateWakeSettleCandidates). Some terms repeat the pass-2 caller's
 // filters and are kept for direct-call safety. historyRetireUnknown is set only by
 // retireHibernationHistory, which skips non-preparing workers, so for a waking entry it
 // is defensive only. A pool-level hold (blocker or poolReason with e.blocked == "")
@@ -707,7 +709,7 @@ func wakeRollAdmitted(ctx context.Context, id string) bool {
 func wakeAnnotationPermitted(ctx context.Context, id string) bool {
 	e := rollFrom(ctx, id)
 	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
-	return e != nil && tick != nil && !e.hibernation && e.blocked == "" && !e.snapshotIncomplete &&
+	return e != nil && tick != nil && !e.hibernation && (e.blocked == "" || e.duplicateWakeSettle) && !e.snapshotIncomplete &&
 		!e.historyRetireUnknown && !tick.uncertain[coverageKey(e.coverage)] && !migrationLaneFenced(tick, e.coverage)
 }
 
