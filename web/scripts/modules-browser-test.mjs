@@ -334,6 +334,8 @@ const shutdownAll = () => Promise.allSettled([shutdown(), killSelfChild()]);
 
 // Whether the first signal arrived while the launch was still pending (null: no signal yet).
 let signalLaunchPending = null;
+// Set by a signal or crash before its cleanup starts; selftestInterrupt refuses to spawn after it.
+let terminating = false;
 
 function installSignalHandlers() {
   for (const [sig, code] of [
@@ -343,11 +345,13 @@ function installSignalHandlers() {
     process.on(sig, () => {
       const first = signalLaunchPending === null;
       if (first) signalLaunchPending = launchPromise !== null && !launchSettled;
+      terminating = true;
       if (first && MODE === "selftest-child") console.log(`SIGNAL launch-pending=${signalLaunchPending}`);
       void shutdownAll().finally(() => flushThenExit(code));
     });
   }
   const crash = (e) => {
+    terminating = true;
     console.error("harness: unhandled error", e);
     void shutdownAll().finally(() => flushThenExit(1));
   };
@@ -378,8 +382,24 @@ async function selftestChild() {
     // launchServer has not resolved, announce it, and keep waiting. The wrapper's SIGTERM
     // arrives in this window.
     const launching = startBrowser();
+    // Observe the launch from the start: a rejection while the poll sleeps must end the poll
+    // and surface through `await launching` (the BROKEN path), not as an unhandled rejection.
+    let launchFailed = false;
+    launching.catch(() => {
+      launchFailed = true;
+    });
     const end = Date.now() + 10000;
-    while (childGroupRowsOrBroken(process.pid).length === 0 && Date.now() < end) await sleep(10);
+    let led = false;
+    while (!launchFailed && Date.now() < end) {
+      if (childGroupRowsOrBroken(process.pid).length > 0) {
+        led = true;
+        break;
+      }
+      await sleep(10);
+    }
+    if (launchFailed) await launching;
+    // Announce only once a browser group leader was actually seen.
+    if (!led) throw new InstrumentError("the browser never appeared as a group-leading child within 10 s of the launch");
     console.log(`LAUNCHING ports=${[...ports].join(",")}`);
     await launching;
     // Not signalled: the wrapper reports it; stay alive so it can.
@@ -406,6 +426,11 @@ async function selftestChild() {
  * "no group identified" is a failure of the self-test, not a pass.
  */
 async function selftestInterrupt(phase) {
+  // A signal's (or crash's) cleanup (shutdownAll -> killSelfChild) may already have run while
+  // its exit waits on the stdout flush: never spawn a child it can no longer cover. Park; that
+  // handler ends the process. (Not `shuttingDown`: the full run calls shutdown() before the
+  // self-tests on purpose.)
+  if (terminating) await new Promise(() => {});
   const env = { ...process.env, ...(phase === "launch" ? { MODULES_SELFTEST_LAUNCH_DELAY_MS: "1500" } : {}) };
   const args = [SELF, "--selftest-child", ...(phase === "launch" ? ["--selftest-launch"] : [])];
   const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "inherit"], env });
