@@ -245,9 +245,47 @@ describe("staged output capture (provider key forms)", { skip: LINUX_ONLY }, () 
     assert.equal(spy.calls(), 1, "one write call: the zero-byte result ends the loop");
   });
 
+  type Role = "source" | "capture";
+  /** Records every output descriptor opened (the pinned final open of the source, the O_EXCL capture)
+   *  and, in `events`, when each one is closed. Install BEFORE other fsp.open spies. */
+  async function trackHandles(events: string[] = []): Promise<{ handles: { role: Role; fh: FileHandle }[]; events: string[] }> {
+    const handles: { role: Role; fh: FileHandle }[] = [];
+    const origOpen = fsp.open.bind(fsp);
+    mock.method(fsp, "open", async (p: string, flags?: number, mode?: number) => {
+      const fh = await origOpen(p, flags as never, mode as never);
+      let role: Role | undefined;
+      if (typeof flags === "number" && (flags & fsc.O_EXCL) !== 0) role = "capture";
+      else if (typeof flags === "number" && (flags & fsc.O_NONBLOCK) !== 0 && String(p).startsWith("/proc/self/fd/")) role = "source";
+      if (role) {
+        handles.push({ role, fh });
+        events.push(`open-${role}`);
+        // close is an own property of each handle, so it is wrapped per handle.
+        const realClose = fh.close.bind(fh);
+        let seen = false;
+        fh.close = async () => {
+          const result = await realClose();
+          // A handle may be closed again by a later cleanup; only its first close is an event.
+          if (!seen) events.push(`close-${role}`);
+          seen = true;
+          return result;
+        };
+      }
+      return fh;
+    });
+    return { handles, events };
+  }
+  const captureDirs = async (ws: { root: string }): Promise<string[]> => (await fsp.readdir(ws.root)).filter((n) => n.startsWith(".capture-"));
+  async function assertSettled(ws: { root: string }, handles: { role: Role; fh: FileHandle }[], what: string): Promise<void> {
+    assert.deepEqual([...new Set(handles.map((h) => h.role))].sort(), ["capture", "source"], `${what}: both descriptors were opened`);
+    for (const h of handles) assert.equal(h.fh.fd, -1, `${what}: the ${h.role} descriptor is closed`);
+    // The capture directory is removed with rmdir, which fails while any named capture file is left in it.
+    assert.deepEqual(await captureDirs(ws), [], `${what}: no capture directory or named capture is left`);
+  }
+
   it("an abort between two partial writes stops the phase and uploads nothing", async () => {
     const ws = await workspace({ "outputs/a.txt": "0123456789" });
     const ac = new AbortController();
+    const tracked = await trackHandles();
     await spyCaptureWrites(ws, async (_n, args, real) => {
       const [buf, off, len, pos] = args as [Buffer, number, number, number];
       void real;
@@ -259,12 +297,14 @@ describe("staged output capture (provider key forms)", { skip: LINUX_ONLY }, () 
     assert.equal(attempts.length, 0);
     assert.ok(s.stopped, "the phase reports it stopped");
     assert.deepEqual(dropped(s), ["a.txt:worker_upload_failed"]);
+    await assertSettled(ws, tracked.handles, "abort");
   });
 
   it("a deadline that passes between two partial writes stops the phase and uploads nothing", async () => {
     const ws = await workspace({ "outputs/a.txt": "0123456789" });
     const deadlineAt = Date.now() + 5_000;
     const realNow = Date.now.bind(Date);
+    const tracked = await trackHandles();
     await spyCaptureWrites(ws, async (_n, args) => {
       const [, , len] = args as [Buffer, number, number, number];
       mock.method(Date, "now", () => realNow() + 10_000);
@@ -274,6 +314,48 @@ describe("staged output capture (provider key forms)", { skip: LINUX_ONLY }, () 
     const s = await upload(ws, ["outputs/a.txt"], client, { deadlineAt });
     assert.equal(attempts.length, 0);
     assert.ok(s.stopped);
+    await assertSettled(ws, tracked.handles, "deadline");
+  });
+
+  it("closes the source before the first upload attempt and the capture only after the last", async () => {
+    const ws = await workspace({ "outputs/a.txt": "deliverable bytes" });
+    const events: string[] = [];
+    const tracked = await trackHandles(events);
+    // The first attempt hits a transient error, so there are two attempts to order against.
+    const { client, attempts } = recordingClient(async (n) => {
+      events.push(`upload-${n}`);
+      if (n === 1) throw new RequestError("POST", "/files", 503, JSON.stringify({ reason: "uploads_busy" }));
+    });
+    const s = await upload(ws, ["outputs/a.txt"], client);
+    assert.equal(s.stored, 1);
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(events, ["open-source", "open-capture", "close-source", "upload-1", "upload-2", "close-capture"]);
+    await assertSettled(ws, tracked.handles, "success");
+  });
+
+  it("a pathname swapped to a symlink after resolution but before the guarded open is refused and never uploaded", async () => {
+    const ws = await workspace({ "outputs/a.txt": "legit" });
+    const outside = path.join(await tmp(), "outside.txt");
+    await fsp.writeFile(outside, "outside file that must never be published");
+    const target = path.join(ws.work, "outputs/a.txt");
+    const origOpen = fsp.open.bind(fsp);
+    let swapped = 0;
+    // The preflight (resolveOutputFile) has already accepted the regular file by the time the pinned
+    // open of the leaf runs: swap it for a symlink at exactly that point.
+    mock.method(fsp, "open", async (p: string, flags?: number, mode?: number) => {
+      if (swapped === 0 && typeof flags === "number" && (flags & fsc.O_NONBLOCK) !== 0 && String(p).startsWith("/proc/self/fd/")) {
+        swapped++;
+        await fsp.rm(target);
+        await fsp.symlink(outside, target);
+      }
+      return origOpen(p, flags as never, mode as never);
+    });
+    const { client, attempts } = recordingClient();
+    const s = await upload(ws, ["outputs/a.txt"], client);
+    assert.equal(swapped, 1, "the swap ran between resolution and the guarded open");
+    assert.equal(attempts.length, 0, "nothing was uploaded");
+    assert.deepEqual(dropped(s), ["a.txt:worker_unreadable"]);
+    assert.deepEqual(await captureDirs(ws), []);
   });
 
   it("a source mutated in place after capture: every retry sends only the scanned bytes", async () => {

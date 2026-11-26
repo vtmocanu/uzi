@@ -258,6 +258,22 @@ so does every Test, right before it connects) and the claims of runs already bou
 run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
 run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
 
+That pause applies to bound runs only. A provider-bound **job** or **judge** never pauses: if the key,
+its revision or the allowlist entry is gone when it is claimed, it fails terminally with
+`fail_origin` `credential_unavailable` and a fixed reason, and never falls back to a vendor credential.
+
+**Rolling out provider jobs.** A provider-bound job is claimed only by a non-Docker worker advertising
+both `claude_provider_job_v1` and `claude_provider_v1`, which means a worker image from a release that
+includes provider jobs. Upgrade worker images before owners rely on provider jobs. Until a capable
+worker is online the job stays `queued` and its health reads "no worker that supports provider jobs
+(claude_provider_job_v1) is online"; this covers a fleet of only older workers and a fleet of only
+isolated (Docker) ephemeral workers. A job already bound to an ephemeral worker that registered
+without the capabilities is failed by the sweeper as `no_job_capable_worker` with the reason "the
+worker provisioned for this job lacks the job_runner_v1 capability (or, for a job created with files
+support, job_files_v1, for a site-list job, isolated_job_v1, or for a provider job, claude_provider_v1
+and claude_provider_job_v1); update the worker image". Persistent older workers never claim a provider
+job and are not swept, so update them yourself.
+
 **Activated, with an accepted redirect risk.** Workers advertise the capability `claude_provider_v1`
 by default (no switch), so a run bound to a provider starts on a current worker. The pinned Claude
 CLI follows gateway redirects, so the allowlist is the only control on where provider traffic

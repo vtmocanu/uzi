@@ -11,6 +11,7 @@ import type { WorkerClient } from "../src/client.js";
 import { buildJobResultServer, JobRunner } from "../src/job-runner.js";
 import type { Logger } from "../src/log.js";
 import { Outbox } from "../src/outbox.js";
+import { makeTerminalOutboxDeps, resolvePendingTerminal } from "../src/terminal-resolve.js";
 import { PROVIDER_LANE_UNSUPPORTED } from "../src/provider-binding.js";
 import type { ClaimResponse, JobFileUploadMeta, JobResultRequest, OutgoingMessage, StateRequest } from "../src/protocol.js";
 import { providerKeyForms } from "../src/redact.js";
@@ -147,6 +148,58 @@ describe("provider job: SDK options (A5 worker side)", () => {
     }
   });
 
+  describe("the model alias and the gateway target are separate facts", () => {
+    const MODEL_ENV = { opus: "ANTHROPIC_DEFAULT_OPUS_MODEL", sonnet: "ANTHROPIC_DEFAULT_SONNET_MODEL", haiku: "ANTHROPIC_DEFAULT_HAIKU_MODEL" } as const;
+    async function resolved(modelMap: Record<string, unknown>, config: Record<string, unknown>): Promise<{ model: unknown; env: Record<string, string | undefined> }> {
+      const { client } = fakeClient();
+      const seen: { options?: SdkOptions; calls: number } = { calls: 0 };
+      const qf = scripted(async function* ({ options }) { yield INIT_OK; await callSubmit(options, GOOD); yield RESULT_OK; }, seen);
+      await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim(KEY, { config } as never, { model_map: modelMap }));
+      assert.equal(seen.calls, 1, "the session ran");
+      return { model: seen.options!.model, env: seen.options!.env as Record<string, string | undefined> };
+    }
+    const MAP = { opus: { model: "corp-opus" }, sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } };
+
+    it("an alias is the model; the map's target for it is the gateway target", async () => {
+      const r = await resolved(MAP, { default_model: "opus" });
+      assert.equal(r.model, "opus");
+      assert.equal(r.env[MODEL_ENV.opus], "corp-opus");
+      assert.equal(r.env[MODEL_ENV.sonnet], "corp-sonnet");
+    });
+
+    it("a sonnet slot mapped to the literal target inherit is passed through unrewritten when no model is configured", async () => {
+      const r = await resolved({ ...MAP, sonnet: { model: "inherit" } }, {});
+      assert.equal(r.model, "sonnet");
+      assert.equal(r.env[MODEL_ENV.sonnet], "inherit");
+    });
+
+    it("the server-canonical sonnet model keeps its own target next to an opus slot mapped to inherit", async () => {
+      const r = await resolved({ ...MAP, opus: { model: "inherit" }, sonnet: { model: "x" } }, { default_model: "sonnet" });
+      assert.equal(r.model, "sonnet");
+      assert.equal(r.env[MODEL_ENV.sonnet], "x");
+      assert.equal(r.env[MODEL_ENV.opus], "inherit");
+    });
+
+    it("a blank model is the sonnet slot", async () => {
+      const r = await resolved(MAP, { default_model: "   " });
+      assert.equal(r.model, "sonnet");
+      assert.equal(r.env[MODEL_ENV.sonnet], "corp-sonnet");
+    });
+
+    it("an explicit alias other than sonnet selects that alias and its target", async () => {
+      const r = await resolved(MAP, { default_model: "haiku" });
+      assert.equal(r.model, "haiku");
+      assert.equal(r.env[MODEL_ENV.haiku], "corp-haiku");
+    });
+
+    it("an explicit mapped target ID is the model as written, with the same target in its slot", async () => {
+      const r = await resolved(MAP, { default_model: "corp-haiku" });
+      assert.equal(r.model, "corp-haiku");
+      assert.equal(r.env[MODEL_ENV.haiku], "corp-haiku");
+      assert.equal(r.env[MODEL_ENV.sonnet], "corp-sonnet");
+    });
+  });
+
   it("an unmapped model fails the job with the constant reason before any workspace or model call", async () => {
     const { client, calls } = fakeClient();
     const seen: { options?: SdkOptions; calls: number } = { calls: 0 };
@@ -239,41 +292,89 @@ describe("provider job: a key echoed by the gateway never reaches the api or the
     roots.push(root);
     const outbox = new Outbox({ root: path.join(root, "outbox"), log: nullLogger(), runMaxBytes: 1e6, maxBytes: 1e6, retentionMs: 86_400_000 });
     await outbox.init();
-    const { client, calls } = fakeClient();
+    // The api is unreachable for the terminal report: the send throws, so the journal stays pending.
+    const { client, calls } = fakeClient({
+      reportState: (b) => {
+        if (b.status === "failed" || b.status === "completed") throw new Error("connect ECONNRESET: api unreachable");
+        return { applied: true, status: b.status };
+      },
+    });
     const qf = scripted(async function* () {
       yield INIT_OK;
       throw new Error(`gateway said ${KEY} is bad`);
     });
     const claim = providerJobClaim();
-    await runner(client, path.join(root, "jobs"), qf, nullLogger(), { outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 }).execute(claim);
-    const last = calls.states.at(-1)!;
-    assert.equal(last.status, "failed");
-    assert.match(last.failure_reason ?? "", /the job session failed: gateway said \*\*\*REDACTED\*\*\* is bad/);
-    assertNoKey(KEY, everywhere(calls), "failed job with outbox");
-    // Nothing is left pending that could replay the key later.
-    for (const p of outbox.listPendingTerminals()) {
-      const journal = outbox.readTerminalJournal(p.run_id, p.claim_generation);
-      assertNoKey(KEY, JSON.stringify(journal ?? {}), "terminal journal");
-    }
+    const jobLog = recordingLogger();
+    await runner(client, path.join(root, "jobs"), qf, jobLog.logger, { outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 }).execute(claim);
+    // The terminal report itself was attempted (and refused), so every observation is of the journal.
+    const attempted = calls.states.at(-1)!;
+    assert.equal(attempted.status, "failed");
+    assert.match(attempted.failure_reason ?? "", /the job session failed: gateway said \*\*\*REDACTED\*\*\* is bad/);
+    assertNoKey(KEY, everywhere(calls, jobLog.lines), "attempted terminal");
+    // The journal is still pending: the replay below is the only thing that can deliver it.
+    const pending = outbox.listPendingTerminals();
+    assert.ok(pending.length >= 1, "a retryable terminal delivery failure leaves a pending terminal record");
+    const mine = pending.find((p) => p.run_id === claim.run_id && p.claim_generation === GEN);
+    assert.ok(mine, "the job's own terminal is the pending one");
+    const journal = await outbox.readTerminalJournal(mine.run_id, mine.claim_generation);
+    assert.ok(journal, "the journal is readable");
+    assertNoKey(KEY, JSON.stringify(journal), "terminal journal");
+    // Replay it now, long after the claim's key registration ended, through the real resolve path.
+    const sent: StateRequest[] = [];
+    const deps = makeTerminalOutboxDeps(outbox, client, { gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() })!;
+    await resolvePendingTerminal(deps, {
+      runId: mine.run_id, claimGeneration: mine.claim_generation,
+      send: async (body) => { sent.push(body); return { applied: true, status: body.status } as never; },
+    });
+    assert.equal(sent.length, 1, "the replay sent the journaled terminal exactly once");
+    assert.equal(sent[0]!.status, "failed");
+    assert.match(sent[0]!.failure_reason ?? "", /gateway said \*\*\*REDACTED\*\*\* is bad/);
+    assertNoKey(KEY, JSON.stringify(sent), "replayed terminal");
+    assert.deepEqual(outbox.listPendingTerminals().filter((p) => p.run_id === claim.run_id), [], "the replay retired the journal");
   });
 
-  it("strips cost from the usage frame and keeps its token counts", async () => {
+  const PRICED = {
+    ...RESULT_OK, total_cost_usd: 1.25,
+    usage: { input_tokens: 123, output_tokens: 45, cache_read_input_tokens: 678, cache_creation_input_tokens: 91 },
+    modelUsage: {
+      "corp-sonnet": { inputTokens: 123, outputTokens: 45, cacheReadInputTokens: 678, cacheCreationInputTokens: 91, webSearchRequests: 3, costUSD: 0.5 },
+      "corp-haiku": { inputTokens: 8, outputTokens: 6, cacheReadInputTokens: 5, cacheCreationInputTokens: 4, webSearchRequests: 2, costUSD: 0.25 },
+    },
+  };
+  const usageOf = (calls: Calls): Record<string, unknown> => {
+    const found = calls.messages.filter((m) => "usage" in (m.payload as Record<string, unknown>));
+    assert.equal(found.length, 1, "exactly one emitted message carries the usage");
+    return found[0]!.payload as Record<string, unknown>;
+  };
+  function assertPricedCounters(payload: Record<string, unknown>): void {
+    assert.ok(!Object.hasOwn(payload, "total_cost_usd"), "top-level cost dropped");
+    const usage = payload["usage"] as Record<string, unknown>;
+    assert.equal(usage["input_tokens"], 123);
+    assert.equal(usage["output_tokens"], 45);
+    assert.equal(usage["cache_read_input_tokens"], 678);
+    assert.equal(usage["cache_creation_input_tokens"], 91);
+    const mu = payload["modelUsage"] as Record<string, Record<string, unknown>>;
+    assert.deepEqual(mu["corp-sonnet"], { inputTokens: 123, outputTokens: 45, cacheReadInputTokens: 678, cacheCreationInputTokens: 91, webSearchRequests: 3 });
+    assert.deepEqual(mu["corp-haiku"], { inputTokens: 8, outputTokens: 6, cacheReadInputTokens: 5, cacheCreationInputTokens: 4, webSearchRequests: 2 });
+    for (const entry of Object.values(mu)) assert.ok(!Object.hasOwn(entry, "costUSD"), "per-model cost dropped");
+  }
+
+  it("strips cost from the usage frame and keeps every token counter at its exact field", async () => {
     const { client, calls } = fakeClient();
-    const qf = scripted(async function* ({ options }) {
-      yield INIT_OK;
-      await callSubmit(options, GOOD);
-      yield {
-        ...RESULT_OK, total_cost_usd: 1.25,
-        usage: { input_tokens: 123, output_tokens: 45 },
-        modelUsage: { "corp-sonnet": { inputTokens: 123, outputTokens: 45, costUSD: 0.5 } },
-      };
-    });
+    const qf = scripted(async function* ({ options }) { yield INIT_OK; await callSubmit(options, GOOD); yield PRICED; });
     await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim());
-    const text = JSON.stringify(calls.messages);
-    assert.ok(!text.includes("total_cost_usd"), "top-level cost dropped");
-    assert.ok(!text.includes("costUSD"), "per-model cost dropped");
-    assert.ok(text.includes("123") && text.includes("45"), "token counts kept");
+    assertPricedCounters(usageOf(calls));
   });
+
+  for (const counterKey of ["cacheReadInputTokens", "cache_read_input_tokens", "cacheCreationInputTokens"]) {
+    it(`a key equal to the counter name ${counterKey} cannot rename the field and zero the count`, async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options }) { yield INIT_OK; await callSubmit(options, GOOD); yield PRICED; });
+      await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim(counterKey));
+      assertPricedCounters(usageOf(calls));
+      assert.equal(calls.states.at(-1)!.status, "completed");
+    });
+  }
 });
 
 describe("provider job: gateway limit settlement reads the raw frame", () => {
@@ -417,6 +518,17 @@ describe("provider job: submit_job_result with key forms present", { skip: LINUX
     assert.ok(textOf(res).includes("***REDACTED***"), "the key position is marked");
   });
 
+  it("a key spanning the diagnostic label and the start of the path is scrubbed from the final text", async () => {
+    const key = ["output_files", ": ", "outputs/missing"].join("");
+    assert.ok(key.length >= 16);
+    const { submit, store } = await toolEnv(key);
+    const res = submit({ ...GOOD, output_files: ["outputs/missing.txt"] });
+    assert.equal(res.isError, true);
+    assertNoKey(key, textOf(res), "tool response");
+    assert.ok(!textOf(res).includes("output_files: outputs/missing"), "the reassembled key is gone");
+    assert.equal(store.result, undefined);
+  });
+
   it("(b2) a duplicate-name message that renders the key is scrubbed", async () => {
     const key = ["(abcdefghijklmnop", ")"].join("");
     const { submit, store } = await toolEnv(key, { "outputs/a/abcdefghijklmnop": "1", "outputs/b/abcdefghijklmnop": "2" });
@@ -529,6 +641,20 @@ describe("provider job: output publication end to end", { skip: LINUX_ONLY }, ()
     assert.equal(calls.states.at(-1)!.status, "completed");
     const text = everywhere(calls);
     assert.ok(!text.toLowerCase().includes(STATUS_KEY), "no case variant of the key is published");
+  });
+
+  it("a key straddling the display-name cut is scrubbed before the cut, so no prefix of it is reported", async () => {
+    const { client, calls } = fakeClient();
+    // 80 filler characters then the key then ".txt": the 100-code-point display cut falls inside the key.
+    const name = `${"a".repeat(80)}${STATUS_KEY}.txt`;
+    const qf = session({ [`outputs/${name}`]: "named by the key", "outputs/clean.txt": "ok" }, [`outputs/${name}`, "outputs/clean.txt"]);
+    await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim(STATUS_KEY));
+    assert.deepEqual(calls.uploads.map((u) => u.meta.display_name), ["clean.txt"]);
+    assert.equal(calls.results[0]!.refused_outputs?.length, 1);
+    assert.equal(calls.results[0]!.refused_outputs![0]!.reason, "worker_unreadable");
+    const text = everywhere(calls);
+    assert.ok(!text.includes(STATUS_KEY.slice(0, 8)), "no prefix of the key was posted");
+    assert.equal(calls.states.at(-1)!.status, "completed");
   });
 
   it("a vendor job is untouched: no capture, same-handle upload, key-free claim carries no provider", async () => {

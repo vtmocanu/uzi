@@ -89,7 +89,7 @@ import type {
   JobRefusedOutput,
   JobResultRequest,
 } from "./protocol.js";
-import { makeRedactor, makeTextRedactor, providerKeyForms, redactStrings, type TextRedactor } from "./redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms, redactStrings, type PayloadRedactor, type TextRedactor } from "./redact.js";
 import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
 import {
   isGatewayLimitStatus,
@@ -323,6 +323,46 @@ function redactJobResult(result: JobResultBody, redactText: TextRedactor): JobRe
   };
 }
 
+const isPlainRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+const finiteNumbersOf = (v: Record<string, unknown>): Record<string, number> =>
+  Object.fromEntries(Object.entries(v).filter((e): e is [string, number] => typeof e[1] === "number" && Number.isFinite(e[1])));
+
+/** The scrubbed record with its numeric members dropped (a renamed counter leaves a summed placeholder
+ *  member behind), then the raw record's finite numbers under their raw keys. */
+const withRawCounters = (scrubbed: unknown, raw: Record<string, unknown>): Record<string, unknown> => ({
+  ...Object.fromEntries(Object.entries(isPlainRecord(scrubbed) ? scrubbed : {}).filter(([, v]) => typeof v !== "number")),
+  ...finiteNumbersOf(raw),
+});
+
+/** Scrubbing a frame rewrites member NAMES too, so a provider key equal to an SDK usage counter name
+ *  (for example cacheReadInputTokens) would rename the field and the api's typed usage fold would
+ *  record 0. After scrubbing, put back the finite numeric counters of the RAW frame under their raw
+ *  keys: top-level `usage`, an assistant frame's `message.usage`, and each `modelUsage` entry (placed
+ *  under the scrubbed model name). Only numbers are restored, never strings, so no key text returns. */
+function restoreUsageCounters(raw: unknown, frame: unknown, scrub: TextRedactor): unknown {
+  if (!isPlainRecord(raw) || !isPlainRecord(frame)) return frame;
+  const out: Record<string, unknown> = { ...frame };
+  if (isPlainRecord(raw["usage"])) {
+    out["usage"] = withRawCounters(out["usage"], raw["usage"]);
+  }
+  const rawMessage = raw["message"];
+  if (isPlainRecord(rawMessage) && isPlainRecord(rawMessage["usage"]) && isPlainRecord(out["message"])) {
+    const msg = out["message"];
+    out["message"] = { ...msg, usage: withRawCounters(msg["usage"], rawMessage["usage"]) };
+  }
+  if (isPlainRecord(raw["modelUsage"])) {
+    const mu: Record<string, unknown> = { ...(isPlainRecord(out["modelUsage"]) ? out["modelUsage"] : {}) };
+    for (const [model, entry] of Object.entries(raw["modelUsage"])) {
+      if (!isPlainRecord(entry)) continue;
+      const key = scrub(model);
+      mu[key] = withRawCounters(mu[key], entry);
+    }
+    out["modelUsage"] = mu;
+  }
+  return out;
+}
+
 /** Holds the (latest) validated result the model submitted. */
 interface JobResultStore {
   result?: JobResultBody;
@@ -371,7 +411,8 @@ export function buildJobResultServer(
         const shown = render(problems.join("; ")).slice(0, 1000);
         return {
           isError: true,
-          content: [{ type: "text", text: `Result rejected, nothing was stored: output_files: ${shown}. Fix it and call ${SUBMIT_TOOL} again.` }],
+          // Scrub the COMPLETE text too: a key can span the label/path interpolation boundary.
+          content: [{ type: "text", text: render(`Result rejected, nothing was stored: output_files: ${shown}. Fix it and call ${SUBMIT_TOOL} again.`) }],
         };
       }
     }
@@ -871,7 +912,12 @@ export class JobRunner {
           : DEFAULT_BUDGET_WALL_SECONDS;
 
       const budgetMs = Math.round(budgetSeconds * 1000);
-      const redact = makeRedactor(secrets);
+      // A provider-bound claim: the batcher's payload scrub renames member names too, so it would
+      // rename a usage counter a key equals (see restoreUsageCounters); put the counters back there too.
+      const scrubPayload = makeRedactor(secrets);
+      const redact: PayloadRedactor = providerKeys.length
+        ? (payload) => restoreUsageCounters(payload, scrubPayload(payload), redactText) as Record<string, unknown>
+        : scrubPayload;
       batcher = new MessageBatcher(this.client, runId, claim.last_seq, this.batchMs, runLog, redact, redactText, {
         ...(this.outbox ? { outbox: this.outbox } : {}),
         generation,
@@ -1249,7 +1295,7 @@ export class JobRunner {
           const status = (msg as Record<string, unknown>)["api_error_status"];
           facts.status = typeof status === "number" ? status : null;
         }
-        const frame = args.provider ? redactStrings(msg, args.redactText) : msg;
+        const frame = args.provider ? restoreUsageCounters(msg, redactStrings(msg, args.redactText), args.redactText) : msg;
         rateLimits.observe(frame);
         for (const em of mapSdkMessage(frame) as EmittedMessage[]) batcher.emit(args.provider ? stripProviderCost(em) : em);
         if (isResult(msg)) {
@@ -1390,9 +1436,19 @@ export class JobRunner {
     // the fetch credential out of the prompt and env does not prove an echoed credential can never
     // reach a file.
     const unsafeNames: JobRefusedOutput[] = [];
+    // The path is scrubbed UNCAPPED before the display cut: capping first could slice a key in two and
+    // leave its prefix, which no exact-form scrub recognises. Returns the reportable name, or null when
+    // even the scrubbed spelling still carries a case variant of the key (or one rejoined by the cut).
+    const withheldName = (rel: string): string | null => {
+      const full = redactText(rel);
+      const name = outputDisplayName(full);
+      const clean = (t: string): boolean => redactText(t.toLowerCase()) === t.toLowerCase();
+      return clean(full) && clean(name) ? name : null;
+    };
     const outputFiles = (store.outputFiles ?? []).filter((rel) => {
       if (redactText(rel) === rel && redactText(outputDisplayName(rel)) === outputDisplayName(rel)) return true;
-      unsafeNames.push({ display_name: redactText(outputDisplayName(rel)), reason: "worker_unreadable" });
+      const display_name = withheldName(rel) ?? `withheld-output-${unsafeNames.length + 1}`;
+      if (!unsafeNames.some((u) => u.display_name === display_name)) unsafeNames.push({ display_name, reason: "worker_unreadable" });
       return false;
     });
     // PRD #4322 M1b: outputs the result tool withheld because their path or name carried provider key
@@ -1401,8 +1457,7 @@ export class JobRunner {
     // A name withheld only for a case variant of the key (the partition's lowercase test) survives the
     // exact-form scrub, so it is reported under a positional placeholder instead of its own spelling.
     for (const [i, rel] of [...new Set(store.keyedOutputs ?? [])].entries()) {
-      const scrubbed = redactText(outputDisplayName(rel));
-      const display_name = redactText(scrubbed.toLowerCase()) === scrubbed.toLowerCase() ? scrubbed : `withheld-output-${i + 1}`;
+      const display_name = withheldName(rel) ?? `withheld-output-${i + 1}`;
       if (!unsafeNames.some((u) => u.display_name === display_name)) unsafeNames.push({ display_name, reason: "worker_unreadable" });
     }
     let uploaded: Awaited<ReturnType<typeof uploadJobOutputs>>;
