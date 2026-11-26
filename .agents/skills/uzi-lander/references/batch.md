@@ -103,6 +103,21 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   `--active-jobs N` and a conservative incremental peak, including companion workflows,
   with `--peak-jobs N`. Treat the result as an estimate against the 20-job cap. Include
   pending demand when planning the push wave. A missing proof stays unknown.
+- **CI slots**: let the lane owner grant at most two concurrent PR CI runs alongside
+  main CI. Prioritize a red-main or release fix, then the migration-chain head, then
+  ready PRs with exact-head obligations, then the rest. Size grants in jobs using the
+  readiness report, including queued demand and companion workflows. A push without a
+  slot is allowed. Cancel its new head's CI and KinD Smoke runs at once, then use
+  `gh run rerun <id>` on the cancelled CI when the slot is granted and report the run ID.
+  Keep CodeQL and Codex packaged proof. For other capacity cleanup, prefer unstarted
+  queued runs over near-complete ones. Preserve required LiveDB and packaged evidence,
+  including a parent workflow carrying such evidence, and runs another owner relies on.
+- **Low-risk main-CI option**: use only on the user's explicit request. Confirm an
+  approved, mergeable PR has no migration, trust-boundary change or exact-head CI
+  obligation. It needs no PR CI slot. Use `merge.sh ... --expect-head FULL_SHA
+  --main-ci-gate`. The flag refuses detected migration and trust markers or known red
+  checks. All other guards run. Gate the batch on main CI and retain exact-tip release
+  coverage.
 - **Batch grant**: have the lane owner authorize the ordered PR and full-SHA list for a
   bounded window. Run `merge.sh` per PR and report each merge SHA. Return to the owner if
   a head or the order changes, a hold arrives, or the grant expires. The report alone
