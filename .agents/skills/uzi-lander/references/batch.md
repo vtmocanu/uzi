@@ -89,6 +89,24 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   are separable. If both touch the worker image or packaged runtime, dispatch
   `gh workflow run codex-packaged-proof.yml --ref main` after both merge, confirm the run's
   `headSha` is the combined batch SHA (or a descendant), and watch it with `main` CI; a red counts below.
+- **Prepare migrations early**: pin one live main SHA. Assign non-overlapping ranges
+  above its migration head in landing order. Preflight the cumulative merge tree in a
+  throwaway worktree. Compose any replacement SQL function on its actual predecessor,
+  with Down restoring that definition. Finish renumbering and reference edits, then
+  push each final head once so CI overlaps. Merge individually in order after the
+  per-PR proofs above. If the base or order invalidates a range, replan before pushing
+  or merging. Never fill a lower gap after a higher version lands.
+- **Readiness report**: run `S/fast-batch.sh [PR ...]` with the proposed landing order.
+  Pass `--evidence FILE` with a JSON array of `{pr,head,review,trust_boundary}` records
+  from the reviewed heads. Use the full SHA and an approval receipt for `review`.
+  Use null for unknown evidence. Pass the observed account-wide count with
+  `--active-jobs N` and a conservative incremental peak, including companion workflows,
+  with `--peak-jobs N`. Treat the result as an estimate against the 20-job cap. Include
+  pending demand when planning the push wave. A missing proof stays unknown.
+- **Batch grant**: have the lane owner authorize the ordered PR and full-SHA list for a
+  bounded window. Run `merge.sh` per PR and report each merge SHA. Return to the owner if
+  a head or the order changes, a hold arrives, or the grant expires. The report alone
+  grants no merge authority.
 - **Order**: PRs without infra deltas before PRs with one (an infra delta re-runs the others' CI).
   Within each group, large or conflict-prone PRs first: rebasing a small PR onto a large one is
   cheap, the reverse re-conflicts the large one per merge. Give a large PR at most one separable
