@@ -74,8 +74,9 @@ func readRunbookFK(ctx context.Context, t *testing.T, pool *pgxpool.Pool, table,
 	return fk
 }
 
-// runbook runs the ADR's documented inspection queries for the refusing stage and returns the row of
-// its state table that applies.
+// runbook follows the ADR's runbook for the refusing stage and returns the row of its state table that
+// applies. The precondition and count queries run as written; the other rows are read from the index
+// and foreign key catalogs the remaining inspection queries show.
 func runbook(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stage runbookStage) string {
 	t.Helper()
 	// Preconditions: no index build in progress on model_providers (any row means wait).
@@ -357,6 +358,15 @@ func TestScopeIndexRecoveryStopRowsLiveDB(t *testing.T) {
 		invalidateScopeIndex(ctx, t, pool)
 		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00527, 526)
 		wantRunbook(ctx, t, pool, stage00527, "stop-wrong-definition")
+	})
+	t.Run("00527 with a foreign key already on the index", func(t *testing.T) {
+		ctx, dsn, pool := sharedDB(t, "scope_idx_fk527_", 526)
+		// Any foreign key on the index, whatever its name or table, makes the 00527 count nonzero.
+		mustExec(ctx, t, pool, `CREATE TABLE scope_decoy (s uuid, p uuid)`)
+		mustExec(ctx, t, pool, `ALTER TABLE scope_decoy ADD CONSTRAINT scope_decoy_fkey FOREIGN KEY (s, p) REFERENCES model_providers (scope_owner_id, id) NOT VALID`)
+		invalidateScopeIndex(ctx, t, pool)
+		wantRefusal(ctx, t, pool, store.Migrate(ctx, dsn), refusal00527, 526)
+		wantRunbook(ctx, t, pool, stage00527, "stop-fks")
 	})
 	t.Run("users_codex_provider_scope with a missing Claude foreign key", func(t *testing.T) {
 		pred := sharedCodexPredecessor(t, resolveSharedCodexVersions(t).userScope)
