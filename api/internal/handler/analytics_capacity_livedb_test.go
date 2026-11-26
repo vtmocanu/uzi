@@ -428,6 +428,26 @@ func TestAnalyticsCapacitySelectorAttributionLiveDB(t *testing.T) {
 	}
 }
 
+// Staleness is judged at the request's captured clock (h.now), not the wall clock. The fixture year
+// is in the past, so a reading synced a minute before the pinned now would read stale (and a Codex
+// account stale) if either gauge call site used time.Now instead.
+func TestAnalyticsCapacityGaugeStalenessUsesRequestClockLiveDB(t *testing.T) {
+	f := newCapFixture(t, 2020, true)
+	u := f.user(false)
+	tok := f.anthropicToken(u, "tok", true, 10, f.now.Add(-time.Minute))
+	acct := f.codexAccount(u, "sub", true, f.now.Add(-time.Minute))
+
+	dto := f.capOwner(u, "")
+	a, ok := capAnthropicBySecret(dto.Gauges.Anthropic, tok)
+	if !ok || a.Limits.Status != "ok" || a.Limits.Stale == nil || *a.Limits.Stale {
+		t.Fatalf("anthropic identity = %+v (found %v), want a fresh reading at the request clock", a, ok)
+	}
+	c, ok := capCodexByAccount(dto.Gauges.Codex, acct)
+	if !ok || c.Status != "fresh" {
+		t.Fatalf("codex identity = %+v (found %v), want status fresh at the request clock", c, ok)
+	}
+}
+
 // The snapshot is fixed by the first read: a run and a fresh reading committed on another
 // connection afterwards are invisible in flight and visible to the next request. A second request
 // by the same caller during the hold is refused as busy.

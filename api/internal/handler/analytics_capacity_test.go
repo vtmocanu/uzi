@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
-	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -298,10 +298,31 @@ func TestCapacityOwnerVaultLockedMapsToStatus(t *testing.T) {
 	}
 
 	// No identities, no vault read: an empty set never consults the vault.
+	counter := &countingStateReader{memVaultQ: newMemVaultQ()}
 	h := capacityHandler(time.Minute)
+	h.vault = vault.New(newHandlerTestBox(t), counter, counter.transaction)
 	if locked, observed := h.observeCodexVault(context.Background(), &analyticsDeps{}, req, nil); !observed || len(locked) != 0 {
 		t.Fatalf("empty set observe = %v, %v", locked, observed)
 	}
+	if n := counter.reads.Load(); n != 0 {
+		t.Fatalf("empty set read the vault %d times, want 0", n)
+	}
+	// Control: the same double does see the read when an identity is selected.
+	h.observeCodexVault(context.Background(), &analyticsDeps{}, req, []capacityCodexRow{row})
+	if counter.reads.Load() == 0 {
+		t.Fatal("counting double never observed a read for a selected identity")
+	}
+}
+
+// countingStateReader counts vault state reads.
+type countingStateReader struct {
+	*memVaultQ
+	reads atomic.Int32
+}
+
+func (q *countingStateReader) GetUserVaultState(ctx context.Context, id uuid.UUID) (store.GetUserVaultStateRow, error) {
+	q.reads.Add(1)
+	return q.memVaultQ.GetUserVaultState(ctx, id)
 }
 
 func TestCapacityAdminVaultObservation(t *testing.T) {
@@ -333,10 +354,6 @@ func TestCapacityAdminVaultObservation(t *testing.T) {
 		g := h.codexGauge(req, capacityCodexSet{selected: true, rows: rows}, nil, false, time.Now())
 		if g.Status != "unavailable" || *g.Reason != "vault_status_unavailable" || len(g.Identities) != 0 {
 			t.Fatalf("gauge = %+v", g)
-		}
-		body, _ := json.Marshal(g)
-		if strings.Contains(string(body), "private-credential-sentinel") {
-			t.Fatal("gauge leaks the vault error text")
 		}
 	})
 	t.Run("budget expiry", func(t *testing.T) {

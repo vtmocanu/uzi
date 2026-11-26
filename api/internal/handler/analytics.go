@@ -132,8 +132,9 @@ type analyticsRequest struct {
 	repo    uuid.UUID // uuid.Nil: no repo filter
 	harness string
 	kinds   []string
-	// kindName is the raw kind parameter ("" when absent): the capacity filters echo it and the
-	// gauges name it as an unattributed selector.
+	// kindName is the raw kind parameter ("" when absent). The capacity filters echo the effective
+	// kinds (req.kinds), not this name; kindName feeds only the effective-scope selectors the
+	// gauges cannot attribute and excluded_kind_selected.
 	kindName string
 
 	split     string
@@ -423,7 +424,7 @@ func analyticsFail(w http.ResponseWriter, r *http.Request, err error) {
 	httpx.Error(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorize runs the in-snapshot checks shared by Options and Spend: the timezone, the selected
+// authorize runs the in-snapshot checks shared by Options, Spend and Capacity: the timezone, the selected
 // user's existence and the repo filter's authority. A repo that does not exist and one the scope
 // cannot see produce the identical 400.
 func (d *analyticsDeps) authorize(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest) (*time.Location, error) {
