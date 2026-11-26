@@ -439,8 +439,10 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		// A row that sets it never reaches the duplicate block: an earlier arm holds or
 		// splits the pool, and the row only proves that nothing cancels the duplicate.
 		reasons [2]string
-		wantErr bool
-		mutate  func(t *testing.T, o *orphanCohort)
+		// noCancel additionally requires that w2's reservation is never cancelled.
+		noCancel bool
+		wantErr  bool
+		mutate   func(t *testing.T, o *orphanCohort)
 	}{
 		{name: "D replicas 1", mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w2", func(d *appsv1.Deployment) { d.Spec.Replicas = &one })
@@ -640,7 +642,7 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		}},
 		{name: "out-of-pool canary", mutate: func(t *testing.T, o *orphanCohort) { o.outsider(t, true, false) }},
 		{name: "out-of-pool open reservation", mutate: func(t *testing.T, o *orphanCohort) { o.outsider(t, false, false) }},
-		{name: "waking pool member with a reservation", mutate: func(t *testing.T, o *orphanCohort) {
+		{name: "waking pool member with a reservation", noCancel: true, mutate: func(t *testing.T, o *orphanCohort) {
 			o.at("w1").Hibernation = &protocol.Hibernation{State: protocol.HibernationWaking, OpID: orphanWakeOp}
 		}},
 		{name: "both canaries absent", mutate: func(t *testing.T, o *orphanCohort) {
@@ -755,7 +757,7 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 					}
 				}
 			}
-			if tc.name == "waking pool member with a reservation" && w2Cancellations(o.c) != 0 {
+			if tc.noCancel && w2Cancellations(o.c) != 0 {
 				t.Fatalf("w2 was cancelled while w1 wakes: %v", actionTrace(o.c))
 			}
 			for id, raw := range reservations {

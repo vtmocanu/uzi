@@ -45,12 +45,11 @@ func TestDuplicateWakeAuthorizationFlags(t *testing.T) {
 		}
 	}
 	cases := []struct {
-		name        string
-		setup       func(wc *wakeCanary)
-		w1Block     string
-		w1Settle    bool
-		w1Shape     bool
-		w2Independt string
+		name     string
+		setup    func(wc *wakeCanary)
+		w1Block  string
+		w1Settle bool
+		w1Shape  bool
 	}{
 		{name: "regression fixture", w1Settle: true, w1Shape: true},
 		{name: "independent block on w1", setup: invalid, w1Block: "retained reservation invalid; explicit recovery required"},
@@ -110,6 +109,8 @@ func TestDuplicateWakeAuthorizationIsolation(t *testing.T) {
 		"uncertain": {preset: func(tick *rollTick, w1, _ *rollEntry) {
 			tick.uncertain[coverageKey(w1.coverage)] = true
 		}},
+		"identity ambiguous": {preset: func(_ *rollTick, w1, _ *rollEntry) { w1.identityAmbiguous = true }},
+		"stray reservation":  {preset: func(_ *rollTick, w1, _ *rollEntry) { w1.strayReservation = true }},
 		"unavailable": {preset: func(tick *rollTick, w1, _ *rollEntry) {
 			tick.unavailable = map[string]bool{"w1": true}
 		}},

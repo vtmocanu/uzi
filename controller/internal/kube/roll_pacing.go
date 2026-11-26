@@ -106,9 +106,10 @@ type rollEntry struct {
 	// duplicate branch, together with duplicateHeld.
 	independentBlock string
 	// duplicateHeld marks an entry whose pool was held with "duplicate canary
-	// reservations unresolved; explicit recovery required".
+	// reservations unresolved; explicit recovery required". Production does not read it:
+	// it records the hold for tests and diagnostics.
 	duplicateHeld bool
-	// duplicateWakeSettle marks the one waking current canary of such a held pool whose
+	// duplicateWakeSettle marks each waking current canary of such a held pool whose
 	// unadmitted wake may bind its op annotation and settle (wakeAnnotationPermitted, the
 	// pass-2 hibernateWake call) although e.blocked is set. It never authorizes a replica
 	// or template write: hibernateWake still requires wakeRollAdmitted for those.

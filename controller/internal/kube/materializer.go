@@ -811,7 +811,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				if ns, err := m.cfg.Placement(w); err == nil {
 					if spec, err := m.resolveWorker(w); err == nil {
 						waking := w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking
-						// duplicateWakeSettle lets only the wake's annotation-only settlement
+						// duplicateWakeSettle lets only the op binding and ready report
 						// through a duplicate-canary hold; reconcileDinD still needs no block.
 						if e.blocked == "" || (waking && e.duplicateWakeSettle) {
 							var err error

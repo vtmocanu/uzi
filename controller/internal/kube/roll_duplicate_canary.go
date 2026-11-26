@@ -197,10 +197,10 @@ func currentSurvivor(t *rollTick, e *rollEntry) bool {
 	return !e.w.CustodyHeld && currentCanaryShape(t, e)
 }
 
-// duplicateWakeSettleCandidates sets duplicateWakeSettle on the one entry of a pool held
+// duplicateWakeSettleCandidates sets duplicateWakeSettle on each waking current canary of a pool held
 // for unresolved duplicate canaries (called with every entry's independentBlock already
-// recorded, before the hold text overwrites e.blocked) that is a waking current canary
-// with no other obstacle. The pool-wide terms refuse any in-flight mutation, any
+// recorded, before the hold text overwrites e.blocked) that has no other obstacle. Two
+// such canaries are both authorized: each binds only its own op and reports its own ready. The pool-wide terms refuse any in-flight mutation, any
 // unconfirmed sibling write and any uncertain coverage; the entry terms refuse every
 // other block, admitted or hibernation-lane state, and a rendered generation the
 // Deployment does not carry (rollSnapshot refreshes the hash and op but not e.o.Generation).

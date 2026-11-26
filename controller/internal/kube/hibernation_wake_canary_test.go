@@ -590,11 +590,10 @@ func TestWakeAnnotationPermittedGuards(t *testing.T) {
 			e.blocked, e.duplicateWakeSettle = "held", true
 			tick.migrationFences[migrationLane(e.coverage)] = true
 		},
-		"blocked without settle": func(e *rollEntry, _ *rollTick) { e.blocked = "held" },
-		"hibernation":            func(e *rollEntry, _ *rollTick) { e.hibernation = true },
-		"blocked":                func(e *rollEntry, _ *rollTick) { e.blocked = "held" },
-		"snapshotIncomplete":     func(e *rollEntry, _ *rollTick) { e.snapshotIncomplete = true },
-		"historyRetireUnknown":   func(e *rollEntry, _ *rollTick) { e.historyRetireUnknown = true },
+		"hibernation":          func(e *rollEntry, _ *rollTick) { e.hibernation = true },
+		"blocked":              func(e *rollEntry, _ *rollTick) { e.blocked = "held" },
+		"snapshotIncomplete":   func(e *rollEntry, _ *rollTick) { e.snapshotIncomplete = true },
+		"historyRetireUnknown": func(e *rollEntry, _ *rollTick) { e.historyRetireUnknown = true },
 		"uncertain": func(e *rollEntry, tick *rollTick) {
 			tick.uncertain[coverageKey(e.coverage)] = true
 		},

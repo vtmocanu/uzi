@@ -314,7 +314,9 @@ func mirrorSibling(t *testing.T, wc *wakeCanary) {
 	})
 }
 
-// (f) A sibling's mirror cleanup that fails leaves the sibling unconfirmed: w1 stays unwritten.
+// (f) A sibling's mirror cleanup that fails leaves w2 blocked "unconfirmed" and, in the same
+// tick, marks the pool mutated; the pool-wide terms together refuse w1's settlement. The
+// Isolation test is what isolates each term.
 func TestDuplicateCanaryWakeFailedSiblingMirrorCleanup(t *testing.T) {
 	wc := newDupWake(t, nil)
 	mirrorSibling(t, wc)
@@ -406,4 +408,37 @@ func TestDuplicateCanaryWakeBoundReadyReportsWithRefreshedRV(t *testing.T) {
 	}
 	wc.requireReservations(t, res, "ready")
 	wc.requireDupReasons(t, "ready")
+}
+
+// Two waking current canaries in one duplicate-held pool are both authorized: each binds
+// only its own op, neither reservation changes, and the pool keeps the duplicate reason.
+func TestDuplicateCanaryTwoWakingCurrentCanariesEachBindOwnOp(t *testing.T) {
+	wc := newWakeCanary(t, nil)
+	mk := wc.marker(t, "w2")
+	mk.Canary = true
+	raw, err := json.Marshal(mk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	one := int32(1)
+	wc.edit(t, "w2", func(d *appsv1.Deployment) {
+		d.Annotations[annotationRoll] = string(raw)
+		d.Annotations[annotationHibernationOp] = wakeCanaryOldOp
+		d.Spec.Replicas = &one
+	})
+	wc.at("w2").Hibernation = &protocol.Hibernation{State: protocol.HibernationWaking, OpID: wakeCanaryOp}
+	before := map[string]*appsv1.Deployment{"w1": wc.dep(t, "w1").DeepCopy(), "w2": wc.dep(t, "w2").DeepCopy()}
+	res := wc.dupReservations(t)
+
+	wc.c.ClearActions()
+	wc.mustTick(t)
+	for _, id := range []string{"w1", "w2"} {
+		wc.requirePatchCount(t, id, 1)
+		requireOnlyOpBinding(t, wc.allPatches(t, id)[0], string(before[id].UID), before[id].ResourceVersion)
+		if got := wc.dep(t, id).Annotations[annotationHibernationOp]; got != wakeCanaryOp {
+			t.Fatalf("%s op annotation = %q", id, got)
+		}
+	}
+	wc.requireReservations(t, res, "tick 1")
+	wc.requireDupReasons(t, "tick 1")
 }
