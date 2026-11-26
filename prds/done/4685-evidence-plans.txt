@@ -1,7 +1,8 @@
 Reliability plan evidence for PRD #4685 (prds/done/4685-scoped-outcomes-reliability-api.md, section 8).
 Extracted verbatim from the run's plan-evidence harness output (api/internal/store/analytics_evidence_livedb_test.go,
 build tag analyticsevidence). Seed: 120,000 runs, 846,668 run_usage rows, 1,250 repos, 200 users; PostgreSQL 17; jit off;
-warm cache; single client. Each block is the harness's text plan summary for one workload in custom and generic plan mode.
+warm cache; single client. Each block is the harness's text plan summary for one workload in custom and generic plan mode,
+except the last (candidate index), which has the generic plan only with both timing lines.
 Source line ranges refer to the harness log (not committed).
 
 ##### 1. owner 30d, breakdown=primary_model, custom + generic (baseline, no candidate index); harness log lines 3087-3255
