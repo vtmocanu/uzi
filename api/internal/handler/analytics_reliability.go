@@ -46,6 +46,20 @@ func reliabilityKinds(kinds []string) []string {
 	return out
 }
 
+// analyticsFilterArgs converts the request's repo and harness cohort filters to statement
+// arguments; a NULL argument means the filter is off.
+func analyticsFilterArgs(req analyticsRequest) (pgtype.UUID, pgtype.Text) {
+	var repo pgtype.UUID
+	if req.repo != uuid.Nil {
+		repo = pgtype.UUID{Bytes: req.repo, Valid: true}
+	}
+	var harness pgtype.Text
+	if req.harness != "" {
+		harness = pgtype.Text{String: req.harness, Valid: true}
+	}
+	return repo, harness
+}
+
 func (d *analyticsDeps) reliability(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest, now time.Time) (apitypes.AnalyticsReliabilityDTO, error) {
 	loc, err := d.authorize(ctx, s, req)
 	if err != nil {
@@ -63,14 +77,7 @@ func (d *analyticsDeps) reliability(ctx context.Context, s *store.AnalyticsSnaps
 		return mapAnalyticsReliabilityInapplicable(req, bounds), nil
 	}
 
-	var repo pgtype.UUID
-	if req.repo != uuid.Nil {
-		repo = pgtype.UUID{Bytes: req.repo, Valid: true}
-	}
-	var harness pgtype.Text
-	if req.harness != "" {
-		harness = pgtype.Text{String: req.harness, Valid: true}
-	}
+	repo, harness := analyticsFilterArgs(req)
 	var hist pgtype.Timestamptz
 	if req.allUsers {
 		hist, err = s.Q.AnalyticsAllHistoryStart(ctx, store.AnalyticsAllHistoryStartParams{RepoID: repo, Harness: harness, Kinds: kinds})
@@ -108,11 +115,12 @@ func (d *analyticsDeps) reliability(ctx context.Context, s *store.AnalyticsSnaps
 
 	var latest store.AnalyticsOwnerLatestFailureRow
 	if req.allUsers {
+		// The all-scope row type has the owner row's fields, so it converts directly.
 		var row store.AnalyticsAllLatestFailureRow
-		row, err = s.Q.AnalyticsAllLatestFailure(ctx, store.AnalyticsAllLatestFailureParams{RepoID: repo, Harness: harness, Kinds: kinds})
+		row, err = s.Q.AnalyticsAllLatestFailure(ctx, allLatestFailureParams(req, kinds))
 		latest = store.AnalyticsOwnerLatestFailureRow(row)
 	} else {
-		latest, err = s.Q.AnalyticsOwnerLatestFailure(ctx, store.AnalyticsOwnerLatestFailureParams{UserID: req.scopeUser, RepoID: repo, Harness: harness, Kinds: kinds})
+		latest, err = s.Q.AnalyticsOwnerLatestFailure(ctx, ownerLatestFailureParams(req, kinds))
 	}
 	if err != nil {
 		return apitypes.AnalyticsReliabilityDTO{}, err
@@ -125,18 +133,21 @@ func (d *analyticsDeps) reliability(ctx context.Context, s *store.AnalyticsSnaps
 	return mapAnalyticsReliability(req, bounds, doc, latest)
 }
 
+func ownerLatestFailureParams(req analyticsRequest, kinds []string) store.AnalyticsOwnerLatestFailureParams {
+	repo, harness := analyticsFilterArgs(req)
+	return store.AnalyticsOwnerLatestFailureParams{UserID: req.scopeUser, RepoID: repo, Harness: harness, Kinds: kinds}
+}
+
+func allLatestFailureParams(req analyticsRequest, kinds []string) store.AnalyticsAllLatestFailureParams {
+	repo, harness := analyticsFilterArgs(req)
+	return store.AnalyticsAllLatestFailureParams{RepoID: repo, Harness: harness, Kinds: kinds}
+}
+
 // buildOwnerReliabilityParams fills the owner-shaped cohort statement. RevealRepos comes only
 // from which route was mounted (req.admin), never from the query: the owner route always masks
 // repos the caller has no connection to.
 func buildOwnerReliabilityParams(req analyticsRequest, b analytics.Bounds, kinds []string) store.AnalyticsOwnerReliabilityParams {
-	var repo pgtype.UUID
-	if req.repo != uuid.Nil {
-		repo = pgtype.UUID{Bytes: req.repo, Valid: true}
-	}
-	var harness pgtype.Text
-	if req.harness != "" {
-		harness = pgtype.Text{String: req.harness, Valid: true}
-	}
+	repo, harness := analyticsFilterArgs(req)
 	var prev pgtype.Timestamptz
 	if b.PreviousFrom != nil {
 		prev = analyticsTS(*b.PreviousFrom)
@@ -154,14 +165,7 @@ func buildOwnerReliabilityParams(req analyticsRequest, b analytics.Bounds, kinds
 
 // buildAllReliabilityParams fills the all-scope cohort statement (admin, every user).
 func buildAllReliabilityParams(req analyticsRequest, b analytics.Bounds, kinds []string) store.AnalyticsAllReliabilityParams {
-	var repo pgtype.UUID
-	if req.repo != uuid.Nil {
-		repo = pgtype.UUID{Bytes: req.repo, Valid: true}
-	}
-	var harness pgtype.Text
-	if req.harness != "" {
-		harness = pgtype.Text{String: req.harness, Valid: true}
-	}
+	repo, harness := analyticsFilterArgs(req)
 	var prev pgtype.Timestamptz
 	if b.PreviousFrom != nil {
 		prev = analyticsTS(*b.PreviousFrom)
@@ -205,6 +209,15 @@ func mapAnalyticsReliability(req analyticsRequest, b analytics.Bounds, doc store
 	if len(doc.Buckets) != len(b.Buckets) || len(doc.Rolling.Overall) != len(b.Rolling) {
 		return apitypes.AnalyticsReliabilityDTO{}, fmt.Errorf("analytics: reliability document has %d buckets and %d rolling points for a calendar of %d and %d",
 			len(doc.Buckets), len(doc.Rolling.Overall), len(b.Buckets), len(b.Rolling))
+	}
+	if len(doc.Rolling.Harnesses) != len(analyticsHarnesses) {
+		return apitypes.AnalyticsReliabilityDTO{}, fmt.Errorf("analytics: reliability document has %d harness series, want %d", len(doc.Rolling.Harnesses), len(analyticsHarnesses))
+	}
+	for i, h := range doc.Rolling.Harnesses {
+		if h.Harness != analyticsHarnesses[i] || len(h.Points) != len(b.Rolling) {
+			return apitypes.AnalyticsReliabilityDTO{}, fmt.Errorf("analytics: reliability harness series %d is %q with %d points, want %q with %d",
+				i, h.Harness, len(h.Points), analyticsHarnesses[i], len(b.Rolling))
+		}
 	}
 	out := apitypes.AnalyticsReliabilityDTO{
 		AnalyticsEnvelopeDTO: analyticsEnvelope(req, b),

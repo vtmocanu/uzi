@@ -432,6 +432,63 @@ func TestAnalyticsReliabilityAdminAllUsersLiveDB(t *testing.T) {
 	}
 }
 
+// The repo and harness cohort filters reach both the cohort statement and the latest-failure
+// statement: each filtered request has totals that differ from the unfiltered ones and equal
+// counts worked out by hand from the seeds below, and its latest failure is the older matching
+// failure, not the newest failure of the run set.
+func TestAnalyticsReliabilityRepoAndHarnessFiltersLiveDB(t *testing.T) {
+	f := newAnFixture(t, 2040)
+	admin, u := f.user(true), f.user(false)
+	r1, _ := f.repoOwnedBy(u, "flt1")
+	var conn uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `SELECT connection_id FROM repos WHERE id = $1`, r1).Scan(&conn); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := f.repoOn(conn, "flt2")
+	seed := func(repo uuid.UUID, harness, status, origin string, hoursAgo int) uuid.UUID {
+		return f.relRun(relSeed{user: u, repo: repo, harness: harness, status: status, origin: origin, created: f.now.Add(-time.Duration(hoursAgo) * time.Hour)})
+	}
+	seed(r1, "claude", "completed", "", 100)
+	seed(r1, "claude", "completed", "", 90)
+	seed(r1, "claude", "failed", "agent_failure", 80)
+	seed(r2, "codex", "completed", "", 70)
+	seed(r2, "codex", "failed", "run_timeout", 60)
+	f50 := seed(r1, "codex", "failed", "agent_failure", 50) // newest failure on codex and in r1
+	seed(r1, "claude", "completed", "", 40)                 // completed after f50, in r1 on claude
+	g20 := seed(r2, "claude", "failed", "worker_lost", 20)  // newest failure overall, in r2 on claude
+
+	type want struct {
+		finished, completed, failed int64
+		latest                      uuid.UUID
+		since                       int64
+	}
+	check := func(label string, user uuid.UUID, path string, w want) {
+		t.Helper()
+		dto, _ := f.rel(user, path)
+		c := dto.Totals.Current
+		if c.Finished != w.finished || c.Outcomes.Completed != w.completed || c.Outcomes.Failed != w.failed {
+			t.Errorf("%s: totals = %d finished %d completed %d failed, want %d %d %d", label, c.Finished, c.Outcomes.Completed, c.Outcomes.Failed, w.finished, w.completed, w.failed)
+		}
+		lf := dto.LatestFailure
+		if lf == nil || lf.RunID != w.latest.String() || lf.CompletedSinceLastFailure != w.since {
+			t.Errorf("%s: latest_failure = %+v, want run %s with %d completed since", label, lf, w.latest, w.since)
+		}
+	}
+	for _, rt := range []struct {
+		name, base string
+		user       uuid.UUID
+		sep        string
+	}{
+		{"owner", "/api/analytics/reliability", u, "?"},
+		{"admin all", "/api/admin/analytics/reliability?user=all", admin, "&"},
+	} {
+		check(rt.name+" unfiltered", rt.user, rt.base, want{8, 4, 4, g20, 0})
+		check(rt.name+" harness=codex", rt.user, rt.base+rt.sep+"harness=codex", want{3, 1, 2, f50, 0})
+		check(rt.name+" repo=r1", rt.user, rt.base+rt.sep+"repo="+r1.String(), want{5, 3, 2, f50, 1})
+		check(rt.name+" repo=r1 harness=codex", rt.user, rt.base+rt.sep+"repo="+r1.String()+"&harness=codex", want{1, 0, 1, f50, 0})
+	}
+}
+
 func mapsKeys[V any](m map[string][]V) func(func(string) bool) {
 	return func(yield func(string) bool) {
 		for k := range m {

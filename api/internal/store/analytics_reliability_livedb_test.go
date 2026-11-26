@@ -769,6 +769,9 @@ func TestAnalyticsLatestFailureUnwindowedAndFilteredLiveDB(t *testing.T) {
 	f.run(spendRun{Owner: o.User, Repo: r1, Status: "completed", At: utcAt(2024, 2, 1, 9, 0, 0), Finished: utcAt(2024, 2, 1, 10, 0, 0)})
 	f.run(spendRun{Owner: o.User, Repo: r1, Status: "completed", At: utcAt(2024, 6, 1, 9, 0, 0), Finished: utcAt(2024, 6, 1, 10, 0, 0)})
 	f.run(spendRun{Owner: o.User, Repo: r2, Status: "completed", Harness: "codex", At: utcAt(2024, 7, 1, 9, 0, 0), Finished: utcAt(2024, 7, 1, 10, 0, 0)})
+	// Another owner's completions after the failure never count toward this owner's total.
+	f.run(spendRun{Owner: other.User, Repo: or, Status: "completed", At: utcAt(2024, 8, 1, 9, 0, 0), Finished: utcAt(2024, 8, 1, 10, 0, 0)})
+	f.run(spendRun{Owner: other.User, Repo: or, Status: "completed", At: utcAt(2024, 9, 1, 9, 0, 0), Finished: utcAt(2024, 9, 1, 10, 0, 0)})
 	// The cohort at spendNow does not contain the run, the latest failure still does.
 	if d := f.rel(relCall{Owner: o.User, Now: spendNow}).Doc; d.Totals.Current.Finished != 0 {
 		t.Errorf("window cohort finished = %d, want 0", d.Totals.Current.Finished)

@@ -266,7 +266,24 @@ func TestAnalyticsReliabilityStatementScopeAndReveal(t *testing.T) {
 	if owner.Breakdown != "primary_model" || !owner.FoldFrom.Valid || !owner.PreviousFrom.Valid {
 		t.Fatalf("owner params = breakdown %q fold %v previous %v", owner.Breakdown, owner.FoldFrom, owner.PreviousFrom)
 	}
+	// The repo and harness cohort filters reach the statement arguments; absent filters stay NULL.
+	repoID := uuid.New()
+	filtered := "repo=" + repoID.String() + "&harness=codex"
+	fo := buildOwnerReliabilityParams(mustParseAnalytics(t, filtered, false, analytics.SectionReliability, caller), bounds, kinds)
+	if fo.RepoID != (pgtype.UUID{Bytes: repoID, Valid: true}) || fo.Harness != (pgtype.Text{String: "codex", Valid: true}) {
+		t.Fatalf("owner params repo %v harness %v, want %s and codex", fo.RepoID, fo.Harness, repoID)
+	}
+	if owner.RepoID.Valid || owner.Harness.Valid {
+		t.Fatalf("unfiltered owner params repo %v harness %v, want NULL", owner.RepoID, owner.Harness)
+	}
+	fa := buildAllReliabilityParams(mustParseAnalytics(t, filtered, true, analytics.SectionReliability, caller), bounds, kinds)
+	if fa.RepoID != fo.RepoID || fa.Harness != fo.Harness {
+		t.Fatalf("all-scope params repo %v harness %v, want %v and %v", fa.RepoID, fa.Harness, fo.RepoID, fo.Harness)
+	}
 	all := buildAllReliabilityParams(mustParseAnalytics(t, "breakdown=user", true, analytics.SectionReliability, caller), bounds, kinds)
+	if all.RepoID.Valid || all.Harness.Valid {
+		t.Fatalf("unfiltered all-scope params repo %v harness %v, want NULL", all.RepoID, all.Harness)
+	}
 	if all.Breakdown != "user" || !slices.Equal(all.Kinds, kinds) {
 		t.Fatalf("all-scope params = %+v", all)
 	}
@@ -282,6 +299,9 @@ func TestAnalyticsReliabilityStatementScopeAndReveal(t *testing.T) {
 func relDocFor(b analytics.Bounds) store.AnalyticsReliabilityDoc {
 	doc := store.AnalyticsReliabilityDoc{Buckets: make([]store.AnalyticsReliabilityBucket, len(b.Buckets))}
 	doc.Rolling.Overall = make([]store.AnalyticsReliabilityPoint, len(b.Rolling))
+	for _, h := range []string{"claude", "codex"} {
+		doc.Rolling.Harnesses = append(doc.Rolling.Harnesses, store.AnalyticsReliabilityHarnessSeries{Harness: h, Points: make([]store.AnalyticsReliabilityPoint, len(b.Rolling))})
+	}
 	for i := range doc.Buckets {
 		doc.Buckets[i].Index = i
 	}
@@ -342,8 +362,46 @@ func TestMapAnalyticsReliabilityShape(t *testing.T) {
 	if _, err := mapAnalyticsReliability(req, bounds, short, store.AnalyticsOwnerLatestFailureRow{}); err == nil {
 		t.Fatal("a document with a missing bucket must fail the mapping")
 	}
+	// A harness series that is short, misnamed or out of order is an error too.
+	for name, mutate := range map[string]func(*store.AnalyticsReliabilityDoc){
+		"short points": func(d *store.AnalyticsReliabilityDoc) {
+			d.Rolling.Harnesses[1].Points = d.Rolling.Harnesses[1].Points[1:]
+		},
+		"missing series": func(d *store.AnalyticsReliabilityDoc) { d.Rolling.Harnesses = d.Rolling.Harnesses[:1] },
+		"swapped order": func(d *store.AnalyticsReliabilityDoc) {
+			d.Rolling.Harnesses[0], d.Rolling.Harnesses[1] = d.Rolling.Harnesses[1], d.Rolling.Harnesses[0]
+		},
+		"unknown harness": func(d *store.AnalyticsReliabilityDoc) { d.Rolling.Harnesses[1].Harness = "gemini" },
+	} {
+		bad := relDocFor(bounds)
+		mutate(&bad)
+		if _, err := mapAnalyticsReliability(req, bounds, bad, store.AnalyticsOwnerLatestFailureRow{}); err == nil {
+			t.Fatalf("%s: a misaligned harness series must fail the mapping", name)
+		}
+	}
 	// found without a timestamp is malformed.
 	if _, err := mapAnalyticsReliability(req, bounds, doc, store.AnalyticsOwnerLatestFailureRow{Found: true}); err == nil {
 		t.Fatal("found=true without failed_at must fail the mapping")
+	}
+}
+
+// The latest-failure statements receive the same repo, harness and kinds filters as the cohort,
+// and the owner statement the selected user.
+func TestAnalyticsReliabilityLatestFailureParamsCarryFilters(t *testing.T) {
+	caller, repoID := uuid.New(), uuid.New()
+	kinds := runkind.Delivery()
+	wantRepo, wantHarness := pgtype.UUID{Bytes: repoID, Valid: true}, pgtype.Text{String: "codex", Valid: true}
+	q := "repo=" + repoID.String() + "&harness=codex"
+
+	o := ownerLatestFailureParams(mustParseAnalytics(t, q, false, analytics.SectionReliability, caller), kinds)
+	if o.UserID != caller || o.RepoID != wantRepo || o.Harness != wantHarness || !slices.Equal(o.Kinds, kinds) {
+		t.Fatalf("owner latest params = %+v", o)
+	}
+	a := allLatestFailureParams(mustParseAnalytics(t, q, true, analytics.SectionReliability, caller), kinds)
+	if a.RepoID != wantRepo || a.Harness != wantHarness || !slices.Equal(a.Kinds, kinds) {
+		t.Fatalf("all latest params = %+v", a)
+	}
+	if u := ownerLatestFailureParams(mustParseAnalytics(t, "", false, analytics.SectionReliability, caller), kinds); u.RepoID.Valid || u.Harness.Valid {
+		t.Fatalf("unfiltered owner latest params = %+v, want NULL filters", u)
 	}
 }

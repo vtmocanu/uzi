@@ -412,7 +412,7 @@ func analyticsFail(w http.ResponseWriter, r *http.Request, err error) {
 	httpx.Error(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorize runs the in-snapshot checks shared by Options and Spend: the timezone, the selected
+// authorize runs the in-snapshot checks shared by Options, Spend and Reliability: the timezone, the selected
 // user's existence and the repo filter's authority. A repo that does not exist and one the scope
 // cannot see produce the identical 400.
 func (d *analyticsDeps) authorize(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest) (*time.Location, error) {
@@ -730,7 +730,7 @@ func (m *spendMapper) createdAt(s string) time.Time {
 	return t.UTC()
 }
 
-// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all spend request.
+// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all Spend or Reliability request.
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
 // analyticsEnvelope builds the calendar envelope every analytics response is indexed against.
