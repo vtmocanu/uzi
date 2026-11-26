@@ -58,7 +58,7 @@ function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
     firstTagged: undefined as LaunchRoundTag | undefined, gated: undefined as LaunchRoundTag | undefined,
     readReturned: false, releasedBy: undefined as "abort" | "cap" | undefined,
     liveAtRelease: undefined as boolean | undefined, remainingMs: undefined as number | undefined,
-    abortReason: "none", entered: false,
+    abortReason: "none", entered: false, frameMissing: false, heldMs: undefined as number | undefined,
     warnings: [] as { message: string; class: unknown; tag: LaunchRoundTag | undefined }[],
   };
   const logger = nullLogger();
@@ -69,7 +69,7 @@ function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
   };
   const facts = () => " [launch control facts: " + JSON.stringify({
     target, firstRound: s.firstTagged, gated: s.gated, readReturned: s.readReturned, releasedBy: s.releasedBy,
-    signalLiveAtRelease: s.liveAtRelease, remainingMs: s.remainingMs, abortReason: s.abortReason,
+    signalLiveAtRelease: s.liveAtRelease, frameMissing: s.frameMissing, heldMs: s.heldMs, remainingMs: s.remainingMs, abortReason: s.abortReason,
     warnings: s.warnings, executorEntered: s.entered }) + "]";
   const attach = (runner: RunRunner) => {
     let seq = 0;
@@ -94,13 +94,16 @@ function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
       s.gated = tag;
       s.readReturned = true;
       const frame = target$.recoveryOperations.getStore();
-      assert.ok(frame, "the gate runs inside the bootstrap recovery operation" + facts());
+      // Recorded, not asserted here: the runner's bootstrap catch would swallow an assertion thrown in this wrapper.
+      if (!frame) { s.frameMissing = true; return result; }
+      const heldFrom = performance.now();
       await new Promise<void>(resolve => {
         const done = (by: "abort" | "cap") => { clearTimeout(timer); s.releasedBy ??= by; resolve(); };
         const timer = setTimeout(() => done("cap"), LAUNCH_GATE_CAP_MS);
         if (frame.signal.aborted) done("abort");
         else frame.signal.addEventListener("abort", () => done("abort"), { once: true });
       });
+      s.heldMs = performance.now() - heldFrom;
       s.liveAtRelease = !frame.signal.aborted;
       s.remainingMs = frame.deadline - Date.now();
       const reason: unknown = frame.signal.reason;
@@ -113,12 +116,16 @@ function launchControl(claim: ClaimResponse, target: LaunchRoundTag["round"]) {
   return {
     logger, attach, facts, markEntered: () => { s.entered = true; },
     assertControl: () => {
+      assert.ok(LAUNCH_GATE_CAP_MS > 200, "the hold cap exceeds the 200 ms base launch budget" + facts());
       assert.equal(s.firstTagged?.round, target, "the declared target is the first remediation round" + facts());
       assert.ok(s.gated, "the target round was gated" + facts());
+      assert.ok(!s.frameMissing, "the gate runs inside the bootstrap recovery operation" + facts());
+      assert.equal(s.releasedBy, "cap", "the gate released by cap, not by abort" + facts());
+      // 1 ms of slack: the timer clock is millisecond-rounded, so a timer can read ~0.3 ms short on performance.now().
+      assert.ok(s.heldMs! >= LAUNCH_GATE_CAP_MS - 1, "the hold lasted at least the cap" + facts());
       assert.equal(s.liveAtRelease, true, "the launch signal was live at release" + facts());
       assert.ok(s.remainingMs! > 0, "the launch allowance remained at release" + facts());
-      assert.equal(s.warnings.filter(w => w.tag?.seq === s.gated!.seq).length, 0,
-        "no expiry warning for the gated round" + facts());
+      assert.equal(s.warnings.length, 0, "no remediation-unavailable warning at all" + facts());
       assert.equal(s.entered, true, "the executor was entered" + facts());
     },
   };
@@ -1531,7 +1538,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   const work = obs.invoke("original", () => runner.execute(f.claim));
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await until(() => nativeAck !== undefined, 3000, launch?.facts);
+    await until(() => nativeAck !== undefined, 3000 + (launch ? LAUNCH_GATE_CAP_MS : 0), launch?.facts);
     assert.equal(liveAtSend, true, "original park send starts before its owner deadline");
     if (hold) assert.equal(hold.held(), 1, "control: first park POST response was held");
     assert.ok(nativeAck!.memoryParkAccepted, "receipt derives from the native public memory-hold DTO");
@@ -1774,7 +1781,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
   obs.startClock();
   const work = obs.invoke("original", () => runner.execute(f.claim));
   try {
-    await until(() => sending, 3000, launch?.facts);
+    await until(() => sending, 3000 + (launch ? LAUNCH_GATE_CAP_MS : 0), launch?.facts);
     assert.equal(liveAtSend, true, "original feedback send starts before its owner deadline");
     const receipt = f.memory.sinkReceipts.find(r => r.kind === "feedback" && r.context.flight === original);
     assert.ok(receipt, "original feedback sink owns its completion receipt");
@@ -2452,7 +2459,7 @@ for (const { scenario, control } of handoffCases) {
       obs?.startClock();
       await (obs ? obs.invoke("original", () => runner.execute(f.claim)) : runner.execute(f.claim));
       // execute() can return while the executor is still joining a long capture; wait for its assertions to finish.
-      await withTimeout(executorDone.promise, 7000, "executor assertions", launch?.facts);
+      await withTimeout(executorDone.promise, 7000 + (launch ? LAUNCH_GATE_CAP_MS : 0), "executor assertions", launch?.facts);
       if (executorError) throw executorError;
       if (scenario === "already-parked") assert.equal(parkAssertionsRan, true, "already-parked park assertions ran");
       if (control === "slow transport control") assert.equal(api.delayedMessages, 0, "the in-process transport never rides the delayed HTTP route");
