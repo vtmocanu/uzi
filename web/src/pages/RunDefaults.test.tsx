@@ -1640,6 +1640,11 @@ describe("Run defaults — weekly limit warning margin (PRD #4123)", () => {
     const input = (await screen.findByLabelText("Warn this many points before the limit")) as HTMLInputElement;
     expect(input.value).toBe("15");
     expect(screen.getByText("Warnings start at 85% weekly usage, 15 points before the limit.")).toBeTruthy();
+    // Edit the way a user does: focus first. The setting mounts once the settings read
+    // resolves outside act, so its [saved] effect can still be pending here. Without focus
+    // (#4717), the change flushes that effect, which re-adopts 15 because nothing marks the
+    // field as being edited, and blur then sees no change to save.
+    fireEvent.focus(input);
     fireEvent.change(input, { target: { value: "0" } });
     fireEvent.blur(input);
     await waitFor(() => expect(mockApi.setWeeklyWarningMargin).toHaveBeenCalledWith(0));
