@@ -669,6 +669,32 @@ describe("Providers — admin-shared definitions (PRD #4324)", () => {
     expect(row.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
+  // Issue #4633: a shared Codex definition sits in the Codex picker with Codex redirect wording.
+  it("discloses Codex redirect behaviour for a shared Codex definition, then selects it as the Codex source", async () => {
+    const codex = shared({ engine: "codex", protocol: "openai_responses", auth_style: "bearer", model_map: { default: { model: "gw-code" } } });
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: null, codex_provider_id: null } } as never);
+    mockApi.setCodexProviderSource.mockResolvedValue({ codex_provider_id: "s1" });
+    await renderCard(list({ providers: [codex] }));
+    const row = within(await screen.findByTestId("provider-s1"));
+    expect(row.queryByRole("button", { name: "Use as Claude source" })).toBeNull();
+    fireEvent.click(row.getByRole("button", { name: "Use as Codex source" }));
+    expect(mockApi.setCodexProviderSource).not.toHaveBeenCalled();
+    const box = row.getByRole("region", { name: "Before you use this provider" });
+    const redirect = row.getByTestId("shared-disclosure-redirect-s1").textContent ?? "";
+    expect(redirect).toMatch(/Codex runtime redirects may forward request bodies and\s+authentication headers/);
+    expect(redirect).not.toMatch(/another path on the same host/);
+    expect(row.queryByTestId("shared-disclosure-xapikey-s1")).toBeNull();
+    expect(box.textContent).toContain("your key is sent as Authorization: Bearer");
+    expect(document.activeElement).toBe(box);
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: null, codex_provider_id: "s1" } } as never);
+    fireEvent.click(row.getByRole("button", { name: "Confirm and use as Codex source" }));
+    await waitFor(() => expect(mockApi.setCodexProviderSource).toHaveBeenCalledWith("s1"));
+    expect(mockApi.setClaudeProviderSource).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-source").textContent).toMatch(/Current Codex source: platform-gateway \(managed by your admin\)/),
+    );
+  });
+
   it("cancelling the select disclosure selects nothing", async () => {
     await renderCard(list({ providers: [shared()] }));
     const row = within(await screen.findByTestId("provider-s1"));

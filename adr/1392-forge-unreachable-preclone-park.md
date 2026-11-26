@@ -1,7 +1,7 @@
 # ADR-1392: pre-clone forge-unreachable park (reuse `recovery_wait`, add a cause)
 
 **Status**: Accepted; amended 2026-10-29 for #3585 M1-M4 behavior and M5
-documentation, and 2026-11-01 for the #1324 publication phase. The #3585
+documentation, 2026-11-01 for the #1324 publication phase, and 2026-11-25 for the #4689 claim-time guard refusal. The #3585
 delivery was partial and non-closing; no hosted acceptance is claimed.
 **Date**: 2026-09-16
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
@@ -270,6 +270,47 @@ and the #3585 legacy extra-attempt residual above (an older API's
 E2E phase 73 gains cases D and E for the publication park and owner hold
 (`e2e/phases/73-forge-unreachable-park.sh`). They are written but were not run
 in the delivery that added them; no hosted acceptance is claimed.
+
+## Amendment — 2026-11-25: claim-time guardrail refusal parks a started run (#4689)
+
+(AI-synced 2026-11-25)
+
+The claim backstop of [PRD #66](../prds/done/66-guardrail-enforcement.md) layer 3
+still refuses fail-closed and delivers no payload or credential. A new case parks
+the run instead of failing it, when all of these hold: the api's own guard read of
+the forge (bot-token verification, or the default-branch protection read including
+a GitHub ruleset read) failed transiently (timeout, 5xx, rate limit, connection
+refused, reset or unreachable, or a temporary DNS failure); that unreadable
+protection is the only blocking finding; and the run has already started once
+(`first_started_at` set). The run goes `claimed` to `recovery_wait` with cause
+`forge_unreachable`. A Fresh-resume transfer refusal keeps precedence.
+
+- **Ordinary started continuations** count against `forge_park_count` /
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS` with the existing backoff; at the cap they hold
+  for owner Resume with a NULL retry time (`0` = unlimited).
+- **Publication-enrolled runs** keep phase `publication`, intent, custodian worker,
+  handoff and episode clock. They use `RUN_PROVIDER_PARK_MAX_DURATION` as their own
+  elapsed bound and hold for owner Resume with `publication_retry_exhausted` at it,
+  leaving `forge_park_count` unchanged. After Resume the next park starts a new
+  episode clock.
+- **Not recorded:** no worker-origin cooldown and no worker health evidence, because
+  the read happened on the api, not the worker. The claim's own half-open
+  reservations are released by the existing lifecycle cleanup.
+- **Late reports:** the payload was never delivered, so no flight holds the parked
+  generation. The park revokes the Codex claim capability (`codex_cap_hash` cleared,
+  epoch + 1). Like the worker-path park it keeps `claim_released_at` NULL, so a report
+  at an older generation is refused as a stale claim. A report at the parked generation,
+  or one with no generation from a worker without `credential_switch_v1` before
+  reconciliation, passes that fence exactly as for the worker-path park; the state's own
+  guard then decides (a `running` report matches nothing from `recovery_wait` or
+  `queued`, while a `failed` or cancel report can still end the run). This boundary is
+  accepted.
+- **Still terminal `guardrail_blocked`:** a never-started run; auth (401/403, a revoked
+  or expired token); a client-build failure; an unknown error class; NXDOMAIN,
+  certificate/TLS and address errors; a cancelled forge call (a cancelled claim request
+  writes nothing and leaves the run claimed for the sweeper); any mix with another
+  blocking finding; a stop or cancel requested during the claim; and the legacy
+  mr_rework and cross-check refusals.
 
 ## Consequences
 

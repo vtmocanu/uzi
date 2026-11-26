@@ -55,9 +55,9 @@ func TestCodexProviderSwitchRequestPreflightApplyNoWriteLiveDB(t *testing.T) {
 	sourceB := fx.provider
 	for _, source := range []uuid.UUID{sourceA, sourceB, uuid.Nil} {
 		if source == uuid.Nil {
-			fx.env.exec("UPDATE users SET codex_provider_id=NULL WHERE id=$1", fx.userID)
+			fx.env.exec("UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1", fx.userID)
 		} else {
-			fx.env.exec("UPDATE users SET codex_provider_id=$2 WHERE id=$1", fx.userID, source)
+			fx.env.exec("UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1 WHERE id=$1", fx.userID, source)
 		}
 		reads.reset()
 		f.noWrite(t, run.ID, func() {
@@ -147,9 +147,9 @@ func TestCodexNativeSwitchProviderTargetNoWriteLiveDB(t *testing.T) {
 		t.Fatal("usable native control not ready", pre, err)
 	}
 	// Select the usable Codex provider after native preflight has admitted the target.
-	f.env.exec("UPDATE users SET codex_provider_id=$2 WHERE id=$1", f.o.userID, p.ID)
+	f.env.exec("UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1 WHERE id=$1", f.o.userID, p.ID)
 	// Restore the owner setting before the fixture's cascading user cleanup.
-	defer f.env.exec("UPDATE users SET codex_provider_id=NULL WHERE id=$1", f.o.userID)
+	defer f.env.exec("UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id=$1", f.o.userID)
 	got := f.apply(t, run, req)
 	if got.Outcome != ApplyOutcomeApplied || got.Codex == nil || got.Codex.AccessToken != "apply-target-key" {
 		t.Fatal("source edit reclassified native run", got)

@@ -146,6 +146,12 @@ type BranchProtection struct {
 	// requirement recorded for PRD #66; adding the field changes no interface
 	// method, so it does not break the fakes.
 	ProtectionUnverified bool
+	// UnverifiedReadClass is the scrubbed class of the read error that made
+	// ProtectionUnverified true (GitHub's ruleset read). Empty when the protection
+	// was unverified for another reason (legacy protection with no readable
+	// ruleset) or is verified. It is advisory metadata for retry decisions and never
+	// changes the fail-closed meaning of ProtectionUnverified.
+	UnverifiedReadClass ErrorClass
 }
 
 // MR states as GitLab reports them on the single-MR GET. The MR-close watcher

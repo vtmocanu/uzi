@@ -111,3 +111,41 @@ it("lays out the shared-provider disclosure at 390px and 1100px, then attaches a
   await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toContain("platform-gateway (managed by your admin)"));
   expect(claude).toBe("s1");
 });
+
+// Issue #4633: a shared Codex definition in the Codex picker. Opening the select panel moves
+// focus onto the disclosure (Codex redirect wording, no x-api-key line); one Tab reaches
+// Confirm, and Enter selects it as the Codex source only.
+it("focuses the shared Codex disclosure and selects it as the Codex source on Confirm", async () => {
+  await page.viewport(390, 844);
+  const mock = vi.mocked(api);
+  const row: ProviderDTO = {
+    id: "sc", name: "shared-codex", engine: "codex", retired: false, current_revision: 1,
+    protocol: "openai_responses", base_url: "https://gateway.example.com/v1", auth_style: "bearer",
+    model_map: { default: { model: "gw-code" } },
+    credential_mode: "per_user_key", has_key: true, key_enabled: true, probe: null,
+  };
+  let codex: string | null = null;
+  mock.listProviders.mockImplementation(async () => ({ enabled: true, allowed_base_urls: [row.base_url], providers: [row] }));
+  mock.getMySettings.mockImplementation(async () => ({ settings: { claude_provider_id: null, codex_provider_id: codex } }) as never);
+  mock.setCodexProviderSource.mockImplementation(async id => { codex = id; return { codex_provider_id: id }; });
+  // Earlier cases in this file select sources too; count only this case's calls.
+  mock.setClaudeProviderSource.mockClear();
+  mock.setCodexProviderSource.mockClear();
+  render(<div className="px-4"><Providers /></div>);
+  const r = within(await screen.findByTestId("provider-sc"));
+  await userEvent.click(r.getByRole("button", { name: "Use as Codex source" }));
+  const box = await r.findByRole("region", { name: "Before you use this provider" });
+  expect(document.activeElement).toBe(box);
+  expect(r.getByTestId("shared-disclosure-redirect-sc").textContent).toMatch(/Codex runtime redirects may forward request bodies/);
+  expect(r.queryByTestId("shared-disclosure-xapikey-sc")).toBeNull();
+  expect(box.scrollWidth).toBeLessThanOrEqual(box.clientWidth + 1);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+  await userEvent.tab();
+  const confirm = r.getByRole("button", { name: "Confirm and use as Codex source" });
+  expect(document.activeElement).toBe(confirm);
+  expect(mock.setCodexProviderSource).not.toHaveBeenCalled();
+  await userEvent.keyboard("{Enter}");
+  await waitFor(() => expect(screen.getByTestId("codex-source").textContent).toContain("shared-codex (managed by your admin)"));
+  expect(codex).toBe("sc");
+  expect(mock.setClaudeProviderSource).not.toHaveBeenCalled();
+});

@@ -972,7 +972,7 @@ type RunDTO struct {
 	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
 	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
 	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
-	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// non-null values are "forge_unreachable" (the forge could not be reached: at clone or fetch, during publication, or, for a started run, by the api's guardrail read at claim, issue #4689),
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
@@ -1947,7 +1947,7 @@ type RunSummaryItemDTO struct {
 	// RecoveryWaitCause is the TYPED cause of a 'recovery_wait' park (PRD #1392 M1). Null is
 	// the LEGACY/untyped park — the empty-turn park writes NULL (D9), so a client must render
 	// null as the generic "waiting to retry" wording, NOT as any particular cause. Today the
-	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
+	// non-null values are "forge_unreachable" (the forge could not be reached: at clone or fetch, during publication, or, for a started run, by the api's guardrail read at claim, issue #4689),
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full

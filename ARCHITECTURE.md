@@ -587,13 +587,16 @@ model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);
 [ADR-4320, Codex engine](adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)
 records the claim ordering and recovery model.
 
-**Admin-shared definitions (PRD #4324).** An admin can publish a keyless Claude definition
-(`owner_user_id IS NULL`, `credential_mode = 'per_user_key'`) from Admin → Shared providers. Every
-user sees it next to their own providers, attaches their own sealed key and selects it as their
-Claude source; the admin never sees a key. Endpoint and auth style are fixed at creation (admin
-edits change only the name and model map), keys and selections are pinned to the definition's
-scope by composite foreign keys to `model_providers (scope_owner_id, id)`, Test results are kept
-per user, and delete is refused while anyone has it selected. Codex shared definitions are #4633.
+**Admin-shared definitions (PRD #4324).** An admin can publish a keyless Claude or Codex definition
+(`owner_user_id IS NULL`, `credential_mode = 'per_user_key'`) from Admin → Shared providers; the
+engine is chosen at creation and never changes. Every user sees it next to their own providers,
+attaches their own sealed key and selects it as their Claude or Codex source; uzi's admin UI and API never show
+a key (whoever operates the gateway receives it), and a Codex definition's admin-chosen URL receives every recipient's key (the accepted
+redirect risk). Endpoint and auth style are fixed at creation (admin
+edits change only the name and model map), keys and selections (Claude and, since #4633, Codex)
+are pinned to the definition's scope by composite foreign keys to `model_providers (scope_owner_id, id)`,
+Test results are kept per user, and delete is refused while anyone has it selected. With no usable
+key a run is refused, never sent on the vendor credential.
 Design record, lock orders and migration failure model:
 [adr/4324-admin-shared-providers.md](adr/4324-admin-shared-providers.md).
 

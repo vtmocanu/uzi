@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PRD #4324 M1 against real Postgres: the ownership/reference migrations 00524-00531, the shared
@@ -81,7 +82,7 @@ func wantViolation(t *testing.T, what string, err error, code string, names ...s
 
 func newSharedProvider(ctx context.Context, t *testing.T, q *store.Queries, name string) store.ModelProvider {
 	t.Helper()
-	p, err := q.InsertSharedModelProvider(ctx, name)
+	p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
 	if err != nil {
 		t.Fatalf("insert shared provider %q: %v", name, err)
 	}
@@ -201,6 +202,29 @@ func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT codex_provider_id FROM users WHERE id = $1`, s.userB).Scan(&codexSel); err != nil || uuid.UUID(codexSel.Bytes) != s.codexP {
 		t.Errorf("user B codex source = %v (%v), want %s", codexSel, err, s.codexP)
 	}
+	// The personal Codex selection is backfilled with the owner's scope and still resolves.
+	if got := scalar[uuid.UUID](ctx, t, pool, `SELECT codex_provider_scope_id FROM users WHERE id = $1`, s.userB); got != s.userB {
+		t.Errorf("user B codex_provider_scope_id = %s, want %s", got, s.userB)
+	}
+	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM users WHERE id = $1 AND codex_provider_scope_id IS NULL`, s.userA); got != 1 {
+		t.Errorf("a user with no Codex source must keep a NULL Codex scope")
+	}
+	resolved, err := store.New(pool).GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: s.userB, Engine: "codex"})
+	if err != nil || !resolved.ProviderID.Valid || uuid.UUID(resolved.ProviderID.Bytes) != s.codexP {
+		t.Errorf("upgraded Codex selection resolves to %+v (%v), want provider %s", resolved, err, s.codexP)
+	}
+	// ProviderID alone comes straight from users.codex_provider_id even when the revision and key joins
+	// miss, so also require the whole source to judge usable with the original revision and key.
+	allowAll := func(string) (string, bool) { return "", true }
+	if got := workersvc.EvaluateProviderSource("codex", resolved, allowAll); got.State != workersvc.ProviderSourceUsable {
+		t.Errorf("upgraded Codex selection judged %+v, want usable", got)
+	}
+	if !resolved.CurrentRevision.Valid || resolved.CurrentRevision.Int32 != 1 {
+		t.Errorf("upgraded Codex selection revision = %+v, want the original revision 1", resolved.CurrentRevision)
+	}
+	if !resolved.KeySecretID.Valid || uuid.UUID(resolved.KeySecretID.Bytes) != s.codexKy {
+		t.Errorf("upgraded Codex selection key = %+v, want the original key %s", resolved.KeySecretID, s.codexKy)
+	}
 	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM users WHERE id = $1 AND claude_provider_scope_id IS NULL`, s.userB); got != 1 {
 		t.Errorf("a user with no Claude source must keep a NULL scope")
 	}
@@ -227,7 +251,7 @@ func TestSharedScopeUpgradePreservesPersonalDataLiveDB(t *testing.T) {
 	if got := scalar[string](ctx, t, pool, `SELECT is_nullable FROM information_schema.columns WHERE table_name = 'model_providers' AND column_name = 'scope_owner_id'`); got != "NO" {
 		t.Errorf("scope_owner_id nullable = %s, want NO", got)
 	}
-	for _, idx := range []string{"model_providers_scope_owner_id_key", "model_providers_shared_name_lower_key", "users_claude_provider_id_idx", "model_providers_owner_id_key", "model_providers_owner_name_lower_key"} {
+	for _, idx := range []string{"model_providers_scope_owner_id_key", "model_providers_shared_name_lower_key", "users_claude_provider_id_idx", "users_codex_provider_id_idx", "model_providers_owner_id_key", "model_providers_owner_name_lower_key"} {
 		if !scalar[bool](ctx, t, pool, `SELECT COALESCE((SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)), false)`, idx) {
 			t.Errorf("index %s missing or invalid after the upgrade", idx)
 		}
@@ -261,8 +285,11 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 	wantViolation(t, "owned provider with a credential mode", err, "23514", "model_providers_shared_mode_check")
 	_, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "bad-mode", "claude", "operator_key", nilScope)
 	wantViolation(t, "unknown credential mode", err, "23514", "model_providers_credential_mode_check")
-	_, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "shared-codex", "codex", "per_user_key", nilScope)
-	wantViolation(t, "NULL-owner Codex insert", err, "23514", "model_providers_shared_engine_check")
+	// A shared Codex definition is accepted since 00536 (issue #4633); a third engine is still refused
+	// by the engine check, covered in TestSharedCodexScopeConstraintNegativesLiveDB.
+	if _, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "shared-codex", "codex", "per_user_key", nilScope); err != nil {
+		t.Errorf("NULL-owner Codex insert: %v, want accepted", err)
+	}
 	_, err = pool.Exec(ctx, insProv, pgtype.UUID{Bytes: uuid.Nil, Valid: true}, "nil-owner", "claude", nil, nilScope)
 	wantViolation(t, "owner carrying the nil UUID", err, "23514", "model_providers_owner_not_nil_check")
 	_, err = pool.Exec(ctx, insProv, owner, "no-scope", "claude", nil, nil)
@@ -281,13 +308,24 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 	for i, c := range []struct{ scope, code, name string }{
 		{a.String(), "23514", "user_secrets_provider_scope_check"}, // A's scope on B's key
 		{b.String(), "23503", "user_secrets_provider_fkey"},        // B's own scope: no such (scope, provider) pair
-		{nilScope, "23514", "user_secrets_provider_scope_check"},   // the shared scope is for Claude keys only
+		{nilScope, "23503", "user_secrets_provider_fkey"},          // the shared scope now admits Codex keys, but A's definition is personal
 	} {
 		_, err = pool.Exec(ctx, insKey, b, "openai_compatible_key", fmt.Sprintf("c%d", i), cx.ID, c.scope)
 		wantViolation(t, "B's Codex key planted on A's Codex provider with scope "+c.scope, err, c.code, c.name)
 	}
-	_, err = pool.Exec(ctx, insKey, b, "openai_compatible_key", "c-shared", shared.ID, nilScope)
-	wantViolation(t, "a Codex key with the shared scope", err, "23514", "user_secrets_provider_scope_check")
+	// Since 00537 the database accepts a Codex-kind key with the shared scope (the handler and the
+	// queries decide which definitions may carry one). Rolled back so it does not collide with the
+	// valid key below under the one-key-per-provider unique index.
+	func() {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := tx.Exec(ctx, insKey, b, "openai_compatible_key", "c-shared", shared.ID, nilScope); err != nil {
+			t.Errorf("a Codex-kind key with the shared scope: %v, want accepted", err)
+		}
+	}()
 	_, err = pool.Exec(ctx, insKey, b, "openai_compatible_key", "c-shared-b", shared.ID, b)
 	wantViolation(t, "a Codex key on a shared provider with B's own scope", err, "23503", "user_secrets_provider_fkey")
 	_, err = pool.Exec(ctx, `INSERT INTO user_secrets (user_id, kind, label, ciphertext, sealed_with, provider_id) VALUES ($1, 'anthropic_compatible_key', 'np', 'ct', 'master', $2)`, b, shared.ID)
@@ -308,9 +346,9 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 	_, err = pool.Exec(ctx, `UPDATE users SET claude_provider_scope_id = $2 WHERE id = $1`, b, b)
 	wantViolation(t, "a scope with no source", err, "23514", "users_claude_provider_scope_check")
 	_, err = pool.Exec(ctx, `UPDATE users SET codex_provider_id = $2 WHERE id = $1`, b, shared.ID)
-	wantViolation(t, "a Codex source on a shared provider", err, "23503", "users_codex_provider_fkey")
+	wantViolation(t, "a Codex source with no scope", err, "23514", "users_codex_provider_scope_check")
 	_, err = pool.Exec(ctx, `UPDATE users SET codex_provider_id = $2 WHERE id = $1`, b, cx.ID)
-	wantViolation(t, "B's Codex source on A's Codex provider", err, "23503", "users_codex_provider_fkey")
+	wantViolation(t, "B's Codex source on A's Codex provider with no scope", err, "23514", "users_codex_provider_scope_check")
 
 	// The legitimate shapes still work.
 	if _, err := pool.Exec(ctx, insKey, b, "anthropic_compatible_key", "ok", shared.ID, nilScope); err != nil {
@@ -413,9 +451,9 @@ func TestSharedScopeRecipientQueriesLiveDB(t *testing.T) {
 	if src, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{ID: b, Engine: "codex"}); err != nil || src.ProviderID.Valid {
 		t.Errorf("B's Codex source = %+v (%v), want none", src, err)
 	}
-	// A Codex source never accepts a shared definition, and selecting Codex leaves the Claude scope alone.
+	// A Codex source never accepts a shared CLAUDE definition (the cross-engine guard), and selecting Codex leaves the Claude scope alone.
 	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: b, Engine: "codex", ProviderID: pgUUID(shared.ID)}); !errors.Is(err, pgx.ErrNoRows) {
-		t.Errorf("B's Codex source on a shared definition = %v, want no rows", err)
+		t.Errorf("B's Codex source on a shared Claude definition = %v, want no rows", err)
 	}
 	bc, err := q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: b, Name: "b-codex", Engine: "codex"})
 	if err != nil {
@@ -544,14 +582,14 @@ func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 			t.Fatalf("Down to %d = %v, want a refusal containing %q", to, err, snippet)
 		}
 	}
-	// 00531-00529 roll back freely; 00528 refuses while B's source is the shared definition.
+	// 00541-00529 roll back freely (no shared Codex state exists here); 00528 refuses while B's source is the shared definition.
 	refuses(527, "refusing to roll back 00528")
 	if v := appliedVersion(ctx, t, pool); v != 528 {
 		t.Fatalf("version after the refused 00528 Down = %d, want 528", v)
 	}
-	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: b, Engine: "claude"}); err != nil {
-		t.Fatal(err)
-	}
+	// Raw SQL, not SetUserProviderSource: the database is now at 528, below the Codex scope column the
+	// generated statement writes.
+	mustExec(ctx, t, pool, `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, b)
 	refuses(526, "refusing to roll back 00527")
 	if _, err := q.DeleteSharedProviderKeys(ctx, shared.ID); err != nil {
 		t.Fatal(err)
@@ -569,7 +607,7 @@ func TestSharedScopeDownGuardsAndFullDownLiveDB(t *testing.T) {
 	if got := schemaFingerprint(ctx, t, pool); diffFingerprints(want, got) != "" {
 		t.Errorf("schema after the full Down differs from a 00523 database:\n%s", diffFingerprints(want, got))
 	}
-	for _, f := range []string{"model_providers_scope_owner_id_key", "model_providers_shared_name_lower_key", "users_claude_provider_id_idx"} {
+	for _, f := range []string{"model_providers_scope_owner_id_key", "model_providers_shared_name_lower_key", "users_claude_provider_id_idx", "users_codex_provider_id_idx"} {
 		if scalar[bool](ctx, t, pool, `SELECT to_regclass($1) IS NOT NULL`, f) {
 			t.Errorf("orphan index %s survived the full Down", f)
 		}
@@ -682,6 +720,29 @@ WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
       SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
         AND p.owner_user_id = u.id AND p.engine = $1::text))
 RETURNING claude_provider_id, codex_provider_id`
+	// The source reader of the image before #4633 (base 591871c34): its Codex arm is owner-only.
+	baseGetUserProviderSource = `SELECT u.claude_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id
+ AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = $1
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = $2 AND $1::text = 'claude'
+UNION ALL
+SELECT u.codex_provider_id AS provider_id,
+       p.engine, r.protocol, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.codex_provider_id AND p.owner_user_id = u.id AND p.engine = $1
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
+WHERE u.id = $2 AND $1::text = 'codex'`
 	baseUpsertModelProviderProbeResult = `INSERT INTO model_provider_probe_results (provider_id, revision, auth_result, tool_result, probed_at)
 SELECT p.id, p.current_revision, $1, $2, now()
 FROM model_providers p
@@ -691,9 +752,10 @@ SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, prob
 )
 
 // TestSharedScopeImageOnlyRollbackLiveDB: with the new schema and the previous API image, the writes that
-// cannot fill the scope columns fail (provider insert, key insert, Claude source set and clear), while the
-// stop levers keep working: Codex set and clear, key disable and delete, retire, and the old probe upsert
-// against the retained legacy table.
+// cannot fill the scope columns fail (provider insert, key insert, Claude source set and clear, and since
+// 00538 a Codex source set from a cleared state and a Codex clear), while the stop levers keep working:
+// a personal-to-personal Codex switch (the scope is already the user's own), key disable and delete,
+// retire, and the old probe upsert against the retained legacy table.
 func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	ctx, _, pool := sharedDB(t, "shared_scope_image_", 0)
 	q := store.New(pool)
@@ -733,7 +795,7 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	if tag, err := pool.Exec(ctx, baseSetUserProviderSource, "claude", pgUUID(pk.ID), a); err != nil || tag.RowsAffected() != 1 {
 		t.Errorf("the old image switching between personal Claude providers: rows=%d err=%v, want one row", tag.RowsAffected(), err)
 	}
-	sh, err := q.InsertSharedModelProvider(ctx, "rollback-shared")
+	sh, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: "rollback-shared", Engine: "claude"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -747,23 +809,78 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 
 	checkSources := func(wantCodex pgtype.UUID) {
 		t.Helper()
-		var codex, claude, scope pgtype.UUID
-		if err := pool.QueryRow(ctx, `SELECT codex_provider_id, claude_provider_id, claude_provider_scope_id FROM users WHERE id = $1`, a).Scan(&codex, &claude, &scope); err != nil {
+		var codex, claude, scope, codexScope pgtype.UUID
+		if err := pool.QueryRow(ctx, `SELECT codex_provider_id, claude_provider_id, claude_provider_scope_id, codex_provider_scope_id FROM users WHERE id = $1`, a).Scan(&codex, &claude, &scope, &codexScope); err != nil {
 			t.Fatal(err)
 		}
-		if codex != wantCodex || claude != pgUUID(pk.ID) || scope != pgUUID(a) {
-			t.Errorf("after old-image Codex write: codex=%v claude=%v scope=%v; want codex=%v, claude=%s, scope=%s",
-				codex, claude, scope, wantCodex, pk.ID, a)
+		wantCodexScope := pgtype.UUID{}
+		if wantCodex.Valid {
+			wantCodexScope = pgUUID(a)
+		}
+		if codex != wantCodex || claude != pgUUID(pk.ID) || scope != pgUUID(a) || codexScope != wantCodexScope {
+			t.Errorf("after Codex write: codex=%v claude=%v scope=%v codexScope=%v; want codex=%v, claude=%s, scope=%s, codexScope=%v",
+				codex, claude, scope, codexScope, wantCodex, pk.ID, a, wantCodexScope)
 		}
 	}
-	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "codex", pgUUID(cx.ID), a); err != nil {
-		t.Errorf("the old image selecting a Codex source: %v", err)
+	// A Codex source cannot be selected by the old image from a cleared state (it cannot fill the scope).
+	_, err = pool.Exec(ctx, baseSetUserProviderSource, "codex", pgUUID(cx.ID), a)
+	wantViolation(t, "the old image selecting a Codex source from a cleared state", err, "23514", "users_codex_provider_scope_check")
+	checkSources(pgtype.UUID{})
+	// Select through the current statement, then the old image cannot clear it but can still switch between the user's own Codex definitions (the scope is already theirs).
+	cx2, err := q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "codex-gw-2", Engine: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: a, Engine: "codex", ProviderID: pgUUID(cx.ID)}); err != nil {
+		t.Fatalf("selecting a Codex source through the current statement: %v", err)
 	}
 	checkSources(pgUUID(cx.ID))
-	if _, err := pool.Exec(ctx, baseSetUserProviderSource, "codex", pgtype.UUID{}, a); err != nil {
-		t.Errorf("the old image clearing a Codex source: %v", err)
+	_, err = pool.Exec(ctx, baseSetUserProviderSource, "codex", pgtype.UUID{}, a)
+	wantViolation(t, "the old image clearing a selected Codex source", err, "23514", "users_codex_provider_scope_check")
+	checkSources(pgUUID(cx.ID))
+	if tag, err := pool.Exec(ctx, baseSetUserProviderSource, "codex", pgUUID(cx2.ID), a); err != nil || tag.RowsAffected() != 1 {
+		t.Errorf("the old image switching between personal Codex providers: rows=%d err=%v, want one row", tag.RowsAffected(), err)
+	}
+	checkSources(pgUUID(cx2.ID))
+	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: a, Engine: "codex"}); err != nil {
+		t.Errorf("clearing the Codex source through the current statement: %v", err)
 	}
 	checkSources(pgtype.UUID{})
+	// A shared Codex selection made by the new image (with a usable key) reads, through the old image's
+	// owner-only reader, as a selected source whose definition is invisible: provider_missing, so the
+	// old image fails closed and never falls back to a vendor credential.
+	shCx, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: "rollback-shared-codex", Engine: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.InsertModelProviderRevision(ctx, store.InsertModelProviderRevisionParams{ProviderID: shCx.ID, Revision: 1, Protocol: "openai_responses", BaseUrl: "https://resp.example.com/v1", AuthStyle: "bearer", ModelMap: []byte(`{"default":{"model":"m"}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	cxSel, _ := newProductUser(ctx, t, pool)
+	if _, err := insertProviderKey(ctx, q, cxSel, shCx.ID); err != nil {
+		t.Fatalf("attaching the recipient's key to the shared Codex definition: %v", err)
+	}
+	if _, err := q.SetUserProviderSource(ctx, store.SetUserProviderSourceParams{ID: cxSel, Engine: "codex", ProviderID: pgUUID(shCx.ID)}); err != nil {
+		t.Fatalf("selecting the shared Codex definition through the current statement: %v", err)
+	}
+	allowAll := func(string) (string, bool) { return "", true }
+	cur, err := q.GetUserProviderSource(ctx, store.GetUserProviderSourceParams{Engine: "codex", ID: cxSel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := workersvc.EvaluateProviderSource("codex", cur, allowAll); got.State != workersvc.ProviderSourceUsable {
+		t.Fatalf("control: the current reader judges the shared Codex selection %+v, want usable", got)
+	}
+	var old store.GetUserProviderSourceRow
+	if err := pool.QueryRow(ctx, baseGetUserProviderSource, "codex", cxSel).Scan(&old.ProviderID, &old.Engine, &old.Protocol,
+		&old.CurrentRevision, &old.RetiredAt, &old.BaseUrl, &old.AuthStyle, &old.ModelMap, &old.KeySecretID, &old.KeyKind,
+		&old.KeyProviderID, &old.KeyDisabledAt, &old.KeyEnablementRev); err != nil {
+		t.Fatalf("the old image reading the Codex source: %v", err)
+	}
+	if got := workersvc.EvaluateProviderSource("codex", old, allowAll); got.State != workersvc.ProviderSourceUnusable ||
+		got.Reason != workersvc.SourceUnusableProviderMissing || got.ProviderID != shCx.ID {
+		t.Errorf("the old image reading a shared Codex selection = %+v, want unusable %s for %s", got, workersvc.SourceUnusableProviderMissing, shCx.ID)
+	}
 	// Key disable, then delete, then retire: the application's own statements for those.
 	if _, err := pool.Exec(ctx, `UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, key.ID); err != nil {
 		t.Errorf("disabling the key: %v", err)
@@ -805,7 +922,7 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 		if n >= cap {
 			return false, nil
 		}
-		p, err := q.InsertSharedModelProvider(ctx, name)
+		p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
 		if err != nil {
 			return false, err
 		}

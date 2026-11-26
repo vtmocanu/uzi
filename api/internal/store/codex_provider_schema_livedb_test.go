@@ -83,8 +83,11 @@ func TestCodexProviderSchemaLiveDB(t *testing.T) {
 		}
 	}
 	// Cross-owner Codex source assignment is also refused at the database boundary.
-	if _, err := pool.Exec(ctx, "UPDATE users SET codex_provider_id=$1 WHERE id=$2", p.ID, other); err == nil {
-		t.Fatal("cross-owner Codex source accepted")
+	// The scope names the other user's own id, so the scope check passes and the composite foreign
+	// key (scope, provider) is what refuses the owner's definition.
+	_, err = pool.Exec(ctx, "UPDATE users SET codex_provider_id=$1, codex_provider_scope_id=$2 WHERE id=$2", p.ID, other)
+	if code, c := pgCodeC(err); code != "23503" || c != "users_codex_provider_fkey" {
+		t.Fatalf("cross-owner Codex source = %v (%s %s), want users_codex_provider_fkey", err, code, c)
 	}
 
 	if _, err := q.GetProviderKeyForUpdate(ctx, store.GetProviderKeyForUpdateParams{UserID: owner, ProviderID: src.ProviderID}); err != nil {
@@ -118,7 +121,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(ctx, t, pool, `UPDATE users SET codex_provider_id=$1 WHERE id=$2`, p.ID, owner)
+	mustExec(ctx, t, pool, `UPDATE users SET codex_provider_id=$1, codex_provider_scope_id=$2 WHERE id=$2`, p.ID, owner)
 	insert := `INSERT INTO runs(user_id,repo_id,kind,branch,issue_title,issue_description,harness,model_provider_id,model_provider_revision,model_provider_key_mode,model_provider_key_secret_id,model_provider_key_rev) VALUES($1,$2,$3,'schema-branch','schema','schema','codex',$4,3,'user_key',$5,7) RETURNING id`
 	var runs []uuid.UUID
 	for _, kind := range []string{"task", "prompt"} {
@@ -193,7 +196,7 @@ func TestCodexProviderRunSchemaLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE users SET codex_provider_id=NULL WHERE id=$1`, owner); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE users SET codex_provider_id=NULL, codex_provider_scope_id=NULL WHERE id=$1`, owner); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM user_secrets WHERE id=$1`, key.ID); err != nil {

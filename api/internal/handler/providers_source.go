@@ -148,7 +148,7 @@ func (h *Handler) setMyProviderSource(w http.ResponseWriter, r *http.Request, en
 			}
 			return err
 		} else if profile.Engine != engine {
-			// Includes a shared definition on /codex-source: a shared definition is Claude only.
+			// A definition of the other engine, shared or not (a shared Claude definition on /codex-source).
 			return errProviderNotFound
 		}
 		if _, err := q.SetUserProviderSource(r.Context(), store.SetUserProviderSourceParams{

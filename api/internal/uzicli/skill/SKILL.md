@@ -543,7 +543,7 @@ uzi version
   or workspace spend limit; no timer, no automatic retry or credential switch, work and custody kept,
   owner Resume, Switch token or Cancel). Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`
   (`uzi token list`, then `uzi run set-token <id> <label>`; not for chat, judge, self_improve or job runs) — or
-  because the forge was unreachable at clone — cause `forge_unreachable`, with up to
+  because the forge was unreachable at clone (or, for a started run, the api could not read it at claim) — cause `forge_unreachable`, with up to
   `RUN_FORGE_UNREACHABLE_MAX_PARKS` timed parks (`0` means unlimited), followed by an
   owner Resume/Cancel hold with NULL retry. Resume queues one bounded attempt without
   resetting lifetime counts or bypassing cooldown/custody admission. Heartbeat online

@@ -262,9 +262,9 @@ func TestCodexJudgeSkipsProviderSourceOwnerLiveDB(t *testing.T) {
 	}
 
 	provider, _ := seedCodexProviderKeyFor(t, env, userID)
-	env.exec(`UPDATE users SET codex_provider_id = $2 WHERE id = $1`, userID, provider)
+	env.exec(`UPDATE users SET codex_provider_id=$2,codex_provider_scope_id=$1 WHERE id = $1`, userID, provider)
 	t.Cleanup(func() {
-		_, _ = env.pool.Exec(env.ctx, `UPDATE users SET codex_provider_id = NULL WHERE id = $1`, userID)
+		_, _ = env.pool.Exec(env.ctx, `UPDATE users SET codex_provider_id=NULL,codex_provider_scope_id=NULL WHERE id = $1`, userID)
 	})
 
 	t.Run("codex target", func(t *testing.T) {

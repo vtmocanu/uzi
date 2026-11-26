@@ -139,6 +139,16 @@ type claimTestHooks struct {
 	afterRunEnvLock func(ctx context.Context, run store.Run)
 	// afterChatAssembly runs after a successful assembleChatClaim, before finishChatClaim.
 	afterChatAssembly func(ctx context.Context, run store.Run)
+	// beforeClaimParkCommit runs after the claim-time forge park's writes, before its commit (issue #4689).
+	beforeClaimParkCommit func(context.Context) error
+	// commitAckLost makes the claim-time forge park return an error AFTER a successful commit,
+	// simulating a lost acknowledgement.
+	commitAckLost bool
+	// intentRead runs just before the claim-time forge park reads the publication intent.
+	intentRead func() error
+	// sideRowWrite runs between the claim-time forge park's run update and its side-row update, on the
+	// same transaction.
+	sideRowWrite func(ctx context.Context, q *store.Queries) error
 }
 
 // This matches the kind and capability half of ClaimRun's hold CTE, using the boolean passed
@@ -237,6 +247,10 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 				// Issue #4628: an assembly arm refused the fresh transfer and the run is back at its
 				// held recovery_wait. That restored state is the only transition to publish; the run
 				// neither failed nor paused, so neither of those goes out.
+				s.publishSwept(run.ID, "recovery_wait")
+			case claimForgeParkSettle:
+				// Issue #4689: the claim-time forge park committed; recovery_wait is the only
+				// transition to publish (no failed notify).
 				s.publishSwept(run.ID, "recovery_wait")
 			}
 			return out, nil
@@ -420,6 +434,14 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 	if locked.CodexClaimEpoch != epoch || !bytes.Equal(locked.CodexCapHash, hash) {
 		return nil, "", nil // superseded mint; never settle a newer claim's custody
+	}
+	// Issue #4689: a transient forge guardrail block of an already-released claim has nothing to
+	// settle (the sweeper or a report already ended this claim). Idle before any write, where the
+	// terminal arm would have failed to match and rolled back.
+	var forgeTransient guardrailForgeTransientError
+	forgeSentinel := errors.As(assemblyErr, &forgeTransient)
+	if forgeSentinel && locked.ClaimReleasedAt.Valid {
+		return nil, "", nil
 	}
 
 	// A lead-lane claim whose assembly carries a run-environment snapshot takes the owner's
@@ -618,6 +640,39 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	if runEnvPark {
 		holdClass, transient = false, false
 	}
+
+	// Issue #4689: a STARTED run whose claim-time guardrail read failed only transiently parks on
+	// forge_unreachable instead of failing terminally. The sentinel's origin is guardrail_blocked, so
+	// holdClass and transient stayed false above and the authority rewrite was skipped. A never-started
+	// run, a stamped stop, a fresh transfer and the kinds that cannot park keep every existing path.
+	parkEligible := forgeSentinel && identity.freshID == uuid.Nil &&
+		locked.FirstStartedAt.Valid &&
+		(!locked.StopKind.Valid || locked.StopKind.String == "") &&
+		locked.Kind != runkind.Judge && locked.Kind != runkind.Job && locked.Kind != runkind.CrossCheck &&
+		!credDisabled && !overrideUnavailable
+	var livePark pgxClaimFinishTx
+	var parkPlan claimForgeParkPlan
+	if parkEligible {
+		var ok bool
+		if livePark, ok = q.(pgxClaimFinishTx); !ok {
+			return nil, "", errClaimRecoveryNoTx
+		}
+		// The intent is read before the custody release below and under the run lock held here, so the
+		// enrolled/ordinary choice and the retry boundary come from one consistent view. A fresh-row or
+		// intent race between this read and the park statement matches 0 rows (ParkClaimForgeUnreachable
+		// re-checks both) and returns errClaimRecoveryStale: the transaction rolls back and the claim stays
+		// claimed for the sweeper, an accepted boundary.
+		if h := s.claimHooks; h != nil && h.intentRead != nil {
+			if err := h.intentRead(); err != nil {
+				return nil, "", err
+			}
+		}
+		parkPlan, err = s.planClaimForgePark(ctx, livePark.Queries, locked)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+
 	if decision == nil {
 		if locked.Kind == runkind.Task && len(locked.CheckpointCoordinates) > 0 && payload != nil {
 			live, ok := q.(pgxClaimFinishTx)
@@ -789,6 +844,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			ReserveHoldReason: pgconv.TextOrNull(reserveHeldReasonOf(decision)),
 			ID:                run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
 		})
+	case parkEligible:
+		// Issue #4689. Its own commit tail: the park settles a different status than the arms above.
+		return s.commitClaimForgePark(ctx, q, livePark, run, identity, forgeTransient, parkPlan, expected)
 	default:
 		failureReason := decision.Error()
 		if checkerStage == "code" && errors.Is(decision, errCheckerPinUnavailable) {
@@ -843,6 +901,112 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		return nil, "failed", nil
 	}
 	return nil, "", nil
+}
+
+// claimForgeParkSettle is finishRunClaimTx's settle value for the issue #4689 claim-time forge
+// park: the run is now recovery_wait / forge_unreachable, so that is the only transition to publish.
+const claimForgeParkSettle = "forge_parked"
+
+// claimForgeParkPlan is the retry decision of one claim-time forge park, taken under the run lock.
+type claimForgeParkPlan struct {
+	enrolled   bool
+	countPark  bool
+	retry      pgtype.Timestamptz // NULL is the owner hold
+	holdReason pgtype.Text        // side-row hold reason, enrolled runs only
+	now        time.Time
+}
+
+// planClaimForgePark reads the run's active publication intent and decides the retry boundary,
+// mirroring the worker-path parks. An ordinary continuation follows the pre-clone forge cap
+// (forgepark.go: a finite RunForgeUnreachableMaxParks reached by forge_park_count holds for the
+// owner without counting another park); an enrolled run follows the publication elapsed bound
+// (parkPublicationForgeUnreachable: RunProviderParkMaxDuration from the side row's wait_started_at,
+// zero disables the hold) and never counts against the pre-clone cap. Any intent read error other
+// than no-rows is returned so the transaction rolls back.
+func (s *Service) planClaimForgePark(ctx context.Context, q *store.Queries, locked store.Run) (claimForgeParkPlan, error) {
+	intent, err := q.GetActivePublicationResume(ctx, locked.ID)
+	enrolled := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return claimForgeParkPlan{}, err
+	}
+	now := s.now()
+	plan := claimForgeParkPlan{enrolled: enrolled, now: now}
+	backoff := now.Add(s.recoveryParkFallbackFor(locked.RecoveryWaitCount) + recoveryParkJitter())
+	if enrolled {
+		start := now
+		if intent.WaitStartedAt.Valid {
+			start = intent.WaitStartedAt.Time
+		}
+		if bound := s.p.RunProviderParkMaxDuration; bound > 0 && now.Sub(start) >= bound {
+			plan.holdReason = pgconv.TextOrNull(publicationHoldRetryExhausted)
+		} else {
+			plan.retry = pgconv.Time(backoff)
+		}
+		return plan, nil
+	}
+	maxParks := s.p.RunForgeUnreachableMaxParks
+	if maxParks != 0 && int(locked.ForgeParkCount) >= maxParks {
+		return plan, nil
+	}
+	plan.countPark = true
+	plan.retry = pgconv.Time(backoff)
+	return plan, nil
+}
+
+// commitClaimForgePark writes the claim-time forge park and commits it. The run park runs first and
+// any non-1 count fails before a side-row write; the enrolled side-row update follows in the same
+// transaction. Every error leaves through the caller's deferred rollback with nothing published.
+//
+// claim_released_at stays NULL to match the worker-path forge parks. The handoff is kept because no
+// flight ran. A 0-row side-row update is defensive: every side-row writer serializes on the run
+// lock this transaction holds, and ParkClaimForgeUnreachable already proved the intent active.
+// No forge-origin observation or cooldown is written and no custody is released beyond the
+// pre-switch release.
+func (s *Service) commitClaimForgePark(ctx context.Context, q claimFinishTx, live pgxClaimFinishTx, run store.Run, identity claimRecoveryIdentity, cause guardrailForgeTransientError, plan claimForgeParkPlan, expected int) (*ClaimPayload, string, error) {
+	n, err := live.ParkClaimForgeUnreachable(ctx, store.ParkClaimForgeUnreachableParams{
+		ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		Publication: plan.enrolled, CountPark: plan.countPark, RetryNotBefore: plan.retry,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if n != 1 {
+		return nil, "", errClaimRecoveryStale
+	}
+	h := s.claimHooks
+	if plan.enrolled {
+		if h != nil && h.sideRowWrite != nil {
+			if err := h.sideRowWrite(ctx, live.Queries); err != nil {
+				return nil, "", err
+			}
+		}
+		n, err := live.MarkPublicationClaimParked(ctx, store.MarkPublicationClaimParkedParams{
+			Now: pgconv.Time(plan.now), HoldReason: plan.holdReason, RunID: run.ID,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		if n != 1 {
+			return nil, "", errClaimRecoveryStale
+		}
+	}
+	if h != nil && h.beforeClaimParkCommit != nil {
+		if err := h.beforeClaimParkCommit(ctx); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := q.Commit(ctx); err != nil {
+		return nil, "", err
+	}
+	if h != nil && h.commitAckLost {
+		return nil, "", errors.New("claim forge park commit acknowledgement lost")
+	}
+	slog.Info("claim parked on a transient forge guardrail read", "run", run.ID, "class", cause.class,
+		"enrolled", plan.enrolled, "owner_hold", !plan.retry.Valid)
+	if expected == 1 {
+		s.SettleRetainedCheckpoint(run.ID)
+	}
+	return nil, claimForgeParkSettle, nil
 }
 
 // The hold reasons the exact-claim park writes (ParkCredentialDisabledRun, and the chat twin).

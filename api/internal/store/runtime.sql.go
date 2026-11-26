@@ -19335,6 +19335,93 @@ func (q *Queries) PRCountsPerUser(ctx context.Context) ([]PRCountsPerUserRow, er
 	return items, nil
 }
 
+const parkClaimForgeUnreachable = `-- name: ParkClaimForgeUnreachable :execrows
+WITH fresh_restored AS (
+    INSERT INTO run_user_inputs (run_id, kind, body)
+    SELECT r.id, 'resume', '{"policy_fresh":"restored","generation":' || r.claim_generation::text || '}'
+    FROM runs r
+    WHERE r.id = $5 AND r.worker_id = $6 AND r.claim_generation = $1
+      AND r.claim_released_at IS NULL AND r.status = 'claimed'
+      AND r.policy_fresh_consumed_generation = $1::bigint
+      AND r.policy_fresh_confirmed_generation IS NULL AND r.policy_preserve_required
+    RETURNING 1
+)
+UPDATE runs SET
+    policy_pending_fresh = CASE WHEN runs.policy_fresh_consumed_generation = $1::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN true ELSE runs.policy_pending_fresh END,
+    policy_fresh_consumed_generation = CASE WHEN runs.policy_fresh_consumed_generation = $1::bigint AND runs.policy_fresh_confirmed_generation IS NULL AND runs.policy_preserve_required
+        THEN NULL ELSE runs.policy_fresh_consumed_generation END,
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = 'forge_unreachable',
+    recovery_wait_phase       = CASE WHEN $2::boolean THEN 'publication' END,
+    forge_park_count          = forge_park_count + CASE WHEN $3::boolean THEN 1 ELSE 0 END,
+    recovery_retry_not_before = $4::timestamptz,
+    hold_reason               = CASE WHEN runs.hold_reason = 'completion_blocked' THEN NULL ELSE runs.hold_reason END,
+    codex_cap_hash            = NULL,
+    codex_claim_epoch         = codex_claim_epoch + 1,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE runs.id = $5 AND runs.worker_id = $6
+  AND runs.claim_generation = $1
+  AND runs.status = 'claimed'
+  AND runs.claim_released_at IS NULL
+  AND COALESCE(runs.stop_kind, '') = ''
+  AND runs.first_started_at IS NOT NULL
+  AND runs.kind NOT IN ('judge', 'job', 'cross_check')
+  AND NOT EXISTS (SELECT 1 FROM run_fresh_resumes frt WHERE frt.run_id = runs.id AND frt.state IN ('pending', 'claimed'))
+  AND $2::boolean = EXISTS (SELECT 1 FROM run_publication_resume p WHERE p.run_id = runs.id AND p.state = 'active')
+`
+
+type ParkClaimForgeUnreachableParams struct {
+	ClaimGeneration int64              `json:"claim_generation"`
+	Publication     bool               `json:"publication"`
+	CountPark       bool               `json:"count_park"`
+	RetryNotBefore  pgtype.Timestamptz `json:"retry_not_before"`
+	ID              uuid.UUID          `json:"id"`
+	WorkerID        pgtype.UUID        `json:"worker_id"`
+}
+
+// Issue #4689: the claim finisher's forge park for a STARTED run whose claim-time guardrail read
+// failed transiently (finishRunClaimTx, guardrailForgeTransientError). The claim payload was never
+// delivered, so no flight ran: worker_id, started_at and session_id are kept as resume affinity, the
+// run's published handoff (if any) stays valid, and claim_released_at is deliberately NOT set, which
+// matches the worker-path forge parks (ParkRunForgeUnreachable). The Codex claim capability is revoked
+// (codex_cap_hash NULL, epoch + 1); other reports at this generation are not fenced by this park, the
+// same accepted boundary as the worker-path park.
+//
+// It is ParkCredentialDisabledRun's twin for the undelivered-claim shape: the same exact-claim fence
+// (status 'claimed' at this worker and generation, claim unreleased) and the same one-claim Fresh
+// restore (#3607 Mf), because the payload was never delivered. Differences: the park is
+// recovery_wait / forge_unreachable, a pending completion_blocked annotation is cleared (the owner's
+// decision is already recorded; the forge is now the actionable reason), and a run with a claimed
+// or pending fresh transfer, a stamped stop, or no first start never matches. The caller sends a
+// stamped stop, a missing first start and a fresh claim to their own arms before this statement;
+// an active transfer on a non-fresh claim, which the caller does not check, matches 0 rows and
+// the caller returns errClaimRecoveryStale, rolling back.
+//
+// @count_park is true for an ordinary pre-clone continuation (the cap counter advances) and false
+// for the cap hold and for a publication-enrolled run, which never counts against the pre-clone
+// forge cap. @publication must equal whether the run has an active publication intent: a mismatch
+// (the intent appeared or vanished since the caller read it) matches 0 rows and the caller rolls back.
+// A NULL retry_not_before is the owner hold. sqlc.arg/sqlc.narg only: the multibyte comment above
+// breaks the @name parser.
+func (q *Queries) ParkClaimForgeUnreachable(ctx context.Context, arg ParkClaimForgeUnreachableParams) (int64, error) {
+	result, err := q.db.Exec(ctx, parkClaimForgeUnreachable,
+		arg.ClaimGeneration,
+		arg.Publication,
+		arg.CountPark,
+		arg.RetryNotBefore,
+		arg.ID,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const parkQueuedCodexAccountUnavailablePage = `-- name: ParkQueuedCodexAccountUnavailablePage :one
 WITH page AS MATERIALIZED (
     SELECT runs.id FROM runs

@@ -83,12 +83,13 @@ func (q *Queries) CountSharedModelProviders(ctx context.Context) (int64, error) 
 
 const countSharedProviderSelections = `-- name: CountSharedProviderSelections :one
 SELECT count(*) FROM users
-WHERE claude_provider_id = $1::uuid AND claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+WHERE (claude_provider_id = $1::uuid AND claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid)
+   OR (codex_provider_id = $1::uuid AND codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid)
 `
 
-// How many users have this shared definition selected as their Claude source. A delete is refused
-// while it is above zero (users_claude_provider_fkey is ON DELETE RESTRICT as the structural backstop).
-// Authorized caller: admin delete.
+// How many users have this shared definition selected as their source, in either engine's lane. A
+// delete is refused while it is above zero (users_claude_provider_fkey and users_codex_provider_fkey are
+// ON DELETE RESTRICT as the structural backstop). Authorized caller: admin delete.
 func (q *Queries) CountSharedProviderSelections(ctx context.Context, id uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countSharedProviderSelections, id)
 	var count int64
@@ -106,8 +107,8 @@ type DeleteModelProviderParams struct {
 }
 
 // Owner-scoped. Cascades to the provider's revisions, probe results and key. Refused with a
-// foreign-key violation (users_claude_provider_fkey, ON DELETE RESTRICT) while any user has the
-// provider selected as their source; the handler maps that to provider_in_use_as_source.
+// foreign-key violation (users_claude_provider_fkey / users_codex_provider_fkey, ON DELETE RESTRICT)
+// while any user has the provider selected as their source; the handler maps that to provider_in_use_as_source.
 func (q *Queries) DeleteModelProvider(ctx context.Context, arg DeleteModelProviderParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteModelProvider, arg.ID, arg.OwnerUserID)
 	if err != nil {
@@ -156,7 +157,7 @@ RETURNING id
 
 // Deletes every user's key attached to one shared definition and returns the ids, so the delete's
 // warning and audit record the exact count under the same provider lock. The shared scope is the nil
-// UUID, which only a Claude gateway key may carry. The cascading foreign keys then remove their Test
+// UUID, which only a shared definition's key (either engine) may carry. The cascading foreign keys then remove their Test
 // evidence. Authorized caller: admin delete, after LockSharedModelProviderForDelete and a zero
 // CountSharedProviderSelections.
 func (q *Queries) DeleteSharedProviderKeys(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
@@ -391,9 +392,13 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        COALESCE(ak.n, 0)::bigint AS attached_key_count
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
-LEFT JOIN (SELECT claude_provider_id AS pid, count(*) AS n FROM users
-            WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
-            GROUP BY claude_provider_id) su ON su.pid = p.id
+LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
+              SELECT id AS uid, claude_provider_id AS pid FROM users
+               WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
+               WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
+            GROUP BY sel.pid) su ON su.pid = p.id
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
@@ -497,7 +502,8 @@ SELECT u.codex_provider_id AS provider_id,
        k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
        k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
 FROM users u
-LEFT JOIN model_providers p ON p.id = u.codex_provider_id AND p.owner_user_id = u.id AND p.engine = $1
+LEFT JOIN model_providers p ON p.id = u.codex_provider_id
+ AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key')) AND p.engine = $1
 LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
 LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END
 WHERE u.id = $2 AND $1::text = 'codex'
@@ -525,9 +531,9 @@ type GetUserProviderSourceRow struct {
 }
 
 // The caller's selected source for one engine with everything run creation needs to judge it usable
-// in ONE read: the setting, the provider, its CURRENT revision and the CALLER's key row for it. The
-// Claude arm resolves the caller's own definition or a shared per-user-key one; the Codex arm stays
-// owner-only (a shared definition is never a Codex source). The key join is always the caller's own
+// in ONE read: the setting, the provider, its CURRENT revision and the CALLER's key row for it. Each
+// engine arm resolves the caller's own definition or a shared per-user-key one of that engine
+// (p.engine = @engine). The key join is always the caller's own
 // (k.user_id = u.id), so a shared definition never resolves another user's key. A NULL setting
 // returns a row whose provider columns are all NULL (no rows only for an unknown user). Plain read:
 // the freeze takes LockSecretMutationShared and then LockModelProviderForShare around its own re-read.
@@ -714,14 +720,14 @@ type InsertProviderKeySecretRow struct {
 // Stores the CALLER's gateway key for a definition visible to them (their own, or a shared per-user-key
 // one); derives its kind from the definition's engine. The key is always the caller's, never the
 // admin's: user_id is the caller and provider_scope_id is the definition's scope (the caller's own id,
-// or the nil UUID for a shared Claude definition).
+// or the nil UUID for a shared definition of either engine).
 // Deliberately NOT InsertUserSecret: that statement forces the first secret of a kind to be the
 // default and the first anthropic_token into the auto-select pool, and a provider key must be
 // neither (is_default=false, auto_eligible=false), so it never enters a default slot, the poller,
 // the weekly reserve or pool selection. provider_id and provider_scope_id are written here and by no
 // UPDATE. The composite foreign key (provider_scope_id, provider_id) keeps the key under a scope the
-// caller may use, and user_secrets_provider_scope_check pins that scope to the caller's id or, for a
-// Claude key, the shared scope; the unique index user_secrets_one_provider_key allows one key per
+// caller may use, and user_secrets_provider_scope_check pins that scope to the caller's id or the
+// shared scope; the unique index user_secrets_one_provider_key allows one key per
 // (user, provider). The label is the provider id.
 func (q *Queries) InsertProviderKeySecret(ctx context.Context, arg InsertProviderKeySecretParams) (InsertProviderKeySecretRow, error) {
 	row := q.db.QueryRow(ctx, insertProviderKeySecret,
@@ -746,15 +752,21 @@ func (q *Queries) InsertProviderKeySecret(ctx context.Context, arg InsertProvide
 
 const insertSharedModelProvider = `-- name: InsertSharedModelProvider :one
 INSERT INTO model_providers (owner_user_id, name, engine, current_revision, credential_mode, scope_owner_id)
-VALUES (NULL, $1, 'claude', 1, 'per_user_key', '00000000-0000-0000-0000-000000000000'::uuid)
+VALUES (NULL, $1, $2, 1, 'per_user_key', '00000000-0000-0000-0000-000000000000'::uuid)
 RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id
 `
 
-// A shared definition: NULL owner, per-user-key mode, the nil shared scope, Claude only. The CHECKs
+type InsertSharedModelProviderParams struct {
+	Name   string `json:"name"`
+	Engine string `json:"engine"`
+}
+
+// A shared definition of the named engine (claude or codex): NULL owner, per-user-key mode, the nil
+// shared scope. The handler validates the engine; the CHECKs
 // (model_providers_shared_mode_check, _shared_engine_check, _scope_owner_check) enforce the same shape.
 // Authorized caller: the admin create path.
-func (q *Queries) InsertSharedModelProvider(ctx context.Context, name string) (ModelProvider, error) {
-	row := q.db.QueryRow(ctx, insertSharedModelProvider, name)
+func (q *Queries) InsertSharedModelProvider(ctx context.Context, arg InsertSharedModelProviderParams) (ModelProvider, error) {
+	row := q.db.QueryRow(ctx, insertSharedModelProvider, arg.Name, arg.Engine)
 	var i ModelProvider
 	err := row.Scan(
 		&i.ID,
@@ -888,9 +900,13 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        COALESCE(ak.n, 0)::bigint AS attached_key_count
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
-LEFT JOIN (SELECT claude_provider_id AS pid, count(*) AS n FROM users
-            WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
-            GROUP BY claude_provider_id) su ON su.pid = p.id
+LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
+              SELECT id AS uid, claude_provider_id AS pid FROM users
+               WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
+               WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
+            GROUP BY sel.pid) su ON su.pid = p.id
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
@@ -986,7 +1002,7 @@ type ListVisibleProvidersRow struct {
 }
 
 // Every definition visible to the CALLER: their own (either engine) and the shared per-user-key
-// catalogue (Claude only). The key and the Test evidence are always the CALLER's: the key join is
+// catalogue (either engine). The key and the Test evidence are always the CALLER's: the key join is
 // (caller, definition, the engine's key kind) and the evidence joins only while its provider revision,
 // key identity and key enablement revision are all current, so a rotated or edited definition reads as
 // not tested and another user's key or result never appears. owner_user_id is NULL on a shared row.
@@ -1253,7 +1269,7 @@ func (q *Queries) LockSharedModelProviderForDelete(ctx context.Context, id uuid.
 }
 
 const lockSharedModelProviderForEdit = `-- name: LockSharedModelProviderForEdit :one
-SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at FROM model_providers p
 WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
 FOR NO KEY UPDATE OF p
 `
@@ -1261,6 +1277,7 @@ FOR NO KEY UPDATE OF p
 type LockSharedModelProviderForEditRow struct {
 	ID              uuid.UUID          `json:"id"`
 	Name            string             `json:"name"`
+	Engine          string             `json:"engine"`
 	CurrentRevision int32              `json:"current_revision"`
 	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
 }
@@ -1275,6 +1292,7 @@ func (q *Queries) LockSharedModelProviderForEdit(ctx context.Context, id uuid.UU
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
+		&i.Engine,
 		&i.CurrentRevision,
 		&i.RetiredAt,
 	)
@@ -1483,7 +1501,10 @@ SET claude_provider_id = CASE WHEN $1::text = 'claude' THEN $2::uuid ELSE claude
     claude_provider_scope_id = CASE WHEN $1::text = 'claude'
         THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $2::uuid)
         ELSE claude_provider_scope_id END,
-    codex_provider_id = CASE WHEN $1::text = 'codex' THEN $2::uuid ELSE codex_provider_id END
+    codex_provider_id = CASE WHEN $1::text = 'codex' THEN $2::uuid ELSE codex_provider_id END,
+    codex_provider_scope_id = CASE WHEN $1::text = 'codex'
+        THEN (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $2::uuid)
+        ELSE codex_provider_scope_id END
 WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
   AND ($2::uuid IS NULL
        OR ($1::text = 'claude' AND EXISTS (
@@ -1492,7 +1513,8 @@ WHERE u.id = $3 AND $1::text IN ('claude', 'codex')
               AND p.engine = 'claude'))
        OR ($1::text = 'codex' AND EXISTS (
             SELECT 1 FROM model_providers p WHERE p.id = $2::uuid
-              AND p.owner_user_id = u.id AND p.engine = 'codex')))
+              AND (p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+              AND p.engine = 'codex')))
 RETURNING claude_provider_id, codex_provider_id
 `
 
@@ -1510,8 +1532,10 @@ type SetUserProviderSourceRow struct {
 // Sets or clears (NULL) the caller's source for one engine; a NULL provider_id CLEARS the setting and
 // the engine must be named. The Claude branch accepts a definition visible to the caller (their own
 // or a shared per-user-key one) and writes claude_provider_scope_id from that definition in the same
-// statement (NULL when clearing); the Codex branch accepts only the caller's own Codex definition and
-// never touches the Claude scope. The composite foreign keys (users_claude_provider_fkey,
+// statement (NULL when clearing); the Codex branch likewise writes codex_provider_scope_id from the
+// definition and never touches the Claude scope. Each branch accepts a definition of its own engine
+// that is the caller's own or a shared per-user-key one, so a shared definition of the other engine is
+// refused (no row). The composite foreign keys (users_claude_provider_fkey,
 // users_codex_provider_fkey) independently reject a definition the caller may not use. Usability is
 // checked by the caller, which holds the user's secret-mutation lock.
 func (q *Queries) SetUserProviderSource(ctx context.Context, arg SetUserProviderSourceParams) (SetUserProviderSourceRow, error) {

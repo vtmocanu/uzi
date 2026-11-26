@@ -18,17 +18,48 @@ import (
 // TestModelProviderDownLockSerializesWithAWriterLiveDB).
 func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 	// ALTER Downs take their final ACCESS EXCLUSIVE lock up front (no lock upgrade).
-	for file, spec := range map[string]struct{ table, mode string }{
-		"00476_model_providers.sql":                  {"model_providers", "SHARE ROW EXCLUSIVE"},
-		"00477_user_secrets_provider_key.sql":        {"user_secrets", "ACCESS EXCLUSIVE"},
-		"00479_users_claude_provider_source.sql":     {"users", "ACCESS EXCLUSIVE"},
-		"00481_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
-		"00488_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
-		"00524_model_providers_shared_scope.sql":     {"model_providers", "ACCESS EXCLUSIVE"},
-		"00527_user_secrets_provider_scope.sql":      {"user_secrets", "ACCESS EXCLUSIVE"},
-		"00528_users_claude_provider_scope.sql":      {"users", "ACCESS EXCLUSIVE"},
+	type guardSpec struct{ table, mode string }
+	// The shared Codex Downs lock three tables and read each guarded one in turn. The engine and
+	// key-scope migrations predate users.codex_provider_scope_id, so they read no selection, though they still lock users.
+	sharedCodexDownNoSelection := []guardSpec{{"model_providers", "ACCESS EXCLUSIVE"}, {"user_secrets", "ACCESS EXCLUSIVE"}}
+	sharedCodexDown := append(append([]guardSpec{}, sharedCodexDownNoSelection...), guardSpec{"users", "ACCESS EXCLUSIVE"})
+	specsByFile := map[string][]guardSpec{
+		"00476_model_providers.sql":                  {{"model_providers", "SHARE ROW EXCLUSIVE"}},
+		"00477_user_secrets_provider_key.sql":        {{"user_secrets", "ACCESS EXCLUSIVE"}},
+		"00479_users_claude_provider_source.sql":     {{"users", "ACCESS EXCLUSIVE"}},
+		"00481_runs_model_provider_binding.sql":      {{"runs", "ACCESS EXCLUSIVE"}},
+		"00488_runs_provider_gateway_limit_type.sql": {{"runs", "ACCESS EXCLUSIVE"}},
+		"00524_model_providers_shared_scope.sql":     {{"model_providers", "ACCESS EXCLUSIVE"}},
+		"00527_user_secrets_provider_scope.sql":      {{"user_secrets", "ACCESS EXCLUSIVE"}},
+		"00528_users_claude_provider_scope.sql":      {{"users", "ACCESS EXCLUSIVE"}},
+	}
+	// The six shared Codex migrations are draft-numbered and renumbered at merge, so each is resolved
+	// by its stable name suffix (exactly one file) rather than by a literal number.
+	for name, specs := range map[string][]guardSpec{
+		"model_providers_shared_codex_engine":          sharedCodexDownNoSelection,
+		"user_secrets_shared_codex_scope":              sharedCodexDownNoSelection,
+		"users_codex_provider_scope":                   sharedCodexDown,
+		"validate_model_providers_shared_codex_engine": sharedCodexDown,
+		"validate_user_secrets_shared_codex_scope":     sharedCodexDown,
+		"validate_users_codex_provider_scope":          sharedCodexDown,
 	} {
-		table := spec.table
+		matches, err := filepath.Glob(filepath.Join("migrations", "*_"+name+".sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// "*_<name>.sql" also matches a longer name ending in it (validate_<name>); keep the exact one.
+		var exact []string
+		for _, m := range matches {
+			if _, rest, ok := strings.Cut(filepath.Base(m), "_"); ok && rest == name+".sql" {
+				exact = append(exact, filepath.Base(m))
+			}
+		}
+		if len(exact) != 1 {
+			t.Fatalf("migration %s resolves to %v, want exactly one file", name, exact)
+		}
+		specsByFile[exact[0]] = specs
+	}
+	for file, specs := range specsByFile {
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
 		if err != nil {
 			t.Fatal(err)
@@ -37,15 +68,60 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s has no Down block", file)
 		}
-		timeout := strings.Index(down, "SET LOCAL lock_timeout = '5s';")
-		lock := strings.Index(down, "LOCK TABLE "+table+" IN "+spec.mode+" MODE;")
-		guard := strings.Index(down, "IF EXISTS (SELECT 1 FROM "+table)
-		if timeout < 0 || lock < 0 || guard < 0 || timeout >= lock || lock >= guard {
-			t.Errorf("%s Down: lock_timeout@%d, LOCK TABLE %s@%d, IF EXISTS guard@%d; want all present in that order", file, timeout, table, lock, guard)
+		down = stripSQLLineComments(down)
+		if strings.Contains(file, "shared_codex") || strings.Contains(file, "codex_provider_scope") {
+			// The six shared Codex Downs lock all three tables, strictly in this order, before the first guard.
+			first := strings.Index(down, "IF EXISTS")
+			prev := -1
+			for _, table := range []string{"model_providers", "user_secrets", "users"} {
+				pos := strings.Index(down, "LOCK TABLE "+table+" IN ACCESS EXCLUSIVE MODE;")
+				if pos < 0 || pos <= prev || first < 0 || pos >= first {
+					t.Errorf("%s Down: LOCK TABLE %s@%d (previous lock@%d, first IF EXISTS@%d); want all three present in order before the first guard", file, table, pos, prev, first)
+				}
+				prev = pos
+			}
+		}
+		for _, spec := range specs {
+			table := spec.table
+			timeout := strings.Index(down, "SET LOCAL lock_timeout = '5s';")
+			lock := strings.Index(down, "LOCK TABLE "+table+" IN "+spec.mode+" MODE;")
+			guard := strings.Index(down, "IF EXISTS (SELECT 1 FROM "+table)
+			if timeout < 0 || lock < 0 || guard < 0 || timeout >= lock || lock >= guard {
+				t.Errorf("%s Down: lock_timeout@%d, LOCK TABLE %s@%d, IF EXISTS guard@%d; want all present in that order", file, timeout, table, lock, guard)
+			}
 		}
 		if strings.Contains(down, "count(*)") {
 			t.Errorf("%s Down still counts rows instead of IF EXISTS", file)
 		}
+	}
+}
+
+// TestUsersCodexScopeUpLocksBeforeAddColumn: the 00538 Up (resolved by name, so a renumber needs no
+// edit) takes ACCESS EXCLUSIVE on model_providers and users before it adds the users column.
+func TestUsersCodexScopeUpLocksBeforeAddColumn(t *testing.T) {
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file string
+	for _, e := range entries {
+		if _, rest, ok := strings.Cut(e.Name(), "_"); ok && rest == "users_codex_provider_scope.sql" {
+			file = e.Name()
+		}
+	}
+	if file == "" {
+		t.Fatal("no migration named users_codex_provider_scope")
+	}
+	b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a name found in this package's migrations dir.
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, _, _ := strings.Cut(string(b), "-- +goose Down")
+	up = stripSQLLineComments(up)
+	lock := strings.Index(up, "LOCK TABLE model_providers, users IN ACCESS EXCLUSIVE MODE;")
+	add := strings.Index(up, "ALTER TABLE users ADD COLUMN")
+	if lock < 0 || add < 0 || lock >= add {
+		t.Errorf("%s Up: LOCK TABLE model_providers, users@%d, ALTER TABLE users ADD COLUMN@%d; want both present, lock first", file, lock, add)
 	}
 }
 
@@ -215,4 +291,16 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 	if err := run00("00481_runs_model_provider_binding.sql"); err != nil {
 		t.Fatalf("00481 Down with no bound run: %v", err)
 	}
+}
+
+// stripSQLLineComments drops every "--" line comment, so a commented-out statement cannot satisfy
+// a position check on the executable SQL. The migrations under test carry no "--" inside literals.
+func stripSQLLineComments(sql string) string {
+	lines := strings.Split(sql, "\n")
+	for i, l := range lines {
+		if c := strings.Index(l, "--"); c >= 0 {
+			lines[i] = l[:c]
+		}
+	}
+	return strings.Join(lines, "\n")
 }

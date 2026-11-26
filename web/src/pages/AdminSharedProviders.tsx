@@ -1,6 +1,7 @@
-// Admin → Shared providers (PRD #4324): Claude gateway definitions every user can pick as
-// their Claude source with their OWN key. The admin fixes the endpoint and auth style at
-// creation and may later change only the name and model map; there is no key here at all.
+// Admin → Shared providers (PRD #4324): Claude or Codex gateway definitions every user can
+// pick as their source for that engine, with their OWN key. The admin fixes the engine,
+// endpoint and auth style at creation and may later change only the name and model map;
+// there is no key here at all.
 // Every write is a cookie-only admin route, so the CLI can list and show but never write.
 //
 // The page answers two questions per definition: what is fixed (endpoint, auth style: a
@@ -13,11 +14,11 @@
 // uses dangerouslySetInnerHTML.
 
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { api, type AdminSharedProvider, type ProviderAuthStyle, type ProviderModelMap } from "../lib/api";
+import { api, type AdminSharedProvider, type ProviderAuthStyle, type ProviderDTO, type ProviderModelMap } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, ListSkeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, ListSkeleton, Select } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { KeyIcon, LockIcon } from "../components/icons";
 import {
@@ -34,18 +35,23 @@ import {
   type ModelRows,
 } from "../components/providerFields";
 
-const REASONS: Record<string, string> = {
-  provider_name_taken: "A shared provider with that name already exists. Shared names are unique regardless of case.",
-  provider_limit_reached: "This instance already has 50 shared providers, retired ones included. Delete one first.",
-  provider_in_use_as_source:
-    "Delete refused: at least one user still has this definition selected as their Claude source. They must choose another source first.",
-  provider_retired: "This shared provider is retired and can no longer be edited.",
-  provider_base_url_not_allowed: "That base URL is not on the operator's allowlist. Pick one from the list.",
+type Engine = ProviderDTO["engine"];
+
+const ENGINE_LABELS: Record<Engine, string> = { claude: "Claude", codex: "Codex" };
+const PROTOCOL_LABELS: Record<Engine, string> = { claude: "Anthropic Messages", codex: "OpenAI Responses" };
+
+const REASONS: Record<string, (engine: Engine) => string> = {
+  provider_name_taken: () => "A shared provider with that name already exists. Shared names are unique regardless of case.",
+  provider_limit_reached: () => "This instance already has 50 shared providers, retired ones included. Delete one first.",
+  provider_in_use_as_source: (engine) =>
+    `Delete refused: at least one user still has this definition selected as their ${ENGINE_LABELS[engine]} source. They must choose another source first.`,
+  provider_retired: () => "This shared provider is retired and can no longer be edited.",
+  provider_base_url_not_allowed: () => "That base URL is not on the operator's allowlist. Pick one from the list.",
 };
 
-function sharedError(err: unknown, fallback: string): string {
+function sharedError(err: unknown, fallback: string, engine: Engine): string {
   const reason = err instanceof ApiError ? (err.body as { reason?: string } | null)?.reason : undefined;
-  return (reason && REASONS[reason]) || errorMessage(err, fallback);
+  return (reason && REASONS[reason]?.(engine)) || errorMessage(err, fallback);
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -99,8 +105,8 @@ export function AdminSharedProviders() {
     <AdminShell
       description={
         <>
-          Shared providers are Claude gateways any user can pick as their Claude source. You fix the endpoint and auth
-          style and map the models; each user attaches their own key, which you never see.
+          Shared providers are Claude or Codex gateways any user can pick as their source for that engine. You fix the
+          engine, endpoint and auth style and map the models; each user attaches their own key, which you never see.
         </>
       }
     >
@@ -135,7 +141,7 @@ export function AdminSharedProviders() {
           <EmptyState
             icon={<KeyIcon />}
             title="No shared providers yet"
-            description="Create one so users can run Claude through your gateway with a key of their own."
+            description="Create one so users can run Claude or Codex through your gateway with a key of their own."
             action={newButton}
           />
         )
@@ -216,7 +222,7 @@ function ProviderCard({
     try {
       await onDone(await fn());
     } catch (err) {
-      setError(sharedError(err, fallback));
+      setError(sharedError(err, fallback, p.engine));
       // A 409 means the counts on screen were stale, a 404 that another admin already deleted the
       // definition: either way refresh the list, so no stale count or ghost card stays behind.
       if (err instanceof ApiError && (err.status === 409 || err.status === 404)) await onStale();
@@ -233,7 +239,9 @@ function ProviderCard({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 space-y-1">
           <h2 className="[overflow-wrap:anywhere] text-sm font-semibold text-fg">{name}</h2>
-          <p className="text-xs text-faint">Claude, Anthropic Messages, revision {p.current_revision}</p>
+          <p className="text-xs text-faint">
+            {ENGINE_LABELS[p.engine]}, {PROTOCOL_LABELS[p.engine]}, revision {p.current_revision}
+          </p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           {p.retired && <Badge tone="neutral">Retired</Badge>}
@@ -266,7 +274,7 @@ function ProviderCard({
 
       <div className="text-sm">
         <p className="text-muted">Models</p>
-        <MappedModels engine="claude" map={p.model_map} blankLabel=" (no context window)" />
+        <MappedModels engine={p.engine} map={p.model_map} blankLabel=" (no context window)" />
       </div>
 
       {confirm === "retire" && (
@@ -315,7 +323,7 @@ function ProviderCard({
           {selected > 0 ? (
             <>
               <p data-testid={`delete-selected-${p.id}`} className="text-warn">
-                {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their Claude source. ${p.retired ? "Ask them" : "Retire it, then ask them"} to choose another source.`}
+                {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their ${ENGINE_LABELS[p.engine]} source. ${p.retired ? "Ask them" : "Retire it, then ask them"} to choose another source.`}
               </p>
               <p data-testid={`delete-keys-${p.id}`} className="text-muted">
                 Once nobody has it selected, deleting it would also delete {plural(keys, "personal key", "personal keys")} users
@@ -329,7 +337,7 @@ function ProviderCard({
                 Test results. This cannot be undone.
               </p>
               <p data-testid={`delete-selected-${p.id}`} className="text-muted">
-                No user has it selected as their Claude source.
+                No user has it selected as their {ENGINE_LABELS[p.engine]} source.
               </p>
             </>
           )}
@@ -371,6 +379,7 @@ function CreateForm({
   onCreated: (p: AdminSharedProvider) => Promise<void>;
 }) {
   const uid = useId();
+  const [engine, setEngine] = useState<Engine>("claude");
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [auth, setAuth] = useState<ProviderAuthStyle>("bearer");
@@ -380,13 +389,14 @@ function CreateForm({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const built = buildModelMap(rows, "claude");
+    const built = buildModelMap(rows, engine);
     const err = validName(name) ?? (baseUrl === "" ? "Pick a base URL." : null) ?? ("error" in built ? built.error : null);
     if (err) return setError(err);
     setError("");
     setSaving(true);
     try {
       const { provider } = await api.adminCreateSharedProvider({
+        engine,
         name: name.trim(),
         base_url: baseUrl,
         auth_style: auth,
@@ -394,7 +404,7 @@ function CreateForm({
       });
       await onCreated(provider);
     } catch (err) {
-      setError(sharedError(err, "Failed to create the shared provider"));
+      setError(sharedError(err, "Failed to create the shared provider", engine));
     } finally {
       setSaving(false);
     }
@@ -405,20 +415,40 @@ function CreateForm({
       <form onSubmit={submit} className="space-y-3" aria-label="New shared provider">
         <h2 className="text-sm font-semibold text-fg">New shared provider</h2>
         <p className="text-sm text-muted">
-          No key here: each user attaches their own. The endpoint and auth style cannot be changed after you create it;
-          a different gateway needs a new definition, which users select again on purpose.
+          No key here: each user attaches their own. The engine, endpoint and auth style cannot be changed after you
+          create it; a different gateway needs a new definition, which users select again on purpose.
         </p>
+        {/* Switching engine starts the map and auth over: the two engines share no model slots,
+            and Codex is bearer-only. */}
+        <Field label="Engine">
+          <Select
+            aria-label="Engine"
+            value={engine}
+            onChange={(e) => {
+              setEngine(e.target.value as Engine);
+              setRows(emptyRows());
+              setAuth("bearer");
+              setError("");
+            }}
+          >
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </Select>
+        </Field>
+        <p className="text-xs text-muted" data-testid="engine-protocol">Protocol: {PROTOCOL_LABELS[engine]}</p>
         <Field label="Name">
           <Input aria-label="Provider name" placeholder="platform-gateway" value={name} onChange={(e) => setName(e.target.value)} />
         </Field>
         <BaseUrlSelect value={baseUrl} onChange={setBaseUrl} allowed={allowed} />
-        <AuthStyleSelect engine="claude" value={auth} onChange={setAuth} />
+        <AuthStyleSelect engine={engine} value={auth} onChange={setAuth} />
         <p className={auth === "x_api_key" ? "text-xs text-warn" : "text-xs text-faint"} data-testid="auth-advice">
-          {auth === "x_api_key"
-            ? "With x-api-key, a redirecting gateway can forward each user's key to another host. Bearer is recommended."
-            : "Bearer is recommended: on a redirect the key can reach another path on the same host, but not another host. Request bodies can still follow a redirect."}
+          {engine === "codex"
+            ? "Codex sends each user's key as a Bearer token. Codex runtime redirects may forward request bodies and authentication headers, so share only a gateway you trust not to redirect: allowlist admission is not confinement to that host."
+            : auth === "x_api_key"
+              ? "With x-api-key, a redirecting gateway can forward each user's key to another host. Bearer is recommended."
+              : "Bearer is recommended: on a redirect the key can reach another path on the same host, but not another host. Request bodies can still follow a redirect."}
         </p>
-        <ModelMapFields engine="claude" rows={rows} onChange={setRows} idPrefix={`${uid}-new`} />
+        <ModelMapFields engine={engine} rows={rows} onChange={setRows} idPrefix={`${uid}-new`} />
         {error && <Alert message={error} />}
         <div className="flex flex-wrap gap-2">
           <Button type="submit" disabled={saving}>{saving ? "Creating…" : "Create shared provider"}</Button>
@@ -446,7 +476,7 @@ function EditForm({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const built = buildModelMap(rows, "claude");
+    const built = buildModelMap(rows, p.engine);
     const err = validName(name) ?? ("error" in built ? built.error : null);
     if (err) return setError(err);
     // Send only what changed: a model map is a new revision for every user who selected it.
@@ -460,7 +490,7 @@ function EditForm({
     try {
       await onSaved((await api.adminPatchSharedProvider(p.id, body)).provider);
     } catch (err) {
-      setError(sharedError(err, "Failed to save the shared provider"));
+      setError(sharedError(err, "Failed to save the shared provider", p.engine));
     } finally {
       setSaving(false);
     }
@@ -474,8 +504,11 @@ function EditForm({
           <Input aria-label="Provider name" value={name} onChange={(e) => setName(e.target.value)} />
         </Field>
         <FixedFacts baseUrl={p.base_url} auth={p.auth_style} />
-        <p className="text-xs text-faint">To use a different endpoint or auth style, create a new definition.</p>
-        <ModelMapFields engine="claude" rows={rows} onChange={setRows} idPrefix={`${uid}-edit`} />
+        <p className="text-xs text-faint">
+          {ENGINE_LABELS[p.engine]}, {PROTOCOL_LABELS[p.engine]}. To use a different engine, endpoint or auth style,
+          create a new definition.
+        </p>
+        <ModelMapFields engine={p.engine} rows={rows} onChange={setRows} idPrefix={`${uid}-edit`} />
         <p className="text-xs text-faint">
           A model map change applies to new runs of {plural(p.selected_user_count, "user", "users")} who selected it and resets
           every user's Test result. Runs already started keep their map.

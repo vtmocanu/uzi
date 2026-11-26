@@ -106,3 +106,23 @@ func TestModelMapped(t *testing.T) {
 		t.Error("an empty model must resolve through the sonnet alias when it is mapped")
 	}
 }
+
+// TestEvaluateProviderSourceRefusesWrongKeyKind: a populated row whose key is of the other engine's
+// kind is not a usable source for the requested engine; it reads as key_missing, never a usable key.
+func TestEvaluateProviderSourceRefusesWrongKeyKind(t *testing.T) {
+	pid := uuid.New()
+	allow := allowOnly("https://gw.example.com/a")
+	row := usableRow(pid)
+	row.Engine = pgtype.Text{String: providers.EngineCodex, Valid: true}
+	row.Protocol = pgtype.Text{String: providers.ProtocolResponses, Valid: true}
+	row.ModelMap = []byte(`{"default":{"model":"m"}}`)
+	// usableRow carries an anthropic_compatible_key.
+	got := EvaluateProviderSource(providers.EngineCodex, row, allow)
+	if got.State != ProviderSourceUnusable || got.Reason != SourceUnusableKeyMissing {
+		t.Fatalf("codex source with an anthropic_compatible_key = %+v, want key_missing", got)
+	}
+	row.KeyKind = pgtype.Text{String: store.KindOpenAICompatibleKey, Valid: true}
+	if got := EvaluateProviderSource(providers.EngineCodex, row, allow); got.State != ProviderSourceUsable {
+		t.Fatalf("control: codex source with an openai_compatible_key = %+v, want usable", got)
+	}
+}
