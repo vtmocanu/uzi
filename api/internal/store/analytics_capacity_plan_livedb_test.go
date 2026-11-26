@@ -29,7 +29,13 @@ import (
 //     runs_user_nonterminal_idx (nonterminal arm);
 //   - neither historical statement joins the interval/event set with the bucket set through a
 //     Nested Loop (that join shape is quadratic in intervals x buckets);
-//   - neither contains a self-join of the interval/event set (or of runs).
+//   - neither contains a self-join of the interval/event set (or of runs);
+//   - the plan shows a bucket side (CTE bk or a Function Scan) at all, so the join
+//     check cannot pass because the bucket set was inlined out of sight.
+//
+// Not guarded: a Seq Scan on runs. With enable_seqscan = off the planner avoids one wherever an
+// index can serve the scan, so "no Seq Scan on runs" would be nearly vacuous here; the seq scans
+// of the admin statements at 30d and beyond are measured by the evidence harness instead.
 //
 // The gauge statements are not checked here: they legitimately use nested loops.
 
@@ -48,6 +54,10 @@ func (n capPlanNode) sources(into map[string]bool) {
 	switch {
 	case n.NodeType == "CTE Scan" && n.CTEName != "":
 		into["cte:"+n.CTEName] = true
+	case n.NodeType == "Function Scan":
+		// The bucket set is ROWS FROM (unnest(..), unnest(..)), a Function Scan; any Function
+		// Scan counts as the bucket side.
+		into["fn"] = true
 	case n.RelationName != "":
 		into["rel:"+n.RelationName] = true
 	}
@@ -66,10 +76,13 @@ func (n capPlanNode) indexes(into map[string]bool) {
 }
 
 // capIntervalSources are the scans that carry the interval/event set or the runs it comes from;
-// the bucket set is the CTE bk.
+// the bucket set is the CTE bk. When the planner inlines bk (AS NOT MATERIALIZED) the CTE Scan
+// disappears and the bucket side shows as a Function Scan, so both count as the bucket
+// side, and capPlanViolations also demands that the plan shows one of them at all (otherwise the
+// no-join check would pass vacuously).
 var capIntervalSources = []string{"rel:runs", "cte:pop", "cte:iv", "cte:ev", "cte:pts", "cte:run", "cte:seg", "cte:uw"}
 
-const capBucketSource = "cte:bk"
+var capBucketSources = []string{"cte:bk", "fn"}
 
 func capHasAny(set map[string]bool, names []string) bool {
 	for _, n := range names {
@@ -78,6 +91,13 @@ func capHasAny(set map[string]bool, names []string) bool {
 		}
 	}
 	return false
+}
+
+// capPlanSources is every scan source of the whole plan.
+func capPlanSources(n capPlanNode) map[string]bool {
+	all := map[string]bool{}
+	n.sources(all)
+	return all
 }
 
 // capPlanViolations walks every join node and returns the guard violations under it.
@@ -90,7 +110,7 @@ func capPlanViolations(n capPlanNode, path string) []string {
 		n.Plans[0].sources(l)
 		n.Plans[1].sources(r)
 		lInt, rInt := capHasAny(l, capIntervalSources), capHasAny(r, capIntervalSources)
-		if n.NodeType == "Nested Loop" && ((l[capBucketSource] && rInt) || (r[capBucketSource] && lInt)) {
+		if n.NodeType == "Nested Loop" && ((capHasAny(l, capBucketSources) && rInt) || (capHasAny(r, capBucketSources) && lInt)) {
 			out = append(out, label+": Nested Loop joins the interval/event set with the bucket set")
 		}
 		for _, name := range capIntervalSources {
@@ -145,22 +165,24 @@ func TestAnalyticsCapacityPlanGuardLiveDB(t *testing.T) {
 	ctx, pool := capPrivateDB(t)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 	owner, other := seedCapUser(ctx, t, pool, "cap-plan-a@e2e"), seedCapUser(ctx, t, pool, "cap-plan-b@e2e")
-	for _, u := range []uuid.UUID{owner, other} {
-		// 6000 ordinary-lane runs over 30 days: every twentieth is still running, the rest are
-		// terminal with a retained end 1-97 minutes after the start.
-		mustExec(ctx, t, pool, `INSERT INTO runs (id, user_id, issue_title, issue_description, status, kind, created_at,
-		                                          first_started_at, finished_at, status_since, harness, job_type)
-		    SELECT gen_random_uuid(), $1, 't', 'd',
-		           CASE WHEN g % 20 = 0 THEN 'running' ELSE 'completed' END, 'job',
-		           $2::timestamptz - (g::float8 / 6000) * interval '30 days',
-		           $2::timestamptz - (g::float8 / 6000) * interval '30 days' + interval '30 seconds',
-		           CASE WHEN g % 20 = 0 THEN NULL
-		                ELSE $2::timestamptz - (g::float8 / 6000) * interval '30 days' + (90 + (g % 97) * 60) * interval '1 second' END,
-		           CASE WHEN g % 20 = 0 THEN $2::timestamptz - (g::float8 / 6000) * interval '30 days' + interval '30 seconds'
-		                ELSE $2::timestamptz - (g::float8 / 6000) * interval '30 days' + (90 + (g % 97) * 60) * interval '1 second' END,
-		           'claude', 'research'
-		    FROM generate_series(1, 6000) g`, u, now)
-	}
+	// The two owners' rows are interleaved (ORDER BY g, user): a heap laid out owner by owner has a
+	// user_id correlation of +1 or -1 depending on which random uuid sorts first, and that tips the
+	// planner between idx_runs_user and runs_user_terminal_end_idx from one run to the next.
+	// 6000 ordinary-lane runs per owner over 30 days: every twentieth is still running, the rest
+	// are terminal with a retained end 1-97 minutes after the start.
+	mustExec(ctx, t, pool, `INSERT INTO runs (id, user_id, issue_title, issue_description, status, kind, created_at,
+	                                          first_started_at, finished_at, status_since, harness, job_type)
+	    SELECT gen_random_uuid(), u.id, 't', 'd',
+	           CASE WHEN g % 20 = 0 THEN 'running' ELSE 'completed' END, 'job',
+	           $2::timestamptz - (g::float8 / 6000) * interval '30 days',
+	           $2::timestamptz - (g::float8 / 6000) * interval '30 days' + interval '30 seconds',
+	           CASE WHEN g % 20 = 0 THEN NULL
+	                ELSE $2::timestamptz - (g::float8 / 6000) * interval '30 days' + (90 + (g % 97) * 60) * interval '1 second' END,
+	           CASE WHEN g % 20 = 0 THEN $2::timestamptz - (g::float8 / 6000) * interval '30 days' + interval '30 seconds'
+	                ELSE $2::timestamptz - (g::float8 / 6000) * interval '30 days' + (90 + (g % 97) * 60) * interval '1 second' END,
+	           'claude', 'research'
+	    FROM generate_series(1, 6000) g CROSS JOIN unnest($1::uuid[]) AS u(id)
+	    ORDER BY g, u.id`, []uuid.UUID{owner, other}, now)
 	mustExec(ctx, t, pool, `ANALYZE runs`)
 
 	earliest := now.AddDate(0, 0, -30)
@@ -212,6 +234,10 @@ func TestAnalyticsCapacityPlanGuardLiveDB(t *testing.T) {
 				if !used[idx] {
 					t.Errorf("%s: plan does not use %s (uses %v):\n%s", label, idx, names, pretty)
 				}
+			}
+			if !capHasAny(capPlanSources(plan), capBucketSources) {
+				// Calibration: without a visible bucket side the Nested Loop check cannot fire.
+				t.Errorf("%s: the plan shows no bucket side (%v), so the join check is blind:\n%s", label, capBucketSources, pretty)
 			}
 			if v := capPlanViolations(plan, ""); len(v) > 0 {
 				t.Errorf("%s: %s\n%s", label, strings.Join(v, "; "), pretty)

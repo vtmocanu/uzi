@@ -40,7 +40,7 @@ bill. Capacity reports no dollars.
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
-| `kind` | a run kind, `delivery` or `supporting` | all kinds | `chat` is accepted but only feeds `untracked_chat_runs`. |
+| `kind` | a run kind, `delivery` or `supporting` | all kinds | `chat` is accepted. On Spend it only feeds `untracked_chat_runs`; on Capacity it gives empty measures and `excluded_kind_selected` `chat`. |
 | `split` (spend only) | `usage_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `usage_model` | Top 5 groups plus Other. |
 | `breakdown` (spend only) | `primary_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `repo` | Top 50 rows plus Other. |
 | `user` (admin only) | `all` or a user UUID | `all` | Omitting it is byte-identical to `user=all`. |
@@ -237,9 +237,12 @@ now. It takes `window`, `tz`, `repo`, `harness`, `kind` and, on the admin route,
 `breakdown`. Authorization, the owner and admin scopes, admission (its own
 `capacity` slot) and the 8 second budget are as above, and `window=all` on the
 admin all-users scope is the same 400 `window all not available for all users`.
-The response carries the same calendar envelope as Spend. Its `previous_from`,
-`previous_to` and `rolling` fields are present, but Capacity reports no
-previous-period and no rolling series. The response is sent with
+The 8 second budget covers the database snapshot only: the Codex vault
+observation runs after it (see [Provider gauges](#provider-gauges)). The
+response carries the same calendar envelope as Spend: `previous_from` and
+`previous_to` are present for `7d`, `30d` and `90d` and absent for `window=all`,
+and `rolling` is always present. Capacity itself reports no previous-period
+figures and no rolling series. The response is sent with
 `Cache-Control: private, no-store`.
 
 ### Occupancy
@@ -264,22 +267,23 @@ worker count is read.
 - `window` and every bucket carry `run_seconds`, `duration_seconds`,
   `average_concurrent_runs` and `reason`. Each bucket is divided by its own
   actual duration (a 23 or 25 hour DST day, or the partial bucket for today),
-  not by a fixed day. A zero-duration bucket (the final `[now, now)` bucket at a
-  local midnight) has `average_concurrent_runs` null with reason
+  not by a fixed day. A zero-duration bucket (for day windows, the final
+  `[now, now)` bucket when `generated_at` is exactly a local midnight; for
+  `window=all`, see [Calendar](#calendar)) has `average_concurrent_runs` null with reason
   `zero_duration_bucket`; a zero-duration range has null with
   `zero_duration_range`.
 - `population` counts the candidate runs: `candidates` is `with_interval` +
   `without_start` + `invalid_interval`. A terminal run is a candidate when its
-  end is after the range start, a nonterminal run when it was created before
-  `generated_at`.
+  end is after the range start and it was created before `generated_at`; a
+  nonterminal run when it was created before `generated_at`.
 
   | Field | Meaning |
   |---|---|
   | `with_interval` | Runs with a valid interval, which feed the integral. |
   | `without_start` | Runs with no `first_started_at`, excluded. |
-  | `invalid_interval` | Runs whose end is before their start, or whose first start falls after the request's captured clock (`generated_at`); excluded. |
+  | `invalid_interval` | Runs whose end is before their start, or whose first start is at or after the request's captured clock (`generated_at`); excluded. |
   | `end_from_status_since` | Terminal runs with no `finished_at`, whose end falls back to `status_since`. |
-  | `ongoing` | Nonterminal runs, ended at `generated_at`. |
+  | `ongoing` | Every nonterminal candidate, including queued runs with no start (those are also `without_start` and add nothing to occupancy). A started one ends at `generated_at`. |
   | `cross_check_kind_included` | `cross_check` runs not on a lane that are included. |
 
 - `limitations` is a fixed, ordered list of `{code, runs}`. Method codes have
@@ -326,8 +330,8 @@ raw provider identifiers or poll-error text.
 - A shared quota cannot be split by repo or kind. When `repo` or `kind` is
   given, `effective_scope.unattributed_selectors` lists them (`repo` then
   `kind`) with reason `shared_quota_not_attributable`; the identities are
-  unchanged. `effective_scope` also names the `user` (as `selected_user`) and
-  `provider`.
+  unchanged. `effective_scope` also names the `user` (always equal to the response's
+  `selected_user`) and `provider`.
 - At most 200 identities per provider, in stable order. `truncated` is true when
   more exist, and `set_state` is `empty` (a proven empty set), `complete` or
   `truncated`; it is null unless the gauge is `available`. A Codex login with
@@ -342,11 +346,13 @@ raw provider identifiers or poll-error text.
   the whole request with 503 and `Retry-After: 1`, like any other analytics
   timeout.
 - Codex vault state (`vault_state_basis` `live_observation`) is read live after
-  the snapshot, not from it. The owner route reads the caller's own state and
-  fails closed: a locked or unreadable vault reports `vault_locked` per identity
-  (`polling_disabled` instead when Codex polling is turned off). The admin routes
-  read each distinct owner without waiting for any user's vault lifecycle, within
-  a 2 second budget. If a state is contended, fails to read or the budget runs
+  the snapshot, outside its 8 second budget. The owner route reads the caller's
+  own state with the same unbounded `RequiresUnlock` read as
+  `GET /api/me/codex-rate-limits` and fails closed: a locked or unreadable vault
+  reports `vault_locked` per identity (`polling_disabled` instead when Codex
+  polling is turned off). The admin routes read each distinct owner without
+  waiting for any user's vault lifecycle, within a 2 second budget, so they add
+  at most 2 seconds. If a state is contended, fails to read or the budget runs
   out, the Codex gauge is `unavailable` with reason `vault_status_unavailable`
   and occupancy is kept. This reason appears on the admin routes only.
 
