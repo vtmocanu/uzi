@@ -57,10 +57,11 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   Skip that wait only when the PR must merge ASAP or the user asks. For a longer or
   unknown reset, switch: a large or trust-boundary PR goes to Greptile (the buddy
   reviews too); a small PR to the buddy alone (step 3).
-- **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
-  repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
-  and message you instead of double-driving it. A PR another live session holds stops you
-  at `NEXT=claimed_by_other`: talk to them (SendMessage), do not take it.
+- **Claim what you land.** `takeover.sh` records this session as the PR's lander
+  (`claims.sh`), so other landers see who holds what and message you instead of
+  double-driving it. A PR another live session holds stops you at `NEXT=claimed_by_other`:
+  talk to them (SendMessage), do not take it. Each pass over parked claims, run
+  `S/owned-gates.sh OWNER/REPO`: exit 1 lists uzi runs gated on them.
 - **Never in the `main` worktree.** Every local edit happens in a sibling worktree
   (`land-prep.sh` makes one); auto-clean worktrees you created once the PR merges.
 - **Run the scripts from your own fresh `origin/main` worktree**, not the long-lived
