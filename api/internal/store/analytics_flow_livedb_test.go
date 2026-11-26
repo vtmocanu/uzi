@@ -370,6 +370,22 @@ func TestAnalyticsFlowGateEvidenceLiveDB(t *testing.T) {
 		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, notApproved: 1, planning: store.AnalyticsFlowPlanning{Unknown: 1},
 			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, approvalUnk: store.AnalyticsFlowApprovalReasons{LegacyUnbound: 1}}},
 
+		{"auto-approve configuration beats legacy evidence in the approval cohort", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			r := gr(0)
+			f.patch(r, "auto_approve = true, plan_md = 'p', plan_source = 'agent'")
+			f.receipt(r, receipt{Binding: "unbound", CreatedAt: gateIn, AppliedAt: gateApplied})
+		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{LegacyUnbound: 1}, planning: store.AnalyticsFlowPlanning{SettledAuto: 1},
+			disc: store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}, auto: 1}},
+
+		{"two current receipts beat a stray unbound receipt as ambiguous, not legacy", func(f *spendFixture, gr func(int64) uuid.UUID) {
+			r := gr(1)
+			f.presentation(r, 1, gatePres)
+			f.receipt(r, elig)
+			f.receipt(r, receipt{Revision: 1, CreatedAt: flowAt(12, 10, 37), AppliedAt: flowAt(12, 10, 38)})
+			f.receipt(r, receipt{Binding: "unbound", CreatedAt: flowAt(12, 10, 50), AppliedAt: flowAt(12, 10, 51)})
+		}, gateWant{runs: 1, reasons: store.AnalyticsFlowResponseReasons{Ambiguous: 1, LegacyUnbound: 1}, planning: store.AnalyticsFlowPlanning{Unknown: 1},
+			disc: store.AnalyticsFlowFunnelDisclosure{AmbiguousCurrent: 1, LegacyEvidence: 1}, approvalUnk: store.AnalyticsFlowApprovalReasons{Ambiguous: 1}}},
+
 		{"plan_rejected beats a current eligible receipt", func(f *spendFixture, gr func(int64) uuid.UUID) {
 			r := gr(1)
 			f.patch(r, "status = 'failed', fail_origin = 'plan_rejected'")
