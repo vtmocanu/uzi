@@ -7037,3 +7037,153 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   top_runs: AnalyticsTopRunDTO[];
   breakdown: AnalyticsBreakdownDTO;
 }
+
+// ── Capacity analytics (issue #4731) ─────────────────────────────────────────
+// GET /api/analytics/capacity and GET /api/admin/analytics/capacity. Every slice is
+// non-null on the wire. A null value always travels with a reason from a closed set.
+
+export interface AnalyticsCapacityFiltersDTO {
+  /** The authorized repo filter, null when none was given. */
+  repo: string | null;
+  harness: "claude" | "codex" | null;
+  /** The run kinds the measures cover; chat is never listed. */
+  kinds: string[];
+}
+
+export interface AnalyticsCapacityPopulationDTO {
+  /** Sum of with_interval, without_start and invalid_interval. */
+  candidates: number;
+  with_interval: number;
+  without_start: number;
+  invalid_interval: number;
+  end_from_status_since: number;
+  ongoing: number;
+  cross_check_kind_included: number;
+}
+
+/** The closed set of occupancy limitation codes the server emits. */
+export type AnalyticsCapacityLimitationCode =
+  | "elapsed_envelope_includes_waits"
+  | "claim_and_resume_history_not_recovered"
+  | "lane_assignment_history_limited"
+  | "missing_start_excluded"
+  | "invalid_interval_excluded"
+  | "end_from_status_since"
+  | "ongoing_end_is_generated_at"
+  | "cross_check_kind_not_on_lane_included";
+
+export interface AnalyticsCapacityLimitationDTO {
+  code: AnalyticsCapacityLimitationCode;
+  /** Runs the limit applies to; null when it describes the method. */
+  runs: number | null;
+}
+
+export interface AnalyticsCapacityOccupancyCellDTO {
+  run_seconds: number;
+  duration_seconds: number;
+  /** Null with a reason when the duration is zero. */
+  average_concurrent_runs: number | null;
+  reason: "zero_duration_bucket" | "zero_duration_range" | null;
+}
+
+export interface AnalyticsCapacityOccupancyBucketDTO extends AnalyticsCapacityOccupancyCellDTO {
+  index: number;
+}
+
+export interface AnalyticsCapacityOccupancyDTO {
+  time_basis: "interval_overlap";
+  unit: "average_concurrent_runs";
+  population: AnalyticsCapacityPopulationDTO;
+  limitations: AnalyticsCapacityLimitationDTO[];
+  window: AnalyticsCapacityOccupancyCellDTO;
+  buckets: AnalyticsCapacityOccupancyBucketDTO[];
+}
+
+export interface AnalyticsCapacityUsageWaitCellDTO {
+  count: number;
+  n: number;
+  /** Null with no_applicable_runs when n is zero. */
+  share: number | null;
+  reason: "no_applicable_runs" | null;
+}
+
+export interface AnalyticsCapacityUsageWaitBucketDTO extends AnalyticsCapacityUsageWaitCellDTO {
+  index: number;
+}
+
+export interface AnalyticsCapacityUsageWaitDTO {
+  time_basis: "created_at";
+  cohort: "creation";
+  basis: "limit_wait_count";
+  current: AnalyticsCapacityUsageWaitCellDTO;
+  buckets: AnalyticsCapacityUsageWaitBucketDTO[];
+}
+
+export interface AnalyticsCapacityNotTrackedDTO {
+  measure: "historical_provider_headroom" | "slot_count" | "utilization" | "parked_duration";
+  /** Always null. */
+  value: number | null;
+  reason: "not_tracked";
+}
+
+export interface AnalyticsCapacityEffectiveScopeDTO {
+  user: string;
+  provider: "anthropic" | "codex";
+  /** The request selectors the gauge could not honor, in the order repo then kind. */
+  unattributed_selectors: ("repo" | "kind")[];
+  /** "shared_quota_not_attributable" when the list is not empty. */
+  reason: "shared_quota_not_attributable" | null;
+}
+
+export interface AnalyticsCapacityGaugeBaseDTO {
+  provider: "anthropic" | "codex";
+  status: "available" | "unavailable" | "not_selected";
+  /** Null when available. */
+  reason: "gauge_unavailable" | "vault_status_unavailable" | "not_selected" | null;
+  time_basis: "current_observation";
+  effective_scope: AnalyticsCapacityEffectiveScopeDTO;
+  truncated: boolean;
+  /** Null unless available; identities are cut at 200. */
+  set_state: "empty" | "complete" | "truncated" | null;
+}
+
+export interface AnalyticsCapacityAnthropicIdentityDTO {
+  secret_id: string;
+  label: string;
+  is_default: boolean;
+  /** user_id and email are set on an admin all-users response, null otherwise. */
+  user_id: string | null;
+  email: string | null;
+  limits: MyRateLimits;
+}
+
+export interface AnalyticsCapacityAnthropicGaugeDTO extends AnalyticsCapacityGaugeBaseDTO {
+  identities: AnalyticsCapacityAnthropicIdentityDTO[];
+}
+
+export interface AnalyticsCapacityCodexIdentityDTO extends CodexAccountRateLimit {
+  user_id: string | null;
+  email: string | null;
+}
+
+export interface AnalyticsCapacityCodexGaugeDTO extends AnalyticsCapacityGaugeBaseDTO {
+  vault_state_basis: "live_observation";
+  identities: AnalyticsCapacityCodexIdentityDTO[];
+}
+
+export interface AnalyticsCapacityGaugesDTO {
+  anthropic: AnalyticsCapacityAnthropicGaugeDTO;
+  codex: AnalyticsCapacityCodexGaugeDTO;
+}
+
+export interface AnalyticsCapacityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  filters: AnalyticsCapacityFiltersDTO;
+  /** "chat" when kind=chat was requested (outside the population), else null. */
+  excluded_kind_selected: "chat" | null;
+  occupancy: AnalyticsCapacityOccupancyDTO;
+  usage_wait: AnalyticsCapacityUsageWaitDTO;
+  not_tracked: AnalyticsCapacityNotTrackedDTO[];
+  gauges: AnalyticsCapacityGaugesDTO;
+}

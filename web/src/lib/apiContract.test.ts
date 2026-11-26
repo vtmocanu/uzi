@@ -25,11 +25,31 @@ import type {
   AnalyticsBreakdownRowDTO,
   AnalyticsBreakdownDTO,
   AnalyticsSpendDTO,
+  AnalyticsCapacityDTO,
+  AnalyticsCapacityFiltersDTO,
+  AnalyticsCapacityPopulationDTO,
+  AnalyticsCapacityLimitationDTO,
+  AnalyticsCapacityOccupancyCellDTO,
+  AnalyticsCapacityOccupancyBucketDTO,
+  AnalyticsCapacityOccupancyDTO,
+  AnalyticsCapacityUsageWaitCellDTO,
+  AnalyticsCapacityUsageWaitBucketDTO,
+  AnalyticsCapacityUsageWaitDTO,
+  AnalyticsCapacityNotTrackedDTO,
+  AnalyticsCapacityEffectiveScopeDTO,
+  AnalyticsCapacityGaugeBaseDTO,
+  AnalyticsCapacityAnthropicIdentityDTO,
+  AnalyticsCapacityAnthropicGaugeDTO,
+  AnalyticsCapacityCodexIdentityDTO,
+  AnalyticsCapacityCodexGaugeDTO,
+  AnalyticsCapacityGaugesDTO,
 } from "./apiTypes";
 import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
 import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
 import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
 import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
+import analyticsCapacityFull from "../../../fixtures/api-contract/analytics_capacity.full.json";
+import analyticsCapacityZero from "../../../fixtures/api-contract/analytics_capacity.zero.json";
 import type { CrossCheckHistoryDTO, CrossCheckHistoryAvailabilityDTO, FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
 import crossHistoryFull from "../../../fixtures/api-contract/cross_check_history.full.json";
 import crossHistoryZero from "../../../fixtures/api-contract/cross_check_history.zero.json";
@@ -2577,6 +2597,81 @@ describe("analytics spend contract (issue #4684)", () => {
   });
 });
 
+describe("analytics capacity contract (issue #4731)", () => {
+  // Fixed-string fields are literal unions in the TS type but "x" or "" in the recorded
+  // fixtures, so the fixtures are checked after Widen (strings stay strings, shape and
+  // nullability stay exact). NullSlices then lets every array slot accept the zero null.
+  type Full = typeof analyticsCapacityFull;
+  const _top: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityDTO, Full>;
+  const _filters: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityDTO["filters"], Full["filters"]>;
+  const _occ: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityDTO["occupancy"], Full["occupancy"]>;
+  const _pop: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityPopulationDTO, Full["occupancy"]["population"]>;
+  const _lim: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityLimitationDTO, Full["occupancy"]["limitations"][number]>;
+  const _occCell: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityOccupancyCellDTO, Full["occupancy"]["window"]>;
+  const _occBucket: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityOccupancyBucketDTO, Full["occupancy"]["buckets"][number]>;
+  const _wait: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityUsageWaitDTO, Full["usage_wait"]>;
+  const _waitCell: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityUsageWaitCellDTO, Full["usage_wait"]["current"]>;
+  const _waitBucket: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityUsageWaitBucketDTO, Full["usage_wait"]["buckets"][number]>;
+  const _nt: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityNotTrackedDTO, Full["not_tracked"][number]>;
+  const _gauges: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityGaugesDTO, Full["gauges"]>;
+  const _anth: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityAnthropicGaugeDTO, Full["gauges"]["anthropic"]>;
+  const _codex: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityCodexGaugeDTO, Full["gauges"]["codex"]>;
+  const _scope: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityEffectiveScopeDTO, Full["gauges"]["codex"]["effective_scope"]>;
+  const _anthId: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityAnthropicIdentityDTO, Full["gauges"]["anthropic"]["identities"][number]>;
+  const _codexId: never = null as unknown as AnalyticsKeyDiff<AnalyticsCapacityCodexIdentityDTO, Full["gauges"]["codex"]["identities"][number]>;
+  type GaugeBase = AnalyticsCapacityGaugeBaseDTO;
+  const _base: never = null as unknown as Exclude<keyof GaugeBase, keyof Full["gauges"]["anthropic"]>;
+  void [
+    _top, _filters, _occ, _pop, _lim, _occCell, _occBucket, _wait, _waitCell, _waitBucket, _nt, _gauges, _anth,
+    _codex, _scope, _anthId, _codexId, _base,
+  ];
+
+  it("accepts the full fixture", () => {
+    const full: Widen<AnalyticsCapacityDTO> = analyticsCapacityFull;
+    expect(full.selected_user).toBe("x");
+    expect(full.filters).toEqual({ repo: "x", harness: "x", kinds: ["x"] });
+    expect(full.excluded_kind_selected).toBe("x");
+    expect(full.occupancy.population.cross_check_kind_included).toBe(1);
+    expect(full.occupancy.limitations[0]).toEqual({ code: "x", runs: 1 });
+    expect(full.occupancy.window.average_concurrent_runs).toBe(1.5);
+    expect(full.occupancy.buckets[0].index).toBe(1);
+    expect(full.usage_wait.current).toEqual({ count: 1, n: 1, share: 1.5, reason: "x" });
+    expect(full.usage_wait.buckets[0].index).toBe(1);
+    expect(full.not_tracked[0].value).toBe(1.5);
+    expect(full.gauges.anthropic.identities[0].limits.status).toBe("x");
+    expect(full.gauges.anthropic.identities[0].user_id).toBe("x");
+    expect(full.gauges.codex.vault_state_basis).toBe("x");
+    expect(full.gauges.codex.identities[0].account_id).toBe("x");
+    expect(full.gauges.codex.identities[0].email).toBe("x");
+    expect(full.gauges.codex.set_state).toBe("x");
+  });
+
+  it("accepts the zero fixture: pointers and slices null, scalars zero", () => {
+    const zero: NullSlices<Widen<AnalyticsCapacityDTO>> = analyticsCapacityZero;
+    expect("previous_from" in zero).toBe(false);
+    expect(zero.history_start).toBeNull();
+    expect(zero.filters.repo).toBeNull();
+    expect(zero.filters.harness).toBeNull();
+    expect(zero.filters.kinds).toBeNull();
+    expect(zero.excluded_kind_selected).toBeNull();
+    expect(zero.occupancy.limitations).toBeNull();
+    expect(zero.occupancy.buckets).toBeNull();
+    expect(zero.occupancy.window.average_concurrent_runs).toBeNull();
+    expect(zero.occupancy.window.reason).toBeNull();
+    expect(zero.occupancy.window.run_seconds).toBe(0);
+    expect(zero.usage_wait.current.share).toBeNull();
+    expect(zero.usage_wait.buckets).toBeNull();
+    expect(zero.not_tracked).toBeNull();
+    expect(zero.gauges.anthropic.reason).toBeNull();
+    expect(zero.gauges.anthropic.set_state).toBeNull();
+    expect(zero.gauges.anthropic.identities).toBeNull();
+    expect(zero.gauges.anthropic.effective_scope.unattributed_selectors).toBeNull();
+    expect(zero.gauges.codex.identities).toBeNull();
+    expect(zero.gauges.codex.truncated).toBe(false);
+    expect(zero.occupancy.time_basis).toBe("");
+  });
+});
+
 // Exact nullability of every analytics DTO: NullKeys lists the fields whose type admits null,
 // and each assertion pins that to the Go side's *T fields (api/internal/apitypes/analytics.go).
 // omitempty pointers (previous, previous_from, previous_to) are absent, never null, so they
@@ -2610,8 +2705,29 @@ describe("analytics DTO exact nullability (issue #4684)", () => {
   const _row: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownRowDTO>, "key" | "label" | "id">;
   const _breakdown: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownDTO>, never>;
   const _spend: never = null as unknown as UnionDiff<NullKeys<AnalyticsSpendDTO>, "history_start">;
+  const _capFilters: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityFiltersDTO>, "repo" | "harness">;
+  const _capPopulation: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityPopulationDTO>, never>;
+  const _capLimitation: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityLimitationDTO>, "runs">;
+  const _capOccCell: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityOccupancyCellDTO>, "average_concurrent_runs" | "reason">;
+  const _capOccBucket: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityOccupancyBucketDTO>, "average_concurrent_runs" | "reason">;
+  const _capOccupancy: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityOccupancyDTO>, never>;
+  const _capWaitCell: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityUsageWaitCellDTO>, "share" | "reason">;
+  const _capWaitBucket: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityUsageWaitBucketDTO>, "share" | "reason">;
+  const _capWait: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityUsageWaitDTO>, never>;
+  const _capNotTracked: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityNotTrackedDTO>, "value">;
+  const _capScope: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityEffectiveScopeDTO>, "reason">;
+  const _capGaugeBase: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityGaugeBaseDTO>, "reason" | "set_state">;
+  const _capAnthropicId: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityAnthropicIdentityDTO>, "user_id" | "email">;
+  const _capAnthropicGauge: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityAnthropicGaugeDTO>, "reason" | "set_state">;
+  const _capCodexId: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityCodexIdentityDTO>, "user_id" | "email">;
+  const _capCodexGauge: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityCodexGaugeDTO>, "reason" | "set_state">;
+  const _capGauges: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityGaugesDTO>, never>;
+  const _capacity: never = null as unknown as UnionDiff<NullKeys<AnalyticsCapacityDTO>, "history_start" | "excluded_kind_selected">;
   it("pins every analytics DTO's nullable fields", () => {
     void [
+      _capFilters, _capPopulation, _capLimitation, _capOccCell, _capOccBucket, _capOccupancy, _capWaitCell,
+      _capWaitBucket, _capWait, _capNotTracked, _capScope, _capGaugeBase, _capAnthropicId, _capAnthropicGauge,
+      _capCodexId, _capCodexGauge, _capGauges, _capacity,
       _scope, _bucket, _rolling, _envelope, _repoOption, _repoOptions, _userOption, _userOptions, _options,
       _disclosure, _coverage, _block, _cell, _totals, _group, _split, _ratio, _ratioCell, _panel, _cache,
       _topRun, _nullableNumber, _outcomes, _row, _breakdown, _spend,
