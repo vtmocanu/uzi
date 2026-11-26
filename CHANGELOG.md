@@ -417,6 +417,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Overlapping secret occurrences are fully redacted ([#4688](https://github.com/vtmocanu/uzi/pull/4688), [#4690](https://github.com/vtmocanu/uzi/pull/4690)).**
   The worker's text redactor now finds every eligible occurrence of a run-owned secret in the original text, overlapping and invisible-separated ones included, and replaces the union of those matches in one pass.
 
+- **The hosted-worker controller no longer stops reconciling the whole fleet when a worker advertises more than 64 protocol capabilities ([#4714](https://github.com/vtmocanu/uzi/pull/4714)).**
+  Each capability set in the controller poll now allows up to 256 names, and a shared limit plus a vocabulary test keep the api and controller from drifting apart again.
+
+- **A started run no longer fails when the api cannot read the forge during the claim-time guardrail check ([#4689](https://github.com/vtmocanu/uzi/pull/4689), [#4709](https://github.com/vtmocanu/uzi/pull/4709)).**
+  A transient forge read failure that is the only blocking finding now parks the run in `recovery_wait` as `forge_unreachable` instead of `guardrail_blocked`; never-started runs, auth failures and other findings still fail, and the claim still delivers no payload or credential.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -658,6 +664,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **A Claude judge runs on the owner's model provider ([#4322](https://github.com/vtmocanu/uzi/pull/4322), [#4678](https://github.com/vtmocanu/uzi/pull/4678)).**
   The provider is frozen when the judge is created, with no vendor fallback (an owner who pinned an Anthropic token gets a vendor judge instead); it needs workers advertising claude_provider_judge_v1, fails instead of parking on revocation or a gateway limit, and sends judged traces to the gateway.
+
+- **Admins can share Codex provider definitions, not only Claude ones ([#4633](https://github.com/vtmocanu/uzi/pull/4633), [#4705](https://github.com/vtmocanu/uzi/pull/4705)).**
+  Each recipient attaches their own key and selects it as their Codex source; the base URL receives every recipient's key, and an older API image on the new schema can no longer clear a Codex source back to the vendor credential.
 
 ### Changed
 
