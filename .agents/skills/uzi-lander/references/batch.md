@@ -103,8 +103,11 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
   `--active-jobs N` and a conservative incremental peak, including companion workflows,
   with `--peak-jobs N`. Treat the result as an estimate against the 20-job cap. Include
   pending demand when planning the push wave. A missing proof stays unknown.
-- **CI slots**: let the lane owner (tower) grant at most two concurrent PR CI runs alongside
-  main CI. Size grants in jobs using the readiness report, including queued demand and
+- **CI slots**: let the lane owner (tower) grant at most two concurrent PR CI runs
+  alongside main CI with `S/ci-lane.sh grant PR FULL_SHA --owner NAME`, then
+  `S/ci-lane.sh release PR` after the slot is no longer needed. Use `list` to see grants.
+  Keep the local slot state outside the checkout.
+  Size grants in jobs using the readiness report, including queued demand and
   companion workflows. A push without a slot is allowed. Identify the CI and KinD Smoke
   runs created for its exact head. For a queued run, use
   `gh api -X POST repos/vtmocanu/uzi/actions/runs/<id>/force-cancel` and verify
@@ -132,10 +135,13 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
 - **After each batch**: one `main` CI run; the next batch may merge while it runs. Red: rerun a
   known flake, or fix forward / revert the culprit in parallel. A second unresolved red pauses merges.
 - **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
-- **Main CI**: keep only the newest run. After a newer main push, force-cancel older
-  main CI runs except those for a `chore(release)` commit whose tag is unpublished
-  or runs more than about 85% complete. Preserve the exact or two-hop metadata CI
-  evidence needed to publish a release.
+- **Main CI**: keep the newest main CI, KinD and CodeQL runs. After a newer main push,
+  use `S/ci-lane.sh plan` to inspect older runs, then `apply --log FILE` to force-cancel
+  eligible runs and verify the outcome. The same plan covers ungranted PR runs and
+  proposes the next slots. Use `plan --json --evidence FILE` with head-pinned
+  `{pr,head,blocks,red_main_or_release_fix,conflict_prone}` records for the proposal. Keep unpublished `chore(release)` runs, runs more than 85%
+  complete, and runs with LiveDB jobs. Unknowns stay untouched. Preserve the exact or
+  two-hop metadata CI evidence needed to publish a release.
 - **CI hygiene**: cancel runs for already-merged PRs when they no longer supply evidence.
   Preserve required packaged proof, trust-boundary CI or `e2e.yml`, the exact-head
   LiveDB proofs above, and runs another owner relies on.
