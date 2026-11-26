@@ -131,16 +131,16 @@ func TestProviderJobFleetClaimLiveDB(t *testing.T) {
 			t.Fatalf("ClaimRun = (%v %s, %v), want the job claimed", run.ID, run.Status, err)
 		}
 	})
-	t.Run("peer mirror: a busy capable claimant does not defer to an old idle peer", func(t *testing.T) {
+	t.Run("peer mirror: a busy capable claimant does not defer to an idle peer lacking only the job capability", func(t *testing.T) {
 		p := newPJobFix(t)
 		r := p.mustCreate()
 		cap2 := int32(2)
 		me := p.je.seedWorkerRow(t, p.userID, false, &cap2, pjobFullWorkerCaps...)
 		p.je.seedRawJob(t, p.userID, "running", &me, 30*time.Second, 600) // one active run: not minimum-loaded
-		p.je.seedWorkerRow(t, p.userID, false, &cap2, pjobOldWorkerCaps...)
+		p.je.seedWorkerRow(t, p.userID, false, &cap2, pjobNoJobCapCaps...)
 		run, err := p.tryClaim(me, false, pjobFullWorkerCaps)
 		if err != nil || run.ID != r.ID {
-			t.Fatalf("the busy claimant must claim: the old peer can never take a provider job (run=%v err=%v)", run.ID, err)
+			t.Fatalf("the busy claimant must claim: the peer (claude_provider_v1 without claude_provider_job_v1) can never take a provider job (run=%v err=%v)", run.ID, err)
 		}
 	})
 	t.Run("peer mirror: a fully capable idle peer is a spread target", func(t *testing.T) {
@@ -363,6 +363,19 @@ func TestProviderJobWakeCensusLiveDB(t *testing.T) {
 		}
 		if !sawLost {
 			t.Fatal("a wake on a worker without claude_provider_job_v1 was not listed stale")
+		}
+		// Drive the real release: the lost wake row is deleted, the capable one stays.
+		if released, err := f.svc.ReleaseStaleWake(f.env.ctx, lost.ID); err != nil || !released {
+			t.Fatalf("ReleaseStaleWake(lost) = %v, %v; want released", released, err)
+		}
+		if n := f.wakeRows(lost.ID); n != 0 {
+			t.Fatalf("lost run still has %d wake rows after release", n)
+		}
+		if released, err := f.svc.ReleaseStaleWake(f.env.ctx, capable.ID); err != nil || released {
+			t.Fatalf("ReleaseStaleWake(capable) = %v, %v; want kept", released, err)
+		}
+		if n := f.wakeRows(capable.ID); n != 1 {
+			t.Fatalf("capable run has %d wake rows, want 1", n)
 		}
 	})
 }

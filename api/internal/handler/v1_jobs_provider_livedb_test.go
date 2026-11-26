@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -177,6 +181,92 @@ func TestV1ProviderJobOutputReadsLiveDB(t *testing.T) {
 		t.Fatalf("clean sibling sha256 = %s, want %s", res.Result.Files[0].Sha256, sha256Hex(cleanBytes))
 	}
 	if dl := e.call(http.MethodGet, "/api/v1/files/"+clean.ID.String(), tok, ""); dl.status != http.StatusOK || string(dl.body) != string(cleanBytes) {
+		t.Fatalf("download clean sibling: %d %q", dl.status, dl.body)
+	}
+}
+
+// TestV1ProviderJobWorkerResultReadsLiveDB is the same read-back as TestV1ProviderJobOutputReadsLiveDB, but
+// every output is ingested the way a worker does it: the clean sibling is uploaded through
+// POST /api/worker/runs/{id}/files, and the withheld output, the finding and the report arrive in one
+// POST /api/worker/runs/{id}/job-result carrying refused_outputs, then the run is completed through
+// POST /api/worker/runs/{id}/state. The job itself is created through POST /api/v1/jobs (provider-bound);
+// only the claim is seeded (the run is set running under a worker at claim generation 1), because the
+// claim machinery is not what is under test.
+//
+// MUTATION CHECK: dropping the refused_outputs ingest loop (SubmitJobResult) makes the refused_files
+// assertions red; dropping the findings ingest makes the finding assertion red.
+func TestV1ProviderJobWorkerResultReadsLiveDB(t *testing.T) {
+	e := newV1JobsEnv(t, 0)
+	e.wireFiles(workersvc.JobFileLimits{InputFileMaxBytes: 1000, PerOwnerBytes: 100000})
+	owner, tok := e.user()
+	e.selectUsableProvider(owner, v1ProviderMap)
+	job := e.create(tok, v1MinimalJob)
+
+	workerID := uuid.New()
+	workerToken, hash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.exec(`INSERT INTO workers (id,user_id,name,token_hash,protocol_capabilities) VALUES ($1,$2,$3,$4,'{}')`, workerID, owner, "pjob-result-"+workerID.String(), hash)
+	e.exec(`UPDATE runs SET status = 'running', worker_id = $2, started_at = now(), claimed_at = now(), claim_generation = 1 WHERE id = $1`, job.ID, workerID)
+	t.Cleanup(func() { _, _ = e.pool.Exec(context.Background(), `DELETE FROM runs WHERE id = $1`, job.ID) })
+	router := e.h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+	workerPost := func(path, meta, body string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/"+job.ID+path, strings.NewReader(body))
+		if meta != "" {
+			req.Header.Set(jobFileMetaHeader, meta)
+		}
+		req.Header.Set("Authorization", "Bearer "+workerToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	cleanBytes := []byte("a clean sibling")
+	if code, out := workerPost("/files", outMeta(1, "clean.txt", len(cleanBytes), shaHex(cleanBytes)), string(cleanBytes)); code != http.StatusOK && code != http.StatusCreated {
+		t.Fatalf("worker upload of the clean sibling = %d %s", code, out)
+	}
+	result := `{"claim_generation":1,"status":"completed","report_md":"# done",` +
+		`"findings":[{"severity":"warning","message_md":"withheld.txt held a credential-shaped value","file":"withheld.txt","line":3}],` +
+		`"refused_outputs":[{"display_name":"withheld.txt","reason":"worker_unreadable"}]}`
+	if code, out := workerPost("/job-result", "", result); code != http.StatusOK {
+		t.Fatalf("worker job-result = %d %s", code, out)
+	}
+	if code, out := workerPost("/state", "", `{"status":"completed","claim_generation":1}`); code != http.StatusOK {
+		t.Fatalf("worker completed state = %d %s", code, out)
+	}
+
+	files := e.jobFiles(tok, job.ID)
+	byName := v1FilesByName(files.Files)
+	clean, ok := byName["clean.txt"]
+	if !ok {
+		t.Fatalf("files = %+v, want the uploaded clean sibling listed", files.Files)
+	}
+	if _, leaked := byName["withheld.txt"]; leaked {
+		t.Fatalf("files = %+v, the withheld output must not be listed as a file", files.Files)
+	}
+	if len(files.RefusedFiles) != 1 || files.RefusedFiles[0].DisplayName != "withheld.txt" || files.RefusedFiles[0].Reason != "worker_unreadable" {
+		t.Fatalf("refused_files = %+v, want exactly withheld.txt with reason worker_unreadable", files.RefusedFiles)
+	}
+	r := e.call(http.MethodGet, "/api/v1/jobs/"+job.ID+"/result", tok, "")
+	if r.status != http.StatusOK {
+		t.Fatalf("GET result: %d %s", r.status, r.body)
+	}
+	var res apitypes.V1JobResultDTO
+	r.decode(t, &res)
+	if res.JobStatus != "completed" || res.Result == nil || res.Result.Status != "completed" || res.Result.ReportMd != "# done" {
+		t.Fatalf("result = %+v, want a completed job with the worker's report", res)
+	}
+	if len(res.Result.Findings) != 1 || res.Result.Findings[0].Severity != "warning" || res.Result.Findings[0].File == nil || *res.Result.Findings[0].File != "withheld.txt" {
+		t.Fatalf("findings = %+v, want the worker's finding", res.Result.Findings)
+	}
+	if len(res.Result.RefusedFiles) != 1 || res.Result.RefusedFiles[0].Reason != "worker_unreadable" {
+		t.Fatalf("result refused_files = %+v, want the worker_unreadable refusal", res.Result.RefusedFiles)
+	}
+	if got := v1FilesByName(res.Result.Files)["clean.txt"]; got.ID != clean.ID || got.Sha256 != sha256Hex(cleanBytes) {
+		t.Fatalf("result clean sibling = %+v, want id %s with sha256 %s", got, clean.ID, sha256Hex(cleanBytes))
+	}
+	if dl := e.call(http.MethodGet, "/api/v1/files/"+clean.ID, tok, ""); dl.status != http.StatusOK || string(dl.body) != string(cleanBytes) {
 		t.Fatalf("download clean sibling: %d %q", dl.status, dl.body)
 	}
 }

@@ -625,6 +625,7 @@ func TestProviderJobCreateVisibilityLiveDB(t *testing.T) {
 	})
 	t.Run("(iii) the post-insert model refusal leaves nothing; the mapped control commits", func(t *testing.T) {
 		unmapped := newPJobFixMap(t, pvJobNoSonnetMap)
+		inserted := unmapped.countRunInserts(t)
 		var reached atomic.Int32
 		unmapped.svc.createBeforeCommitHook = func(store.Run) { reached.Add(1) }
 		t.Cleanup(func() { unmapped.svc.createBeforeCommitHook = nil })
@@ -638,14 +639,24 @@ func TestProviderJobCreateVisibilityLiveDB(t *testing.T) {
 			t.Fatalf("the commit seam ran %d times for a refused create", reached.Load())
 		}
 		unmapped.wantNoNewJob(before)
+		// The refusal is post-insert: the run INSERT executed (a non-transactional sequence bump from a
+		// trigger survives the rollback) and was then rolled back. A typed error raised before the
+		// insert would leave the count at 0 and fail here.
+		if n := inserted(); n != 1 {
+			t.Fatalf("run INSERT statements for the refused create = %d, want exactly 1 (insert ran, then rolled back)", n)
+		}
 
 		mapped := newPJobFix(t)
+		mappedInserted := mapped.countRunInserts(t)
 		var reachedMapped atomic.Int32
 		mapped.svc.createBeforeCommitHook = func(store.Run) { reachedMapped.Add(1) }
 		t.Cleanup(func() { mapped.svc.createBeforeCommitHook = nil })
 		mapped.wantProviderJob(mapped.mustCreate(), mapped.provider, mapped.key)
 		if reachedMapped.Load() != 1 {
 			t.Fatalf("the mapped control reached the commit seam %d times, want 1", reachedMapped.Load())
+		}
+		if n := mappedInserted(); n != 1 {
+			t.Fatalf("control: run INSERT statements = %d, want 1 (the counter itself works)", n)
 		}
 	})
 }
@@ -859,6 +870,17 @@ func TestProviderJobGatewayLimitFailsTerminallyLiveDB(t *testing.T) {
 		r := p.mustCreate()
 		w := p.jobWorker(pjobWorkerCaps...)
 		gen := running(p, w, r)
+		// The owner's vendor Anthropic credential (the fixture's usable token) and its limit state: a
+		// gateway limit is the provider's, so none of it may move.
+		vendorState := func() string {
+			var st string
+			if err := p.env.pool.QueryRow(p.env.ctx, `SELECT to_jsonb(s)::text || '|' || COALESCE((SELECT jsonb_agg(to_jsonb(l))::text FROM anthropic_rate_limits l WHERE l.user_secret_id = s.id), 'none')
+				FROM user_secrets s WHERE s.id = $1 AND s.kind = 'anthropic_token'`, p.token).Scan(&st); err != nil {
+				t.Fatalf("read the vendor credential state: %v", err)
+			}
+			return st
+		}
+		beforeVendor := vendorState()
 		reset := time.Now().Add(5 * time.Hour).UnixMilli()
 		got, applied, err := p.svc.SetState(p.env.ctx, w, r.ID, StateRequest{State: "failed", ClaimGeneration: &gen,
 			FailureReason: strPtr("worker text"), RateLimitType: strPtr("five_hour"), LimitResetsAt: &reset})
@@ -870,6 +892,9 @@ func TestProviderJobGatewayLimitFailsTerminallyLiveDB(t *testing.T) {
 			row.LimitResetsAt.Valid || row.RetryNotBefore.Valid || row.RateLimitType.Valid || row.LimitWaitCount != 0 {
 			t.Fatalf("reason=%q resets=%v retry=%v type=%v waits=%d, want the job wording and NULL limit columns",
 				row.FailureReason.String, row.LimitResetsAt, row.RetryNotBefore, row.RateLimitType, row.LimitWaitCount)
+		}
+		if after := vendorState(); after != beforeVendor {
+			t.Fatalf("the vendor credential's limit state moved on a gateway limit:\nbefore %s\nafter  %s", beforeVendor, after)
 		}
 	})
 	t.Run("limit_wait is refused and the job is untouched", func(t *testing.T) {
@@ -900,4 +925,40 @@ func TestProviderJobGatewayLimitFailsTerminallyLiveDB(t *testing.T) {
 			t.Fatalf("vendor job reason = %q, want the unchanged vendor wording", got)
 		}
 	})
+}
+
+// countRunInserts counts INSERT statements into runs for this fixture's owner, including ones a later
+// rollback undoes: an AFTER INSERT trigger bumps a sequence, and nextval is not transactional. The
+// returned func reads the count. The trigger is filtered to this owner, so concurrent tests do not
+// add to it, and everything is dropped in cleanup.
+func (p *pjobFix) countRunInserts(t *testing.T) func() int64 {
+	t.Helper()
+	id := strings.ReplaceAll(uuid.NewString(), "-", "")
+	seq, fn, trg := "pjob_ins_seq_"+id, "pjob_ins_fn_"+id, "pjob_ins_trg_"+id
+	for _, stmt := range []string{
+		fmt.Sprintf(`CREATE SEQUENCE %s`, seq),
+		fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN PERFORM nextval('%s'); RETURN NEW; END $f$`, fn, seq),
+		fmt.Sprintf(`CREATE TRIGGER %s AFTER INSERT ON runs FOR EACH ROW WHEN (NEW.user_id = '%s') EXECUTE FUNCTION %s()`, trg, p.userID, fn),
+	} {
+		if _, err := p.env.pool.Exec(p.env.ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, stmt := range []string{
+			fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON runs`, trg),
+			fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, fn),
+			fmt.Sprintf(`DROP SEQUENCE IF EXISTS %s`, seq),
+		} {
+			_, _ = p.env.pool.Exec(context.Background(), stmt)
+		}
+	})
+	return func() int64 {
+		var n int64
+		q := fmt.Sprintf(`SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %s`, seq)
+		if err := p.env.pool.QueryRow(p.env.ctx, q).Scan(&n); err != nil {
+			t.Fatalf("read run insert counter: %v", err)
+		}
+		return n
+	}
 }
