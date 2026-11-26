@@ -116,8 +116,18 @@ function runner(client: WorkerClient, jobsRoot: string, queryFn: SdkQueryFn, log
 
 const everywhere = (calls: Calls, lines: unknown[] = []): string => JSON.stringify([calls.states, calls.messages, calls.results, calls.uploads.map((u) => u.meta), lines]);
 function assertNoKey(key: string, text: string, what: string): void {
-  for (const f of providerKeyForms(key)) assert.ok(!text.includes(f), `${what}: a form of the key reached the api or a log: ${f}`);
+  // The text is JSON-stringified, which doubles a form's backslashes: check both spellings.
+  for (const f of providerKeyForms(key)) {
+    assert.ok(!text.includes(f), `${what}: a form of the key reached the api or a log: ${f}`);
+    assert.ok(!text.includes(JSON.stringify(f).slice(1, -1)), `${what}: a JSON-escaped form of the key reached the api or a log: ${f}`);
+  }
 }
+
+it("assertNoKey catches a JSON-escaped echo of every key form (negative control)", () => {
+  const escaped = providerKeyForms(KEY).filter((f) => JSON.stringify(f).slice(1, -1) !== f);
+  assert.ok(escaped.length > 0, "at least one form carries a backslash");
+  for (const f of escaped) assert.throws(() => assertNoKey(KEY, JSON.stringify([f]), "control"), /JSON-escaped form/);
+});
 
 describe("provider job: SDK options (A5 worker side)", () => {
   it("runs on the gateway: provider env, no vendor token, the mapped model, the same closed tool surface", async () => {

@@ -293,7 +293,11 @@ function assertFallbackReview(calls: Calls): void {
 }
 
 function assertNoKey(text: string, what = "output"): void {
-  for (const form of providerKeyForms(KEY)) assert.ok(!text.includes(form), `a key form reached the ${what}: ${form.slice(0, 8)}`);
+  // The recording logger JSON-stringifies its fields, which doubles a form's backslashes: check both spellings.
+  for (const form of providerKeyForms(KEY)) {
+    assert.ok(!text.includes(form), `a key form reached the ${what}: ${form.slice(0, 8)}`);
+    assert.ok(!text.includes(JSON.stringify(form).slice(1, -1)), `a JSON-escaped key form reached the ${what}: ${form.slice(0, 8)}`);
+  }
   assert.ok(!text.replace(/[\p{Cc}\p{Cf}]/gu, "").includes(KEY), `an invisible-separated key reached the ${what}`);
 }
 
@@ -302,6 +306,10 @@ const SLASH_ESCAPED = KEY.replaceAll("/", "\\/");
 const HTML_SAFE = KEY.replace(/[<>&]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const INVISIBLE = KEY.split("").join("\u200b");
 for (const form of [SLASH_ESCAPED, HTML_SAFE, INVISIBLE]) assert.notEqual(form, KEY, "each echoed form is a distinct encoding of the key");
+it("assertNoKey catches a JSON-escaped echo of the key (negative control)", () => {
+  assert.throws(() => assertNoKey(JSON.stringify(SLASH_ESCAPED)), /key form/);
+  assert.throws(() => assertNoKey(JSON.stringify(HTML_SAFE)), /key form/);
+});
 const ECHO = (): string => [KEY, SLASH_ESCAPED, HTML_SAFE, INVISIBLE].join(" | ");
 
 function capturingLog(lines: string[]): Logger {
