@@ -1,3 +1,7 @@
+import { RUN_ENV_FORM_CHARS_MAX, RUN_ENV_FORMS_OVER_BUDGET, multiLineSecretVariables, runEnvClaimForms, type RunEnvClaimForms, type ScanNeedle } from "./run-env-forms.js";
+import { redactPorcelainLine, hitVariableNames, resolveScanNeedles, scanCoversCandidate, scanRunEnvRange, FORMS_OVER_BUDGET, patchScanVerdict, type NeedleResolution, type RunEnvScanVerdict } from "./run-env-scan.js";
+import { runEnvContextField } from "./run-env-lane.js";
+import { markRunEnvSeen, runEnvSeen } from "./run-env-seen.js";
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { FreshConfigLockedError, FreshSeedError } from "./git.js";
 import { FreshAbandoned, FreshNoAuthority, FreshUnresolved, abandonFresh, classifyFreshState, commitFreshReceipt, decodeFreshResumeClaim, isFreshPreSeedAck, preemptFresh, produceFreshAttemptId, seedFresh, type FreshAbandonOutcome, type FreshDeps, type FreshResumeClaim } from "./fresh-resume.js";
@@ -67,6 +71,7 @@ import {
   isWorkflowScopeRejection,
   INVENTORY_CONTENT_PROOF_BOUNDS,
   RECOVERY_MAX_BUNDLE_BYTES,
+  capReviewDiff,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
 import {
@@ -255,7 +260,7 @@ import {
   residueQuarantine,
 } from "./residue-quarantine.js";
 import { ProviderLaneUnsupportedError } from "./provider-binding.js";
-import { makeTextRedactor, providerKeyForms, redactNonClosingReason, SecretSet } from "./redact.js";
+import { makeTextRedactor, providerKeyForms, REDACTION_WITHHELD, redactNonClosingReason, SecretSet } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { coordinateCodexSwitchPreflight, type CodexSwitchAuthority, type CodexSwitchOperation } from "./codex-switch-preflight.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
@@ -353,6 +358,26 @@ const RECEIPT_REPAIR_NEEDED_MESSAGE = "recovery source does not belong to this k
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** Redact the trigger paths of a toolchain detection's capability evidence (agent-chosen repo paths) once, so every
+ *  report that carries `detection.evidence` sees the redacted form. */
+function redactToolchainEvidence(detection: ToolchainDetection, redactText: (text: string) => string): ToolchainDetection {
+  const evidence: ToolchainDetection["evidence"] = {};
+  for (const cap of ["docker", "jvm"] as const) {
+    const entry = detection.evidence[cap];
+    if (entry) evidence[cap] = { ...entry, triggers: entry.triggers.map((t) => ({ ...t, path: redactText(t.path) })) };
+  }
+  return { ...detection, evidence };
+}
+
+/** `body` with its `failure_reason` scrubbed of the run's secrets, then capped to MAX_FAILURE_REASON_LEN. The
+ *  scrub sees the whole reason, so a secret that straddles the cap is masked before the cut. The same object
+ *  when the reason is absent, carries no secret and is within the cap. */
+function redactFailureReason<T extends { failure_reason?: string }>(redactText: (text: string) => string, body: T): T {
+  if (typeof body.failure_reason !== "string") return body;
+  const safe = redactText(body.failure_reason).slice(0, MAX_FAILURE_REASON_LEN);
+  return safe === body.failure_reason ? body : { ...body, failure_reason: safe };
+}
 /** Bound remembered unsafe markers per flight; unknown identity or overflow stays blocked. */
 const WIP_UNSAFE_MARKER_LIMIT = 64;
 
@@ -997,6 +1022,21 @@ class ProviderKeyBlockedError extends SecretRemediationPendingError {
 /** The run's provider key forms, `[]` for a vendor run. `RunFlight.providerKeyForms` is required and buildFlight
  *  always sets it; the `?? []` only tolerates the partial flights hand-built by unit tests, which are never provider-bound. */
 const keyFormsOf = (flight: Pick<RunFlight, "providerKeyForms">): readonly string[] => flight.providerKeyForms ?? [];
+
+/** PRD 4416 M2: the exact-value scan found a registered form of one of the run's secret variables in the
+ *  objects about to be published. A subclass, so every catch of SecretRemediationPendingError classifies it
+ *  (finalize: push_secret_blocked; checkpoint: secret_remediation_pending). `findings` name the variables
+ *  and carry no value; the message is fixed text. */
+class RunEnvBlockedError extends SecretRemediationPendingError {
+  constructor(readonly findings: SecretFinding[], readonly tip: string) {
+    super("run variable scan blocked the upload");
+    this.name = "RunEnvBlockedError";
+  }
+}
+
+/** The run's scan needles, `[]` when the claim carried no secret variable, when its forms were over budget (no
+ *  needle set exists then: consumers must check `flight.scanOverBudget` first) or on a hand-built test flight. */
+const needlesOf = (flight: Pick<RunFlight, "scanNeedles">): readonly ScanNeedle[] => flight.scanNeedles ?? [];
 
 /** issue #1597 M1: the typed result of {@link RunRunner.publishCheckpointOutcome}. Only the
  *  allowlisted skip label and the numeric HTTP status are carried — never an error message,
@@ -3184,6 +3224,14 @@ interface RunFlight {
    *  path scans its objects for these before any network write. Empty for a vendor run, which does no
    *  extra git work. */
   providerKeyForms: readonly string[];
+  /** PRD 4416 M2: the exact-value scan needles of this run's secret variables, one per variable name, built from
+   *  the claim and never persisted. Empty when the claim carried no secret variable; every scanned publish
+   *  searches its whole outgoing range for them (requireNoRunEnv). */
+  scanNeedles?: readonly ScanNeedle[];
+  /** The registered line forms of this run's multi-line secret variables, per variable name. */
+  scanLineForms?: readonly ScanNeedle[];
+  /** The claim's forms passed the budget: no needle set is complete, so every scanned publish withholds. */
+  scanOverBudget?: boolean;
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -3989,6 +4037,8 @@ export class RunRunner {
    *  its persisted gate under the persisted presentation id (or adopt an id-less one). Consumed by
    *  the claim's first gatePlan; cleared with gatedRuns. */
   private readonly gateResumes = new Map<string, GateResume>();
+  /** PRD 4416 M2: per live run, the exact-value scan needles of the claim in flight (memory only). */
+  private readonly liveScanNeedles = new Map<string, readonly ScanNeedle[] | typeof FORMS_OVER_BUDGET>();
   /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
    *  catch fetch the committed work back before the container dies. Registered before
    *  retained discovery so shutdown can interrupt pre-clone work too; deregistered
@@ -4109,6 +4159,8 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        // PRD 4416 M2: bundle uploads and held or terminal packs are searched for the run's secret variable values.
+        scanNeedlesFor: (runId, signal) => this.resolveRunScanNeedles(runId, signal),
         // Operator Case B: the clone inventory with identities, and the worker-wide retained-source view (no selector,
         // no bare filter: the coordinator filters and judges completeness itself).
         operatorSourceEvidence: async (runId, bare, signal) => ({
@@ -6504,6 +6556,12 @@ export class RunRunner {
     const runId = claim.run_id;
     const admission = await this.preparePolicyAdmission(claim);
     if (admission === false) return;
+    // PRD 4416 M2: a claim that carries variables is recorded durably BEFORE the executor, the redactor
+    // registrations or the scan needles exist, so no variable is handed out without the marker. A failed write
+    // throws out of the claim: the run never starts with variables.
+    if ((claim.secrets.run_env?.length ?? 0) > 0 || (claim.secrets.run_env_redact?.length ?? 0) > 0) {
+      await markRunEnvSeen(this.git.runEnvSeenRoot, runId);
+    }
     // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
     // canaries with the logger BEFORE makeExecutor, so a construction error inside the
     // Codex executor factory can never log an unredacted token. Both are secrets; absent on
@@ -6546,15 +6604,19 @@ export class RunRunner {
     const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
-    // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
-    // this registration (with the redactors' below) is the only protection for it.
-    // Every encoding a gateway may echo it in (raw, JSON, `\/`, HTML-safe, percent); removeSecret mirrors this list.
+    // PRD #4416 M2: the forms of every secret run variable (live and older versions), rebuilt from each
+    // claim and evicted with the other per-run secrets at terminal. Plain variables are not registered.
+    // An over-budget claim registers its raw values only: it fails below, before the executor starts.
+    const runEnvForms = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact);
+    // A loop, not an argument spread: the form count is data-sized and a spread past the engine's call-argument limit throws RangeError.
+    for (const form of runEnvForms.redaction) runScopedSecrets.push(form);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // Codex canaries and provider forms were ALREADY registered before construction; append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
     // exactly ONCE yet still evicted at the terminal (removeSecret is ref-counted, so a
     // second add here would leave a dangling registration the single eviction can't clear).
-    runScopedSecrets.push(...codexCanaries, ...providerForms);
+    for (const canary of codexCanaries) runScopedSecrets.push(canary);
+    for (const form of providerForms) runScopedSecrets.push(form);
 
     const flight = this.buildFlight(
       claim,
@@ -6563,8 +6625,13 @@ export class RunRunner {
       initialRunHome,
       gitBasic,
       runScopedSecrets,
+      runEnvForms,
     );
     flight.policyReservation = reservation;
+    // PRD 4416 M2: a live flight's claim set is the authority for lanes that publish with no flight in hand
+    // (the recovery coordinator's held, terminal and bundle lanes); removed with the run's other secrets.
+    // An over-budget claim has no complete needle set: lanes with no flight withhold rather than read an empty one.
+    this.liveScanNeedles.set(runId, runEnvForms.overBudget ? FORMS_OVER_BUDGET : flight.scanNeedles!);
     if (admission) {
       flight.policyAdmission = true;
       flight.policyHold = { outcomeId: admission.outcome_id, body: admission };
@@ -7651,6 +7718,13 @@ export class RunRunner {
         flight.keepGuardedInventoryOpen = true;
         throw new Error("transport permanently failed (outbox_unavailable)");
       }
+      // The variables' forms passed the budget: no complete form set exists, so the run fails before the clone,
+      // the executor or any output.
+      if (runEnvForms.overBudget) {
+        // A pending policy outcome is settled first.
+        if (flight.policyAdmission && !await this.reconcilePolicyAdmission(claim, flight)) return;
+        throw new Error(`${RUN_ENV_FORMS_OVER_BUDGET}: the run's secret variables exceed ${RUN_ENV_FORM_CHARS_MAX} characters of registered forms`);
+      }
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
@@ -7942,6 +8016,8 @@ export class RunRunner {
       // will not resume". The park is the first path that reaches here and DOES
       // resume, so both sentences are corrected above rather than left to mislead.)
       for (const s of runScopedSecrets) this.log.removeSecret(s);
+      const live = this.liveScanNeedles.get(runId);
+      if (live === flight.scanNeedles || (live === FORMS_OVER_BUDGET && flight.scanOverBudget)) this.liveScanNeedles.delete(runId);
       // ── The park / shutdown carve-out (PRD #35 Decision 6a; PRD #556 M1) ──────
       // EXACTLY two filesystem removals below are skipped for a parked run, and
       // nothing else in this finally is. The two are what a resume needs: the
@@ -8773,7 +8849,8 @@ export class RunRunner {
     if (!await this.provePolicyClaim(claim)) return false;
     await this.resolveRunPendingTerminals(flight.runId, {
       claimGeneration: flight.claimGeneration,
-      continuationMode: flight.effectiveAttemptPaths ? "fresh_from_saved_work" : "same_conversation",
+      // Before phaseClone sets effectiveAttemptPaths, the runner's own attemptPaths mode applies.
+      continuationMode: (flight.effectiveAttemptPaths ?? this.attemptPaths) ? "fresh_from_saved_work" : "same_conversation",
     });
     // A void resolver return is not settlement proof; authenticate through EOF.
     if (await this.outbox!.hasPendingPolicyOutcome(flight.runId) || !await this.provePolicyClaim(claim)) return false;
@@ -8858,6 +8935,9 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
+    // Every terminal report is journaled and sent from here: the reason is scrubbed, then capped, before it is
+    // stored.
+    body = redactFailureReason(flight.redactText, body);
     const deps = this.terminalDeps();
     const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
     const previouslyAttempted = flight.completionSendAttempted ||
@@ -9106,7 +9186,7 @@ export class RunRunner {
         TERMINAL_JOURNAL_PHASE,
         {
           status: "failed",
-          failure_reason: reason.slice(0, MAX_FAILURE_REASON_LEN),
+          failure_reason: reason,
         },
         (b, sig) => flight.reportState(b, sig),
         async () => {
@@ -9358,10 +9438,11 @@ export class RunRunner {
       err instanceof ResidueQuarantinedError
         ? archiveFailureReasonSuffix(await this.archiveQuarantinedSource(claim, flight))
         : "";
+    const safeReason = flight.redactText(reason);
     const reportedReason =
       archiveSuffix === ""
-        ? reason.slice(0, MAX_FAILURE_REASON_LEN)
-        : reason.slice(0, MAX_FAILURE_REASON_LEN - archiveSuffix.length) + archiveSuffix;
+        ? safeReason.slice(0, MAX_FAILURE_REASON_LEN)
+        : safeReason.slice(0, MAX_FAILURE_REASON_LEN - archiveSuffix.length) + archiveSuffix;
     // Cap what lands in the run row (matches the GitLab error-body cap). Journal it WRITE-AHEAD then
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
@@ -11688,7 +11769,7 @@ export class RunRunner {
     // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting to
     // agent_failure. NEVER attach preserved_patch (the diff carries the detected secret).
     const reportPushSecretBlocked = async (reason: string): Promise<void> => {
-      const capped = reason.slice(0, MAX_FAILURE_REASON_LEN);
+      const capped = flight.redactText(reason).slice(0, MAX_FAILURE_REASON_LEN);
       try {
         await journalTerminalReport({
           status: "failed",
@@ -11710,10 +11791,18 @@ export class RunRunner {
       withholdFromState: boolean,
       knownFinding = true,
       providerKey = false,
+      runEnvFindings?: SecretFinding[],
     ): Promise<void> => {
       let reason: string;
       let statusText: string;
-      if (providerKey) {
+      if (runEnvFindings) {
+        // PRD 4416 M2: the exact-value scan names the variable(s) and nothing else: no value, form or path.
+        const names = hitVariableNames(runEnvFindings).slice(0, 10).join(", ");
+        reason = `This run's branch was not pushed: the pre-push scan found the value of the secret variable${names.includes(",") ? "s" : ""} ${names} in the objects to push. ` +
+          "The diff is withheld because it carries the value; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
+        statusText = `the pre-push scan found the value of the secret variable ${names} in the objects to push; failing without pushing and withholding the diff`;
+        runLog.info("run failed: the run variable scan blocked the push; withholding diff", { run_id: runId, variables: names });
+      } else if (providerKey) {
         // The exact-key push scan: fixed text only, so no key form, path or match can reach the api.
         reason = "This run's branch was not pushed: the pre-push scan found this run's provider key in the objects to push, or could not verify they are free of it. " +
           "The diff is withheld because it may carry the key; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
@@ -12166,7 +12255,7 @@ export class RunRunner {
       if (!holdEligible) {
         try {
           await closeBatcher();
-          await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+          await journalTerminalReport({ status: "failed", failure_reason: failureReason });
         } finally {
           // Guarded inventory settlement owns its existing verified-cleanup policy. Legacy
           // refresh refusals retain the local source unless the original pinned H was archived.
@@ -12216,7 +12305,7 @@ export class RunRunner {
           return;
         }
         await closeBatcher();
-        await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        await journalTerminalReport({ status: "failed", failure_reason: failureReason });
       };
       await finalizeHold(holdReason, { publishCheckpoint: false, allowDegradedCapture: true, signal }, finish);
     };
@@ -12227,7 +12316,30 @@ export class RunRunner {
     // is not enough on its own: it can be trustworthy AND carry findings.
     const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
       if (rawPatch === null) return undefined;
-      const patch = redactText(rawPatch);
+      // PRD 4416 M2: the RAW, uncapped patch is judged before redaction. It is withheld whole (not shipped
+      // scrubbed) when the claim's forms were over budget, when a whole-value form occurs in the patch or in any
+      // hunk's rebuilt pre- or post-image, when a registered line form of a multi-line secret occurs, when the
+      // run holds any multi-line secret at all (live or a retained version, any length: fragments split across
+      // files or hunks cannot be matched), or when the patch cannot be rebuilt into hunk images.
+      if (flight.scanOverBudget) {
+        runLog.warn("preserved patch withheld: the run's secret forms were over budget", { run_id: runId, site });
+        return undefined;
+      }
+      const verdict = patchScanVerdict(rawPatch, needlesOf(flight), flight.scanLineForms ?? [],
+        multiLineSecretVariables(claim.secrets.run_env, claim.secrets.run_env_redact));
+      if (verdict.withhold) {
+        runLog.warn("preserved patch withheld: run secret scan", {
+          run_id: runId, site, reason: verdict.reason, variables: verdict.variables.slice(0, 10),
+        });
+        return undefined;
+      }
+      const redactedPatch = redactText(rawPatch);
+      if (redactedPatch === REDACTION_WITHHELD) {
+        // The redactor passed its work budget and withheld the whole text: there is no patch to ship.
+        runLog.warn("preserved patch withheld: redaction work budget exceeded", { run_id: runId, site });
+        return undefined;
+      }
+      const patch = capReviewDiff(redactedPatch);
       const scan = await this.git.scanPatchForSecrets(patch);
       if (scan.trusted && scan.findings.length === 0) return patch;
       runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
@@ -12257,7 +12369,7 @@ export class RunRunner {
       if (ciConfigGuardReported) return;
       ciConfigGuardReported = true;
       const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
-      const reason = composeCIConfigGuardReason(paths, patch !== undefined);
+      const reason = composeCIConfigGuardReason(paths === null ? null : paths.map((p) => redactText(p)), patch !== undefined);
       batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
       runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
       await closeBatcher();
@@ -12400,7 +12512,7 @@ export class RunRunner {
       } });
       await closeBatcher();
       await journalTerminalReport({ status: "failed", fail_origin: "workflow_scope_missing",
-        failure_reason: composeWorkflowScopeReason(paths, patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
+        failure_reason: composeWorkflowScopeReason(paths.map((p) => redactText(p)), patch !== undefined).slice(0, MAX_FAILURE_REASON_LEN),
         preserved_patch: patch });
     };
     const freshWorkflowFiles = async (
@@ -12679,6 +12791,11 @@ export class RunRunner {
       } catch (error) {
         // A deadline/cancel abort stays permanent: an aborted fetch classifies transient but is not an outage.
         if (boundarySignal?.aborted) throw error;
+        if (error instanceof RunEnvBlockedError) {
+          await this.persistRunEnvHit(flight, finalizeBarePath, result.branch, error);
+          await reportRemediationBlocked(undefined, false, true, false, error.findings);
+          throw new PushSecretBlockedSignal();
+        }
         if (error instanceof SecretRemediationPendingError) {
           await reportRemediationBlocked(undefined, false, flight.secretRemediation?.everKnown === true ||
             Boolean(flight.remediationRestrictions?.flaggedOIDs?.length), error instanceof ProviderKeyBlockedError);
@@ -13042,7 +13159,7 @@ export class RunRunner {
               // diff a human needs to land.
               await journalTerminalReport({
                 status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined, stage),
+                failure_reason: composeBaseAlignConflictReason(redactText(alignDefaultBranch), patch !== undefined, stage),
                 fail_origin: "finalize_base_align_conflict",
                 preserved_patch: patch,
               });
@@ -13816,7 +13933,7 @@ export class RunRunner {
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
     const issueTitleLabel = linkedDelivery ? linkedIssueLabel(linkedIssueKey(claim)) : undefined;
     const titleFor = (): string => {
-      const title = mrTitle(claim, result.scopeCapped, completionScope);
+      const title = redactText(mrTitle(claim, result.scopeCapped, completionScope));
       return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath, issueTitleLabel) : title;
     };
     let mr: Awaited<ReturnType<typeof forge.createMergeRequest>>;
@@ -14180,6 +14297,7 @@ export class RunRunner {
     runHome: string | undefined,
     gitBasic: string,
     runScopedSecrets: string[],
+    runEnvForms: RunEnvClaimForms,
   ): RunFlight {
     const runLog = this.log.child({
       run_id: runId,
@@ -14193,6 +14311,7 @@ export class RunRunner {
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
       ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []),
+      ...runEnvForms.redaction,
       this.joinToken,
       gitBasic,
     ];
@@ -14464,6 +14583,7 @@ export class RunRunner {
               body.status === "failed" && body.failure_reason === "run cancelled"))
           throw new RetainedRecoveryStop();
         if (steering.claimFence() !== undefined) throw new StaleClaimError();
+        body = redactFailureReason(redactText, body);
         const memory = flight.workerMemory;
         const memorySequence = memory && body.status !== undefined ? ++memory.stateSequence : undefined;
         const reportOrdinal = body.status !== undefined ? (flight.stateReportOrdinal = (flight.stateReportOrdinal ?? 0) + 1) : undefined;
@@ -14724,6 +14844,9 @@ export class RunRunner {
         ? { ciConfigGuardGlobs: [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
         : {}),
       providerKeyForms: claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [],
+      scanNeedles: runEnvForms.needles,
+      scanOverBudget: runEnvForms.overBudget,
+      scanLineForms: runEnvForms.lineForms,
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -16429,7 +16552,7 @@ export class RunRunner {
     // the FROZEN set on the autopilot running report — threaded through gatePlan below.
     let toolchainDetection: ToolchainDetection | undefined;
     try {
-      toolchainDetection = await detectToolchain(runnerClone.path);
+      toolchainDetection = redactToolchainEvidence(await detectToolchain(runnerClone.path), flight.redactText);
     } catch (err) {
       runLog.warn("toolchain detection failed; continuing without a requirement set", {
         error: errMessage(err),
@@ -16951,7 +17074,9 @@ export class RunRunner {
           // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
           // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
           // which do not come through here) is byte-unchanged and not scanned.
-          if (!resolvedOverlay && inPermit) {
+          // PRD 4416 M2: a run holding secret variables defers every in-permit publish, overlay or not, because the
+          // exact-value scan at the pack seam must not run inside a permit either.
+          if (inPermit && (!resolvedOverlay || needlesOf(flight).length > 0 || flight.scanOverBudget)) {
             // issue #1597 M2 (round 3): NEVER run gitleaks inside a Codex permit. A permit-held child
             // cannot be killed on its own and execScoped's scoped branch ignores `timeout`, while
             // gitleaks' own git-mode `--timeout` yields a silent clean partial scan — so a slow scan
@@ -17646,6 +17771,9 @@ export class RunRunner {
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
       ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
+      // PRD #4416 M2: the run's user variables, for the lead lane's env builders.
+      // Only a lead-lane run (leadLaneRunEnv mirrors the api's LeadLane); redaction forms are registered for every kind.
+      ...runEnvContextField(claim, claim.secrets.run_env),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
@@ -18398,7 +18526,7 @@ export class RunRunner {
         if (semanticGate) {
           try {
             if (!barePath) throw new Error("semantic candidate: bare source unavailable");
-            semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
+            semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog, flight.redactText);
             if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
             semanticSources = await captureSemanticSources(this.git, {
               barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
@@ -18553,7 +18681,7 @@ export class RunRunner {
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
-              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog);
+              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, barePath, steering.lifecycleSignal(), runLog, flight.redactText);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -18738,6 +18866,7 @@ export class RunRunner {
           steering,
           semanticCompiled ? reportSemanticState : checkedHuman || checkedApproval ? reportCheckedState : reportState,
           runLog,
+          (text) => flight.redactText(text),
           effectiveAutoApprove,
           crossCheckReason,
           repoAgents,
@@ -19153,7 +19282,8 @@ export class RunRunner {
               if (!barePath) return "";
               const read = await readRepoInstructionsAtCommit(this.git, barePath, instructionsCommit, { timeoutMs: 15_000, signal });
               if (!("text" in read)) runLog.warn("code cross-check repository instructions not read", { reason: read.dropped });
-              return "text" in read ? read.text : "";
+              // PRD #4416 M2: repository text leaves the worker redacted with the run's own secret set.
+              return "text" in read ? flight.redactText(read.text) : "";
             },
             snapshot: async () => {
               if (!barePath || (executor.safety && (steering.lifecycleSignal().aborted || this.shuttingDownGlobal))) {
@@ -20722,11 +20852,12 @@ export class RunRunner {
     claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
   ): Promise<{ pack: Buffer } | { reason: string }> {
     const negative = await this.bootstrapRemediationRestrictions(flight, flight.barePath, record.branch, signal);
-    if (negative.kind === "unavailable" || flight.remediationRestrictions)
+    if (negative.kind === "unavailable" || flight.remediationRestrictions || flight.scanOverBudget)
       return { reason: "secret_remediation_pending" };
     return prepareFrozenHeld({
       git: this.git, barePath: flight.barePath!, branch: record.branch, sourceSha: record.sourceSha,
       policy: record.heldPolicy!, deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight),
+      needles: needlesOf(flight),
       defaultBranch: claim.repo.default_branch ?? undefined,
       maxBytes: this.checkpointTestHooks?.heldPackMaxBytes,
       onScan: scan => {
@@ -21932,8 +22063,10 @@ export class RunRunner {
         if ((await this.git.trackingTip(barePath, branch)) === null) return { kind: "none" };
         return untrusted("range_unresolved");
       }
+      // An over-budget claim carries no needle set: report it untrusted rather than scan.
+      if (flight.scanOverBudget) return untrusted(FORMS_OVER_BUDGET);
       const scan = await (scanScope ?? ((fn) => fn()))(() =>
-        this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight) }),
+        this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }),
       );
       if (scan.findings.length > 0) {
         // A TRUSTED finding is remembered as flaggedCommits (without setting `known`). Its SHA
@@ -22030,8 +22163,10 @@ export class RunRunner {
     if (options?.unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
+    // An over-budget claim carries no needle set: report it untrusted rather than scan.
+    if (flight.scanOverBudget) return { trusted: false, why: FORMS_OVER_BUDGET };
     const scan = await (options?.scanScope ?? ((fn) => fn()))(() =>
-      this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight) }));
+      this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs(), literals: keyFormsOf(flight), needles: needlesOf(flight) }));
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
     return { trusted: true, range, findings: scan.findings, floorCandidates };
   }
@@ -23459,6 +23594,68 @@ export class RunRunner {
     throw new ProviderKeyBlockedError();
   }
 
+  /**
+   * PRD 4416 M2: the fail-closed exact-value scan of the objects an upload of `tip` would carry, for the
+   * registered forms of this run's secret variables (same range rules as {@link requireNoProviderKey}). Throws
+   * {@link RunEnvBlockedError} on a hit, after latching it into the existing remediation state (flagged commit,
+   * trusted-finding evidence) so the hold, the held-publication outcomes and the follow-up all fire; throws
+   * {@link SecretRemediationPendingError} when the range could not be proven clean (the work stays local and the
+   * caller retries later). Returns the clean verdict so a caller can bind it to the candidate it then publishes.
+   * Called from guards that hold the bare lock, so it takes none and persists nothing: the catch sites persist
+   * a hit with {@link persistRunEnvHit}. No variable in the claim: no git work.
+   */
+  private async requireNoRunEnv(
+    flight: RunFlight, barePath: string, tip: string, excludes: readonly string[], what: string,
+    excludeRemoteTracking = false,
+  ): Promise<RunEnvScanVerdict> {
+    if (flight.scanOverBudget) {
+      flight.runLog.warn("run variable scan withheld an upload", { run_id: flight.runId, what, reason: RUN_ENV_FORMS_OVER_BUDGET });
+      throw new SecretRemediationPendingError();
+    }
+    const needles = needlesOf(flight);
+    const range = { tip, excludes, ...(excludeRemoteTracking ? { excludeRemoteTracking: true } : {}) };
+    if (needles.length === 0) return { kind: "clean", range };
+    let verdict: RunEnvScanVerdict;
+    try {
+      verdict = await scanRunEnvRange(this.git, barePath, range, needles, { deadlineMs: this.scanDeadlineMs() });
+    } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      verdict = { kind: "withhold", reason: "scan_threw" };
+    }
+    if (verdict.kind === "clean") return verdict;
+    if (verdict.kind === "withhold") {
+      flight.runLog.warn("run variable scan withheld an upload", { run_id: flight.runId, what, reason: verdict.reason });
+      throw new SecretRemediationPendingError();
+    }
+    this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), verdict.findings, flight.runLog);
+    if (barePath === flight.barePath && flight.branch) this.noteTrustedFinding(flight, barePath, flight.branch, "scan");
+    flight.runLog.warn("run variable scan blocked an upload", {
+      run_id: flight.runId, what, variables: hitVariableNames(verdict.findings).slice(0, 10),
+    });
+    throw new RunEnvBlockedError(verdict.findings, tip);
+  }
+
+  /** Persists a run-variable hit into the remediation record, outside any bare lock. Best effort: the in-memory
+   *  latch of {@link requireNoRunEnv} already holds every later publish, and a failure here only logs. */
+  private async persistRunEnvHit(flight: RunFlight, barePath: string, branch: string, hit: RunEnvBlockedError): Promise<void> {
+    try {
+      await this.persistRemediationScan(flight, barePath, branch, hit.tip, hit.findings, "checkpoint-pending");
+    } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      flight.runLog.warn("could not persist a run variable finding", { run_id: flight.runId, error: errMessage(e) });
+    }
+  }
+
+  /** The needles for a publish that has no flight in hand: the live claim's set, else the api's maintenance
+   *  answer ({@link resolveScanNeedles}); an unresolvable answer withholds. */
+  private resolveRunScanNeedles(runId: string, signal?: AbortSignal): Promise<NeedleResolution> {
+    return resolveScanNeedles({
+      live: this.liveScanNeedles.get(runId),
+      fetchProtected: () => this.client.getRunEnvRedact(runId, signal),
+      runEnvSeen: () => runEnvSeen(this.git.runEnvSeenRoot, runId),
+    });
+  }
+
   /** Final push seam, shared by plain and aligned candidates and every network retry. */
   private async pushRemediationCandidate(flight: RunFlight, barePath: string, branch: string,
     pat: string, repoUrl: string, username: string | undefined,
@@ -23472,6 +23669,10 @@ export class RunRunner {
             [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
             context.restrictionFacts);
           await this.requireNoProviderKey(flight, barePath, candidate,
+            [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
+            "branch push", true);
+          // PRD 4416 M2: every forge, fail closed, bound to this exact candidate; gitleaks stays as it was.
+          await this.requireNoRunEnv(flight, barePath, candidate,
             [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
             "branch push", true);
         }, admission.identity)), signal, deadlineAt);
@@ -23534,7 +23735,7 @@ export class RunRunner {
     const changed = await this.git.changedFilesNoRenames(barePath, sha);
     const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
     if (flagged !== null && flagged.length === 0) return "clear";
-    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
+    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map((p) => displayGuardPath(flight.redactText(p))).join(", ") +
       (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
     this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
       `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });
@@ -23725,6 +23926,8 @@ export class RunRunner {
       // re-captures); an accepted publication clears the episode only if no trusted finding arrived
       // after this version (noteCheckpointPublished).
       let admittedEvidenceSeq: number | undefined;
+      // PRD 4416 M2: every clean exact-value verdict this publish took, one per guarded candidate.
+      const scannedForVariables: RunEnvScanVerdict[] = [];
       let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
       const produce = <T,>(start: (identity: RemediationRestrictionIdentity) => Promise<T>) =>
         this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
@@ -23741,6 +23944,11 @@ export class RunRunner {
             // Exact-key scan of exactly what the producer will send (packExcludeShas is the exclude
             // list the pack uses, including the zero-range parent form), before any producer starts.
             await this.requireNoProviderKey(flight, barePath, wantedSha, context.packExcludeShas, "checkpoint publish");
+            // PRD 4416 M2: the exact-value scan of the objects this very pack carries (same tip, same
+            // excludes), before any producer starts. The clean verdict is remembered so the candidate that is
+            // then sent can be checked against it below.
+            const scanned = await this.requireNoRunEnv(flight, barePath, wantedSha, context.packExcludeShas, "checkpoint publish");
+            scannedForVariables.push(scanned);
             signal?.throwIfAborted();
             admittedEvidenceSeq = flight.trustedFindingSeq ?? 0;
           };
@@ -23767,6 +23975,12 @@ export class RunRunner {
       producer = packed;
       observeProducer();
       packedTip = packed.tipOid;
+      // PRD 4416 M2: the pack's tip must be a candidate the exact-value scan covered; otherwise what would be
+      // published is not what was scanned, and nothing is sent.
+      if ((needlesOf(flight).length > 0 || flight.scanOverBudget) && !scanCoversCandidate(scannedForVariables, { tip: packed.tipOid })) {
+        flight.runLog.warn("run variable scan does not cover the candidate; withholding the upload", { run_id: flight.runId });
+        throw new SecretRemediationPendingError();
+      }
       let res;
       // Only an explicit 5xx is retriable. Three requests share the caller's deadline AND one
       // request allowance, created once here and never renewed by a retry; any failed guard,
@@ -23847,6 +24061,7 @@ export class RunRunner {
     } catch (e) {
       if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof SecretRemediationPendingError) {
+        if (e instanceof RunEnvBlockedError) await this.persistRunEnvHit(flight, barePath, branch, e);
         this.noteCheckpointWithheld(flight, true);
         this.reportPublishOutcome(flight, "secret:remediation", "checkpoint publish skipped: secret_remediation_pending");
         return { published: false, reason: "secret_remediation_pending" };
@@ -33303,6 +33518,9 @@ export class RunRunner {
    *  autopilot short-circuit is unchanged and never returns a revise. */
   private async captureCheckedPlanningDiff(
     clonePath: string, baseCommit: string, barePath: string | undefined, signal: AbortSignal, runLog: Logger,
+    // PRD #4416 M2: the run's redactor. The gitleaks scan below cannot know a run variable's value, so the
+    // diff that leaves the worker is passed through it after the scan.
+    redactText?: (text: string) => string,
   ): Promise<{ diff: string } | { refusal: PlanCrossCheckDiffRefusal; diagnostic: string }> {
     if (!/^[a-f0-9]{40}$/.test(baseCommit)) {
       runLog.warn("plan cross-check: planning diff refused", { refusal: "base_unavailable", diagnostic: "base_invalid" });
@@ -33335,7 +33553,10 @@ export class RunRunner {
         signal.throwIfAborted();
         if (!scan.trusted || ownerSignal.aborted) return { refusal: "scan_failed", diagnostic: "scan_untrusted" };
         if (scan.findings.length) return { refusal: "secret_detected", diagnostic: "secret_detected" };
-        return { diff };
+        const redacted = redactText ? redactText(diff) : diff;
+        // Redaction can grow the text (each match becomes a longer placeholder), so the cap holds for what leaves.
+        if (Buffer.byteLength(redacted, "utf8") > 512 * 1024) return { refusal: "diff_too_large", diagnostic: "output_cap" };
+        return { diff: redacted };
       });
     } finally {
       clearTimeout(timer);
@@ -33364,6 +33585,8 @@ export class RunRunner {
     // narrowed the return would make the park branch unable to reuse this closure.
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
+    // The run's redactor (required: no identity default): plan_changed_files are raw porcelain lines naming agent-chosen paths.
+    redactText: (text: string) => string,
     autoApprove: boolean,
     crossCheckReason: string | undefined,
     repoAgents: AgentTemplate[],
@@ -33552,7 +33775,7 @@ export class RunRunner {
     // PRD #212: surface the plan turn's worktree writes at the gate. Runner-uid status,
     // best-effort (planChangedFiles swallows errors → []), computed EVERY round so a
     // revision gate reflects that round's tree (a revert between rounds clears the list).
-    const planChangedFiles = await this.git.planChangedFiles(worktreePath);
+    const planChangedFiles = (await this.git.planChangedFiles(worktreePath)).map((line) => redactPorcelainLine(line, redactText));
     // PRD #1795 (decision 9): this gate waits on a human (a CI-config ci_fix plan forces one even on
     // an auto-approve claim), so bound/unbound verdict handling applies.
     steering.setHumanGated(true);

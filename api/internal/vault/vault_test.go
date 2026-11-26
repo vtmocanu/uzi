@@ -35,6 +35,9 @@ type fakeEnv struct {
 	secret     bool
 	ciphertext []byte
 	sealedWith string
+	varID      uuid.UUID
+	rev        int32
+	aadVersion int16
 }
 
 type fakeVaultStore struct {

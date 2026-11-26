@@ -7,6 +7,7 @@ import type { CodexExecutionSafety } from "../src/harness.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
+import { runEnvClaimForms } from "../src/run-env-forms.js";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -69,7 +70,7 @@ async function setup(codex = true) {
       defaultIdentity: { ref: "refs/remotes/origin/main", sha: head } },
     clonePath: clone.path, attemptId, expectedHead: head, roots: [],
   };
-  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", []);
+  const flight = p.buildFlight(claim, claim.run_id, executor, undefined, "", [], runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact));
   Object.assign(flight, { barePath: bare, worktreePath: clone.path, branch, runnerClone: clone });
   const remember = (s = source, e = executor) => p.rememberCompletionSource(s, flight, e,
     e.safety ? p.terminalSource(flight, e, e.safety) : undefined);

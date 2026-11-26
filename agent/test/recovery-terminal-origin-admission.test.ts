@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import test, { mock } from "node:test";
 import type { GitCache } from "../src/git.js";
 import assert from "node:assert/strict";
@@ -92,7 +93,7 @@ async function fixture(t: test.TestContext) {
   let boundaryJoin: (() => Promise<void>) | undefined;
   let onCapture: (() => Promise<void>) | undefined;
   let exclusion: ReturnType<typeof passingExclusion> | undefined | { run: () => Promise<{ entered: false; reason: "worker_not_idle" }> } = passingExclusion();
-  const make = () => new RecoveryCoordinator({
+  const make = () => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot, workerToken, client, git: git as never, log: log.logger, isExecuting: () => executing,
     writerExclusion: exclusion as never,
     terminalSettlementConfirmed: () => true,

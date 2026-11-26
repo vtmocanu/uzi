@@ -4,6 +4,7 @@ import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY } from "./provider-binding.js";
+import { RUN_ENV_CAPABILITY } from "./run-env-claim.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
 import type { Outbox, PendingFinalize } from "./outbox.js";
@@ -1090,6 +1091,12 @@ export class Worker {
           // worker advertising it, and client.ts requireProviderCapability still refuses a provider
           // claim on a registration that did not advertise it.
           CLAUDE_PROVIDER_CAPABILITY,
+          // run_env_v1: this image decodes run_env / run_env_redact, injects the variables into the
+          // lead lane's env and registers the secret forms for redaction. Advertised only under the
+          // uid split (uidSplitActive); a single-uid worker does not advertise it, so the api's
+          // placement clause keeps runs that carry variables (or secret receipts) off it.
+          // sdk-executor's phaseSetup refusal (assertRunEnvDeliverable) is the second check.
+          ...(uidSplitActive() ? [RUN_ENV_CAPABILITY] : []),
           // PRD #4322 M1a: this image runs a Claude provider-bound JUDGE (judge-runner.ts provider path).
           // Advertised UNCONDITIONALLY: the api places a provider judge only on a worker advertising it
           // (placement 00534), and client.ts requireProviderCapability refuses a provider judge claim on

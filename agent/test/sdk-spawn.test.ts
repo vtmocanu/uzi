@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
+import { claudeConfigDir } from "../src/claude-config-dir.js";
 import { spawnDetached, killProcessGroup, killProcessGroupOnly, processGroupPresent } from "../src/sdk-spawn.js";
 
 // Proves the process-group kill actually reaps a grandchild (the whole point of
@@ -29,8 +30,18 @@ const waitUntil = async (fn: () => boolean, timeoutMs = 4000): Promise<boolean> 
   return fn();
 };
 
+// spawnDetached prepares `$HOME/.uzi-claude-config` before every spawn (PRD #4416), so these spawns
+// get a throwaway HOME rather than the developer's real one.
+const spawnHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-spawn-home-")));
+
+after(() => {
+  // The one-uid config directory is 0555; reopen it so the tree can be removed.
+  fs.chmodSync(path.join(spawnHome, ".uzi-claude-config"), 0o755);
+  fs.rmSync(spawnHome, { recursive: true, force: true });
+});
+
 function spawnOpts(command: string, args: string[]): SpawnOptions {
-  return { command, args, env: { ...process.env }, signal: new AbortController().signal };
+  return { command, args, env: { ...process.env, HOME: spawnHome, CLAUDE_CONFIG_DIR: claudeConfigDir(spawnHome) }, signal: new AbortController().signal };
 }
 
 describe("killProcessGroup", () => {

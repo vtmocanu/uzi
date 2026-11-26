@@ -1,0 +1,19 @@
+{
+  "protected": true,
+  "versions": [
+    {
+      "var_id": "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44",
+      "scope": "user",
+      "rev": 1,
+      "name": "PAYMENTS_SANDBOX_PASSWORD",
+      "value": "correct-horse-battery"
+    },
+    {
+      "var_id": "9e4a2c77-5b1d-4f68-b3a0-71c8d0e6f2a9",
+      "scope": "repo",
+      "rev": 2,
+      "name": "LEDGER_ADMIN_PASSPHRASE",
+      "value": "staple-orbit-lantern-92"
+    }
+  ]
+}

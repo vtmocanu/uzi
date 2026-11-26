@@ -704,6 +704,19 @@ also retains its source clone until capture succeeds or a terminal outcome is
 acknowledged. One SDK home was measured holding 167.3 MB of Go module cache
 (see `UZI_HOME_RECLAIM` below); this is an example, not an upper bound.
 
+Each Claude CLI start also prepares `<HOME>/.uzi-claude-config` (the CLI's config
+directory, see [Run variables](run-env-vars.md)). Anything unexpected found at that
+path, or a broken `.claude`, is renamed aside as `.uzi-claude-config.stale-*` or
+`.claude.stale-*` and rebuilt, so a planted entry needs no operator action. When
+space matters, remove those aside copies under `agent-home/`; a reclaimed HOME takes
+its own with it. Some cases refuse the start instead: the run or chat then fails with
+"Claude CLI config directory could not be prepared by the worker" or "Claude CLI
+config directory refused: <reason>". Check, by class: the data volume is writable
+(the rename aside failed); the home directory is worker-owned and its parent's modes
+match the layout `agent/templates/entrypoint.sh` creates (a boundary refusal); for a
+transient failure under load, start again. A directory that keeps changing, or a
+second failure preparing the transcript directories, also refuses the start.
+
 Size storage for shared repositories plus active clones, all retained
 plugin/HOME directories, pending-capture clones and operating headroom. A
 Codex run's clone is a full object copy, not a `--shared` borrow: it is

@@ -75,6 +75,18 @@ func (v *Vault) RequiresUnlock(ctx context.Context, userID uuid.UUID) bool {
 	return fresh.VaultMode == store.VaultModeProtected && (v == nil || !v.hasEpoch(userID, fresh.VaultEpoch))
 }
 
+// UsableAtState reports whether material at the already-read state can be used:
+// true for an unprotected user, and for a protected one only when this process
+// caches the DEK for state's epoch. It makes no state read, so a caller that has
+// checked an epoch from the same state gets one consistent answer, unlike
+// RequiresUnlock, which re-reads state itself.
+func (v *Vault) UsableAtState(userID uuid.UUID, state store.GetUserVaultStateRow) bool {
+	if state.VaultMode == store.VaultModeUnprotected {
+		return true
+	}
+	return v != nil && v.hasEpoch(userID, state.VaultEpoch)
+}
+
 type SealPurpose uint8
 
 const (

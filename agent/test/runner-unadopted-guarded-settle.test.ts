@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -58,7 +59,7 @@ function rig(opts: { releaseFails?: boolean; releaseAck?: Partial<RecoveryReleas
     if (opts.releaseFails) throw new Error("not ready");
     return { run_id: id, generation, released: true, holds_released: 1, ...opts.releaseAck };
   };
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "journal-key",
     unadoptedSettleRetryDelaysMs: [0, 0, 0],
   });

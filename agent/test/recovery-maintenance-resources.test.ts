@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -259,7 +260,7 @@ for (const resource of Object.keys(caps) as Array<keyof typeof caps>) {
       releaseRecoveryCustody: async () => { throw new Error("unexpected FINAL"); },
       listRecoveryHolds: async () => { throw new Error("unexpected advisory list"); },
     };
-    const coordinator = new RecoveryCoordinator({
+    const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       recoveryRoot: path.join(root, "recovery"), workerToken: "fixture", client, log: nullLogger(),
       git: { importMaintenanceTip: async () => { imports++; throw new Error("unexpected import"); },
         matchMaintenanceSourceFamily: async () => ({ sources: observation.family!.originals, metadata: "family" }),

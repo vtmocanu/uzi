@@ -65,6 +65,8 @@ export class E2EClient {
   /** Late-bound: the coordinator's authenticated view of a run's records (set once the runner exists). */
   records: (runId: string) => Promise<RecoveryRecord[]> = async () => [];
   hasFeature = (): boolean => true;
+  /** PRD 4416 M2: the runner resolves scan needles through the api when it holds no live claim; these runs hold none. */
+  async getRunEnvRedact(): Promise<{ protected: false }> { return { protected: false }; }
 
   key(runId: string, generation: number): string { return `${runId}/${generation}`; }
   of(runId: string, generation: number): GenInfo | undefined { return this.gens.get(this.key(runId, generation)); }

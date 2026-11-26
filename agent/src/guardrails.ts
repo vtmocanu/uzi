@@ -107,6 +107,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
+import { claudeConfigDir } from "./claude-config-dir.js";
 import type { Logger } from "./log.js";
 import { buildOperatorConstraintsBlock, OPERATOR_CONSTRAINTS_MAX_CHARS } from "./prompt.js";
 
@@ -765,7 +766,7 @@ function consumeHeredocBodies(command: string, pos: number, docs: Heredoc[], bod
     if (!doc.quoted || bodyEnd === n) {
       const inner = extractSubstitutionBodies(command.slice(pos, bodyEnd), false, depth);
       if (inner === undefined || bodies.length + inner.length > MAX_SUBST_BODIES) return -1;
-      bodies.push(...inner);
+      for (const body of inner) bodies.push(body);
     }
     pos = resume;
     if (pos >= n) return n;
@@ -1543,7 +1544,8 @@ function isRegularFile(p: string): boolean {
 /**
  * Derive the SDK's tool-result spill directory for this hook call from TRUSTED hook
  * data (#2332): the SDK-supplied `session_id` and `transcript_path`, which must agree
- * with the run's own SDK HOME (`<HOME>/.claude/projects/<P>/<session_id>.jsonl`).
+ * with the run's own SDK HOME (`<HOME>/.claude/projects/<P>/<session_id>.jsonl`, or the same
+ * path under `<HOME>/.uzi-claude-config/projects` when the CLI names it through CLAUDE_CONFIG_DIR).
  * Returns the directory both lexically and with only the HOME realpath'd (the tail
  * stays lexical, so an agent-made symlink at `.../<session_id>/tool-results` cannot
  * move the root), or undefined on any mismatch (no allowance).
@@ -1555,9 +1557,16 @@ export function sdkSpillRoots(
 ): { lexical: string; real: string } | undefined {
   if (typeof sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
   if (typeof transcriptPath !== "string" || !transcriptPath) return undefined;
-  const projects = path.resolve(sdkHomeDir, ".claude", "projects");
+  // The CLI names its transcript through CLAUDE_CONFIG_DIR (`<HOME>/.uzi-claude-config/projects/...`,
+  // a symlink to `<HOME>/.claude/projects`, PRD #4416) or, for a CLI without it, directly. The
+  // lexical root follows the form the CLI used; the real root below is always anchored at
+  // `<realpath(HOME)>/.claude/projects`, so a retargeted `projects` link resolves outside it.
+  const home = path.resolve(sdkHomeDir);
   const t = path.resolve(transcriptPath);
-  if (path.dirname(path.dirname(t)) !== projects) return undefined;
+  const projects = [path.join(home, ".claude", "projects"), path.join(claudeConfigDir(home), "projects")].find(
+    (root) => path.dirname(path.dirname(t)) === root,
+  );
+  if (projects === undefined) return undefined;
   if (path.basename(t) !== `${sessionId}.jsonl`) return undefined;
   const slug = path.basename(path.dirname(t));
   return {
