@@ -39,7 +39,7 @@ bill.
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
-| `kind` | a run kind, `delivery` or `supporting` | all kinds | `chat` is accepted but only feeds `untracked_chat_runs`. |
+| `kind` | a run kind, `delivery` or `supporting` | all kinds | In Spend, `chat` is accepted but only feeds `untracked_chat_runs`. In Flow, chat feeds `waiting_now`, `activity.created`, `first_start_delay` and `plan_response`, but not finished activity, the delivery funnel, approval or `issue_elapsed`. |
 | `split` (spend) | `usage_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `usage_model` | Top 5 groups plus Other. |
 | `breakdown` (spend) | `primary_model`, `harness`, `repo`, `kind`, plus `user` on an admin all-users response | `repo` | Top 50 rows plus Other. |
 | `user` (admin only) | `all` or a user UUID | `all` | Omitting it is byte-identical to `user=all`. |
@@ -338,8 +338,9 @@ never null.
     (no outcome yet).
   - `disclosure` counts runs with incomplete approval evidence:
     `historical_approval_only`, `ambiguous_current` and `legacy_evidence`
-    (any no-binding or `unbound` `approve_plan` receipt, even when the run also
-    has timed pairs or current human proof). These counts are not additive with
+    (an `issue` or `self_improve` run with any no-binding or `unbound`
+    `approve_plan` receipt, even when the run also has timed pairs or current
+    human proof). These counts are not additive with
     each other, with `approval.unknown` or with plan response `unknown`: a run
     can appear in several.
   - `pr_units` counts **distinct PRs**, not runs. A PR is the pair (repo, PR
@@ -398,11 +399,14 @@ Plan response, the funnel and the approval classification share these rules:
   revision is `historical_approval_only`. Revisions are never matched across
   runs.
 - **Legacy and unbound.** A receipt written before gate binding (no binding) or
-  recorded as `unbound` never proves an approval. Any run with such an
+  recorded as `unbound` never proves an approval. A run with such an
   `approve_plan` receipt is counted once in plan response
-  `unknown.legacy_unbound` and in the funnel `disclosure.legacy_evidence`, even
-  when it also has timed pairs or current human proof. An unbound approval can
-  never have acted on a gate, so beside a pair that pair stays `not_approved`.
+  `unknown.legacy_unbound`, which covers every selected kind (the gate-evidence
+  cohort, chat included when selected). It is also counted once in the funnel
+  `disclosure.legacy_evidence`, which covers only `issue` and `self_improve`
+  runs (the funnel cohort). Both apply even when the run also has timed pairs
+  or current human proof. An unbound receipt never approves a pair; a pair with
+  no eligible bound receipt is `not_approved`.
 - **Approval classification ranks separately.** `approval` places a run by the
   first reason that applies: human, `auto_approve_configured`, `ambiguous`,
   then `legacy_unbound`, so a run with current human proof is `human` there
