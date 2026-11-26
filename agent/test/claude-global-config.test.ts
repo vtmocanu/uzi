@@ -12,7 +12,7 @@ import {
   type HelperResult,
   type PrepareDeps,
 } from "../src/claude-global-config.js";
-import { RUNNER_UID, setprivRunnerArgs } from "../src/runner-uid.js";
+import { CODEX_SESSION_GID, COMMAND_UID, RUNNER_UID, setprivRunnerArgs } from "../src/runner-uid.js";
 import { claudeConfigDir } from "../src/claude-config-dir.js";
 import { rmHomeTree, PURGE_CHILDREN_SCRIPT } from "../src/rmtree.js";
 import { spawnDetached } from "../src/sdk-spawn.js";
@@ -51,8 +51,8 @@ const runDirect = (bin: string, args: readonly string[]): HelperResult => {
   return { status: r.status, signal: r.signal, stdout: r.stdout ?? "" };
 };
 
-/** One line of the stat helper's output, as `stat -c '%u|%a|%F|%n'` prints it. */
-const statLine = (uid: number, mode: string, kind: string, p: string): string => `${uid}|${mode}|${kind}|${p}\n`;
+/** One line of the stat helper's output, as `stat -c '%u|%g|%a|%F|%n'` prints it; the group defaults to the runner's own. */
+const statLine = (uid: number, mode: string, kind: string, p: string, gid: number = RUNNER_UID): string => `${uid}|${gid}|${mode}|${kind}|${p}\n`;
 
 interface ModelOptions {
   /** Force the exit status of the n-th (1-based) mkdir; undefined runs the real mkdir. */
@@ -480,7 +480,7 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
     const clean = (): string => statLine(RUNNER_UID, "700", "directory", claude());
     const failTargetsOnce = (_args: readonly string[], n: number): number | undefined => (n === 1 ? 1 : undefined);
     const failEveryTargets = (args: readonly string[]): number | undefined => (args.at(-1) === claude() ? undefined : 1);
-    const statArgs = (...missing: string[]): string[] => ["-c", "%u|%a|%F|%n", "--", claude(), ...missing];
+    const statArgs = (...missing: string[]): string[] => ["-c", "%u|%g|%a|%F|%n", "--", claude(), ...missing];
     beforeEach(() => {
       process.env.UZI_UID_SPLIT = "1";
       fs.mkdirSync(claude());
@@ -510,8 +510,8 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
       ["an empty regular file at a target", () => clean() + statLine(RUNNER_UID, "600", "regular empty file", "PROJECTS")],
       ["a symlink at a target", () => clean() + statLine(RUNNER_UID, "777", "symbolic link", "PROJECTS")],
       ["a fifo at a target", () => clean() + statLine(RUNNER_UID, "600", "fifo", "PROJECTS")],
-      ["a .claude owned by another uid", () => statLine(RUNNER_UID + 100, "700", "directory", "CLAUDE")],
-      ["a .claude without owner read", () => statLine(RUNNER_UID, "300", "directory", "CLAUDE")],
+      ["a .claude owned by another uid with no write and search for the runner", () => statLine(RUNNER_UID + 100, "700", "directory", "CLAUDE", 12345)],
+      ["a .claude owned by another uid, group runner-cmd (not a runner group) with group rwx", () => statLine(RUNNER_UID + 100, "770", "directory", "CLAUDE", COMMAND_UID)],
       ["a .claude without owner write", () => statLine(RUNNER_UID, "500", "directory", "CLAUDE")],
       ["a .claude without owner search", () => statLine(RUNNER_UID, "600", "directory", "CLAUDE")],
       ["a .claude with mode 0", () => statLine(RUNNER_UID, "0", "directory", "CLAUDE")],
@@ -525,6 +525,42 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
         assertTargets();
       });
     }
+
+    // Cases where the runner can write and search .claude (or the mode evidence says nothing), so the
+    // capacity failure is transient: the start is refused and the existing transcripts stay in place.
+    const nonObstructions: Array<[string, () => string]> = [
+      ["a foreign owner whose group is a runner group with group rwx", () => statLine(RUNNER_UID + 100, "770", "directory", "CLAUDE", RUNNER_UID)],
+      ["a foreign owner whose group is codex-session with group rwx", () => statLine(RUNNER_UID + 100, "770", "directory", "CLAUDE", CODEX_SESSION_GID)],
+      ["a foreign owner with other rwx", () => statLine(RUNNER_UID + 100, "777", "directory", "CLAUDE", 12345)],
+      ["a foreign owner with other wx and no read", () => statLine(RUNNER_UID + 100, "703", "directory", "CLAUDE", 12345)],
+      ["a runner-owned .claude without owner read", () => statLine(RUNNER_UID, "300", "directory", "CLAUDE")],
+      ["a runner-owned .claude with a setgid bit", () => statLine(RUNNER_UID, "2700", "directory", "CLAUDE")],
+    ];
+    for (const [label, make] of nonObstructions) {
+      it(`${label} is not an obstruction: the start is refused and .claude stays`, () => {
+        const out = make().replaceAll("CLAUDE", claude());
+        const h = helpers({ mkdir: failTargetsOnce, stat: out });
+        assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /did not complete/);
+        untouched();
+      });
+    }
+
+    it("a capacity failure with a writable root keeps an existing transcript in place and refuses as transient", () => {
+      const transcript = path.join(claude(), "projects", "-p", "s.jsonl");
+      fs.mkdirSync(path.dirname(transcript), { recursive: true });
+      fs.writeFileSync(transcript, "TRANSCRIPT");
+      const roots = [
+        statLine(RUNNER_UID + 100, "770", "directory", claude(), RUNNER_UID),
+        statLine(RUNNER_UID + 100, "777", "directory", claude(), 12345),
+        statLine(RUNNER_UID, "300", "directory", claude()),
+      ];
+      for (const stat of roots) {
+        const h = helpers({ mkdir: () => 1, stat });
+        assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /did not complete/);
+        assert.strictEqual(fs.readFileSync(transcript, "utf8"), "TRANSCRIPT");
+        untouched();
+      }
+    });
 
     it("a second obstruction after the move refuses, with exactly one aside", () => {
       const out = clean() + statLine(RUNNER_UID, "600", "regular file", path.join(claude(), "projects"));
@@ -550,7 +586,7 @@ describe("prepareClaudeConfigDir: the .claude targets", () => {
     it("output for paths that were not asked about, or only share a prefix, is not evidence", () => {
       const projects = path.join(claude(), "projects");
       const stat = clean() + statLine(RUNNER_UID, "600", "regular file", `${projects}x`) + statLine(RUNNER_UID, "600", "regular file", path.join(home, "other"))
-        + statLine(RUNNER_UID, "600", "regular file", `${projects}/`) + `garbage\n${RUNNER_UID}|600|regular file\n`;
+        + statLine(RUNNER_UID, "600", "regular file", `${projects}/`) + `garbage\n${RUNNER_UID}|${RUNNER_UID}|600|regular file\n${RUNNER_UID}|600|regular file|${projects}\n`;
       const h = helpers({ mkdir: failTargetsOnce, stat });
       assert.throws(() => prep(envOf(), { runAsRunner: h.run }), /did not complete/);
       untouched();
@@ -971,6 +1007,41 @@ describe("the bounded runner helper", () => {
   it("a command that does not exist returns status 127", () => {
     const r = runBounded(path.join(root, "no-such-binary"), []);
     assert.strictEqual(r.status, 127);
+  });
+
+  const PRINT_ARGV = "process.stdout.write(JSON.stringify(process.argv.slice(1)))";
+
+  it("arguments with spaces and shell metacharacters reach the helper verbatim and nothing is evaluated", () => {
+    const marker = path.join(root, "injected");
+    const meta = [`$(touch ${marker})`, `;touch ${marker}`, "`touch " + marker + "`", 'a "b" c', "it's", "x y\tz", "*", "-n", "--"];
+    const r = runBounded(process.execPath, ["-e", PRINT_ARGV, "--", ...meta]);
+    assert.strictEqual(r.status, 0);
+    assert.deepStrictEqual(JSON.parse(r.stdout), meta);
+    assert.ok(!fs.existsSync(marker), "no metacharacter was evaluated");
+  });
+
+  it("a TMPDIR with spaces and shell metacharacters is used as a plain path", () => {
+    const marker = path.join(root, "injected-tmp");
+    const priv = path.join(root, `tmp dir $(touch ${marker}); "q" 'r'`);
+    fs.mkdirSync(priv);
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = priv;
+    try {
+      const r = runBounded(process.execPath, ["-e", PRINT_ARGV, "--", "ok"]);
+      assert.strictEqual(r.status, 0);
+      assert.deepStrictEqual(JSON.parse(r.stdout), ["ok"]);
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+    }
+    assert.ok(!fs.existsSync(marker), "no metacharacter in the directory name was evaluated");
+    assert.deepStrictEqual(fs.readdirSync(priv), [], "the output directory is removed");
+  });
+
+  it("a helper killed by a signal reports 128 plus the signal number", () => {
+    const r = runBounded("/bin/sh", ["-c", "kill -9 $$"]);
+    assert.strictEqual(r.status, 128 + 9);
+    assert.strictEqual(r.signal, null);
   });
 
   it("leaves no output directory behind", () => {

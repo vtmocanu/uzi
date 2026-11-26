@@ -29,7 +29,7 @@ WORKDIR /app
 RUN n=0; until apk add --no-cache git git-daemon bash tini curl xz tar openjdk17 setpriv acl docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
     && /bin/setpriv --help 2>&1 | grep -q -- --reuid \
     && test -x /bin/stat && test -x /usr/bin/timeout \
-    && /usr/bin/timeout -s KILL 2 /bin/stat -c '%u|%a|%F|%n' -- / | grep -q '^0|[0-7]*|directory|/$' \
+    && /usr/bin/timeout -s KILL 2 /bin/stat -c '%u|%g|%a|%F|%n' -- / | grep -q '^0|0|[0-7]*|directory|/$' \
     && test -x /usr/bin/getfacl && /usr/bin/getfacl --version | grep -q '^getfacl ' \
     && test -x /usr/bin/setfacl \
     && test -x "$(git --exec-path)/git-http-backend"

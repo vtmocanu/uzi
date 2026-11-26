@@ -431,19 +431,26 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     const claude = path.join(home, ".claude");
     const projects = path.join(claude, "projects");
 
-    const stat = config.helperCommand("/bin/stat", ["-c", "%u|%a|%F|%n", "--", claude, projects], true);
+    const stat = config.helperCommand("/bin/stat", ["-c", "%u|%g|%a|%F|%n", "--", claude, projects], true);
     const r = config.runBounded(stat.command, stat.args);
     assert.equal(r.status, 0);
     const lines = r.stdout.split("\n").filter((l) => l !== "").map((l) => l.split("|"));
     assert.equal(lines.length, 2);
+    for (const l of lines) assert.equal(l.length, 5, "uid|gid|mode|kind|name");
+    // The runner creates the entries in the setgid HOME, so they carry HOME's group (the runner's own
+    // group 10002 when HOME's group is the runner group); the field is the numeric gid of the entry.
+    const homeGid = (await fs.stat(home)).gid;
     const [dirLine, fileLine] = lines;
     assert.equal(dirLine![0], String(runnerUid.RUNNER_UID));
-    assert.equal(Number.parseInt(dirLine![1]!, 8) & 0o700, 0o700, "the owner has rwx");
-    assert.equal(dirLine![2], "directory");
-    assert.equal(dirLine![3], claude);
+    assert.match(dirLine![1]!, /^\d+$/);
+    assert.equal(dirLine![1], String(homeGid), "the setgid HOME's group is inherited");
+    assert.equal(Number.parseInt(dirLine![2]!, 8) & 0o700, 0o700, "the owner has rwx");
+    assert.equal(dirLine![3], "directory");
+    assert.equal(dirLine![4], claude);
     assert.equal(fileLine![0], String(runnerUid.RUNNER_UID));
-    assert.equal(fileLine![2], "regular file");
-    assert.equal(fileLine![3], projects);
+    assert.equal(fileLine![1], String(homeGid));
+    assert.equal(fileLine![3], "regular file");
+    assert.equal(fileLine![4], projects);
 
     await rmtree.rmHomeTree(home);
     assert.equal(await exists(home), false);

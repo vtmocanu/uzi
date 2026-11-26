@@ -57,8 +57,8 @@
 //
 // Targets. `<HOME>/.claude/projects` and `<HOME>/.claude/tasks` must exist and be writable by the
 // CLI. Missing ones are created AS THE RUNNER UID (a fixed worker-authored `/bin/mkdir -p -m 700`
-// argv, workerSpawnEnv on a minimal PATH env, started through a constant worker-uid /bin/sh
-// intermediary script that takes its arguments by position, with no interpolation; see Bound), so they are runner-owned and private
+// argv, workerSpawnEnv on a minimal PATH env, started through a constant worker-uid Node
+// intermediary (process.execPath -e) that takes its argv only, with no shell; see Bound), so they are runner-owned and private
 // (0700), and neither runner-cmd (the Codex command uid, which shares group runner) nor the worker
 // ever holds a write path into a Claude transcript directory. The worker never writes or renames
 // anything under `.claude`; the only thing it ever moves is the `.claude` entry itself in HOME. The
@@ -73,22 +73,32 @@
 // EDQUOT, EIO and from setpriv failing to resolve the runner user. After a runner mkdir of the
 // targets exits non-zero, the module establishes a POSITIVE obstruction and only then moves
 // `.claude` aside, once; a second obstruction refuses the start. Under the split a second fixed
-// runner-uid helper, `/bin/stat -c '%u|%a|%F|%n' -- <HOME>/.claude <missing targets>`, prints one
+// runner-uid helper, `/bin/stat -c '%u|%g|%a|%F|%n' -- <HOME>/.claude <missing targets>`, prints one
 // line per entry that exists; its stdout is captured (utf8, 64 KiB) and its exit status ignored.
 // Lines are matched by exact `%n` equal to a path that was passed. An obstruction is: a matched line
-// whose `%F` is not exactly `directory` (a regular file, a symlink, ...), or the `.claude` line
-// showing an owner other than RUNNER_UID, or an owner mode without rwx. No lines (the helper was
-// killed, setpriv could not resolve the user, the paths are absent), a lookup failure and a full
-// disk are not an obstruction: the start is refused and `.claude` stays in place. With one uid there
-// is no stat or timeout helper: the worker is the runner, lstat-inspects `.claude` and the missing
-// targets itself and applies the same rule (the owner is compared with the worker's uid), and mkdir
-// is spawned directly.
+// whose `%F` is not exactly `directory` (a regular file, a symlink, ...), or a `.claude` directory
+// the runner cannot both write and search. The runner's access is computed from the mode bits:
+// the owner bits when the owner is RUNNER_UID, else the group bits when the group is one the runner
+// holds (RUNNER_OWN_GIDS: runner 10002 and codex-session 10004; not runner-cmd 10003), else the
+// other bits; `.claude` is obstructed iff those bits lack write or search (the read bit is
+// irrelevant, since the mkdir only needs to create and traverse). A different owner, or a missing
+// owner read bit, is therefore not an obstruction by itself. The evidence is mode bits only: a
+// named-user ACL granting the runner access to a foreign-owned `.claude` is not seen (only that
+// directory's owner can set one), so such a directory still counts as obstructed when its bits say
+// so. No lines (the helper was killed, setpriv could not resolve the user, the paths are absent), a
+// lookup failure, a full disk, and a `.claude` the runner can write and search are not an
+// obstruction: the start is refused ("did not complete") and `.claude` stays in place, with its
+// transcripts. With one uid there is no stat or timeout helper: the worker is the runner,
+// lstat-inspects `.claude` and the missing targets itself and applies the same rule (its own uid and
+// process.getgroups()), and mkdir is spawned directly.
 //
 // Bound. Each helper is `runnerCommand("/usr/bin/timeout", ["-s", "KILL", "2", <bin>, ...args])`
-// under the split (the binary itself with one uid), started by a worker-uid `/bin/sh` intermediary
-// (INTERMEDIARY_SCRIPT) that sends its stdout to a file in a worker-private mkdtemp directory and
-// waits for it. spawnSync waits only on that sh, with a 4 s timeout and SIGKILL: the sh runs as the
-// worker uid, so that kill always lands, and all of spawnSync's stdio is ignored, so no pipe is held
+// under the split (the binary itself with one uid), started by a worker-uid Node intermediary
+// (NODE_INTERMEDIARY, `process.execPath -e`, no shell) that opens a file in a worker-private mkdtemp
+// directory without following a symlink, runs the helper with it as stdout and exits with the
+// helper's status (127 if it could not start, 128 + signal number if a signal ended it). spawnSync
+// waits only on that intermediary, with a 4 s timeout and SIGKILL: it runs as the worker uid, so
+// that kill always lands, and all of spawnSync's stdio is ignored, so no pipe is held
 // open by a helper that outlives it. The worker uid cannot signal the runner-uid helper (no
 // CAP_KILL); an orphaned runner helper may outlive the preparation and is the runner's own process.
 // Its output is read from the file after the spawn, at most 64 KiB; more refuses. The whole
@@ -138,6 +148,10 @@ const DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constant
 /** Groups the runner uids hold: a group-writable non-sticky ancestor in one of them lets the runner
  *  rename the entry below it. runner (10002), runner-cmd (10003), codex-session (10004). */
 const RUNNER_GIDS: readonly number[] = [RUNNER_UID, COMMAND_UID, CODEX_SESSION_GID];
+/** The groups the runner uid itself holds (setpriv --init-groups: its primary group runner 10002 and
+ *  codex-session 10004). runner-cmd (COMMAND_UID) is a separate account the runner is not a member of,
+ *  so its group is not here, unlike in RUNNER_GIDS. */
+const RUNNER_OWN_GIDS: readonly number[] = [RUNNER_UID, CODEX_SESSION_GID];
 const MKDIR_BIN = "/bin/mkdir";
 const STAT_BIN = "/bin/stat";
 const TIMEOUT_BIN = "/usr/bin/timeout";
@@ -150,7 +164,7 @@ const PREPARE_DEADLINE_MS = 10_000;
 const HELPER_MAX_BUFFER = 64 * 1024;
 /** The exit status of a mkdir that ran and failed (a planted file, an unsearchable directory, ENOSPC). */
 const MKDIR_FAILED_STATUS = 1;
-const STAT_FORMAT = "%u|%a|%F|%n";
+const STAT_FORMAT = "%u|%g|%a|%F|%n";
 
 /** The outcome of one helper run: its exit status (null when it did not exit), the signal that ended
  *  it, and its captured stdout. */
@@ -258,9 +272,21 @@ function renameAside(p: string): void {
   fs.renameSync(p, `${p}.stale-${hex()}`);
 }
 
-/** The constant script of the worker-uid intermediary: `$0` is the output file, the rest is the
- *  helper argv; nothing is interpolated. */
-const INTERMEDIARY_SCRIPT = '"$@" >"$0" & wait $!';
+/** The constant CommonJS script of the worker-uid Node intermediary (`node -e`): argv is the output
+ *  file, then the helper command and its arguments. It opens the file without following a symlink,
+ *  runs the helper with that file as stdout and no shell, and exits with the helper's status
+ *  (127 when it could not start, 128 + signal number when a signal ended it). */
+const NODE_INTERMEDIARY = [
+  'const fs = require("node:fs");',
+  'const os = require("node:os");',
+  'const cp = require("node:child_process");',
+  "const [out, command, ...args] = process.argv.slice(1);",
+  "const fd = fs.openSync(out, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);",
+  'const r = cp.spawnSync(command, args, { stdio: ["ignore", fd, "ignore"], shell: false });',
+  "if (r.error) process.exit(127);",
+  "if (r.signal) process.exit(128 + (os.constants.signals[r.signal] || 0));",
+  "process.exit(r.status === null ? 127 : r.status);",
+].join("\n");
 
 /** Read at most HELPER_MAX_BUFFER bytes of the helper's output file; more than that refuses. */
 function readHelperOutput(file: string): string {
@@ -275,18 +301,19 @@ function readHelperOutput(file: string): string {
   }
 }
 
-/** Run `command args` through a worker-uid `/bin/sh` intermediary that starts it in the background
- *  with stdout going to a file in a worker-private directory (mkdtemp, mode 0700) and waits for it.
- *  spawnSync waits only on that sh, with a timeout (default 4 s) and SIGKILL, which the worker uid can always
- *  deliver; all of spawnSync's stdio is ignored, so no pipe is held by a helper that outlives it. The
- *  helper's exit status is the sh's. A spawn error, a timeout or a signal on the sh, or output over
- *  64 KiB, throws a refusal. */
+/** Run `command args` through a worker-uid Node intermediary (`process.execPath -e`, no shell) that
+ *  starts it with stdout going to a file in a worker-private directory (mkdtemp, mode 0700) and waits
+ *  for it. spawnSync waits only on that intermediary, with a timeout (default 4 s) and SIGKILL, which
+ *  the worker uid can always deliver; all of spawnSync's stdio is ignored, so no pipe is held by a
+ *  helper that outlives it. The helper's exit status is the intermediary's (a helper ended by a signal
+ *  reports 128 + the signal number, one that could not start 127). A spawn error, a timeout or a
+ *  signal on the intermediary, or output over 64 KiB, throws a refusal. */
 export function runBounded(command: string, args: readonly string[], timeoutMs: number = HELPER_SPAWN_TIMEOUT_MS): HelperResult {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-helper-"));
   try {
     const out = path.join(dir, "out");
     fs.closeSync(fs.openSync(out, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600));
-    const r = spawnSync("/bin/sh", ["-c", INTERMEDIARY_SCRIPT, out, command, ...args], {
+    const r = spawnSync(process.execPath, ["-e", NODE_INTERMEDIARY, "--", out, command, ...args], {
       env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
       shell: false,
       stdio: "ignore",
@@ -331,15 +358,31 @@ function mkdirAsRunner(prep: Prep, args: readonly string[], what: string): boole
 interface EntryFact {
   path: string;
   uid: number;
+  gid: number;
   mode: number;
   kind: string;
 }
 
-/** True when `facts` show a positive obstruction (see the header's Obstruction). */
-function obstructs(claude: string, facts: readonly EntryFact[], runnerUid: number | undefined): boolean {
+/** Who the access check is made for: the uid and every group the process holds. */
+interface Principal {
+  uid: number;
+  gids: readonly number[];
+}
+
+/** The mode bits (rwx as 0-7) that apply to `who` on an entry: owner bits for the owner, else group
+ *  bits for a member of the entry's group, else other bits. */
+function effectiveBits(f: EntryFact, who: Principal): number {
+  if (f.uid === who.uid) return (f.mode >> 6) & 0o7;
+  if (who.gids.includes(f.gid)) return (f.mode >> 3) & 0o7;
+  return f.mode & 0o7;
+}
+
+/** True when `facts` show a positive obstruction (see the header's Obstruction): a matched entry that
+ *  is not a directory, or a `.claude` directory the runner can not both write and search. */
+function obstructs(claude: string, facts: readonly EntryFact[], who: Principal | undefined): boolean {
   for (const f of facts) {
     if (f.kind !== "directory") return true;
-    if (f.path === claude && ((runnerUid !== undefined && f.uid !== runnerUid) || (f.mode & 0o700) !== 0o700)) return true;
+    if (f.path === claude && who !== undefined && (effectiveBits(f, who) & 0o3) !== 0o3) return true;
   }
   return false;
 }
@@ -348,9 +391,9 @@ function obstructs(claude: string, facts: readonly EntryFact[], runnerUid: numbe
 function parseStat(stdout: string, asked: readonly string[]): EntryFact[] {
   const facts: EntryFact[] = [];
   for (const line of stdout.split("\n")) {
-    const m = /^(\d+)\|([0-7]+)\|([^|]*)\|(.*)$/.exec(line);
-    if (m === null || !asked.includes(m[4]!)) continue;
-    facts.push({ path: m[4]!, uid: Number(m[1]), mode: Number.parseInt(m[2]!, 8), kind: m[3]! });
+    const m = /^(\d+)\|(\d+)\|([0-7]+)\|([^|]*)\|(.*)$/.exec(line);
+    if (m === null || !asked.includes(m[5]!)) continue;
+    facts.push({ path: m[5]!, uid: Number(m[1]), gid: Number(m[2]), mode: Number.parseInt(m[3]!, 8), kind: m[4]! });
   }
   return facts;
 }
@@ -361,7 +404,7 @@ function positiveObstruction(prep: Prep, claude: string, missing: readonly strin
   if (uidSplitActive()) {
     const r = runHelper(prep, STAT_BIN, ["-c", STAT_FORMAT, "--", ...asked]);
     if (r.signal !== null || r.status === null) throw refuse("the runner stat of the .claude targets did not complete");
-    return obstructs(claude, parseStat(r.stdout, asked), RUNNER_UID);
+    return obstructs(claude, parseStat(r.stdout, asked), { uid: RUNNER_UID, gids: RUNNER_OWN_GIDS });
   }
   const facts: EntryFact[] = [];
   for (const p of asked) {
@@ -371,9 +414,10 @@ function positiveObstruction(prep: Prep, claude: string, missing: readonly strin
     } catch {
       continue;
     }
-    facts.push({ path: p, uid: st.uid, mode: st.mode & 0o7777, kind: st.isDirectory() ? "directory" : "other" });
+    facts.push({ path: p, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777, kind: st.isDirectory() ? "directory" : "other" });
   }
-  return obstructs(claude, facts, process.getuid?.());
+  const uid = process.getuid?.();
+  return obstructs(claude, facts, uid === undefined ? undefined : { uid, gids: process.getgroups?.() ?? [] });
 }
 
 /** Make `<HOME>/.claude/{projects,tasks}` exist, writable by the CLI (see the Targets section). */
