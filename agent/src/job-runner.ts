@@ -1396,10 +1396,11 @@ export class JobRunner {
       return false;
     });
     // PRD #4322 M1b: outputs the result tool withheld because their path or name carried provider key
-    // material (store.keyedOutputs). Never opened and never uploaded; reported once per scrubbed name.
+    // material (store.keyedOutputs). Never opened and never uploaded; a path listed twice is reported
+    // once, and paths that scrub to the same reported name share one refusal.
     // A name withheld only for a case variant of the key (the partition's lowercase test) survives the
     // exact-form scrub, so it is reported under a positional placeholder instead of its own spelling.
-    for (const [i, rel] of (store.keyedOutputs ?? []).entries()) {
+    for (const [i, rel] of [...new Set(store.keyedOutputs ?? [])].entries()) {
       const scrubbed = redactText(outputDisplayName(rel));
       const display_name = redactText(scrubbed.toLowerCase()) === scrubbed.toLowerCase() ? scrubbed : `withheld-output-${i + 1}`;
       if (!unsafeNames.some((u) => u.display_name === display_name)) unsafeNames.push({ display_name, reason: "worker_unreadable" });

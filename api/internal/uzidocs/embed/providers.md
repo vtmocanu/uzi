@@ -179,7 +179,10 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   the job is created, with your provider key and no Anthropic token. A job that names a site list
   (`egress_profile`) is still refused with `provider_lane_unsupported`, and site-list jobs on a
   provider are not shipped yet. A job never parks: revocation or a gateway rate limit fails it. The
-  same redirect risk and output-publication limits apply; see the linked section.
+  same redirect risk applies, and the job's agent can see your provider key in its environment. The
+  worker scrubs the key from what the job publishes and withholds output files that carry it, but
+  matching is byte-exact (an encoded copy is not detected), so this guards against accidental
+  publication only, not a malicious or prompt-injected job; see the linked section.
 - **Other lanes that cannot use a provider refuse.** The cross-check lane refuses an
   owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
   that use an Anthropic token. A plan cross-check whose

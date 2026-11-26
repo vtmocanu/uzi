@@ -518,7 +518,8 @@ describe("provider job: output publication end to end", { skip: LINUX_ONLY }, ()
   it("a name withheld for an uppercase spelling of the key is reported under a placeholder, never its own spelling", async () => {
     const { client, calls } = fakeClient();
     const upper = STATUS_KEY.toUpperCase();
-    const qf = session({ [`outputs/${upper}.txt`]: "named by the key", [`outputs/${STATUS_KEY}.md`]: "x", "outputs/clean.txt": "ok" }, [`outputs/${upper}.txt`, `outputs/${STATUS_KEY}.md`, "outputs/clean.txt"]);
+    // The upper-case path is listed twice: one file still yields one refusal.
+    const qf = session({ [`outputs/${upper}.txt`]: "named by the key", [`outputs/${STATUS_KEY}.md`]: "x", "outputs/clean.txt": "ok" }, [`outputs/${upper}.txt`, `outputs/${upper}.txt`, `outputs/${STATUS_KEY}.md`, "outputs/clean.txt"]);
     await runner(client, await tmpJobsRoot(), qf).execute(providerJobClaim(STATUS_KEY));
     assert.deepEqual(calls.uploads.map((u) => u.meta.display_name), ["clean.txt"]);
     assert.deepEqual(calls.results[0]!.refused_outputs, [

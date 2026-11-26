@@ -148,6 +148,7 @@ func TestV1ProviderJobOutputReadsLiveDB(t *testing.T) {
 	clean := e.storeOutput(jf, owner, job.ID, "clean.txt", []byte("a clean sibling"))
 	e.exec(`INSERT INTO job_results (run_id, status, report_md) VALUES ($1, 'completed', '# done')`, job.ID)
 	e.exec(`INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason) VALUES ($1, 'withheld.txt', 17, 'worker_unreadable')`, job.ID)
+	e.exec(`UPDATE runs SET status = 'completed' WHERE id = $1`, job.ID)
 
 	files := e.jobFiles(tok, job.ID)
 	if len(files.Files) != 1 || files.Files[0].DisplayName != "clean.txt" || files.Files[0].ID != clean.ID.String() {
@@ -160,14 +161,22 @@ func TestV1ProviderJobOutputReadsLiveDB(t *testing.T) {
 	if r.status != http.StatusOK {
 		t.Fatalf("GET result: %d %s", r.status, r.body)
 	}
-	var res struct {
-		Result struct {
-			Files        []apitypes.V1JobFileDTO        `json:"files"`
-			RefusedFiles []apitypes.V1JobRefusedFileDTO `json:"refused_files"`
-		} `json:"result"`
-	}
+	var res apitypes.V1JobResultDTO
 	r.decode(t, &res)
+	if res.JobStatus != "completed" || res.Result == nil {
+		t.Fatalf("result = %+v, want a completed job with a result", res)
+	}
+	if res.Result.Status != "completed" || res.Result.ReportMd != "# done" || len(res.Result.Findings) != 0 {
+		t.Fatalf("result body = %+v, want the clean status, report and no findings", res.Result)
+	}
 	if len(res.Result.Files) != 1 || res.Result.Files[0].DisplayName != "clean.txt" || len(res.Result.RefusedFiles) != 1 || res.Result.RefusedFiles[0].Reason != "worker_unreadable" {
 		t.Fatalf("result files/refused = %+v / %+v, want the clean sibling and the worker_unreadable refusal", res.Result.Files, res.Result.RefusedFiles)
+	}
+	cleanBytes := []byte("a clean sibling")
+	if res.Result.Files[0].Sha256 != sha256Hex(cleanBytes) {
+		t.Fatalf("clean sibling sha256 = %s, want %s", res.Result.Files[0].Sha256, sha256Hex(cleanBytes))
+	}
+	if dl := e.call(http.MethodGet, "/api/v1/files/"+clean.ID.String(), tok, ""); dl.status != http.StatusOK || string(dl.body) != string(cleanBytes) {
+		t.Fatalf("download clean sibling: %d %q", dl.status, dl.body)
 	}
 }

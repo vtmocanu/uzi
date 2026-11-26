@@ -80,7 +80,6 @@ A schedule with a harness pin resolves the engine's source at fire time. A set p
 
 Run-level credential overrides (`--token`, per-run or per-schedule overrides) and live switching (the ADR-4201 resolver, `set-token`, `approve --token`) are refused on provider runs, including a vendor run switched to `default` while the user's source is a provider. The switch machinery is vendor-token-shaped; extending it is out of scope.
 
-
 **Jobs (PRD #4322 M1b, 2026-11-26).** The D5 exposure extends to ordinary jobs: a provider-bound job's prompt, input files and everything its agent reads reach the selected gateway and any redirect it issues, product (`uzp_`) token jobs included, and the job agent can see the bound key in its environment. The worker's key scrub and output-file scan prevent accidental publication of the key only: matching is byte-exact, so an encoded or transformed copy is not detected, and it is no defence against a malicious or prompt-injected job. The ADR-1906 exact-name/443 isolated-channel invariant and its chart/CNI validation stay with M3.
 
 ### D6. Issue runs wait out a gateway limit on a fixed schedule; chat ends the turn
