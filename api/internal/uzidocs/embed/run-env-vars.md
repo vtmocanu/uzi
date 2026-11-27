@@ -468,8 +468,9 @@ Things to know:
 - **Credential helpers.** The login lasts across commands only when Docker
   writes it to the run's `.docker/config.json`. The worker images ship no
   `pass` and no `docker-credential-*` helper, so with the run's empty
-  configuration that is where `docker login` writes it. With no `credsStore` in
-  the configuration, the Docker CLI on Linux picks `pass` if `pass` is on
+  configuration that is where `docker login` writes it. When the configuration
+  holds no `credsStore`, no `credHelpers` and no saved login, the Docker CLI on
+  Linux picks `pass` if `pass` is on
   `PATH`, otherwise `secretservice`, and uses that helper when its
   `docker-credential-pass` or `docker-credential-secretservice` binary is on
   `PATH` (for example, a repo that adds one through devbox). The login is then
