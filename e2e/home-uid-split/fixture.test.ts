@@ -169,6 +169,12 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await fs.chmod(home, 0o3770);
     asCommand(`set -e; umask 077; mkdir -p "$1/.docker" && echo '{}' > "$1/.docker/config.json"`, home);
     assert.equal(await exists(path.join(home, ".docker")), true, "the fixture exists before teardown");
+    const homeStat = await fs.stat(home);
+    assert.equal(homeStat.mode & 0o7777, 0o3770, "the run HOME is 3770");
+    assert.equal(homeStat.gid, runnerUid.RUNNER_UID, "the run HOME is group runner");
+    const dockerStat = await fs.stat(path.join(home, ".docker"));
+    assert.equal(dockerStat.uid, 10003, ".docker is owned by runner-cmd");
+    assert.equal(dockerStat.mode & 0o777, 0o700, ".docker is private to its owner");
     await rmtree.rmHomeTree(home);
     assert.equal(await exists(home), false, "the whole run HOME, .docker included, must be gone");
     await assertSentinelIntact();

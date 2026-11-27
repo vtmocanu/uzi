@@ -44,7 +44,7 @@ readonly TEST_TIMEOUT="${DCP_TEST_TIMEOUT:-1500}"
 readonly BUILD_TIMEOUT="${DCP_BUILD_TIMEOUT:-3000}"
 readonly PORT="${DCP_REGISTRY_PORT:-$((20000 + RANDOM % 20000))}"
 readonly REGISTRY_REF="127.0.0.1:$PORT"
-readonly PRIVATE_IMAGE="$REGISTRY_REF/private/base:1"
+readonly PRIVATE_IMAGE="$REGISTRY_REF/$PREFIX/base:1"
 
 log() { printf '\n### %s\n' "$*"; }
 
@@ -71,7 +71,7 @@ cleanup() {
       docker rmi -f "$ref" >/dev/null 2>&1 || true
     fi
   done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
-  # The private tag is unique to this run (its registry port is part of the name), so it is always
+  # The private tag is unique to this run (its repository path carries this run's token), so it is always
   # attempted, whatever step failed; it only untags when it shares an image id with the pinned fixture.
   docker rmi "$PRIVATE_IMAGE" >/dev/null 2>&1 || true
   if [[ $built_run == 1 ]]; then docker rmi "$RUN_IMAGE" >/dev/null 2>&1 || true; fi

@@ -10895,6 +10895,51 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     }
   });
 
+  it("issue #4416: the model-command launch carries --docker-config and DOCKER_CONFIG for an ordinary run, never for a cross_check run", async () => {
+    for (const { kind, granted } of [{ kind: undefined, granted: true }, { kind: "cross_check", granted: false }] as const) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(toolCall(10, "Bash", { command: "echo dcp4416" }, "th-1", "tn-1", "c-dcp")).push(signalDone()).push(turnCompleted("completed")).end();
+      const launch = rig.deps.launchEffectRoot!;
+      const commandSpecs: CodexEffectLaunchSpec[] = [];
+      // spawnCommand stays undefined so the executor builds makeDefaultSpawnCommand over this launch.
+      rig.deps = { ...rig.deps, spawnCommand: undefined, launchEffectRoot: async (spec, deadline) => {
+        const handle = await launch(spec, deadline);
+        if (spec.args.includes("/usr/local/bin/uzi-codex-fileop")) return handle;
+        if (JSON.stringify(spec.args).includes("echo dcp4416")) commandSpecs.push(spec);
+        const stdout = handle.transport.stdout as PassThrough;
+        const stderr = handle.transport.stderr as PassThrough;
+        setImmediate(() => { stdout.end(spec.args.includes(ENV_PROBE_SCRIPT) ? PROBE_OK_STDOUT : "dcp\n"); stderr.end(); });
+        return {
+          ...handle,
+          observe: async () => ({
+            event: "observe", id: 1, state: "complete",
+            supervisor: { pid: 200, startTime: "1" }, root: { pid: 201, startTime: "1" },
+            processes: [{ pid: 201, startTime: "1", ppid: 200, rss: 100 }],
+          }),
+        };
+      } };
+      const { ctx } = makeCtx({ kind: kind as RunContext["kind"] });
+      const executor = new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, commandSandbox: "required" },
+        rig.deps,
+      );
+      await withTimeout(executor.run(ctx), 3000, `${kind ?? "ordinary"} docker-config run`);
+      assert.equal(commandSpecs.length, 1, `${kind ?? "ordinary"}: exactly one model command launched`);
+      const spec = commandSpecs[0]!;
+      const flags = spec.args.slice(0, spec.args.indexOf("--"));
+      if (granted) {
+        const at = flags.indexOf("--docker-config");
+        assert.deepEqual(flags.slice(at, at + 2), ["--docker-config", "/data/agent-home/run-1/.docker"]);
+        assert.equal(spec.env.DOCKER_CONFIG, "/data/agent-home/run-1/.docker");
+      } else {
+        assert.ok(!flags.includes("--docker-config"), "a cross_check command launch has no --docker-config");
+        assert.equal(spec.env.DOCKER_CONFIG, undefined);
+      }
+    }
+  });
+
   it("writes ONE degraded-mode line into the run feed when commandSandboxDegraded is set, none otherwise", async () => {
     // Degraded on: exactly one worker status line naming the unconfined posture.
     const rigOn = makeRig();

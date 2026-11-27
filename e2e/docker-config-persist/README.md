@@ -28,9 +28,10 @@ Per mode (`off`, plus `required` when `uzi-codex-command-sandbox --probe` exits 
 | f | a planted `.docker` owned by another uid degrades: the command runs, stderr has the degrade line, `DOCKER_CONFIG` is gone |
 | g | (required only) another run's `.docker` is not writable from this run's sandbox |
 
-A Claude leg runs the same login-then-pull as `runner` (10002) with `DOCKER_CONFIG` set explicitly;
-the value `buildSdkEnv` sets; that wiring is pinned by `agent/test/sdk-env.test.ts`, not by this leg. When Landlock is unavailable the script prints
-`required: NOT PROVEN` and does not count it as passing.
+A Claude leg runs the same login-then-pull as `runner` (10002) with `DOCKER_CONFIG` set explicitly
+to the value `buildSdkEnv` sets; that wiring is pinned by `agent/test/sdk-env.test.ts`, not by this
+leg. When Landlock is unavailable the script prints `required: NOT PROVEN` and does not count it
+as passing.
 
 Isolation: every container and image is named `dcp-test-<hex>-*`, containers are labeled
 `dcp-test.owner=<hex>`, and the EXIT trap removes only those by exact name after checking the label.

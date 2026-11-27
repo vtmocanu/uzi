@@ -20,20 +20,6 @@ const recordingLaunch = (specs: CodexEffectLaunchSpec[]) => async (spec: CodexEf
 const WT = "/data/runner/repo/run-1";
 
 describe("issue #4416: Docker config grant on Codex launches", () => {
-  it("a model command spec places --docker-config between the cache and --mode, with DOCKER_CONFIG overridden", async () => {
-    const specs: CodexEffectLaunchSpec[] = [];
-    const docker = "/data/agent-home/run-1/.docker";
-    const spawn = makeDefaultSpawnCommand(new ExecutionRegistry(newLocalExecutionEpoch(1)), recordingLaunch(specs), 1000, WT,
-      { DOCKER_CONFIG: "/planted/.docker" }, "required", undefined, undefined, undefined, undefined, undefined, docker);
-    await assert.rejects(spawn(["/bin/true"], { cwd: WT }));
-    const spec = specs[0]!;
-    const flags = spec.args.slice(0, spec.args.indexOf("--"));
-    const at = flags.indexOf("--docker-config");
-    assert.deepEqual(flags.slice(at, at + 3), ["--docker-config", docker, "--mode"]);
-    assert.equal(spec.env.DOCKER_CONFIG, docker);
-    assert.equal(spec.env.HOME, spec.env.TMPDIR, "HOME and TMPDIR stay the private tmp");
-  });
-
   it("a malformed docker config dir is refused as a trusted-execution refusal", async () => {
     for (const bad of ["relative/.docker", "/data/x/docker", "/data/x/../x/.docker"]) {
       const specs: CodexEffectLaunchSpec[] = [];
