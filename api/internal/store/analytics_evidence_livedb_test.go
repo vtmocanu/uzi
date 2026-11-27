@@ -755,11 +755,8 @@ func (h *evHarness) qualityWorkload(name string, owner uuid.UUID, win analytics.
 }
 
 const (
-	evSQLOwnerRepoOptions = `SELECT r.id, r.path_with_namespace FROM repos r JOIN forge_connections c ON c.id = r.connection_id
-		WHERE c.user_id = $1::uuid ORDER BY r.path_with_namespace COLLATE "C", r.id LIMIT 201`
-	evSQLAllRepoOptions = `SELECT r.id, r.path_with_namespace FROM repos r ORDER BY r.path_with_namespace COLLATE "C", r.id LIMIT 201`
-	evSQLUserOptions    = `SELECT u.id, u.email FROM users u ORDER BY u.email COLLATE "C", u.id LIMIT 201`
-	evSQLOwnerHistory   = `SELECT MIN(r.created_at)::timestamptz FROM runs r WHERE r.user_id = $1::uuid
+	evSQLUserOptions  = `SELECT u.id, u.email FROM users u ORDER BY u.email COLLATE "C", u.id LIMIT 201`
+	evSQLOwnerHistory = `SELECT MIN(r.created_at)::timestamptz FROM runs r WHERE r.user_id = $1::uuid
 		AND ($2::uuid IS NULL OR r.repo_id = $2::uuid) AND ($3::text IS NULL OR r.harness = $3::text) AND r.kind = ANY($4::text[])`
 	evSQLAllHistory = `SELECT MIN(r.created_at)::timestamptz FROM runs r
 		WHERE ($1::uuid IS NULL OR r.repo_id = $1::uuid) AND ($2::text IS NULL OR r.harness = $2::text) AND r.kind = ANY($3::text[])`
@@ -772,7 +769,7 @@ func (h *evHarness) optionWorkloads() []evWorkload {
 		{
 			name: "owner options",
 			stmts: []evStmt{
-				{"AnalyticsOwnerRepoOptions", evSQLOwnerRepoOptions, owner},
+				{"AnalyticsOwnerRepoOptions", store.AnalyticsOwnerRepoOptionsSQL, owner},
 				{"AnalyticsOwnerHistoryStart", evSQLOwnerHistory, owner + ", NULL::uuid, NULL::text, " + kinds},
 			},
 			run: func(ctx context.Context, q *store.Queries) error {
@@ -786,7 +783,7 @@ func (h *evHarness) optionWorkloads() []evWorkload {
 		{
 			name: "admin options",
 			stmts: []evStmt{
-				{"AnalyticsAllRepoOptions", evSQLAllRepoOptions, ""},
+				{"AnalyticsAllRepoOptions", store.AnalyticsAllRepoOptionsSQL, ""},
 				{"AnalyticsUserOptions", evSQLUserOptions, ""},
 				{"AnalyticsAllHistoryStart", evSQLAllHistory, "NULL::uuid, NULL::text, " + kinds},
 			},

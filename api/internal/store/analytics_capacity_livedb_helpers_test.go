@@ -47,27 +47,61 @@ func capPrivateDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 			t.Errorf("drop private database: %v", err)
 		}
 	})
-	owned := dsn + " dbname=" + name
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			t.Fatal(err)
-		}
-		u.Path = "/" + name
-		q := u.Query()
-		q.Del("dbname") // a query dbname would override the path
-		u.RawQuery = q.Encode()
-		owned = u.String()
-	}
-	if err := store.Migrate(ctx, owned); err != nil {
-		t.Fatalf("migrate private database: %v", err)
+	owned, err := capPrivateDSN(dsn, name)
+	if err != nil {
+		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, owned)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	if err := requireCurrentDB(ctx, pool, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(ctx, owned); err != nil {
+		t.Fatalf("migrate private database: %v", err)
+	}
 	return ctx, pool
+}
+
+// capPrivateDSN rewrites dsn to name a database. pgx treats database as an alias of dbname and a
+// query value overrides the URL path, so both keys are dropped from a URL; a keyword DSN gets
+// dbname appended last. The result must parse to exactly name, else an error is returned.
+func capPrivateDSN(dsn, name string) (string, error) {
+	owned := dsn + " dbname=" + name
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", err
+		}
+		u.Path = "/" + name
+		q := u.Query()
+		q.Del("dbname")
+		q.Del("database")
+		u.RawQuery = q.Encode()
+		owned = u.String()
+	}
+	cfg, err := pgx.ParseConfig(owned)
+	if err != nil {
+		return "", fmt.Errorf("private DSN does not parse: %w", err)
+	}
+	if cfg.Database != name {
+		return "", fmt.Errorf("private DSN resolves to database %q, want %q", cfg.Database, name)
+	}
+	return owned, nil
+}
+
+// requireCurrentDB errors unless the pool is connected to the database called name.
+func requireCurrentDB(ctx context.Context, pool *pgxpool.Pool, name string) error {
+	var got string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&got); err != nil {
+		return err
+	}
+	if got != name {
+		return fmt.Errorf("connected to database %q, want %q", got, name)
+	}
+	return nil
 }
 
 func capFixtureOn(t *testing.T, ctx context.Context, pool *pgxpool.Pool) *spendFixture {

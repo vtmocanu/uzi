@@ -822,6 +822,7 @@ func (q *Queries) AnalyticsAllReliability(ctx context.Context, arg AnalyticsAllR
 const analyticsAllRepoOptions = `-- name: AnalyticsAllRepoOptions :many
 SELECT r.id, r.path_with_namespace
 FROM repos r
+WHERE EXISTS (SELECT 1 FROM runs ru WHERE ru.repo_id = r.id)
 ORDER BY r.path_with_namespace COLLATE "C", r.id
 LIMIT 201
 `
@@ -831,6 +832,7 @@ type AnalyticsAllRepoOptionsRow struct {
 	PathWithNamespace string    `json:"path_with_namespace"`
 }
 
+// Repos with at least one run, at any time and of any kind. Same LIMIT 201 truncation contract.
 func (q *Queries) AnalyticsAllRepoOptions(ctx context.Context) ([]AnalyticsAllRepoOptionsRow, error) {
 	rows, err := q.db.Query(ctx, analyticsAllRepoOptions)
 	if err != nil {
@@ -2290,6 +2292,7 @@ SELECT r.id, r.path_with_namespace
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1::uuid
+  AND EXISTS (SELECT 1 FROM runs ru WHERE ru.repo_id = r.id AND ru.user_id = $1::uuid)
 ORDER BY r.path_with_namespace COLLATE "C", r.id
 LIMIT 201
 `
@@ -2299,7 +2302,8 @@ type AnalyticsOwnerRepoOptionsRow struct {
 	PathWithNamespace string    `json:"path_with_namespace"`
 }
 
-// Repos on the caller's connections. LIMIT 201 lets the caller serve 200 and flag truncation.
+// Repos on the caller's connections that have at least one run by the caller, at any time and of
+// any kind. LIMIT 201 lets the caller serve 200 and flag truncation.
 func (q *Queries) AnalyticsOwnerRepoOptions(ctx context.Context, userID uuid.UUID) ([]AnalyticsOwnerRepoOptionsRow, error) {
 	rows, err := q.db.Query(ctx, analyticsOwnerRepoOptions, userID)
 	if err != nil {
