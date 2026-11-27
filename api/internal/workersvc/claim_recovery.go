@@ -298,20 +298,31 @@ func isClaudeCheckerChild(run store.Run) bool {
 	return run.Kind == runkind.CrossCheck && run.Harness == harnessClaude
 }
 
-// claudeCheckerClaimError maps a Claude cross-check child's assembly-time credential
-// failure to the bare errCheckerPinUnavailable sentinel (PRD #2460, acceptance 4), so the
+// isProviderCheckerChild reports a provider-bound cross-check child (PRD #4574 M2). Like a Claude
+// checker it decides its check at claim time instead of parking on a binding that may never recover.
+func isProviderCheckerChild(run store.Run) bool {
+	return run.Kind == runkind.CrossCheck && providerBoundRun(run)
+}
+
+// claudeCheckerClaimError maps a checker child's (Claude or provider-bound) assembly-time
+// credential failure to the bare errCheckerPinUnavailable sentinel (PRD #2460, acceptance 4), so the
 // lead-first path decides failed/checker_unavailable instead of the child waiting on a
 // credential that may never come. errAutoPoolEmpty counts: it means "nothing pooled to
 // spend", and the auto lane never spends the owner's non-pooled default (secretchoice.go
-// autoChoice), so waiting for a check that has a deadline serves nothing. errVaultLocked
+// autoChoice), so waiting for a check that has a deadline serves nothing. A provider checker
+// child also maps a providerClaimRefusal (revoked or rotated binding), which would otherwise park
+// it; errProviderLaneClaimRefused already wraps errCredentialUnavailable. errVaultLocked
 // is NOT mapped: a locked vault is transient and a later claim may succeed. The sentinel
 // carries no credential detail. The finalizer selects the stage-specific failure
 // reason; the sentinel retains its legacy plan text. Other run shapes return err unchanged.
 func claudeCheckerClaimError(run store.Run, err error) error {
-	if err == nil || !isClaudeCheckerChild(run) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
+	if err == nil || !(isClaudeCheckerChild(run) || isProviderCheckerChild(run)) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 		return err
 	}
 	if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errCredentialDisabled) || errors.Is(err, errAutoPoolEmpty) {
+		return errCheckerPinUnavailable
+	}
+	if _, ok := isProviderClaimRefusal(err); ok && isProviderCheckerChild(run) {
 		return errCheckerPinUnavailable
 	}
 	return err
@@ -355,7 +366,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	var checkerLead store.Run
 	var checkerStage string
 	var checkerQueries *store.Queries
-	if run.Kind == runkind.CrossCheck && (errors.Is(assemblyErr, errCheckerPinUnavailable) || isClaudeCheckerChild(run)) {
+	if run.Kind == runkind.CrossCheck && (errors.Is(assemblyErr, errCheckerPinUnavailable) || isClaudeCheckerChild(run) || isProviderCheckerChild(run)) {
 		live, ok := q.(pgxClaimFinishTx)
 		if !ok {
 			return nil, "", errClaimRecoveryNoTx
@@ -492,6 +503,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		if reason != "" {
 			providerRefusal = &providerClaimRefusal{Reason: reason}
 			payload, assemblyErr = nil, providerRefusal
+			if isProviderCheckerChild(run) {
+				// PRD #4574 M2: a provider checker child never parks. The binding changed after
+				// assembly: decide the check unavailable under the lead lock already held, deliver
+				// nothing, and clear providerRefusal (the park arm below keys on it).
+				payload, assemblyErr, providerRefusal = nil, errCheckerPinUnavailable, nil
+			}
 		}
 	}
 	// PRD #4322 D-G and M1b: a provider JUDGE or JOB never parks (a job never waits, PRD #1908 D-E).

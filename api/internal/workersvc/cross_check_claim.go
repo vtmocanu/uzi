@@ -149,11 +149,12 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if err != nil {
 		return ErrCrossCheckRefused
 	}
+	var lead store.Run
 	if persisted.Stage == "code" {
-		_, err = q.LockCodeCrossCheckLeadForVerdict(ctx, store.LockCodeCrossCheckLeadForVerdictParams{
+		lead, err = q.LockCodeCrossCheckLeadForVerdict(ctx, store.LockCodeCrossCheckLeadForVerdictParams{
 			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
 	} else {
-		_, err = q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
+		lead, err = q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
 			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -176,6 +177,16 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	var modelSource, effortSource *string
 	if len(resolutions) > 0 && resolutions[0] != nil {
 		modelSource, effortSource = &resolutions[0].ModelSource, &resolutions[0].EffortSource
+	}
+	// PRD #4574 M2: the same-model guard runs under the lead verdict lock, after the checker's
+	// config and provider binding are assembled and before the claim is recorded. A refusal rolls
+	// this transaction back and settles through finishRunClaimTx's errCheckerPinUnavailable arm.
+	var resolution *agenttmpl.CrossCheckResolution
+	if len(resolutions) > 0 {
+		resolution = resolutions[0]
+	}
+	if err := checkSameModel(ctx, q, lead, run, persisted, payload, resolution); err != nil {
+		return err
 	}
 	var cc store.CrossCheck
 	if persisted.Stage == "code" {
