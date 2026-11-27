@@ -3,8 +3,8 @@
 
 -- Issue #4695: the history_retention sweeper pass trims pr_history_events with an age predicate on observed_at.
 -- This btree serves the pr_history_events retention delete (DeleteExpiredPRHistoryEvents), whose age predicate is observed_at < cutoff AND NOT first_merge. The index is partial on NOT first_merge because the first_merge rows are never expired, so they never need to be in it. Measured at 1,000,000 rows, a no-op tick without the index ran about 105 ms after churn (about 30 ms after backlog), and the slowest batch of a compressed churn on the unindexed table was 416 ms.
--- Plan flip: a stale-statistics Seq Scan was also seen on pr_history_events with this partial btree
--- present (about 30 ms, no timeout; estimated 731,064 rows, actual 0). The statement therefore
+-- Plan flip: a stale-statistics Seq Scan was also seen on pr_history_events with a btree on
+-- observed_at present (about 30 ms, no timeout; estimated 731,064 rows, actual 0). The statement therefore
 -- carries ORDER BY s.observed_at like the other three history tables, so the planner reads the
 -- page in index order from this btree and removes the oldest rows first. The largest flip was
 -- measured on codex_usage_samples at the maximum jsonb size with autovacuum disabled: a Seq Scan

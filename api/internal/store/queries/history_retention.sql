@@ -26,7 +26,7 @@
 -- Without a valid index on the expiry column the ORDER BY forces a sort of all expired rows (about
 -- 27 MiB in the measured backlog), because LockRows sits between Limit and Sort and the limit
 -- cannot stop the sort early. An INVALID or missing index would therefore make each batch sort
--- every expired row and likely hit the statement timeout (unmeasured). That is reachable only if
+-- every expired row and likely hit the statement timeout (unmeasured). The INVALID case is reachable only if
 -- the boot migration left an invalid index while another process runs the pass; the
 -- single-migrator prerequisite rules that out.
 

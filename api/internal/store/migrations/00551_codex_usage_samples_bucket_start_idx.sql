@@ -11,7 +11,9 @@
 -- statement also carries ORDER BY s.bucket_start to make the planner read the page in index order.
 -- Why btree and not BRIN: BRIN timed out in churn and in backlog drain on this table (57014 in
 -- churn: 119 at the typical jsonb size, 256 at the maximum; 50 in the backlog drain at the typical
--- size), in the runs that used the statement without ORDER BY. BRIN cannot supply the ORDER BY, so the read needs a sort over every candidate row.
+-- size), in the runs that used the statement without ORDER BY; those runs also had btree timeouts at
+-- the maximum size (81, 95 and 345), which is why the statement gained ORDER BY, after which the
+-- btree had none. BRIN cannot supply the ORDER BY, so the read needs a sort over every candidate row.
 -- Build concurrently so the table stays writable. goose v3.29.0 (migration_sql.go:70-86) runs a
 -- NO TRANSACTION migration's statements one by one and calls InsertVersionNoTx only after they all
 -- returned, so the version is recorded only after the concurrent build returned a valid index; the
