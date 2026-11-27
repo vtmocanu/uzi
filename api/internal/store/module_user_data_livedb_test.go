@@ -120,8 +120,6 @@ func mdWaitNoAcquired(t *testing.T, pool *pgxpool.Pool) {
 	}
 }
 
-func i64(v int64) *int64 { return &v }
-
 func TestModuleUserDataConditionalUpdateLiveDB(t *testing.T) {
 	ctx, pool := openModuleDataLiveDB(t)
 	u := mdSeedUser(ctx, t, pool)
@@ -228,6 +226,9 @@ func mdInvalidBodies() map[string][]byte {
 		"raw-invalid-utf8": {'"', 0xff, '"'},
 		"huge-exponent":    []byte(`1e1000000`),
 		"huge-integer":     []byte("1" + strings.Repeat("0", 131072)),
+		"nil":              nil,
+		"json-null":        []byte(`null`),
+		"json-null-ws":     []byte(" null \n"),
 		"huge-fraction":    []byte("1." + strings.Repeat("1", 20000)),
 	}
 }
@@ -399,7 +400,7 @@ func TestModuleUserDataLastSlotRaceLiveDB(t *testing.T) {
 			case <-tick.C:
 				var n int
 				err := pool.QueryRow(context.Background(),
-					`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`).Scan(&n)
+					`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid() AND query LIKE '%LockUserForModuleData%'`).Scan(&n)
 				if err != nil {
 					t.Errorf("observer query: %v", err)
 					return

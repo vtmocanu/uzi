@@ -1,7 +1,8 @@
 -- Issue #4784: per-user JSON documents for runtime web modules.
 
 -- name: ValidateModuleUserDataJSON :one
-SELECT $1::jsonb IS NOT NULL;
+-- A nil body binds as SQL NULL; report it as JSON null so the caller rejects both alike.
+SELECT coalesce(jsonb_typeof(sqlc.arg(data)::jsonb), 'null')::text;
 
 -- name: GetModuleUserData :one
 SELECT data, revision FROM module_user_data WHERE user_id = $1 AND module_id = $2;

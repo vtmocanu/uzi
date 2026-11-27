@@ -142,11 +142,16 @@ func PutModuleUserData(ctx context.Context, db moduleDataTxBeginner, userID uuid
 	q := New(tx)
 	runModuleDataHook(&moduleDataAfterBeginHook)
 
-	if _, err := q.ValidateModuleUserDataJSON(ctx, data); err != nil {
+	typ, err := q.ValidateModuleUserDataJSON(ctx, data)
+	if err != nil {
 		if validateErrIsInput(err) {
 			return 0, ErrModuleDataInvalid
 		}
 		return 0, fmt.Errorf("store: validate module data: %w", err)
+	}
+	// The query maps a nil body (SQL NULL) to "null" too; neither is a document.
+	if typ == "null" {
+		return 0, ErrModuleDataInvalid
 	}
 
 	var rev int64

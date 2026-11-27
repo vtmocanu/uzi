@@ -1,4 +1,5 @@
 -- +goose Up
+SET LOCAL lock_timeout = '5s';
 
 -- Issue #4784: per-user JSON documents for runtime web modules. One document per
 -- (user, module). Revisions come from a single sequence and are never reused, so a

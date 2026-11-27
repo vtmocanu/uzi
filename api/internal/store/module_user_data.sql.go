@@ -118,13 +118,14 @@ func (q *Queries) UpdateModuleUserData(ctx context.Context, arg UpdateModuleUser
 
 const validateModuleUserDataJSON = `-- name: ValidateModuleUserDataJSON :one
 
-SELECT $1::jsonb IS NOT NULL
+SELECT coalesce(jsonb_typeof($1::jsonb), 'null')::text
 `
 
 // Issue #4784: per-user JSON documents for runtime web modules.
-func (q *Queries) ValidateModuleUserDataJSON(ctx context.Context, dollar_1 []byte) (interface{}, error) {
-	row := q.db.QueryRow(ctx, validateModuleUserDataJSON, dollar_1)
-	var column_1 interface{}
+// A nil body binds as SQL NULL; report it as JSON null so the caller rejects both alike.
+func (q *Queries) ValidateModuleUserDataJSON(ctx context.Context, data []byte) (string, error) {
+	row := q.db.QueryRow(ctx, validateModuleUserDataJSON, data)
+	var column_1 string
 	err := row.Scan(&column_1)
 	return column_1, err
 }
