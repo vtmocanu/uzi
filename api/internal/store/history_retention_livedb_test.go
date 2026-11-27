@@ -715,8 +715,8 @@ func hrGenericPlan(t *testing.T, f *hrFx) {
 		var def string
 		var valid bool
 		err := f.pool.QueryRow(f.ctx, `SELECT i.indexdef, x.indisvalid
-		        FROM pg_indexes i JOIN pg_class c ON c.relname = i.indexname
-		        JOIN pg_index x ON x.indexrelid = c.oid
+		        FROM pg_indexes i
+		        JOIN pg_index x ON x.indexrelid = format('%I.%I', i.schemaname, i.indexname)::regclass
 		        WHERE i.schemaname = current_schema() AND i.tablename = $1 AND i.indexname = $2`,
 			string(table), hrRetentionIndex[table]).Scan(&def, &valid)
 		if err != nil {

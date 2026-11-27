@@ -2,18 +2,24 @@
 -- +goose Up
 
 -- Issue #4695: the history_retention sweeper pass trims pr_history_events with an age predicate on observed_at.
--- This btree serves the pr_history_events retention delete (DeleteExpiredPRHistoryEvents), whose age predicate is observed_at < cutoff AND NOT first_merge. The index is partial on NOT first_merge because the first_merge rows are never expired, so they never need to be in it. Measured at 1,000,000 rows, a no-op tick without the index ran about 105 ms, and the slowest batch of a compressed churn on the unindexed table was 416 ms.
--- Plan flip: no flip was observed on pr_history_events. The statement carries ORDER BY s.observed_at
--- like the other three history tables, so the planner reads the page in index order from this
--- btree and removes the oldest rows first (the flip itself was measured on codex_usage_samples
--- with autovacuum disabled, 1,107 ms against 5 ms).
--- Why btree and not BRIN: BRIN (autosummarize on) was measured at 1,000,000 rows against the
--- statement as shipped, with ORDER BY, after dropping this btree. BRIN cannot supply the ORDER BY,
--- so the read needs a Bitmap Heap Scan plus a sort over every candidate row. A warm 90% backlog
+-- This btree serves the pr_history_events retention delete (DeleteExpiredPRHistoryEvents), whose age predicate is observed_at < cutoff AND NOT first_merge. The index is partial on NOT first_merge because the first_merge rows are never expired, so they never need to be in it. Measured at 1,000,000 rows, a no-op tick without the index ran about 105 ms after churn (about 30 ms after backlog), and the slowest batch of a compressed churn on the unindexed table was 416 ms.
+-- Plan flip: a stale-statistics Seq Scan was also seen on pr_history_events with this partial btree
+-- present (about 30 ms, no timeout; estimated 731,064 rows, actual 0). The statement therefore
+-- carries ORDER BY s.observed_at like the other three history tables, so the planner reads the
+-- page in index order from this btree and removes the oldest rows first. The largest flip was
+-- measured on codex_usage_samples at the maximum jsonb size with autovacuum disabled: a Seq Scan
+-- at 1,088 ms reading 512,478 blocks.
+-- Why btree and not BRIN, in order. BRIN (autosummarize on) with the statement WITHOUT ORDER BY
+-- passed the backlog drain and the 250-arrival churn (4,400 ticks, no timeouts). The shipped
+-- statement needs ORDER BY to keep the planner on the index once statistics go stale. BRIN cannot
+-- supply that order, so the read needs a Bitmap Heap Scan plus a sort over every candidate row.
+-- Against the shipped statement, at 1,000,000 rows after dropping this btree, a warm 90% backlog
 -- batch took a median 253 ms (max 275 ms, 27 MB on-disk sort) against a 300 ms statement timeout,
--- and the compressed backlog drain hit 29 statement timeouts (57014, slowest batch 306 ms). The
--- 4,400-tick churn had no timeouts (slowest batch 88 ms at 6 arrivals per tick, 215 ms at 250), as
--- did the earlier runs of the statement without ORDER BY. The backlog drain fails, so btree.
+-- and the compressed backlog drain failed with 29 statement timeouts (57014, slowest batch
+-- 306 ms). After churn its no-op tick reads most of the heap (about 17,300 blocks of a heap of
+-- about 19,600 to 20,200). So btree is chosen for the shared statement. BRIN's 4,400-tick churn
+-- with the shipped statement had no timeouts (slowest batch 88 ms at 6 arrivals per tick, 215 ms
+-- at 250), so the churn alone does not decide it; the backlog drain does.
 -- Build concurrently so the table stays writable. goose v3.29.0 (migration_sql.go:70-86) runs a
 -- NO TRANSACTION migration's statements one by one and calls InsertVersionNoTx only after they all
 -- returned, so the version is recorded only after the concurrent build returned a valid index; the

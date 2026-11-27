@@ -94,16 +94,20 @@ type DeleteExpiredPRHistoryEventsParams struct {
 //
 // ORDER BY s.<expiry column> in the inner SELECT is load-bearing (issue #4695 plan-flip evidence):
 // without it, after a drain or churn leaves the table statistics stale, the planner chose a
-// Seq Scan for the page read (1,107 ms against 5 ms), measured on codex_usage_samples with
-// autovacuum disabled; similar whole-heap near-empty reads were seen on anthropic_usage_samples
-// and worker_capacity_samples. No flip was observed on pr_history_events. The ORDER BY lets the
-// planner satisfy LIMIT from the btree on the expiry column in expiry order, an Index Scan, and
-// it removes the oldest rows first. The indexes are created by migrations 00549 to 00552.
+// Seq Scan for the page read even with the btree present. The largest case was a Seq Scan at
+// 1,088 ms reading 512,478 blocks, measured on codex_usage_samples at the maximum jsonb size with
+// autovacuum disabled. Similar whole-heap near-empty reads were seen on anthropic_usage_samples
+// and worker_capacity_samples, and the flip was also seen on pr_history_events (about 30 ms, no
+// timeout). The ORDER BY lets the planner satisfy LIMIT from the btree on the expiry column in
+// expiry order, an Index Scan, and it removes the oldest rows first. The indexes are created by
+// migrations 00549 to 00552.
 //
-// Without a valid index on the expiry column the ORDER BY forces an unbounded sort of all expired
-// rows, because LockRows sits between Limit and Sort and the limit cannot stop the sort early. So
-// the index must not be dropped, and an INVALID one (a failed concurrent build) makes retention
-// time out until the next boot rebuilds it.
+// Without a valid index on the expiry column the ORDER BY forces a sort of all expired rows (about
+// 27 MiB in the measured backlog), because LockRows sits between Limit and Sort and the limit
+// cannot stop the sort early. An INVALID or missing index would therefore make each batch sort
+// every expired row and likely hit the statement timeout (unmeasured). That is reachable only if
+// the boot migration left an invalid index while another process runs the pass; the
+// single-migrator prerequisite rules that out.
 func (q *Queries) DeleteExpiredPRHistoryEvents(ctx context.Context, arg DeleteExpiredPRHistoryEventsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredPRHistoryEvents, arg.Cutoff, arg.BatchSize)
 	if err != nil {
