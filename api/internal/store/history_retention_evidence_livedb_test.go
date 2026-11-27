@@ -172,9 +172,12 @@ func heShort(t store.HistoryRetentionTable) string {
 
 func heRows() int { return heEnvInt("UZI_EVIDENCE_ROWS", 1_000_000) }
 
-// newHeFx connects to the evidence database. With admin=true it also checks the throwaway-database
-// marker, creates hrev when absent and migrates it; with admin=false (the cold tick) it opens the
-// pool and nothing else, so no query touches the tables before the first measured tick.
+// newHeFx connects to the evidence database. The marker of the database UZI_TEST_DATABASE_URL names
+// is checked first (admin paths); the evidence database hrev is created with its own marker row
+// (the e2e/test-database-marker.sql shape) and EVERY path, including the cold one, verifies that
+// hrev itself carries the marker before anything mutates it, so a hrev that something else made
+// is refused. With admin=true it then migrates hrev; with admin=false (the cold tick) it opens the
+// pool and nothing else, so no query touches the history tables before the first measured tick.
 func newHeFx(t *testing.T, admin bool) *heFx {
 	t.Helper()
 	if os.Getenv("UZI_HISTORY_RETENTION_EVIDENCE") != "1" {
@@ -219,7 +222,12 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 			if _, err := ap.Exec(ctx, `CREATE DATABASE `+heDBName); err != nil {
 				t.Fatalf("create database: %v", err)
 			}
+			fx.markEvidenceDB()
 		}
+	}
+	// Before ANY mutation of hrev (migrate, truncate, seed, delete, ALTER), on every path.
+	fx.requireEvidenceMarker()
+	if admin {
 		if err := store.Migrate(ctx, fx.dsn); err != nil {
 			t.Fatalf("migrate: %v", err)
 		}
@@ -230,10 +238,75 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 	}
 	t.Cleanup(pool.Close)
 	fx.pool = pool
+	fx.log.rec("env", map[string]any{"server_version": fx.serverVersion(), "rows": heRows(), "diagnostic_overrides": heDiagnosticReasons(fx)})
 	if admin {
 		fx.ensureOwner()
 	}
 	return fx
+}
+
+// markEvidenceDB writes the throwaway-database marker row into the freshly created hrev, in the
+// shape of e2e/test-database-marker.sql.
+func (fx *heFx) markEvidenceDB() {
+	fx.t.Helper()
+	p, err := pgxpool.New(fx.ctx, fx.dsn)
+	if err != nil {
+		fx.t.Fatalf("hrev marker pool: %v", err)
+	}
+	defer p.Close()
+	for _, q := range []string{
+		`CREATE SCHEMA uzi_test_harness`,
+		`CREATE TABLE uzi_test_harness.database_marker (marker text PRIMARY KEY)`,
+		`INSERT INTO uzi_test_harness.database_marker (marker) VALUES ('` + heMarker + `')`,
+	} {
+		if _, err := p.Exec(fx.ctx, q); err != nil {
+			fx.t.Fatalf("write hrev marker: %v\n%s", err, q)
+		}
+	}
+}
+
+// requireEvidenceMarker refuses (t.Fatalf) unless hrev itself carries the throwaway marker. It is a
+// read-only query over a connection of its own, so nothing is mutated on a refusal.
+func (fx *heFx) requireEvidenceMarker() {
+	fx.t.Helper()
+	p, err := pgxpool.New(fx.ctx, fx.dsn)
+	if err != nil {
+		fx.t.Fatalf("refusing to touch %s: cannot connect to verify its marker: %v", heDBName, err)
+	}
+	defer p.Close()
+	var marker string
+	if err := p.QueryRow(fx.ctx, `SELECT marker FROM uzi_test_harness.database_marker`).Scan(&marker); err != nil || marker != heMarker {
+		fx.t.Fatalf("refusing to touch database %s: it does not carry the throwaway marker (marker=%q err=%v); drop it so the harness can recreate it", heDBName, marker, err)
+	}
+}
+
+func (fx *heFx) serverVersion() string {
+	fx.t.Helper()
+	var v string
+	if err := fx.pool.QueryRow(fx.ctx, `SHOW server_version`).Scan(&v); err != nil {
+		fx.t.Fatalf("SHOW server_version: %v", err)
+	}
+	return v
+}
+
+// heDiagnosticReasons lists every override that makes a run diagnostic only: fewer rows than the
+// 1,000,000 of the evidence fixture, a smoke shorter than 300 s, or a table or candidate selector
+// that narrows coverage. Empty means the run is qualifying.
+func heDiagnosticReasons(fx *heFx) []string {
+	var r []string
+	if n := heRows(); n < 1_000_000 {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_ROWS=%d (below 1000000)", n))
+	}
+	if n := heEnvInt("UZI_EVIDENCE_SMOKE_SECONDS", 300); n < 300 {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_SMOKE_SECONDS=%d (below 300)", n))
+	}
+	if len(fx.tables) < len(store.HistoryRetentionTables()) {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_TABLES selects %d of %d tables", len(fx.tables), len(store.HistoryRetentionTables())))
+	}
+	if c := heList("UZI_EVIDENCE_CANDS", heCands); len(c) < len(heCands) {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_CANDS selects %d of %d candidates", len(c), len(heCands)))
+	}
+	return r
 }
 
 func (fx *heFx) exec(sql string, args ...any) {
@@ -377,6 +450,9 @@ func (fx *heFx) insertRows(s heSpec, from, to int64) {
 func (fx *heFx) reseed(s heSpec) time.Duration {
 	fx.t.Helper()
 	t0 := time.Now()
+	// An interrupted compressed run with UZI_EVIDENCE_NO_AV=1 can leave the table with autovacuum
+	// disabled; every fixture starts from the default.
+	fx.exec(`ALTER TABLE ` + string(s.table) + ` RESET (autovacuum_enabled)`)
 	fx.exec(`TRUNCATE ` + string(s.table))
 	for from := int64(0); from < int64(s.n); from += 200_000 {
 		fx.insertRows(s, from, min(from+200_000, int64(s.n)))
@@ -858,6 +934,17 @@ type heTabRun struct {
 	backlogEnd int // first tick whose batch came back short and clean; -1 while a backlog exists
 }
 
+// autovacuumState reads the table's actual autovacuum_enabled reloption from pg_class.reloptions
+// (not the environment flag) and returns whether it is off, with the raw reloptions text.
+func (fx *heFx) autovacuumState(table store.HistoryRetentionTable) (off bool, reloptions string) {
+	fx.t.Helper()
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT coalesce('autovacuum_enabled=false' = ANY (reloptions), false), coalesce(reloptions::text, '')
+	        FROM pg_class WHERE oid = $1::regclass`, string(table)).Scan(&off, &reloptions); err != nil {
+		fx.t.Fatalf("read reloptions of %s: %v", table, err)
+	}
+	return off, reloptions
+}
+
 func (fx *heFx) tableStats(table store.HistoryRetentionTable) map[string]any {
 	var live, dead, av, aav, ins int64
 	_ = fx.pool.QueryRow(fx.ctx, `SELECT n_live_tup, n_dead_tup, autovacuum_count, autoanalyze_count, n_tup_ins
@@ -897,17 +984,20 @@ func (fx *heFx) compressedRun(mode, cand string, ticks int, offFrac float64, wal
 		fx.reseed(spec)
 		fx.setIndex(table, cand)
 		// Diagnostic only (UZI_EVIDENCE_NO_AV=1): switch autovacuum off for the table during the run, to
-		// tell vacuum interference from the statement itself. Always switched back on at the end.
+		// tell vacuum interference from the statement itself. reseed has just reset it to the default,
+		// so a run without the flag measures with autovacuum on whatever an earlier run left behind.
 		if os.Getenv("UZI_EVIDENCE_NO_AV") == "1" {
 			fx.exec(`ALTER TABLE ` + string(table) + ` SET (autovacuum_enabled = false)`)
-			fx.t.Cleanup(func() {
-				_, _ = fx.pool.Exec(context.Background(), `ALTER TABLE `+string(table)+` RESET (autovacuum_enabled)`)
-			})
 		}
+		fx.t.Cleanup(func() {
+			_, _ = fx.pool.Exec(context.Background(), `ALTER TABLE `+string(table)+` RESET (autovacuum_enabled)`)
+		})
 		spanDur := time.Duration(int64(spec.n)*spec.stepUS()) * time.Microsecond
 		runs[table] = &heTabRun{spec: spec, arrivals: spec.arrivals, offset: time.Duration(offFrac * float64(spanDur)), backlogEnd: -1}
 		kv := fx.sizes(table, cand).kv()
-		kv["table"], kv["cand"], kv["mode"], kv["after"], kv["autovacuum_off"] = fx.tableLabel(table), cand, mode, "run_start", os.Getenv("UZI_EVIDENCE_NO_AV") == "1"
+		kv["table"], kv["cand"], kv["mode"], kv["after"] = fx.tableLabel(table), cand, mode, "run_start"
+		kv["autovacuum_off"], kv["reloptions"] = fx.autovacuumState(table)
+		kv["server_version"] = fx.serverVersion()
 		for k, v := range fx.tableStats(table) {
 			kv[k] = v
 		}
@@ -1221,9 +1311,24 @@ func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 	}
 	kv["per_table_delta_ok"], kv["smoke_pass"] = perTable, pass2
 	kv["indexes"] = fmt.Sprint(idx)
+	kv["server_version"] = fx.serverVersion()
+	reasons := heDiagnosticReasons(fx)
+	kv["qualifying"], kv["diagnostic_overrides"] = len(reasons) == 0, reasons
+	av := map[string]bool{}
+	for _, table := range store.HistoryRetentionTables() {
+		off, _ := fx.autovacuumState(table)
+		av[string(table)] = off
+	}
+	kv["autovacuum_off"] = av
 	fx.log.rec("smoke", kv)
 	fx.log.rec("smoke_slog", map[string]any{"log": truncateTail(logs, 60_000)})
-	t.Logf("smoke: %d ticks, max %.0f ms, deltas %v, confirmed %d <= %d, pass=%v", len(recs), maxDur, deltas, sumConfirmed, sumDelta, pass2)
+	t.Logf("smoke: %d ticks, max %.0f ms, deltas %v, confirmed %d <= %d, pass=%v qualifying=%v", len(recs), maxDur, deltas, sumConfirmed, sumDelta, pass2, len(reasons) == 0)
+	if len(reasons) > 0 {
+		t.Logf("smoke is diagnostic only, not qualifying evidence: %s", strings.Join(reasons, "; "))
+	}
+	if !pass2 {
+		t.Errorf("smoke gate failed: max tick %.0f ms (limit 2000), confirmed %d vs table delta %d (confirmed must not exceed it), per-table delta ok %v", maxDur, sumConfirmed, sumDelta, perTable)
+	}
 }
 
 func truncateTail(s string, n int) string {

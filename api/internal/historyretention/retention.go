@@ -4,7 +4,9 @@
 //
 // One tick takes a cross-replica session advisory lock, reads one cutoff from the database
 // clock, deletes at most one adaptive batch (at most 1000 rows) per table, and releases the
-// lock, all inside a fixed client budget so a slow database cannot stall the sweeper tick.
+// lock. Every database call is bound to a 2 s client budget (the work context ends 250 ms before
+// the cleanup context, which ends at the budget), but the pass's actual return time also depends
+// on the driver and on scheduling, so it is measured, not guaranteed.
 package historyretention
 
 import (

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,14 @@ func TestLoadHistoryRetention(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			autoselectEnv(t)
-			if tc.set {
+			if !tc.set {
+				// Register the restore of whatever the environment held, then really unset it: an
+				// empty value is the "empty is off" case, not "unset".
+				t.Setenv("UZI_HISTORY_RETENTION", "")
+				if err := os.Unsetenv("UZI_HISTORY_RETENTION"); err != nil {
+					t.Fatalf("unset UZI_HISTORY_RETENTION: %v", err)
+				}
+			} else {
 				t.Setenv("UZI_HISTORY_RETENTION", tc.value)
 			}
 			cfg, err := Load()

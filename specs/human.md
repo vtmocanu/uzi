@@ -2097,7 +2097,7 @@ PRD at `prds/done/4691-pr-merge-close-history.md`.
 
 ## Feature #4695: Opt-in history retention
 
-- An operator can set `UZI_HISTORY_RETENTION` (a Go duration, at least `24h`; unset, empty or `0` is off, and it is off by default) so a sweeper pass deletes ordinary history older than that age: `pr_history_events` (not `first_merge` rows), `anthropic_usage_samples`, `codex_usage_samples` and `worker_capacity_samples`. `pr_history_heads` and `first_merge` events are never expired and keep the repository cascade; owner and repository cascades are unchanged. A malformed, negative or too-short value aborts boot. Deletes are irreversible (a backup is the only recovery) and the deleting pass is bounded per tick so it cannot stall the sweeper (`docs/configuration.md`). (AI-synced 2026-11-27)
+- An operator can set `UZI_HISTORY_RETENTION` (a Go duration, at least `24h`; unset, empty or `0` is off, and it is off by default) so a sweeper pass deletes ordinary history older than that age: `pr_history_events` (not `first_merge` rows), `anthropic_usage_samples`, `codex_usage_samples` and `worker_capacity_samples`. `pr_history_heads` and `first_merge` events are never expired and keep the repository cascade; owner and repository cascades are unchanged. A malformed, negative or too-short value aborts boot. Deletes are irreversible (a backup is the only recovery) and every database call of the deleting pass is bound to a 2 s client budget, though the pass's actual return time also depends on the driver and scheduling, so it is measured, not guaranteed (`docs/configuration.md`). (AI-synced 2026-11-27)
 
 ## Deferred (user, "later stuff")
 

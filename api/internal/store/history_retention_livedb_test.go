@@ -1,10 +1,12 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -398,7 +401,17 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		}
 		started := time.Now()
 		done := make(chan res, 1)
+		// Registered after f.open and lockRelation, so it runs BEFORE the session's own cleanup
+		// Close even when an assertion below fails: the goroutine is cancelled and has returned
+		// before anything else touches the shared session.
+		var wg sync.WaitGroup
+		t.Cleanup(func() {
+			cancelWork()
+			wg.Wait()
+		})
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			n, err := s.DeleteBatch(workCtx, table, hrBase.Add(time.Hour), 1000)
 			done <- res{n, err, time.Since(started)}
 		}()
@@ -595,6 +608,96 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		hrWaitLockFree(t, f)
 	})
 
+	// The try-lock IS sent and the server acquires the lock, but its reply never reaches the client
+	// and the work deadline expires: the open cannot know whether it holds the lock. The probe
+	// pool's connection is wrapped so that, once the try-lock statement has been executed on the
+	// server, every client read blocks until its deadline or the close. The open must return an
+	// error, the session must still be ended by the client side (the server-side lock was really
+	// taken, so a leaked backend would keep it), and all of this is asserted while the probe pool
+	// is still open.
+	root.run(t, "try-lock sent, reply lost, work deadline expires", func(t *testing.T, f *hrFx) {
+		p, w := hrReplyLostPool(t, f)
+		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
+		defer cancelCleanup()
+		workCtx, cancelWork := context.WithTimeout(f.ctx, 500*time.Millisecond)
+		defer cancelWork()
+
+		type res struct {
+			s   *store.HistoryRetentionSession
+			got bool
+			err error
+		}
+		done := make(chan res, 1)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, got, err := store.OpenHistoryRetentionSession(workCtx, cleanupCtx, p.pool, time.Second, time.Second)
+			done <- res{s, got, err}
+		}()
+		t.Cleanup(func() {
+			cancelWork()
+			wg.Wait()
+		})
+
+		// While the open is still waiting for the reply, the server must already hold the lock for
+		// the probe's backend: this is what makes the outcome ambiguous for the client.
+		var holderPID int64
+		sawLock := false
+		pollEnd := time.Now().Add(5 * time.Second)
+		for !sawLock && time.Now().Before(pollEnd) {
+			select {
+			case r := <-done:
+				t.Fatalf("open returned (%v, %v, %v) before the server-side lock was observed", r.s, r.got, r.err)
+			default:
+			}
+			err := f.pool.QueryRow(f.ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			        WHERE l.locktype = 'advisory' AND l.granted AND l.objid = 0 AND l.classid = $1::int8::oid
+			          AND a.application_name = $2`, int64(store.HistoryRetentionLockClass), p.tag).Scan(&holderPID)
+			switch {
+			case err == nil:
+				sawLock = true
+			case errors.Is(err, pgx.ErrNoRows):
+				time.Sleep(5 * time.Millisecond)
+			default:
+				t.Fatalf("lock holder query: %v", err)
+			}
+		}
+		if !sawLock {
+			t.Fatalf("the server never showed an advisory lock held by the probe backend (reply hold armed=%v)", w.armed())
+		}
+		if w.closed() {
+			t.Fatal("the wrapped connection was already closed when the server-side lock was observed")
+		}
+		if !w.armed() {
+			t.Fatal("the lock is held but the wrapper never saw the try-lock execute: the reply was not withheld by the design under test")
+		}
+
+		r := <-done
+		if r.s != nil || r.got || r.err == nil || !strings.Contains(r.err.Error(), "try lock") {
+			t.Fatalf("open = (%v, %v, %v), want (nil, false, a try-lock error)", r.s, r.got, r.err)
+		}
+		if !w.blockedRead() {
+			t.Error("no client read was ever blocked: the reply was not lost")
+		}
+		// The probe pool is still open here.
+		f.waitNoSessions(t, p.tag)
+		if f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1`, holderPID) > 0 {
+			t.Errorf("backend %d that held the lock is still alive after the open returned", holderPID)
+		}
+		hrWaitLockFree(t, f)
+		if n := f.lockHolders(); n != 0 {
+			t.Errorf("%d lock holders after the open returned, want 0", n)
+		}
+		s2, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)
+		if err != nil || !got {
+			t.Fatalf("fresh open on the main pool: got=%v err=%v, want the lock", got, err)
+		}
+		if unlocked, err := s2.Close(f.ctx); err != nil || !unlocked {
+			t.Errorf("fresh session Close = (%v, %v), want a proven unlock", unlocked, err)
+		}
+	})
+
 	// Close on a session whose connection is open but inside a transaction (open or failed) must
 	// not run the unlock: it reports no proven unlock, closes the connection, and the lock ends
 	// with the backend.
@@ -652,6 +755,155 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hrReplyLostConn wraps the probe's client socket. Writes pass through to the server. Once the
+// try-lock statement has been executed (its Execute message follows the write that carried the
+// SQL text, or arrives in the same write for the simple and unprepared protocols), every Read
+// blocks until the read deadline passes or the connection is closed, so the client never sees
+// the reply the server sends. Writes (the Terminate pgx sends when it gives up) still pass.
+type hrReplyLostConn struct {
+	net.Conn
+	mu       sync.Mutex
+	sawSQL   bool
+	hold     bool
+	blocked  bool
+	isClosed bool
+	deadline time.Time
+	wake     chan struct{}
+}
+
+// pgExecuteUnnamedPortal is the Execute message for the unnamed portal with no row limit.
+var pgExecuteUnnamedPortal = []byte{'E', 0, 0, 0, 9, 0, 0, 0, 0, 0}
+
+func (c *hrReplyLostConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	if !c.hold {
+		if bytes.Contains(b, []byte("pg_try_advisory_lock")) {
+			c.sawSQL = true
+			if len(b) > 0 && b[0] == 'Q' { // simple protocol: this message executes the query
+				c.hold = true
+			}
+		}
+		if c.sawSQL && bytes.Contains(b, pgExecuteUnnamedPortal) {
+			c.hold = true
+		}
+	}
+	c.mu.Unlock()
+	return c.Conn.Write(b)
+}
+
+func (c *hrReplyLostConn) signal() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *hrReplyLostConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	c.signal()
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *hrReplyLostConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	c.signal()
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *hrReplyLostConn) Read(b []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		if !c.hold || c.isClosed {
+			closed := c.isClosed
+			c.mu.Unlock()
+			if closed {
+				return 0, net.ErrClosed
+			}
+			return c.Conn.Read(b)
+		}
+		c.blocked = true
+		dl := c.deadline
+		c.mu.Unlock()
+		var timer <-chan time.Time
+		if !dl.IsZero() {
+			if !time.Now().Before(dl) {
+				return 0, hrTimeoutErr{}
+			}
+			tm := time.NewTimer(time.Until(dl))
+			timer = tm.C
+			defer tm.Stop()
+		}
+		select {
+		case <-c.wake:
+		case <-timer:
+		}
+	}
+}
+
+func (c *hrReplyLostConn) Close() error {
+	c.mu.Lock()
+	c.isClosed = true
+	c.mu.Unlock()
+	c.signal()
+	return c.Conn.Close()
+}
+
+func (c *hrReplyLostConn) armed() bool       { c.mu.Lock(); defer c.mu.Unlock(); return c.hold }
+func (c *hrReplyLostConn) closed() bool      { c.mu.Lock(); defer c.mu.Unlock(); return c.isClosed }
+func (c *hrReplyLostConn) blockedRead() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.blocked }
+
+// hrTimeoutErr is the error a net.Conn read returns when its deadline passes.
+type hrTimeoutErr struct{}
+
+func (hrTimeoutErr) Error() string   { return "i/o timeout" }
+func (hrTimeoutErr) Timeout() bool   { return true }
+func (hrTimeoutErr) Temporary() bool { return true }
+
+// hrReplyLostPool is a one-connection probe pool (tagged application_name, a single dial allowed so
+// a client-side cancel request cannot reach the server) whose socket is the wrapper above.
+func hrReplyLostPool(t *testing.T, f *hrFx) (*wcsProbe, *hrReplyLostConn) {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(f.pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &wcsProbe{tag: "hr-lost-reply-" + uuid.NewString()}
+	cfg.MaxConns = 1
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["application_name"] = p.tag
+	w := &hrReplyLostConn{wake: make(chan struct{}, 1)}
+	var dials int
+	var dmu sync.Mutex
+	d := &net.Dialer{}
+	cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dmu.Lock()
+		defer dmu.Unlock()
+		if dials > 0 {
+			return nil, errors.New("reply-lost pool: only one dial is allowed")
+		}
+		c, err := d.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		dials++
+		w.Conn = c
+		return w, nil
+	}
+	pool, err := pgxpool.NewWithConfig(f.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	p.pool = pool
+	return p, w
 }
 
 // hrPlan is the part of an EXPLAIN (FORMAT JSON) node this test reads.
