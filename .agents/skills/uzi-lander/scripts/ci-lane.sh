@@ -278,6 +278,12 @@ classify() {
   if [[ "$first" == 'chore(release)'* ]] && ! release_published "$first"; then
     decision KEEP 'release publication not proven'; return
   fi
+  # These workflows let an in-progress main run finish and replace only pending runs.
+  if [ "$event" = push ] && [ "$run_state" = in_progress ]; then
+    case "$workflow" in
+      CI|'KinD Smoke') decision KEEP 'running main-push CI or KinD'; return ;;
+    esac
+  fi
   if [ -z "$job_rows" ]; then
     job_rows=$(read_jobs "$id") || { decision UNKNOWN 'jobs unreadable or incomplete'; return; }
   fi
