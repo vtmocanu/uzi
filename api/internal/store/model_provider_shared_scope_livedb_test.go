@@ -283,7 +283,8 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 	wantViolation(t, "NULL owner without a credential mode", err, "23514", "model_providers_shared_mode_check")
 	_, err = pool.Exec(ctx, insProv, owner, "owned-mode", "claude", "per_user_key", a)
 	wantViolation(t, "owned provider with a credential mode", err, "23514", "model_providers_shared_mode_check")
-	_, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "bad-mode", "claude", "operator_key", nilScope)
+	// "operator_key" is a real mode since PRD #4540 (00549); the unknown-mode refusal uses a name no migration admits.
+	_, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "bad-mode", "claude", "bogus_mode", nilScope)
 	wantViolation(t, "unknown credential mode", err, "23514", "model_providers_credential_mode_check")
 	// A shared Codex definition is accepted since 00536 (issue #4633); a third engine is still refused
 	// by the engine check, covered in TestSharedCodexScopeConstraintNegativesLiveDB.
@@ -745,6 +746,60 @@ ON CONFLICT (provider_id, revision) DO UPDATE
 SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, probed_at = EXCLUDED.probed_at`
 )
 
+// The statements the image BEFORE PRD #4540 M1 (base 9be56a40c) runs against the shared catalogue and the
+// freeze lock, copied verbatim from its generated queries (the sqlc name header dropped, bind order as
+// generated). An image-only rollback keeps the M1 schema and its organization-funded definitions, so
+// these are what an older API executes against them: they predate the operator mode and see only
+// per-user-key rows.
+const (
+	preM1CountSharedModelProviders      = `SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode = 'per_user_key'`
+	preM1LockSharedModelProviderForEdit = `SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at FROM model_providers p
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+FOR NO KEY UPDATE OF p`
+	preM1LockSharedModelProviderForDelete = `SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+FOR UPDATE OF p`
+	preM1GetSharedModelProviderAdmin = `SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       COALESCE(su.n, 0)::bigint AS selected_user_count,
+       COALESCE(ak.n, 0)::bigint AS attached_key_count
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
+              SELECT id AS uid, claude_provider_id AS pid FROM users
+               WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
+               WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
+            GROUP BY sel.pid) su ON su.pid = p.id
+LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
+            WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+            GROUP BY provider_id) ak ON ak.pid = p.id
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'`
+	preM1ListSharedModelProvidersAdmin = `SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       COALESCE(su.n, 0)::bigint AS selected_user_count,
+       COALESCE(ak.n, 0)::bigint AS attached_key_count
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
+              SELECT id AS uid, claude_provider_id AS pid FROM users
+               WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+              UNION
+              SELECT id AS uid, codex_provider_id AS pid FROM users
+               WHERE codex_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid) sel
+            GROUP BY sel.pid) su ON su.pid = p.id
+LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
+            WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
+            GROUP BY provider_id) ak ON ak.pid = p.id
+WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+ORDER BY lower(p.name), p.id`
+	preM1LockModelProviderForShare = `SELECT p.id, p.current_revision, p.retired_at FROM model_providers p
+WHERE p.id = $1
+  AND (p.owner_user_id = $2::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))
+FOR SHARE OF p`
+)
+
 // TestSharedScopeImageOnlyRollbackLiveDB: with the new schema and the previous API image, the writes that
 // cannot fill the scope columns fail (provider insert, key insert, Claude source set and clear, and since
 // 00538 a Codex source set from a cleared state and a Codex clear), while the stop levers keep working:
@@ -892,14 +947,99 @@ func TestSharedScopeImageOnlyRollbackLiveDB(t *testing.T) {
 	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM model_provider_probe_results WHERE provider_id = $1`, pk.ID); got != 1 {
 		t.Errorf("legacy probe rows = %d, want 1", got)
 	}
+
+	// PRD #4540 M1: an organization-funded definition with its key and Test evidence, staged by the
+	// current image, is invisible to the image before M1. Its shared-catalogue and freeze statements
+	// (copied from base 9be56a40c above) see only per-user-key rows, so the old image can neither edit,
+	// delete, list, read nor lock the operator definition; the control definition shows the same
+	// statements do work for a per-user-key one.
+	op, err := q.InsertSharedOperatorModelProvider(ctx, "rollback-operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addRevision(ctx, t, q, op.ID, 1, "https://gw.example.com/anthropic")
+	custody, err := q.InsertOperatorProviderKey(ctx, store.InsertOperatorProviderKeyParams{ProviderID: op.ID, Ciphertext: []byte("sealed"), SetBy: a})
+	if err != nil {
+		t.Fatalf("staging the organization key: %v", err)
+	}
+	if err := q.UpsertOperatorProviderKeyTestResult(ctx, store.UpsertOperatorProviderKeyTestResultParams{
+		ProviderID: op.ID, Revision: 1, KeyID: custody.ID, KeyRev: custody.KeyRev, AuthResult: "ok", ProbedBy: a}); err != nil {
+		t.Fatalf("staging the Test evidence: %v", err)
+	}
+	addRevision(ctx, t, q, sh.ID, 1, "https://gw.example.com/anthropic") // the admin get and list join the current revision
+	rowCount := func(sql string, args ...any) int {
+		t.Helper()
+		rows, err := pool.Query(ctx, sql, args...)
+		if err != nil {
+			t.Fatalf("pre-M1 statement: %v", err)
+		}
+		defer rows.Close()
+		n := 0
+		for rows.Next() {
+			n++
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for _, c := range []struct {
+		name, sql string
+		args      func(id uuid.UUID) []any
+	}{
+		{"shared edit lock", preM1LockSharedModelProviderForEdit, func(id uuid.UUID) []any { return []any{id} }},
+		{"shared delete lock", preM1LockSharedModelProviderForDelete, func(id uuid.UUID) []any { return []any{id} }},
+		{"shared admin get", preM1GetSharedModelProviderAdmin, func(id uuid.UUID) []any { return []any{id} }},
+		{"freeze share lock", preM1LockModelProviderForShare, func(id uuid.UUID) []any { return []any{id, a} }},
+	} {
+		if got := rowCount(c.sql, c.args(sh.ID)...); got != 1 {
+			t.Errorf("control: the pre-M1 %s on a per-user-key definition returned %d rows, want 1", c.name, got)
+		}
+		if got := rowCount(c.sql, c.args(op.ID)...); got != 0 {
+			t.Errorf("the pre-M1 %s on an organization-funded definition returned %d rows, want 0", c.name, got)
+		}
+	}
+	listed, err := pool.Query(ctx, preM1ListSharedModelProvidersAdmin)
+	if err != nil {
+		t.Fatalf("the pre-M1 admin list: %v", err)
+	}
+	listedIDs := map[uuid.UUID]bool{}
+	for listed.Next() {
+		vals, err := listed.Values()
+		if err != nil {
+			t.Fatal(err)
+		}
+		listedIDs[uuid.UUID(vals[0].([16]byte))] = true
+	}
+	listed.Close()
+	if err := listed.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !listedIDs[sh.ID] || listedIDs[op.ID] {
+		t.Errorf("the pre-M1 admin list shows per-user-key=%t organization-funded=%t, want true and false", listedIDs[sh.ID], listedIDs[op.ID])
+	}
+	// The pre-M1 cap count excludes the operator definition: during an image-only rollback the shared
+	// cap can be overshot by the number of organization-funded definitions. This documents the limit.
+	var oldCount int64
+	if err := pool.QueryRow(ctx, preM1CountSharedModelProviders).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	newCount, err := q.CountSharedModelProviders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newCount != oldCount+1 {
+		t.Errorf("shared count: the current statement = %d, the pre-M1 statement = %d; want the current one to include the single organization-funded definition", newCount, oldCount)
+	}
 }
 
 // TestSharedCatalogueRacesLiveDB: two concurrent shared creates race on the case-insensitive name (one
 // loses with a unique violation) and on the cap (the catalogue lock makes the count-then-insert exact,
-// and retired definitions keep their slot).
+// and retired definitions keep their slot). Both credential modes share one name space and one cap
+// (PRD #4540): the racers alternate between a per-user-key and an organization-funded create.
 func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 	ctx, _, pool := sharedDB(t, "shared_scope_races_", 0)
-	create := func(name string, cap int64) (created bool, err error) {
+	create := func(name string, cap int64, operator bool) (created bool, err error) {
 		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			return false, err
@@ -916,7 +1056,12 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 		if n >= cap {
 			return false, nil
 		}
-		p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
+		var p store.ModelProvider
+		if operator {
+			p, err = q.InsertSharedOperatorModelProvider(ctx, name)
+		} else {
+			p, err = q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
+		}
 		if err != nil {
 			return false, err
 		}
@@ -933,7 +1078,7 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			won[i], results[i] = create(name, 100)
+			won[i], results[i] = create(name, 100, i == 1)
 		}()
 	}
 	wg.Wait()
@@ -962,7 +1107,7 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ok, err := create(fmt.Sprintf("cap-%d", i), cap)
+			ok, err := create(fmt.Sprintf("cap-%d", i), cap, i%2 == 1)
 			if err != nil {
 				t.Errorf("cap creator %d: %v", i, err)
 				return
@@ -1001,8 +1146,33 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 			t.Fatalf("retire is idempotent: second call = %d (%v)", n, err)
 		}
 	}
-	if ok, err := create("after-retire", cap); err != nil || ok {
+	if ok, err := create("after-retire", cap, false); err != nil || ok {
 		t.Errorf("create with every slot retired = %t (%v), want refused by the cap", ok, err)
+	}
+	if ok, err := create("after-retire-operator", cap, true); err != nil || ok {
+		t.Errorf("an organization-funded create with every slot retired = %t (%v), want refused by the cap", ok, err)
+	}
+	// The count itself spans both modes, retired included. Freeing one slot lets an organization-funded
+	// create take it (the cap counts operator rows too), after which the cap holds again for either mode.
+	if n, err := q.CountSharedModelProviders(ctx); err != nil || n != cap {
+		t.Errorf("CountSharedModelProviders = %d (%v), want %d", n, err, cap)
+	}
+	if n, err := q.DeleteSharedModelProvider(ctx, ids[0]); err != nil || n != 1 {
+		t.Fatalf("delete %s = %d (%v)", ids[0], n, err)
+	}
+	if ok, err := create("operator-fills-the-slot", cap, true); err != nil || !ok {
+		t.Fatalf("an organization-funded create into the freed slot = %t (%v), want created", ok, err)
+	}
+	if n, err := q.CountSharedModelProviders(ctx); err != nil || n != cap {
+		t.Errorf("CountSharedModelProviders after the operator create = %d (%v), want %d", n, err, cap)
+	}
+	if got := scalar[int](ctx, t, pool, `SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode = 'operator_key'`); got < 1 {
+		t.Errorf("organization-funded definitions after the create = %d, want at least 1", got)
+	}
+	for _, operator := range []bool{false, true} {
+		if ok, err := create(fmt.Sprintf("over-cap-%t", operator), cap, operator); err != nil || ok {
+			t.Errorf("create (operator=%t) with the cap full = %t (%v), want refused", operator, ok, err)
+		}
 	}
 }
 

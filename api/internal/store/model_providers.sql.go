@@ -41,7 +41,7 @@ func (q *Queries) BumpModelProviderRevision(ctx context.Context, arg BumpModelPr
 const bumpSharedModelProviderRevision = `-- name: BumpSharedModelProviderRevision :one
 UPDATE model_providers
 SET current_revision = current_revision + 1
-WHERE id = $1 AND owner_user_id IS NULL AND credential_mode = 'per_user_key' AND retired_at IS NULL
+WHERE id = $1 AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key') AND retired_at IS NULL
 RETURNING current_revision
 `
 
@@ -69,10 +69,11 @@ func (q *Queries) CountModelProvidersForOwner(ctx context.Context, ownerUserID u
 }
 
 const countSharedModelProviders = `-- name: CountSharedModelProviders :one
-SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode = 'per_user_key'
+SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key')
 `
 
-// The shared cap count: retired definitions included (retiring must not free a slot). Run under
+// The shared cap count: retired definitions included (retiring must not free a slot), and both
+// credential modes (an organization-funded definition holds a slot too). Run under
 // LockSharedModelProviderCatalogue. Authorized caller: the admin create path.
 func (q *Queries) CountSharedModelProviders(ctx context.Context) (int64, error) {
 	row := q.db.QueryRow(ctx, countSharedModelProviders)
@@ -117,6 +118,20 @@ func (q *Queries) DeleteModelProvider(ctx context.Context, arg DeleteModelProvid
 	return result.RowsAffected(), nil
 }
 
+const deleteOperatorProviderKey = `-- name: DeleteOperatorProviderKey :execrows
+DELETE FROM model_provider_operator_keys WHERE provider_id = $1
+`
+
+// Removes the organization key and, through the foreign key, its Test evidence. A later set inserts a
+// new row with a new id and a larger key_rev. Authorized caller: admin key delete.
+func (q *Queries) DeleteOperatorProviderKey(ctx context.Context, providerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOperatorProviderKey, providerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteProviderKeySecret = `-- name: DeleteProviderKeySecret :execrows
 DELETE FROM user_secrets
 WHERE user_id = $1 AND provider_id = $2 AND kind IN ('anthropic_compatible_key', 'openai_compatible_key')
@@ -136,7 +151,7 @@ func (q *Queries) DeleteProviderKeySecret(ctx context.Context, arg DeleteProvide
 }
 
 const deleteSharedModelProvider = `-- name: DeleteSharedModelProvider :execrows
-DELETE FROM model_providers WHERE id = $1 AND owner_user_id IS NULL AND credential_mode = 'per_user_key'
+DELETE FROM model_providers WHERE id = $1 AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key')
 `
 
 // Cascades to the definition's revisions and legacy probe rows. Refused with a foreign-key violation
@@ -178,6 +193,38 @@ func (q *Queries) DeleteSharedProviderKeys(ctx context.Context, id uuid.UUID) ([
 		return nil, err
 	}
 	return items, nil
+}
+
+const disableOperatorProviderKey = `-- name: DisableOperatorProviderKey :execrows
+UPDATE model_provider_operator_keys
+SET disabled_at = now(), key_rev = nextval('model_provider_operator_key_rev_seq')
+WHERE provider_id = $1 AND disabled_at IS NULL
+`
+
+// Disabling is a state change: it draws a new key_rev. Disabling a disabled key matches no row, so a
+// repeat leaves key_rev alone. Authorized caller: admin key disable, after LockOperatorProviderKeyForWrite.
+func (q *Queries) DisableOperatorProviderKey(ctx context.Context, providerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, disableOperatorProviderKey, providerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const enableOperatorProviderKey = `-- name: EnableOperatorProviderKey :execrows
+UPDATE model_provider_operator_keys
+SET disabled_at = NULL, key_rev = nextval('model_provider_operator_key_rev_seq')
+WHERE provider_id = $1 AND disabled_at IS NOT NULL
+`
+
+// Enabling is a state change: it draws a new key_rev. Enabling an enabled key matches no row.
+// Authorized caller: admin key enable, after LockOperatorProviderKeyForWrite.
+func (q *Queries) EnableOperatorProviderKey(ctx context.Context, providerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, enableOperatorProviderKey, providerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getModelProviderForOwner = `-- name: GetModelProviderForOwner :one
@@ -324,6 +371,78 @@ func (q *Queries) GetModelProviderRevisionForOwner(ctx context.Context, arg GetM
 	return i, err
 }
 
+const getOperatorProviderForTest = `-- name: GetOperatorProviderForTest :one
+SELECT p.id, p.name, p.current_revision, p.retired_at,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       cust.id AS key_id, cust.key_rev AS key_rev, cust.disabled_at AS key_disabled_at
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN model_provider_operator_keys cust ON cust.provider_id = p.id
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'operator_key'
+`
+
+type GetOperatorProviderForTestRow struct {
+	ID              uuid.UUID          `json:"id"`
+	Name            string             `json:"name"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	Protocol        string             `json:"protocol"`
+	BaseUrl         string             `json:"base_url"`
+	AuthStyle       string             `json:"auth_style"`
+	ModelMap        []byte             `json:"model_map"`
+	KeyID           pgtype.UUID        `json:"key_id"`
+	KeyRev          pgtype.Int8        `json:"key_rev"`
+	KeyDisabledAt   pgtype.Timestamptz `json:"key_disabled_at"`
+}
+
+// The admin Test probe's snapshot of an organization-funded definition in one statement: whether it is
+// retired, its current revision and that revision's profile, and the key's identity, revision and
+// enablement (all NULL when no key is set). It never returns ciphertext. Authorized caller: admin Test.
+func (q *Queries) GetOperatorProviderForTest(ctx context.Context, id uuid.UUID) (GetOperatorProviderForTestRow, error) {
+	row := q.db.QueryRow(ctx, getOperatorProviderForTest, id)
+	var i GetOperatorProviderForTestRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.Protocol,
+		&i.BaseUrl,
+		&i.AuthStyle,
+		&i.ModelMap,
+		&i.KeyID,
+		&i.KeyRev,
+		&i.KeyDisabledAt,
+	)
+	return i, err
+}
+
+const getOperatorProviderKeyForTest = `-- name: GetOperatorProviderKeyForTest :one
+SELECT ciphertext, key_rev FROM model_provider_operator_keys
+WHERE id = $1 AND provider_id = $2 AND key_rev = $3 AND disabled_at IS NULL
+`
+
+type GetOperatorProviderKeyForTestParams struct {
+	ID         uuid.UUID `json:"id"`
+	ProviderID uuid.UUID `json:"provider_id"`
+	KeyRev     int64     `json:"key_rev"`
+}
+
+type GetOperatorProviderKeyForTestRow struct {
+	Ciphertext []byte `json:"ciphertext"`
+	KeyRev     int64  `json:"key_rev"`
+}
+
+// The ONE read of the sealed organization key, for the admin Test probe. It matches only the exact key
+// the probe captured (row id, definition and key_rev) while it is enabled, so a replaced, disabled or
+// deleted key reads as no row. Authorized caller: admin Test.
+func (q *Queries) GetOperatorProviderKeyForTest(ctx context.Context, arg GetOperatorProviderKeyForTestParams) (GetOperatorProviderKeyForTestRow, error) {
+	row := q.db.QueryRow(ctx, getOperatorProviderKeyForTest, arg.ID, arg.ProviderID, arg.KeyRev)
+	var i GetOperatorProviderKeyForTestRow
+	err := row.Scan(&i.Ciphertext, &i.KeyRev)
+	return i, err
+}
+
 const getProviderBindingKeyByID = `-- name: GetProviderBindingKeyByID :one
 SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
 WHERE id = $1 AND user_id = $2
@@ -387,11 +506,19 @@ func (q *Queries) GetProviderKeyForUpdate(ctx context.Context, arg GetProviderKe
 
 const getSharedModelProviderAdmin = `-- name: GetSharedModelProviderAdmin :one
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       p.credential_mode,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
-       COALESCE(ak.n, 0)::bigint AS attached_key_count
+       COALESCE(ak.n, 0)::bigint AS attached_key_count,
+       (cust.provider_id IS NOT NULL) AS operator_key_present,
+       cust.disabled_at AS operator_key_disabled_at,
+       cust.set_at AS operator_key_set_at,
+       cev.auth_result, cev.tool_result, cev.probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN model_provider_operator_keys cust ON cust.provider_id = p.id
+LEFT JOIN model_provider_operator_key_test_results cev ON cev.provider_id = p.id AND cev.revision = p.current_revision
+     AND cev.key_id = cust.id AND cev.key_rev = cust.key_rev AND p.retired_at IS NULL
 LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
               SELECT id AS uid, claude_provider_id AS pid FROM users
                WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
@@ -402,22 +529,29 @@ LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
-WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 `
 
 type GetSharedModelProviderAdminRow struct {
-	ID                uuid.UUID          `json:"id"`
-	Name              string             `json:"name"`
-	Engine            string             `json:"engine"`
-	CurrentRevision   int32              `json:"current_revision"`
-	RetiredAt         pgtype.Timestamptz `json:"retired_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	Protocol          string             `json:"protocol"`
-	BaseUrl           string             `json:"base_url"`
-	AuthStyle         string             `json:"auth_style"`
-	ModelMap          []byte             `json:"model_map"`
-	SelectedUserCount int64              `json:"selected_user_count"`
-	AttachedKeyCount  int64              `json:"attached_key_count"`
+	ID                    uuid.UUID          `json:"id"`
+	Name                  string             `json:"name"`
+	Engine                string             `json:"engine"`
+	CurrentRevision       int32              `json:"current_revision"`
+	RetiredAt             pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	CredentialMode        pgtype.Text        `json:"credential_mode"`
+	Protocol              string             `json:"protocol"`
+	BaseUrl               string             `json:"base_url"`
+	AuthStyle             string             `json:"auth_style"`
+	ModelMap              []byte             `json:"model_map"`
+	SelectedUserCount     int64              `json:"selected_user_count"`
+	AttachedKeyCount      int64              `json:"attached_key_count"`
+	OperatorKeyPresent    interface{}        `json:"operator_key_present"`
+	OperatorKeyDisabledAt pgtype.Timestamptz `json:"operator_key_disabled_at"`
+	OperatorKeySetAt      pgtype.Timestamptz `json:"operator_key_set_at"`
+	AuthResult            pgtype.Text        `json:"auth_result"`
+	ToolResult            pgtype.Text        `json:"tool_result"`
+	ProbedAt              pgtype.Timestamptz `json:"probed_at"`
 }
 
 // One shared definition as ListSharedModelProvidersAdmin returns it. Authorized caller: admin get.
@@ -431,12 +565,19 @@ func (q *Queries) GetSharedModelProviderAdmin(ctx context.Context, id uuid.UUID)
 		&i.CurrentRevision,
 		&i.RetiredAt,
 		&i.CreatedAt,
+		&i.CredentialMode,
 		&i.Protocol,
 		&i.BaseUrl,
 		&i.AuthStyle,
 		&i.ModelMap,
 		&i.SelectedUserCount,
 		&i.AttachedKeyCount,
+		&i.OperatorKeyPresent,
+		&i.OperatorKeyDisabledAt,
+		&i.OperatorKeySetAt,
+		&i.AuthResult,
+		&i.ToolResult,
+		&i.ProbedAt,
 	)
 	return i, err
 }
@@ -689,6 +830,40 @@ func (q *Queries) InsertModelProviderRevision(ctx context.Context, arg InsertMod
 	return err
 }
 
+const insertOperatorProviderKey = `-- name: InsertOperatorProviderKey :one
+INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by)
+VALUES ($1, $2, $3)
+RETURNING id, key_rev, disabled_at, set_at
+`
+
+type InsertOperatorProviderKeyParams struct {
+	ProviderID uuid.UUID `json:"provider_id"`
+	Ciphertext []byte    `json:"ciphertext"`
+	SetBy      uuid.UUID `json:"set_by"`
+}
+
+type InsertOperatorProviderKeyRow struct {
+	ID         uuid.UUID          `json:"id"`
+	KeyRev     int64              `json:"key_rev"`
+	DisabledAt pgtype.Timestamptz `json:"disabled_at"`
+	SetAt      pgtype.Timestamptz `json:"set_at"`
+}
+
+// Sets the organization key of a definition: the first key only (provider_id is unique). key_rev comes
+// from the column default, the one sequence every write to custody draws from. The caller seals the key
+// with operatorkey.Seal. Authorized caller: admin key set, after LockSharedModelProviderForEdit.
+func (q *Queries) InsertOperatorProviderKey(ctx context.Context, arg InsertOperatorProviderKeyParams) (InsertOperatorProviderKeyRow, error) {
+	row := q.db.QueryRow(ctx, insertOperatorProviderKey, arg.ProviderID, arg.Ciphertext, arg.SetBy)
+	var i InsertOperatorProviderKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.KeyRev,
+		&i.DisabledAt,
+		&i.SetAt,
+	)
+	return i, err
+}
+
 const insertProviderKeySecret = `-- name: InsertProviderKeySecret :one
 INSERT INTO user_secrets (user_id, kind, label, is_default, auto_eligible, ciphertext, sealed_with, provider_id, provider_scope_id)
 SELECT $1::uuid, CASE p.engine WHEN 'claude' THEN 'anthropic_compatible_key' WHEN 'codex' THEN 'openai_compatible_key' END,
@@ -767,6 +942,32 @@ type InsertSharedModelProviderParams struct {
 // Authorized caller: the admin create path.
 func (q *Queries) InsertSharedModelProvider(ctx context.Context, arg InsertSharedModelProviderParams) (ModelProvider, error) {
 	row := q.db.QueryRow(ctx, insertSharedModelProvider, arg.Name, arg.Engine)
+	var i ModelProvider
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerUserID,
+		&i.Name,
+		&i.Engine,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.CreatedAt,
+		&i.CredentialMode,
+		&i.ScopeOwnerID,
+	)
+	return i, err
+}
+
+const insertSharedOperatorModelProvider = `-- name: InsertSharedOperatorModelProvider :one
+INSERT INTO model_providers (owner_user_id, name, engine, current_revision, credential_mode, scope_owner_id)
+VALUES (NULL, $1, 'claude', 1, 'operator_key', '00000000-0000-0000-0000-000000000000'::uuid)
+RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id
+`
+
+// An organization-funded shared definition: NULL owner, operator-key mode, Claude only (the engine is a
+// literal here and model_providers_operator_engine_check enforces it), the nil shared scope. Its key is
+// held in model_provider_operator_keys. Authorized caller: the admin create path.
+func (q *Queries) InsertSharedOperatorModelProvider(ctx context.Context, name string) (ModelProvider, error) {
+	row := q.db.QueryRow(ctx, insertSharedOperatorModelProvider, name)
 	var i ModelProvider
 	err := row.Scan(
 		&i.ID,
@@ -895,11 +1096,19 @@ func (q *Queries) ListRunProviderNames(ctx context.Context, runIds []uuid.UUID) 
 
 const listSharedModelProvidersAdmin = `-- name: ListSharedModelProvidersAdmin :many
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       p.credential_mode,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
-       COALESCE(ak.n, 0)::bigint AS attached_key_count
+       COALESCE(ak.n, 0)::bigint AS attached_key_count,
+       (cust.provider_id IS NOT NULL) AS operator_key_present,
+       cust.disabled_at AS operator_key_disabled_at,
+       cust.set_at AS operator_key_set_at,
+       cev.auth_result, cev.tool_result, cev.probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN model_provider_operator_keys cust ON cust.provider_id = p.id
+LEFT JOIN model_provider_operator_key_test_results cev ON cev.provider_id = p.id AND cev.revision = p.current_revision
+     AND cev.key_id = cust.id AND cev.key_rev = cust.key_rev AND p.retired_at IS NULL
 LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
               SELECT id AS uid, claude_provider_id AS pid FROM users
                WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
@@ -910,27 +1119,35 @@ LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
-WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+WHERE p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 ORDER BY lower(p.name), p.id
 `
 
 type ListSharedModelProvidersAdminRow struct {
-	ID                uuid.UUID          `json:"id"`
-	Name              string             `json:"name"`
-	Engine            string             `json:"engine"`
-	CurrentRevision   int32              `json:"current_revision"`
-	RetiredAt         pgtype.Timestamptz `json:"retired_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	Protocol          string             `json:"protocol"`
-	BaseUrl           string             `json:"base_url"`
-	AuthStyle         string             `json:"auth_style"`
-	ModelMap          []byte             `json:"model_map"`
-	SelectedUserCount int64              `json:"selected_user_count"`
-	AttachedKeyCount  int64              `json:"attached_key_count"`
+	ID                    uuid.UUID          `json:"id"`
+	Name                  string             `json:"name"`
+	Engine                string             `json:"engine"`
+	CurrentRevision       int32              `json:"current_revision"`
+	RetiredAt             pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	CredentialMode        pgtype.Text        `json:"credential_mode"`
+	Protocol              string             `json:"protocol"`
+	BaseUrl               string             `json:"base_url"`
+	AuthStyle             string             `json:"auth_style"`
+	ModelMap              []byte             `json:"model_map"`
+	SelectedUserCount     int64              `json:"selected_user_count"`
+	AttachedKeyCount      int64              `json:"attached_key_count"`
+	OperatorKeyPresent    interface{}        `json:"operator_key_present"`
+	OperatorKeyDisabledAt pgtype.Timestamptz `json:"operator_key_disabled_at"`
+	OperatorKeySetAt      pgtype.Timestamptz `json:"operator_key_set_at"`
+	AuthResult            pgtype.Text        `json:"auth_result"`
+	ToolResult            pgtype.Text        `json:"tool_result"`
+	ProbedAt              pgtype.Timestamptz `json:"probed_at"`
 }
 
-// The shared catalogue as an admin sees it: the current revision's fields and two counts, never a key
-// or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
+// The shared catalogue as an admin sees it: the current revision's fields and two counts, and for an
+// organization-funded definition whether its key is set, enabled and when, plus the Test evidence for
+// that exact key. Never a key, its ciphertext, its revision or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
 func (q *Queries) ListSharedModelProvidersAdmin(ctx context.Context) ([]ListSharedModelProvidersAdminRow, error) {
 	rows, err := q.db.Query(ctx, listSharedModelProvidersAdmin)
 	if err != nil {
@@ -947,12 +1164,19 @@ func (q *Queries) ListSharedModelProvidersAdmin(ctx context.Context) ([]ListShar
 			&i.CurrentRevision,
 			&i.RetiredAt,
 			&i.CreatedAt,
+			&i.CredentialMode,
 			&i.Protocol,
 			&i.BaseUrl,
 			&i.AuthStyle,
 			&i.ModelMap,
 			&i.SelectedUserCount,
 			&i.AttachedKeyCount,
+			&i.OperatorKeyPresent,
+			&i.OperatorKeyDisabledAt,
+			&i.OperatorKeySetAt,
+			&i.AuthResult,
+			&i.ToolResult,
+			&i.ProbedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1095,6 +1319,88 @@ SELECT pg_advisory_xact_lock(
 func (q *Queries) LockModelProviderOwner(ctx context.Context, ownerUserID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, lockModelProviderOwner, ownerUserID)
 	return err
+}
+
+const lockOperatorProviderForEvidence = `-- name: LockOperatorProviderForEvidence :one
+SELECT p.id, p.current_revision
+FROM model_providers p
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'operator_key'
+  AND p.current_revision = $2
+  AND p.retired_at IS NULL
+FOR SHARE OF p
+`
+
+type LockOperatorProviderForEvidenceParams struct {
+	ID       uuid.UUID `json:"id"`
+	Revision int32     `json:"revision"`
+}
+
+type LockOperatorProviderForEvidenceRow struct {
+	ID              uuid.UUID `json:"id"`
+	CurrentRevision int32     `json:"current_revision"`
+}
+
+// First half of the admin Test evidence fence, in one short transaction AFTER the probe returns: the
+// definition must still be an organization-funded one at the probed revision and not retired. FOR SHARE
+// (not KEY SHARE) so a revision bump, which takes FOR NO KEY UPDATE, waits for this transaction instead
+// of committing past it. Followed by LockOperatorProviderKeyForEvidence, then
+// UpsertOperatorProviderKeyTestResult. Authorized caller: admin Test.
+func (q *Queries) LockOperatorProviderForEvidence(ctx context.Context, arg LockOperatorProviderForEvidenceParams) (LockOperatorProviderForEvidenceRow, error) {
+	row := q.db.QueryRow(ctx, lockOperatorProviderForEvidence, arg.ID, arg.Revision)
+	var i LockOperatorProviderForEvidenceRow
+	err := row.Scan(&i.ID, &i.CurrentRevision)
+	return i, err
+}
+
+const lockOperatorProviderKeyForEvidence = `-- name: LockOperatorProviderKeyForEvidence :one
+SELECT k.id, k.key_rev FROM model_provider_operator_keys k
+WHERE k.id = $1 AND k.provider_id = $2 AND k.key_rev = $3 AND k.disabled_at IS NULL
+FOR SHARE
+`
+
+type LockOperatorProviderKeyForEvidenceParams struct {
+	KeyID      uuid.UUID `json:"key_id"`
+	ProviderID uuid.UUID `json:"provider_id"`
+	KeyRev     int64     `json:"key_rev"`
+}
+
+type LockOperatorProviderKeyForEvidenceRow struct {
+	ID     uuid.UUID `json:"id"`
+	KeyRev int64     `json:"key_rev"`
+}
+
+// Second half of the admin Test evidence fence: the exact key row the probe used, locked FOR SHARE, only
+// while it is at the probed key_rev and enabled. A replace, disable or delete that committed first finds
+// no row; one in flight holds the row FOR UPDATE, so this waits for it and re-checks (READ COMMITTED).
+// Authorized caller: admin Test.
+func (q *Queries) LockOperatorProviderKeyForEvidence(ctx context.Context, arg LockOperatorProviderKeyForEvidenceParams) (LockOperatorProviderKeyForEvidenceRow, error) {
+	row := q.db.QueryRow(ctx, lockOperatorProviderKeyForEvidence, arg.KeyID, arg.ProviderID, arg.KeyRev)
+	var i LockOperatorProviderKeyForEvidenceRow
+	err := row.Scan(&i.ID, &i.KeyRev)
+	return i, err
+}
+
+const lockOperatorProviderKeyForWrite = `-- name: LockOperatorProviderKeyForWrite :one
+SELECT id, key_rev, disabled_at FROM model_provider_operator_keys
+WHERE provider_id = $1
+FOR UPDATE
+`
+
+type LockOperatorProviderKeyForWriteRow struct {
+	ID         uuid.UUID          `json:"id"`
+	KeyRev     int64              `json:"key_rev"`
+	DisabledAt pgtype.Timestamptz `json:"disabled_at"`
+}
+
+// The organization key's identity, revision and enablement, locked FOR UPDATE inside a key write or a
+// definition delete. It reads no ciphertext. A key write takes the definition's edit lock first, so the
+// order is always definition then key; a delete takes it as a presence read, and no row (pgx.ErrNoRows)
+// means no key is set. Authorized callers: the admin key writes and admin delete.
+func (q *Queries) LockOperatorProviderKeyForWrite(ctx context.Context, providerID uuid.UUID) (LockOperatorProviderKeyForWriteRow, error) {
+	row := q.db.QueryRow(ctx, lockOperatorProviderKeyForWrite, providerID)
+	var i LockOperatorProviderKeyForWriteRow
+	err := row.Scan(&i.ID, &i.KeyRev, &i.DisabledAt)
+	return i, err
 }
 
 const lockProviderBindingKeyForShareNowait = `-- name: LockProviderBindingKeyForShareNowait :one
@@ -1241,7 +1547,7 @@ func (q *Queries) LockSharedModelProviderCatalogue(ctx context.Context) error {
 
 const lockSharedModelProviderForDelete = `-- name: LockSharedModelProviderForDelete :one
 SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
-WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 FOR UPDATE OF p
 `
 
@@ -1269,8 +1575,8 @@ func (q *Queries) LockSharedModelProviderForDelete(ctx context.Context, id uuid.
 }
 
 const lockSharedModelProviderForEdit = `-- name: LockSharedModelProviderForEdit :one
-SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at FROM model_providers p
-WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.credential_mode FROM model_providers p
+WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 FOR NO KEY UPDATE OF p
 `
 
@@ -1280,6 +1586,7 @@ type LockSharedModelProviderForEditRow struct {
 	Engine          string             `json:"engine"`
 	CurrentRevision int32              `json:"current_revision"`
 	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CredentialMode  pgtype.Text        `json:"credential_mode"`
 }
 
 // The edit transaction's first statement for a shared definition: FOR NO KEY UPDATE takes the same lock
@@ -1295,6 +1602,7 @@ func (q *Queries) LockSharedModelProviderForEdit(ctx context.Context, id uuid.UU
 		&i.Engine,
 		&i.CurrentRevision,
 		&i.RetiredAt,
+		&i.CredentialMode,
 	)
 	return i, err
 }
@@ -1406,7 +1714,7 @@ DELETE FROM model_provider_revisions rev
 USING model_providers p
 WHERE rev.provider_id = $1
   AND p.id = rev.provider_id
-  AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+  AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
   AND rev.revision <> p.current_revision
   AND NOT EXISTS (
         SELECT 1 FROM runs r
@@ -1445,7 +1753,7 @@ func (q *Queries) RenameModelProvider(ctx context.Context, arg RenameModelProvid
 
 const renameSharedModelProvider = `-- name: RenameSharedModelProvider :execrows
 UPDATE model_providers SET name = $1
-WHERE id = $2 AND owner_user_id IS NULL AND credential_mode = 'per_user_key'
+WHERE id = $2 AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key')
 `
 
 type RenameSharedModelProviderParams struct {
@@ -1461,6 +1769,40 @@ func (q *Queries) RenameSharedModelProvider(ctx context.Context, arg RenameShare
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const replaceOperatorProviderKey = `-- name: ReplaceOperatorProviderKey :one
+UPDATE model_provider_operator_keys
+SET ciphertext = $1, key_rev = nextval('model_provider_operator_key_rev_seq'), set_by = $2, set_at = now()
+WHERE provider_id = $3
+RETURNING id, key_rev, disabled_at, set_at
+`
+
+type ReplaceOperatorProviderKeyParams struct {
+	Ciphertext []byte    `json:"ciphertext"`
+	SetBy      uuid.UUID `json:"set_by"`
+	ProviderID uuid.UUID `json:"provider_id"`
+}
+
+type ReplaceOperatorProviderKeyRow struct {
+	ID         uuid.UUID          `json:"id"`
+	KeyRev     int64              `json:"key_rev"`
+	DisabledAt pgtype.Timestamptz `json:"disabled_at"`
+	SetAt      pgtype.Timestamptz `json:"set_at"`
+}
+
+// Replaces the sealed key in place: a new key_rev from the sequence, the setter and the time, and the
+// enablement kept as it was. Authorized caller: admin key replace, after LockOperatorProviderKeyForWrite.
+func (q *Queries) ReplaceOperatorProviderKey(ctx context.Context, arg ReplaceOperatorProviderKeyParams) (ReplaceOperatorProviderKeyRow, error) {
+	row := q.db.QueryRow(ctx, replaceOperatorProviderKey, arg.Ciphertext, arg.SetBy, arg.ProviderID)
+	var i ReplaceOperatorProviderKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.KeyRev,
+		&i.DisabledAt,
+		&i.SetAt,
+	)
+	return i, err
 }
 
 const retireModelProvider = `-- name: RetireModelProvider :execrows
@@ -1483,7 +1825,7 @@ func (q *Queries) RetireModelProvider(ctx context.Context, arg RetireModelProvid
 
 const retireSharedModelProvider = `-- name: RetireSharedModelProvider :execrows
 UPDATE model_providers SET retired_at = COALESCE(retired_at, now())
-WHERE id = $1 AND owner_user_id IS NULL AND credential_mode = 'per_user_key'
+WHERE id = $1 AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key')
 `
 
 // Idempotent: the first retirement time is kept. Authorized caller: admin retire.
@@ -1581,6 +1923,41 @@ func (q *Queries) UpsertModelProviderProbeResult(ctx context.Context, arg Upsert
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const upsertOperatorProviderKeyTestResult = `-- name: UpsertOperatorProviderKeyTestResult :exec
+INSERT INTO model_provider_operator_key_test_results (provider_id, revision, key_id, key_rev, auth_result, tool_result, probed_at, probed_by)
+VALUES ($1, $2, $3, $4, $5, $6, now(), $7)
+ON CONFLICT (provider_id) DO UPDATE
+SET revision = EXCLUDED.revision, key_id = EXCLUDED.key_id, key_rev = EXCLUDED.key_rev,
+    auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result,
+    probed_at = EXCLUDED.probed_at, probed_by = EXCLUDED.probed_by
+`
+
+type UpsertOperatorProviderKeyTestResultParams struct {
+	ProviderID uuid.UUID   `json:"provider_id"`
+	Revision   int32       `json:"revision"`
+	KeyID      uuid.UUID   `json:"key_id"`
+	KeyRev     int64       `json:"key_rev"`
+	AuthResult string      `json:"auth_result"`
+	ToolResult pgtype.Text `json:"tool_result"`
+	ProbedBy   uuid.UUID   `json:"probed_by"`
+}
+
+// Records the Test evidence for one definition: the exact tuple the probe ran against. Called only after
+// LockOperatorProviderForEvidence and LockOperatorProviderKeyForEvidence both returned a row in the same
+// transaction; the foreign keys (revision, custody) are the structural backstop. Authorized caller: admin Test.
+func (q *Queries) UpsertOperatorProviderKeyTestResult(ctx context.Context, arg UpsertOperatorProviderKeyTestResultParams) error {
+	_, err := q.db.Exec(ctx, upsertOperatorProviderKeyTestResult,
+		arg.ProviderID,
+		arg.Revision,
+		arg.KeyID,
+		arg.KeyRev,
+		arg.AuthResult,
+		arg.ToolResult,
+		arg.ProbedBy,
+	)
+	return err
 }
 
 const upsertProviderKeyTestResult = `-- name: UpsertProviderKeyTestResult :exec

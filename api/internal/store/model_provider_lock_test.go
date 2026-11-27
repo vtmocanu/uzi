@@ -50,7 +50,31 @@ var (
 	scopeAssignRE          = regexp.MustCompile(`(?i)\b(owner_user_id|scope_owner_id|credential_mode|provider_scope_id|provider_id)\s*=`)
 	scopeTupleAssignRE     = regexp.MustCompile(`(?i)\(([a-z_][a-z_0-9]*(?:\s*,\s*[a-z_][a-z_0-9]*)*)\)\s*=`)
 	immutableScopeColumnRE = regexp.MustCompile(`(?i)\b(owner_user_id|scope_owner_id|credential_mode|provider_scope_id|provider_id)\b`)
+
+	// An organization key's key_rev (PRD #4540) is drawn from its sequence on every write and assigned
+	// from nothing else: an UPDATE or upsert of the custody table may set it only to nextval of that
+	// sequence, and an INSERT leaves it to the column default. The evidence table keeps its own copy
+	// (key_rev = EXCLUDED.key_rev) and is not this table.
+	custodyUpdateSetRE = regexp.MustCompile(`(?is)\bUPDATE\s+(?:ONLY\s+)?model_provider_operator_keys\b(?:\s+(?:AS\s+)?\w+)?\s+SET\b(.*?)(?:\bWHERE\b|\bFROM\b|\bRETURNING\b|$)`)
+	custodyInsertRE    = regexp.MustCompile(`(?is)\bINSERT\s+INTO\s+model_provider_operator_keys\b\s*\(([^)]*)\)(.*)$`)
+	custodyDoUpdateRE  = regexp.MustCompile(`(?is)\bDO\s+UPDATE\s+SET\b(.*)$`)
+	keyRevAssignRE     = regexp.MustCompile(`(?is)\bkey_rev\s*=\s*([^,]+)`)
+	keyRevColumnRE     = regexp.MustCompile(`(?i)\bkey_rev\b`)
 )
+
+const custodyKeyRevOnlyValue = "nextval('model_provider_operator_key_rev_seq')"
+
+// custodyKeyRevAssignViolations returns each assignment in a SET list that gives key_rev anything but
+// the sequence's nextval.
+func custodyKeyRevAssignViolations(setList, stmt string) []string {
+	var out []string
+	for _, m := range keyRevAssignRE.FindAllStringSubmatch(setList, -1) {
+		if strings.TrimSpace(m[1]) != custodyKeyRevOnlyValue {
+			out = append(out, "organization key key_rev assigned "+strings.TrimSpace(m[1])+", only "+custodyKeyRevOnlyValue+" is allowed: "+stmt)
+		}
+	}
+	return out
+}
 
 // providerImmutabilityViolations returns a description of each statement in sqlText that updates
 // model_provider_revisions or assigns user_secrets.provider_id after insert.
@@ -66,6 +90,17 @@ func providerImmutabilityViolations(sqlText string) []string {
 		}
 		if m := doUpdateSetRE.FindStringSubmatch(stmt); m != nil && providerIDRE.MatchString(m[1]) {
 			out = append(out, "upsert user_secrets SET provider_id: "+stmt)
+		}
+		if m := custodyUpdateSetRE.FindStringSubmatch(stmt); m != nil {
+			out = append(out, custodyKeyRevAssignViolations(m[1], stmt)...)
+		}
+		if m := custodyInsertRE.FindStringSubmatch(stmt); m != nil {
+			if keyRevColumnRE.MatchString(m[1]) {
+				out = append(out, "INSERT INTO model_provider_operator_keys names key_rev (it comes from the column default): "+stmt)
+			}
+			if u := custodyDoUpdateRE.FindStringSubmatch(m[2]); u != nil {
+				out = append(out, custodyKeyRevAssignViolations(u[1], stmt)...)
+			}
 		}
 		for _, m := range anyUpdateSetRE.FindAllStringSubmatch(stmt, -1) {
 			if col := scopeAssignRE.FindStringSubmatch(m[1]); col != nil {
@@ -95,6 +130,15 @@ func TestNoModelProviderRevisionOrKeyAssociationUpdate(t *testing.T) {
 		"UPDATE model_providers SET credential_mode = 'per_user_key' WHERE id = $1;",
 		"UPDATE user_secrets SET label = $1, provider_scope_id = $2 WHERE id = $3;",
 		"INSERT INTO model_providers (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET owner_user_id = NULL;",
+		// An organization key's definition link is set at insert and never reassigned.
+		"UPDATE model_provider_operator_keys SET provider_id = $1 WHERE id = $2;",
+		"UPDATE model_provider_operator_keys k SET ciphertext = $1, provider_id = $2 WHERE k.id = $3;",
+		// key_rev comes from the sequence and nothing else.
+		"UPDATE model_provider_operator_keys SET key_rev = key_rev + 1 WHERE provider_id = $1;",
+		"UPDATE model_provider_operator_keys SET disabled_at = now(), key_rev = 7 WHERE provider_id = $1;",
+		"UPDATE model_provider_operator_keys SET key_rev = nextval('some_other_seq') WHERE provider_id = $1;",
+		"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by, key_rev) VALUES ($1, $2, $3, 1);",
+		"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by) VALUES ($1, $2, $3) ON CONFLICT (provider_id) DO UPDATE SET key_rev = EXCLUDED.key_rev;",
 	}
 	for _, c := range canaries {
 		if len(providerImmutabilityViolations(c)) == 0 {
@@ -107,6 +151,15 @@ func TestNoModelProviderRevisionOrKeyAssociationUpdate(t *testing.T) {
 		if !strings.Contains(got, "UPDATE assigns "+column+":") {
 			t.Errorf("tuple assignment missed %s: %q", column, got)
 		}
+	}
+	// The custody statements as shipped, and the evidence upsert that copies key_rev into its own table,
+	// are clean.
+	custodyClean := "UPDATE model_provider_operator_keys SET ciphertext = $1, key_rev = nextval('model_provider_operator_key_rev_seq'), set_by = $2, set_at = now() WHERE provider_id = $3 RETURNING id;\n" +
+		"UPDATE model_provider_operator_keys SET disabled_at = NULL, key_rev = nextval('model_provider_operator_key_rev_seq') WHERE provider_id = $1 AND disabled_at IS NOT NULL;\n" +
+		"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by) VALUES ($1, $2, $3) RETURNING id, key_rev;\n" +
+		"INSERT INTO model_provider_operator_key_test_results (provider_id, revision, key_id, key_rev) VALUES ($1, $2, $3, $4) ON CONFLICT (provider_id) DO UPDATE SET revision = EXCLUDED.revision, key_id = EXCLUDED.key_id, key_rev = EXCLUDED.key_rev;"
+	if v := providerImmutabilityViolations(custodyClean); len(v) != 0 {
+		t.Fatalf("the scanner flagged a shipped custody statement: %v", v)
 	}
 	clean := "UPDATE user_secrets SET label = $1 WHERE user_id = $2 AND provider_id IS NULL RETURNING id;\n-- UPDATE model_provider_revisions SET x = 1;\n" +
 		"UPDATE users u SET claude_provider_id = $1, claude_provider_scope_id = (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $1) WHERE u.id = $2 AND u.id = $3;"
