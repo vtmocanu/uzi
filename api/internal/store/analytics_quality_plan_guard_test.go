@@ -43,15 +43,15 @@ func TestQualityExecutedProblemsPlanGuard(t *testing.T) {
 	})
 	t.Run("zero rows under the hashed SubPlan", func(t *testing.T) {
 		root := withRows(0, 5)
-		if got := qualityExecutedProblems(&root); len(got) != 1 {
-			t.Fatalf("problems = %v, want one", got)
+		if got := qualityExecutedProblems(&root); !reflect.DeepEqual(got, []string{qualityNoExecutedRwSel}) {
+			t.Fatalf("problems = %v, want [%s]", got, qualityNoExecutedRwSel)
 		}
 	})
 	t.Run("rows under an un-hashed SubPlan", func(t *testing.T) {
 		root := withRows(3, 0)
 		root.Plans[1].Filter = "(SubPlan 1)"
-		if got := qualityExecutedProblems(&root); len(got) != 1 {
-			t.Fatalf("problems = %v, want one", got)
+		if got := qualityExecutedProblems(&root); !reflect.DeepEqual(got, []string{qualityNoExecutedRwSel}) {
+			t.Fatalf("problems = %v, want [%s]", got, qualityNoExecutedRwSel)
 		}
 	})
 	t.Run("rows only outside the SubPlan", func(t *testing.T) {
@@ -59,8 +59,8 @@ func TestQualityExecutedProblemsPlanGuard(t *testing.T) {
 		root.Plans = append(root.Plans, planNode{
 			NodeType: "CTE Scan", CTEName: "rw_sel", ParentRelationship: "Outer", ActualRows: 4, ActualLoops: 1,
 		})
-		if got := qualityExecutedProblems(&root); len(got) != 1 {
-			t.Fatalf("problems = %v, want one", got)
+		if got := qualityExecutedProblems(&root); !reflect.DeepEqual(got, []string{qualityNoExecutedRwSel}) {
+			t.Fatalf("problems = %v, want [%s]", got, qualityNoExecutedRwSel)
 		}
 	})
 }

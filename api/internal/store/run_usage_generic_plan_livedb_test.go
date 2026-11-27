@@ -1010,8 +1010,11 @@ func qualityExecutedProblems(root *planNode) []string {
 	if executed {
 		return nil
 	}
-	return []string{"no CTE Scan on rw_sel under a hashed SubPlan returned rows: the seed must give both rw_sel and rework a non-empty set, or the membership check is vacuous"}
+	return []string{qualityNoExecutedRwSel}
 }
+
+// qualityNoExecutedRwSel is qualityExecutedProblems' one diagnostic.
+const qualityNoExecutedRwSel = "no CTE Scan on rw_sel under a hashed SubPlan returned rows: the seed must give both rw_sel and rework a non-empty set, or the membership check is vacuous"
 
 // qualityOffenders is the generic-plan check of the Quality statements: the row-count classes
 // shared with Spend (loopOffenders) plus qualityShapeProblems and qualityExecutedProblems.
