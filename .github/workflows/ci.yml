@@ -430,9 +430,10 @@ jobs:
     runs-on: ubuntu-latest
     # The sweep minus workersvc, plus the bridge and proofs. The full consolidated
     # execution measured a 2,845s median on main (2026-11), of which workersvc was about
-    # 936s. 75 stays until the split execution is re-measured; a run nearing it is a
+    # 936s. The split job then took 66 min of 75 on main at ddb179cd (store 2020s, handler
+    # 1112s), so 90 is headroom while #4142 cuts runtime; a run nearing it is a
     # re-measurement signal.
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:

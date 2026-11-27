@@ -223,7 +223,9 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
 # b4ebbd33, both ~1200.1s) while recent successful samples took 704.1-1162.9s, seven
 # of nine at least 987s, prompting a 30m cap. Main at 9f93c988 then took 1732s
 # for the same store tree that took 1152s at c7332170, and #4594 hit 30m twice.
-# Allow 35m for store as headroom while #4142 tracks runtime reduction.
+# Allow 35m for store as headroom while #4142 tracks runtime reduction. Main at ddb179cd
+# (v0.87.0-rc.28) then took 2020.3s of that 2100s budget, and later trees add more store
+# LiveDB tests, so store gets 45m, as workersvc has.
 # Handler then hit its 20m cap on main CI run 45915026653 (6eb2acf0, no test hung:
 # the package ran out of time) after green main samples of 709-1005s and 862s
 # on the PR run; allow 30m for handler as the same kind of headroom.
@@ -232,7 +234,7 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
 for p in "${PKGS[@]}"; do
   timeout=10m
   if [ "$p" = "./internal/store/..." ]; then
-    timeout=35m
+    timeout=45m
   elif [ "$p" = "./internal/handler/..." ]; then
     timeout=30m
   elif [ "$p" = "./internal/workersvc/..." ]; then
