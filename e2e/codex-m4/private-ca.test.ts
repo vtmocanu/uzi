@@ -9,27 +9,30 @@ import {
 } from "./private-ca.js";
 import { PRIVATE_CA_TITLE } from "./private-ca-title.js";
 
+// Issue #4574 M2 added the two provider-checker cases: 10 -> 12 named cases.
+const n = PRIVATE_CA_CASES.length;
 const complete = [
   ...PRIVATE_CA_CASES.map((title, i) => `ok ${i + 1} - ${title}`),
   ...PRIVATE_CA_OBSERVATIONS.map(value => `# ${value}1`),
-  "1..10", "# tests 10", "# pass 10", "# fail 0", "# cancelled 0",
+  `1..${n}`, `# tests ${n}`, `# pass ${n}`, "# fail 0", "# cancelled 0",
   "# skipped 0", "# todo 0", "CONTAINER_EXIT=0",
 ].join("\n");
 
 test("private CA parser accepts a complete transcript shape only", () => {
+  assert.equal(n, 12);
   requirePrivateCaProof(complete);
   for (const line of complete.split("\n")) {
     assert.throws(() => requirePrivateCaProof(complete.split("\n").filter(value => value !== line).join("\n")));
   }
   assert.throws(() => requirePrivateCaProof(""));
   for (const [before, after] of [
-    ["# pass 10", "# pass 9"], ["# fail 0", "# fail 1"],
+    [`# pass ${n}`, `# pass ${n - 1}`], ["# fail 0", "# fail 1"],
     ["# skipped 0", "# skipped 1"], ["# cancelled 0", "# cancelled 1"],
     ["# todo 0", "# todo 1"],
   ]) assert.throws(() => requirePrivateCaProof(complete.replace(before!, after!)));
   assert.throws(() => requirePrivateCaProof(complete.replace("CONTAINER_EXIT=0", "CONTAINER_EXIT=1")));
-  assert.throws(() => requirePrivateCaProof(complete + "\nnot ok 11 - extra"));
-  assert.throws(() => requirePrivateCaProof(complete + "\n# tests 10"));
+  assert.throws(() => requirePrivateCaProof(complete + `\nnot ok ${n + 1} - extra`));
+  assert.throws(() => requirePrivateCaProof(complete + `\n# tests ${n}`));
 });
 
 test("M4 clears both standalone image overrides without changing caller environment", () => {

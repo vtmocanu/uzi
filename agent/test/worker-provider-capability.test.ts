@@ -5,12 +5,12 @@ import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_CHECKER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
 
 // PRD #4320 / #4505: the pinned Claude CLI follows gateway redirects (see the PRD Decision Log), and
 // that risk was accepted on 2026-11-19 (ADR-4320), so the worker advertises claude_provider_v1 on
 // registration and the api may hand it provider-bound runs. The relay (#4496) is the future mitigation.
-async function registeredCaps(advertise: boolean): Promise<string[]> {
+async function registeredCaps(advertise: boolean, crossCheck: { slots: number; runner: boolean } = { slots: 0, runner: false }): Promise<string[]> {
   const { Worker } = await import("../src/worker.js");
   const { WorkerClient } = await import("../src/client.js");
   const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
@@ -24,11 +24,13 @@ async function registeredCaps(advertise: boolean): Promise<string[]> {
     },
   });
   const worker = new Worker({
-    workerName: "prov", workerTemplate: "base", maxConcurrentRuns: 1, crossCheckSlots: 0,
+    workerName: "prov", workerTemplate: "base", maxConcurrentRuns: 1, crossCheckSlots: crossCheck.slots,
     heartbeatIntervalMs: 15_000, pollIntervalMs: 1000, dataDir: ".",
     codexHarness: { advertise },
   } as Config, client, {} as RunRunner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
-  nullLogger(), () => ({ ok: true, missing: [] }), undefined, undefined, new ActiveRunRegistry());
+  nullLogger(), () => ({ ok: true, missing: [] }), undefined, undefined, new ActiveRunRegistry(),
+  undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+  crossCheck.runner ? { execute: async () => {} } : undefined);
   await (worker as unknown as { registerWithRetry(s: AbortSignal): Promise<void> }).registerWithRetry(new AbortController().signal);
   const reg = requests.find(r => r.path.endsWith("/register"));
   assert.ok(reg, "the worker registered");
@@ -78,6 +80,19 @@ it("a Codex-harness worker advertises codex_provider_judge_v1; one without the h
   assert.equal(on.includes("codex_provider_judge_v1"), true);
   const off = await registeredCaps(false);
   assert.equal(off.includes("codex_provider_judge_v1"), false);
+});
+
+// Issue #4574 M2: codex_provider_checker_v1 needs the Codex harness gate AND a cross-check slot AND a runner.
+it("codex_provider_checker_v1 is advertised only with the Codex harness, a cross-check slot and a runner", async () => {
+  const all = await registeredCaps(true, { slots: 1, runner: true });
+  assert.equal(all.includes(CODEX_PROVIDER_CHECKER_CAPABILITY), true);
+  assert.equal(all.includes("codex_provider_checker_v1"), true);
+  assert.equal(all.includes(CODEX_PROVIDER_CAPABILITY), true, "the checker capability rides with the Codex provider trio");
+  for (const [label, caps] of [
+    ["no Codex harness", await registeredCaps(false, { slots: 1, runner: true })],
+    ["no cross-check slot", await registeredCaps(true, { slots: 0, runner: true })],
+    ["no cross-check runner", await registeredCaps(true, { slots: 1, runner: false })],
+  ] as const) assert.equal(caps.includes("codex_provider_checker_v1"), false, label);
 });
 
 it("a worker without the Codex harness does not advertise codex_provider_v1", async () => {

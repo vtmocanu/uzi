@@ -42,6 +42,13 @@ export const CODEX_PROVIDER_CAPABILITY = "codex_provider_v1";
  *  requireProviderCapability refuses one on a registration that did not. */
 export const CODEX_PROVIDER_JUDGE_CAPABILITY = "codex_provider_judge_v1";
 
+/** The additional protocol capability a worker must advertise (at register) to accept a Codex
+ *  provider-bound CROSS-CHECK claim (issue #4574 M2): this image runs the provider checker path
+ *  (cross-check-runner.ts / codex/cross-check.ts). Advertised only with the Codex harness and a
+ *  cross-check slot and runner; the api places a Codex provider checker only on a worker
+ *  advertising it, and client.ts requireProviderCapability refuses one on a registration that did not. */
+export const CODEX_PROVIDER_CHECKER_CAPABILITY = "codex_provider_checker_v1";
+
 /** The reason a claim whose lane cannot serve a provider reports (the server refuses these lanes
  *  first; this is the worker's second layer). */
 export const PROVIDER_LANE_UNSUPPORTED = "provider_lane_unsupported";
