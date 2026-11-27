@@ -423,6 +423,21 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A started run no longer fails when the api cannot read the forge during the claim-time guardrail check ([#4689](https://github.com/vtmocanu/uzi/pull/4689), [#4709](https://github.com/vtmocanu/uzi/pull/4709)).**
   A transient forge read failure that is the only blocking finding now parks the run in `recovery_wait` as `forge_unreachable` instead of `guardrail_blocked`; never-started runs, auth failures and other findings still fail, and the claim still delivers no payload or credential.
 
+- **Enabling the extra CA no longer rolls a uid-split worker whose Secret lacks the Codex CA key ([#4702](https://github.com/vtmocanu/uzi/pull/4702), [#4707](https://github.com/vtmocanu/uzi/pull/4707)).**
+  The controller renders `UZI_CODEX_CA_FILE` only after confirming the worker's Secret holds the key; on upgrade a worker whose template already carries it drifts and, once its roll is admitted, drops it, and workers created with the extra CA before this release have no recorded evidence and lose the Codex CA until reprovisioned. The evidence survives a controller restart during a /data recycle that keeps the Deployment. A worker whose join token arrives after its /data claim exists now has that claim stamped by a confirmed patch right after its Secret is written, so it still gets the Codex CA on its next roll; a same-ID /data claim in another worker namespace no longer stalls or steers this worker's recycle, provisioning or placement.
+
+- **The scope-index migration guard names a recovery that works with shared providers in use ([#4710](https://github.com/vtmocanu/uzi/pull/4710), [#4727](https://github.com/vtmocanu/uzi/pull/4727)).**
+  The new message appears only while 00527, 00528 or users_codex_provider_scope is still pending, including a retry after a refusal; goose skips applied versions, so installs past them never see it, and an operator who saw the old message on an older image follows Scope-index recovery in ADR 4324.
+
+- **A finalize push that GitHub refuses with its `Internal Server Error` banner is retried on the publication schedule before the run fails or parks ([#4716](https://github.com/vtmocanu/uzi/pull/4716), [#4721](https://github.com/vtmocanu/uzi/pull/4721)).**
+  The exact observed shape, one `(Internal Server Error)` ref line plus the complete `remote:` banner, now takes the existing publication retry schedule; any other format keeps its previous classification.
+
+- **Board column moves keep retrying for up to 24 hours after a forge outage ([#4704](https://github.com/vtmocanu/uzi/pull/4704), [#4708](https://github.com/vtmocanu/uzi/pull/4708)).**
+  A failed board column move is now retried every 30 seconds for 30 minutes and then every 10 minutes (batch-limited, oldest first) until it has been pending for 24 hours, instead of giving up after 30 minutes; an older run's move is skipped when a newer run on the same issue already exists, and admin health's board.drift now separates moves still retrying from moves given up.
+
+- **Hosted worker wake no longer deadlocks with a duplicate-canary roll hold ([#4723](https://github.com/vtmocanu/uzi/pull/4723), [#4726](https://github.com/vtmocanu/uzi/pull/4726)).**
+  A waking current canary now settles its own wake through the metadata-only op write while the pool stays held; a claim mirror on its data claim still holds the wake, and a roll write in the pool refuses it for that tick.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -668,6 +683,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admins can share Codex provider definitions, not only Claude ones ([#4633](https://github.com/vtmocanu/uzi/pull/4633), [#4705](https://github.com/vtmocanu/uzi/pull/4705)).**
   Each recipient attaches their own key and selects it as their Codex source; the base URL receives every recipient's key, and an older API image on the new schema can no longer clear a Codex source back to the vendor credential.
 
+- **Capacity analytics API reports average concurrent runs, usage-wait share and current provider gauges ([#4731](https://github.com/vtmocanu/uzi/pull/4731), [#4736](https://github.com/vtmocanu/uzi/pull/4736)).**
+  `GET /api/analytics/capacity` and `GET /api/admin/analytics/capacity` (API only, see `docs/usage-analytics.md`) estimate occupancy from retained run intervals as an elapsed envelope that includes waits, with no slot denominator, and refuse admin all-users `window=all` like Spend; a gauge timeout fails the request with 503 and the admin vault observation never waits, reporting `vault_status_unavailable` instead.
+
+- **Reliability analytics API for run outcomes and failure causes ([#4685](https://github.com/vtmocanu/uzi/pull/4685), [#4734](https://github.com/vtmocanu/uzi/pull/4734)).**
+  `GET /api/analytics/reliability` (and the admin variant) returns outcome counts, failure causes, a rolling failure rate and a ranked breakdown for delivery runs by creation time; it is API only, and a supporting-only `kind` filter answers `applicable: false`, while admin all-users `window=all` is a 400 as for Spend. See docs/usage-analytics.md.
+
+- **Runs receive their repo's variables as environment variables ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4594](https://github.com/vtmocanu/uzi/pull/4594)).**
+  Lead-agent runs on both harnesses get the enabled variables in every command at the lowest precedence, with secret values redacted from output (raw, JSON, HTML-safe, percent and base64 forms, and every line of a multi-line value of 8 or more characters except exact standard PEM BEGIN/END markers and lines of only ASCII spaces and tabs, so structural lines of a secret file are masked too, and the plan-turn changed-file list, capability evidence paths and proposal repo fields); redaction is bounded by a step-counted work budget, and a string or log record that passes it is withheld whole as a fixed marker, the preserved-patch check reports every form present so the patch is withheld; every publish is searched for the values (a run holding a multi-line secret gets no preserved patch, `multi_line_secret`, and its work stays recoverable through `uzi run held` or `uzi run export`), file paths of outgoing commits included, failing closed (a path scan that cannot finish is `path_scan_incomplete`, and the publish is withheld or the push blocked); saving a secret that would push the repo's secret value bytes past 116,959 (the bound counts the logger's JSON-escaped copies) is refused with 409 `env_forms_budget` (a repo already above it can shrink but not grow), a claim whose secret forms still pass the form cap fails before any work as `run_env_forms_over_budget`, `AWS_ENDPOINT_URL` and every `AWS_ENDPOINT_URL_` per-service name (such as `AWS_ENDPOINT_URL_S3`) are refused, and the feature needs a worker that reports `run_env_v1`, which a worker does only when it runs as two users (the protected uid split), so a lead-agent run whose repo has an enabled variable is not claimed by an older worker or a single-user worker and waits for a two-user worker.
+
+- **Scoped usage analytics API with filter options and Spend ([#4684](https://github.com/vtmocanu/uzi/pull/4684), [#4698](https://github.com/vtmocanu/uzi/pull/4698)).**
+  Owner routes `/api/analytics/{options,spend}` and admin routes `/api/admin/analytics/{options,spend}` return calendar-bucketed spend, ranked splits, cost per completed run and per merged PR, and per-run cost disclosure; API only, and an admin all-users Spend `window=all` request answers 400 (all-time remains for owner and single-user admin scopes).
+
+- **Codex judges run on the owner's Codex model provider ([#4574](https://github.com/vtmocanu/uzi/pull/4574), [#4711](https://github.com/vtmocanu/uzi/pull/4711)).**
+  A Codex judge for an owner whose Codex source is a provider now runs on it with no vendor fallback, needs the new worker capability `codex_provider_judge_v1` (finish the API and worker rollout first), and fails with no review on a gateway 429/529; cross-check on Codex providers stays refused.
+
+- **uzi now records pull request merge and close history ([#4691](https://github.com/vtmocanu/uzi/pull/4691), [#4699](https://github.com/vtmocanu/uzi/pull/4699)).**
+  The MR-state watcher writes a per-PR head and append-only events with the forge's merge/close time kept apart from observation time, in the same statement as `runs.mr_state`; nothing reads it yet, there is no expiry, and coverage limits are in `docs/pr-history.md`.
+
+- **Accepted Anthropic token and Codex account rate-limit readings are now kept as a five-minute history ([#4692](https://github.com/vtmocanu/uzi/pull/4692), [#4703](https://github.com/vtmocanu/uzi/pull/4703)).**
+  Each accepted poll, and each successful Anthropic token test, copies its reading into two new tables, best effort and under a 250 ms deadline; a missing bucket means no accepted copy, never zero use, and nothing deletes rows unless the owner's user row is deleted. Nothing reads the history yet, and rolling the migration back drops it.
+
+- **Owners and admins can read scoped run Flow diagnostics over the API ([#4729](https://github.com/vtmocanu/uzi/pull/4729), [#4745](https://github.com/vtmocanu/uzi/pull/4745)).**
+  `GET /api/analytics/flow` and `GET /api/admin/analytics/flow` return live waits, activity, approximate first-start and plan-response timing, the delivery funnel, approval classification and issue elapsed time, each with its own time basis; approval is proven only by a unique applied current-revision receipt, and admin all-users `window=all` is refused as for Spend.
+
+- **Owner and admin Quality analytics API ([#4730](https://github.com/vtmocanu/uzi/pull/4730), [#4743](https://github.com/vtmocanu/uzi/pull/4743)).**
+  Read-only `GET /api/analytics/quality` and `/api/admin/analytics/quality` report retained rework per merged PR, CI-fix outcomes, plan and code cross-check results and judge review coverage from one snapshot; judge coverage is the retained latest review with non-historical eligibility, and admin all-users `window=all` is refused like Spend.
+
 ### Changed
 
 - **Routine dependency updates ([#4650](https://github.com/vtmocanu/uzi/pull/4650)).**
@@ -898,6 +940,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A non-zero guarded command result explains its exit code ([#4681](https://github.com/vtmocanu/uzi/pull/4681)).**
   Claude runs under the memory guard now note that the code is the supervised shell's final status, so passing output from earlier commands can sit above it, and that a code above 128 does not by itself establish a signal kill.
 
+- **The lead takes a fresh Go cache reading and records a disposition at every settled validation handoff ([#4741](https://github.com/vtmocanu/uzi/pull/4741), [#4744](https://github.com/vtmocanu/uzi/pull/4744)).**
+  At each completed validation-wave handoff that ran or will run Go builds or tests, the lead's advisory cache rule now asks for a fresh cache and filesystem reading (never one reused from an earlier handoff) and exactly one progress-note disposition: skipped with a reason, skipped because the reading failed, kept below threshold, kept because the filesystem episode is not re-armed, cleared with before and after sizes, or cleanup failed; the 12 GiB / 75% triggers, 70% re-arm, settlement, ownership and subagent rules are unchanged.
+
+- **Jobs run on your custom model provider ([#4322](https://github.com/vtmocanu/uzi/pull/4322), [#4742](https://github.com/vtmocanu/uzi/pull/4742)).**
+  A job created through /api/v1/jobs for an owner whose Claude source is a provider is frozen onto that provider at creation, never parks (revocation or a gateway limit fails it) and needs a worker advertising `claude_provider_job_v1`; a site-list job is still refused, and the bound key is scrubbed from result text, while an output file whose name or contents carry it is withheld, not uploaded sanitised; both by byte-exact matching only, which protects against accidental publication and not against the job's own agent.
+
 ### Security
 
 - **A run can no longer rewrite the repo agents its later claims use ([#3913](https://github.com/vtmocanu/uzi/pull/3913), [#3940](https://github.com/vtmocanu/uzi/pull/3940)).**
@@ -923,6 +971,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **The API no longer ships a gorilla/websocket version affected by GO-2026-6278 ([#4654](https://github.com/vtmocanu/uzi/pull/4654)).**
   The indirect `github.com/gorilla/websocket` dependency moves from v1.5.3 to `v1.5.4-0.20240701034025-d67f41855da4`; `govulncheck` reported v1.5.3 as reachable through the Slack Socket Mode client, and upstream has no tagged release carrying the fix.
+
+- **The Claude CLI now reads its global config from a directory the agent cannot write ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4594](https://github.com/vtmocanu/uzi/pull/4594)).**
+  Every Claude CLI start runs with `CLAUDE_CONFIG_DIR=<HOME>/.uzi-claude-config`, a worker-owned directory holding fixed config bytes and links to the run's transcripts, so an `env` block an agent writes to `HOME/.claude.json` or `HOME/.claude/` is not applied; unexpected entries at that path are renamed aside and rebuilt, and the start is refused when that cannot be done or the layout cannot be trusted (a read-only data volume, a home directory failing the ownership and parent-mode checks, a repeated or transient failure preparing the transcript directories, or a directory that keeps changing). With a single uid the directory gives no protection (it is not an integrity boundary), so Claude run variables are delivered only on a two-uid worker: a single-uid worker does not report `run_env_v1`, and a run that carries variables waits for a two-uid worker, while launches without variables still start there. A real OAuth subscription session was not tested against an unsigned stored remote-settings file.
 
 ### Removed
 
