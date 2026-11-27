@@ -166,9 +166,10 @@ var visibilityTable = map[string]visEntry{
 		must: bothSelectionArms, callers: []string{"handler/providers_admin.go"}},
 	"ListSharedModelProvidersAdmin": {class: classShared, caller: adminRead, exact: exactSQL["ListSharedModelProvidersAdmin"],
 		must: adminCountMust, callers: []string{"handler/providers_admin.go"}},
-	// The read-back of every definition write: the key routes and the admin Test return the admin view.
+	// The read-back of every definition write: the admin routes and the key routes return the admin view.
+	// The admin Test answers from its own probe result and does not read it back.
 	"GetSharedModelProviderAdmin": {class: classShared, caller: adminRead, exact: exactSQL["GetSharedModelProviderAdmin"],
-		must: adminCountMust, callers: []string{handlerAdmin, handlerKey, handlerProbe}},
+		must: adminCountMust, callers: []string{handlerAdmin, handlerKey}},
 
 	// organization key custody and the admin Test evidence (PRD #4540). The key routes (handlerKey) write
 	// custody, the admin Test (handlerProbe) reads the sink and records evidence, and the admin delete
