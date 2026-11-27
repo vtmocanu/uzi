@@ -26,6 +26,7 @@ The gap #91 records is the part that mitigation does **not** cover: runner-conte
 
 ### Accept the residual, bounded and stated honestly
 - **Not** a secret-exfil or worker-escalation path — the worker is isolated from `/nix`/`/data` (above), and egress is NetworkPolicy-fenced ([ADR-285](0285-worker-egress-tier-trust-model.md)).
+  - *Note (2026-11-27):* [ADR-4416](4416-run-env-vars.md) adds per-run credential-bearing state under this same shared uid: the run's `.docker` directory can hold a registry login that a concurrent same-user run can read and modify. See its M3 residuals.
 - **Not** a cross-user path — workers are per-user.
 - It **is** a cross-repo **output-integrity** risk on a shared-per-user worker: hostile repo A poisoning the user's trusted repo B run's output/MR. Distinct from PRD #90, which persists **inert data** read into the lead; this is **executable** persistence in the runner context.
 - **Low** for single-repo or ephemeral-worker usage, and low in absolute terms for the mostly-single-user private-factory model this product targets: the trigger requires a user to run both a hostile repo and a trusted repo on the same worker.

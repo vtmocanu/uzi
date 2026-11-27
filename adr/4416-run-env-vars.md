@@ -1,6 +1,6 @@
 # ADR-4416: Run environment variables reach lead-lane runs, redacted and scanned
 
-**Status**: Implemented (PRD #4416 M2: runs receive the variables); M3 (registry logins that last for the run) and M4 (user-level variables) pending; exact-head CI, the compose E2E scenarios and live-fleet acceptance pending
+**Status**: Implemented (PRD #4416 M2: runs receive the variables; M3: a per-run Docker client configuration directory, implemented, pending landing); M4 (user-level variables) pending; exact-head CI, the landing-head compose E2E scenarios for M2 and live-fleet acceptance pending
 **Date**: 2026-11-21
 **Related**: PRD #4416 (`prds/4416-repo-env-vars.md`); [ADR-319](0319-env-read-diagnostic-allowlist.md); [ADR-285](0285-worker-egress-tier-trust-model.md); [ADR-91](0091-runner-cross-run-persistence-residual.md); [ADR-3507](3507-optional-credential-vault.md); user doc `docs/run-env-vars.md`
 
@@ -769,9 +769,73 @@ The split-across-files and elided-context patch gaps are closed by the `multi_li
   Deployment check: pending - maintainers supply the evidence; no fleet check has been performed by
   this change.
 
-## Not shipped in M2
+## M3: a per-run Docker client configuration directory
 
-M3 (a per-run Docker client configuration directory, so a registry login lasts for the run) and
-M4 (user-level variables) are not implemented; the user doc says logins do not persist across
-commands on Codex. The compose E2E scenarios are authored and run at landing; they are
-not evidence here.
+The Docker CLI cannot take a login from the environment, and the worker owns `DOCKER_CONFIG`, so
+a registry login needs a directory that lives as long as the run. M3 gives each run one directory
+named `.docker` inside the run home and points `DOCKER_CONFIG` at it for model commands.
+
+Decisions:
+
+- **Single-fd create and unconditional repair (Codex).** The command sandbox
+  (`agent/codex/supervisor/cmdsandbox/main.go`, `docker_config.go`) takes
+  `--docker-config <runHome>/.docker`. As the command uid it checks the parent is
+  `worker:runner` mode 03770 through an `O_NOFOLLOW` fd, creates `.docker` mode 0700 (an existing
+  one is fine), opens it `O_NOFOLLOW`, requires it owned by the caller, `fchmod`s it 0700 on every
+  run, re-verifies, and grants Landlock rights through that fd only. No path is checked and then
+  used.
+- **Degrade, never fail.** Any refusal (a symlink, a foreign owner, a bad parent, a syscall error)
+  prints one stderr line, `uzi-codex-command-sandbox: Docker config directory unavailable
+  (<reason>); this command runs without a persistent Docker login`, removes `DOCKER_CONFIG` from
+  the child environment and runs the command. A planted or damaged directory costs the login, not
+  the run.
+- **Model-command roots only.** The worker sets `DOCKER_CONFIG=<runHome>/.docker` for model
+  commands (`commandEffectSpec`, `makeDefaultSpawnCommand` and `runDockerConfigDir` in
+  `agent/src/codex/codex-executor.ts`), not for the fileop root or the boundary spawner, and not
+  for a `cross_check` run. The last exclusion is a backstop: real Codex cross-check runs never
+  enter `CodexExecutor` (`agent/src/codex/cross-check.ts`).
+- **Claude through `buildSdkEnv`.** `agent/src/sdk-env.ts` sets `DOCKER_CONFIG=<homeDir>/.docker`
+  after the variable fold, only when Docker is wired. `DOCKER_CONFIG` is in `PROTECTED_ENV_KEYS`,
+  so a user variable cannot override it.
+- **Custody inside the run home.** The directory follows the run home: removed with it by
+  `rmtree`, kept on park, preserve and retained homes, and kept with the existing warning when
+  removal fails. `dropRunCaches` leaves it.
+- **Resume note.** `dockerScratchResumeNote` (`agent/src/prompt.ts`) adds that a registry login
+  made before the pause may be gone and to log in again if a pull or build is refused. It is
+  inside the existing Docker resume note, so it fires on every Docker-wired resume.
+
+Evidence: `e2e/docker-config-persist/run.sh` with `agent/test/codex-docker-config-linux.test.ts`
+runs the production path through `uzi-codex-supervisor` as the command uid, in a worker image
+built at the commit, against an htpasswd registry on the daemon host loopback. It passed at
+`b429d4973` on a fresh build and again on the later M3 tree: every step passed with the sandbox
+modes `off` and `required`, and the Claude leg (which sets `DOCKER_CONFIG` explicitly to
+`buildSdkEnv`'s value) passed.
+
+Residuals:
+
+- (a) On Claude (the shared runner uid, always) and on Codex without Landlock (mode `off`, the
+  chart default, or `best-effort` on a kernel without Landlock), a concurrent run of the same user
+  on the worker can read and write another run's `.docker`: credentials in `config.json`,
+  `cli-plugins`, `credsStore` and `credHelpers` (which make the Docker CLI execute a helper),
+  contexts and proxies. That is executable persistence, the class [ADR-91](0091-runner-cross-run-persistence-residual.md)
+  accepts, and it lasts through parked and retained homes. Codex with Landlock `required` closes
+  it.
+- (b) The owner check does not bind the directory to a run: all runs share one command uid.
+- (c) A planted `.docker` keeps a run degraded, visible only to the model through the stderr line.
+- (d) There is no size bound on `.docker`.
+- (e) The Docker CLI may detect a `docker-credential-*` helper on `PATH` when no `credsStore` is
+  set, and the command `PATH` includes the shared `/nix`.
+- (f) A successor attempt executor gets a new home, so its login is lost; the resume note tells
+  the model.
+- (g) Codex creates the grant whether or not Docker is wired; Claude sets `DOCKER_CONFIG` only
+  when Docker is wired. The extra Codex directory is inert.
+- (h) The `cross_check` exclusion is a backstop, not the enforcing path.
+- (i) The PRD says the grant applies "with and without the uid split". That is moot: Codex is
+  advertised only under the uid split (`agent/src/codex/codex-capability.ts`).
+
+## Not shipped
+
+M4 (user-level variables) is not implemented. M3 is implemented and pending landing; it is not
+accepted on a hosted deployment. The compose E2E scenarios are authored and run at landing; they
+are not evidence here, and the M3 compose scenario is replaced by the disposable harness above
+(see the PRD Decision Log).

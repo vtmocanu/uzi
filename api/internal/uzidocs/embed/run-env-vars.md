@@ -434,15 +434,43 @@ POM receives them; use 3.10.0 or later.
 | `REGISTRY_USER` | plain | the user name | Usually not sensitive. |
 | `REGISTRY_PASSWORD` | secret | the password or token | A credential. |
 
-The agent or your repo scripts log in, for example:
+The agent or your repo scripts log in once, and later commands in the same run
+use the login, on both the Claude and the Codex harness:
 
 ```sh
-printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin &&
-  docker pull "$REGISTRY_HOST/team/image:tag"
+printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+# a later command in the same run
+docker pull "$REGISTRY_HOST/team/image:tag"
 ```
 
-A login does not yet persist across commands, so log in in the same command
-that uses the registry.
+The login lasts for the rest of the run when the worker has Docker, including
+image builds and test libraries that read the Docker client configuration. Each
+run has its own Docker client configuration directory, `.docker` in the run's
+home directory, and the worker points `DOCKER_CONFIG` at it, so you cannot set
+`DOCKER_CONFIG` yourself.
+
+Things to know:
+
+- **A resumed run may need to log in again.** A login made before a pause may be
+  gone when the run resumes on another worker or in a new attempt's home
+  directory. The agent is told this on resume; if a pull or build is refused
+  for authentication, log in again.
+- **Where the login is kept.** The login file (`config.json`) lives in the run's
+  home directory until that home is removed, including while the run is parked.
+  It is removed with the home, and kept with it where the home is kept.
+- **Other runs of the same user can read it.** Runs of one user on the same
+  worker share a user ID, so another run there can read and modify that
+  directory. This always holds on Claude. On Codex only the `required` command
+  sandbox mode (`UZI_CODEX_COMMAND_SANDBOX`) prevents it; with `off` (the
+  default) or `best-effort` on a kernel without Landlock it holds too. Store
+  only read-only, narrowly scoped registry credentials.
+- **Credential helpers.** With no `credsStore` in the configuration, the Docker
+  CLI may detect a `docker-credential-*` helper on `PATH` and use it instead of
+  writing the login to `config.json`.
+- **A refused directory.** On Codex, if the sandbox cannot set up the directory
+  (for example a planted symlink), the command prints
+  `Docker config directory unavailable` on stderr and runs without a persistent
+  login; log in in the same command that uses the registry.
 
 ## Edit, disable, delete
 

@@ -1,6 +1,6 @@
 # PRD #4416: Per-repo secrets and variables for runs
 
-**Status**: M1 shipped; M2 implemented (pending landing); M3 and M4 pending
+**Status**: M1 and M2 shipped; M3 implemented (pending landing); M4 pending
 **Priority**: Normal
 
 ## Problem
@@ -72,7 +72,7 @@ Residuals, accepted and to be recorded in the ADR:
 - Concurrent runs on one worker share a runner uid and one DinD daemon (`adr/0091-runner-cross-run-persistence-residual.md`, `docs/proc-hardening.md`). A run on one repo can reach another repo's variables and pulled images. A worker serves one user, so nothing crosses users. The Anthropic token has the same exposure today.
 - Redaction is exact-match with an 8-character floor (`agent/src/redact.ts`). It covers the forms listed under Worker and no other encoding. It is a net, not a boundary.
 - Values reach the model provider: the agent reads them and tool results carry them. Native Claude and Codex transcripts persisted on the worker hold them unredacted, as they hold anything else the agent reads.
-- Login state a tool writes to disk holds the credential for as long as the directory lives. On Claude that is the run home, until the run ends. On Codex the command home is recreated per command, so before M3 a login and the command that uses it must run in one command (`docker login … && docker pull …`); from M3 the run's Docker configuration directory keeps the login, including while the run is parked. Either directory follows the run home's custody: it is removed with the run home, kept where the run home is retained (resume-preserving paths, a retained-home marker), and kept with a warning when removal is refused or fails. While it exists, a concurrent run on the same worker can read it, per the shared-uid residual above.
+- Login state a tool writes to disk holds the credential for as long as the directory lives. On Claude that is the run home, until the run ends. On Codex the command home is recreated per command, so before M3 a login and the command that uses it must run in one command (`docker login … && docker pull …`); from M3 the run's Docker configuration directory keeps the login, including while the run is parked. Either directory follows the run home's custody: it is removed with the run home, kept where the run home is retained (resume-preserving paths, a retained-home marker), and kept with a warning when removal is refused or fails. While it exists, a concurrent run on the same worker can read and modify it, per the shared-uid residual above. That is always so on Claude, and on Codex whenever Landlock is not applied (sandbox mode `off`, the chart default, or `best-effort` on a kernel without Landlock); only `required` closes it.
 - Values passed to an image build as build arguments stay in that image's history in the shared DinD daemon. That is how such builds behave everywhere; the user doc says so.
 
 ## Modules and seams
@@ -173,6 +173,8 @@ The claim fields, snapshot check and capability gate with its placement and heal
 
 The Codex login-persistence proof first; it gates the rest. Then the run's Docker configuration directory on both harnesses, the resume hint, the registry example in the user doc. Gate: `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` plus the touched agent tests and `task test:codex-m4`; `task scan:secrets`.
 
+Delivery (2026-11-27): the command sandbox takes `--docker-config <runHome>/.docker` (single-fd create and repair, degrade with one stderr line on any refusal); the worker sets `DOCKER_CONFIG` for Codex model commands only and for Claude through `buildSdkEnv` when Docker is wired; the directory follows the run home's custody; the resume note adds the registry-login hint; `docs/run-env-vars.md` shows login in one command and a pull in a later one. Evidence: `e2e/docker-config-persist/run.sh` with `agent/test/codex-docker-config-linux.test.ts` drives the production path through `uzi-codex-supervisor` as the command uid in a worker image built at the commit, against an htpasswd registry on the daemon host loopback. It passed at `b429d4973` (fresh build) and on the later M3 tree: every step passed with sandbox modes `off` and `required`, plus the Claude leg. See ADR-4416 for the residuals.
+
 ### M4: Variables for all of a user's repos
 
 A user-level set applied to every repo the user owns. Services of one product usually share the same values, and without this a user re-enters them per repo. The table, its indexes and the AAD already carry the user-level scope from M1, so no row migrates.
@@ -194,7 +196,7 @@ Gate: `task check:api` plus `-race` tests on the touched packages and the claim 
 - The ADR for the amended invariants and accepted residuals lands with M2.
 - `full agent suite: exact-head PR CI`
 - API, web and repo checks: exact-head PR CI green on every milestone PR.
-- The compose E2E scenarios for M2 and M3 pass on the landing head, on both harnesses.
+- The compose E2E scenario for M2 passes on the landing head, on both harnesses. For M3 the disposable production-path harness `e2e/docker-config-persist/run.sh` stands in for the compose scenario (see the Decision Log); run it on the landing head too.
 
 ## Owner acceptance
 
@@ -279,3 +281,10 @@ Outside the milestones, not a worker obligation; this delivery is `non_closing` 
 - **Merge with main at bf2c7cf (AI-synced 2026-11-26).** Main added `00536` to `00541` (shared Codex provider definitions, #4705). The run-env migrations are renumbered with `task migration:renumber` to `00542_run_env_receipts.sql` and `00543_run_env_placement.sql`, with no change to their SQL. None of `00536` to `00541` redefines `fn_placement_admitting_workers`, so the placement migration still composes `00534_placement_provider_judge_capability.sql`'s definition plus the `run_env_v1` clause, and its Down restores the `00534` Up definition. The one merge conflict (`finishRunClaimTx`) keeps both sides: the run-env recompute block, then #4709's claim-time forge park; the two are mutually exclusive (the forge park needs an assembly error, the recompute none).
 
 - **Landing renumber after #4698 (AI-synced 2026-11-26).** Main added `00542_run_usage_model_totals.sql`. The run-env migrations moved to `00543_run_env_receipts.sql` and `00544_run_env_placement.sql`. `00534` remains the placement predecessor.
+- **M3: single-fd create and unconditional repair (AI-synced 2026-11-27).** The sandbox creates `.docker` and opens it through one `O_NOFOLLOW` fd, requires caller ownership, and `fchmod`s 0700 on every run, so a pre-existing directory with loose permissions is repaired and no path is checked then used.
+- **M3: degrade, not fail (AI-synced 2026-11-27).** A refused `.docker` (symlink, foreign owner, bad parent, syscall error) prints one stderr line, drops `DOCKER_CONFIG` from the child and runs the command. The cost is a lost login, visible only to the model; the run does not fail.
+- **M3: model-command roots only (AI-synced 2026-11-27).** `DOCKER_CONFIG` is set for model commands, not the fileop root, the boundary spawner or a `cross_check` run. The cross-check exclusion is a backstop: real Codex cross-check runs never enter `CodexExecutor`.
+- **M3: compose E2E replaced by a disposable harness (AI-synced 2026-11-27).** The compose stub executor (`e2e/phases/77-run-env-vars.sh`) never spawns commands, so it cannot prove a login persists. The M3 landing obligation is met by `e2e/docker-config-persist/run.sh`, which runs in-run and on the landing head. It covers the production Codex path in sandbox modes `off` and `required` and a Claude leg that sets `DOCKER_CONFIG` to `buildSdkEnv`'s value; the compose scenario itself is not authored for M3.
+- **M3: the uid-split clause is narrowed (AI-synced 2026-11-27).** The Worker section says the grant applies with and without the uid split. Codex is advertised only under the split (`agent/src/codex/codex-capability.ts`), so the no-split case does not arise; the text is left as written.
+- **M3: the resume hint is unconditional (AI-synced 2026-11-27).** It sits inside the existing Docker resume note and fires on every Docker-wired resume, not only when a login is known to be lost.
+- **M3: Codex and Claude wiring differ (AI-synced 2026-11-27).** Codex creates the grant whether or not Docker is wired; Claude sets `DOCKER_CONFIG` only when Docker is wired. The Codex directory is inert without Docker.
