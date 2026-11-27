@@ -316,7 +316,7 @@ func isProviderCheckerChild(run store.Run) bool {
 // carries no credential detail. The finalizer selects the stage-specific failure
 // reason; the sentinel retains its legacy plan text. Other run shapes return err unchanged.
 func claudeCheckerClaimError(run store.Run, err error) error {
-	if err == nil || !(isClaudeCheckerChild(run) || isProviderCheckerChild(run)) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
+	if err == nil || (!isClaudeCheckerChild(run) && !isProviderCheckerChild(run)) || errors.Is(err, errVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 		return err
 	}
 	if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errCredentialDisabled) || errors.Is(err, errAutoPoolEmpty) {

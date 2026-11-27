@@ -201,8 +201,11 @@ var visibilityTable = map[string]visEntry{
 	// identity-only: keyed by an id the caller already holds under a prior visibility check
 	"InsertModelProviderRevision": {class: classIdentity, must: []string{"WHERE p.id = @provider_id"},
 		callers: []string{"handler/providers.go", "handler/providers_admin.go"}},
+	// workersvc/cross_check_same_model.go (PRD #4574 M2 same-model guard) reads the LEAD run's
+	// frozen (model_provider_id, model_provider_revision) stamp, which the server wrote when it froze
+	// the lead's binding under the owner-visibility check; the row feeds only the identity comparison.
 	"GetModelProviderRevision": {class: classIdentity, must: []string{"WHERE provider_id = $1 AND revision = $2"},
-		callers: []string{"handler/providers.go", "handler/providers_admin.go"}},
+		callers: []string{"handler/providers.go", "handler/providers_admin.go", "workersvc/cross_check_same_model.go"}},
 	"GetProviderBindingKeyByID": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"},
 		callers: []string{"workersvc/provider_claim.go", "workersvc/provider_source.go"}},
 	"LockProviderBindingKeyForShareNowait": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"},

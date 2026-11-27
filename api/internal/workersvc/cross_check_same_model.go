@@ -79,6 +79,8 @@ func leadIdentitySide(ctx context.Context, rd sameModelReader, lead store.Run, c
 		return providers.IdentitySide{ModelID: model, Resolved: model != ""}, nil
 	}
 	side := providers.IdentitySide{ProviderBound: true}
+	// Identity-only read (pinned in store's TestIdentityQueryCallersArePinned): the ids are the lead's
+	// server-written frozen stamp, visibility-checked when the lead's binding was frozen.
 	rev, err := rd.GetModelProviderRevision(ctx, store.GetModelProviderRevisionParams{
 		ProviderID: lead.ModelProviderID.Bytes, Revision: lead.ModelProviderRevision.Int32})
 	if errors.Is(err, pgx.ErrNoRows) {
