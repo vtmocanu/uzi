@@ -605,16 +605,39 @@ describe("stationary geometry while a part moves", () => {
 
 // The same gestures for runtime module entries (issue #4777), one per vocabulary icon.
 describe.each(RAILS)("%s rail: module entries animate like built-in entries", (rail) => {
-  it("hover and focus start nothing; click plays within 0.7s-1.8s", { timeout: 120000 }, async () => {
+  it("hover alone starts nothing", { timeout: 120000 }, async () => {
     for (const def of MODULE_DEFS) {
       const m = mount(def.key, rail);
       expect(m.svg.getAttribute("data-nav-motion"), `${def.key} motion key`).toBe(def.motionKey);
       expect(cssAnims(m.svg), `${def.key} baseline`).toHaveLength(0);
       await hover(m.link);
-      await userEvent.tab();
+      await frames();
+      expect(m.svg.classList.contains(PLAY), `${def.key} hover class`).toBe(false);
+      expect(allAnims(m.svg), `${def.key} hover starts nothing`).toHaveLength(0);
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  });
+
+  it("focus alone starts nothing", { timeout: 120000 }, async () => {
+    for (const def of MODULE_DEFS) {
+      const m = mount(def.key, rail);
+      m.link.focus();
       expect(document.activeElement, `${def.key} focus lands on the link`).toBe(m.link);
       await frames();
-      expect(allAnims(m.svg), `${def.key} hover and focus start nothing`).toHaveLength(0);
+      expect(m.svg.classList.contains(PLAY), `${def.key} focus class`).toBe(false);
+      expect(allAnims(m.svg), `${def.key} focus starts nothing`).toHaveLength(0);
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  });
+
+  it("a click on a fresh, unhovered, unfocused row plays within 0.7s-1.8s, then returns to rest", { timeout: 120000 }, async () => {
+    for (const def of MODULE_DEFS) {
+      const m = mount(def.key, rail);
+      await userEvent.unhover(document.body);
+      expect(document.activeElement, `${def.key} link not focused`).not.toBe(m.link);
+      expect(cssAnims(m.svg), `${def.key} baseline`).toHaveLength(0);
       m.link.click();
       const first = cssAnims(m.svg);
       expect(first.length, `${def.key} click`).toBeGreaterThan(0);
@@ -627,12 +650,18 @@ describe.each(RAILS)("%s rail: module entries animate like built-in entries", (r
       }
       expect(total, `${def.key} total`).toBeGreaterThanOrEqual(700);
       expect(total, `${def.key} total`).toBeLessThanOrEqual(1800);
+      for (const a of allAnims(m.svg)) a.finish();
+      await awaitRest(m.svg);
+      expect(allAnims(m.svg), `${def.key} click rest`).toHaveLength(0);
       cleanup();
       await userEvent.unhover(document.body);
     }
   });
 
   it("Enter on a focused module row plays (real key press) and a second Enter restarts", { timeout: 120000 }, async () => {
+    // Identity of a CSS animation: the element it runs on plus its keyframes name.
+    const signature = (as: CSSAnimation[]) =>
+      as.map((a) => `${(a.effect as KeyframeEffect).target?.getAttribute("class") ?? ""}|${a.animationName}`).sort();
     for (const def of MODULE_DEFS) {
       const m = mount(def.key, rail);
       await userEvent.tab();
@@ -641,10 +670,16 @@ describe.each(RAILS)("%s rail: module entries animate like built-in entries", (r
       await userEvent.keyboard("{Enter}");
       const before = cssAnims(m.svg);
       expect(before.length, `${def.key} Enter plays`).toBeGreaterThan(0);
-      seek(m.svg, 350);
+      // Park every animation at half of its own length: all still mid-flight, none finished.
+      for (const a of before) {
+        a.pause();
+        a.currentTime = endTimeOf(a) / 2;
+        expect(a.playState, `${def.key} ${a.animationName} mid-flight`).not.toBe("finished");
+      }
       await userEvent.keyboard("{Enter}");
-      const after = cssAnims(m.svg).filter((a) => a.playState === "running");
-      expect(after.length, `${def.key} Enter restarted`).toBeGreaterThan(0);
+      const after = cssAnims(m.svg);
+      expect(after.length, `${def.key} Enter single set`).toBe(before.length);
+      expect(signature(after), `${def.key} Enter same parts`).toEqual(signature(before));
       for (const a of after) {
         expect(before.includes(a), `${def.key} Enter replaced`).toBe(false);
         expect(Number(a.currentTime), `${def.key} Enter restarted at zero`).toBeLessThan(300);
@@ -836,7 +871,12 @@ describe("chart-line motion timing (issue #4777)", () => {
     expect(late, "trace ink at 880").toBeGreaterThan(50);
     expect(early, `ink @300 (${early}) vs @880 (${late})`).toBeLessThan(0.75 * late);
 
-    for (const t of [950, 1100]) {
+    // The reveal starts from a fully undrawn trace (pathLength 1, offset 1).
+    seek(m.svg, 0);
+    expect(Math.abs(num(getComputedStyle(draw).strokeDashoffset) - 1), "dashoffset @0 is 1").toBeLessThan(0.02);
+
+    // The handoff happens right at 900ms: the trace animations must not run any longer.
+    for (const t of [905, 920, 950, 1100]) {
       seek(m.svg, t);
       expect(opacity(orig), `original trace back @${t}`).toBe("1");
       expect(opacity(draw), `copy hidden @${t}`).toBe("0");
