@@ -82,7 +82,7 @@ jobs:
       # run-e2e.sh's PRD #97 M2 CLI leg builds api/cmd/uzi on the host, so `go` must
       # be on PATH. Pinned to the same toolchain ci.yml uses. node/docker/compose/jq/
       # curl/openssl are all preinstalled on ubuntu-latest.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5  # v7
         with:
           go-version: "1.27"
           check-latest: true
