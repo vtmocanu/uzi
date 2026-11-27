@@ -152,6 +152,7 @@ expect_valid navsection
 expect_invalid navsection-blank 'web.modules[0] (blank): navSection must be 1 to 24 characters after trimming whitespace'
 expect_invalid navsection-25 'web.modules[0] (long): navSection must be 1 to 24 characters after trimming whitespace'
 expect_invalid navsection-bidi 'web.modules[0] (bidi): navSection contains control or invisible formatting characters'
+expect_invalid navsection-edge 'web.modules[0] (edge): navSection contains control or invisible formatting characters'
 expect_invalid navsection-number 'web.modules[0] (num): navSection must be a string'
 expect_invalid navsection-factory 'web.modules[0] (fac): navSection is only valid with navGroup modules'
 expect_invalid bad-id 'id "Bad" is malformed'

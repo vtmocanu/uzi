@@ -141,21 +141,35 @@ describe("parseModuleList", () => {
       expect(own[0].items.map((i) => i.key)).toEqual(["module:a", "module:b"]);
     });
 
+    const LENGTH = "navSection must be 1 to 24 characters after trimming whitespace";
+    const UNSAFE = "navSection contains control or invisible formatting characters";
     it.each([
-      ["blank", "   "],
-      ["25 code points", "é".repeat(25)],
-      ["bidi", "\u202eX"],
-      ["control", "a\u0000b"],
-      ["lone surrogate", "\ud800"],
-      ["number", 7],
-      ["null", null],
-    ])("drops an invalid navSection (%s) with one log and keeps the entry", (_n, navSection) => {
+      ["blank", "   ", LENGTH],
+      ["25 code points", "é".repeat(25), LENGTH],
+      ["25 astral code points", "😀".repeat(25), LENGTH],
+      ["trailing newline (trim would remove it)", "Tools\n", UNSAFE],
+      ["trailing line separator (trim would remove it)", "Tools ", UNSAFE],
+      ["leading BOM (trim would remove it)", "﻿Tools", UNSAFE],
+      ["bidi", "\u202eX", UNSAFE],
+      ["control", "a\u0000b", UNSAFE],
+      ["lone surrogate", "\ud800", UNSAFE],
+      ["number", 7, "navSection must be a string"],
+      ["null", null, "navSection must be a string"],
+    ])("drops an invalid navSection (%s) with one log and keeps the entry", (_n, navSection, reason) => {
       const out = parseModuleList([{ ...mods, navSection }]);
       expect(out).toHaveLength(1);
       expect("navSection" in out[0]).toBe(false);
       expect(errors).toHaveBeenCalledTimes(1);
       expect(logged()[0]).toContain("demo");
-      expect(logged()[0]).toContain("navSection");
+      expect(logged()[0]).toContain(reason);
+      expect(logged()[0].endsWith('; using "Modules"')).toBe(true);
+    });
+
+    it("counts code points, not UTF-16 units: 24 astral characters pass", () => {
+      const s = "😀".repeat(24);
+      const out = parseModuleList([{ ...mods, navSection: s }]);
+      expect(out[0].navSection).toBe(s);
+      expect(errors).not.toHaveBeenCalled();
     });
 
     it.each(["work", "factory"])("ignores navSection on %s silently", (navGroup) => {

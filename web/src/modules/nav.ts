@@ -20,8 +20,9 @@ function navDefOf(m: ModuleEntry): NavDef {
 
 // `work` and `factory` entries are appended, in manifest order, to those sections. `modules`
 // entries form their own sections after Factory and before the unlabelled bottom cluster:
-// one per distinct `navSection` (id `modules:<name>`, first-appearance order), and entries
-// without one share the default "Modules" section (id `modules`). Only non-empty sections
+// one per distinct section name in first-appearance order. An absent `navSection` and an
+// explicit "Modules" share the default section (id `modules`); any other value gets its own
+// section (id `modules:<value>`). Only non-empty sections
 // exist. With no modules the input is returned as is.
 const DEFAULT_SECTION = "Modules";
 
