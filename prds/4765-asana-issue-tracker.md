@@ -4,7 +4,7 @@
 
 **Priority:** Medium
 
-**Status:** Draft r3.2, 2026-11-27. Checked against the Asana API reference, fact-checked against the code at #4173 M6 (PR #4757, `d77731b2b`), and approved by an architecture review after one fix. Not yet reviewed by the maintainer. Three Asana facts the reference does not settle are marked *(live check)* and are confirmed on a real workspace before the code that relies on them.
+**Status:** Draft r3.3, 2026-11-27. Checked against the Asana API reference, fact-checked against the code at #4173 M6 (PR #4757, `d77731b2b`), and approved by an architecture review after one fix. Not yet reviewed by the maintainer. Three Asana facts the reference does not settle are marked *(live check)* and are confirmed on a real workspace before the code that relies on them.
 
 **Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.
 
@@ -45,6 +45,7 @@ Teams that plan in Asana cannot hand that work to uzi without copying every task
 - **More than one Asana workspace per user.** `issue_tracker_connections` is unique on `(user_id, kind, base_url)`, and Asana has one base URL, so a user has at most one Asana connection, hence one workspace.
 - **The Asana permalink in merge request bodies.** It would need a new claim field and an agent change gated like `issue_key_v1`. On Asana, uzi's lifecycle comments on the task carry the merge request link instead.
 - **The PRD link patch in the task description** (A11).
+- **Trusted Asana text**, and with it scheduled auto-approval on Asana (A10): it needs a provenance record a story deletion cannot erase.
 
 ## Current state (at `d77731b2b`)
 
@@ -100,12 +101,11 @@ Teams that plan in Asana cannot hand that work to uzi without copying every task
   - The poller, handlers and worker routes share one token concurrently. uzi does not throttle per token; it relies on the 429 handling above. `FORGE_POLL_INTERVAL` is global, so the docs give the request cost per pass.
 - **A9. Comments are stories.** `ListIssueNotes` reads the task's stories with `created_by` in `opt_fields` and keeps `comment_added` ones; `CreateIssueNote` posts one. `IssueNote.ID` is 0 and the account id is 0, as on YouTrack; the author is `created_by.gid` as text.
 - **A10. Author mapping, fail closed.**
-  - `MapsAuthor`: an author maps exactly when it is the connection's account (`users/me` gid, read once per driver).
-  - `IssueTextMapped`: the task's text maps only when its creator maps and every story on the task other than `comment_added` was created by that account. This needs no list of text-change subtypes, which the reference does not enumerate.
-  - A missing or null `created_by` on the task or on a story (forms, rules, integrations) is unmapped. A story listing cut off at its ceiling is `permission_unknown`, never mapped.
-  - The effect: any section move or follower change by a person makes the text `permission_unknown`, so a scheduled start on that task waits for a person. Safe, and noisier than YouTrack.
+  - `MapsAuthor`: an author maps exactly when it is the connection's account (`users/me` gid, read once per driver). A missing or null `created_by` (forms, rules, integrations) is unmapped. This gates comments (D11), as on YouTrack.
+  - `IssueTextMapped` always reports `permission_unknown` on Asana. A task's story listing cannot prove who wrote its current title and body: Asana consolidates some stories, and an author can delete their own stories (`DELETE /stories/{gid}`), so a third party's edit can leave no visible trace even when every story shown maps to the connection's account. A manual start proceeds as on YouTrack; a scheduled start may plan, and its plan always waits for a person.
+  - Trusted Asana text needs a provenance record that cannot be erased this way. Designing one is out of scope; until then scheduled auto-approval is not offered on Asana.
 - **A11. uzi never writes the task body.** The driver reads `notes` (plain text), never `html_notes`. The reference does not say what writing `notes` does to rich text *(live check)*, so `UpdateIssueDescription` returns `ErrIssueWriteNotOffered` on Asana. `IssueWriteSkippable` already settles it; its log text ("the linked issue is gone") is reworded for this case. The contract suite gains a skip for it. The PRD link patch is therefore not offered on Asana.
-- **A12. Creating a task.** `POST /tasks` with `projects: [project gid]` and the tags, then `addTask` to the open section, then the number (A1). The reference marks `memberships` read-only on create, so it is not relied on.
+- **A12. Creating a task.** `POST /tasks` with `projects: [project gid]` and the tags, then `addTask` to the open section, then the number (A1). The Tasks reference describes `memberships` as create-only, which allows setting the section at creation; A3 evaluates that single-call form against the two-call sequence, which works either way.
 
 ## Feature parity on a repo linked to Asana
 
@@ -113,7 +113,7 @@ Teams that plan in Asana cannot hand that work to uzi without copying every task
 |---|---|---|
 | Bring tagged tasks into uzi | Yes, by the eligibility tag's gid (A6, A7) | A2 |
 | Give the run the title, body and comments | Yes, body as plain text, comments subject to D11 (A9, A10) | A2 |
-| Auto-approve a scheduled run's plan | Only when the creator and every non-comment story map (A10) | A2 |
+| Auto-approve a scheduled run's plan | Not offered: the title and body are always `permission_unknown`, so the plan waits for a person (A10) | — |
 | Agent reads the issue through the worker API | Yes, same routes | A2 |
 | Issue key and link on the board and issue page | Key `ATL-12`, linked to the permalink (A2) | A2 |
 | Board and card moves | Yes, through sections (A5) | A3 |
@@ -150,14 +150,14 @@ Only the changes a second kind needs before its first line of code. YouTrack's b
 - **Acceptance:**
   - `asanatest`-backed unit tests for every read method, the paging and `Retry-After`;
   - a differential test of the two `TaskRefs`: the same gid is idempotent, distinct gids get distinct numbers, numbering starts at 1, an unknown number is not found, `Lookup` never allocates and leaves an unknown gid out, and concurrent first sightings allocate exactly one number (on Postgres for the store one);
-  - LiveDB tests for intake, eviction, a task removed from the project, a multi-homed task in another project's section, an untagged task, an unmapped author on a manual and on a scheduled start, and a `ListIssues` call that allocates nothing.
+  - LiveDB tests for intake, eviction, a task removed from the project, a multi-homed task in another project's section, an untagged task, an unmapped author on a manual and on a scheduled start, a scheduled start on a task whose creator maps and whose every visible non-comment story maps (or which has none) that still does not auto-approve (A10), and a `ListIssues` call that allocates nothing.
 
 ### A3: board and writes, surfaces, docs and live acceptance
 
 - `MoveToColumn`, `SetIssueState`, reopen, `CreateIssue` with its number, `CreateIssueNote`, and `UpdateIssueDescription` not offered (A5, A9, A11, A12).
 - The full contract suite on the Asana driver. `caseUpdate` is split into a label update and a description update, so the label assertion still runs on Asana. The Asana subject skips exactly: the description update (A11), label events (A6), and the owner-tag cases `caseSameNameTag`, `caseRenamedEligibilityTag` and `caseListLabelsOnlyUsableTags` (`Subject.SameName` nil), because Asana resolves other tags by name (A6).
 - Web: the connect form offers Asana, with the workspace choice when the account has several; the States panel shows sections and the fixed `Completed`. The CLI needs no new verb (`uzi issue-tracker list` and `uzi repo issue-tracker-states` are kind-neutral); `api/cmd/uzi` is checked for anything YouTrack-worded.
-- `docs/issue-trackers.md`: an Asana section with the dedicated account (SA2), the allowlist entry (SA1), one eligibility tag per project (A7), the request cost per pass (A8), the noisier auto-approval (A10) and the parity table.
+- `docs/issue-trackers.md`: an Asana section with the dedicated account (SA2), the allowlist entry (SA1), one eligibility tag per project (A7), the request cost per pass (A8), scheduled auto-approval not offered (A10) and the parity table.
 - **Acceptance (maintainer-owned, live):** connect, link, tag, run, board move, close and reopen on a real Asana workspace from a hosted Kubernetes install, plus a regression pass on a YouTrack-linked repo and on GitHub, GitLab and Forgejo.
 
 ## Testing decisions
@@ -195,3 +195,4 @@ Only the changes a second kind needs before its first line of code. YouTrack's b
   - Also added: the tag listing's workspace-wide limit, the State read from the bound project's membership, the fail-closed edges of the text mapping, the differential `TaskRefs` test, label events as not offered, and an owner for the live checks.
 - **2026-11-27: r3.1 after the re-review (approved with one blocking item, now fixed).** A2 no longer claims the contract suite's read cases: they seed through `CreateIssue` and `EnsureLabels`, which are A3. A3 lists the exact skip set and splits `caseUpdate`. An Asana connection must carry a workspace (CHECK). A2 is exercised through the API, the CLI and tests.
 - **2026-11-27: r3.2 after CodeRabbit on #4766.** `TaskRefs` gains the read-only `Lookup`, which `ListIssues` needs to resolve without allocating. The `CreateIssue` window now states that finding-group marker reconciliation does not run on linked repos at all (`FullSync` only), so the window adds no new gap.
+- **2026-11-27: r3.3 after the maintainer's review of #4766.** A10: a story listing cannot prove who wrote the text (Asana consolidates stories and authors can delete theirs), so `IssueTextMapped` is always `permission_unknown` on Asana and scheduled auto-approval is not offered; A2 gains the acceptance case where every visible story maps and auto-approval still stays off. A12: `memberships` is create-only, not read-only; A3 evaluates the single-call create.
