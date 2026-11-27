@@ -174,6 +174,43 @@ func heShort(t store.HistoryRetentionTable) string {
 
 func heRows() int { return heEnvInt("UZI_EVIDENCE_ROWS", 1_000_000) }
 
+func heEvidenceDSN(base string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("parse DSN: %w", err)
+	}
+	u.Path = "/" + heDBName
+	dsn := u.String()
+	// A URL query parameter can override the database named by the path.
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse evidence DSN: %w", err)
+	}
+	if cfg.Database != heDBName {
+		return "", fmt.Errorf("evidence DSN selects database %q, want %q", cfg.Database, heDBName)
+	}
+	return dsn, nil
+}
+
+func TestHistoryRetentionEvidenceDSN(t *testing.T) {
+	const base = "postgres://tester@localhost/sweep?sslmode=disable"
+	dsn, err := heEvidenceDSN(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database != heDBName {
+		t.Fatalf("effective database = %q, want %q", cfg.Database, heDBName)
+	}
+
+	if _, err := heEvidenceDSN(base + "&dbname=sweep"); err == nil || !strings.Contains(err.Error(), "database") {
+		t.Fatalf("conflicting dbname error = %v, want a database identity refusal", err)
+	}
+}
+
 // newHeFx connects to the evidence database. The marker of the database UZI_TEST_DATABASE_URL names
 // is checked first (admin paths); the evidence database hrev is created with its own marker row
 // (the e2e/test-database-marker.sql shape) and EVERY path, including the cold one, verifies that
@@ -195,12 +232,11 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 		t.Fatal("UZI_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
-	u, err := url.Parse(base)
+	dsn, err := heEvidenceDSN(base)
 	if err != nil {
-		t.Fatalf("parse DSN: %v", err)
+		t.Fatal(err)
 	}
-	u.Path = "/" + heDBName
-	fx := &heFx{t: t, ctx: ctx, dsn: u.String(), log: &heLog{t: t, path: logPath}, codex: "typical"}
+	fx := &heFx{t: t, ctx: ctx, dsn: dsn, log: &heLog{t: t, path: logPath}, codex: "typical"}
 	if v := os.Getenv("UZI_EVIDENCE_CODEX"); v == "max" {
 		fx.codex = "max"
 	}
@@ -257,6 +293,7 @@ func (fx *heFx) markEvidenceDB() {
 		fx.t.Fatalf("hrev marker pool: %v", err)
 	}
 	defer p.Close()
+	fx.requireEvidenceDatabase(p)
 	for _, q := range []string{
 		`CREATE SCHEMA uzi_test_harness`,
 		`CREATE TABLE uzi_test_harness.database_marker (marker text PRIMARY KEY)`,
@@ -268,7 +305,7 @@ func (fx *heFx) markEvidenceDB() {
 	}
 }
 
-// requireEvidenceMarker refuses (t.Fatalf) unless hrev itself carries the throwaway marker. It is a
+// requireEvidenceMarker refuses unless the server reports hrev and it carries the marker. It is a
 // read-only query over a connection of its own, so nothing is mutated on a refusal.
 func (fx *heFx) requireEvidenceMarker() {
 	fx.t.Helper()
@@ -277,13 +314,27 @@ func (fx *heFx) requireEvidenceMarker() {
 		fx.t.Fatalf("refusing to touch %s: cannot connect to verify its marker: %v", heDBName, err)
 	}
 	defer p.Close()
+	fx.requireEvidenceDatabase(p)
 	var marker string
 	if err := p.QueryRow(fx.ctx, `SELECT marker FROM uzi_test_harness.database_marker`).Scan(&marker); err != nil || marker != heMarker {
-		fx.t.Fatalf("refusing to touch database %s: it does not carry the throwaway marker (marker=%q err=%v); drop it so the harness can recreate it", heDBName, marker, err)
+		fx.t.Fatalf("refusing to touch database %s: it does not carry the throwaway marker (marker=%q err=%v)", heDBName, marker, err)
 	}
 	// server_version is read here, on the marker check's own backend, so fx.pool never runs it.
 	if err := p.QueryRow(fx.ctx, `SHOW server_version`).Scan(&fx.version); err != nil {
 		fx.t.Fatalf("SHOW server_version: %v", err)
+	}
+}
+
+// requireEvidenceDatabase verifies the server-selected database before a marker can authorize
+// fixture work or be written to a newly created database.
+func (fx *heFx) requireEvidenceDatabase(p *pgxpool.Pool) {
+	fx.t.Helper()
+	var database string
+	if err := p.QueryRow(fx.ctx, `SELECT pg_catalog.current_database()`).Scan(&database); err != nil {
+		fx.t.Fatalf("read evidence database identity: %v", err)
+	}
+	if database != heDBName {
+		fx.t.Fatalf("evidence connection selected database %q, want %q", database, heDBName)
 	}
 }
 
