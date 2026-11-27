@@ -1825,6 +1825,9 @@ web:
   #   icon      (required) one of activity board book bot bug chat clock factory file-text gear git
   #             home key package scale search server shield skill terminal.
   #   navGroup  (required) work | factory | modules (the sidebar section).
+  #   navSection (optional) the sidebar heading for a navGroup modules entry (default "Modules");
+  #             1 to 24 characters after trimming whitespace, no control or invisible characters;
+  #             refused with navGroup work or factory. Entries with the same heading share a section.
   #   adminOnly (optional) boolean, default false. A UI visibility rule only: anyone can
   #             fetch /modules.json and the module files (no authentication on those paths). Never put a secret in a module.
   #   upstream  (required) [http://]HOST:PORT of the module's static server; HOST is a lowercase
@@ -1843,6 +1846,7 @@ web:
   #       label: Example
   #       icon: package
   #       navGroup: modules
+  #       navSection: Tools
   #       adminOnly: false
   #       upstream: example-module:8080
   modules: []

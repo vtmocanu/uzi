@@ -32,15 +32,16 @@ Each entry has these fields.
 | `page` | Required. The expose name the module's build exposes (the example uses `./Page`; a leading `./` is optional). Rendered at `/m/<id>/*`. |
 | `label` | Required. 1 to 40 characters. Control and invisible formatting characters are refused in `label`, `version` and `page`. |
 | `icon` | Required. One of `activity`, `board`, `book`, `bot`, `bug`, `chat`, `clock`, `factory`, `file-text`, `gear`, `git`, `home`, `key`, `package`, `scale`, `search`, `server`, `shield`, `skill`, `terminal`. |
-| `navGroup` | Required. `work` or `factory` appends the entry to that existing sidebar section; `modules` puts it in a new "Modules" section after Factory (shown only when it has an entry). |
+| `navGroup` | Required. `work` or `factory` appends the entry to that existing sidebar section; `modules` puts it in a new section after Factory (shown only when it has an entry), headed "Modules" unless the entry sets `navSection`. |
+| `navSection` | Optional. The sidebar heading for a `navGroup: modules` entry; refused on a `work` or `factory` entry. A string, 1 to 24 characters (Unicode code points) after surrounding whitespace is trimmed; control and invisible formatting characters in the raw value are refused, as for `label`. The trimmed value is both the heading and the grouping key, so `Tools` and `Tools ` share one section. Entries with the same heading share one section, in list order; sections appear in order of their first entry, after Factory and before the unlabelled bottom cluster. Absent and an explicit `Modules` both mean the default "Modules" section. The command-menu hint shows the heading. `/modules.json` carries `navSection` (trimmed) only when set, so a list without it is byte-identical to before. A heading may reuse a built-in name such as "Work"; it is still a separate section. |
 | `adminOnly` | Optional boolean, default `false`. Hides the nav and command-menu entries from non-admins and puts the route behind the admin gate. Presentation only. |
 | `upstream` | Required in chart values and in the generator input; never appears in `/modules.json`. `[http://]HOST:PORT`: `HOST` is a strict IPv4 address or a lowercase DNS-1123 name, `PORT` is 1 to 65535, nothing else (no path, query, userinfo or other scheme). |
 
 In the chart only, a dotless `HOST` (a Service name such as `example-module`) expands to `<host>.<release namespace>.svc.cluster.local`. The compose generator does not expand: Docker resolves a service name as it is.
 
-A bad list never deploys: the chart fails the render, and the generator exits non-zero and writes nothing; a per-entry error names `modules[<index>]` and the field. Unknown input fields are ignored and never published.
+A bad list never deploys: the chart fails the render, and the generator exits non-zero and writes nothing; a per-entry error names `modules[<index>]` and the field. The generator reports the same `navSection` messages as the chart, plus `navSection is not valid UTF-8 text`. Unknown input fields are ignored and never published.
 
-The browser re-validates `/modules.json` because the file can be hand-edited: it skips an entry with an invalid id, a missing required field, a bad label, icon or `adminOnly`, a `label`, `version` or `page` containing control or invisible characters, or a duplicate id (the first valid entry wins), and maps an unknown `navGroup` to `modules`. Each skip logs one `console.error` naming the entry. A file that is not a JSON array means no modules.
+The browser re-validates `/modules.json` because the file can be hand-edited: it skips an entry with an invalid id, a missing required field, a bad label, icon or `adminOnly`, a `label`, `version` or `page` containing control or invisible characters, or a duplicate id (the first valid entry wins), and maps an unknown `navGroup` to `modules`. Each skip logs one `console.error` naming the entry. An invalid `navSection` does not skip the entry: the value is dropped with one `console.error` and the entry falls back to the default "Modules" section. `navSection` is ignored on a `work` or `factory` entry, and an entry with an unknown `navGroup` keeps its warning and lands under "Modules" even with a valid `navSection`. A file that is not a JSON array means no modules.
 
 ## Enable modules with the Helm chart
 
@@ -57,6 +58,7 @@ web:
       label: Example
       icon: package
       navGroup: modules
+      navSection: Tools      # optional sidebar heading; omit for "Modules"
       adminOnly: false
       upstream: example-module:8080
 ```
@@ -64,7 +66,7 @@ web:
 - **`web.nginx.resolver` is required whenever `web.modules` is non-empty.** The chart fails the render without it. nginx resolves each module upstream per request, which needs a resolver. This is the same value `web.nginx.dynamicResolution` uses for the api upstream; you do not need to turn `dynamicResolution` on, and enabling modules does not change how the api upstream resolves.
 - The module itself is your own Deployment and Service, serving its build at `/modules/<id>/`. The chart does not create it.
 - The list and the nginx locations are rendered into the web ConfigMap and mounted into each web pod as individual files (`subPath`), so a pod's files always match what its own nginx loaded at start. A change to the list rolls the web pods through the `checksum/nginx` annotation. While that rollout is mixed, different pods can serve different generations of the list; a page load may see either until it completes.
-- Chart render failures name `web.modules[<index>]` and the rule that failed: malformed or duplicate `id`, a missing required field, a `label` outside 1 to 40 characters, an unknown `icon` or `navGroup`, a non-boolean `adminOnly`, an invalid `upstream`, or modules set without `web.nginx.resolver`.
+- Chart render failures name `web.modules[<index>]` and the rule that failed: malformed or duplicate `id`, a missing required field, a `label` outside 1 to 40 characters, an unknown `icon` or `navGroup`, an invalid `navSection` (`navSection must be a string`, `navSection contains control or invisible formatting characters`, `navSection must be 1 to 24 characters after trimming whitespace`) or one on a `work` or `factory` entry (`navSection is only valid with navGroup modules`), a non-boolean `adminOnly`, an invalid `upstream`, or modules set without `web.nginx.resolver`.
 
 ## Enable modules with compose
 

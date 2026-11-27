@@ -19,23 +19,39 @@ function navDefOf(m: ModuleEntry): NavDef {
 }
 
 // `work` and `factory` entries are appended, in manifest order, to those sections. `modules`
-// entries form a new "Modules" section after Factory and before the unlabelled bottom
-// cluster, only when there is at least one. With no modules the input is returned as is.
+// entries form their own sections after Factory and before the unlabelled bottom cluster:
+// one per distinct section name in first-appearance order. An absent `navSection` and an
+// explicit "Modules" share the default section (id `modules`); any other value gets its own
+// section (id `modules:<value>`). Only non-empty sections
+// exist. With no modules the input is returned as is.
+const DEFAULT_SECTION = "Modules";
+
 export function mergeModuleNav(sections: NavSection[], modules: ModuleEntry[]): NavSection[] {
   if (modules.length === 0) return sections;
   const extra = (group: ModuleEntry["navGroup"]) => modules.filter((m) => m.navGroup === group).map(navDefOf);
   const work = extra("work");
   const factory = extra("factory");
-  const own = extra("modules");
+  const groups = new Map<string, NavDef[]>();
+  for (const m of modules) {
+    if (m.navGroup !== "modules") continue;
+    const key = m.navSection ?? DEFAULT_SECTION;
+    const list = groups.get(key);
+    if (list) list.push(navDefOf(m));
+    else groups.set(key, [navDefOf(m)]);
+  }
   const merged = sections.map((s) => {
     if (s.id === "work" && work.length > 0) return { ...s, items: [...s.items, ...work] };
     if (s.id === "factory" && factory.length > 0) return { ...s, items: [...s.items, ...factory] };
     return s;
   });
-  if (own.length === 0) return merged;
+  if (groups.size === 0) return merged;
   const at = merged.findIndex((s) => s.id === "factory");
-  const section: NavSection = { id: "modules", group: "Modules", items: own };
-  merged.splice(at === -1 ? merged.length : at + 1, 0, section);
+  const own: NavSection[] = [...groups].map(([key, items]) =>
+    key === DEFAULT_SECTION
+      ? { id: "modules", group: DEFAULT_SECTION, items }
+      : { id: `modules:${key}`, group: key, items },
+  );
+  merged.splice(at === -1 ? merged.length : at + 1, 0, ...own);
   return merged;
 }
 

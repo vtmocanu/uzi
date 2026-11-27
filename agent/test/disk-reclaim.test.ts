@@ -57,7 +57,9 @@ function dataDir(): { home: string; provision: string } {
 }
 
 const CACHES = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"];
-const RESUME = [path.join(".claude", "projects", "-data-runner-clone", "sess-1.jsonl"), ".claude.json", "unknown.txt"];
+// Issue #4416: the run's Docker client config (a registry login) is not a rebuildable cache, so a park's
+// cache drop leaves it for the resume.
+const RESUME = [path.join(".claude", "projects", "-data-runner-clone", "sess-1.jsonl"), ".claude.json", "unknown.txt", path.join(".docker", "config.json")];
 
 /** A run HOME shaped like a Go + npm run's: the three caches (with a read-only module cache)
  *  beside the files a resume needs. */

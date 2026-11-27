@@ -45,6 +45,16 @@
 // parsing. The adoption checks run in every mode, including the best-effort
 // degrade.
 //
+// The optional per-run Docker config directory (--docker-config) is the one
+// directory this command may create: exactly ".docker", directly inside the
+// run home the trusted worker names (see ADR-1598). Its path must be absolute,
+// already clean, and end in ".docker". The command creates it if absent, forces
+// it to owner-only 0700 through an fd it holds, and grants the Landlock rule
+// through that fd, so a Docker login in one command persists for the run's later
+// commands. Any failure in that setup degrades instead of failing: the command
+// runs without the grant, with DOCKER_CONFIG removed from its variables, after
+// one fixed-format stderr line. It never removes anything (no cleanup role).
+//
 // "Unavailable" is defined by errno (D8): a version probe returning ENOSYS or
 // EOPNOTSUPP is unavailable; any other errno, an ABI below 1, and every later
 // create/add-rule/restrict/deny-probe failure is an ERROR and stays fatal in
@@ -166,7 +176,7 @@ func realMain(args []string) int {
 	if len(args) > 0 && args[0] == "--cross-check" {
 		return crossCheckMain(args[1:])
 	}
-	root, tmp, cwd, cache, mode, nullStdin, child, err := parseArgs(args)
+	root, tmp, cwd, cache, dockerConfig, mode, nullStdin, child, err := parseArgs(args)
 	if err != nil {
 		return setupFailure("invalid arguments", err)
 	}
@@ -184,7 +194,19 @@ func realMain(args []string) int {
 		}
 		defer unix.Close(cacheFd)
 	}
-	if err := applyPolicy(root, grantFds{tmp: tmpFd, cache: cacheFd}, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
+	fds := grantFds{tmp: tmpFd, cache: cacheFd}
+	dockerDegraded := false
+	if dockerConfig != "" {
+		dockerFd, err := setupDockerConfig(filepath.Dir(dockerConfig), realDockerConfigSys, os.Getuid(), productionDockerParent)
+		if err != nil {
+			dockerDegraded = true
+			_, _ = fmt.Fprintf(os.Stderr, "uzi-codex-command-sandbox: Docker config directory unavailable (%v); this command runs without a persistent Docker login\n", err)
+		} else {
+			defer unix.Close(dockerFd)
+			fds.docker, fds.hasDocker = dockerFd, true
+		}
+	}
+	if err := applyPolicy(root, fds, mode, realVersionProbe, confine, applyNoNewPrivs); err != nil {
 		return setupFailure("apply Landlock policy", err)
 	}
 	if err := os.Chdir(cwd); err != nil {
@@ -198,6 +220,9 @@ func realMain(args []string) int {
 		cmd.Stdin = nil
 	}
 	cmd.Env = os.Environ()
+	if dockerDegraded {
+		cmd.Env = withoutDockerConfig(cmd.Env)
+	}
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
@@ -300,18 +325,18 @@ func requireEmptyDir(fd int) error {
 
 // parseArgs reads the trusted worker-built argv. Grammar:
 //
-//	--root R --tmp T --cwd C [--cache K] [--mode required|best-effort|off] [--stdin null] -- CMD...
+//	--root R --tmp T --cwd C [--cache K] [--docker-config D] [--mode required|best-effort|off] [--stdin null] -- CMD...
 //
-// The three path flags stay positional (as before). The cache, mode and stdin
-// flags are OPTIONAL and, when present, come in that order after --cwd and
-// before the `--` separator. Everything after `--` is the child command
-// verbatim, so a `--cache`, `--mode` or `--stdin` token there is part of the
-// CHILD and is NEVER read as a sandbox flag (the trust property: all come only
+// The three path flags stay positional (as before). The cache, docker-config,
+// mode and stdin flags are OPTIONAL and, when present, come in that order after
+// --cwd and before the `--` separator. Everything after `--` is the child
+// command verbatim, so a `--cache`, `--docker-config`, `--mode` or `--stdin`
+// token there is part of the CHILD and is NEVER read as a sandbox flag (the trust property: all come only
 // from this argv, built by the trusted worker). cache is "" when --cache is
 // absent; nullStdin is false (inherit stdin) when --stdin is absent.
-func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, nullStdin bool, child []string, err error) {
-	fail := func(err error) (string, string, string, string, sandboxMode, bool, []string, error) {
-		return "", "", "", "", "", false, nil, err
+func parseArgs(args []string) (root, tmp, cwd, cache, dockerConfig string, mode sandboxMode, nullStdin bool, child []string, err error) {
+	fail := func(err error) (string, string, string, string, string, sandboxMode, bool, []string, error) {
+		return "", "", "", "", "", "", false, nil, err
 	}
 	mode = modeRequired
 	if len(args) < 7 || args[0] != "--root" || args[2] != "--tmp" || args[4] != "--cwd" {
@@ -326,6 +351,13 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, n
 		cache = rest[1]
 		if !validCachePath(cache) {
 			return fail(errors.New("cache must be an absolute, clean path to a run directory named by a lowercase uuid"))
+		}
+		rest = rest[2:]
+	}
+	if len(rest) >= 2 && rest[0] == "--docker-config" {
+		dockerConfig = rest[1]
+		if !validDockerConfigPath(dockerConfig) {
+			return fail(errors.New("docker config must be an absolute, clean path whose last element is .docker"))
 		}
 		rest = rest[2:]
 	}
@@ -358,7 +390,7 @@ func parseArgs(args []string) (root, tmp, cwd, cache string, mode sandboxMode, n
 	if relErr != nil || rel == ".." || (len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator)) {
 		return fail(errors.New("cwd escapes root"))
 	}
-	return root, tmp, cwd, cache, mode, nullStdin, child, nil
+	return root, tmp, cwd, cache, dockerConfig, mode, nullStdin, child, nil
 }
 
 // validCachePath accepts only a per-run cache directory: an absolute path that
@@ -373,6 +405,12 @@ func validCachePath(cache string) bool {
 		return false
 	}
 	return isLowercaseUUID(filepath.Base(cache))
+}
+
+// validDockerConfigPath accepts only an absolute, already clean path whose last
+// element is exactly ".docker"; its parent (the run home) is checked at setup.
+func validDockerConfigPath(p string) bool {
+	return filepath.IsAbs(p) && filepath.Clean(p) == p && filepath.Base(p) == dockerConfigName
 }
 
 // isLowercaseUUID matches exactly 8-4-4-4-12 lowercase hex digits (the
@@ -475,11 +513,15 @@ func decidePolicy(probe versionProbe, mode sandboxMode) (action policyAction, ab
 type confineFunc func(root string, fds grantFds, abi int) error
 
 // grantFds are the adopted directories confine grants through their fds: the
-// private tmp, and the per-run cache (-1 when --cache is absent).
+// private tmp, the per-run cache (-1 when --cache is absent) and the per-run
+// Docker config directory. docker is meaningful only when hasDocker is set, so
+// a zero value never grants fd 0.
 type grantFds struct {
-	tmp      int
-	cache    int
-	readOnly bool // dedicated checker policy, never ordinary command mode
+	tmp       int
+	cache     int
+	docker    int
+	hasDocker bool
+	readOnly  bool // dedicated checker policy, never ordinary command mode
 }
 
 type noNewPrivsFunc func() error
@@ -577,7 +619,9 @@ var realRuleAdders = ruleAdders{path: addPathRule, fd: addFdRule}
 // dirs (a missing one is skipped), read/write on /dev, every handled right
 // beneath root, every handled right beneath the adopted tmp through fds.tmp
 // itself, and, when fds.cache is not -1, every handled right beneath that
-// run's cache directory through fds.cache (never the cache root above it).
+// run's cache directory through fds.cache (never the cache root above it) and,
+// when fds.hasDocker is set and the policy is not read-only, every handled right
+// beneath the run's Docker config directory through fds.docker.
 // Neither is named by path here, so a rename or symlink swap of the --tmp or
 // --cache path after adoption cannot redirect its rule.
 //
@@ -626,7 +670,13 @@ func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAd
 		return err
 	}
 	if fds.cache >= 0 {
-		return add.fd(ruleset, fds.cache, handled)
+		if err := add.fd(ruleset, fds.cache, handled); err != nil {
+			return err
+		}
+	}
+	// Never granted to the read-only checker policy.
+	if fds.hasDocker && !fds.readOnly {
+		return add.fd(ruleset, fds.docker, handled)
 	}
 	return nil
 }

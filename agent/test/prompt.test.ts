@@ -56,7 +56,7 @@ import type {
 } from "../src/protocol.js";
 
 describe("Docker scratch resume prompts", () => {
-  const note = "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them.";
+  const note = "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them. A registry login (`docker login`) made before the pause may also be gone: if a pull or build is refused for authentication, log in again.";
   const base = { branch: "b", subagentNames: ["coder"], first: true, iteration: 1 };
 
   it("omits the note for absent and false flags", () => {
