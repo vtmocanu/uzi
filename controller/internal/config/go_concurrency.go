@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -29,5 +30,29 @@ func loadWorkerGoConcurrency(cfg *Config) error {
 		}
 		*setting.dst = int(n)
 	}
-	return nil
+	return loadWorkerGoMemLimit(cfg)
+}
+
+// loadWorkerGoMemLimit reads the optional UZI_WORKER_GO_MEMLIMIT. Only ASCII
+// space, tab, CR and LF are trimmed. Empty means unset; otherwise the value must
+// be a positive decimal <= goConcurrencyCeiling followed by MiB or GiB, and is
+// stored canonically (leading zeros stripped).
+func loadWorkerGoMemLimit(cfg *Config) error {
+	const name = "UZI_WORKER_GO_MEMLIMIT"
+	raw := strings.Trim(os.Getenv(name), " \t\r\n")
+	if raw == "" {
+		return nil
+	}
+	for _, unit := range []string{"MiB", "GiB"} {
+		digits, ok := strings.CutSuffix(raw, unit)
+		if !ok {
+			continue
+		}
+		if n, ok := parsePositiveDecimal(digits, goConcurrencyCeiling); ok {
+			cfg.WorkerGoMemLimit = strconv.FormatInt(n, 10) + unit
+			return nil
+		}
+		break
+	}
+	return fmt.Errorf("%s must be a positive integer <= %d followed by MiB or GiB", name, goConcurrencyCeiling)
 }

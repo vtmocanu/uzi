@@ -10705,6 +10705,19 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     }
   });
 
+  it("GOMEMLIMIT: the configured memLimit applies, a toolEnv value loses, an injected run variable wins", () => {
+    const runVar = { var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "GOMEMLIMIT", value: "2GiB", secret: false, description: "" } as const;
+    try {
+      assert.equal(Object.hasOwn(buildCommandEnv("/private/tmp", { GOMEMLIMIT: "1MiB" }), "GOMEMLIMIT"), true, "unset: a toolEnv value passes as before");
+      configureGoConcurrency({ memLimit: "6GiB" });
+      assert.equal(buildCommandEnv("/private/tmp", {}).GOMEMLIMIT, "6GiB");
+      assert.equal(buildCommandEnv("/private/tmp", { GOMEMLIMIT: "1MiB" }).GOMEMLIMIT, "6GiB");
+      assert.equal(buildCommandEnv("/private/tmp", {}, undefined, false, { vars: [runVar] }).GOMEMLIMIT, "2GiB");
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
   it("with no provisioned PATH the fixed boundary PATH stands alone", () => {
     assert.equal(buildCommandEnv("/private/tmp", {}).PATH, FIXED_PATH);
   });
@@ -10803,6 +10816,7 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
   // spec and the env the command seam receives), with a provisioned toolEnv in play.
   for (const [label, settings, expected] of [
     ["both set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["memLimit set", { memLimit: "6GiB" }, { GOMEMLIMIT: "6GiB" }],
     ["unset", {}, {}],
   ] as const) {
     it(`issue #3382: run() launches commands with the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
@@ -10835,7 +10849,9 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
         assert.ok(String(env.PATH).includes("/provisioned/go/bin"), "the provisioned PATH rides in the same env");
         assert.equal(env.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
         assert.equal(env.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+        assert.equal(env.GOMEMLIMIT, (expected as { GOMEMLIMIT?: string }).GOMEMLIMIT);
         if (label === "unset") {
+          assert.equal(Object.hasOwn(env, "GOMEMLIMIT"), false);
           assert.equal(Object.hasOwn(env, "GOFLAGS"), false, "an unset setting adds no GOFLAGS key");
           assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
         }

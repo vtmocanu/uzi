@@ -923,6 +923,13 @@ workers:
   # an aggregate worker limit. See docs/configuration.md.
   goBuildParallelism: ""
   goMaxProcs: ""
+  # Optional GOMEMLIMIT for worker commands: a per-process soft GC memory target for
+  # the Go runtime, not a worker-wide limit. Empty = unset. A string of a positive
+  # integer <= 2147483647 followed by the required unit MiB or GiB (for example
+  # "6GiB"); surrounding ASCII whitespace is trimmed. Strings only: a typed number
+  # has no unit and fails the render. Relayed through UZI_WORKER_GO_MEMLIMIT to
+  # WORKER_GO_MEMLIMIT. See docs/configuration.md.
+  goMemLimit: ""
   # Optional per-run cache cap settings (issue #4576). Relayed through
   # UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES / UZI_WORKER_RUN_CACHE_CAP_FRACTION to the worker
   # pod's UZI_RUN_CACHE_CAP_MAX_BYTES / UZI_RUN_CACHE_CAP_FRACTION.

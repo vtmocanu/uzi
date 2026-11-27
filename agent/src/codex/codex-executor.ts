@@ -70,7 +70,7 @@ import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
-import { goConcurrencyEnv } from "../go-concurrency.js";
+import { applyGoMemLimitDefault, goConcurrencyEnv } from "../go-concurrency.js";
 import { foldRunEnv, runEnvDropText, runEnvInjectedSet, type RunEnvInjectedSet, type RunEnvInjection } from "../run-env-inject.js";
 import { buildRunEnvBlock } from "../run-env-prompt.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -8556,7 +8556,8 @@ export function commandSandboxArgv(
  *     displace or drop the boundary dirs (the fixed prefix always wins on a collision).
  *   - the OTHER allowlisted vars (NIX_SSL_CERT_FILE / LOCALE_ARCHIVE) are folded in.
  *   - an optional startup-resolved Docker host is set after the toolEnv fold.
- *   - the worker's optional Go concurrency defaults (GOFLAGS=-p=N, GOMAXPROCS=N; issue #3382)
+ *   - the worker's optional Go concurrency defaults (GOFLAGS=-p=N, GOMAXPROCS=N; issue #3382) and
+ *     GOMEMLIMIT (WORKER_GO_MEMLIMIT; an injected run variable named GOMEMLIMIT wins over it)
  *     are set after the fold; absent settings add no key.
  *   - a `toolEnv` entry can NEVER overwrite a boundary literal (PATH/TMPDIR/LANG/HOME) or a
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
@@ -8586,12 +8587,14 @@ export function buildCommandEnv(
   const env = commandPreFoldEnv(tmpdir, toolEnv);
   // PRD #4416 M2: the run's user variables, lowest precedence: after the tool profile, before every
   // worker-set key below, and never a protected key or git config carrier.
-  foldRunEnv(env, runEnv, isCommandRunEnvProtected);
+  const injectedRunEnv = foldRunEnv(env, runEnv, isCommandRunEnvProtected);
   // PRD #4416 M2: the worker-set keys below overwrite a user variable of the same name silently (no
   // drop event); every such key is also denied by name (RUN_ENV_DENIED_NAMES / prefixes), so a user
-  // variable never reaches this point under it.
+  // variable never reaches this point under it. The one exception is GOMEMLIMIT: it is not denied, and
+  // the worker default yields to an injected run variable of that name.
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
+  applyGoMemLimitDefault(env, injectedRunEnv);
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
   if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
   return env;

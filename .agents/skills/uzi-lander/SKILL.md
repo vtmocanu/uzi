@@ -191,9 +191,9 @@ For `unknown`/exit 9 caused by `uzi run list` reporting "cannot reach", "no such
 ## CI-fix branch ownership
 
 `takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
-repo/branch. Recent is the newest terminal run finished within 24 hours, including failed
-and cancelled runs; `unknown` blocks branch work.
-`VISIBILITY=owner_only` means `none` is not factory-wide: references/merge-mechanics.md.
+repo/branch. Recent is the newest terminal run finished within 24 hours (failed and
+cancelled count); `unknown` blocks branch work.
+`VISIBILITY=owner_only` means `none` is not factory-wide; watch a held PR with `--writers-only`: references/merge-mechanics.md.
 
 Before any local fix, push, rebase or merge, refresh the snapshot. With an active ci_fix, decide
 with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`
@@ -205,7 +205,7 @@ Before rebasing or merging after cancellation, confirm terminal state and inspec
 merge, even with green CI. Require the same exact-head buddy review as a small local fix;
 record `ci_fix reviewed ID SHA`. The 24-hour advisory never waives review of older changes.
 After recording that review, handle `RESULT=ci_fix_recent` as exit 1: fix the red CI
-locally in step 4. The advisory still prints until the window expires.
+locally in step 4.
 
 ## The loop
 

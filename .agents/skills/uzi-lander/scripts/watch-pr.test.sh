@@ -20,7 +20,9 @@ cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then [ "${UZI_REPO_FAIL:-}" = 1 ] && exit 1; echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
-if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1
+  if [ -n "${UZI_RUN_LIST_FAIL_ONCE:-}" ] && [ ! -e "$UZI_RUN_LIST_FAIL_ONCE" ]; then : > "$UZI_RUN_LIST_FAIL_ONCE"; exit 1; fi
+  echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
 # cobra prints the parent help (rc 0) for any admin subcommand; the verb line exists only on a new CLI.
 if [ "${1:-}" = admin ] && [ "${2:-}" = --help ]; then printf 'Available Commands:\n  review       x\n'; [ -z "${UZI_ADMIN_RW:-}" ] || printf '  run-writers  y\n'; exit 0; fi
 if [ "${1:-}" = admin ] && [ "${2:-}" = run-writers ]; then [ "${UZI_WRITERS_RC:-0}" -eq 0 ] || exit "$UZI_WRITERS_RC"; printf '%s\n' "$UZI_WRITERS_OUT"; exit 0; fi
@@ -39,7 +41,13 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
         n=$(( $(cat "$MERGEABLE_N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$MERGEABLE_N"
         read -r -a seq <<< "$MERGEABLE_SEQ"; mg=${seq[$(( n <= ${#seq[@]} ? n - 1 : ${#seq[@]} - 1 ))]}
       fi
-      printf '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","headRefName":"agent/issue-1","state":"OPEN","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s"}\n' "$mg" "$([ "$mg" = CONFLICTING ] && echo DIRTY || echo CLEAN)" ;;
+      # HEAD_SEQ="A B": the n-th view's head SHA (the last repeats); default deadbeef….
+      hd=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+      if [ -n "${HEAD_SEQ:-}" ]; then
+        hn=$(( $(cat "$HEAD_N" 2>/dev/null || echo 0) + 1 )); echo "$hn" > "$HEAD_N"
+        read -r -a hseq <<< "$HEAD_SEQ"; hd=${hseq[$(( hn <= ${#hseq[@]} ? hn - 1 : ${#hseq[@]} - 1 ))]}
+      fi
+      printf '{"headRefOid":"%s","headRefName":"agent/issue-1","state":"OPEN","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s"}\n' "$hd" "$mg" "$([ "$mg" = CONFLICTING ] && echo DIRTY || echo CLEAN)" ;;
     *'-q .headRefOid'*) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;
     *'-q .baseRefName'*) echo main ;;
     *) echo "unexpected pr view: $*" >&2; exit 1 ;;
@@ -1045,6 +1053,37 @@ UZI_WRITERS_RC=3 UZI_RUN_LIST_FAIL=1 ci_watch wr-fb-fail 9
 UZI_WRITERS_OUT='{"writers":[],"complete":true}' UZI_RUN_LIST_FAIL=1 ci_watch wr-ok-listfail 9
 grep -qxF 'CI_FIX_RECENT=unknown' "$WORK/ci-wr-ok-listfail.out" || fail 'run-list failure after an authorized read did not leave CI_FIX_RECENT unknown'
 unset UZI_ADMIN_RW UZI_WRITERS_OUT UZI_WRITERS_RC
+
+# --writers-only: a held PR (red head, waiting for a slot) keeps watching for branch writers.
+wo_watch() { # label want_rc [extra args...]
+  local rc=0 label=$1 want=$2; shift 2
+  bash "$SCRIPT" test/repo 42 --writers-only 0 2 --max-unknown 1 "$@" > "$WORK/wo-$label.out" 2>&1 || rc=$?
+  [ "$rc" -eq "$want" ] || fail "wo-$label rc=$rc want=$want: $(cat "$WORK/wo-$label.out")"
+}
+export CHECKS_JSON='[{"name":"ci","bucket":"fail"}]' UZI_RUNS_JSON='[]'
+wo_watch red-quiet 2
+[ "$(grep -c '^try [0-9]*: held head=deadbeef writers=none$' "$WORK/wo-red-quiet.out")" -eq 2 ] || fail 'red held head did not keep polling'
+grep -qxF 'RESULT=timeout' "$WORK/wo-red-quiet.out" || fail 'held watch did not end as a timeout'
+export UZI_RUNS_JSON='[{"id":"fix-new","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"awaiting_approval"}]'
+wo_watch red-cifix 10
+grep -qxF 'RESULT=ci_fix_active' "$WORK/wo-red-cifix.out" || fail 'held watch missed an awaiting_approval ci_fix'
+export UZI_RUNS_JSON='[]' UZI_ADMIN_RW=1
+UZI_WRITERS_OUT='{"writers":[{"run_id":"rw","kind":"mr_rework","status":"running","owner_id":"o2","repo_id":"r1","pipeline_ref":null,"mr_iid":42,"created_at":"t"}],"complete":true}' wo_watch rework 4
+grep -qxF 'RESULT=mr_rework_active' "$WORK/wo-rework.out" || fail 'held watch missed an mr_rework'
+unset UZI_ADMIN_RW
+export HEAD_N="$WORK/head-n" HEAD_SEQ='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+rm -f "$HEAD_N"; wo_watch moved 14
+grep -qxF 'RESULT=head_changed from=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa to=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$WORK/wo-moved.out" || fail 'held watch missed a head move'
+# A head seen while uzi is unreadable is still the baseline: A (lookup fails), then B.
+rm -f "$HEAD_N"
+rc=0; UZI_RUN_LIST_FAIL_ONCE="$WORK/fail-once" bash "$SCRIPT" test/repo 42 --writers-only 0 3 --max-unknown 3 > "$WORK/wo-moved-unknown.out" 2>&1 || rc=$?
+[ "$rc" -eq 14 ] || fail "head move after an unreadable lookup rc=$rc: $(cat "$WORK/wo-moved-unknown.out")"
+grep -qxF 'RESULT=head_changed from=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa to=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$WORK/wo-moved-unknown.out" || fail 'unreadable first poll moved the held baseline'
+unset HEAD_SEQ HEAD_N
+UZI_RUN_LIST_FAIL=1 wo_watch unknown 9
+grep -qxF 'CI_FIX_ACTIVE=unknown' "$WORK/wo-unknown.out" || fail 'held watch read an unreadable run list as none'
+wo_watch with-since 2 --since deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+grep -qF 'exclusive' "$WORK/wo-with-since.out" || fail '--writers-only accepted --since'
 unset UZI_REPO_JSON UZI_RUNS_JSON CHECKS_JSON
 
 # Author mode is isolated from readiness fixtures. Unexpected gate or write calls fail.
