@@ -79,7 +79,25 @@ const hostUnsafe = codePoints(mustMatch(manifestSrc, /const UNSAFE_TEXT_RE =\s*\
 const chartUnsafe = codePoints(mustMatch(chartTpl, /\$unsafe := `\[(.*?)\]`/s, "the chart $unsafe"));
 const genUnsafe = codePoints(mustMatch(generatorSrc, /^UNSAFE_TEXT_RE = re\.compile\("\[(.*?)\]"\)/ms, "the generator UNSAFE_TEXT_RE"));
 
+// The navSection length limit: the host and generator constants, and the chart's regex bound
+// and failure message (the chart has no constant; both literals must carry the same number).
+const hostNavSectionMax = Number(mustMatch(manifestSrc, /^const NAV_SECTION_MAX = (\d+);$/m, "the host NAV_SECTION_MAX"));
+const genNavSectionMax = Number(mustMatch(generatorSrc, /^NAV_SECTION_MAX = (\d+)$/m, "the generator NAV_SECTION_MAX"));
+const chartNavSectionRegexMax = Number(
+  mustMatch(chartTpl, /regexMatch `\(\?s\)\^\.\{1,(\d+)\}\$` \$navSection/, "the chart navSection length regex"),
+);
+const chartNavSectionMessageMax = Number(
+  mustMatch(chartTpl, /navSection must be 1 to (\d+) characters after trimming whitespace/, "the chart navSection length message"),
+);
+
 describe("module vocabulary parity across the host, the chart and the compose generator", () => {
+  it("navSection length limit: the chart and the generator equal the host's", () => {
+    expect(hostNavSectionMax).toBe(24);
+    expect(genNavSectionMax).toBe(hostNavSectionMax);
+    expect(chartNavSectionRegexMax).toBe(hostNavSectionMax);
+    expect(chartNavSectionMessageMax).toBe(hostNavSectionMax);
+  });
+
   it("icon names: the chart and the generator equal MODULE_ICON_NAMES", () => {
     expect(MODULE_ICON_NAMES.length).toBeGreaterThan(10);
     expect(sorted(chartIcons)).toEqual(sorted(MODULE_ICON_NAMES));

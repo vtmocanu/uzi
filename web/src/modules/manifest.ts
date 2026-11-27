@@ -24,6 +24,8 @@ export interface ModuleEntry {
 const MODULE_ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const NAV_GROUPS: readonly string[] = ["work", "factory", "modules"];
 const LABEL_MAX = 40;
+// The navSection length limit in code points. Keep equal to NAV_SECTION_MAX in
+// scripts/web-modules-gen.py and the chart's navSection check; parity.test.ts pins all three.
 const NAV_SECTION_MAX = 24;
 // C0/C1 controls, zero-width and directional marks (U+200B-200F), bidi embeddings and
 // overrides (U+202A-202E), bidi isolates (U+2066-2069), the line/paragraph separators, the Arabic
