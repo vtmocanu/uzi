@@ -48,8 +48,16 @@ func hrWantAfterPass(t *testing.T, f *hrFx, fresh time.Time) {
 	}
 }
 
-func TestHistoryRetentionPassOffThenOnLiveDB(t *testing.T) {
-	f := newHrFx(t)
+// TestHistoryRetentionPassLiveDB runs the production pass on one shared database, one subtest per
+// case (each starts from emptied history tables).
+func TestHistoryRetentionPassLiveDB(t *testing.T) {
+	root := newHrFx(t)
+	root.run(t, "off then on", hrPassOffThenOn)
+	root.run(t, "contended", hrPassContended)
+	root.run(t, "capacity sampler stamps the current bucket", hrCapacitySamplerBucket)
+}
+
+func hrPassOffThenOn(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
 	before := map[store.HistoryRetentionTable]int{}
 	for _, table := range hrTables {
@@ -75,8 +83,7 @@ func TestHistoryRetentionPassOffThenOnLiveDB(t *testing.T) {
 	hrWantAfterPass(t, f, fresh)
 }
 
-func TestHistoryRetentionPassContendedLiveDB(t *testing.T) {
-	f := newHrFx(t)
+func hrPassContended(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
 	pass := historyretention.New(f.pool, 24*time.Hour)
 
@@ -112,10 +119,34 @@ func TestHistoryRetentionPassContendedLiveDB(t *testing.T) {
 	}
 }
 
+// hrCapacitySamplerBucket characterizes the UNCHANGED capacity sampler: it stamps the database
+// clock, so the sample it writes is in the current five-minute bucket.
+func hrCapacitySamplerBucket(t *testing.T, f *hrFx) {
+	owner := f.user()
+	hb := time.Now().UTC()
+	w := f.worker(owner, wcsWorkerOpts{heartbeat: &hb})
+	row, err := f.q.SampleWorkerCapacityBatch(f.ctx, store.SampleWorkerCapacityBatchParams{
+		StaleAfter: pgtype.Interval{Microseconds: wcsStaleAfter.Microseconds(), Valid: true},
+		BatchSize:  10,
+	})
+	if err != nil || row.Inserted != 1 {
+		t.Fatalf("sampler = (%+v, %v), want 1 inserted", row, err)
+	}
+	var micros int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT (extract(epoch FROM (now() - bucket_start)) * 1000000)::bigint FROM worker_capacity_samples WHERE worker_id = $1`, w).Scan(&micros); err != nil {
+		t.Fatal(err)
+	}
+	age := time.Duration(micros) * time.Microsecond
+	if age < 0 || age > 5*time.Minute+time.Minute {
+		t.Errorf("sample bucket age = %v, want the current five-minute bucket (0..5m)", age)
+	}
+}
+
 // TestHistoryRetentionWritersAdmitOnlyInWindowLiveDB characterizes the UNCHANGED writers (the
 // retention change touches none): the provider usage copies admit a reading only when it is
 // newer than one hour on the database clock, and the capacity sampler stamps the database clock,
-// so no writer produces a row older than about 65 minutes. That is what keeps a retention of
+// so no writer produces a row older than about 65 minutes (the capacity sampler half is
+// hrCapacitySamplerBucket, in TestHistoryRetentionPassLiveDB). That is what keeps a retention of
 // 24h or more from deleting a row a writer has just admitted.
 func TestHistoryRetentionWritersAdmitOnlyInWindowLiveDB(t *testing.T) {
 	const maxAge = 65 * time.Minute
@@ -177,29 +208,6 @@ func TestHistoryRetentionWritersAdmitOnlyInWindowLiveDB(t *testing.T) {
 		}
 		if got := countRows(ctx, t, pool, "codex_usage_samples", user); got != 1 {
 			t.Errorf("codex samples = %d, want exactly the one admitted", got)
-		}
-	})
-
-	t.Run("capacity sampler", func(t *testing.T) {
-		f := newWcsFx(t)
-		owner := f.user()
-		hb := time.Now().UTC()
-		w := f.worker(owner, wcsWorkerOpts{heartbeat: &hb})
-		row, err := f.q.SampleWorkerCapacityBatch(f.ctx, store.SampleWorkerCapacityBatchParams{
-			StaleAfter: pgtype.Interval{Microseconds: wcsStaleAfter.Microseconds(), Valid: true},
-			BatchSize:  10,
-		})
-		if err != nil || row.Inserted != 1 {
-			t.Fatalf("sampler = (%+v, %v), want 1 inserted", row, err)
-		}
-		var age time.Duration
-		var micros int64
-		if err := f.pool.QueryRow(f.ctx, `SELECT (extract(epoch FROM (now() - bucket_start)) * 1000000)::bigint FROM worker_capacity_samples WHERE worker_id = $1`, w).Scan(&micros); err != nil {
-			t.Fatal(err)
-		}
-		age = time.Duration(micros) * time.Microsecond
-		if age < 0 || age > 5*time.Minute+time.Minute {
-			t.Errorf("sample bucket age = %v, want the current five-minute bucket (0..5m)", age)
 		}
 	})
 }

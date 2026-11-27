@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -369,60 +370,138 @@ func TestPassReturnsWithinBudgetWithBlockingSession(t *testing.T) {
 	}
 }
 
-func TestPassStarvationOverManyTicks(t *testing.T) {
-	// Four failure shapes, one per table, over 12 ticks that alternate between two instances
-	// (each with its own rotation counter): every table must still be attempted as the leading
-	// table at least once, and the healthy table must make progress in every tick that reaches it.
-	type shape struct {
-		table store.HistoryRetentionTable
-		fn    func(int, int32, context.Context) (int64, error)
-	}
-	shapes := []shape{
-		{tPR, func(int, int32, context.Context) (int64, error) { return 0, rollback(tPR, "55P03") }},
-		{tAnth, func(_ int, _ int32, ctx context.Context) (int64, error) { return 0, timeoutErr(tAnth) }},
-		{tCodex, func(int, int32, context.Context) (int64, error) { return 0, errors.New("connection reset") }},
-		{tCap, nil},
-	}
-	leading := map[store.HistoryRetentionTable]int{}
-	attempted := map[store.HistoryRetentionTable]int{}
-	instances := []*Retention{nil, nil}
+type starveFn = func(int, int32, context.Context) (int64, error)
+
+// starvationRun drives len(schedule) ticks. schedule[i] names the instance (an index into
+// counters, each its own rotation counter) that wins tick i. The shared fake clock is reset to
+// the real time at the start of every tick, so the contexts are live; a shape can advance it to
+// consume the work budget without a real sleep. It returns, per instance, the set of tables
+// attempted in each tick that instance won, in order.
+func starvationRun(t *testing.T, shapes map[store.HistoryRetentionTable]func(clock *time.Time) starveFn, counters []uint64, schedule []int) [][]map[store.HistoryRetentionTable]bool {
+	t.Helper()
+	var clock time.Time
 	var sessions []*fakeSession
 	opener := func(context.Context, context.Context) (session, bool, error) {
 		f := newFake()
-		for _, s := range shapes {
-			if s.fn != nil {
-				f.script[s.table] = s.fn
-			}
+		for table, mk := range shapes {
+			f.script[table] = mk(&clock)
 		}
 		sessions = append(sessions, f)
 		return f, true, nil
 	}
-	instances[0] = newRetention(opener, time.Now, 24*time.Hour, 1)
-	instances[1] = newRetention(opener, time.Now, 24*time.Hour, 3)
-	for tick := 0; tick < 12; tick++ {
-		// instance 0 wins ticks 0,1,2,3,... except where instance 1 wins: alternate unevenly
-		inst := instances[0]
-		if tick%3 == 2 {
-			inst = instances[1]
+	instances := make([]*Retention, len(counters))
+	for i, c := range counters {
+		instances[i] = newRetention(opener, func() time.Time { return clock }, 24*time.Hour, c)
+	}
+	wins := make([][]map[store.HistoryRetentionTable]bool, len(counters))
+	for _, inst := range schedule {
+		clock = time.Now()
+		before := len(sessions)
+		_, _ = instances[inst].Pass(context.Background())
+		if len(sessions) != before+1 {
+			t.Fatalf("a tick opened %d sessions, want 1", len(sessions)-before)
 		}
-		_, _ = inst.Pass(context.Background())
-		last := sessions[len(sessions)-1]
-		if len(last.calls) > 0 {
-			leading[last.calls[0].table]++
+		got := map[store.HistoryRetentionTable]bool{}
+		for _, c := range sessions[before].calls {
+			got[c.table] = true
 		}
-		for _, c := range last.calls {
-			attempted[c.table]++
+		wins[inst] = append(wins[inst], got)
+	}
+	return wins
+}
+
+// assertEveryTableWithinFour fails when, in any four consecutive ticks won by one instance, a
+// table in want was never attempted (the rotation advances once per lock-holding tick, so each
+// table leads once per four).
+func assertEveryTableWithinFour(t *testing.T, wins [][]map[store.HistoryRetentionTable]bool, want []store.HistoryRetentionTable) {
+	t.Helper()
+	for inst, ticks := range wins {
+		if len(ticks) < 8 {
+			t.Fatalf("instance %d won only %d ticks, want at least 8", inst, len(ticks))
+		}
+		for from := 0; from+4 <= len(ticks); from++ {
+			for _, tb := range want {
+				seen := false
+				for _, tick := range ticks[from : from+4] {
+					seen = seen || tick[tb]
+				}
+				if !seen {
+					t.Errorf("instance %d: %s was not attempted in its ticks %d..%d (attempted per tick: %v)", inst, tb, from, from+3, ticks[from:from+4])
+				}
+			}
 		}
 	}
-	for _, tb := range baseOrder {
-		if leading[tb] == 0 {
-			t.Errorf("%s never led a tick over 12 ticks (leading=%v)", tb, leading)
+}
+
+// unevenSchedule is n ticks in which instance 1 wins every third one and instance 0 the rest.
+func unevenSchedule(n int) []int {
+	out := make([]int, n)
+	for i := range out {
+		if i%3 == 2 {
+			out[i] = 1
 		}
 	}
-	// the tick ends at the connection error, so a table after it is reached only when it leads
-	// or sits before the failing table; the healthy table must at least be reached whenever it leads
-	if attempted[tCap] < leading[tCap] || attempted[tCap] < 2 {
-		t.Errorf("healthy table attempted %d times over 12 ticks (led %d), want it reached every time it leads (attempted=%v)", attempted[tCap], leading[tCap], attempted)
+	return out
+}
+
+func TestPassStarvationOverManyTicks(t *testing.T) {
+	// One failure shape per table over 24 ticks that alternate unevenly between two instances
+	// (each with its own rotation counter): a known rollback, a statement timeout and a connection
+	// error. A table that is skipped by the tick that failed before it must still lead, and so be
+	// attempted, within four ticks of the instance that won them.
+	shapes := map[store.HistoryRetentionTable]func(*time.Time) starveFn{
+		tPR: func(*time.Time) starveFn {
+			return func(int, int32, context.Context) (int64, error) { return 0, rollback(tPR, "55P03") }
+		},
+		tAnth: func(*time.Time) starveFn {
+			return func(int, int32, context.Context) (int64, error) { return 0, timeoutErr(tAnth) }
+		},
+		tCodex: func(*time.Time) starveFn {
+			return func(int, int32, context.Context) (int64, error) { return 0, errors.New("connection reset") }
+		},
+	}
+	wins := starvationRun(t, shapes, []uint64{1, 3}, unevenSchedule(24))
+	assertEveryTableWithinFour(t, wins, baseOrder)
+}
+
+func TestPassStarvationDeadlineTable(t *testing.T) {
+	// pr_history_events consumes the whole work budget whenever it is reached (the fake clock
+	// jumps past the work deadline, as a statement that ran to the client deadline would). Every
+	// other table must still get an attempt within four ticks, alone and with two instances
+	// alternating, whatever position the blocking table has in a rotation.
+	blocking := map[store.HistoryRetentionTable]func(*time.Time) starveFn{
+		tPR: func(clock *time.Time) starveFn {
+			return func(int, int32, context.Context) (int64, error) {
+				*clock = clock.Add(totalBudget)
+				return 0, fmt.Errorf("delete %s: %w", tPR, context.DeadlineExceeded)
+			}
+		},
+	}
+	others := []store.HistoryRetentionTable{tAnth, tCodex, tCap}
+	for _, tc := range []struct {
+		name     string
+		counters []uint64
+		schedule []int
+	}{
+		{"one instance", []uint64{0}, make([]int, 12)},
+		{"one instance, random start", []uint64{6}, make([]int, 12)},
+		{"two instances", []uint64{1, 3}, unevenSchedule(24)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wins := starvationRun(t, blocking, tc.counters, tc.schedule)
+			assertEveryTableWithinFour(t, wins, others)
+			// The blocking table must itself be reached (it is what exhausts the budget), or the
+			// scenario never exercised the deadline.
+			reached := false
+			for _, ticks := range wins {
+				for _, tick := range ticks {
+					reached = reached || tick[tPR]
+				}
+			}
+			if !reached {
+				t.Fatal("the deadline table was never attempted")
+			}
+		})
 	}
 }
 

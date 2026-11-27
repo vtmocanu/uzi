@@ -18,8 +18,12 @@ import (
 
 // history_retention_livedb_test.go drives the session half of the history_retention pass (issue
 // #4695) against PostgreSQL: the pinned lock, the cutoff statement and the four batch deletes.
-// Every test stands its own isolated database (newWcsFx), because a delete test must never see
-// another test's rows. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run
+// Each top-level test stands ONE isolated database (newHrFx, which uses newWcsFx), because a delete
+// test must never see another top-level test's rows; its subtests share that database and each
+// starts from emptied history tables (hrFx.run). Standing a database (create plus migrate) costs
+// about four seconds, so one per table or per case dominated the package's LiveDB time. The tests
+// do not use t.Parallel: the surrounding store LiveDB tests do not, and lockHolders counts the
+// advisory lock server-wide, so two tests holding it at once would confuse each other. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run
 // via ./e2e/run-store-it.sh. The session tests live in package store_test (not store) so they
 // can use the isolated-database helpers; the unexported seams come from
 // history_retention_export_test.go.
@@ -84,6 +88,33 @@ func (f *hrFx) seedFirstMerge(n int, at time.Time) {
 	f.exec(`INSERT INTO pr_history_events (repo_id, mr_iid, to_state, time_source, observed_at, bootstrap, first_merge)
 	        SELECT $1, $2::bigint + g, 'merged', 'observation_fallback', $3, true, true FROM generate_series(1, $4::int) g`,
 		f.repoQ, f.nextIID(n), at, n)
+}
+
+// sub returns a view of the fixture bound to the subtest t, so fixture failures and cleanups
+// belong to that subtest while the database, pool and rows stay shared.
+func (f *hrFx) sub(t *testing.T) *hrFx {
+	g := *f
+	w := *f.wcsFx
+	w.t = t
+	g.wcsFx = &w
+	return &g
+}
+
+// reset empties every table the retention pass reads or protects, so a subtest never sees another
+// subtest's rows.
+func (f *hrFx) reset() {
+	f.t.Helper()
+	f.exec(`TRUNCATE pr_history_events, pr_history_heads, anthropic_usage_samples, codex_usage_samples, worker_capacity_samples`)
+}
+
+// run runs fn as a subtest on a reset, subtest-bound view of the shared fixture.
+func (f *hrFx) run(t *testing.T, name string, fn func(t *testing.T, f *hrFx)) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) {
+		g := f.sub(t)
+		g.reset()
+		fn(t, g)
+	})
 }
 
 func (f *hrFx) nextIID(n int) int64 {
@@ -151,30 +182,33 @@ func hrMustDelete(t *testing.T, s *store.HistoryRetentionSession, table store.Hi
 	}
 }
 
-func TestHistoryRetentionBoundaryPRHistoryEventsLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	s := f.open(time.Second, time.Second)
-	c := hrBase.Add(36*time.Hour + 123456*time.Microsecond)
-	for _, at := range []time.Time{c.Add(-time.Microsecond), c, c.Add(time.Microsecond)} {
-		f.seed(store.HistoryRetentionPRHistoryEvents, 1, at)
-	}
-	hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, c, 1000, 1)
-	if f.countAt(store.HistoryRetentionPRHistoryEvents, c.Add(-time.Microsecond)) != 0 {
-		t.Error("the row 1µs before the cutoff was kept")
-	}
-	if f.countAt(store.HistoryRetentionPRHistoryEvents, c) != 1 {
-		t.Error("the row exactly at the cutoff was deleted (the comparison must be strict)")
-	}
-	if f.countAt(store.HistoryRetentionPRHistoryEvents, c.Add(time.Microsecond)) != 1 {
-		t.Error("the row 1µs after the cutoff was deleted")
-	}
-	hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, c, 1000, 0)
-}
+// TestHistoryRetentionDeleteLiveDB drives the delete half of the session: the strict boundaries,
+// the exact cutoff, protected rows, batching, row-lock skipping, the server-side timeouts, the
+// abandoned-statement path, the refusals and the plan shape. One database, one subtest per case.
+func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
+	root := newHrFx(t)
 
-func TestHistoryRetentionBoundarySampleTablesLiveDB(t *testing.T) {
+	root.run(t, "boundary pr_history_events", func(t *testing.T, f *hrFx) {
+		s := f.open(time.Second, time.Second)
+		c := hrBase.Add(36*time.Hour + 123456*time.Microsecond)
+		for _, at := range []time.Time{c.Add(-time.Microsecond), c, c.Add(time.Microsecond)} {
+			f.seed(store.HistoryRetentionPRHistoryEvents, 1, at)
+		}
+		hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, c, 1000, 1)
+		if f.countAt(store.HistoryRetentionPRHistoryEvents, c.Add(-time.Microsecond)) != 0 {
+			t.Error("the row 1µs before the cutoff was kept")
+		}
+		if f.countAt(store.HistoryRetentionPRHistoryEvents, c) != 1 {
+			t.Error("the row exactly at the cutoff was deleted (the comparison must be strict)")
+		}
+		if f.countAt(store.HistoryRetentionPRHistoryEvents, c.Add(time.Microsecond)) != 1 {
+			t.Error("the row 1µs after the cutoff was deleted")
+		}
+		hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, c, 1000, 0)
+	})
+
 	for _, table := range hrTables[1:] {
-		t.Run(string(table), func(t *testing.T) {
-			f := newHrFx(t)
+		root.run(t, "boundary "+string(table), func(t *testing.T, f *hrFx) {
 			s := f.open(time.Second, time.Second)
 			b := hrBase.Add(10 * time.Hour) // a bucket boundary
 			for _, at := range []time.Time{b.Add(-5 * time.Minute), b, b.Add(5 * time.Minute)} {
@@ -190,56 +224,51 @@ func TestHistoryRetentionBoundarySampleTablesLiveDB(t *testing.T) {
 			}
 		})
 	}
-}
 
-func TestHistoryRetentionCutoffExactLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	s := f.open(time.Second, time.Second)
-	retention := 720*time.Hour + 1234567*time.Microsecond
-	before := time.Now()
-	ref, cut, err := s.Cutoff(f.ctx, retention)
-	after := time.Now()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := ref.Sub(cut); got != retention {
-		t.Errorf("reference - cutoff = %v, want exactly %v", got, retention)
-	}
-	// The reference is the database clock; the test and the database share the host clock.
-	if ref.Before(before.Add(-time.Millisecond)) || ref.After(after.Add(time.Millisecond)) {
-		t.Errorf("reference %v is not between the client readings %v and %v", ref, before, after)
-	}
-	for _, bad := range []time.Duration{0, -time.Hour} {
-		if _, _, err := s.Cutoff(f.ctx, bad); err == nil {
-			t.Errorf("Cutoff(%v) succeeded, want a refusal", bad)
+	root.run(t, "cutoff exact", func(t *testing.T, f *hrFx) {
+		s := f.open(time.Second, time.Second)
+		retention := 720*time.Hour + 1234567*time.Microsecond
+		before := time.Now()
+		ref, cut, err := s.Cutoff(f.ctx, retention)
+		after := time.Now()
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-}
+		if got := ref.Sub(cut); got != retention {
+			t.Errorf("reference - cutoff = %v, want exactly %v", got, retention)
+		}
+		// The reference is the database clock; the test and the database share the host clock.
+		if ref.Before(before.Add(-time.Millisecond)) || ref.After(after.Add(time.Millisecond)) {
+			t.Errorf("reference %v is not between the client readings %v and %v", ref, before, after)
+		}
+		for _, bad := range []time.Duration{0, -time.Hour} {
+			if _, _, err := s.Cutoff(f.ctx, bad); err == nil {
+				t.Errorf("Cutoff(%v) succeeded, want a refusal", bad)
+			}
+		}
+	})
 
-func TestHistoryRetentionProtectedRowsLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	s := f.open(time.Second, time.Second)
-	old := hrBase
-	f.seed(store.HistoryRetentionPRHistoryEvents, 4, old)
-	f.seedFirstMerge(3, old)
-	f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_to_state)
-	        SELECT $1, $2::bigint + g, 'merged', $3, 'merged' FROM generate_series(1, 5) g`, f.repoQ, f.nextIID(5), old)
-	hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, old.Add(24*time.Hour), 1000, 4)
-	if got := f.count(`SELECT count(*) FROM pr_history_events WHERE first_merge`); got != 3 {
-		t.Errorf("first_merge events = %d, want all 3 kept", got)
-	}
-	if got := f.total(store.HistoryRetentionPRHistoryEvents); got != 3 {
-		t.Errorf("pr_history_events rows = %d, want only the 3 protected ones", got)
-	}
-	if got := f.count(`SELECT count(*) FROM pr_history_heads`); got != 5 {
-		t.Errorf("pr_history_heads rows = %d, want all 5 kept", got)
-	}
-}
+	root.run(t, "protected rows", func(t *testing.T, f *hrFx) {
+		s := f.open(time.Second, time.Second)
+		old := hrBase
+		f.seed(store.HistoryRetentionPRHistoryEvents, 4, old)
+		f.seedFirstMerge(3, old)
+		f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_to_state)
+		        SELECT $1, $2::bigint + g, 'merged', $3, 'merged' FROM generate_series(1, 5) g`, f.repoQ, f.nextIID(5), old)
+		hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, old.Add(24*time.Hour), 1000, 4)
+		if got := f.count(`SELECT count(*) FROM pr_history_events WHERE first_merge`); got != 3 {
+			t.Errorf("first_merge events = %d, want all 3 kept", got)
+		}
+		if got := f.total(store.HistoryRetentionPRHistoryEvents); got != 3 {
+			t.Errorf("pr_history_events rows = %d, want only the 3 protected ones", got)
+		}
+		if got := f.count(`SELECT count(*) FROM pr_history_heads`); got != 5 {
+			t.Errorf("pr_history_heads rows = %d, want all 5 kept", got)
+		}
+	})
 
-func TestHistoryRetentionBatchingLiveDB(t *testing.T) {
 	for _, table := range hrTables {
-		t.Run(string(table), func(t *testing.T) {
-			f := newHrFx(t)
+		root.run(t, "batching "+string(table), func(t *testing.T, f *hrFx) {
 			s := f.open(5*time.Second, time.Second)
 			f.seed(table, 1500, hrBase)
 			cutoff := hrBase.Add(time.Hour)
@@ -251,12 +280,9 @@ func TestHistoryRetentionBatchingLiveDB(t *testing.T) {
 			hrMustDelete(t, s, table, cutoff, 1000, 0)
 		})
 	}
-}
 
-func TestHistoryRetentionRowLockSkipLiveDB(t *testing.T) {
 	for _, table := range hrTables {
-		t.Run(string(table), func(t *testing.T) {
-			f := newHrFx(t)
+		root.run(t, "row lock skip "+string(table), func(t *testing.T, f *hrFx) {
 			s := f.open(5*time.Second, 5*time.Second)
 			f.seed(table, 10, hrBase)
 			tx, err := f.pool.Begin(f.ctx)
@@ -278,137 +304,163 @@ func TestHistoryRetentionRowLockSkipLiveDB(t *testing.T) {
 			hrMustDelete(t, s, table, hrBase.Add(time.Hour), 1000, 3)
 		})
 	}
-}
 
-func TestHistoryRetentionRelationLockLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	s := f.open(300*time.Millisecond, 200*time.Millisecond)
-	for _, table := range hrTables {
+	root.run(t, "relation lock", func(t *testing.T, f *hrFx) {
+		s := f.open(300*time.Millisecond, 200*time.Millisecond)
+		for _, table := range hrTables {
+			f.seed(table, 5, hrBase)
+		}
+		locked := store.HistoryRetentionPRHistoryEvents
+		release := f.lockRelation(locked)
+		cutoff := hrBase.Add(time.Hour)
+
+		start := time.Now()
+		n, err := s.DeleteBatch(f.ctx, locked, cutoff, 1000)
+		t.Logf("delete on a relation held ACCESS EXCLUSIVE: returned after %v (lock_timeout 200ms): n=%d err=%v", time.Since(start), n, err)
+		var rb *store.HistoryRetentionRollbackError
+		if !errors.As(err, &rb) || rb.Code != "55P03" || rb.StatementTimeout() || n != 0 {
+			t.Fatalf("delete on the locked table = (%d, %v), want a known 55P03 rollback with 0 rows", n, err)
+		}
+		if !s.Idle() {
+			t.Fatal("session is not idle after a known rollback")
+		}
+		for _, other := range hrTables[1:] {
+			hrMustDelete(t, s, other, cutoff, 1000, 5)
+		}
+		release()
+		if got := f.total(locked); got != 5 {
+			t.Fatalf("%s count after release = %d, want the 5 rows unchanged", locked, got)
+		}
+		hrMustDelete(t, s, locked, cutoff, 1000, 5)
+	})
+
+	root.run(t, "server timeout", func(t *testing.T, f *hrFx) {
+		// statement_timeout fires first: the lock wait is far longer than the statement bound.
+		s := f.open(150*time.Millisecond, 10*time.Second)
+		table := store.HistoryRetentionAnthropicUsage
 		f.seed(table, 5, hrBase)
-	}
-	locked := store.HistoryRetentionPRHistoryEvents
-	release := f.lockRelation(locked)
-	cutoff := hrBase.Add(time.Hour)
-
-	start := time.Now()
-	n, err := s.DeleteBatch(f.ctx, locked, cutoff, 1000)
-	t.Logf("delete on a relation held ACCESS EXCLUSIVE: returned after %v (lock_timeout 200ms): n=%d err=%v", time.Since(start), n, err)
-	var rb *store.HistoryRetentionRollbackError
-	if !errors.As(err, &rb) || rb.Code != "55P03" || rb.StatementTimeout() || n != 0 {
-		t.Fatalf("delete on the locked table = (%d, %v), want a known 55P03 rollback with 0 rows", n, err)
-	}
-	if !s.Idle() {
-		t.Fatal("session is not idle after a known rollback")
-	}
-	for _, other := range hrTables[1:] {
-		hrMustDelete(t, s, other, cutoff, 1000, 5)
-	}
-	release()
-	if got := f.total(locked); got != 5 {
-		t.Fatalf("%s count after release = %d, want the 5 rows unchanged", locked, got)
-	}
-	hrMustDelete(t, s, locked, cutoff, 1000, 5)
-}
-
-func TestHistoryRetentionServerTimeoutLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	// statement_timeout fires first: the lock wait is far longer than the statement bound.
-	s := f.open(150*time.Millisecond, 10*time.Second)
-	table := store.HistoryRetentionAnthropicUsage
-	f.seed(table, 5, hrBase)
-	release := f.lockRelation(table)
-	start := time.Now()
-	n, err := s.DeleteBatch(f.ctx, table, hrBase.Add(time.Hour), 1000)
-	t.Logf("statement_timeout 150ms against a held relation lock: returned after %v", time.Since(start))
-	var rb *store.HistoryRetentionRollbackError
-	if !errors.As(err, &rb) || rb.Code != "57014" || !rb.StatementTimeout() || n != 0 {
-		t.Fatalf("delete = (%d, %v), want a known 57014 rollback with 0 rows", n, err)
-	}
-	if !s.Idle() {
-		t.Fatal("session is not idle after a statement timeout")
-	}
-	release()
-	if got := f.total(table); got != 5 {
-		t.Fatalf("count after the timeout = %d, want 5 unchanged", got)
-	}
-}
-
-func TestHistoryRetentionCancelAndReacquireLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	table := store.HistoryRetentionPRHistoryEvents
-	f.seed(table, 5, hrBase)
-	s := f.open(5*time.Second, 5*time.Second)
-	pid := s.PIDForTest()
-	release := f.lockRelation(table)
-
-	workCtx, cancelWork := context.WithTimeout(f.ctx, 1500*time.Millisecond)
-	defer cancelWork()
-	type res struct {
-		n   int64
-		err error
-		at  time.Duration
-	}
-	started := time.Now()
-	done := make(chan res, 1)
-	go func() {
-		n, err := s.DeleteBatch(workCtx, table, hrBase.Add(time.Hour), 1000)
-		done <- res{n, err, time.Since(started)}
-	}()
-	waiting := false
-	for deadline := time.Now().Add(1200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		if f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, int64(pid)) == 1 {
-			waiting = true
-			break
+		release := f.lockRelation(table)
+		start := time.Now()
+		n, err := s.DeleteBatch(f.ctx, table, hrBase.Add(time.Hour), 1000)
+		t.Logf("statement_timeout 150ms against a held relation lock: returned after %v", time.Since(start))
+		var rb *store.HistoryRetentionRollbackError
+		if !errors.As(err, &rb) || rb.Code != "57014" || !rb.StatementTimeout() || n != 0 {
+			t.Fatalf("delete = (%d, %v), want a known 57014 rollback with 0 rows", n, err)
 		}
-	}
-	if !waiting {
-		t.Fatal("the delete never showed wait_event_type = Lock in pg_stat_activity")
-	}
-	r := <-done
-	t.Logf("work context expired: DeleteBatch returned after %v", r.at)
-	var rb *store.HistoryRetentionRollbackError
-	if r.err == nil || errors.As(r.err, &rb) || r.n != 0 {
-		t.Fatalf("DeleteBatch = (%d, %v), want an UNKNOWN outcome (not a known rollback)", r.n, r.err)
-	}
-	if !strings.Contains(r.err.Error(), string(table)) {
-		t.Errorf("unknown-outcome error %q does not name the table %s", r.err, table)
-	}
-
-	cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, time.Second)
-	defer cancelCleanup()
-	closeStart := time.Now()
-	unlocked, cerr := s.Close(cleanupCtx)
-	t.Logf("production Close(cleanupCtx) returned after %v (unlocked=%v err=%v)", time.Since(closeStart), unlocked, cerr)
-	if unlocked {
-		t.Error("Close claims a proven unlock on a session whose statement was abandoned")
-	}
-
-	exitStart := time.Now()
-	for f.pidAlive(pid) {
-		if time.Since(exitStart) > 3*time.Second {
-			t.Fatalf("backend %d still alive 3s after Close (idle_session_timeout is 5s, so only the close can end it)", pid)
+		if !s.Idle() {
+			t.Fatal("session is not idle after a statement timeout")
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Logf("backend pid %d exited %v after Close", pid, time.Since(exitStart))
+		release()
+		if got := f.total(table); got != 5 {
+			t.Fatalf("count after the timeout = %d, want 5 unchanged", got)
+		}
+	})
 
-	reacquireStart := time.Now()
-	for {
-		s2, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)
-		if err == nil && got {
-			t.Logf("second open acquired the lock %v after Close", time.Since(reacquireStart))
-			_, _ = s2.Close(f.ctx)
-			break
+	root.run(t, "cancel and reacquire", func(t *testing.T, f *hrFx) {
+		table := store.HistoryRetentionPRHistoryEvents
+		f.seed(table, 5, hrBase)
+		s := f.open(5*time.Second, 5*time.Second)
+		pid := s.PIDForTest()
+		release := f.lockRelation(table)
+
+		workCtx, cancelWork := context.WithTimeout(f.ctx, 1500*time.Millisecond)
+		defer cancelWork()
+		type res struct {
+			n   int64
+			err error
+			at  time.Duration
 		}
-		if time.Since(reacquireStart) > 3*time.Second {
-			t.Fatalf("lock not reacquirable 3s after Close (got=%v err=%v)", got, err)
+		started := time.Now()
+		done := make(chan res, 1)
+		go func() {
+			n, err := s.DeleteBatch(workCtx, table, hrBase.Add(time.Hour), 1000)
+			done <- res{n, err, time.Since(started)}
+		}()
+		waiting := false
+		for deadline := time.Now().Add(1200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, int64(pid)) == 1 {
+				waiting = true
+				break
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	release()
-	if got := f.total(table); got != 5 {
-		t.Fatalf("count after release = %d, want 5 unchanged", got)
-	}
+		if !waiting {
+			t.Fatal("the delete never showed wait_event_type = Lock in pg_stat_activity")
+		}
+		r := <-done
+		t.Logf("work context expired: DeleteBatch returned after %v", r.at)
+		var rb *store.HistoryRetentionRollbackError
+		if r.err == nil || errors.As(r.err, &rb) || r.n != 0 {
+			t.Fatalf("DeleteBatch = (%d, %v), want an UNKNOWN outcome (not a known rollback)", r.n, r.err)
+		}
+		if !strings.Contains(r.err.Error(), string(table)) {
+			t.Errorf("unknown-outcome error %q does not name the table %s", r.err, table)
+		}
+
+		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, time.Second)
+		defer cancelCleanup()
+		closeStart := time.Now()
+		unlocked, cerr := s.Close(cleanupCtx)
+		t.Logf("production Close(cleanupCtx) returned after %v (unlocked=%v err=%v)", time.Since(closeStart), unlocked, cerr)
+		if unlocked {
+			t.Error("Close claims a proven unlock on a session whose statement was abandoned")
+		}
+
+		exitStart := time.Now()
+		for f.pidAlive(pid) {
+			if time.Since(exitStart) > 3*time.Second {
+				t.Fatalf("backend %d still alive 3s after the work context expired and Close ran (idle_session_timeout is 5s, so only the client side can end it: when the context expires pgx itself sends the cancel request and the terminate, and Close then finds a closed connection and does nothing)", pid)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Logf("backend pid %d exited %v after Close", pid, time.Since(exitStart))
+
+		reacquireStart := time.Now()
+		for {
+			s2, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)
+			if err == nil && got {
+				t.Logf("second open acquired the lock %v after Close", time.Since(reacquireStart))
+				_, _ = s2.Close(f.ctx)
+				break
+			}
+			if time.Since(reacquireStart) > 3*time.Second {
+				t.Fatalf("lock not reacquirable 3s after Close (got=%v err=%v)", got, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		release()
+		if got := f.total(table); got != 5 {
+			t.Fatalf("count after release = %d, want 5 unchanged", got)
+		}
+	})
+
+	root.run(t, "session refusals", func(t *testing.T, f *hrFx) {
+		for _, c := range [][2]time.Duration{{0, time.Second}, {time.Second, 0}, {999 * time.Microsecond, time.Second}} {
+			if s, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, c[0], c[1]); err == nil || got || s != nil {
+				t.Fatalf("open with timeouts %v = (%v, %v, %v), want a refusal", c, s, got, err)
+			}
+		}
+		if n := f.lockHolders(); n != 0 {
+			t.Fatalf("%d lock holders after refused opens", n)
+		}
+		s := f.open(time.Second, time.Second)
+		if _, err := s.DeleteBatch(f.ctx, store.HistoryRetentionPRHistoryEvents, hrBase, 0); err == nil {
+			t.Error("DeleteBatch with limit 0 succeeded, want a refusal")
+		}
+		if _, err := s.DeleteBatch(f.ctx, "pr_history_heads", hrBase, 10); err == nil {
+			t.Error("DeleteBatch on pr_history_heads succeeded, want it refused as an unknown table")
+		}
+		if unlocked, err := s.Close(f.ctx); err != nil || !unlocked {
+			t.Fatalf("Close = (%v, %v), want a proven unlock", unlocked, err)
+		}
+		if _, err := s.DeleteBatch(f.ctx, store.HistoryRetentionPRHistoryEvents, hrBase, 10); err == nil {
+			t.Error("DeleteBatch on a closed session succeeded")
+		}
+		if unlocked, err := s.Close(f.ctx); unlocked || err != nil {
+			t.Errorf("second Close = (%v, %v), want (false, nil)", unlocked, err)
+		}
+	})
+
+	root.run(t, "generic plan", hrGenericPlan)
 }
 
 // hrOpenOn opens a session on the probe pool (one tagged connection, so a leaked backend shows in
@@ -417,93 +469,161 @@ func hrOpenOn(p *wcsProbe, work, cleanup context.Context, idle string) (*store.H
 	return store.OpenHistoryRetentionSessionWithIdleForTest(work, cleanup, p.pool, time.Second, time.Second, idle)
 }
 
-func TestHistoryRetentionFailedOpenContentionLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	holder := f.open(time.Second, time.Second)
-	_ = holder
-	p := f.probePool(t)
-	workCtx, cancelWork := context.WithTimeout(f.ctx, 5*time.Second)
-	defer cancelWork()
-	cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
-	defer cancelCleanup()
-	s, got, err := hrOpenOn(p, workCtx, cleanupCtx, "5000")
-	if s != nil || got || err != nil {
-		t.Fatalf("contended open = (%v, %v, %v), want (nil, false, nil)", s, got, err)
-	}
-	p.pool.Close()
-	f.waitNoSessions(t, p.tag)
-	if n := f.lockHolders(); n != 1 {
-		t.Fatalf("%d sessions hold the lock, want only the original holder", n)
-	}
-}
-
-func TestHistoryRetentionFailedOpenSetupErrorLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	p := f.probePool(t)
-	workCtx, cancelWork := context.WithTimeout(f.ctx, 5*time.Second)
-	defer cancelWork()
-	cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
-	defer cancelCleanup()
-	// An invalid idle_session_timeout makes the settings statement fail on the real server.
-	s, got, err := hrOpenOn(p, workCtx, cleanupCtx, "not-a-number")
-	if s != nil || got || err == nil || !strings.Contains(err.Error(), "session setup") {
-		t.Fatalf("setup-error open = (%v, %v, %v), want (nil, false, a session setup error)", s, got, err)
-	}
-	p.pool.Close()
-	f.waitNoSessions(t, p.tag)
-	if n := f.lockHolders(); n != 0 {
-		t.Fatalf("%d sessions hold the lock after a failed setup, want 0", n)
-	}
-}
-
-func TestHistoryRetentionFailedOpenTryLockExpiringWorkLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	p := f.probePool(t)
-	workCtx, cancelWork := context.WithCancel(f.ctx)
-	defer cancelWork()
-	// The work context ends between the settings statement and the try-lock; the cleanup context
-	// is a separate, still-live one, so the close is not shortened by the expired work deadline.
-	cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
-	defer cancelCleanup()
-	p.mu.Lock()
-	p.afterSetup = cancelWork
-	p.mu.Unlock()
-	s, got, err := store.OpenHistoryRetentionSession(workCtx, cleanupCtx, p.pool, time.Second, time.Second)
-	if s != nil || got || err == nil || !strings.Contains(err.Error(), "try lock") {
-		t.Fatalf("open = (%v, %v, %v), want (nil, false, a try-lock error)", s, got, err)
-	}
-	p.pool.Close()
-	f.waitNoSessions(t, p.tag)
-	if n := f.lockHolders(); n != 0 {
-		t.Fatalf("%d sessions hold the lock after an interrupted try-lock, want 0", n)
-	}
-}
-
-func TestHistoryRetentionSessionRefusalsLiveDB(t *testing.T) {
-	f := newHrFx(t)
-	for _, c := range [][2]time.Duration{{0, time.Second}, {time.Second, 0}, {999 * time.Microsecond, time.Second}} {
-		if s, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, c[0], c[1]); err == nil || got || s != nil {
-			t.Fatalf("open with timeouts %v = (%v, %v, %v), want a refusal", c, s, got, err)
+// hrWaitLockFree polls, within 1.5s, until no backend holds the history retention lock.
+func hrWaitLockFree(t *testing.T, f *hrFx) {
+	t.Helper()
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for f.lockHolders() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d backend(s) still hold the history retention lock 1.5s after the session was abandoned", f.lockHolders())
 		}
+		time.Sleep(25 * time.Millisecond)
 	}
-	if n := f.lockHolders(); n != 0 {
-		t.Fatalf("%d lock holders after refused opens", n)
-	}
-	s := f.open(time.Second, time.Second)
-	if _, err := s.DeleteBatch(f.ctx, store.HistoryRetentionPRHistoryEvents, hrBase, 0); err == nil {
-		t.Error("DeleteBatch with limit 0 succeeded, want a refusal")
-	}
-	if _, err := s.DeleteBatch(f.ctx, "pr_history_heads", hrBase, 10); err == nil {
-		t.Error("DeleteBatch on pr_history_heads succeeded, want it refused as an unknown table")
-	}
-	if unlocked, err := s.Close(f.ctx); err != nil || !unlocked {
-		t.Fatalf("Close = (%v, %v), want a proven unlock", unlocked, err)
-	}
-	if _, err := s.DeleteBatch(f.ctx, store.HistoryRetentionPRHistoryEvents, hrBase, 10); err == nil {
-		t.Error("DeleteBatch on a closed session succeeded")
-	}
-	if unlocked, err := s.Close(f.ctx); unlocked || err != nil {
-		t.Errorf("second Close = (%v, %v), want (false, nil)", unlocked, err)
+}
+
+// TestHistoryRetentionFailedOpenLiveDB covers every way OpenHistoryRetentionSession can end
+// without a usable session, and the close of a session abandoned inside a transaction. Each case
+// asserts, BEFORE the probe pool is closed, that no tagged backend and no lock holder is left: the
+// connection must have been closed by the session code itself, not merely returned to a pool
+// whose own close would hide a leak.
+func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
+	root := newHrFx(t)
+
+	root.run(t, "contention", func(t *testing.T, f *hrFx) {
+		_ = f.open(time.Second, time.Second) // the holder
+		p := f.probePool(t)
+		workCtx, cancelWork := context.WithTimeout(f.ctx, 5*time.Second)
+		defer cancelWork()
+		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
+		defer cancelCleanup()
+		s, got, err := hrOpenOn(p, workCtx, cleanupCtx, "5000")
+		if s != nil || got || err != nil {
+			t.Fatalf("contended open = (%v, %v, %v), want (nil, false, nil)", s, got, err)
+		}
+		f.waitNoSessions(t, p.tag)
+		if n := f.lockHolders(); n != 1 {
+			t.Fatalf("%d sessions hold the lock, want only the original holder", n)
+		}
+	})
+
+	root.run(t, "setup error", func(t *testing.T, f *hrFx) {
+		p := f.probePool(t)
+		workCtx, cancelWork := context.WithTimeout(f.ctx, 5*time.Second)
+		defer cancelWork()
+		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
+		defer cancelCleanup()
+		// An invalid idle_session_timeout makes the settings statement fail on the real server.
+		s, got, err := hrOpenOn(p, workCtx, cleanupCtx, "not-a-number")
+		if s != nil || got || err == nil || !strings.Contains(err.Error(), "session setup") {
+			t.Fatalf("setup-error open = (%v, %v, %v), want (nil, false, a session setup error)", s, got, err)
+		}
+		f.waitNoSessions(t, p.tag)
+		if n := f.lockHolders(); n != 0 {
+			t.Fatalf("%d sessions hold the lock after a failed setup, want 0", n)
+		}
+	})
+
+	// The work context ends between the settings statement and the try-lock. pgx refuses to send
+	// on a context that is already done, so the try-lock never reaches the server: this pins the
+	// close under a separate, still-live cleanup context, not a lost reply (the next case).
+	root.run(t, "deadline before try-lock", func(t *testing.T, f *hrFx) {
+		p := f.probePool(t)
+		workCtx, cancelWork := context.WithCancel(f.ctx)
+		defer cancelWork()
+		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
+		defer cancelCleanup()
+		p.mu.Lock()
+		p.afterSetup = cancelWork
+		p.mu.Unlock()
+		s, got, err := store.OpenHistoryRetentionSession(workCtx, cleanupCtx, p.pool, time.Second, time.Second)
+		if s != nil || got || err == nil || !strings.Contains(err.Error(), "try lock") {
+			t.Fatalf("open = (%v, %v, %v), want (nil, false, a try-lock error)", s, got, err)
+		}
+		f.waitNoSessions(t, p.tag)
+		hrWaitLockFree(t, f)
+	})
+
+	// The connection is lost at the try-lock round trip while both contexts are still live: the
+	// client socket is closed from the TraceQueryStart hook the moment the try-lock statement
+	// starts, so the open returns a try-lock error with the lock state unknown to the client. The
+	// session code must close what it holds; nothing may be left behind.
+	root.run(t, "connection lost at try-lock", func(t *testing.T, f *hrFx) {
+		p := f.probePool(t)
+		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
+		defer cancelCleanup()
+		p.mu.Lock()
+		p.onQueryStart = func(sql string) {
+			if strings.Contains(sql, "pg_try_advisory_lock") {
+				p.killClient(t)
+			}
+		}
+		p.mu.Unlock()
+		workCtx, cancelWork := context.WithTimeout(f.ctx, 5*time.Second)
+		defer cancelWork()
+		s, got, err := store.OpenHistoryRetentionSession(workCtx, cleanupCtx, p.pool, time.Second, time.Second)
+		if s != nil || got || err == nil || !strings.Contains(err.Error(), "try lock") {
+			t.Fatalf("open = (%v, %v, %v), want (nil, false, a try-lock error)", s, got, err)
+		}
+		f.waitNoSessions(t, p.tag)
+		hrWaitLockFree(t, f)
+	})
+
+	// Close on a session whose connection is open but inside a transaction (open or failed) must
+	// not run the unlock: it reports no proven unlock, closes the connection, and the lock ends
+	// with the backend.
+	for _, c := range []struct {
+		name   string
+		stmts  []string
+		status byte
+	}{
+		{"open transaction", []string{"BEGIN"}, 'T'},
+		{"failed transaction", []string{"BEGIN", "SELECT 1/0"}, 'E'},
+	} {
+		root.run(t, "close inside "+c.name, func(t *testing.T, f *hrFx) {
+			p := f.probePool(t)
+			s, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, p.pool, 10*time.Second, 5*time.Second)
+			if err != nil || !got {
+				t.Fatalf("open session: got=%v err=%v", got, err)
+			}
+			t.Cleanup(func() { _, _ = s.Close(context.Background()) })
+			pid := s.PIDForTest()
+			for _, st := range c.stmts {
+				_ = s.ExecForTest(f.ctx, st) // the failing statement is expected to error
+			}
+			if s.TxStatusForTest() != c.status || s.Idle() {
+				t.Fatalf("setup: tx status %q idle=%v, want %q and not idle", s.TxStatusForTest(), s.Idle(), c.status)
+			}
+			if n := f.lockHolders(); n != 1 {
+				t.Fatalf("%d sessions hold the lock before Close, want the session's own", n)
+			}
+			unlocked, err := s.Close(f.ctx)
+			if unlocked || err != nil {
+				t.Errorf("Close on a non-idle session: unlocked=%v err=%v, want false/nil (no unlock attempted)", unlocked, err)
+			}
+			// No unlock round trip: the last statement the connection ran is the one the test
+			// issued (an unlock inside the failed transaction would also have errored above).
+			p.mu.Lock()
+			last := p.lastSQL
+			p.mu.Unlock()
+			if strings.Contains(last, "pg_advisory_unlock") {
+				t.Errorf("Close sent the unlock %q on a non-idle session", last)
+			}
+			if s.Idle() {
+				t.Error("session still reports idle after Close")
+			}
+			f.waitNoSessions(t, p.tag)
+			if f.pidAlive(pid) {
+				t.Errorf("backend %d is still alive after Close", pid)
+			}
+			hrWaitLockFree(t, f)
+			s2, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)
+			if err != nil || !got {
+				t.Fatalf("fresh open after the close: got=%v err=%v, want the lock", got, err)
+			}
+			if unlocked, err := s2.Close(f.ctx); err != nil || !unlocked {
+				t.Errorf("fresh session Close = (%v, %v), want a proven unlock", unlocked, err)
+			}
+		})
 	}
 }
 
@@ -526,12 +646,13 @@ func (p *hrPlan) find(nodeType, relation string) bool {
 	return false
 }
 
-// TestHistoryRetentionGenericPlanLiveDB pins the plan shape of the four delete statements under
-// force_generic_plan (what a long-lived pooled connection reaches after five executions): the
+// hrGenericPlan pins the plan shape of the four delete statements under force_generic_plan: the
 // outer DELETE must be a Tid Scan on the target table, the inner page read a LockRows over the
-// table. The plan is explained inside a rolled-back transaction.
-func TestHistoryRetentionGenericPlanLiveDB(t *testing.T) {
-	f := newHrFx(t)
+// table. Production runs each delete once on a fresh hijacked connection, so it uses a custom
+// plan; the generic plan checked here is a conservative safety pin (it is what a long-lived
+// pooled connection would reach after five executions), not a path the pass takes. The plan is
+// explained inside a rolled-back transaction.
+func hrGenericPlan(t *testing.T, f *hrFx) {
 	for _, table := range hrTables {
 		f.seed(table, 2000, hrBase)
 		f.seed(table, 2000, hrBase.Add(48*time.Hour))
@@ -549,7 +670,11 @@ func TestHistoryRetentionGenericPlanLiveDB(t *testing.T) {
 		}
 	}
 	simple(`SET plan_cache_mode = force_generic_plan`)
-	defer func() { _, _ = conn.Exec(context.Background(), `RESET ALL`, pgx.QueryExecModeSimpleProtocol) }()
+	// The connection returns to the pool: drop the prepared statements and the setting with it.
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `RESET ALL`, pgx.QueryExecModeSimpleProtocol)
+		_, _ = conn.Exec(context.Background(), `DEALLOCATE ALL`, pgx.QueryExecModeSimpleProtocol)
+	}()
 	for _, table := range hrTables {
 		stmt := "hr_gp_" + string(table)
 		simple("DEALLOCATE ALL")
