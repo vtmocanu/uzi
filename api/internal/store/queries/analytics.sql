@@ -627,10 +627,15 @@ model_fold AS MATERIALIZED (
     UNION ALL  -- all-only
     SELECT c.id, mm.model, mm.input_tokens, mm.cache_read_tokens, mm.cache_creation_tokens,  -- all-only
            mm.output_tokens, mm.cost_usd, mm.cost_status  -- all-only
-    FROM cohort c  -- all-only
-    JOIN run_usage_fold_state fs ON fs.run_id = c.id AND NOT fs.stale  -- all-only
+    -- all-only: Compute stored-fold membership as a set before joining the model rows.
+    -- all-only: A direct join can rescan a small state table once per cohort row.
+    FROM (  -- all-only
+        SELECT c.id FROM cohort c  -- all-only
+        WHERE c.kind <> 'chat' AND c.status IN ('completed', 'failed', 'cancelled')  -- all-only
+        INTERSECT  -- all-only
+        SELECT fs.run_id FROM run_usage_fold_state fs WHERE NOT fs.stale  -- all-only
+    ) c  -- all-only
     LEFT JOIN run_usage_model_folds mm ON mm.run_id = c.id  -- all-only
-    WHERE c.kind <> 'chat' AND c.status IN ('completed', 'failed', 'cancelled')  -- all-only
 ),
 merged_witness AS MATERIALIZED (
     SELECT DISTINCT w.repo_id, w.mr_iid

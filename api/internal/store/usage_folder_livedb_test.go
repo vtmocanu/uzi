@@ -580,58 +580,51 @@ func TestUsageFolderDeadlineBatchRetriedRunByRunLiveDB(t *testing.T) {
 func TestUsageFolderRetriesChargeLaneAllowanceLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	const limit = 3
-	var (
-		mu       sync.Mutex
-		attempts []uuid.UUID
-		blocking atomic.Bool
-	)
+	var attempts []uuid.UUID
+	firstPass, cancelFirstPass := context.WithCancel(context.Background())
+	defer cancelFirstPass()
+	interruptBatch := true
 	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{
-		ParentTimeout: 10 * time.Second,
-		LaneTimeout:   500 * time.Millisecond,
+		ParentTimeout: 30 * time.Second,
+		LaneTimeout:   30 * time.Second,
 		LaneLimit:     limit,
 		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
-			mu.Lock()
 			attempts = append(attempts, ids...)
-			mu.Unlock()
-			if blocking.Load() && len(ids) > 1 {
-				<-ctx.Done()
+			if interruptBatch && len(ids) > 1 {
+				// Interrupt only after the missing lane selects its batch. This exercises the
+				// same retry path as a deadline without making Pass 2 race a short timer.
+				cancelFirstPass()
 				return 0, ctx.Err()
 			}
 			return e.realMaterialize(ctx, ids)
 		},
 	})
 
-	// Pass 1: a batch of two missing runs (short of LIMIT, so the lane's cursor resets) outlasts
-	// the lane budget; its ids become the lane's pending retries.
+	// Pass 1: the interrupted batch becomes the missing lane's pending retries.
 	old := []uuid.UUID{e.missingRun(t), e.missingRun(t)}
-	blocking.Store(true)
-	if _, err := f.Pass(context.Background()); err != nil {
-		t.Fatalf("Pass 1: %v", err)
+	if _, err := f.Pass(firstPass); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Pass 1: got %v, want context cancellation", err)
 	}
-	blocking.Store(false)
+	interruptBatch = false
+	if len(attempts) != len(old) || !containsID(attempts, old[0]) || !containsID(attempts, old[1]) {
+		t.Fatalf("Pass 1 attempted %v, want the interrupted batch %v", attempts, old)
+	}
 	for _, r := range old {
 		if e.isFresh(t, r) {
-			t.Fatal("Pass 1 folded a run of the batch that was meant to time out")
+			t.Fatalf("Pass 1 unexpectedly folded %s", r)
 		}
 	}
 
-	// Pass 2: two newer missing runs exist, but the two retries used two of the lane's three
-	// attempts, so only the newest new run may be taken (fresh[1]; the lane walks newest first).
+	// Pass 2: two new missing runs exist, but two retries leave room for only the newest.
 	fresh := []uuid.UUID{e.missingRun(t), e.missingRun(t)}
-	mu.Lock()
+	mustExec(e.ctx, t, e.pool, `UPDATE runs SET created_at = CASE WHEN id = $1 THEN TIMESTAMPTZ '2090-01-01 00:00:00+00'
+		ELSE TIMESTAMPTZ '2090-01-02 00:00:00+00' END WHERE id IN ($1, $2)`, fresh[0], fresh[1])
 	attempts = nil
-	mu.Unlock()
 	if _, err := f.Pass(context.Background()); err != nil {
 		t.Fatalf("Pass 2: %v", err)
 	}
-	mu.Lock()
-	distinct := map[uuid.UUID]bool{}
-	for _, id := range attempts {
-		distinct[id] = true
-	}
-	mu.Unlock()
-	if len(distinct) > limit {
-		t.Fatalf("one Pass attempted %d distinct runs, want at most LaneLimit=%d", len(distinct), limit)
+	if len(attempts) != limit || !containsID(attempts, old[0]) || !containsID(attempts, old[1]) || !containsID(attempts, fresh[1]) {
+		t.Fatalf("Pass 2 attempted %v, want retries %v and newest run %s within LaneLimit=%d", attempts, old, fresh[1], limit)
 	}
 	for _, r := range old {
 		e.wantFresh(t, "retried run", r)

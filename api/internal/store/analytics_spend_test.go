@@ -119,10 +119,13 @@ func TestAnalyticsSpendStatementsDoNotDrift(t *testing.T) {
 		"UNION ALL  -- all-only",
 		"SELECT c.id, mm.model, mm.input_tokens, mm.cache_read_tokens, mm.cache_creation_tokens,  -- all-only",
 		"mm.output_tokens, mm.cost_usd, mm.cost_status  -- all-only",
-		"FROM cohort c  -- all-only",
-		"JOIN run_usage_fold_state fs ON fs.run_id = c.id AND NOT fs.stale  -- all-only",
-		"LEFT JOIN run_usage_model_folds mm ON mm.run_id = c.id  -- all-only",
+		"FROM (  -- all-only",
+		"SELECT c.id FROM cohort c  -- all-only",
 		"WHERE c.kind <> 'chat' AND c.status IN ('completed', 'failed', 'cancelled')  -- all-only",
+		"INTERSECT  -- all-only",
+		"SELECT fs.run_id FROM run_usage_fold_state fs WHERE NOT fs.stale  -- all-only",
+		") c  -- all-only",
+		"LEFT JOIN run_usage_model_folds mm ON mm.run_id = c.id  -- all-only",
 	}
 	gotOO, gotAO := tagged(owner)
 	if !reflect.DeepEqual(gotOO, wantOwnerOnly) || len(gotAO) != 0 {
