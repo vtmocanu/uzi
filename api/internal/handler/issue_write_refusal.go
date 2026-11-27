@@ -73,7 +73,7 @@ func writeLinkedMoveError(w http.ResponseWriter, err error, projectShort string)
 	// the unrelated "map this column" text. httpx.Error JSON-encodes the message, so
 	// the issue id the driver's error carries goes out as an escaped JSON string.
 	case errors.Is(err, issuetracker.ErrStateMachineField):
-		httpx.Error(w, http.StatusConflict, issuetrackersvc.StateMachineRefusal(projectShort))
+		httpx.Error(w, http.StatusConflict, issuetrackersvc.StateMachineRefusal(projectShort, err))
 	case errors.Is(err, issuetracker.ErrStateFieldUnreadable):
 		httpx.Error(w, http.StatusConflict, issuetrackersvc.StateFieldUnreadableRefusal(projectShort, err))
 	case errors.Is(err, issuetracker.ErrStateNotAllowed):

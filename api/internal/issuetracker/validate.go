@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"errors"
+	"regexp"
 	"slices"
 	"unicode"
 )
@@ -35,20 +36,27 @@ func InvisibleRune(c rune) bool {
 // maxEntityIDLen is the longest project or eligibility tag id the store holds:
 // the issue_tracker_project_id and eligibility_tag_id columns carry a
 // char_length CHECK of 1 to 128 (migration 00474_issue_tracker_repo_link.sql).
-// entityIDRE has no cap because it also matches listings and user and group
-// ids, so the bound applies only where an id is about to be stored.
 const maxEntityIDLen = 128
 
-// ValidProjectID reports whether id is a well-formed project entity id such as
-// "0-1", short enough for the store's column.
+// storedIDRE is the shape every kind's project and tag id must have to be
+// stored and later placed in a request path: a letter or digit, then letters,
+// digits, hyphens and underscores. It holds YouTrack's "0-1" and a digit-only
+// id alike and admits no path or query separator. It is deliberately not a
+// kind's own grammar: each driver checks its ids against that itself (YouTrack's
+// entityIDRE), at build time and on every request (PRD #4765 A1).
+var storedIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
+// ValidProjectID reports whether id is a project id of the stored shape
+// (storedIDRE), short enough for the store's column. It is kind-neutral; the
+// driver checks the kind's own grammar.
 func ValidProjectID(id string) bool {
-	return len(id) <= maxEntityIDLen && entityIDRE.MatchString(id)
+	return len(id) <= maxEntityIDLen && storedIDRE.MatchString(id)
 }
 
-// ValidTagID reports whether id is a well-formed tag entity id short enough
-// for the store's column.
+// ValidTagID reports whether id is a tag id of the stored shape, short enough
+// for the store's column. Like ValidProjectID it is kind-neutral.
 func ValidTagID(id string) bool {
-	return len(id) <= maxEntityIDLen && entityIDRE.MatchString(id)
+	return len(id) <= maxEntityIDLen && storedIDRE.MatchString(id)
 }
 
 // ValidTagRef requires a well-formed tag id, short enough for the store's

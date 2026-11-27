@@ -163,7 +163,7 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
     }
     const codexOnly = [...COMMAND_ENV_PROTECTED_KEYS].filter((k) => !PROTECTED_ENV_KEYS.has(k)).sort();
     assert.deepStrictEqual(codexOnly, [
-      "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_HOST", "GOCACHE", "GOMODCACHE", "LANG", "NPM_CONFIG_CACHE", "PATH", "TMPDIR", "npm_config_cache",
+      "DOCKER_CONTEXT", "DOCKER_HOST", "GOCACHE", "GOMODCACHE", "LANG", "NPM_CONFIG_CACHE", "PATH", "TMPDIR", "npm_config_cache",
     ], "the Codex mirror's extras are exactly the command-boundary literals");
     for (const k of [
       "ANTHROPIC_BASE_URL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
