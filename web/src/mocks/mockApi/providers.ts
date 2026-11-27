@@ -56,6 +56,11 @@ function fail(status: number, reason: string, message: string): never {
   throw new ApiError(status, message, { error: message, reason });
 }
 
+// failPlain answers like a server error that carries no reason code.
+function failPlain(status: number, message: string): never {
+  throw new ApiError(status, message, { error: message });
+}
+
 function find(id: string): ProviderDTO {
   const p = providers.find((x) => x.id === id);
   if (!p) throw new ApiError(404, "provider not found", { error: "provider not found" });
@@ -445,33 +450,42 @@ export const providersApi = {
   },
 
   // ── Organization key (PRD #4540) ────────────────────────────────────────────
-  // A new key makes the last Test result unknown; the key itself is dropped, never stored.
+  // A new key makes the last Test result unknown (the key itself is dropped, never stored) and keeps
+  // the enablement; a retired definition still takes a key, like the server.
   adminPutOperatorKey: async (id: string, key: string) => {
     requireAdmin();
-    const o = operatorFor(id);
-    if (o.def.retired) fail(409, "provider_retired", "provider is retired");
+    operatorFor(id);
     if (key.trim() === "") fail(400, "invalid_provider", "key is required");
-    const next = updateOperator(id, (cur) => ({ ...cur, key: { present: true, enabled: true, set_at: new Date().toISOString() } }));
+    const next = updateOperator(id, (cur) => ({
+      ...cur,
+      key: { present: true, enabled: cur.key.present ? cur.key.enabled : true, set_at: new Date().toISOString() },
+    }));
     return delay({ provider: operatorView(next) });
   },
+  // A keyless enable/disable/delete is a bare 404; repeating the current state changes nothing, so it
+  // keeps the Test result.
   adminSetOperatorKeyEnabled: async (id: string, enabled: boolean) => {
     requireAdmin();
-    if (!operatorFor(id).key.present) fail(409, "provider_key_missing", "the provider has no organization key");
+    const o = operatorFor(id);
+    if (!o.key.present) failPlain(404, "the provider has no key");
+    if (o.key.enabled === enabled) return delay({ provider: operatorView(o) });
     const next = updateOperator(id, (cur) => ({ ...cur, key: { ...cur.key, enabled, probe: undefined } }));
     return delay({ provider: operatorView(next) });
   },
   adminDeleteOperatorKey: async (id: string) => {
     requireAdmin();
-    if (!operatorFor(id).key.present) fail(409, "provider_key_missing", "the provider has no organization key");
+    if (!operatorFor(id).key.present) failPlain(404, "the provider has no key");
     const next = updateOperator(id, (cur) => ({ ...cur, key: { present: false, enabled: false } }));
     return delay({ provider: operatorView(next) });
   },
+  // Test only looks at operator-mode definitions: a per-user one is a plain 404, as on the server.
   adminTestOperatorKey: async (id: string) => {
     requireAdmin();
-    const o = operatorFor(id);
-    if (o.def.retired) fail(409, "provider_retired", "provider is retired");
-    if (!o.key.present) fail(409, "provider_key_missing", "the provider has no organization key; set one before testing");
-    if (!o.key.enabled) fail(409, "provider_key_disabled", "the organization key is disabled; enable it before testing");
+    const o = findOperator(id);
+    if (!o) return failPlain(404, "provider not found");
+    if (o.def.retired) fail(409, "provider_retired", "the provider is retired");
+    if (!o.key.present) failPlain(409, "the provider has no organization key; set one before testing");
+    if (!o.key.enabled) failPlain(409, "the organization key is disabled; enable it before testing");
     const probe: ProviderProbe = { auth_result: "ok", tool_result: "passed", probed_at: new Date().toISOString() };
     updateOperator(id, (cur) => ({ ...cur, key: { ...cur.key, probe } }));
     return delay({ probe });

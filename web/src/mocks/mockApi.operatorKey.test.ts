@@ -100,10 +100,11 @@ describe("mock organization-funded definitions", () => {
       () => api.adminPutOperatorKey(id, "k"),
       () => api.adminSetOperatorKeyEnabled(id, false),
       () => api.adminDeleteOperatorKey(id),
-      () => api.adminTestOperatorKey(id),
     ]) {
       await expect(call()).rejects.toMatchObject({ status: 409, body: { reason: "provider_not_operator_key" } });
     }
+    // Test only reads operator-mode definitions, so a per-user one is not found.
+    await expect(api.adminTestOperatorKey(id)).rejects.toMatchObject({ status: 404 });
     await expect(api.adminPutOperatorKey("nope", "k")).rejects.toMatchObject({ status: 404 });
   });
 
@@ -111,5 +112,37 @@ describe("mock organization-funded definitions", () => {
     const api = await load();
     await expect(api.adminDeleteSharedProvider(OP)).resolves.toEqual({ deleted: true, deleted_key_count: 0 });
     expect((await api.adminListSharedProviders()).providers.map((p) => p.id)).not.toContain(OP);
+  });
+
+  it("allows a key on a retired definition and keeps the enablement on replace", async () => {
+    const api = await load();
+    await api.adminSetOperatorKeyEnabled(OP, false);
+    expect((await api.adminPutOperatorKey(OP, "next")).provider.operator_key).toMatchObject({ present: true, enabled: false });
+    await api.adminRetireSharedProvider(OP);
+    expect((await api.adminPutOperatorKey(OP, "again")).provider.operator_key).toMatchObject({ present: true, enabled: false });
+    expect((await api.adminSetOperatorKeyEnabled(OP, true)).provider.operator_key?.enabled).toBe(true);
+    await expect(api.adminTestOperatorKey(OP)).rejects.toMatchObject({ status: 409, body: { reason: "provider_retired" } });
+  });
+
+  it("answers a keyless enable, disable or delete with a bare 404 and a keyless Test with a bare 409", async () => {
+    const api = await load();
+    await api.adminDeleteOperatorKey(OP);
+    for (const call of [() => api.adminSetOperatorKeyEnabled(OP, true), () => api.adminSetOperatorKeyEnabled(OP, false), () => api.adminDeleteOperatorKey(OP)]) {
+      const err = await call().catch((e) => e);
+      expect(err).toMatchObject({ status: 404, message: "the provider has no key" });
+      expect(err.body.reason).toBeUndefined();
+    }
+    const t = await api.adminTestOperatorKey(OP).catch((e) => e);
+    expect(t.status).toBe(409);
+    expect(t.body.reason).toBeUndefined();
+  });
+
+  it("treats enabling or disabling to the current state as a no-op that keeps the Test result", async () => {
+    const api = await load();
+    await api.adminTestOperatorKey(OP);
+    const same = (await api.adminSetOperatorKeyEnabled(OP, true)).provider.operator_key;
+    expect(same?.probe).toBeDefined();
+    const flipped = (await api.adminSetOperatorKeyEnabled(OP, false)).provider.operator_key;
+    expect(flipped?.probe).toBeUndefined();
   });
 });

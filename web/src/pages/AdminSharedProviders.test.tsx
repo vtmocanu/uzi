@@ -508,7 +508,7 @@ describe("AdminSharedProviders — organization key card", () => {
     await renderPage([operator({ operator_key: { present: false, enabled: false } })]);
     const input = screen.getByLabelText("Organization key") as HTMLInputElement;
     expect(input.type).toBe("password");
-    expect(input.autocomplete).toBe("off");
+    expect(input.autocomplete).toBe("new-password");
     const save = screen.getByRole("button", { name: "Set organization key for org-gateway" }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     fireEvent.change(input, { target: { value: "org-secret-value" } });
@@ -534,7 +534,7 @@ describe("AdminSharedProviders — organization key card", () => {
     mockApi.adminSetOperatorKeyEnabled.mockResolvedValue({ provider: operator() });
     await renderPage([operator()]);
     expect(screen.getByTestId("disable-effect-o1").textContent).toMatch(
-      /stops this key being used.*frozen copies held by recipients are not revoked/i,
+      /unusable for runs.*frozen copies held by recipients are not revoked/i,
     );
     fireEvent.click(screen.getByRole("button", { name: "Disable organization key for org-gateway" }));
     await waitFor(() => expect(mockApi.adminSetOperatorKeyEnabled).toHaveBeenCalledWith("o1", false));
@@ -553,7 +553,7 @@ describe("AdminSharedProviders — organization key card", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete organization key for org-gateway" }));
     expect(mockApi.adminDeleteOperatorKey).not.toHaveBeenCalled();
     const group = screen.getByRole("group", { name: "Confirm deleting the organization key of org-gateway" });
-    expect(group.textContent).toMatch(/copies recipients already hold are not taken back/i);
+    expect(group.textContent).toMatch(/copies recipients may already hold.*are not taken back/i);
     expect(document.activeElement).toBe(within(group).getByRole("button", { name: "Cancel" }));
     fireEvent.click(within(group).getByRole("button", { name: "Delete key" }));
     await waitFor(() => expect(mockApi.adminDeleteOperatorKey).toHaveBeenCalledWith("o1"));
@@ -562,10 +562,51 @@ describe("AdminSharedProviders — organization key card", () => {
   it("runs Test and shows its result, naming that it uses the key", async () => {
     mockApi.adminTestOperatorKey.mockResolvedValue({ probe: { auth_result: "rejected", tool_result: "not_run", probed_at: "2026-11-21T00:00:00Z" } });
     await renderPage([operator()]);
-    expect(screen.getByTestId("test-effect-o1").textContent).toMatch(/sends one small request/i);
+    expect(screen.getByTestId("test-effect-o1").textContent).toMatch(/up to two small requests.*authentication check.*single-tool check/i);
     fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
     await waitFor(() => expect(mockApi.adminTestOperatorKey).toHaveBeenCalledWith("o1"));
     expect((await screen.findByTestId("probe-results-o1")).textContent).toMatch(/Authentication rejected/);
+  });
+
+  it("drops a shown Test result when a later key write reloads the card without one", async () => {
+    mockApi.adminTestOperatorKey.mockResolvedValue({ probe: { auth_result: "ok", tool_result: "passed", probed_at: "2026-11-21T00:00:00Z" } });
+    mockApi.adminPutOperatorKey.mockResolvedValue({ provider: operator() });
+    await renderPage([operator()]);
+    fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
+    await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Authentication worked/));
+    fireEvent.change(screen.getByLabelText("Organization key"), { target: { value: "next-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Replace organization key for org-gateway" }));
+    await waitFor(() => expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/));
+  });
+
+  it("marks organization keys as staged on the card and in the create form", async () => {
+    await renderPage([operator()]);
+    expect(screen.getByTestId("staged-notice-o1").textContent).toMatch(/Staged: not yet available to users or runs/);
+    cleanup();
+    const form = await openOperatorForm();
+    expect(form.getByTestId("staged-notice-new").textContent).toMatch(/Staged: not yet available to users or runs/);
+    expect(form.getByTestId("disclosure-copy").textContent).toMatch(/rotate at the gateway.*per-key spend limits/i);
+  });
+
+  it("keeps the key controls on a retired definition but not Test", async () => {
+    await renderPage([operator({ retired: true })]);
+    expect(screen.getByRole("button", { name: "Replace organization key for org-gateway" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Disable organization key for org-gateway" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Delete organization key for org-gateway" })).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Test organization key for org-gateway" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("says an operator definition delete also deletes its organization key", async () => {
+    mockApi.adminDeleteSharedProvider.mockResolvedValue({ deleted: true, deleted_key_count: 0 });
+    await renderPage([operator()]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete org-gateway" }));
+    const box = within(screen.getByRole("group", { name: "Confirm deleting org-gateway" }));
+    const text = box.getByTestId("delete-keys-o1").textContent ?? "";
+    expect(text).toMatch(/organization key and that key's Test result/);
+    expect(text).not.toMatch(/personal key/);
+    fireEvent.click(box.getByRole("button", { name: "Delete definition and key" }));
+    expect(await screen.findByText("org-gateway deleted, with its organization key.")).toBeTruthy();
   });
 
   it("explains a rate-limited Test", async () => {

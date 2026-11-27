@@ -74,7 +74,7 @@ function sharedError(err: unknown, fallback: string, engine: Engine): string {
 const OPERATOR_DISCLOSURES: { id: string; text: string }[] = [
   {
     id: "disclosure-copy",
-    text: "Granted users, and code in their runs, receive the key and can copy it. Revoking access in uzi does not take copies back; only rotating the key at the gateway revokes them.",
+    text: "Granted users, and code in their runs, receive the key and can copy it. Revoking access in uzi does not take copies back; only rotating the key at the gateway revokes them. Rotate at the gateway when access ends, and set per-key spend limits there.",
   },
   {
     id: "disclosure-redirect",
@@ -289,6 +289,11 @@ function ProviderCard({
 
   const selected = p.selected_user_count;
   const keys = p.attached_key_count;
+  const operatorMode = p.credential_mode === "operator_key";
+  // What a delete takes with it, in the words that fit the definition's credential mode.
+  const deletes = operatorMode
+    ? "its organization key and that key's Test result"
+    : `${plural(keys, "personal key", "personal keys")} users attached to it, and their Test results`;
 
   return (
     <Card className="space-y-3">
@@ -370,9 +375,11 @@ function ProviderCard({
             <>
               <Button variant="dangerSolid" size="sm" disabled={working || selected > 0} onClick={() => void act(async () => {
                 const r = await api.adminDeleteSharedProvider(p.id);
-                return `${name} deleted, with ${plural(r.deleted_key_count, "attached key", "attached keys")}.`;
+                return operatorMode
+                  ? `${name} deleted, with its organization key.`
+                  : `${name} deleted, with ${plural(r.deleted_key_count, "attached key", "attached keys")}.`;
               }, "Failed to delete the shared provider")}>
-                {working ? "Deleting…" : "Delete definition and keys"}
+                {working ? "Deleting…" : operatorMode ? "Delete definition and key" : "Delete definition and keys"}
               </Button>
               <Button variant="ghost" size="sm" disabled={working} onClick={onCancel} data-confirm-cancel>Cancel</Button>
             </>
@@ -386,15 +393,13 @@ function ProviderCard({
                 {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their ${ENGINE_LABELS[p.engine]} source. ${p.retired ? "Ask them" : "Retire it, then ask them"} to choose another source.`}
               </p>
               <p data-testid={`delete-keys-${p.id}`} className="text-muted">
-                Once nobody has it selected, deleting it would also delete {plural(keys, "personal key", "personal keys")} users
-                attached to it, and their Test results.
+                Once nobody has it selected, deleting it would also delete {deletes}.
               </p>
             </>
           ) : (
             <>
               <p data-testid={`delete-keys-${p.id}`}>
-                Delete {name}? This also deletes {plural(keys, "personal key", "personal keys")} users attached to it, and their
-                Test results. This cannot be undone.
+                Delete {name}? This also deletes {deletes}. This cannot be undone.
               </p>
               <p data-testid={`delete-selected-${p.id}`} className="text-muted">
                 No user has it selected as their {ENGINE_LABELS[p.engine]} source.
@@ -424,18 +429,25 @@ function OperatorKeyPanel({
   const key = p.operator_key ?? { present: false, enabled: false };
   const [draft, setDraft] = useState("");
   const [working, setWorking] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [error, setError] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  // The result of a Test run on this card; until then the stored one from the list read.
+  // The result of a Test run on this card; until then the stored one from the list read. Every
+  // key write clears it, because the server drops the stored result on a write too.
   const [probe, setProbe] = useState<ProviderProbe | null>(null);
   const confirmRef = useRef<HTMLDivElement>(null);
   const inputId = useId();
   const shownProbe = probe ?? key.probe ?? null;
-  const usable = key.present && !p.retired;
+  const testable = key.present && key.enabled && !p.retired;
 
   useEffect(() => {
     if (confirmingDelete) confirmRef.current?.querySelector<HTMLButtonElement>("button[data-confirm-cancel]")?.focus();
   }, [confirmingDelete]);
+
+  const written = async (message: string) => {
+    setProbe(null);
+    await onDone(message);
+  };
 
   const run = async (fn: () => Promise<void>, fallback: string) => {
     setError("");
@@ -457,7 +469,7 @@ function OperatorKeyPanel({
     setDraft("");
     return run(async () => {
       await api.adminPutOperatorKey(p.id, value);
-      await onDone(`Organization key for ${name} saved.`);
+      await written(`Organization key for ${name} saved.`);
     }, "Failed to save the organization key");
   };
 
@@ -467,12 +479,16 @@ function OperatorKeyPanel({
         <Badge tone="neutral"><span data-testid={`credential-mode-${p.id}`}>Organization key</span></Badge>
         <p className="text-muted" data-testid={`key-status-${p.id}`}>
           {!key.present
-            ? "No key set. Runs cannot use this definition until you set one."
+            ? "No key set."
             : `Key set, ${key.enabled ? "enabled" : "disabled"}.${key.set_at ? ` Set ${new Date(key.set_at).toLocaleString()}.` : ""}`}
         </p>
       </div>
 
-      <div data-testid={`probe-results-${p.id}`} className="space-y-0.5 text-xs">
+      <p className="text-xs text-warn" data-testid={`staged-notice-${p.id}`}>
+        Staged: not yet available to users or runs.
+      </p>
+
+      <div data-testid={`probe-results-${p.id}`} aria-live="polite" className="space-y-0.5 text-xs">
         {shownProbe ? (
           <>
             <p>{AUTH_RESULT_TEXT[shownProbe.auth_result]}</p>
@@ -486,95 +502,102 @@ function OperatorKeyPanel({
         )}
       </div>
 
-      {!p.retired && (
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <label htmlFor={inputId} className="block text-muted">Organization key</label>
-            <div className="flex flex-wrap gap-2">
-              <Input
-                id={inputId}
-                type="password"
-                autoComplete="off"
-                spellCheck={false}
-                className="min-w-0 flex-1"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-              />
+      <div className="space-y-3">
+        <div className="space-y-1">
+          <label htmlFor={inputId} className="block text-muted">Organization key</label>
+          <div className="flex flex-wrap gap-2">
+            <Input
+              id={inputId}
+              type="password"
+              autoComplete="new-password"
+              spellCheck={false}
+              className="min-w-0 flex-1"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+            />
+            <Button
+              size="sm"
+              disabled={working || draft === ""}
+              onClick={() => void save()}
+              aria-label={`${key.present ? "Replace" : "Set"} organization key for ${name}`}
+            >
+              {key.present ? "Replace key" : "Set key"}
+            </Button>
+          </div>
+          <p className="text-xs text-faint">
+            {key.present
+              ? "Replacing the key clears the last Test result. Once recipients are granted access in a later release, copies they already hold keep working until the old key is rotated at the gateway."
+              : "Stored encrypted and never shown again."}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
+          {key.present && (
+            <div className="space-y-1">
               <Button
+                variant="secondary"
                 size="sm"
-                disabled={working || draft === ""}
-                onClick={() => void save()}
-                aria-label={`${key.present ? "Replace" : "Set"} organization key for ${name}`}
+                disabled={working}
+                onClick={() => void run(async () => {
+                  await api.adminSetOperatorKeyEnabled(p.id, !key.enabled);
+                  await written(`Organization key for ${name} ${key.enabled ? "disabled" : "enabled"}.`);
+                }, "Failed to change the organization key")}
+                aria-label={`${key.enabled ? "Disable" : "Enable"} organization key for ${name}`}
               >
-                {key.present ? "Replace key" : "Set key"}
+                {key.enabled ? "Disable key" : "Enable key"}
               </Button>
+              <p className="max-w-xs text-xs text-faint" data-testid={`disable-effect-${p.id}`}>
+                {key.enabled
+                  ? "Marks the key unusable for runs once recipients have access; frozen copies held by recipients are not revoked."
+                  : "Marks the key usable again for runs once recipients have access."}
+              </p>
             </div>
-            <p className="text-xs text-faint">
-              {key.present
-                ? "Replacing the key makes new runs use it and clears the last Test result. Copies recipients already hold keep working until the old key is rotated at the gateway."
-                : "Stored encrypted and never shown again."}
+          )}
+          <div className="space-y-1">
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={working || !testable}
+              onClick={() => void (async () => {
+                setTesting(true);
+                try {
+                  await run(async () => {
+                    setProbe((await api.adminTestOperatorKey(p.id)).probe);
+                  }, "Failed to test the organization key");
+                } finally {
+                  setTesting(false);
+                }
+              })()}
+              aria-label={`Test organization key for ${name}`}
+            >
+              {testing ? "Testing…" : "Test key"}
+            </Button>
+            <p className="max-w-xs text-xs text-faint" data-testid={`test-effect-${p.id}`}>
+              {!key.present
+                ? "Set a key to test it."
+                : p.retired
+                  ? "A retired definition cannot be tested."
+                  : key.enabled
+                    ? "Makes up to two small requests to the gateway with this key: an authentication check, then a single-tool check."
+                    : "Enable the key to test it."}
             </p>
           </div>
-
-          <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
-              {usable && (
-              <div className="space-y-1">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={working}
-                  onClick={() => void run(async () => {
-                    await api.adminSetOperatorKeyEnabled(p.id, !key.enabled);
-                    await onDone(`Organization key for ${name} ${key.enabled ? "disabled" : "enabled"}.`);
-                  }, "Failed to change the organization key")}
-                  aria-label={`${key.enabled ? "Disable" : "Enable"} organization key for ${name}`}
-                >
-                  {key.enabled ? "Disable key" : "Enable key"}
-                </Button>
-                <p className="max-w-xs text-xs text-faint" data-testid={`disable-effect-${p.id}`}>
-                  {key.enabled
-                    ? "Stops this key being used; frozen copies held by recipients are not revoked."
-                    : "Lets runs use this key again."}
-                </p>
-              </div>
-              )}
-              <div className="space-y-1">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={working || !usable || !key.enabled}
-                  onClick={() => void run(async () => {
-                    setProbe((await api.adminTestOperatorKey(p.id)).probe);
-                  }, "Failed to test the organization key")}
-                  aria-label={`Test organization key for ${name}`}
-                >
-                  {working ? "Working…" : "Test key"}
-                </Button>
-                <p className="max-w-xs text-xs text-faint" data-testid={`test-effect-${p.id}`}>
-                  {!usable
-                    ? "Set a key to test it."
-                    : key.enabled
-                      ? "Sends one small request to the gateway with this key."
-                      : "Enable the key to test it."}
-                </p>
-              </div>
-              {usable && (
-              <div className="space-y-1">
-                <Button
-                  variant="danger"
-                  size="sm"
-                  disabled={working}
-                  onClick={() => { setError(""); setConfirmingDelete(true); }}
-                  aria-label={`Delete organization key for ${name}`}
-                >
-                  Delete key
-                </Button>
-                <p className="max-w-xs text-xs text-faint">Removes the key from uzi; the definition stays.</p>
-              </div>
-              )}
+          {key.present && (
+            <div className="space-y-1">
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={working}
+                onClick={() => { setError(""); setConfirmingDelete(true); }}
+                aria-label={`Delete organization key for ${name}`}
+              >
+                Delete key
+              </Button>
+              <p className="max-w-xs text-xs text-faint">Removes the key from uzi; the definition stays.</p>
             </div>
+          )}
         </div>
-      )}
+      </div>
 
       {confirmingDelete && (
         <ConfirmBox
@@ -586,7 +609,7 @@ function OperatorKeyPanel({
               <Button variant="dangerSolid" size="sm" disabled={working} onClick={() => void run(async () => {
                 await api.adminDeleteOperatorKey(p.id);
                 setConfirmingDelete(false);
-                await onDone(`Organization key for ${name} deleted.`);
+                await written(`Organization key for ${name} deleted.`);
               }, "Failed to delete the organization key")}>
                 {working ? "Deleting…" : "Delete key"}
               </Button>
@@ -595,8 +618,8 @@ function OperatorKeyPanel({
           }
         >
           <p>
-            Delete the organization key of {name}? New runs can no longer use this definition until you set a key again.
-            Copies recipients already hold are not taken back; only rotating the key at the gateway revokes them.
+            Delete the organization key of {name}? The definition stays; set a key again to use it later.
+            Copies recipients may already hold, once access is granted in a later release, are not taken back; only rotating the key at the gateway revokes them.
           </p>
         </ConfirmBox>
       )}
@@ -679,7 +702,7 @@ function CreateForm({
         <h2 className="text-sm font-semibold text-fg">New shared provider</h2>
         <p className="text-sm text-muted">
           {operatorMode
-            ? "You set one organization key after creating it; granted users' runs receive it."
+            ? "You set one organization key after creating it. Staged: not yet available to users or runs; once access can be granted in a later release, granted users' runs will receive it."
             : "No key here: each user attaches their own."}{" "}
           The engine, endpoint and auth style cannot be changed after you create it; a different gateway needs a new
           definition, which users select again on purpose.
@@ -741,6 +764,9 @@ function CreateForm({
             className="space-y-2 rounded-lg border border-warn/50 bg-warn/5 px-3 py-2 text-sm text-fg"
           >
             <p className="font-medium text-warn">Before you create an organization-funded definition</p>
+            <p data-testid="staged-notice-new">
+              Staged: not yet available to users or runs. These terms apply once recipients are granted access, in a later release.
+            </p>
             <ul className="list-disc space-y-1.5 pl-5">
               {OPERATOR_DISCLOSURES.map((d) => (
                 <li key={d.id} data-testid={d.id}>{d.text}</li>
