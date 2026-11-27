@@ -160,6 +160,14 @@ async function until(predicate: () => boolean, timeoutMs = 3000, facts?: () => s
   }
 }
 
+/** Fixture teardown: awaits each started promise in order (thunks, so a later read sees state the earlier join settled),
+ *  recording rejections instead of throwing, so a rejected join cannot skip the joins and monitor stop after it. */
+async function joinSettled(steps: (() => unknown)[]): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  for (const step of steps) { try { await step(); } catch (error) { errors.push(error); } }
+  return errors;
+}
+
 async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string, facts?: () => string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -2251,6 +2259,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   let work!: Promise<void>;
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   // Attach runs inside the try so a throwing attach still reaches the finally that stops the monitor and joins the observer.
+  let teardownErrors: unknown[] = [];
   try {
     launch?.attach(runner);
     obs.attach(runner, executor);
@@ -2379,11 +2388,8 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
       cleanupRelease.resolve();
       duplicateRelease.resolve();
       successorRelease.resolve();
-      await work;
-      await original?.workerMemory?.operation;
-      await original?.workerMemory?.closing;
-      await successorWork;
-      await queuedWork;
+      teardownErrors = await joinSettled([() => work, () => original?.workerMemory?.operation,
+        () => original?.workerMemory?.closing, () => successorWork, () => queuedWork]);
       git.normalizeRetainedSourceObjects = originalReadiness;
       await f.memory.stop(); await monitoring;
       await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
@@ -2391,6 +2397,8 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
       await obs.join();
     }
   }
+  // A rejected teardown join surfaces only after the monitor stopped, and only when the test body itself passed.
+  if (teardownErrors.length > 0) throw teardownErrors[0];
   obs.assertAll();
   verifyUnenrolledReads();
   launch?.assertControl();
@@ -2512,6 +2520,7 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
   let hold: ReturnType<typeof holdFirstPost> | undefined;
   let work!: Promise<void>;
   // Attach runs inside the try so a throwing attach still reaches the finally that stops the monitor and joins the observer.
+  let teardownErrors: unknown[] = [];
   try {
     launch?.attach(runner);
     obs.attach(runner, executor);
@@ -2551,15 +2560,16 @@ test(`M3 delayed feedback beyond deadline retains original send and sink receipt
     try {
       hold?.restore();
       clearTimeout(rescue); release.resolve();
-      await work;
-      await original?.workerMemory?.operation;
-      await original?.workerMemory?.closing;
+      teardownErrors = await joinSettled([() => work, () => original?.workerMemory?.operation,
+        () => original?.workerMemory?.closing]);
       await f.memory.stop(); await monitoring;
       await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
     } finally {
       await obs.join();
     }
   }
+  // A rejected teardown join surfaces only after the monitor stopped, and only when the test body itself passed.
+  if (teardownErrors.length > 0) throw teardownErrors[0];
   obs.assertAll();
   launch?.assertControl();
 });
@@ -3193,6 +3203,7 @@ for (const { scenario, control } of handoffCases) {
     runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, launch?.logger,
       { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000,
         ...(scenario === "unsettled" || scenario === "expired" ? { memoryHoldDeadlineMs: 200 } : {}) });
+    let teardownErrors: unknown[] = [];
     try {
       launch?.attach(runner);
       obs?.attach(runner, executor);
@@ -3212,12 +3223,14 @@ for (const { scenario, control } of handoffCases) {
     } finally {
       try {
         release.resolve();
-        await captured?.workerMemory?.operation;
+        teardownErrors = await joinSettled([() => captured?.workerMemory?.operation]);
         await f.memory.stop(); await monitoring;
       } finally {
         await obs?.join();
       }
     }
+    // A rejected teardown join surfaces only after the monitor stopped, and only when the test body itself passed.
+    if (teardownErrors.length > 0) throw teardownErrors[0];
     obs?.assertAll();
     verifyUnenrolledReads?.();
     launch?.assertControl();
