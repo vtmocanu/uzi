@@ -92,6 +92,8 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Get("/analytics/reliability", h.AdminAnalyticsReliability)
 			r.Get("/analytics/capacity", h.AdminAnalyticsCapacity)
 			r.Get("/analytics/quality", h.AdminAnalyticsQuality)
+			// Scoped run Flow (issue #4729), same admin read group and reveal rules.
+			r.Get("/analytics/flow", h.AdminAnalyticsFlow)
 			// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
 			// /usage: admin-only via this group, per-user rows incl. no_token.
 			r.Get("/rate-limits", h.AdminRateLimits)

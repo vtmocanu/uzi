@@ -69,12 +69,16 @@ func (h *Handler) analyticsServe(rt analyticsRoute, rec http.ResponseWriter, req
 		h.AnalyticsOptions(rec, req)
 	case !rt.admin && rt.section == analytics.SectionReliability:
 		h.AnalyticsReliability(rec, req)
+	case !rt.admin && rt.section == analytics.SectionFlow:
+		h.AnalyticsFlow(rec, req)
 	case !rt.admin:
 		h.AnalyticsSpend(rec, req)
 	case rt.section == analytics.SectionOptions:
 		h.AdminAnalyticsOptions(rec, req)
 	case rt.section == analytics.SectionReliability:
 		h.AdminAnalyticsReliability(rec, req)
+	case rt.section == analytics.SectionFlow:
+		h.AdminAnalyticsFlow(rec, req)
 	default:
 		h.AdminAnalyticsSpend(rec, req)
 	}
@@ -92,6 +96,10 @@ var analyticsRoutes = []analyticsRoute{
 	// Issue #4731. Appended, so the indexes above keep their meaning.
 	{"owner capacity", "/api/analytics/capacity", false, analytics.SectionCapacity},
 	{"admin capacity", "/api/admin/analytics/capacity", true, analytics.SectionCapacity},
+	// Issue #4729: appended so the positional indexes above stay valid. The route-wide tests
+	// that range over this table (busy, timeout, sanitized 500, unset deps) cover flow too.
+	{"owner flow", "/api/analytics/flow", false, analytics.SectionFlow},
+	{"admin flow", "/api/admin/analytics/flow", true, analytics.SectionFlow},
 }
 
 const (
@@ -99,6 +107,8 @@ const (
 	analyticsAdminReliabilityRoute = 5
 	analyticsOwnerCapacityRoute    = 6
 	analyticsAdminCapacityRoute    = 7
+	analyticsOwnerFlowRoute        = 8
+	analyticsAdminFlowRoute        = 9
 )
 
 func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {

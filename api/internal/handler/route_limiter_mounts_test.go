@@ -438,6 +438,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/admin/analytics/capacity", noLimiter},
 	{"GET", "/api/admin/analytics/reliability", noLimiter},
 	{"GET", "/api/admin/analytics/quality", noLimiter},
+	{"GET", "/api/admin/analytics/flow", noLimiter},
 	{"GET", "/api/admin/users", noLimiter},
 	{"GET", "/api/admin/vault-migration", noLimiter},
 	{"GET", "/api/admin/workers", noLimiter},
@@ -619,6 +620,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/analytics/capacity", noLimiter},
 	{"GET", "/api/analytics/reliability", noLimiter},
 	{"GET", "/api/analytics/quality", noLimiter},
+	{"GET", "/api/analytics/flow", noLimiter},
 	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter (v1Limiter
 	// since PRD #1908 D-B) is mounted on the whole /api/v1 subtree after RequireV1Caller
 	// (routes_v1.go), so it keys on the caller's user, not the token: minting more tokens

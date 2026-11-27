@@ -26,18 +26,18 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4684: the scoped usage analytics API.
+// Issue #4684: the scoped usage analytics API (Flow added by issue #4729).
 //
-//	GET /api/analytics/{options,spend,reliability,capacity,quality}        the caller's own runs (requireUser)
-//	GET /api/admin/analytics/{options,spend,reliability,capacity,quality}  admin read group (RequireAdminRO)
+//	GET /api/analytics/{options,spend,reliability,capacity,quality,flow}        the caller's own runs (requireUser)
+//	GET /api/admin/analytics/{options,spend,reliability,capacity,quality,flow}  admin read group (RequireAdminRO)
 //
 // Request order: (1) syntax validation with no database access, (2) single-flight admission
 // that never blocks, (3) one REPEATABLE READ READ ONLY snapshot holding the timezone check,
-// the selected-user and repo authority checks and, for spend, reliability, capacity and quality
-// (#4730), the history-start read and the statements (reliability: cohort, then latest failure;
-// analytics_reliability.go); options reads no history start. Capacity (issue #4731) also reads
-// the current provider gauges inside the snapshot, each in a savepoint, and observes Codex
-// vault state live after it (analytics_capacity.go).
+// the selected-user and repo authority checks and, for spend, reliability, capacity, quality
+// (#4730) and flow (#4729), the history-start read and the statements (reliability: cohort,
+// then latest failure; analytics_reliability.go); options reads no history start. Capacity
+// (issue #4731) also reads the current provider gauges inside the snapshot, each in a
+// savepoint, and observes Codex vault state live after it (analytics_capacity.go).
 
 const (
 	analyticsRouteOwner = "owner"
@@ -250,9 +250,9 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	}
 
 	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
-	// per-run totals for finished runs; Reliability, Capacity (issue #4731) and Quality (#4730)
-	// follow the same window choices. Options still accepts and ignores window, so the check is
-	// skipped for it.
+	// per-run totals for finished runs; Reliability, Capacity (issue #4731), Quality (#4730) and
+	// Flow (#4729) follow the same window choices. Options still accepts and ignores window, so
+	// the check is skipped for it.
 	if section != analytics.SectionOptions && !slices.Contains(req.windowChoices(), string(req.window)) {
 		return req, msgAnalyticsWindowAllAllUsers
 	}
@@ -334,6 +334,16 @@ func (h *Handler) AnalyticsOptions(w http.ResponseWriter, r *http.Request) {
 // AnalyticsSpend serves GET /api/analytics/spend for the caller's own scope.
 func (h *Handler) AnalyticsSpend(w http.ResponseWriter, r *http.Request) {
 	h.serveAnalytics(w, r, false, analytics.SectionSpend)
+}
+
+// AnalyticsFlow serves GET /api/analytics/flow for the caller's own scope.
+func (h *Handler) AnalyticsFlow(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, false, analytics.SectionFlow)
+}
+
+// AdminAnalyticsFlow serves GET /api/admin/analytics/flow.
+func (h *Handler) AdminAnalyticsFlow(w http.ResponseWriter, r *http.Request) {
+	h.serveAnalytics(w, r, true, analytics.SectionFlow)
 }
 
 // AdminAnalyticsOptions serves GET /api/admin/analytics/options.
@@ -418,6 +428,8 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 			capacity, ferr = h.capacity(ctx, deps, s, req, now)
 		case analytics.SectionQuality:
 			body, ferr = deps.quality(ctx, s, req, now)
+		case analytics.SectionFlow:
+			body, ferr = deps.flow(ctx, s, req, now)
 		default:
 			body, ferr = deps.spend(ctx, s, req, now)
 		}

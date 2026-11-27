@@ -176,7 +176,7 @@ func (f *spendFixture) capture(run, captureUser uuid.UUID, state string) {
 		 VALUES($1,$2,$3,$4,'ident','aaaa1111',$1::uuid::text,$5,now()+interval '1 hour')`, id, hold, run, captureUser, state)
 }
 
-func (f *spendFixture) patch(run uuid.UUID) {
+func (f *spendFixture) preservePatch(run uuid.UUID) {
 	f.t.Helper()
 	mustExec(f.ctx, f.t, f.pool, `UPDATE runs SET preserved_patch = 'diff --git a/x b/x' WHERE id = $1`, run)
 }
@@ -298,12 +298,12 @@ func (f *spendFixture) outcomeSet(o spendOwner, repo uuid.UUID, other spendOwner
 	f.capture(n1, o.User, "available")
 	// ... or a preserved patch.
 	n2 := run("failed", "push_secret_blocked", 14, runkind.Issue)
-	f.patch(n2)
+	f.preservePatch(n2)
 	// Negatives: landable but nothing recoverable; recoverable but not landable; a capture
 	// owned by another user; a capture that is not available.
 	run("failed", "workflow_scope_missing", 15, runkind.Issue)
 	n4 := run("failed", "agent_failure", 16, runkind.Issue)
-	f.patch(n4)
+	f.preservePatch(n4)
 	n5 := run("failed", "history_rewritten", 17, runkind.Issue)
 	f.capture(n5, other.User, "available")
 	n6 := run("failed", "finalize_base_align_conflict", 18, runkind.Issue)
@@ -311,9 +311,9 @@ func (f *spendFixture) outcomeSet(o spendOwner, repo uuid.UUID, other spendOwner
 	// Recoverable work on runs that are not failed does not count, even when the run also
 	// carries a human-landable fail_origin (so only the status guard keeps it out of needs_landing).
 	c4 := run("completed", "push_secret_blocked", 19, runkind.Issue)
-	f.patch(c4)
+	f.preservePatch(c4)
 	c5 := run("cancelled", "workflow_scope_missing", 19, runkind.Issue)
-	f.patch(c5)
+	f.preservePatch(c5)
 	f.capture(c5, o.User, "available")
 	// In flight: created, never finished.
 	f.run(spendRun{Owner: o.User, Repo: repo, Status: "running", At: day(20)})

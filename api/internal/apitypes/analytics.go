@@ -2,8 +2,8 @@ package apitypes
 
 import "time"
 
-// Issues #4684, #4685, #4730 and #4731: wire DTOs of the scoped usage analytics API
-// (GET /api/analytics/{options,spend,reliability,capacity,quality} and GET /api/admin/analytics/{options,spend,reliability,capacity,quality}).
+// Issues #4684, #4685, #4729, #4730 and #4731: wire DTOs of the scoped usage analytics API
+// (GET /api/analytics/{options,spend,reliability,capacity,quality,flow} and GET /api/admin/analytics/{options,spend,reliability,capacity,quality,flow}).
 //
 // Conventions shared by every type below:
 //   - Dollar amounts (cost_usd, numerator_usd and ratio values) are float64 converted from the

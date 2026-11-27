@@ -318,6 +318,10 @@ type evHarness struct {
 	// jitOff mirrors the production snapshot (store.RunAnalyticsSnapshot sets jit = off) for the
 	// Reliability phase; the Spend phase keeps the server default so its figures stay comparable.
 	jitOff bool
+	// Optional observers (nil for the Spend harness): onPlan sees every EXPLAIN measure takes,
+	// onTiming every timing it records.
+	onPlan   func(w evWorkload, mode string, st evStmt, p *evPlan)
+	onTiming func(phase string, w evWorkload, mode string, tm evTiming)
 }
 
 func (h *evHarness) logf(format string, a ...any) {
@@ -349,7 +353,11 @@ func evEnvInt(name string, def int) int {
 	return def
 }
 
-func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
+// newEvidenceHarness gates on UZI_ANALYTICS_PLAN_EVIDENCE, proves the throwaway marker, migrates,
+// and builds the harness (pool, pinned connection, now, run counts, modes, optional log). The
+// Spend and Flow evidence tests share it.
+func newEvidenceHarness(t *testing.T) *evHarness {
+	t.Helper()
 	if os.Getenv("UZI_ANALYTICS_PLAN_EVIDENCE") != "1" {
 		t.Skip("UZI_ANALYTICS_PLAN_EVIDENCE=1 not set; this is a measurement harness, not a gate")
 	}
@@ -382,6 +390,12 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 		t.Cleanup(func() { _ = f.Close() })
 		h.log = f
 	}
+	return h
+}
+
+func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
+	h := newEvidenceHarness(t)
+	pool := h.pool
 	h.simple(`SET statement_timeout = 0`)
 	for _, ix := range evIndexes {
 		h.simple("DROP INDEX IF EXISTS " + ix.name)
@@ -860,6 +874,9 @@ func (h *evHarness) measure(phase string, w evWorkload, modes []string, fullPlan
 	for _, mode := range []string{"custom", "generic"} {
 		for _, st := range w.stmts {
 			p := h.explain(mode, st)
+			if h.onPlan != nil {
+				h.onPlan(w, mode, st, p)
+			}
 			h.logf("-- EXPLAIN %s plan_cache_mode=%s (generic_plans=%d custom_plans=%d): exec=%.1fms planning=%.1fms temp_written_blocks=%d temp_read_blocks=%d disk_sorts=%d jit_ms=%.1f jit_funcs=%.0f shared_hit=%d shared_read=%d",
 				st.name, mode, p.generic, p.custom, p.execMs, p.planMs, p.tempW, p.tempR, p.sortDisk, p.jitMs, p.jitFuncs, p.sharedHit, p.sharedRead)
 			for _, n := range idxNames {
@@ -883,6 +900,9 @@ func (h *evHarness) measure(phase string, w evWorkload, modes []string, fullPlan
 	}
 	for _, mode := range modes {
 		tm := h.timeWorkload(w, mode)
+		if h.onTiming != nil {
+			h.onTiming(phase, w, mode, tm)
+		}
 		h.logf("TIMING %s %s mode=%s n=%d reduced=%v median=%.1fms p95=%.1fms max=%.1fms",
 			phase, w.name, mode, tm.n, tm.reduced, ms(tm.median), ms(tm.p95), ms(tm.max))
 	}
@@ -962,6 +982,7 @@ type evPlan struct {
 	indexNames            map[string]bool
 	sortDisk              int
 	totalMs               float64
+	root                  map[string]any // the EXPLAIN plan root, for checks that need the tree
 }
 
 func (p *evPlan) loopsOf(label string) float64 {
@@ -1021,6 +1042,7 @@ func (h *evHarness) explain(mode string, st evStmt) *evPlan {
 	}
 	root, _ := doc[0]["Plan"].(map[string]any)
 	p.totalMs = p.execMs
+	p.root = root
 	p.sharedHit, p.sharedRead = int64(evNum(root, "Shared Hit Blocks")), int64(evNum(root, "Shared Read Blocks"))
 	p.walk(root, 0)
 	return p

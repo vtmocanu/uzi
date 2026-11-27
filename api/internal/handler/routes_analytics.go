@@ -8,7 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// mountAnalyticsRoutes registers GET /analytics/{options,spend,reliability,capacity,quality}. RequireUser
+// mountAnalyticsRoutes registers GET /analytics/{options,spend,reliability,capacity,quality,flow}. RequireUser
 // accepts a session or a CLI Bearer; the handlers scope every statement to the context user
 // and never read the user from the query (an admin on this route sees only their own runs).
 func (h *Handler) mountAnalyticsRoutes(r chi.Router) {
@@ -19,5 +19,6 @@ func (h *Handler) mountAnalyticsRoutes(r chi.Router) {
 		r.Get("/analytics/reliability", h.AnalyticsReliability)
 		r.Get("/analytics/capacity", h.AnalyticsCapacity)
 		r.Get("/analytics/quality", h.AnalyticsQuality)
+		r.Get("/analytics/flow", h.AnalyticsFlow)
 	})
 }
