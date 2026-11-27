@@ -255,7 +255,8 @@ func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.
 	var out []store.LockVaultEnvMaterialBatchRow
 	for _, e := range matching {
 		out = append(out, store.LockVaultEnvMaterialBatchRow{ID: e.id, RepoID: e.repoID, Name: e.name, Secret: e.secret,
-			Ciphertext: append([]byte(nil), e.ciphertext...), SealedWith: e.sealedWith})
+			Ciphertext: append([]byte(nil), e.ciphertext...), SealedWith: e.sealedWith,
+			VarID: e.varID, Rev: e.rev, AadVersion: e.aadVersion})
 	}
 	return out, nil
 }

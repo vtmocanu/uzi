@@ -209,7 +209,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// repos → forge_connections and returns no rows for a repo-less judge run, which
 	// the no-rows branch below would then fail as an owner mismatch, #1691)
 	// and before the bot-PAT open. A vendor judge's claim carries only the Anthropic token; a
-	// provider-bound Claude judge carries only its frozen provider binding, and a provider refusal
+	// provider-bound judge (Claude or Codex) carries only its frozen provider binding, and a provider refusal
 	// fails it terminally (credential_unavailable) rather than parking it (PRD #4322 D-G).
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
@@ -221,9 +221,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, errIsolatedClaimRefused
 	}
 	// Provider claims support ordinary engine-aware lanes only; refuse unsupported
-	// shapes before context or credential reads, without entering a vendor ladder. A Claude judge
-	// is supported (PRD #4322 M1a); a provider-bound Codex judge stays refused here until #4574.
-	if providerBoundRun(run) && ((run.Kind == runkind.Judge && run.Harness != harnessClaude) || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
+	// shapes before context or credential reads, without entering a vendor ladder. A Claude or
+	// Codex judge is supported (PRD #4322 M1a, #4574 M1); the worker capability check below gates it.
+	// A Claude job is supported (PRD #4322 M1b); a provider-bound Codex job (a data error) stays refused,
+	// and a profile-bound (isolated) provider job is refused by the isolated term.
+	if providerBoundRun(run) && ((run.Kind == runkind.Job && run.Harness != harnessClaude) || run.Kind == runkind.CrossCheck ||
 		isolated || (run.Harness != harnessClaude && run.Harness != harnessCodex) ||
 		(run.Harness == harnessCodex && run.Kind == runkind.Chat)) {
 		return nil, errProviderLaneClaimRefused
@@ -1156,6 +1158,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		payload.Secrets.Codex = codex
 		// Issue #4201: journal the Codex binding this claim spends as the generation's epoch row,
 		// so a run's credential history is complete for both harnesses.
+	}
+
+	// PRD #4416 M2: the run environment variables of a lead-lane run. Isolated runs are excluded
+	// (RunEnvDelivered), and stripForIsolation clears both lists as a backstop. The snapshot of
+	// what was delivered rides unexported on the payload for finishRunClaimTx's re-check.
+	// A Codex claim has minted its capability by now, so the failure carries the minted identity
+	// (the cross-check lane's crossCheckAssemblyError idiom) for finishRunClaimTx to settle.
+	if err := s.attachRunEnv(ctx, wkr, run, payload); err != nil {
+		return nil, crossCheckAssemblyError(payload, err)
 	}
 
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR

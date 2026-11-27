@@ -2,7 +2,7 @@
 
 **Status**: Done (2026-11-05, uzi run on branch `agent/issue-3878`). Child of epic #3873. Blocked by: none.
 
-**Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
+**Design brief**: `prds/done/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
 **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`. Open it in a browser; append `#factory` for the Factory usage scope. The mock contract in the brief applies: implement the mock for this PRD's surfaces (page header, banner placement, Needs your decision, Runs), small consistency tweaks are fine, any larger deviation goes in the PR body under `Mock deviations` with its reason, and the PR carries side-by-side screenshots.
 

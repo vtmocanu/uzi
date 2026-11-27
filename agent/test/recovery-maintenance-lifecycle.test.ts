@@ -16,6 +16,7 @@ import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import { nullLogger } from "./helpers.js";
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 
 function deferred() {
   let resolve!: () => void;
@@ -52,7 +53,7 @@ async function fixture() {
         prerequisiteShas: [], selfContained: true, alreadyPublished: false };
     },
   };
-  const options = { recoveryRoot: root, workerToken: "local-worker-fixture", log: nullLogger(), client, git };
+  const options = { recoveryRoot: root, workerToken: "local-worker-fixture", log: nullLogger(), client, git, ...NO_SCAN_NEEDLES };
   const seed = new RecoveryCoordinator(options);
   const record = await seed.pin({ runId: "run-fixture", sourceSha: "1".repeat(40), kind: "issue", branch: "work" });
   assert.ok(record);

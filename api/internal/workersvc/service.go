@@ -623,6 +623,13 @@ type Store interface {
 	GetRunForgeConnForWorker(ctx context.Context, arg store.GetRunForgeConnForWorkerParams) (store.GetRunForgeConnForWorkerRow, error)
 	ClaimRun(ctx context.Context, arg store.ClaimRunParams) (store.Run, error)
 	GetRunClaimContext(ctx context.Context, runID uuid.UUID) (store.GetRunClaimContextRow, error)
+	// Run environment variables (PRD #4416 M2): the claim-time reads assembleClaim opens.
+	ListRunEnvEffectiveForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvEffectiveForRunRow, error)
+	ListRunEnvRedactForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvRedactForRunRow, error)
+	// The redact maintenance route and a cross-check child's claim (PRD #4416 M2).
+	ListRunEnvSecretReceiptVersionsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListRunEnvSecretReceiptVersionsForRunRow, error)
+	WorkerHoldsOpenCustodyForRun(ctx context.Context, arg store.WorkerHoldsOpenCustodyForRunParams) (bool, error)
+	RunEnvRedactOpen(ctx context.Context, runID uuid.UUID) (bool, error)
 
 	// Durable run recovery (PRD #1296 M1): the custody/archive store contract M2
 	// (upload/owner API), M3 (worker capture/retry) and M5 (owner UX) consume. Frozen
@@ -2207,7 +2214,9 @@ type Service struct {
 	heldCleanupHook func(stage string)
 	// terminal holds the terminal-preservation route's broker seams and fault-injection points
 	// (terminal_preservation.go); its zero value uses the pushbroker functions.
-	terminal           terminalHooks
+	terminal terminalHooks
+	// runEnvSweep is the retired-version sweeper's owner cursor (run_env_sweep.go).
+	runEnvSweep        runEnvSweepState
 	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
@@ -2308,6 +2317,10 @@ type Service struct {
 	// create transaction right after the lane decision, holding the shared secret-mutation lock,
 	// before the provider branch freezes its source. Nil in production.
 	judgeDecidedHook func(ctx context.Context)
+	// jobDecidedHook is the same seam for the job lane (PRD #4322 M1b): it runs in the create
+	// transaction right after the job lane read, holding the shared secret-mutation lock, before the
+	// provider branch freezes its source. Nil in production.
+	jobDecidedHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -4057,6 +4070,23 @@ var errCustomModelCapabilityMissing = errors.New("worker lacks codex_custom_mode
 // secret bytes.
 var errPhaseModelsCapabilityMissing = errors.New("worker lacks the harness phase-models capability for a planning phase")
 
+// errRunEnvCapabilityMissing marks a claim that would deliver run environment variables
+// (PRD #4416 M2) to a worker that does not advertise run_env_v1. Like
+// errCustomModelCapabilityMissing it is transient: the run returns to queued for a capable
+// worker and nothing is delivered. Its message carries no secret bytes.
+var errRunEnvCapabilityMissing = errors.New("worker lacks run_env_v1 for a run with environment variables")
+
+// errRunEnvStale marks a claim whose run environment lists changed between assembly and the
+// finish transaction (a create, rotation, delete, disable or enable). Transient: the run
+// returns to queued and nothing is delivered.
+var errRunEnvStale = errors.New("run environment variables changed during the claim")
+
+// errRunEnvHistoryUnavailable marks a claim whose receipted secret history cannot be masked
+// completely (a receipted version is missing, was swapped, or cannot be opened). The run is
+// parked with hold reason run_env_history_unavailable and neither resumes nor publishes until
+// the owner acts. Its message carries no secret bytes.
+var errRunEnvHistoryUnavailable = errors.New("run environment history is unavailable")
+
 // errGuardrailBlockedClaim marks a claim refused AT CLAIM for a terminal, run-level reason:
 // the #66 default-branch guardrail (D1 layer 3, the security net) found the bot can reach the
 // repo's default branch or could not verify it (fail-closed), or a legacy mr_rework run
@@ -5065,7 +5095,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// error: refuse it rather than stall a run whose cancel nothing would consume.
 	if owned.Kind == runkind.Job {
 		switch req.State {
-		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused":
+		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused", "limit_wait":
 			return owned, false, fmt.Errorf("%w: %w (%s)", ErrInvalidState, ErrJobNeverParks, req.State)
 		}
 	}

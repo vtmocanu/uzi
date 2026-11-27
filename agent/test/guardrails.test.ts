@@ -1486,6 +1486,28 @@ describe("path guard — SDK spill read allowance (#2332)", () => {
     assert.deepStrictEqual(await mk()(readSpill(path.join(spill(home, "sidA"), "x.txt"))), {});
   });
 
+  it("allows Read of the run's own spill file named through the CLAUDE_CONFIG_DIR form (PRD #4416), and denies it once the link is retargeted", async () => {
+    const cfg = path.join(home, ".uzi-claude-config");
+    fs.mkdirSync(cfg);
+    fs.symlinkSync("../.claude/projects", path.join(cfg, "projects"));
+    const viaCfg = (sid: string, ...rest: string[]): string => path.join(cfg, "projects", P, sid, ...rest);
+    const tp = path.join(cfg, "projects", P, "sidA.jsonl");
+    const file = viaCfg("sidA", "tool-results", "x.txt");
+    assert.deepStrictEqual(await mk()(readSpill(file, "sidA", tp)), {});
+    assert.strictEqual(decision(await mk()(readSpill(viaCfg("sidB", "tool-results", "y.txt"), "sidA", tp))), "deny", "another session");
+    assert.strictEqual(decision(await mk()(readSpill(path.join(cfg, "projects", P, "..", "..", "x"), "sidA", tp))), "deny");
+    // The same lexical path, but `projects` now leads outside HOME/.claude/projects.
+    const elsewhere = path.join(tmp, "elsewhere");
+    fs.mkdirSync(path.join(elsewhere, P, "sidA", "tool-results"), { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, P, "sidA", "tool-results", "x.txt"), "data");
+    fs.rmSync(path.join(cfg, "projects"));
+    fs.symlinkSync(elsewhere, path.join(cfg, "projects"));
+    assert.strictEqual(decision(await mk()(readSpill(file, "sidA", tp))), "deny");
+    // A transcript path under some other directory in HOME is still not accepted.
+    const other = path.join(home, ".other", "projects", P, "sidA.jsonl");
+    assert.strictEqual(decision(await mk()(readSpill(path.join(home, ".other", "projects", P, "sidA", "tool-results", "x.txt"), "sidA", other))), "deny");
+  });
+
   it("denies another session's spill file in the same run", async () => {
     assert.strictEqual(decision(await mk()(readSpill(path.join(spill(home, "sidB"), "y.txt")))), "deny");
   });

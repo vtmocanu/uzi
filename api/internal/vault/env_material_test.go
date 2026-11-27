@@ -19,6 +19,10 @@ import (
 
 type envFixtureRow struct {
 	id     uuid.UUID
+	user   uuid.UUID
+	varID  uuid.UUID
+	rev    int32
+	v2     bool // sealed under the version-2 context; false is version 1
 	repo   *uuid.UUID
 	name   string
 	secret bool
@@ -32,12 +36,27 @@ func (r envFixtureRow) scope() string {
 	return runenv.ScopeRepo
 }
 
-func (r envFixtureRow) kind() string { return runenv.AADKind(r.scope(), r.repo, r.secret, r.name) }
+func (r envFixtureRow) aadVersion() int16 {
+	if r.v2 {
+		return runenv.AADVersion2
+	}
+	return runenv.AADVersion1
+}
+
+func (r envFixtureRow) kind() string {
+	k, err := runenv.AADFor(r.aadVersion(), r.user, r.scope(), r.repo, r.secret, r.name, r.varID, r.rev)
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
 
 // seedEnv seals each row with the real seam and stages it in the fake.
 func seedEnv(t *testing.T, v *Vault, st *fakeVaultStore, uid uuid.UUID, rows []envFixtureRow) []envFixtureRow {
 	t.Helper()
 	for i := range rows {
+		rows[i].user, rows[i].varID, rows[i].rev = uid, uuid.New(), int32(i+1)
+		rows[i].v2 = i%2 == 1 // a mix of both contexts
 		m, err := v.Seal(context.Background(), uid, rows[i].kind(), []byte(rows[i].plain), SealForUse)
 		if err != nil {
 			t.Fatal(err)
@@ -49,7 +68,8 @@ func seedEnv(t *testing.T, v *Vault, st *fakeVaultStore, uid uuid.UUID, rows []e
 		}
 		st.mu.Lock()
 		st.envs = append(st.envs, &fakeEnv{id: rows[i].id, userID: uid, repoID: repo, name: rows[i].name,
-			secret: rows[i].secret, ciphertext: m.Ciphertext, sealedWith: m.SealedWith})
+			secret: rows[i].secret, ciphertext: m.Ciphertext, sealedWith: m.SealedWith,
+			varID: rows[i].varID, rev: rows[i].rev, aadVersion: rows[i].aadVersion()})
 		st.mu.Unlock()
 	}
 	return rows
@@ -160,7 +180,7 @@ func TestEnvMaterialCountsTowardConversionLimit(t *testing.T) {
 	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
 	repo := pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	for i := int64(0); i <= maxMaterialRows; i++ {
-		st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: uid, repoID: repo, name: "X", ciphertext: []byte{1}, sealedWith: store.SealedWithMasterAAD})
+		st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: uid, repoID: repo, name: "X", ciphertext: []byte{1}, sealedWith: store.SealedWithMasterAAD, aadVersion: 1})
 	}
 	err := v.Enable(context.Background(), uid, "current-login-password")
 	var limit *ConversionLimitError
@@ -179,7 +199,7 @@ func TestEnvMaterialConversionRefusesMasterMarkedRow(t *testing.T) {
 	uid := uuid.New()
 	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
 	repo := pgtype.UUID{Bytes: uuid.New(), Valid: true}
-	st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: uid, repoID: repo, name: "LEGACY", ciphertext: []byte{1}, sealedWith: store.SealedWithMaster})
+	st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: uid, repoID: repo, name: "LEGACY", ciphertext: []byte{1}, sealedWith: store.SealedWithMaster, aadVersion: 1})
 	err := v.Enable(context.Background(), uid, "current-login-password")
 	if !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("Enable with a master-marked env row = %v; want ErrInvalidState", err)
@@ -407,7 +427,7 @@ func TestResetDeletesEnvRows(t *testing.T) {
 	v, st, uid, ctx := resetFixture(t)
 	seedEnv(t, v, st, uid, fixtureEnvRows())
 	other := uuid.New()
-	st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: other, name: "KEEP_ME", ciphertext: []byte{1}, sealedWith: store.SealedWithMasterAAD})
+	st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: other, name: "KEEP_ME", ciphertext: []byte{1}, sealedWith: store.SealedWithMasterAAD, aadVersion: 1})
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := v.Reset(ctx, uid, noopReset); err != nil {

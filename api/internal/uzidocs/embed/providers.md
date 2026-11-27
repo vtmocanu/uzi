@@ -174,7 +174,17 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   [A judge on a model provider](./judge.md#a-judge-on-a-model-provider). Before PRD #4322 M1a, this
   lane refused every owner whose Claude source was set with `provider_lane_unsupported`, so older
   runs can still show that skip.
-- **Other lanes that cannot use a provider refuse.** The jobs and cross-check lanes refuse an
+- **Jobs run on your provider.** A [job](./jobs.md#jobs-on-a-model-provider) created through
+  `/api/v1/jobs` for an owner whose Claude source is a provider runs on that provider, frozen when
+  the job is created, with your provider key and no Anthropic token. A job that names a site list
+  (`egress_profile`) is still refused with `provider_lane_unsupported`, and site-list jobs on a
+  provider are not shipped yet. A job never parks: revocation (a removed allowlist entry or a replaced, disabled or deleted key) or a gateway rate limit fails it. The
+  same redirect risk applies, and the job's agent can see your provider key in its environment. The
+  worker scrubs the key from what the job publishes and withholds output files that carry it, but
+  matching covers only the key's raw, JSON-escaped, `\/`, `\u`-escaped and percent-encoded forms (other
+  encodings such as base64 are not detected), so this guards against accidental
+  publication only, not a malicious or prompt-injected job; see the linked section.
+- **Other lanes that cannot use a provider refuse.** The cross-check lane refuses an
   owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
   that use an Anthropic token. A plan cross-check whose
   checker would be refused sends the plan to the human plan gate instead; for a Codex lead that
@@ -198,10 +208,11 @@ use your current source. Editing a provider's model map creates a new revision f
 and older ones keep theirs.
 
 Revocation takes effect at the run's **next claim**, not mid-claim, and cancelling is the
-immediate stop. If the operator removes the URL from the allowlist, the run pauses as
-`provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the
+immediate stop. If the operator removes the URL from the allowlist, the run (a job excepted, below)
+pauses as `provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the
 key was replaced, disabled or deleted, the run pauses as `provider_binding_stale`: it cannot
-continue, so cancel it and start a new run, which uses the current key.
+continue, so cancel it and start a new run, which uses the current key. A job never pauses: a
+removed allowlist entry, or a replaced, disabled or deleted key, fails it with the same reason.
 
 ### Gateway rate limits
 
@@ -254,8 +265,8 @@ picks the source from the provider's engine; clearing needs the engine named
   - **An explicit model you pick** (`--model` on a run, or a model pinned on a schedule) resolves
     only through its own key. If the map has no such key the run is refused with
     `provider_model_unmapped` before any credential is sent.
-  - **A model uzi picks** (the default model, the planning default and the task-review model)
-    resolves through its own key when the map has one, otherwise through `default`.
+  - **A model uzi picks** (the default model, the planning default, the task-review model and the
+    Codex judge model) resolves through its own key when the map has one, otherwise through `default`.
   - **Effort** values pass through to the gateway unchanged.
   - **Context window.** A map entry's `context_window` sets the runtime's
     `model_context_window` for that model. Without one, the runtime's own fallback applies, which
@@ -284,23 +295,30 @@ Rotating or disabling the key, or a revision or allowlist change, takes effect a
 `provider_gateway_limit`, retried after 1, 5 and then 15 minutes, then it waits for you to
 Resume ([the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit)).
 
+### The Codex judge on a provider
+
+A Codex judge for an owner whose **Codex** source is a provider (their own; shared Codex definitions are
+#4633) runs on that provider, frozen when the judge is created, with no vendor
+fallback. A selected Codex source always wins; there is no judge pin that keeps it a vendor judge. An
+owner with only a Claude source gets a Codex judge on the vendor Codex credential, ignoring the Claude
+source. The judge model resolves through the provider's model map: an exact key, else the required
+`default` slot. A map without `default` is an unusable source, skipped as `provider_source_unusable`,
+never `provider_model_unmapped`. Failure behavior, the `codex_provider_judge_v1` worker capability and the
+trace destination: [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider). Older
+`provider_lane_unsupported` skip rows for a Codex judge are historical.
+
 ### What a Codex provider run does not do
 
-- **Judge.** A Codex judge is skipped for an owner whose **Codex** source is a provider, with the
-  visible skip "the selected Codex source is a model provider, which the Codex judge does not
-  support yet." An owner with only a Claude source gets a Codex judge on the vendor Codex
-  credential, ignoring the Claude source. A Claude judge follows your Claude source as described
-  above.
 - **Cross-check.** Plan and code cross-check refuse when either side would be bound to a Codex
   provider, with `provider_lane_unsupported`. For the plan stage this means a human plan gate: a
   Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker
   refused and waits for you to approve the plan. The code stage records the checker as
   unavailable with no verdict.
-- **Jobs and chat** are Claude-only and unchanged by a Codex source. A job refuses with
-  `provider_lane_unsupported` while your **Claude** source is set; a Codex source does not
-  affect them.
+- **Jobs and chat** are Claude-only and unchanged by a Codex source. A Codex source does not
+  affect them. A job follows your **Claude** source (see
+  [Use a provider as your Claude source](#use-a-provider-as-your-claude-source)).
 
-Codex providers on the judge and cross-check lanes are tracked in #4574.
+Codex providers on the cross-check lane are tracked in #4574.
 
 ### Operators: rollout and keys
 
@@ -409,8 +427,10 @@ details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 
 ## Gateways behind a private CA
 
-For a Codex provider, the worker's existing extra-CA bundle is delivered to the Codex runtime with
-TLS verification left on, so a private-CA gateway works there. A stalled connection fails with a
+For a Codex provider, the worker's extra-CA bundle is delivered to the Codex runtime with
+TLS verification left on, so a private-CA gateway works there, but only on workers the controller recorded as
+created with it (see the `workers.extraCA` upgrade note in [Configuration](./configuration.md)); a worker without
+that record fails TLS until it is reprovisioned. A stalled connection fails with a
 typed timeout (setup through the first model response is bounded at 10 seconds per runtime
 root); it is reported as a certificate error only when the runtime reports one. This page does not
 separately document the `workers.uidSplit` case for Codex; the paragraph below describes Claude.

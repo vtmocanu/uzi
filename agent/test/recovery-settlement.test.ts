@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { createHmac } from "node:crypto";
 import assert from "node:assert/strict";
@@ -175,7 +176,7 @@ describe("SettlementJournal (issue #1582 M2)", () => {
     const gc = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions());
     assert.equal(gc.recoverySettlementRoot, path.join(dataDir, "recovery-settlement"));
     assert.ok(!gc.recoverySettlementRoot.startsWith(gc.recoveryRoot + path.sep), "never inside recovery/");
-    const coord = new RecoveryCoordinator({
+    const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client: new FakeRecoveryClient(),
       git: new FakeRecoveryGit(),
       log: nullLogger(),

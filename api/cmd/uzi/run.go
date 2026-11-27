@@ -145,6 +145,10 @@ const (
 	// (final; start a new run). Resume is refused for both (409).
 	holdProviderDestinationNotAllowed = "provider_destination_not_allowed"
 	holdProviderBindingStale          = "provider_binding_stale"
+	// holdRunEnvHistoryUnavailable (PRD #4416 M2) holds a run whose claim needs a receipted secret
+	// variable version that is missing or cannot be opened, so its output cannot be masked. Resume
+	// retries the claim and parks again while the version is still missing; otherwise the owner cancels.
+	holdRunEnvHistoryUnavailable = "run_env_history_unavailable"
 )
 
 // nonCompletionHold is one row of nonCompletionHolds.
@@ -184,6 +188,7 @@ var nonCompletionHolds = map[string]nonCompletionHold{
 	// PRD #4320 module 5: not owner-resumable (the promoter re-queues the first; the second is final).
 	holdProviderDestinationNotAllowed: {ownerResumable: false, announcesEntry: true, boardOwnerHold: true},
 	holdProviderBindingStale:          {ownerResumable: false, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
+	holdRunEnvHistoryUnavailable:      {ownerResumable: true, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
 }
 
 // isNonCompletionHold reports whether reason is one of the nonCompletionHolds.

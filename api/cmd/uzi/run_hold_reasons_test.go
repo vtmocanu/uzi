@@ -128,13 +128,43 @@ func TestRunOverrideNoticeCopy(t *testing.T) {
 	}
 }
 
+func TestHoldRowRunEnvHistoryUnavailable(t *testing.T) {
+	reason := holdRunEnvHistoryUnavailable
+	r := apitypes.RunDTO{ID: "run-1", Status: statusPaused, Kind: "issue", HoldReason: &reason}
+	row := holdRow(r, statusEnteredAt(r))
+	if len(row) != 2 || row[0] != "HOLD" || !strings.HasPrefix(row[1], "variable history unavailable · parked ") ||
+		!strings.HasSuffix(row[1], " · "+runEnvHistoryAction(r)) {
+		t.Errorf("HOLD row = %v", row)
+	}
+	r.Status = "queued"
+	if row := holdRow(r, time.Now()); row != nil {
+		t.Errorf("a resumed run must not render the hold, got %v", row)
+	}
+}
+
+func TestRenderRunDetailInjectedEnv(t *testing.T) {
+	r := apitypes.RunDTO{ID: "run-1", Kind: "issue", Status: "completed", Health: "ok",
+		InjectedEnv: []apitypes.InjectedEnvVarDTO{{Name: "API_URL", Scope: "repo"}, {Name: "TOKEN\x1b[31m", Scope: "user", Secret: true}}}
+	out := renderDetail(t, r)
+	if !strings.Contains(out, "INJECTED_ENV") || !strings.Contains(out, "API_URL (repo)") || !strings.Contains(out, "(user, secret)") {
+		t.Errorf("INJECTED_ENV row missing or wrong:\n%s", out)
+	}
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("a hostile variable name reached the terminal:\n%q", out)
+	}
+	none := renderDetail(t, apitypes.RunDTO{ID: "run-2", Kind: "issue", Status: "completed", Health: "ok"})
+	if strings.Contains(none, "INJECTED_ENV") {
+		t.Errorf("a run with no injected variables must render no row:\n%s", none)
+	}
+}
+
 // The set drives the default `run wait` stop and the TUI owner band and count: membership is pinned.
 func TestHoldSetStopAndBoardMembership(t *testing.T) {
 	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
-		holdPhaseSwitchUnavailable: true, holdProviderBindingStale: true}
+		holdPhaseSwitchUnavailable: true, holdProviderBindingStale: true, holdRunEnvHistoryUnavailable: true}
 	wantBoard := map[string]bool{holdCredentialDisabled: true, holdCredentialsReset: true, holdProviderUnavailable: true, holdIterationExhausted: true,
 		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
-		holdPhaseSwitchUnavailable: true, holdProviderDestinationNotAllowed: true, holdProviderBindingStale: true}
+		holdPhaseSwitchUnavailable: true, holdProviderDestinationNotAllowed: true, holdProviderBindingStale: true, holdRunEnvHistoryUnavailable: true}
 	for reason := range nonCompletionHolds {
 		reason := reason
 		r := apitypes.RunDTO{ID: "r1", Status: statusPaused, HoldReason: &reason}

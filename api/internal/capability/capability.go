@@ -316,8 +316,24 @@ const ClaudeProviderV1 = "claude_provider_v1"
 // placeable only on a worker that advertises both.
 const ClaudeProviderJudgeV1 = "claude_provider_judge_v1"
 
+// ClaudeProviderJobV1 identifies workers whose job runner can run a provider-bound Claude job
+// (PRD #4322 M1b): a job claim carrying one `provider` binding and no Anthropic OAuth token, with
+// scrubbed output publication. A protocol capability and a NON-BYPASSABLE ClaimRun and placement
+// clause, layered on ClaudeProviderV1 for kind 'job' only: a worker that has only claude_provider_v1
+// would run the job with the vendor job runner, so a provider-bound job is claimable and placeable
+// only on a worker that advertises both.
+const ClaudeProviderJobV1 = "claude_provider_job_v1"
+
 // CodexProviderV1 identifies workers that accept exclusive Responses-provider claims.
 const CodexProviderV1 = "codex_provider_v1"
+
+// CodexProviderJudgeV1 identifies workers whose judge runner can run a provider-bound Codex
+// judge (PRD #4574 M1): a judge claim carrying one `provider` binding on the Codex harness.
+// A protocol capability and a NON-BYPASSABLE ClaimRun and placement clause, layered on
+// CodexProviderV1 for kind 'judge' only: a worker that has only codex_provider_v1 would run
+// the judge with the vendor judge runner, so a provider-bound Codex judge is claimable and
+// placeable only on a worker that advertises both.
+const CodexProviderJudgeV1 = "codex_provider_judge_v1"
 
 // CrossCheckSemanticPlanV1 identifies workers whose Claude/Codex checker understands the
 // semantic plan-candidate digest and payload (PRD #1230 D2). It is a protocol capability and a
@@ -418,6 +434,18 @@ const RecoveryRunOpenHoldsV1 = "recovery_run_open_holds_v1"
 // reports it; the route refuses unsupported, with no write, for a worker that does not.
 const RecoveryTerminalPreservationV1 = "recovery_terminal_preservation_v1"
 
+// RunEnvV1 (PRD #4416 M2) negotiates run-scoped environment variables: a worker that reports it
+// receives secrets.run_env and secrets.run_env_redact on its claim. A worker that does not report
+// it is never sent either field; a claim that has variables to deliver, or a secret receipt to
+// mask, is requeued instead. A cross-check child receives secrets.run_env_redact only (the lead's
+// secret versions, never run_env) and, on a worker without this capability, ends as
+// checker_unavailable when the lead holds secret receipts. The redact maintenance route
+// (GET /api/worker/runs/{id}/run-env-redact) is served to any authenticated worker for the runs it
+// holds or last held, or whose open recovery custody hold it took, and does not check this
+// capability: a worker without it was never sent a value to mask. A run with no governing run
+// (not a lead-lane run and not a cross-check child) answers {protected:false}.
+const RunEnvV1 = "run_env_v1"
+
 // TemplateEffortV1 (issue #3258) negotiates the per-subagent reasoning effort on claim agents
 // (ClaimAgent.effort). A worker that reports it applies a template's effort pin; the api never
 // sends the key to one that does not and records a run-feed notice instead. It is a worker/server
@@ -441,6 +469,7 @@ const FreshResumeV1 = "fresh_resume_v1"
 
 var protocolVocabulary = map[string]struct{}{
 	TaskReviewSettingsV1:            {},
+	RunEnvV1:                        {},
 	TemplateEffortV1:                {},
 	RecoveryRunOpenHoldsV1:          {},
 	RecoveryTerminalPreservationV1:  {},
@@ -496,7 +525,9 @@ var protocolVocabulary = map[string]struct{}{
 	CrossCheckGatedV1:               {},
 	ClaudeProviderV1:                {},
 	ClaudeProviderJudgeV1:           {},
+	ClaudeProviderJobV1:             {},
 	CodexProviderV1:                 {},
+	CodexProviderJudgeV1:            {},
 	CrossCheckSemanticPlanV1:        {},
 	CrossCheckOwnerSteeringV1:       {},
 	CompletionSemanticPublicationV1: {},
@@ -513,7 +544,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, HibernationCachePruneV1, HibernationInventoryV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, RecoveryTerminalPreservationV1, CodexHarnessV1, CodexRuntimeV2, CodexRuntimeV3, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, ClaudePhaseModelsV1, CodexPhaseModelsV1, CodexCompletionInterlockV1, CredentialSwitchV1, CredentialSwitchInPlaceV1, CodexCredentialSwitchV1, CodexSwitchStoppedV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, ClaudeProviderV1, ClaudeProviderJudgeV1, CodexProviderV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, IssueKeyV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1, TemplateEffortV1, TaskReviewSettingsV1, FreshResumeV1}
+var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, HibernationCachePruneV1, HibernationInventoryV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryRunOpenHoldsV1, RecoveryPrerequisiteClosureV1, RecoveryTerminalPreservationV1, CodexHarnessV1, CodexRuntimeV2, CodexRuntimeV3, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, ClaudePhaseModelsV1, CodexPhaseModelsV1, CodexCompletionInterlockV1, CredentialSwitchV1, CredentialSwitchInPlaceV1, CodexCredentialSwitchV1, CodexSwitchStoppedV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, ClaudeProviderV1, ClaudeProviderJudgeV1, ClaudeProviderJobV1, CodexProviderV1, CodexProviderJudgeV1, CrossCheckSemanticPlanV1, CrossCheckOwnerSteeringV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, RepoAgentSourceV1, AgentSourceRequestV1, IssueKeyV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1, RunEnvV1, TemplateEffortV1, TaskReviewSettingsV1, FreshResumeV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

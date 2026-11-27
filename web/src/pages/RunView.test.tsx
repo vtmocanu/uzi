@@ -2190,6 +2190,52 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
   });
 
+  // PRD #4416 M2: a receipted secret variable version is unreadable; the owner can Resume or Cancel.
+  it("a run-env-history hold shows its panel with Resume and Cancel for the owner only", async () => {
+    const { refreshRun } = renderPage({ ...PAUSED, hold_reason: "run_env_history_unavailable" }, true);
+    const heading = await screen.findByRole("heading", { name: "Variable history unavailable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/secret variable version it was given can no longer be read, so its output cannot be masked/i)).toBeTruthy();
+    expect(panel.getByText(/Resume retries once the variable history is restored/i)).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  it("lists injected variables by name, scope and secret badge, only when present", async () => {
+    renderPage({ ...PAUSED, injected_env: [{ name: "DB_URL", scope: "repo", secret: true }, { name: "LOG_LEVEL", scope: "user", secret: false }] }, true);
+    const section = await screen.findByRole("region", { name: "Variables injected" });
+    expect(within(section).getByText("DB_URL")).toBeTruthy();
+    expect(within(section).getByText("LOG_LEVEL")).toBeTruthy();
+    expect(within(section).getAllByText("secret")).toHaveLength(1);
+    expect(within(section).getByText("user")).toBeTruthy();
+    expect(within(section).getByText(/Set for this run.s current attempt/)).toBeTruthy();
+  });
+
+  it("renders a hostile injected variable name and scope with control and bidi characters stripped", async () => {
+    renderPage({ ...PAUSED, injected_env: [{ name: "EVIL\u001b[31mNAME‮", scope: "us‮er\u001b[0m", secret: false }] }, true);
+    const section = await screen.findByRole("region", { name: "Variables injected" });
+    expect(section.textContent).not.toContain("\u001b");
+    expect(section.textContent).not.toContain("‮");
+    expect(within(section).getByText("EVIL[31mNAME")).toBeTruthy();
+    expect(within(section).getByText("user[0m")).toBeTruthy();
+  });
+
+  it.each([[undefined], [[]]] as const)("renders no injected variables section when injected_env is %j", async (injected) => {
+    renderPage({ ...PAUSED, injected_env: injected as never }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByRole("region", { name: "Variables injected" })).toBeNull();
+  });
+
+  it("a run-env-history hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "run_env_history_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Variable history unavailable: waiting for owner" });
+    expect(within(heading.parentElement!).queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
   it("a run-override hold gives non-owners no Resume or Cancel controls", async () => {
     renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, false);
     const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
@@ -6690,6 +6736,7 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     ["credential_switch_settling", true],
     ["credential_switch_unsettled", true],
     ["run_override_unavailable", false],
+    ["run_env_history_unavailable", false],
     ["phase_switch_unavailable", false],
   ] as const)("a paused run held on %s with a live completion phase shows the panel: %s", (hold, shown) => {
     const { container } = render(<CompletionStatePanel run={run({ status: "paused", completion_phase: "checking", hold_reason: hold })} />);
@@ -6707,6 +6754,7 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     ["credential_switch_settling", true],
     ["credential_switch_unsettled", true],
     ["run_override_unavailable", false],
+    ["run_env_history_unavailable", false],
     ["phase_switch_unavailable", false],
   ] as const)("a retained %s marker on a non-paused run with no phase shows the panel: %s", (hold, shown) => {
     const { container } = render(<CompletionStatePanel run={run({ status: "queued", completion_phase: "", hold_reason: hold })} />);

@@ -17,8 +17,8 @@ const AT = "2026-11-10T09:30:00Z";
 const cases: [string, JudgeSkip, string][] = [
   ["claude historical lane", { harness: "claude", reason: "provider_lane_unsupported", at: AT },
     "the selected source was a model provider, which the judge did not support at the time."],
-  ["codex current lane", { harness: "codex", reason: "provider_lane_unsupported", at: AT },
-    "the selected Codex source is a model provider, which the Codex judge does not support yet."],
+  ["codex historical lane", { harness: "codex", reason: "provider_lane_unsupported", at: AT },
+    "the selected Codex source is a model provider, which the Codex judge did not support at the time."],
   ["source unusable", { harness: "claude", reason: "provider_source_unusable", at: AT },
     "the selected model provider could not serve the judge."],
 ];

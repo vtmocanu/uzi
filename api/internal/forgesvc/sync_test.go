@@ -74,6 +74,10 @@ type fakeForge struct {
 	remoteLabels        []string // optional remote state for partial-failure tests
 	removeBeforeFailure bool
 	updateCalls         []mrUpdateCall
+	// PRD #4691 ordering evidence: when GetMergeRequest returned (one per call) and when each
+	// UpdateIssueLabels (the board move) started.
+	mrReturnedAt    []time.Time
+	updateStartedAt []time.Time
 
 	// Pipeline sync (PRD #6) scripting + capture. pipelineByRef keys on a branch
 	// ref, pipelineByMR on an MR iid; a missing key returns ErrNoPipeline (the
@@ -271,6 +275,8 @@ func (f *fakeForge) GetIssue(_ context.Context, _ int64, issueIID int64) (forge.
 }
 func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove []string) error {
 	f.updateCalls = append(f.updateCalls, mrUpdateCall{add: add, remove: remove})
+	f.updateStartedAt = append(f.updateStartedAt, time.Now())
+	time.Sleep(50 * time.Millisecond) // lets an ordering test tell "before" from "after" the move
 	if f.removeBeforeFailure {
 		f.remoteLabels = slices.DeleteFunc(f.remoteLabels, func(label string) bool { return slices.Contains(remove, label) })
 	}
@@ -299,11 +305,13 @@ func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.Me
 		return forge.MergeRequest{}, err
 	}
 	if mr, ok := f.mrByIID[mrIID]; ok {
+		f.mrReturnedAt = append(f.mrReturnedAt, time.Now())
 		return mr, nil
 	}
 	if f.mrErr != nil {
 		return forge.MergeRequest{}, f.mrErr
 	}
+	f.mrReturnedAt = append(f.mrReturnedAt, time.Now())
 	return f.mr, nil
 }
 
@@ -370,6 +378,9 @@ type fakeStore struct {
 	columns                []store.BoardColumn
 	columnsErr             error
 	mrStateWrites          []store.SetRunMRStateParams
+	mrStateWriteAt         []time.Time // when each SetRunMRState call happened
+	mrStateFailOnce        error       // when set, the FIRST SetRunMRState call fails (args still recorded)
+	persistMRState         bool        // when set, a successful SetRunMRState updates the matching board-free candidate's mr_state
 
 	// Pipeline sync (PRD #6) scripting + capture.
 	watchedRefs      []store.ListWatchedRunRefsForRepoRow
@@ -526,6 +537,17 @@ func (s *fakeStore) ListBoardColumns(context.Context, uuid.UUID) ([]store.BoardC
 }
 func (s *fakeStore) SetRunMRState(_ context.Context, arg store.SetRunMRStateParams) (int64, error) {
 	s.mrStateWrites = append(s.mrStateWrites, arg)
+	s.mrStateWriteAt = append(s.mrStateWriteAt, time.Now())
+	if s.mrStateFailOnce != nil && len(s.mrStateWrites) == 1 {
+		return 0, s.mrStateFailOnce
+	}
+	if s.persistMRState {
+		for i := range s.boardFreeCandidates {
+			if s.boardFreeCandidates[i].ID == arg.ID {
+				s.boardFreeCandidates[i].MrState = pgtype.Text{String: arg.MrState, Valid: true}
+			}
+		}
+	}
 	return 1, nil
 }
 func (s *fakeStore) ListWatchedRunRefsForRepo(_ context.Context, arg store.ListWatchedRunRefsForRepoParams) ([]store.ListWatchedRunRefsForRepoRow, error) {
@@ -621,14 +643,17 @@ func (s *fakeStore) SettlePRDLinkPatch(_ context.Context, id uuid.UUID) (int64, 
 // cancel, in order, and can be forced to fail (err) to exercise the leave-unadvanced
 // retry contract on the opened->closed / ->merged cancel path.
 type fakeReworkCanceller struct {
-	calls   []int64  // mrIIDs cancelled, in order
-	reasons []string // the reason passed with each call, in order (issue #4616)
-	err     error    // when non-nil, forces every CancelReworkForMR to fail
+	calls   []int64     // mrIIDs cancelled, in order
+	reasons []string    // the reason passed with each call, in order (issue #4616)
+	started []time.Time // when each call started (PRD #4691 ordering evidence)
+	err     error       // when non-nil, forces every CancelReworkForMR to fail
 }
 
 func (c *fakeReworkCanceller) CancelReworkForMR(_ context.Context, _ uuid.UUID, mrIID int64, reason string) error {
 	c.calls = append(c.calls, mrIID)
 	c.reasons = append(c.reasons, reason)
+	c.started = append(c.started, time.Now())
+	time.Sleep(50 * time.Millisecond) // lets an ordering test tell "before" from "after" the cancel
 	return c.err
 }
 

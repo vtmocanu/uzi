@@ -525,12 +525,32 @@ workers:
   #   configMap: an existing ConfigMap in the RELEASE namespace (e.g. a trust-manager
   #     Bundle target), by name and key.
   # Like the api CA, it is written into a worker's Secret when the worker is created:
-  # adding or changing it reaches new workers, so reprovision existing ones. The
-  # controller reads it at boot; an inline pem change restarts the controller, an edit
-  # to an existing ConfigMap needs a controller restart. Without workers.uidSplit,
-  # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
-  # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
-  # reprovisioning is still what delivers the CA to it.
+  # adding or changing it reaches new workers only, so reprovision existing ones (a bundle
+  # change A to B leaves them on A). The controller reads it at boot; an inline pem change
+  # restarts the controller, an edit to an existing ConfigMap needs a controller restart.
+  # UZI_CODEX_CA_FILE is rendered only for a non-isolated worker whose own Secret the
+  # controller has confirmed holds the Codex CA key (a uzi.dev/codex-extra-ca annotation on
+  # its /data PVC), so enabling this never rolls a uid-split worker whose Secret lacks the
+  # key; a Codex provider behind a private CA on such a worker fails TLS rather than crashing
+  # it. Without workers.uidSplit, turning it on also adds UZI_CLI_CA_FILE to the worker pod
+  # template, which can start paced worker rolls; those rolls never add UZI_CODEX_CA_FILE
+  # for a Secret that lacks the key, and a roll does not rewrite an existing Secret.
+  # Removing it withdraws UZI_CODEX_CA_FILE (and, without workers.uidSplit, UZI_CLI_CA_FILE);
+  # existing Secrets and NODE_EXTRA_CA_CERTS keep the original bundle. A Secret recreated by
+  # hand is not tracked.
+  # UPGRADE: no worker has recorded evidence yet, so a worker whose deployed template already
+  # carries UZI_CODEX_CA_FILE (earlier controllers added it whenever this was set) now drifts
+  # and, once the ordinary roll admits it, rolls without it; those created with the extra CA
+  # lose the Codex CA until reprovisioned. A worker still on its pre-CA template does not
+  # drift on this account. A controller restart between a new worker's Secret create and its
+  # /data claim create leaves that worker without the Codex CA (its first Deployment never
+  # gets it). A controller restart during a /data recycle that keeps the Deployment at zero
+  # replicas does not lose it: the controller records the evidence on the Deployment
+  # (uzi.dev/codex-extra-ca: written) before deleting the /data claim (and clears it if the
+  # claim being deleted is unstamped), and the stamped replacement claim lets the worker
+  # resume. A recycle that deletes the Deployment keeps only in-process evidence: a restart
+  # mid-recycle recreates the worker (when its recreation is admitted) without
+  # UZI_CODEX_CA_FILE, so a private-CA Codex provider fails TLS rather than crashing it.
   # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
   # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
   # no other api client; the api refuses to boot if the file is unreadable or holds no
@@ -758,7 +778,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.26"
+    tag: "0.87.0-rc.28"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image

@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -69,12 +71,14 @@ func jobCredentialErr(err error) error {
 //
 // The wire keeps the (empty) repo and forge_pat keys because a job rides the ordinary
 // ClaimPayload; the no-PAT guarantee is that assembly never decrypts one.
+//
+// PRD #4322 M1b: a provider-bound Claude job claims against its FROZEN binding exactly like a
+// provider judge (assembleProviderBinding): it never calls claimSecretID, openWithAutoRetry or
+// recordRunCredential, so no vendor credential is opened or recorded and the claim carries only
+// secrets.provider. Everything after the credential step is the vendor job's assembly, with the model
+// read strictly (resolveJobModel). A provider refusal is settled terminally by finishRunClaim.
 func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
-	// PRD #4320 module 5: the job lane has no provider support until PRD #4322. A provider-bound row
-	// (creation cannot produce one; defence in depth) fails closed before any credential is opened.
-	if providerBoundRun(run) {
-		return nil, errProviderLaneClaimRefused
-	}
+	providerJob := providerBoundRun(run)
 	if run.Harness == harnessCodex {
 		// Jobs are created with an explicit Claude pin; a Codex job is a data error and must
 		// fail closed rather than run without a credential.
@@ -95,18 +99,28 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 			return nil, fmt.Errorf("clear earlier job outputs: %w", err)
 		}
 	}
-	choice, err := s.claimSecretID(ctx, wkr, run)
-	if err != nil {
-		return nil, jobCredentialErr(err)
-	}
-	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
-	if err != nil {
-		return nil, jobCredentialErr(err)
-	}
-	// emitSwitchMessage=false: a job is not credential-switchable (D-E), so it never emits a
-	// 'credential_switch' message and last_seq cannot diverge from run.LastSeq.
-	if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
-		return nil, err
+	var secrets ClaimSecrets
+	if providerJob {
+		binding, err := s.assembleProviderBinding(ctx, wkr, run)
+		if err != nil {
+			return nil, err
+		}
+		secrets = ClaimSecrets{Provider: binding}
+	} else {
+		choice, err := s.claimSecretID(ctx, wkr, run)
+		if err != nil {
+			return nil, jobCredentialErr(err)
+		}
+		cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
+		if err != nil {
+			return nil, jobCredentialErr(err)
+		}
+		// emitSwitchMessage=false: a job is not credential-switchable (D-E), so it never emits a
+		// 'credential_switch' message and last_seq cannot diverge from run.LastSeq.
+		if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
+			return nil, err
+		}
+		secrets = ClaimSecrets{AnthropicOAuthToken: string(cred.Token)}
 	}
 
 	inputs, err := s.q.ListJobInputsForClaim(ctx, run.ID)
@@ -154,18 +168,19 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 
 	// The owner's Claude model lane, then a frozen per-run model when it is compatible. Best
 	// effort: a lookup error logs and the runner uses its own default, it never fails the claim.
-	var defaultModel *string
-	if lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID); lerr != nil {
-		slog.Warn("job claim: read user model defaults", "user", run.UserID.String(), "error", lerr)
-	} else {
-		if lane := lanes.DefaultClaudeModel; lane.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(lane.String)] {
-			slog.Warn("job claim: dropped Codex role model from Claude lane", "run_id", run.ID.String(), "model", strings.TrimSpace(lane.String))
-		} else {
-			defaultModel = textPtr(lane)
+	defaultModel, merr := s.resolveJobModel(ctx, s.q, run, providerJob)
+	if merr != nil {
+		// Only a provider job reads strictly. A transient database error stays classifiable so
+		// finishRunClaim leaves the claim for the never-started sweep; any other error settles the run
+		// terminally with a FIXED reason (the raw error is logged here, never stored).
+		if isTransientClaimDBError(merr) {
+			return nil, fmt.Errorf("%w: job model settings: %w", errCredentialUnavailable, merr)
 		}
+		slog.Error("job claim: read job model settings", "run_id", run.ID.String(), "error", merr)
+		return nil, fmt.Errorf("%w: the job's model settings could not be read", errCredentialUnavailable)
 	}
-	if run.Model.Valid && harnessModelCompatible(Harness(run.Harness), run.Model.String) {
-		defaultModel = textPtr(run.Model)
+	if providerJob && !modelMapped(secrets.Provider.ModelMap, *defaultModel) {
+		return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: "the job's model is not mapped by the provider"}
 	}
 	defaultEffort, eerr := s.q.GetUserDefaultEffort(ctx, run.UserID)
 	if eerr != nil {
@@ -202,7 +217,6 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	if policyErr != nil {
 		return nil, policyErr
 	}
-	secrets := ClaimSecrets{AnthropicOAuthToken: string(cred.Token)}
 	if err := assertClaimSecretsExclusive(secrets); err != nil {
 		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
 	}
@@ -229,4 +243,80 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		SkillsDropped:              skillDrops,
 		Config:                     cfg,
 	}, nil
+}
+
+// jobModelReader is the one per-user read resolveJobModel needs.
+type jobModelReader interface {
+	GetUserHarnessModelDefaults(context.Context, uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error)
+}
+
+// providerJobInheritModel is the literal a stored model may carry for "use the runner's default".
+// It is never a model id: a provider job treats it as absent at every level, so it can neither reach
+// the model map's target comparison nor the worker's SDK options.
+const providerJobInheritModel = "inherit"
+
+// resolveJobModel resolves the model a job claim carries as config.default_model.
+//
+// strict=false is the vendor job's best-effort posture, unchanged: the owner's Claude lane default
+// (a Codex role token dropped with a warning), then a compatible frozen run model, no fallback (the
+// runner uses its own default); a read error is logged and the lane treated as unset, so err is nil.
+//
+// strict=true is the provider job's (PRD #4322 M1b) and returns a concrete, canonical model, never nil
+// and never "inherit": a compatible frozen run model, then the owner's Claude lane default minus Codex
+// role models, then the "sonnet" alias the provider map must carry. Each candidate is trimmed, and an
+// empty or literal "inherit" candidate counts as absent at every level and falls through. The lane
+// read is made first and its error is returned, so a create validating the model rolls back and a
+// claim settles rather than check a guessed model against the provider's map.
+func (s *Service) resolveJobModel(ctx context.Context, q jobModelReader, run store.Run, strict bool) (*string, error) {
+	lanes, lerr := q.GetUserHarnessModelDefaults(ctx, run.UserID)
+	if !strict {
+		var defaultModel *string
+		if lerr != nil {
+			slog.Warn("job claim: read user model defaults", "user", run.UserID.String(), "error", lerr)
+		} else if lane := lanes.DefaultClaudeModel; lane.Valid && agenttmpl.CodexRoleModels[strings.TrimSpace(lane.String)] {
+			slog.Warn("job claim: dropped Codex role model from Claude lane", "run_id", run.ID.String(), "model", strings.TrimSpace(lane.String))
+		} else {
+			defaultModel = textPtr(lane)
+		}
+		if run.Model.Valid && harnessModelCompatible(Harness(run.Harness), run.Model.String) {
+			defaultModel = textPtr(run.Model)
+		}
+		return defaultModel, nil
+	}
+	if lerr != nil {
+		return nil, lerr
+	}
+	canonical := func(v string) string {
+		t := strings.TrimSpace(v)
+		if t == providerJobInheritModel {
+			return ""
+		}
+		return t
+	}
+	if run.Model.Valid {
+		if m := canonical(run.Model.String); m != "" && harnessModelCompatible(HarnessClaude, m) {
+			return &m, nil
+		}
+	}
+	if lanes.DefaultClaudeModel.Valid {
+		if m := canonical(lanes.DefaultClaudeModel.String); m != "" && !agenttmpl.CodexRoleModels[m] {
+			return &m, nil
+		}
+	}
+	m := providerDefaultModelAlias
+	return &m, nil
+}
+
+// checkProviderJobModel is the job arm of verifyRunBinding: a provider-bound job runs ONE model (no
+// lead, planning or template models), resolved strictly, and it must map through the frozen provider's
+// model map. The same canonical model is what the claim carries as config.default_model.
+func (s *Service) checkProviderJobModel(ctx context.Context, q *store.Queries, run store.Run, src providerSource) error {
+	model, err := s.resolveJobModel(ctx, q, run, true)
+	if err != nil {
+		return fmt.Errorf("provider job model check: %w", err)
+	}
+	if !modelMapped(src.ModelMap, *model) {
+		return &ProviderModelUnmappedError{Model: *model, Source: "job"}
+	}
+	return nil
 }

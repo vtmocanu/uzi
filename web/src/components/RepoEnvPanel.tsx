@@ -3,6 +3,7 @@
 // never prefills it, and nothing here renders one back.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent } from "react";
+import { Link } from "react-router-dom";
 import { api, ApiError, isVaultLocked, type RunEnvList, type RunEnvVar, type RunEnvWriteInput } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Input, Textarea, Toggle } from "./ui";
@@ -50,6 +51,16 @@ function writeErrorMessage(err: unknown, fallback: string): string {
   return errorMessage(err, fallback);
 }
 
+// A write refused because the owner's retired secret versions are at their limit answers 409
+// env_history_full, optionally naming the runs that keep versions sealed (held_by_runs, at most 20,
+// absent or empty when none is known). Returns those run ids, or null for any other error.
+function historyFullRuns(err: unknown): string[] | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { code?: unknown; held_by_runs?: unknown } | null;
+  if (body?.code !== "env_history_full") return null;
+  return Array.isArray(body.held_by_runs) ? body.held_by_runs.filter((id): id is string => typeof id === "string") : [];
+}
+
 function stateBadge(v: RunEnvVar) {
   if (v.state === "disabled") return <Badge tone="warning">Disabled</Badge>;
   if (v.state === "pending_deletion") return <Badge tone="neutral">Pending deletion</Badge>;
@@ -75,6 +86,8 @@ export function RepoEnvPanel({
   const [rowError, setRowError] = useState("");
   const [notice, setNotice] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // Run ids named by the latest env_history_full refusal; null when the last write was not one.
+  const [heldByRuns, setHeldByRuns] = useState<string[] | null>(null);
 
   // Held in a ref so a parent that passes a fresh callback each render never reloads the list.
   const onLiveCountRef = useRef(onLiveCount);
@@ -126,6 +139,9 @@ export function RepoEnvPanel({
     setNotice("");
   };
 
+  // Records an env_history_full refusal so the held run ids render; clears them for any other outcome.
+  const noteHistoryFull = (err: unknown) => setHeldByRuns(historyFullRuns(err));
+
   const closeForm = () => {
     setDraft(null);
     setProblem(null);
@@ -138,6 +154,7 @@ export function RepoEnvPanel({
     setProblem(null);
     setFormError("");
     setNotice("");
+    setHeldByRuns(null);
     try {
       const input: RunEnvWriteInput = { description: draft.description };
       const orig = draft.editing;
@@ -160,6 +177,7 @@ export function RepoEnvPanel({
       setNotice(`Saved ${draft.name}`);
       await load();
     } catch (err) {
+      noteHistoryFull(err);
       const p = fieldProblem(err);
       if (p) setProblem(p);
       else setFormError(writeErrorMessage(err, "Failed to save the variable"));
@@ -172,11 +190,13 @@ export function RepoEnvPanel({
     setBusy(true);
     setRowError("");
     setNotice("");
+    setHeldByRuns(null);
     try {
       if (v.state === "disabled") await api.enableRepoEnv(repoId, v.name);
       else await api.disableRepoEnv(repoId, v.name);
       await load();
     } catch (err) {
+      noteHistoryFull(err);
       setRowError(writeErrorMessage(err, `Failed to update ${v.name}`));
     } finally {
       setBusy(false);
@@ -187,12 +207,14 @@ export function RepoEnvPanel({
     setBusy(true);
     setRowError("");
     setNotice("");
+    setHeldByRuns(null);
     try {
       const res = await api.deleteRepoEnv(repoId, name);
       setConfirmDelete(null);
       setNotice(res.state === "pending_deletion" ? `${name}: Pending deletion, kept to mask runs` : `Deleted ${name}`);
       await load();
     } catch (err) {
+      noteHistoryFull(err);
       setRowError(writeErrorMessage(err, `Failed to delete ${name}`));
     } finally {
       setBusy(false);
@@ -246,7 +268,9 @@ export function RepoEnvPanel({
       <div className="space-y-1 text-xs text-muted">
         <p>
           The agent can read every value, secret or not. uzi only sets these variables in the run&rsquo;s environment; any login
-          or tool configuration is done by the agent or the repo&rsquo;s scripts. Variables are not yet injected into runs.
+          or tool configuration is done by the agent or the repo&rsquo;s scripts. Variables are set in the environment of every
+          command a repo&rsquo;s issue, CI-fix, prompt, self-improvement, rework and task runs execute; review, isolated, chat, judge, job and cross-check runs do not receive them.
+          Secret values are redacted from run output and checked before anything is pushed.
         </p>
         <p>Disabling or deleting a variable does not revoke the credential; revoke it at the provider.</p>
       </div>
@@ -257,6 +281,25 @@ export function RepoEnvPanel({
       )}
       {notice && <Alert tone="success" message={notice} />}
       {rowError && <Alert message={rowError} />}
+      {heldByRuns && (
+        <div className="space-y-1 text-xs text-muted">
+          <p>
+            Retired secret versions are kept while the runs holding them are active, for at least 24 hours after they end, and longer
+            while their retained work is kept. You can still Disable or Delete a variable.
+          </p>
+          {heldByRuns.length > 0 ? (
+            <ul className="flex flex-wrap gap-x-3 gap-y-1">
+              {heldByRuns.map((id) => (
+                <li key={id}>
+                  <Link to={`/runs/${encodeURIComponent(id)}`} className="font-mono underline">
+                    {id}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      )}
 
       {list && list.variables.length === 0 && !draft && (
         <p className="text-sm text-faint">No variables yet. Add one to set it in this repo&rsquo;s run environment.</p>

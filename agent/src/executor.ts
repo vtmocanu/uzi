@@ -34,6 +34,7 @@ import type {
   ReviewCommentsSnapshot,
   RunKind,
   ClaimProviderBinding,
+  ClaimRunEnvVar,
 } from "./protocol.js";
 import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
 import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
@@ -329,6 +330,16 @@ export interface RunContext {
   /** PRD #4320 module 5/6: the decoded provider binding of a provider-bound run (exclusive with
    *  `oauthToken`). Every Claude spawn of the run builds its env from it, never from an OAuth token. */
   provider?: ClaimProviderBinding;
+  /** PRD #4416 M2: the run's user environment variables (decoded claim `run_env`). The runner sets it
+   *  only for a lead-lane run (run-env-lane.ts, the mirror of the api's LeadLane: kinds issue, ci_fix,
+   *  prompt, self_improve, mr_rework, task, no review target, not egress-bound) and only the lead
+   *  lane's env builders read it. */
+  runEnv?: ClaimRunEnvVar[];
+  /** The variables of `runEnv` the executor's env builder injects: a variable dropped for its name, a
+   *  protected key or a tool-profile collision is absent. The executor sets it once per executor run, after tool
+   *  provisioning and before any prompt or env build, from the same pre-fold keys and predicate the builder
+   *  folds with (runEnvInjectedSet), and hands the same set to the builder, which folds exactly it. Every prompt that lists the run's variables reads this list, never `runEnv`. */
+  injectedRunEnv?: ClaimRunEnvVar[];
   /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
    *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
   credential?: () => Readonly<{ token: string; ordinal: number }>;

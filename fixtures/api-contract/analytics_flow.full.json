@@ -1,0 +1,243 @@
+{
+  "scope": {
+    "route": "x",
+    "user": "x"
+  },
+  "generated_at": "2020-01-02T03:04:05Z",
+  "window": "x",
+  "timezone": "x",
+  "from": "2020-01-02T03:04:05Z",
+  "to": "2020-01-02T03:04:05Z",
+  "previous_from": "2020-01-02T03:04:05Z",
+  "previous_to": "2020-01-02T03:04:05Z",
+  "history_start": "2020-01-02T03:04:05Z",
+  "bucket_width_days": 1,
+  "buckets": [
+    {
+      "label": "x",
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "rolling": [
+    {
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "selected_user": "x",
+  "filters": {
+    "repo": "x",
+    "harness": "x",
+    "kinds": [
+      "x"
+    ]
+  },
+  "waiting_now": {
+    "time_basis": "x",
+    "population": "x",
+    "states": [
+      {
+        "state": "x",
+        "count": 1,
+        "oldest_status_since": "2020-01-02T03:04:05Z",
+        "oldest_age_seconds": 1.5
+      }
+    ],
+    "total": 1
+  },
+  "activity": {
+    "created": {
+      "time_basis": "x",
+      "population": "x",
+      "total": 1,
+      "buckets": [
+        {
+          "index": 1,
+          "count": 1
+        }
+      ]
+    },
+    "finished": {
+      "time_basis": "x",
+      "population": "x",
+      "excluded_kinds": [
+        "x"
+      ],
+      "total": {
+        "completed": 1,
+        "cancelled": 1,
+        "plan_rejected": 1,
+        "base_diverged": 1,
+        "failed": 1,
+        "total": 1
+      },
+      "buckets": [
+        {
+          "index": 1,
+          "completed": 1,
+          "cancelled": 1,
+          "plan_rejected": 1,
+          "base_diverged": 1,
+          "failed": 1,
+          "total": 1
+        }
+      ]
+    }
+  },
+  "first_start_delay": {
+    "time_basis": "x",
+    "population": "x",
+    "approximate": true,
+    "limitations": [
+      "x"
+    ],
+    "observed": 1,
+    "not_started": 1,
+    "invalid": 1,
+    "p50_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "p90_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    }
+  },
+  "plan_response": {
+    "time_basis": "x",
+    "population": "x",
+    "approximate": true,
+    "n": 1,
+    "p50_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "p90_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "unknown": {
+      "total": 1,
+      "reasons": {
+        "ambiguous": 1,
+        "no_presentation": 1,
+        "invalid_chronology": 1,
+        "excluded_disposition": 1,
+        "reconciliation_only": 1,
+        "legacy_unbound": 1
+      }
+    },
+    "not_approved": 1
+  },
+  "delivery_funnel": {
+    "time_basis": "x",
+    "population": "x",
+    "applicable": true,
+    "reason": "x",
+    "stages": {
+      "created": 1,
+      "plan_settled": 1,
+      "completed": 1,
+      "pr_present": 1,
+      "merged": 1
+    },
+    "planning": {
+      "settled_human": 1,
+      "settled_auto": 1,
+      "skipped": 1,
+      "rejected": 1,
+      "in_progress": 1,
+      "failed": 1,
+      "cancelled": 1,
+      "unknown": 1
+    },
+    "outcomes": {
+      "completed": 1,
+      "failed": 1,
+      "cancelled": 1,
+      "plan_rejected": 1,
+      "base_diverged": 1,
+      "in_progress": 1
+    },
+    "disclosure": {
+      "historical_approval_only": 1,
+      "ambiguous_current": 1,
+      "legacy_evidence": 1
+    },
+    "pr_units": {
+      "present": 1,
+      "merged": 1,
+      "buckets": [
+        {
+          "index": 1,
+          "present": 1,
+          "merged": 1
+        }
+      ]
+    }
+  },
+  "approval": {
+    "time_basis": "x",
+    "population": "x",
+    "applicable": true,
+    "reason": "x",
+    "total": 1,
+    "human": 1,
+    "auto_approve_configured": 1,
+    "unknown": {
+      "total": 1,
+      "reasons": {
+        "ambiguous": 1,
+        "legacy_unbound": 1,
+        "historical_approval_only": 1,
+        "no_evidence": 1
+      }
+    }
+  },
+  "issue_elapsed": {
+    "time_basis": "x",
+    "population": "x",
+    "applicable": true,
+    "reason": "x",
+    "n": 1,
+    "unfinished": 1,
+    "invalid": 1,
+    "incomplete": true,
+    "p50_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "p90_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "histogram": [
+      {
+        "lower_seconds": 1.5,
+        "upper_seconds": 1.5,
+        "count": 1
+      }
+    ],
+    "buckets": [
+      {
+        "index": 1,
+        "partial": true,
+        "n": 1,
+        "unfinished": 1,
+        "invalid": 1,
+        "incomplete": true,
+        "p50_seconds": {
+          "value": 1.5,
+          "reason": "x"
+        },
+        "p90_seconds": {
+          "value": 1.5,
+          "reason": "x"
+        }
+      }
+    ]
+  }
+}

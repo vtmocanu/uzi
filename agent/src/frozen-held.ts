@@ -1,6 +1,7 @@
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { CheckpointRange, GitCache } from "./git.js";
 import { flagCIConfigPathsRaw } from "./ci-config-guard.js";
+import type { ScanNeedle } from "./run-env-forms.js";
 
 /** Authenticated at freeze. No paths or finding text are needed to retain a remediation hold. */
 export interface FrozenHeldPolicy {
@@ -45,6 +46,12 @@ type FrozenHeldInput = {
   deadlineMs: number; maxBytes?: number; defaultBranch?: string;
   /** The encoded forms of the run's provider key; `[]` for a vendor run or a caller with no claim. */
   literals: readonly string[];
+  /** PRD 4416 M2: the run's secret-variable needles, scanned in every commit of the held range. A hit is a
+   *  `secret_found` (the existing remediation hold); an unreadable range is `scan_untrusted`. */
+  needles?: readonly ScanNeedle[];
+  /** The needles could not be resolved (no flight and no maintenance answer): nothing can prove the range clean,
+   *  so the work stays local and the lane reports `scan_untrusted`. */
+  needlesUnavailable?: true;
   onScan?: (scan: Awaited<ReturnType<HeldGit["secretScanCheckpointRange"]>>) => void;
   remediationHold?: () => Promise<boolean>;
   ciHold?: () => Promise<"clear" | "blocked" | "unknown">;
@@ -122,7 +129,11 @@ async function prepareOverRange(input: FrozenHeldInput, range: CheckpointRange, 
   };
   // A provider-bound policy with no key forms to scan for cannot prove the range clean: the work stays local.
   if (policy.providerKeyScan === true && input.literals.length === 0) return { reason: "scan_untrusted" };
-  const scan = await git.secretScanCheckpointRange(barePath, range, { deadlineMs: deadlineMs(), literals: input.literals });
+  if (input.needlesUnavailable === true) return { reason: "scan_untrusted" };
+  const scan = await git.secretScanCheckpointRange(barePath, range, {
+    deadlineMs: deadlineMs(), literals: input.literals,
+    ...(input.needles && input.needles.length > 0 ? { needles: input.needles } : {}),
+  });
   check();
   input.onScan?.(scan);
   check();

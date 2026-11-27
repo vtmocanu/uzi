@@ -1947,6 +1947,8 @@ export class FakeApi {
     // issue #559 M3: the read-only ownership probe. Not part of the runMatch
     // alternation above (it is a GET-only read of a distinct segment), so it is
     // routed here. No override ⇒ 200 {status:"running"} (still ours, keep going).
+    // PRD 4416 M2: the run-env redact maintenance read; a run holding no secret variables answers protected:false.
+    if (req.method === "GET" && /^\/api\/worker\/runs\/[^/]+\/run-env-redact$/.test(p)) return send(res, 200, { protected: false });
     const ownMatch = /^\/api\/worker\/runs\/([^/]+)\/ownership$/.exec(p);
     if (req.method === "GET" && ownMatch) {
       const runId = ownMatch[1] as string;

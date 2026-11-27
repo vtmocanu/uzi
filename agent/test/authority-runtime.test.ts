@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -418,7 +419,7 @@ describe("outermost entries take A before the locks beneath it", () => {
   it("forgetGeneration opens A before the capture-cycle key and the journal lock", async (t) => {
     const events: string[] = [];
     const root = makeTmp(t, "authority-recovery-");
-    const coord = new RecoveryCoordinator({
+    const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       authority: scopeOf(events),
       client: {} as RecoveryArchiveClient,
       git: {} as RecoveryBundleProducer,

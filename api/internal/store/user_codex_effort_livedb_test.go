@@ -73,10 +73,7 @@ func TestCodexEffortBackfillLiveDB(t *testing.T) {
 }
 
 func TestCodexEffortQueriesIndependentLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "codex_effort_queries_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatal(err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "codex_effort_queries_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

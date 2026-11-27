@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"time"
@@ -86,4 +87,51 @@ func ClassifyAnalyticsErr(err error) error {
 		return ErrAnalyticsTimeout
 	}
 	return err
+}
+
+// Savepoint runs fn, one provider gauge read, inside a SAVEPOINT of the snapshot transaction so
+// a gauge that fails with an ordinary error does not poison the snapshot for the statements
+// that follow (issue #4731). ctx is the snapshot context RunAnalyticsSnapshot handed to its
+// callback. fn receives New(gtx) and the savepoint transaction itself, so raw statements can run
+// on it too. fn must not SET LOCAL on a path that returns nil: RELEASE keeps the setting for the
+// rest of the snapshot (a SET LOCAL is rolled back only when fn fails and the savepoint rolls back).
+//
+// Failure model, two results:
+//   - gaugeErr: fn failed with an ordinary error (not a timeout) while the snapshot context was
+//     live, and the savepoint rolled back cleanly. The transaction and its snapshot are intact
+//     and err is nil; the caller marks that gauge unavailable and carries on.
+//   - err: fatal for the whole request. Begin, Commit or Rollback of the savepoint failed (the
+//     transaction state is unknown), the snapshot context ended, or fn failed with a timeout
+//     (57014 or a network timeout). The caller aborts the snapshot and maps err through
+//     ClassifyAnalyticsErr like any other analytics failure.
+//
+// When fn fails and the snapshot context is already done, ctx.Err() is returned unwrapped
+// instead of fn's error: a driver error surfaced as the deadline hit would otherwise look like
+// an ordinary gauge failure and answer 500 instead of the timeout the snapshot deadline really
+// was. On a snapshot deadline that error is context.DeadlineExceeded, which ClassifyAnalyticsErr
+// maps to ErrAnalyticsTimeout; on client cancellation it is context.Canceled, and the caller
+// writes nothing.
+func (s *AnalyticsSnapshot) Savepoint(ctx context.Context, fn func(ctx context.Context, q *Queries, db DBTX) error) (gaugeErr error, err error) {
+	gtx, err := s.tx.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("analytics savepoint begin: %w", err)
+	}
+	ferr := fn(ctx, New(gtx), gtx)
+	if ferr == nil {
+		if err := gtx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("analytics savepoint release: %w", err)
+		}
+		return nil, nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		slog.Debug("analytics gauge failed as the snapshot context ended", "gauge_err", ferr, "ctx_err", cerr)
+		return nil, cerr
+	}
+	if errors.Is(ClassifyAnalyticsErr(ferr), ErrAnalyticsTimeout) {
+		return nil, ferr
+	}
+	if rerr := gtx.Rollback(ctx); rerr != nil {
+		return nil, fmt.Errorf("analytics savepoint rollback: %w", rerr)
+	}
+	return ferr, nil
 }

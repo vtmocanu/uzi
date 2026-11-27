@@ -267,6 +267,29 @@ func staleDuplicate(t *testing.T, o *orphanCohort, older bool) {
 	})
 }
 
+// isWakeBindingPatch reports a patch body that is exactly the top-level metadata key
+// holding only the given uid, the given resourceVersion and an annotations map whose one
+// entry binds op through annotationHibernationOp.
+func isWakeBindingPatch(body []byte, uid, rv, op string) bool {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil || len(top) != 1 || top["metadata"] == nil {
+		return false
+	}
+	var md map[string]json.RawMessage
+	if json.Unmarshal(top["metadata"], &md) != nil || len(md) != 3 {
+		return false
+	}
+	var got struct {
+		UID             string            `json:"uid"`
+		ResourceVersion string            `json:"resourceVersion"`
+		Annotations     map[string]string `json:"annotations"`
+	}
+	if json.Unmarshal(top["metadata"], &got) != nil || got.UID != uid || got.ResourceVersion != rv {
+		return false
+	}
+	return len(got.Annotations) == 1 && got.Annotations[annotationHibernationOp] == op
+}
+
 // w2Cancellations lists patches that cleared w2's reservation annotation.
 func w2Cancellations(c interface{ Actions() []k8stesting.Action }) int {
 	n := 0
@@ -419,8 +442,13 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		// A row that sets it never reaches the duplicate block: an earlier arm holds or
 		// splits the pool, and the row only proves that nothing cancels the duplicate.
 		reasons [2]string
-		wantErr bool
-		mutate  func(t *testing.T, o *orphanCohort)
+		// noCancel additionally requires that w2's reservation is never cancelled.
+		noCancel bool
+		// wakeBindID names the one worker whose exact op-only wake binding patch is exempt
+		// from the no-metadata-patch rule; every other row exempts nothing.
+		wakeBindID string
+		wantErr    bool
+		mutate     func(t *testing.T, o *orphanCohort)
 	}{
 		{name: "D replicas 1", mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w2", func(d *appsv1.Deployment) { d.Spec.Replicas = &one })
@@ -620,7 +648,7 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		}},
 		{name: "out-of-pool canary", mutate: func(t *testing.T, o *orphanCohort) { o.outsider(t, true, false) }},
 		{name: "out-of-pool open reservation", mutate: func(t *testing.T, o *orphanCohort) { o.outsider(t, false, false) }},
-		{name: "waking pool member with a reservation", mutate: func(t *testing.T, o *orphanCohort) {
+		{name: "waking pool member with a reservation", noCancel: true, wakeBindID: "w1", mutate: func(t *testing.T, o *orphanCohort) {
 			o.at("w1").Hibernation = &protocol.Hibernation{State: protocol.HibernationWaking, OpID: orphanWakeOp}
 		}},
 		{name: "both canaries absent", mutate: func(t *testing.T, o *orphanCohort) {
@@ -719,17 +747,38 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 					reservations[id] = raw
 				}
 			}
+			var bindUID, bindRV string
+			if tc.wakeBindID != "" {
+				d := o.dep(t, tc.wakeBindID)
+				bindUID, bindRV = string(d.UID), d.ResourceVersion
+			}
 			o.c.ClearActions()
 			err := o.tick(t)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("tick error = %v, want error: %v", err, tc.wantErr)
 			}
-			for _, line := range actionTrace(o.c) {
+			for _, a := range o.c.Actions() {
+				p, ok := a.(k8stesting.PatchAction)
+				if !ok || a.GetResource().Resource != "deployments" {
+					continue
+				}
+				if tc.wakeBindID != "" && p.GetName() == deploymentName(tc.wakeBindID) &&
+					isWakeBindingPatch(p.GetPatch(), bindUID, bindRV, orphanWakeOp) {
+					continue
+				}
 				for id := range reservations {
-					if line == "patch deployments "+deploymentName(id)+" metadata" {
+					// Same rule as actionTrace: any patch without a top-level "spec" (including
+					// a JSON Patch array, which does not decode as an object) counts as a
+					// metadata write. Only the row-scoped wake binding above is exempt.
+					var body map[string]json.RawMessage
+					_ = json.Unmarshal(p.GetPatch(), &body)
+					if _, spec := body["spec"]; p.GetName() == deploymentName(id) && !spec {
 						t.Fatalf("a canary reservation was written: %v", actionTrace(o.c))
 					}
 				}
+			}
+			if tc.noCancel && w2Cancellations(o.c) != 0 {
+				t.Fatalf("w2 was cancelled while w1 wakes: %v", actionTrace(o.c))
 			}
 			for id, raw := range reservations {
 				if got := o.dep(t, id).Annotations[annotationRoll]; got != raw {

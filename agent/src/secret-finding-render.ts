@@ -34,6 +34,8 @@ const MAX_PATH_LEN = 120;
 
 const RULE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const COMMIT_RE = /^[0-9a-fA-F]{40}$/;
+/** The run-variable name grammar (fixtures/run-env/names.json): the only text a variable finding may show. */
+const VARIABLE_NAME_RE = /^[A-Z_][A-Z0-9_]{0,127}$/;
 // Backslash (so a literal escape-looking name stays distinguishable), C0, DEL, C1, every Unicode
 // format char (Cf: zero-width, bidi marks/overrides/isolates, BOM), U+2028/U+2029 (Zl/Zp) and lone
 // surrogates (Cs).
@@ -174,7 +176,9 @@ export function renderSecretFinding(
     Number.isSafeInteger(f.startLine) && f.startLine >= 0
       ? String(f.startLine)
       : "?";
-  return `${commit} ${renderPath(f.file, opts)}:${line} (rule ${rule})`;
+  // The exact-value scan of a run's secret variables names the variable (a validated name, never a value).
+  const variable = typeof f.variable === "string" && VARIABLE_NAME_RE.test(f.variable) ? `, variable ${f.variable}` : "";
+  return `${commit} ${renderPath(f.file, opts)}:${line} (rule ${rule}${variable})`;
 }
 
 /** The distinct, validated rule ids of the findings (first `max`), comma-joined; an invalid id renders `[rule withheld]`. */

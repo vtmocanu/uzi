@@ -605,7 +605,7 @@ describe("renderCodexRun — prompts", () => {
       const flatPrompt = prompt.replace(/\s+/g, " ");
       assert.ok(flatPrompt.includes(rule), "carries the go clean prohibition");
       // The lead-only cleanup permission must never reach a subagent.
-      for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only"]) {
+      for (const leadOnly of ["completed validation-wave boundary", "Run `go clean -cache` only", "kept (filesystem episode not re-armed)"]) {
         assert.ok(!flatPrompt.includes(leadOnly), `subagent prompt carries lead-only ${JSON.stringify(leadOnly)}`);
       }
     }
@@ -808,7 +808,7 @@ describe("renderCodexRun — diagnostic name sanitization", () => {
   const REPLACEMENT = "�"; // U+FFFD, the visible replacement char sanitizeName emits.
 
   /** A code-point scan asserting no control/DEL/C1/bidi/zero-width byte survives —
-   *  the reader-side mirror of render.ts's isUnsafeNameChar (NOT a control-char regex;
+   *  the reader-side mirror of diagnostic-name.ts's isUnsafeNameChar (NOT a control-char regex;
    *  oxlint no-control-regex is denied). */
   function assertNoUnsafeChars(s: string): void {
     for (const ch of s) {

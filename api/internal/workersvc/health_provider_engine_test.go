@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -29,7 +30,24 @@ func (f *providerHealthStore) CountOnlineWorkersSatisfyingCodexRuntime(context.C
 }
 
 func TestHealthProviderEngineCount(t *testing.T) {
-	for _, engine := range []string{"claude", "codex", "unknown"} {
+	for _, kind := range []string{"issue", runkind.Judge} {
+		for _, engine := range []string{"claude", "codex", "unknown"} {
+			missing := reasonNoProviderCapableWorker
+			if kind == runkind.Judge {
+				switch engine {
+				case "claude":
+					missing = reasonNoProviderJudgeCapableWorker
+				case "codex":
+					missing = reasonNoCodexProviderJudgeCapableWorker
+				}
+			}
+			testHealthProviderEngineCount(t, kind, engine, missing)
+		}
+	}
+}
+
+func testHealthProviderEngineCount(t *testing.T, kind, engine, missing string) {
+	{
 		for _, tc := range []struct {
 			name  string
 			bound bool
@@ -37,15 +55,15 @@ func TestHealthProviderEngineCount(t *testing.T) {
 			err   error
 			want  string
 		}{
-			{"missing", true, 0, nil, reasonNoProviderCapableWorker},
+			{"missing", true, 0, nil, missing},
 			{"available", true, 1, nil, reasonWaitingWorker},
 			{"read-error", true, 0, errors.New("count failed"), reasonWaitingWorker},
 			{"vendor", false, 0, nil, reasonWaitingWorker},
 		} {
-			t.Run(engine+"/"+tc.name, func(t *testing.T) {
+			t.Run(kind+"/"+engine+"/"+tc.name, func(t *testing.T) {
 				r := queuedRunPastThreshold()
 				r.Harness = engine
-				r.Kind = "issue"
+				r.Kind = kind
 				r.RepoID = pgtype.UUID{}
 				r.ModelProviderKeyMode = pgtype.Text{String: "user_key", Valid: tc.bound}
 				fs := &providerHealthStore{healthFakeStore: &healthFakeStore{onlineWorkers: 1, freeSlotWorkers: 1}, providerCount: tc.count, providerErr: tc.err}

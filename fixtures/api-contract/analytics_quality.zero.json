@@ -1,0 +1,175 @@
+{
+  "scope": {
+    "route": "",
+    "user": ""
+  },
+  "generated_at": "0001-01-01T00:00:00Z",
+  "window": "",
+  "timezone": "",
+  "from": "0001-01-01T00:00:00Z",
+  "to": "0001-01-01T00:00:00Z",
+  "history_start": null,
+  "bucket_width_days": 0,
+  "buckets": null,
+  "rolling": null,
+  "selected_user": "",
+  "rework": {
+    "applicable": false,
+    "reason": null,
+    "time_basis": "",
+    "applicable_prs": 0,
+    "groups": {
+      "zero": 0,
+      "one": 0,
+      "two": 0,
+      "three_plus": 0
+    },
+    "buckets": null,
+    "unwitnessed_prs": 0,
+    "unverified_links": 0,
+    "shared_external_prs": 0,
+    "shared_detection_unavailable": 0,
+    "retention": "",
+    "merge_day_activity": {
+      "value": null,
+      "reason": null
+    },
+    "run_end_to_merge_seconds": {
+      "value": null,
+      "reason": null
+    }
+  },
+  "ci_fix": {
+    "applicable": false,
+    "reason": null,
+    "time_basis": "",
+    "runs": 0,
+    "finished": 0,
+    "in_flight": 0,
+    "outcomes": {
+      "completed": 0,
+      "cancelled": 0,
+      "plan_rejected": 0,
+      "base_diverged": 0,
+      "failed": 0
+    },
+    "buckets": null
+  },
+  "cross_check": {
+    "plan": {
+      "applicable": false,
+      "reason": null,
+      "time_basis": "",
+      "decided_in_window": 0,
+      "stored_result": {
+        "approve": 0,
+        "revise": 0,
+        "block": 0,
+        "failed": 0
+      },
+      "classes": {
+        "passed": 0,
+        "raised_issues": 0,
+        "didnt_finish": 0,
+        "replaced": 0,
+        "unclassified": 0
+      },
+      "checker_harness": {
+        "claude": 0,
+        "codex": 0,
+        "unknown": 0
+      },
+      "undated": {
+        "window": "",
+        "count": 0,
+        "stored_result": {
+          "approve": 0,
+          "revise": 0,
+          "block": 0,
+          "failed": 0
+        }
+      },
+      "buckets": null
+    },
+    "code": {
+      "applicable": false,
+      "reason": null,
+      "time_basis": "",
+      "decided_in_window": 0,
+      "stored_result": {
+        "completed": 0,
+        "failed": 0
+      },
+      "classes": {
+        "passed": 0,
+        "raised_issues": 0,
+        "didnt_finish": 0,
+        "replaced": 0,
+        "unclassified": 0
+      },
+      "checker_harness": {
+        "claude": 0,
+        "codex": 0,
+        "unknown": 0
+      },
+      "undated": {
+        "window": "",
+        "count": 0,
+        "stored_result": {
+          "completed": 0,
+          "failed": 0
+        }
+      },
+      "buckets": null
+    },
+    "pending": {
+      "applicable": false,
+      "reason": null,
+      "time_basis": "",
+      "window": "",
+      "total": 0,
+      "plan": 0,
+      "code": 0,
+      "effective_filters": {
+        "repo": null,
+        "harness": null,
+        "kinds": null
+      }
+    }
+  },
+  "judge": {
+    "applicable": false,
+    "reason": null,
+    "time_basis": "",
+    "candidates": {
+      "total": 0,
+      "completed": 0,
+      "failed": 0
+    },
+    "eligible": {
+      "total": 0,
+      "unreviewed": 0,
+      "unreviewed_skipped": 0,
+      "failed": 0,
+      "complete": {
+        "total": 0,
+        "ideal": 0,
+        "ok": 0,
+        "issues": 0
+      }
+    },
+    "excluded": {
+      "cancelled": 0,
+      "in_flight": 0,
+      "skip_origin": 0,
+      "reviewed_excluded": 0
+    },
+    "coverage": {
+      "value": null,
+      "reason": null
+    },
+    "buckets": null,
+    "selection": "",
+    "limitations": null
+  }
+}

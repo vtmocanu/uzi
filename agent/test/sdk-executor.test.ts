@@ -26,6 +26,7 @@ import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src
 import { LeadConfigReporter, leadConfigActive, type LeadConfigClient } from "../src/lead-config-report.js";
 import type { ClaimConfig, LeadConfigReportBody } from "../src/protocol.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
+import type { ClaimRunEnvVar } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
@@ -2681,7 +2682,7 @@ describe("SdkExecutor guardrail options", () => {
           // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
           // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
           // credential — the no-PAT / no-join-token assertions below still hold.
-          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "CLAUDE_CONFIG_DIR", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
           "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
           if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
           if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
@@ -10869,5 +10870,45 @@ describe("SdkExecutor settings barrier on a phase switch (PRD #3252 m4)", () => 
       assert.equal(result.phaseSwitchHeld?.cause, "no_characterized_expectation");
       assert.equal(turns[1]!.promptText, undefined);
     }
+  });
+});
+
+// PRD 4416 M2: the prompt lists the run variables the env builder actually injected, not the claim's list.
+describe("SdkExecutor prompts: the listed run variables are the injected ones", () => {
+  const rv = (name: string, value: string): ClaimRunEnvVar =>
+    ({ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name, value, secret: false, description: "" });
+
+  // Run variables are delivered only under the uid split.
+  let priorSplit: string | undefined;
+  beforeEach(() => {
+    priorSplit = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+  });
+  afterEach(() => {
+    if (priorSplit === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = priorSplit;
+  });
+
+  it("omits a variable the tool profile already set, and lists a normal one", async () => {
+    const provision: SdkExecutorOptions["provision"] = async () => ({ toolEnv: { NPM_TOKEN: "x" } });
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      runId: "12121212-1212-1212-1212-121212121212",
+      agents: [lead, coder],
+      config: { tool_packages: ["jq"] },
+      runEnv: [rv("NPM_TOKEN", "run-value"), rv("REGION", "eu-west")],
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, provision }).run(probe.ctx);
+
+    const env = turns[0]!.options.env as Record<string, string>;
+    assert.strictEqual(env.NPM_TOKEN, "x", "the tool profile wins");
+    assert.strictEqual(env.REGION, "eu-west");
+    const prompts = turns.map((t) => t.promptText ?? "").join("\n");
+    assert.match(prompts, /<run_env_[0-9a-f]+>/);
+    assert.match(prompts, /- REGION \(repo scope\)/);
+    assert.doesNotMatch(prompts, /- NPM_TOKEN/);
   });
 });

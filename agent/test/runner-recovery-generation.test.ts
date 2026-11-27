@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -595,7 +596,7 @@ describe("RunRunner — credentialed settle reaps the Codex provider FIRST (PRD 
       const client = new FakeRecoveryClient();
       const git = new ReapProbeGit(state);
       git.alreadyPublished = false; // committed work → the credentialed fresh-forge fetch runs
-      const coord = new RecoveryCoordinator({
+      const coord = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
         client,
         git,
         log: nullLogger(),

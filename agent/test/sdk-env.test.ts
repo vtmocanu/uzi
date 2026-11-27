@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildCheckEnv, buildSdkEnv, type SdkEnv } from "../src/sdk-env.js";
+import { buildCheckEnv, buildSdkEnv, PROTECTED_ENV_KEYS, REASON_RUN_ENV_NEEDS_SPLIT, sdkRunEnvInjected, type SdkEnv } from "../src/sdk-env.js";
+import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { runnerPath } from "../src/runner-uid.js";
 
@@ -59,11 +60,18 @@ describe("buildSdkEnv", () => {
 
     // Exactly the core keys (+ TMPDIR, the 5-bis per-uid scratch dir, when the ambient
     // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
-    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+    assert.strictEqual(env.CLAUDE_CONFIG_DIR, `${HOME_DIR}/.uzi-claude-config`);
+    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "CLAUDE_CONFIG_DIR", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
       "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     if (process.env.UZI_SQLC_DIR) expected.add("UZI_SQLC_DIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+  });
+
+  it("CLAUDE_CONFIG_DIR is protected: a provisioned tool env cannot move the CLI's config directory (PRD #4416)", () => {
+    assert.ok(PROTECTED_ENV_KEYS.has("CLAUDE_CONFIG_DIR"));
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { CLAUDE_CONFIG_DIR: "/tmp/attacker" });
+    assert.strictEqual(env.CLAUDE_CONFIG_DIR, `${HOME_DIR}/.uzi-claude-config`);
   });
 
   it("hands the CLI the extra CA bundle path, which a provisioned tool env cannot redirect", () => {
@@ -297,5 +305,38 @@ describe("run-owned TMPDIR (issue #4420)", () => {
     const source = { PATH: "/usr/bin", TMPDIR: "/shared/tmp" };
     assert.strictEqual(buildCheckEnv(source, HOME_DIR, undefined, undefined, leaf).TMPDIR, leaf);
     assert.strictEqual(buildCheckEnv(source, HOME_DIR).TMPDIR, "/shared/tmp");
+  });
+});
+
+describe("run variables are delivered only under the uid split (PRD #4416)", () => {
+  const cred = { kind: "oauth", token: FAKE_OAUTH } as const;
+  const vars = [{ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "REGION", value: "eu-west", secret: false, description: "" }] as const;
+  let priorSplit: string | undefined;
+  beforeEach(() => {
+    priorSplit = process.env.UZI_UID_SPLIT;
+  });
+  afterEach(() => {
+    if (priorSplit === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = priorSplit;
+  });
+  const injection = () => ({ vars: [...vars], set: sdkRunEnvInjected(vars, cred, HOME_DIR, {}) });
+
+  it("with the split the variable reaches the env", () => {
+    process.env.UZI_UID_SPLIT = "1";
+    assert.strictEqual(buildSdkEnv(cred, HOME_DIR, {}, undefined, undefined, undefined, undefined, injection()).REGION, "eu-west");
+  });
+
+  it("without the split a non-empty injection is refused with the fixed reason", () => {
+    delete process.env.UZI_UID_SPLIT;
+    assert.throws(
+      () => buildSdkEnv(cred, HOME_DIR, {}, undefined, undefined, undefined, undefined, injection()),
+      (err: unknown) => err instanceof TrustedExecutionRefusal && err.message === REASON_RUN_ENV_NEEDS_SPLIT,
+    );
+  });
+
+  it("without the split no injection and an empty injection build the same env as a run without variables", () => {
+    delete process.env.UZI_UID_SPLIT;
+    const plain = buildSdkEnv(cred, HOME_DIR);
+    assert.deepStrictEqual(buildSdkEnv(cred, HOME_DIR, {}, undefined, undefined, undefined, undefined, { vars: [] }), plain);
   });
 });

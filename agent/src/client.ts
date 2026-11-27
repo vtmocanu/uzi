@@ -15,7 +15,8 @@ import type { PublicationIntentRequest, PublicationIntentResult } from "./public
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { decodeRunEnvClaim, decodeRunEnvRedactResponse } from "./run-env-claim.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -113,6 +114,7 @@ import {
   type UserInput,
   type InputsResponse,
   type RunOwnershipResponse,
+  type RunEnvRedactResponse,
   type RunOrphanClassificationResponse,
   type MessageGapsResponse,
   type WorkerProposal,
@@ -1559,6 +1561,8 @@ export class WorkerClient {
   /** Whether this registration advertised claude_provider_v1; a provider claim is refused without it. */
   private hasClaudeProviderCapability = false;
   private hasClaudeProviderJudgeCapability = false;
+  private hasCodexProviderJudgeCapability = false;
+  private hasClaudeProviderJobCapability = false;
   private hasCodexProviderCapability = false;
   private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
@@ -2155,6 +2159,8 @@ export class WorkerClient {
     this.hasExactHoldCapability = false;
     this.hasClaudeProviderCapability = false;
     this.hasClaudeProviderJudgeCapability = false;
+    this.hasCodexProviderJudgeCapability = false;
+    this.hasClaudeProviderJobCapability = false;
     this.hasCodexProviderCapability = false;
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
@@ -2240,6 +2246,8 @@ export class WorkerClient {
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     this.hasClaudeProviderCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_CAPABILITY) ?? false;
     this.hasClaudeProviderJudgeCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_JUDGE_CAPABILITY) ?? false;
+    this.hasCodexProviderJudgeCapability = originalCapabilities?.includes(CODEX_PROVIDER_JUDGE_CAPABILITY) ?? false;
+    this.hasClaudeProviderJobCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_JOB_CAPABILITY) ?? false;
     this.hasCodexProviderCapability = [CODEX_PROVIDER_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY]
       .every(c => originalCapabilities?.includes(c) ?? false);
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
@@ -2763,6 +2771,14 @@ export class WorkerClient {
           this.requireProviderCapability(provider.engine, claim.kind);
           claim.secrets.provider = provider;
         }
+        // PRD #4416 M2: run_env / run_env_redact are decoded fail-closed and bounded (a malformed list
+        // throws a RunEnvClaimError naming the field and rule, never a value). Empty lists are removed,
+        // so a claim without variables keeps today's shape.
+        if (claim.secrets.run_env !== undefined || claim.secrets.run_env_redact !== undefined) {
+          const { runEnv, runEnvRedact } = decodeRunEnvClaim(claim.secrets);
+          if (runEnv.length > 0) claim.secrets.run_env = runEnv; else delete claim.secrets.run_env;
+          if (runEnvRedact.length > 0) claim.secrets.run_env_redact = runEnvRedact; else delete claim.secrets.run_env_redact;
+        }
       }
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -2891,14 +2907,18 @@ export class WorkerClient {
    *  claude_provider_v1; Codex needs codex_provider_v1 together with the Codex harness and runtime
    *  v2 (the api's claim SQL clause checks codex_provider_v1; its Go admission checks the trio of
  *  provider, harness and runtime v2), else the lane refuses. A Claude JUDGE claim (PRD #4322 M1a)
- *  additionally needs claude_provider_judge_v1 on this registration. */
+ *  additionally needs claude_provider_judge_v1, and a Claude provider JOB claim (PRD #4322 M1b)
+ *  claude_provider_job_v1, on this registration; a Codex JUDGE claim (issue #4574)
+ *  additionally needs codex_provider_judge_v1. */
   private requireProviderCapability(engine: "claude" | "codex", kind?: string): void {
     if (engine === "codex") {
       if (!this.hasCodexProviderCapability) throw new ProviderLaneUnsupportedError();
+      if (kind === "judge" && !this.hasCodexProviderJudgeCapability) throw new ProviderBindingError("judge capability not advertised");
       return;
     }
     if (!this.hasClaudeProviderCapability) throw new ProviderBindingError("capability not advertised");
     if (kind === "judge" && !this.hasClaudeProviderJudgeCapability) throw new ProviderBindingError("judge capability not advertised");
+    if (kind === "job" && !this.hasClaudeProviderJobCapability) throw new ProviderBindingError("job capability not advertised");
   }
 
   /** Claim guard (PRD #3247): a `config.default_effort` outside the closed HARNESS_EFFORTS set
@@ -4855,6 +4875,22 @@ export class WorkerClient {
       signal)) as RunOwnershipResponse;
   }
 
+  /** PRD 4416 M2: the secret variable versions a run was delivered, for a publish scan that has no live
+   *  claim (after a restart or once the run is terminal). GET /worker/runs/{id}/run-env-redact. Resolves to
+   *  `{protected:false}` when the run holds no secret receipt or has no governing run (not lead-lane, not
+   *  a cross-check child). Throws a RequestError on 404 and 409 (`vault_locked`, `run_env_history_unavailable`,
+   *  `run_env_redact_closed`), and a decoder error on a malformed body. A 404 whose JSON body carries the code
+   *  `run_env_run_not_found` (not this worker's run, or deleted) and a 409 withhold the publish; a 404 with no
+   *  code (the route is absent) withholds unless the worker's local marker proves the run never received
+   *  variables here (resolveScanNeedles). A 404 with another code, and every other throw, withholds. The body carries plaintext secrets
+   *  and is never logged. */
+  async getRunEnvRedact(runId: string, signal?: AbortSignal): Promise<RunEnvRedactResponse> {
+    const timeout = AbortSignal.timeout(RUN_ENV_REDACT_TIMEOUT_MS);
+    const raw = await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/run-env-redact`,
+      RUN_ENV_REDACT_TIMEOUT_MS, RUN_ENV_REDACT_MAX_RESPONSE_BYTES, signal ? AbortSignal.any([signal, timeout]) : timeout);
+    return decodeRunEnvRedactResponse(raw);
+  }
+
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
    *  (GET /worker/runs/{id}/message-gaps?claim_generation=G&through=N&limit=&cursor=), index-backed
    *  and keyset-paginated so the read never materialises N rows. The terminal-resolve path calls it
@@ -6468,6 +6504,10 @@ class ResponseBodyOverflowError extends Error {
 
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
+/** The run-env redact answer: at most 2621440 value bytes (RUN_ENV_MAX_REDACT_TOTAL_BYTES), each possibly
+ *  escaped to six bytes in JSON, plus per-entry metadata; 24 MiB bounds it with room to spare. */
+const RUN_ENV_REDACT_MAX_RESPONSE_BYTES = 24 * 1024 * 1024;
+const RUN_ENV_REDACT_TIMEOUT_MS = 20_000;
 /** The publication-intent ack and its refusal bodies are a few small members. */
 const PUBLICATION_ACK_MAX_BYTES = 16 * 1024;
 

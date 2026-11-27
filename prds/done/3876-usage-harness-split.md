@@ -2,7 +2,7 @@
 
 **Status**: Done (2026-11-10, issue #3876). Child of epic #3873. Was blocked by #3881 (the by-user table the column lives in), which landed first.
 
-**Design brief**: `prds/3873-overview-redesign.md` (data readiness, constraints, mock contract). This PRD wins where it is more specific.
+**Design brief**: `prds/done/3873-overview-redesign.md` (data readiness, constraints, mock contract). This PRD wins where it is more specific.
 
 **Design mock**: `prds/mockups/3873-overview-redesign-mock.html#factory`, the "Claude / Codex" column of the By user table. The brief's mock contract applies; the PR carries screenshots.
 

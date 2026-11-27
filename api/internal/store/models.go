@@ -93,6 +93,20 @@ type AnthropicRateLimit struct {
 	EnablementRev    int64              `json:"enablement_rev"`
 }
 
+type AnthropicUsageSample struct {
+	UserID           uuid.UUID          `json:"user_id"`
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
+	ObservedAt       pgtype.Timestamptz `json:"observed_at"`
+	BucketStart      pgtype.Timestamptz `json:"bucket_start"`
+	EnablementRev    int64              `json:"enablement_rev"`
+	Source           string             `json:"source"`
+	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
+	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
+	SevenDayPct      int16              `json:"seven_day_pct"`
+	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type AppSetting struct {
 	Key       string             `json:"key"`
 	Value     string             `json:"value"`
@@ -331,6 +345,17 @@ type CodexRefreshIntent struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
 	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
+}
+
+type CodexUsageSample struct {
+	UserID                     uuid.UUID          `json:"user_id"`
+	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
+	ObservedAt                 pgtype.Timestamptz `json:"observed_at"`
+	BucketStart                pgtype.Timestamptz `json:"bucket_start"`
+	ObservedGeneration         int64              `json:"observed_generation"`
+	ObservedCredentialRevision int64              `json:"observed_credential_revision"`
+	Buckets                    []byte             `json:"buckets"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 }
 
 type ControllerReportStatus struct {
@@ -891,6 +916,38 @@ type PrDescriptionVersion struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	PublishedAt          pgtype.Timestamptz `json:"published_at"`
 	RegionHasDiagram     pgtype.Bool        `json:"region_has_diagram"`
+}
+
+type PrHistoryEvent struct {
+	ID         int64              `json:"id"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	MrIid      int64              `json:"mr_iid"`
+	FromState  pgtype.Text        `json:"from_state"`
+	ToState    string             `json:"to_state"`
+	ProviderAt pgtype.Timestamptz `json:"provider_at"`
+	TimeSource string             `json:"time_source"`
+	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	Bootstrap  bool               `json:"bootstrap"`
+	FirstMerge bool               `json:"first_merge"`
+}
+
+type PrHistoryHead struct {
+	RepoID              uuid.UUID          `json:"repo_id"`
+	MrIid               int64              `json:"mr_iid"`
+	State               string             `json:"state"`
+	ObservedAt          pgtype.Timestamptz `json:"observed_at"`
+	LastProviderAt      pgtype.Timestamptz `json:"last_provider_at"`
+	FirstMergedAt       pgtype.Timestamptz `json:"first_merged_at"`
+	FirstMergedSource   pgtype.Text        `json:"first_merged_source"`
+	LastChanged         bool               `json:"last_changed"`
+	LastFromState       pgtype.Text        `json:"last_from_state"`
+	LastToState         string             `json:"last_to_state"`
+	LastEventProviderAt pgtype.Timestamptz `json:"last_event_provider_at"`
+	LastTimeSource      string             `json:"last_time_source"`
+	LastBootstrap       bool               `json:"last_bootstrap"`
+	LastFirstMerge      bool               `json:"last_first_merge"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Product struct {
@@ -1523,6 +1580,19 @@ type RunDecisionMemo struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunEnvReceipt struct {
+	RunID                uuid.UUID          `json:"run_id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	VarID                uuid.UUID          `json:"var_id"`
+	Rev                  int32              `json:"rev"`
+	Scope                string             `json:"scope"`
+	Name                 string             `json:"name"`
+	Secret               bool               `json:"secret"`
+	FirstClaimGeneration int64              `json:"first_claim_generation"`
+	LastClaimGeneration  int64              `json:"last_claim_generation"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
 type RunEnvVar struct {
 	ID              uuid.UUID          `json:"id"`
 	VarID           uuid.UUID          `json:"var_id"`
@@ -1540,6 +1610,15 @@ type RunEnvVar struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
+}
+
+type RunEnvVarID struct {
+	VarID  uuid.UUID   `json:"var_id"`
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+	Scope  string      `json:"scope"`
+	Name   string      `json:"name"`
 }
 
 type RunFetch struct {
@@ -2354,6 +2433,24 @@ type WorkerActiveRun struct {
 	CooldownEligibleAt   pgtype.Timestamptz `json:"cooldown_eligible_at"`
 	CooldownObservedAt   pgtype.Timestamptz `json:"cooldown_observed_at"`
 	CooldownUntil        pgtype.Timestamptz `json:"cooldown_until"`
+}
+
+type WorkerCapacitySample struct {
+	WorkerID             uuid.UUID          `json:"worker_id"`
+	BucketStart          pgtype.Timestamptz `json:"bucket_start"`
+	UserID               uuid.UUID          `json:"user_id"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+	Freshness            string             `json:"freshness"`
+	LastHeartbeatAt      pgtype.Timestamptz `json:"last_heartbeat_at"`
+	WorkerKind           string             `json:"worker_kind"`
+	Ephemeral            bool               `json:"ephemeral"`
+	IsolatedLane         bool               `json:"isolated_lane"`
+	MaxConcurrentRuns    pgtype.Int4        `json:"max_concurrent_runs"`
+	MaxCrossCheckSlots   pgtype.Int4        `json:"max_cross_check_slots"`
+	Attribution          string             `json:"attribution"`
+	OrdinaryActive       pgtype.Int4        `json:"ordinary_active"`
+	CrossCheckLaneActive pgtype.Int4        `json:"cross_check_lane_active"`
+	ChatActive           pgtype.Int4        `json:"chat_active"`
 }
 
 type WorkerCordonEvent struct {

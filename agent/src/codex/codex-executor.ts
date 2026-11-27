@@ -71,6 +71,8 @@ import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
+import { foldRunEnv, runEnvDropText, runEnvInjectedSet, type RunEnvInjectedSet, type RunEnvInjection } from "../run-env-inject.js";
+import { buildRunEnvBlock } from "../run-env-prompt.js";
 import { createHash, randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
@@ -141,12 +143,12 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
+import { redactPlanSummary, SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
 import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor, redactStrings } from "../redact.js";
-import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexProviderBinding, type ClaimCodexSecrets, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { gateVerdictSelection, planAgentSource, resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimCodexProviderBinding, type ClaimCodexSecrets, type ClaimRunEnvVar, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
 import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
@@ -320,6 +322,7 @@ export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "NPM_CONFIG_CACHE",
   // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (exported there; copied here, not imported).
   "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CONFIG_DIR",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   // PRD #4320 module 6: the provider-mode routing, model and context-window keys.
@@ -2742,12 +2745,12 @@ export class CodexExecutor implements Executor {
         try {
           if (!sibling) {
             const settled = await registry.settleForCapture(remaining(), undefined, true);
-            if (settled.kind === "incomplete") drainErrors.push(...settled.errors);
+            if (settled.kind === "incomplete") for (const err of settled.errors) drainErrors.push(err);
             drainErrors.push({ category: "protocol", message: "codex capture: half-built epoch lacks clean teardown" });
           } else if (sibling !== safety) {
             this.completedCaptures.delete(registry);
             const settled = await sibling.withCredentialFreeCapture(remaining(), async () => undefined, signal);
-            if (settled.kind === "incomplete") drainErrors.push(...settled.errors);
+            if (settled.kind === "incomplete") { for (const err of settled.errors) drainErrors.push(err); }
             else this.completedCaptures.set(registry, settled.proof);
           }
         } catch {
@@ -3492,10 +3495,13 @@ export class CodexExecutor implements Executor {
               return;
             }
             if (!allowed()) return;
+            // PRD #4416 M2: the generated summary and the plan text leave the worker redacted, like every
+            // other agent-derived payload; the redacted value is also what the terminal report carries.
+            const safe = redactPlanSummary(result, ctx.redactText);
             await this.opts.client.postPlanSummary(ctx.runId, {
-              ...result, plan_md: planMd.replaceAll("\u0000", ""),
+              ...safe, plan_md: (ctx.redactText?.(planMd) ?? planMd).replaceAll("\u0000", ""),
             });
-            if (allowed()) latestPlanSummary = result;
+            if (allowed()) latestPlanSummary = safe;
           } catch (error) {
             this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
           } finally { this.planFlights.delete(owned); }
@@ -3857,6 +3863,12 @@ export class CodexExecutor implements Executor {
       // run's canonical checkout, via worker-set command-line-scope config (see
       // withCommandGitTrust). Composed HERE, never in commandEffectSpec: the post-run
       // boundary sink shares that function and must keep its own gitEnv() untouched.
+      // PRD #4416 M2: the set of variables the builder injects, computed once per executor run after provisioning:
+      // each prompt site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+      const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
+        ? commandRunEnvInjected(ctx.runEnv, this.deps.commandTmpdir ?? "/tmp", provisioned.toolEnv)
+        : undefined;
+      if (runEnvSet) ctx.injectedRunEnv = runEnvSet.injected;
       const commandEnv: NodeJS.ProcessEnv = withCommandGitTrust(
         buildCommandEnv(
           this.deps.commandTmpdir ?? "/tmp",
@@ -3865,6 +3877,9 @@ export class CodexExecutor implements Executor {
           // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
+          ctx.runEnv && runEnvSet
+            ? { vars: ctx.runEnv, set: runEnvSet, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+            : undefined,
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -4493,7 +4508,8 @@ export class CodexExecutor implements Executor {
             });
             if ((summary || skip.reason) && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
               // Issue #3248 M3: a skipped summary posts nothing and leaves one visible note instead.
-              if (summary) await this.opts.client.postIntentSummary(ctx.runId, summary);
+              // PRD #4416 M2: redacted like the plan summary, since the intent text derives from the issue and PRD.
+              if (summary) await this.opts.client.postIntentSummary(ctx.runId, ctx.redactText?.(summary) ?? summary);
               else if (skip.reason) ctx.emit({ kind: "status", agent: "worker", payload: summarySkipPayload("intent", skip.reason) });
             }
           } catch (error) {
@@ -7505,12 +7521,14 @@ export class CodexExecutor implements Executor {
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
+    const runEnvAppend = buildRunEnvBlock(ctx.injectedRunEnv);
     const request: RunTurnRequest = {
       semanticPlanning: ctx.semanticPlanning,
       ciEvidencePrepared: !!ctx.ciEvidence,
       prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
       childTurnBudgetMs: this.childTurnDeadlineMs(),
+      ...(runEnvAppend ? { runEnvAppend } : {}),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       redactText: ctx.redactText,
@@ -7565,7 +7583,9 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${head}\n\n${review}` : head;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
+    // PRD #4416 M2: the run's user variables (lead lane; absent otherwise), after the facts block.
+    const runEnvBlock = buildRunEnvBlock(ctx.injectedRunEnv);
+    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}${runEnvBlock ? `\n\n${runEnvBlock}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -7657,7 +7677,10 @@ export class CodexExecutor implements Executor {
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
     const block = buildEnvironmentFactsBlock(facts);
-    const withFacts = block ? `${prompt}\n\n${block}` : prompt;
+    const withFactsOnly = block ? `${prompt}\n\n${block}` : prompt;
+    // PRD #4416 M2: the run's user variables ride every implement prompt this builder returns, like the facts.
+    const runEnvBlock = buildRunEnvBlock(ctx.injectedRunEnv);
+    const withFacts = runEnvBlock ? `${withFactsOnly}\n\n${runEnvBlock}` : withFactsOnly;
     const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
     return dockerResume ? `${withFacts}\n\n${dockerResume}` : withFacts;
   }
@@ -8522,11 +8545,51 @@ export function commandSandboxArgv(
  *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
  *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
  *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
+ *   - PRD #4416 M2: `runEnv` (lead lane only) adds the run's user variables after the toolEnv
+ *     fold, lowest precedence (see foldRunEnv): never a protected key, git config carrier, denied
+ *     name or key already set; the worker keys below overwrite it.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
+export function buildCommandEnv(
+  tmpdir: string,
+  toolEnv: Record<string, string>,
+  dockerHost?: string,
+  browserDiscovery = false,
+  runEnv?: RunEnvInjection,
+): NodeJS.ProcessEnv {
+  const env = commandPreFoldEnv(tmpdir, toolEnv);
+  // PRD #4416 M2: the run's user variables, lowest precedence: after the tool profile, before every
+  // worker-set key below, and never a protected key or git config carrier.
+  foldRunEnv(env, runEnv, isCommandRunEnvProtected);
+  // PRD #4416 M2: the worker-set keys below overwrite a user variable of the same name silently (no
+  // drop event); every such key is also denied by name (RUN_ENV_DENIED_NAMES / prefixes), so a user
+  // variable never reaches this point under it.
+  // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
+  Object.assign(env, goConcurrencyEnv());
+  if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
+  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
+  return env;
+}
+
+/** The keys {@link buildCommandEnv} refuses to let a user variable take. */
+const isCommandRunEnvProtected = (k: string): boolean => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k);
+
+/** PRD #4416 M2: which of `vars` {@link buildCommandEnv} injects and which it drops for these inputs, computed over
+ *  the same pre-fold env the builder folds into and with the same predicate, so the executor can name them
+ *  once per run (before any prompt) and pass it to the builder as `RunEnvInjection.set`, which folds exactly it. */
+export function commandRunEnvInjected(
+  vars: readonly ClaimRunEnvVar[],
+  tmpdir: string,
+  toolEnv: Record<string, string>,
+): RunEnvInjectedSet {
+  return runEnvInjectedSet(vars, Object.keys(commandPreFoldEnv(tmpdir, toolEnv)), isCommandRunEnvProtected);
+}
+
+/** The command env before the run's variables fold in: the fixed boundary keys, UZI_SQLC_DIR and the
+ *  provisioned tool env minus the protected keys and git config carriers. */
+function commandPreFoldEnv(tmpdir: string, toolEnv: Record<string, string>): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -8544,10 +8607,6 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
-  // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
-  Object.assign(env, goConcurrencyEnv());
-  if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
-  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
   return env;
 }
 

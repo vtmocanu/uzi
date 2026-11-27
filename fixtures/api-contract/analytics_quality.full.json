@@ -1,0 +1,263 @@
+{
+  "scope": {
+    "route": "x",
+    "user": "x"
+  },
+  "generated_at": "2020-01-02T03:04:05Z",
+  "window": "x",
+  "timezone": "x",
+  "from": "2020-01-02T03:04:05Z",
+  "to": "2020-01-02T03:04:05Z",
+  "previous_from": "2020-01-02T03:04:05Z",
+  "previous_to": "2020-01-02T03:04:05Z",
+  "history_start": "2020-01-02T03:04:05Z",
+  "bucket_width_days": 1,
+  "buckets": [
+    {
+      "label": "x",
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "rolling": [
+    {
+      "start": "2020-01-02T03:04:05Z",
+      "end": "2020-01-02T03:04:05Z",
+      "partial": true
+    }
+  ],
+  "selected_user": "x",
+  "rework": {
+    "applicable": true,
+    "reason": "x",
+    "time_basis": "x",
+    "applicable_prs": 1,
+    "groups": {
+      "zero": 1,
+      "one": 1,
+      "two": 1,
+      "three_plus": 1
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "prs": 1,
+        "groups": {
+          "zero": 1,
+          "one": 1,
+          "two": 1,
+          "three_plus": 1
+        }
+      }
+    ],
+    "unwitnessed_prs": 1,
+    "unverified_links": 1,
+    "shared_external_prs": 1,
+    "shared_detection_unavailable": 1,
+    "retention": "x",
+    "merge_day_activity": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "run_end_to_merge_seconds": {
+      "value": 1.5,
+      "reason": "x"
+    }
+  },
+  "ci_fix": {
+    "applicable": true,
+    "reason": "x",
+    "time_basis": "x",
+    "runs": 1,
+    "finished": 1,
+    "in_flight": 1,
+    "outcomes": {
+      "completed": 1,
+      "cancelled": 1,
+      "plan_rejected": 1,
+      "base_diverged": 1,
+      "failed": 1
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "runs": 1,
+        "finished": 1,
+        "in_flight": 1,
+        "outcomes": {
+          "completed": 1,
+          "cancelled": 1,
+          "plan_rejected": 1,
+          "base_diverged": 1,
+          "failed": 1
+        }
+      }
+    ]
+  },
+  "cross_check": {
+    "plan": {
+      "applicable": true,
+      "reason": "x",
+      "time_basis": "x",
+      "decided_in_window": 1,
+      "stored_result": {
+        "approve": 1,
+        "revise": 1,
+        "block": 1,
+        "failed": 1
+      },
+      "classes": {
+        "passed": 1,
+        "raised_issues": 1,
+        "didnt_finish": 1,
+        "replaced": 1,
+        "unclassified": 1
+      },
+      "checker_harness": {
+        "claude": 1,
+        "codex": 1,
+        "unknown": 1
+      },
+      "undated": {
+        "window": "x",
+        "count": 1,
+        "stored_result": {
+          "approve": 1,
+          "revise": 1,
+          "block": 1,
+          "failed": 1
+        }
+      },
+      "buckets": [
+        {
+          "index": 1,
+          "decided": 1,
+          "stored_result": {
+            "approve": 1,
+            "revise": 1,
+            "block": 1,
+            "failed": 1
+          },
+          "classes": {
+            "passed": 1,
+            "raised_issues": 1,
+            "didnt_finish": 1,
+            "replaced": 1,
+            "unclassified": 1
+          }
+        }
+      ]
+    },
+    "code": {
+      "applicable": true,
+      "reason": "x",
+      "time_basis": "x",
+      "decided_in_window": 1,
+      "stored_result": {
+        "completed": 1,
+        "failed": 1
+      },
+      "classes": {
+        "passed": 1,
+        "raised_issues": 1,
+        "didnt_finish": 1,
+        "replaced": 1,
+        "unclassified": 1
+      },
+      "checker_harness": {
+        "claude": 1,
+        "codex": 1,
+        "unknown": 1
+      },
+      "undated": {
+        "window": "x",
+        "count": 1,
+        "stored_result": {
+          "completed": 1,
+          "failed": 1
+        }
+      },
+      "buckets": [
+        {
+          "index": 1,
+          "decided": 1,
+          "stored_result": {
+            "completed": 1,
+            "failed": 1
+          },
+          "classes": {
+            "passed": 1,
+            "raised_issues": 1,
+            "didnt_finish": 1,
+            "replaced": 1,
+            "unclassified": 1
+          }
+        }
+      ]
+    },
+    "pending": {
+      "applicable": true,
+      "reason": "x",
+      "time_basis": "x",
+      "window": "x",
+      "total": 1,
+      "plan": 1,
+      "code": 1,
+      "effective_filters": {
+        "repo": "x",
+        "harness": "x",
+        "kinds": [
+          "x"
+        ]
+      }
+    }
+  },
+  "judge": {
+    "applicable": true,
+    "reason": "x",
+    "time_basis": "x",
+    "candidates": {
+      "total": 1,
+      "completed": 1,
+      "failed": 1
+    },
+    "eligible": {
+      "total": 1,
+      "unreviewed": 1,
+      "unreviewed_skipped": 1,
+      "failed": 1,
+      "complete": {
+        "total": 1,
+        "ideal": 1,
+        "ok": 1,
+        "issues": 1
+      }
+    },
+    "excluded": {
+      "cancelled": 1,
+      "in_flight": 1,
+      "skip_origin": 1,
+      "reviewed_excluded": 1
+    },
+    "coverage": {
+      "value": 1.5,
+      "reason": "x"
+    },
+    "buckets": [
+      {
+        "index": 1,
+        "eligible": 1,
+        "complete": 1,
+        "coverage": {
+          "value": 1.5,
+          "reason": "x"
+        }
+      }
+    ],
+    "selection": "x",
+    "limitations": [
+      "x"
+    ]
+  }
+}

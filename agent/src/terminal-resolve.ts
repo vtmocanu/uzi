@@ -325,10 +325,13 @@ async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: Resolv
     }
     // The send exhausted its bounded retries, hit a fatal 4xx we do not classify, or was aborted.
     // Leave the journal installed (the outcome is durable) for a later resolve, and do NOT rethrow.
+    // Issue #4574: a bounded, credential-independent diagnostic. A resolve may run long after the lane
+    // that journaled it exited (sweep, drain, boot) with no per-run redactor, and a response body can
+    // echo a secret, so the response body is never logged here.
     log.warn("outbox: terminal report send failed; leaving the journal for a later resolve", {
       run_id: runId,
       claim_generation: claimGeneration,
-      error: errMessage(err),
+      error: terminalSendFailureDiagnostic(err),
     });
     return;
   }
@@ -433,7 +436,7 @@ async function gapFillLoop(
       } catch (err) {
         log.warn("outbox: message-gaps read failed during gap fill; leaving the journal", {
           run_id: runId,
-          error: errMessage(err),
+          error: terminalSendFailureDiagnostic(err),
         });
         return;
       }
@@ -484,7 +487,7 @@ async function gapFillLoop(
       }
       log.warn("outbox: terminal re-send failed after gap fill; leaving the journal", {
         run_id: runId,
-        error: errMessage(err),
+        error: terminalSendFailureDiagnostic(err),
       });
       return;
     }
@@ -570,4 +573,12 @@ function withTerminalFence(deps: TerminalOutboxDeps, body: Record<string, unknow
   if (deps.client.hasFeature("terminal_fence")) out.messages_through_seq = fence;
   else delete out.messages_through_seq;
   return out;
+}
+
+/** Issue #4574: the terminal-send failure log line names the request and status, or only the error class,
+ *  never a response body or free-form message text (which can echo a credential). */
+function terminalSendFailureDiagnostic(err: unknown): string {
+  if (err instanceof RequestError) return `${err.method} ${err.path} returned ${err.status}`;
+  if (err instanceof Error) return err.name === "Error" ? "send failed" : `send failed (${err.name})`;
+  return "send failed";
 }

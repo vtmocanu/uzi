@@ -33,6 +33,8 @@ import { linkedIssueKey } from "./linked-issue.js";
 import { SEEDED_PLAN_RULES } from "./seeded-plan.js";
 import { clampUtf8Bytes, DECISIONS_MEMO_MAX_BYTES } from "./decisions-memo.js";
 import type { EnvFacts } from "./env-probe.js";
+import type { ClaimRunEnvVar } from "./protocol.js";
+import { buildRunEnvBlock } from "./run-env-prompt.js";
 
 /** Captured issue fields are evidence, fenced together with a fresh per-prompt nonce. */
 export function buildIssueContext(title: string, description: string, iid?: number | null, issueKey?: string): string {
@@ -184,6 +186,9 @@ const LEAD_EXPORT_SLOT_RULE = [
  * Codex, GOCACHE is the adopted per-run cache outside the per-command HOME, so the filesystem
  * read is the one holding the resolved GOCACHE. In the runtime append so a customized lead
  * carries it on both harnesses; the subagent half is SUBAGENT_GO_CLEAN_RULE.
+ * Issue #4741: the rule only said what to do with a reading, so leads reached handoffs with a
+ * stale or no reading; the Handoff paragraph requires a fresh reading at every settled
+ * validation handoff and exactly one recorded disposition, without changing any threshold or guard.
  */
 const LEAD_GO_CACHE_RULE = [
   "Go build cache under disk pressure (advisory; not an enforced cap or a predicted next-wave",
@@ -203,6 +208,22 @@ const LEAD_GO_CACHE_RULE = [
   "reading below 70%, then a later reading at or above 75%. Fresh cache growth to at least",
   "12 GiB may independently trigger another attempt at a settled boundary. Keep stable export",
   "slots and warm reuse within a wave.",
+  "Handoff: at every completed validation-wave handoff that ran or will run Go builds or tests",
+  "(a milestone close, a review or rework dispatch, the step before the next wave), when",
+  "settlement, ownership (verified as under Ownership below) and a safe measurement of the",
+  "resolved, verified run-owned `GOCACHE` are all established and no independent consumer is",
+  "known or suspected, take a fresh reading of that cache's size and its filesystem use; a",
+  "reading from an earlier handoff is never reused. Record exactly one disposition in the run's",
+  "progress notes:",
+  "- `skipped: <reason>` when settlement or ownership is unknown, safe measurement is not",
+  "  possible, or an independent consumer is known or suspected. No reading is forced, and the",
+  "  guard above holds.",
+  "- `skipped: reading failed` for a failed or partial reading (unknown, not zero, not a trigger).",
+  "- `kept (below threshold)` when the cache is below 12 GiB and the filesystem below 75%.",
+  "- `kept (filesystem episode not re-armed)` when the filesystem is still at or above 75% in an",
+  "  episode with a previous cleanup attempt (successful or failed) and not re-armed (no reading",
+  "  below 70% since), with the cache below 12 GiB.",
+  "- `cleared (before → after)` or `cleanup failed` when a trigger fires.",
   "Ownership: before cleaning, resolve `go env GOCACHE` in the same tool environment that built",
   "the code and confirm by its canonical path that it is this run's own cache, with no explicit",
   "shared or external override and no `GOCACHEPROG` backend. On Codex, `GOCACHE` legitimately",
@@ -1614,8 +1635,14 @@ export function depsProvisionImplementNote(
     if (shown !== d.dir) lossy.push(i + 1);
     (d.ok ? installed : failed).push(`${i + 1}. ${shown}`);
   });
-  if (installed.length > 0) rows.push("installed:", ...installed);
-  if (failed.length > 0) rows.push("failed:", ...failed);
+  if (installed.length > 0) {
+    rows.push("installed:");
+    for (const row of installed) rows.push(row);
+  }
+  if (failed.length > 0) {
+    rows.push("failed:");
+    for (const row of failed) rows.push(row);
+  }
 
   const lines = [
     "The worker attempted to provision this repo's JS dependencies. Between the tags below, the",
@@ -1769,6 +1796,10 @@ export interface PlanPromptInput {
    *  buildEnvironmentFactsBlock; absent, or nothing limited and Docker wired ⇒ no block,
    *  byte-identical to before. */
   environmentFacts?: EnvFacts;
+  /** PRD #4416 M2: the run's user environment variables (lead lane). Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty ⇒ no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
 }
 
 /**
@@ -1810,6 +1841,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
   );
   // issue #1866: measured environment limits, beside the deps note. "" ⇒ nothing added.
   const envFactsBlock = buildEnvironmentFactsBlock(input.environmentFacts);
+  const runEnvBlock = buildRunEnvBlock(input.runEnv);
   return [
     `Plan the work described by this forge issue. You are on branch \`${input.branch}\`.`,
     ...(priorNote ? ["", priorNote] : []),
@@ -1826,6 +1858,7 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
     "",
     depsProvisionPlanNote(),
     ...(envFactsBlock ? ["", envFactsBlock] : []),
+    ...(runEnvBlock ? ["", runEnvBlock] : []),
     "",
     // PRD #88 M4: the pre-run clarification framing. Placed with the plan
     // instruction rather than in the system append because the TIMING is what is
@@ -2027,6 +2060,10 @@ export interface ImplementPromptInput {
   /** issue #1866: the run-start environment probe's facts. FIRST TURN ONLY, like `deps`.
    *  Absent, or nothing limited and Docker wired ⇒ no block. See buildEnvironmentFactsBlock. */
   environmentFacts?: EnvFacts;
+  /** PRD #4416 M2: the run's user environment variables (lead lane). FIRST TURN ONLY. Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty ⇒ no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
 }
 
 /** Repeat on ordinary and answered rework turns on both harnesses. */
@@ -2104,7 +2141,8 @@ export function renderFollowUpBatch(bodies: readonly string[]): string[] {
     `The user sent ${n} follow-ups, oldest first; each is in its own fenced block below.`,
   ];
   bodies.forEach((body, i) => {
-    lines.push("", `Follow-up ${i + 1} of ${n}:`, ...renderFollowUpBlock(body));
+    lines.push("", `Follow-up ${i + 1} of ${n}:`);
+    for (const line of renderFollowUpBlock(body)) lines.push(line);
   });
   lines.push("", FOLLOW_UP_TRAILER);
   return lines;
@@ -2173,7 +2211,8 @@ export function renderPriorOwnerHistory(bodies: readonly string[]): string[] {
     "server-reported scope and progress, take precedence.",
   ];
   bodies.forEach((body, i) => {
-    lines.push("", `Earlier follow-up ${i + 1} of ${n}:`, ...renderPriorOwnerHistoryBlock(body));
+    lines.push("", `Earlier follow-up ${i + 1} of ${n}:`);
+    for (const line of renderPriorOwnerHistoryBlock(body)) lines.push(line);
   });
   lines.push("", PRIOR_OWNER_HISTORY_TRAILER);
   return lines;
@@ -2264,6 +2303,8 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // issue #1866: measured environment limits, first turn only, beside the deps facts.
   const envFactsBlock = input.first ? buildEnvironmentFactsBlock(input.environmentFacts) : "";
   if (envFactsBlock) lines.push("", envFactsBlock);
+  const runEnvBlock = input.first ? buildRunEnvBlock(input.runEnv) : "";
+  if (runEnvBlock) lines.push("", runEnvBlock);
   // issue #222: the reseed warning, first turn only. Placed BEFORE baseNote so the two read
   // together — "the tree was rebuilt at the start of this attempt" then "your branch was
   // created at <base>". A follow-up queued before the loop (issue #1800: pulled at the
@@ -2316,9 +2357,14 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     );
   }
   // Issue #3149: earlier owner follow-ups read BEFORE any live follow-up, so a live correction wins.
-  if (input.priorOwnerFollowUps?.length) lines.push(...renderPriorOwnerHistory(input.priorOwnerFollowUps));
-  if (input.followUp) lines.push(...renderFollowUpBlock(input.followUp));
-  else if (input.ownerFollowUps?.length) lines.push(...renderFollowUpBatch(input.ownerFollowUps));
+  if (input.priorOwnerFollowUps?.length) {
+    for (const line of renderPriorOwnerHistory(input.priorOwnerFollowUps)) lines.push(line);
+  }
+  if (input.followUp) {
+    for (const line of renderFollowUpBlock(input.followUp)) lines.push(line);
+  } else if (input.ownerFollowUps?.length) {
+    for (const line of renderFollowUpBatch(input.ownerFollowUps)) lines.push(line);
+  }
   if (input.completionRework) lines.push("", input.completionRework.text);
   if (input.ownerDecisionEligible && !input.completionRework) lines.push("", COMPLETION_CONTRACT_GUIDANCE);
   lines.push(
@@ -2686,6 +2732,10 @@ function openSelfImproveMRsFrame(openTag: string, closeTag: string): string {
 }
 
 export interface SelfImprovePlanPromptInput {
+  /** PRD #4416 M2: the run's user environment variables (lead lane). Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty => no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
   branch: string;
   /** The accumulated improve_uzi backlog (untrusted), carried as issue_description. */
   recommendations: string;
@@ -2754,6 +2804,7 @@ export function buildSelfImprovePlanPrompt(
   // PRD #90: inert, nonce-fenced cross-run memory (its own fence, distinct from the
   // recommendations fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
+  const runEnvBlock = buildRunEnvBlock(input.runEnv);
   const priorNote = priorWorkNote(input.priorWork, input.interruptedSnapshot);
   const baseNote = baseCommitNote(input.baseCommit, input.defaultBranchCommit);
   // PRD #1416 M1: name the published floor P beside the base-commit/branch facts, OUTSIDE
@@ -2870,6 +2921,7 @@ export function buildSelfImprovePlanPrompt(
     ...(inflightBlock ? ["", inflightBlock] : []),
     ...(openMRsBlock ? ["", openMRsBlock] : []),
     ...(memoryBlock ? ["", memoryBlock] : []),
+    ...(runEnvBlock ? ["", runEnvBlock] : []),
     "",
     delegatesLine(input.subagentNames, input.subagentCanWrite),
     "",
@@ -2939,6 +2991,10 @@ export function fenceNonce(): string {
 }
 
 export interface CIFixPlanPromptInput {
+  /** PRD #4416 M2: the run's user environment variables (lead lane). Rendered by buildRunEnvBlock:
+   *  names, scope, description and PLAIN values only, never a secret value. Absent or empty => no
+   *  block, byte-identical to before. */
+  runEnv?: readonly ClaimRunEnvVar[];
   ref: string;
   branch: string;
   pipelineWebURL: string;
@@ -3037,6 +3093,8 @@ export function buildCIFixPlanPrompt(input: CIFixPlanPromptInput): string {
   // job-log fence). Empty/absent injects nothing. Same helper as buildPlanPrompt.
   const memoryBlock = buildMemoryContext(input.memory ?? []);
   if (memoryBlock) lines.push(memoryBlock, "");
+  const runEnvBlock = buildRunEnvBlock(input.runEnv);
+  if (runEnvBlock) lines.push(runEnvBlock, "");
   lines.push(
     delegatesLine(input.subagentNames, input.subagentCanWrite),
     "Diagnose the failure. You may re-run the failing commands locally (tests,",

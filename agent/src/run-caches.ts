@@ -25,7 +25,7 @@ const DROP_DEADLINE_MS = 5 * 60_000;
 /**
  * PRD #1809 D2: drop a parked run's rebuildable caches ({@link RUN_CACHE_SUBTREES}) from
  * its preserved HOME, keeping everything else a resume needs (the session transcript,
- * `.claude.json`, `go/bin`, unknown files). Called from `executeClaim`'s finally for a
+ * `.uzi-claude-config`, `go/bin`, unknown files). Called from `executeClaim`'s finally for a
  * Claude run that parked, i.e. whose process has ended, and (issue #1830) in place by the
  * hard disk layer for a live run that cannot be parked (a gate wait, finalize), where the
  * run keeps going and `keep` names any subtree a still-running step needs; a Codex run's

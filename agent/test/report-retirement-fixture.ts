@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -215,7 +216,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.equal(api.wallParkRequests[0]!.body.published, false);
     const bootRecords = await predecessor.snapshotBootRecoveries();
     await predecessor.resumePendingRecoveries(undefined, bootRecords);
-    const reader = new RecoveryCoordinator({ client, git, log: nullLogger(),
+    const reader = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(),
       recoveryRoot: git.recoveryRoot, workerToken: token });
     const priorRecords = await reader.inspect(claim.run_id);
     priorFinal = priorRecords.find(row => row.generation === 1 && row.state === "uploaded");
@@ -362,7 +363,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     barePath: bare, runId: claim.run_id, generation: archiveGeneration, kind: "issue", branch,
     defaultIdentity: { ref: "refs/remotes/origin/main", sha: cmd(bare, ["rev-parse", "refs/remotes/origin/main"]) },
   };
-  const coordinator = new RecoveryCoordinator({ client, git, log: nullLogger(),
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client, git, log: nullLogger(),
     recoveryRoot: git.recoveryRoot, workerToken: token });
   let archive: RecoveryRecord;
   if (options.priorPendingArchiveFinal) {

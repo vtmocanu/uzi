@@ -45,7 +45,9 @@ import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, SecretRem
 import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
-import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import { assertRunEnvDeliverable, buildSdkEnv, sdkRunEnvInjected, type SdkCredential } from "./sdk-env.js";
+import { runEnvDropText } from "./run-env-inject.js";
+import { buildRunEnvBlock } from "./run-env-prompt.js";
 import { assertAgentModelsMapped, isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
@@ -144,8 +146,9 @@ import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedE
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { isSeededOwnerPlan } from "./seeded-plan.js";
-import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
+import { redactPlanSummary, SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
@@ -416,7 +419,7 @@ export function fillOwnerBatch(
   }
   if (queuedOwner.length === 0) {
     const pulled = ctx.pullFollowUps?.(remaining, batch.length === 0);
-    if (pulled !== undefined) batch.push(...pulled);
+    if (pulled !== undefined) for (const item of pulled) batch.push(item);
   }
   return batch.length > 0 ? batch : undefined;
 }
@@ -1530,10 +1533,13 @@ export class SdkExecutor implements Executor {
             },
           });
           if (!result || !allowed()) return;
+          // PRD #4416 M2: the generated summary and the plan text leave the worker redacted, like every
+          // other agent-derived payload; the redacted value is also what the terminal report carries.
+          const safe = redactPlanSummary(result, ctx.redactText);
           await this.client!.postPlanSummary(ctx.runId, {
-            ...result, plan_md: planMd.replaceAll("\u0000", ""),
+            ...safe, plan_md: (ctx.redactText?.(planMd) ?? planMd).replaceAll("\u0000", ""),
           });
-          if (allowed()) this.latestPlanSummary = result;
+          if (allowed()) this.latestPlanSummary = safe;
         } catch (error) {
           this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
         } finally { this.planFlights.delete(owned); }
@@ -1663,6 +1669,8 @@ export class SdkExecutor implements Executor {
    * closes over the same `state`/`depsAbort` objects it stores on the carrier.
    */
   private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
+    // PRD #4416 M2: run variables are delivered only under the uid split; refuse before anything is provisioned or started.
+    assertRunEnvDeliverable(ctx.runEnv);
     const oauthToken = ctx.oauthToken?.trim();
     if (!oauthToken && !ctx.provider) {
       // OAuth is the sole supported credential (no API keys). Detect its
@@ -1698,7 +1706,18 @@ export class SdkExecutor implements Executor {
     // agent starts is positively attributable to this attempt by the quiescence reaper.
     // PRD #4320 module 6: a provider run builds its env from the frozen binding and never carries an OAuth token.
     const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
-    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir);
+    // PRD #4416 M2: the lead lane alone receives the run's user variables (lowest precedence); each
+    // dropped name is reported as a run event naming the rule, never the value.
+    // The set of variables the builder injects, computed once per executor run after provisioning: each prompt
+    // site reads ctx.injectedRunEnv, and the builder folds exactly this set (RunEnvInjection.set).
+    const runEnvSet = ctx.runEnv && ctx.runEnv.length > 0
+      ? sdkRunEnvInjected(ctx.runEnv, credential, this.homeDir, toolEnv, ctx.runTmpdir)
+      : undefined;
+    if (runEnvSet) ctx.injectedRunEnv = runEnvSet.injected;
+    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir,
+      ctx.runEnv && runEnvSet
+        ? { vars: ctx.runEnv, set: runEnvSet, onDrop: (name, rule) => ctx.emit({ kind: "status", agent: "worker", payload: { text: runEnvDropText(name, rule) } }) }
+        : undefined);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -1825,10 +1844,13 @@ export class SdkExecutor implements Executor {
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
     const survivorNames = new Set(runSkills.map((s) => s.name));
+    // PRD #4416 M2: the run-variables block rides every subagent's prompt (own and repo rosters).
+    const runEnvAppend = buildRunEnvBlock(ctx.injectedRunEnv);
     const assembled = assembleAgents(
       ctx.agents ?? [],
       survivorNames,
       prepared.repoSurvivorNames,
+      runEnvAppend,
     );
     // Model precedence (PRD #17 Decision 6): the run owner's per-user default
     // model wins over the lead template's model for the main thread. Set the key
@@ -1886,6 +1908,7 @@ export class SdkExecutor implements Executor {
         ctx.approvedSelection?.source === "repo" ? ctx.approvedSelection.exclusions : [],
         survivorNames,
         prepared.repoSurvivorNames,
+        runEnvAppend,
       )
       : assembled.subagents;
     const planTurn = planTurnSubagents(planPool);
@@ -2576,7 +2599,10 @@ export class SdkExecutor implements Executor {
               },
             });
             if (summary && this.intentFlight === flight && !flight.abandoned && !flight.ctrl.signal.aborted
-                && !ctx.claimFenced?.() && !ctx.cancelRequested?.()) await this.client!.postIntentSummary(ctx.runId, summary);
+                && !ctx.claimFenced?.() && !ctx.cancelRequested?.()) {
+              // PRD #4416 M2: redacted like the plan summary, since the intent text derives from the issue and PRD.
+              await this.client!.postIntentSummary(ctx.runId, ctx.redactText?.(summary) ?? summary);
+            }
           } catch (err) {
             this.log.warn("intent summary hook failed", {
               run_id: ctx.runId,
@@ -2636,6 +2662,8 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
+            // PRD #4416 M2: the run's user variables (names, descriptions, plain values; never a secret value).
+            runEnv: ctx.injectedRunEnv,
           });
         } else if (isSelfImprove) {
           // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -2668,6 +2696,7 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
+            runEnv: ctx.injectedRunEnv,
           });
         } else {
           planPrompt = buildPlanPrompt({
@@ -2703,6 +2732,7 @@ export class SdkExecutor implements Executor {
             autoApprove: ctx.autoApprove,
             // issue #1866 M2: the run-start environment facts (no block when nothing to say).
             environmentFacts,
+            runEnv: ctx.injectedRunEnv,
           });
         }
         const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
@@ -3138,6 +3168,7 @@ export class SdkExecutor implements Executor {
           selection.exclusions,
           survivorNames,
           prepared.repoSurvivorNames,
+          buildRunEnvBlock(ctx.injectedRunEnv),
         ),
         state.implementRequest.effort,
       );
@@ -3574,6 +3605,7 @@ export class SdkExecutor implements Executor {
         // park, whatever the soft layer concluded.
         throwIfDiskStop(ctx);
         if (capVerdict === "park") throw new DiskParkSignal(true);
+        await this.warnLiveWritersAtConfigReset();
         // Checkpoints bypass the post-turn limit. Refresh budget/history and honor
         // controls first; a clarification still owns the uncompleted current turn.
         if (iteration - 1 >= maxIterations && !state.tripReason && state.wallRemainingMs > 0 &&
@@ -3811,6 +3843,8 @@ export class SdkExecutor implements Executor {
             // issue #1866 M2: the run-start environment facts, rendered on first turns only
             // (gated inside buildImplementPrompt).
             environmentFacts,
+            // PRD #4416 M2: first turn only (gated inside buildImplementPrompt).
+            runEnv: ctx.injectedRunEnv,
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,
@@ -5970,6 +6004,41 @@ export class SdkExecutor implements Executor {
       if (!alive) return false;
       if (Date.now() - started >= this.quietSettleMs) return true;
       await sleep(QUIET_POLL_MS);
+    }
+  }
+
+  /**
+   * PRD #4416: evidence only, never a reap or a refusal. spawnDetached prepares the CLI's config
+   * directory at each CLI start; under the uid split a live runner process cannot change it, so
+   * nothing is scanned or logged there. With one uid a process of this run that is still alive (the
+   * HOME-attributed scan, one pass, no settle poll) can alter it between that preparation and the
+   * CLI's startup read. Logs the count (or an incomplete scan), nothing else. RunProcessOps.scan
+   * takes no budget option, so this scan runs under the scan's own default budget.
+   */
+  private async warnLiveWritersAtConfigReset(): Promise<void> {
+    if (uidSplitActive()) return;
+    // Advisory only: nothing here may fail the run or skip the reset that follows. A scan that
+    // throws or returns a malformed result (no `pids` array) is reported as incomplete, and any
+    // error while logging is swallowed.
+    try {
+      let raw: RunProcessScan | undefined;
+      try {
+        raw = await this.runProcesses.scan(this.homeDir, this.runWorktree, [...this.spawnedPids]);
+      } catch {
+        raw = { pids: [], complete: false };
+      }
+      const pids = Array.isArray(raw?.pids) ? raw.pids : [];
+      const complete = raw?.complete === true && Array.isArray(raw?.pids);
+      if (complete && pids.length === 0) return;
+      const what = complete
+        ? `${pids.length} run processes are alive at this turn boundary`
+        : `the process scan was incomplete (${pids.length} run processes seen) at this turn boundary`;
+      this.log.warn(`${what}; a live process of the run can alter the Claude config directory before the CLI reads it (single uid)`, {
+        count: pids.length,
+        scanComplete: complete,
+      });
+    } catch {
+      /* advisory: never fails the turn */
     }
   }
 

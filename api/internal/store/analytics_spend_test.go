@@ -39,16 +39,22 @@ func analyticsSQLBlocks(t *testing.T) (file string, blocks map[string]string) {
 // parameters. The legacy usage message tables are not an input either.
 func TestAnalyticsSQLForbiddenConstructs(t *testing.T) {
 	file, _ := analyticsSQLBlocks(t)
-	for _, c := range []struct{ what, pattern string }{
-		{"now()", `(?i)\bnow\s*\(`},
-		{"generate_series", `(?i)generate_series`},
-		{"date_trunc", `(?i)date_trunc`},
-		{"run_usage_messages", `(?i)run_usage_messages`},
-		{"run_usage_estimated", `(?i)run_usage_estimated`},
-	} {
-		if loc := regexp.MustCompile(c.pattern).FindStringIndex(file); loc != nil {
-			line := strings.Count(file[:loc[0]], "\n") + 1
-			t.Errorf("analytics.sql contains %s at line %d", c.what, line)
+	quality, err := os.ReadFile("queries/analytics_quality.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"analytics.sql": file, "analytics_quality.sql": string(quality)} {
+		for _, c := range []struct{ what, pattern string }{
+			{"now()", `(?i)\bnow\s*\(`},
+			{"generate_series", `(?i)generate_series`},
+			{"date_trunc", `(?i)date_trunc`},
+			{"run_usage_messages", `(?i)run_usage_messages`},
+			{"run_usage_estimated", `(?i)run_usage_estimated`},
+		} {
+			if loc := regexp.MustCompile(c.pattern).FindStringIndex(text); loc != nil {
+				line := strings.Count(text[:loc[0]], "\n") + 1
+				t.Errorf("%s contains %s at line %d", name, c.what, line)
+			}
 		}
 	}
 }

@@ -76,7 +76,7 @@ func TestEphemeralReapPredicateIdenticalAcrossLockAndDelete(t *testing.T) {
 		normalized := strings.Join(strings.Fields(p), " ")
 		for _, clause := range []string{
 			"(r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))",
-			"(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities))",
+			"(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))",
 		} {
 			if !strings.Contains(normalized, clause) {
 				t.Errorf("%s predicate lacks engine-specific provider arm %q", name, clause)

@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import fs from "node:fs/promises";
@@ -19,7 +20,7 @@ it("unadopted empty-settle retry stops at the shared cancellation deadline", asy
   let now = 0, releases = 0;
   const budget = new MaintenanceBudget(600_000, () => now);
   const attempted = deferred();
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: root, workerToken: "fixture", log: nullLogger(),
     client: {
       hasFeature: () => true,
@@ -59,7 +60,7 @@ it("capture tail expiry preserves FIFO and never starts the expired action", asy
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "budget-tail-"));
   const entered = deferred(), release = deferred();
   let actions = 0, now = 0;
-  const coordinator = new RecoveryCoordinator({ recoveryRoot: root, workerToken: "fixture", log: nullLogger(),
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: root, workerToken: "fixture", log: nullLogger(),
     client: { hasFeature: () => true, listRecoveryHolds: async () => ({ run_id: "run", holds: [{
       hold_id: "00000000-0000-4000-8000-000000000001", generation: 1, inventory_guarded: true,
     }] }) } as never, git: {} as never, testHooks: { afterPinObserve: async () => {
@@ -97,7 +98,7 @@ it("journal queued abort performs no mutation", async t => {
     writes++; if (writes === 1) { entered.resolve(); await release.promise; }
     return original(...args);
   });
-  const coordinator = new RecoveryCoordinator({ recoveryRoot: root, workerToken: "fixture", log: nullLogger(), client: { hasFeature: () => true, listRecoveryHolds: async () => ({ run_id: "run", holds: [1, 2].map(generation => ({ generation, inventory_guarded: true, hold_id: `hold-${generation}` })) }) } as never, git: {} as never });
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, recoveryRoot: root, workerToken: "fixture", log: nullLogger(), client: { hasFeature: () => true, listRecoveryHolds: async () => ({ run_id: "run", holds: [1, 2].map(generation => ({ generation, inventory_guarded: true, hold_id: `hold-${generation}` })) }) } as never, git: {} as never });
   const input = { runId: "run", inventoryGuarded: true, kind: "issue" as const, branch: "task", sourceSha: tip };
   const budget = new MaintenanceBudget(100, () => now);
   try {

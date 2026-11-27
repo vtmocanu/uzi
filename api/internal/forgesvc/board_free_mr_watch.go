@@ -3,6 +3,7 @@ package forgesvc
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -107,6 +108,9 @@ func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, 
 		slog.Warn("forgesvc: board-free MR-state read failed", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "error", err)
 		return
 	}
+	// Observation time, captured right after the fetch and before the rework cancel
+	// (PRD #4691; see syncOneMRState).
+	observedAt := time.Now()
 	observed := mr.State
 	if !forge.IsKnownMRState(observed) {
 		slog.Warn("forgesvc: ignoring unknown board-free MR state", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed)
@@ -116,7 +120,7 @@ func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, 
 		// Bootstrap: first observation records without acting. No rework was ever gated in
 		// for a run whose mr_state was NULL, so there is nothing to cancel; recording an
 		// `opened` here is exactly what opens the rework gate for a scheduled MR.
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.ID, mr, observedAt)
 		return
 	}
 	stored := c.MrState.String
@@ -138,10 +142,10 @@ func (s *Service) recordBoardFreeMRState(ctx context.Context, repoID uuid.UUID, 
 			slog.Warn("forgesvc: cancel board-free rework on MR terminal state failed, will retry", "repo", repoID, "run", c.ID, "mr", c.MrIid.Int64, "state", observed, "error", err)
 			return
 		}
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.ID, mr, observedAt)
 	default:
 		// KNOWN non-terminal transition: `locked` (transient during merge processing) or a
 		// `locked`->`opened` settle. Record, never cancel — the gate stays open.
-		s.recordMRState(ctx, c.ID, observed)
+		s.recordMRState(ctx, c.ID, mr, observedAt)
 	}
 }

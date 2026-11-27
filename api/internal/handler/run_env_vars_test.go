@@ -15,6 +15,18 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
+// fixedStateReader reports an unprotected vault at a fixed epoch, bound to a context with
+// vault.WithStateReader so an epoch-fenced open needs no database.
+type fixedStateReader struct{ epoch int64 }
+
+func (r fixedStateReader) GetUserVaultState(context.Context, uuid.UUID) (store.GetUserVaultStateRow, error) {
+	return store.GetUserVaultStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: r.epoch}, nil
+}
+
+func epochCtx(epoch int64) context.Context {
+	return vault.WithStateReader(context.Background(), fixedStateReader{epoch: epoch})
+}
+
 // A plain env row marked sealed_with=master (nil AAD) is never opened for a response.
 func TestRunEnvDTORefusesMasterMarkedRow(t *testing.T) {
 	// A real nil-AAD ciphertext under a configured master box: without the master-marker
@@ -32,9 +44,9 @@ func TestRunEnvDTORefusesMasterMarkedRow(t *testing.T) {
 	})}
 	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMaster,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
-	dto, locked := h.runEnvDTO(uuid.New(), uuid.New(), row, false)
+	dto, locked := h.runEnvDTOAt(epochCtx(0), uuid.New(), uuid.New(), row, false, 0)
 	if dto.Value != nil || !dto.ValueWithheld || locked {
-		t.Fatalf("master-marked row: %+v locked=%v", dto, locked)
+		t.Fatalf("master-marked row: value present=%v withheld=%v locked=%v", dto.Value != nil, dto.ValueWithheld, locked)
 	}
 }
 
@@ -58,28 +70,28 @@ func TestRunEnvDTOWithholdsWhenVaultLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD,
+	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD, AadVersion: runenv.AADVersion1,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
 	// Control: unlocked, the same row opens, so only the vaultLocked branch withholds it.
-	if dto, _ := h.runEnvDTO(userID, repoID, row, false); dto.Value == nil || *dto.Value != "stale-plain" {
-		t.Fatalf("unlocked control did not open: %+v", dto)
+	if dto, _ := h.runEnvDTOAt(epochCtx(0), userID, repoID, row, false, 0); dto.Value == nil || *dto.Value != "stale-plain" {
+		t.Fatalf("unlocked control did not open: value present=%v withheld=%v", dto.Value != nil, dto.ValueWithheld)
 	}
-	dto, locked := h.runEnvDTO(userID, repoID, row, true)
+	dto, locked := h.runEnvDTOAt(epochCtx(0), userID, repoID, row, true, 0)
 	if dto.Value != nil || !dto.ValueWithheld || !locked {
-		t.Fatalf("locked vault: %+v locked=%v", dto, locked)
+		t.Fatalf("locked vault: value present=%v withheld=%v locked=%v", dto.Value != nil, dto.ValueWithheld, locked)
 	}
 }
 
-// A write response asks the vault for its lock state after the write committed: a vault
-// that reports locked (here its state lookup fails, which fails closed) withholds a
-// master_aad plain value the master key would otherwise open.
-func TestRunEnvWriteDTOWithholdsWhenVaultLocked(t *testing.T) {
+// A write response opens a plain value at the epoch its row was written or read at: once the
+// vault's epoch has moved (protection enabled or a rewrap), the master_aad value the master key
+// would still open is withheld.
+func TestRunEnvWriteDTOWithholdsAtStaleEpoch(t *testing.T) {
 	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := &Handler{vault: vault.New(box, nil, func(context.Context, func(context.Context, vault.Store) error) error {
-		return errors.New("state lookup unavailable")
+		return errors.New("unused")
 	})}
 	userID, repoID := uuid.New(), uuid.New()
 	kind := runenv.AADKind(runenv.ScopeRepo, &repoID, false, "PLAIN_ONE")
@@ -88,14 +100,14 @@ func TestRunEnvWriteDTOWithholdsWhenVaultLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD,
+	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD, AadVersion: runenv.AADVersion1,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
-	if dto, _ := h.runEnvDTO(userID, repoID, row, false); dto.Value == nil {
-		t.Fatalf("control: the row must open when not reported locked: %+v", dto)
+	if dto := h.runEnvWriteDTO(epochCtx(1), userID, repoID, row, 1); dto.Value == nil {
+		t.Fatalf("control: the row must open at the epoch the vault reports: withheld=%v", dto.ValueWithheld)
 	}
-	dto := h.runEnvWriteDTO(context.Background(), userID, repoID, row)
+	dto := h.runEnvWriteDTO(epochCtx(1), userID, repoID, row, 0)
 	if dto.Value != nil || !dto.ValueWithheld {
-		t.Fatalf("write response under a locked vault: %+v", dto)
+		t.Fatalf("write response at a stale epoch: value present=%v withheld=%v", dto.Value != nil, dto.ValueWithheld)
 	}
 }
 

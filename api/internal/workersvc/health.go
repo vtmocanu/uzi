@@ -235,6 +235,11 @@ const (
 	// whose owner has no online worker self-reporting 'issue_key_v1': ClaimRun's standalone
 	// issue_key clause can never be satisfied until a worker that renders references by
 	// issue_key (and never closes #<iid>) comes online.
+	// reasonNoRunEnvCapableWorker (PRD #4416 M2) is emitted for a queued lead-lane run that
+	// receives repo variables (an enabled live variable, or a secret delivery receipt) whose
+	// owner has no online worker self-reporting 'run_env_v1': ClaimRun's standalone run_env
+	// clause can never be satisfied until a worker that injects the variables comes online.
+	reasonNoRunEnvCapableWorker             = "no online worker supports repo variables (run_env_v1); repo variables need a current two-uid worker (UZI_UID_SPLIT, or UZI_WORKER_UID_SPLIT on hosted workers)"
 	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
@@ -269,7 +274,15 @@ const (
 	// clause counted by CountOnlineWorkersSatisfyingProvider with Kind), so a fleet that only
 	// supports ordinary provider runs still leaves the judge queued, and this names why.
 	reasonNoProviderJudgeCapableWorker = "no worker that supports provider judges (claude_provider_judge_v1) is online"
-	reasonNoCurrentCodexRuntime        = "no worker with the current Codex runtime is online; waiting for the worker roll"
+	// reasonNoCodexProviderJudgeCapableWorker (PRD #4574 M1) is the Codex twin: a provider-bound
+	// Codex JUDGE needs codex_provider_judge_v1 on top of the Codex provider trio and
+	// codex_provider_v1, so a fleet supporting only ordinary Codex provider runs leaves it queued.
+	reasonNoCodexProviderJudgeCapableWorker = "no worker that supports Codex provider judges (codex_provider_judge_v1) is online"
+	// reasonNoProviderJobCapableWorker (PRD #4322 M1b) is the job counterpart: a provider-bound JOB
+	// needs claude_provider_job_v1 (and claude_provider_v1) on a non-Docker job runner, so a fleet that
+	// only supports ordinary provider runs or vendor jobs still leaves it queued, and this names why.
+	reasonNoProviderJobCapableWorker = "no worker that supports provider jobs (claude_provider_job_v1) is online"
+	reasonNoCurrentCodexRuntime      = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -1652,6 +1665,22 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			}
 		}
 	}
+	// PRD #4416 M2: a lead-lane run that receives repo variables with no online run_env_v1 worker
+	// is unplaceable. The lane is decided in SQL from the run row (the review-target half is not
+	// on the health row), so the Go pre-gate only skips the lookup for kinds that never receive
+	// variables; a failed read falls through like the rungs above.
+	if r.RepoID.Valid && RunEnvDelivered(r.Kind, false, r.EgressProfileID.Valid) {
+		if q, ok := s.q.(interface {
+			RunEnvWorkerMissingForRun(context.Context, store.RunEnvWorkerMissingForRunParams) (bool, error)
+		}); ok {
+			missing, merr := q.RunEnvWorkerMissingForRun(ctx, store.RunEnvWorkerMissingForRunParams{RunID: r.ID, UserID: r.UserID})
+			if merr != nil {
+				slog.Error("health: check run_env_v1 workers for run", "run_id", r.ID, "error", merr)
+			} else if missing {
+				return reasonNoRunEnvCapableWorker
+			}
+		}
+	}
 	sourceCapablePeerConfirmed := false
 	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
 		if q, ok := s.q.(interface {
@@ -1740,6 +1769,12 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if r.Kind == runkind.Judge && r.Harness == harnessClaude {
 				return reasonNoProviderJudgeCapableWorker
 			}
+			if r.Kind == runkind.Judge && r.Harness == harnessCodex {
+				return reasonNoCodexProviderJudgeCapableWorker
+			}
+			if r.Kind == runkind.Job && r.Harness == harnessClaude {
+				return reasonNoProviderJobCapableWorker
+			}
 			return reasonNoProviderCapableWorker
 		}
 	}
@@ -1776,12 +1811,26 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		// PRD #1909 M1: a job stamped with runs.job_protocol also needs 'job_files_v1'. A profile-bound
 		// job (PRD #1976, runs.egress_profile_id) never reaches this rung: queuedReason returns
 		// isolatedLaneReason for it first, and this count excludes ephemeral (lane) workers.
+		// PRD #4322 M1b: a provider-bound job also needs claude_provider_v1 and claude_provider_job_v1 on
+		// the SAME non-Docker worker (RequiresProviderJob).
 		c, cerr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, store.CountOnlineWorkersSatisfyingJobRunnerParams{
-			UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid,
+			UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid, RequiresProviderJob: r.ModelProviderKeyMode.Valid,
 		})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying job runner", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
+			if r.ModelProviderKeyMode.Valid {
+				// Tell a fleet with no job runner at all from one whose job runners lack the provider
+				// capabilities: the second count drops only the provider requirement.
+				base, berr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, store.CountOnlineWorkersSatisfyingJobRunnerParams{
+					UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid,
+				})
+				if berr != nil {
+					slog.Error("health: count online workers satisfying job runner (base)", "run_id", r.ID, "error", berr)
+				} else if base > 0 {
+					return reasonNoProviderJobCapableWorker
+				}
+			}
 			return reasonNoJobCapableWorker
 		}
 	}

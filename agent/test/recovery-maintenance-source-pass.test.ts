@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -108,7 +109,7 @@ async function fixture(t: test.TestContext) {
   log.warn = (message, fields) => warnings.push({ message, fields });
   let executing = false;
   let executionCheck: (() => boolean) | undefined;
-  const make = () => new RecoveryCoordinator({
+  const make = () => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     isExecuting: () => executionCheck?.() ?? executing,
     recoveryRoot, workerToken: token, client, git: git as never, log, now: () => 1000,
     withInventorySourceBoundary: async (_ctx, action) => { await action(async () => true); return "passed"; },

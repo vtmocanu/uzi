@@ -8,7 +8,7 @@
 
 ## Problem
 
-Run logs accumulate in PostgreSQL after runs finish. During the hosted disk-full incident in #2623, `run_messages` occupied about 2.4 GB of a 4.66 GB database. A hosted-derived sample of 189 terminal runs averaged about 3.1 MB of logical payload per run. #2755's DB-only rollup benchmark showed size savings but failed its paging and resource criteria, and the PRD remains parked. This PRD evaluates a bounded, whole-transcript cold tier using the optional S3 backend. [Hosted-derived sample](https://github.com/vtmocanu/uzi/issues/80#issuecomment-6110889256) · [#2755 measurement and reader inventory](2755-run-message-rollups.md)
+Run logs accumulate in PostgreSQL after runs finish. During the hosted disk-full incident in #2623, `run_messages` occupied about 2.4 GB of a 4.66 GB database. A hosted-derived sample of 189 terminal runs averaged about 3.1 MB of logical payload per run. #2755's DB-only rollup benchmark showed size savings but failed its paging and resource criteria, and #2755 was closed as not planned. This PRD evaluates a bounded, whole-transcript cold tier using the optional S3 backend. [Hosted-derived sample](https://github.com/vtmocanu/uzi/issues/80#issuecomment-6110889256) · [#2755 measurement and reader inventory](done/2755-run-message-rollups.md)
 
 ## Outcome
 
