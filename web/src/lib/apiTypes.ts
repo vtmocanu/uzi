@@ -7138,6 +7138,15 @@ export interface AnalyticsTopRunDTO {
   repo_key: string;
   repo_id: string | null;
   repo_path: string | null;
+  /**
+   * Null = withheld (inaccessible_repo: all three; no_repo: the numbers) or none recorded.
+   * The internal issue number; links go through the issue-key/URL contract.
+   */
+  issue_iid: number | null;
+  /** The run's stored title, untruncated ("" when stored empty). Render as plain text. */
+  issue_title: string | null;
+  /** The run's MR number; null for an unbound CI fix or when withheld. */
+  mr_iid: number | null;
   user_id: string;
   user_email: string;
 }
