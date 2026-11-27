@@ -396,11 +396,18 @@ results.
   Codex credential while it is your selected source.
 - **The accepted redirect risk applies to a shared definition under either auth style** (owner
   decision, 2026-11-20), and the operator allowlist still governs where its URL may point.
+- **Organization key: not yet available to you.** An admin can also define a Claude definition
+  funded by one organization key (see [Organization key (staged)](#organization-key-staged)). In this
+  release such a definition is staged only: it does not appear in your Settings, `uzi provider list`
+  or source selection, you cannot attach a key to it, test it or select it, and no run can use it.
+  Recipient grants, which would let an admin authorize users to spend the organization key, are not
+  yet available.
 
 ### Admin: manage shared providers
 
 In the web app, **Admin → Shared providers** (admin only). Create a definition (engine, name, one of
-the allowed base URLs, auth style, model map; it has no key), edit its name and model map, retire it,
+the allowed base URLs, auth style, model map; a per-user-key definition has no key, and an
+[organization-funded](#organization-key-staged) Claude definition gets its key afterwards), edit its name and model map, retire it,
 or delete it. **The engine is chosen at creation**: Claude is the default and Codex the alternative.
 A Codex definition uses `openai_responses` with Bearer auth and needs a `default` model slot. When a
 create request omits the protocol, it defaults to `anthropic_messages` for Claude and
@@ -421,8 +428,75 @@ allowlist is admission control, not confinement to that host (see the Codex warn
 this page). Share only a gateway you trust not to redirect; the create form says so. A mistake here
 exposes every recipient who attached a key, not one user.
 
+### Organization key (staged)
+
+A **Claude** shared definition can instead be **organization-funded**: its one credential is a key
+the admin sets, not a key each user attaches. In this release this is **staged only**. An admin can
+create such a definition, set its key and verify it with **Test**, but **recipient grants are not yet
+available**: no user can see, attach, test or select an organization-funded definition, and no run can
+bind one. The key is spent only by the admin's own Test. Nothing here changes how per-user-key
+definitions work.
+
+- **Create.** In **Admin → Shared providers**, choose the organization-key option when creating a
+  Claude definition (the option is not offered for Codex; the API refuses it with a 400). The
+  create form shows a recipient-trust warning and the **Create shared provider** button stays disabled until you acknowledge it
+  (`acknowledge_recipient_trust: true` in the API; a request without it is refused with a 400).
+  The warning says that:
+  - recipients who are later granted the key can copy it, so rotating it at the gateway is the only
+    revocation;
+  - a redirecting gateway can forward request bodies and the key, with differences by auth style
+    (Bearer is recommended);
+  - product-token jobs can spend the key;
+  - a shared gateway identity can expose recipients' work to one another;
+  - rotating `UZI_SECRET_KEY` invalidates the stored key, which must then be set again;
+  - use is limited to authorized users.
+- **The mode is fixed.** `credential_mode` (`per_user_key`, the default, or `operator_key`) cannot be
+  changed afterwards: a PATCH naming it is refused. To switch, create a new definition.
+- **The key.** It is sealed with the instance key (`UZI_SECRET_KEY`) with the definition's id bound
+  into the encryption, so a copied ciphertext does not open under another definition. There is no
+  reveal route and no API or CLI returns the key; only its presence, enablement, set time and last
+  Test outcome are shown. Key controls, all cookie and CSRF admin writes:
+
+  | Control | Route | Effect |
+  |---|---|---|
+  | Set or replace | `PUT /api/admin/providers/{id}/key` | Stores the key (16 to 4096 printable ASCII characters, excluding space: 0x21 to 0x7E). A replace makes a new key version, keeps enabled or disabled as it was, and makes the previous Test result read as not tested. Allowed on a retired definition, so a key can be staged before the definition is used. |
+  | Enable or disable | `PATCH /api/admin/providers/{id}/key/enabled` | Sets `{"enabled": true\|false}`. Changing it makes a new key version, so the previous Test result is hidden. Test is refused while the key is disabled. |
+  | Delete | `DELETE /api/admin/providers/{id}/key` | Removes the key and its Test result. |
+
+  A key route on a per-user-key definition returns 409; on a personal or unknown id it returns 404.
+- **Test.** **Test** (`POST /api/admin/providers/{id}/test`) decrypts the key and sends one probe to
+  the definition's allowlisted gateway. It refuses before any outbound request (409) when the
+  definition is retired, has no key or has a disabled key, and refuses a base URL that is no longer on
+  the allowlist. The probe follows no redirects. Just before dialling it re-checks that the
+  definition, its model map and its key have not changed, and refuses with 409 if they have. The
+  result (auth and tool outcome, time) is stored for the current definition and key only, so editing
+  the model map, replacing, disabling, enabling or deleting the key, or retiring the definition
+  hides it: the page shows the current state, not history. A rename does not hide it. A change made
+  after that last check can still let the probe already in flight use the key and endpoint it
+  captured. A Test is refused with 429 when another Test of the same definition is running, when 4
+  provider Tests (admin and users' own) are already in flight, or after 30 Tests per hour for that
+  definition. These limits are held in memory by the API process, so each API process counts them
+  separately and they reset when it restarts. The web
+  page shows the key controls on retired definitions too (set or replace, enable or disable and delete
+  are allowed there; only Test is refused when the definition is retired).
+- **Audit.** Each key change writes a `provider_audit` line (`admin_key_set`, `admin_key_replace`,
+  `admin_key_enable`, `admin_key_disable`, `admin_key_delete`), and each Test admitted past the rate
+  limiter (including one that ends `key_unavailable` or `key_read_error` before decrypting) writes one `admin_test` line with the provider id, key id and version, and an outcome
+  (for example `probed_recorded`, `refused_not_allowed` or `changed_before_dial`). No line contains
+  the key, a header or a response body. A process crash mid-Test writes no line.
+- **Cap and delete.** Organization-funded definitions count toward the same 50-definition cap as
+  per-user-key ones, retired included. Deleting one is allowed while no user has it selected (none
+  can in this release) and also deletes its key and Test result.
+- **Boundaries.** The key is sealed under the instance key, not a user vault, so anyone who holds
+  `UZI_SECRET_KEY` and database access can decrypt it ([vault threat model](./vault-threat-model.md)).
+  Rotating `UZI_SECRET_KEY` makes it unreadable; set it again after a rotation. An image-only rollback
+  to an earlier release hides these definitions from that release's checks, so its 50-definition
+  count can let the combined catalogue exceed 50; see
+  [ADR-4324](../adr/4324-admin-shared-providers.md#amended-for-4540-m1-2026-11-27).
+
 `uzi admin provider list` and `uzi admin provider get <id|name>`
-are the read-only terminal view and need an admin-read token. Design and the lock and rollback
+are the read-only terminal view and need an admin-read token; they show each definition's mode and
+whether an organization key is set, never key material. Design and the lock and rollback
 details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 
 ## Gateways behind a private CA

@@ -61,8 +61,13 @@ type Handler struct {
 	providerProbeOnce    sync.Once
 	providerProber       *providers.Prober
 	providerProbeLimiter *providers.ProbeLimiter
-	pool                 *pgxpool.Pool
-	q                    *store.Queries
+	// adminProbeWrap and adminProbeAfterDial are test-only seams of the admin organization-key Test
+	// (providers_admin_probe.go). A nil adminProbeWrap uses *store.Queries as is; a nil
+	// adminProbeAfterDial does nothing. Neither is set in production.
+	adminProbeWrap      func(operatorProbeStore) operatorProbeStore
+	adminProbeAfterDial func()
+	pool                *pgxpool.Pool
+	q                   *store.Queries
 	// anthropicHistory is a test-only override of the usage-history recorder the test-connection
 	// handler copies accepted Anthropic readings through; nil means h.q (issue #4692).
 	anthropicHistory anthropicUsageHistory

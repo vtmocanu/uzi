@@ -52,7 +52,7 @@ CHECKs keep the pair honest and the scopes closed:
 | CHECK | Rule |
 |---|---|
 | `model_providers_shared_mode_check` | `(owner_user_id IS NULL) = (credential_mode IS NOT NULL)` |
-| `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key')` |
+| `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key', 'operator_key')` (migration 00551 model_providers_operator_mode widened it from `('per_user_key')` for #4540 M1) |
 | `model_providers_shared_engine_check` | `owner_user_id IS NOT NULL OR engine IN ('claude', 'codex')` (Claude only until #4633 widened it, migration 00536 model_providers_shared_codex_engine) |
 | `model_providers_scope_owner_check` | `scope_owner_id = COALESCE(owner_user_id, nil)`, never NULL |
 | `model_providers_owner_not_nil_check` | no personal owner is the nil UUID |
@@ -242,3 +242,55 @@ This **contradicts** the Codex statements in the rollback hazards above and in [
 - The older admin delete of a selected shared Codex definition hits the `RESTRICT` foreign key and is refused.
 
 The API is a Recreate singleton, so this bites only on an image-only rollback. Pause or cancel affected runs first, and recover by re-upgrading.
+
+## Amended for #4540 M1 (2026-11-27)
+
+Organization-funded (`operator_key`) shared **Claude** definitions, staged only (PRD #4540 M1). The decisions above stand for `per_user_key` definitions; this section records what changed. **Not shipped:** recipient grants, run binding, claim-time authority and every recipient-facing path (M2, still to come). In M1 no user can list, select, attach a key to or test an operator definition, and no run can bind one. Hosted acceptance is owner acceptance (#4770 M1) and is not verified here.
+
+### Behaviour
+
+- `credential_mode` admits `per_user_key` or `operator_key` (`model_providers_credential_mode_check`). A new CHECK, `model_providers_operator_engine_check`, keeps an operator definition Claude only: `credential_mode IS DISTINCT FROM 'operator_key' OR engine = 'claude'`. Create refuses Codex with operator mode, an unknown mode, and a missing `acknowledge_recipient_trust`, each with its own 400.
+- The mode is immutable: PATCH refuses `credential_mode` ("create a new definition instead"). The 50-definition cap is one count across both modes, retired included, under the catalogue lock.
+- The organization key is held in `model_provider_operator_keys`, sealed with `UZI_SECRET_KEY` through the instance secretbox with AAD bound to the provider id. There is no reveal route. Set, replace, enable, disable and delete are cookie and CSRF admin routes (`/api/admin/providers/{id}/key`, `…/key/enabled`).
+- Admin **Test** (`POST /api/admin/providers/{id}/test`) decrypts the key and probes the allowlisted gateway with no redirects, re-checking the tuple before the dial and storing evidence only for the current tuple. Each admitted Test writes one `provider_audit` line with an outcome. A process crash writes none.
+- `uzi admin provider list|get` shows the mode and key status (`MODE`, `ORG KEY`; `credential_mode`, `org_key`, `org_key_test`) and never key material.
+
+### D3, narrowed
+
+Operator definitions are kept out of every recipient path by the recipient SQL predicates (`credential_mode = 'per_user_key'`), pinned by exact-text classifier tests, so a change that widens one fails the build. Separately, the organization-key routes (set/replace, enable/disable, delete) refuse a per-user-key definition with 409 `provider_not_operator_key`; the admin Test reads operator definitions only, so a per-user-key definition there is a 404. The `model_providers_credential_mode_check` row of the D3 table now reads `credential_mode IN ('per_user_key', 'operator_key')`, and `model_providers_shared_engine_check` is unchanged.
+
+### D7, operator rows
+
+The existing orders stand. The operator paths add these, none of which takes a per-user secret-mutation lock:
+
+| Path | Order |
+|---|---|
+| Organization key set, replace, enable, disable, delete | definition `FOR NO KEY UPDATE` (`LockSharedModelProviderForEdit`) -> custody row `FOR UPDATE` (`LockOperatorProviderKeyForWrite`) -> write |
+| Admin Test evidence write | definition `FOR SHARE` -> key row `FOR SHARE` -> upsert, in a short transaction after the dial |
+| Admin delete | definition `FOR UPDATE` -> selection count -> custody row `FOR UPDATE`, a presence read only (the definition lock already excludes key writers) -> attached keys -> definition. Custody and evidence then cascade |
+
+The definition is always locked before custody, so no cycle exists with the key-write order. Admin Test reads and probes outside any transaction and takes locks only for the evidence write.
+
+### Probe tuple and evidence fence
+
+The evidence tuple is the current revision, base URL, auth style, protocol, model map, the custody id, `key_rev`, enabled and not retired. A key replace, enable, disable or delete, a model-map edit and retirement invalidate it; a rename does not. A retired definition hides its evidence (current status, not history). The fence is exact for the write: a change committed before the evidence write's locks gets 409 and no write, and a change that starts while the write holds them waits and then hides the result. It is not a fence on the dial: a change made after the pre-dial recheck can still let the in-flight probe use the key and endpoint it captured.
+
+### Migrations 00551-00553
+
+Draft numbers; they are renumbered at merge, so match by name.
+
+| File | Does |
+|---|---|
+| 00551 (`model_providers_operator_mode`) | replaces the mode CHECK and adds the operator engine CHECK, both `NOT VALID` |
+| 00552 (`validate_model_providers_operator_mode`) | validates both |
+| 00553 (`model_provider_operator_keys`) | creates the custody table, its `key_rev` sequence and the Test evidence table |
+
+Each Down is guarded: it takes `ACCESS EXCLUSIVE` locks before the check, then refuses while an operator definition, custody row or evidence row exists (00552's Down is a guarded no-op that keeps a rollback between 00551 and 00552 in step). Nothing deletes a key or definition automatically. Run Downs with the API stopped; as for 00538, the lock order is not guaranteed to match every application path, so a Down against live traffic can deadlock in a narrow window, with one side aborted and nothing lost.
+
+**Indexes.** There is no standalone index. Both tables are new and empty, and their primary keys and unique constraints are the only lookups the statements use, so no `CONCURRENTLY` file exists. This departs from the PRD's wording that CONCURRENTLY indexes go in separate files (R14), which assumed an index on an existing table.
+
+**Failure model (limited).** The recovery claim covers an API-process failure with PostgreSQL intact. A migration file or key write whose transaction had not committed rolls back; one that PostgreSQL committed stays committed (a migration with its `goose_db_version` row), even if the process failed before it saw the commit result. The next boot reads `goose_db_version` and re-runs only unrecorded files, and an admin re-reads the key status before retrying a key write. It does not cover a PostgreSQL or host crash or storage loss, and it does not cover concurrent migrators.
+
+### Rollback (image-only)
+
+An older API image cannot see operator definitions, so it neither lists nor guards them. Its cap count covers `per_user_key` definitions only, so after a rollback the combined catalogue can exceed 50 when definitions are created there. Operator definitions and their keys stay in the database untouched, and re-upgrading restores them. A schema rollback is refused by the guarded Downs above while any exist.

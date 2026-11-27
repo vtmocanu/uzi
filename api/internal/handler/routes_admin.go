@@ -326,6 +326,14 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Patch("/providers/{id}", h.AdminPatchSharedProvider)
 			r.Post("/providers/{id}/retire", h.AdminRetireSharedProvider)
 			r.Delete("/providers/{id}", h.AdminDeleteSharedProvider)
+			// Organization key of an operator_key definition (PRD #4540): set or replace, enable or
+			// disable, delete, and the admin Test that dials the gateway with it. Cookie + CSRF admin
+			// writes like the rest of this group (a uza_ Bearer 401s before the handler). The Test is
+			// limited per definition in the handler, not by a route limiter.
+			r.Put("/providers/{id}/key", h.AdminPutOperatorKey)
+			r.Patch("/providers/{id}/key/enabled", h.AdminPatchOperatorKeyEnabled)
+			r.Delete("/providers/{id}/key", h.AdminDeleteOperatorKey)
+			r.Post("/providers/{id}/test", h.AdminTestSharedProvider)
 		})
 	})
 }

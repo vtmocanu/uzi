@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -24,9 +25,10 @@ func newAdminProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List every admin-shared provider definition with its counts",
-		Long: "List the admin-shared model provider definitions on this instance: name, engine, base URL,\n" +
-			"auth style, whether it is retired, its current revision, how many users have selected it\n" +
-			"and how many users have attached a key to it.\n\n" +
+		Long: "List the admin-shared model provider definitions on this instance: name, engine, credential\n" +
+			"mode, base URL, auth style, whether it is retired, its current revision, how many users have\n" +
+			"selected it, how many users have attached a key to it, and the state of its organization key\n" +
+			"(ORG KEY: - for a per-user-key definition; none, enabled or disabled for an organization-key one).\n\n" +
 			"Read-only. Creating and editing a shared definition is done from the web Admin page\n" +
 			"(cookie-only admin writes). Needs a uza_ (admin_ro) token.",
 		Args: cobra.NoArgs,
@@ -49,12 +51,12 @@ func newAdminProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			rows := make([][]string, 0, len(ps))
 			for _, d := range ps {
 				rows = append(rows, []string{
-					cellText(d.Name), cellText(d.Engine), cellText(d.BaseURL), cellText(d.AuthStyle),
+					cellText(d.Name), cellText(d.Engine), dashOr(cellText(d.CredentialMode)), cellText(d.BaseURL), cellText(d.AuthStyle),
 					boolStr(d.Retired), fmt.Sprintf("%d", d.CurrentRevision),
-					fmt.Sprintf("%d", d.SelectedUserCount), fmt.Sprintf("%d", d.AttachedKeyCount),
+					fmt.Sprintf("%d", d.SelectedUserCount), fmt.Sprintf("%d", d.AttachedKeyCount), orgKeyCell(d),
 				})
 			}
-			return p.Table([]string{"NAME", "ENGINE", "URL", "AUTH", "RETIRED", "REVISION", "SELECTED", "KEYS"}, rows)
+			return p.Table([]string{"NAME", "ENGINE", "MODE", "URL", "AUTH", "RETIRED", "REVISION", "SELECTED", "KEYS", "ORG KEY"}, rows)
 		},
 	}
 
@@ -117,12 +119,45 @@ func renderAdminSharedProvider(p *uzicli.Printer, d apitypes.AdminSharedProvider
 		{"id", cellText(d.ID)},
 		{"name", cellText(d.Name)},
 		{"engine", cellText(d.Engine)},
+		{"credential_mode", dashOr(cellText(d.CredentialMode))},
 		{"base_url", cellText(d.BaseURL)},
 		{"auth_style", cellText(d.AuthStyle)},
 		{"retired", boolStr(d.Retired)},
 		{"revision", fmt.Sprintf("%d", d.CurrentRevision)},
 		{"selected_user_count", fmt.Sprintf("%d", d.SelectedUserCount)},
 		{"attached_key_count", fmt.Sprintf("%d", d.AttachedKeyCount)},
+		{"org_key", orgKeyCell(d)},
+		{"org_key_test", orgKeyTestCell(d)},
 		{"models", dashOr(modelsCell(d.ModelMap))},
 	})
+}
+
+// orgKeyCell is the state of the organization key: "-" for a definition that has none (per-user-key),
+// otherwise none, enabled or disabled. The key itself is never in the DTO.
+func orgKeyCell(d apitypes.AdminSharedProviderDTO) string {
+	if d.OperatorKey == nil {
+		return "-"
+	}
+	switch {
+	case !d.OperatorKey.Present:
+		return "none"
+	case d.OperatorKey.Enabled:
+		return "enabled"
+	default:
+		return "disabled"
+	}
+}
+
+// orgKeyTestCell is the latest Test evidence for the current organization key: "-" for a definition
+// without one, "not tested" when no probe ran against the current key and revision, otherwise
+// "<auth_result>/<tool_result> at <probed_at>" with a missing tool result shown as "-".
+func orgKeyTestCell(d apitypes.AdminSharedProviderDTO) string {
+	if d.OperatorKey == nil {
+		return "-"
+	}
+	pr := d.OperatorKey.Probe
+	if pr == nil {
+		return "not tested"
+	}
+	return cellText(fmt.Sprintf("%s/%s at %s", dashOr(cellText(pr.AuthResult)), dashOr(cellText(pr.ToolResult)), pr.ProbedAt.UTC().Format(time.RFC3339)))
 }
