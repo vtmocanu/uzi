@@ -47,6 +47,13 @@ func TestQualityExecutedProblemsPlanGuard(t *testing.T) {
 			t.Fatalf("problems = %v, want one", got)
 		}
 	})
+	t.Run("rows under an un-hashed SubPlan", func(t *testing.T) {
+		root := withRows(3, 0)
+		root.Plans[1].Filter = "(SubPlan 1)"
+		if got := qualityExecutedProblems(&root); len(got) != 1 {
+			t.Fatalf("problems = %v, want one", got)
+		}
+	})
 	t.Run("rows only outside the SubPlan", func(t *testing.T) {
 		root := cleanQualityPlan()
 		root.Plans = append(root.Plans, planNode{
