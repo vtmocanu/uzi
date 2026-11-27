@@ -329,10 +329,14 @@ func (f *UsageFolder) Pass(ctx context.Context) (int64, error) {
 }
 
 func (f *UsageFolder) staleLane(ctx context.Context) (int64, error) {
-	limit := f.opt.LaneLimit
-	n0, err := f.retryPending(ctx, &f.retryStale)
+	n0, used, err := f.retryPending(ctx, &f.retryStale, int(f.opt.LaneLimit))
 	if err != nil {
 		return n0, err
+	}
+	// Retries are charged against the per-tick allowance: select only what is left of it.
+	limit := f.opt.LaneLimit - int32(used) //nolint:gosec // G115: used <= LaneLimit (an int32).
+	if limit <= 0 {
+		return n0, nil
 	}
 	var ids []uuid.UUID
 	err = f.readTx(ctx, func(q *Queries) error {
@@ -369,10 +373,14 @@ func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 	if now.Before(f.missingBackoff) {
 		return 0, nil
 	}
-	limit := f.opt.LaneLimit
-	n0, err := f.retryPending(ctx, &f.retryMissing)
+	n0, used, err := f.retryPending(ctx, &f.retryMissing, int(f.opt.LaneLimit))
 	if err != nil {
 		return n0, err
+	}
+	// Retries are charged against the per-tick allowance: select only what is left of it.
+	limit := f.opt.LaneLimit - int32(used) //nolint:gosec // G115: used <= LaneLimit (an int32).
+	if limit <= 0 {
+		return n0, nil
 	}
 	var rows []ListMissingRunUsageFoldRunsRow
 	fullQuery := f.fullBudget(ctx)
@@ -434,11 +442,19 @@ func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 // skipped for the TTL because it ran out of time ALONE with a full lane budget. An id that ran
 // out of time with a short budget (or while waiting for the materializer) stays for the next
 // tick, where it goes first.
-func (f *UsageFolder) retryPending(ctx context.Context, pending *[]uuid.UUID) (int64, error) {
+//
+// It also returns how many runs it attempted: the caller charges them against the lane's
+// per-tick allowance (LaneLimit), so a lane never attempts more than LaneLimit pending retries
+// plus new ids in one tick. (The run-by-run retry inside fold of a batch that just failed
+// re-attempts the SAME runs of that batch, which the approved contract calls out explicitly, so
+// it is not charged again.)
+func (f *UsageFolder) retryPending(ctx context.Context, pending *[]uuid.UUID, allowance int) (int64, int, error) {
 	var total int64
-	for len(*pending) > 0 {
+	attempts := 0
+	for len(*pending) > 0 && attempts < allowance {
 		id := (*pending)[0]
 		full := f.fullBudget(ctx)
+		attempts++
 		n, err := f.materialize(ctx, []uuid.UUID{id})
 		if err == nil {
 			total += n
@@ -451,12 +467,12 @@ func (f *UsageFolder) retryPending(ctx context.Context, pending *[]uuid.UUID) (i
 				f.skipRun(id, err)
 				*pending = (*pending)[1:]
 			}
-			return total, fmt.Errorf("retry of a deadline-failed batch: %w", err)
+			return total, attempts, fmt.Errorf("retry of a deadline-failed batch: %w", err)
 		}
 		f.skipRun(id, err)
 		*pending = (*pending)[1:]
 	}
-	return total, nil
+	return total, attempts, nil
 }
 
 // fold materializes ids as one batch. When the batch fails on its own it retries run by run, and

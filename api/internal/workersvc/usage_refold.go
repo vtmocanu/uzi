@@ -31,7 +31,9 @@ import (
 // A GREATEST re-delivery of a straggler frame after this commits lands at the same
 // position-absolute epoch and changes nothing (PRD D1).
 func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, run store.Run) error {
-	tx, err := pool.Begin(ctx)
+	// READ COMMITTED explicitly (as the materializer does): the delete's statement snapshot must
+	// be taken after the run pre-lock below, which a database-default REPEATABLE READ would not do.
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fmt.Errorf("refold usage (run %s): begin: %w", run.ID, err)
 	}

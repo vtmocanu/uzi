@@ -26,21 +26,69 @@ import (
 //	(iv)  RefoldRunUsage takes the run lock (LockRunForUsageRefold) before DeleteRunUsage.
 
 var (
-	// run_usage itself, never run_usage_legs / _messages / _tail_state / _model_totals: each
-	// pattern requires whitespace or "(" right after the table name.
-	runUsageWriteRE = regexp.MustCompile(`(?is)\b(?:INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+(?:ONLY\s+)?run_usage[\s(;]`)
-	runUsageLockRE  = regexp.MustCompile(`(?is)fn_run_usage_fold_lock\s*\(`)
-	runUsageFromLk  = regexp.MustCompile(`(?is)\bFROM\s+lk\b`)
-	usageSQLComment = regexp.MustCompile(`(?m)--[^\n]*`)
+	// run_usage itself, never run_usage_legs / _messages / _tail_state / _model_totals /
+	// _fold_state: the table name must be followed by whitespace, "(" or ";" (after an optional
+	// closing quote). The target may be quoted and/or schema-qualified ("run_usage",
+	// public.run_usage, public."run_usage").
+	runUsageWriteRE = regexp.MustCompile(`(?is)\b(?:INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?[\s(;]`)
+	// The lock CTE must be defined as lk AND be the one the main statement reads.
+	runUsageLockDefRE = regexp.MustCompile(`(?is)\blk\s+AS\s*\(\s*SELECT\s+fn_run_usage_fold_lock\s*\(`)
+	runUsageFromLk    = regexp.MustCompile(`(?is)\bFROM\s+lk\b`)
+	usageSQLComment   = regexp.MustCompile(`(?m)--[^\n]*`)
+	usageWithRE       = regexp.MustCompile(`(?i)\bWITH\b`)
+	usageMainKwRE     = regexp.MustCompile(`(?i)^(?:INSERT|DELETE|UPDATE|MERGE|SELECT|TRUNCATE)\b`)
 )
 
-// unguardedRunUsageWrite reports whether stmt writes run_usage without the lock CTE.
+// splitWithClause splits stmt at its WITH clause into the CTE list and the main statement (the
+// first top-level INSERT/DELETE/UPDATE/MERGE/SELECT after the list). ok is false without a WITH
+// or when no main statement follows it.
+func splitWithClause(stmt string) (ctes, main string, ok bool) {
+	loc := usageWithRE.FindStringIndex(stmt)
+	if loc == nil {
+		return "", "", false
+	}
+	depth := 0
+	for i := loc[1]; i < len(stmt); i++ {
+		switch c := stmt[i]; c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case '\'':
+			j := strings.IndexByte(stmt[i+1:], '\'')
+			if j < 0 {
+				return "", "", false
+			}
+			i += j + 1
+		default:
+			if depth == 0 && !isUsageWordByte(stmt[i-1]) && usageMainKwRE.MatchString(stmt[i:]) {
+				return stmt[loc[1]:i], stmt[i:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func isUsageWordByte(b byte) bool {
+	return b == '_' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+// unguardedRunUsageWrite reports whether stmt writes run_usage without the lock CTE: the WITH
+// clause must define lk as fn_run_usage_fold_lock, no CTE may itself write run_usage, and the
+// MAIN statement (not some other CTE) must be the writer and read FROM lk.
 func unguardedRunUsageWrite(stmt string) bool {
 	stmt = usageSQLComment.ReplaceAllString(stmt, "") + " "
 	if !runUsageWriteRE.MatchString(stmt) {
 		return false
 	}
-	return !runUsageLockRE.MatchString(stmt) || !runUsageFromLk.MatchString(stmt)
+	ctes, main, ok := splitWithClause(stmt)
+	if !ok || !runUsageLockDefRE.MatchString(ctes) {
+		return true
+	}
+	if runUsageWriteRE.MatchString(ctes) || !runUsageWriteRE.MatchString(main) {
+		return true
+	}
+	return !runUsageFromLk.MatchString(main)
 }
 
 func writesRunUsage(s string) bool {
@@ -56,6 +104,11 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		"UPDATE run_usage_tail_state SET a = 1",
 		"SELECT * FROM run_usage",
 		"-- DELETE FROM run_usage WHERE x\nSELECT 1",
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM public.\"run_usage\" WHERE EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
+		// Not run_usage, quoted or qualified or not.
+		"DELETE FROM run_usage_fold_state WHERE x",
+		"DELETE FROM \"run_usage_model_folds\" WHERE x",
+		"UPDATE public.run_usage_totals SET a = 1",
 	}
 	for _, s := range good {
 		if unguardedRunUsageWrite(s) {
@@ -71,6 +124,16 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE run_id = $1", // CTE never read
 		"DELETE FROM run_usage WHERE run_id = $1 -- fn_run_usage_fold_lock( FROM lk",                   // lock only in a comment
 		"TRUNCATE run_usage;",
+		// lk is referenced only by a different, unused CTE: the main statement never reads it.
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok), other AS (SELECT 1 FROM lk) DELETE FROM run_usage WHERE run_id = $1",
+		// Quoted and schema-qualified targets are still run_usage writers.
+		"DELETE FROM \"run_usage\" WHERE run_id = $1",
+		"DELETE FROM public.run_usage WHERE run_id = $1",
+		"DELETE FROM public.\"run_usage\" WHERE run_id = $1",
+		"INSERT INTO \"public\".\"run_usage\" (a) VALUES (1)",
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM \"run_usage\" WHERE run_id = $1",
+		// The guard is on a different statement shape: a CTE does the write, the main reads lk.
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok), d AS (DELETE FROM run_usage WHERE run_id = $1) SELECT 1 FROM lk",
 	}
 	for _, s := range bad {
 		if !unguardedRunUsageWrite(s) {
@@ -250,41 +313,95 @@ func TestRunUsageWritersTakeFoldLock_Go(t *testing.T) {
 	}
 }
 
-func TestRefoldRunUsageLocksRunBeforeDelete(t *testing.T) {
-	const path = "../workersvc/usage_refold.go"
+// refoldProtocolViolations parses a Go source file declaring RefoldRunUsage and returns what is
+// wrong with its transaction protocol: it must begin the transaction with an explicit
+// READ COMMITTED BeginTx (never a bare Begin), then CALL LockRunForUsageRefold, and only then
+// CALL DeleteRunUsage. A bare selector or method value does not count as a call.
+func refoldProtocolViolations(t *testing.T, filename string, src any) []string {
+	t.Helper()
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, nil, 0)
+	file, err := parser.ParseFile(fset, filename, src, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var lockPos, delPos token.Pos
+	var beginTxPos, lockPos, delPos token.Pos
+	var bareBegin, readCommitted bool
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Name.Name != "RefoldRunUsage" {
 			continue
 		}
 		ast.Inspect(fn, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
 			if !ok {
 				return true
 			}
 			switch sel.Sel.Name {
+			case "Begin":
+				bareBegin = true
+			case "BeginTx":
+				if beginTxPos == token.NoPos {
+					beginTxPos = call.Pos()
+				}
+				ast.Inspect(call, func(m ast.Node) bool {
+					if s, ok := m.(*ast.SelectorExpr); ok && s.Sel.Name == "ReadCommitted" {
+						readCommitted = true
+					}
+					return true
+				})
 			case "LockRunForUsageRefold":
 				if lockPos == token.NoPos {
-					lockPos = sel.Pos()
+					lockPos = call.Pos()
 				}
 			case "DeleteRunUsage":
 				if delPos == token.NoPos {
-					delPos = sel.Pos()
+					delPos = call.Pos()
 				}
 			}
 			return true
 		})
 	}
+	var out []string
 	if lockPos == token.NoPos || delPos == token.NoPos {
-		t.Fatalf("RefoldRunUsage must call LockRunForUsageRefold (found %v) and DeleteRunUsage (found %v)", lockPos != token.NoPos, delPos != token.NoPos)
+		return append(out, "RefoldRunUsage must CALL LockRunForUsageRefold and DeleteRunUsage")
 	}
 	if lockPos > delPos {
-		t.Errorf("RefoldRunUsage calls DeleteRunUsage at %s before LockRunForUsageRefold at %s", fset.Position(delPos), fset.Position(lockPos))
+		out = append(out, "DeleteRunUsage is called before LockRunForUsageRefold")
+	}
+	if bareBegin || beginTxPos == token.NoPos || !readCommitted {
+		out = append(out, "the transaction must start with BeginTx(..., pgx.TxOptions{IsoLevel: pgx.ReadCommitted}), not Begin")
+	} else if beginTxPos > lockPos {
+		out = append(out, "BeginTx must precede LockRunForUsageRefold")
+	}
+	return out
+}
+
+func TestRefoldRunUsageLocksRunBeforeDelete(t *testing.T) {
+	const path = "../workersvc/usage_refold.go"
+	for _, v := range refoldProtocolViolations(t, path, nil) {
+		t.Error(v)
+	}
+
+	const head = "package p\nfunc RefoldRunUsage() {\n"
+	const begin = "tx, _ := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})\n"
+	bad := map[string]string{
+		"method value, not a call":   head + begin + "f := qtx.LockRunForUsageRefold\n_ = f\nqtx.DeleteRunUsage(ctx, id)\n}\n",
+		"lock after delete":          head + begin + "qtx.DeleteRunUsage(ctx, id)\nqtx.LockRunForUsageRefold(ctx, id)\n}\n",
+		"no lock":                    head + begin + "qtx.DeleteRunUsage(ctx, id)\n}\n",
+		"bare Begin":                 head + "tx, _ := pool.Begin(ctx)\nqtx.LockRunForUsageRefold(ctx, id)\nqtx.DeleteRunUsage(ctx, id)\n}\n",
+		"BeginTx not read committed": head + "tx, _ := pool.BeginTx(ctx, pgx.TxOptions{})\nqtx.LockRunForUsageRefold(ctx, id)\nqtx.DeleteRunUsage(ctx, id)\n}\n",
+	}
+	for name, src := range bad {
+		if len(refoldProtocolViolations(t, "fixture.go", src)) == 0 {
+			t.Errorf("fixture %q accepted, want rejected", name)
+		}
+	}
+	good := head + begin + "qtx.LockRunForUsageRefold(ctx, id)\nqtx.DeleteRunUsage(ctx, id)\n}\n"
+	if v := refoldProtocolViolations(t, "fixture.go", good); len(v) != 0 {
+		t.Errorf("good fixture rejected: %v", v)
 	}
 }

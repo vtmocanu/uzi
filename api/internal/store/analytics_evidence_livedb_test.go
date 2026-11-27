@@ -55,6 +55,9 @@ const (
 var evSeed = []string{
 	`SELECT setseed(0.4684)`,
 	`TRUNCATE users CASCADE`,
+	// run_usage_fold_state has no FK to runs (a row trigger clears it on run delete, which TRUNCATE
+	// does not fire), so its rows survive the users truncate above.
+	`TRUNCATE run_usage_fold_state CASCADE`,
 	`INSERT INTO users (id, email, password_hash)
 	 SELECT gen_random_uuid(), 'evid-' || lpad(g::text, 4, '0') || '@e2e', 'x' FROM generate_series(1, 200) g`,
 	`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
@@ -244,6 +247,7 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 				_, _ = pool.Exec(context.Background(), "DROP INDEX IF EXISTS "+ix.name)
 			}
 			_, _ = pool.Exec(context.Background(), `TRUNCATE users CASCADE`)
+			_, _ = pool.Exec(context.Background(), `TRUNCATE run_usage_fold_state CASCADE`)
 		})
 	}
 

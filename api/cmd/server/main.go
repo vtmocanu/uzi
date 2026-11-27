@@ -1083,7 +1083,9 @@ func run() error {
 			Run:  redeliverer.Pass,
 		},
 		// Usage fold safety net (#4700 M2): registered LAST so a slow fold lane (it can spend up to
-		// its 5 s parent deadline per tick) never delays the liveness and recovery passes above it.
+		// its 5 s parent deadline per tick) delays no other extra pass. sweeper.Engine.runOnce
+		// runs every extra pass BEFORE the run-liveness Sweep (Boot included), so the fold pass
+		// can still delay that sweep by up to its 5 s budget; the budget is the bound.
 		usageFoldPass,
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484

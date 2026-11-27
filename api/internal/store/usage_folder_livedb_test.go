@@ -575,6 +575,78 @@ func TestUsageFolderDeadlineBatchRetriedRunByRunLiveDB(t *testing.T) {
 	}
 }
 
+// A lane that has pending deadline retries AND new work attempts at most LaneLimit distinct runs
+// in one Pass: the retries are charged against the same per-tick allowance as new ids.
+func TestUsageFolderRetriesChargeLaneAllowanceLiveDB(t *testing.T) {
+	e := newFolderEnv(t)
+	const limit = 3
+	var (
+		mu       sync.Mutex
+		attempts []uuid.UUID
+		blocking atomic.Bool
+	)
+	f := store.NewUsageFolder(e.pool, store.UsageFolderOptions{
+		ParentTimeout: 10 * time.Second,
+		LaneTimeout:   500 * time.Millisecond,
+		LaneLimit:     limit,
+		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
+			mu.Lock()
+			attempts = append(attempts, ids...)
+			mu.Unlock()
+			if blocking.Load() && len(ids) > 1 {
+				<-ctx.Done()
+				return 0, ctx.Err()
+			}
+			return e.realMaterialize(ctx, ids)
+		},
+	})
+
+	// Pass 1: a batch of two missing runs (short of LIMIT, so the lane's cursor resets) outlasts
+	// the lane budget; its ids become the lane's pending retries.
+	old := []uuid.UUID{e.missingRun(t), e.missingRun(t)}
+	blocking.Store(true)
+	if _, err := f.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass 1: %v", err)
+	}
+	blocking.Store(false)
+	for _, r := range old {
+		if e.isFresh(t, r) {
+			t.Fatal("Pass 1 folded a run of the batch that was meant to time out")
+		}
+	}
+
+	// Pass 2: two newer missing runs exist, but the two retries used two of the lane's three
+	// attempts, so only the newest new run may be taken (fresh[1]; the lane walks newest first).
+	fresh := []uuid.UUID{e.missingRun(t), e.missingRun(t)}
+	mu.Lock()
+	attempts = nil
+	mu.Unlock()
+	if _, err := f.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass 2: %v", err)
+	}
+	mu.Lock()
+	distinct := map[uuid.UUID]bool{}
+	for _, id := range attempts {
+		distinct[id] = true
+	}
+	mu.Unlock()
+	if len(distinct) > limit {
+		t.Fatalf("one Pass attempted %d distinct runs, want at most LaneLimit=%d", len(distinct), limit)
+	}
+	for _, r := range old {
+		e.wantFresh(t, "retried run", r)
+	}
+	if !e.isFresh(t, fresh[1]) {
+		t.Fatal("the lane did not use the allowance the retries left over")
+	}
+	if e.isFresh(t, fresh[0]) {
+		t.Fatal("the lane took a second new run: retries were not charged against its allowance")
+	}
+
+	// Pass 3: the rest of the new work follows on the next tick.
+	passUntil(t, f, 4, func() bool { return e.isFresh(t, fresh[0]) && e.isFresh(t, fresh[1]) })
+}
+
 // Both lanes run in a read-only transaction with a server-side statement_timeout of one lane
 // budget, and lane order alternates between Passes.
 type recordingDB struct {
@@ -712,8 +784,10 @@ func TestUsageFolderLaneQueryErrorAfterRetryDoesNotBackOffLiveDB(t *testing.T) {
 	f := store.NewUsageFolder(db, store.UsageFolderOptions{
 		ParentTimeout: 10 * time.Second,
 		LaneTimeout:   600 * time.Millisecond,
-		LaneLimit:     2,
-		Now:           func() time.Time { return time.Unix(1_700_000_000, 0) }, // frozen: never passes the backoff
+		// 3, with only two missing runs: the retried batch of two leaves one attempt of the
+		// per-tick allowance, so the lane still reaches its query after the retry.
+		LaneLimit: 3,
+		Now:       func() time.Time { return time.Unix(1_700_000_000, 0) }, // frozen: never passes the backoff
 		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
 			if batchPhase.Load() && len(ids) > 1 && (containsID(ids, a) || containsID(ids, b)) {
 				<-ctx.Done()

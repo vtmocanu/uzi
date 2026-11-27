@@ -133,7 +133,7 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 		t.Errorf("the pass returned by wireUsageFolder (%s) is not an argument of sweeper.New (args: %v)", passVar, sweeperNewArgs)
 	}
 	if sweeperLast != passVar {
-		t.Errorf("the usage-fold pass (%s) must be the LAST sweeper.New argument so its slow lanes never delay the liveness passes; last is %q", passVar, sweeperLast)
+		t.Errorf("the usage-fold pass (%s) must be the LAST sweeper.New argument so its slow lanes delay no other extra pass; last is %q", passVar, sweeperLast)
 	}
 	if !waited[folderVar] {
 		t.Errorf("%s.Wait is never called in main.go: in-flight usage-fold kicks would not be drained at shutdown", folderVar)

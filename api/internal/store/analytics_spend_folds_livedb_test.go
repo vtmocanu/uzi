@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/analytics"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // Issue #4700 M3: AnalyticsAllSpend reads a terminal run's stored fold (run_usage_model_folds)
@@ -392,6 +393,51 @@ func TestAnalyticsSpendFoldsRefoldLiveDB(t *testing.T) {
 	if n := fx.stateRows(t, fx.eligible, true); n != int64(len(fx.eligible)) {
 		t.Fatalf("%d fresh runs after re-materializing, want %d", n, len(fx.eligible))
 	}
+}
+
+// TestAnalyticsSpendFoldsRealRefoldLiveDB: the real workersvc.RefoldRunUsage replaces a stored,
+// fresh run's distinguishable OLD usage with the usage re-folded from its result-frame history.
+// The refold marks the run stale, the document follows the refolded usage (equal to an all-live
+// oracle), and re-materializing keeps it equal.
+func TestAnalyticsSpendFoldsRealRefoldLiveDB(t *testing.T) {
+	fx := seedFoldSpend(t, 2011)
+	fx.materialize(t, fx.eligible)
+	if n := fx.stateRows(t, []uuid.UUID{fx.fresh}, true); n != 1 {
+		t.Fatalf("the run to refold is not fresh after materializing (fresh rows = %d, want 1)", n)
+	}
+	// A pre-migration run: not yet refolded, with a result-frame history whose re-fold differs
+	// from the old (collapsed) rows it carries.
+	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET usage_refolded = false WHERE id = $1`, fx.fresh)
+	mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_messages (run_id, seq, kind, agent, payload)
+		VALUES ($1, 1, 'status', 'lead', $2::jsonb)`, fx.fresh,
+		`{"event":"result","modelUsage":{"model-refolded":{"inputTokens":7777,"outputTokens":3333,"cacheReadInputTokens":11,"cacheCreationInputTokens":3,"costUSD":4.25}}}`)
+	before := fx.docs(t)
+
+	run, err := store.New(fx.pool).GetRunByID(fx.ctx, fx.fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workersvc.RefoldRunUsage(fx.ctx, fx.pool, store.New(fx.pool), run); err != nil {
+		t.Fatalf("RefoldRunUsage: %v", err)
+	}
+	if n := fx.stateRows(t, []uuid.UUID{fx.fresh}, true); n != 0 {
+		t.Fatal("the refolded run is still marked fresh")
+	}
+	if n := fx.count(t, `SELECT count(*) FROM run_usage WHERE run_id = $1 AND model = 'model-refolded'`, fx.fresh); n != 1 {
+		t.Fatalf("%d refolded run_usage rows, want 1", n)
+	}
+	afterRefold := fx.docs(t)
+	const probe = "30d/usage_model+primary_model"
+	if bytes.Equal(before[probe], afterRefold[probe]) {
+		t.Fatal("the refold did not change the document: the test is vacuous")
+	}
+
+	fx.markStale(t, fx.eligible, true)
+	oracle := fx.docs(t)
+	requireSameDocs(t, "after the real refold vs a fresh live computation", oracle, afterRefold)
+
+	fx.materialize(t, fx.eligible)
+	requireSameDocs(t, "after re-materializing vs live", oracle, fx.docs(t))
 }
 
 // TestAnalyticsSpendFoldsFallbackLiveDB: a run with no state row, a stale run and a
