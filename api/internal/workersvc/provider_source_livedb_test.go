@@ -1061,28 +1061,52 @@ func TestProviderOwnerJudgeSkipIsVisibleLiveDB(t *testing.T) {
 	wantSkip(t, fx.env, unusable.ID, "claude", JudgeSkipProviderSourceUnusable)
 }
 
-// TestProviderOwnerGetsNoJobLiveDB: a job is refused for a provider-sourced owner (usable or not)
-// and created as before otherwise.
+// TestProviderOwnerGetsNoJobLiveDB: the entry-point proof of the job lane (PRD #4322 M1b; the name is
+// kept, the contract flipped). A job is created as before for an owner with no source; with a usable
+// Claude source it is provider-bound (never refused); an unusable source is the typed
+// provider_source_unusable refusal; and a site-list job under a selected source (usable or not) keeps
+// provider_lane_unsupported. Refusals leave no run.
 func TestProviderOwnerGetsNoJobLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
+	e.svc.p.ProviderAllowedBaseURLs = []string{pvBase}
 	u := e.seedJobUser(t)
-	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); err != nil {
+	e.ownJobsCleanup(t, u)
+	control, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+	if err != nil {
 		t.Fatalf("control job: %v", err)
 	}
-	provider, _ := seedProviderFor(t, e.codexTestEnv, u, pvDefaultMap)
+	if r := mustRun(t, e.codexTestEnv, control.ID); providerBoundRun(r) || r.ModelProviderKeyMode.Valid {
+		t.Fatalf("control job carries a binding: %+v", bindingOfRun(r))
+	}
+	_, siteList := e.seedProfile(t, "docs.example.com")
+	provider, key := seedProviderFor(t, e.codexTestEnv, u, pvDefaultMap)
 	t.Cleanup(func() {
 		if _, err := e.pool.Exec(context.Background(), `UPDATE users SET claude_provider_id = NULL, claude_provider_scope_id = NULL WHERE id = $1`, u); err != nil {
 			t.Errorf("clear the Claude source in cleanup: %v", err)
 		}
 	})
 	e.exec(`UPDATE users SET claude_provider_id = $2, claude_provider_scope_id = id WHERE id = $1`, u, provider)
+
+	v, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+	if err != nil {
+		t.Fatalf("usable source: %v, want a provider-bound job", err)
+	}
+	bound := mustRun(t, e.codexTestEnv, v.ID)
+	if !bound.ModelProviderID.Valid || uuid.UUID(bound.ModelProviderID.Bytes) != provider || uuid.UUID(bound.ModelProviderKeySecretID.Bytes) != key ||
+		bound.ModelProviderKeyMode.String != "user_key" || bound.AnthropicSecretID.Valid || bound.Harness != "claude" {
+		t.Fatalf("provider job = %+v, want a Claude job frozen to provider %s key %s with no vendor credential", bindingOfRun(bound), provider, key)
+	}
+
 	before := e.jobCount(t, u)
-	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); !errors.Is(err, ErrProviderLaneUnsupported) {
-		t.Fatalf("err = %v, want provider_lane_unsupported", err)
+	if _, err := e.svc.CreateJobRun(e.ctx, profileReq(cliCaller(u), siteList)); !errors.Is(err, ErrProviderLaneUnsupported) {
+		t.Fatalf("site-list job under a usable source: err = %v, want provider_lane_unsupported", err)
 	}
 	e.exec(`UPDATE model_providers SET retired_at = now() WHERE id = $1`, provider)
-	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); !errors.Is(err, ErrProviderLaneUnsupported) {
-		t.Fatalf("unusable source: err = %v, want provider_lane_unsupported", err)
+	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); !isUnusable(err, SourceUnusableRetired) {
+		t.Fatalf("unusable source: err = %v, want provider_source_unusable (retired)", err)
+	}
+	if _, err := e.svc.CreateJobRun(e.ctx, profileReq(cliCaller(u), siteList)); !errors.Is(err, ErrProviderLaneUnsupported) {
+		t.Fatalf("site-list job under an unusable source: err = %v, want provider_lane_unsupported", err)
 	}
 	if e.jobCount(t, u) != before {
 		t.Fatal("a refused job left a run")

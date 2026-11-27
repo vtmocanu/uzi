@@ -2317,6 +2317,10 @@ type Service struct {
 	// create transaction right after the lane decision, holding the shared secret-mutation lock,
 	// before the provider branch freezes its source. Nil in production.
 	judgeDecidedHook func(ctx context.Context)
+	// jobDecidedHook is the same seam for the job lane (PRD #4322 M1b): it runs in the create
+	// transaction right after the job lane read, holding the shared secret-mutation lock, before the
+	// provider branch freezes its source. Nil in production.
+	jobDecidedHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -5091,7 +5095,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// error: refuse it rather than stall a run whose cancel nothing would consume.
 	if owned.Kind == runkind.Job {
 		switch req.State {
-		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused":
+		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused", "limit_wait":
 			return owned, false, fmt.Errorf("%w: %w (%s)", ErrInvalidState, ErrJobNeverParks, req.State)
 		}
 	}

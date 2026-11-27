@@ -494,10 +494,11 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			payload, assemblyErr = nil, providerRefusal
 		}
 	}
-	// PRD #4322 D-G: a provider JUDGE never parks. Its refusal (from assembly, or found by the locked
-	// re-check above) settles terminally through the generic FailClaimAssemblyExact arm below, with
-	// fail_origin credential_unavailable and the refusal reason as the typed failure_reason.
-	if providerRefusal != nil && run.Kind == runkind.Judge {
+	// PRD #4322 D-G and M1b: a provider JUDGE or JOB never parks (a job never waits, PRD #1908 D-E).
+	// Its refusal (from assembly, or found by the locked re-check above) settles terminally through
+	// the generic FailClaimAssemblyExact arm below, with fail_origin credential_unavailable and the
+	// refusal reason as the typed failure_reason.
+	if providerRefusal != nil && (run.Kind == runkind.Judge || run.Kind == runkind.Job) {
 		assemblyErr = fmt.Errorf("%w: %w", errCredentialUnavailable, providerRefusal)
 		payload, providerRefusal = nil, nil
 	}

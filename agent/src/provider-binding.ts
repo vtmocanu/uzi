@@ -23,6 +23,13 @@ export const CLAUDE_PROVIDER_CAPABILITY = "claude_provider_v1";
  *  advertising it, and client.ts requireProviderCapability refuses one on a registration that did not. */
 export const CLAUDE_PROVIDER_JUDGE_CAPABILITY = "claude_provider_judge_v1";
 
+/** The additional protocol capability a worker must advertise (at register) to accept a Claude
+ *  provider-bound JOB claim (PRD #4322 M1b): this image runs the provider job path (job-runner.ts:
+ *  exact-key redaction of results and output files, staged capture, typed gateway-limit settlement).
+ *  The api places a provider-bound job only on a worker advertising it, and client.ts
+ *  requireProviderCapability refuses one on a registration that did not. */
+export const CLAUDE_PROVIDER_JOB_CAPABILITY = "claude_provider_job_v1";
+
 /** The protocol capability a worker must advertise (at register) to accept a Codex provider-bound
  *  claim. Advertised only together with the Codex harness and runtime v2 capabilities (worker.ts),
  *  and the api admits a Codex provider claim only on provider, harness and runtime v2. */

@@ -278,7 +278,11 @@ const (
 	// Codex JUDGE needs codex_provider_judge_v1 on top of the Codex provider trio and
 	// codex_provider_v1, so a fleet supporting only ordinary Codex provider runs leaves it queued.
 	reasonNoCodexProviderJudgeCapableWorker = "no worker that supports Codex provider judges (codex_provider_judge_v1) is online"
-	reasonNoCurrentCodexRuntime             = "no worker with the current Codex runtime is online; waiting for the worker roll"
+	// reasonNoProviderJobCapableWorker (PRD #4322 M1b) is the job counterpart: a provider-bound JOB
+	// needs claude_provider_job_v1 (and claude_provider_v1) on a non-Docker job runner, so a fleet that
+	// only supports ordinary provider runs or vendor jobs still leaves it queued, and this names why.
+	reasonNoProviderJobCapableWorker = "no worker that supports provider jobs (claude_provider_job_v1) is online"
+	reasonNoCurrentCodexRuntime      = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -1768,6 +1772,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if r.Kind == runkind.Judge && r.Harness == harnessCodex {
 				return reasonNoCodexProviderJudgeCapableWorker
 			}
+			if r.Kind == runkind.Job && r.Harness == harnessClaude {
+				return reasonNoProviderJobCapableWorker
+			}
 			return reasonNoProviderCapableWorker
 		}
 	}
@@ -1804,12 +1811,26 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		// PRD #1909 M1: a job stamped with runs.job_protocol also needs 'job_files_v1'. A profile-bound
 		// job (PRD #1976, runs.egress_profile_id) never reaches this rung: queuedReason returns
 		// isolatedLaneReason for it first, and this count excludes ephemeral (lane) workers.
+		// PRD #4322 M1b: a provider-bound job also needs claude_provider_v1 and claude_provider_job_v1 on
+		// the SAME non-Docker worker (RequiresProviderJob).
 		c, cerr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, store.CountOnlineWorkersSatisfyingJobRunnerParams{
-			UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid,
+			UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid, RequiresProviderJob: r.ModelProviderKeyMode.Valid,
 		})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying job runner", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
+			if r.ModelProviderKeyMode.Valid {
+				// Tell a fleet with no job runner at all from one whose job runners lack the provider
+				// capabilities: the second count drops only the provider requirement.
+				base, berr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, store.CountOnlineWorkersSatisfyingJobRunnerParams{
+					UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid,
+				})
+				if berr != nil {
+					slog.Error("health: count online workers satisfying job runner (base)", "run_id", r.ID, "error", berr)
+				} else if base > 0 {
+					return reasonNoProviderJobCapableWorker
+				}
+			}
 			return reasonNoJobCapableWorker
 		}
 	}

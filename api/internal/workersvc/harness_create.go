@@ -163,6 +163,20 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 			return store.Run{}, err
 		}
 	}
+	if len(origins) > 0 && origins[0].JobLane {
+		if explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex) {
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
+		q, ok := s.q.(providerLaneSourceReader)
+		if !ok {
+			return store.Run{}, errHarnessStoreUnavailable
+		}
+		// No transaction here: a vendor job proceeds, and a selected Claude source fails closed
+		// (a provider job's freeze needs the atomic create).
+		if err := s.jobLaneNonAtomic(ctx, q, userID, *explicit, origins[0].JobSiteList); err != nil {
+			return store.Run{}, err
+		}
+	}
 	if len(origins) > 0 && origins[0].JudgeLane {
 		if explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex) {
 			return store.Run{}, ErrProviderLaneUnsupported

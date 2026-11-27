@@ -11,9 +11,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// TestWriteV1JobErrorMapsProviderLaneRefusal pins issue #4541: a provider-sourced owner's job create
-// is refused with ErrProviderLaneUnsupported (until PRD #4322), and the v1 mapper must answer the
-// shared typed 409 rather than a logged 500. The representative job mappings around it stay put.
+// TestWriteV1JobErrorMapsProviderLaneRefusal pins issue #4541: a job create is refused with
+// ErrProviderLaneUnsupported (a site-list job under a selected Claude source, PRD #4322 M1b), and the
+// v1 mapper must answer the shared typed 409 rather than a logged 500. The representative job
+// mappings around it stay put.
 func TestWriteV1JobErrorMapsProviderLaneRefusal(t *testing.T) {
 	cases := []struct {
 		name   string

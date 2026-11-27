@@ -261,18 +261,32 @@ func TestJudgeLaneFakeCreationAdmission(t *testing.T) {
 	}
 }
 
-// A guarded origin that is NOT the judge (jobs, checkers) keeps refusing any Claude source: the
-// judge lane must not have relaxed RefuseProviderOwner. (Entry-point proofs for CreateJobRun and the
-// plan and code checker creations are TestProviderOwnerGetsNoJobLiveDB,
-// TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB and TestProviderCheckerFrozenLeadBeforeVendorLiveDB.)
+// A guarded origin that is NOT the judge or the job (the plan and code checkers) keeps refusing any
+// Claude source: neither the judge lane (PRD #4322 M1a) nor the job lane (M1b) may have relaxed
+// RefuseProviderOwner. (Entry-point proofs for the plan and code checker creations are
+// TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB and
+// TestProviderCheckerFrozenLeadBeforeVendorLiveDB; the job lane's own are in
+// TestProviderOwnerGetsNoJobLiveDB.) The JobLane row shows the contrast: the same fake store and
+// selected source fail closed on the transaction, not on the lane.
 func TestRefuseProviderOwnerOriginStillRefusesAClaudeSource(t *testing.T) {
-	f := &laneCreationStore{lanePresenceReader: lanePresenceReader{row: store.GetUserProviderLaneSourcesRow{ClaudeProviderID: uuidOf(1)}}}
-	inserts := 0
-	_, err := (&Service{q: f}).createRunResolved(context.Background(), uuid.New(), laneHarness(HarnessClaude), func(Store, resolvedHarness) (store.Run, error) {
-		inserts++
-		return store.Run{}, nil
-	}, harnessCreationOrigin{RefuseProviderOwner: true})
-	if !errors.Is(err, ErrProviderLaneUnsupported) || inserts != 0 {
-		t.Fatalf("err = %v inserts = %d, want provider_lane_unsupported and no insert", err, inserts)
+	for _, tc := range []struct {
+		name   string
+		origin harnessCreationOrigin
+		want   error
+	}{
+		{"checker origin", harnessCreationOrigin{RefuseProviderOwner: true}, ErrProviderLaneUnsupported},
+		{"job origin", harnessCreationOrigin{JobLane: true}, errProviderCreateRequiresTx},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &laneCreationStore{lanePresenceReader: lanePresenceReader{row: store.GetUserProviderLaneSourcesRow{ClaudeProviderID: uuidOf(1)}}}
+			inserts := 0
+			_, err := (&Service{q: f}).createRunResolved(context.Background(), uuid.New(), laneHarness(HarnessClaude), func(Store, resolvedHarness) (store.Run, error) {
+				inserts++
+				return store.Run{}, nil
+			}, tc.origin)
+			if !errors.Is(err, tc.want) || inserts != 0 {
+				t.Fatalf("err = %v inserts = %d, want %v and no insert", err, inserts, tc.want)
+			}
+		})
 	}
 }

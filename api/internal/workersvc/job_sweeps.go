@@ -20,7 +20,7 @@ const jobWallBackstopGraceSeconds = 300
 // Failure reasons stamped on a job whose run-bound ephemeral worker cannot serve it. They are
 // user-visible through the job's failure_reason, so they name the cause and the fix.
 const (
-	jobFailNoCapableWorker    = "the worker provisioned for this job lacks the job_runner_v1 capability (or, for a job created with files support, job_files_v1, or for a site-list job, isolated_job_v1); update the worker image"
+	jobFailNoCapableWorker    = "the worker provisioned for this job lacks the job_runner_v1 capability (or, for a job created with files support, job_files_v1, for a site-list job, isolated_job_v1, or for a provider job, claude_provider_v1 and claude_provider_job_v1); update the worker image"
 	jobFailWorkerNeverArrived = "the worker provisioned for this job never registered before the provisioning deadline"
 	jobFailPastWallDeadline   = "the job exceeded its time budget"
 )

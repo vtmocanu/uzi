@@ -60,11 +60,13 @@ func providerBoundRow(kind string) store.Run {
 	}
 }
 
-// Job and cross-check claims (and an isolated profile-bound one) refuse a provider-bound row with
+// Cross-check claims (and an isolated profile-bound one) refuse a provider-bound row with
 // provider_lane_unsupported before anything is opened: the store is a nil-embedding fake, so any
-// credential read would panic. The judge row is refused here too, but only because the zero Worker
-// lacks claude_provider_v1 / claude_provider_judge_v1 (a Claude judge is provider-bound since PRD
-// #4322 M1a); a Codex-bound judge is likewise refused only for a missing capability (PRD #4574 M1).
+// credential read would panic. The judge and job rows are refused here too, but only because the zero
+// Worker lacks claude_provider_v1 / claude_provider_judge_v1 / claude_provider_job_v1 (a Claude judge
+// is provider-bound since PRD #4322 M1a, a Claude job since M1b); a Codex-bound judge is likewise
+// refused only for a missing capability (PRD #4574 M1), while a Codex-bound job is the one refused
+// as an unsupported lane (its worker below advertises every Claude capability).
 func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 	svc := New(&fakeStore{}, newBox(t), testParams())
 	for _, kind := range []string{runkind.Judge, runkind.Job, runkind.CrossCheck} {
@@ -73,17 +75,54 @@ func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 			t.Errorf("%s: err = %v, want terminal provider_lane_unsupported", kind, err)
 		}
 	}
+	// A Codex-bound job is refused as an unsupported lane whatever the worker advertises: the worker
+	// below advertises every Claude and Codex capability, so the capability check cannot be what
+	// refuses it (were the lane restriction removed, the claim would proceed to the nil store and panic).
+	allCaps := store.Worker{ProtocolCapabilities: []string{
+		capability.ClaudeProviderV1, capability.ClaudeProviderJudgeV1, capability.ClaudeProviderJobV1,
+		capability.CodexProviderV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexRuntimeV3, capability.CodexProviderJudgeV1,
+	}}
+	codexJob := providerBoundRow(runkind.Job)
+	codexJob.Harness = harnessCodex
+	if _, err := svc.assembleClaim(context.Background(), allCaps, codexJob); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Errorf("codex-bound job: err = %v, want terminal provider_lane_unsupported", err)
+	}
+	// A Codex-bound judge is supported; this worker advertises no Codex capability, so that alone refuses it.
+	allClaude := store.Worker{ProtocolCapabilities: []string{capability.ClaudeProviderV1, capability.ClaudeProviderJudgeV1, capability.ClaudeProviderJobV1}}
+	codexJudge := providerBoundRow(runkind.Judge)
+	codexJudge.Harness = harnessCodex
+	if _, err := svc.assembleClaim(context.Background(), allClaude, codexJudge); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Errorf("codex-bound judge: err = %v, want terminal provider_lane_unsupported", err)
+	}
 	iso := providerBoundRow(runkind.Issue)
 	iso.EgressProfileID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	if _, err := svc.assembleClaim(context.Background(), store.Worker{IsolatedLane: true}, iso); !errors.Is(err, ErrProviderLaneUnsupported) {
 		t.Errorf("isolated: err = %v, want provider_lane_unsupported", err)
 	}
+	// A profile-bound provider JOB is refused by the isolated term even on a fully capable lane worker.
+	isoJob := providerBoundRow(runkind.Job)
+	isoJob.EgressProfileID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	laneWorker := allClaude
+	laneWorker.IsolatedLane = true
+	if _, err := svc.assembleClaim(context.Background(), laneWorker, isoJob); !errors.Is(err, ErrProviderLaneUnsupported) {
+		t.Errorf("isolated job: err = %v, want provider_lane_unsupported", err)
+	}
 	// The lane assemblers themselves refuse too (defence in depth for a direct call).
 	if _, err := svc.assembleJudgeClaim(context.Background(), store.Worker{}, providerBoundRow(runkind.Judge)); !errors.Is(err, ErrProviderLaneUnsupported) {
 		t.Errorf("assembleJudgeClaim: err = %v", err)
 	}
-	if _, err := svc.assembleJobClaim(context.Background(), store.Worker{}, providerBoundRow(runkind.Job)); !errors.Is(err, ErrProviderLaneUnsupported) {
-		t.Errorf("assembleJobClaim: err = %v", err)
+	// The job assembler no longer refuses a provider-bound row outright: it claims against the frozen
+	// binding, so a worker without claude_provider_v1 or claude_provider_job_v1 is what refuses, before
+	// any binding read or vault open (the store would panic on one).
+	jobSvc := New(&roleLaneStore{fakeStore: &fakeStore{}}, newBox(t), testParams())
+	for _, caps := range [][]string{nil, {capability.ClaudeProviderV1}, {capability.ClaudeProviderJobV1}} {
+		_, err := jobSvc.assembleJobClaim(context.Background(), store.Worker{ProtocolCapabilities: caps}, providerBoundRow(runkind.Job))
+		if !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+			t.Errorf("assembleJobClaim caps %v: err = %v, want terminal provider_lane_unsupported", caps, err)
+		}
+	}
+	if _, err := jobSvc.assembleJobClaim(context.Background(), allClaude, codexJob); !errors.Is(err, errCredentialUnavailable) {
+		t.Errorf("assembleJobClaim codex: err = %v, want errCredentialUnavailable", err)
 	}
 	if singleFamilyCheckerCustody(string(HarnessClaude), &ClaimPayload{Secrets: ClaimSecrets{AnthropicOAuthToken: "t", Provider: &ClaimProviderBinding{}}}) {
 		t.Error("a checker child holding a provider binding passed the custody rule")

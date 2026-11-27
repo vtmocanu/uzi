@@ -15,7 +15,7 @@ import type { PublicationIntentRequest, PublicationIntentResult } from "./public
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY, decodeProviderBinding, ProviderBindingError, ProviderLaneUnsupportedError } from "./provider-binding.js";
 import { decodeRunEnvClaim, decodeRunEnvRedactResponse } from "./run-env-claim.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -1562,6 +1562,7 @@ export class WorkerClient {
   private hasClaudeProviderCapability = false;
   private hasClaudeProviderJudgeCapability = false;
   private hasCodexProviderJudgeCapability = false;
+  private hasClaudeProviderJobCapability = false;
   private hasCodexProviderCapability = false;
   private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
@@ -2159,6 +2160,7 @@ export class WorkerClient {
     this.hasClaudeProviderCapability = false;
     this.hasClaudeProviderJudgeCapability = false;
     this.hasCodexProviderJudgeCapability = false;
+    this.hasClaudeProviderJobCapability = false;
     this.hasCodexProviderCapability = false;
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
@@ -2245,6 +2247,7 @@ export class WorkerClient {
     this.hasClaudeProviderCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_CAPABILITY) ?? false;
     this.hasClaudeProviderJudgeCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_JUDGE_CAPABILITY) ?? false;
     this.hasCodexProviderJudgeCapability = originalCapabilities?.includes(CODEX_PROVIDER_JUDGE_CAPABILITY) ?? false;
+    this.hasClaudeProviderJobCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_JOB_CAPABILITY) ?? false;
     this.hasCodexProviderCapability = [CODEX_PROVIDER_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY]
       .every(c => originalCapabilities?.includes(c) ?? false);
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
@@ -2904,8 +2907,9 @@ export class WorkerClient {
    *  claude_provider_v1; Codex needs codex_provider_v1 together with the Codex harness and runtime
    *  v2 (the api's claim SQL clause checks codex_provider_v1; its Go admission checks the trio of
  *  provider, harness and runtime v2), else the lane refuses. A Claude JUDGE claim (PRD #4322 M1a)
- *  additionally needs claude_provider_judge_v1 on this registration; a Codex JUDGE claim (issue
- *  #4574) additionally needs codex_provider_judge_v1. */
+ *  additionally needs claude_provider_judge_v1, and a Claude provider JOB claim (PRD #4322 M1b)
+ *  claude_provider_job_v1, on this registration; a Codex JUDGE claim (issue #4574)
+ *  additionally needs codex_provider_judge_v1. */
   private requireProviderCapability(engine: "claude" | "codex", kind?: string): void {
     if (engine === "codex") {
       if (!this.hasCodexProviderCapability) throw new ProviderLaneUnsupportedError();
@@ -2914,6 +2918,7 @@ export class WorkerClient {
     }
     if (!this.hasClaudeProviderCapability) throw new ProviderBindingError("capability not advertised");
     if (kind === "judge" && !this.hasClaudeProviderJudgeCapability) throw new ProviderBindingError("judge capability not advertised");
+    if (kind === "job" && !this.hasClaudeProviderJobCapability) throw new ProviderBindingError("job capability not advertised");
   }
 
   /** Claim guard (PRD #3247): a `config.default_effort` outside the closed HARNESS_EFFORTS set
