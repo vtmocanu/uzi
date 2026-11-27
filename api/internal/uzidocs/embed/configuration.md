@@ -307,6 +307,14 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
   workers that run the Codex harness. Without one the judge stays queued and health reads "no worker that
   supports Codex provider judges (codex_provider_judge_v1) is online"; the same gates (claim, placement, wake, reap) and rollout notes apply, and
   [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider) covers the rolling-deploy caveat.
+- **Codex provider cross-check checkers (#4574).** A plan or code cross-check whose Codex checker runs on the
+  owner's Codex source needs the worker capability `codex_provider_checker_v1` on top of the Codex provider
+  capabilities, advertised by workers that run the Codex harness with cross-check slots. It gates claim and
+  placement (migration 00549 replaces `fn_placement_admitting_workers`; the number is a draft until landing).
+  Roll the api first: an older worker lacks the capability, so at the code stage (where the checker runs on
+  the lead's worker) the check fails fast as `checker_unavailable`, and at the plan stage the checker waits up
+  to its deadline for a capable worker, then the plan takes the human gate. Workers rolled first leave the
+  capability unused. See [Cross-check on a Codex provider](./providers.md#cross-check-on-a-codex-provider).
 - **Weekly reserve exempt.** Provider-bound runs, provider judges included, are exempt from the vendor
   [weekly usage reserve](./rate-limits.md#weekly-usage-reserve): it protects vendor allowances only, and
   these runs spend their own gateway key. A run explicitly bound to a vendor credential stays subject to it.
@@ -456,7 +464,7 @@ Matching is exact and case-sensitive after trimming whitespace from the config v
 
 ## Cross-check settings
 
-**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires usable credentials for both Claude and Codex. The requirement is copied onto each new eligible auto-approved run (a run that is not auto-approved snapshots the check-before-review mode instead, below), so toggling the setting does not change a run already created. A Claude lead's plan is checked on Codex and a Codex lead's on Claude, never the same family; round-capable workers automatically revise eligible REVISE outcomes within the server-counted budget. Exhaustion, BLOCK, timeout and other check failures retain the human fallback, with terminal exceptions for irrecoverable delivery losses. A Codex lead needs a worker advertising `cross_check_codex_lead_v1`, and a Claude checker child requires it too; without it the lead parks for a human. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, at claim time fails `checker_unavailable` and the lead parks for a human. See [Cross-check](./cross-check.md) for coverage and evidence display.
+**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires a usable credential for each of Claude and Codex; a selected, usable [model provider](./providers.md#cross-check-on-a-codex-provider) source counts for its engine, and a selected but unusable one refuses it even with that engine's vendor credential. The requirement is copied onto each new eligible auto-approved run (a run that is not auto-approved snapshots the check-before-review mode instead, below), so toggling the setting does not change a run already created. A Claude lead's plan is checked on Codex and a Codex lead's on Claude, never the same family; round-capable workers automatically revise eligible REVISE outcomes within the server-counted budget. Exhaustion, BLOCK, timeout and other check failures retain the human fallback, with terminal exceptions for irrecoverable delivery losses. A Codex lead needs a worker advertising `cross_check_codex_lead_v1`, and a Claude checker child requires it too; without it the lead parks for a human. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, at claim time fails `checker_unavailable` and the lead parks for a human. A Codex checker on a Codex model provider requires a worker advertising `codex_provider_checker_v1` (with the Codex provider capabilities), and a check where either side is provider-bound also goes through the same-model guard, which can end it `checker_unavailable`; see [Cross-check on a Codex model provider](./cross-check.md#checks-on-a-codex-model-provider). See [Cross-check](./cross-check.md) for coverage and evidence display.
 
 | Var | Default | Notes |
 |---|---|---|

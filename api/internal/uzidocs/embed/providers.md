@@ -184,12 +184,15 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   matching covers only the key's raw, JSON-escaped, `\/`, `\u`-escaped and percent-encoded forms (other
   encodings such as base64 are not detected), so this guards against accidental
   publication only, not a malicious or prompt-injected job; see the linked section.
-- **Other lanes that cannot use a provider refuse.** The cross-check lane refuses an
-  owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
-  that use an Anthropic token. A plan cross-check whose
-  checker would be refused sends the plan to the human plan gate instead; for a Codex lead that
-  means a Codex lead with plan cross-check, owned by someone with a Claude source, waits for you
-  to approve the plan. The isolated research lane refuses provider runs.
+- **Other lanes that cannot use a provider refuse.** The cross-check lane refuses a Claude
+  checker for an owner whose Claude source is set (or whose lead is bound to a provider), with
+  `provider_lane_unsupported`, including that owner's runs that use an Anthropic token. A plan
+  cross-check whose checker would be refused sends the plan to the human plan gate instead; for a
+  Codex lead that means a Codex lead with plan cross-check, owned by someone with a Claude source,
+  waits for you to approve the plan. The Codex checker lane is open for the rows listed under
+  [What a Codex provider run does not do](#what-a-codex-provider-run-does-not-do) and in
+  [Cross-check on a Codex provider](#cross-check-on-a-codex-provider). The isolated research lane
+  refuses provider runs.
 - **Where judged traces go.** A provider judge sends the judged run's trace to your gateway, including
   the trace of a run that used an Anthropic token. A pinned vendor judge sends a provider run's trace to
   Anthropic. Because the Claude CLI follows gateway redirects (the warning above), judged trace bodies
@@ -307,18 +310,53 @@ never `provider_model_unmapped`. Failure behavior, the `codex_provider_judge_v1`
 trace destination: [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider). Older
 `provider_lane_unsupported` skip rows for a Codex judge are historical.
 
+### Cross-check on a Codex provider
+
+A plan or code cross-check whose checker is Codex runs on your selected, usable Codex source,
+frozen when the checker is created, with no vendor fallback. The decision is taken under the same
+secret-mutation lock as the freeze, so a source edit made while the check is being created either
+lands before it or affects only later checks. A selected Codex source that is unusable (for example
+a disabled key or a map without `default`) refuses the check rather than falling back to the vendor
+Codex credential: the plan goes to the human plan gate and the code stage records the checker as
+unavailable with no verdict (`provider_source_unusable` internally; no new public reason).
+
+- **Which rows stay refused.** These keep `provider_lane_unsupported` (plan: human plan gate;
+  code: checker unavailable): a Claude checker when the lead is bound to a provider or your Claude
+  source is selected; a Codex checker when you have no Codex source and either the lead is bound to
+  a provider or a Claude source is selected (a vendor Claude lead with a vendor Codex checker, and
+  a Claude-provider lead with a vendor Codex checker, stay refused while a Claude source is
+  selected); and Codex-lead checks for an owner who has both sources, until the Claude checker lane
+  ships with #4322 M2.
+- **The same model cannot check itself.** When either side is bound to a provider, the claim
+  compares the lead's model with the checker's model and gateway host; a match, or evidence that
+  cannot be resolved, makes the check unavailable. See
+  [the same-model guard](./cross-check.md#the-same-model-guard) for the inputs and limits.
+- **Worker capability.** Only a worker advertising `codex_provider_checker_v1`, together with the
+  Codex provider capabilities, can claim or be placed a provider checker. At the code stage the
+  checker runs on the lead's worker, so a lead on a worker without it fails the check immediately;
+  at the plan stage the checker waits up to its deadline for a capable worker, which also happens
+  while an API rollout is ahead of the worker fleet.
+- **A revoked key never parks the checker.** A key revoked, rotated or disabled while the checker is
+  queued, or a destination removed from the allowlist, decides the check unavailable; the
+  checker is not paused for you to resume.
+- **Private CA.** A provider checker receives the same worker extra-CA bundle as other Codex
+  provider runs (see [Gateways behind a private CA](#gateways-behind-a-private-ca)); the same
+  `workers.extraCA` upgrade note applies.
+- **Cost reads as unknown.** The checker's usage is reported as tokens only: cost is unreported,
+  and no vendor pricing is applied to a gateway model. A gateway 429 or overload is a non-pass
+  with no vendor cooldown. A key echoed by the gateway is redacted from the verdict, usage frames
+  and logs for the whole claim, within the exact-match limits above. An explicit checker model pin
+  that is missing from the provider's model map makes the check unavailable.
+
 ### What a Codex provider run does not do
 
-- **Cross-check.** Plan and code cross-check refuse when either side would be bound to a Codex
-  provider, with `provider_lane_unsupported`. For the plan stage this means a human plan gate: a
-  Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker
-  refused and waits for you to approve the plan. The code stage records the checker as
-  unavailable with no verdict.
+- **Cross-check, held rows.** The rows listed under
+  [Cross-check on a Codex provider](#cross-check-on-a-codex-provider) stay refused with
+  `provider_lane_unsupported`, and a Codex provider lead's check on a Claude checker waits for
+  #4322 M2.
 - **Jobs and chat** are Claude-only and unchanged by a Codex source. A Codex source does not
   affect them. A job follows your **Claude** source (see
   [Use a provider as your Claude source](#use-a-provider-as-your-claude-source)).
-
-Codex providers on the cross-check lane are tracked in #4574.
 
 ### Operators: rollout and keys
 
@@ -504,7 +542,8 @@ details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 For a Codex provider, the worker's extra-CA bundle is delivered to the Codex runtime with
 TLS verification left on, so a private-CA gateway works there, but only on workers the controller recorded as
 created with it (see the `workers.extraCA` upgrade note in [Configuration](./configuration.md)); a worker without
-that record fails TLS until it is reprovisioned. A stalled connection fails with a
+that record fails TLS until it is reprovisioned. The Codex provider cross-check checker passes the same
+bundle to its runtime, so its private-CA gateway works under the same condition. A stalled connection fails with a
 typed timeout (setup through the first model response is bounded at 10 seconds per runtime
 root); it is reported as a certificate error only when the runtime reports one. This page does not
 separately document the `workers.uidSplit` case for Codex; the paragraph below describes Claude.
