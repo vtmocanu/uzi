@@ -924,6 +924,13 @@ workers:
   # an aggregate worker limit. See docs/configuration.md.
   goBuildParallelism: ""
   goMaxProcs: ""
+  # Optional GOMEMLIMIT for worker commands: a per-process soft GC memory target for
+  # the Go runtime, not a worker-wide limit. Empty = unset. A string of a positive
+  # integer <= 2147483647 followed by the required unit MiB or GiB (for example
+  # "6GiB"); surrounding ASCII whitespace is trimmed. Strings only: a typed number
+  # has no unit and fails the render. Relayed through UZI_WORKER_GO_MEMLIMIT to
+  # WORKER_GO_MEMLIMIT. See docs/configuration.md.
+  goMemLimit: ""
   # Optional per-run cache cap settings (issue #4576). Relayed through
   # UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES / UZI_WORKER_RUN_CACHE_CAP_FRACTION to the worker
   # pod's UZI_RUN_CACHE_CAP_MAX_BYTES / UZI_RUN_CACHE_CAP_FRACTION.
@@ -1816,9 +1823,12 @@ web:
   #   version   (required) a string shown to admins in error cards (quote it: 1.0 is a number).
   #   page      (required) the module's exposed page name.
   #   label     (required) the nav label, 1 to 40 characters, no control or invisible characters.
-  #   icon      (required) one of activity board book bot bug chat clock factory file-text gear git
-  #             home key package scale search server shield skill terminal.
+  #   icon      (required) one of activity board book bot bug chart-line chat clock factory
+  #             file-text gear git home key package scale search server shield skill terminal.
   #   navGroup  (required) work | factory | modules (the sidebar section).
+  #   navSection (optional) the sidebar heading for a navGroup modules entry (default "Modules");
+  #             1 to 24 characters after trimming whitespace, no control or invisible characters;
+  #             refused with navGroup work or factory. Entries with the same heading share a section.
   #   adminOnly (optional) boolean, default false. A UI visibility rule only: anyone can
   #             fetch /modules.json and the module files (no authentication on those paths). Never put a secret in a module.
   #   upstream  (required) [http://]HOST:PORT of the module's static server; HOST is a lowercase
@@ -1837,6 +1847,7 @@ web:
   #       label: Example
   #       icon: package
   #       navGroup: modules
+  #       navSection: Tools
   #       adminOnly: false
   #       upstream: example-module:8080
   modules: []

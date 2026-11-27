@@ -7,6 +7,7 @@ import { ApiError } from "../../lib/apiError";
 import { state } from "../store";
 import { delay, requireSession } from "./shared";
 import { appSettings } from "./settings";
+import { awaitingFirstEnable } from "./forge";
 
 // boardResponse clones a board fixture for return. Cards are shallow-cloned so a caller
 // mutating the response never touches the stored fixture.
@@ -22,6 +23,9 @@ function boardResponse(b: Board): { board: Board } {
 export const boardsApi = {
   // ── Board ───────────────────────────────────────────────────────────────────
   getBoard: async (repoId: string) => {
+    // PRD 4173 D13: a never-enabled repo has no board until its first enable (the
+    // server's refuseNeverEnabled).
+    if (awaitingFirstEnable.has(repoId)) throw new ApiError(409, "the repo has never been enabled; enable it first");
     const b = state.boards.get(repoId);
     if (!b) throw new ApiError(404, "board not found");
     return delay(boardResponse(b));
@@ -140,7 +144,17 @@ export const boardsApi = {
     // bot_forge_user_id rides the issue detail (PRD #767 M5), from the board's single
     // connection, so the issue view evaluates the same "uzi OR assigned-to-bot" predicate
     // as the board card — assignee_ids comes through on ...rest.
-    return delay({ issue: { ...rest, assignee_ids: rest.assignee_ids ?? [], description, bot_forge_user_id: b.bot_forge_user_id ?? 0 } });
+    // A linked repo's issue also carries the stored eligibility tag (PRD #4173 M6); its
+    // issue_key comes through on ...rest.
+    return delay({
+      issue: {
+        ...rest,
+        assignee_ids: rest.assignee_ids ?? [],
+        description,
+        bot_forge_user_id: b.bot_forge_user_id ?? 0,
+        ...(b.eligibility_label ? { eligibility_label: b.eligibility_label } : {}),
+      },
+    });
   },
   syncRepo: async (repoId: string) => {
     const b = state.boards.get(repoId);

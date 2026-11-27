@@ -138,6 +138,12 @@ func newProjectSyncCmd(env Env, gf *globalFlags) *cobra.Command {
 // resolveHandoffRepo's origin-match, kept local so this command does not couple to
 // handoff's origin-detection path.
 func resolveProjectSyncRepo(ctx context.Context, c uzicli.Client, arg string) (string, error) {
+	return resolveProjectSyncRepoHint(ctx, c, arg, "; pass the repo id instead (see 'uzi repo list')")
+}
+
+// resolveProjectSyncRepoHint is resolveProjectSyncRepo with the no-match hint supplied by the
+// verb (it begins with "; "), for a verb whose repo may not be enabled and so not listed.
+func resolveProjectSyncRepoHint(ctx context.Context, c uzicli.Client, arg, noMatchHint string) (string, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "a <repo> (path-with-namespace or repo id) is required")
@@ -160,7 +166,7 @@ func resolveProjectSyncRepo(ctx context.Context, c uzicli.Client, arg string) (s
 		return matches[0], nil
 	case 0:
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"could not match %q to a uzi repo; pass the repo id instead (see 'uzi repo list')", arg)
+			"could not match %q to a uzi repo%s", arg, noMatchHint)
 	default:
 		return "", uzicli.Exitf(uzicli.ExitUsage,
 			"%q is ambiguous — it matches %d uzi repos; pass the repo id to pick one (see 'uzi repo list')", arg, len(matches))

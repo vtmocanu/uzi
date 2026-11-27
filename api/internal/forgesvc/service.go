@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -1078,7 +1078,7 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		}
 		issueKey := pgtype.Text{}
 		if issueKeyShort != "" {
-			issueKey = pgtype.Text{String: issueKeyShort + "-" + strconv.FormatInt(is.IID, 10), Valid: true}
+			issueKey = pgtype.Text{String: issuetracker.IssueKey(issueKeyShort, is.IID), Valid: true}
 		}
 		params := store.UpsertIssueParams{
 			RepoID:         repoID,

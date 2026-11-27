@@ -128,7 +128,7 @@ describe("mock admin-shared providers", () => {
     await api.putProviderKey(SHARED, "k".repeat(24));
     await api.setClaudeProviderSource(SHARED);
     const view = (await api.adminListSharedProviders()).providers;
-    expect(view.map(p => p.id)).toEqual([SHARED, "prov-shared-legacy"]);
+    expect(view.map(p => p.id)).toEqual([SHARED, "prov-shared-legacy", "prov-operator-org"]);
     expect(view[0]).toMatchObject({ selected_user_count: 3, attached_key_count: 4 });
     expect(JSON.stringify(view)).not.toContain("k".repeat(24));
     await expect(api.adminDeleteSharedProvider(SHARED)).rejects.toMatchObject({ status: 409, body: { reason: "provider_in_use_as_source" } });

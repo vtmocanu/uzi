@@ -1355,12 +1355,18 @@ A few worth knowing:
 - **`admin provider list` and `admin provider get <id|name>` read the
   [admin-shared providers](providers.md#admin-shared-providers)** (PRD #4324),
   model provider definitions an admin shares with every user. `list` prints `NAME`,
-  `ENGINE`, `URL`, `AUTH`, `RETIRED`, `REVISION`, `SELECTED` (users who selected it)
-  and `KEYS` (users with a key attached). `get` takes the id, or the name matched
-  without regard to case, and prints the fields plus the model map; an unknown
+  `ENGINE`, `MODE` (`per_user_key` or `operator_key`), `URL`, `AUTH`, `RETIRED`, `REVISION`,
+  `SELECTED` (users who selected it), `KEYS` (users with a key attached) and `ORG KEY`
+  (the [organization key](providers.md#organization-key-staged) of an `operator_key`
+  definition: `none`, `enabled` or `disabled`; `-` for a per-user-key one). `get` takes the id,
+  or the name matched without regard to case, and prints the fields (including
+  `credential_mode`, `org_key` as above, and `org_key_test`: `-` for a per-user-key definition,
+  `not tested` when no Test result is current, otherwise `<auth>/<tools> at <time>`) plus the
+  model map; key material is never shown. An unknown
   id or name exits 4 (a personal provider is never shown). `--json` carries the
-  same fields. Read-only and need an `admin_ro` (`uza_`) token; there is no write
-  verb, because creating, editing, retiring and deleting a shared definition are
+  same fields, as `credential_mode` and `operator_key` (`{present, enabled, set_at, probe}`). Read-only and need an `admin_ro` (`uza_`) token; there is no write
+  verb, because creating, editing, retiring and deleting a shared definition, and
+  setting, enabling, disabling, deleting or testing its organization key, are
   cookie-only admin writes in the web app (Admin → Shared providers).
 - **`admin egress-profile list` and `admin egress-profile show <name>` read the
   [egress profiles](egress-profiles.md)** (PRD #1906), the named site lists for
@@ -2151,6 +2157,30 @@ you always know which repo you're looking at. Get repo ids from `uzi repo list`.
 All five support `--json` (a top-level array for the lists, one object for a
 detail), for agents. The human table's PR/MR noun follows the repo's forge
 (GitLab says MR).
+
+## Issue trackers from the CLI: `uzi issue-tracker` and `uzi repo issue-tracker-states`
+
+Two read-only verbs show how a repo is wired to an issue tracker (see
+[Issue trackers](./issue-trackers.md)). Connecting and linking are web-only.
+
+```sh
+uzi issue-tracker list                     # your issue tracker connections
+uzi repo issue-tracker-states group/proj   # a linked repo's State mapping
+```
+
+- **`uzi issue-tracker list`** shows each connection's kind, base URL, account,
+  created and last verified time.
+- **`uzi repo issue-tracker-states <repo>`** takes the repo by path or id. A path
+  resolves only for a repo `uzi repo list` shows; a repo is linked before it is
+  first enabled, so a repo not yet enabled needs its id, shown in the Map States panel on the web Repos page.
+  It shows the open and closed States, each mapped board column's State, and the
+  project's States with whether each can close or open an issue. It ends a
+  mapping with "Columns not listed are unmapped: a move into one is refused
+  until it is mapped."; map them with "Map States" in the web.
+
+Both support `--json`. On a repo linked to an issue tracker, the CLI and TUI show
+an issue's key (`ABC-12`) instead of `#number` in run, schedule, finding and
+created-issue output; `uzi schedule` fire output and continued issues still show `#number`.
 
 ## Watching runs live: `uzi tui`
 

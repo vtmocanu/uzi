@@ -298,3 +298,24 @@ func (h *Handler) LinkRepoToIssueTracker(w http.ResponseWriter, r *http.Request)
 		ProjectShortName: link.ProjectShort, TagID: link.TagID, TagName: link.TagName, LinkedAt: link.LinkedAt,
 	}})
 }
+
+// IssueTrackerConfig exposes what the connect and link screens need to offer only valid
+// choices: the operator's issue tracker base URL allowlist (a separate list from the
+// forge's) and the supported kinds. Read-only config, nothing secret. The allowlist is
+// always an array, never null, so the web can tell "an operator must set it" from a
+// missing field.
+func (h *Handler) IssueTrackerConfig(w http.ResponseWriter, r *http.Request) {
+	allowed := h.cfg.IssueTrackerAllowedBaseURLs
+	if allowed == nil {
+		allowed = []string{}
+	}
+	kinds := issuetracker.SupportedKinds()
+	names := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		names = append(names, string(k))
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"allowed_base_urls": allowed,
+		"kinds":             names,
+	})
+}

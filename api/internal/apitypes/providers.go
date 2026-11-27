@@ -68,6 +68,20 @@ type AdminSharedProviderDTO struct {
 	CredentialMode    string      `json:"credential_mode"`
 	SelectedUserCount int64       `json:"selected_user_count"`
 	AttachedKeyCount  int64       `json:"attached_key_count"`
+	// OperatorKey is present only for an organization-funded definition (credential_mode
+	// "operator_key", PRD #4540): the state of its one organization key. Never the key, its
+	// ciphertext or its revision counter.
+	OperatorKey *AdminOperatorKeyDTO `json:"operator_key,omitempty"`
+}
+
+// AdminOperatorKeyDTO is the state of an organization key as an admin reads it: whether one is set,
+// whether it is enabled, when it was set, and the latest Test evidence for that exact key (nil
+// until a probe ran against the current key and revision).
+type AdminOperatorKeyDTO struct {
+	Present bool              `json:"present"`
+	Enabled bool              `json:"enabled"`
+	SetAt   *time.Time        `json:"set_at,omitempty"`
+	Probe   *ProviderProbeDTO `json:"probe,omitempty"`
 }
 
 // AdminSharedProviderListDTO is the GET /api/admin/providers response.

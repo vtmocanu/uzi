@@ -342,10 +342,79 @@ func (s *Server) IssueState(n int64) string {
 	if i == nil {
 		s.t.Fatalf("youtracktest: no issue %d", n)
 	}
-	for _, cf := range s.m.customFieldsJSON(i) {
-		if v, ok := cf["value"].(map[string]any); ok {
-			return v["name"].(string)
-		}
+	// Read from the model, not the wire, so an issue listed in a non-plain
+	// State field shape still reports the State it holds.
+	if v := s.m.issueStateValue(i); v != nil {
+		return v.name
 	}
 	return ""
+}
+
+// SeedStateFieldShape sets how issue number n of the main project lists its
+// State field. The non-plain shapes are this fake's own (see StateFieldShape);
+// a State value write to such an issue answers 400.
+func (s *Server) SeedStateFieldShape(n int64, shape StateFieldShape) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	switch shape {
+	case StateFieldPlain, StateFieldAbsent, StateFieldUntyped:
+	default:
+		s.t.Fatalf("youtracktest: unknown State field shape %q", shape)
+	}
+	i.stateShape = shape
+}
+
+// SeedIDReadable makes issue number n of the main project serve id as its
+// "idReadable", empty included. This is the fake's own: it lets a test serve an
+// over-long or empty id-readable. The issue still resolves by its real one.
+func (s *Server) SeedIDReadable(n int64, id string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	i.idReadableSet, i.idReadableOverride = true, id
+}
+
+// SetStateMachine makes the State field of the project with id projectID one a
+// state-machine workflow runs (or a plain one again). Its issues then list a
+// StateMachineIssueCustomField, and a value write to one answers 400.
+func (s *Server) SetStateMachine(projectID string, on bool) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.m.projectByID(projectID)
+	if p == nil {
+		s.t.Fatalf("youtracktest: no project %q", projectID)
+	}
+	p.stateMachine = on
+}
+
+// SetExtraStateMachineField adds to every issue of the project with id
+// projectID a second custom field, named name and run by a state machine, next
+// to its plain State field; an empty name removes it.
+func (s *Server) SetExtraStateMachineField(projectID, name string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.m.projectByID(projectID)
+	if p == nil {
+		s.t.Fatalf("youtracktest: no project %q", projectID)
+	}
+	p.extraMachineField = name
+}
+
+// FailIssueListing makes every issues search (GET /api/issues) answer status,
+// for example 403 or 404; 0 restores normal answers.
+func (s *Server) FailIssueListing(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m.listFailure = status
 }

@@ -319,6 +319,13 @@ var wantRouteMounts = []routeMount{
 	{"PATCH", "/api/admin/providers/{id}", noLimiter},
 	{"POST", "/api/admin/providers/{id}/retire", noLimiter},
 	{"DELETE", "/api/admin/providers/{id}", noLimiter},
+	// PRD #4540: the organization key writes are local DB writes. The admin Test dials the definition's
+	// own gateway but is limited inside the handler (one in flight per definition, four instance-wide,
+	// 30 per definition per hour), not by a route limiter.
+	{"PUT", "/api/admin/providers/{id}/key", noLimiter},
+	{"DELETE", "/api/admin/providers/{id}/key", noLimiter},
+	{"PATCH", "/api/admin/providers/{id}/key/enabled", noLimiter},
+	{"POST", "/api/admin/providers/{id}/test", noLimiter},
 	// PRD #3989: admin-issued reset link, a cookie-only admin DB write with no per-user limiter.
 	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
@@ -493,6 +500,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
 	// PRD #4173 M4: the issue tracker connection list reads only the store; projects and tags
 	// call the issue tracker, so they ride the per-user forge budget.
+	{"GET", "/api/issue-trackers/config", noLimiter},
 	{"GET", "/api/issue-trackers/connections/", noLimiter},
 	{"GET", "/api/issue-trackers/connections/{id}/projects", limForge},
 	{"GET", "/api/issue-trackers/connections/{id}/tags", limForge},

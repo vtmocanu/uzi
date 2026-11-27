@@ -2,8 +2,10 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -29,7 +31,9 @@ import (
 // A GREATEST re-delivery of a straggler frame after this commits lands at the same
 // position-absolute epoch and changes nothing (PRD D1).
 func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, run store.Run) error {
-	tx, err := pool.Begin(ctx)
+	// READ COMMITTED explicitly (as the materializer does): the delete's statement snapshot must
+	// be taken after the run pre-lock below, which a database-default REPEATABLE READ would not do.
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fmt.Errorf("refold usage (run %s): begin: %w", run.ID, err)
 	}
@@ -37,7 +41,27 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 	// delete so a failed refold marks nothing and is retried on the next tick.
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Bound every lock wait below (the run pre-lock and the fold-state row the delete takes) so
+	// the boot refold loop cannot stall behind a long lock holder; a failure rolls back and the
+	// existing loop retries the run.
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '5s'"); err != nil {
+		return fmt.Errorf("refold usage (run %s): set lock_timeout: %w", run.ID, err)
+	}
+
 	qtx := q.WithTx(tx)
+
+	// Issue #4700: the runs row is the master lock of the run_usage fold-freshness protocol
+	// (migration 00549). Take it FOR UPDATE before the first run_usage write: that waits out
+	// every in-flight writer (each holds the row FOR KEY SHARE) before DeleteRunUsage's
+	// statement snapshot is taken, so the delete sees every row they committed, and it
+	// serialises this refold against a concurrent run delete and other refolds. No row means
+	// the run was deleted while the refold waited: nothing to refold or mark, and not a failure.
+	if _, err := qtx.LockRunForUsageRefold(ctx, run.ID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("refold usage (run %s): lock run: %w", run.ID, err)
+	}
 
 	if err := qtx.DeleteRunUsage(ctx, run.ID); err != nil {
 		return fmt.Errorf("refold usage (run %s): delete old rows: %w", run.ID, err)

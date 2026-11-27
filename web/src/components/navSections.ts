@@ -28,6 +28,7 @@ const SETTINGS_TABS: SectionDef[] = [
   { label: "Models", to: "/settings/models", keywords: ["model", "models", "effort", "harness", "planning", "cross-check", "judge", "summary"] },
   { label: "Run defaults", to: "/settings/run-defaults", keywords: ["run", "defaults", "harness", "overflow"] },
   { label: "Forge", to: "/settings/forge", keywords: ["github", "gitlab", "connection", "repo"] },
+  { label: "Issue trackers", to: "/settings/issue-trackers", keywords: ["youtrack", "issues", "connection", "project"] },
   { label: "Access", to: "/settings/access", keywords: ["tokens", "permissions", "sharing", "oauth"] },
   { label: "Memory", to: "/settings/memory", keywords: ["notes", "context", "remember"] },
   { label: "Appearance", to: "/settings/appearance", keywords: ["theme", "dark", "light", "typeface", "mode"] },

@@ -116,7 +116,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		writeCIFixCreateError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }
 
 // writeCIFixCreateError maps CreateCIFixRun's non-guardrail refusals to an HTTP status (extracted so each arm is testable).

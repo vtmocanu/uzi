@@ -709,6 +709,11 @@ type FakeClient struct {
 	// records the repo id it was asked about.
 	RepoEnvResult         apitypes.RunEnvListDTO
 	LastListRepoEnvRepoID string
+	// Issue tracker CLI reads (PRD #4173 M6): the canned connections and states replies;
+	// LastIssueTrackerStatesRepoID records the repo id the states read was asked about.
+	IssueTrackerConnections      []IssueTrackerConnection
+	IssueTrackerStatesResult     IssueTrackerStates
+	LastIssueTrackerStatesRepoID string
 
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun

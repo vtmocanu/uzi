@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api, type Board as BoardData } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { chipLabels } from "../../lib/labelChips";
@@ -7,6 +7,9 @@ import { Button, Card, cx, Input, SectionTitle } from "../../components/ui";
 import { GripVerticalIcon } from "../../components/icons";
 import { useAuth } from "../../auth/AuthContext";
 import { COLUMN_ACCENTS } from "./shared";
+import { IssueTrackerStatesPanel } from "../../components/IssueTrackerStatesPanel";
+import { useDemoMode } from "../../lib/demoMode";
+import { maskRepoPath } from "../../lib/demoMask";
 
 export function ColumnSettings({
   board,
@@ -18,6 +21,12 @@ export function ColumnSettings({
   onError: (m: string) => void;
 }) {
   const { autopilotLabel } = useAuth();
+  const demo = useDemoMode();
+  // A board linked to an issue tracker (PRD #4173 M6) carries its eligibility tag name;
+  // its columns map to the project's States, edited in the panel below the card.
+  const linked = Boolean(board.eligibility_label);
+  const [mappingStates, setMappingStates] = useState(false);
+  const mapStatesRef = useRef<HTMLButtonElement>(null);
   const [names, setNames] = useState<string[]>(board.columns.map((c) => c.label_name));
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
@@ -73,115 +82,147 @@ export function ColumnSettings({
   };
 
   return (
-    <Card className="max-w-2xl">
-      <SectionTitle>Columns</SectionTitle>
-      <p className="mt-1 text-xs text-faint">
-        Each column is a label. Order is left-to-right. New names are created as labels on the forge.
-      </p>
-      <ul className="mt-3 space-y-2">
-        {names.map((name, i) => (
-          <li
-            key={name}
-            draggable
-            onDragStart={(e) => {
-              setDragName(name);
-              e.dataTransfer.setData("text/plain", name);
-              e.dataTransfer.effectAllowed = "move";
-            }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              const r = e.currentTarget.getBoundingClientRect();
-              setInsertion({ name, edge: insertionEdgeFor(r.top, r.height, e.clientY) });
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              const from = names.indexOf(e.dataTransfer.getData("text/plain"));
-              const r = e.currentTarget.getBoundingClientRect();
-              // Recompute the edge at drop time (like the cards' onCardDrop) so a
-              // drop with no preceding dragOver still resolves.
-              const edge = insertionEdgeFor(r.top, r.height, e.clientY);
-              // `to` is the insertion index in the ORIGINAL array. Dragging
-              // downward (from < to) removes the source first, shifting every
-              // later index down by one, so decrement to compensate.
-              let to = i + (edge === "bottom" ? 1 : 0);
-              if (from < to) to -= 1;
-              if (from >= 0) moveTo(from, to);
-              setDragName(null);
-              setInsertion(null);
-            }}
-            onDragEnd={() => {
-              setDragName(null);
-              setInsertion(null);
-            }}
-            className={cx(
-              "flex items-center gap-2 cursor-grab active:cursor-grabbing",
-              name === dragName && "opacity-40",
-              insertion?.name === name &&
-                insertion.edge === "top" &&
-                "shadow-[inset_0_2px_0_0_rgb(var(--brand))]",
-              insertion?.name === name &&
-                insertion.edge === "bottom" &&
-                "shadow-[inset_0_-2px_0_0_rgb(var(--brand))]",
-            )}
-          >
-            <span
-              aria-hidden="true"
-              className="flex items-center text-faint hover:text-fg cursor-grab active:cursor-grabbing"
+    <>
+      <Card className="max-w-2xl">
+        <SectionTitle>Columns</SectionTitle>
+        {linked ? (
+          <div className="mt-1 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-faint">
+              Each column maps to a State of the linked issue tracker project. Order is left-to-right.
+            </p>
+            <Button
+              ref={mapStatesRef}
+              variant="secondary"
+              size="sm"
+              aria-expanded={mappingStates}
+              onClick={() => setMappingStates((v) => !v)}
             >
-              <GripVerticalIcon />
-            </span>
-            <span className="flex flex-1 items-center gap-2 rounded-md border border-edge bg-raised px-3 py-1.5 text-sm">
+              {mappingStates ? "Hide States" : "Map States"}
+            </Button>
+          </div>
+        ) : (
+          <p className="mt-1 text-xs text-faint">
+            Each column is a label. Order is left-to-right. New names are created as labels on the forge.
+          </p>
+        )}
+        <ul className="mt-3 space-y-2">
+          {names.map((name, i) => (
+            <li
+              key={name}
+              draggable
+              onDragStart={(e) => {
+                setDragName(name);
+                e.dataTransfer.setData("text/plain", name);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                const r = e.currentTarget.getBoundingClientRect();
+                setInsertion({ name, edge: insertionEdgeFor(r.top, r.height, e.clientY) });
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const from = names.indexOf(e.dataTransfer.getData("text/plain"));
+                const r = e.currentTarget.getBoundingClientRect();
+                // Recompute the edge at drop time (like the cards' onCardDrop) so a
+                // drop with no preceding dragOver still resolves.
+                const edge = insertionEdgeFor(r.top, r.height, e.clientY);
+                // `to` is the insertion index in the ORIGINAL array. Dragging
+                // downward (from < to) removes the source first, shifting every
+                // later index down by one, so decrement to compensate.
+                let to = i + (edge === "bottom" ? 1 : 0);
+                if (from < to) to -= 1;
+                if (from >= 0) moveTo(from, to);
+                setDragName(null);
+                setInsertion(null);
+              }}
+              onDragEnd={() => {
+                setDragName(null);
+                setInsertion(null);
+              }}
+              className={cx(
+                "flex items-center gap-2 cursor-grab active:cursor-grabbing",
+                name === dragName && "opacity-40",
+                insertion?.name === name &&
+                  insertion.edge === "top" &&
+                  "shadow-[inset_0_2px_0_0_rgb(var(--brand))]",
+                insertion?.name === name &&
+                  insertion.edge === "bottom" &&
+                  "shadow-[inset_0_-2px_0_0_rgb(var(--brand))]",
+              )}
+            >
               <span
                 aria-hidden="true"
-                className={cx("h-2 w-2 rounded-full", COLUMN_ACCENTS[i % COLUMN_ACCENTS.length])}
-              />
-              {name}
-            </span>
-            <Button variant="danger" size="sm" draggable={false} onClick={() => removeAt(i)}>
-              Remove
-            </Button>
-          </li>
-        ))}
-        {names.length === 0 && <li className="text-xs text-faint">No columns.</li>}
-      </ul>
-
-      <div className="mt-4 flex gap-2">
-        <Input
-          placeholder="New column label"
-          value={newName}
-          onChange={(e) => setNewName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              add(newName);
-            }
-          }}
-        />
-        <Button variant="secondary" onClick={() => add(newName)} disabled={!newName.trim()}>
-          Add
-        </Button>
-      </div>
-
-      {suggestions.length > 0 && (
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <span className="text-xs text-faint">Suggestions:</span>
-          {suggestions.map((s) => (
-            <button
-              key={s}
-              onClick={() => add(s)}
-              className="rounded-md border border-edge bg-raised px-2 py-0.5 text-xs text-muted transition-colors hover:border-brand/60 hover:text-fg"
-            >
-              + {s}
-            </button>
+                className="flex items-center text-faint hover:text-fg cursor-grab active:cursor-grabbing"
+              >
+                <GripVerticalIcon />
+              </span>
+              <span className="flex flex-1 items-center gap-2 rounded-md border border-edge bg-raised px-3 py-1.5 text-sm">
+                <span
+                  aria-hidden="true"
+                  className={cx("h-2 w-2 rounded-full", COLUMN_ACCENTS[i % COLUMN_ACCENTS.length])}
+                />
+                {name}
+              </span>
+              <Button variant="danger" size="sm" draggable={false} onClick={() => removeAt(i)}>
+                Remove
+              </Button>
+            </li>
           ))}
+          {names.length === 0 && <li className="text-xs text-faint">No columns.</li>}
+        </ul>
+
+        <div className="mt-4 flex gap-2">
+          <Input
+            placeholder="New column label"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                add(newName);
+              }
+            }}
+          />
+          <Button variant="secondary" onClick={() => add(newName)} disabled={!newName.trim()}>
+            Add
+          </Button>
+        </div>
+
+        {suggestions.length > 0 && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-faint">Suggestions:</span>
+            {suggestions.map((s) => (
+              <button
+                key={s}
+                onClick={() => add(s)}
+                className="rounded-md border border-edge bg-raised px-2 py-0.5 text-xs text-muted transition-colors hover:border-brand/60 hover:text-fg"
+              >
+                + {s}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="mt-4">
+          <Button onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save columns"}
+          </Button>
+        </div>
+      </Card>
+      {linked && mappingStates && (
+        <div className="mt-4">
+          <IssueTrackerStatesPanel
+            repoId={board.repo_id}
+            repoLabel={maskRepoPath(board.path_with_namespace, demo)}
+            columns={board.columns.map((c) => c.label_name)}
+            onClose={() => {
+              setMappingStates(false);
+              mapStatesRef.current?.focus();
+            }}
+          />
         </div>
       )}
-
-      <div className="mt-4">
-        <Button onClick={save} disabled={saving}>
-          {saving ? "Saving…" : "Save columns"}
-        </Button>
-      </div>
-    </Card>
+    </>
   );
 }

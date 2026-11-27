@@ -222,6 +222,8 @@ func TestLinkedMoveRefusedColumnKeepsMarker(t *testing.T) {
 		"column not mapped": fmt.Errorf("move: %w", issuetracker.ErrColumnNotMapped),
 		"mapping unset":     fmt.Errorf("move: %w", issuetracker.ErrStateMappingUnset),
 		"state not allowed": fmt.Errorf("move: %w", issuetracker.ErrStateNotAllowed),
+		"state machine":     fmt.Errorf("move: %w", issuetracker.ErrStateMachineField),
+		"state unreadable":  fmt.Errorf("move: %w", issuetracker.ErrStateFieldUnreadable),
 	} {
 		t.Run(name, func(t *testing.T) {
 			fs, sm, _, l, runID, _, _ := linkedFixture("queued", err)

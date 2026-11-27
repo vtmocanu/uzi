@@ -24,6 +24,7 @@
   "created_issues": [
     {
       "iid": 1,
+      "issue_key": "x",
       "title": "x",
       "web_url": "x"
     }
@@ -351,6 +352,7 @@
   "forge_type": "x",
   "kind": "x",
   "issue_iid": 1,
+  "issue_key": "x",
   "continued_issue_iid": 1,
   "issue_title": "x",
   "issue_description": "x",

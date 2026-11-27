@@ -36,6 +36,7 @@ import { ModelSelect } from "./ModelSelect";
 import { Modal } from "./Modal";
 import { TokenPicker } from "./TokenPicker";
 import { XIcon } from "./icons";
+import { issueRef } from "../lib/issueRef";
 import { Button, Field } from "./ui";
 
 // The Default options name where each value really comes from (defaultChoiceLabels, from the
@@ -77,6 +78,7 @@ export interface RunOptionsStartCallbacks {
 
 export function RunOptionsDialog({
   issueIid,
+  issueKey,
   issueTitle,
   facts,
   gate,
@@ -85,6 +87,8 @@ export function RunOptionsDialog({
   onClose,
 }: {
   issueIid: number;
+  // The issue tracker key of a linked repo's issue (PRD 4173 M6), named in place of "#iid".
+  issueKey?: string;
   issueTitle?: string;
   // The page's harness-availability facts. They are live: the board's precondition poll
   // updates them while the dialog is open, and row visibility follows.
@@ -175,13 +179,13 @@ export function RunOptionsDialog({
   const describedBy = [!startGate.enabled ? gateId : "", modelError ? modelErrorId : ""].filter(Boolean).join(" ");
 
   return (
-    <Modal label={`Run options for #${issueIid}`} onClose={close} closeOnBackdrop={!submitting}>
+    <Modal label={`Run options for ${issueRef(issueIid, issueKey)}`} onClose={close} closeOnBackdrop={!submitting}>
       <div className="my-8 w-full max-w-md overflow-hidden rounded-2xl border border-edge-strong bg-surface shadow-2xl">
         <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-4">
           <div className="min-w-0">
             <h2 className="text-base font-semibold">Run options</h2>
             <p className="mt-0.5 truncate text-xs text-muted">
-              #{issueIid}
+              {issueRef(issueIid, issueKey)}
               {issueTitle ? ` ${stripUnsafeChars(issueTitle)}` : ""}
             </p>
           </div>

@@ -168,6 +168,7 @@ services:
       WORKER_CROSS_CHECK_SLOTS: ${WORKER_CROSS_CHECK_SLOTS:-1}
       WORKER_GO_BUILD_PARALLELISM: ${WORKER_GO_BUILD_PARALLELISM:-}
       WORKER_GO_MAXPROCS: ${WORKER_GO_MAXPROCS:-}
+      WORKER_GO_MEMLIMIT: ${WORKER_GO_MEMLIMIT:-}
       # Optional per-run cache cap (issue #4576). Empty = the worker default (15 GiB
       # ceiling, 0.5 fraction); the worker parses both leniently.
       UZI_RUN_CACHE_CAP_MAX_BYTES: ${UZI_RUN_CACHE_CAP_MAX_BYTES:-}

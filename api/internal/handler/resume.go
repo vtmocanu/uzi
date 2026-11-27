@@ -381,7 +381,7 @@ func (h *Handler) writeResumedRun(w http.ResponseWriter, r *http.Request, userID
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
-	out := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)}
+	out := map[string]any{"run": h.runDTO(r.Context(), run)}
 	if replay {
 		// A repeated identical policy resume (lost response): nothing changed, say so.
 		out["replay"] = true

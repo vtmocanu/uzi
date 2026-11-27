@@ -332,18 +332,23 @@ func TestSharedProviderAdminCreateRefusalsLiveDB(t *testing.T) {
 	}
 	// Bidi and ANSI names, an unallowlisted URL, and a key field are refused.
 	for label, body := range map[string]string{
-		"bidi name":      strings.Replace(good, name, `ab\u202ecd`, 1),
-		"ansi name":      strings.Replace(good, name, `\u001b[31mred`, 1),
-		"empty name":     strings.Replace(good, name, ``, 1),
-		"base url":       strings.Replace(good, s.base, "https://evil.example.com/anthropic", 1),
-		"key in body":    strings.Replace(good, `"name"`, `"key":"x","name"`, 1),
-		"unknown auth":   strings.Replace(good, `"bearer"`, `"basic"`, 1),
-		"missing haiku":  strings.Replace(good, `"haiku":{"model":"corp-haiku","context_window":200000}`, `"fable":{"model":"f"}`, 1),
-		"unknown fields": strings.Replace(good, `"name"`, `"credential_mode":"operator_key","name"`, 1),
+		"bidi name":     strings.Replace(good, name, `ab\u202ecd`, 1),
+		"ansi name":     strings.Replace(good, name, `\u001b[31mred`, 1),
+		"empty name":    strings.Replace(good, name, ``, 1),
+		"base url":      strings.Replace(good, s.base, "https://evil.example.com/anthropic", 1),
+		"key in body":   strings.Replace(good, `"name"`, `"key":"x","name"`, 1),
+		"unknown auth":  strings.Replace(good, `"bearer"`, `"basic"`, 1),
+		"missing haiku": strings.Replace(good, `"haiku":{"model":"corp-haiku","context_window":200000}`, `"fable":{"model":"f"}`, 1),
+		"unknown mode":  strings.Replace(good, `"name"`, `"credential_mode":"shared_key","name"`, 1),
 	} {
 		if rec := post(body); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s = %d %s, want 400", label, rec.Code, rec.Body.String())
 		}
+	}
+	// An organization-key definition without the acknowledgment is refused with its own message (PRD #4540).
+	rec := post(strings.Replace(good, `"name"`, `"credential_mode":"operator_key","name"`, 1))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "acknowledge_recipient_trust must be true") {
+		t.Errorf("operator_key without the acknowledgment = %d %s, want 400 naming acknowledge_recipient_trust", rec.Code, rec.Body.String())
 	}
 	if n := countRows(t, s, `SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL`); n != before {
 		t.Fatalf("a refused create wrote a row: %d -> %d", before, n)
@@ -354,7 +359,7 @@ func TestSharedProviderAdminCreateRefusalsLiveDB(t *testing.T) {
 	if created.CredentialMode != "per_user_key" || created.Engine != "claude" || created.CurrentRevision != 1 || created.AttachedKeyCount != 0 {
 		t.Errorf("created = %+v", created)
 	}
-	rec := post(s.sharedBody(strings.ToUpper(name), "bearer"))
+	rec = post(s.sharedBody(strings.ToUpper(name), "bearer"))
 	if rec.Code != http.StatusConflict || providerReason(t, rec) != "provider_name_taken" {
 		t.Errorf("name collision = %d %s, want 409 provider_name_taken", rec.Code, rec.Body.String())
 	}

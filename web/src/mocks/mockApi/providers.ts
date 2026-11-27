@@ -6,6 +6,12 @@
 // server, the owner routes (PATCH, /endpoint, /retire, DELETE) answer 404 for them, and the
 // admin routes below see only them, with counts that add the demo user's own selection and
 // key to the seeded other users.
+//
+// Organization-funded definitions (PRD #4540, credential_mode "operator_key") live in a SEPARATE
+// store, never in `providers`: the user routes (list, owner routes, source selection) therefore
+// cannot see them, which is the server's rule (they are not the caller's providers, and the
+// owner routes answer 404). Only the admin routes below read it. The key is never kept, only
+// whether one is set, enabled, and its last Test result.
 
 import type {
   AdminSharedProvider,
@@ -15,7 +21,13 @@ import type {
   ProviderProbe,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { mockProviderAllowedBaseUrls, mockProviders, mockSharedProviderOtherUsers } from "../data";
+import {
+  mockOperatorProviders,
+  mockProviderAllowedBaseUrls,
+  mockProviders,
+  mockSharedProviderOtherUsers,
+  type MockOperatorProvider,
+} from "../data";
 import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 
 const SHARED_CAP = 50;
@@ -26,6 +38,9 @@ const otherUsers: Record<string, { selected: number; keys: number }> = Object.fr
 
 const featureOn = mockScenario() === "providers";
 let providers: ProviderDTO[] = featureOn ? mockProviders.map((p) => ({ ...p })) : [];
+let operators: MockOperatorProvider[] = featureOn
+  ? mockOperatorProviders.map((o) => ({ ...o, def: { ...o.def }, key: { ...o.key } }))
+  : [];
 let nextId = 1;
 // The user's selected Claude source (UserSettings.claude_provider_id); null = Anthropic.
 let claudeProviderId: string | null = null;
@@ -39,6 +54,11 @@ export function mockClaudeProviderId(): string | null {
 
 function fail(status: number, reason: string, message: string): never {
   throw new ApiError(status, message, { error: message, reason });
+}
+
+// failPlain answers like a server error that carries no reason code.
+function failPlain(status: number, message: string): never {
+  throw new ApiError(status, message, { error: message });
 }
 
 function find(id: string): ProviderDTO {
@@ -85,7 +105,46 @@ function adminView(p: ProviderDTO): AdminSharedProvider {
 
 function sharedNameTaken(name: string, exceptId?: string): boolean {
   const n = name.trim().toLowerCase();
-  return providers.some((p) => isShared(p) && p.id !== exceptId && p.name.toLowerCase() === n);
+  return (
+    providers.some((p) => isShared(p) && p.id !== exceptId && p.name.toLowerCase() === n) ||
+    operators.some((o) => o.def.id !== exceptId && o.def.name.toLowerCase() === n)
+  );
+}
+
+function findOperator(id: string): MockOperatorProvider | undefined {
+  return operators.find((o) => o.def.id === id);
+}
+
+// operatorFor is the organization-key routes' lookup: an unknown id is a 404, and a per-user
+// definition is a 409 provider_not_operator_key, like the server.
+function operatorFor(id: string): MockOperatorProvider {
+  const o = findOperator(id);
+  if (o) return o;
+  shared(id);
+  return fail(409, "provider_not_operator_key", "the definition is not organization-funded: recipients attach their own key to it");
+}
+
+function operatorView(o: MockOperatorProvider): AdminSharedProvider {
+  const { key, def } = o;
+  return {
+    ...def,
+    credential_mode: "operator_key",
+    selected_user_count: o.selectedUsers,
+    attached_key_count: 0,
+    operator_key: {
+      present: key.present,
+      enabled: key.present && key.enabled,
+      ...(key.set_at ? { set_at: key.set_at } : {}),
+      // The server's admin read hides the stored Test result of a retired definition.
+      ...(key.probe && !def.retired ? { probe: key.probe } : {}),
+    },
+  };
+}
+
+function updateOperator(id: string, fn: (o: MockOperatorProvider) => MockOperatorProvider): MockOperatorProvider {
+  const next = fn(operatorFor(id));
+  operators = operators.map((o) => (o.def.id === id ? next : o));
+  return next;
 }
 
 function live(id: string): ProviderDTO {
@@ -277,7 +336,7 @@ export const providersApi = {
   // ── Admin-shared definitions (PRD #4324) ───────────────────────────────────
   adminListSharedProviders: async () => {
     requireAdmin();
-    return delay({ providers: providers.filter(isShared).map(adminView) });
+    return delay({ providers: [...providers.filter(isShared).map(adminView), ...operators.map(operatorView)] });
   },
   adminCreateSharedProvider: async (input: AdminSharedProviderCreateInput) => {
     requireAdmin();
@@ -285,8 +344,31 @@ export const providersApi = {
     const engine = input.engine ?? "claude";
     validate(engine, input.auth_style, input.model_map);
     if (sharedNameTaken(input.name)) fail(409, "provider_name_taken", "a shared provider with that name already exists");
-    if (providers.filter(isShared).length >= SHARED_CAP) {
+    if (providers.filter(isShared).length + operators.length >= SHARED_CAP) {
       fail(409, "provider_limit_reached", "shared provider limit reached (50 definitions, retired ones included)");
+    }
+    if (input.credential_mode === "operator_key") {
+      if (engine !== "claude") fail(400, "invalid_provider", "an organization key is available for Claude only");
+      if (input.acknowledge_recipient_trust !== true) {
+        fail(400, "invalid_provider", "acknowledge_recipient_trust must be true for an organization-key definition");
+      }
+      const op: MockOperatorProvider = {
+        def: {
+          id: `prov-operator-mock-${nextId++}`,
+          name: input.name.trim(),
+          engine,
+          retired: false,
+          current_revision: 1,
+          protocol: "anthropic_messages",
+          base_url: input.base_url,
+          auth_style: input.auth_style,
+          model_map: input.model_map,
+        },
+        key: { present: false, enabled: false },
+        selectedUsers: 0,
+      };
+      operators = [...operators, op];
+      return delay({ provider: operatorView(op) });
     }
     const created: ProviderDTO = {
       id: `prov-shared-mock-${nextId++}`,
@@ -308,6 +390,26 @@ export const providersApi = {
   },
   adminPatchSharedProvider: async (id: string, body: { name?: string; model_map?: ProviderDTO["model_map"] }) => {
     requireAdmin();
+    const op = findOperator(id);
+    if (op) {
+      if (op.def.retired) fail(409, "provider_retired", "provider is retired");
+      if (body.model_map) validate(op.def.engine, op.def.auth_style, body.model_map);
+      if (body.name !== undefined && sharedNameTaken(body.name, id)) {
+        fail(409, "provider_name_taken", "a shared provider with that name already exists");
+      }
+      return delay({
+        provider: operatorView(updateOperator(id, (o) => ({
+          ...o,
+          def: {
+            ...o.def,
+            ...(body.name !== undefined ? { name: body.name.trim() } : {}),
+            ...(body.model_map ? { model_map: body.model_map, current_revision: o.def.current_revision + 1 } : {}),
+          },
+          // A new revision makes the stored Test evidence unknown.
+          key: body.model_map ? { ...o.key, probe: undefined } : o.key,
+        }))),
+      });
+    }
     const p = shared(id);
     if (p.retired) fail(409, "provider_retired", "provider is retired");
     if (body.model_map) validate(p.engine, p.auth_style, body.model_map);
@@ -321,11 +423,23 @@ export const providersApi = {
   },
   adminRetireSharedProvider: async (id: string) => {
     requireAdmin();
+    if (findOperator(id)) {
+      return delay({ provider: operatorView(updateOperator(id, (o) => ({ ...o, def: { ...o.def, retired: true } }))) });
+    }
     shared(id);
     return delay({ provider: adminView(update(id, { retired: true })) });
   },
   adminDeleteSharedProvider: async (id: string) => {
     requireAdmin();
+    const op = findOperator(id);
+    if (op) {
+      if (op.selectedUsers > 0) {
+        fail(409, "provider_in_use_as_source",
+          "the provider is selected as a source by at least one user; they must choose another source before it can be deleted");
+      }
+      operators = operators.filter((o) => o.def.id !== id);
+      return delay({ deleted: true, deleted_key_count: 0 });
+    }
     const view = adminView(shared(id));
     if (view.selected_user_count > 0) {
       fail(409, "provider_in_use_as_source",
@@ -334,5 +448,47 @@ export const providersApi = {
     providers = providers.filter((p) => p.id !== id);
     delete otherUsers[id];
     return delay({ deleted: true, deleted_key_count: view.attached_key_count });
+  },
+
+  // ── Organization key (PRD #4540) ────────────────────────────────────────────
+  // A new key makes the last Test result unknown (the key itself is dropped, never stored) and keeps
+  // the enablement; a retired definition still takes a key, like the server.
+  adminPutOperatorKey: async (id: string, key: string) => {
+    requireAdmin();
+    operatorFor(id);
+    if (key.trim() === "") fail(400, "invalid_provider", "key is required");
+    const next = updateOperator(id, (cur) => ({
+      ...cur,
+      key: { present: true, enabled: cur.key.present ? cur.key.enabled : true, set_at: new Date().toISOString() },
+    }));
+    return delay({ provider: operatorView(next) });
+  },
+  // A keyless enable/disable/delete is a bare 404; repeating the current state changes nothing, so it
+  // keeps the Test result.
+  adminSetOperatorKeyEnabled: async (id: string, enabled: boolean) => {
+    requireAdmin();
+    const o = operatorFor(id);
+    if (!o.key.present) failPlain(404, "the provider has no key");
+    if (o.key.enabled === enabled) return delay({ provider: operatorView(o) });
+    const next = updateOperator(id, (cur) => ({ ...cur, key: { ...cur.key, enabled, probe: undefined } }));
+    return delay({ provider: operatorView(next) });
+  },
+  adminDeleteOperatorKey: async (id: string) => {
+    requireAdmin();
+    if (!operatorFor(id).key.present) failPlain(404, "the provider has no key");
+    const next = updateOperator(id, (cur) => ({ ...cur, key: { present: false, enabled: false } }));
+    return delay({ provider: operatorView(next) });
+  },
+  // Test only looks at operator-mode definitions: a per-user one is a plain 404, as on the server.
+  adminTestOperatorKey: async (id: string) => {
+    requireAdmin();
+    const o = findOperator(id);
+    if (!o) return failPlain(404, "provider not found");
+    if (o.def.retired) fail(409, "provider_retired", "the provider is retired");
+    if (!o.key.present) failPlain(409, "the provider has no organization key; set one before testing");
+    if (!o.key.enabled) failPlain(409, "the organization key is disabled; enable it before testing");
+    const probe: ProviderProbe = { auth_result: "ok", tool_result: "passed", probed_at: new Date().toISOString() };
+    updateOperator(id, (cur) => ({ ...cur, key: { ...cur.key, probe } }));
+    return delay({ probe });
   },
 };

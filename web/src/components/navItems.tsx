@@ -29,6 +29,9 @@ export type NavDef = {
   label: string;
   to: string;
   icon: ReactNode;
+  // The sidebar motion key (sidebarMotion.tsx) when it differs from `key`: a module entry keeps
+  // its `module:<id>` key and plays its vocabulary icon's motion. The command menu ignores it.
+  motionKey?: string;
   // Rendered (and listed in the command menu) for admins only.
   adminOnly?: boolean;
   // Active only on an exact path match, so a parent is not lit by its children.
@@ -43,14 +46,13 @@ export type NavDef = {
   hint?: string;
 };
 
-export type NavGroupName = "Work" | "Factory" | "Modules";
-
 export type NavSection = {
   // A stable identity: AppShell keys the sidebar sections by it, so merging the runtime
   // module list in (a new "modules" section, extra items) never remounts a neighbour.
-  id: "leading" | "work" | "factory" | "modules" | "system";
-  // null: no label (the leading Overview block and the bottom cluster).
-  group: NavGroupName | null;
+  id: "leading" | "work" | "factory" | "modules" | `modules:${string}` | "system";
+  // null: no label (the leading Overview block and the bottom cluster). Module sections
+  // may carry an operator-chosen heading (manifest `navSection`).
+  group: string | null;
   // The leading block renders without a NavGroup rule above it.
   leading?: true;
   items: NavDef[];
@@ -112,7 +114,7 @@ export const NAV_SECTIONS: NavSection[] = [
 
 export type VisibleNavItem = NavDef & {
   // The section's group name, null for the unlabelled sections.
-  group: NavGroupName | null;
+  group: string | null;
   // The right-hand hint the command menu shows: the item's own hint, else the group.
   hint: string;
 };

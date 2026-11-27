@@ -1,0 +1,44 @@
+# Fixture for scripts/assert-web-modules-render.sh: valid navSection values (sidebar headings, navGroup modules only): "Tools", " Tools " (trimmed to Tools), exactly 24 non-ASCII characters, a value padded with NBSP and ideographic spaces whose raw length is over 24 but trims to 5, and an entry without navSection
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: plain
+      version: "1.0.0"
+      page: Page
+      label: Plain
+      icon: package
+      navGroup: modules
+      navSection: Tools
+      upstream: plain.tools.svc.cluster.local:8080
+    - id: padded
+      version: "1.0.0"
+      page: Page
+      label: Padded
+      icon: package
+      navGroup: modules
+      navSection: " Tools "
+      upstream: padded.tools.svc.cluster.local:8080
+    - id: wide
+      version: "1.0.0"
+      page: Page
+      label: Wide
+      icon: package
+      navGroup: modules
+      navSection: "éééééééééééééééééééééééé"
+      upstream: wide.tools.svc.cluster.local:8080
+    - id: unicode-pad
+      version: "1.0.0"
+      page: Page
+      label: Unicode pad
+      icon: package
+      navGroup: modules
+      navSection: "　　　　　　　　　    Admin    　　　　　　　　　"
+      upstream: unicode-pad.tools.svc.cluster.local:8080
+    - id: none
+      version: "1.0.0"
+      page: Page
+      label: None
+      icon: package
+      navGroup: modules
+      upstream: none.tools.svc.cluster.local:8080

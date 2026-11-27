@@ -257,7 +257,15 @@ only) is active.
   result, unparseable run list) refuses and never downgrades to owner-only: merge exit 4,
   land-prep exit 4, takeover/watch-pr unknown.
 - **Unchanged:** a repo not connected under the lander's own account still skips the check.
-  `CI_FIX_RECENT` stays owner-scoped. `--no-rework-check` keeps its meaning.
+  `CI_FIX_RECENT` stays owner-scoped and keeps printing until its 24-hour window expires.
+  `--no-rework-check` keeps its meaning.
+- **Held PRs:** while a PR you hold waits (for a CI slot, or with a reviewed local head not
+  pushed), keep `S/watch-pr.sh OWNER/REPO PR --writers-only 300 288` in the background. A red
+  head can start a `ci_fix` at any time, and the readiness watch stops on red before it sees
+  one. It ignores CI and review: exit 10 is an active `ci_fix`, 4 an active `mr_rework`, 14 a
+  head that moved from the first head read (someone pushed; re-snapshot), 9 an unreadable
+  lookup. A `ci_fix` you cancel can leave a custody hold; handle it with `uzi-watcher`'s
+  recovery procedure, never by discarding on sight.
 - **Audit:** each read writes one server audit line, so `watch-pr.sh` polling writes one per poll.
 - **Race:** a writer may start after the read. `merge.sh` repeats the read right before
   `gh pr merge`, and `--match-head-commit` refuses the merge if anything was pushed since.

@@ -287,7 +287,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 			for _, br := range m.board.runs {
 				if br.ID == run.RunID {
 					if br.IssueIID != nil {
-						id = fmt.Sprintf("#%d", *br.IssueIID)
+						id = issueRef(*br.IssueIID, m.renderer.Plain(br.IssueKey, tuiIssueKeyCells))
 						title = m.renderer.Plain(runTitle(br.RunDTO), width)
 					}
 					engine = m.renderer.Plain(br.Harness, width)
@@ -365,7 +365,7 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 		if m.board.runsAdmin == m.board.admin {
 			for _, br := range m.board.runs {
 				if br.ID == d.RunID && br.IssueIID != nil {
-					id = fmt.Sprintf("#%d", *br.IssueIID)
+					id = issueRef(*br.IssueIID, m.renderer.Plain(br.IssueKey, tuiIssueKeyCells))
 					break
 				}
 			}

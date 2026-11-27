@@ -197,6 +197,25 @@ describe("navigation entries", () => {
     expect(document.body.textContent).toContain("Modules");
   }, 30000);
 
+  it("groups a module with a navSection under that heading, others under Modules", async () => {
+    serveList([
+      { ...base, id: "tmod", label: "Tool Mod", navGroup: "modules", navSection: "Tools" },
+      { ...base, id: "mmod", label: "Own Mod", navGroup: "modules" },
+    ]);
+    mount("/dashboard");
+    await screen.findAllByRole("link", { name: "Tool Mod" }, { timeout: 5000 });
+    const headings = Array.from(document.querySelectorAll("nav p")).map((p) => p.textContent);
+    expect(headings).toContain("Tools");
+    expect(headings).toContain("Modules");
+    const labels = navLinkLabels();
+    const at = (l: string) => indexOfLabel(labels, l);
+    expect(at("Tool Mod")).toBeLessThan(at("Own Mod"));
+    const toolsHeading = Array.from(document.querySelectorAll("nav p")).find((p) => p.textContent === "Tools")!;
+    const group = toolsHeading.parentElement!;
+    expect(within(group).getByRole("link", { name: "Tool Mod" })).toBeTruthy();
+    expect(within(group).queryByRole("link", { name: "Own Mod" })).toBeNull();
+  }, 30000);
+
   it("hide admin-only entries from non-admins, and an all-hidden Modules section drops its heading", async () => {
     serveList([{ ...base, id: "admmod", label: "Staff Mod", navGroup: "modules", adminOnly: true }]);
     await mockApi.login("mira@uzi.local", "x");

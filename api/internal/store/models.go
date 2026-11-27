@@ -783,6 +783,27 @@ type ModelProviderKeyTestResult struct {
 	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
 }
 
+type ModelProviderOperatorKey struct {
+	ID         uuid.UUID          `json:"id"`
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Ciphertext []byte             `json:"ciphertext"`
+	KeyRev     int64              `json:"key_rev"`
+	DisabledAt pgtype.Timestamptz `json:"disabled_at"`
+	SetBy      uuid.UUID          `json:"set_by"`
+	SetAt      pgtype.Timestamptz `json:"set_at"`
+}
+
+type ModelProviderOperatorKeyTestResult struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	KeyID      uuid.UUID          `json:"key_id"`
+	KeyRev     int64              `json:"key_rev"`
+	AuthResult string             `json:"auth_result"`
+	ToolResult pgtype.Text        `json:"tool_result"`
+	ProbedAt   pgtype.Timestamptz `json:"probed_at"`
+	ProbedBy   uuid.UUID          `json:"probed_by"`
+}
+
 type ModelProviderProbeResult struct {
 	ProviderID uuid.UUID          `json:"provider_id"`
 	Revision   int32              `json:"revision"`
@@ -1953,6 +1974,12 @@ type RunUsage struct {
 	CredentialEpochOrdinal pgtype.Int4        `json:"credential_epoch_ordinal"`
 }
 
+type RunUsageFoldState struct {
+	RunID    uuid.UUID          `json:"run_id"`
+	Stale    bool               `json:"stale"`
+	FoldedAt pgtype.Timestamptz `json:"folded_at"`
+}
+
 type RunUsageLeg struct {
 	RunID             uuid.UUID          `json:"run_id"`
 	LegID             uuid.UUID          `json:"leg_id"`
@@ -1987,6 +2014,17 @@ type RunUsageMessage struct {
 	Conflict                   bool               `json:"conflict"`
 	ClaimGeneration            pgtype.Int8        `json:"claim_generation"`
 	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunUsageModelFold struct {
+	RunID               uuid.UUID      `json:"run_id"`
+	Model               string         `json:"model"`
+	InputTokens         int64          `json:"input_tokens"`
+	CacheReadTokens     int64          `json:"cache_read_tokens"`
+	CacheCreationTokens int64          `json:"cache_creation_tokens"`
+	OutputTokens        int64          `json:"output_tokens"`
+	CostUsd             pgtype.Numeric `json:"cost_usd"`
+	CostStatus          string         `json:"cost_status"`
 }
 
 type RunUsageModelTotal struct {

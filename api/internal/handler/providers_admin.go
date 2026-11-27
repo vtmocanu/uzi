@@ -38,14 +38,23 @@ var (
 	errSharedProviderInUse = errors.New("shared provider is selected as a source")
 )
 
-// sharedProviderMode is the credential_mode of every admin-shared definition (model_providers_credential_mode_check).
-const sharedProviderMode = "per_user_key"
+// The two credential modes of a shared definition (model_providers_credential_mode_check): recipients
+// attach their own key, or the organization holds one key for the definition (PRD #4540).
+const (
+	sharedProviderModeUserKey     = "per_user_key"
+	sharedProviderModeOperatorKey = "operator_key"
+)
+
+// errNotOperatorProvider: an organization-key route addressed a definition whose mode is per_user_key.
+var errNotOperatorProvider = errors.New("the definition is not organization-funded")
+
+const reasonProviderNotOperatorKey = "provider_not_operator_key"
 
 // sharedProviderAdminRow is the shape of GetSharedModelProviderAdminRow and ListSharedModelProvidersAdminRow.
 type sharedProviderAdminRow = store.GetSharedModelProviderAdminRow
 
 func adminSharedProviderDTO(row sharedProviderAdminRow) apitypes.AdminSharedProviderDTO {
-	return apitypes.AdminSharedProviderDTO{
+	dto := apitypes.AdminSharedProviderDTO{
 		ID:                row.ID.String(),
 		Name:              row.Name,
 		Engine:            row.Engine,
@@ -55,10 +64,27 @@ func adminSharedProviderDTO(row sharedProviderAdminRow) apitypes.AdminSharedProv
 		BaseURL:           row.BaseUrl,
 		AuthStyle:         row.AuthStyle,
 		ModelMap:          modelMapDTO(row.ModelMap),
-		CredentialMode:    sharedProviderMode,
+		CredentialMode:    row.CredentialMode.String,
 		SelectedUserCount: row.SelectedUserCount,
 		AttachedKeyCount:  row.AttachedKeyCount,
 	}
+	if row.CredentialMode.String == sharedProviderModeOperatorKey {
+		key := &apitypes.AdminOperatorKeyDTO{
+			Present: row.OperatorKeyPresent,
+			Enabled: row.OperatorKeyPresent && !row.OperatorKeyDisabledAt.Valid,
+		}
+		if row.OperatorKeySetAt.Valid {
+			setAt := row.OperatorKeySetAt.Time
+			key.SetAt = &setAt
+		}
+		if row.AuthResult.Valid {
+			key.Probe = &apitypes.ProviderProbeDTO{
+				AuthResult: row.AuthResult.String, ToolResult: row.ToolResult.String, ProbedAt: row.ProbedAt.Time,
+			}
+		}
+		dto.OperatorKey = key
+	}
+	return dto
 }
 
 // withAdminTx runs fn in one READ COMMITTED transaction with no advisory or per-user lock of its own.
@@ -105,6 +131,9 @@ func writeSharedProviderError(w http.ResponseWriter, err error) bool {
 		httpx.ErrorReason(w, http.StatusConflict,
 			"the provider is selected as a source by at least one user; they must choose another source before it can be deleted",
 			reasonProviderInUseAsSource)
+	case errors.Is(err, errNotOperatorProvider):
+		httpx.ErrorReason(w, http.StatusConflict,
+			"the definition is not organization-funded: recipients attach their own key to it", reasonProviderNotOperatorKey)
 	case isPGUnique(err, sharedProviderNameIndex):
 		httpx.ErrorReason(w, http.StatusConflict, "a shared provider with that name already exists", reasonProviderNameTaken)
 	default:
@@ -154,19 +183,24 @@ func (h *Handler) AdminGetSharedProvider(w http.ResponseWriter, r *http.Request)
 
 // AdminCreateSharedProvider is POST /api/admin/providers: a keyless shared definition with revision 1.
 // The engine is claude (the default when omitted) or codex; any other engine is a 400 and writes no
-// row. An omitted protocol defaults per engine (anthropic_messages, openai_responses).
+// row. An omitted protocol defaults per engine (anthropic_messages, openai_responses). The credential
+// mode is per_user_key (the default) or operator_key (PRD #4540): an organization-funded definition is
+// Claude only and needs acknowledge_recipient_trust, the admin's statement that they accept the terms
+// of funding recipients' runs from one organization key. Its key is set afterwards, on the key route.
 func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Request) {
 	actor, ok := egressProfileAdmin(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		Name      string             `json:"name"`
-		Engine    string             `json:"engine"`
-		Protocol  string             `json:"protocol"`
-		BaseURL   string             `json:"base_url"`
-		AuthStyle string             `json:"auth_style"`
-		ModelMap  providers.ModelMap `json:"model_map"`
+		Name                      string             `json:"name"`
+		Engine                    string             `json:"engine"`
+		Protocol                  string             `json:"protocol"`
+		BaseURL                   string             `json:"base_url"`
+		AuthStyle                 string             `json:"auth_style"`
+		ModelMap                  providers.ModelMap `json:"model_map"`
+		CredentialMode            string             `json:"credential_mode"`
+		AcknowledgeRecipientTrust bool               `json:"acknowledge_recipient_trust"`
 	}
 	if !decodeProviderBody(w, r, &req, providerKeyFieldRefusals) {
 		return
@@ -181,6 +215,24 @@ func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Reque
 	}
 	if req.Engine != providers.EngineClaude && req.Engine != providers.EngineCodex {
 		httpx.Error(w, http.StatusBadRequest, "a shared provider supports the claude and codex engines only")
+		return
+	}
+	if req.CredentialMode == "" {
+		req.CredentialMode = sharedProviderModeUserKey
+	}
+	switch req.CredentialMode {
+	case sharedProviderModeUserKey:
+	case sharedProviderModeOperatorKey:
+		if req.Engine != providers.EngineClaude {
+			httpx.Error(w, http.StatusBadRequest, "an organization key supports the claude engine only")
+			return
+		}
+		if !req.AcknowledgeRecipientTrust {
+			httpx.Error(w, http.StatusBadRequest, operatorTrustAckMessage)
+			return
+		}
+	default:
+		httpx.Error(w, http.StatusBadRequest, "credential_mode must be per_user_key or operator_key")
 		return
 	}
 	if req.Protocol == "" {
@@ -215,7 +267,12 @@ func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Reque
 		if n >= maxSharedProviders {
 			return errSharedProviderCap
 		}
-		p, err := q.InsertSharedModelProvider(r.Context(), store.InsertSharedModelProviderParams{Name: name, Engine: req.Engine})
+		var p store.ModelProvider
+		if req.CredentialMode == sharedProviderModeOperatorKey {
+			p, err = q.InsertSharedOperatorModelProvider(r.Context(), name)
+		} else {
+			p, err = q.InsertSharedModelProvider(r.Context(), store.InsertSharedModelProviderParams{Name: name, Engine: req.Engine})
+		}
 		if err != nil {
 			return err
 		}
@@ -235,7 +292,8 @@ func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Reque
 		internalProviderError(w, "create shared model provider", err)
 		return
 	}
-	auditProvider("admin_create", actor.ID, row.ID)
+	auditProvider("admin_create", actor.ID, row.ID,
+		"credential_mode", req.CredentialMode, "acknowledged_recipient_trust", req.AcknowledgeRecipientTrust)
 	httpx.JSON(w, http.StatusCreated, map[string]any{"provider": adminSharedProviderDTO(row)})
 }
 
@@ -260,6 +318,7 @@ func (h *Handler) AdminPatchSharedProvider(w http.ResponseWriter, r *http.Reques
 		{"auth_style", "base_url and auth_style are fixed when a shared provider is created; create a new definition instead"},
 		{"engine", "engine cannot be changed"},
 		{"protocol", "protocol cannot be changed"},
+		{"credential_mode", "credential mode is fixed at creation; create a new definition instead"},
 	}
 	if !decodeProviderBody(w, r, &req, providerKeyFieldRefusals, endpointRefusals) {
 		return
@@ -408,8 +467,9 @@ func (h *Handler) AdminRetireSharedProvider(w http.ResponseWriter, r *http.Reque
 // provider_in_use_as_source) while any user has the definition selected; otherwise it deletes every
 // user's attached key with it (their Test evidence cascades) and answers with the exact number of keys
 // removed. Order inside the one transaction: definition FOR UPDATE first, then the selection count,
-// then the keys, then the definition, so a key mutation holding KEY SHARE on the definition cannot cycle
-// with the key delete.
+// then the organization key's custody row (a presence read, FOR UPDATE, no ciphertext), then the keys,
+// then the definition, so a key mutation holding KEY SHARE on the definition cannot cycle with the key
+// delete and the definition is always locked before custody.
 func (h *Handler) AdminDeleteSharedProvider(w http.ResponseWriter, r *http.Request) {
 	actor, ok := egressProfileAdmin(w, r)
 	if !ok {
@@ -420,6 +480,7 @@ func (h *Handler) AdminDeleteSharedProvider(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var deletedKeys int
+	var operatorKeyDeleted bool
 	err := h.withAdminTx(r.Context(), func(q *store.Queries) error {
 		if _, err := q.LockSharedModelProviderForDelete(r.Context(), id); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -433,6 +494,15 @@ func (h *Handler) AdminDeleteSharedProvider(w http.ResponseWriter, r *http.Reque
 		}
 		if selected > 0 {
 			return errSharedProviderInUse
+		}
+		// A presence read of the organization key's custody row (ciphertext-free): the definition FOR
+		// UPDATE above already excludes every key writer, and the definition is always locked before
+		// custody, the key-write order. No row means a per-user-key or keyless definition. The row,
+		// and its Test evidence, go with the definition below (ON DELETE CASCADE).
+		if _, err := q.LockOperatorProviderKeyForWrite(r.Context(), id); err == nil {
+			operatorKeyDeleted = true
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
 		}
 		keys, err := q.DeleteSharedProviderKeys(r.Context(), id)
 		if err != nil {
@@ -455,6 +525,6 @@ func (h *Handler) AdminDeleteSharedProvider(w http.ResponseWriter, r *http.Reque
 		internalProviderError(w, "delete shared model provider", err)
 		return
 	}
-	auditProvider("admin_delete", actor.ID, id, "deleted_key_count", deletedKeys)
+	auditProvider("admin_delete", actor.ID, id, "deleted_key_count", deletedKeys, "operator_key_deleted", operatorKeyDeleted)
 	httpx.JSON(w, http.StatusOK, map[string]any{"deleted": true, "deleted_key_count": deletedKeys})
 }

@@ -24,6 +24,7 @@ export function SweepLabelWarn({
   repoPath,
   labels,
   className,
+  linked = false,
   // Called after a successful ensure, so a parent can refresh any dependent view.
   onEnsured,
   onCheckStateChange,
@@ -32,6 +33,10 @@ export function SweepLabelWarn({
   repoPath?: string;
   labels: string[];
   className?: string;
+  // The repo is linked to an issue tracker (PRD 4173 M6): its labels are not forge labels
+  // and the API refuses to create them (409), so nothing is checked or offered and the
+  // warning says why instead.
+  linked?: boolean;
   onEnsured?: (ensured: string[]) => void;
   // "checking" while this repo's label check is pending (including the debounce window),
   // "done" once the current check settled, whatever its result. A check superseded by a
@@ -55,7 +60,7 @@ export function SweepLabelWarn({
   // the check nor reports into a stale closure.
   const reportRef = useRef(onCheckStateChange);
   reportRef.current = onCheckStateChange;
-  const hasCheck = !!repoId && selector.length > 0;
+  const hasCheck = !!repoId && selector.length > 0 && !linked;
 
   // Report "checking" from a layout effect, which React runs before the browser paints
   // and before the debounced check below is scheduled. No test pins that timing; the
@@ -63,14 +68,14 @@ export function SweepLabelWarn({
   // itself.
   useLayoutEffect(() => {
     reportRef.current?.(hasCheck ? "checking" : "done");
-  }, [repoId, selectorKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [repoId, selectorKey, linked]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     window.clearTimeout(debounceRef.current);
     setError("");
     // A new selector/repo re-checks from scratch, so a prior confirmation no longer applies.
     setCreated([]);
-    if (!repoId || selector.length === 0) {
+    if (!hasCheck) {
       setMissing([]);
       return;
     }
@@ -95,9 +100,17 @@ export function SweepLabelWarn({
       window.clearTimeout(debounceRef.current);
     };
     // selectorKey captures the label set by value; repoId is the other input.
-  }, [repoId, selectorKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [repoId, selectorKey, linked]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const on = repoPath ? ` on ${repoPath}` : "";
+
+  if (linked && selector.length > 0) {
+    return (
+      <p className={cx("text-[12.5px] text-muted", className)} role="status">
+        Labels are not created on a repo linked to an issue tracker.
+      </p>
+    );
+  }
 
   if (missing.length === 0) {
     // Not warning: show the brief created-confirmation if a create just landed, else nothing.

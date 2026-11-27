@@ -67,8 +67,8 @@ func TestAnalyticsSpendStatementsDoNotDrift(t *testing.T) {
 	norm := func(block, drop string) string {
 		var out []string
 		for i, line := range strings.Split(block, "\n") {
-			if i == 0 || strings.HasSuffix(line, drop) {
-				continue // the "-- name:" line, or a line only the other statement has
+			if i == 0 || strings.HasSuffix(line, drop) || strings.HasPrefix(strings.TrimSpace(line), drop+":") {
+				continue // the "-- name:" line, a line only the other statement has, or a comment only it carries
 			}
 			out = append(out, strings.TrimRight(line, " "))
 		}
@@ -93,6 +93,9 @@ func TestAnalyticsSpendStatementsDoNotDrift(t *testing.T) {
 	tagged := func(block string) (ownerOnly, allOnly []string) {
 		for _, line := range strings.Split(block, "\n") {
 			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "--") {
+				continue // a comment-only line (prefixed "-- all-only:") is not a predicate
+			}
 			if strings.Contains(line, "-- owner-only") {
 				ownerOnly = append(ownerOnly, line)
 			}
@@ -108,7 +111,22 @@ func TestAnalyticsSpendStatementsDoNotDrift(t *testing.T) {
 		"AND r.user_id = @user_id::uuid  -- owner-only",
 		"AND w.user_id = @user_id::uuid  -- owner-only",
 	}
-	wantAllOnly := []string{"true AS repo_shown,  -- all-only"}
+	// Issue #4700 M3: the stored-fold branch of model_fold is the all-scope statement's only
+	// other difference (the owner statement never reads folds).
+	wantAllOnly := []string{
+		"true AS repo_shown,  -- all-only",
+		"AND NOT (c.status IN ('completed', 'failed', 'cancelled') AND EXISTS (SELECT 1 FROM run_usage_fold_state fs WHERE fs.run_id = c.id AND NOT fs.stale))  -- all-only",
+		"UNION ALL  -- all-only",
+		"SELECT c.id, mm.model, mm.input_tokens, mm.cache_read_tokens, mm.cache_creation_tokens,  -- all-only",
+		"mm.output_tokens, mm.cost_usd, mm.cost_status  -- all-only",
+		"FROM (  -- all-only",
+		"SELECT c.id FROM cohort c  -- all-only",
+		"WHERE c.kind <> 'chat' AND c.status IN ('completed', 'failed', 'cancelled')  -- all-only",
+		"INTERSECT  -- all-only",
+		"SELECT fs.run_id FROM run_usage_fold_state fs WHERE NOT fs.stale  -- all-only",
+		") c  -- all-only",
+		"LEFT JOIN run_usage_model_folds mm ON mm.run_id = c.id  -- all-only",
+	}
 	gotOO, gotAO := tagged(owner)
 	if !reflect.DeepEqual(gotOO, wantOwnerOnly) || len(gotAO) != 0 {
 		t.Errorf("owner statement tagged lines:\n owner-only %q\n all-only %q\nwant owner-only %q and no all-only", gotOO, gotAO, wantOwnerOnly)

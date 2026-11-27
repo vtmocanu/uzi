@@ -46,7 +46,7 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }
 
 // chatListDTO is one conversation in the Chat page's list: the display + activity
@@ -175,7 +175,7 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }
 
 // startChatRunRequest is the body of the chat start-run card's Start click (PRD #191
@@ -224,7 +224,7 @@ func (h *Handler) StartChatRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }
 
 // cancelChatRunRequest is the body of the chat cancel card's Cancel click (PRD #322):
@@ -329,9 +329,11 @@ func (h *Handler) SteerChatRun(w http.ResponseWriter, r *http.Request) {
 
 // createdIssueDTO is the confirm response: the real forge issue the click created.
 type createdIssueDTO struct {
-	IID    int64  `json:"iid"`
-	WebURL string `json:"web_url"`
-	Title  string `json:"title"`
+	IID int64 `json:"iid"`
+	// IssueKey is the issue tracker key of IID on a linked repo, omitted otherwise (PRD #4173 M6).
+	IssueKey string `json:"issue_key,omitempty"`
+	WebURL   string `json:"web_url"`
+	Title    string `json:"title"`
 }
 
 // ConfirmProposal executes a proposed issue on the forge (Decision 8): the ONLY
@@ -368,7 +370,7 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"issue": createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
+		"issue": createdIssueDTO{IID: created.IID, IssueKey: created.IssueKey, WebURL: created.WebURL, Title: created.Title},
 	})
 }
 

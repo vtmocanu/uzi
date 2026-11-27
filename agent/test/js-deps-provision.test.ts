@@ -52,7 +52,7 @@ describe("harness-neutral JS dependency provisioning", () => {
 
   // Issue #3382: asserted at the installer launch seam (the env the install receives).
   for (const [label, settings, expected] of [
-    ["set", { buildParallelism: 2, maxProcs: 3 }, { GOFLAGS: "-p=2", GOMAXPROCS: "3" }],
+    ["set", { buildParallelism: 2, maxProcs: 3, memLimit: "6GiB" }, { GOFLAGS: "-p=2", GOMAXPROCS: "3", GOMEMLIMIT: "6GiB" }],
     ["unset", {}, {}],
   ] as const) {
     it(`issue #3382: the install env carries the configured Go concurrency (${label}) next to a provisioned toolEnv`, async () => {
@@ -73,7 +73,9 @@ describe("harness-neutral JS dependency provisioning", () => {
       assert.equal(seen.PATH, "/fixture/tools/bin");
       assert.equal(seen.GOFLAGS, (expected as { GOFLAGS?: string }).GOFLAGS);
       assert.equal(seen.GOMAXPROCS, (expected as { GOMAXPROCS?: string }).GOMAXPROCS);
+      assert.equal(seen.GOMEMLIMIT, (expected as { GOMEMLIMIT?: string }).GOMEMLIMIT);
       if (label === "unset") {
+        assert.equal(Object.hasOwn(seen, "GOMEMLIMIT"), false);
         assert.equal(Object.hasOwn(seen, "GOFLAGS"), false);
         assert.equal(Object.hasOwn(seen, "GOMAXPROCS"), false);
       }

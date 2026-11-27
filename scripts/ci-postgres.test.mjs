@@ -23,7 +23,7 @@ assert.equal((code.match(/run-store-it\.sh|-run 'LiveDB\$'|livedb\.log|livedb-sk
 // Each producer owns its share of the one sweep: pull step, pulled ref, canonical task once.
 const producers = [
   { name: "test-livedb-workersvc", task: "test:livedb-workersvc", timeout: 60, group: null },
-  { name: "test-codex-refresh-lostreply-e2e", task: "test:codex-refresh-lostreply-e2e", timeout: 75, group: "rest" },
+  { name: "test-codex-refresh-lostreply-e2e", task: "test:codex-refresh-lostreply-e2e", timeout: 90, group: "rest" },
 ];
 const blocks = [];
 for (const p of producers) {

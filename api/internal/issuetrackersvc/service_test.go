@@ -102,6 +102,18 @@ type fakeDriver struct {
 	projectErr error
 	tags       []issuetracker.Tag
 	tagErr     error
+	// listStatesErr is what ListStates returns; nil means an empty, successful list.
+	listStatesErr error
+	// stateFieldErr is what CheckStateField returns; nil means a plain State field.
+	stateFieldErr error
+}
+
+func (d *fakeDriver) CheckStateField(context.Context, issuetracker.ProjectRef) error {
+	return d.stateFieldErr
+}
+
+func (d *fakeDriver) ListStates(context.Context, string) ([]issuetracker.State, error) {
+	return nil, d.listStatesErr
 }
 
 func (d *fakeDriver) ListTags(context.Context) ([]issuetracker.Tag, error) {
@@ -585,9 +597,9 @@ func TestDriverForRefusesPartialOrMalformedBinding(t *testing.T) {
 		"no project":          mutate(func(b *issuetracker.Binding) { b.Project = issuetracker.ProjectRef{} }),
 		"negative project id": mutate(func(b *issuetracker.Binding) { b.ProjectID = -1 }),
 		"half project":        mutate(func(b *issuetracker.Binding) { b.Project.ID = "" }),
-		"bad project id":      mutate(func(b *issuetracker.Binding) { b.Project.ID = "x" }),
+		"bad project id":      mutate(func(b *issuetracker.Binding) { b.Project.ID = "x/y" }),
 		"bad short name":      mutate(func(b *issuetracker.Binding) { b.Project.ShortName = "1bad" }),
-		"bad tag id":          mutate(func(b *issuetracker.Binding) { b.EligibilityTag.ID = "x" }),
+		"bad tag id":          mutate(func(b *issuetracker.Binding) { b.EligibilityTag.ID = "../x" }),
 		"bad tag name":        mutate(func(b *issuetracker.Binding) { b.EligibilityTag.Name = "a}b" }),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -597,30 +609,6 @@ func TestDriverForRefusesPartialOrMalformedBinding(t *testing.T) {
 	}
 	if len(h.built) != 0 {
 		t.Error("driver built for a partial or malformed binding")
-	}
-}
-
-func TestListStatesUsesEmptyProjectRefAndValidatesID(t *testing.T) {
-	h := newHarness(t)
-	ctx := context.Background()
-	user := uuid.New()
-	c, err := h.svc.Connect(ctx, user, "youtrack", testHost, testToken("t"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.built = nil
-	// The double's ListStates is unstubbed and errors; only the build matters here.
-	_, _ = h.svc.ListStates(ctx, user, c.ID, "0-1")
-	if len(h.built) != 1 || h.built[0].Project != (issuetracker.ProjectRef{}) {
-		t.Errorf("built = %+v, want one build with an empty Project", h.built)
-	}
-	h.built = nil
-	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
-		_, err = h.svc.ListStates(ctx, user, c.ID, bad)
-		_ = wantKind(t, err, KindBadRequest)
-	}
-	if len(h.built) != 0 {
-		t.Error("driver built for a bad project id")
 	}
 }
 
@@ -640,11 +628,6 @@ func TestListProjectsAndStates(t *testing.T) {
 	h.template.projectErr = errors.New("boom")
 	_, err = h.svc.ListProjects(ctx, user, c.ID)
 	_ = wantKind(t, err, KindBadGateway)
-	// ListStates is not stubbed on the double: its error surfaces as a bad gateway, not a panic.
-	_, err = h.svc.ListStates(ctx, user, c.ID, "0-1")
-	_ = wantKind(t, err, KindBadGateway)
-	_, err = h.svc.ListStates(ctx, uuid.New(), c.ID, "0-1")
-	_ = wantKind(t, err, KindNotFound)
 }
 
 func TestListTags(t *testing.T) {

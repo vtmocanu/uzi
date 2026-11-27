@@ -226,7 +226,7 @@ export interface Config {
    * only — the chat lane has its own, distinct ceiling (chatSessions above).
    */
   maxConcurrentRuns: number;
-  /** Optional WORKER_GO_BUILD_PARALLELISM / WORKER_GO_MAXPROCS (issue #3382); `{}` when unset. */
+  /** Optional WORKER_GO_BUILD_PARALLELISM / WORKER_GO_MAXPROCS / WORKER_GO_MEMLIMIT (issue #3382); `{}` when unset. */
   goConcurrency: GoConcurrency;
   /** Explicit opt-in; limit-relative thresholds are validated by the memory guard. */
   memoryGuard?: { enabled: false } | {

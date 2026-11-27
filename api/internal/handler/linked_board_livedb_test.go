@@ -164,6 +164,80 @@ func TestLinkedBoardMoveToAnUnmappedColumnIsRefusedLiveDB(t *testing.T) {
 	}
 }
 
+// A drag on a repo whose project's State field a state machine runs (set up after the
+// mapping was saved) is a 409 with the state-machine reason; the YouTrack fake sees no write
+// and the cache is unchanged so the card snaps back.
+// youTrackStateMachineReason is the state-machine refusal exactly as it read before PRD
+// #4765 A1 moved its remedy into the driver's error: the real YouTrack driver must still
+// produce it word for word.
+const youTrackStateMachineReason = "project " + youtracktest.ProjectShortName +
+	" uses a state-machine workflow on its State field; uzi needs a plain State field. " +
+	"Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack."
+
+func TestLinkedBoardDragOnAStateMachineProjectIs409LiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	f.boardMapping(t)
+	f.srv.SetStateMachine(youtracktest.ProjectID, true)
+	f.srv.ResetRequests()
+
+	code, body := f.move("In Progress")
+	if code != http.StatusConflict || !strings.Contains(body, youTrackStateMachineReason) {
+		t.Fatalf("move = %d %s, want 409 with the state-machine reason", code, body)
+	}
+	f.assertNoYouTrackWrites(t)
+	f.assertCache(t, "opened", "")
+	if col, _ := f.boardCard(t); col == "In Progress" {
+		t.Fatalf("the card moved to %q, want it to snap back", col)
+	}
+}
+
+// A drag or a close on a repo whose issue's State field uzi cannot read as a plain one (set up
+// after the mapping was saved) is a 409 naming the project and the issue; the YouTrack fake
+// sees no write and the cache is unchanged so the card snaps back.
+func TestLinkedBoardDragOnAnUnreadableStateFieldIs409LiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	f.boardMapping(t)
+	f.srv.SeedStateFieldShape(f.issueN, youtracktest.StateFieldAbsent)
+	before := f.srv.IssueState(f.issueN)
+	f.srv.ResetRequests()
+
+	code, body := f.move("In Progress")
+	key := wantKey(f.issueN)
+	if code != http.StatusConflict || !strings.Contains(body, "could not read project") || !strings.Contains(body, key) {
+		t.Fatalf("move = %d %s, want 409 naming the project and %s", code, body, key)
+	}
+	f.assertNoYouTrackWrites(t)
+	if got := f.srv.IssueState(f.issueN); got != before {
+		t.Fatalf("YouTrack State = %q, want %q unchanged", got, before)
+	}
+	f.assertCache(t, "opened", "")
+	if col, _ := f.boardCard(t); col == "In Progress" {
+		t.Fatalf("the card moved to %q, want it to snap back", col)
+	}
+}
+
+func TestLinkedBoardCloseOnAnUnreadableStateFieldIs409LiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	f.boardMapping(t)
+	f.srv.SeedStateFieldShape(f.issueN, youtracktest.StateFieldUntyped)
+	before := f.srv.IssueState(f.issueN)
+	f.srv.ResetRequests()
+
+	code, body := f.move("closed")
+	key := wantKey(f.issueN)
+	if code != http.StatusConflict || !strings.Contains(body, "could not read project") || !strings.Contains(body, key) {
+		t.Fatalf("close = %d %s, want 409 naming the project and %s", code, body, key)
+	}
+	f.assertNoYouTrackWrites(t)
+	if got := f.srv.IssueState(f.issueN); got != before {
+		t.Fatalf("YouTrack State = %q, want %q unchanged", got, before)
+	}
+	f.assertCache(t, "opened", "")
+	if _, closed := f.boardCard(t); closed {
+		t.Fatal("the board must not show the card closed")
+	}
+}
+
 // A card a person resolved in YouTrack while the cache still shows it open is not moved by a
 // drag: 409, no State write, the cache unchanged so the card snaps back.
 func TestLinkedBoardDragOfAnIssueResolvedInYouTrackIs409LiveDB(t *testing.T) {

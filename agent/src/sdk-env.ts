@@ -24,9 +24,10 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import path from "node:path";
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { claudeConfigDir } from "./claude-config-dir.js";
-import { goConcurrencyEnv } from "./go-concurrency.js";
+import { applyGoMemLimitDefault, goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
@@ -42,6 +43,9 @@ export const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // PRD #4416: where the CLI reads its global config from (claudeConfigDir(HOME)); spawnDetached
   // refuses any other value, and a provisioned or user variable must never move it.
   "CLAUDE_CONFIG_DIR",
+  // PRD #4416 M3: the per-run Docker client config dir (<HOME>/.docker), worker-set after the fold
+  // whenever the Docker daemon is wired; a provisioned or user variable must never move it.
+  "DOCKER_CONFIG",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   // PRD #4320 module 6: the provider-mode routing and model keys. A provisioned tool env may never
@@ -294,7 +298,9 @@ export function sdkRunEnvInjected(
  *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
  * @param runEnv     PRD #4416 M2: the run's user variables. Lead-lane spawn sites only. Folded in
  *                   right after the toolEnv fold with the lowest precedence (see foldRunEnv); every
- *                   worker-set key below still wins; its `set`, when given, is the precomputed
+ *                   worker-set key below still wins, except the optional GOMEMLIMIT default
+ *                   (WORKER_GO_MEMLIMIT), which yields to an injected GOMEMLIMIT run variable
+ *                   (see applyGoMemLimitDefault); its `set`, when given, is the precomputed
  *                   list the fold applies (see {@link sdkRunEnvInjected}). Undefined ⇒ the env is
  *                   byte-identical to before.
  */
@@ -311,20 +317,28 @@ export function buildSdkEnv(
   assertRunEnvDeliverable(runEnv?.vars);
   const env = sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir);
   // PRD #4416 M2: user variables, after the tool profile and before every worker-set key below.
-  foldRunEnv(env, runEnv, isSdkRunEnvProtected);
+  const injectedRunEnv = foldRunEnv(env, runEnv, isSdkRunEnvProtected);
   // PRD #4416 M2: every worker-set key assigned from here on overwrites a user variable of the same
   // name silently (no drop event), which is safe only because each such key is also denied by name
-  // (RUN_ENV_DENIED_NAMES / prefixes), so a user variable never reaches this point under it.
+  // (RUN_ENV_DENIED_NAMES / prefixes), so a user variable never reaches this point under it. The one
+  // exception is GOMEMLIMIT: it is not denied, and the worker default yields to an injected run variable.
   // Issue #3382: the worker's optional Go build concurrency defaults (GOFLAGS=-p=N,
   // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
   // override them; absent settings add no key at all. Not protected keys.
   Object.assign(env, goConcurrencyEnv());
+  // WORKER_GO_MEMLIMIT: GOMEMLIMIT defaults here but yields to an injected run variable of that name.
+  applyGoMemLimitDefault(env, injectedRunEnv);
   // Issue #3870: the managed Go work dir, last among the Go keys so nothing provisioned wins.
   if (goWorkDir) env.GOTMPDIR = goWorkDir;
   // DOCKER_HOST is worker-set (not agent-set) and NOT in PROTECTED_ENV_KEYS: the
   // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
   // the fold so a provisioned var can never clobber the worker's wired endpoint.
-  if (dockerHost) env.DOCKER_HOST = dockerHost;
+  if (dockerHost) {
+    env.DOCKER_HOST = dockerHost;
+    // PRD #4416 M3: a Docker login must persist across the agent's commands, so the client config
+    // lives in the run home (not an ephemeral default). Same condition and precedence as DOCKER_HOST.
+    env.DOCKER_CONFIG = path.join(homeDir, ".docker");
+  }
   // Issue #3907: browser discovery points at the uzi-chromium wrapper, set AFTER the fold
   // (and protected above) so a provisioned var can neither redirect nor drop it.
   Object.assign(env, BROWSER_DISCOVERY_ENV);
@@ -403,6 +417,7 @@ export function buildCheckEnv(
   }
   // Issue #3382: the worker's optional Go build concurrency defaults reach checks too.
   Object.assign(env, goConcurrencyEnv());
+  applyGoMemLimitDefault(env);
   // Issue #3870: the managed Go work dir (absent ⇒ no key; buildCheckEnv never carries a provisioned one).
   if (goWorkDir) env.GOTMPDIR = goWorkDir;
   return env;

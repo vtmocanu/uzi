@@ -4,6 +4,7 @@ import { errorMessage } from "../../lib/apiError";
 import { forgePlatform } from "../../lib/forgeNoun";
 import { Button, Card, Field, Input, SectionTitle, Textarea } from "../../components/ui";
 import { useAuth } from "../../auth/AuthContext";
+import { stripUnsafeChars } from "../../lib/safeText";
 
 // CreateIssueForm opens a runnable issue on the forge: the server labels it with the
 // configured `uzi` label so uzi can work it (PRD #764). A prds/*.md link is optional
@@ -11,11 +12,15 @@ import { useAuth } from "../../auth/AuthContext";
 export function CreateIssueForm({
   repoId,
   forgeType,
+  eligibilityLabel,
   onCreated,
   onError,
 }: {
   repoId: string;
   forgeType: string;
+  // The stored eligibility tag of a repo linked to an issue tracker (PRD 4173 M6); the
+  // server applies it instead of the uzi label there.
+  eligibilityLabel?: string;
   onCreated: () => void;
   onError: (m: string) => void;
 }) {
@@ -42,7 +47,16 @@ export function CreateIssueForm({
     <Card className="max-w-2xl space-y-3">
       <SectionTitle>Create an issue</SectionTitle>
       <p className="text-xs text-faint">
-        Opened on {forgePlatform(forgeType)} with the <span className="font-medium text-muted">{uziLabel}</span> label,
+        {eligibilityLabel ? (
+          <>
+            Opened in the issue tracker with the{" "}
+            <span className="font-medium text-muted">{stripUnsafeChars(eligibilityLabel)}</span> tag,
+          </>
+        ) : (
+          <>
+            Opened on {forgePlatform(forgeType)} with the <span className="font-medium text-muted">{uziLabel}</span> label,
+          </>
+        )}{" "}
         so a run can be started from it. Optionally link a{" "}
         <code className="rounded bg-raised px-1 py-0.5 text-muted">prds/*.md</code> file in the description — a linked
         PRD is detected and shown with a badge.

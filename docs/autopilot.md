@@ -19,6 +19,9 @@ implementation. Eligible changes requested go back to the lead
 for bounded automatic revisions. Exhaustion, blockers and check failures
 normally require a human decision; irrecoverable delivery losses fail the run.
 
+Autopilot is not offered on a repo linked to an issue tracker: see
+[Issue trackers](./issue-trackers.md).
+
 ## 1. Set your forge identity
 
 uzi only knows your bot account's identity from its PAT, not yours. Open

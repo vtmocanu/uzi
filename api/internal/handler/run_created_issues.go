@@ -110,7 +110,7 @@ func (h *Handler) overlayCreatedIssues(ctx context.Context, run store.Run, dto *
 			continue
 		}
 		seen[key] = true
-		issues = append(issues, apitypes.CreatedIssueDTO{IID: row.Iid, Title: row.Title, WebURL: createdIssueURL(row.WebUrl, row.ForgeType, row.Iid)})
+		issues = append(issues, apitypes.CreatedIssueDTO{IID: row.Iid, IssueKey: issueKeyFromShort(row.IssueTrackerProjectShort, row.Iid), Title: row.Title, WebURL: createdIssueURL(row.WebUrl, row.ForgeType, row.Iid)})
 	}
 	dto.CreatedIssues = issues
 }

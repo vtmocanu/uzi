@@ -208,7 +208,7 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// The response is the exported apitypes.IncidentalFindingFileResultDTO (PRD #1183 M3 folds the
 	// handler-local fileFindingResponse twin into it): wire-identical to what shipped before.
 	httpx.JSON(w, http.StatusCreated, apitypes.IncidentalFindingFileResultDTO{
-		Issue:   apitypes.IncidentalFindingFiledIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
+		Issue:   apitypes.IncidentalFindingFiledIssueDTO{IID: created.IID, IssueKey: linkedIssueKey(repo, created.IID), WebURL: created.WebURL, Title: created.Title},
 		Warning: warning,
 	})
 }
@@ -549,6 +549,7 @@ func (h *Handler) BulkDismissFindings(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		out.Findings = append(out.Findings, findingDispositionDTO(row))
 	}
+	h.stampFindingIssueKeys(r.Context(), out.Findings)
 	httpx.JSON(w, http.StatusOK, out)
 }
 
@@ -585,7 +586,7 @@ func (h *Handler) UndoDismissFinding(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, findingDispositionDTO(row))
+	httpx.JSON(w, http.StatusOK, h.findingDispositionDTOWithKey(r.Context(), row))
 }
 
 // findingDispositionDTO projects a re-read finding_dispositions row onto the wire DTO for the

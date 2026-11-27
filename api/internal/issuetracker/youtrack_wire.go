@@ -12,7 +12,8 @@ import (
 const (
 	issueFields = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name,owner(id)),project(id,shortName)"
 	// listingIssueFields adds the custom fields the listing reads the State from;
-	// the single-issue reads do not ask for them.
+	// the single-issue reads do not ask for them, except the State-write resolve,
+	// which asks for customFields(name,$type) only.
 	listingIssueFields = issueFields + ",customFields(name,$type,value(name))"
 	tagFields          = "id,name"
 	ownedTagFields     = "id,name,owner(id)"
@@ -95,7 +96,7 @@ func (w ytIssue) nestedCount() int { return len(w.Tags) }
 // issue has none or the name is one stateNameProblem refuses.
 func (y *youTrack) stateName(w ytIssue) string {
 	for _, f := range w.CustomFields {
-		if f.Name == y.stateField && (f.Type == "StateIssueCustomField" || f.Type == "StateMachineIssueCustomField") {
+		if f.Name == y.stateField && (f.Type == plainStateType || f.Type == stateMachineType) {
 			if stateNameProblem(f.Value.Name) {
 				return ""
 			}
