@@ -105,6 +105,11 @@ func CompareCheckerIdentity(lead, checker IdentitySide) IdentityOutcome {
 	if !lead.Resolved || !checker.Resolved {
 		return Unresolved
 	}
+	// A provider-bound side with no host cannot be compared (NormalizedHost failed or was never
+	// read): fail closed rather than let an empty host read as a different gateway.
+	if (lead.ProviderBound && lead.Host == "") || (checker.ProviderBound && checker.Host == "") {
+		return Unresolved
+	}
 	if lead.ModelID != checker.ModelID {
 		return Independent
 	}

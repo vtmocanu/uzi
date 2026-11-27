@@ -52,7 +52,7 @@ describe("provider model identity contract (PRD #4574 M2)", () => {
       "codex explicit blank is unresolved", "codex requested default literal without explicit",
       "codex requested default literal with explicit",
     ];
-    assert.deepEqual([...cases.map((c) => c.name)].sort(), [...expected].sort(), "fixture case names");
+    assert.deepEqual(cases.map((c) => c.name).sort(), [...expected].sort(), "fixture case names");
     const seen = new Set<string>();
     for (const c of cases) {
       if (c.resolved === null) {

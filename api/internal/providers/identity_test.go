@@ -118,6 +118,8 @@ func TestCompareCheckerIdentity(t *testing.T) {
 		{"unresolved lead", unres(prov("h", "m")), prov("h", "m"), Unresolved},
 		{"unresolved checker", prov("h", "m"), unres(prov("h", "m")), Unresolved},
 		{"unresolved vendor lead with provider checker", unres(vendor("")), prov("h", "m"), Unresolved},
+		{"provider lead with empty host fails closed", prov("", "m"), prov("h", "m"), Unresolved},
+		{"provider checker with empty host fails closed", vendor("m"), prov("", "m"), Unresolved},
 	} {
 		if got := CompareCheckerIdentity(c.lead, c.checker); got != c.want {
 			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
