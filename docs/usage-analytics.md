@@ -16,6 +16,13 @@ gauges. The historical figures are computed on the server from one database
 snapshot. It is API only: there is no web page or `uzi` command for it yet, and
 `GET /api/usage` and `GET /api/admin/usage` are unchanged.
 
+Options and Spend share this boundary with a third section, Quality (retained
+rework, CI-fix, cross-check and judge coverage), at
+`/api/analytics/quality` and `/api/admin/analytics/quality`. It is documented
+in [Quality analytics API](quality-analytics.md); the parameters, errors,
+admission and calendar below apply to it too, except where that page says
+otherwise.
+
 Every dollar figure is recorded spend (an estimate for comparison), not a
 bill. Capacity reports no dollars.
 
@@ -23,8 +30,8 @@ bill. Capacity reports no dollars.
 
 | Scope | Routes | Who |
 |---|---|---|
-| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend`, `GET /api/analytics/reliability`, `GET /api/analytics/capacity` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
-| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend`, `GET /api/admin/analytics/reliability`, `GET /api/admin/analytics/capacity` | An admin session, or a Bearer token with the `admin_ro` scope. |
+| Owner | `GET /api/analytics/options`, `GET /api/analytics/spend`, `GET /api/analytics/reliability`, `GET /api/analytics/capacity`, `GET /api/analytics/quality` | Any signed-in user (session or `uzc_` Bearer). Always the caller's own runs. |
+| Admin | `GET /api/admin/analytics/options`, `GET /api/admin/analytics/spend`, `GET /api/admin/analytics/reliability`, `GET /api/admin/analytics/capacity`, `GET /api/admin/analytics/quality` | An admin session, or a Bearer token with the `admin_ro` scope. |
 
 - The owner route never reads a user from the query. An admin calling it sees
   only their own runs, and a `user` parameter there is a 400.
@@ -32,6 +39,7 @@ bill. Capacity reports no dollars.
   is an admin (403).
 - The paths are literal. Any other `/api/analytics/...` path, such as a section
   that does not exist yet, is a 404.
+- Spend is the only section with `split` and `breakdown`; Quality rejects both.
 
 ## Parameters and errors
 
@@ -72,7 +80,7 @@ bill. Capacity reports no dollars.
 
 - Capacity is a quarter of the database pool (`max(1, MaxConns / 4)`; the
   default pool of 20 gives 5). One request per caller per section (`options`,
-  `spend`, `reliability` or `capacity`) may be in flight, and the owner and admin variants share that
+  `spend`, `reliability`, `capacity` or `quality`) may be in flight, and the owner and admin variants share that
   slot. Nothing queues.
 - A request that finds no slot answers 503 with `Retry-After: 1` before any
   analytics database work. Authentication runs earlier (bearer and cookie
@@ -92,8 +100,9 @@ bill. Capacity reports no dollars.
 ## Calendar
 
 Go computes every boundary and the SQL only tests half-open membership
-(`start <= created_at < end`) against those instants. Buckets are by **run
-creation time**, not by when cost was incurred.
+(`start <= created_at < end`) against those instants. For Spend, buckets are by **run
+creation time**, not by when cost was incurred. Quality measures have their
+own time bases; see [Quality analytics](quality-analytics.md#response-shape).
 
 - Buckets are contiguous: bucket D runs from the first instant whose local date
   is D (the first midnight at or after the previous bucket) to the first

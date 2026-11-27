@@ -20,6 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/analytics"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestRunUsageGenericPlanLiveDB is the issue #1620 regression: /api/runs timed out because
@@ -88,6 +89,12 @@ func TestRunUsageGenericPlanLiveDB(t *testing.T) {
 		genericPlanCase{name: "AnalyticsOwnerSpend", sql: store.AnalyticsOwnerSpendSQL, args: e.spendArgs(t, e.spendOwnerID, false, true), scoped: true, spend: true, ownLegs: e.spendOwnLegs},
 		genericPlanCase{name: "AnalyticsAllSpend", sql: store.AnalyticsAllSpendSQL, args: e.spendArgs(t, uuid.Nil, false, false), scoped: false, spend: true},
 	)
+	// Issue #4730: the Quality statements, owner-scoped to the Quality owner (whose PRs carry
+	// mr_rework runs, merge witnesses, cross-checks and reviews in the seed) and all-scope.
+	cases = append(cases,
+		genericPlanCase{name: "AnalyticsOwnerQuality", sql: store.AnalyticsOwnerQualitySQL, args: e.qualityArgs(t, e.qualityOwnerID), quality: true},
+		genericPlanCase{name: "AnalyticsAllQuality", sql: store.AnalyticsAllQualitySQL, args: e.qualityArgs(t, uuid.Nil), quality: true},
+	)
 
 	for i, c := range cases {
 		stmt := fmt.Sprintf("usage_plan_%d", i)
@@ -114,6 +121,10 @@ type genericPlanCase struct {
 	scoped    bool
 	spend     bool
 	ownLegs   int64
+	// quality marks the #4730 Quality statements: they read no run_usage, so qualityOffenders
+	// applies instead (the looped-work class limited to CTE Scans and runs, no join-discard
+	// class, plus qualityShapeProblems).
+	quality bool
 }
 
 // genericPlanEnv is the seeded database, the repeatable-read connection with
@@ -134,6 +145,8 @@ type genericPlanEnv struct {
 	relOwnerID  uuid.UUID
 	relOwnLegs  int64
 	seededUsers []uuid.UUID
+	// The Quality-only owner (PRs, reworks, cross-checks, reviews), seeded last.
+	qualityOwnerID uuid.UUID
 
 	// denominator, ownLegs, bound and scopedBound serve the five original cases and exclude
 	// the Spend owner's legs; the spend* fields serve the Spend cases.
@@ -277,6 +290,62 @@ func newGenericPlanEnvWith(t *testing.T, withReliability bool) *genericPlanEnv {
 		 CROSS JOIN generate_series(0, 1) AS k
 		 CROSS JOIN generate_series(0, 1) AS e
 		 WHERE r.user_id = $1`, spendOwnerID)
+	// Issue #4730 Quality seed: a dedicated owner (so the usage and Spend cases' data is
+	// untouched) whose 300 issue runs share ~120 PRs (three quarters merged), with verified and
+	// mismatched mr_rework runs, plan and code cross-checks, retained reviews and judge skips,
+	// so the witness fold, the rework-link membership and the judge joins all execute.
+	qualityOwnerID, qualityConnID, qualityRepoID := uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		qualityOwnerID, fmt.Sprintf("genericplan-quality-%s@e2e", qualityOwnerID))
+	mustExec(ctx, t, pool,
+		`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+		 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, qualityConnID, qualityOwnerID, []byte{0x1})
+	mustExec(ctx, t, pool,
+		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		 VALUES ($1, $2, 1, 'g/generic-plan-quality', 'https://forge.e2e/g/generic-plan-quality', 'main', true)`, qualityRepoID, qualityConnID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, created_at, status_since,
+		                   mr_iid, mr_state)
+		 SELECT gen_random_uuid(), $1, $2, g, 't', 'd', CASE WHEN g % 9 = 0 THEN 'failed' ELSE 'completed' END, 'issue',
+		        now() - make_interval(hours => g * 2), now() - make_interval(hours => g * 2),
+		        (g % 120) + 1, CASE WHEN g % 4 = 0 THEN 'opened' ELSE 'merged' END
+		 FROM generate_series(1, $3::int) g`, qualityOwnerID, qualityRepoID, nRuns)
+	mustExec(ctx, t, pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_title, issue_description, status, kind, created_at, status_since, mr_iid,
+		                   pipeline_ref, target_run_id, trigger_source)
+		 SELECT gen_random_uuid(), r.user_id, r.repo_id, 't', 'd', 'completed', 'mr_rework', r.created_at + interval '1 hour',
+		        r.created_at + interval '1 hour', r.mr_iid, 'refs/mr/' || r.id || '-' || k,
+		        CASE WHEN r.issue_iid % 10 = 0 AND k = 1 THEN (SELECT o.id FROM runs o WHERE o.user_id = r.user_id AND o.kind = 'issue' AND o.mr_iid <> r.mr_iid LIMIT 1) ELSE r.id END,
+		        CASE WHEN r.issue_iid % 3 = 0 THEN 'manual' ELSE 'mr_rework' END
+		 FROM runs r CROSS JOIN generate_series(1, 2) k
+		 WHERE r.user_id = $1 AND r.kind = 'issue'
+		   AND ((r.issue_iid % 4 = 1 AND (k = 1 OR r.issue_iid % 8 = 1)) OR (r.issue_iid % 16 = 0 AND k = 1))`, qualityOwnerID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, size_class,
+		     base_commit, candidate_digest, verdict, reason_class, decided_at, deadline_at, created_at, checker_harness)
+		 SELECT r.id, 'plan', 1, 0, 'p', '[]'::jsonb, 'S', 'base', '\x01'::bytea, 'approve', 'approve',
+		        r.created_at + interval '10 minutes', r.created_at + interval '1 hour', r.created_at, 'codex'
+		 FROM runs r WHERE r.user_id = $1 AND r.kind = 'issue' AND r.issue_iid % 5 = 0`, qualityOwnerID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, base_commit, head_commit, candidate_digest,
+		     verdict, outcome, findings, decided_at, deadline_at, created_at, checker_harness,
+		     code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled,
+		     repo_instructions_text, repo_instructions_digest)
+		 SELECT r.id, 'code', 1, 0, repeat('a', 40), repeat('b', 40), '\x01'::bytea,
+		     'failed', 'completed', '[]'::jsonb, r.created_at + interval '20 minutes', r.created_at + interval '1 hour', r.created_at, 'codex',
+		     '{}'::jsonb, '', '', sha256(convert_to('', 'UTF8')), false, '', sha256(convert_to('', 'UTF8'))
+		 FROM runs r WHERE r.user_id = $1 AND r.kind = 'issue' AND r.issue_iid % 7 = 0`, qualityOwnerID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO run_reviews (target_run_id, user_id, verdict, status, created_at, updated_at)
+		 SELECT r.id, r.user_id, 'ok', 'complete', r.created_at + interval '5 minutes', r.created_at + interval '5 minutes'
+		 FROM runs r WHERE r.user_id = $1 AND r.kind = 'issue' AND r.issue_iid % 6 = 0`, qualityOwnerID)
+	mustExec(ctx, t, pool,
+		`INSERT INTO judge_skips (target_run_id, harness, reason)
+		 SELECT r.id, 'claude', 'no_usable_credential'
+		 FROM runs r WHERE r.user_id = $1 AND r.kind = 'issue' AND r.issue_iid % 11 = 1`, qualityOwnerID)
+	for _, tbl := range []string{"cross_checks", "run_reviews", "judge_skips"} {
+		mustExec(ctx, t, pool, `ANALYZE `+tbl)
+	}
 	mustExec(ctx, t, pool, `ANALYZE runs`)
 	mustExec(ctx, t, pool, `ANALYZE run_usage`)
 	latest := seedGenericPlanLatestFailure(ctx, t, pool)
@@ -291,7 +360,7 @@ func newGenericPlanEnvWith(t *testing.T, withReliability bool) *genericPlanEnv {
 	}
 	t.Cleanup(conn.Release)
 	e := &genericPlanEnv{ctx: ctx, pool: pool, q: q, conn: conn, userID: userID, targetID: targetID, spendOwnerID: spendOwnerID, latest: latest,
-		relOwnerID: relOwnerID, seededUsers: []uuid.UUID{userID, otherUserID, spendOwnerID}}
+		relOwnerID: relOwnerID, seededUsers: []uuid.UUID{userID, otherUserID, spendOwnerID}, qualityOwnerID: qualityOwnerID}
 	// Simple protocol throughout: these are session/utility statements, and the plan under
 	// test is the one the server-side PREPARE produces, not a pgx-cached one.
 	e.exec(t, `BEGIN ISOLATION LEVEL REPEATABLE READ`)
@@ -411,6 +480,12 @@ func (e *genericPlanEnv) planOffenders(c genericPlanCase, root *planNode) []stri
 // extra #4684 conditions.
 func (e *genericPlanEnv) checkPlan(t *testing.T, name string, c genericPlanCase, root *planNode) {
 	t.Helper()
+	if c.quality {
+		for _, o := range e.qualityOffenders(root) {
+			t.Errorf("%s: %s", name, o)
+		}
+		return
+	}
 	own := e.ownLegs
 	if c.ownLegs != 0 {
 		own = c.ownLegs
@@ -548,6 +623,64 @@ func (e *genericPlanEnv) spendArgs(t *testing.T, owner uuid.UUID, reveal, bothRe
 		out = append(out, strings.Join(lits, ", "))
 	}
 	return out
+}
+
+// qualityArgs renders the EXECUTE arguments of a Quality statement for a 30d window ending at
+// the transaction's now(). owner == uuid.Nil selects the all-scope statement. The argument
+// order is read from what the generated Go method actually passes, as in spendArgs.
+func (e *genericPlanEnv) qualityArgs(t *testing.T, owner uuid.UUID) []string {
+	t.Helper()
+	var now time.Time
+	if err := e.conn.QueryRow(e.ctx, `SELECT now()`, pgx.QueryExecModeSimpleProtocol).Scan(&now); err != nil {
+		t.Fatalf("select now(): %v", err)
+	}
+	b, err := analytics.ComputeBounds(now, time.UTC, analytics.Window30d, nil)
+	if err != nil {
+		t.Fatalf("ComputeBounds: %v", err)
+	}
+	return []string{qualityExecuteArgs(t, e.ctx, owner, b)}
+}
+
+// qualityExecuteArgs is the EXECUTE argument list of the owner (owner != uuid.Nil) or all-scope
+// Quality statement for the given bounds, all kinds, no repo or harness filter.
+func qualityExecuteArgs(t *testing.T, ctx context.Context, owner uuid.UUID, b analytics.Bounds) string {
+	t.Helper()
+	ts := func(v time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: v, Valid: true} }
+	tss := func(vs []time.Time) []pgtype.Timestamptz {
+		out := make([]pgtype.Timestamptz, len(vs))
+		for i, v := range vs {
+			out[i] = ts(v)
+		}
+		return out
+	}
+	var judge []string
+	for _, k := range runkind.All() {
+		if runkind.JudgeEligible(k) {
+			judge = append(judge, k)
+		}
+	}
+	planLead, codeLead := qualityCall{}.leadKinds()
+	always, prestart := workersvc.JudgeSkipFailOrigins()
+	capture := &capturingDBTX{}
+	cq := store.New(capture)
+	if owner != uuid.Nil {
+		_, _ = cq.AnalyticsOwnerQuality(ctx, store.AnalyticsOwnerQualityParams{
+			UserID: owner, Now: ts(b.Now), From: ts(b.From), BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds),
+			Kinds: runkind.All(), DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+			PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
+		})
+	} else {
+		_, _ = cq.AnalyticsAllQuality(ctx, store.AnalyticsAllQualityParams{
+			Now: ts(b.Now), From: ts(b.From), BucketStarts: tss(b.BucketStarts), BucketEnds: tss(b.BucketEnds),
+			Kinds: runkind.All(), DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+			PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
+		})
+	}
+	lits := make([]string, len(capture.args))
+	for i, a := range capture.args {
+		lits[i] = sqlLiteral(t, a)
+	}
+	return strings.Join(lits, ", ")
 }
 
 // capturingDBTX records the arguments of the last QueryRow so a test can read the argument
@@ -691,6 +824,31 @@ type planNode struct {
 	Plans               []planNode `json:"Plans"`
 }
 
+// loopOffenders reports every plan node that looped more than once for more than
+// 4 × count(runs) rows of work (counting the rows it emitted plus the rows its Filter and Join
+// Filter discarded, CTE Scans included), and every join that discarded more than that by its
+// Join Filter.
+func (e *genericPlanEnv) loopOffenders(root *planNode, counts func(*planNode) bool, joinDiscards bool) []string {
+	limit := 4 * float64(e.runsTotal)
+	var out []string
+	var loops func(n *planNode)
+	loops = func(n *planNode) {
+		if work := (n.ActualRows + n.RowsRemovedByFilter + n.RowsRemovedByJoin) * n.ActualLoops; n.ActualLoops > 1 && work > limit && counts(n) {
+			out = append(out, fmt.Sprintf("%s %s%s looped %.0f times for %.0f rows of work (> 4 × count(runs) = %.0f): a per-row re-scan or a runs × groups join",
+				n.NodeType, n.CTEName, n.RelationName, n.ActualLoops, work, limit))
+		}
+		if joinDiscards && n.RowsRemovedByJoin > limit {
+			out = append(out, fmt.Sprintf("%s discarded %.0f rows by its Join Filter (> 4 × count(runs) = %.0f): a cross product filtered after the join",
+				n.NodeType, n.RowsRemovedByJoin, limit))
+		}
+		for i := range n.Plans {
+			loops(&n.Plans[i])
+		}
+	}
+	loops(root)
+	return out
+}
+
 // spendOffenders holds the Spend-only plan conditions (issue #4684) that work on every node,
 // whether or not it scans run_usage:
 //   - a node that looped more than once may not do more than 4 × count(runs) work in total,
@@ -702,23 +860,7 @@ type planNode struct {
 //     join, never a correlated SubPlan that re-scans the CTE per cohort row; and at least
 //     one such hashed read exists, so the check is not vacuous.
 func (e *genericPlanEnv) spendOffenders(root *planNode) []string {
-	limit := 4 * float64(e.runsTotal)
-	var out []string
-	var loops func(n *planNode)
-	loops = func(n *planNode) {
-		if work := (n.ActualRows + n.RowsRemovedByFilter + n.RowsRemovedByJoin) * n.ActualLoops; n.ActualLoops > 1 && work > limit {
-			out = append(out, fmt.Sprintf("%s %s%s looped %.0f times for %.0f rows of work (> 4 × count(runs) = %.0f): a per-row re-scan or a runs × groups join",
-				n.NodeType, n.CTEName, n.RelationName, n.ActualLoops, work, limit))
-		}
-		if n.RowsRemovedByJoin > limit {
-			out = append(out, fmt.Sprintf("%s discarded %.0f rows by its Join Filter (> 4 × count(runs) = %.0f): a cross product filtered after the join",
-				n.NodeType, n.RowsRemovedByJoin, limit))
-		}
-		for i := range n.Plans {
-			loops(&n.Plans[i])
-		}
-	}
-	loops(root)
+	out := e.loopOffenders(root, func(*planNode) bool { return true }, true)
 	problems, hashed := witnessProblems(root)
 	out = append(out, problems...)
 	if hashed == 0 {
@@ -732,11 +874,9 @@ func (e *genericPlanEnv) spendOffenders(root *planNode) []string {
 // only the expression that references it says "hashed".
 var hashedSubPlanRef = regexp.MustCompile(`hashed (SubPlan \d+)`)
 
-// witnessProblems reports each scan of the merged_witness CTE that is neither inside a
-// hashed SubPlan nor under a Hash node, and counts the hashed ones. A SubPlan is hashed when
-// some expression in the plan (Output, Filter or Join Filter) references it as
-// "hashed SubPlan N".
-func witnessProblems(root *planNode) (problems []string, hashed int) {
+// hashedSubPlanNames returns the SubPlans that some expression in the plan (Output, Filter or
+// Join Filter) references as "hashed SubPlan N".
+func hashedSubPlanNames(root *planNode) map[string]bool {
 	hashedSubPlans := map[string]bool{}
 	var collect func(n *planNode)
 	collect = func(n *planNode) {
@@ -751,6 +891,15 @@ func witnessProblems(root *planNode) (problems []string, hashed int) {
 		}
 	}
 	collect(root)
+	return hashedSubPlans
+}
+
+// witnessProblems reports each scan of the merged_witness CTE that is neither inside a
+// hashed SubPlan nor under a Hash node, and counts the hashed ones. A SubPlan is hashed when
+// some expression in the plan (Output, Filter or Join Filter) references it as
+// "hashed SubPlan N".
+func witnessProblems(root *planNode) (problems []string, hashed int) {
+	hashedSubPlans := hashedSubPlanNames(root)
 	var visit func(n *planNode, sub *planNode, underHash bool)
 	visit = func(n *planNode, sub *planNode, underHash bool) {
 		if n.ParentRelationship == "SubPlan" {
@@ -775,6 +924,79 @@ func witnessProblems(root *planNode) (problems []string, hashed int) {
 	}
 	visit(root, nil, false)
 	return problems, hashed
+}
+
+// cteSubPlanReport walks the plan once and reports (a) every CTE Scan that sits inside a
+// SubPlan which no expression references as hashed (an unhashed per-row SubPlan over a CTE,
+// which re-scans it once per outer row and degrades quadratically once the CTE outgrows
+// hash_mem), (b) how many CTE Scans sit inside a hashed SubPlan, per CTE name, and (c) how many
+// CTE Scans of each name sit outside any SubPlan. The plan may be EXPLAIN with or without ANALYZE.
+func cteSubPlanReport(root *planNode) (unhashed []string, hashedByCTE, outsideByCTE map[string]int) {
+	hashedSubPlans := hashedSubPlanNames(root)
+	hashedByCTE, outsideByCTE = map[string]int{}, map[string]int{}
+	var visit func(n *planNode, sub *planNode)
+	visit = func(n *planNode, sub *planNode) {
+		if n.ParentRelationship == "SubPlan" {
+			sub = n
+		}
+		if n.NodeType == "CTE Scan" {
+			switch {
+			case sub == nil:
+				outsideByCTE[n.CTEName]++
+			case hashedSubPlans[sub.SubplanName]:
+				hashedByCTE[n.CTEName]++
+			default:
+				unhashed = append(unhashed, fmt.Sprintf("CTE Scan on %s is read by the un-hashed %q: a per-row SubPlan (loops %.0f)", n.CTEName, sub.SubplanName, n.ActualLoops))
+			}
+		}
+		for i := range n.Plans {
+			visit(&n.Plans[i], sub)
+		}
+	}
+	visit(root, nil)
+	return unhashed, hashedByCTE, outsideByCTE
+}
+
+// qualityShapeProblems holds the issue #4730 conditions that need no row counts, so they also
+// hold for a plain EXPLAIN: no unhashed SubPlan over any CTE Scan, no nested loop whose Join
+// Filter is the (repo_id, mr_iid) pair, the merge witness (rw_witness) folded in by a plain scan
+// outside any SubPlan, and the rework-link membership (rw_sel) still a hashed SubPlan.
+func qualityShapeProblems(root *planNode) []string {
+	unhashed, hashedByCTE, outsideByCTE := cteSubPlanReport(root)
+	out := append([]string{}, unhashed...)
+	var walk func(n *planNode)
+	walk = func(n *planNode) {
+		if n.NodeType == "Nested Loop" && strings.Contains(n.JoinFilter, "mr_iid") {
+			out = append(out, fmt.Sprintf("Nested Loop with Join Filter on the (repo_id, mr_iid) pair: %s", n.JoinFilter))
+		}
+		for i := range n.Plans {
+			walk(&n.Plans[i])
+		}
+	}
+	walk(root)
+	if outsideByCTE["rw_witness"] == 0 {
+		out = append(out, "rw_witness is not read by a plain scan outside a SubPlan: the witness fold changed shape or the check is vacuous")
+	}
+	if hashedByCTE["rw_witness"] != 0 {
+		out = append(out, "rw_witness is read under a hashed SubPlan: the witness lookup is a membership SubPlan again")
+	}
+	if hashedByCTE["rw_sel"] == 0 {
+		out = append(out, "no hashed SubPlan over rw_sel: the rework-link membership changed shape or the check is vacuous")
+	}
+	return out
+}
+
+// qualityOffenders is the generic-plan check of the Quality statements: the row-count classes
+// shared with Spend (loopOffenders) plus qualityShapeProblems.
+//
+// The looped-work bound counts CTE Scans and scans of runs only, and the join-discard bound is
+// not applied: a per-row probe of a small side table (the judge_skips EXISTS, a nested loop
+// against repos) is a Seq Scan on a freshly seeded table and an index probe or hash join on a
+// large one, so its total work tracks that table's statistics, not the statement's shape. The
+// (repo_id, mr_iid) nested-loop class is checked separately by qualityShapeProblems.
+func (e *genericPlanEnv) qualityOffenders(root *planNode) []string {
+	counted := func(n *planNode) bool { return n.CTEName != "" || n.RelationName == "runs" }
+	return append(e.loopOffenders(root, counted, false), qualityShapeProblems(root)...)
 }
 
 // nodeWork is a node's total row work across all its loops: the rows it emitted, plus,

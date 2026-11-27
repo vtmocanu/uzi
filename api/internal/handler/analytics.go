@@ -28,13 +28,13 @@ import (
 
 // Issue #4684: the scoped usage analytics API.
 //
-//	GET /api/analytics/{options,spend,reliability,capacity}        the caller's own runs (requireUser)
-//	GET /api/admin/analytics/{options,spend,reliability,capacity}  admin read group (RequireAdminRO)
+//	GET /api/analytics/{options,spend,reliability,capacity,quality}        the caller's own runs (requireUser)
+//	GET /api/admin/analytics/{options,spend,reliability,capacity,quality}  admin read group (RequireAdminRO)
 //
 // Request order: (1) syntax validation with no database access, (2) single-flight admission
 // that never blocks, (3) one REPEATABLE READ READ ONLY snapshot holding the timezone check,
-// the selected-user and repo authority checks and, for spend, reliability and capacity, the
-// history-start read and the statements (reliability: cohort, then latest failure;
+// the selected-user and repo authority checks and, for spend, reliability, capacity and quality
+// (#4730), the history-start read and the statements (reliability: cohort, then latest failure;
 // analytics_reliability.go); options reads no history start. Capacity (issue #4731) also reads
 // the current provider gauges inside the snapshot, each in a savepoint, and observes Codex
 // vault state live after it (analytics_capacity.go).
@@ -70,6 +70,11 @@ type analyticsDeps struct {
 
 	// vaultBudget overrides capacityVaultObserveBudget when positive (tests only).
 	vaultBudget time.Duration
+
+	// qualityBeforeSnapshotRead, when non-nil, runs at the very start of the Quality statement
+	// function, before the snapshot's first query. Tests use it to commit a write that the
+	// response must still see.
+	qualityBeforeSnapshotRead func(ctx context.Context)
 
 	// tzSet caches pg_timezone_names after the first successful read (never on failure).
 	tzMu  sync.Mutex
@@ -245,8 +250,9 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 	}
 
 	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
-	// per-run totals for finished runs; Reliability and Capacity (issue #4731) follow the same
-	// window choices. Options still accepts and ignores window, so the check is skipped for it.
+	// per-run totals for finished runs; Reliability, Capacity (issue #4731) and Quality (#4730)
+	// follow the same window choices. Options still accepts and ignores window, so the check is
+	// skipped for it.
 	if section != analytics.SectionOptions && !slices.Contains(req.windowChoices(), string(req.window)) {
 		return req, msgAnalyticsWindowAllAllUsers
 	}
@@ -410,6 +416,8 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 			body, ferr = deps.reliability(ctx, s, req, now)
 		case analytics.SectionCapacity:
 			capacity, ferr = h.capacity(ctx, deps, s, req, now)
+		case analytics.SectionQuality:
+			body, ferr = deps.quality(ctx, s, req, now)
 		default:
 			body, ferr = deps.spend(ctx, s, req, now)
 		}
@@ -448,7 +456,7 @@ func analyticsFail(w http.ResponseWriter, r *http.Request, err error) {
 	httpx.Error(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorize runs the in-snapshot checks shared by Options, Spend, Reliability and Capacity: the timezone, the selected
+// authorize runs the in-snapshot checks shared by Options, Spend, Reliability, Capacity and Quality: the timezone, the selected
 // user's existence and the repo filter's authority. A repo that does not exist and one the scope
 // cannot see produce the identical 400.
 func (d *analyticsDeps) authorize(ctx context.Context, s *store.AnalyticsSnapshot, req analyticsRequest) (*time.Location, error) {
@@ -776,8 +784,8 @@ func (m *spendMapper) createdAt(s string) time.Time {
 	return t.UTC()
 }
 
-// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all Spend,
-// Reliability or Capacity request.
+// msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all request on
+// any section except options (Spend, Reliability, Capacity and Quality).
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
 
 // analyticsEnvelope builds the calendar envelope every analytics response is indexed against.

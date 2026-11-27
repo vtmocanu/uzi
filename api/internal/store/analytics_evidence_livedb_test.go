@@ -47,7 +47,7 @@ import (
 //	                        already ran on fails the run while the Spend phase is enabled: reseed,
 //	                        or set UZI_EVIDENCE_SPEND=0
 //	UZI_EVIDENCE_BASELINE=0 skip the baseline phase
-//	UZI_EVIDENCE_INDEXES=   comma list of candidate numbers 1-5 (default 1,2,3,4; "" or "0" none)
+//	UZI_EVIDENCE_INDEXES=   comma list of candidate numbers 1-7 (default 1,2,3,4; "" or "0" none; 5 is the #4731 Capacity candidate, 6-7 the #4730 Quality candidates)
 //	UZI_EVIDENCE_ONLY=      comma list of workload-name substrings (cap- selects the #4731 capacity workloads)
 //	UZI_EVIDENCE_RUNS=20    measured executions per workload and mode
 //	UZI_EVIDENCE_MODES=     custom,generic (timing modes for the baseline)
@@ -157,6 +157,137 @@ var evSeed = []string{
 	 WHERE r.h % 100 >= 10 AND e <= r.h % 3`,
 	`DROP TABLE ev_gen`, `DROP TABLE ev_iss`, `DROP TABLE ev_repo`, `DROP TABLE ev_owner`,
 	`ANALYZE users`, `ANALYZE forge_connections`, `ANALYZE repos`, `ANALYZE runs`, `ANALYZE run_usage`,
+}
+
+// evSeedQuality extends the #4684 seed for the #4730 Quality statements (milestone 3). It runs
+// after evSeed on the same connection and never touches what evSeed generated except for one
+// UPDATE that adds merge witnesses. Stated distributions (the seed logs the measured values):
+//   - mr_rework runs: per PR (one row per (repo, mr_iid), owned by the PR's first run's owner)
+//     0 reworks 55%, 1 reworks 25%, 2 reworks 12%, 3-5 reworks 8%; 12% of reworks are created
+//     before the PR's first run (out of window for window-seeded PRs), 25% have trigger_source
+//     manual, 7% point at a run of another PR (an unverified link);
+//   - merge witnesses: 45% of the unmerged PR-carrying runs become merged (a majority of PRs
+//     end up witnessed; the evSeed 40% of mr runs were already merged);
+//   - plan cross-checks: 40% of delivery leads (issue, task, self_improve, prompt, ci_fix) carry
+//     1 round (55%), 2 (30%) or 3 (15%) with the automatic round budget on; non-final rounds
+//     are revise, the final round approve 60% / block 10% / failed 10% / revise 20%; 12% of the
+//     final rounds of leads younger than 10 days are pending; 4% are interrupted; 10% of the
+//     leads created 30-60 days ago are decided inside the last 30 days; plan_md, planning_diff
+//     and findings are TOASTed text (8 KB, 6 KB on 30% and up to 12 findings of 288 bytes);
+//   - code cross-checks: 35% of the leads carry exactly one code attempt: completed 72%, failed
+//     20%, pending 8% (leads younger than 10 days only); 60% of the completed ones carry findings
+//     (1-15 of ~400 bytes, 1.5% over 64 KB); guidance, repo-instruction and code_context texts are
+//     TOASTed; 10% of the leads created 30-60 days ago are decided inside the last 30 days;
+//   - run_reviews: 60% of the judge-eligible (issue, ci_fix) completed/failed runs, 15% of them
+//     failed; judge_skips: another 5% of the eligible runs.
+var evSeedQuality = []string{
+	`SELECT setseed(0.4730)`,
+	`CREATE TEMP TABLE ev_pr AS
+	 SELECT x.*, lead(x.seed_id) OVER (ORDER BY x.repo_id, x.mr_iid) AS other_id,
+	        (hashtext(x.seed_id::text || 'n')::bigint & 2147483647) % 1000 AS rk
+	 FROM (SELECT DISTINCT ON (repo_id, mr_iid) repo_id, mr_iid, user_id, id AS seed_id, created_at AS first_at
+	       FROM runs WHERE mr_iid IS NOT NULL AND repo_id IS NOT NULL AND kind <> 'mr_rework'
+	       ORDER BY repo_id, mr_iid, created_at, id) x`,
+	`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, created_at,
+	                   finished_at, status_since, harness, mr_iid, pipeline_ref, target_run_id, trigger_source)
+	 SELECT gen_random_uuid(), p.user_id, p.repo_id, NULL, 't', 'd', 'completed', 'mr_rework', s.ts,
+	        s.ts + interval '1 hour', s.ts + interval '1 hour', CASE WHEN s.h % 3 = 0 THEN 'codex' ELSE 'claude' END,
+	        p.mr_iid, 'refs/mr/' || left(p.seed_id::text, 8) || '-' || k,
+	        CASE WHEN s.h % 100 < 7 THEN COALESCE(p.other_id, p.seed_id) ELSE p.seed_id END,
+	        CASE WHEN s.h % 100 >= 40 AND s.h % 100 < 65 THEN 'manual' ELSE 'mr_rework' END
+	 FROM (SELECT q.*, CASE WHEN rk < 550 THEN 0 WHEN rk < 800 THEN 1 WHEN rk < 920 THEN 2 ELSE 3 + rk % 3 END AS n FROM ev_pr q) p
+	 CROSS JOIN LATERAL generate_series(1, p.n) k
+	 CROSS JOIN LATERAL (SELECT (hashtext(p.seed_id::text || '/' || k::text)::bigint & 2147483647) AS h) hh
+	 CROSS JOIN LATERAL (SELECT hh.h,
+	        LEAST(CASE WHEN hh.h % 100 < 12 THEN p.first_at - (1 + hh.h % 25) * interval '1 day'
+	                   ELSE p.first_at + k * interval '6 hours' + (hh.h % 600) * interval '1 minute' END,
+	              TIMESTAMPTZ '` + evNowRFC + `' - interval '2 hours') AS ts) s`,
+	`DROP TABLE ev_pr`,
+	`UPDATE runs SET mr_state = 'merged'
+	 WHERE mr_iid IS NOT NULL AND kind <> 'mr_rework' AND mr_state IS DISTINCT FROM 'merged'
+	   AND (hashtext(id::text || 'w')::bigint & 2147483647) % 100 < 45`,
+	`VACUUM (ANALYZE) runs`,
+	`CREATE TEMP TABLE ev_lead AS
+	 SELECT r.id, r.created_at, r.harness,
+	        (hashtext(r.id::text || 'p')::bigint & 2147483647) % 1000 AS hp,
+	        (hashtext(r.id::text || 'c')::bigint & 2147483647) % 1000 AS hc,
+	        (hashtext(r.id::text || 'r')::bigint & 2147483647) % 100 AS hr
+	 FROM runs r WHERE r.kind IN ('issue', 'task', 'self_improve', 'prompt', 'ci_fix')`,
+	`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, size_class, base_commit,
+	                          planning_diff, candidate_digest, checker_harness, verdict, reason_class, findings, decided_at,
+	                          deadline_at, created_at, interrupted_at, automatic_rounds_enabled, automatic_revision_limit, wait_credited)
+	 SELECT f.id, 'plan', f.k, 0, f.blob, '[{"id":"m1"}]'::jsonb, 'M', repeat('a', 40),
+	        CASE WHEN f.h % 10 < 3 THEN left(f.blob, 6000) END, sha256(convert_to(f.id::text, 'UTF8')),
+	        CASE WHEN f.h % 2 = 0 THEN 'claude' ELSE 'codex' END, f.v,
+	        CASE f.v WHEN 'pending' THEN NULL WHEN 'failed' THEN (ARRAY['model_error', 'timed_out', 'superseded', 'checker_unavailable'])[1 + f.h % 4] ELSE f.v END,
+	        CASE WHEN f.v IN ('pending', 'failed') THEN NULL
+	             ELSE jsonb_build_object('items', COALESCE((SELECT jsonb_agg(jsonb_build_object('id', 'f' || g, 'severity', 'medium', 'text', repeat(md5(g::text || f.h::text), 9)))
+	                                                         FROM generate_series(1, CASE WHEN f.v = 'approve' THEN f.h % 3 ELSE 1 + f.h % 12 END) g), '[]'::jsonb)) END,
+	        CASE WHEN f.v = 'pending' THEN NULL ELSE f.decided END,
+	        f.created + interval '1 hour', f.created,
+	        CASE WHEN f.v <> 'pending' AND f.h % 100 >= 96 THEN f.created + interval '1 minute' END,
+	        true, 2, true
+	 FROM (SELECT g.*, GREATEST(g.created0, LEAST(g.decided0, TIMESTAMPTZ '` + evNowRFC + `' - interval '1 second')) AS decided,
+	              LEAST(g.created0, TIMESTAMPTZ '` + evNowRFC + `' - interval '1 minute') AS created
+	       FROM (SELECT l.id, k, n, l.hr, h, b.blob,
+	                    l.created_at + k * interval '40 minutes' AS created0,
+	                    CASE WHEN l.created_at < TIMESTAMPTZ '` + evNowRFC + `' - interval '30 days'
+	                          AND l.created_at >= TIMESTAMPTZ '` + evNowRFC + `' - interval '60 days' AND h % 100 < 10
+	                         THEN TIMESTAMPTZ '` + evNowRFC + `' - (h % 43200) * interval '1 minute'
+	                         ELSE l.created_at + k * interval '40 minutes' + (3 + h % 40) * interval '1 minute' END AS decided0,
+	                    CASE WHEN k = n AND l.created_at > TIMESTAMPTZ '` + evNowRFC + `' - interval '10 days' AND h % 100 < 12 THEN 'pending'
+	                         WHEN k < n THEN 'revise'
+	                         WHEN h % 100 < 60 THEN 'approve' WHEN h % 100 < 70 THEN 'block' WHEN h % 100 < 80 THEN 'failed' ELSE 'revise' END AS v
+	             FROM (SELECT x.*, CASE WHEN hr < 55 THEN 1 WHEN hr < 85 THEN 2 ELSE 3 END AS n FROM ev_lead x WHERE hp < 400) l
+	             CROSS JOIN LATERAL generate_series(1, l.n) k
+	             CROSS JOIN LATERAL (SELECT (hashtext(l.id::text || '/' || k::text)::bigint & 2147483647) AS h) hh
+	             CROSS JOIN LATERAL (SELECT string_agg(md5(l.id::text || g::text), '') AS blob FROM generate_series(1, 250) g) b) g) f`,
+	`INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, base_commit, head_commit, candidate_digest, verdict,
+	                          outcome, reason_class, findings, decided_at, deadline_at, created_at, interrupted_at, checker_harness,
+	                          code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled,
+	                          repo_instructions_text, repo_instructions_digest, wait_credited)
+	 SELECT f.id, 'code', 1, 0, substr(md5(f.id::text) || md5(f.id::text || 'x'), 1, 40), substr(md5(f.id::text || 'h') || md5(f.id::text || 'y'), 1, 40),
+	        sha256(convert_to(f.id::text, 'UTF8')), 'failed', f.o,
+	        CASE WHEN f.o = 'failed' THEN (ARRAY['model_error', 'timed_out', 'superseded', 'malformed'])[1 + f.h % 4] END,
+	        CASE WHEN f.o <> 'completed' OR f.h % 100 < 40 THEN CASE WHEN f.o = 'completed' THEN '[]'::jsonb END
+	             ELSE (SELECT jsonb_agg(jsonb_build_object('id', 'f' || g, 'severity', 'medium', 'text', repeat(md5(g::text || f.h::text), 12)))
+	                   FROM generate_series(1, CASE WHEN f.h % 1000 < 15 THEN 200 ELSE 1 + f.h % 15 END) g) END,
+	        CASE WHEN f.o = 'pending' THEN NULL ELSE f.decided END, f.created + interval '1 hour', f.created,
+	        CASE WHEN f.o <> 'pending' AND f.h % 100 >= 97 THEN f.created + interval '1 minute' END,
+	        CASE WHEN f.h % 100 < 3 THEN NULL WHEN f.harness = 'claude' THEN 'codex' ELSE 'claude' END,
+	        jsonb_build_object('issue_title', 't', 'issue_description', left(f.blob, 3000)),
+	        CASE WHEN f.h % 2 = 0 THEN left(f.blob, 3000) ELSE '' END, CASE WHEN f.h % 2 = 0 THEN left(f.blob, 3000) ELSE '' END,
+	        sha256(convert_to(CASE WHEN f.h % 2 = 0 THEN left(f.blob, 3000) ELSE '' END, 'UTF8')),
+	        f.h % 3 = 0, CASE WHEN f.h % 3 = 0 THEN left(f.blob, 2500) ELSE '' END,
+	        sha256(convert_to(CASE WHEN f.h % 3 = 0 THEN left(f.blob, 2500) ELSE '' END, 'UTF8')), true
+	 FROM (SELECT g.*, GREATEST(g.created, LEAST(g.decided0, TIMESTAMPTZ '` + evNowRFC + `' - interval '1 second')) AS decided
+	       FROM (SELECT l.id, l.harness, h, b.blob,
+	                    LEAST(l.created_at + (20 + h % 90) * interval '1 minute', TIMESTAMPTZ '` + evNowRFC + `' - interval '1 minute') AS created,
+	                    CASE WHEN l.created_at < TIMESTAMPTZ '` + evNowRFC + `' - interval '30 days'
+	                          AND l.created_at >= TIMESTAMPTZ '` + evNowRFC + `' - interval '60 days' AND h % 100 < 10
+	                         THEN TIMESTAMPTZ '` + evNowRFC + `' - (h % 43200) * interval '1 minute'
+	                         ELSE l.created_at + (30 + h % 90) * interval '1 minute' END AS decided0,
+	                    CASE WHEN l.created_at > TIMESTAMPTZ '` + evNowRFC + `' - interval '10 days' AND h % 100 < 8 THEN 'pending'
+	                         WHEN h % 100 < 80 THEN 'completed' ELSE 'failed' END AS o
+	             FROM ev_lead l
+	             CROSS JOIN LATERAL (SELECT (hashtext(l.id::text || '/code')::bigint & 2147483647) AS h) hh
+	             CROSS JOIN LATERAL (SELECT string_agg(md5(l.id::text || g::text), '') AS blob FROM generate_series(1, 100) g) b
+	             WHERE l.hc < 350) g) f`,
+	`DROP TABLE ev_lead`,
+	`INSERT INTO run_reviews (target_run_id, user_id, verdict, status, created_at, updated_at)
+	 SELECT r.id, r.user_id,
+	        CASE WHEN h % 100 < 30 THEN 'ideal' WHEN h % 100 < 75 THEN 'ok' ELSE 'issues' END,
+	        CASE WHEN (h / 100) % 100 < 15 THEN 'failed' ELSE 'complete' END,
+	        COALESCE(r.finished_at, r.created_at) + interval '5 minutes', COALESCE(r.finished_at, r.created_at) + interval '5 minutes'
+	 FROM (SELECT r.*, (hashtext(r.id::text || 'v')::bigint & 2147483647) AS h FROM runs r
+	       WHERE r.kind IN ('issue', 'ci_fix') AND r.status IN ('completed', 'failed')) r
+	 WHERE r.h % 100 < 60`,
+	`INSERT INTO judge_skips (target_run_id, harness, reason)
+	 SELECT r.id, 'claude', 'no_usable_credential'
+	 FROM (SELECT r.id, (hashtext(r.id::text || 'v')::bigint & 2147483647) AS h FROM runs r
+	       WHERE r.kind IN ('issue', 'ci_fix') AND r.status IN ('completed', 'failed')) r
+	 WHERE r.h % 100 >= 95`,
+	`ANALYZE cross_checks`, `ANALYZE run_reviews`, `ANALYZE judge_skips`, `ANALYZE runs`,
 }
 
 type evStmt struct{ name, sql, args string }
@@ -306,6 +437,7 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 		start := time.Now()
 		h.simple(ix.ddl)
 		h.simple(`ANALYZE runs`)
+		h.simple(`ANALYZE cross_checks`)
 		var size int64
 		h.scalar(fmt.Sprintf("SELECT pg_relation_size('%s')", ix.name), &size)
 		h.logf("CREATE INDEX + ANALYZE took %s; index size %d bytes", time.Since(start).Round(time.Millisecond), size)
@@ -315,6 +447,7 @@ func TestAnalyticsPlanEvidenceLiveDB(t *testing.T) {
 		}
 		h.simple("DROP INDEX " + ix.name)
 		h.simple(`ANALYZE runs`)
+		h.simple(`ANALYZE cross_checks`)
 	}
 
 	// Issue #4685 (m3): the Reliability evidence runs AFTER every Spend workload, because the
@@ -331,6 +464,9 @@ var evIndexes = []struct{ name, ddl string }{
 	{"evid_runs_user_repo_mr_merged_idx", `CREATE INDEX evid_runs_user_repo_mr_merged_idx ON runs (user_id, repo_id, mr_iid) WHERE mr_state = 'merged'`},
 	// #4731 candidate: the terminal-end arm of the admin all-users Capacity statement (no user prefix).
 	{"evid_runs_terminal_end_idx", `CREATE INDEX evid_runs_terminal_end_idx ON runs ((COALESCE(finished_at, status_since))) WHERE status IN ('completed', 'failed', 'cancelled')`},
+	// Issue #4730 candidates (6 and 7): the rework join and the cross-check decision window.
+	{"evid_runs_rework_repo_mr_idx", `CREATE INDEX evid_runs_rework_repo_mr_idx ON runs (repo_id, mr_iid) WHERE kind = 'mr_rework'`},
+	{"evid_cc_decided_idx", `CREATE INDEX evid_cc_decided_idx ON cross_checks (decided_at)`},
 }
 
 func (h *evHarness) seed() {
@@ -341,7 +477,12 @@ func (h *evHarness) seed() {
 			h.simple(s)
 		}
 		h.seedCapacity()
-		h.logf("seed took %s", time.Since(start).Round(time.Second))
+		h.logf("seed (Spend base and Capacity) took %s", time.Since(start).Round(time.Second))
+		start = time.Now()
+		for _, s := range evSeedQuality {
+			h.simple(s)
+		}
+		h.logf("seed (Quality extension) took %s", time.Since(start).Round(time.Second))
 	}
 	var nRuns, nUsage, nRepos, nUsers, nRunRepos int64
 	h.scalar(`SELECT (SELECT count(*) FROM runs), (SELECT count(*) FROM run_usage), (SELECT count(*) FROM repos),
@@ -368,6 +509,65 @@ func (h *evHarness) seed() {
 	h.logf("%s", h.shape(`SELECT 'runs without usage (non-chat)', count(*) FROM runs r WHERE kind <> 'chat' AND NOT EXISTS (SELECT 1 FROM run_usage u WHERE u.run_id = r.id)`))
 	h.logf("%s", h.shape(`SELECT 'session_cumulative legs', count(*) FROM run_usage WHERE usage_basis = 'session_cumulative'`))
 	h.logCapacityShape()
+	h.qualityShape()
+}
+
+// qualityShape logs the measured #4730 seed: row counts, the 30d range selectivity, the fan-out
+// of reworks per PR, plan attempts per lead and reviews per eligible target, and the detoast
+// weight of cross_checks.
+func (h *evHarness) qualityShape() {
+	h.t.Helper()
+	// The window the 30d workloads run on: ComputeBounds' UTC midnight 29 calendar days before
+	// today through now, not now minus 30 days.
+	b30, err := analytics.ComputeBounds(h.now, time.UTC, analytics.Window30d, nil)
+	if err != nil {
+		h.t.Fatalf("ComputeBounds 30d: %v", err)
+	}
+	win := `TIMESTAMPTZ '` + b30.From.UTC().Format(time.RFC3339Nano) + `'`
+	upper := `TIMESTAMPTZ '` + b30.Now.UTC().Format(time.RFC3339Nano) + `'`
+	h.logf("QUALITY SEED SHAPE (30d window %s to %s)", b30.From.UTC().Format(time.RFC3339), b30.Now.UTC().Format(time.RFC3339))
+	h.logf("%s", h.shape(`SELECT 'row counts', 'runs=' || (SELECT count(*) FROM runs) || ' mr_rework=' || (SELECT count(*) FROM runs WHERE kind = 'mr_rework')
+	    || ' cross_checks=' || (SELECT count(*) FROM cross_checks) || ' (plan ' || (SELECT count(*) FROM cross_checks WHERE stage = 'plan')
+	    || ', code ' || (SELECT count(*) FROM cross_checks WHERE stage = 'code') || ') run_reviews=' || (SELECT count(*) FROM run_reviews)
+	    || ' judge_skips=' || (SELECT count(*) FROM judge_skips)`))
+	h.logf("%s", h.shape(`SELECT 'size', 'runs=' || pg_size_pretty(pg_total_relation_size('runs')) || ' cross_checks=' || pg_size_pretty(pg_total_relation_size('cross_checks'))
+	    || ' (toast ' || pg_size_pretty(pg_total_relation_size(reltoastrelid)) || ') run_reviews=' || pg_size_pretty(pg_total_relation_size('run_reviews'))
+	    FROM pg_class WHERE oid = 'cross_checks'::regclass`))
+	for _, scope := range []struct{ label, pred string }{
+		{"overall", "true"},
+		{"largest owner", "user_id = (SELECT id FROM users WHERE email = 'evid-0001@e2e')"},
+	} {
+		h.logf("%s", h.shape(`SELECT '30d range selectivity of runs (`+scope.label+`)', round(100.0 * count(*) FILTER (WHERE created_at >= `+win+` AND created_at < `+upper+`) / count(*), 2) || '% of ' || count(*) || ' runs ('
+	        || count(*) FILTER (WHERE created_at >= `+win+`) || ' in window)' FROM runs WHERE `+scope.pred))
+		h.logf("%s", h.shape(`SELECT 'rw_seed cohort 30d (`+scope.label+`)', count(*) || ' PRs from ' || sum(c) || ' delivery runs' FROM
+	        (SELECT repo_id, mr_iid, count(*) AS c FROM runs WHERE created_at >= `+win+` AND created_at < `+upper+`
+	         AND kind = ANY(ARRAY['issue','mr_rework','ci_fix','prompt','self_improve','task','job']) AND mr_iid IS NOT NULL AND repo_id IS NOT NULL AND `+scope.pred+`
+	         GROUP BY repo_id, mr_iid) x`))
+	}
+	h.logf("%s", h.shape(`SELECT 'PRs (distinct repo,mr) / witnessed share', count(*) || ' / ' || round(100.0 * count(*) FILTER (WHERE w) / count(*), 1) || '%' FROM
+	    (SELECT repo_id, mr_iid, bool_or(mr_state = 'merged') AS w FROM runs WHERE mr_iid IS NOT NULL AND repo_id IS NOT NULL GROUP BY repo_id, mr_iid) x`))
+	h.logf("%s", h.shape(`SELECT 'reworks per PR (0 / 1 / 2 / 3+)', string_agg(g || '=' || c, ' ' ORDER BY g) FROM
+	    (SELECT CASE WHEN n >= 3 THEN '3+' ELSE n::text END AS g, count(*) AS c FROM
+	       (SELECT p.repo_id, p.mr_iid, count(w.id) AS n FROM (SELECT DISTINCT repo_id, mr_iid FROM runs WHERE mr_iid IS NOT NULL AND repo_id IS NOT NULL AND kind <> 'mr_rework') p
+	        LEFT JOIN runs w ON w.kind = 'mr_rework' AND w.repo_id = p.repo_id AND w.mr_iid = p.mr_iid GROUP BY p.repo_id, p.mr_iid) y GROUP BY 1) x`))
+	h.logf("%s", h.shape(`SELECT 'reworks: manual / created before the 30d window / unverified link', round(100.0 * count(*) FILTER (WHERE r.trigger_source = 'manual') / count(*), 1) || '% / '
+	    || round(100.0 * count(*) FILTER (WHERE r.created_at < `+win+`) / count(*), 1) || '% / '
+	    || round(100.0 * count(*) FILTER (WHERE t.repo_id IS DISTINCT FROM r.repo_id OR t.mr_iid IS DISTINCT FROM r.mr_iid OR t.user_id IS DISTINCT FROM r.user_id) / count(*), 1) || '%'
+	    FROM runs r LEFT JOIN runs t ON t.id = r.target_run_id WHERE r.kind = 'mr_rework'`))
+	h.logf("%s", h.shape(`SELECT 'plan attempts per lead (1 / 2 / 3 rounds), leads with plan checks', string_agg(n || '=' || c, ' ' ORDER BY n) || ' of ' || (SELECT count(*) FROM runs WHERE kind IN ('issue','task','self_improve','prompt','ci_fix')) || ' delivery leads' FROM
+	    (SELECT n, count(*) AS c FROM (SELECT lead_run_id, count(*) AS n FROM cross_checks WHERE stage = 'plan' GROUP BY lead_run_id) y GROUP BY n) x`))
+	h.logf("%s", h.shape(`SELECT 'plan final verdict mix', string_agg(verdict || '=' || c, ' ' ORDER BY verdict) FROM (SELECT verdict, count(*) c FROM cross_checks WHERE stage = 'plan' GROUP BY 1) x`))
+	h.logf("%s", h.shape(`SELECT 'code attempts per lead / outcome mix', max(n) || ' max; ' || string_agg(outcome || '=' || c, ' ' ORDER BY outcome) FROM
+	    (SELECT outcome, count(*) AS c, 1 AS n FROM cross_checks WHERE stage = 'code' GROUP BY 1) x`))
+	h.logf("%s", h.shape(`SELECT 'cross_checks decided in 30d window (plan / code), of which lead created before window', count(*) FILTER (WHERE cc.stage = 'plan') || ' / ' || count(*) FILTER (WHERE cc.stage = 'code')
+	    || ', older leads ' || count(*) FILTER (WHERE l.created_at < `+win+`)
+	    FROM cross_checks cc JOIN runs l ON l.id = cc.lead_run_id WHERE cc.decided_at >= `+win+` AND cc.decided_at < `+upper+``))
+	h.logf("%s", h.shape(`SELECT 'pending attempts (plan / code)', count(*) FILTER (WHERE stage = 'plan' AND verdict = 'pending') || ' / ' || count(*) FILTER (WHERE stage = 'code' AND outcome = 'pending') FROM cross_checks`))
+	h.logf("%s", h.shape(`SELECT 'judge-eligible targets / reviewed / failed reviews / skips', t.n || ' / ' || t.rev || ' (' || round(100.0 * t.rev / t.n, 1) || '%) / ' || t.fl || ' / ' || t.sk FROM
+	    (SELECT count(*) AS n, count(rv.id) AS rev, count(rv.id) FILTER (WHERE rv.status = 'failed') AS fl, count(js.target_run_id) AS sk
+	     FROM runs r LEFT JOIN run_reviews rv ON rv.target_run_id = r.id LEFT JOIN judge_skips js ON js.target_run_id = r.id
+	     WHERE r.kind IN ('issue', 'ci_fix') AND r.status IN ('completed', 'failed')) t`))
+	h.logf("%s", h.shape(`SELECT 'reviews per eligible target (max)', max(c) FROM (SELECT count(*) AS c FROM run_reviews GROUP BY target_run_id) x`))
 }
 
 func (h *evHarness) shape(sql string) string {
@@ -474,6 +674,68 @@ func (h *evHarness) spendWorkloadWith(name string, owner uuid.UUID, win analytic
 	return w
 }
 
+// qualityWorkload is the #4730 Quality statement for owner (owner-shaped, which is also what the
+// admin route runs for a selected user) or, for owner == uuid.Nil, the all-scope statement, with
+// every kind and no repo or harness filter, exactly as the handler builds it.
+func (h *evHarness) qualityWorkload(name string, owner uuid.UUID, win analytics.Window) evWorkload {
+	h.t.Helper()
+	kinds := runkind.All()
+	var hist pgtype.Timestamptz
+	var err error
+	if owner != uuid.Nil {
+		hist, err = h.q.AnalyticsOwnerHistoryStart(h.ctx, store.AnalyticsOwnerHistoryStartParams{UserID: owner, Kinds: kinds})
+	} else {
+		hist, err = h.q.AnalyticsAllHistoryStart(h.ctx, store.AnalyticsAllHistoryStartParams{Kinds: kinds})
+	}
+	if err != nil {
+		h.t.Fatalf("history start: %v", err)
+	}
+	var earliest *time.Time
+	if hist.Valid {
+		e := hist.Time
+		earliest = &e
+	}
+	b, err := analytics.ComputeBounds(h.now, time.UTC, win, earliest)
+	if err != nil {
+		h.t.Fatalf("ComputeBounds: %v", err)
+	}
+	var judge []string
+	for _, k := range runkind.All() {
+		if runkind.JudgeEligible(k) {
+			judge = append(judge, k)
+		}
+	}
+	planLead, codeLead := qualityCall{}.leadKinds()
+	always, prestart := workersvc.JudgeSkipFailOrigins()
+	ownerP := store.AnalyticsOwnerQualityParams{
+		UserID: owner, Now: spendTS(b.Now), From: spendTS(b.From), BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
+		Kinds: kinds, DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+		PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
+	}
+	allP := store.AnalyticsAllQualityParams{
+		Now: spendTS(b.Now), From: spendTS(b.From), BucketStarts: spendTSs(b.BucketStarts), BucketEnds: spendTSs(b.BucketEnds),
+		Kinds: kinds, DeliveryKinds: runkind.Delivery(), AlwaysSkipOrigins: always, PrestartOrigins: prestart, JudgeKinds: judge,
+		PlanLeadKinds: planLead, CodeLeadKinds: codeLead,
+	}
+	w := evWorkload{name: name}
+	if owner != uuid.Nil {
+		w.stmts = []evStmt{{name: "AnalyticsOwnerQuality", sql: store.AnalyticsOwnerQualitySQL}}
+		w.run = func(ctx context.Context, q *store.Queries) error {
+			_, err := q.AnalyticsOwnerQuality(ctx, ownerP)
+			return err
+		}
+	} else {
+		w.stmts = []evStmt{{name: "AnalyticsAllQuality", sql: store.AnalyticsAllQualitySQL}}
+		w.run = func(ctx context.Context, q *store.Queries) error {
+			_, err := q.AnalyticsAllQuality(ctx, allP)
+			return err
+		}
+	}
+	w.stmts[0].args = qualityExecuteArgs(h.t, h.ctx, owner, b)
+	h.logf("WORKLOAD %s: window=%s buckets=%d from=%s now=%s", name, win, len(b.BucketStarts), b.From.Format(time.RFC3339), b.Now.Format(time.RFC3339))
+	return w
+}
+
 const (
 	evSQLOwnerRepoOptions = `SELECT r.id, r.path_with_namespace FROM repos r JOIN forge_connections c ON c.id = r.connection_id
 		WHERE c.user_id = $1::uuid ORDER BY r.path_with_namespace COLLATE "C", r.id LIMIT 201`
@@ -540,6 +802,16 @@ func (h *evHarness) workloads() []evWorkload {
 		h.spendWorkloadWith("admin-user-30d-harness-kind", h.topOwner, analytics.Window30d, "harness", "kind",
 			evSpendOpts{harness: "claude", kinds: []string{runkind.Issue}, revealRepos: true}),
 	}
+	// Issue #4730: the Quality statements. The admin route's user=<uuid> request runs the same
+	// owner-shaped statement as the owner route; it is listed under its own name so the table
+	// carries the four scopes the HTTP evidence covers.
+	all = append(all,
+		h.qualityWorkload("quality-owner-30d", h.topOwner, analytics.Window30d),
+		h.qualityWorkload("quality-owner-window-all", h.topOwner, analytics.WindowAll),
+		h.qualityWorkload("quality-admin-all-users-30d", uuid.Nil, analytics.Window30d),
+		h.qualityWorkload("quality-admin-user-30d", h.topOwner, analytics.Window30d),
+		h.qualityWorkload("quality-admin-all-users-window-all", uuid.Nil, analytics.WindowAll),
+	)
 	all = append(all, h.optionWorkloads()...)
 	all = append(all, h.capacityWorkloads()...)
 	return evOnly(all)
