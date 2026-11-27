@@ -63,6 +63,10 @@ export function loadPackagedTransport(): Promise<TransportModule> {
   return load<TransportModule>("codex/transport.ts");
 }
 
+export function loadPackagedRmtree(): Promise<typeof import("../../agent/src/rmtree.js")> {
+  return load("rmtree.ts");
+}
+
 // NOTE (main.ts): the DARK selection FACTORY lives in main.ts as a private const
 // `makeExecutor` — it is NOT exported, and importing main.ts is impossible for this harness
 // because main.ts self-invokes the worker on import (`main().catch(...)` at module scope),

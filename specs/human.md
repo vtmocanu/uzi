@@ -16,9 +16,10 @@ terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 ## Feature #4416 — Run environment variables
 
-PRD at `prds/4416-repo-env-vars.md` (M1 shipped; M2 implemented, pending landing; M3 and M4 pending).
+PRD at `prds/4416-repo-env-vars.md` (M1 and M2 shipped; M3 implemented, pending landing; M4 pending).
 
 - A repo's variables reach lead-lane runs only (`issue`, `ci_fix`, `prompt`, `self_improve`, `mr_rework`, `task`, no review target, no egress profile), at the lowest precedence in the agent command environment on both harnesses; chat, judge, job, task-review and cross-check runs get none. Secret values are redacted from run output and every publish (checkpoint, final push on every forge, held and terminal packs, recovery uploads, preserved patch) is exact-value scanned and fails closed. A lead-lane run whose repo has an enabled variable, or that holds a secret receipt, is claimed only by a worker reporting `run_env_v1`. (AI-synced 2026-11-21)
+- A registry login (`docker login`) now lasts for the rest of the run on both harnesses when Docker is wired: each run has a `.docker` directory in its run home that `DOCKER_CONFIG` points at for model commands, kept and removed with the run home. A resumed run may need to log in again, and a concurrent same-user run on the worker can read and modify the directory on Claude and on Codex without Landlock. See `docs/run-env-vars.md`. (AI-synced 2026-11-27)
 
 ## Project
 

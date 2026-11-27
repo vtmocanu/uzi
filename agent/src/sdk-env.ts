@@ -24,6 +24,7 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import path from "node:path";
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { claudeConfigDir } from "./claude-config-dir.js";
 import { applyGoMemLimitDefault, goConcurrencyEnv } from "./go-concurrency.js";
@@ -42,6 +43,9 @@ export const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // PRD #4416: where the CLI reads its global config from (claudeConfigDir(HOME)); spawnDetached
   // refuses any other value, and a provisioned or user variable must never move it.
   "CLAUDE_CONFIG_DIR",
+  // PRD #4416 M3: the per-run Docker client config dir (<HOME>/.docker), worker-set after the fold
+  // whenever the Docker daemon is wired; a provisioned or user variable must never move it.
+  "DOCKER_CONFIG",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   // PRD #4320 module 6: the provider-mode routing and model keys. A provisioned tool env may never
@@ -329,7 +333,12 @@ export function buildSdkEnv(
   // DOCKER_HOST is worker-set (not agent-set) and NOT in PROTECTED_ENV_KEYS: the
   // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
   // the fold so a provisioned var can never clobber the worker's wired endpoint.
-  if (dockerHost) env.DOCKER_HOST = dockerHost;
+  if (dockerHost) {
+    env.DOCKER_HOST = dockerHost;
+    // PRD #4416 M3: a Docker login must persist across the agent's commands, so the client config
+    // lives in the run home (not an ephemeral default). Same condition and precedence as DOCKER_HOST.
+    env.DOCKER_CONFIG = path.join(homeDir, ".docker");
+  }
   // Issue #3907: browser discovery points at the uzi-chromium wrapper, set AFTER the fold
   // (and protected above) so a provisioned var can neither redirect nor drop it.
   Object.assign(env, BROWSER_DISCOVERY_ENV);

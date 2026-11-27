@@ -161,6 +161,41 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await assertSentinelIntact();
   });
 
+  // Issue #4416: a Docker login lives in `<HOME>/.docker`, created by a Codex command root (runner-cmd)
+  // as a private 0700 dir under the worker:runner 3770 run home. Teardown must still remove it.
+  it("rmHomeTree removes a runner-cmd-owned private .docker with its config under a 3770 run HOME (#4416)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000004416");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o3770);
+    asCommand(`set -e; umask 077; mkdir -p "$1/.docker" && echo '{}' > "$1/.docker/config.json"`, home);
+    assert.equal(await exists(path.join(home, ".docker")), true, "the fixture exists before teardown");
+    const homeStat = await fs.stat(home);
+    assert.equal(homeStat.mode & 0o7777, 0o3770, "the run HOME is 3770");
+    assert.equal(homeStat.gid, runnerUid.RUNNER_UID, "the run HOME is group runner");
+    const dockerStat = await fs.stat(path.join(home, ".docker"));
+    assert.equal(dockerStat.uid, 10003, ".docker is owned by runner-cmd");
+    assert.equal(dockerStat.mode & 0o777, 0o700, ".docker is private to its owner");
+    await rmtree.rmHomeTree(home);
+    assert.equal(await exists(home), false, "the whole run HOME, .docker included, must be gone");
+    await assertSentinelIntact();
+  });
+
+  // Issue #4416: terminal run-home teardown (runner.ts) and disk reclaim use the pinned walk, not
+  // rmHomeTree. Its runner pass cannot open runner-cmd's private .docker; the runner-cmd pass must.
+  it("rmTeardownTree removes a runner-cmd-owned private .docker with its config under a 3770 run HOME (#4416)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000044160");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o3770);
+    asCommand(`set -e; umask 077; mkdir -p "$1/.docker" && echo '{}' > "$1/.docker/config.json"`, home);
+    const dockerStat = await fs.stat(path.join(home, ".docker"));
+    assert.equal(dockerStat.uid, 10003, ".docker is owned by runner-cmd");
+    assert.equal(dockerStat.mode & 0o777, 0o700, ".docker is private to its owner");
+    await assert.rejects(fs.readdir(path.join(home, ".docker")), { code: "EACCES" }, "the worker alone cannot read .docker");
+    await rmtree.rmTeardownTree(home);
+    assert.equal(await exists(home), false, "the whole run HOME, .docker included, must be gone");
+    await assertSentinelIntact();
+  });
+
   it("a partial pass never widens a runner-private dir to group (runner-cmd must not read it)", async () => {
     // A runner-private dir that a runner pass CANNOT empty: runner-cmd wrote into it while it
     // was group-writable, then runner made it private. Run one runner pass of the production
