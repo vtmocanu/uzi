@@ -12,12 +12,19 @@
 --
 -- pr_history_events: a first_merge row is the only record of when a PR first merged and is never
 -- expired. pr_history_heads is not touched.
+--
+-- ORDER BY s.<expiry column> in the inner SELECT is load-bearing (issue #4695 plan-flip evidence):
+-- without it, after a drain or churn leaves the table statistics stale, the planner chose a
+-- Seq Scan for the page read (1,107 ms against 5 ms) even with the btree on the expiry column;
+-- the ORDER BY lets the planner satisfy LIMIT from that index in expiry order, an Index Scan, and
+-- it removes the oldest rows first. The indexes are created by migrations 00549 to 00552.
 
 -- name: DeleteExpiredPRHistoryEvents :execrows
 DELETE FROM pr_history_events AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM pr_history_events AS s
         WHERE s.observed_at < @cutoff::timestamptz AND NOT s.first_merge
+        ORDER BY s.observed_at
         LIMIT @batch_size::int
         FOR UPDATE SKIP LOCKED))
   AND d.observed_at < @cutoff::timestamptz
@@ -28,6 +35,7 @@ DELETE FROM anthropic_usage_samples AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM anthropic_usage_samples AS s
         WHERE s.bucket_start < @cutoff::timestamptz
+        ORDER BY s.bucket_start
         LIMIT @batch_size::int
         FOR UPDATE SKIP LOCKED))
   AND d.bucket_start < @cutoff::timestamptz;
@@ -37,6 +45,7 @@ DELETE FROM codex_usage_samples AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM codex_usage_samples AS s
         WHERE s.bucket_start < @cutoff::timestamptz
+        ORDER BY s.bucket_start
         LIMIT @batch_size::int
         FOR UPDATE SKIP LOCKED))
   AND d.bucket_start < @cutoff::timestamptz;
@@ -46,6 +55,7 @@ DELETE FROM worker_capacity_samples AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM worker_capacity_samples AS s
         WHERE s.bucket_start < @cutoff::timestamptz
+        ORDER BY s.bucket_start
         LIMIT @batch_size::int
         FOR UPDATE SKIP LOCKED))
   AND d.bucket_start < @cutoff::timestamptz;

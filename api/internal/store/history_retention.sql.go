@@ -16,6 +16,7 @@ DELETE FROM anthropic_usage_samples AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM anthropic_usage_samples AS s
         WHERE s.bucket_start < $1::timestamptz
+        ORDER BY s.bucket_start
         LIMIT $2::int
         FOR UPDATE SKIP LOCKED))
   AND d.bucket_start < $1::timestamptz
@@ -39,6 +40,7 @@ DELETE FROM codex_usage_samples AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM codex_usage_samples AS s
         WHERE s.bucket_start < $1::timestamptz
+        ORDER BY s.bucket_start
         LIMIT $2::int
         FOR UPDATE SKIP LOCKED))
   AND d.bucket_start < $1::timestamptz
@@ -63,6 +65,7 @@ DELETE FROM pr_history_events AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM pr_history_events AS s
         WHERE s.observed_at < $1::timestamptz AND NOT s.first_merge
+        ORDER BY s.observed_at
         LIMIT $2::int
         FOR UPDATE SKIP LOCKED))
   AND d.observed_at < $1::timestamptz
@@ -88,6 +91,12 @@ type DeleteExpiredPRHistoryEventsParams struct {
 //
 // pr_history_events: a first_merge row is the only record of when a PR first merged and is never
 // expired. pr_history_heads is not touched.
+//
+// ORDER BY s.<expiry column> in the inner SELECT is load-bearing (issue #4695 plan-flip evidence):
+// without it, after a drain or churn leaves the table statistics stale, the planner chose a
+// Seq Scan for the page read (1,107 ms against 5 ms) even with the btree on the expiry column;
+// the ORDER BY lets the planner satisfy LIMIT from that index in expiry order, an Index Scan, and
+// it removes the oldest rows first. The indexes are created by migrations 00549 to 00552.
 func (q *Queries) DeleteExpiredPRHistoryEvents(ctx context.Context, arg DeleteExpiredPRHistoryEventsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredPRHistoryEvents, arg.Cutoff, arg.BatchSize)
 	if err != nil {
@@ -101,6 +110,7 @@ DELETE FROM worker_capacity_samples AS d
 WHERE d.ctid = ANY(ARRAY(
         SELECT s.ctid FROM worker_capacity_samples AS s
         WHERE s.bucket_start < $1::timestamptz
+        ORDER BY s.bucket_start
         LIMIT $2::int
         FOR UPDATE SKIP LOCKED))
   AND d.bucket_start < $1::timestamptz

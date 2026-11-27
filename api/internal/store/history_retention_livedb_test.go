@@ -283,6 +283,30 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		})
 	}
 
+	// The inner SELECT orders by the expiry column (issue #4695), so a batch removes the oldest
+	// rows first. The groups are inserted newest first, so heap order is the reverse of age: a
+	// statement without the ORDER BY would take the newest group.
+	for _, table := range hrTables {
+		root.run(t, "oldest first "+string(table), func(t *testing.T, f *hrFx) {
+			s := f.open(5*time.Second, time.Second)
+			at := []time.Time{hrBase.Add(2 * time.Hour), hrBase.Add(time.Hour), hrBase}
+			for _, a := range at {
+				f.seed(table, 300, a)
+			}
+			cutoff := hrBase.Add(3 * time.Hour)
+			hrMustDelete(t, s, table, cutoff, 300, 300)
+			for i, want := range []int{300, 300, 0} {
+				if got := f.countAt(table, at[i]); got != want {
+					t.Errorf("after the first batch %d rows remain at %v, want %d (the oldest group goes first)", got, at[i], want)
+				}
+			}
+			hrMustDelete(t, s, table, cutoff, 300, 300)
+			if got := f.countAt(table, at[1]); got != 0 {
+				t.Errorf("after the second batch %d rows remain at %v, want 0", got, at[1])
+			}
+		})
+	}
+
 	for _, table := range hrTables {
 		root.run(t, "row lock skip "+string(table), func(t *testing.T, f *hrFx) {
 			s := f.open(5*time.Second, 5*time.Second)
@@ -632,9 +656,32 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 
 // hrPlan is the part of an EXPLAIN (FORMAT JSON) node this test reads.
 type hrPlan struct {
-	NodeType string   `json:"Node Type"`
-	Relation string   `json:"Relation Name"`
-	Plans    []hrPlan `json:"Plans"`
+	NodeType  string   `json:"Node Type"`
+	Relation  string   `json:"Relation Name"`
+	IndexName string   `json:"Index Name"`
+	Plans     []hrPlan `json:"Plans"`
+}
+
+// findIndexScan reports whether the tree has an Index Scan or Index Only Scan node on relation
+// that reads the named index.
+func (p *hrPlan) findIndexScan(relation, index string) bool {
+	if (p.NodeType == "Index Scan" || p.NodeType == "Index Only Scan") && p.Relation == relation && p.IndexName == index {
+		return true
+	}
+	for i := range p.Plans {
+		if p.Plans[i].findIndexScan(relation, index) {
+			return true
+		}
+	}
+	return false
+}
+
+// hrRetentionIndex is the time index migrations 00549 to 00552 create for each table.
+var hrRetentionIndex = map[store.HistoryRetentionTable]string{
+	store.HistoryRetentionPRHistoryEvents:      "pr_history_events_observed_at_idx",
+	store.HistoryRetentionAnthropicUsage:       "anthropic_usage_samples_bucket_start_idx",
+	store.HistoryRetentionCodexUsage:           "codex_usage_samples_bucket_start_idx",
+	store.HistoryRetentionWorkerCapacitySample: "worker_capacity_samples_bucket_start_idx",
 }
 
 func (p *hrPlan) find(nodeType, relation string) bool {
@@ -650,15 +697,17 @@ func (p *hrPlan) find(nodeType, relation string) bool {
 }
 
 // hrGenericPlan pins the plan shape of the four delete statements under force_generic_plan: the
-// outer DELETE must be a Tid Scan on the target table, the inner page read a LockRows over the
-// table. Production runs each delete once on a fresh hijacked connection, so it uses a custom
+// outer DELETE must be a Tid Scan on the target table, the inner page read a LockRows over an
+// Index Scan (or Index Only Scan) on the table's retention time index from migrations 00549 to
+// 00552, which the ORDER BY on the expiry column lets the planner use. The table is large enough
+// (40,000 rows, 5% expired) that the planner prefers the index over a sort of a scan. Production runs each delete once on a fresh hijacked connection, so it uses a custom
 // plan; the generic plan checked here is a conservative safety pin (it is what a long-lived
 // pooled connection would reach after five executions), not a path the pass takes. The plan is
 // explained inside a rolled-back transaction.
 func hrGenericPlan(t *testing.T, f *hrFx) {
 	for _, table := range hrTables {
 		f.seed(table, 2000, hrBase)
-		f.seed(table, 2000, hrBase.Add(48*time.Hour))
+		f.seed(table, 38000, hrBase.Add(48*time.Hour))
 		f.exec(`ANALYZE ` + string(table))
 	}
 	conn, err := f.pool.Acquire(f.ctx)
@@ -706,6 +755,9 @@ func hrGenericPlan(t *testing.T, f *hrFx) {
 		}
 		if !root.find("LockRows", "") {
 			t.Errorf("%s: the inner page read has no LockRows node:\n%s", table, raw)
+		}
+		if !root.findIndexScan(string(table), hrRetentionIndex[table]) {
+			t.Errorf("%s: the inner page read is not an Index Scan on %s:\n%s", table, hrRetentionIndex[table], raw)
 		}
 	}
 }
