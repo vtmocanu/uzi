@@ -8301,11 +8301,44 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
   it("emits --stdin null after --mode and before --, and a model-supplied --stdin lands after --", () => {
     const wt = "/data/runner/repo/run-a";
     const tmp = "/tmp/uzi-codex-command-test-a";
-    const args = commandSandboxArgv(wt, wt, "/bin/sh", ["-c", "cat", "--stdin", "inherit"], tmp, "required", undefined, true);
+    const args = commandSandboxArgv(wt, wt, "/bin/sh", ["-c", "cat", "--stdin", "inherit"], tmp, "required", { nullStdin: true });
     const sep = args.indexOf("--");
     assert.deepEqual(args.slice(0, sep), ["--root", wt, "--tmp", tmp, "--cwd", wt, "--mode", "required", "--stdin", "null"]);
     assert.deepEqual(args.slice(sep + 1), ["/bin/sh", "-c", "cat", "--stdin", "inherit"]);
     assert.ok(!commandSandboxArgv(wt, wt, "/bin/sh", [], tmp, "required").includes("--stdin"), "absent unless requested");
+  });
+
+  it("emits --docker-config after --cache and before --mode, and refuses a bad docker config dir", () => {
+    const wt = "/data/runner/repo/run-a";
+    const tmp = "/tmp/uzi-codex-command-test-a";
+    const docker = "/data/agent-home/run-1/.docker";
+    const cache = "/var/cache/uzi-codex-cmd/0a1b2c3d-0000-4000-8000-00000000000a";
+    const args = commandSandboxArgv(wt, wt, "/bin/sh", ["-c", "true", "--docker-config", "/evil/.docker"], tmp, "required", { cacheDir: cache, nullStdin: true, dockerConfigDir: docker });
+    const sep = args.indexOf("--");
+    assert.deepEqual(args.slice(0, sep), ["--root", wt, "--tmp", tmp, "--cwd", wt, "--cache", cache, "--docker-config", docker, "--mode", "required", "--stdin", "null"]);
+    assert.deepEqual(args.slice(sep + 1), ["/bin/sh", "-c", "true", "--docker-config", "/evil/.docker"]);
+    assert.ok(!commandSandboxArgv(wt, wt, "/bin/sh", [], tmp, "required").includes("--docker-config"), "absent unless requested");
+    for (const bad of ["relative/.docker", "/data/x/docker", "/data/x/../x/.docker", "/data/x/.docker/", "/"]) {
+      assert.throws(() => commandSandboxArgv(wt, wt, "/bin/true", [], tmp, "required", { dockerConfigDir: bad }), /docker config/, bad);
+    }
+  });
+
+  it("a model command launch carries --docker-config and DOCKER_CONFIG; without one DOCKER_CONFIG is stripped; HOME/TMPDIR stay private", async () => {
+    const specs: CodexEffectLaunchSpec[] = [];
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const docker = "/data/agent-home/run-1/.docker";
+    const wt = "/data/runner/repo/run-1";
+    const withDocker = makeDefaultSpawnCommand(registry, recordingLaunch(specs), 1000, wt, { DOCKER_CONFIG: "/planted/.docker" }, "required", undefined, undefined, undefined, undefined, undefined, docker);
+    const without = makeDefaultSpawnCommand(new ExecutionRegistry(newLocalExecutionEpoch(2)), recordingLaunch(specs), 1000, wt, { DOCKER_CONFIG: "/planted/.docker" }, "required");
+    await assert.rejects(withDocker(["/bin/true"], { cwd: wt }));
+    await assert.rejects(without(["/bin/true"], { cwd: wt }));
+    const [a, b] = specs as [CodexEffectLaunchSpec, CodexEffectLaunchSpec];
+    const flagsA = a.args.slice(0, a.args.indexOf("--"));
+    assert.deepEqual(flagsA.slice(flagsA.indexOf("--docker-config"), flagsA.indexOf("--docker-config") + 3), ["--docker-config", docker, "--mode"]);
+    assert.equal(a.env.DOCKER_CONFIG, docker);
+    assert.equal(a.env.HOME, a.env.TMPDIR);
+    assert.ok(!b.args.includes("--docker-config"));
+    assert.equal(b.env.DOCKER_CONFIG, undefined, "an inherited DOCKER_CONFIG never reaches a command without a granted dir");
   });
 
   // Launch that records the spec and then refuses, so only the argv the caller built is observed.
@@ -13261,7 +13294,11 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     const flags = flagsOf(command);
     const tmp = flags[flags.indexOf("--tmp") + 1];
     assert.match(String(tmp), /^\/tmp\/uzi-codex-command-/);
-    assert.deepEqual(flags, ["--root", WORKSPACE, "--tmp", tmp, "--cwd", WORKSPACE, "--cache", CACHE_DIR, "--mode", "required", "--stdin", "null"]);
+    const dockerAt = flags.indexOf("--docker-config");
+    assert.equal(path.basename(String(flags[dockerAt + 1])), ".docker", "issue #4416: the model command is granted the run home's .docker");
+    assert.equal(command.env.DOCKER_CONFIG, flags[dockerAt + 1]);
+    assert.deepEqual(flags.filter((_, i) => i !== dockerAt && i !== dockerAt + 1), ["--root", WORKSPACE, "--tmp", tmp, "--cwd", WORKSPACE, "--cache", CACHE_DIR, "--mode", "required", "--stdin", "null"]);
+    assert.equal(fileop.env.DOCKER_CONFIG, undefined, "the fileop root is never granted a docker config");
     assert.equal(command.env.GOMODCACHE, `${CACHE_DIR}/gomod`);
     assert.equal(command.env.GOCACHE, `${CACHE_DIR}/gocache`);
     assert.equal(command.env.npm_config_cache, `${CACHE_DIR}/npm`);
@@ -14129,8 +14166,8 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
   });
 
   it("commandSandboxArgv refuses a cache outside the cache root", () => {
-    assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", "/tmp/evil"), /cache/);
-    assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", `${CACHE_DIR}/../x`), /cache/);
+    assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", { cacheDir: "/tmp/evil" }), /cache/);
+    assert.throws(() => commandSandboxArgv(WORKSPACE, WORKSPACE, "/bin/true", [], "/tmp/uzi-codex-command-x", "required", { cacheDir: `${CACHE_DIR}/../x` }), /cache/);
   });
 });
 

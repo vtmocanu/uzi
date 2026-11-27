@@ -6040,6 +6040,9 @@ export class CodexExecutor implements Executor {
         DEFAULT_COMMAND_WALL_MS,
         LONG_COMMAND_WALL_MS,
         capturedMemory,
+        // Issue #4416: the run home's `.docker` is granted to model commands so a Docker login
+        // persists across them. Never to a cross-check run, the fileop root or a boundary process.
+        (ctx.kind as string | undefined) === "cross_check" ? undefined : path.join(this.homeRoot, ".docker"),
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => this.lifetime.admit(() => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv }));
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
@@ -8484,10 +8487,21 @@ async function launchRegisteredEffectRoot(
  * lands AFTER `--` and the Go sandbox reads it as part of the child, never as the
  * mode.
  *
+ * `dockerConfigDir` (issue #4416) emits `--docker-config <dir>` after the cache flag and before
+ * `--mode`. It must be an absolute, clean path whose last element is `.docker` (the run home's
+ * Docker config directory); the sandbox creates and Landlock-grants exactly it, or degrades
+ * without it. Only model commands of a non-cross-check run pass it.
+ *
  * `nullStdin` emits `--stdin null` after `--mode` (also before `--`), giving the command an
  * empty stdin. Only model-authorized commands set it: their inherited stdin is a pipe nobody
  * writes or closes, so `rg PATTERN` or `cat` would block until the wall deadline. The fileop
  * root and boundary processes (git `index-pack --stdin`) leave it unset and keep their stdin. */
+export interface CommandSandboxOptions {
+  cacheDir?: string;
+  nullStdin?: boolean;
+  dockerConfigDir?: string;
+}
+
 export function commandSandboxArgv(
   worktreePath: string,
   cwd: string,
@@ -8495,8 +8509,7 @@ export function commandSandboxArgv(
   args: readonly string[],
   privateTmp: string,
   mode: CommandSandboxMode,
-  cacheDir?: string,
-  nullStdin?: boolean,
+  { cacheDir, nullStdin, dockerConfigDir }: CommandSandboxOptions = {},
 ): string[] {
   const worktree = path.resolve(worktreePath);
   const workCwd = path.resolve(cwd);
@@ -8510,11 +8523,16 @@ export function commandSandboxArgv(
   if (cacheDir !== undefined && (path.dirname(cacheDir) !== CODEX_COMMAND_CACHE_ROOT || path.resolve(cacheDir) !== cacheDir)) {
     throw new TrustedExecutionRefusal("command cache must be a clean child of the command cache root");
   }
+  if (dockerConfigDir !== undefined
+    && (!path.isAbsolute(dockerConfigDir) || path.resolve(dockerConfigDir) !== dockerConfigDir || path.basename(dockerConfigDir) !== ".docker")) {
+    throw new TrustedExecutionRefusal("command docker config must be a clean absolute path named .docker");
+  }
   return [
     "--root", worktree,
     "--tmp", privateTmp,
     "--cwd", workCwd,
     ...(cacheDir === undefined ? [] : ["--cache", cacheDir]),
+    ...(dockerConfigDir === undefined ? [] : ["--docker-config", dockerConfigDir]),
     "--mode", mode,
     ...(nullStdin === true ? ["--stdin", "null"] : []),
     "--", command, ...args,
@@ -8688,8 +8706,7 @@ function commandEffectSpec(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
   mode: CommandSandboxMode,
-  cacheDir?: string,
-  nullStdin?: boolean,
+  { cacheDir, nullStdin, dockerConfigDir }: CommandSandboxOptions = {},
 ): CodexEffectLaunchSpec {
   const cleanupToken = randomUUID();
   const privateTmp = `/tmp/uzi-codex-command-${cleanupToken}`;
@@ -8698,6 +8715,10 @@ function commandEffectSpec(
   // one they are removed, so a command never names a cache the sandbox did not grant.
   const commandEnv: NodeJS.ProcessEnv = { ...env };
   for (const key of Object.keys(commandEnv)) if (isCommandCacheEnvKey(key)) delete commandEnv[key];
+  // Issue #4416: DOCKER_CONFIG is likewise owned here: always stripped from the copied
+  // variables, then set to the run's granted `.docker` only when one is passed.
+  delete commandEnv.DOCKER_CONFIG;
+  if (dockerConfigDir !== undefined) commandEnv.DOCKER_CONFIG = dockerConfigDir;
   if (cacheDir !== undefined) {
     commandEnv.GOMODCACHE = `${cacheDir}/gomod`;
     commandEnv.GOCACHE = `${cacheDir}/gocache`;
@@ -8706,7 +8727,7 @@ function commandEffectSpec(
   return {
     identity: "command",
     command: COMMAND_SANDBOX_BIN,
-    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode, cacheDir, nullStdin),
+    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode, { cacheDir, nullStdin, dockerConfigDir }),
     cwd: worktreePath,
     env: { ...commandEnv, HOME: privateTmp, TMPDIR: privateTmp },
     supervisorBin: SUPERVISOR_BIN,
@@ -8736,6 +8757,7 @@ export function makeDefaultSpawnCommand(
   wallMs: number = DEFAULT_COMMAND_WALL_MS,
   longWallMs: number = LONG_COMMAND_WALL_MS,
   capturedMemory?: CapturedMemoryContext,
+  dockerConfigDir?: string,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
       const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
@@ -8771,7 +8793,7 @@ export function makeDefaultSpawnCommand(
       const launched = await launchRegisteredEffectRoot(
         registry,
         boundedLaunch,
-        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, withCache.dir, true),
+        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, { cacheDir: withCache.dir, nullStdin: true, dockerConfigDir }),
         reapDeadlineMs,
         "command",
         log,
@@ -8945,7 +8967,7 @@ function makeBoundaryProcessSpawner(
     let handle: CodexRootHandle;
     try {
       const spec: CodexEffectLaunchSpec = request.identity === "command"
-        ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, withCache.dir)
+        ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, { cacheDir: withCache.dir })
         : {
             identity: "worker_pat",
             command,
