@@ -61,7 +61,8 @@ NAV_GROUPS = ("work", "factory", "modules")
 # the Mongolian vowel separator U+180E.
 UNSAFE_TEXT_RE = re.compile("[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\u061c\ufeff\u2060-\u2064\u00ad\u180e]")
 
-# Keep equal to the 1,24 in the chart's navSection check (_web-modules.tpl) and to the SPA's limit.
+# The navSection length limit in code points. Keep equal to NAV_SECTION_MAX in
+# web/src/modules/manifest.ts and the chart's navSection check; parity.test.ts pins all three.
 NAV_SECTION_MAX = 24
 
 ID_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
