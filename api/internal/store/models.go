@@ -893,6 +893,38 @@ type PrDescriptionVersion struct {
 	RegionHasDiagram     pgtype.Bool        `json:"region_has_diagram"`
 }
 
+type PrHistoryEvent struct {
+	ID         int64              `json:"id"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	MrIid      int64              `json:"mr_iid"`
+	FromState  pgtype.Text        `json:"from_state"`
+	ToState    string             `json:"to_state"`
+	ProviderAt pgtype.Timestamptz `json:"provider_at"`
+	TimeSource string             `json:"time_source"`
+	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	Bootstrap  bool               `json:"bootstrap"`
+	FirstMerge bool               `json:"first_merge"`
+}
+
+type PrHistoryHead struct {
+	RepoID              uuid.UUID          `json:"repo_id"`
+	MrIid               int64              `json:"mr_iid"`
+	State               string             `json:"state"`
+	ObservedAt          pgtype.Timestamptz `json:"observed_at"`
+	LastProviderAt      pgtype.Timestamptz `json:"last_provider_at"`
+	FirstMergedAt       pgtype.Timestamptz `json:"first_merged_at"`
+	FirstMergedSource   pgtype.Text        `json:"first_merged_source"`
+	LastChanged         bool               `json:"last_changed"`
+	LastFromState       pgtype.Text        `json:"last_from_state"`
+	LastToState         string             `json:"last_to_state"`
+	LastEventProviderAt pgtype.Timestamptz `json:"last_event_provider_at"`
+	LastTimeSource      string             `json:"last_time_source"`
+	LastBootstrap       bool               `json:"last_bootstrap"`
+	LastFirstMerge      bool               `json:"last_first_merge"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Product struct {
 	ID                    uuid.UUID          `json:"id"`
 	Name                  string             `json:"name"`

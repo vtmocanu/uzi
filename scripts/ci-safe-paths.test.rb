@@ -398,6 +398,7 @@ audited_prd_refs = %w[
   api/internal/uzidocs/embed/instance-maintenance.md
   api/internal/uzidocs/embed/isolated-research-lane.md
   api/internal/uzidocs/embed/memory.md
+  api/internal/uzidocs/embed/pr-history.md
   api/internal/uzidocs/embed/quality-analytics.md
   api/internal/uzidocs/embed/run-recovery.md
   api/internal/uzidocs/embed/scheduling.md
@@ -436,6 +437,7 @@ audited_prd_refs = %w[
   docs/instance-maintenance.md
   docs/isolated-research-lane.md
   docs/memory.md
+  docs/pr-history.md
   docs/quality-analytics.md
   docs/run-recovery.md
   docs/scheduling.md

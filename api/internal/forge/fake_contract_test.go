@@ -194,7 +194,8 @@ func TestForgeFakeOperationContracts(t *testing.T) {
 			t.Run("GetMergeRequest", func(t *testing.T) {
 				got, err := client.GetMergeRequest(ctx, 1, mr.IID)
 				want := forge.MergeRequest{IID: mr.IID, State: mr.State, WebURL: mr.WebURL}
-				if err != nil || got != want {
+				if err != nil || got.IID != want.IID || got.State != want.State || got.WebURL != want.WebURL ||
+					!sameTime(got.MergedAt, want.MergedAt) || !sameTime(got.ClosedAt, want.ClosedAt) {
 					t.Errorf("got %+v, %v; want %+v", got, err, want)
 				}
 				// Basic Get promises a generic error, not a not-found sentinel.
@@ -240,4 +241,12 @@ func TestForgeFakeOperationContracts(t *testing.T) {
 			})
 		})
 	}
+}
+
+// sameTime compares two optional timestamps by value; nil only equals nil.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
 }

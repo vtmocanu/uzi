@@ -29132,15 +29132,72 @@ func (q *Queries) SetRunLimitWait(ctx context.Context, arg SetRunLimitWaitParams
 	return result.RowsAffected(), nil
 }
 
-const setRunMRState = `-- name: SetRunMRState :execrows
+const setRunMRState = `-- name: SetRunMRState :one
 
-UPDATE runs SET mr_state = $1, updated_at = now()
-WHERE id = $2
+WITH prev AS (
+  SELECT r.id, r.repo_id, r.mr_iid,
+         CASE WHEN r.mr_state IN ('opened','closed','merged','locked') THEN r.mr_state END AS prev_state,
+         (r.user_id = fc.user_id) AS owner_match
+  FROM runs r
+  JOIN repos rp ON rp.id = r.repo_id
+  JOIN forge_connections fc ON fc.id = rp.connection_id
+  WHERE r.id = $1 AND $2::text IN ('opened','closed','merged','locked')
+  FOR NO KEY UPDATE OF r
+), upd AS (
+  UPDATE runs SET mr_state = $2::text, updated_at = now()
+  FROM prev
+  WHERE runs.id = prev.id
+  RETURNING runs.id, runs.repo_id, runs.mr_iid, prev.prev_state, prev.owner_match
+), head AS (
+  INSERT INTO pr_history_heads AS h (repo_id, mr_iid, state, observed_at, last_provider_at, first_merged_at, first_merged_source,
+      last_changed, last_from_state, last_to_state, last_event_provider_at, last_time_source, last_bootstrap, last_first_merge)
+  SELECT u.repo_id, u.mr_iid, $2::text, $3::timestamptz, n.p,
+      CASE WHEN $2::text = 'merged' THEN COALESCE(n.p, $3::timestamptz) END,
+      CASE WHEN $2::text = 'merged' THEN CASE WHEN n.p IS NULL THEN 'observation_fallback' ELSE 'provider' END END,
+      true, u.prev_state, $2::text, n.p,
+      CASE WHEN n.p IS NULL THEN 'observation_fallback' ELSE 'provider' END,
+      true, $2::text = 'merged'
+  FROM upd u
+  CROSS JOIN LATERAL (SELECT CASE WHEN $4::timestamptz <= $3::timestamptz
+                                  THEN $4::timestamptz END AS p) n
+  WHERE u.owner_match AND u.mr_iid IS NOT NULL
+  ON CONFLICT (repo_id, mr_iid) DO UPDATE SET
+    state = EXCLUDED.state,
+    last_to_state = EXCLUDED.state,
+    last_from_state = h.state,
+    last_changed = (h.state IS DISTINCT FROM EXCLUDED.state),
+    observed_at = EXCLUDED.observed_at,
+    last_bootstrap = false,
+    last_event_provider_at = CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END,
+    last_time_source = CASE WHEN (CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END) IS NULL
+                            THEN 'observation_fallback' ELSE 'provider' END,
+    last_provider_at = GREATEST(h.last_provider_at, EXCLUDED.last_provider_at),
+    last_first_merge = (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL,
+    first_merged_at = CASE WHEN (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL
+                           THEN COALESCE(CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END, EXCLUDED.observed_at)
+                           ELSE h.first_merged_at END,
+    first_merged_source = CASE WHEN (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL
+                               THEN CASE WHEN (CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END) IS NULL
+                                         THEN 'observation_fallback' ELSE 'provider' END
+                               ELSE h.first_merged_source END,
+    updated_at = now()
+  WHERE EXCLUDED.observed_at > h.observed_at
+  RETURNING h.repo_id, h.mr_iid, h.last_changed, h.last_from_state, h.last_to_state, h.last_event_provider_at,
+            h.last_time_source, h.observed_at, h.last_bootstrap, h.last_first_merge
+), ev AS (
+  INSERT INTO pr_history_events (repo_id, mr_iid, from_state, to_state, provider_at, time_source, observed_at, bootstrap, first_merge)
+  SELECT repo_id, mr_iid, last_from_state, last_to_state, last_event_provider_at, last_time_source, observed_at, last_bootstrap, last_first_merge
+  FROM head WHERE last_changed
+  RETURNING 1
+)
+SELECT count(*)::bigint AS updated FROM upd
 `
 
 type SetRunMRStateParams struct {
-	MrState pgtype.Text `json:"mr_state"`
-	ID      uuid.UUID   `json:"id"`
+	ID         uuid.UUID          `json:"id"`
+	MrState    string             `json:"mr_state"`
+	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	ProviderAt pgtype.Timestamptz `json:"provider_at"`
 }
 
 // MR-close watcher (PRD #24) --------------------------------------------------
@@ -29154,12 +29211,39 @@ type SetRunMRStateParams struct {
 // prompt/self_improve are excluded by its CTE (see recordMRState). The run itself
 // stays terminal — closing an MR is review feedback, not a run-status event — so
 // this touches mr_state (and updated_at) only.
+//
+// PRD #4691: the same statement also records PR history, atomically, with
+// data-modifying CTEs. CTE order: prev (lock the run row, read its previous state and
+// whether the run's owner owns the repo's forge connection) -> upd (write mr_state) ->
+// head (upsert pr_history_heads) -> ev (append the transition event). PG16 has no
+// RETURNING OLD, so the head upsert carries the latest transition through the head's
+// transport-only last_* columns and RETURNING; ev reads them from that.
+//   - Unknown state: the prev CTE yields no row, so NOTHING is written (not even mr_state).
+//   - Owner filter: history is recorded only when the run's user owns the repo's forge
+//     connection; mr_state is still written for any owner.
+//   - Watermark: a head advances only when the observation is strictly newer than
+//     head.observed_at (WHERE on the DO UPDATE). An older or tied observation updates
+//     runs.mr_state only, and writes no head change and no event.
+//   - Bootstrap: the first head insert for a run that already carried a pre-tracking
+//     mr_state records that state as from_state (provenance), with bootstrap = true.
+//   - First merge: first_merged_* is set once, on the first change to merged; the unique
+//     partial index pr_history_events_first_merge_uq backs it.
+//   - provider_at is dropped (NULL) when it is after observed_at or older than the newest
+//     provider time already on the head (never moves backwards): the event is then an
+//     observation_fallback. Every SET right-hand side reads only h or EXCLUDED, never a
+//     stored transport column of h.
+//
+// Returns the number of runs updated (0 or 1).
 func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunMRState, arg.MrState, arg.ID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	row := q.db.QueryRow(ctx, setRunMRState,
+		arg.ID,
+		arg.MrState,
+		arg.ObservedAt,
+		arg.ProviderAt,
+	)
+	var updated int64
+	err := row.Scan(&updated)
+	return updated, err
 }
 
 const setRunMrReworkEnabled = `-- name: SetRunMrReworkEnabled :execrows

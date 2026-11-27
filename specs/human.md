@@ -2086,6 +2086,12 @@ PRD at `prds/done/4686-runtime-web-modules.md`.
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)
 
+## Feature #4691: PR merge/close history
+
+PRD at `prds/done/4691-pr-merge-close-history.md`.
+
+- uzi records PR merge/close history: a per-PR head plus append-only transition events, written in the same statement as `runs.mr_state`. The forge's own merge/close time is kept apart from uzi's observation time (an event with no provider time is marked as an observation fallback), a PR's first observation is a bootstrap event, and the first merge is recorded once. There is no expiry; rows go only with their repository. Nothing reads it yet. Only the connection owner's observations are recorded, and the watcher's coverage limits apply (`docs/pr-history.md`). (AI-synced 2026-11-25)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is
