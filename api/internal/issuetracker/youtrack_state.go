@@ -195,12 +195,19 @@ func (y *youTrack) resolveIssueForStateWrite(ctx context.Context, projectID, iss
 	}
 	switch y.stateFieldKind(w) {
 	case stateFieldMachine:
-		return ytIssue{}, y.red.sentinel(ErrStateMachineField, 0, "")
+		return ytIssue{}, WithRemedy(y.red.sentinel(ErrStateMachineField, 0, ""), ytStateMachineRemedy)
 	case stateFieldUnreadable:
-		return ytIssue{}, y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableDetail(w))
+		return ytIssue{}, WithRemedy(y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableDetail(w)), ytStateFieldUnreadableRemedy)
 	}
 	return w, nil
 }
+
+// The remedies YouTrack attaches to a refused State field (WithRemedy): what to
+// change in YouTrack. issuetrackersvc builds the user-facing message around them.
+const (
+	ytStateMachineRemedy         = "remove the state-machine rule from the State field in YouTrack"
+	ytStateFieldUnreadableRemedy = "Let that account see the State field in YouTrack, or link a project whose State field it can read."
+)
 
 // stateCheckFields is what the State-write read adds to issueFields, and what
 // CheckStateField reads of each sampled issue besides its id and project.
@@ -221,6 +228,9 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 	}
 	if project == (ProjectRef{}) {
 		return y.fail("youtrack: no project to check")
+	}
+	if err := validYouTrackRef(project.ID, ""); err != nil {
+		return err
 	}
 	query := url.Values{
 		"query":        {issueQuery(project.ShortName, forge.ListIssuesOptions{})},
@@ -254,10 +264,10 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 		return err
 	}
 	if found {
-		return y.red.sentinel(ErrStateMachineField, 0, "")
+		return WithRemedy(y.red.sentinel(ErrStateMachineField, 0, ""), ytStateMachineRemedy)
 	}
 	if unreadableAt != "" {
-		return y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableAt)
+		return WithRemedy(y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableAt), ytStateFieldUnreadableRemedy)
 	}
 	if sampled && !inProject {
 		// A page of issues, none of them in the project: the stored short name

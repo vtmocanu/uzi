@@ -290,9 +290,64 @@ func TestValidProjectRef(t *testing.T) {
 			t.Errorf("ValidProjectRef(%+v) ok = %v, want %v", ref, got, want)
 		}
 	}
-	if !ValidProjectID("12-3") || ValidProjectID("12") || ValidProjectID("") {
-		t.Error("ValidProjectID disagrees with the entity id shape")
+}
+
+// The stored-id validators are kind-neutral (PRD #4765 A1): they accept any id a
+// store column and a request path can carry, YouTrack's "0-1" and a digit-only
+// id alike, and refuse separators, spaces and a leading hyphen or underscore.
+func TestStoredIDValidatorsAreKindNeutral(t *testing.T) {
+	for id, want := range map[string]bool{
+		"12-3":             true,
+		"1208765432109876": true,
+		"abc_1-2":          true,
+		"":                 false,
+		"-1":               false,
+		"_1":               false,
+		"../x":             false,
+		"a/b":              false,
+		"a?b":              false,
+		"a b":              false,
+		"a%2Fb":            false,
+	} {
+		if got := ValidProjectID(id); got != want {
+			t.Errorf("ValidProjectID(%q) = %v, want %v", id, got, want)
+		}
+		if got := ValidTagID(id); got != want {
+			t.Errorf("ValidTagID(%q) = %v, want %v", id, got, want)
+		}
 	}
+}
+
+// The YouTrack driver keeps its own grammar after the stored-id validators were
+// made kind-neutral: a bound project or tag id that is not an entity id fails the
+// build, and CheckStateField refuses such a project before any request.
+func TestYouTrackKeepsItsEntityIDGrammar(t *testing.T) {
+	const tok = "perm:abcdefghijklmnopqrstuvwxyz"
+	tag := TagRef{ID: "6-2", Name: "uzi"}
+	for _, b := range []Binding{
+		{Project: ProjectRef{ID: "1208765432109876", ShortName: "UZI"}, ProjectID: 7, EligibilityTag: tag},
+		{Project: ProjectRef{ID: "0-1", ShortName: "UZI"}, ProjectID: 7, EligibilityTag: TagRef{ID: "1208765432109876", Name: "uzi"}},
+	} {
+		if _, err := buildYouTrack(Options{BaseURL: "https://yt.example.com", Token: tok, Project: b.Project, ProjectID: b.ProjectID, EligibilityTag: b.EligibilityTag}, nil); err == nil {
+			t.Errorf("buildYouTrack accepted a non-entity id in %+v", b)
+		}
+	}
+	y, err := buildYouTrack(Options{BaseURL: "https://yt.example.com", Token: tok}, refuseRoundTrip{t})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := y.CheckStateField(context.Background(), ProjectRef{ID: "1208765432109876", ShortName: "UZI"}); err == nil {
+		t.Error("CheckStateField accepted a non-entity project id")
+	}
+}
+
+// refuseRoundTrip fails the test on any request: the guard under test must refuse
+// before the driver reaches the network.
+type refuseRoundTrip struct{ t *testing.T }
+
+func (r refuseRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.t.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+	return nil, errors.New("refused")
 }
 
 // TestBuildErrorsNeverCarryTheToken builds a driver with each kind of invalid

@@ -16,7 +16,7 @@ The icon vocabulary. Keep it EQUAL to MODULE_ICON_NAMES in web/src/modules/icons
 re-validates the list and skips an entry naming any other icon). A parity test pins the two.
 */ -}}
 {{- define "uzi.webModules.icons" -}}
-{{- list "activity" "board" "book" "bot" "bug" "chat" "clock" "factory" "file-text" "gear" "git" "home" "key" "package" "scale" "search" "server" "shield" "skill" "terminal" | toJson -}}
+{{- list "activity" "board" "book" "bot" "bug" "chart-line" "chat" "clock" "factory" "file-text" "gear" "git" "home" "key" "package" "scale" "search" "server" "shield" "skill" "terminal" | toJson -}}
 {{- end -}}
 
 {{- /*

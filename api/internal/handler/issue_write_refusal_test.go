@@ -16,7 +16,8 @@ import (
 // The state-machine refusal is also what forgesvc.ColumnMoveRefused matches, so its case must
 // come first: a 409 with the project named, never the "map this column" hint.
 func TestWriteLinkedMoveErrorStateMachineIs409WithTheProjectNamed(t *testing.T) {
-	err := fmt.Errorf("move: %w", issuetracker.ErrStateMachineField)
+	// As the YouTrack driver returns it: the sentinel with YouTrack's remedy (PRD #4765 A1).
+	err := fmt.Errorf("move: %w", issuetracker.WithRemedy(issuetracker.ErrStateMachineField, "remove the state-machine rule from the State field in YouTrack"))
 	if !forgesvc.ColumnMoveRefused(err) {
 		t.Fatal("precondition: ColumnMoveRefused must also match the state-machine refusal")
 	}
@@ -35,7 +36,7 @@ func TestWriteLinkedMoveErrorStateMachineIs409WithTheProjectNamed(t *testing.T) 
 	}
 	want := "project UZI uses a state-machine workflow on its State field; uzi needs a plain State field. " +
 		"Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack."
-	if body.Error != want || body.Error != issuetrackersvc.StateMachineRefusal("UZI") {
+	if body.Error != want || body.Error != issuetrackersvc.StateMachineRefusal("UZI", err) {
 		t.Fatalf("message = %q, want %q", body.Error, want)
 	}
 }
@@ -64,7 +65,7 @@ func TestWriteLinkedMoveErrorUnreadableStateFieldIs409WithItsOwnText(t *testing.
 	if body.Error != issuetrackersvc.StateFieldUnreadableRefusal("UZI", err) {
 		t.Fatalf("message = %q", body.Error)
 	}
-	if body.Error == issuetrackersvc.StateMachineRefusal("UZI") || strings.Contains(body.Error, "map this column") {
+	if body.Error == issuetrackersvc.StateMachineRefusal("UZI", err) || strings.Contains(body.Error, "map this column") {
 		t.Fatalf("answered with another refusal's text: %q", body.Error)
 	}
 	if !strings.Contains(body.Error, "could not read project UZI") || !strings.Contains(body.Error, "UZI-3") {

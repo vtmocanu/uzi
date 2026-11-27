@@ -313,6 +313,16 @@ order_ok=$(jq -r --arg d "$W/order-out" '
   and .calls[1].locations_present' "$W/order.json" || true)
 if [ "$order_ok" = true ]; then ok; else bad "rename order / temp-file contract: $(cat "$W/order.json")"; fi
 
+# --- the chart-line icon (issue #4777) -----------------------------------------------------------
+jq -n '[{id: "chart", version: "1.0.0", page: "Page", label: "Chart", icon: "chart-line", navGroup: "modules", upstream: "svc:8080"}]' > "$W/chart.json"
+run_gen "$W/chart.json" "$W/chart-out"
+if [ "$RC" -eq 0 ]; then
+  want_chart='[{"id":"chart","version":"1.0.0","page":"Page","label":"Chart","icon":"chart-line","navGroup":"modules","adminOnly":false}]'
+  [ "$(jq -c . "$W/chart-out/modules.json")" = "$want_chart" ] && ok || bad "chart-line projection is $(jq -c . "$W/chart-out/modules.json")"
+else
+  bad "icon chart-line was rejected: $ERR"
+fi
+
 # --- the projection -----------------------------------------------------------------------------
 jq -n '[
   {id: "alpha", version: "1.2.3", page: "Alpha page", label: "Alpha", icon: "factory", navGroup: "factory", adminOnly: true, upstream: "http://alpha.tools:9000", secret: "do-not-leak", extra: {a: 1}},

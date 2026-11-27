@@ -192,9 +192,17 @@ export interface AdminSharedProvider {
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
-  credential_mode: "per_user_key";
+  credential_mode: "per_user_key" | "operator_key";
   selected_user_count: number;
   attached_key_count: number;
+  /** Present only for an organization-funded definition (credential_mode "operator_key", PRD #4540):
+   *  the state of its one organization key. Never the key itself. */
+  operator_key?: {
+    present: boolean;
+    enabled: boolean;
+    set_at?: string;
+    probe?: ProviderProbe;
+  };
 }
 
 export interface AdminSharedProviderList {
@@ -210,6 +218,11 @@ export interface AdminSharedProviderCreateInput {
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
+  /** Omitted means "per_user_key". "operator_key" (Claude only, PRD #4540) is an
+   *  organization-funded definition: the admin sets one key that granted users' runs receive. */
+  credential_mode?: "per_user_key" | "operator_key";
+  /** Required true for an operator_key definition: the admin accepts the recipient-trust disclosures. */
+  acknowledge_recipient_trust?: boolean;
 }
 
 export interface ProvidersList {

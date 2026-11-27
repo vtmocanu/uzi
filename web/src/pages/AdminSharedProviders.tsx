@@ -4,6 +4,12 @@
 // there is no key here at all.
 // Every write is a cookie-only admin route, so the CLI can list and show but never write.
 //
+// A Claude definition may instead be organization-funded (PRD #4540, credential_mode
+// "operator_key"): the admin sets one key that every granted user's runs receive. The create
+// form then shows six disclosures the admin must acknowledge, and the card carries the key
+// controls (set or replace, enable or disable, delete, Test). The key is typed into a password
+// input, cleared after every attempt and never rendered back; the server never returns it.
+//
 // The page answers two questions per definition: what is fixed (endpoint, auth style: a
 // locked block, never an input once created) and who depends on it (how many users selected
 // it, how many personal keys are attached). Delete is guarded on both: its confirmation says
@@ -14,7 +20,7 @@
 // uses dangerouslySetInnerHTML.
 
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { api, type AdminSharedProvider, type ProviderAuthStyle, type ProviderDTO, type ProviderModelMap } from "../lib/api";
+import { api, type AdminSharedProvider, type ProviderAuthStyle, type ProviderDTO, type ProviderModelMap, type ProviderProbe } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -47,12 +53,62 @@ const REASONS: Record<string, (engine: Engine) => string> = {
     `Delete refused: at least one user still has this definition selected as their ${ENGINE_LABELS[engine]} source. They must choose another source first.`,
   provider_retired: () => "This shared provider is retired and can no longer be edited.",
   provider_base_url_not_allowed: () => "That base URL is not on the operator's allowlist. Pick one from the list.",
+  provider_not_operator_key: () =>
+    "This definition is not organization-funded: each user attaches their own key to it, so there is no organization key to manage.",
+  provider_probe_rate_limited: () => "Tests are rate limited. Wait a moment, then test again.",
 };
+
+// The server's stale-Test 409 carries no reason code, only its message.
+const STALE_TEST_COPY = "The provider or key changed while testing; test again.";
 
 function sharedError(err: unknown, fallback: string, engine: Engine): string {
   const reason = err instanceof ApiError ? (err.body as { reason?: string } | null)?.reason : undefined;
+  if (err instanceof ApiError && err.status === 409 && !reason && /changed while it was being tested/.test(err.message)) {
+    return STALE_TEST_COPY;
+  }
   return (reason && REASONS[reason]?.(engine)) || errorMessage(err, fallback);
 }
+
+// The six things an admin accepts before an organization key exists (PRD #4540). Each is one
+// list item with its own test id, so a test can pin them one by one.
+const OPERATOR_DISCLOSURES: { id: string; text: string }[] = [
+  {
+    id: "disclosure-copy",
+    text: "Granted users, and code in their runs, receive the key and can copy it. Revoking access in uzi does not take copies back; only rotating the key at the gateway revokes them. Rotate at the gateway when access ends, and set per-key spend limits there.",
+  },
+  {
+    id: "disclosure-redirect",
+    text: "A redirecting gateway can forward request bodies to the redirect host, and can send the key to a same-host sibling path, or to another host with the x_api_key auth style. Bearer is recommended.",
+  },
+  {
+    id: "disclosure-product-token",
+    text: "Jobs created through an external product's job token for a granted user can spend the key.",
+  },
+  {
+    id: "disclosure-shared-identity",
+    text: "One gateway key is a shared identity: requests, logs or batches the gateway stores may expose recipients' work to one another.",
+  },
+  {
+    id: "disclosure-secret-key",
+    text: "Rotating UZI_SECRET_KEY invalidates the stored key; you must set it again.",
+  },
+  {
+    id: "disclosure-authorized-users",
+    text: "Use is restricted to the organization's authorized users.",
+  },
+];
+
+const AUTH_RESULT_TEXT: Record<ProviderProbe["auth_result"], string> = {
+  ok: "Authentication worked",
+  rejected: "Authentication rejected by the gateway",
+  inconclusive: "Authentication check inconclusive",
+};
+const TOOL_RESULT_TEXT: Record<NonNullable<ProviderProbe["tool_result"]>, string> = {
+  passed: "Tool use passed",
+  not_supported: "Tool use not supported by the gateway",
+  inconclusive: "Tool use check inconclusive",
+  not_run: "Tool use check not run",
+};
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
@@ -77,7 +133,12 @@ export function AdminSharedProviders() {
     [],
     { fallback: "Failed to load the shared providers" },
   );
-  const providers = data?.providers ?? [];
+  // Authoritative server answers to key writes, shown over the loaded list until a list load
+  // succeeds (a new `data`), so a failed refresh never leaves the pre-write state on screen.
+  const [applied, setApplied] = useState<Record<string, AdminSharedProvider>>({});
+  useEffect(() => { setApplied({}); }, [data]);
+  const providers = (data?.providers ?? []).map((p) => applied[p.id] ?? p);
+  const apply = (p: AdminSharedProvider) => setApplied((prev) => ({ ...prev, [p.id]: p }));
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<Confirm>(null);
@@ -106,7 +167,9 @@ export function AdminSharedProviders() {
       description={
         <>
           Shared providers are Claude or Codex gateways any user can pick as their source for that engine. You fix the
-          engine, endpoint and auth style and map the models; each user attaches their own key, which you never see.
+          engine, endpoint and auth style and map the models. With a per-user key, each user attaches their own key, which
+          you never see. With an organization key, you set one key for the definition; that mode is staged and not yet
+          available to users.
         </>
       }
     >
@@ -123,7 +186,11 @@ export function AdminSharedProviders() {
       )}
 
       {creating ? (
-        <CreateForm allowed={data?.allowed ?? []} onCancel={() => setCreating(false)} onCreated={(p) => done(`Shared provider ${sanitizeLabel(p.name)} created. Users can now attach their own key to it.`)} />
+        <CreateForm allowed={data?.allowed ?? []} onCancel={() => setCreating(false)} onCreated={(p) => done(
+          p.credential_mode === "operator_key"
+            ? `Shared provider ${sanitizeLabel(p.name)} created. Staged: set its organization key next; it is not yet available to users.`
+            : `Shared provider ${sanitizeLabel(p.name)} created. Users can now attach their own key to it.`,
+        )} />
       ) : (
         !loading &&
         providers.length > 0 && (
@@ -159,6 +226,7 @@ export function AdminSharedProviders() {
                   onAsk={(kind) => { setNotice(""); setConfirm({ kind, id: p.id }); }}
                   onCancel={() => setConfirm(null)}
                   onDone={done}
+                  onApply={apply}
                   onStale={reload}
                 />
               )}
@@ -195,6 +263,7 @@ function ProviderCard({
   onAsk,
   onCancel,
   onDone,
+  onApply,
   onStale,
 }: {
   provider: AdminSharedProvider;
@@ -203,6 +272,7 @@ function ProviderCard({
   onAsk: (kind: "retire" | "delete") => void;
   onCancel: () => void;
   onDone: (message: string) => Promise<void>;
+  onApply: (p: AdminSharedProvider) => void;
   onStale: () => Promise<void>;
 }) {
   const name = sanitizeLabel(p.name);
@@ -233,6 +303,12 @@ function ProviderCard({
 
   const selected = p.selected_user_count;
   const keys = p.attached_key_count;
+  const operatorMode = p.credential_mode === "operator_key";
+  // What a delete takes with it, in the words that fit the definition's credential mode.
+  const hasOrgKey = operatorMode && p.operator_key?.present === true;
+  const deletes = operatorMode
+    ? "its organization key and that key's Test result"
+    : `${plural(keys, "personal key", "personal keys")} users attached to it, and their Test results`;
 
   return (
     <Card className="space-y-3">
@@ -265,10 +341,14 @@ function ProviderCard({
         <li className="rounded-md border border-edge px-2 py-0.5" data-testid={`selected-count-${p.id}`}>
           Selected by {plural(selected, "user", "users")}
         </li>
-        <li className="rounded-md border border-edge px-2 py-0.5" data-testid={`key-count-${p.id}`}>
-          {plural(keys, "personal key", "personal keys")} attached
-        </li>
+        {p.credential_mode === "per_user_key" && (
+          <li className="rounded-md border border-edge px-2 py-0.5" data-testid={`key-count-${p.id}`}>
+            {plural(keys, "personal key", "personal keys")} attached
+          </li>
+        )}
       </ul>
+
+      {p.credential_mode === "operator_key" && <OperatorKeyPanel provider={p} name={name} onDone={onDone} onApply={onApply} onStale={onStale} />}
 
       <FixedFacts baseUrl={p.base_url} auth={p.auth_style} />
 
@@ -310,9 +390,10 @@ function ProviderCard({
             <>
               <Button variant="dangerSolid" size="sm" disabled={working || selected > 0} onClick={() => void act(async () => {
                 const r = await api.adminDeleteSharedProvider(p.id);
+                if (operatorMode) return hasOrgKey ? `${name} deleted, with its organization key.` : `${name} deleted.`;
                 return `${name} deleted, with ${plural(r.deleted_key_count, "attached key", "attached keys")}.`;
               }, "Failed to delete the shared provider")}>
-                {working ? "Deleting…" : "Delete definition and keys"}
+                {working ? "Deleting…" : operatorMode ? (hasOrgKey ? "Delete definition and key" : "Delete definition") : "Delete definition and keys"}
               </Button>
               <Button variant="ghost" size="sm" disabled={working} onClick={onCancel} data-confirm-cancel>Cancel</Button>
             </>
@@ -326,15 +407,17 @@ function ProviderCard({
                 {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their ${ENGINE_LABELS[p.engine]} source. ${p.retired ? "Ask them" : "Retire it, then ask them"} to choose another source.`}
               </p>
               <p data-testid={`delete-keys-${p.id}`} className="text-muted">
-                Once nobody has it selected, deleting it would also delete {plural(keys, "personal key", "personal keys")} users
-                attached to it, and their Test results.
+                {operatorMode && !hasOrgKey
+                  ? "Once nobody has it selected, it can be deleted. No organization key is set."
+                  : `Once nobody has it selected, deleting it would also delete ${deletes}.`}
               </p>
             </>
           ) : (
             <>
               <p data-testid={`delete-keys-${p.id}`}>
-                Delete {name}? This also deletes {plural(keys, "personal key", "personal keys")} users attached to it, and their
-                Test results. This cannot be undone.
+                {operatorMode && !hasOrgKey
+                  ? `Delete ${name}? This cannot be undone.`
+                  : `Delete ${name}? This also deletes ${deletes}. This cannot be undone.`}
               </p>
               <p data-testid={`delete-selected-${p.id}`} className="text-muted">
                 No user has it selected as their {ENGINE_LABELS[p.engine]} source.
@@ -344,6 +427,221 @@ function ProviderCard({
         </ConfirmBox>
       )}
     </Card>
+  );
+}
+
+// OperatorKeyPanel is the organization-key block of an operator_key card: status, last Test
+// result and the four key controls, each labelled with what it does. The typed key lives only
+// in this component's state, is cleared whether the save succeeds or not, and is never shown.
+function OperatorKeyPanel({
+  provider: p,
+  name,
+  onDone,
+  onApply,
+  onStale,
+}: {
+  provider: AdminSharedProvider;
+  name: string;
+  onDone: (message: string) => Promise<void>;
+  onApply: (p: AdminSharedProvider) => void;
+  onStale: () => Promise<void>;
+}) {
+  const key = p.operator_key ?? { present: false, enabled: false };
+  const [draft, setDraft] = useState("");
+  const [working, setWorking] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const confirmRef = useRef<HTMLDivElement>(null);
+  const inputId = useId();
+  // Only the server's result is ever shown: a Test reloads the list, and the server hides the
+  // stored result after a key write, a model-map edit or a retire.
+  const shownProbe = key.probe ?? null;
+  const testable = key.present && key.enabled && !p.retired;
+
+  useEffect(() => {
+    if (confirmingDelete) confirmRef.current?.querySelector<HTMLButtonElement>("button[data-confirm-cancel]")?.focus();
+  }, [confirmingDelete]);
+
+  const run = async (fn: () => Promise<void>, fallback: string) => {
+    setError("");
+    setWorking(true);
+    try {
+      await fn();
+    } catch (err) {
+      setError(sharedError(err, fallback, p.engine));
+      // A 409 means the key or definition changed under this card; a 404 that it is gone.
+      if (err instanceof ApiError && (err.status === 409 || err.status === 404)) await onStale();
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const save = () => {
+    const value = draft;
+    // Clear first: the key must not outlive the attempt, whatever its outcome.
+    setDraft("");
+    return run(async () => {
+      onApply((await api.adminPutOperatorKey(p.id, value)).provider);
+      await onDone(`Organization key for ${name} saved.`);
+    }, "Failed to save the organization key");
+  };
+
+  return (
+    <div className="space-y-3 rounded-lg border border-edge px-3 py-2 text-sm" data-testid={`operator-key-${p.id}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge tone="neutral"><span data-testid={`credential-mode-${p.id}`}>Organization key</span></Badge>
+        <p className="text-muted" data-testid={`key-status-${p.id}`}>
+          {!key.present
+            ? "No key set."
+            : `Key set, ${key.enabled ? "enabled" : "disabled"}.${key.set_at ? ` Set ${new Date(key.set_at).toLocaleString()}.` : ""}`}
+        </p>
+      </div>
+
+      <p className="text-xs text-warn" data-testid={`staged-notice-${p.id}`}>
+        Staged: not yet available to users or runs.
+      </p>
+
+      <div data-testid={`probe-results-${p.id}`} aria-live="polite" className="space-y-0.5 text-xs">
+        {shownProbe ? (
+          <>
+            <p>{AUTH_RESULT_TEXT[shownProbe.auth_result]}</p>
+            <p>{TOOL_RESULT_TEXT[shownProbe.tool_result ?? "not_run"]}</p>
+            <p className="text-faint">
+              Neither result certifies full compatibility. Last tested {new Date(shownProbe.probed_at).toLocaleString()}.
+            </p>
+          </>
+        ) : (
+          <p className="text-faint">Not tested yet.</p>
+        )}
+      </div>
+
+      <div className="space-y-3">
+        <div className="space-y-1">
+          <label htmlFor={inputId} className="block text-muted">Organization key</label>
+          <div className="flex flex-wrap gap-2">
+            <Input
+              id={inputId}
+              type="password"
+              autoComplete="new-password"
+              spellCheck={false}
+              className="min-w-0 flex-1"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+            />
+            <Button
+              size="sm"
+              disabled={working || draft === ""}
+              onClick={() => void save()}
+              aria-label={`${key.present ? "Replace" : "Set"} organization key for ${name}`}
+            >
+              {key.present ? "Replace key" : "Set key"}
+            </Button>
+          </div>
+          <p className="text-xs text-faint">
+            {key.present
+              ? "Replacing the key clears the last Test result. Once recipients are granted access in a later release, copies they already hold keep working until the old key is rotated at the gateway."
+              : "Stored encrypted and never shown again."}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
+          {key.present && (
+            <div className="space-y-1">
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={working}
+                onClick={() => void run(async () => {
+                  onApply((await api.adminSetOperatorKeyEnabled(p.id, !key.enabled)).provider);
+                  await onDone(`Organization key for ${name} ${key.enabled ? "disabled" : "enabled"}.`);
+                }, "Failed to change the organization key")}
+                aria-label={`${key.enabled ? "Disable" : "Enable"} organization key for ${name}`}
+              >
+                {key.enabled ? "Disable key" : "Enable key"}
+              </Button>
+              <p className="max-w-xs text-xs text-faint" data-testid={`disable-effect-${p.id}`}>
+                {key.enabled
+                  ? "Marks the key unusable for runs once recipients have access; frozen copies held by recipients are not revoked."
+                  : "Marks the key usable again for runs once recipients have access."}
+              </p>
+            </div>
+          )}
+          <div className="space-y-1">
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={working || !testable}
+              onClick={() => void (async () => {
+                setTesting(true);
+                try {
+                  await run(async () => {
+                    // The 200 body is the stored result for the current tuple: show it now, then reload.
+                    const { probe } = await api.adminTestOperatorKey(p.id);
+                    onApply({ ...p, operator_key: { ...key, probe } });
+                    await onStale();
+                  }, "Failed to test the organization key");
+                } finally {
+                  setTesting(false);
+                }
+              })()}
+              aria-label={`Test organization key for ${name}`}
+            >
+              {testing ? "Testing…" : "Test key"}
+            </Button>
+            <p className="max-w-xs text-xs text-faint" data-testid={`test-effect-${p.id}`}>
+              {!key.present
+                ? "Set a key to test it."
+                : p.retired
+                  ? "A retired definition cannot be tested."
+                  : key.enabled
+                    ? "Makes up to two small requests to the gateway with this key: an authentication check, then a single-tool check."
+                    : "Enable the key to test it."}
+            </p>
+          </div>
+          {key.present && (
+            <div className="space-y-1">
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={working}
+                onClick={() => { setError(""); setConfirmingDelete(true); }}
+                aria-label={`Delete organization key for ${name}`}
+              >
+                Delete key
+              </Button>
+              <p className="max-w-xs text-xs text-faint">Removes the key from uzi; the definition stays.</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {confirmingDelete && (
+        <ConfirmBox
+          refEl={confirmRef}
+          label={`Confirm deleting the organization key of ${name}`}
+          error={error}
+          actions={
+            <>
+              <Button variant="dangerSolid" size="sm" disabled={working} onClick={() => void run(async () => {
+                onApply((await api.adminDeleteOperatorKey(p.id)).provider);
+                setConfirmingDelete(false);
+                await onDone(`Organization key for ${name} deleted.`);
+              }, "Failed to delete the organization key")}>
+                {working ? "Deleting…" : "Delete key"}
+              </Button>
+              <Button variant="ghost" size="sm" disabled={working} onClick={() => setConfirmingDelete(false)} data-confirm-cancel>Cancel</Button>
+            </>
+          }
+        >
+          <p>
+            Delete the organization key of {name}? The definition stays; set a key again to use it later.
+            Copies recipients may already hold, once access is granted in a later release, are not taken back; only rotating the key at the gateway revokes them.
+          </p>
+        </ConfirmBox>
+      )}
+      {!confirmingDelete && error && <Alert message={error} />}
+    </div>
   );
 }
 
@@ -384,11 +682,15 @@ function CreateForm({
   const [baseUrl, setBaseUrl] = useState("");
   const [auth, setAuth] = useState<ProviderAuthStyle>("bearer");
   const [rows, setRows] = useState<ModelRows>(emptyRows);
+  const [mode, setMode] = useState<"per_user_key" | "operator_key">("per_user_key");
+  const [acknowledged, setAcknowledged] = useState(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const operatorMode = mode === "operator_key";
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (operatorMode && !acknowledged) return;
     const built = buildModelMap(rows, engine);
     const err = validName(name) ?? (baseUrl === "" ? "Pick a base URL." : null) ?? ("error" in built ? built.error : null);
     if (err) return setError(err);
@@ -401,6 +703,7 @@ function CreateForm({
         base_url: baseUrl,
         auth_style: auth,
         model_map: (built as { map: ProviderModelMap }).map,
+        ...(operatorMode ? { credential_mode: "operator_key" as const, acknowledge_recipient_trust: true } : {}),
       });
       await onCreated(provider);
     } catch (err) {
@@ -415,8 +718,11 @@ function CreateForm({
       <form onSubmit={submit} className="space-y-3" aria-label="New shared provider">
         <h2 className="text-sm font-semibold text-fg">New shared provider</h2>
         <p className="text-sm text-muted">
-          No key here: each user attaches their own. The engine, endpoint and auth style cannot be changed after you
-          create it; a different gateway needs a new definition, which users select again on purpose.
+          {operatorMode
+            ? "You set one organization key after creating it. Staged: not yet available to users or runs; once access can be granted in a later release, granted users' runs will receive it."
+            : "No key here: each user attaches their own."}{" "}
+          The engine, endpoint and auth style cannot be changed after you create it; a different gateway needs a new
+          definition, which users select again on purpose.
         </p>
         {/* Switching engine starts the map and auth over: the two engines share no model slots,
             and Codex is bearer-only. */}
@@ -428,6 +734,9 @@ function CreateForm({
               setEngine(e.target.value as Engine);
               setRows(emptyRows());
               setAuth("bearer");
+              // An organization key is Claude only: leaving Claude drops the choice and its acknowledgment.
+              setMode("per_user_key");
+              setAcknowledged(false);
               setError("");
             }}
           >
@@ -435,6 +744,22 @@ function CreateForm({
             <option value="codex">Codex</option>
           </Select>
         </Field>
+        {engine === "claude" && (
+          <Field label="Credential source">
+            <Select
+              aria-label="Credential source"
+              value={mode}
+              onChange={(e) => {
+                setMode(e.target.value as typeof mode);
+                setAcknowledged(false);
+                setError("");
+              }}
+            >
+              <option value="per_user_key">Each user attaches their own key</option>
+              <option value="operator_key">One organization key</option>
+            </Select>
+          </Field>
+        )}
         <p className="text-xs text-muted" data-testid="engine-protocol">Protocol: {PROTOCOL_LABELS[engine]}</p>
         <Field label="Name">
           <Input aria-label="Provider name" placeholder="platform-gateway" value={name} onChange={(e) => setName(e.target.value)} />
@@ -449,9 +774,35 @@ function CreateForm({
               : "Bearer is recommended: on a redirect the key can reach another path on the same host, but not another host. Request bodies can still follow a redirect."}
         </p>
         <ModelMapFields engine={engine} rows={rows} onChange={setRows} idPrefix={`${uid}-new`} />
+        {operatorMode && (
+          <div
+            role="group"
+            aria-label="Organization key disclosures"
+            className="space-y-2 rounded-lg border border-warn/50 bg-warn/5 px-3 py-2 text-sm text-fg"
+          >
+            <p className="font-medium text-warn">Before you create an organization-funded definition</p>
+            <p data-testid="staged-notice-new">
+              Staged: not yet available to users or runs. These terms apply once recipients are granted access, in a later release.
+            </p>
+            <ul className="list-disc space-y-1.5 pl-5">
+              {OPERATOR_DISCLOSURES.map((d) => (
+                <li key={d.id} data-testid={d.id}>{d.text}</li>
+              ))}
+            </ul>
+            <label className="flex items-start gap-2 pt-1">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={acknowledged}
+                onChange={(e) => setAcknowledged(e.target.checked)}
+              />
+              <span>I acknowledge these terms for every user I grant this key to.</span>
+            </label>
+          </div>
+        )}
         {error && <Alert message={error} />}
         <div className="flex flex-wrap gap-2">
-          <Button type="submit" disabled={saving}>{saving ? "Creating…" : "Create shared provider"}</Button>
+          <Button type="submit" disabled={saving || (operatorMode && !acknowledged)}>{saving ? "Creating…" : "Create shared provider"}</Button>
           <Button type="button" variant="ghost" onClick={onCancel} disabled={saving}>Cancel</Button>
         </div>
       </form>

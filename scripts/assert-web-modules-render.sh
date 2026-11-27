@@ -293,6 +293,17 @@ else
   bad "(d2) modules.json is '$(compact_json "$WORK/mn.json")', want '$WANTN'"
 fi
 
+# --- (d3) the chart-line icon (issue #4777) ---------------------------------------------------
+yq -n '.web.nginx.resolver = "10.96.0.10" | .web.modules = [{"id": "chart", "version": "1.0.0", "page": "Page", "label": "Chart", "icon": "chart-line", "navGroup": "modules", "upstream": "svc:8080"}]' > "$WORK/values-chart.yaml"
+render web-configmap.yaml "$WORK/cmc.yaml" -f "$WORK/values-chart.yaml"
+cm_key "$WORK/cmc.yaml" modules.json "$WORK/mc.json"
+WANTC='[{"adminOnly":false,"icon":"chart-line","id":"chart","label":"Chart","navGroup":"modules","page":"Page","version":"1.0.0"}]'
+if [ "$(compact_json "$WORK/mc.json")" = "$WANTC" ]; then
+  ok "(d3) icon chart-line is accepted and projected"
+else
+  bad "(d3) modules.json is '$(compact_json "$WORK/mc.json")', want '$WANTC'"
+fi
+
 # --- (e) checksum/nginx follows the list --------------------------------------------------
 for s in "$SUM0" "$SUM1" "$SUM2"; do
   case "$s" in

@@ -3,7 +3,7 @@
 **Issue**: [#4540](https://github.com/vtmocanu/uzi/issues/4540)
 **Umbrella**: #4319
 **Priority / area**: High / security
-**Status**: v7 (opus final pass APPROVE folded). Anchors verified at `d63a86d90` (2026-11-27). The provider area is unchanged since `bc0348e1a`. Split by owner decision 2026-11-27 into M1 (custody and admin Test) and M2 (recipients). Not started.
+**Status**: v7 (opus final pass APPROVE folded). Anchors verified at `d63a86d90` (2026-11-27). The provider area is unchanged since `bc0348e1a`. Split by owner decision 2026-11-27 into M1 (custody and admin Test) and M2 (recipients). **M1 delivered (owner acceptance #4770 M1 pending); M2 not started.**
 **Entry prerequisites**: met. #4324 (PR #4656) and its Codex extension #4633 (PR #4705), #4505 (PR #4551), and #4322 M1a (judge, PR #4678) and M1b (jobs, PR #4742) are all merged. There is no implementation dependency on #4323, #4496 or #50. Each milestone needs the user's dispatch go.
 **Disposition**: one milestone per gated run, with no on-deck enrollment. Each PR is `non_closing` (`Refs #4540`). The issue closes when M2's owner acceptance passes in #4770.
 
@@ -417,6 +417,10 @@ Full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, `scan:secrets` and
   - The hot-row MultiXact cost is accepted at the expected scale.
 - **D19. Three definition-row locks.** Key attach keeps the per-user-key lock. Select gets a grant-aware `FOR SHARE` lock with an in-lock recheck. Freeze gets an identity `FOR SHARE` lock on the selected ID and scope pair, held through the run insert. Inherited creation holds `FOR SHARE` through the successor insert. One lock cannot both exclude operator definitions (key attach) and admit them (select). The no-cycle analysis (opus N15) goes in the D7 amendment.
 - **D20. ADR and threat model land with M1.** M1 makes "credential_mode admits only per_user_key" false and ships a sealed instance key.
+- **D21. Indexes (M1 delivery, 2026-11-27).** The custody and evidence tables are new and empty, and their primary keys and unique constraints are the only indexes the statements use, so M1 has no standalone index and no `CONCURRENTLY` file. This deviates from R14's wording, which assumed an index on an existing table.
+- **D22. Probe tuple and evidence fence (M1 delivery).** The tuple is revision, base URL, auth style, protocol, model map, custody id, `key_rev`, enabled and not retired. A rename does not invalidate it. The fence is exact for the evidence write; it is not a fence on the dial, so a change after the pre-dial recheck can still let the in-flight probe use the key and endpoint it captured.
+- **D23. Retired definitions hide Test evidence (M1 delivery).** The evidence read is current status, not history, so retiring a definition hides it.
+- **D24. Limited durability claim (M1 delivery).** The recovery claim covers an API-process failure with PostgreSQL intact. It does not cover a PostgreSQL or host crash, storage loss or concurrent migrators.
 - **History.**
   - v1 (re-anchor at `bc0348e1a`): Claude-only mode, the omitted mode CHECK, no endpoint mutation, mode-filtered admin queries, publication scans already shipped, the missing claim-time lock, the threat-model heading, the #4322 wording, the preview anchor.
   - v2 (buddy): D14, D15, D16; the checker-child case handed off.

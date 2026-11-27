@@ -2278,6 +2278,18 @@ const realApi = {
       ...input,
       protocol: input.engine === "codex" ? "openai_responses" : "anthropic_messages",
     }),
+  // Organization key of an operator_key definition (PRD #4540): cookie-only admin writes. Each
+  // answers {provider} (the key itself is never returned); a per_user_key definition is a 409
+  // provider_not_operator_key on those, but a 404 on Test (it only looks up operator definitions).
+  // Test answers {probe} and is rate limited (429, Retry-After).
+  adminPutOperatorKey: (id: string, key: string) =>
+    request<{ provider: AdminSharedProvider }>("PUT", `/admin/providers/${encodeURIComponent(id)}/key`, { key }),
+  adminSetOperatorKeyEnabled: (id: string, enabled: boolean) =>
+    request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}/key/enabled`, { enabled }),
+  adminDeleteOperatorKey: (id: string) =>
+    request<{ provider: AdminSharedProvider }>("DELETE", `/admin/providers/${encodeURIComponent(id)}/key`),
+  adminTestOperatorKey: (id: string) =>
+    request<{ probe: ProviderProbe }>("POST", `/admin/providers/${encodeURIComponent(id)}/test`),
   adminPatchSharedProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
     request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}`, body),
   adminRetireSharedProvider: (id: string) =>

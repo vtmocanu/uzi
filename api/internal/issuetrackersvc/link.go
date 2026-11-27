@@ -62,6 +62,11 @@ func (s *Service) LinkRepo(ctx context.Context, userID, repoID, connID uuid.UUID
 	if !issuetracker.ValidProjectID(projectID) {
 		return Link{}, &Error{Kind: KindBadRequest, Message: "invalid project id"}
 	}
+	// The kind's own id grammar too, before any request (PRD #4765 A1). An unknown kind
+	// is left to checkLinkTarget, which reports it as the internal error it is.
+	if kind, ok := issuetracker.ParseKind(row.Kind); ok && !issuetracker.ValidIDFor(kind, projectID) {
+		return Link{}, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
 
 	account, project, tag, err := s.checkLinkTarget(ctx, userID, connID, row, projectID, tagID)
 	if err != nil {
@@ -217,18 +222,19 @@ func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID,
 	if !found {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "tag not found among the tags this connection's account can see"}
 	}
-	if !issuetracker.ValidTagID(tag.ID) {
+	if !issuetracker.ValidIDFor(kind, tag.ID) {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "the tag's id is too long or malformed to store as an eligibility tag"}
 	}
 	if utf8.RuneCountInString(tag.Name) > maxTagNameLen ||
 		issuetracker.ValidTagRef(issuetracker.TagRef{ID: tag.ID, Name: tag.Name}) != nil {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "the tag's name cannot be used as an eligibility tag: rename it in the issue tracker (no braces, no control characters)"}
 	}
-	if !issuetracker.AccountCanApply(tag, account) {
+	accountCanApply, othersCanApply := issuetracker.TagVerdicts(kind, tag, account)
+	if !accountCanApply {
 		return noAccount, noProject, noTag, conflict("the connection's account cannot apply this tag; in the issue tracker, share the tag's use settings with this account, " +
 			"or with All Users, or pick a tag the account owns")
 	}
-	if !issuetracker.OthersCanApply(tag, account) {
+	if !othersCanApply {
 		return noAccount, noProject, noTag, conflict("nobody other than the connection's account can apply this tag; in the issue tracker, " +
 			"share the tag's use settings with named users or with All Users. " +
 			"This only checks who can apply the tag; it does not show who can edit issues in the project")
@@ -255,14 +261,13 @@ func (s *Service) ListTagsWithVerdicts(ctx context.Context, userID, connID uuid.
 	if err != nil {
 		return nil, err
 	}
+	// An unknown kind judges every tag unusable (TagVerdicts), so the zero kind is safe.
+	kind, _ := issuetracker.ParseKind(row.Kind)
 	account := issuetracker.Account{ID: row.AccountID, Login: row.AccountLogin}
 	out := make([]TagView, 0, len(tags))
 	for _, t := range tags {
-		out = append(out, TagView{
-			Tag:             t,
-			AccountCanApply: issuetracker.AccountCanApply(t, account),
-			OthersCanApply:  issuetracker.OthersCanApply(t, account),
-		})
+		accountCanApply, othersCanApply := issuetracker.TagVerdicts(kind, t, account)
+		out = append(out, TagView{Tag: t, AccountCanApply: accountCanApply, OthersCanApply: othersCanApply})
 	}
 	return out, nil
 }
