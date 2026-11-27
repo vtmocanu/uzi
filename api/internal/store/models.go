@@ -93,6 +93,20 @@ type AnthropicRateLimit struct {
 	EnablementRev    int64              `json:"enablement_rev"`
 }
 
+type AnthropicUsageSample struct {
+	UserID           uuid.UUID          `json:"user_id"`
+	UserSecretID     uuid.UUID          `json:"user_secret_id"`
+	ObservedAt       pgtype.Timestamptz `json:"observed_at"`
+	BucketStart      pgtype.Timestamptz `json:"bucket_start"`
+	EnablementRev    int64              `json:"enablement_rev"`
+	Source           string             `json:"source"`
+	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
+	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
+	SevenDayPct      int16              `json:"seven_day_pct"`
+	SevenDayResetsAt pgtype.Timestamptz `json:"seven_day_resets_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type AppSetting struct {
 	Key       string             `json:"key"`
 	Value     string             `json:"value"`
@@ -331,6 +345,17 @@ type CodexRefreshIntent struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 	ProviderErrorAt   pgtype.Timestamptz `json:"provider_error_at"`
 	ReuseAttemptedAt  pgtype.Timestamptz `json:"reuse_attempted_at"`
+}
+
+type CodexUsageSample struct {
+	UserID                     uuid.UUID          `json:"user_id"`
+	ProviderAccountID          uuid.UUID          `json:"provider_account_id"`
+	ObservedAt                 pgtype.Timestamptz `json:"observed_at"`
+	BucketStart                pgtype.Timestamptz `json:"bucket_start"`
+	ObservedGeneration         int64              `json:"observed_generation"`
+	ObservedCredentialRevision int64              `json:"observed_credential_revision"`
+	Buckets                    []byte             `json:"buckets"`
+	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
 }
 
 type ControllerReportStatus struct {

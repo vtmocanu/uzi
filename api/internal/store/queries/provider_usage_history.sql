@@ -1,0 +1,192 @@
+-- Provider usage-limit history (issue #4692, M1): the two best-effort copies from an
+-- accepted gauge reading into the raw five-minute sample tables (00547). Each is ONE
+-- autocommit INSERT ... SELECT ... ON CONFLICT DO NOTHING, run by the caller AFTER its gauge
+-- write succeeded. There is no transaction, no SET LOCAL, no FOR SHARE and no advisory lock:
+-- every guard is a plain read in the same snapshot as the insert, and the only implicit lock
+-- is the users FK's FOR KEY SHARE. A guard that fails selects no row (0 rows affected), which
+-- is a GAP in the history, never a zero reading.
+--
+-- Admission (both providers, database clock): the reading's timestamp must be newer than one
+-- hour ago and no later than 15 minutes ahead. The upper bound absorbs api-to-database clock
+-- skew for the Anthropic synced_at (stamped by the api clock); the window only guards
+-- freshness and skew, it is not an expiry.
+
+-- name: CopyAnthropicUsageSample :execrows
+-- The gauge row must still be EXACTLY the reading the caller's upsert wrote: same owner and
+-- token (the join to user_secrets re-checks the pair), token still enabled at the same
+-- enablement revision, same synced_at / source / pct / reset columns. A later accepted poll,
+-- a disable or re-enable, or MarkFiveHourExhausted / MarkSevenDayExhausted (which keep
+-- synced_at but set source = 'limit_report' and change the pct) all make this select nothing.
+-- A NULL gauge source never matches. The first accepted copy in a five-minute bucket wins.
+INSERT INTO anthropic_usage_samples (
+    user_id, user_secret_id, observed_at, enablement_rev, source,
+    five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at
+)
+SELECT g.user_id, g.user_secret_id, g.synced_at, g.enablement_rev, g.source,
+       g.five_hour_pct, g.five_hour_resets_at, g.seven_day_pct, g.seven_day_resets_at
+FROM anthropic_rate_limits g
+JOIN user_secrets s ON s.id = g.user_secret_id AND s.user_id = g.user_id
+WHERE g.user_secret_id = @user_secret_id::uuid
+  AND g.user_id = @user_id::uuid
+  AND s.kind = 'anthropic_token'
+  AND s.disabled_at IS NULL
+  AND s.enablement_rev = @enablement_rev::bigint
+  AND g.enablement_rev = @enablement_rev::bigint
+  AND g.synced_at = sqlc.narg(synced_at)::timestamptz
+  AND g.source = sqlc.narg(source)::text
+  AND g.source IN ('usage_endpoint', 'header_probe')
+  AND g.five_hour_pct IS NOT DISTINCT FROM sqlc.narg(five_hour_pct)::smallint
+  AND g.five_hour_resets_at IS NOT DISTINCT FROM sqlc.narg(five_hour_resets_at)::timestamptz
+  AND g.seven_day_pct = sqlc.narg(seven_day_pct)::smallint
+  AND g.seven_day_resets_at IS NOT DISTINCT FROM sqlc.narg(seven_day_resets_at)::timestamptz
+  AND g.synced_at > now() - interval '1 hour'
+  AND g.synced_at <= now() + interval '15 minutes'
+ON CONFLICT (user_id, user_secret_id, bucket_start) DO NOTHING;
+
+-- name: CopyCodexUsageSample :execrows
+-- The Codex counterpart. The gauge row must still be exactly the reading the caller's
+-- UpsertCodexAccountRateLimits wrote (same observed generation / credential revision /
+-- enablement_sig / buckets bytes, attempt_status 'ok', and last_success_at = last_attempt_at =
+-- the returned last_success_at, so a later RecordCodexAccountPollFailure, which moves
+-- last_attempt_at and the status, makes the copy skip). The account must still be at that
+-- generation and credential revision with an enabled linked alias, and the linked-alias
+-- signature, recomputed with the same expression UpsertCodexAccountRateLimits uses, must still
+-- equal the poll's enablement_sig (plain reads, no FOR SHARE, no advisory lock). The identity
+-- is (owner, account), so several aliases of one account share one gauge row and one sample
+-- per bucket.
+--
+-- Payload policy, in the same statement: ANY violation selects nothing (a gap, never a
+-- truncation). buckets must be an array of at most 17 objects; each object has a string id of
+-- 1..99 bytes, unique within the array; allowed and limit_reached are boolean or null;
+-- primary and secondary are objects or null; in a window, used_percent is a number 0..100 or
+-- null, limit_window_seconds a positive integer or null, reset_at and reset_after_seconds
+-- non-negative integers or null (integers are also capped at 2^53-1 so the derived reset
+-- below cannot overflow bigint). [] is admissible; JSON null is not. Unknown keys are ignored.
+-- Every cast is guarded by a CASE on jsonb_typeof, never by AND (AND does not short-circuit).
+--
+-- The stored projection is bucket {id, a, l, s1, s2} with window {p, w, r, rd}: display_name
+-- is dropped; r is reset_at, or, when reset_at is null and reset_after_seconds is present,
+-- floor(epoch of last_success_at) + reset_after_seconds with rd = true marking it approximate.
+-- The projection must be at most 4096 bytes as text, the same bound the table CHECK enforces,
+-- so near-maximum readings (about 17 buckets with long ids) are skipped as gaps.
+WITH gauge AS MATERIALIZED (
+    SELECT g.user_id, g.provider_account_id, g.observed_generation,
+           g.observed_credential_revision, g.last_success_at, g.buckets
+    FROM codex_account_rate_limits g
+    JOIN codex_provider_account a
+      ON a.user_id = g.user_id AND a.id = g.provider_account_id
+     AND a.generation = @observed_generation::bigint
+     AND a.credential_revision = @observed_credential_revision::bigint
+    WHERE g.user_id = @user_id::uuid
+      AND g.provider_account_id = @provider_account_id::uuid
+      AND g.observed_generation = @observed_generation::bigint
+      AND g.observed_credential_revision = @observed_credential_revision::bigint
+      AND g.enablement_sig = @enablement_sig::text
+      AND g.buckets = @buckets::jsonb
+      AND g.attempt_status = 'ok'
+      AND g.last_success_at = @last_success_at::timestamptz
+      AND g.last_attempt_at = @last_success_at::timestamptz
+      AND g.last_success_at > now() - interval '1 hour'
+      AND g.last_success_at <= now() + interval '15 minutes'
+      AND CASE WHEN jsonb_typeof(g.buckets) = 'array'
+               THEN jsonb_array_length(g.buckets) <= 17 ELSE false END
+      AND EXISTS (
+          SELECT 1
+          FROM codex_credential_state s
+          JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+          WHERE s.user_id = g.user_id AND s.provider_account_id = g.provider_account_id
+            AND s.status = 'linked' AND us.disabled_at IS NULL)
+      AND (
+          SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+          FROM codex_credential_state s
+          JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+          WHERE s.user_id = g.user_id AND s.provider_account_id = g.provider_account_id
+            AND s.status = 'linked'
+      ) = @enablement_sig::text
+)
+INSERT INTO codex_usage_samples (
+    user_id, provider_account_id, observed_at, observed_generation,
+    observed_credential_revision, buckets
+)
+SELECT ga.user_id, ga.provider_account_id, ga.last_success_at, ga.observed_generation,
+       ga.observed_credential_revision, p.buckets
+FROM gauge ga
+CROSS JOIN LATERAL (
+    SELECT COALESCE(bool_and(e.ok), true) AS ok,
+           count(*) AS n,
+           count(DISTINCT e.id) AS n_ids,
+           COALESCE(jsonb_agg(e.bucket ORDER BY el.ord), '[]'::jsonb) AS buckets
+    FROM jsonb_array_elements(
+             CASE WHEN jsonb_typeof(ga.buckets) = 'array' THEN ga.buckets ELSE '[]'::jsonb END
+         ) WITH ORDINALITY AS el(v, ord)
+    CROSS JOIN LATERAL (
+        SELECT bool_and(win.ok) AS ok,
+               jsonb_agg(win.pj ORDER BY ws.k) AS pjs
+        FROM (VALUES (1, el.v -> 'primary'), (2, el.v -> 'secondary')) AS ws(k, j)
+        CROSS JOIN LATERAL (
+            SELECT COALESCE(jsonb_typeof(ws.j -> 'used_percent'), 'null') AS tp,
+                   COALESCE(jsonb_typeof(ws.j -> 'limit_window_seconds'), 'null') AS tl,
+                   COALESCE(jsonb_typeof(ws.j -> 'reset_at'), 'null') AS tr,
+                   COALESCE(jsonb_typeof(ws.j -> 'reset_after_seconds'), 'null') AS tq,
+                   CASE WHEN jsonb_typeof(ws.j -> 'used_percent') = 'number'
+                        THEN (ws.j ->> 'used_percent')::numeric END AS np,
+                   CASE WHEN jsonb_typeof(ws.j -> 'limit_window_seconds') = 'number'
+                        THEN (ws.j ->> 'limit_window_seconds')::numeric END AS nl,
+                   CASE WHEN jsonb_typeof(ws.j -> 'reset_at') = 'number'
+                        THEN (ws.j ->> 'reset_at')::numeric END AS nr,
+                   CASE WHEN jsonb_typeof(ws.j -> 'reset_after_seconds') = 'number'
+                        THEN (ws.j ->> 'reset_after_seconds')::numeric END AS nq
+        ) f
+        CROSS JOIN LATERAL (
+            SELECT CASE COALESCE(jsonb_typeof(ws.j), 'null')
+                       WHEN 'null' THEN true
+                       WHEN 'object' THEN COALESCE(
+                           (f.tp = 'null' OR (f.tp = 'number' AND f.np BETWEEN 0 AND 100))
+                           AND (f.tl = 'null'
+                                OR (f.tl = 'number' AND scale(f.nl) = 0
+                                    AND f.nl > 0 AND f.nl <= 9007199254740991))
+                           AND (f.tr = 'null'
+                                OR (f.tr = 'number' AND scale(f.nr) = 0
+                                    AND f.nr >= 0 AND f.nr <= 9007199254740991))
+                           AND (f.tq = 'null'
+                                OR (f.tq = 'number' AND scale(f.nq) = 0
+                                    AND f.nq >= 0 AND f.nq <= 9007199254740991)),
+                           false)
+                       ELSE false
+                   END AS ok,
+                   CASE WHEN jsonb_typeof(ws.j) = 'object' THEN
+                       jsonb_build_object(
+                           'p', ws.j -> 'used_percent',
+                           'w', ws.j -> 'limit_window_seconds',
+                           'r', CASE
+                                    WHEN f.tr = 'number' THEN ws.j -> 'reset_at'
+                                    WHEN f.tq = 'number' AND f.nq >= 0 AND f.nq <= 9007199254740991
+                                        THEN to_jsonb(floor(extract(epoch FROM ga.last_success_at))::bigint + f.nq::bigint)
+                                    ELSE 'null'::jsonb
+                                END,
+                           'rd', CASE WHEN f.tr <> 'number' AND f.tq = 'number' THEN true ELSE false END)
+                   ELSE 'null'::jsonb END AS pj
+        ) win
+    ) wins
+    CROSS JOIN LATERAL (
+        SELECT COALESCE(
+                   jsonb_typeof(el.v) = 'object'
+                   AND jsonb_typeof(el.v -> 'id') = 'string'
+                   AND octet_length(el.v ->> 'id') BETWEEN 1 AND 99
+                   AND COALESCE(jsonb_typeof(el.v -> 'allowed'), 'null') IN ('boolean', 'null')
+                   AND COALESCE(jsonb_typeof(el.v -> 'limit_reached'), 'null') IN ('boolean', 'null')
+                   AND wins.ok,
+                   false) AS ok,
+               CASE WHEN jsonb_typeof(el.v -> 'id') = 'string' THEN el.v ->> 'id' END AS id,
+               jsonb_build_object(
+                   'id', el.v -> 'id',
+                   'a', el.v -> 'allowed',
+                   'l', el.v -> 'limit_reached',
+                   's1', wins.pjs -> 0,
+                   's2', wins.pjs -> 1) AS bucket
+    ) e
+) p
+WHERE p.ok
+  AND p.n = p.n_ids
+  AND octet_length(p.buckets::text) <= 4096
+ON CONFLICT (user_id, provider_account_id, bucket_start) DO NOTHING;
