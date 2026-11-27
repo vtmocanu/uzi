@@ -26,7 +26,7 @@
 
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { claudeConfigDir } from "./claude-config-dir.js";
-import { goConcurrencyEnv } from "./go-concurrency.js";
+import { applyGoMemLimitDefault, goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import type { ClaimRunEnvVar } from "./protocol.js";
@@ -311,14 +311,17 @@ export function buildSdkEnv(
   assertRunEnvDeliverable(runEnv?.vars);
   const env = sdkPreFoldEnv(credential, homeDir, toolEnv, runTmpdir);
   // PRD #4416 M2: user variables, after the tool profile and before every worker-set key below.
-  foldRunEnv(env, runEnv, isSdkRunEnvProtected);
+  const injectedRunEnv = foldRunEnv(env, runEnv, isSdkRunEnvProtected);
   // PRD #4416 M2: every worker-set key assigned from here on overwrites a user variable of the same
   // name silently (no drop event), which is safe only because each such key is also denied by name
-  // (RUN_ENV_DENIED_NAMES / prefixes), so a user variable never reaches this point under it.
+  // (RUN_ENV_DENIED_NAMES / prefixes), so a user variable never reaches this point under it. The one
+  // exception is GOMEMLIMIT: it is not denied, and the worker default yields to an injected run variable.
   // Issue #3382: the worker's optional Go build concurrency defaults (GOFLAGS=-p=N,
   // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
   // override them; absent settings add no key at all. Not protected keys.
   Object.assign(env, goConcurrencyEnv());
+  // WORKER_GO_MEMLIMIT: GOMEMLIMIT defaults here but yields to an injected run variable of that name.
+  applyGoMemLimitDefault(env, injectedRunEnv);
   // Issue #3870: the managed Go work dir, last among the Go keys so nothing provisioned wins.
   if (goWorkDir) env.GOTMPDIR = goWorkDir;
   // DOCKER_HOST is worker-set (not agent-set) and NOT in PROTECTED_ENV_KEYS: the
@@ -403,6 +406,7 @@ export function buildCheckEnv(
   }
   // Issue #3382: the worker's optional Go build concurrency defaults reach checks too.
   Object.assign(env, goConcurrencyEnv());
+  applyGoMemLimitDefault(env);
   // Issue #3870: the managed Go work dir (absent ⇒ no key; buildCheckEnv never carries a provisioned one).
   if (goWorkDir) env.GOTMPDIR = goWorkDir;
   return env;

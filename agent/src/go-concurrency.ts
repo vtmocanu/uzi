@@ -2,13 +2,29 @@
 //
 // WORKER_GO_BUILD_PARALLELISM becomes GOFLAGS=-p=N and WORKER_GO_MAXPROCS becomes
 // GOMAXPROCS=N in the env of the commands the worker launches (agent Bash, Codex
-// commands, checks, the PR-description helper). Both are parsed ONCE at startup;
+// commands, checks, the PR-description helper). WORKER_GO_MEMLIMIT (`<n>MiB|GiB`)
+// becomes GOMEMLIMIT via applyGoMemLimitDefault, which yields to a run variable named
+// GOMEMLIMIT. All are parsed ONCE at startup;
 // unset or blank means the key is absent. Nothing is passed through from the host
 // GOFLAGS or any other variable: the scrubbed env builders stay allowlists.
 
 export interface GoConcurrency {
   buildParallelism?: number;
   maxProcs?: number;
+  /** Canonical GOMEMLIMIT value, `<n>MiB` or `<n>GiB`. */
+  memLimit?: string;
+}
+
+const MEM_LIMIT_ERROR = `WORKER_GO_MEMLIMIT must be a positive integer <= 2147483647 followed by MiB or GiB`;
+
+function optionalMemLimit(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = (env.WORKER_GO_MEMLIMIT ?? "").replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, "");
+  if (raw === "") return undefined;
+  const m = /^([0-9]+)(MiB|GiB)$/.exec(raw);
+  if (!m) throw new Error(MEM_LIMIT_ERROR);
+  const n = parseBoundedPositiveInt((m[1] ?? "").replace(/^0+(?=[0-9])/, ""), GO_CONCURRENCY_CEILING);
+  if (n === undefined) throw new Error(MEM_LIMIT_ERROR);
+  return `${String(n)}${m[2]}`;
 }
 
 /** The int32 ceiling shared with the controller/chart validation. */
@@ -40,6 +56,8 @@ export function parseGoConcurrency(env: NodeJS.ProcessEnv): GoConcurrency {
   if (parallelism !== undefined) out.buildParallelism = parallelism;
   const maxProcs = optionalGoSetting(env, "WORKER_GO_MAXPROCS");
   if (maxProcs !== undefined) out.maxProcs = maxProcs;
+  const memLimit = optionalMemLimit(env);
+  if (memLimit !== undefined) out.memLimit = memLimit;
   return out;
 }
 
@@ -65,4 +83,19 @@ export function goConcurrencyEnv(
   else if (trustedGoflags) out.GOFLAGS = trustedGoflags;
   if (settings.maxProcs !== undefined) out.GOMAXPROCS = String(settings.maxProcs);
   return out;
+}
+
+/**
+ * Default GOMEMLIMIT into `env` from the settings (default: the configured ones). It
+ * yields to a run variable the fold injected (`injected` names GOMEMLIMIT); a GOMEMLIMIT
+ * that arrived any other way (toolEnv, host) is overwritten. No-op when unset.
+ */
+export function applyGoMemLimitDefault(
+  env: Record<string, string | undefined>,
+  injected?: readonly { name: string }[],
+  settings: GoConcurrency = configured,
+): void {
+  if (settings.memLimit === undefined) return;
+  if (injected?.some((v) => v.name === "GOMEMLIMIT")) return;
+  env.GOMEMLIMIT = settings.memLimit;
 }

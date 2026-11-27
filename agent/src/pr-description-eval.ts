@@ -11,7 +11,7 @@ import { capBody, renderBody, renderRegion, type RegionInput } from "./pr-descri
 import type { DeliveryContext } from "./pr-description-context.js";
 import type { PrSummaryClaim } from "./signals.js";
 import type { Logger } from "./log.js";
-import { goConcurrencyEnv, type GoConcurrency } from "./go-concurrency.js";
+import { applyGoMemLimitDefault, goConcurrencyEnv, type GoConcurrency } from "./go-concurrency.js";
 
 export const evalLog: Logger = {
   debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
@@ -115,6 +115,7 @@ export async function sanitizeEditorFields(checkout: string, fields: RawPrDescri
   const scratch = path.join(checkout, ".uzi/scratch");
   // Issue #3382: GOFLAGS is "-buildvcs=false" plus the optional "-p=N" parsed by the CLI.
   const env: NodeJS.ProcessEnv = { HOME: scratch, ...goConcurrencyEnv(go ?? {}, "-buildvcs=false"), ...(await goCacheDirs()) };
+  applyGoMemLimitDefault(env, undefined, go ?? {});
   for (const key of ["PATH", "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE"] as const) {
     if (process.env[key]) env[key] = process.env[key];
   }
