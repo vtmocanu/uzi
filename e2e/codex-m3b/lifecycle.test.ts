@@ -37,6 +37,7 @@ import {
   loadPackagedSessionState,
   loadPackagedSelect,
   loadPackagedLauncher,
+  loadPackagedRmtree,
   loadPackagedTransport,
   type CodexExecutorModule,
   type LauncherModule,
@@ -1250,6 +1251,13 @@ function makeScratch(): { scratch: string; worktree: string; home: string } {
   fs.mkdirSync(worktree, { recursive: true, mode: 0o2770 });
   fs.chmodSync(worktree, 0o2770);
   return { scratch, worktree, home: nodePath.join(scratch, "home") };
+}
+
+async function removePackagedScratch(scratch: string): Promise<void> {
+  // A real command may leave a runner-cmd-owned 0700 .docker in the run HOME.
+  // Use the worker's terminal tree remover, which has a descriptor-pinned pass as that uid.
+  const { rmTeardownTree } = await loadPackagedRmtree();
+  await rmTeardownTree(scratch);
 }
 
 function sleepMs(ms: number): Promise<void> {
@@ -2491,10 +2499,9 @@ async function runLiveSubscription(): Promise<void> {
       await fullExec.safety.dispose({ boundary: "terminal", deadlineMs: 5000 }).catch(() => undefined);
     }
     try {
-      fs.rmSync(scratch, { recursive: true, force: true });
+      await removePackagedScratch(scratch);
     } catch {
-      // Best-effort: a model run's uid-10003 command files can be unremovable by this uid (EACCES).
-      // The pod is throwaway, so a leftover scratch dir never affects the proof.
+      // The live pod is throwaway. A cleanup refusal must not replace its lifecycle verdict.
     }
   }
 }
@@ -2774,7 +2781,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         await exec.safety.dispose({ boundary: "terminal", deadlineMs: 3000 }).catch(() => undefined);
       }
       await fake.close();
-      fs.rmSync(scratch, { recursive: true, force: true });
+      await removePackagedScratch(scratch);
     }
   });
 
@@ -2887,7 +2894,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         await exec.safety.dispose({ boundary: "terminal", deadlineMs: 3000 }).catch(() => undefined);
       }
       await fake.close();
-      fs.rmSync(scratch, { recursive: true, force: true });
+      await removePackagedScratch(scratch);
     }
   });
 });
