@@ -240,7 +240,9 @@ func TestStateMappingRefusesAStoredInvalidProjectID(t *testing.T) {
 	h := newHarness(t)
 	user := uuid.New()
 	ctx := context.Background()
-	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
+	// "abc" and "1-" fit the kind-neutral stored shape but not YouTrack's grammar: the
+	// kind-aware admission (ValidIDFor) still refuses them here, before a driver (PRD #4765 A1).
+	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n", "a/b", "-1", "a?b"} {
 		repo := linkedFakeRepo(t, h, user, bad)
 		// The id is refused before a driver is built, so no request can carry it.
 		h.template.listStatesErr = errors.New("must not be reached")

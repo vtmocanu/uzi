@@ -1,6 +1,7 @@
 package issuetracker
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -67,6 +68,11 @@ func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 	if err := ValidBinding(Binding{Project: opts.Project, ProjectID: opts.ProjectID, EligibilityTag: opts.EligibilityTag}); err != nil {
 		return nil, err
 	}
+	// ValidBinding checks only the kind-neutral stored shape; a bound project and
+	// tag must also be YouTrack entity ids.
+	if err := validYouTrackRef(opts.Project.ID, opts.EligibilityTag.ID); err != nil {
+		return nil, err
+	}
 	stateField := opts.StateField
 	if stateField == "" {
 		stateField = defaultStateField
@@ -84,6 +90,18 @@ func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 		client:       newHTTPClient(opts.Timeout, base),
 		red:          newRedactor(opts.Token),
 	}, nil
+}
+
+// validYouTrackRef refuses a project or tag id that is set but is not a YouTrack
+// entity id (entityIDRE). An empty id passes: the binding is optional.
+func validYouTrackRef(projectID, tagID string) error {
+	if projectID != "" && !entityIDRE.MatchString(projectID) {
+		return errors.New("issuetracker: invalid project id")
+	}
+	if tagID != "" && !entityIDRE.MatchString(tagID) {
+		return errors.New("issuetracker: invalid eligibility tag id")
+	}
+	return nil
 }
 
 // strictBaseURL accepts only https://host[:port] with an optional single

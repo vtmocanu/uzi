@@ -18,20 +18,30 @@ const wantStateMachineReason = "project " + youtracktest.ProjectShortName +
 	" uses a state-machine workflow on its State field; uzi needs a plain State field. " +
 	"Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack."
 
+// The remedy comes from the driver's error (PRD #4765 A1). With YouTrack's remedy the text is
+// exactly what it was before A1; with none it falls back to kind-neutral wording.
 func TestStateMachineRefusalText(t *testing.T) {
-	if got := StateMachineRefusal("ABC"); got != "project ABC uses a state-machine workflow on its State field; uzi needs a plain State field. "+
+	youTrack := issuetracker.WithRemedy(issuetracker.ErrStateMachineField, "remove the state-machine rule from the State field in YouTrack")
+	if got := StateMachineRefusal("ABC", youTrack); got != "project ABC uses a state-machine workflow on its State field; uzi needs a plain State field. "+
 		"Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack." {
 		t.Fatalf("StateMachineRefusal = %q", got)
+	}
+	if got := StateMachineRefusal("ABC", issuetracker.ErrStateMachineField); got != "project ABC uses a state-machine workflow on its State field; uzi needs a plain State field. "+
+		"Link a project with a plain State field, or remove the state-machine rule from the State field in the issue tracker." {
+		t.Fatalf("StateMachineRefusal with no remedy = %q", got)
 	}
 }
 
 func TestStateFieldUnreadableRefusalText(t *testing.T) {
 	cause := errors.New("issuetracker: the State field could not be read as a plain State field: issue \"ABC-3\"")
-	want := "uzi could not read project ABC's State field as a plain State field (" + cause.Error() + "). " +
-		"The connection's account may not be allowed to see the State field, or the project has no field by that name. " +
-		"Let that account see the State field in YouTrack, or link a project whose State field it can read."
-	if got := StateFieldUnreadableRefusal("ABC", cause); got != want {
+	head := "uzi could not read project ABC's State field as a plain State field (" + cause.Error() + "). " +
+		"The connection's account may not be allowed to see the State field, or the project has no field by that name. "
+	youTrack := issuetracker.WithRemedy(cause, "Let that account see the State field in YouTrack, or link a project whose State field it can read.")
+	if got, want := StateFieldUnreadableRefusal("ABC", youTrack), head+"Let that account see the State field in YouTrack, or link a project whose State field it can read."; got != want {
 		t.Fatalf("StateFieldUnreadableRefusal = %q", got)
+	}
+	if got, want := StateFieldUnreadableRefusal("ABC", cause), head+"Let that account see the State field in the issue tracker, or link a project whose State field it can read."; got != want {
+		t.Fatalf("StateFieldUnreadableRefusal with no remedy = %q", got)
 	}
 }
 
@@ -177,7 +187,7 @@ func TestStateFieldCheckFailureIsABadGatewayNamingTheProject(t *testing.T) {
 func TestCheckStateFieldMapsDriverErrors(t *testing.T) {
 	ref := issuetracker.ProjectRef{ID: "0-1", ShortName: "ABC"}
 	d := &fakeDriver{stateFieldErr: issuetracker.ErrStateMachineField}
-	if e := wantKind(t, checkStateField(context.Background(), d, ref), KindConflict); e.Message != StateMachineRefusal("ABC") {
+	if e := wantKind(t, checkStateField(context.Background(), d, ref), KindConflict); e.Message != StateMachineRefusal("ABC", issuetracker.ErrStateMachineField) {
 		t.Errorf("message = %q", e.Message)
 	}
 	unreadable := fmt.Errorf("check: %w", issuetracker.ErrStateFieldUnreadable)

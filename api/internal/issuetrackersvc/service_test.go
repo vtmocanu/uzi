@@ -597,9 +597,9 @@ func TestDriverForRefusesPartialOrMalformedBinding(t *testing.T) {
 		"no project":          mutate(func(b *issuetracker.Binding) { b.Project = issuetracker.ProjectRef{} }),
 		"negative project id": mutate(func(b *issuetracker.Binding) { b.ProjectID = -1 }),
 		"half project":        mutate(func(b *issuetracker.Binding) { b.Project.ID = "" }),
-		"bad project id":      mutate(func(b *issuetracker.Binding) { b.Project.ID = "x" }),
+		"bad project id":      mutate(func(b *issuetracker.Binding) { b.Project.ID = "x/y" }),
 		"bad short name":      mutate(func(b *issuetracker.Binding) { b.Project.ShortName = "1bad" }),
-		"bad tag id":          mutate(func(b *issuetracker.Binding) { b.EligibilityTag.ID = "x" }),
+		"bad tag id":          mutate(func(b *issuetracker.Binding) { b.EligibilityTag.ID = "../x" }),
 		"bad tag name":        mutate(func(b *issuetracker.Binding) { b.EligibilityTag.Name = "a}b" }),
 	} {
 		t.Run(name, func(t *testing.T) {

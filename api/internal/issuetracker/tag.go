@@ -92,3 +92,9 @@ func OthersCanApply(t Tag, a Account) bool {
 	}
 	return false
 }
+
+// youTrackTagVerdicts is YouTrack's tag judgment for a link: AccountCanApply
+// and OthersCanApply over the tag's owner and use settings.
+func youTrackTagVerdicts(t Tag, a Account) (accountCanApply, othersCanApply bool) {
+	return AccountCanApply(t, a), OthersCanApply(t, a)
+}
