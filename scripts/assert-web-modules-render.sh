@@ -11,6 +11,13 @@
 #   - 0, 1 and 2 modules render; with none, modules.json is `[]` and locations.conf is comment-only;
 #   - modules.json is exactly the projection id, version, page, label, icon, navGroup, adminOnly
 #     (adminOnly always a boolean); the upstream and unknown input fields never reach it;
+#   - navSection (optional sidebar heading, navGroup modules only) is projected trimmed and only
+#     for the entries that set it, in the sorted-key order of the render; an entry without it
+#     renders as before, pinned by the raw modules.json bytes of values-two.yaml (the
+#     checksum/nginx value is NOT pinned: it hashes the whole ConfigMap, which carries the chart
+#     version in its labels and the whole default.conf, so it moves with every release);
+#   - a blank, 25-character, bidi, non-string or non-modules navSection fails the render naming
+#     web.modules[<i>] (<id>) and renders nothing at all;
 #   - a dotless upstream host expands with the RELEASE namespace, a dotted host and an IPv4 stay
 #     verbatim, and a leading http:// is stripped;
 #   - each emitted location block is byte-identical to scripts/fixtures/web-modules/
@@ -89,6 +96,13 @@ expect_fail() {
   else
     bad "$_label failed, but without '$_frag': $(head -c 300 "$WORK/f.err")"
   fi
+}
+
+# expect_fail_empty <label> <message-fragment> [helm args...]: expect_fail, and the failed render
+# must also have written nothing to stdout (no partial manifest).
+expect_fail_empty() {
+  expect_fail "$@"
+  if [ -s "$WORK/f.out" ]; then bad "$1 wrote output although the render failed"; else ok "$1 wrote nothing"; fi
 }
 
 # cm_key <configmap.yaml> <key> <out>: the raw value of a ConfigMap data key; exit 2 if absent.
@@ -221,6 +235,35 @@ check_mounts "(c) one module" "$WORK/d1.yaml"
 render web-configmap.yaml "$WORK/cm2.yaml" -f "$FIX/values-two.yaml"
 cm_key "$WORK/cm2.yaml" modules.json "$WORK/m2.json"
 cm_key "$WORK/cm2.yaml" modules-locations.conf "$WORK/l2.conf"
+# The raw ConfigMap value, byte for byte, as the chart rendered it before navSection existed.
+cat > "$WORK/m2.want" <<'RAWEOF'
+[
+  {
+    "adminOnly": true,
+    "icon": "factory",
+    "id": "first",
+    "label": "éééééééééééééééééééééééééééééééééééééééé",
+    "navGroup": "factory",
+    "page": "Page",
+    "version": "2.1.0"
+  },
+  {
+    "adminOnly": false,
+    "icon": "terminal",
+    "id": "second",
+    "label": "Second",
+    "navGroup": "modules",
+    "page": "Admin",
+    "version": "0.0.1"
+  }
+]
+
+RAWEOF
+if cmp -s "$WORK/m2.want" "$WORK/m2.json"; then
+  ok "(d) the raw modules.json bytes for a list without navSection are unchanged"
+else
+  bad "(d) the raw modules.json bytes changed: $(diff "$WORK/m2.want" "$WORK/m2.json" | head -n 6 | tr '\n' '|')"
+fi
 LAB40=$(awk 'BEGIN { for (i = 0; i < 40; i++) printf "\303\251" }')
 WANT2='[{"adminOnly":true,"icon":"factory","id":"first","label":"'$LAB40'","navGroup":"factory","page":"Page","version":"2.1.0"},{"adminOnly":false,"icon":"terminal","id":"second","label":"Second","navGroup":"modules","page":"Admin","version":"0.0.1"}]'
 if [ "$(compact_json "$WORK/m2.json")" = "$WANT2" ]; then
@@ -238,6 +281,17 @@ golden "(d)" "$WORK/l2.conf" second second 10.96.0.10 10.0.0.1:8080
 render web-deployment.yaml "$WORK/d2.yaml" -f "$FIX/values-two.yaml"
 SUM2=$(checksum_of "$WORK/d2.yaml")
 check_mounts "(d) two modules" "$WORK/d2.yaml"
+
+# --- (d2) navSection ------------------------------------------------------------------------
+render web-configmap.yaml "$WORK/cmn.yaml" -f "$FIX/values-navsection.yaml"
+cm_key "$WORK/cmn.yaml" modules.json "$WORK/mn.json"
+LAB24=$(awk 'BEGIN { for (i = 0; i < 24; i++) printf "\303\251" }')
+WANTN='[{"adminOnly":false,"icon":"package","id":"plain","label":"Plain","navGroup":"modules","navSection":"Tools","page":"Page","version":"1.0.0"},{"adminOnly":false,"icon":"package","id":"padded","label":"Padded","navGroup":"modules","navSection":"Tools","page":"Page","version":"1.0.0"},{"adminOnly":false,"icon":"package","id":"wide","label":"Wide","navGroup":"modules","navSection":"'$LAB24'","page":"Page","version":"1.0.0"},{"adminOnly":false,"icon":"package","id":"unicode-pad","label":"Unicode pad","navGroup":"modules","navSection":"Admin","page":"Page","version":"1.0.0"},{"adminOnly":false,"icon":"package","id":"none","label":"None","navGroup":"modules","page":"Page","version":"1.0.0"}]'
+if [ "$(compact_json "$WORK/mn.json")" = "$WANTN" ]; then
+  ok "(d2) navSection is projected trimmed (a 24-character value and a Unicode-padded one are accepted) and only on the entries that set it"
+else
+  bad "(d2) modules.json is '$(compact_json "$WORK/mn.json")', want '$WANTN'"
+fi
 
 # --- (e) checksum/nginx follows the list --------------------------------------------------
 for s in "$SUM0" "$SUM1" "$SUM2"; do
@@ -280,7 +334,10 @@ done < "$FIX/upstreams.txt"
 # --- (g) invalid values fixtures ----------------------------------------------------------------
 invalid() { # <fixture-suffix> <message fragment>
   [ -f "$FIX/values-$1.yaml" ] || broken "missing fixture values-$1.yaml"
-  expect_fail "(g) $1" "$2" -f "$FIX/values-$1.yaml"
+  case "$1" in
+    navsection-*) expect_fail_empty "(g) $1" "$2" -f "$FIX/values-$1.yaml" ;;
+    *) expect_fail "(g) $1" "$2" -f "$FIX/values-$1.yaml" ;;
+  esac
 }
 invalid bad-id 'id "Bad" is malformed'
 invalid bad-id-long 'is malformed'
@@ -307,6 +364,11 @@ invalid modules-false 'web.modules must be a list'
 invalid modules-zero 'web.modules must be a list'
 invalid modules-empty-string 'web.modules must be a list'
 invalid modules-empty-map 'web.modules must be a list'
+invalid navsection-blank 'web.modules[0] (blank): navSection must be 1 to 24 characters after trimming whitespace'
+invalid navsection-25 'web.modules[0] (long): navSection must be 1 to 24 characters after trimming whitespace'
+invalid navsection-bidi 'web.modules[0] (bidi): navSection contains control or invisible formatting characters'
+invalid navsection-number 'web.modules[0] (num): navSection must be a string'
+invalid navsection-factory 'web.modules[0] (fac): navSection is only valid with navGroup modules'
 invalid no-resolver 'web.modules requires web.nginx.resolver'
 invalid bad-resolver 'not valid in an nginx resolver directive'
 # The failure is not specific to the ConfigMap template: the whole chart refuses too.

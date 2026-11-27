@@ -20,7 +20,12 @@
 #     each from a temporary file in the same directory, and modules.json absent at the first
 #     rename (a first generation into an empty directory);
 #   - the projection: exactly id, version, page, label, icon, navGroup, adminOnly (a boolean,
-#     false by default), in input order, with no upstream and no unknown field;
+#     false by default), in input order, with no upstream and no unknown field; navSection
+#     (trimmed) is appended after adminOnly only for an entry that sets it, and a list without
+#     it is pinned byte for byte against a literal produced by the generator before navSection;
+#   - navSection: valid values are accepted; blank, 25 characters, bidi, a number and a
+#     non-modules navGroup are refused, a lone surrogate exits 1 without a traceback, and a late
+#     invalid entry leaves an existing output directory byte-unchanged;
 #   - the emitted block equals scripts/fixtures/web-modules/location.example.conf with the
 #     resolver 127.0.0.11 and the upstream filled in, byte for byte.
 #
@@ -143,6 +148,12 @@ expect_not_list() {
 expect_valid zero
 expect_valid one
 expect_valid two
+expect_valid navsection
+expect_invalid navsection-blank 'web.modules[0] (blank): navSection must be 1 to 24 characters after trimming whitespace'
+expect_invalid navsection-25 'web.modules[0] (long): navSection must be 1 to 24 characters after trimming whitespace'
+expect_invalid navsection-bidi 'web.modules[0] (bidi): navSection contains control or invisible formatting characters'
+expect_invalid navsection-number 'web.modules[0] (num): navSection must be a string'
+expect_invalid navsection-factory 'web.modules[0] (fac): navSection is only valid with navGroup modules'
 expect_invalid bad-id 'id "Bad" is malformed'
 expect_invalid bad-id-long 'is malformed'
 expect_invalid dup-id 'web.modules[1]: duplicate id "same" (web.modules[0] already uses it)'
@@ -198,6 +209,11 @@ printf '[{"id":"s","version":"1","page":"P","label":"\\ud800","icon":"package","
 run_gen "$W/sur.json" "$W/sur-out"
 if [ "$RC" -eq 1 ] && [[ $ERR != *Traceback* ]] && [[ $ERR == *"web-modules-gen:"* ]] && [ ! -e "$W/sur-out" ]; then ok; else bad "a lone surrogate label: exit $RC, output dir present=$([ -e "$W/sur-out" ] && echo yes || echo no), $ERR"; fi
 
+# A lone surrogate in navSection is invalid input too, reported as such rather than as a crash.
+printf '[{"id":"s","version":"1","page":"P","label":"L","icon":"package","navGroup":"modules","navSection":"\\ud800","upstream":"svc:80"}]' > "$W/sursec.json"
+run_gen "$W/sursec.json" "$W/sursec-out"
+if [ "$RC" -eq 1 ] && [[ $ERR != *Traceback* ]] && [[ $ERR == *"modules[0] (s): navSection is not valid UTF-8 text"* ]] && [ ! -e "$W/sursec-out" ]; then ok; else bad "a lone surrogate navSection: exit $RC, output dir present=$([ -e "$W/sursec-out" ] && echo yes || echo no), $ERR"; fi
+
 # --- nothing is written on invalid input, into an existing directory too ---------------------
 mkdir "$W/keep"
 printf 'old locations\n' > "$W/keep/locations.conf"
@@ -211,6 +227,18 @@ if [ "$RC" -eq 1 ] && [ "$before" = "$after" ] && [ "$(find "$W/keep" -type f | 
   ok
 else
   bad "an invalid second module changed the existing directory (exit $RC, $ERR)"
+fi
+
+# A late invalid navSection (second entry) over existing output changes nothing either.
+before=$(cd "$W/keep" && find . -type f -print0 | sort -z | xargs -0 cksum | cksum)
+jq -n '[{id: "good", version: "1", page: "P", label: "L", icon: "package", navGroup: "modules", navSection: "Tools", upstream: "svc:80"},
+        {id: "late", version: "1", page: "P", label: "L", icon: "package", navGroup: "modules", navSection: "   ", upstream: "svc:80"}]' > "$W/late-section.json"
+run_gen "$W/late-section.json" "$W/keep"
+after=$(cd "$W/keep" && find . -type f -print0 | sort -z | xargs -0 cksum | cksum)
+if [ "$RC" -eq 1 ] && [[ $ERR == *"modules[1] (late): navSection must be 1 to 24 characters"* ]] && [ "$before" = "$after" ] && [ "$(find "$W/keep" -type f | wc -l)" -eq 2 ]; then
+  ok
+else
+  bad "a late invalid navSection changed the existing directory (exit $RC, $ERR)"
 fi
 
 # --- first generation into a directory that does not exist, modes under a hostile umask -------
@@ -293,10 +321,45 @@ run_gen "$W/proj.json" "$W/proj-out"
 [ "$RC" -eq 0 ] || broken "projection input was rejected: $ERR"
 want_json='[{"id":"alpha","version":"1.2.3","page":"Alpha page","label":"Alpha","icon":"factory","navGroup":"factory","adminOnly":true},{"id":"beta-two","version":"0.0.1","page":"Beta","label":"Beta","icon":"terminal","navGroup":"work","adminOnly":false}]'
 [ "$(jq -c . "$W/proj-out/modules.json")" = "$want_json" ] && ok || bad "projection is $(jq -c . "$W/proj-out/modules.json")"
+# The exact bytes for a list without navSection, as the generator wrote them before navSection existed.
+cat > "$W/proj.want" <<'JSONEOF'
+[
+  {
+    "id": "alpha",
+    "version": "1.2.3",
+    "page": "Alpha page",
+    "label": "Alpha",
+    "icon": "factory",
+    "navGroup": "factory",
+    "adminOnly": true
+  },
+  {
+    "id": "beta-two",
+    "version": "0.0.1",
+    "page": "Beta",
+    "label": "Beta",
+    "icon": "terminal",
+    "navGroup": "work",
+    "adminOnly": false
+  }
+]
+JSONEOF
+cmp -s "$W/proj.want" "$W/proj-out/modules.json" && ok || bad "modules.json bytes for a list without navSection changed: $(diff "$W/proj.want" "$W/proj-out/modules.json" | head -n 6 | tr '\n' '|')"
 # Key order is part of the contract (a stable, reviewable file).
 [ "$(jq -c '.[0] | keys_unsorted' "$W/proj-out/modules.json")" = '["id","version","page","label","icon","navGroup","adminOnly"]' ] && ok || bad "projection key order changed"
 if grep -q 'upstream\|do-not-leak\|alpha.tools\|10.0.0.1' "$W/proj-out/modules.json"; then bad "modules.json leaks the upstream or an unknown field"; else ok; fi
 [ "$(jq '.[1].adminOnly | type' "$W/proj-out/modules.json")" = '"boolean"' ] && ok || bad "adminOnly is not a boolean when omitted"
+
+# navSection is projected trimmed, after adminOnly, and only on the entries that set it.
+jq -n '[
+  {id: "with", version: "1", page: "P", label: "W", icon: "package", navGroup: "modules", navSection: "  Tools  ", upstream: "svc:80"},
+  {id: "without", version: "1", page: "P", label: "N", icon: "package", navGroup: "modules", upstream: "svc:81"}
+]' > "$W/sec.json"
+run_gen "$W/sec.json" "$W/sec-out"
+[ "$RC" -eq 0 ] || broken "navSection projection input was rejected: $ERR"
+[ "$(jq -c '.[0].navSection' "$W/sec-out/modules.json")" = '"Tools"' ] && ok || bad "navSection was not projected trimmed"
+[ "$(jq -c '.[0] | keys_unsorted' "$W/sec-out/modules.json")" = '["id","version","page","label","icon","navGroup","adminOnly","navSection"]' ] && ok || bad "navSection is not appended after adminOnly"
+[ "$(jq -c '.[1] | keys_unsorted' "$W/sec-out/modules.json")" = '["id","version","page","label","icon","navGroup","adminOnly"]' ] && ok || bad "an entry without navSection gained a navSection key"
 
 # --- the emitted blocks equal the shared template ----------------------------------------------
 # golden <locations.conf> <id> <var-suffix> <upstream>

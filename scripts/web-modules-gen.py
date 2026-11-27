@@ -5,7 +5,8 @@ usage: web-modules-gen.py <input.json> <outdir>
        web-modules-gen.py --help
 
 <input.json> is a JSON array of modules with the chart's web.modules[] field names:
-id, version, page, label, icon, navGroup, adminOnly (optional boolean) and upstream
+id, version, page, label, icon, navGroup, adminOnly (optional boolean), navSection (optional
+sidebar heading, valid only with navGroup modules) and upstream
 ([http://]HOST:PORT, the compose service name and port of the module's container). It applies
 the SAME rules as the Helm chart (deploy/chart/templates/_web-modules.tpl) and shares its
 fixtures (scripts/fixtures/web-modules/); the one difference is that a dotless host is NOT
@@ -18,8 +19,8 @@ created). On success <outdir> is created or chmod-ed 0755 and gets, in this orde
   locations.conf  one `location ^~ /modules/<id>/` block per module (a comment-only file for an
                   empty list), resolved by Docker's embedded DNS (127.0.0.11)
   modules.json    the public list the SPA fetches: exactly id, version, page, label, icon,
-                  navGroup and adminOnly, in input order. The upstream and any unknown input
-                  field never appear in it.
+                  navGroup and adminOnly, in input order, then navSection (trimmed) only for an
+                  entry that sets it. The upstream and any unknown input field never appear in it.
 
 Each file is written to a temporary file in <outdir> (mode 0644) and renamed into place.
 
@@ -59,6 +60,9 @@ NAV_GROUPS = ("work", "factory", "modules")
 # U+2066-2069, U+061C, U+FEFF, the invisible operators U+2060-2064, the soft hyphen U+00AD and
 # the Mongolian vowel separator U+180E.
 UNSAFE_TEXT_RE = re.compile("[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\u061c\ufeff\u2060-\u2064\u00ad\u180e]")
+
+# Keep equal to the 1,24 in the chart's navSection check (_web-modules.tpl) and to the SPA's limit.
+NAV_SECTION_MAX = 24
 
 ID_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 IPV4_RE = re.compile(r"(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}")
@@ -172,6 +176,22 @@ def validate(modules):
             raise Invalid("%s: unknown icon %s (see MODULE_ICON_NAMES in web/src/modules/icons.tsx)" % (where, json.dumps(m["icon"])))
         if m["navGroup"] not in NAV_GROUPS:
             raise Invalid("%s: unknown navGroup %s (use work, factory or modules)" % (where, json.dumps(m["navGroup"])))
+        nav_section = None
+        if "navSection" in m:
+            ns = m["navSection"]
+            if not isinstance(ns, str):
+                raise Invalid("%s: navSection must be a string" % where)
+            if UNSAFE_TEXT_RE.search(ns):
+                raise Invalid("%s: navSection contains control or invisible formatting characters" % where)
+            try:
+                ns.encode("utf-8")
+            except UnicodeEncodeError:
+                raise Invalid("%s: navSection is not valid UTF-8 text" % where)
+            nav_section = ns.strip()
+            if not 1 <= len(nav_section) <= NAV_SECTION_MAX:
+                raise Invalid("%s: navSection must be 1 to %d characters after trimming whitespace" % (where, NAV_SECTION_MAX))
+            if m["navGroup"] != "modules":
+                raise Invalid("%s: navSection is only valid with navGroup modules" % where)
         admin_only = False
         if "adminOnly" in m:
             if not isinstance(m["adminOnly"], bool):
@@ -190,18 +210,19 @@ def validate(modules):
                 raise _bad_upstream(where, up)
         elif len(host) > 253 or DNS_RE.fullmatch(host) is None:
             raise _bad_upstream(where, up)
-        out.append(
-            {
-                "id": mid,
-                "version": m["version"],
-                "page": m["page"],
-                "label": m["label"],
-                "icon": m["icon"],
-                "navGroup": m["navGroup"],
-                "adminOnly": admin_only,
-                "upstream": "%s:%s" % (host, port),
-            }
-        )
+        entry = {
+            "id": mid,
+            "version": m["version"],
+            "page": m["page"],
+            "label": m["label"],
+            "icon": m["icon"],
+            "navGroup": m["navGroup"],
+            "adminOnly": admin_only,
+            "upstream": "%s:%s" % (host, port),
+        }
+        if nav_section is not None:
+            entry["navSection"] = nav_section
+        out.append(entry)
     return out
 
 
@@ -234,7 +255,7 @@ def render_locations(mods):
 
 
 def render_json(mods):
-    pub = [{k: m[k] for k in ("id", "version", "page", "label", "icon", "navGroup", "adminOnly")} for m in mods]
+    pub = [{k: m[k] for k in ("id", "version", "page", "label", "icon", "navGroup", "adminOnly", "navSection") if k in m} for m in mods]
     return json.dumps(pub, indent=2, ensure_ascii=False) + "\n"
 
 
