@@ -434,12 +434,20 @@ func TestWorkerCapacitySampleOwnerDeleteCascadesLiveDB(t *testing.T) {
 	wb := f.worker(b, wcsWorkerOpts{heartbeat: &hb})
 	f.tick(0, 100)
 	f.tick(1, 100)
-	f.exec(`DELETE FROM users WHERE id=$1`, a)
-	if got := f.count(`SELECT count(*) FROM worker_capacity_samples WHERE worker_id=$1`, wa); got != 0 {
-		t.Errorf("deleted owner still has %d samples", got)
+	// Both owners must have recorded both buckets, or a cascade that removes nothing would pass.
+	for _, w := range []uuid.UUID{wa, wb} {
+		f.sampleAt(w, 0)
+		f.sampleAt(w, 1)
 	}
-	if got := f.count(`SELECT count(*) FROM worker_capacity_samples WHERE worker_id=$1`, wb); got != 2 {
-		t.Errorf("other owner has %d samples, want 2", got)
+	f.exec(`DELETE FROM users WHERE id=$1`, a)
+	if got := f.samples(wa); len(got) != 0 {
+		t.Errorf("deleted owner still has samples: %+v", got)
+	}
+	// The other owner keeps exactly its two buckets.
+	f.sampleAt(wb, 0)
+	f.sampleAt(wb, 1)
+	if got := f.samples(wb); len(got) != 2 {
+		t.Errorf("other owner samples = %+v, want buckets 0 and 1 only", got)
 	}
 }
 
