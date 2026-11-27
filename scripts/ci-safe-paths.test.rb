@@ -525,7 +525,7 @@ assert.call(File.read(File.join(root, 'e2e/run-store-it.sh')).include?('"$ROOT/s
 assert.call(jobs.values.flat_map { |j| j.fetch('steps', []).map { |s| s['run'].to_s } }.grep(/livedb-skip-guard|-run 'LiveDB\$'|run-store-it/), [], 'no workflow step carries a third LiveDB sweep')
 aggregator = jobs.fetch('test-api-store-it')
 assert.call(Array(aggregator['needs']).sort, %w[changes test-codex-refresh-lostreply-e2e test-livedb-workersvc], 'store-it context waits for both producers')
-assert.call(producer.fetch('timeout-minutes'), 75, 'rest producer headroom')
+assert.call(producer.fetch('timeout-minutes'), 90, 'rest producer headroom')
 assert.call(workersvc_producer.fetch('timeout-minutes'), 60, 'workersvc producer headroom')
 agg_run = aggregator.fetch('steps').first.fetch('run')
 assert.call(aggregator.fetch('steps').first.fetch('env'), {'WORKERSVC_RESULT' => "${{ needs['test-livedb-workersvc'].result }}", 'REST_RESULT' => "${{ needs['test-codex-refresh-lostreply-e2e'].result }}"}, 'aggregator reads both producer results')

@@ -328,7 +328,7 @@ async function withFakeGo(run: (dump: string) => Promise<void>) {
     "#!/bin/sh",
     'if [ "$1" = "run" ]; then',
     "  cat > /dev/null",
-    `  printf '%s|%s|%s' "\${GOFLAGS-<unset>}" "\${GOMAXPROCS-<unset>}" "\${GOFLAGS+set}" > '${dump}'`,
+    `  printf '%s|%s|%s|%s' "\${GOFLAGS-<unset>}" "\${GOMAXPROCS-<unset>}" "\${GOFLAGS+set}" "\${GOMEMLIMIT-<unset>}" > '${dump}'`,
     `  printf '{"fields":{},"diagram_rejected":false}'`,
     "  exit 0",
     "fi",
@@ -347,11 +347,11 @@ const noFields = { summary: "x", changes: [], scope_notes: [], review_pointers: 
 test("helper child env: -buildvcs=false alone, with -p, and GOMAXPROCS only when configured", async () => {
   await withFakeGo(async (dump) => {
     await sanitizeEditorFields(checkout, noFields);
-    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false|<unset>|set");
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false|<unset>|set|<unset>");
     await sanitizeEditorFields(checkout, noFields, { buildParallelism: 2 });
-    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|<unset>|set");
-    await sanitizeEditorFields(checkout, noFields, { buildParallelism: 2, maxProcs: 3 });
-    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|3|set");
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|<unset>|set|<unset>");
+    await sanitizeEditorFields(checkout, noFields, { buildParallelism: 2, maxProcs: 3, memLimit: "6GiB" });
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|3|set|6GiB");
   });
 });
 test("runEvalCli threads parsed Go settings to the helper and fails startup on an invalid value", async () => {
@@ -364,7 +364,7 @@ test("runEvalCli threads parsed Go settings to the helper and fails startup on a
   assert.deepEqual(rows.map((r) => JSON.parse(r)), [{ error: "startup_failed" }]);
   rows.length = 0;
   await withFakeGo(async (dump) => {
-    await runEvalCli(args(), deps({ ...env, WORKER_GO_BUILD_PARALLELISM: " 2 ", WORKER_GO_MAXPROCS: "007" }));
-    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|7|set");
+    await runEvalCli(args(), deps({ ...env, WORKER_GO_BUILD_PARALLELISM: " 2 ", WORKER_GO_MAXPROCS: "007", WORKER_GO_MEMLIMIT: " 006GiB " }));
+    assert.equal(await fs.readFile(dump, "utf8"), "-buildvcs=false -p=2|7|set|6GiB");
   });
 });

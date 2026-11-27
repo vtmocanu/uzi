@@ -38,8 +38,40 @@ are formatted explicitly: an integral float via %.0f, a fractional one is reject
 {{- end -}}
 {{- end -}}
 
-{{- /* Validate both settings unconditionally (invoked from worker-invariants.yaml). */ -}}
+{{- /*
+Canonical value of workers.goMemLimit (GOMEMLIMIT for worker commands). Call with a
+dict holding "root". Renders "<n>MiB" or "<n>GiB", or nothing when unset (null or
+blank). Same rule as agent/src/go-concurrency.ts and controller/internal/config:
+trim only ASCII space, tab, CR and LF; empty is unset; the value must match
+^[0-9]+(MiB|GiB)$ with the number 1..2147483647 (leading zeros stripped). Only a
+string is accepted: the unit is required, so any typed number or bool fails.
+*/ -}}
+{{- define "uzi.workerGoMemLimit" -}}
+{{- $diag := "workers.goMemLimit must be a positive integer <= 2147483647 followed by MiB or GiB" -}}
+{{- $ceiling := "2147483647" -}}
+{{- $v := get (.root.Values.workers | default dict) "goMemLimit" -}}
+{{- if kindIs "invalid" $v -}}
+{{- else if not (kindIs "string" $v) -}}
+{{- fail $diag -}}
+{{- else -}}
+{{- $raw := regexReplaceAll "^[ \t\r\n]+|[ \t\r\n]+$" $v "" -}}
+{{- if $raw -}}
+{{- if not (regexMatch "^[0-9]+(MiB|GiB)$" $raw) -}}
+{{- fail $diag -}}
+{{- end -}}
+{{- $unit := regexFind "(MiB|GiB)$" $raw -}}
+{{- $n := regexReplaceAll "^0+" (regexFind "^[0-9]+" $raw) "" | default "0" -}}
+{{- if or (eq $n "0") (gt (len $n) (len $ceiling)) (and (eq (len $n) (len $ceiling)) (gt $n $ceiling)) -}}
+{{- fail $diag -}}
+{{- end -}}
+{{- printf "%s%s" $n $unit -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Validate all settings unconditionally (invoked from worker-invariants.yaml). */ -}}
 {{- define "uzi.workerGoConcurrencyValidate" -}}
 {{- $_ := include "uzi.workerGoSetting" (dict "name" "goBuildParallelism" "root" .) -}}
 {{- $_ := include "uzi.workerGoSetting" (dict "name" "goMaxProcs" "root" .) -}}
+{{- $_ := include "uzi.workerGoMemLimit" (dict "root" .) -}}
 {{- end -}}
